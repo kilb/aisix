@@ -185,11 +185,9 @@ pub fn build_router(state: ProxyState) -> Router {
     // fast path, the in-flight/cancel telemetry, and the Server-header
     // override — dispatching to the bare handler would silently shed all
     // three (and let an upstream Server header leak through).
-    let host_entry_stack = apply_shared_proxy_layers(
-        Router::new().fallback(passthrough_route::entry),
-        &state,
-    )
-    .with_state(state.clone());
+    let host_entry_stack =
+        apply_shared_proxy_layers(Router::new().fallback(passthrough_route::entry), &state)
+            .with_state(state.clone());
 
     // Pre-routing URL rewriting (`proxy.url_rewrites`). `Router::layer`
     // middleware runs AFTER route matching, so a URI rewritten there could
@@ -262,10 +260,7 @@ pub fn build_router(state: ProxyState) -> Router {
 ///   authoritative — any Server header set by inner handlers or proxied
 ///   from an upstream is replaced, so client-visible Server never leaks
 ///   provider identity.
-fn apply_shared_proxy_layers(
-    router: Router<ProxyState>,
-    state: &ProxyState,
-) -> Router<ProxyState> {
+fn apply_shared_proxy_layers(router: Router<ProxyState>, state: &ProxyState) -> Router<ProxyState> {
     router
         .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(middleware::from_fn_with_state(

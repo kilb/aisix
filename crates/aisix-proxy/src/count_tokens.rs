@@ -205,6 +205,7 @@ async fn dispatch(
     // send the prompt to a third party. Run only dedicated DLP kinds and apply
     // their masks before any quota reservation or upstream attempt.
     let guardrail_ctx = aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
         model_id: &model_entry.id,
         mcp_server_id: "",
         api_key_id: &auth.entry.id,
