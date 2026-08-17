@@ -142,9 +142,12 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
                 .map(str::to_string),
         );
     }
-    if let Some(tool_calls) = m.extra.get("tool_calls") {
-        if !tool_calls.is_null() {
-            parts.push(tool_calls.to_string());
+    for tool_payload in [m.extra.get("tool_calls"), m.extra.get("function_call")]
+        .into_iter()
+        .flatten()
+    {
+        if !tool_payload.is_null() {
+            parts.push(tool_payload.to_string());
         }
     }
     parts.join("\n")
@@ -791,6 +794,19 @@ mod tests {
             scanned.contains("hidden arg payload") && scanned.contains("lookup_evilname"),
             "scan must cover tool_call name and arguments, got {scanned:?}"
         );
+
+        let legacy: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "function_call": {
+                "name": "legacy_lookup",
+                "arguments": "{\"q\":\"legacy hidden payload\"}"
+            }
+        }))
+        .unwrap();
+        let scanned = message_scan_text(&legacy);
+        assert!(scanned.contains("legacy_lookup"));
+        assert!(scanned.contains("legacy hidden payload"));
     }
 
     struct DefaultPolicyGuardrail;

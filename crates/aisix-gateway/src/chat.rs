@@ -431,9 +431,9 @@ pub struct ChatResponse {
 
 impl ChatResponse {
     /// The client-visible output text that content/DLP output guardrails
-    /// must inspect: the assistant `content` plus any `tool_calls`
-    /// material (function names + arguments, and Anthropic `tool_use`
-    /// normalized into the same `extra["tool_calls"]` slot). Tool-call
+    /// must inspect: the assistant `content` plus any `tool_calls` or legacy
+    /// `function_call` material (function names + arguments, and Anthropic
+    /// `tool_use` normalized into `extra["tool_calls"]`). Tool-call
     /// output is rendered to clients but would otherwise bypass output
     /// guardrails that only read `message.content` (#448).
     ///
@@ -441,15 +441,21 @@ impl ChatResponse {
     /// left out of output-guardrail scope by design.
     pub fn guardrail_output_text(&self) -> String {
         let mut out = self.message.content.clone().unwrap_or_default();
-        if let Some(tool_calls) = self.message.extra.get("tool_calls") {
-            if !tool_calls.is_null() {
+        for tool_payload in [
+            self.message.extra.get("tool_calls"),
+            self.message.extra.get("function_call"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !tool_payload.is_null() {
                 if !out.is_empty() {
                     out.push('\n');
                 }
                 // Serialize the whole tool-call payload so no function
                 // name or argument can escape inspection regardless of the
                 // provider-specific shape.
-                out.push_str(&tool_calls.to_string());
+                out.push_str(&tool_payload.to_string());
             }
         }
         for text in [
@@ -494,6 +500,10 @@ pub struct ChatDelta {
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<serde_json::Value>>,
+    /// Legacy OpenAI streamed function-call delta. Kept separate from
+    /// `tool_calls` so older SDK clients receive the wire shape they sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function_call: Option<serde_json::Value>,
     /// Reasoning-content slot the DP renders into `delta
     /// .reasoning_content` on the customer-visible SSE chunk. Populated
     /// by the Bridge after applying the
@@ -953,6 +963,7 @@ mod tests {
                 role: None,
                 content: Some("hello".into()),
                 tool_calls: None,
+                function_call: None,
                 reasoning_content: None,
             },
             finish_reason: None,

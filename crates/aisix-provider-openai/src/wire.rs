@@ -177,6 +177,8 @@ pub struct OpenAiResponseMessage {
     pub content: Option<String>,
     #[serde(default)]
     pub tool_calls: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub function_call: Option<serde_json::Value>,
     /// DeepSeek-reasoner (and other reasoning models) return the
     /// chain-of-thought text at `message.reasoning_content` on the
     /// non-streaming path (#466). Without this field it was silently
@@ -269,6 +271,11 @@ pub fn response_into_chat_response(mut raw: OpenAiResponse) -> ChatResponse {
                         "tool_calls".to_string(),
                         serde_json::Value::Array(tool_calls),
                     );
+                }
+            }
+            if let Some(function_call) = c.message.function_call {
+                if !function_call.is_null() {
+                    extra.insert("function_call".to_string(), function_call);
                 }
             }
             // #466: surface DeepSeek-reasoner's reasoning_content on the
@@ -417,6 +424,8 @@ pub struct OpenAiStreamDelta {
     pub content: Option<String>,
     #[serde(default)]
     pub tool_calls: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub function_call: Option<serde_json::Value>,
     /// Canonical reasoning slot — DeepSeek emits this directly; for
     /// upstreams that put their reasoning text at a different path
     /// (issue #302 §5 `response.reasoning_field`) the bridge runs
@@ -444,6 +453,7 @@ pub fn stream_chunk_into_chat_chunk(mut raw: OpenAiStreamChunk) -> ChatChunk {
                 role: c.delta.role.as_deref().map(role_from_str),
                 content: c.delta.content,
                 tool_calls: c.delta.tool_calls,
+                function_call: c.delta.function_call,
                 // #648 canonical precedence, mirrored on the streaming path
                 // (#502): DeepSeek-canonical `reasoning_content` wins; fall
                 // back to OpenRouter's `reasoning`. Skip empties so a model
@@ -657,6 +667,31 @@ mod tests {
         assert_eq!(tc.len(), 1);
         assert_eq!(tc[0]["id"], "call_abc");
         assert_eq!(tc[0]["function"]["name"], "get_time");
+    }
+
+    #[test]
+    fn response_with_legacy_function_call_propagates_to_message_extra() {
+        let body = r#"{
+            "id": "cmpl-fc",
+            "object": "chat.completion",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "function_call": {"name": "get_time", "arguments": "{\"tz\":\"UTC\"}"}
+                },
+                "finish_reason": "function_call"
+            }]
+        }"#;
+        let raw: OpenAiResponse = serde_json::from_str(body).unwrap();
+        let out = response_into_chat_response(raw);
+        assert_eq!(out.message.extra["function_call"]["name"], "get_time");
+        assert_eq!(
+            out.message.extra["function_call"]["arguments"],
+            "{\"tz\":\"UTC\"}"
+        );
     }
 
     #[test]
@@ -1173,6 +1208,29 @@ mod tests {
         assert_eq!(tc.len(), 1);
         assert_eq!(tc[0]["id"], "call_abc");
         assert_eq!(tc[0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn stream_chunk_with_legacy_function_call_propagates_to_delta() {
+        let body = r#"{
+            "id": "cmpl-f",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "function_call": {"name": "get_weather", "arguments": "{\"city\":"}
+                },
+                "finish_reason": null
+            }]
+        }"#;
+        let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
+        let chunk = stream_chunk_into_chat_chunk(raw);
+        let call = chunk
+            .delta
+            .function_call
+            .expect("legacy function_call in delta");
+        assert_eq!(call["name"], "get_weather");
+        assert_eq!(call["arguments"], "{\"city\":");
     }
 
     #[test]

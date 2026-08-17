@@ -2159,6 +2159,59 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
           },
           {
             nonStreamBody: {
+              id: "chat_legacy_function_output",
+              object: "chat.completion",
+              model: "gpt-4o-mini",
+              choices: [
+                {
+                  index: 0,
+                  message: {
+                    role: "assistant",
+                    content: null,
+                    function_call: {
+                      name: "lookup",
+                      arguments: JSON.stringify({ owner: EMAIL }),
+                    },
+                  },
+                  finish_reason: "function_call",
+                },
+              ],
+              usage: { prompt_tokens: 4, completion_tokens: 3, total_tokens: 7 },
+            },
+          },
+          {
+            nonStreamBody: {
+              id: "chat_legacy_function_blocked_output",
+              object: "chat.completion",
+              model: "gpt-4o-mini",
+              choices: [
+                {
+                  index: 0,
+                  message: {
+                    role: "assistant",
+                    content: null,
+                    function_call: {
+                      name: "lookup",
+                      arguments: JSON.stringify({ owner: CN_ID }),
+                    },
+                  },
+                  finish_reason: "function_call",
+                },
+              ],
+              usage: { prompt_tokens: 4, completion_tokens: 3, total_tokens: 7 },
+            },
+          },
+          {
+            streamEvents: [
+              '{"id":"chat_legacy_function_stream","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}',
+              `{"id":"chat_legacy_function_stream","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"function_call":{"name":"lookup","arguments":"{\\"owner\\":\\"alice@exam"}},"finish_reason":null}]}`,
+              '{"id":"chat_legacy_function_stream","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"function_call":{"arguments":"ple.com\\"}"}},"finish_reason":null}]}',
+              '{"id":"chat_legacy_function_stream","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"function_call"}]}',
+              "[DONE]",
+            ],
+          },
+          {
+            nonStreamBody: {
               id: "resp_prompt_input",
               object: "response",
               status: "completed",
@@ -2280,7 +2333,17 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
       let baseline = structuredUpstream.receivedRequests.length;
       const chatResponse = await post("/v1/chat/completions", {
         model: "pii-current-chat",
-        messages: [{ role: "user", content: "chat structured marker" }],
+        messages: [
+          { role: "user", content: "chat structured marker" },
+          {
+            role: "assistant",
+            content: null,
+            function_call: {
+              name: "lookup",
+              arguments: JSON.stringify({ owner: EMAIL }),
+            },
+          },
+        ],
         functions: [
           {
             name: "lookup",
@@ -2299,7 +2362,69 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
       let forwarded = structuredUpstream.receivedRequests.at(-1)!.body;
       expect(forwarded).toContain("chat structured marker");
       expect(forwarded).not.toContain(EMAIL);
-      expect(forwarded.match(/\[EMAIL_REDACTED\]/g)?.length).toBe(3);
+      expect(forwarded.match(/\[EMAIL_REDACTED\]/g)?.length).toBe(4);
+
+      baseline = structuredUpstream.receivedRequests.length;
+      const legacyOutputResponse = await post("/v1/chat/completions", {
+        model: "pii-current-chat",
+        messages: [{ role: "user", content: "legacy function output marker" }],
+      });
+      const legacyOutputBody = await legacyOutputResponse.text();
+      expect(legacyOutputResponse.status).toBe(200);
+      expect(legacyOutputBody).toContain("[EMAIL_REDACTED]");
+      expect(legacyOutputBody).not.toContain(EMAIL);
+      expect(structuredUpstream.receivedRequests).toHaveLength(baseline + 1);
+      expect(structuredUpstream.receivedRequests.at(-1)!.body).toContain(
+        "legacy function output marker",
+      );
+
+      baseline = structuredUpstream.receivedRequests.length;
+      const legacyBlockedInput = await post("/v1/chat/completions", {
+        model: "pii-current-chat",
+        messages: [
+          { role: "user", content: "legacy blocked input marker" },
+          {
+            role: "assistant",
+            content: null,
+            function_call: {
+              name: "lookup",
+              arguments: JSON.stringify({ owner: CN_ID }),
+            },
+          },
+        ],
+      });
+      const legacyBlockedInputBody = await legacyBlockedInput.text();
+      expect(legacyBlockedInput.status).toBe(422);
+      expect(legacyBlockedInputBody).not.toContain(CN_ID);
+      expect(structuredUpstream.receivedRequests).toHaveLength(baseline);
+
+      baseline = structuredUpstream.receivedRequests.length;
+      const legacyBlockedOutput = await post("/v1/chat/completions", {
+        model: "pii-current-chat",
+        messages: [{ role: "user", content: "legacy blocked output marker" }],
+      });
+      const legacyBlockedOutputBody = await legacyBlockedOutput.text();
+      expect(legacyBlockedOutput.status).toBe(422);
+      expect(legacyBlockedOutputBody).not.toContain(CN_ID);
+      expect(structuredUpstream.receivedRequests).toHaveLength(baseline + 1);
+      expect(structuredUpstream.receivedRequests.at(-1)!.body).toContain(
+        "legacy blocked output marker",
+      );
+
+      baseline = structuredUpstream.receivedRequests.length;
+      const legacyStreamResponse = await post("/v1/chat/completions", {
+        model: "pii-current-chat",
+        messages: [{ role: "user", content: "legacy function stream marker" }],
+        stream: true,
+      });
+      const legacyStreamBody = await legacyStreamResponse.text();
+      expect(legacyStreamResponse.status).toBe(200);
+      expect(legacyStreamBody).toContain("[EMAIL_REDACTED]");
+      expect(legacyStreamBody).not.toContain(EMAIL);
+      expect(structuredUpstream.receivedRequests).toHaveLength(baseline + 1);
+      expect(structuredUpstream.receivedRequests.at(-1)!.body).toContain(
+        "legacy function stream marker",
+      );
 
       baseline = structuredUpstream.receivedRequests.length;
       const promptResponse = await post("/v1/responses", {

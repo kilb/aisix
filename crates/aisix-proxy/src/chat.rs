@@ -4957,7 +4957,8 @@ where
             None
         };
         // #448 parity for streaming: accumulate tool-call text (function name +
-        // arguments) so the end-of-stream output check scans tool calls too.
+        // arguments) so the end-of-stream output check scans modern tool calls
+        // and the deprecated single `function_call` shape too.
         // The chat non-streaming path (`guardrail_output_text`) and /v1/messages
         // streaming already scan tool calls, but chat streaming buffered only
         // `delta.content` — a blocked literal in tool-call `arguments` leaked.
@@ -5074,6 +5075,7 @@ where
                         && chunk.delta.role.is_none()
                         && chunk.delta.content.is_none()
                         && chunk.delta.tool_calls.is_none()
+                        && chunk.delta.function_call.is_none()
                         && chunk.delta.reasoning_content.is_none()
                     {
                         continue;
@@ -5108,6 +5110,15 @@ where
                                     {
                                         push_capped(&mut comp.est_output_text, a);
                                     }
+                                }
+                            }
+                        }
+                        if let Some(function_call) = chunk.delta.function_call.as_ref() {
+                            for field in ["name", "arguments"] {
+                                if let Some(text) =
+                                    function_call.get(field).and_then(serde_json::Value::as_str)
+                                {
+                                    push_capped(&mut comp.est_output_text, text);
                                 }
                             }
                         }
@@ -5267,6 +5278,36 @@ where
                                         );
                                     }
                                 }
+                            }
+                        }
+                    }
+                    if let (Some(function_call), Some(buf)) = (
+                        chunk.delta.function_call.as_ref(),
+                        tool_calls_buf.as_mut(),
+                    ) {
+                        for field in ["name", "arguments"] {
+                            let Some(text) = function_call
+                                .get(field)
+                                .and_then(serde_json::Value::as_str)
+                            else {
+                                continue;
+                            };
+                            if matches!(
+                                stream_policy,
+                                aisix_guardrails::StreamOutputPolicy::Window { .. }
+                            ) {
+                                window_buf.push_str(text);
+                            } else if matches!(
+                                stream_policy,
+                                aisix_guardrails::StreamOutputPolicy::BufferFull { .. }
+                            ) {
+                                buf.push_str(text);
+                            } else {
+                                scan_truncated |= push_to_byte_cap(
+                                    buf,
+                                    text,
+                                    aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
+                                );
                             }
                         }
                     }

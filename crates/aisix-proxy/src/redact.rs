@@ -473,6 +473,15 @@ fn redact_chat_format_impl(
                 detect_keys,
             );
         }
+        if let Some(function_call) = msg.extra.get_mut("function_call") {
+            unrewritable_tool_key |= redact_legacy_function_call(
+                chain,
+                Direction::Input,
+                function_call,
+                &mut counts,
+                detect_keys,
+            );
+        }
         if let Some(refusal) = msg.extra.get_mut("refusal") {
             apply_to_value_string(chain, Direction::Input, refusal, &mut counts);
         }
@@ -664,6 +673,29 @@ fn redact_tool_call_arguments(
         }
     }
     unrewritable_tool_key
+}
+
+/// Rewrite the JSON-encoded arguments of OpenAI's deprecated single
+/// `function_call` shape. The function name is a stable protocol identifier:
+/// inspect it, but fail closed rather than changing it.
+fn redact_legacy_function_call(
+    chain: &dyn Guardrail,
+    dir: Direction,
+    function_call: &mut Value,
+    counts: &mut RedactionCounts,
+    detect_keys: bool,
+) -> bool {
+    let mut unrewritable = false;
+    if detect_keys {
+        unrewritable |=
+            detect_named_structural_fields(chain, dir, function_call, &["name"], counts);
+    }
+    if let Some(Value::String(arguments)) = function_call.get_mut("arguments") {
+        let mut owned = std::mem::take(arguments);
+        unrewritable |= redact_json_encoded_structured(chain, dir, &mut owned, counts, detect_keys);
+        *arguments = owned;
+    }
+    unrewritable
 }
 
 /// Result of rewriting an Anthropic request. JSON object keys cannot be
@@ -1035,7 +1067,9 @@ fn anthropic_additional_content_for_inspection(content: &Value) -> Option<Value>
             (!additional.is_empty()).then_some(Value::Array(additional))
         }
         Value::Object(map) => match map.get("type").and_then(Value::as_str) {
-            Some("text" | "image" | "tool_use") => None,
+            Some("text") => map.get("citations").cloned(),
+            Some("tool_use") => map.get("caller").cloned(),
+            Some("image") => None,
             Some("tool_result") => match map.get("content") {
                 Some(Value::Array(items)) => {
                     let additional: Vec<_> = items
@@ -1167,7 +1201,7 @@ fn redact_anthropic_value(
             }
             let mut unrewritable = false;
             for (field, child) in map {
-                if key_context != AnthropicKeyContext::UserDefined && field == "type" {
+                if key_context == AnthropicKeyContext::Protocol && field == "type" {
                     continue;
                 }
                 let opaque = key_context == AnthropicKeyContext::Protocol
@@ -2153,6 +2187,15 @@ fn redact_chat_response_impl(
                 detect_keys,
             )
         });
+    if let Some(function_call) = resp.message.extra.get_mut("function_call") {
+        unrewritable_tool_key |= redact_legacy_function_call(
+            chain,
+            Direction::Output,
+            function_call,
+            &mut counts,
+            detect_keys,
+        );
+    }
     AnthropicRequestRedaction {
         counts,
         unrewritable_tool_key,
@@ -2337,6 +2380,97 @@ fn redact_chat_chunks_impl(
             } else {
                 String::new()
             });
+        }
+        merge_counts(&mut counts, local);
+    }
+
+    // Deprecated single-function-call channel. OpenAI streams `name` and
+    // JSON-encoded `arguments` as fragments just like modern tool calls, but
+    // without an index because only one call can be active.
+    let legacy_name_sites: Vec<usize> = chunks
+        .iter()
+        .enumerate()
+        .filter(|(_, chunk)| {
+            chunk
+                .delta
+                .function_call
+                .as_ref()
+                .and_then(|call| call.get("name"))
+                .and_then(Value::as_str)
+                .is_some_and(|name| !name.is_empty())
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if !legacy_name_sites.is_empty() {
+        let joined: String = legacy_name_sites
+            .iter()
+            .filter_map(|&index| {
+                chunks[index]
+                    .delta
+                    .function_call
+                    .as_ref()
+                    .and_then(|call| call.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .collect();
+        unrewritable_tool_key |= detect_unrewritable_value_strings(
+            chain,
+            Direction::Output,
+            &Value::String(joined),
+            &mut counts,
+        );
+    }
+    let legacy_argument_sites: Vec<usize> = chunks
+        .iter()
+        .enumerate()
+        .filter(|(_, chunk)| {
+            chunk
+                .delta
+                .function_call
+                .as_ref()
+                .and_then(|call| call.get("arguments"))
+                .and_then(Value::as_str)
+                .is_some_and(|arguments| !arguments.is_empty())
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if !legacy_argument_sites.is_empty() {
+        let joined: String = legacy_argument_sites
+            .iter()
+            .filter_map(|&index| {
+                chunks[index]
+                    .delta
+                    .function_call
+                    .as_ref()
+                    .and_then(|call| call.get("arguments"))
+                    .and_then(Value::as_str)
+            })
+            .collect();
+        let mut rewritten = joined.clone();
+        let mut local = RedactionCounts::new();
+        unrewritable_tool_key |= redact_json_encoded_structured(
+            chain,
+            Direction::Output,
+            &mut rewritten,
+            &mut local,
+            detect_keys,
+        );
+        if rewritten != joined {
+            let mut first = true;
+            for &index in &legacy_argument_sites {
+                let arguments = chunks[index]
+                    .delta
+                    .function_call
+                    .as_mut()
+                    .and_then(|call| call.get_mut("arguments"))
+                    .expect("site was selected for having function-call arguments");
+                *arguments = Value::String(if first {
+                    first = false;
+                    rewritten.clone()
+                } else {
+                    String::new()
+                });
+            }
         }
         merge_counts(&mut counts, local);
     }
@@ -3361,7 +3495,10 @@ mod tests {
                 ]},
                 {"role": "assistant", "content": null, "tool_calls": [
                     {"index": 0, "function": {"name": "send", "arguments": "{\"to\":\"b@y.org\"}"}}
-                ]}
+                ]},
+                {"role": "assistant", "content": null, "function_call": {
+                    "name": "legacy_send", "arguments": "{\"to\":\"c@z.io\"}"
+                }}
             ]
         }))
         .unwrap();
@@ -3379,7 +3516,11 @@ mod tests {
             .as_str()
             .unwrap();
         assert_eq!(args, "{\"to\":\"[EMAIL_REDACTED]\"}");
-        assert_eq!(counts.get("email"), Some(&2));
+        assert_eq!(
+            req.messages[3].extra["function_call"]["arguments"],
+            "{\"to\":\"[EMAIL_REDACTED]\"}"
+        );
+        assert_eq!(counts.get("email"), Some(&3));
         assert_eq!(counts.get("china_mobile"), Some(&1));
     }
 
@@ -3463,6 +3604,10 @@ mod tests {
         );
         msg.extra
             .insert("refusal".into(), json!("cannot help c@z.io"));
+        msg.extra.insert(
+            "function_call".into(),
+            json!({"name": "legacy", "arguments": "{\"mail\":\"d@w.dev\"}"}),
+        );
         let mut resp = ChatResponse {
             id: "r".into(),
             model: "m".into(),
@@ -3485,7 +3630,11 @@ mod tests {
             resp.message.extra["refusal"],
             "cannot help [EMAIL_REDACTED]"
         );
-        assert_eq!(counts.get("email"), Some(&3));
+        assert_eq!(
+            resp.message.extra["function_call"]["arguments"],
+            "{\"mail\":\"[EMAIL_REDACTED]\"}"
+        );
+        assert_eq!(counts.get("email"), Some(&4));
     }
 
     #[test]
@@ -3851,6 +4000,42 @@ mod tests {
 
         let body = json!({
             "model": "claude",
+            "messages": [{"role": "assistant", "content": [
+                {
+                    "type": "text",
+                    "text": "ordinary text",
+                    "citations": [{
+                        "type": "char_location",
+                        "cited_text": "citation-only marker",
+                        "document_index": 0,
+                        "document_title": "citation title",
+                        "start_char_index": 0,
+                        "end_char_index": 1
+                    }]
+                },
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "lookup",
+                    "input": {},
+                    "caller": {"type": "code_execution_20250825", "tool_id": "caller-only marker"}
+                }
+            ]}]
+        });
+        let chat = anthropic_request_for_inspection(&body).unwrap();
+        let joined = chat
+            .messages
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(joined.matches("ordinary text").count(), 1);
+        assert_eq!(joined.matches("citation-only marker").count(), 1);
+        assert_eq!(joined.matches("citation title").count(), 1);
+        assert_eq!(joined.matches("caller-only marker").count(), 1);
+
+        let body = json!({
+            "model": "claude",
             "messages": [{"role": "assistant", "content": [{
                 "type": "web_fetch_tool_result",
                 "tool_use_id": "toolu_fetch",
@@ -4050,6 +4235,7 @@ mod tests {
             "name": "web_search",
             "input": {
                 "query": "weather for a@x.com",
+                "type": "request for b@y.org",
                 "max_uses": 3,
                 "options": {"domain": "example.test"}
             }
@@ -4071,7 +4257,11 @@ mod tests {
             response["content"][0]["input"]["query"],
             "weather for [EMAIL_REDACTED]"
         );
-        assert_eq!(redaction.counts.get("email"), Some(&1));
+        assert_eq!(
+            response["content"][0]["input"]["type"],
+            "request for [EMAIL_REDACTED]"
+        );
+        assert_eq!(redaction.counts.get("email"), Some(&2));
     }
 
     #[test]
@@ -4531,6 +4721,47 @@ mod tests {
             .unwrap();
         assert_eq!(first_args, "{\"to\":\"[EMAIL_REDACTED]\"}");
         assert_eq!(second_args, "");
+    }
+
+    #[test]
+    fn stream_chunks_mask_legacy_function_call_arguments_channel() {
+        let chain = both();
+        let mut chunks = vec![
+            ChatChunk {
+                id: "c".into(),
+                model: "m".into(),
+                delta: ChatDelta {
+                    function_call: Some(json!({
+                        "name": "legacy_send",
+                        "arguments": "{\"to\":\"a@"
+                    })),
+                    ..ChatDelta::default()
+                },
+                finish_reason: None,
+                usage: None,
+            },
+            ChatChunk {
+                id: "c".into(),
+                model: "m".into(),
+                delta: ChatDelta {
+                    function_call: Some(json!({"arguments": "x.com\"}"})),
+                    ..ChatDelta::default()
+                },
+                finish_reason: None,
+                usage: None,
+            },
+        ];
+        let redaction = redact_chat_chunks_structured(chain.as_ref(), &mut chunks);
+        assert!(!redaction.unrewritable_tool_key);
+        assert_eq!(redaction.counts.get("email"), Some(&1));
+        assert_eq!(
+            chunks[0].delta.function_call.as_ref().unwrap()["arguments"],
+            "{\"to\":\"[EMAIL_REDACTED]\"}"
+        );
+        assert_eq!(
+            chunks[1].delta.function_call.as_ref().unwrap()["arguments"],
+            ""
+        );
     }
 
     #[test]
