@@ -58,6 +58,36 @@ async function usage5xxCounter(): Promise<number> {
   return line ? Number(line.trim().split(/\s+/).at(-1)) : 0;
 }
 
+async function outputTokenCounter(model: string): Promise<number> {
+  const response = await fetch(`${app!.metricsUrl}/metrics`);
+  if (response.status !== 200) {
+    throw new Error(`metrics probe returned ${response.status}`);
+  }
+  let total = 0;
+  for (const line of (await response.text()).split("\n")) {
+    if (!line.startsWith("aisix_llm_output_tokens_total{")) continue;
+    if (!line.includes(`model="${model}"`)) continue;
+    total += Number(line.trim().split(/\s+/).at(-1)) || 0;
+  }
+  return total;
+}
+
+async function readCommittedStream(response: Response): Promise<string> {
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let body = "";
+  try {
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      body += decoder.decode(next.value, { stream: true });
+    }
+  } catch {
+    // The typed decode failure terminates an already-committed response body.
+  }
+  return body + decoder.decode();
+}
+
 async function waitForTimeoutObservability(
   modelId: string,
   model: string,
@@ -117,10 +147,12 @@ describe("legacy completions stream timeout", () => {
   let midStream: OpenAiUpstream | undefined;
   let truncated: OpenAiUpstream | undefined;
   let malformed: OpenAiUpstream | undefined;
+  let malformedDone: OpenAiUpstream | undefined;
   let slowModelId = "";
   let midModelId = "";
   let truncatedModelId = "";
   let malformedModelId = "";
+  let malformedDoneModelId = "";
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -147,6 +179,13 @@ describe("legacy completions stream timeout", () => {
     malformed = await startOpenAiUpstream({
       rawSseChunks: ["data: not-json\n\n"],
     });
+    malformedDone = await startOpenAiUpstream({
+      rawSseChunks: [
+        `data: ${chunk("billed-before-malformed-done")}\n\n`,
+        "data: not-json\n\n",
+        "data: [DONE]\n\n",
+      ],
+    });
 
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
@@ -163,6 +202,10 @@ describe("legacy completions stream timeout", () => {
     const midPk = await providerKey("legacy-timeout-mid", midStream);
     const truncatedPk = await providerKey("legacy-truncated", truncated);
     const malformedPk = await providerKey("legacy-malformed", malformed);
+    const malformedDonePk = await providerKey(
+      "legacy-malformed-before-done",
+      malformedDone,
+    );
 
     const slowModel = await seed.createModel({
       display_name: "legacy-timeout-slow",
@@ -203,6 +246,15 @@ describe("legacy completions stream timeout", () => {
       cooldown: { default_seconds: 60 },
     });
     malformedModelId = malformedModel.id;
+    const malformedDoneModel = await seed.createModel({
+      display_name: "legacy-malformed-before-done",
+      provider: "openai",
+      model_name: "gpt-3.5-turbo-instruct",
+      provider_key_id: malformedDonePk,
+      retries: 0,
+      cooldown: { default_seconds: 60 },
+    });
+    malformedDoneModelId = malformedDoneModel.id;
 
     // The caller key is the final revision. Authenticated model listing is a
     // propagation barrier without exercising the timeout behavior under test.
@@ -213,6 +265,7 @@ describe("legacy completions stream timeout", () => {
         "legacy-timeout-mid",
         "legacy-truncated",
         "legacy-malformed",
+        "legacy-malformed-before-done",
       ],
     });
     await waitConfigPropagation(async () => {
@@ -229,7 +282,8 @@ describe("legacy completions stream timeout", () => {
         ids.has("legacy-timeout-slow") &&
         ids.has("legacy-timeout-mid") &&
         ids.has("legacy-truncated") &&
-        ids.has("legacy-malformed")
+        ids.has("legacy-malformed") &&
+        ids.has("legacy-malformed-before-done")
       );
     });
   });
@@ -241,6 +295,7 @@ describe("legacy completions stream timeout", () => {
       midStream?.close(),
       truncated?.close(),
       malformed?.close(),
+      malformedDone?.close(),
     ]);
   });
 
@@ -353,6 +408,37 @@ describe("legacy completions stream timeout", () => {
       "legacy-malformed",
       usageBaseline,
       "upstream_decode_error",
+    );
+  });
+
+  test("malformed SSE before DONE is a billed decode failure without a success terminal", async (ctx) => {
+    if (!etcdReachable || !app || !malformedDone) {
+      ctx.skip();
+      return;
+    }
+    const upstreamBaseline = malformedDone.receivedRequests.length;
+    const usageBaseline = await usage5xxCounter();
+    const outputBaseline = await outputTokenCounter(
+      "legacy-malformed-before-done",
+    );
+
+    const response = await completion("legacy-malformed-before-done");
+    expect(response.status).toBe(200);
+    const body = await readCommittedStream(response);
+    expect(body).toContain("billed-before-malformed-done");
+    expect(body).toContain("not-json");
+    expect(body).not.toContain("[DONE]");
+    expect(malformedDone.receivedRequests).toHaveLength(upstreamBaseline + 1);
+    await waitForTimeoutObservability(
+      malformedDoneModelId,
+      "legacy-malformed-before-done",
+      usageBaseline,
+      "upstream_decode_error",
+    );
+    await waitConfigPropagation(
+      async () =>
+        (await outputTokenCounter("legacy-malformed-before-done")) >
+        outputBaseline,
     );
   });
 });

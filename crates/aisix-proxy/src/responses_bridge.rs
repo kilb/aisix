@@ -1061,6 +1061,7 @@ pub fn build_responses_bridge_stream(
     output_guardrail: Option<Arc<aisix_guardrails::GuardrailChain>>,
     hold_back: bool,
     max_buffer_bytes: usize,
+    on_exceeded_fail_open: bool,
     model_label: String,
     // Largest content cap any content-capturing exporter wants
     // (AISIX-Cloud#947); `None` skips response-text accumulation entirely.
@@ -1099,6 +1100,7 @@ pub fn build_responses_bridge_stream(
         let mut held: Vec<bytes::Bytes> = Vec::new();
         let mut held_bytes = 0usize;
         let mut overflowed = false;
+        let mut cap_released = false;
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(chunk) => {
@@ -1125,8 +1127,8 @@ pub fn build_responses_bridge_stream(
                         // bounded to the cap so a long stream can't grow the
                         // buffer without limit. Only when an exporter wants
                         // full content — mirrors chat.rs's stream capture.
-                        if let (Some(cap), Some(text)) =
-                            (content_cap, chunk.delta.content.as_deref())
+                        if let (false, Some(cap), Some(text)) =
+                            (cap_released, content_cap, chunk.delta.content.as_deref())
                         {
                             let _ = crate::token_estimate::push_capped_to(
                                 &mut comp.response_text,
@@ -1185,13 +1187,34 @@ pub fn build_responses_bridge_stream(
                     }
                     for ev in events {
                         let b = bytes::Bytes::from(ev.to_sse_string());
-                        if buffering {
-                            held_bytes += b.len();
-                            if held_bytes > max_buffer_bytes {
-                                overflowed = true;
-                                break;
+                        if buffering && !cap_released {
+                            if held_bytes.saturating_add(b.len()) > max_buffer_bytes {
+                                if on_exceeded_fail_open {
+                                    tracing::warn!(
+                                        guardrail_hook = "output",
+                                        model = %model_label,
+                                        max_buffer_bytes,
+                                        "streaming /v1/responses (cross-provider) output exceeded buffer cap; failing open",
+                                    );
+                                    cap_released = true;
+                                    held_bytes = 0;
+                                    let comp = guard.comp();
+                                    comp.response_capture_safe = false;
+                                    comp.response_text.clear();
+                                    for pending in held.drain(..) {
+                                        downstream_mark!();
+                                        yield Ok::<_, std::io::Error>(pending);
+                                    }
+                                    downstream_mark!();
+                                    yield Ok::<_, std::io::Error>(b);
+                                } else {
+                                    overflowed = true;
+                                    break;
+                                }
+                            } else {
+                                held_bytes += b.len();
+                                held.push(b);
                             }
-                            held.push(b);
                         } else {
                             downstream_mark!();
                             yield Ok::<_, std::io::Error>(b);
@@ -1221,13 +1244,28 @@ pub fn build_responses_bridge_stream(
         if !encoder.is_finished() {
             for ev in encoder.force_finish() {
                 let b = bytes::Bytes::from(ev.to_sse_string());
-                if buffering {
-                    held_bytes += b.len();
-                    if held_bytes > max_buffer_bytes {
-                        overflowed = true;
-                        break;
+                if buffering && !cap_released {
+                    if held_bytes.saturating_add(b.len()) > max_buffer_bytes {
+                        if on_exceeded_fail_open {
+                            cap_released = true;
+                            held_bytes = 0;
+                            let comp = guard.comp();
+                            comp.response_capture_safe = false;
+                            comp.response_text.clear();
+                            for pending in held.drain(..) {
+                                downstream_mark!();
+                                yield Ok(pending);
+                            }
+                            downstream_mark!();
+                            yield Ok(b);
+                        } else {
+                            overflowed = true;
+                            break;
+                        }
+                    } else {
+                        held_bytes += b.len();
+                        held.push(b);
                     }
-                    held.push(b);
                 } else {
                     downstream_mark!();
                     yield Ok(b);
@@ -1258,6 +1296,9 @@ pub fn build_responses_bridge_stream(
             comp.response_capture_safe = false;
             comp.response_text.clear();
             yield Ok(bytes::Bytes::from(guardrail_error_frame(None)));
+            return;
+        }
+        if cap_released {
             return;
         }
 

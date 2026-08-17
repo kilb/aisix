@@ -22,6 +22,8 @@ const MODELS = {
   messagesMid: "native-messages-mid-timeout",
   responsesFirst: "native-responses-first-timeout",
   responsesMid: "native-responses-mid-timeout",
+  messagesTerminal: "native-messages-terminal-before-stall",
+  responsesTerminal: "native-responses-terminal-before-stall",
   chatBridgeMid: "chat-bridge-mid-timeout",
   messagesBridgeMid: "messages-bridge-mid-timeout",
   responsesBridgeMid: "responses-bridge-mid-timeout",
@@ -35,6 +37,8 @@ const REQUEST_MARKERS = {
   messagesMid: "messages-mid-request-8d32",
   responsesFirst: "responses-first-request-9e43",
   responsesMid: "responses-mid-request-af54",
+  messagesTerminal: "messages-terminal-request-16cb",
+  responsesTerminal: "responses-terminal-request-27dc",
   chatBridgeMid: "chat-bridge-mid-request-b065",
   messagesBridgeMid: "messages-bridge-mid-request-c176",
   responsesBridgeMid: "responses-bridge-mid-request-d287",
@@ -50,6 +54,10 @@ const OUTPUT_MARKERS = {
   responsesFirst: "responses-first-late-output-e498",
   responsesMidFirst: "responses-mid-first-output-f5a9",
   responsesMidLate: "responses-mid-late-output-06ba",
+  messagesTerminal: "messages-terminal-output-071c",
+  messagesAfterTerminal: "messages-after-terminal-must-not-arrive-182d",
+  responsesTerminal: "responses-terminal-output-293e",
+  responsesAfterTerminal: "responses-after-terminal-must-not-arrive-3a4f",
   chatBridgeFirst: "chat-bridge-first-output-17cb",
   chatBridgeLate: "chat-bridge-late-output-28dc",
   messagesBridgeFirst: "messages-bridge-first-output-39ed",
@@ -185,6 +193,22 @@ async function usage5xxCounter(app: SpawnedApp, handler: string): Promise<number
   return line ? Number(line.trim().split(/\s+/).at(-1)) : 0;
 }
 
+async function usage2xxCounter(app: SpawnedApp, handler: string): Promise<number> {
+  const response = await fetch(`${app.metricsUrl}/metrics`);
+  if (response.status !== 200) {
+    throw new Error(`metrics probe returned ${response.status}`);
+  }
+  const line = (await response.text())
+    .split("\n")
+    .find(
+      (candidate) =>
+        candidate.startsWith("aisix_usage_events_emitted_total{") &&
+        candidate.includes(`handler="${handler}"`) &&
+        candidate.includes('status_code="2xx"'),
+    );
+  return line ? Number(line.trim().split(/\s+/).at(-1)) : 0;
+}
+
 async function waitForTimeoutObservability(
   app: SpawnedApp,
   modelId: string,
@@ -248,6 +272,8 @@ describe("stream timeout terminal state across handler families", () => {
   let messagesMid: OpenAiUpstream | undefined;
   let responsesFirst: OpenAiUpstream | undefined;
   let responsesMid: OpenAiUpstream | undefined;
+  let messagesTerminal: OpenAiUpstream | undefined;
+  let responsesTerminal: OpenAiUpstream | undefined;
   let chatBridgeMid: OpenAiUpstream | undefined;
   let messagesBridgeMid: OpenAiUpstream | undefined;
   let responsesBridgeMid: OpenAiUpstream | undefined;
@@ -282,6 +308,20 @@ describe("stream timeout terminal state across handler families", () => {
         OUTPUT_MARKERS.responsesMidFirst,
         OUTPUT_MARKERS.responsesMidLate,
       ),
+    });
+    messagesTerminal = await startOpenAiUpstream({
+      eventDelayMs: STALL_MS,
+      rawSseChunks: [
+        messagesFrames(OUTPUT_MARKERS.messagesTerminal)[0]!,
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: OUTPUT_MARKERS.messagesAfterTerminal } })}\n\n`,
+      ],
+    });
+    responsesTerminal = await startOpenAiUpstream({
+      eventDelayMs: STALL_MS,
+      rawSseChunks: [
+        responsesFrames(OUTPUT_MARKERS.responsesTerminal)[0]!,
+        `data: ${JSON.stringify({ type: "response.output_text.delta", delta: OUTPUT_MARKERS.responsesAfterTerminal })}\n\n`,
+      ],
     });
     chatBridgeMid = await startOpenAiUpstream({
       eventDelayMs: STALL_MS,
@@ -356,6 +396,8 @@ describe("stream timeout terminal state across handler families", () => {
     await createModel("messagesMid", "anthropic", messagesMid);
     await createModel("responsesFirst", "openai", responsesFirst);
     await createModel("responsesMid", "openai", responsesMid);
+    await createModel("messagesTerminal", "anthropic", messagesTerminal);
+    await createModel("responsesTerminal", "openai", responsesTerminal);
     const createBridgeModel = async (
       key:
         | "chatBridgeMid"
@@ -415,6 +457,8 @@ describe("stream timeout terminal state across handler families", () => {
       messagesMid?.close(),
       responsesFirst?.close(),
       responsesMid?.close(),
+      messagesTerminal?.close(),
+      responsesTerminal?.close(),
       chatBridgeMid?.close(),
       messagesBridgeMid?.close(),
       responsesBridgeMid?.close(),
@@ -532,6 +576,67 @@ describe("stream timeout terminal state across handler families", () => {
       "/v1/responses",
       responsesUsageBase,
     );
+  });
+
+  test("semantic terminals complete before a later transport stall", async (ctx) => {
+    if (!etcdReachable || !app || !messagesTerminal || !responsesTerminal) {
+      ctx.skip();
+      return;
+    }
+    const cases = [
+      {
+        endpoint: "/v1/messages" as const,
+        modelKey: "messagesTerminal" as const,
+        upstream: messagesTerminal,
+        marker: OUTPUT_MARKERS.messagesTerminal,
+        after: OUTPUT_MARKERS.messagesAfterTerminal,
+        post: postMessages,
+      },
+      {
+        endpoint: "/v1/responses" as const,
+        modelKey: "responsesTerminal" as const,
+        upstream: responsesTerminal,
+        marker: OUTPUT_MARKERS.responsesTerminal,
+        after: OUTPUT_MARKERS.responsesAfterTerminal,
+        post: postResponses,
+      },
+    ];
+
+    for (const scenario of cases) {
+      const handler = scenario.endpoint.slice(4);
+      const usageBaseline = await usage2xxCounter(app, handler);
+      const failureBaseline = await usage5xxCounter(app, handler);
+      const upstreamBaseline = scenario.upstream.receivedRequests.length;
+      const started = Date.now();
+      const response = await scenario.post(
+        app,
+        MODELS[scenario.modelKey],
+        REQUEST_MARKERS[scenario.modelKey],
+      );
+      expect(response.status).toBe(200);
+      const body = await response.text();
+      expect(Date.now() - started).toBeLessThan(STALL_MS / 2);
+      expect(body).toContain(scenario.marker);
+      expect(body).not.toContain(scenario.after);
+      expect(body).not.toContain("upstream stream failed");
+      expect(scenario.upstream.receivedRequests.length).toBe(
+        upstreamBaseline + 1,
+      );
+
+      await waitConfigPropagation(
+        async () => (await usage2xxCounter(app!, handler)) === usageBaseline + 1,
+      );
+      expect(await usage5xxCounter(app, handler)).toBe(failureBaseline);
+      const statusResponse = await fetch(`${app.metricsUrl}/status/models`);
+      expect(statusResponse.status).toBe(200);
+      const statuses = (await statusResponse.json()) as Array<{
+        id?: string;
+        status?: string;
+      }>;
+      expect(
+        statuses.find((row) => row.id === modelIds[scenario.modelKey])?.status,
+      ).not.toBe("cooldown");
+    }
   });
 
   test("translated streams retain timeout failure state after the first chunk", async (ctx) => {

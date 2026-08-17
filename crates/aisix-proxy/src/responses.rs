@@ -36,6 +36,13 @@ use crate::error::ProxyError;
 use crate::state::ProxyState;
 use crate::usage_attr::{total_tokens_with_cache, ResolvedPk};
 
+type RawResponsesByteStream = std::pin::Pin<
+    Box<
+        dyn futures::Stream<Item = Result<bytes::Bytes, crate::stream_timeout::RawStreamError>>
+            + Send,
+    >,
+>;
+
 /// Per-request payload from a successful dispatch — carries the
 /// response + provider label + the bits of usage data needed for
 /// UsageEvent emission (#404). On the verbatim streaming path the
@@ -123,14 +130,15 @@ impl From<ProxyError> for ResponsesDispatchError {
 /// the ones below.
 #[derive(Default, Clone)]
 struct ResponseUsage {
-    /// `true` once the upstream stream reached EOF, i.e. the response was
-    /// delivered in full. Stays `false` when the consumer went away first,
-    /// which is what the telemetry closure turns into `499`.
+    /// `true` once the upstream emitted a successful semantic terminal event,
+    /// i.e. `response.completed` or `response.incomplete`. Stays `false` when
+    /// the consumer went away first, which is what the telemetry closure turns
+    /// into `499`.
     ///
-    /// Set at upstream EOF rather than after the end-of-stream guardrail
-    /// scan: SDK clients routinely close right after the terminal frame and
-    /// drop this generator at that await, and such a request was delivered
-    /// in full — marking it later would report it as abandoned.
+    /// Set before the end-of-stream guardrail scan: SDK clients routinely
+    /// close right after the terminal frame and drop this generator at that
+    /// await, and such a request was delivered in full — marking it later
+    /// would report it as abandoned.
     reached_end: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
@@ -1301,6 +1309,8 @@ async fn responses_to_target(
         // for observation. Requests with no output-hook guardrail keep the
         // zero-copy verbatim passthrough.
         let output_policy = aisix_guardrails::Guardrail::stream_output_policy(chain);
+        let mut upstream_stream = Some(upstream_resp.bytes_stream());
+        let mut released_body_stream: Option<RawResponsesByteStream> = None;
         if aisix_guardrails::Guardrail::runs_on_output(chain) && output_policy.holds_back() {
             // Hold the whole SSE response back to scan it, but cap the
             // buffer so a huge (or malicious) upstream response can't OOM the
@@ -1309,14 +1319,18 @@ async fn responses_to_target(
             // response exceeds the cap — an output-hook guardrail must never
             // release content it couldn't fully buffer to scan. The cap is
             // taken from the chain's resolved streaming policy.
-            let max_buffer_bytes = match output_policy {
+            let (max_buffer_bytes, on_exceeded_fail_open) = match output_policy {
                 aisix_guardrails::StreamOutputPolicy::BufferFull {
-                    max_buffer_bytes, ..
-                } => max_buffer_bytes,
-                _ => aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
+                    max_buffer_bytes,
+                    on_exceeded_fail_open,
+                } => (max_buffer_bytes, on_exceeded_fail_open),
+                _ => (aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false),
             };
-            let stream = upstream_resp.bytes_stream();
-            futures::pin_mut!(stream);
+            let mut stream = Box::pin(
+                upstream_stream
+                    .take()
+                    .expect("native responses upstream stream is consumed once"),
+            );
             // Effective streaming budget — applied to every buffered read,
             // consistent with the verbatim branch and the connect deadline.
             let read_to = timeouts.stream;
@@ -1417,13 +1431,29 @@ async fn responses_to_target(
                             Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode);
                     }
                 }
+                let semantic_terminal = observed_failure.is_some()
+                    || observed_usage
+                        .as_ref()
+                        .is_some_and(|usage| usage.reached_end);
                 if buf.len() + chunk.len() > max_buffer_bytes {
-                    // Unlike chat's BufferFull, we always fail closed on
-                    // overflow regardless of `on_exceeded_fail_open`: an
-                    // output-hook guardrail must not release a response it
-                    // couldn't fully buffer to scan. No shipped guardrail
-                    // configures `BufferFull { on_exceeded_fail_open: true }`
-                    // on this surface today.
+                    if on_exceeded_fail_open {
+                        tracing::warn!(
+                            guardrail_hook = "output",
+                            model = %model.display_name,
+                            max_buffer_bytes,
+                            "streaming /v1/responses output exceeded buffer cap; failing open",
+                        );
+                        let prefix = futures::stream::iter([
+                            Ok::<_, crate::stream_timeout::RawStreamError>(bytes::Bytes::from(
+                                std::mem::take(&mut buf),
+                            )),
+                            Ok(chunk),
+                        ]);
+                        let remaining =
+                            crate::stream_timeout::with_read_timeout_bytes(stream, read_to);
+                        released_body_stream = Some(Box::pin(prefix.chain(remaining)));
+                        break;
+                    }
                     tracing::warn!(
                         guardrail_hook = "output",
                         model = %model.display_name,
@@ -1474,151 +1504,173 @@ async fn responses_to_target(
                     });
                 }
                 buf.extend_from_slice(&chunk);
+                if semantic_terminal {
+                    break;
+                }
             }
-            let terminal_failure =
-                observed_failure.or_else(|| responses_sse_terminal_failure(&buf));
-            if let Some(failure) = terminal_failure {
-                let error = failure.bridge_error();
-                state.health.record_failure(&model.display_name);
-                let _ = crate::cooldown::note_failure(
-                    &state.runtime_status,
-                    model_id,
-                    model.cooldown.as_ref(),
-                    error,
+            if released_body_stream.is_none() {
+                if observed_failure.is_none()
+                    && observed_usage
+                        .as_ref()
+                        .is_some_and(|usage| usage.reached_end)
+                    && !responses_sse_has_done(&buf)
+                {
+                    buf.extend_from_slice(b"data: [DONE]\n\n");
+                }
+                let terminal_failure =
+                    observed_failure.or_else(|| responses_sse_terminal_failure(&buf));
+                if let Some(failure) = terminal_failure {
+                    let error = failure.bridge_error();
+                    state.health.record_failure(&model.display_name);
+                    let _ = crate::cooldown::note_failure(
+                        &state.runtime_status,
+                        model_id,
+                        model.cooldown.as_ref(),
+                        error,
+                    );
+                } else {
+                    state.health.record_success(&model.display_name);
+                    state.runtime_status.mark_healthy(model_id);
+                }
+                let malformed = matches!(
+                    terminal_failure,
+                    Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode)
                 );
-            } else {
-                state.health.record_success(&model.display_name);
-                state.runtime_status.mark_healthy(model_id);
-            }
-            let malformed = matches!(
-                terminal_failure,
-                Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode)
-            );
-            // The held prefix has not passed a complete output moderation
-            // cycle when any terminal failure occurs. Preserve its usage for
-            // billing, but never release partially generated bytes alongside
-            // the gateway's terminal error.
-            let suppress_wire = terminal_failure.is_some();
-            if malformed {
-                tracing::warn!(
-                    model = %model.display_name,
-                    "held /v1/responses stream contained malformed SSE data",
-                );
-            }
-            let out_text = responses_sse_output_text(&buf);
-            let synth = synth_chat_response(&upstream_model, out_text);
-            let mut output_monitor_hits = Vec::new();
-            // Segment pass over the held SSE frames: one Bedrock call; an
-            // ANONYMIZE disposition rewrites `buf` in place (#932 bedrock
-            // follow-up). The capture below reads the post-mask buffer.
-            let mut output_redactions = crate::redact::RedactionCounts::new();
-            let mut response_capture_safe = false;
-            let mut verdict = aisix_guardrails::GuardrailVerdict::Allow;
-            if !suppress_wire {
-                let (non_segment, hits) =
-                    aisix_guardrails::Guardrail::check_output_non_segment_observed(chain, &synth)
+                // The held prefix has not passed a complete output moderation
+                // cycle when any terminal failure occurs. Preserve its usage for
+                // billing, but never release partially generated bytes alongside
+                // the gateway's terminal error.
+                let suppress_wire = terminal_failure.is_some();
+                if malformed {
+                    tracing::warn!(
+                        model = %model.display_name,
+                        "held /v1/responses stream contained malformed SSE data",
+                    );
+                }
+                let out_text = responses_sse_output_text(&buf);
+                let synth = synth_chat_response(&upstream_model, out_text);
+                let mut output_monitor_hits = Vec::new();
+                // Segment pass over the held SSE frames: one Bedrock call; an
+                // ANONYMIZE disposition rewrites `buf` in place (#932 bedrock
+                // follow-up). The capture below reads the post-mask buffer.
+                let mut output_redactions = crate::redact::RedactionCounts::new();
+                let mut response_capture_safe = false;
+                let mut verdict = aisix_guardrails::GuardrailVerdict::Allow;
+                if !suppress_wire {
+                    let (non_segment, hits) =
+                        aisix_guardrails::Guardrail::check_output_non_segment_observed(
+                            chain, &synth,
+                        )
                         .await;
-                output_monitor_hits = hits;
-                let moderation = crate::redact::moderate_responses_sse(
-                    chain,
-                    non_segment,
-                    &mut buf,
-                    &mut output_redactions,
-                    &mut output_monitor_hits,
-                )
-                .await;
-                response_capture_safe = moderation.capture_safe && terminal_failure.is_none();
-                verdict = moderation.verdict;
-                if !verdict.is_block() {
-                    let redaction = crate::redact::redact_responses_sse_structured(chain, &buf);
-                    if let Some(rewritten) = redaction.rewritten {
-                        buf = rewritten;
-                    }
-                    crate::redact::merge_counts(&mut output_redactions, redaction.counts);
-                    if redaction.unrewritable_tool_key {
-                        verdict = crate::redact::unrewritable_tool_key_verdict();
+                    output_monitor_hits = hits;
+                    let moderation = crate::redact::moderate_responses_sse(
+                        chain,
+                        non_segment,
+                        &mut buf,
+                        &mut output_redactions,
+                        &mut output_monitor_hits,
+                    )
+                    .await;
+                    response_capture_safe = moderation.capture_safe && terminal_failure.is_none();
+                    verdict = moderation.verdict;
+                    if !verdict.is_block() {
+                        let redaction = crate::redact::redact_responses_sse_structured(chain, &buf);
+                        if let Some(rewritten) = redaction.rewritten {
+                            buf = rewritten;
+                        }
+                        crate::redact::merge_counts(&mut output_redactions, redaction.counts);
+                        if redaction.unrewritable_tool_key {
+                            verdict = crate::redact::unrewritable_tool_key_verdict();
+                        }
                     }
                 }
-            }
-            if let aisix_guardrails::GuardrailVerdict::Block {
-                reason,
-                guardrail_name,
-            } = verdict
-            {
-                // Per #153 the matched-pattern detail stays in ops logs only.
-                tracing::warn!(
-                    guardrail_hook = "output",
-                    model = %model.display_name,
-                    reason = %reason,
-                    "guardrail blocked streaming /v1/responses response",
-                );
-                return Err(ProxyError::ContentFiltered(
-                    crate::error::guardrail_block_message("response", guardrail_name.as_deref()),
-                ));
-            }
-            // #808: the whole SSE response is buffered here, so parse its
-            // terminal event for usage and let the handler emit (the body is
-            // a single complete chunk now, not a live stream).
-            //
-            // Token-estimation fallback (AISIX-Cloud#1074): a buffered
-            // stream with zero/missing usage fills the counters locally —
-            // telemetry only, the buffered bytes forward untouched.
-            let usage = {
-                let mut u = responses_sse_usage(&buf).unwrap_or_default();
-                // The usage gate is independent of the id: a stream whose
-                // terminal frame reported no usage still names the upstream
-                // call it was (AISIX-Cloud#1289).
-                if u.provider_request_id.is_empty() {
-                    u.provider_request_id = responses_sse_provider_request_id(&buf);
-                }
-                if u.prompt_tokens == 0 || u.completion_tokens == 0 {
-                    let est = crate::token_estimate::Estimator::new(
-                        &upstream_model,
-                        crate::token_estimate::PromptInput::Responses(body.clone()),
+                if let aisix_guardrails::GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                } = verdict
+                {
+                    // Per #153 the matched-pattern detail stays in ops logs only.
+                    tracing::warn!(
+                        guardrail_hook = "output",
+                        model = %model.display_name,
+                        reason = %reason,
+                        "guardrail blocked streaming /v1/responses response",
                     );
-                    let filled = crate::token_estimate::fill_missing(
-                        &est,
-                        u.prompt_tokens,
-                        u.completion_tokens,
-                        Some(&responses_sse_output_text(&buf)),
-                    );
-                    if filled.estimated {
-                        u.prompt_tokens = filled.prompt_tokens;
-                        u.completion_tokens = filled.completion_tokens;
-                        u.usage_estimated = true;
-                    }
+                    return Err(ProxyError::ContentFiltered(
+                        crate::error::guardrail_block_message(
+                            "response",
+                            guardrail_name.as_deref(),
+                        ),
+                    ));
                 }
-                Some(u)
-            };
-            // Content capture (AISIX-Cloud#947): the assembled output text,
-            // read from the POST-redaction buffer so masked PII stays masked
-            // in the exported content.
-            let captured_content = match (&captured_prompt, content_cap) {
-                (Some(prompt), Some(cap)) if input_capture_safe && response_capture_safe => Some(
-                    CapturedContent::new(prompt, &responses_sse_output_text(&buf), cap as usize),
-                ),
-                _ => None,
-            };
-            if suppress_wire {
-                buf = responses_stream_error_body();
+                // #808: the whole SSE response is buffered here, so parse its
+                // terminal event for usage and let the handler emit (the body is
+                // a single complete chunk now, not a live stream).
+                //
+                // Token-estimation fallback (AISIX-Cloud#1074): a buffered
+                // stream with zero/missing usage fills the counters locally —
+                // telemetry only, the buffered bytes forward untouched.
+                let usage = {
+                    let mut u = responses_sse_usage(&buf).unwrap_or_default();
+                    // The usage gate is independent of the id: a stream whose
+                    // terminal frame reported no usage still names the upstream
+                    // call it was (AISIX-Cloud#1289).
+                    if u.provider_request_id.is_empty() {
+                        u.provider_request_id = responses_sse_provider_request_id(&buf);
+                    }
+                    if u.prompt_tokens == 0 || u.completion_tokens == 0 {
+                        let est = crate::token_estimate::Estimator::new(
+                            &upstream_model,
+                            crate::token_estimate::PromptInput::Responses(body.clone()),
+                        );
+                        let filled = crate::token_estimate::fill_missing(
+                            &est,
+                            u.prompt_tokens,
+                            u.completion_tokens,
+                            Some(&responses_sse_output_text(&buf)),
+                        );
+                        if filled.estimated {
+                            u.prompt_tokens = filled.prompt_tokens;
+                            u.completion_tokens = filled.completion_tokens;
+                            u.usage_estimated = true;
+                        }
+                    }
+                    Some(u)
+                };
+                // Content capture (AISIX-Cloud#947): the assembled output text,
+                // read from the POST-redaction buffer so masked PII stays masked
+                // in the exported content.
+                let captured_content = match (&captured_prompt, content_cap) {
+                    (Some(prompt), Some(cap)) if input_capture_safe && response_capture_safe => {
+                        Some(CapturedContent::new(
+                            prompt,
+                            &responses_sse_output_text(&buf),
+                            cap as usize,
+                        ))
+                    }
+                    _ => None,
+                };
+                if suppress_wire {
+                    buf = responses_stream_error_body();
+                }
+                let mut response = axum::response::Response::new(axum::body::Body::from(buf));
+                apply_passthrough_headers(&mut response, &headers, request_id);
+                return Ok(ResponseDispatchSuccess {
+                    response,
+                    provider: provider_label,
+                    usage,
+                    model_id: model_id.to_string(),
+                    provider_key_id: provider_key_id.clone(),
+                    upstream_model: upstream_model.clone(),
+                    routing: RoutingTelemetry::default(),
+                    guardrail_blocked: false,
+                    usage_handled_by_stream: false,
+                    output_redactions,
+                    output_monitor_hits,
+                    captured_content,
+                    terminal_failure,
+                });
             }
-            let mut response = axum::response::Response::new(axum::body::Body::from(buf));
-            apply_passthrough_headers(&mut response, &headers, request_id);
-            return Ok(ResponseDispatchSuccess {
-                response,
-                provider: provider_label,
-                usage,
-                model_id: model_id.to_string(),
-                provider_key_id: provider_key_id.clone(),
-                upstream_model: upstream_model.clone(),
-                routing: RoutingTelemetry::default(),
-                guardrail_blocked: false,
-                usage_handled_by_stream: false,
-                output_redactions,
-                output_monitor_hits,
-                captured_content,
-                terminal_failure,
-            });
         }
 
         // #554: enforce the per-chunk read timeout on the forwarded bytes.
@@ -1628,16 +1680,22 @@ async fn responses_to_target(
         // stall truncates the forwarded stream (no in-band error frame for
         // an opaque byte passthrough).
         let stream_budget = timeouts.stream;
+        let overflow_capture_unsafe = released_body_stream.is_some();
         let wrapped: std::pin::Pin<
             Box<
                 dyn futures::Stream<
                         Item = Result<bytes::Bytes, crate::stream_timeout::RawStreamError>,
                     > + Send,
             >,
-        > = Box::pin(crate::stream_timeout::with_read_timeout_bytes(
-            upstream_resp.bytes_stream(),
-            stream_budget,
-        ));
+        > = match released_body_stream {
+            Some(stream) => stream,
+            None => Box::pin(crate::stream_timeout::with_read_timeout_bytes(
+                upstream_stream
+                    .take()
+                    .expect("native responses upstream stream is consumed once"),
+                stream_budget,
+            )),
+        };
         let body_stream: std::pin::Pin<
             Box<
                 dyn futures::Stream<
@@ -1723,10 +1781,13 @@ async fn responses_to_target(
         // the only way an output-hook chain reaches this live-forward branch)
         // still gets its end-of-stream scan, so would-block / would-mask
         // observations reach telemetry. `None` without an output hook.
-        let eos_scan = aisix_guardrails::Guardrail::runs_on_output(chain).then(|| EosOutputScan {
+        let eos_scan = (!overflow_capture_unsafe
+            && aisix_guardrails::Guardrail::runs_on_output(chain))
+        .then(|| EosOutputScan {
             chain: Arc::clone(&chain_arc),
             upstream_model: upstream_model.clone(),
         });
+        let initial_capture_safe = !overflow_capture_unsafe && eos_scan.is_none();
         // Token-estimation fallback context (AISIX-Cloud#1074): the request
         // body is cloned because the closure runs at end-of-stream Drop.
         // Tokenized only if the upstream never reports usage.
@@ -1740,6 +1801,7 @@ async fn responses_to_target(
             attempt_started,
             content_cap,
             eos_scan,
+            initial_capture_safe,
             move |mut usage, out_text, output_hits, output_capture_safe, stream_failure| {
                 // Streams that reach here are committed 200s — the
                 // `!status.is_success()` guard above returned early on errors.
@@ -2220,11 +2282,12 @@ async fn responses_cross_provider_to_target(
         .then(|| chain.clone());
         let output_policy = aisix_guardrails::Guardrail::stream_output_policy(chain.as_ref());
         let hold_back = output_policy.holds_back();
-        let max_buffer_bytes = match output_policy {
+        let (max_buffer_bytes, on_exceeded_fail_open) = match output_policy {
             aisix_guardrails::StreamOutputPolicy::BufferFull {
-                max_buffer_bytes, ..
-            } => max_buffer_bytes,
-            _ => aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
+                max_buffer_bytes,
+                on_exceeded_fail_open,
+            } => (max_buffer_bytes, on_exceeded_fail_open),
+            _ => (aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false),
         };
 
         let state_c = state.clone();
@@ -2274,6 +2337,7 @@ async fn responses_cross_provider_to_target(
             output_guardrail,
             hold_back,
             max_buffer_bytes,
+            on_exceeded_fail_open,
             requested_model.to_string(),
             content_cap,
             Some(estimator),
@@ -2758,6 +2822,14 @@ fn responses_stream_error_body() -> Vec<u8> {
     .into_bytes()
 }
 
+fn responses_sse_has_done(bytes: &[u8]) -> bool {
+    bytes.split(|byte| *byte == b'\n').any(|line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        line.strip_prefix(b"data:")
+            .is_some_and(|data| data.trim_ascii() == b"[DONE]")
+    })
+}
+
 fn push_capped_lossy_bytes(output: &mut String, bytes: &[u8]) {
     let remaining = crate::token_estimate::OUTPUT_ACCUMULATION_CAP.saturating_sub(output.len());
     if remaining == 0 {
@@ -3122,6 +3194,7 @@ fn build_responses_passthrough_stream<S, F>(
     attempt_started: Instant,
     content_cap: Option<u32>,
     eos_scan: Option<EosOutputScan>,
+    initial_capture_safe: bool,
     on_complete: F,
 ) -> impl futures::Stream<Item = Result<bytes::Bytes, crate::stream_timeout::RawStreamError>>
 where
@@ -3171,7 +3244,7 @@ where
                     capture: capture_cap.map(SseTextCapture::new),
                     // A live output-guarded response is uninspected until its
                     // end-of-stream provider call completes.
-                    capture_safe: eos_scan.is_none(),
+                    capture_safe: initial_capture_safe,
                     failure: None,
                 },
             )),
@@ -3219,6 +3292,14 @@ where
                 // (losing usage parsing for that pathological case) rather than
                 // OOM. Bytes still forward verbatim — only telemetry is affected.
             }
+            let (semantic_terminal, successful_terminal) = {
+                let state = guard.state();
+                let successful = state
+                    .usage
+                    .as_ref()
+                    .is_some_and(|usage| usage.reached_end);
+                (state.failure.is_some() || successful, successful)
+            };
             // Forward the original item verbatim (Ok bytes OR a mid-stream Err).
             // The first successful forward is what the caller waited for.
             if item.is_ok() {
@@ -3235,9 +3316,18 @@ where
                 state.capture_safe = false;
             }
             let errored = item.is_err();
+            let terminal_has_done = item
+                .as_ref()
+                .is_ok_and(|bytes| responses_sse_has_done(bytes));
             yield item;
             if errored {
                 return;
+            }
+            if semantic_terminal {
+                if successful_terminal && !terminal_has_done {
+                    yield Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
+                }
+                break;
             }
         }
         // A clean socket EOF is successful only after a semantic terminal
@@ -5610,6 +5700,47 @@ data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\"}}\n\n";
         let usage = super::parse_responses_terminal_usage(&failed).unwrap();
         assert_eq!(usage.completion_tokens, 4);
         assert!(!usage.reached_end, "a failed response is not a healthy end");
+    }
+
+    #[tokio::test]
+    async fn native_stream_stops_polling_after_response_completed() {
+        use futures::StreamExt;
+        use std::sync::{Arc, Mutex};
+
+        let upstream = futures::stream::iter([
+            Ok::<_, crate::stream_timeout::RawStreamError>(bytes::Bytes::from_static(
+                b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+            )),
+            Err(crate::stream_timeout::RawStreamError::Timeout { elapsed_ms: 300 }),
+        ]);
+        let captured = Arc::new(Mutex::new(None));
+        let captured_out = Arc::clone(&captured);
+        let now = std::time::Instant::now();
+        let stream = super::build_responses_passthrough_stream(
+            upstream,
+            now,
+            now,
+            None,
+            None,
+            true,
+            move |usage, _, _, _, failure| {
+                *captured_out.lock().unwrap() = Some((usage, failure));
+            },
+        );
+        futures::pin_mut!(stream);
+
+        let terminal = stream.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&terminal).contains("response.completed"));
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            bytes::Bytes::from_static(b"data: [DONE]\n\n"),
+        );
+        assert!(stream.next().await.is_none());
+        let (usage, failure) = captured.lock().unwrap().take().expect("on_complete fired");
+        assert!(usage.reached_end);
+        assert_eq!(usage.prompt_tokens, 3);
+        assert_eq!(usage.completion_tokens, 2);
+        assert!(failure.is_none());
     }
 
     /// AISIX-Cloud#1289, streaming: the id arrives on `response.created` and

@@ -2427,8 +2427,9 @@ fn build_anthropic_sse_stream(
     let hold_policy = output_guardrail.as_ref().and_then(|c| {
         match aisix_guardrails::Guardrail::stream_output_policy(c.as_ref()) {
             aisix_guardrails::StreamOutputPolicy::BufferFull {
-                max_buffer_bytes, ..
-            } => Some(max_buffer_bytes),
+                max_buffer_bytes,
+                on_exceeded_fail_open,
+            } => Some((max_buffer_bytes, on_exceeded_fail_open)),
             _ => None,
         }
     });
@@ -2461,6 +2462,7 @@ fn build_anthropic_sse_stream(
         // mask rewrite can run on the normalised chunks.
         let mut held_chunks: Vec<aisix_gateway::ChatChunk> = Vec::new();
         let mut held_bytes: usize = 0;
+        let mut cap_released = false;
         // The Anthropic encoder retains tool-call state until it can close
         // each content block. Bound that translated state independently of
         // guardrail mode so an unguarded tool-only stream cannot grow it
@@ -2478,20 +2480,22 @@ fn build_anthropic_sse_stream(
                         guard.comp().upstream_ttft_ms =
                             attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                     }
-                    let comp = guard.comp();
-                    if let Some(u) = chunk.usage.as_ref() {
-                        comp.prompt_tokens = comp.prompt_tokens.max(u.prompt_tokens);
-                        comp.completion_tokens = comp.completion_tokens.max(u.completion_tokens);
-                        comp.cache_creation_tokens =
-                            comp.cache_creation_tokens.max(u.cache_creation_tokens);
-                        comp.cache_read_tokens = comp.cache_read_tokens.max(u.cache_read_tokens);
-                    }
-                    // Token-estimation accumulator (AISIX-Cloud#1074): all
-                    // generated output, always on (whether the fallback is
-                    // needed is only known at end-of-stream), bounded. This
-                    // precedes the hold-back check so the chunk that trips the
-                    // cap is still accounted for in terminal token limits.
                     {
+                        let comp = guard.comp();
+                        if let Some(u) = chunk.usage.as_ref() {
+                            comp.prompt_tokens = comp.prompt_tokens.max(u.prompt_tokens);
+                            comp.completion_tokens =
+                                comp.completion_tokens.max(u.completion_tokens);
+                            comp.cache_creation_tokens =
+                                comp.cache_creation_tokens.max(u.cache_creation_tokens);
+                            comp.cache_read_tokens =
+                                comp.cache_read_tokens.max(u.cache_read_tokens);
+                        }
+                        // Token-estimation accumulator (AISIX-Cloud#1074): all
+                        // generated output, always on (whether the fallback is
+                        // needed is only known at end-of-stream), bounded. This
+                        // precedes the hold-back check so the chunk that trips the
+                        // cap is still accounted for in terminal token limits.
                         use crate::token_estimate::push_capped;
                         if let Some(t) = chunk.delta.content.as_deref() {
                             push_capped(&mut comp.est_output_text, t);
@@ -2514,23 +2518,48 @@ fn build_anthropic_sse_stream(
                             }
                         }
                     }
-                    if let Some(max_hold) = hold_policy {
+                    if let Some((max_hold, fail_open)) = hold_policy.filter(|_| !cap_released) {
                         // Bound everything retained below, including cloned
                         // tool-call fragments. Counting the complete
                         // normalized chunk prevents a tool-only stream from
                         // bypassing the hold-back ceiling.
                         let remaining = max_hold.saturating_sub(held_bytes);
-                        let Some(chunk_bytes) = bounded_json_len(&chunk, remaining) else {
-                            tracing::warn!(
-                                guardrail_hook = "output",
-                                max_buffer_bytes = max_hold,
-                                "streaming /v1/messages response exceeded hold-back cap; failing closed",
-                            );
-                            guard.comp().guardrail_blocked = true;
-                            yield Ok(bytes::Bytes::from(guardrail_block_frame(None)));
-                            return;
-                        };
-                        held_bytes += chunk_bytes;
+                        match bounded_json_len(&chunk, remaining) {
+                            Some(chunk_bytes) => held_bytes += chunk_bytes,
+                            None if fail_open => {
+                                tracing::warn!(
+                                    guardrail_hook = "output",
+                                    max_buffer_bytes = max_hold,
+                                    "streaming /v1/messages response exceeded hold-back cap; failing open",
+                                );
+                                cap_released = true;
+                                held_bytes = 0;
+                                scan_truncated = true;
+                                content_text.clear();
+                                tool_call_fragments.clear();
+                                let comp = guard.comp();
+                                comp.response_capture_safe = false;
+                                comp.response_text.clear();
+                                for held in held_chunks.drain(..) {
+                                    for ev in encoder.next_events(&held) {
+                                        yield Ok::<_, std::io::Error>(downstream_bytes!(guard, ev));
+                                    }
+                                }
+                            }
+                            None => {
+                                tracing::warn!(
+                                    guardrail_hook = "output",
+                                    max_buffer_bytes = max_hold,
+                                    "streaming /v1/messages response exceeded hold-back cap; failing closed",
+                                );
+                                let comp = guard.comp();
+                                comp.guardrail_blocked = true;
+                                comp.response_capture_safe = false;
+                                comp.response_text.clear();
+                                yield Ok(bytes::Bytes::from(guardrail_block_frame(None)));
+                                return;
+                            }
+                        }
                     }
                     if let Some(tool_calls) = chunk.delta.tool_calls.as_ref() {
                         let mut additional = 0usize;
@@ -2570,6 +2599,7 @@ fn build_anthropic_sse_stream(
                     // chunk passes the complete size check. An oversized id,
                     // model or custom finish reason must not allocate a
                     // second unbounded string before the stream fails closed.
+                    let comp = guard.comp();
                     if !chunk.id.is_empty() {
                         comp.provider_request_id =
                             crate::usage_attr::sanitize_provider_response_id(&chunk.id);
@@ -2580,7 +2610,7 @@ fn build_anthropic_sse_stream(
                     if let Some(fr) = chunk.finish_reason.as_ref() {
                         comp.finish_reason = finish_reason_label(fr);
                     }
-                    if output_guardrail.is_some() {
+                    if output_guardrail.is_some() && !cap_released {
                         if let Some(t) = chunk.delta.content.as_deref() {
                             if hold_policy.is_some() {
                                 content_text.push_str(t);
@@ -2622,7 +2652,7 @@ fn build_anthropic_sse_stream(
                             );
                         }
                     }
-                    if let Some(max_hold) = hold_policy {
+                    if let Some((max_hold, _)) = hold_policy.filter(|_| !cap_released) {
                         // Hold-back: withhold the chunk until the end-of-
                         // stream scan clears it. Overflow fails closed —
                         // unscannable content must not be released.
@@ -2665,7 +2695,7 @@ fn build_anthropic_sse_stream(
         // `error` event instead of completing the stream cleanly.
         let mut moderation_capture_safe = true;
         if let Some(chain) = output_guardrail.as_ref() {
-            if !content_text.is_empty() || !tool_call_fragments.is_empty() {
+            if !cap_released && (!content_text.is_empty() || !tool_call_fragments.is_empty()) {
                 let mut message =
                     aisix_gateway::ChatMessage::assistant(std::mem::take(&mut content_text));
                 if !tool_call_fragments.is_empty() {
@@ -2692,7 +2722,7 @@ fn build_anthropic_sse_stream(
                 guard.comp().monitor_hits.extend(hits);
                 let mut seg_counts = crate::redact::RedactionCounts::new();
                 let mut seg_hits = Vec::new();
-                let moderation = if hold_policy.is_some() {
+                let moderation = if hold_policy.is_some() && !cap_released {
                     crate::redact::moderate_chat_chunks_structured(
                         chain.as_ref(),
                         verdict,
@@ -2769,8 +2799,9 @@ fn build_anthropic_sse_stream(
             }
         }
         if output_guardrail.is_some() {
-            guard.comp().response_capture_safe = moderation_capture_safe && !scan_truncated;
-            if scan_truncated {
+            guard.comp().response_capture_safe =
+                moderation_capture_safe && !scan_truncated && !cap_released;
+            if scan_truncated || cap_released {
                 guard.comp().response_text.clear();
             }
         }
@@ -3708,13 +3739,14 @@ where
     let hold_policy = output_guardrail.as_ref().and_then(|c| {
         match aisix_guardrails::Guardrail::stream_output_policy(c.as_ref()) {
             aisix_guardrails::StreamOutputPolicy::BufferFull {
-                max_buffer_bytes, ..
-            } => Some(max_buffer_bytes),
+                max_buffer_bytes,
+                on_exceeded_fail_open,
+            } => Some((max_buffer_bytes, on_exceeded_fail_open)),
             _ => None,
         }
     });
     let response_text_cap = match (hold_policy, output_guardrail.is_some(), content_cap) {
-        (Some(max_hold), _, _) => max_hold,
+        (Some((max_hold, _)), _, _) => max_hold,
         (None, true, _) => aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
         (None, false, Some(cap)) => cap as usize,
         (None, false, None) => 0,
@@ -3736,23 +3768,47 @@ where
         let mut first_token_seen = false;
         // Whole-response hold-back buffer (BufferFull policies only).
         let mut held: Vec<u8> = Vec::new();
+        let mut cap_released = false;
         while let Some(item) = upstream.next().await {
+            let mut terminal_seen = false;
             if let Ok(bytes) = &item {
-                if let Some(max_hold) = hold_policy {
+                if let Some((max_hold, fail_open)) = hold_policy.filter(|_| !cap_released) {
                     // Enforce the security buffer before any side-channel
                     // parser copies or deserializes this untrusted chunk.
                     if held.len().saturating_add(bytes.len()) > max_hold {
-                        tracing::warn!(
-                            guardrail_hook = "output",
-                            max_buffer_bytes = max_hold,
-                            "streaming /v1/messages passthrough exceeded hold-back cap; failing closed",
-                        );
-                        let usage = guard.usage();
-                        usage.guardrail_blocked = true;
-                        usage.response_capture_safe = false;
-                        usage.response_text.clear();
-                        yield Ok(Bytes::from(guardrail_block_frame(None)));
-                        return;
+                        if fail_open {
+                            tracing::warn!(
+                                guardrail_hook = "output",
+                                max_buffer_bytes = max_hold,
+                                "streaming /v1/messages passthrough exceeded hold-back cap; failing open",
+                            );
+                            cap_released = true;
+                            let usage = guard.usage();
+                            usage.response_capture_safe = false;
+                            usage.response_text.clear();
+                            if !held.is_empty() {
+                                if usage.downstream_latency_ms == 0 {
+                                    usage.downstream_latency_ms = started
+                                        .elapsed()
+                                        .as_millis()
+                                        .min(u32::MAX as u128)
+                                        as u32;
+                                }
+                                yield Ok(Bytes::from(std::mem::take(&mut held)));
+                            }
+                        } else {
+                            tracing::warn!(
+                                guardrail_hook = "output",
+                                max_buffer_bytes = max_hold,
+                                "streaming /v1/messages passthrough exceeded hold-back cap; failing closed",
+                            );
+                            let usage = guard.usage();
+                            usage.guardrail_blocked = true;
+                            usage.response_capture_safe = false;
+                            usage.response_text.clear();
+                            yield Ok(Bytes::from(guardrail_block_frame(None)));
+                            return;
+                        }
                     }
                 }
                 // Side-channel parse: copy into the frame buffer (the
@@ -3776,12 +3832,14 @@ where
                         );
                         let usage = guard.usage();
                         usage.response_text_truncated = true;
-                        if hold_policy.is_some() {
+                        if hold_policy.is_some() && !cap_released {
                             usage.malformed_sse_data = true;
                         }
                         buf.clear();
                     }
                 }
+                terminal_seen = guard.usage().reached_end
+                    || guard.usage().stream_failure.is_some();
                 // Bound the frame buffer (PR #436 audit MEDIUM-2). The
                 // happy path drains complete frames above, so `buf`
                 // only retains a partial trailing frame — normally a
@@ -3795,13 +3853,16 @@ where
                 // rather than OOM. The bytes themselves still forward
                 // to the client verbatim — only telemetry parsing is
                 // affected.
-                if let Some(max_hold) = hold_policy {
+                if let Some((max_hold, _)) = hold_policy.filter(|_| !cap_released) {
                     // Hold-back: withhold the bytes until the end-of-stream
                     // scan clears (and masks) them. Overflow fails closed —
                     // content that can't be fully buffered to scan must not
                     // be released (mirrors /v1/responses).
                     debug_assert!(held.len().saturating_add(bytes.len()) <= max_hold);
                     held.extend_from_slice(bytes);
+                    if terminal_seen {
+                        break;
+                    }
                     continue;
                 }
             }
@@ -3824,6 +3885,9 @@ where
             yield item;
             if errored {
                 return;
+            }
+            if terminal_seen {
+                break;
             }
         }
         // EOF dispatches a final SSE event even when the upstream omitted the
@@ -3875,7 +3939,7 @@ where
         // and the error frame is the trailing signal.
         let mut blocked = false;
         let mut moderation_capture_safe = true;
-        if let Some(chain) = output_guardrail.as_ref() {
+        if let Some(chain) = output_guardrail.as_ref().filter(|_| !cap_released) {
             // Clone (not take) when content capture is on, so the assembled
             // response survives for the on_complete content capture below;
             // otherwise take it (nothing downstream reads it).
@@ -3972,16 +4036,17 @@ where
         if output_guardrail.is_some() {
             let usage = guard.usage();
             usage.response_capture_safe =
-                moderation_capture_safe
+                !cap_released
+                    && moderation_capture_safe
                     && usage.stream_failure.is_none()
                     && !usage.response_text_truncated;
-            if usage.response_text_truncated {
+            if usage.response_text_truncated || cap_released {
                 usage.response_text.clear();
             }
         }
         // Hold-back release (#932): the scan cleared — mask the held SSE
         // bytes (channel reassembly across frames) and release them.
-        if hold_policy.is_some() && !blocked && !held.is_empty() {
+        if hold_policy.is_some() && !cap_released && !blocked && !held.is_empty() {
             if let Some(chain) = output_guardrail.as_ref() {
                 let redaction = crate::redact::redact_anthropic_sse(chain.as_ref(), &held);
                 if redaction.unrewritable_tool_key {
@@ -6064,6 +6129,41 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\"}}\n\n"
 
         assert!(acc.reached_end);
         assert!(acc.stream_failure.is_none());
+    }
+
+    #[tokio::test]
+    async fn native_stream_stops_polling_after_message_stop() {
+        use futures::StreamExt;
+        use std::sync::{Arc, Mutex};
+
+        let upstream = futures::stream::iter([
+            Ok::<_, crate::stream_timeout::RawStreamError>(bytes::Bytes::from_static(
+                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            )),
+            Err(crate::stream_timeout::RawStreamError::Timeout { elapsed_ms: 300 }),
+        ]);
+        let captured = Arc::new(Mutex::new(None));
+        let captured_out = Arc::clone(&captured);
+        let now = std::time::Instant::now();
+        let mut stream = super::build_anthropic_passthrough_stream(
+            upstream,
+            now,
+            now,
+            None,
+            "relay-claude".into(),
+            None,
+            None,
+            move |usage| *captured_out.lock().unwrap() = Some(usage),
+        );
+
+        let terminal = stream.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&terminal).contains("message_stop"));
+        assert!(stream.next().await.is_none());
+        drop(stream);
+
+        let usage = captured.lock().unwrap().take().expect("on_complete fired");
+        assert!(usage.reached_end);
+        assert!(usage.stream_failure.is_none());
     }
 
     /// Issue #245 / #419 parity: the stream Drop guard must zero the

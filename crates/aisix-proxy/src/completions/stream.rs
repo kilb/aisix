@@ -425,6 +425,29 @@ where
                 .as_ref()
                 .is_some_and(|(_, accumulator)| accumulator.saw_done);
             if reached_done {
+                let malformed = guard
+                    .slot
+                    .as_ref()
+                    .is_some_and(|(_, accumulator)| accumulator.malformed_data);
+                if malformed {
+                    let failure = CompletionStreamOutcome::UpstreamError {
+                        status: 502,
+                        failure: CompletionStreamFailure::Decode,
+                        error_class: "upstream_decode_error",
+                    };
+                    guard.drop_outcome = failure;
+                    if let Some((complete, accumulator)) = guard.slot.take() {
+                        complete(
+                            accumulator,
+                            failure,
+                            CompletionOutputObservation::uninspected(),
+                        );
+                    }
+                    yield Err(BridgeError::UpstreamDecode(
+                        "malformed SSE data before [DONE]".into(),
+                    ));
+                    return;
+                }
                 guard.drop_outcome = CompletionStreamOutcome::CleanEof;
                 let observation = match output_observer.as_ref() {
                     Some(chain) => {
@@ -801,6 +824,46 @@ mod tests {
                 failure: CompletionStreamFailure::Decode,
                 error_class: "upstream_decode_error",
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_data_before_done_reports_decode_without_success_terminal() {
+        let upstream: CompletionByteStream = Box::pin(futures::stream::iter([
+            Ok(bytes::Bytes::from(frame("partial", true))),
+            Ok(bytes::Bytes::from_static(b"data: not-json\n\n")),
+            Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")),
+        ]));
+        let completed = Arc::new(std::sync::Mutex::new(None));
+        let completed_for_callback = Arc::clone(&completed);
+        let stream = build_completion_passthrough_stream(
+            upstream,
+            None,
+            "model".to_string(),
+            move |accumulator, terminal, _| {
+                *completed_for_callback.lock().unwrap() =
+                    Some((terminal, accumulator.output_text()));
+            },
+        );
+        futures::pin_mut!(stream);
+        let first = stream.next().await.unwrap().unwrap();
+        let second = stream.next().await.unwrap().unwrap();
+        let terminal = stream.next().await.unwrap().unwrap_err();
+
+        assert!(String::from_utf8_lossy(&first).contains("partial"));
+        assert!(String::from_utf8_lossy(&second).contains("not-json"));
+        assert!(matches!(terminal, BridgeError::UpstreamDecode(_)));
+        assert!(stream.next().await.is_none());
+        assert_eq!(
+            *completed.lock().unwrap(),
+            Some((
+                CompletionStreamOutcome::UpstreamError {
+                    status: 502,
+                    failure: CompletionStreamFailure::Decode,
+                    error_class: "upstream_decode_error",
+                },
+                "partial".to_string(),
+            ))
         );
     }
 

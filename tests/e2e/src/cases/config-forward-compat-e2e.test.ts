@@ -125,6 +125,8 @@ describe("config forward-compat: unknown fields from a newer control plane", () 
     // A second traffic-bearing kind: a model document with an unknown
     // field must also load and serve chat.
     const yellowModelId = randomUUID();
+    const secondCaller = `${CALLER_PLAINTEXT}-2`;
+    const secondKeyId = randomUUID();
     await etcd.put(
       `${app.etcdPrefix}/models/${yellowModelId}`,
       JSON.stringify({
@@ -136,23 +138,39 @@ describe("config forward-compat: unknown fields from a newer control plane", () 
       }),
     );
     await etcd.put(
-      `${app.etcdPrefix}/api_keys/${randomUUID()}`,
+      `${app.etcdPrefix}/api_keys/${secondKeyId}`,
       JSON.stringify({
-        key_hash: createHash("sha256").update(`${CALLER_PLAINTEXT}-2`).digest("hex"),
+        key_hash: createHash("sha256").update(secondCaller).digest("hex"),
         allowed_models: ["fc-model-yellow"],
       }),
     );
-    await waitConfigPropagation(async () => {
-      cfg = await getStatusConfig(app!);
-      return (cfg.applied?.resource_counts.models ?? 0) >= 2;
-    });
-    const proxy2 = new ProxyClient(app.proxyUrl, `${CALLER_PLAINTEXT}-2`);
-    const chat2 = await proxy2.chat({
-      model: "fc-model-yellow",
-      messages: [{ role: "user", content: "does the forward-compat model serve?" }],
-    });
-    expect(chat2.status, JSON.stringify(chat2.body)).toBe(200);
-    await etcd.delete(`${app.etcdPrefix}/models/${yellowModelId}`);
+    try {
+      // The model and its key are separate etcd revisions. Use authenticated,
+      // exact model discovery as the publication barrier so seeing the model
+      // revision alone cannot race the key revision and produce a false 401.
+      await waitConfigPropagation(async () => {
+        const response = await fetch(`${app!.proxyUrl}/v1/models`, {
+          headers: { authorization: `Bearer ${secondCaller}` },
+        });
+        if (response.status === 401) return false;
+        if (response.status !== 200) {
+          throw new Error(`model propagation probe returned ${response.status}`);
+        }
+        const body = (await response.json()) as {
+          data?: Array<{ id?: string }>;
+        };
+        return new Set(body.data?.map((model) => model.id)).has("fc-model-yellow");
+      });
+      const proxy2 = new ProxyClient(app.proxyUrl, secondCaller);
+      const chat2 = await proxy2.chat({
+        model: "fc-model-yellow",
+        messages: [{ role: "user", content: "does the forward-compat model serve?" }],
+      });
+      expect(chat2.status, JSON.stringify(chat2.body)).toBe(200);
+    } finally {
+      await etcd.delete(`${app.etcdPrefix}/models/${yellowModelId}`);
+      await etcd.delete(`${app.etcdPrefix}/api_keys/${secondKeyId}`);
+    }
 
     // The tolerance is reported, not silent: the exact ignored field with
     // a row count, next to an empty rejected[]. The row is served, so the

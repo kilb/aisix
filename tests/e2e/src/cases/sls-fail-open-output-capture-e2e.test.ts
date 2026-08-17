@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
@@ -52,6 +52,19 @@ const INPUTS = {
   messagesBridge: "raw-bridge-messages-input-must-not-be-exported-5be0",
   completions: "raw-completions-input-must-not-be-exported-6cf1",
 };
+const OVERFLOW_REQUEST_IDS = {
+  nativeResponses: "buffer-fail-open-native-responses-18d1",
+  bridgeResponses: "buffer-fail-open-bridge-responses-29e2",
+  nativeMessages: "buffer-fail-open-native-messages-3af3",
+  bridgeMessages: "buffer-fail-open-bridge-messages-4b04",
+};
+const OVERFLOW_MARKERS = {
+  nativeResponses: "native-responses-overflow-visible-18d1",
+  bridgeResponses: "bridge-responses-overflow-visible-29e2",
+  nativeMessages: "native-messages-overflow-visible-3af3",
+  bridgeMessages: "bridge-messages-overflow-visible-4b04",
+};
+const overflowOutput = (marker: string) => `${marker}:${"x".repeat(2_048)}`;
 
 interface FailingBedrock {
   url: string;
@@ -155,6 +168,10 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
   let messages: OpenAiUpstream | undefined;
   let messagesBridge: OpenAiUpstream | undefined;
   let completions: OpenAiUpstream | undefined;
+  let overflowNativeResponses: OpenAiUpstream | undefined;
+  let overflowBridgeResponses: OpenAiUpstream | undefined;
+  let overflowNativeMessages: OpenAiUpstream | undefined;
+  let overflowBridgeMessages: OpenAiUpstream | undefined;
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
@@ -172,6 +189,26 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
     });
     completions = await startOpenAiUpstream({
       rawSseChunks: [completionsSse(OUTPUTS.completions)],
+    });
+    overflowNativeResponses = await startOpenAiUpstream({
+      streamEvents: responsesEvents(
+        overflowOutput(OVERFLOW_MARKERS.nativeResponses),
+      ),
+    });
+    overflowBridgeResponses = await startOpenAiUpstream({
+      streamEvents: chatEvents(
+        overflowOutput(OVERFLOW_MARKERS.bridgeResponses),
+      ),
+    });
+    overflowNativeMessages = await startOpenAiUpstream({
+      rawSseChunks: [
+        messagesSse(overflowOutput(OVERFLOW_MARKERS.nativeMessages)),
+      ],
+    });
+    overflowBridgeMessages = await startOpenAiUpstream({
+      streamEvents: chatEvents(
+        overflowOutput(OVERFLOW_MARKERS.bridgeMessages),
+      ),
     });
     app = await spawnApp({
       extra: { bedrock_endpoint_url: bedrock.url },
@@ -191,6 +228,7 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
       credential_ref: CREDENTIAL_REF,
       content_mode: "full",
     });
+    const modelIds = new Map<string, string>();
     for (const [name, provider, apiBase] of [
       ["fail-open-chat", "openai", `${chat.baseUrl}/v1`],
       ["fail-open-native-responses", "openai", `${native.baseUrl}/v1`],
@@ -198,6 +236,26 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
       ["fail-open-messages", "anthropic", messages.baseUrl],
       ["fail-open-bridge-messages", "deepseek", `${messagesBridge.baseUrl}/v1`],
       ["fail-open-completions", "openai", `${completions.baseUrl}/v1`],
+      [
+        "buffer-fail-open-native-responses",
+        "openai",
+        `${overflowNativeResponses.baseUrl}/v1`,
+      ],
+      [
+        "buffer-fail-open-bridge-responses",
+        "deepseek",
+        `${overflowBridgeResponses.baseUrl}/v1`,
+      ],
+      [
+        "buffer-fail-open-native-messages",
+        "anthropic",
+        overflowNativeMessages.baseUrl,
+      ],
+      [
+        "buffer-fail-open-bridge-messages",
+        "deepseek",
+        `${overflowBridgeMessages.baseUrl}/v1`,
+      ],
     ] as const) {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
@@ -205,12 +263,13 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
         api_base: apiBase,
         ...(provider === "deepseek" ? { provider, adapter: "openai" } : {}),
       });
-      await seed.createModel({
+      const created = await seed.createModel({
         display_name: name,
         provider,
         model_name: "gpt-4o-mini",
         provider_key_id: pk.id,
       });
+      modelIds.set(name, created.id);
     }
     await seed.createGuardrail({
       name: "bedrock-output-fail-open",
@@ -247,6 +306,35 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
       latency_mode: { kind: "serial" },
       enforcement_mode: "enforce",
     });
+    const overflowGuardrail = await seed.createGuardrail({
+      name: "pii-output-buffer-fail-open",
+      enabled: true,
+      hook_point: "output",
+      kind: "pii",
+      detectors: [{ type: "email", action: "mask" }],
+      max_buffer_bytes: 1_024,
+      on_buffer_exceeded: "fail_open",
+    });
+    for (const modelName of [
+      "buffer-fail-open-native-responses",
+      "buffer-fail-open-bridge-responses",
+      "buffer-fail-open-native-messages",
+      "buffer-fail-open-bridge-messages",
+    ]) {
+      const modelId = modelIds.get(modelName);
+      if (!modelId) throw new Error(`missing model id for ${modelName}`);
+      await etcd.put(
+        `${app.etcdPrefix}/guardrail_attachments/${randomUUID()}`,
+        JSON.stringify({
+          guardrail_id: overflowGuardrail.id,
+          env_id: randomUUID(),
+          scope_type: "model",
+          scope_id: modelId,
+          priority: 0,
+          enabled: true,
+        }),
+      );
+    }
     await seed.createApiKey({
       key_hash: CALLER_HASH,
       allowed_models: [
@@ -256,6 +344,10 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
         "fail-open-messages",
         "fail-open-bridge-messages",
         "fail-open-completions",
+        "buffer-fail-open-native-responses",
+        "buffer-fail-open-bridge-responses",
+        "buffer-fail-open-native-messages",
+        "buffer-fail-open-bridge-messages",
       ],
     });
     await waitConfigPropagation(async () => {
@@ -275,6 +367,10 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
         "fail-open-messages",
         "fail-open-bridge-messages",
         "fail-open-completions",
+        "buffer-fail-open-native-responses",
+        "buffer-fail-open-bridge-responses",
+        "buffer-fail-open-native-messages",
+        "buffer-fail-open-bridge-messages",
       ].every((model) => ids.has(model));
     });
   });
@@ -288,6 +384,10 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
       messages?.close(),
       messagesBridge?.close(),
       completions?.close(),
+      overflowNativeResponses?.close(),
+      overflowBridgeResponses?.close(),
+      overflowNativeMessages?.close(),
+      overflowBridgeMessages?.close(),
     ]);
     await bedrock?.close();
     await sls?.close();
@@ -399,6 +499,128 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
       }
       for (const output of Object.values(OUTPUTS)) {
         expect(exported).not.toContain(output);
+      }
+    },
+    90_000,
+  );
+
+  test(
+    "buffer fail-open releases native and bridged Messages/Responses without capturing output",
+    async (ctx) => {
+      if (
+        !etcdReachable ||
+        !app ||
+        !sls ||
+        !overflowNativeResponses ||
+        !overflowBridgeResponses ||
+        !overflowNativeMessages ||
+        !overflowBridgeMessages
+      ) {
+        ctx.skip();
+        return;
+      }
+      const beforeLogs = sls.requests.length;
+      const baselines = {
+        nativeResponses: overflowNativeResponses.receivedRequests.length,
+        bridgeResponses: overflowBridgeResponses.receivedRequests.length,
+        nativeMessages: overflowNativeMessages.receivedRequests.length,
+        bridgeMessages: overflowBridgeMessages.receivedRequests.length,
+      };
+      const post = (path: string, requestId: string, body: unknown) =>
+        fetch(`${app!.proxyUrl}${path}`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${CALLER}`,
+            "content-type": "application/json",
+            "x-aisix-request-id": requestId,
+          },
+          body: JSON.stringify(body),
+        });
+
+      const nativeResponses = await post(
+        "/v1/responses",
+        OVERFLOW_REQUEST_IDS.nativeResponses,
+        {
+          model: "buffer-fail-open-native-responses",
+          input: "ordinary native responses prompt",
+          stream: true,
+        },
+      );
+      expect(nativeResponses.status).toBe(200);
+      const nativeResponsesWire = await nativeResponses.text();
+      expect(nativeResponsesWire).toContain(OVERFLOW_MARKERS.nativeResponses);
+      expect(nativeResponsesWire).not.toContain("content_filter");
+
+      const bridgeResponses = await post(
+        "/v1/responses",
+        OVERFLOW_REQUEST_IDS.bridgeResponses,
+        {
+          model: "buffer-fail-open-bridge-responses",
+          input: "ordinary bridge responses prompt",
+          stream: true,
+        },
+      );
+      expect(bridgeResponses.status).toBe(200);
+      const bridgeResponsesWire = await bridgeResponses.text();
+      expect(bridgeResponsesWire).toContain(OVERFLOW_MARKERS.bridgeResponses);
+      expect(bridgeResponsesWire).not.toContain("content_filter");
+
+      const postMessages = (requestId: string, model: string) =>
+        fetch(`${app!.proxyUrl}/v1/messages`, {
+          method: "POST",
+          headers: {
+            "x-api-key": CALLER,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+            "x-aisix-request-id": requestId,
+          },
+          body: JSON.stringify({
+            model,
+            messages: [{ role: "user", content: "ordinary messages prompt" }],
+            max_tokens: 16,
+            stream: true,
+          }),
+        });
+      const nativeMessages = await postMessages(
+        OVERFLOW_REQUEST_IDS.nativeMessages,
+        "buffer-fail-open-native-messages",
+      );
+      expect(nativeMessages.status).toBe(200);
+      const nativeMessagesWire = await nativeMessages.text();
+      expect(nativeMessagesWire).toContain(OVERFLOW_MARKERS.nativeMessages);
+      expect(nativeMessagesWire).not.toContain("content_filter");
+
+      const bridgeMessages = await postMessages(
+        OVERFLOW_REQUEST_IDS.bridgeMessages,
+        "buffer-fail-open-bridge-messages",
+      );
+      expect(bridgeMessages.status).toBe(200);
+      const bridgeMessagesWire = await bridgeMessages.text();
+      expect(bridgeMessagesWire).toContain(OVERFLOW_MARKERS.bridgeMessages);
+      expect(bridgeMessagesWire).not.toContain("content_filter");
+
+      expect(overflowNativeResponses.receivedRequests.length).toBe(
+        baselines.nativeResponses + 1,
+      );
+      expect(overflowBridgeResponses.receivedRequests.length).toBe(
+        baselines.bridgeResponses + 1,
+      );
+      expect(overflowNativeMessages.receivedRequests.length).toBe(
+        baselines.nativeMessages + 1,
+      );
+      expect(overflowBridgeMessages.receivedRequests.length).toBe(
+        baselines.bridgeMessages + 1,
+      );
+
+      for (const requestId of Object.values(OVERFLOW_REQUEST_IDS)) {
+        await waitForToken(sls, LOGSTORE, requestId, 15_000, beforeLogs);
+      }
+      const exported = decodedTextFor(sls, LOGSTORE, beforeLogs);
+      for (const requestId of Object.values(OVERFLOW_REQUEST_IDS)) {
+        expect(exported).toContain(requestId);
+      }
+      for (const marker of Object.values(OVERFLOW_MARKERS)) {
+        expect(exported).not.toContain(marker);
       }
     },
     90_000,
