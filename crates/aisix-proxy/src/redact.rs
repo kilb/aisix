@@ -1426,13 +1426,18 @@ fn responses_field_is_opaque(
         || (parent_type == Some("code_interpreter_call") && field == "url")
 }
 
+#[derive(Clone, Copy)]
+struct ResponsesWalkMode {
+    detect_keys: bool,
+    inspect_structural_values: bool,
+}
+
 fn redact_responses_tree(
     chain: &dyn Guardrail,
     dir: Direction,
     value: &mut Value,
     counts: &mut RedactionCounts,
-    detect_keys: bool,
-    inspect_structural_values: bool,
+    mode: ResponsesWalkMode,
     item_type: Option<&str>,
     parent_type: Option<&str>,
 ) -> bool {
@@ -1442,16 +1447,7 @@ fn redact_responses_tree(
             false
         }
         Value::Array(items) => items.iter_mut().fold(false, |found, item| {
-            redact_responses_tree(
-                chain,
-                dir,
-                item,
-                counts,
-                detect_keys,
-                inspect_structural_values,
-                item_type,
-                parent_type,
-            ) || found
+            redact_responses_tree(chain, dir, item, counts, mode, item_type, parent_type) || found
         }),
         Value::Object(map) => {
             let object_type = map
@@ -1466,14 +1462,14 @@ fn redact_responses_tree(
                 if RESPONSES_ENUM_FIELDS.contains(&field.as_str()) {
                     continue;
                 }
-                if detect_keys {
+                if mode.detect_keys {
                     if let Some(redaction) = redact_str(chain, dir, field) {
                         unrewritable |= redaction.text != *field;
                         merge_counts(counts, redaction.counts);
                     }
                 }
                 if RESPONSES_STRUCTURAL_FIELDS.contains(&field.as_str()) {
-                    if inspect_structural_values {
+                    if mode.inspect_structural_values {
                         unrewritable |=
                             detect_unrewritable_value_strings(chain, dir, child, counts);
                     }
@@ -1487,7 +1483,7 @@ fn redact_responses_tree(
                         dir,
                         child,
                         counts,
-                        detect_keys,
+                        mode.detect_keys,
                         true,
                     );
                     continue;
@@ -1497,8 +1493,7 @@ fn redact_responses_tree(
                     dir,
                     child,
                     counts,
-                    detect_keys,
-                    inspect_structural_values,
+                    mode,
                     item_type,
                     object_type.as_deref().or(parent_type),
                 );
@@ -1555,8 +1550,10 @@ pub(crate) fn responses_item_content_text_capped(item: &Value, cap: usize) -> (S
         Direction::Input,
         &mut item,
         &mut counts,
-        false,
-        true,
+        ResponsesWalkMode {
+            detect_keys: false,
+            inspect_structural_values: true,
+        },
         item_type.as_deref(),
         item_type.as_deref(),
     );
@@ -1615,8 +1612,10 @@ fn redact_responses_item_structured(
         dir,
         item,
         counts,
-        detect_keys,
-        detect_keys,
+        ResponsesWalkMode {
+            detect_keys,
+            inspect_structural_values: detect_keys,
+        },
         item_type.as_deref(),
         item_type.as_deref(),
     )
