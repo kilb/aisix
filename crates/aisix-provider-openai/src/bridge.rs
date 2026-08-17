@@ -365,6 +365,8 @@ fn prepare_outbound_body<T: serde::Serialize>(
     let mut body = serde_json::to_value(typed)
         .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?;
     if let Some(r) = request {
+        crate::overrides::validate_content_safe_request_overrides(r)
+            .map_err(BridgeError::InvalidUpstreamConfig)?;
         apply_param_renames(&mut body, &r.param_renames);
         if let Some(constraints) = &r.param_constraints {
             apply_param_constraints(&mut body, constraints);
@@ -710,9 +712,21 @@ where
         let mut decoder = SseDecoder::new();
         let mut stream = Box::pin(byte_stream);
         let mut done_marker_seen = false;
+        let mut semantic_terminal_seen = false;
         'outer: while let Some(next) = stream.next().await {
-            let chunk = next.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
-            for event in decoder.feed(chunk.as_ref()) {
+            let chunk = match next {
+                Ok(chunk) => chunk,
+                Err(_) if semantic_terminal_seen => return,
+                Err(e) => {
+                    Err(BridgeError::Transport(
+                        aisix_gateway::transport_error_message(&e),
+                    ))?
+                }
+            };
+            for event in decoder
+                .feed_checked(chunk.as_ref())
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
+            {
                 match event {
                     SseEvent::Done => {
                         done_marker_seen = true;
@@ -720,7 +734,9 @@ where
                     }
                     SseEvent::Data(payload) => {
                         let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
-                        yield stream_chunk_into_chat_chunk(parsed);
+                        let chunk = stream_chunk_into_chat_chunk(parsed);
+                        semantic_terminal_seen |= chunk.finish_reason.is_some();
+                        yield chunk;
                     }
                 }
             }
@@ -732,13 +748,18 @@ where
         // it here. Both forms occur in the wild (the OpenAI SDK
         // tolerates both), so we treat `finish()`-returned Done the
         // same as a feed()-returned Done.
-        match decoder.finish() {
+        match decoder
+            .finish_checked()
+            .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
+        {
             Some(SseEvent::Done) => {
                 done_marker_seen = true;
             }
             Some(SseEvent::Data(payload)) => {
                 let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
-                yield stream_chunk_into_chat_chunk(parsed);
+                let chunk = stream_chunk_into_chat_chunk(parsed);
+                semantic_terminal_seen |= chunk.finish_reason.is_some();
+                yield chunk;
             }
             None => {}
         }
@@ -765,6 +786,9 @@ where
                     );
                 }
             }
+        }
+        if !done_marker_seen && !semantic_terminal_seen {
+            Err(BridgeError::StreamAborted)?;
         }
     }
 }
@@ -1252,6 +1276,42 @@ data: [DONE]\n\n";
         assert_eq!(chunks[1].delta.content.as_deref(), Some("hel"));
         assert_eq!(chunks[2].delta.content.as_deref(), Some("lo"));
         assert_eq!(chunks[2].finish_reason, Some(FinishReason::Stop));
+    }
+
+    #[tokio::test]
+    async fn streaming_eof_before_done_or_finish_is_aborted() {
+        let server = MockServer::start().await;
+        let sse = "data: {\"id\":\"cmpl-s\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let ctx = sample_ctx(&server.uri());
+        let mut stream = bridge.chat_stream(&req(), &ctx).await.unwrap();
+
+        assert_eq!(
+            stream
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .delta
+                .content
+                .as_deref(),
+            Some("partial"),
+        );
+        assert!(matches!(
+            stream.next().await.unwrap(),
+            Err(BridgeError::StreamAborted)
+        ));
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]

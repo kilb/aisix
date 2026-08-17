@@ -24,6 +24,17 @@
 
 use std::borrow::Cow;
 
+/// Maximum bytes retained for one unterminated SSE event. Provider events are
+/// normally a few kilobytes; a missing blank-line delimiter must not turn the
+/// shared decoder into an unbounded per-request buffer.
+pub const MAX_SSE_EVENT_BYTES: usize = 1 << 20;
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SseDecodeError {
+    #[error("upstream SSE event exceeds {MAX_SSE_EVENT_BYTES} bytes")]
+    EventTooLarge,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SseEvent {
     /// A `data:` payload (everything between `data: ` and the message
@@ -62,22 +73,58 @@ impl SseDecoder {
     /// unlocked by this feed. Partial messages remain buffered until a
     /// subsequent call supplies the rest.
     pub fn feed<'a>(&mut self, bytes: impl Into<Cow<'a, [u8]>>) -> Vec<SseEvent> {
-        let bytes = bytes.into();
-        self.byte_buf.extend_from_slice(&bytes);
-        self.decode_buffered_bytes();
+        self.feed_checked(bytes).unwrap_or_default()
+    }
 
+    /// Checked form used at upstream trust boundaries. An oversized event is
+    /// rejected without retaining the attacker-controlled tail.
+    pub fn feed_checked<'a>(
+        &mut self,
+        bytes: impl Into<Cow<'a, [u8]>>,
+    ) -> Result<Vec<SseEvent>, SseDecodeError> {
+        let bytes = bytes.into();
         let mut events = Vec::new();
-        // Event terminator is \n\n; process one message at a time.
-        while let Some(idx) = self.buffer.find("\n\n") {
-            let message: String = self.buffer.drain(..idx + 2).collect();
-            self.decode_message(&message, &mut events);
+        let mut offset = 0;
+        while offset < bytes.len() {
+            // Admit at most one byte beyond the cap so the rejection itself
+            // never first creates an attacker-sized duplicate allocation.
+            let retained = self.byte_buf.len().saturating_add(self.buffer.len());
+            let take = bytes.len().saturating_sub(offset).min(
+                MAX_SSE_EVENT_BYTES
+                    .saturating_add(1)
+                    .saturating_sub(retained)
+                    .max(1),
+            );
+            self.byte_buf
+                .extend_from_slice(&bytes[offset..offset.saturating_add(take)]);
+            offset = offset.saturating_add(take);
+            self.decode_buffered_bytes();
+
+            // Event terminator is \n\n; process one message at a time.
+            while let Some(idx) = self.buffer.find("\n\n") {
+                if idx > MAX_SSE_EVENT_BYTES {
+                    self.clear();
+                    return Err(SseDecodeError::EventTooLarge);
+                }
+                let message: String = self.buffer.drain(..idx + 2).collect();
+                self.decode_message(&message, &mut events);
+            }
+            if self.byte_buf.len().saturating_add(self.buffer.len()) > MAX_SSE_EVENT_BYTES {
+                self.clear();
+                return Err(SseDecodeError::EventTooLarge);
+            }
         }
-        events
+        Ok(events)
     }
 
     /// Flush any buffered trailing bytes as the final event. Call once
     /// the HTTP body has ended; returns `None` if nothing is buffered.
     pub fn finish(&mut self) -> Option<SseEvent> {
+        self.finish_checked().unwrap_or(None)
+    }
+
+    /// Checked end-of-stream flush paired with [`Self::feed_checked`].
+    pub fn finish_checked(&mut self) -> Result<Option<SseEvent>, SseDecodeError> {
         // Force a lossy decode of any trailing bytes we kept around
         // hoping for the rest of a multi-byte sequence — at end-of-
         // stream they're definitively malformed, so replace them with
@@ -90,15 +137,26 @@ impl SseDecoder {
             self.buffer.push_str(&tail);
         }
 
+        if self.buffer.len() > MAX_SSE_EVENT_BYTES {
+            self.clear();
+            return Err(SseDecodeError::EventTooLarge);
+        }
+
         if self.buffer.trim().is_empty() && self.current_data.is_empty() {
-            return None;
+            return Ok(None);
         }
         // Treat the tail as a terminated message so the decoder emits
         // whatever it had collected.
         let tail = std::mem::take(&mut self.buffer);
         let mut events = Vec::new();
         self.decode_message(&format!("{tail}\n\n"), &mut events);
-        events.into_iter().next()
+        Ok(events.into_iter().next())
+    }
+
+    fn clear(&mut self) {
+        self.byte_buf.clear();
+        self.buffer.clear();
+        self.current_data.clear();
     }
 
     /// Drain `byte_buf` of every byte that's part of a fully-formed
@@ -353,5 +411,22 @@ mod tests {
         } else {
             panic!("expected Data event");
         }
+    }
+
+    #[test]
+    fn checked_decoder_rejects_an_unterminated_oversized_event() {
+        let mut decoder = SseDecoder::new();
+        let prefix = format!("data: {}", "x".repeat(MAX_SSE_EVENT_BYTES));
+        let error = decoder
+            .feed_checked(prefix.as_bytes())
+            .expect_err("an unterminated event must be hard-capped");
+        assert_eq!(error, SseDecodeError::EventTooLarge);
+
+        // Rejection clears the retained attacker input instead of poisoning
+        // the decoder or keeping the oversized allocation alive.
+        assert_eq!(
+            decoder.feed_checked(b"data: ok\n\n").unwrap(),
+            vec![SseEvent::Data("ok".to_string())]
+        );
     }
 }

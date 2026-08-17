@@ -14,11 +14,17 @@ pub(super) enum PreparedCompletionStream {
         accumulator: CompletionSseAccumulator,
         output_text: String,
     },
+    Failed {
+        error: BridgeError,
+        accumulator: CompletionSseAccumulator,
+        output_text: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CompletionStreamFailure {
     Timeout,
+    Decode,
     Other,
 }
 
@@ -72,6 +78,7 @@ pub(super) struct CompletionSseAccumulator {
     pub(super) malformed_data: bool,
     pub(super) usage: Option<CompletionUsage>,
     pub(super) provider_request_id: String,
+    observed_bytes: bool,
 }
 
 impl Default for CompletionSseAccumulator {
@@ -89,6 +96,7 @@ impl Default for CompletionSseAccumulator {
             malformed_data: false,
             usage: None,
             provider_request_id: String::new(),
+            observed_bytes: false,
         }
     }
 }
@@ -106,6 +114,7 @@ impl CompletionSseAccumulator {
     }
 
     pub(super) fn push(&mut self, bytes: &[u8]) {
+        self.observed_bytes |= !bytes.is_empty();
         for byte in bytes {
             loop {
                 match self.boundary.feed(*byte) {
@@ -124,6 +133,10 @@ impl CompletionSseAccumulator {
                 break;
             }
         }
+    }
+
+    pub(super) fn has_observed_bytes(&self) -> bool {
+        self.observed_bytes
     }
 
     /// EOF terminates the final SSE event even when the provider omitted its
@@ -394,10 +407,10 @@ where
                 Err(error) => {
                     outcome = CompletionStreamOutcome::UpstreamError {
                         status: error.http_status(),
-                        failure: if matches!(error, BridgeError::Timeout { .. }) {
-                            CompletionStreamFailure::Timeout
-                        } else {
-                            CompletionStreamFailure::Other
+                        failure: match error {
+                            BridgeError::Timeout { .. } => CompletionStreamFailure::Timeout,
+                            BridgeError::UpstreamDecode(_) => CompletionStreamFailure::Decode,
+                            _ => CompletionStreamFailure::Other,
                         },
                         error_class: error.error_type(),
                     };
@@ -440,6 +453,30 @@ where
         if let Some((_, accumulator)) = guard.slot.as_mut() {
             accumulator.finish();
         }
+        if matches!(outcome, CompletionStreamOutcome::CleanEof) {
+            let accumulator = &guard
+                .slot
+                .as_ref()
+                .expect("completion stream guard is armed before terminal callback")
+                .1;
+            if accumulator.malformed_data {
+                outcome = CompletionStreamOutcome::UpstreamError {
+                    status: 502,
+                    failure: CompletionStreamFailure::Decode,
+                    error_class: "upstream_decode_error",
+                };
+            } else if !accumulator.saw_done {
+                outcome = CompletionStreamOutcome::UpstreamError {
+                    status: 502,
+                    failure: CompletionStreamFailure::Other,
+                    error_class: "stream_aborted",
+                };
+            }
+        }
+        // If the downstream disconnects while a terminal monitor observation
+        // awaits, Drop must retain the already-known upstream outcome rather
+        // than relabeling it as a client cancellation.
+        guard.drop_outcome = outcome;
         let observation = match output_observer.as_ref() {
             Some(chain) => {
                 let text = guard
@@ -711,6 +748,58 @@ mod tests {
                 status: 504,
                 failure: CompletionStreamFailure::Timeout,
                 error_class: "timeout",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_without_done_reports_stream_aborted() {
+        let upstream: CompletionByteStream = Box::pin(futures::stream::iter([Ok(
+            bytes::Bytes::from(frame("partial", true)),
+        )]));
+        let outcome = Arc::new(std::sync::Mutex::new(None));
+        let outcome_for_callback = Arc::clone(&outcome);
+        let stream = build_completion_passthrough_stream(
+            upstream,
+            None,
+            "model".to_string(),
+            move |_, terminal, _| *outcome_for_callback.lock().unwrap() = Some(terminal),
+        );
+        futures::pin_mut!(stream);
+        while stream.next().await.is_some() {}
+
+        assert_eq!(
+            *outcome.lock().unwrap(),
+            Some(CompletionStreamOutcome::UpstreamError {
+                status: 502,
+                failure: CompletionStreamFailure::Other,
+                error_class: "stream_aborted",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_eof_reports_upstream_decode() {
+        let upstream: CompletionByteStream = Box::pin(futures::stream::iter([Ok(
+            bytes::Bytes::from_static(b"data: not-json\n\n"),
+        )]));
+        let outcome = Arc::new(std::sync::Mutex::new(None));
+        let outcome_for_callback = Arc::clone(&outcome);
+        let stream = build_completion_passthrough_stream(
+            upstream,
+            None,
+            "model".to_string(),
+            move |_, terminal, _| *outcome_for_callback.lock().unwrap() = Some(terminal),
+        );
+        futures::pin_mut!(stream);
+        while stream.next().await.is_some() {}
+
+        assert_eq!(
+            *outcome.lock().unwrap(),
+            Some(CompletionStreamOutcome::UpstreamError {
+                status: 502,
+                failure: CompletionStreamFailure::Decode,
+                error_class: "upstream_decode_error",
             })
         );
     }

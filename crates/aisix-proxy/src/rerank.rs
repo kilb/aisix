@@ -287,11 +287,13 @@ async fn dispatch(
     // guardrail is attached.
     let applied_guardrails = resolved_chain.applied().to_vec();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    let mut input_capture_safe = true;
     if !resolved_chain.is_empty() {
         let chat = rerank_input_to_chat(&model_name, &*body);
         let (verdict, hits) =
             aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
         monitor_hits.extend(hits);
+        input_capture_safe = !verdict.is_bypass();
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
@@ -387,6 +389,11 @@ async fn dispatch(
     // /v1/rerank path builds the request directly, so without this the override
     // pipeline silently no-ops here. No-op when the PK carries none.
     if let Some(r) = pk_entry.value.request.as_ref() {
+        aisix_provider_openai::overrides::validate_content_safe_request_overrides(r).map_err(
+            |message| {
+                ProxyError::Bridge(aisix_gateway::BridgeError::InvalidUpstreamConfig(message))
+            },
+        )?;
         aisix_provider_openai::overrides::apply_param_renames(body, &r.param_renames);
         if let Some(constraints) = &r.param_constraints {
             aisix_provider_openai::overrides::apply_param_constraints(body, constraints);
@@ -555,7 +562,7 @@ async fn dispatch(
     // Content capture (#700): the relayed response bytes are the JSON the
     // caller sees; non-UTF-8 (unexpected) degrades to lossy text.
     let captured_content = match (&captured_prompt, content_cap) {
-        (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+        (Some(prompt), Some(cap)) if input_capture_safe => Some(CapturedContent::new(
             prompt,
             &String::from_utf8_lossy(&body_bytes),
             cap as usize,

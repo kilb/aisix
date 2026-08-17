@@ -446,8 +446,13 @@ fn filtered_extra_headers(hdr: &UpstreamHeaderContext<'_>) -> Vec<(String, Strin
 /// on. (`param_constraints`'s temperature clamp IS still re-applied on the
 /// Converse path via `build_inference_config` — see #463 — but `param_renames`
 /// / `default_body_fields` / `content_list_to_string` have no Converse target.)
-fn apply_body_overrides(body: &mut serde_json::Value, ctx: &BridgeContext) {
+fn apply_body_overrides(
+    body: &mut serde_json::Value,
+    ctx: &BridgeContext,
+) -> Result<(), BridgeError> {
     if let Some(r) = ctx.provider_key.request.as_ref() {
+        aisix_provider_openai::overrides::validate_content_safe_request_overrides(r)
+            .map_err(BridgeError::Config)?;
         apply_param_renames(body, &r.param_renames);
         if let Some(constraints) = &r.param_constraints {
             apply_param_constraints(body, constraints);
@@ -462,6 +467,7 @@ fn apply_body_overrides(body: &mut serde_json::Value, ctx: &BridgeContext) {
     {
         apply_content_list_to_string(body);
     }
+    Ok(())
 }
 
 /// Injects `request.default_headers` into the outbound Bedrock request at
@@ -839,7 +845,7 @@ impl BedrockBridge {
         // Vertex-style Bedrock shaping below, so the `model`/`stream` strip
         // keeps the final say and an override can never reintroduce a
         // URL-borne `model` into the /invoke body.
-        apply_body_overrides(&mut body_value, ctx);
+        apply_body_overrides(&mut body_value, ctx)?;
         if let Some(obj) = body_value.as_object_mut() {
             obj.remove("model");
             obj.remove("stream");

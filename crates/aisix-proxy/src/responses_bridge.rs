@@ -29,6 +29,8 @@ use aisix_gateway::{
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
+const MAX_STREAM_ASSEMBLY_BYTES: usize = crate::token_estimate::OUTPUT_ACCUMULATION_CAP;
+
 /// Translate a `/v1/responses` request body into the gateway's canonical
 /// [`ChatFormat`]. Unlike `responses::responses_input_to_chat` (which is a
 /// lossy, text-only projection used solely for input-guardrail scanning),
@@ -418,6 +420,8 @@ pub struct ResponsesSseEncoder {
     text_item_id: Option<String>,
     text_output_index: u32,
     text_accum: String,
+    accumulated_bytes: usize,
+    overflowed: bool,
     /// Set once the per-item `*.done` events have been emitted, so
     /// `close_items` is idempotent across the finish chunk + `force_finish`.
     items_closed: bool,
@@ -455,6 +459,8 @@ impl ResponsesSseEncoder {
             text_item_id: None,
             text_output_index: 0,
             text_accum: String::new(),
+            accumulated_bytes: 0,
+            overflowed: false,
             items_closed: false,
             tool_calls: std::collections::BTreeMap::new(),
             pending_status: None,
@@ -492,6 +498,23 @@ impl ResponsesSseEncoder {
             self.cache_creation_tokens = self.cache_creation_tokens.max(u.cache_creation_tokens);
             self.cache_read_tokens = self.cache_read_tokens.max(u.cache_read_tokens);
         }
+    }
+
+    fn reserve_assembly(&mut self, additional: usize) -> bool {
+        let Some(total) = self.accumulated_bytes.checked_add(additional) else {
+            self.overflowed = true;
+            return false;
+        };
+        if total > MAX_STREAM_ASSEMBLY_BYTES {
+            self.overflowed = true;
+            return false;
+        }
+        self.accumulated_bytes = total;
+        true
+    }
+
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
     }
 
     fn usage_value(&self) -> Value {
@@ -613,6 +636,33 @@ impl ResponsesSseEncoder {
             .as_ref()
             .is_some_and(|v| !v.is_empty());
         let has_finish = chunk.finish_reason.is_some();
+
+        let mut additional = chunk.delta.content.as_deref().map_or(0, str::len);
+        if let Some(tool_calls) = chunk.delta.tool_calls.as_ref() {
+            for tc in tool_calls {
+                let index = tc.get("index").and_then(Value::as_u64).unwrap_or(0);
+                if !self.tool_calls.contains_key(&index) {
+                    additional = additional.saturating_add(128);
+                }
+                for value in [
+                    tc.get("id").and_then(Value::as_str),
+                    tc.get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str),
+                    tc.get("function")
+                        .and_then(|function| function.get("arguments"))
+                        .and_then(Value::as_str),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    additional = additional.saturating_add(value.len());
+                }
+            }
+        }
+        if !self.reserve_assembly(additional) {
+            return Vec::new();
+        }
 
         let mut events = Vec::new();
 
@@ -1078,9 +1128,11 @@ pub fn build_responses_bridge_stream(
                         if let (Some(cap), Some(text)) =
                             (content_cap, chunk.delta.content.as_deref())
                         {
-                            if comp.response_text.len() < cap as usize {
-                                comp.response_text.push_str(text);
-                            }
+                            let _ = crate::token_estimate::push_capped_to(
+                                &mut comp.response_text,
+                                text,
+                                cap as usize,
+                            );
                         }
                         // Token-estimation accumulator (AISIX-Cloud#1074):
                         // all generated output, always on (whether the
@@ -1120,7 +1172,18 @@ pub fn build_responses_bridge_stream(
                             comp.cache_read_tokens = comp.cache_read_tokens.max(u.cache_read_tokens);
                         }
                     }
-                    for ev in encoder.next_events(&chunk) {
+                    let events = encoder.next_events(&chunk);
+                    if encoder.overflowed() {
+                        let comp = guard.comp();
+                        comp.response_capture_safe = false;
+                        comp.response_text.clear();
+                        comp.terminal_failure = Some(aisix_gateway::BridgeError::StreamAborted);
+                        yield Ok(bytes::Bytes::from(
+                            "event: error\ndata: {\"type\":\"error\",\"code\":\"stream_aborted\",\"message\":\"upstream stream exceeded translation limit\"}\n\n",
+                        ));
+                        return;
+                    }
+                    for ev in events {
                         let b = bytes::Bytes::from(ev.to_sse_string());
                         if buffering {
                             held_bytes += b.len();
@@ -1818,5 +1881,16 @@ mod tests {
             completed.data["response"]["incomplete_details"]["reason"],
             "max_output_tokens"
         );
+    }
+
+    #[test]
+    fn streaming_encoder_rejects_one_oversized_chunk_before_copying_it() {
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let oversized = "x".repeat(super::MAX_STREAM_ASSEMBLY_BYTES + 1);
+
+        assert!(enc.next_events(&content_chunk(&oversized)).is_empty());
+        assert!(enc.overflowed());
+        assert!(enc.text_accum.is_empty());
+        assert!(enc.tool_calls.is_empty());
     }
 }

@@ -35,9 +35,9 @@ pub mod url_cache;
 
 pub use bridge::{
     capture_in_band_error, capture_upstream_error_http, content_type_is_json, parse_retry_after,
-    read_body_capped, response_is_json, truncate_lossy, Bridge, BridgeContext, BridgeError,
-    ChatChunkStream, CompletionByteStream, UpstreamErrorView, UpstreamWire,
-    MAX_UPSTREAM_ERROR_BODY_BYTES, MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
+    read_body_capped, read_body_capped_with_deadline, response_is_json, truncate_lossy, Bridge,
+    BridgeContext, BridgeError, ChatChunkStream, CompletionByteStream, UpstreamErrorView,
+    UpstreamWire, MAX_UPSTREAM_ERROR_BODY_BYTES, MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
 };
 pub use chat::{
     ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest,

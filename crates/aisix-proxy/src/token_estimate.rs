@@ -39,19 +39,27 @@ pub const OUTPUT_ACCUMULATION_CAP: usize = 1 << 20;
 /// once per chunk — keeps a single oversized chunk from overshooting
 /// the buffer by its full size.
 pub fn push_capped(buf: &mut String, s: &str) {
-    let remaining = OUTPUT_ACCUMULATION_CAP.saturating_sub(buf.len());
+    let _ = push_capped_to(buf, s, OUTPUT_ACCUMULATION_CAP);
+}
+
+/// Append at most `cap` UTF-8 bytes in total. Returns `true` when any input
+/// was omitted because the buffer was already full or this append crossed the
+/// limit.
+pub fn push_capped_to(buf: &mut String, s: &str, cap: usize) -> bool {
+    let remaining = cap.saturating_sub(buf.len());
     if remaining == 0 || s.is_empty() {
-        return;
+        return !s.is_empty();
     }
     if s.len() <= remaining {
         buf.push_str(s);
-        return;
+        return false;
     }
     let mut cut = remaining;
     while !s.is_char_boundary(cut) {
         cut -= 1;
     }
     buf.push_str(&s[..cut]);
+    true
 }
 
 const TOKENS_PER_MESSAGE: u32 = 3;
@@ -714,6 +722,14 @@ mod tests {
         push_capped(&mut buf, &"b".repeat(64));
         assert!(buf.len() <= OUTPUT_ACCUMULATION_CAP);
         assert!(buf.len() >= len);
+    }
+
+    #[test]
+    fn variable_cap_never_overshoots_one_large_unicode_append() {
+        let mut text = "a".repeat(7);
+        assert!(super::push_capped_to(&mut text, "汉字", 10));
+        assert_eq!(text, "a".repeat(7) + "汉");
+        assert_eq!(text.len(), 10);
     }
 
     /// Text past the exact-count budget extrapolates at ~4 bytes/token

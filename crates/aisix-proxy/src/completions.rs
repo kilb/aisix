@@ -84,6 +84,9 @@ struct CompletionDispatchSuccess {
     /// Monitor-mode guardrail observations (AISIX-Cloud#562), input +
     /// output merged. Attached to the emitted UsageEvent.
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    /// Typed failure class for a held stream that failed after generating
+    /// billable output. Empty on successful/gateway-blocked responses.
+    error_class: String,
     /// True when the response leg was blocked by an OUTPUT guardrail
     /// AFTER the upstream billed for it (#911 [23]). The response body is
     /// the redacted 422, but `usage` still carries the billed counts so
@@ -250,7 +253,7 @@ pub async fn completions(
                     &success.provider_request_id,
                     &client,
                     is_stream,
-                    "",
+                    &success.error_class,
                     success.guardrail_blocked,
                     telemetry.applied_guardrails.clone(),
                     success.redactions.clone(),
@@ -320,11 +323,11 @@ pub async fn completions(
 
 /// Build a [`ChatFormat`](aisix_gateway::ChatFormat) of user messages from
 /// the legacy completions `prompt` so the input guardrail chain can scan it
-/// (#545). `prompt` is a string, an array of strings, or an array of token
-/// ids / token-id arrays; only the string forms carry scannable text (token
-/// ids are integers — skipped). Never sent upstream.
+/// (#545). Token-id prompts are rejected before this projection whenever an
+/// input guardrail applies because the gateway cannot safely rewrite them.
+/// Never sent upstream.
 fn completions_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat {
-    let messages = match body.get("prompt") {
+    let mut messages = match body.get("prompt") {
         Some(Value::String(s)) if !s.is_empty() => {
             vec![aisix_gateway::ChatMessage::user(s.clone())]
         }
@@ -336,7 +339,20 @@ fn completions_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFo
             .collect(),
         _ => Vec::new(),
     };
+    for field in ["suffix", "user"] {
+        if let Some(text) = body.get(field).and_then(Value::as_str) {
+            if !text.is_empty() {
+                messages.push(aisix_gateway::ChatMessage::user(text.to_string()));
+            }
+        }
+    }
     aisix_gateway::ChatFormat::new(model, messages)
+}
+
+fn completions_prompt_uses_token_ids(body: &Value) -> bool {
+    body.get("prompt")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(|item| !item.is_string()))
 }
 
 async fn dispatch(
@@ -380,8 +396,19 @@ async fn dispatch(
     };
     let resolved_chain = Arc::new(state.guardrail_index.resolve(&guardrail_ctx));
     telemetry.applied_guardrails = resolved_chain.applied().to_vec();
+    let input_guardrail_applies = telemetry
+        .applied_guardrails
+        .iter()
+        .any(|guardrail| matches!(guardrail.hook.as_str(), "input" | "both"));
+    if input_guardrail_applies && completions_prompt_uses_token_ids(&body) {
+        return Err(ProxyError::ContentFiltered(
+            "request blocked by input guardrail: token-id prompts cannot be inspected safely"
+                .to_string(),
+        ));
+    }
     let mut input_seg_counts = crate::redact::RedactionCounts::new();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    let mut input_capture_safe = true;
     if !resolved_chain.is_empty() {
         let chat = completions_input_to_chat(model_name, &body);
         let (verdict, hits) = aisix_guardrails::Guardrail::check_input_non_segment_observed(
@@ -393,16 +420,17 @@ async fn dispatch(
         // Segment pass: one Bedrock call over the prompt slots; an
         // ANONYMIZE disposition writes the masked text back into the body
         // (#932 bedrock follow-up).
-        let verdict = crate::redact::moderate_body(
+        let moderation = crate::redact::moderate_body(
             resolved_chain.as_ref(),
             crate::redact::Direction::Input,
             verdict,
             &mut input_seg_counts,
             &mut monitor_hits,
-            |g| crate::redact::redact_completions_request(g, &mut body),
+            |g| crate::redact::redact_completions_request_structured(g, &mut body).counts,
         )
-        .await
-        .verdict;
+        .await;
+        input_capture_safe = moderation.capture_safe;
+        let verdict = moderation.verdict;
         telemetry.monitor_hits.clone_from(&monitor_hits);
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
@@ -424,8 +452,14 @@ async fn dispatch(
 
     // #932: mask-action PII rules rewrite the prompt in place AFTER the
     // block check passes, BEFORE the body is forwarded upstream.
-    let mut redactions =
-        crate::redact::redact_completions_request(resolved_chain.as_ref(), &mut body);
+    let final_redaction =
+        crate::redact::redact_completions_request_structured(resolved_chain.as_ref(), &mut body);
+    if final_redaction.unrewritable_tool_key {
+        return Err(ProxyError::ContentFiltered(
+            crate::error::guardrail_block_message("request", None),
+        ));
+    }
+    let mut redactions = final_redaction.counts;
     crate::redact::merge_counts(&mut redactions, input_seg_counts);
 
     // Content capture (AISIX-Cloud#947): the client-facing request body
@@ -508,16 +542,28 @@ async fn dispatch(
                 let mut buffer = Vec::new();
                 let mut observed = CompletionSseAccumulator::default();
                 while let Some(item) = stream.next().await {
-                    let chunk = item.map_err(|error| {
-                        note_completion_failure(
-                            &state.health,
-                            tracker,
-                            &model.display_name,
-                            cooldown_model_id,
-                            cooldown_cfg,
-                            error,
-                        )
-                    })?;
+                    let chunk = match item {
+                        Ok(chunk) => chunk,
+                        Err(error) => {
+                            let error = note_completion_failure(
+                                &state.health,
+                                tracker,
+                                &model.display_name,
+                                cooldown_model_id,
+                                cooldown_cfg,
+                                error,
+                            );
+                            if observed.has_observed_bytes() {
+                                let output_text = observed.finish_for_overflow_estimate();
+                                return Ok(PreparedCompletionStream::Failed {
+                                    error,
+                                    accumulator: observed,
+                                    output_text,
+                                });
+                            }
+                            return Err(error);
+                        }
+                    };
                     // The cap-triggering bytes were generated (and may be
                     // billed) even though fail-closed policy withholds them.
                     // Feed a separately bounded parser before enforcing the
@@ -565,6 +611,16 @@ async fn dispatch(
                         BridgeError::UpstreamDecode(
                             "malformed legacy completion SSE data event".to_string(),
                         ),
+                    ));
+                }
+                if !inspection.saw_done {
+                    return Err(note_completion_failure(
+                        &state.health,
+                        tracker,
+                        &model.display_name,
+                        cooldown_model_id,
+                        cooldown_cfg,
+                        BridgeError::StreamAborted,
                     ));
                 }
                 Ok(PreparedCompletionStream::Buffered(buffer))
@@ -640,6 +696,7 @@ async fn dispatch(
                     usage: None,
                     redactions,
                     monitor_hits,
+                    error_class: String::new(),
                     guardrail_blocked: false,
                     captured_content: None,
                     usage_handled_by_stream: false,
@@ -732,6 +789,7 @@ async fn dispatch(
                         usage: Some(usage),
                         redactions,
                         monitor_hits,
+                        error_class: String::new(),
                         guardrail_blocked: true,
                         captured_content: None,
                         usage_handled_by_stream: false,
@@ -751,7 +809,7 @@ async fn dispatch(
                     parsed.output_text()
                 };
                 let captured_content = match (&captured_prompt, content_cap) {
-                    (Some(prompt), Some(cap)) if capture_safe => {
+                    (Some(prompt), Some(cap)) if input_capture_safe && capture_safe => {
                         Some(CapturedContent::new(prompt, &final_output, cap as usize))
                     }
                     _ => None,
@@ -771,6 +829,7 @@ async fn dispatch(
                     usage: Some(usage),
                     redactions,
                     monitor_hits,
+                    error_class: String::new(),
                     guardrail_blocked: false,
                     captured_content,
                     usage_handled_by_stream: false,
@@ -806,7 +865,42 @@ async fn dispatch(
                     usage: Some(usage),
                     redactions,
                     monitor_hits,
+                    error_class: String::new(),
                     guardrail_blocked: true,
+                    captured_content: None,
+                    usage_handled_by_stream: false,
+                });
+            }
+            PreparedCompletionStream::Failed {
+                error,
+                accumulator,
+                output_text,
+            } => {
+                let usage = completion_usage_with_estimates(
+                    accumulator.usage.unwrap_or_default(),
+                    &upstream_model,
+                    body.get("prompt"),
+                    &output_text,
+                );
+                reservation
+                    .commit_tokens(
+                        u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens),
+                    )
+                    .await;
+                let error_class = error.error_type().to_string();
+                let response = ProxyError::Bridge(error).into_response();
+                return Ok(CompletionDispatchSuccess {
+                    response,
+                    provider: provider_label,
+                    model_id: model_entry.id.to_string(),
+                    provider_key_id: pk_entry.id.to_string(),
+                    upstream_model,
+                    provider_request_id: accumulator.provider_request_id,
+                    usage: Some(usage),
+                    redactions,
+                    monitor_hits,
+                    error_class,
+                    guardrail_blocked: false,
                     captured_content: None,
                     usage_handled_by_stream: false,
                 });
@@ -865,6 +959,9 @@ async fn dispatch(
                                         elapsed_ms: stream_started.elapsed().as_millis() as u64,
                                         cause: "stream body".to_string(),
                                     },
+                                    CompletionStreamFailure::Decode => BridgeError::UpstreamDecode(
+                                        "malformed legacy completion SSE data event".to_string(),
+                                    ),
                                     CompletionStreamFailure::Other => BridgeError::StreamAborted,
                                 };
                                 let _ = crate::cooldown::note_failure(
@@ -893,7 +990,9 @@ async fn dispatch(
                         }
                         drop(stream_hold);
                         let captured_content = match (&captured_prompt_for_stream, content_cap) {
-                            (Some(prompt), Some(cap)) if output_observation.capture_safe => {
+                            (Some(prompt), Some(cap))
+                                if input_capture_safe && output_observation.capture_safe =>
+                            {
                                 Some(CapturedContent::new(prompt, &output_text, cap as usize))
                             }
                             _ => None,
@@ -961,6 +1060,7 @@ async fn dispatch(
                     usage: None,
                     redactions,
                     monitor_hits,
+                    error_class: String::new(),
                     guardrail_blocked: false,
                     captured_content: None,
                     usage_handled_by_stream: true,
@@ -1114,6 +1214,7 @@ async fn dispatch(
                         provider_request_id,
                         redactions,
                         monitor_hits,
+                        error_class: String::new(),
                         guardrail_blocked: true,
                         // Blocked responses never reached the client — no
                         // content capture, matching the chat surface.
@@ -1134,11 +1235,9 @@ async fn dispatch(
             // POST-redaction body, so the exported content matches what the
             // caller received.
             let captured_content = match (&captured_prompt, content_cap) {
-                (Some(prompt), Some(cap)) if output_capture_safe => Some(CapturedContent::new(
-                    prompt,
-                    &completion_output_text(&resp_json),
-                    cap as usize,
-                )),
+                (Some(prompt), Some(cap)) if input_capture_safe && output_capture_safe => Some(
+                    CapturedContent::new(prompt, &completion_output_text(&resp_json), cap as usize),
+                ),
                 _ => None,
             };
 
@@ -1152,6 +1251,7 @@ async fn dispatch(
                 provider_request_id,
                 redactions,
                 monitor_hits,
+                error_class: String::new(),
                 guardrail_blocked: false,
                 captured_content,
                 usage_handled_by_stream: false,
@@ -1174,6 +1274,7 @@ async fn dispatch(
                 provider_request_id: String::new(),
                 redactions,
                 monitor_hits,
+                error_class: String::new(),
                 guardrail_blocked: false,
                 captured_content: None,
                 usage_handled_by_stream: false,

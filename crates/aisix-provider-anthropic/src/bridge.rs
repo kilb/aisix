@@ -383,7 +383,10 @@ where
 
         while let Some(next) = stream.next().await {
             let chunk = next.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
-            for event in decoder.feed(chunk.as_ref()) {
+            for event in decoder
+                .feed_checked(chunk.as_ref())
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
+            {
                 let SseEvent::Data(payload) = event else { continue };
                 let parsed: AnthropicStreamEvent = serde_json::from_str(&payload)
                     .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
@@ -399,6 +402,24 @@ where
                 }
             }
         }
+        if let Some(SseEvent::Data(payload)) = decoder
+            .finish_checked()
+            .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
+        {
+            let parsed: AnthropicStreamEvent = serde_json::from_str(&payload)
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+            if let AnthropicStreamEvent::Error { error } = &parsed {
+                Err(crate::wire::stream_error_into_bridge_error(error))?;
+            }
+            state.update(&parsed);
+            if let Some(c) = state.to_chunk(&parsed) {
+                yield c;
+            }
+            if StreamState::is_terminal(&parsed) {
+                return;
+            }
+        }
+        Err(BridgeError::StreamAborted)?;
     }
 }
 
@@ -820,6 +841,42 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(chunks[1].delta.content.as_deref(), Some("lo"));
         assert_eq!(chunks[2].finish_reason, Some(FinishReason::Stop));
         assert_eq!(chunks[2].usage.as_ref().unwrap().completion_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn streaming_eof_before_message_stop_is_aborted() {
+        let server = MockServer::start().await;
+        let sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_partial\",\"model\":\"claude-sonnet-4-5\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = AnthropicBridge::new();
+        let ctx = sample_ctx(&server.uri());
+        let mut stream = bridge.chat_stream(&req(), &ctx).await.unwrap();
+
+        assert_eq!(
+            stream
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .delta
+                .content
+                .as_deref(),
+            Some("partial"),
+        );
+        assert!(matches!(
+            stream.next().await.unwrap(),
+            Err(BridgeError::StreamAborted)
+        ));
+        assert!(stream.next().await.is_none());
     }
 
     /// AISIX-Cloud#952: some relay backends omit usage from

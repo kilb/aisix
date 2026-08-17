@@ -348,6 +348,30 @@ describe("anthropic count_tokens e2e: /v1/messages/count_tokens through the DP (
     expect(res.status).toBe(422);
     expect(await res.text()).not.toContain(TOOL_IDENTIFIER);
     expect(upstream.receivedRequests).toHaveLength(baseline);
+
+    const forced = await fetch(`${app.proxyUrl}/v1/messages/count_tokens`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": CALLER_PLAINTEXT,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: MODEL_ALIAS,
+        messages: [{ role: "user", content: "clean" }],
+        tools: [
+          {
+            name: "lookup",
+            input_schema: { type: "object", properties: {} },
+          },
+        ],
+        tool_choice: { type: "tool", name: TOOL_IDENTIFIER },
+      }),
+    });
+
+    expect(forced.status).toBe(422);
+    expect(await forced.text()).not.toContain(TOOL_IDENTIFIER);
+    expect(upstream.receivedRequests).toHaveLength(baseline);
   });
 
   test("DLP rejects a sensitive historical tool input key before egress", async (ctx) => {

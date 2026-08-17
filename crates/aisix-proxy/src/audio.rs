@@ -589,6 +589,7 @@ async fn multipart_dispatch(
     let applied_guardrails = resolved_chain.applied().to_vec();
     let mut redactions = crate::redact::RedactionCounts::new();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    let mut input_capture_safe = true;
     if !resolved_chain.is_empty() {
         // EVERY `prompt` field: multipart allows repeated names and the form
         // is rebuilt with all of them, so all are scanned — an empty first
@@ -605,6 +606,7 @@ async fn multipart_dispatch(
             let (verdict, hits) =
                 aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
             monitor_hits.extend(hits);
+            input_capture_safe = !verdict.is_bypass();
             if let aisix_guardrails::GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
@@ -909,6 +911,7 @@ async fn multipart_dispatch(
     // transcribing audio. The upstream already billed (tokens committed
     // above), so a block returns the redacted 422 while keeping the billed
     // usage marked `guardrail_blocked` — same as completions #911 [23].
+    let mut output_capture_safe = true;
     if aisix_guardrails::Guardrail::runs_on_output(&resolved_chain) {
         let transcript = transcription_output_text(&body_bytes);
         if !transcript.is_empty() {
@@ -922,6 +925,7 @@ async fn multipart_dispatch(
             let (verdict, hits) =
                 aisix_guardrails::Guardrail::check_output_observed(&resolved_chain, &synth).await;
             monitor_hits.extend(hits);
+            output_capture_safe = !verdict.is_bypass();
             if let aisix_guardrails::GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
@@ -974,11 +978,9 @@ async fn multipart_dispatch(
     // the POST-redaction body so masked PII stays masked in the exported
     // content.
     let captured_content = match (&captured_prompt, content_cap) {
-        (Some(prompt), Some(cap)) => Some(CapturedContent::new(
-            prompt,
-            &String::from_utf8_lossy(&body_bytes),
-            cap as usize,
-        )),
+        (Some(prompt), Some(cap)) if input_capture_safe && output_capture_safe => Some(
+            CapturedContent::new(prompt, &String::from_utf8_lossy(&body_bytes), cap as usize),
+        ),
         _ => None,
     };
 
@@ -1097,11 +1099,13 @@ async fn speech_dispatch(
     // UsageEvent. Empty when none attached.
     let applied_guardrails = resolved_chain.applied().to_vec();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    let mut input_capture_safe = true;
     if !resolved_chain.is_empty() {
         let chat = speech_input_to_chat(&model_name, &body);
         let (verdict, hits) =
             aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
         monitor_hits.extend(hits);
+        input_capture_safe = !verdict.is_bypass();
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
@@ -1135,6 +1139,7 @@ async fn speech_dispatch(
             .iter()
             .map(|e| &e.value),
     )
+    .filter(|_| input_capture_safe)
     .map(|cap| {
         CapturedContent::new(
             &serde_json::to_string(&body).unwrap_or_default(),
@@ -1164,6 +1169,11 @@ async fn speech_dispatch(
     // bridge's chat() path — /v1/audio/speech is a JSON passthrough that builds
     // the request directly (AISIX-Cloud#867 follow-up). No-op when none set.
     if let Some(r) = pk_entry.value.request.as_ref() {
+        aisix_provider_openai::overrides::validate_content_safe_request_overrides(r).map_err(
+            |message| {
+                ProxyError::Bridge(aisix_gateway::BridgeError::InvalidUpstreamConfig(message))
+            },
+        )?;
         aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
         if let Some(constraints) = &r.param_constraints {
             aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);

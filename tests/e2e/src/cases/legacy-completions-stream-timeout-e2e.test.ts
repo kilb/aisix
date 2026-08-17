@@ -62,6 +62,7 @@ async function waitForTimeoutObservability(
   modelId: string,
   model: string,
   usageBaseline: number,
+  reason = "request_timeout",
 ): Promise<void> {
   await waitConfigPropagation(async () => {
     const response = await fetch(`${app!.metricsUrl}/status/models`);
@@ -77,7 +78,7 @@ async function waitForTimeoutObservability(
       (row) =>
         row.id === modelId &&
         row.status === "cooldown" &&
-        row.status_reason === "request_timeout",
+        row.status_reason === reason,
     );
   });
 
@@ -114,8 +115,12 @@ let app: SpawnedApp | undefined;
 describe("legacy completions stream timeout", () => {
   let slowFirst: OpenAiUpstream | undefined;
   let midStream: OpenAiUpstream | undefined;
+  let truncated: OpenAiUpstream | undefined;
+  let malformed: OpenAiUpstream | undefined;
   let slowModelId = "";
   let midModelId = "";
+  let truncatedModelId = "";
+  let malformedModelId = "";
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -136,6 +141,12 @@ describe("legacy completions stream timeout", () => {
         { streamEvents: [chunk("after-timeout"), done, "[DONE]"] },
       ],
     });
+    truncated = await startOpenAiUpstream({
+      rawSseChunks: [`data: ${chunk("truncated output")}\n\n`],
+    });
+    malformed = await startOpenAiUpstream({
+      rawSseChunks: ["data: not-json\n\n"],
+    });
 
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
@@ -150,6 +161,8 @@ describe("legacy completions stream timeout", () => {
 
     const slowPk = await providerKey("legacy-timeout-slow", slowFirst);
     const midPk = await providerKey("legacy-timeout-mid", midStream);
+    const truncatedPk = await providerKey("legacy-truncated", truncated);
+    const malformedPk = await providerKey("legacy-malformed", malformed);
 
     const slowModel = await seed.createModel({
       display_name: "legacy-timeout-slow",
@@ -172,12 +185,35 @@ describe("legacy completions stream timeout", () => {
       cooldown: { default_seconds: 1 },
     });
     midModelId = midModel.id;
+    const truncatedModel = await seed.createModel({
+      display_name: "legacy-truncated",
+      provider: "openai",
+      model_name: "gpt-3.5-turbo-instruct",
+      provider_key_id: truncatedPk,
+      retries: 0,
+      cooldown: { default_seconds: 60 },
+    });
+    truncatedModelId = truncatedModel.id;
+    const malformedModel = await seed.createModel({
+      display_name: "legacy-malformed",
+      provider: "openai",
+      model_name: "gpt-3.5-turbo-instruct",
+      provider_key_id: malformedPk,
+      retries: 0,
+      cooldown: { default_seconds: 60 },
+    });
+    malformedModelId = malformedModel.id;
 
     // The caller key is the final revision. Authenticated model listing is a
     // propagation barrier without exercising the timeout behavior under test.
     await seed.createApiKey({
       key_hash: HASH,
-      allowed_models: ["legacy-timeout-slow", "legacy-timeout-mid"],
+      allowed_models: [
+        "legacy-timeout-slow",
+        "legacy-timeout-mid",
+        "legacy-truncated",
+        "legacy-malformed",
+      ],
     });
     await waitConfigPropagation(async () => {
       const response = await fetch(`${app!.proxyUrl}/v1/models`, {
@@ -189,13 +225,23 @@ describe("legacy completions stream timeout", () => {
       }
       const body = (await response.json()) as { data?: Array<{ id?: string }> };
       const ids = new Set(body.data?.map((model) => model.id));
-      return ids.has("legacy-timeout-slow") && ids.has("legacy-timeout-mid");
+      return (
+        ids.has("legacy-timeout-slow") &&
+        ids.has("legacy-timeout-mid") &&
+        ids.has("legacy-truncated") &&
+        ids.has("legacy-malformed")
+      );
     });
   });
 
   afterAll(async () => {
     await app?.exit();
-    await Promise.all([slowFirst?.close(), midStream?.close()]);
+    await Promise.all([
+      slowFirst?.close(),
+      midStream?.close(),
+      truncated?.close(),
+      malformed?.close(),
+    ]);
   });
 
   test("a stalled first event times out before committing 200", async (ctx) => {
@@ -267,4 +313,46 @@ describe("legacy completions stream timeout", () => {
     expect(next.status).toBe(200);
     expect(await next.text()).toContain("after-timeout");
   }, 30_000);
+
+  test("EOF without DONE is recorded as an upstream stream failure", async (ctx) => {
+    if (!etcdReachable || !app || !truncated) {
+      ctx.skip();
+      return;
+    }
+    const upstreamBaseline = truncated.receivedRequests.length;
+    const usageBaseline = await usage5xxCounter();
+
+    const response = await completion("legacy-truncated");
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("truncated output");
+    expect(truncated.receivedRequests).toHaveLength(upstreamBaseline + 1);
+    await waitForTimeoutObservability(
+      truncatedModelId,
+      "legacy-truncated",
+      usageBaseline,
+      "transport_error",
+    );
+  });
+
+  test("malformed SSE is recorded as an upstream decode failure", async (ctx) => {
+    if (!etcdReachable || !app || !malformed) {
+      ctx.skip();
+      return;
+    }
+    const upstreamBaseline = malformed.receivedRequests.length;
+    const usageBaseline = await usage5xxCounter();
+
+    const response = await completion("legacy-malformed");
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("not-json");
+    expect(malformed.receivedRequests).toHaveLength(upstreamBaseline + 1);
+    await waitForTimeoutObservability(
+      malformedModelId,
+      "legacy-malformed",
+      usageBaseline,
+      "upstream_decode_error",
+    );
+  });
 });

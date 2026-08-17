@@ -22,6 +22,7 @@
 //! there, one failure here, and two rows in the usage log.
 
 use std::time::Instant;
+use std::{sync::Arc, sync::Mutex};
 
 use aisix_gateway::BridgeError;
 use aisix_obs::RequestOutcome;
@@ -114,6 +115,37 @@ impl RoutingTelemetry {
     /// functions existed on `Metrics` from the start and simply had no
     /// caller.
     pub fn record(&mut self, state: &crate::state::ProxyState, rec: AttemptRecord) {
+        self.emit_metrics(state, &rec);
+        self.attempts.push(rec);
+    }
+
+    /// Retain a streamed winner for request-level attribution without
+    /// declaring the upstream attempt successful before its terminal event.
+    pub fn stage(&mut self, rec: AttemptRecord) {
+        self.attempts.push(rec);
+    }
+
+    /// Emit the deferred per-deployment outcome once a streamed winner has a
+    /// real terminal classification. The staged copy remains the request's
+    /// winner record; streamed UsageEvent emission already carries the final
+    /// status separately.
+    pub fn finish_staged(
+        &self,
+        state: &crate::state::ProxyState,
+        index: u32,
+        status: u16,
+        success: bool,
+    ) {
+        let Some(staged) = self.attempts.get(index as usize) else {
+            return;
+        };
+        let mut rec = staged.clone();
+        rec.status = status;
+        rec.success = success;
+        self.emit_metrics(state, &rec);
+    }
+
+    fn emit_metrics(&self, state: &crate::state::ProxyState, rec: &AttemptRecord) {
         if rec.dispatched {
             state.runtime_status.record_deployment_attempt(
                 &rec.target_model_id,
@@ -127,7 +159,6 @@ impl RoutingTelemetry {
                 &rec.target_model,
             );
         }
-        self.attempts.push(rec);
     }
 
     /// Classify the next attempt against `display_name` and advance the
@@ -183,6 +214,9 @@ pub(crate) struct AttemptInfo {
     pub error_class: String,
     /// Short error message for a failed attempt; empty on success.
     pub error_message: String,
+    /// Installed by the outer routing loop after a streaming target wins;
+    /// consumed once by the terminal callback.
+    pub deferred: Option<DeferredAttempt>,
 }
 
 impl AttemptInfo {
@@ -193,6 +227,30 @@ impl AttemptInfo {
             model: rec.target_model.clone(),
             error_class: rec.error_class.clone(),
             error_message: rec.error_message.clone(),
+            deferred: None,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct DeferredAttempt {
+    inner: Arc<Mutex<Option<(RoutingTelemetry, u32)>>>,
+}
+
+impl DeferredAttempt {
+    pub fn install(&self, routing: &RoutingTelemetry, index: u32) {
+        *self.inner.lock().expect("deferred attempt mutex poisoned") =
+            Some((routing.clone(), index));
+    }
+
+    pub fn finish(&self, state: &crate::state::ProxyState, status: u16, success: bool) {
+        let pending = self
+            .inner
+            .lock()
+            .expect("deferred attempt mutex poisoned")
+            .take();
+        if let Some((routing, index)) = pending {
+            routing.finish_staged(state, index, status, success);
         }
     }
 }

@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  metricDelta,
+  scrapeMetrics,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -15,6 +17,7 @@ const MODELS = {
   messagesMalformed: "native-messages-malformed-sse",
   messagesInBand: "native-messages-in-band-error",
   responsesMalformed: "native-responses-malformed-sse",
+  responsesTruncated: "native-responses-truncated-sse",
   responsesInBand: "native-responses-in-band-error",
 } as const;
 
@@ -85,33 +88,49 @@ async function waitForFailure(
     );
   }
 
-  await waitConfigPropagation(async () => {
-    const response = await fetch(`${app.metricsUrl}/metrics`);
-    if (response.status !== 200) {
-      throw new Error(`metrics probe returned ${response.status}`);
-    }
-    const metrics = await response.text();
-    return metrics.split("\n").some(
-      (line) =>
-        line.startsWith("aisix_request_e2e_latency_seconds_count{") &&
-        line.includes(`endpoint="${endpoint}"`) &&
-        line.includes(`model="${model}"`) &&
-        line.includes('status_class="5xx"') &&
-        line.includes('streaming="true"'),
-    );
-  });
+  try {
+    await waitConfigPropagation(async () => {
+      const response = await fetch(`${app.metricsUrl}/metrics`);
+      if (response.status !== 200) {
+        throw new Error(`metrics probe returned ${response.status}`);
+      }
+      const metrics = await response.text();
+      return metrics.split("\n").some(
+        (line) =>
+          line.startsWith("aisix_request_e2e_latency_seconds_count{") &&
+          line.includes(`endpoint="${endpoint}"`) &&
+          line.includes(`model="${model}"`) &&
+          line.includes('status_class="5xx"') &&
+          line.includes('streaming="true"'),
+      );
+    });
+  } catch (error) {
+    throw new Error(`e2e metric: ${String(error)}`);
+  }
 
   const handler = endpoint.slice(4);
-  await waitConfigPropagation(
-    async () => (await usage5xxCounter(app, handler)) === usageBaseline + 1,
-  );
+  try {
+    await waitConfigPropagation(
+      async () => (await usage5xxCounter(app, handler)) === usageBaseline + 1,
+    );
+  } catch (error) {
+    throw new Error(
+      `usage event: ${String(error)}; ${usageBaseline}->${await usage5xxCounter(app, handler)}`,
+    );
+  }
 
-  await waitConfigPropagation(async () => {
-    const delta = (await outputTokenCounter(app, model)) - outputBaseline;
-    return expectedOutputTokens === undefined
-      ? delta > 0
-      : delta === expectedOutputTokens;
-  });
+  try {
+    await waitConfigPropagation(async () => {
+      const delta = (await outputTokenCounter(app, model)) - outputBaseline;
+      return expectedOutputTokens === undefined
+        ? delta > 0
+        : delta === expectedOutputTokens;
+    });
+  } catch (error) {
+    throw new Error(
+      `output tokens: ${String(error)}; ${outputBaseline}->${await outputTokenCounter(app, model)}`,
+    );
+  }
 }
 
 describe("native stream protocol failures are not healthy completions", () => {
@@ -145,6 +164,12 @@ describe("native stream protocol failures are not healthy completions", () => {
         'data: {"type":"response.created","response":{"id":"resp-malformed","status":"in_progress"}}\n\n',
         'data: {"type":"response.output_text.delta","delta":"billed malformed output"}\n\n',
         "data: not-json\n\n",
+      ],
+    });
+    upstreams.responsesTruncated = await startOpenAiUpstream({
+      rawSseChunks: [
+        'data: {"type":"response.created","response":{"id":"resp-truncated","status":"in_progress"}}\n\n',
+        'data: {"type":"response.output_text.delta","delta":"billed truncated output"}\n\n',
       ],
     });
     upstreams.responsesInBand = await startOpenAiUpstream({
@@ -188,7 +213,11 @@ describe("native stream protocol failures are not healthy completions", () => {
       kind: "keyword",
       patterns: [{ kind: "literal", value: "never-matches-terminal-fixture" }],
     });
-    for (const key of ["messagesMalformed", "responsesMalformed"] as const) {
+    for (const key of [
+      "messagesMalformed",
+      "responsesMalformed",
+      "responsesTruncated",
+    ] as const) {
       await seed.update("guardrail_attachments", randomUUID(), {
         guardrail_id: guardrail.id,
         env_id: randomUUID(),
@@ -241,7 +270,7 @@ describe("native stream protocol failures are not healthy completions", () => {
       ),
     });
 
-  test("malformed held SSE is suppressed and counted as upstream decode failure", async (ctx) => {
+  test("malformed or truncated held SSE is suppressed and counted as upstream failure", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
       return;
@@ -251,11 +280,22 @@ describe("native stream protocol failures are not healthy completions", () => {
         endpoint: "/v1/messages" as const,
         modelKey: "messagesMalformed" as const,
         upstream: upstreams.messagesMalformed!,
+        reason: "upstream_decode_error",
+        rawMarker: "billed malformed output",
       },
       {
         endpoint: "/v1/responses" as const,
         modelKey: "responsesMalformed" as const,
         upstream: upstreams.responsesMalformed!,
+        reason: "upstream_decode_error",
+        rawMarker: "billed malformed output",
+      },
+      {
+        endpoint: "/v1/responses" as const,
+        modelKey: "responsesTruncated" as const,
+        upstream: upstreams.responsesTruncated!,
+        reason: "transport_error",
+        rawMarker: "billed truncated output",
       },
     ];
     for (const scenario of cases) {
@@ -265,22 +305,44 @@ describe("native stream protocol failures are not healthy completions", () => {
         app,
         MODELS[scenario.modelKey],
       );
+      const deploymentBaseline = await scrapeMetrics(app.metricsUrl);
       const response = await post(scenario.endpoint, MODELS[scenario.modelKey]);
       expect(response.status).toBe(200);
       const body = await response.text();
       expect(body).toContain("upstream stream failed");
-      expect(body).not.toContain("billed malformed output");
+      expect(body).not.toContain(scenario.rawMarker);
       expect(body).not.toContain("not-json");
       expect(scenario.upstream.receivedRequests).toHaveLength(baseline + 1);
-      await waitForFailure(
-        app,
-        modelIds[scenario.modelKey]!,
-        MODELS[scenario.modelKey],
-        scenario.endpoint,
-        "upstream_decode_error",
-        usageBaseline,
-        outputBaseline,
-      );
+      try {
+        await waitForFailure(
+          app,
+          modelIds[scenario.modelKey]!,
+          MODELS[scenario.modelKey],
+          scenario.endpoint,
+          scenario.reason,
+          usageBaseline,
+          outputBaseline,
+        );
+      } catch (error) {
+        throw new Error(`${scenario.modelKey}: ${String(error)}`);
+      }
+      const deploymentAfter = await scrapeMetrics(app.metricsUrl);
+      expect(
+        metricDelta(
+          deploymentBaseline,
+          deploymentAfter,
+          "aisix_deployment_failure_responses_total",
+          { model: MODELS[scenario.modelKey] },
+        ),
+      ).toBe(1);
+      expect(
+        metricDelta(
+          deploymentBaseline,
+          deploymentAfter,
+          "aisix_deployment_success_responses_total",
+          { model: MODELS[scenario.modelKey] },
+        ),
+      ).toBe(0);
     }
   });
 

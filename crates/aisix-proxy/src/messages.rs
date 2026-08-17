@@ -55,7 +55,7 @@ use uuid::Uuid;
 
 use crate::attempt::{
     attempt_error_from_proxy, attempt_reached_upstream, ms_since, AttemptInfo, AttemptRecord,
-    RoutingTelemetry,
+    DeferredAttempt, RoutingTelemetry,
 };
 use crate::auth::AuthenticatedKey;
 use crate::chat::sanitize_tag;
@@ -803,6 +803,7 @@ async fn dispatch(
                 }
             };
             let attempt_started = Instant::now();
+            let deferred_attempt = DeferredAttempt::default();
             match dispatch_to_target(
                 state,
                 snapshot,
@@ -823,12 +824,14 @@ async fn dispatch(
                     index: idx,
                     kind: kind.to_string(),
                     model: target_model.clone(),
+                    deferred: Some(deferred_attempt.clone()),
                     ..Default::default()
                 },
                 &mut reservation,
                 &mut member_reservation,
                 redactions_out.clone(),
                 monitor_hits_out.clone(),
+                !*suppress_failure_content_out,
             )
             .await
             {
@@ -836,22 +839,25 @@ async fn dispatch(
                     let latency_ms = ms_since(attempt_started);
                     // Feed the least_latency EWMA for this target.
                     state.runtime_status.record_latency(&target.id, latency_ms);
-                    routing.record(
-                        state,
-                        AttemptRecord {
-                            index: idx,
-                            kind,
-                            target_model,
-                            target_model_id: target.id.clone(),
-                            provider_key_id: outcome.provider_key_id.clone(),
-                            status: 200,
-                            success: true,
-                            error_class: String::new(),
-                            error_message: String::new(),
-                            latency_ms,
-                            dispatched: true,
-                        },
-                    );
+                    let record = AttemptRecord {
+                        index: idx,
+                        kind,
+                        target_model,
+                        target_model_id: target.id.clone(),
+                        provider_key_id: outcome.provider_key_id.clone(),
+                        status: 200,
+                        success: true,
+                        error_class: String::new(),
+                        error_message: String::new(),
+                        latency_ms,
+                        dispatched: true,
+                    };
+                    if outcome.usage_handled_by_stream {
+                        routing.stage(record);
+                        deferred_attempt.install(&routing, idx);
+                    } else {
+                        routing.record(state, record);
+                    }
                     outcome.routing = routing;
                     // #911 [21]: commit the reserved layers with the actual
                     // token cost so TPM/TPD is enforced for /v1/messages like
@@ -980,6 +986,7 @@ async fn dispatch_to_target(
     // Input-side monitor hits (AISIX-Cloud#562), same lifecycle as
     // `input_redactions`.
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    input_capture_safe: bool,
 ) -> Result<DispatchOutcome, ProxyError> {
     let model = &target.model;
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
@@ -1009,6 +1016,7 @@ async fn dispatch_to_target(
             member_reservation,
             input_redactions,
             input_monitor_hits,
+            input_capture_safe,
         )
         .await;
     }
@@ -1037,6 +1045,7 @@ async fn dispatch_to_target(
         member_reservation,
         input_redactions,
         input_monitor_hits,
+        input_capture_safe,
     )
     .await
 }
@@ -1074,6 +1083,7 @@ async fn anthropic_passthrough_dispatch(
     member_reservation: &mut Option<aisix_ratelimit::MultiReservation>,
     input_redactions: crate::redact::RedactionCounts,
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    input_capture_safe: bool,
 ) -> Result<DispatchOutcome, ProxyError> {
     let mut body = body.clone();
     let api_key = crate::dispatch::require_api_key(pk_value, model)?;
@@ -1097,6 +1107,11 @@ async fn anthropic_passthrough_dispatch(
     // Apply order matches §5: renames → constraints → defaults. Each
     // primitive is a no-op when its configured map is empty.
     if let Some(r) = pk_value.request.as_ref() {
+        aisix_provider_openai::overrides::validate_content_safe_request_overrides(r).map_err(
+            |message| {
+                ProxyError::Bridge(aisix_gateway::BridgeError::InvalidUpstreamConfig(message))
+            },
+        )?;
         aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
         if let Some(constraints) = &r.param_constraints {
             aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);
@@ -1208,25 +1223,33 @@ async fn anthropic_passthrough_dispatch(
     if !status.is_success() {
         let status_u16 = status.as_u16();
         let retry_after = aisix_gateway::parse_retry_after(upstream_resp.headers());
-        let message = upstream_resp.text().await.unwrap_or_default();
+        let preliminary = aisix_gateway::BridgeError::upstream_status_with_retry_after(
+            status_u16,
+            String::new(),
+            retry_after,
+        );
+        if preliminary.http_status() >= 500 {
+            state.health.record_failure(&model.display_name);
+        }
+        if let Some((ttl, reason)) =
+            crate::cooldown::decide_cooldown(&preliminary, model.cooldown.as_ref())
+        {
+            state.runtime_status.mark_cooldown(model_id, ttl, reason);
+        }
+        let message = aisix_gateway::read_body_capped_with_deadline(
+            upstream_resp,
+            aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES,
+            connect_deadline,
+        )
+        .await
+        .unwrap_or_default();
+        let message = String::from_utf8_lossy(&message);
         let truncated = crate::util::truncate_on_char_boundary(&message, 1024);
         let err = aisix_gateway::BridgeError::upstream_status_with_retry_after(
             status_u16,
             truncated,
             retry_after,
         );
-        if err.http_status() >= 500 {
-            state.health.record_failure(&model.display_name);
-        }
-        // Apply the cross-request cooldown contract to the
-        // Anthropic-passthrough path too — without this, a 401 / 429 /
-        // 5xx via /v1/messages would never mark the direct model and
-        // subsequent requests would keep hitting the same broken
-        // upstream. See `crate::cooldown` for the shared decision.
-        if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
-        {
-            state.runtime_status.mark_cooldown(model_id, ttl, reason);
-        }
         return Err(ProxyError::Bridge(err));
     }
 
@@ -1411,6 +1434,18 @@ async fn anthropic_passthrough_dispatch(
                     usage.reached_end || usage.guardrail_blocked,
                     anthropic_stream_status_code(usage.reached_end, usage.guardrail_blocked),
                 );
+                if let Some(deferred) = &attempt_c.deferred {
+                    deferred.finish(
+                        &state_c,
+                        if usage.guardrail_blocked {
+                            200
+                        } else {
+                            terminal.status
+                        },
+                        usage.guardrail_blocked
+                            || (terminal.error_class.is_empty() && terminal.status < 400),
+                    );
+                }
                 let mut terminal_attempt = attempt_c.clone();
                 terminal_attempt.error_class = terminal.error_class;
                 let metrics = AnthropicUsageMetrics {
@@ -1482,15 +1517,15 @@ async fn anthropic_passthrough_dispatch(
                     // parser into `usage.response_text`. Held output is exposed
                     // only after its complete moderation pass succeeds.
                     match (&captured_prompt_c, content_cap) {
-                        (Some(prompt), Some(cap)) => Some(CapturedContent::new(
-                            prompt,
-                            if usage.response_capture_safe {
-                                &usage.response_text
-                            } else {
-                                ""
-                            },
-                            cap as usize,
-                        )),
+                        (Some(prompt), Some(cap))
+                            if input_capture_safe && usage.response_capture_safe =>
+                        {
+                            Some(CapturedContent::new(
+                                prompt,
+                                &usage.response_text,
+                                cap as usize,
+                            ))
+                        }
                         _ => None,
                     },
                 );
@@ -1676,7 +1711,7 @@ async fn anthropic_passthrough_dispatch(
                 .iter()
                 .map(|e| &e.value),
         )
-        .filter(|_| output_capture_safe)
+        .filter(|_| input_capture_safe && output_capture_safe)
         .map(|cap| {
             CapturedContent::new(
                 &serde_json::to_string(&body).unwrap_or_default(),
@@ -1865,6 +1900,7 @@ async fn cross_provider_dispatch(
     member_reservation: &mut Option<aisix_ratelimit::MultiReservation>,
     input_redactions: crate::redact::RedactionCounts,
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    input_capture_safe: bool,
 ) -> Result<DispatchOutcome, ProxyError> {
     use aisix_gateway::Bridge;
     use aisix_provider_anthropic::{
@@ -2097,6 +2133,18 @@ async fn cross_provider_dispatch(
                     comp.reached_end || comp.guardrail_blocked,
                     anthropic_stream_status_code(comp.reached_end, comp.guardrail_blocked),
                 );
+                if let Some(deferred) = &attempt_for_telem.deferred {
+                    deferred.finish(
+                        &state_for_telem,
+                        if comp.guardrail_blocked {
+                            200
+                        } else {
+                            terminal.status
+                        },
+                        comp.guardrail_blocked
+                            || (terminal.error_class.is_empty() && terminal.status < 400),
+                    );
+                }
                 terminal_attempt.error_class = terminal.error_class;
 
                 let metrics = AnthropicUsageMetrics {
@@ -2164,15 +2212,15 @@ async fn cross_provider_dispatch(
                     // stream into `comp.response_text`; held output is exposed
                     // only after its complete moderation pass succeeds.
                     match (&captured_prompt_for_telem, content_cap) {
-                        (Some(prompt), Some(cap)) => Some(CapturedContent::new(
-                            prompt,
-                            if comp.response_capture_safe {
-                                &comp.response_text
-                            } else {
-                                ""
-                            },
-                            cap as usize,
-                        )),
+                        (Some(prompt), Some(cap))
+                            if input_capture_safe && comp.response_capture_safe =>
+                        {
+                            Some(CapturedContent::new(
+                                prompt,
+                                &comp.response_text,
+                                cap as usize,
+                            ))
+                        }
                         _ => None,
                     },
                 );
@@ -2305,7 +2353,7 @@ async fn cross_provider_dispatch(
             .iter()
             .map(|e| &e.value),
     )
-    .filter(|_| output_capture_safe)
+    .filter(|_| input_capture_safe && output_capture_safe)
     .map(|cap| {
         CapturedContent::new(
             &serde_json::to_string(body).unwrap_or_default(),
@@ -2406,11 +2454,18 @@ fn build_anthropic_sse_stream(
         // kept raw — the guardrail scans their serialized text, no need to
         // reassemble by index.
         let mut tool_call_fragments: Vec<serde_json::Value> = Vec::new();
+        let mut scan_bytes = 0usize;
+        let mut scan_truncated = false;
         // Chunks withheld from the encoder until the end-of-stream scan
         // clears them (hold-back policies only). Held PRE-encode so the
         // mask rewrite can run on the normalised chunks.
         let mut held_chunks: Vec<aisix_gateway::ChatChunk> = Vec::new();
         let mut held_bytes: usize = 0;
+        // The Anthropic encoder retains tool-call state until it can close
+        // each content block. Bound that translated state independently of
+        // guardrail mode so an unguarded tool-only stream cannot grow it
+        // without limit.
+        let mut encoder_tool_bytes = 0usize;
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(chunk) => {
@@ -2477,6 +2532,40 @@ fn build_anthropic_sse_stream(
                         };
                         held_bytes += chunk_bytes;
                     }
+                    if let Some(tool_calls) = chunk.delta.tool_calls.as_ref() {
+                        let mut additional = 0usize;
+                        for tool_call in tool_calls {
+                            additional = additional.saturating_add(128);
+                            for value in [
+                                tool_call.get("id").and_then(Value::as_str),
+                                tool_call
+                                    .get("function")
+                                    .and_then(|function| function.get("name"))
+                                    .and_then(Value::as_str),
+                                tool_call
+                                    .get("function")
+                                    .and_then(|function| function.get("arguments"))
+                                    .and_then(Value::as_str),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            {
+                                additional = additional.saturating_add(value.len());
+                            }
+                        }
+                        let total = encoder_tool_bytes.saturating_add(additional);
+                        if total > crate::token_estimate::OUTPUT_ACCUMULATION_CAP {
+                            let comp = guard.comp();
+                            comp.response_capture_safe = false;
+                            comp.response_text.clear();
+                            comp.terminal_failure = Some(aisix_gateway::BridgeError::StreamAborted);
+                            yield Ok(bytes::Bytes::from_static(
+                                b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"stream_aborted\",\"message\":\"upstream tool stream exceeded translation limit\"}}\n\n",
+                            ));
+                            return;
+                        }
+                        encoder_tool_bytes = total;
+                    }
                     // Copy upstream-controlled metadata only after a held
                     // chunk passes the complete size check. An oversized id,
                     // model or custom finish reason must not allocate a
@@ -2493,19 +2582,44 @@ fn build_anthropic_sse_stream(
                     }
                     if output_guardrail.is_some() {
                         if let Some(t) = chunk.delta.content.as_deref() {
-                            content_text.push_str(t);
+                            if hold_policy.is_some() {
+                                content_text.push_str(t);
+                            } else {
+                                let before = content_text.len();
+                                scan_truncated |= crate::token_estimate::push_capped_to(
+                                    &mut content_text,
+                                    t,
+                                    aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
+                                );
+                                scan_bytes += content_text.len() - before;
+                            }
                         }
                         if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
-                            tool_call_fragments.extend(tcs.iter().cloned());
+                            if hold_policy.is_some() {
+                                tool_call_fragments.extend(tcs.iter().cloned());
+                            } else {
+                                for tc in tcs {
+                                    let remaining = aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES
+                                        .saturating_sub(scan_bytes);
+                                    if let Some(bytes) = bounded_json_len(tc, remaining) {
+                                        scan_bytes += bytes;
+                                        tool_call_fragments.push(tc.clone());
+                                    } else {
+                                        scan_truncated = true;
+                                    }
+                                }
+                            }
                         }
                     }
                     // Content capture: assemble the response (bounded to the
                     // cap), only when an exporter wants full content.
                     if let Some(cap) = content_cap {
                         if let Some(t) = chunk.delta.content.as_deref() {
-                            if comp.response_text.len() < cap as usize {
-                                comp.response_text.push_str(t);
-                            }
+                            let _ = crate::token_estimate::push_capped_to(
+                                &mut comp.response_text,
+                                t,
+                                cap as usize,
+                            );
                         }
                     }
                     if let Some(max_hold) = hold_policy {
@@ -2615,7 +2729,11 @@ fn build_anthropic_sse_stream(
                                 break;
                             }
                             if let Some(t) = c.delta.content.as_deref() {
-                                rebuilt.push_str(t);
+                                let _ = crate::token_estimate::push_capped_to(
+                                    &mut rebuilt,
+                                    t,
+                                    cap as usize,
+                                );
                             }
                         }
                         guard.comp().response_text = rebuilt;
@@ -2651,7 +2769,10 @@ fn build_anthropic_sse_stream(
             }
         }
         if output_guardrail.is_some() {
-            guard.comp().response_capture_safe = moderation_capture_safe;
+            guard.comp().response_capture_safe = moderation_capture_safe && !scan_truncated;
+            if scan_truncated {
+                guard.comp().response_text.clear();
+            }
         }
         // Hold-back release (#932): the scan cleared — mask the held
         // chunks (channel reassembly across chunk boundaries), then feed
@@ -3206,6 +3327,10 @@ struct AnthropicStreamUsage {
     /// Assistant text accumulated from `content_block_delta` frames, for
     /// the end-of-stream output guardrail (#448).
     response_text: String,
+    /// The response text exceeded the bounded scan/capture accumulator. An
+    /// enforcing full-response scan must fail closed, while exporters must
+    /// omit the incomplete capture.
+    response_text_truncated: bool,
     /// Generated output (text + thinking + tool name/arguments)
     /// accumulated for the token-estimation fallback (AISIX-Cloud#1074).
     /// Separate from `response_text`, which belongs to the guardrail
@@ -3235,6 +3360,7 @@ fn update_anthropic_usage(
     json: &Value,
     attempt_started: Instant,
     first_token_seen: &mut bool,
+    response_text_cap: usize,
 ) {
     // First parsed frame of ANY type (`message_start` included) stops the
     // TTFT clock — the industry convention (LiteLLM, caller-side gateways),
@@ -3279,21 +3405,37 @@ fn update_anthropic_usage(
             // previous block once, then keep all provider deltas adjacent: a
             // sensitive span may be split at any token boundary.
             if !acc.response_text.is_empty() {
-                acc.response_text.push('\n');
+                acc.response_text_truncated |= crate::token_estimate::push_capped_to(
+                    &mut acc.response_text,
+                    "\n",
+                    response_text_cap,
+                );
             }
             if let Some(block) = json.get("content_block") {
                 if let Some(text) = block.get("text").and_then(Value::as_str) {
-                    acc.response_text.push_str(text);
+                    acc.response_text_truncated |= crate::token_estimate::push_capped_to(
+                        &mut acc.response_text,
+                        text,
+                        response_text_cap,
+                    );
                     crate::token_estimate::push_capped(&mut acc.est_output_text, text);
                 }
                 if let Some(name) = block.get("name").and_then(Value::as_str) {
-                    acc.response_text.push_str(name);
+                    acc.response_text_truncated |= crate::token_estimate::push_capped_to(
+                        &mut acc.response_text,
+                        name,
+                        response_text_cap,
+                    );
                     crate::token_estimate::push_capped(&mut acc.est_output_text, name);
                 }
                 if let Some(input) = block.get("input") {
                     if !input.is_null() {
                         let input = input.to_string();
-                        acc.response_text.push_str(&input);
+                        acc.response_text_truncated |= crate::token_estimate::push_capped_to(
+                            &mut acc.response_text,
+                            &input,
+                            response_text_cap,
+                        );
                         crate::token_estimate::push_capped(&mut acc.est_output_text, &input);
                     }
                 }
@@ -3305,10 +3447,18 @@ fn update_anthropic_usage(
             // fragments of one channel and must not gain frame separators.
             if let Some(delta) = json.get("delta") {
                 if let Some(text) = delta.get("text").and_then(Value::as_str) {
-                    acc.response_text.push_str(text);
+                    acc.response_text_truncated |= crate::token_estimate::push_capped_to(
+                        &mut acc.response_text,
+                        text,
+                        response_text_cap,
+                    );
                 }
                 if let Some(partial_json) = delta.get("partial_json").and_then(Value::as_str) {
-                    acc.response_text.push_str(partial_json);
+                    acc.response_text_truncated |= crate::token_estimate::push_capped_to(
+                        &mut acc.response_text,
+                        partial_json,
+                        response_text_cap,
+                    );
                 }
             }
             // Token-estimation accumulator (AISIX-Cloud#1074): raw
@@ -3405,13 +3555,23 @@ fn drain_anthropic_sse_frames(
     acc: &mut AnthropicStreamUsage,
     attempt_started: Instant,
     first_token_seen: &mut bool,
+    response_text_cap: usize,
 ) {
     while let Some(end) = crate::redact::first_sse_event_end(buf) {
         let frame: Vec<u8> = buf.drain(..end).collect();
+        if acc.reached_end {
+            continue;
+        }
         let (json, malformed) = crate::redact::parse_sse_json_event(&frame, !*first_token_seen);
         acc.malformed_sse_data |= malformed;
         if let Some(json) = json {
-            update_anthropic_usage(acc, &json, attempt_started, first_token_seen);
+            update_anthropic_usage(
+                acc,
+                &json,
+                attempt_started,
+                first_token_seen,
+                response_text_cap,
+            );
         }
     }
 }
@@ -3553,6 +3713,12 @@ where
             _ => None,
         }
     });
+    let response_text_cap = match (hold_policy, output_guardrail.is_some(), content_cap) {
+        (Some(max_hold), _, _) => max_hold,
+        (None, true, _) => aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
+        (None, false, Some(cap)) => cap as usize,
+        (None, false, None) => 0,
+    };
     let inner = async_stream::stream! {
         // Live-forward output has already reached the caller. Held output is
         // unsafe for exporters until the complete moderation pass succeeds.
@@ -3572,16 +3738,50 @@ where
         let mut held: Vec<u8> = Vec::new();
         while let Some(item) = upstream.next().await {
             if let Ok(bytes) = &item {
+                if let Some(max_hold) = hold_policy {
+                    // Enforce the security buffer before any side-channel
+                    // parser copies or deserializes this untrusted chunk.
+                    if held.len().saturating_add(bytes.len()) > max_hold {
+                        tracing::warn!(
+                            guardrail_hook = "output",
+                            max_buffer_bytes = max_hold,
+                            "streaming /v1/messages passthrough exceeded hold-back cap; failing closed",
+                        );
+                        let usage = guard.usage();
+                        usage.guardrail_blocked = true;
+                        usage.response_capture_safe = false;
+                        usage.response_text.clear();
+                        yield Ok(Bytes::from(guardrail_block_frame(None)));
+                        return;
+                    }
+                }
                 // Side-channel parse: copy into the frame buffer (the
                 // original `bytes` is yielded unchanged below) and drain
                 // any complete SSE frames into the accumulator.
-                buf.extend_from_slice(bytes);
-                drain_anthropic_sse_frames(
-                    &mut buf,
-                    guard.usage(),
-                    attempt_started,
-                    &mut first_token_seen,
-                );
+                for part in bytes.chunks(64 * 1024) {
+                    buf.extend_from_slice(part);
+                    drain_anthropic_sse_frames(
+                        &mut buf,
+                        guard.usage(),
+                        attempt_started,
+                        &mut first_token_seen,
+                        response_text_cap,
+                    );
+                    if buf.len() > MAX_SSE_FRAME_BUF_BYTES {
+                        tracing::warn!(
+                            buffered = buf.len(),
+                            "anthropic stream: SSE frame buffer exceeded cap without a \
+                             terminator; dropping buffer (usage parsing skipped for the \
+                             oversized frame)"
+                        );
+                        let usage = guard.usage();
+                        usage.response_text_truncated = true;
+                        if hold_policy.is_some() {
+                            usage.malformed_sse_data = true;
+                        }
+                        buf.clear();
+                    }
+                }
                 // Bound the frame buffer (PR #436 audit MEDIUM-2). The
                 // happy path drains complete frames above, so `buf`
                 // only retains a partial trailing frame — normally a
@@ -3595,33 +3795,12 @@ where
                 // rather than OOM. The bytes themselves still forward
                 // to the client verbatim — only telemetry parsing is
                 // affected.
-                if buf.len() > MAX_SSE_FRAME_BUF_BYTES {
-                    tracing::warn!(
-                        buffered = buf.len(),
-                        "anthropic stream: SSE frame buffer exceeded cap without a \
-                         terminator; dropping buffer (usage parsing skipped for the \
-                         oversized frame)"
-                    );
-                    if hold_policy.is_some() {
-                        guard.usage().malformed_sse_data = true;
-                    }
-                    buf.clear();
-                }
                 if let Some(max_hold) = hold_policy {
                     // Hold-back: withhold the bytes until the end-of-stream
                     // scan clears (and masks) them. Overflow fails closed —
                     // content that can't be fully buffered to scan must not
                     // be released (mirrors /v1/responses).
-                    if held.len() + bytes.len() > max_hold {
-                        tracing::warn!(
-                            guardrail_hook = "output",
-                            max_buffer_bytes = max_hold,
-                            "streaming /v1/messages passthrough exceeded hold-back cap; failing closed",
-                        );
-                        guard.usage().guardrail_blocked = true;
-                        yield Ok(Bytes::from(guardrail_block_frame(None)));
-                        return;
-                    }
+                    debug_assert!(held.len().saturating_add(bytes.len()) <= max_hold);
                     held.extend_from_slice(bytes);
                     continue;
                 }
@@ -3660,6 +3839,7 @@ where
                     &json,
                     attempt_started,
                     &mut first_token_seen,
+                    response_text_cap,
                 );
             }
         }
@@ -3752,13 +3932,14 @@ where
                     // (the sync redactor can't reproduce a provider-side
                     // mask) (#932 × AISIX-Cloud#947).
                     if let Some(cap) = content_cap {
-                        let mut rebuilt = crate::redact::anthropic_sse_text(&held);
-                        let mut cut = (cap as usize).min(rebuilt.len());
-                        while cut < rebuilt.len() && !rebuilt.is_char_boundary(cut) {
-                            cut += 1;
-                        }
-                        rebuilt.truncate(cut);
-                        guard.usage().response_text = rebuilt;
+                        let rebuilt = crate::redact::anthropic_sse_text(&held);
+                        let mut bounded = String::new();
+                        let _ = crate::token_estimate::push_capped_to(
+                            &mut bounded,
+                            &rebuilt,
+                            cap as usize,
+                        );
+                        guard.usage().response_text = bounded;
                     }
                     crate::redact::merge_counts(
                         &mut guard.usage().redacted_entity_counts,
@@ -3791,7 +3972,12 @@ where
         if output_guardrail.is_some() {
             let usage = guard.usage();
             usage.response_capture_safe =
-                moderation_capture_safe && usage.stream_failure.is_none();
+                moderation_capture_safe
+                    && usage.stream_failure.is_none()
+                    && !usage.response_text_truncated;
+            if usage.response_text_truncated {
+                usage.response_text.clear();
+            }
         }
         // Hold-back release (#932): the scan cleared — mask the held SSE
         // bytes (channel reassembly across frames) and release them.
@@ -5254,7 +5440,13 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"claude-x\",\"usage\":{\"input_tokens\":11}}}\n\n\
 event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2",
         );
-        drain_anthropic_sse_frames(&mut buf, &mut acc, started, &mut first_token_seen);
+        drain_anthropic_sse_frames(
+            &mut buf,
+            &mut acc,
+            started,
+            &mut first_token_seen,
+            usize::MAX,
+        );
         // Only the complete first frame is consumed.
         assert_eq!(acc.prompt_tokens, 11, "input_tokens parsed from frame 1");
         assert_eq!(acc.provider_request_id, "m1");
@@ -5265,7 +5457,13 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
 
         // Second "chunk": the remainder of the message_delta frame.
         buf.extend_from_slice(b"3}}\n\n");
-        drain_anthropic_sse_frames(&mut buf, &mut acc, started, &mut first_token_seen);
+        drain_anthropic_sse_frames(
+            &mut buf,
+            &mut acc,
+            started,
+            &mut first_token_seen,
+            usize::MAX,
+        );
         assert_eq!(
             acc.completion_tokens, 23,
             "output_tokens parsed once the split frame is reassembled",
@@ -5288,7 +5486,13 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         let mut buf = Vec::new();
         for byte in raw.as_bytes() {
             buf.push(*byte);
-            drain_anthropic_sse_frames(&mut buf, &mut acc, started, &mut first_token_seen);
+            drain_anthropic_sse_frames(
+                &mut buf,
+                &mut acc,
+                started,
+                &mut first_token_seen,
+                usize::MAX,
+            );
         }
         assert!(buf.is_empty());
         assert_eq!(acc.response_text, "joined");
@@ -5303,7 +5507,13 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         let mut first_token_seen = false;
         let started = std::time::Instant::now();
         let mut buf = b"data: not-json\r\r".to_vec();
-        drain_anthropic_sse_frames(&mut buf, &mut acc, started, &mut first_token_seen);
+        drain_anthropic_sse_frames(
+            &mut buf,
+            &mut acc,
+            started,
+            &mut first_token_seen,
+            usize::MAX,
+        );
         assert!(buf.is_empty());
         assert!(acc.malformed_sse_data);
     }
@@ -5334,11 +5544,33 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
                 "content_block": {"type": "text", "text": "next block"}
             }),
         ] {
-            update_anthropic_usage(&mut acc, &event, started, &mut first_token_seen);
+            update_anthropic_usage(&mut acc, &event, started, &mut first_token_seen, usize::MAX);
         }
 
         assert_eq!(acc.response_text, "forbiddenstreamtoken\nnext block");
         assert_eq!(acc.est_output_text, "forbiddenstreamtokennext block");
+    }
+
+    #[test]
+    fn native_stream_text_accumulator_hard_caps_one_large_event() {
+        use super::{update_anthropic_usage, AnthropicStreamUsage};
+
+        let mut acc = AnthropicStreamUsage::default();
+        let mut first_token_seen = false;
+        let event = serde_json::json!({
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "x".repeat(4096)}
+        });
+        update_anthropic_usage(
+            &mut acc,
+            &event,
+            std::time::Instant::now(),
+            &mut first_token_seen,
+            128,
+        );
+
+        assert_eq!(acc.response_text.len(), 128);
+        assert!(acc.response_text_truncated);
     }
 
     #[tokio::test]
@@ -5788,7 +6020,13 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             b"event: ping\ndata: {\"type\":\"ping\"}\n\n\
 event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded\"}}\n\n",
         );
-        drain_anthropic_sse_frames(&mut buf, &mut acc, started, &mut first_token_seen);
+        drain_anthropic_sse_frames(
+            &mut buf,
+            &mut acc,
+            started,
+            &mut first_token_seen,
+            usize::MAX,
+        );
 
         assert_eq!(acc.prompt_tokens, 0, "no usage → prompt_tokens stays zero");
         assert_eq!(acc.completion_tokens, 0, "no usage → completion stays zero");
@@ -5816,7 +6054,13 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\"}}\n\n"
             .to_vec();
         let mut first = false;
 
-        drain_anthropic_sse_frames(&mut buf, &mut acc, std::time::Instant::now(), &mut first);
+        drain_anthropic_sse_frames(
+            &mut buf,
+            &mut acc,
+            std::time::Instant::now(),
+            &mut first,
+            usize::MAX,
+        );
 
         assert!(acc.reached_end);
         assert!(acc.stream_failure.is_none());

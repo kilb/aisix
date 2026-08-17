@@ -434,6 +434,24 @@ fn redact_chat_format_impl(
     }
     let mut unrewritable_tool_key = false;
     for msg in &mut req.messages {
+        if detect_keys {
+            if let Some(name) = msg.name.as_deref() {
+                unrewritable_tool_key |= detect_unrewritable_value_strings(
+                    chain,
+                    Direction::Input,
+                    &Value::String(name.to_owned()),
+                    &mut counts,
+                );
+            }
+            if let Some(tool_call_id) = msg.tool_call_id.as_deref() {
+                unrewritable_tool_key |= detect_unrewritable_value_strings(
+                    chain,
+                    Direction::Input,
+                    &Value::String(tool_call_id.to_owned()),
+                    &mut counts,
+                );
+            }
+        }
         if let Some(content) = msg.content.as_mut() {
             apply_to_string(chain, Direction::Input, content, &mut counts);
         }
@@ -465,6 +483,27 @@ fn redact_chat_format_impl(
     if let Some(tools) = req.extra.get_mut("tools") {
         unrewritable_tool_key |=
             redact_tool_definitions(chain, Direction::Input, tools, &mut counts, detect_keys);
+    }
+    if let Some(response_format) = req.extra.get_mut("response_format") {
+        unrewritable_tool_key |= redact_tool_definitions(
+            chain,
+            Direction::Input,
+            response_format,
+            &mut counts,
+            detect_keys,
+        );
+    }
+    if detect_keys {
+        if let Some(tool_choice) = req.extra.get("tool_choice") {
+            unrewritable_tool_key |=
+                detect_unrewritable_object_keys(chain, Direction::Input, tool_choice, &mut counts);
+            unrewritable_tool_key |= detect_unrewritable_value_strings(
+                chain,
+                Direction::Input,
+                tool_choice,
+                &mut counts,
+            );
+        }
     }
     AnthropicRequestRedaction {
         counts,
@@ -507,12 +546,14 @@ pub async fn moderate_chat_format_structured(
 /// target for the structured moderation pass.
 pub fn chat_request_for_inspection(req: &ChatFormat) -> ChatFormat {
     let mut inspection = req.clone();
-    if let Some(tools) = req.extra.get("tools") {
-        let text = serde_json::to_string(tools).expect("serde_json::Value always serializes");
-        if text != "null" && text != "[]" {
-            inspection
-                .messages
-                .push(aisix_gateway::ChatMessage::user(text));
+    for field in ["tools", "tool_choice", "response_format"] {
+        if let Some(value) = req.extra.get(field) {
+            let text = serde_json::to_string(value).expect("serde_json::Value always serializes");
+            if text != "null" && text != "[]" {
+                inspection
+                    .messages
+                    .push(aisix_gateway::ChatMessage::user(text));
+            }
         }
     }
     inspection
@@ -638,6 +679,9 @@ fn is_tool_contract_field(field: &str) -> bool {
             | "tool_call_id"
             | "tool_use_id"
             | "item_id"
+            | "approval_request_id"
+            | "server_label"
+            | "connector_id"
             | "required"
             | "enum"
             | "const"
@@ -723,6 +767,23 @@ pub fn redact_anthropic_request(
     if let Some(tools) = body.get_mut("tools") {
         unrewritable_tool_key |=
             redact_tool_definitions(chain, Direction::Input, tools, &mut counts, true);
+    }
+    if let Some(format) = body
+        .get_mut("output_config")
+        .and_then(|config| config.get_mut("format"))
+    {
+        unrewritable_tool_key |=
+            redact_tool_definitions(chain, Direction::Input, format, &mut counts, true);
+    }
+    if let Some(format) = body.get_mut("output_format") {
+        unrewritable_tool_key |=
+            redact_tool_definitions(chain, Direction::Input, format, &mut counts, true);
+    }
+    if let Some(tool_choice) = body.get("tool_choice") {
+        unrewritable_tool_key |=
+            detect_unrewritable_object_keys(chain, Direction::Input, tool_choice, &mut counts);
+        unrewritable_tool_key |=
+            detect_unrewritable_value_strings(chain, Direction::Input, tool_choice, &mut counts);
     }
     AnthropicRequestRedaction {
         counts,
@@ -849,10 +910,12 @@ pub async fn moderate_anthropic_request(
 /// projection closes that otherwise invisible provider-forwarded text surface.
 pub fn anthropic_request_for_inspection(body: &Value) -> Result<aisix_gateway::ChatFormat, ()> {
     let mut chat = aisix_provider_anthropic::parse_inbound_request(body).map_err(|_| ())?;
-    if let Some(tools) = body.get("tools") {
-        let text = serde_json::to_string(tools).map_err(|_| ())?;
-        if text != "null" && text != "[]" {
-            chat.messages.push(aisix_gateway::ChatMessage::user(text));
+    for field in ["tools", "tool_choice", "output_config", "output_format"] {
+        if let Some(value) = body.get(field) {
+            let text = serde_json::to_string(value).map_err(|_| ())?;
+            if text != "null" && text != "[]" {
+                chat.messages.push(aisix_gateway::ChatMessage::user(text));
+            }
         }
     }
     Ok(chat)
@@ -996,6 +1059,22 @@ fn redact_responses_request_impl(
         unrewritable_tool_key |=
             redact_tool_definitions(chain, Direction::Input, tools, &mut counts, detect_keys);
     }
+    if let Some(text) = body.get_mut("text").and_then(|text| text.get_mut("format")) {
+        unrewritable_tool_key |=
+            redact_tool_definitions(chain, Direction::Input, text, &mut counts, detect_keys);
+    }
+    if detect_keys {
+        if let Some(tool_choice) = body.get("tool_choice") {
+            unrewritable_tool_key |=
+                detect_unrewritable_object_keys(chain, Direction::Input, tool_choice, &mut counts);
+            unrewritable_tool_key |= detect_unrewritable_value_strings(
+                chain,
+                Direction::Input,
+                tool_choice,
+                &mut counts,
+            );
+        }
+    }
     AnthropicRequestRedaction {
         counts,
         unrewritable_tool_key,
@@ -1068,8 +1147,20 @@ fn redact_responses_item_structured(
         }
     }
     if detect_keys {
-        unrewritable_tool_key |=
-            detect_named_structural_fields(chain, dir, item, &["id", "call_id", "name"], counts);
+        unrewritable_tool_key |= detect_named_structural_fields(
+            chain,
+            dir,
+            item,
+            &[
+                "id",
+                "call_id",
+                "name",
+                "approval_request_id",
+                "server_label",
+                "connector_id",
+            ],
+            counts,
+        );
     }
     match item.get("type").and_then(Value::as_str) {
         Some("function_call" | "mcp_call") => {
@@ -1153,12 +1244,18 @@ pub async fn moderate_responses_response_structured(
     .await
 }
 
-/// Mask a legacy `/v1/completions` request body in place: `prompt` as a
-/// bare string or an array of strings (token-id arrays carry no text).
-pub fn redact_completions_request(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
+/// Mask the mutable legacy completion text slots and report a matched
+/// structural `user` identifier without rewriting it.
+pub fn redact_completions_request_structured(
+    chain: &dyn Guardrail,
+    body: &mut Value,
+) -> AnthropicRequestRedaction {
     let mut counts = RedactionCounts::new();
     if !chain.redacts_input() {
-        return counts;
+        return AnthropicRequestRedaction {
+            counts,
+            unrewritable_tool_key: false,
+        };
     }
     match body.get_mut("prompt") {
         Some(v @ Value::String(_)) => {
@@ -1173,7 +1270,15 @@ pub fn redact_completions_request(chain: &dyn Guardrail, body: &mut Value) -> Re
         }
         _ => {}
     }
-    counts
+    if let Some(suffix) = body.get_mut("suffix") {
+        apply_to_value_string(chain, Direction::Input, suffix, &mut counts);
+    }
+    let unrewritable_tool_key =
+        detect_named_structural_fields(chain, Direction::Input, body, &["user"], &mut counts);
+    AnthropicRequestRedaction {
+        counts,
+        unrewritable_tool_key,
+    }
 }
 
 /// Mask a `/v1/rerank` request body in place: `query` plus `documents[]`
@@ -2660,7 +2765,8 @@ mod tests {
             "tools": [{
                 "type": "function",
                 "function": {"name": secret, "description": "mail a@x.com"}
-            }]
+            }],
+            "tool_choice": {"type": "function", "function": {"name": secret}}
         }))
         .unwrap();
         let chat_redaction = redact_chat_format_structured(chain.as_ref(), &mut chat);
@@ -2675,32 +2781,41 @@ mod tests {
             secret
         );
         assert_eq!(chat.messages[0].extra["tool_calls"][0]["id"], secret);
+        assert_eq!(chat.extra["tool_choice"]["function"]["name"], secret);
 
         let mut anthropic = json!({
             "model": "claude",
             "messages": [{"role": "assistant", "content": [{
                 "type": "tool_use", "id": secret, "name": secret, "input": {}
             }]}],
-            "tools": [{"name": secret, "description": "mail b@y.org"}]
+            "tools": [{"name": secret, "description": "mail b@y.org"}],
+            "tool_choice": {"type": "tool", "name": secret}
         });
         let anthropic_redaction = redact_anthropic_request(chain.as_ref(), &mut anthropic);
         assert!(anthropic_redaction.unrewritable_tool_key);
         assert_eq!(anthropic["tools"][0]["name"], secret);
         assert_eq!(anthropic["messages"][0]["content"][0]["name"], secret);
+        assert_eq!(anthropic["tool_choice"]["name"], secret);
 
         let mut responses = json!({
             "model": "m",
             "input": [{
                 "type": "function_call", "id": secret, "call_id": secret,
                 "name": secret, "arguments": "{}"
+            }, {
+                "type": "mcp_approval_response", "approval_request_id": secret,
+                "approve": true
             }],
-            "tools": [{"type": "function", "name": secret, "description": "mail c@z.io"}]
+            "tools": [{"type": "function", "name": secret, "description": "mail c@z.io"}],
+            "tool_choice": {"type": "function", "name": secret}
         });
         let responses_redaction =
             redact_responses_request_structured(chain.as_ref(), &mut responses);
         assert!(responses_redaction.unrewritable_tool_key);
         assert_eq!(responses["tools"][0]["name"], secret);
         assert_eq!(responses["input"][0]["name"], secret);
+        assert_eq!(responses["input"][1]["approval_request_id"], secret);
+        assert_eq!(responses["tool_choice"]["name"], secret);
     }
 
     #[test]
@@ -3049,6 +3164,65 @@ mod tests {
         assert_eq!(
             responses["tools"][0]["function"]["parameters"]["properties"][sensitive_key]["default"],
             "[EMAIL_REDACTED]"
+        );
+    }
+
+    #[test]
+    fn structured_output_schemas_are_inspected_without_renaming_properties() {
+        let chain = both();
+        let sensitive_key = "owner-a@x.com";
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                (sensitive_key): {
+                    "type": "string",
+                    "description": "contact b@y.org",
+                    "default": "c@z.io"
+                }
+            }
+        });
+
+        let mut chat: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "clean"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "result", "schema": schema.clone()}
+            }
+        }))
+        .unwrap();
+        let chat_redaction = redact_chat_format_structured(chain.as_ref(), &mut chat);
+        assert!(chat_redaction.unrewritable_tool_key);
+        assert_eq!(
+            chat.extra["response_format"]["json_schema"]["schema"]["properties"][sensitive_key]
+                ["description"],
+            "contact [EMAIL_REDACTED]"
+        );
+
+        let mut responses = json!({
+            "model": "m",
+            "input": "clean",
+            "text": {"format": {"type": "json_schema", "name": "result", "schema": schema.clone()}}
+        });
+        let responses_redaction =
+            redact_responses_request_structured(chain.as_ref(), &mut responses);
+        assert!(responses_redaction.unrewritable_tool_key);
+        assert_eq!(
+            responses["text"]["format"]["schema"]["properties"][sensitive_key]["default"],
+            "[EMAIL_REDACTED]"
+        );
+
+        let mut anthropic = json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": "clean"}],
+            "output_config": {"format": {"type": "json_schema", "schema": schema}}
+        });
+        let anthropic_redaction = redact_anthropic_request(chain.as_ref(), &mut anthropic);
+        assert!(anthropic_redaction.unrewritable_tool_key);
+        assert_eq!(
+            anthropic["output_config"]["format"]["schema"]["properties"][sensitive_key]
+                ["description"],
+            "contact [EMAIL_REDACTED]"
         );
     }
 

@@ -702,6 +702,48 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
     expect(await rejectedToolName.text()).not.toContain(TOOL_IDENTIFIER);
     expect(received).toHaveLength(beforeRejectedRequest);
 
+    const rejectedToolChoice = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": anthCaller },
+      body: JSON.stringify({
+        model: "pii-anth-e2e",
+        max_tokens: 32,
+        messages: [{ role: "user", content: "clean" }],
+        tools: [
+          {
+            name: "lookup",
+            input_schema: { type: "object", properties: {} },
+          },
+        ],
+        tool_choice: { type: "tool", name: TOOL_IDENTIFIER },
+      }),
+    });
+    expect(rejectedToolChoice.status).toBe(422);
+    expect(await rejectedToolChoice.text()).not.toContain(TOOL_IDENTIFIER);
+    expect(received).toHaveLength(beforeRejectedRequest);
+
+    const rejectedOutputSchema = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": anthCaller },
+      body: JSON.stringify({
+        model: "pii-anth-e2e",
+        max_tokens: 32,
+        messages: [{ role: "user", content: "clean" }],
+        output_config: {
+          format: {
+            type: "json_schema",
+            schema: {
+              type: "object",
+              properties: { [EMAIL]: { type: "string" } },
+            },
+          },
+        },
+      }),
+    });
+    expect(rejectedOutputSchema.status).toBe(422);
+    expect(await rejectedOutputSchema.text()).not.toContain(EMAIL);
+    expect(received).toHaveLength(beforeRejectedRequest);
+
     const rejectedHistoricalIdentifier = await fetch(`${app.proxyUrl}/v1/messages`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-api-key": anthCaller },
@@ -1205,6 +1247,26 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
             messages: [{ role: "user", content: "chat tool definition marker" }],
             tools,
           }),
+          choiceRequest: (name: string) => ({
+            model: "pii-chat-tool",
+            messages: [{ role: "user", content: "chat tool choice marker" }],
+            tools: chatTools("owner", "safe"),
+            tool_choice: { type: "function", function: { name } },
+          }),
+          schemaRequest: (property: string) => ({
+            model: "pii-chat-tool",
+            messages: [{ role: "user", content: "chat schema marker" }],
+            response_format: {
+              type: "json_schema",
+              json_schema: {
+                name: "result",
+                schema: {
+                  type: "object",
+                  properties: { [property]: { type: "string" } },
+                },
+              },
+            },
+          }),
           tools: chatTools,
         },
         {
@@ -1216,6 +1278,26 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
             input: "native Responses tool definition marker",
             tools,
           }),
+          choiceRequest: (name: string) => ({
+            model: "pii-responses-tool",
+            input: "native Responses tool choice marker",
+            tools: responseTools("owner", "safe"),
+            tool_choice: { type: "function", name },
+          }),
+          schemaRequest: (property: string) => ({
+            model: "pii-responses-tool",
+            input: "native Responses schema marker",
+            text: {
+              format: {
+                type: "json_schema",
+                name: "result",
+                schema: {
+                  type: "object",
+                  properties: { [property]: { type: "string" } },
+                },
+              },
+            },
+          }),
           tools: responseTools,
         },
         {
@@ -1226,6 +1308,26 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
             model: "pii-responses-bridge-tool",
             input: "translated Responses tool definition marker",
             tools,
+          }),
+          choiceRequest: (name: string) => ({
+            model: "pii-responses-bridge-tool",
+            input: "translated Responses tool choice marker",
+            tools: responseTools("owner", "safe"),
+            tool_choice: { type: "function", name },
+          }),
+          schemaRequest: (property: string) => ({
+            model: "pii-responses-bridge-tool",
+            input: "translated Responses schema marker",
+            text: {
+              format: {
+                type: "json_schema",
+                name: "result",
+                schema: {
+                  type: "object",
+                  properties: { [property]: { type: "string" } },
+                },
+              },
+            },
           }),
           tools: responseTools,
         },
@@ -1264,6 +1366,24 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
         expect(rejectedName.status).toBe(422);
         expect(await rejectedName.text()).not.toContain(TOOL_IDENTIFIER);
         expect(toolCase.upstream.receivedRequests).toHaveLength(nameBaseline);
+
+        const choiceBaseline = toolCase.upstream.receivedRequests.length;
+        const rejectedChoice = await post(
+          toolCase.path,
+          toolCase.choiceRequest(TOOL_IDENTIFIER),
+        );
+        expect(rejectedChoice.status).toBe(422);
+        expect(await rejectedChoice.text()).not.toContain(TOOL_IDENTIFIER);
+        expect(toolCase.upstream.receivedRequests).toHaveLength(choiceBaseline);
+
+        const schemaBaseline = toolCase.upstream.receivedRequests.length;
+        const rejectedSchema = await post(
+          toolCase.path,
+          toolCase.schemaRequest(EMAIL),
+        );
+        expect(rejectedSchema.status).toBe(422);
+        expect(await rejectedSchema.text()).not.toContain(EMAIL);
+        expect(toolCase.upstream.receivedRequests).toHaveLength(schemaBaseline);
       }
 
       const chatInputBaseline = chatUpstream.receivedRequests.length;
@@ -1339,6 +1459,21 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
       });
       expect(responsesIdentifierInput.status).toBe(422);
       expect(await responsesIdentifierInput.text()).not.toContain(TOOL_IDENTIFIER);
+      expect(responsesUpstream.receivedRequests).toHaveLength(responsesInputBaseline);
+
+      const responsesApprovalInput = await post("/v1/responses", {
+        model: "pii-responses-tool",
+        input: [
+          {
+            type: "mcp_approval_response",
+            approval_request_id: TOOL_IDENTIFIER,
+            approve: true,
+            reason: "safe",
+          },
+        ],
+      });
+      expect(responsesApprovalInput.status).toBe(422);
+      expect(await responsesApprovalInput.text()).not.toContain(TOOL_IDENTIFIER);
       expect(responsesUpstream.receivedRequests).toHaveLength(responsesInputBaseline);
 
       const nativeResultBaseline = responsesUpstream.receivedRequests.length;

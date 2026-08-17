@@ -494,26 +494,48 @@ pub fn capture_in_band_error(payload: &str, wire: UpstreamWire) -> Option<Bridge
 /// extracting only `kind` from the upstream envelope while suppressing
 /// the `message` for operator-taxonomy redaction).
 pub async fn read_body_capped(resp: reqwest::Response, limit: usize) -> bytes::Bytes {
+    read_body_capped_with_deadline(resp, limit, None)
+        .await
+        .unwrap_or_default()
+}
+
+/// Bounded upstream-error body reader with an optional whole-drain deadline.
+/// It stops once `limit` bytes are retained; dropping the response may forfeit
+/// keep-alive, but avoids letting an error body slow-drip forever after its
+/// diagnostic prefix is already complete.
+pub async fn read_body_capped_with_deadline(
+    resp: reqwest::Response,
+    limit: usize,
+    deadline: Option<std::time::Duration>,
+) -> Result<bytes::Bytes, BridgeError> {
     use futures::StreamExt;
-    let mut buf = bytes::BytesMut::with_capacity(limit.min(16 * 1024));
-    let mut stream = resp.bytes_stream();
-    // Continue draining the stream past `limit` so the underlying
-    // hyper connection can be returned to reqwest's keep-alive pool.
-    // Stopping the iteration mid-stream taints the connection and
-    // forces a new TCP handshake on the next upstream call — a real
-    // cost when an upstream is flapping and producing a burst of
-    // error responses. The extra reads only discard bytes; memory
-    // stays bounded by `limit`.
-    while let Some(chunk) = stream.next().await {
-        let Ok(chunk) = chunk else { break };
-        if buf.len() >= limit {
-            continue;
+    let read = async move {
+        let mut buf = bytes::BytesMut::with_capacity(limit.min(16 * 1024));
+        let mut stream = resp.bytes_stream();
+        while buf.len() < limit {
+            let Some(chunk) = stream.next().await else {
+                break;
+            };
+            let chunk = chunk.map_err(|e| {
+                BridgeError::Transport(crate::upstream_http::transport_error_message(&e))
+            })?;
+            let remaining = limit - buf.len();
+            let take = chunk.len().min(remaining);
+            buf.extend_from_slice(&chunk[..take]);
         }
-        let remaining = limit - buf.len();
-        let take = chunk.len().min(remaining);
-        buf.extend_from_slice(&chunk[..take]);
+        Ok::<_, BridgeError>(buf.freeze())
+    };
+    match deadline {
+        Some(duration) => {
+            tokio::time::timeout(duration, read)
+                .await
+                .map_err(|_| BridgeError::Timeout {
+                    elapsed_ms: duration.as_millis().min(u128::from(u64::MAX)) as u64,
+                    cause: "upstream error body".to_string(),
+                })?
+        }
+        None => read.await,
     }
-    buf.freeze()
 }
 
 /// Content-Type token starts with `application/json` (RFC 7231 §3.1.1.1

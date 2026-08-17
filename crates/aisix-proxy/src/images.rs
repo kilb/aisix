@@ -273,11 +273,13 @@ async fn dispatch(
     // guardrail is attached.
     let applied_guardrails = resolved_chain.applied().to_vec();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    let mut input_capture_safe = true;
     if !resolved_chain.is_empty() {
         let chat = images_input_to_chat(model_name, &body);
         let (verdict, hits) =
             aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
         monitor_hits.extend(hits);
+        input_capture_safe = !verdict.is_bypass();
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
@@ -391,7 +393,7 @@ async fn dispatch(
             // Content capture (#700): the full response JSON (LiteLLM
             // parity); CapturedContent::new truncates to the cap.
             let captured_content = match (&captured_prompt, content_cap) {
-                (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+                (Some(prompt), Some(cap)) if input_capture_safe => Some(CapturedContent::new(
                     prompt,
                     &serde_json::to_string(&resp_json).unwrap_or_default(),
                     cap as usize,

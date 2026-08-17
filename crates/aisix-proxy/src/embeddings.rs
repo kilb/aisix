@@ -353,11 +353,13 @@ async fn dispatch(
     // UsageEvent surfaces them in Logs, like chat / messages. Empty when no
     // guardrail is attached.
     telemetry.applied_guardrails = resolved_chain.applied().to_vec();
+    let mut input_capture_safe = true;
     if !resolved_chain.is_empty() {
         let chat = embeddings_input_to_chat(&body.model, &body.input);
         let (verdict, hits) =
             aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
         telemetry.monitor_hits.extend(hits);
+        input_capture_safe = !verdict.is_bypass();
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
@@ -504,7 +506,7 @@ async fn dispatch(
             // included (LiteLLM parity); CapturedContent::new truncates to
             // the cap.
             let captured_content = match (&captured_prompt, content_cap) {
-                (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+                (Some(prompt), Some(cap)) if input_capture_safe => Some(CapturedContent::new(
                     prompt,
                     &serde_json::to_string(&embed_resp).unwrap_or_default(),
                     cap as usize,

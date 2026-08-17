@@ -49,6 +49,53 @@ pub enum StreamDoneOutcome {
     UnexpectedDoneMarker,
 }
 
+const GUARDED_CONTENT_FIELDS: &[&str] = &[
+    "messages",
+    "prompt",
+    "suffix",
+    "input",
+    "instructions",
+    "tools",
+    "tool_choice",
+    "response_format",
+    "text",
+    "system",
+    "output_config",
+    "output_format",
+    "metadata",
+    "user",
+    "query",
+    "documents",
+];
+
+/// Reject override rules that can introduce provider-visible prompt or
+/// structural content after the gateway's input guardrail pass. Safe scalar
+/// compatibility knobs remain available; content-bearing fields must come
+/// from the moderated caller request itself.
+pub fn validate_content_safe_request_overrides(
+    request: &aisix_core::RequestOverrides,
+) -> Result<(), String> {
+    if let Some(target) = request
+        .param_renames
+        .values()
+        .find(|target| GUARDED_CONTENT_FIELDS.contains(&target.as_str()))
+    {
+        return Err(format!(
+            "request.param_renames cannot target guarded content field `{target}`"
+        ));
+    }
+    if let Some(field) = request
+        .default_body_fields
+        .keys()
+        .find(|field| GUARDED_CONTENT_FIELDS.contains(&field.as_str()))
+    {
+        return Err(format!(
+            "request.default_body_fields cannot define guarded content field `{field}`"
+        ));
+    }
+    Ok(())
+}
+
 /// Apply `request.param_renames` to a JSON request body.
 ///
 /// Rewrites every present top-level key whose name matches a key in
@@ -686,5 +733,29 @@ mod tests {
             chunk["choices"][1]["delta"]["reasoning_content"],
             json!("second")
         );
+    }
+
+    #[test]
+    fn rejects_overrides_that_add_content_after_guardrail_inspection() {
+        let mut renames = aisix_core::RequestOverrides::default();
+        renames
+            .param_renames
+            .insert("smuggle".to_string(), "messages".to_string());
+        assert!(validate_content_safe_request_overrides(&renames).is_err());
+
+        let mut defaults = aisix_core::RequestOverrides::default();
+        defaults
+            .default_body_fields
+            .insert("instructions".to_string(), json!("hidden prompt"));
+        assert!(validate_content_safe_request_overrides(&defaults).is_err());
+
+        let mut safe = aisix_core::RequestOverrides::default();
+        safe.param_renames.insert(
+            "max_completion_tokens".to_string(),
+            "max_tokens".to_string(),
+        );
+        safe.default_body_fields
+            .insert("safe_flag".to_string(), json!(true));
+        assert!(validate_content_safe_request_overrides(&safe).is_ok());
     }
 }

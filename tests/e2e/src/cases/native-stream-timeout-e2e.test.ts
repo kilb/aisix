@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  metricDelta,
+  scrapeMetrics,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -23,6 +25,9 @@ const MODELS = {
   chatBridgeMid: "chat-bridge-mid-timeout",
   messagesBridgeMid: "messages-bridge-mid-timeout",
   responsesBridgeMid: "responses-bridge-mid-timeout",
+  chatBridgeEof: "chat-bridge-premature-eof",
+  messagesBridgeEof: "messages-bridge-premature-eof",
+  responsesBridgeEof: "responses-bridge-premature-eof",
 } as const;
 
 const REQUEST_MARKERS = {
@@ -33,6 +38,9 @@ const REQUEST_MARKERS = {
   chatBridgeMid: "chat-bridge-mid-request-b065",
   messagesBridgeMid: "messages-bridge-mid-request-c176",
   responsesBridgeMid: "responses-bridge-mid-request-d287",
+  chatBridgeEof: "chat-bridge-eof-request-e398",
+  messagesBridgeEof: "messages-bridge-eof-request-f409",
+  responsesBridgeEof: "responses-bridge-eof-request-05ba",
 } as const;
 
 const OUTPUT_MARKERS = {
@@ -48,6 +56,9 @@ const OUTPUT_MARKERS = {
   messagesBridgeLate: "messages-bridge-late-output-4afe",
   responsesBridgeFirst: "responses-bridge-first-output-5b0f",
   responsesBridgeLate: "responses-bridge-late-output-6c10",
+  chatBridgeEof: "chat-bridge-eof-output-7d21",
+  messagesBridgeEof: "messages-bridge-eof-output-8e32",
+  responsesBridgeEof: "responses-bridge-eof-output-9f43",
 } as const;
 
 function chatEvents(first: string, late: string): string[] {
@@ -180,6 +191,7 @@ async function waitForTimeoutObservability(
   model: string,
   endpoint: "/v1/chat/completions" | "/v1/messages" | "/v1/responses",
   usageBaseline: number,
+  reason = "request_timeout",
 ): Promise<void> {
   let observedStatus: unknown;
   try {
@@ -198,7 +210,7 @@ async function waitForTimeoutObservability(
         (row) =>
           row.id === modelId &&
           row.status === "cooldown" &&
-          row.status_reason === "request_timeout",
+          row.status_reason === reason,
       );
     });
   } catch (error) {
@@ -239,6 +251,9 @@ describe("stream timeout terminal state across handler families", () => {
   let chatBridgeMid: OpenAiUpstream | undefined;
   let messagesBridgeMid: OpenAiUpstream | undefined;
   let responsesBridgeMid: OpenAiUpstream | undefined;
+  let chatBridgeEof: OpenAiUpstream | undefined;
+  let messagesBridgeEof: OpenAiUpstream | undefined;
+  let responsesBridgeEof: OpenAiUpstream | undefined;
   const modelIds: Partial<Record<keyof typeof MODELS, string>> = {};
 
   beforeAll(async () => {
@@ -289,6 +304,27 @@ describe("stream timeout terminal state across handler families", () => {
         OUTPUT_MARKERS.responsesBridgeLate,
       ),
     });
+    const openAiPartial = (marker: string) => [
+      JSON.stringify({
+        id: "chatcmpl-eof",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "deepseek-chat",
+        choices: [{ index: 0, delta: { content: marker }, finish_reason: null }],
+      }),
+    ];
+    chatBridgeEof = await startOpenAiUpstream({
+      streamEvents: openAiPartial(OUTPUT_MARKERS.chatBridgeEof),
+    });
+    messagesBridgeEof = await startOpenAiUpstream({
+      streamEvents: openAiPartial(OUTPUT_MARKERS.messagesBridgeEof),
+    });
+    responsesBridgeEof = await startOpenAiUpstream({
+      rawSseChunks: [
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg-eof","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"usage":{"input_tokens":3,"output_tokens":0}}}\n\n',
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: OUTPUT_MARKERS.responsesBridgeEof } })}\n\n`,
+      ],
+    });
 
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
@@ -299,6 +335,8 @@ describe("stream timeout terminal state across handler families", () => {
     ) => {
       const providerKey = await seed.createProviderKey({
         display_name: `${MODELS[key]}-pk`,
+        provider,
+        adapter: provider,
         secret: "sk-mock",
         api_base: provider === "anthropic" ? upstream.baseUrl : `${upstream.baseUrl}/v1`,
       });
@@ -319,7 +357,12 @@ describe("stream timeout terminal state across handler families", () => {
     await createModel("responsesFirst", "openai", responsesFirst);
     await createModel("responsesMid", "openai", responsesMid);
     const createBridgeModel = async (
-      key: "chatBridgeMid" | "messagesBridgeMid" | "responsesBridgeMid",
+      key:
+        | "chatBridgeMid"
+        | "messagesBridgeMid"
+        | "responsesBridgeMid"
+        | "chatBridgeEof"
+        | "messagesBridgeEof",
       upstream: OpenAiUpstream,
     ) => {
       const providerKey = await seed.createProviderKey({
@@ -343,6 +386,9 @@ describe("stream timeout terminal state across handler families", () => {
     await createBridgeModel("chatBridgeMid", chatBridgeMid);
     await createBridgeModel("messagesBridgeMid", messagesBridgeMid);
     await createBridgeModel("responsesBridgeMid", responsesBridgeMid);
+    await createBridgeModel("chatBridgeEof", chatBridgeEof);
+    await createBridgeModel("messagesBridgeEof", messagesBridgeEof);
+    await createModel("responsesBridgeEof", "anthropic", responsesBridgeEof);
     await seed.createApiKey({
       key_hash: HASH,
       allowed_models: Object.values(MODELS),
@@ -372,6 +418,9 @@ describe("stream timeout terminal state across handler families", () => {
       chatBridgeMid?.close(),
       messagesBridgeMid?.close(),
       responsesBridgeMid?.close(),
+      chatBridgeEof?.close(),
+      messagesBridgeEof?.close(),
+      responsesBridgeEof?.close(),
     ]);
   });
 
@@ -531,14 +580,15 @@ describe("stream timeout terminal state across handler families", () => {
           ? "chat"
           : scenario.endpoint.slice(4);
       const usageBaseline = await usage5xxCounter(app, handler);
+      const deploymentBaseline = await scrapeMetrics(app.metricsUrl);
       const started = Date.now();
       const response = await scenario.post(
         app,
         MODELS[scenario.modelKey],
         REQUEST_MARKERS[scenario.modelKey],
       );
-      expect(response.status).toBe(200);
       const body = await readBounded(response);
+      expect(response.status, `${scenario.modelKey}: ${body}`).toBe(200);
       expect(Date.now() - started).toBeLessThan(STALL_MS / 2);
       expect(body).toContain(scenario.first);
       expect(body).not.toContain(scenario.late);
@@ -556,6 +606,100 @@ describe("stream timeout terminal state across handler families", () => {
         MODELS[scenario.modelKey],
         scenario.endpoint,
         usageBaseline,
+      );
+      const deploymentAfter = await scrapeMetrics(app.metricsUrl);
+      expect(
+        metricDelta(
+          deploymentBaseline,
+          deploymentAfter,
+          "aisix_deployment_failure_responses_total",
+          { model: MODELS[scenario.modelKey] },
+        ),
+      ).toBe(1);
+      expect(
+        metricDelta(
+          deploymentBaseline,
+          deploymentAfter,
+          "aisix_deployment_success_responses_total",
+          { model: MODELS[scenario.modelKey] },
+        ),
+      ).toBe(0);
+    }
+  }, 30_000);
+
+  test("translated streams reject clean EOF before the provider terminal event", async (ctx) => {
+    if (
+      !etcdReachable ||
+      !app ||
+      !chatBridgeEof ||
+      !messagesBridgeEof ||
+      !responsesBridgeEof
+    ) {
+      ctx.skip();
+      return;
+    }
+
+    const cases = [
+      {
+        endpoint: "/v1/chat/completions" as const,
+        modelKey: "chatBridgeEof" as const,
+        upstream: chatBridgeEof,
+        output: OUTPUT_MARKERS.chatBridgeEof,
+        forbiddenTerminal: "[DONE]",
+        upstreamPath: "/v1/chat/completions",
+        post: postChat,
+      },
+      {
+        endpoint: "/v1/messages" as const,
+        modelKey: "messagesBridgeEof" as const,
+        upstream: messagesBridgeEof,
+        output: OUTPUT_MARKERS.messagesBridgeEof,
+        forbiddenTerminal: '"type":"message_stop"',
+        upstreamPath: "/v1/chat/completions",
+        post: postMessages,
+      },
+      {
+        endpoint: "/v1/responses" as const,
+        modelKey: "responsesBridgeEof" as const,
+        upstream: responsesBridgeEof,
+        output: OUTPUT_MARKERS.responsesBridgeEof,
+        forbiddenTerminal: "response.completed",
+        upstreamPath: "/v1/messages",
+        post: postResponses,
+      },
+    ];
+
+    for (const scenario of cases) {
+      const baseline = scenario.upstream.receivedRequests.length;
+      const handler =
+        scenario.endpoint === "/v1/chat/completions"
+          ? "chat"
+          : scenario.endpoint.slice(4);
+      const usageBaseline = await usage5xxCounter(app, handler);
+      const response = await scenario.post(
+        app,
+        MODELS[scenario.modelKey],
+        REQUEST_MARKERS[scenario.modelKey],
+      );
+      const body = await readBounded(response);
+      expect(response.status, `${scenario.modelKey}: ${body}`).toBe(200);
+      expect(body).toContain(scenario.output);
+      expect(body).toContain("error");
+      expect(body).not.toContain(scenario.forbiddenTerminal);
+      expect(scenario.upstream.receivedRequests).toHaveLength(baseline + 1);
+      expect(scenario.upstream.receivedRequests.at(-1)?.path).toBe(
+        scenario.upstreamPath,
+      );
+      expect(scenario.upstream.receivedRequests.at(-1)?.body).toContain(
+        REQUEST_MARKERS[scenario.modelKey],
+      );
+      await waitForTimeoutObservability(
+        app,
+        modelIds[scenario.modelKey]!,
+        MODELS[scenario.modelKey],
+        scenario.endpoint,
+        usageBaseline,
+        "transport_error",
       );
     }
   }, 30_000);

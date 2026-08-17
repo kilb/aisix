@@ -47,6 +47,9 @@ use axum::Json;
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
+use crate::attempt::{
+    attempt_error_from_proxy, attempt_reached_upstream, ms_since, AttemptRecord, RoutingTelemetry,
+};
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
@@ -303,6 +306,7 @@ async fn dispatch(
     // pre-dispatch 4xx); if this endpoint ever grows semantic support,
     // widen this flag or the deferred policies are silently skipped.
     let is_routing_request = model_entry.value.routing.is_some();
+    let mut routing = RoutingTelemetry::for_request(&model_entry.value.display_name);
     let mut last_err: Option<ProxyError> = None;
     let mut any_anthropic = false;
     for (target_idx, target) in attempt_models.iter().enumerate() {
@@ -313,6 +317,14 @@ async fn dispatch(
             continue;
         }
         any_anthropic = true;
+        let target_model = if is_routing_request {
+            target.model.display_name.clone()
+        } else {
+            String::new()
+        };
+        let pk_id = crate::dispatch::resolve_provider_key(snapshot, &target.model)
+            .map(|entry| entry.id.clone())
+            .unwrap_or_default();
         // Reserve THIS target's own model rate-limit layers before
         // dispatching to it (AISIX-Cloud#1087); over-limit → skip it and
         // try the remaining targets. Like the handler-level `_reservation` it is
@@ -334,6 +346,23 @@ async fn dispatch(
         {
             Ok(r) => r,
             Err(e) => {
+                let (idx, kind) = routing.begin_attempt(&target.model.display_name);
+                routing.record(
+                    state,
+                    AttemptRecord {
+                        index: idx,
+                        kind,
+                        target_model: target_model.clone(),
+                        target_model_id: target.id.clone(),
+                        provider_key_id: pk_id.clone(),
+                        status: 429,
+                        success: false,
+                        error_class: e.kind().to_string(),
+                        error_message: String::new(),
+                        latency_ms: 0,
+                        dispatched: false,
+                    },
+                );
                 last_err = Some(e);
                 continue;
             }
@@ -365,6 +394,8 @@ async fn dispatch(
                 });
                 tokio::time::sleep(crate::routing::retry_backoff(attempt_idx as u32, hint)).await;
             }
+            let (idx, kind) = routing.begin_attempt(&target.model.display_name);
+            let attempt_started = Instant::now();
             match count_tokens_to_target(
                 state,
                 snapshot,
@@ -381,7 +412,25 @@ async fn dispatch(
             )
             .await
             {
-                Ok(success) => return Ok(success),
+                Ok(success) => {
+                    routing.record(
+                        state,
+                        AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model: target_model.clone(),
+                            target_model_id: target.id.clone(),
+                            provider_key_id: success.provider_key_id.clone(),
+                            status: 200,
+                            success: true,
+                            error_class: String::new(),
+                            error_message: String::new(),
+                            latency_ms: ms_since(attempt_started),
+                            dispatched: true,
+                        },
+                    );
+                    return Ok(success);
+                }
                 Err(e) => {
                     let retryable = matches!(
                         &e,
@@ -394,6 +443,23 @@ async fn dispatch(
                         ProxyError::Bridge(be) => budget.covers(be),
                         _ => true,
                     };
+                    let (error_class, error_message) = attempt_error_from_proxy(&e);
+                    routing.record(
+                        state,
+                        AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model: target_model.clone(),
+                            target_model_id: target.id.clone(),
+                            provider_key_id: pk_id.clone(),
+                            status: e.status().as_u16(),
+                            success: false,
+                            error_class,
+                            error_message,
+                            latency_ms: ms_since(attempt_started),
+                            dispatched: attempt_reached_upstream(&e),
+                        },
+                    );
                     last_err = Some(e);
                     if !retryable {
                         return Err(last_err.unwrap_or(ProxyError::ProviderUnavailable));
@@ -454,6 +520,11 @@ async fn count_tokens_to_target(
     // order matches §5: renames → constraints → defaults; each is a
     // no-op when its configured map is empty.
     if let Some(r) = pk_entry.value.request.as_ref() {
+        aisix_provider_openai::overrides::validate_content_safe_request_overrides(r).map_err(
+            |message| {
+                ProxyError::Bridge(aisix_gateway::BridgeError::InvalidUpstreamConfig(message))
+            },
+        )?;
         aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
         if let Some(constraints) = &r.param_constraints {
             aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);
@@ -529,40 +600,46 @@ async fn count_tokens_to_target(
         req = req.timeout(d);
     }
     let send_started = Instant::now();
-    let upstream_resp = req
-        .send()
-        .await
-        .map_err(|e| {
-            crate::cooldown::note_failure(
-                &state.runtime_status,
-                model_id,
-                model.cooldown.as_ref(),
-                crate::dispatch::reqwest_error_to_bridge(&e, send_started),
-            )
-        })
-        .map_err(ProxyError::Bridge)?;
+    let upstream_resp = req.send().await.map_err(|e| {
+        let err = crate::dispatch::reqwest_error_to_bridge(&e, send_started);
+        state.health.record_failure(&model.display_name);
+        let err = crate::cooldown::note_failure(
+            &state.runtime_status,
+            model_id,
+            model.cooldown.as_ref(),
+            err,
+        );
+        ProxyError::Bridge(err)
+    })?;
 
     let status = upstream_resp.status();
 
     if !status.is_success() {
         let status_u16 = status.as_u16();
         let retry_after = aisix_gateway::parse_retry_after(upstream_resp.headers());
-        let message = upstream_resp.text().await.unwrap_or_default();
+        let message = aisix_gateway::read_body_capped_with_deadline(
+            upstream_resp,
+            aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES,
+            timeouts.request,
+        )
+        .await
+        .unwrap_or_default();
+        let message = String::from_utf8_lossy(&message);
         let truncated = crate::util::truncate_on_char_boundary(&message, 1024);
         let err = aisix_gateway::BridgeError::upstream_status_with_retry_after(
             status_u16,
             truncated,
             retry_after,
         );
+        if status.is_server_error() {
+            state.health.record_failure(&model.display_name);
+        }
         if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
         {
             state.runtime_status.mark_cooldown(model_id, ttl, reason);
         }
         return Err(ProxyError::Bridge(err));
     }
-
-    state.health.record_success(&model.display_name);
-    state.runtime_status.mark_healthy(model_id);
 
     // Forward the `{"input_tokens": <int>}` response body verbatim — the
     // gateway adds nothing to the token-counting contract.
@@ -571,14 +648,19 @@ async fn count_tokens_to_target(
         .bytes()
         .await
         .map_err(|e| {
+            let err = aisix_gateway::BridgeError::UpstreamDecode(e.to_string());
+            state.health.record_failure(&model.display_name);
             crate::cooldown::note_failure(
                 &state.runtime_status,
                 model_id,
                 model.cooldown.as_ref(),
-                aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
+                err,
             )
         })
         .map_err(ProxyError::Bridge)?;
+
+    state.health.record_success(&model.display_name);
+    state.runtime_status.mark_healthy(model_id);
 
     let mut resp = axum::response::Response::new(axum::body::Body::from(body_bytes));
     if let Some(ct) = upstream_headers.get("content-type") {

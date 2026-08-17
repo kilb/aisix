@@ -1607,22 +1607,19 @@ async fn dispatch(
                         r
                     }
                     Err(e) => {
-                        stream_routing.record(
-                            state,
-                            AttemptRecord {
-                                index: idx,
-                                kind,
-                                target_model,
-                                target_model_id: attempt.id.clone(),
-                                provider_key_id: pk_entry.id.clone(),
-                                status: 429,
-                                success: false,
-                                error_class: "rate_limit_exceeded".to_string(),
-                                error_message: e.to_string(),
-                                latency_ms: 0,
-                                dispatched: false,
-                            },
-                        );
+                        stream_routing.stage(AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model,
+                            target_model_id: attempt.id.clone(),
+                            provider_key_id: pk_entry.id.clone(),
+                            status: 429,
+                            success: false,
+                            error_class: "rate_limit_exceeded".to_string(),
+                            error_message: e.to_string(),
+                            latency_ms: 0,
+                            dispatched: false,
+                        });
                         // Keep the limiter's own Retry-After hint on the wire:
                         // when every target is exhausted this error becomes the
                         // client's 429, and SDKs back off on that header.
@@ -1689,22 +1686,19 @@ async fn dispatch(
                         // time-to-first-response (upstream stream established) —
                         // the routing-relevant latency signal.
                         state.runtime_status.record_latency(&attempt.id, latency_ms);
-                        stream_routing.record(
-                            state,
-                            AttemptRecord {
-                                index: idx,
-                                kind,
-                                target_model,
-                                target_model_id: attempt.id.clone(),
-                                provider_key_id: pk_entry.id.clone(),
-                                status: 200,
-                                success: true,
-                                error_class: String::new(),
-                                error_message: String::new(),
-                                latency_ms,
-                                dispatched: true,
-                            },
-                        );
+                        stream_routing.stage(AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model,
+                            target_model_id: attempt.id.clone(),
+                            provider_key_id: pk_entry.id.clone(),
+                            status: 200,
+                            success: true,
+                            error_class: String::new(),
+                            error_message: String::new(),
+                            latency_ms,
+                            dispatched: true,
+                        });
                         won = Some(StreamWin {
                             model: model.clone(),
                             target_id: attempt.id.clone(),
@@ -1889,6 +1883,7 @@ async fn dispatch(
         // Input-side monitor hits (AISIX-Cloud#562), merged with the
         // output-side hits accumulated in `comp.monitor_hits`.
         let input_monitor_hits_for_telem = monitor_hits_out.clone();
+        let input_capture_safe_for_telem = *failure_content_safe_out;
         // Downstream client attribution (#492) moved into the on_complete
         // closure so streamed responses log the same IP/UA as non-streaming.
         let client_for_telem = client.clone();
@@ -1900,6 +1895,7 @@ async fn dispatch(
         } else {
             String::new()
         };
+        let routing_for_terminal = stream_routing.clone();
         // Per #204: pass the resolved guardrail chain so the streaming
         // path can run output guardrails at end-of-stream
         // (buffer-then-check). Mirrors the non-streaming
@@ -1975,6 +1971,17 @@ async fn dispatch(
                     comp.terminal_failure.take(),
                     comp.reached_end || comp.guardrail_blocked,
                     if comp.guardrail_blocked { 422 } else { 200 },
+                );
+                let deployment_success = terminal.error_class.is_empty() && terminal.status < 400;
+                routing_for_terminal.finish_staged(
+                    &state_for_telem,
+                    winner_idx,
+                    if comp.guardrail_blocked {
+                        200
+                    } else {
+                        terminal.status
+                    },
+                    deployment_success || comp.guardrail_blocked,
                 );
                 // Telemetry: emit with the actual upstream-reported counts.
                 // cost_usd stays 0.0; cp-api recomputes server-side from
@@ -2057,9 +2064,15 @@ async fn dispatch(
                     // Prompt captured up front, response assembled across the
                     // stream into `comp.response_text`; both gated on the cap.
                     match (&captured_prompt_for_telem, content_cap) {
-                        (Some(prompt), Some(cap)) if comp.response_capture_safe => Some(
-                            CapturedContent::new(prompt, &comp.response_text, cap as usize),
-                        ),
+                        (Some(prompt), Some(cap))
+                            if input_capture_safe_for_telem && comp.response_capture_safe =>
+                        {
+                            Some(CapturedContent::new(
+                                prompt,
+                                &comp.response_text,
+                                cap as usize,
+                            ))
+                        }
                         _ => None,
                     },
                 );
@@ -2494,13 +2507,15 @@ async fn dispatch(
                 // Capture the prompt + cached response for content-capturing
                 // exporters (gated). A cache hit still served content to the
                 // caller, so it's logged like a fresh response.
-                let captured_content = content_cap.filter(|_| cached_capture_safe).map(|cap| {
-                    CapturedContent::new(
-                        &serde_json::to_string(req).unwrap_or_default(),
-                        cached.message.content.as_deref().unwrap_or(""),
-                        cap as usize,
-                    )
-                });
+                let captured_content = content_cap
+                    .filter(|_| *failure_content_safe_out && cached_capture_safe)
+                    .map(|cap| {
+                        CapturedContent::new(
+                            &serde_json::to_string(req).unwrap_or_default(),
+                            cached.message.content.as_deref().unwrap_or(""),
+                            cap as usize,
+                        )
+                    });
                 state.metrics.record_cache_event(
                     matched_policy
                         .as_ref()
@@ -3119,13 +3134,15 @@ async fn dispatch(
     // `content_cap` is `None` when no exporter wants it). Built here, where both
     // the request and the upstream response text are in scope; threaded to
     // `fan_out` via `Success`, never to the CP sink.
-    let captured_content = content_cap.filter(|_| output_capture_safe).map(|cap| {
-        CapturedContent::new(
-            &serde_json::to_string(req).unwrap_or_default(),
-            upstream.message.content.as_deref().unwrap_or(""),
-            cap as usize,
-        )
-    });
+    let captured_content = content_cap
+        .filter(|_| *failure_content_safe_out && output_capture_safe)
+        .map(|cap| {
+            CapturedContent::new(
+                &serde_json::to_string(req).unwrap_or_default(),
+                upstream.message.content.as_deref().unwrap_or(""),
+                cap as usize,
+            )
+        });
 
     let mut response = Json(render_response(now, upstream, &req.model)).into_response();
     // Header only when the gate was open — policy-disabled requests have
@@ -4755,12 +4772,13 @@ fn observe_stream_usage(comp: &mut StreamCompletion, usage: &aisix_gateway::chat
     comp.cache_read_tokens = comp.cache_read_tokens.max(usage.cache_read_tokens);
 }
 
-fn push_to_byte_cap(buffer: &mut String, text: &str, cap: usize) {
+fn push_to_byte_cap(buffer: &mut String, text: &str, cap: usize) -> bool {
     let mut end = cap.saturating_sub(buffer.len()).min(text.len());
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
     buffer.push_str(&text[..end]);
+    end < text.len()
 }
 
 /// Fires `on_complete` with whatever `StreamCompletion` has been
@@ -4985,6 +5003,10 @@ where
         // released after a remote guardrail bypass, later successful scans
         // cannot make the already-uninspected bytes safe for exporters.
         let mut capture_bypassed = false;
+        // Monitor-only end-of-stream scans retain a bounded prefix. Once the
+        // prefix truncates, it remains useful for observations but cannot
+        // certify full-content export as safe.
+        let mut scan_truncated = false;
         // Accumulate the upstream's `usage` block + per-chunk metadata
         // across the stream. Providers typically populate `usage` on
         // the terminal chunk only; using "max" rather than "last" makes
@@ -5167,7 +5189,18 @@ where
                         ) {
                             window_buf.push_str(text);
                         } else if let Some(buf) = content_buffer.as_mut() {
-                            buf.push_str(text);
+                            if matches!(
+                                stream_policy,
+                                aisix_guardrails::StreamOutputPolicy::EndOfStreamCheck
+                            ) {
+                                scan_truncated |= push_to_byte_cap(
+                                    buf,
+                                    text,
+                                    aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
+                                );
+                            } else {
+                                buf.push_str(text);
+                            }
                         }
                         // Content capture: assemble the response for the
                         // observability fan-out, bounded to the cap so a long
@@ -5175,9 +5208,11 @@ where
                         // an exporter wants full content.
                         if !capture_bypassed {
                             if let Some(cap) = content_cap {
-                                if comp.response_text.len() < cap as usize {
-                                    comp.response_text.push_str(text);
-                                }
+                                let _ = crate::token_estimate::push_capped_to(
+                                    &mut comp.response_text,
+                                    text,
+                                    cap as usize,
+                                );
                             }
                         }
                     }
@@ -5206,7 +5241,7 @@ where
                                         // the same bound.
                                         buf.push_str(n);
                                     } else {
-                                        push_to_byte_cap(
+                                        scan_truncated |= push_to_byte_cap(
                                             buf,
                                             n,
                                             aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
@@ -5225,7 +5260,7 @@ where
                                     ) {
                                         buf.push_str(a);
                                     } else {
-                                        push_to_byte_cap(
+                                        scan_truncated |= push_to_byte_cap(
                                             buf,
                                             a,
                                             aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
@@ -5486,7 +5521,11 @@ where
                                         break;
                                     }
                                     if let Some(t) = c.delta.content.as_deref() {
-                                        rebuilt.push_str(t);
+                                        let _ = crate::token_estimate::push_capped_to(
+                                            &mut rebuilt,
+                                            t,
+                                            cap as usize,
+                                        );
                                     }
                                 }
                                 guard.comp().response_text = rebuilt;
@@ -5623,8 +5662,9 @@ where
                 )
                 .await;
                 guard.comp().monitor_hits.extend(seg_hits);
-                guard.comp().response_capture_safe = moderation.capture_safe;
-                if !moderation.capture_safe {
+                guard.comp().response_capture_safe =
+                    moderation.capture_safe && !scan_truncated;
+                if !guard.comp().response_capture_safe {
                     guard.comp().response_text.clear();
                 }
                 match moderation.verdict {

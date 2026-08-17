@@ -22,6 +22,8 @@ const CALLERS = {
   responses: "sk-holdback-overflow-responses",
 } as const;
 const OVERFLOW_MARKER = "generated-trigger-chunk-must-be-billed ".repeat(256);
+const TIMEOUT_MARKER = "generated timeout chunk must be billed";
+const TIMEOUT_CALLER = "sk-held-partial-timeout";
 
 function chatChunk(content: string): string {
   return JSON.stringify({
@@ -70,6 +72,8 @@ describe("fail-closed stream hold-back overflow usage", () => {
   let chatUpstream: OpenAiUpstream | undefined;
   let completionsUpstream: OpenAiUpstream | undefined;
   let responsesUpstream: OpenAiUpstream | undefined;
+  let completionsTimeoutUpstream: OpenAiUpstream | undefined;
+  let responsesTimeoutUpstream: OpenAiUpstream | undefined;
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
@@ -89,6 +93,43 @@ describe("fail-closed stream hold-back overflow usage", () => {
           delta: OVERFLOW_MARKER,
         }),
         "[DONE]",
+      ],
+    });
+    completionsTimeoutUpstream = await startOpenAiUpstream({
+      scriptedResponses: [
+        {
+          streamEvents: [
+            completionChunk(TIMEOUT_MARKER),
+            completionChunk("late"),
+            "[DONE]",
+          ],
+          eventDelayMs: 3_000,
+        },
+        { streamEvents: [completionChunk("retry must not run"), "[DONE]"] },
+      ],
+    });
+    responsesTimeoutUpstream = await startOpenAiUpstream({
+      scriptedResponses: [
+        {
+          streamEvents: [
+            JSON.stringify({ type: "response.output_text.delta", delta: TIMEOUT_MARKER }),
+            JSON.stringify({
+              type: "response.completed",
+              response: { id: "resp-late", status: "completed" },
+            }),
+            "[DONE]",
+          ],
+          eventDelayMs: 3_000,
+        },
+        {
+          streamEvents: [
+            JSON.stringify({
+              type: "response.completed",
+              response: { id: "resp-retry", status: "completed" },
+            }),
+            "[DONE]",
+          ],
+        },
       ],
     });
 
@@ -113,6 +154,25 @@ describe("fail-closed stream hold-back overflow usage", () => {
         provider_key_id: providerKey.id,
       });
     }
+    for (const [display_name, target, model_name] of [
+      ["held-timeout-completions", completionsTimeoutUpstream, "gpt-3.5-turbo-instruct"],
+      ["held-timeout-responses", responsesTimeoutUpstream, "gpt-4o-mini"],
+    ] as const) {
+      const providerKey = await seed.createProviderKey({
+        display_name: `${display_name}-pk`,
+        secret: "sk-mock",
+        api_base: `${target.baseUrl}/v1`,
+      });
+      await seed.createModel({
+        display_name,
+        provider: "openai",
+        model_name,
+        provider_key_id: providerKey.id,
+        stream_timeout: 250,
+        retries: 1,
+        cooldown: { default_seconds: 60 },
+      });
+    }
     await seed.createGuardrail({
       name: "holdback-overflow-pii",
       enabled: true,
@@ -129,6 +189,10 @@ describe("fail-closed stream hold-back overflow usage", () => {
         rate_limit: { tpm: 10 },
       });
     }
+    await seed.createApiKey({
+      key_hash: createHash("sha256").update(TIMEOUT_CALLER).digest("hex"),
+      allowed_models: ["held-timeout-completions", "held-timeout-responses"],
+    });
     for (const endpoint of Object.keys(MODELS) as Array<keyof typeof MODELS>) {
       await waitConfigPropagation(async () => {
         const response = await fetch(`${app!.proxyUrl}/v1/models`, {
@@ -142,6 +206,18 @@ describe("fail-closed stream hold-back overflow usage", () => {
         return body.data?.some((model) => model.id === MODELS[endpoint]) === true;
       });
     }
+    await waitConfigPropagation(async () => {
+      const response = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${TIMEOUT_CALLER}` },
+      });
+      if (response.status === 401) return false;
+      if (response.status !== 200) {
+        throw new Error(`model propagation probe returned ${response.status}`);
+      }
+      const body = (await response.json()) as { data?: Array<{ id?: string }> };
+      const ids = new Set(body.data?.map((model) => model.id));
+      return ids.has("held-timeout-completions") && ids.has("held-timeout-responses");
+    });
   });
 
   afterAll(async () => {
@@ -149,6 +225,8 @@ describe("fail-closed stream hold-back overflow usage", () => {
     await chatUpstream?.close();
     await completionsUpstream?.close();
     await responsesUpstream?.close();
+    await completionsTimeoutUpstream?.close();
+    await responsesTimeoutUpstream?.close();
   });
 
   const request = (endpoint: keyof typeof MODELS) => {
@@ -220,5 +298,79 @@ describe("fail-closed stream hold-back overflow usage", () => {
       expect(throttled.status).toBe(429);
       expect(upstream.receivedRequests).toHaveLength(upstreamBaseline + 1);
     }, 60_000);
+  }
+
+  for (const scenario of [
+    {
+      endpoint: "completions" as const,
+      model: "held-timeout-completions",
+      upstream: () => completionsTimeoutUpstream,
+      status: 504,
+    },
+    {
+      endpoint: "responses" as const,
+      model: "held-timeout-responses",
+      upstream: () => responsesTimeoutUpstream,
+      status: 200,
+    },
+  ]) {
+    test(`${scenario.endpoint} bills held output observed before a timeout without retrying`, async (ctx) => {
+      const upstream = scenario.upstream();
+      if (!etcdReachable || !app || !upstream) {
+        ctx.skip();
+        return;
+      }
+      const outputBaseline = await metricCounter(app, "aisix_llm_output_tokens_total", {
+        model: scenario.model,
+      });
+      const usageBaseline = await metricCounter(app, "aisix_usage_events_emitted_total", {
+        handler: scenario.endpoint,
+        status_code: "5xx",
+      });
+      const upstreamBaseline = upstream.receivedRequests.length;
+      const path = `/v1/${scenario.endpoint}`;
+      const body =
+        scenario.endpoint === "completions"
+          ? { model: scenario.model, prompt: "go", stream: true }
+          : { model: scenario.model, input: "go", stream: true };
+      const response = await fetch(`${app.proxyUrl}${path}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${TIMEOUT_CALLER}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+      const responseBody = await response.text();
+      expect(response.status, responseBody).toBe(scenario.status);
+      expect(responseBody).not.toContain(TIMEOUT_MARKER);
+      expect(upstream.receivedRequests).toHaveLength(upstreamBaseline + 1);
+      try {
+        await waitConfigPropagation(async () => {
+          const usage = await metricCounter(app!, "aisix_usage_events_emitted_total", {
+            handler: scenario.endpoint,
+            status_code: "5xx",
+          });
+          return usage === usageBaseline + 1;
+        });
+        await waitConfigPropagation(async () => {
+          const output = await metricCounter(app!, "aisix_llm_output_tokens_total", {
+            model: scenario.model,
+          });
+          return output > outputBaseline;
+        });
+      } catch (error) {
+        const usage = await metricCounter(app, "aisix_usage_events_emitted_total", {
+          handler: scenario.endpoint,
+          status_code: "5xx",
+        });
+        const output = await metricCounter(app, "aisix_llm_output_tokens_total", {
+          model: scenario.model,
+        });
+        throw new Error(
+          `${scenario.endpoint}: ${String(error)}; usage ${usageBaseline}->${usage}, output ${outputBaseline}->${output}`,
+        );
+      }
+    }, 70_000);
   }
 });

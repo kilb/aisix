@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use crate::attempt::{
     attempt_error_from_proxy, attempt_reached_upstream, ms_since, AttemptInfo, AttemptRecord,
-    RoutingTelemetry,
+    DeferredAttempt, RoutingTelemetry,
 };
 use crate::auth::AuthenticatedKey;
 use crate::chat::sanitize_tag;
@@ -735,6 +735,7 @@ async fn dispatch(
                 String::new()
             };
             let attempt_started = Instant::now();
+            let deferred_attempt = DeferredAttempt::default();
             // Winning-attempt classification (#655) for the streaming path's
             // end-of-stream UsageEvent. The non-streaming / buffered paths emit
             // from the handler and ignore it.
@@ -742,6 +743,7 @@ async fn dispatch(
                 index: idx,
                 kind: kind.to_string(),
                 model: target_model.clone(),
+                deferred: Some(deferred_attempt.clone()),
                 ..Default::default()
             };
             // Reserve THIS target's own model rate-limit layers before
@@ -805,6 +807,7 @@ async fn dispatch(
                     &mut member_reservation,
                     redactions_out.clone(),
                     monitor_hits_out.clone(),
+                    *failure_content_safe_out,
                 )
                 .await
             } else {
@@ -827,6 +830,7 @@ async fn dispatch(
                     &mut member_reservation,
                     redactions_out.clone(),
                     monitor_hits_out.clone(),
+                    *failure_content_safe_out,
                 )
                 .await
             };
@@ -835,22 +839,36 @@ async fn dispatch(
                     let latency_ms = ms_since(attempt_started);
                     // Feed the least_latency EWMA for this target.
                     state.runtime_status.record_latency(&target.id, latency_ms);
-                    routing.record(
-                        state,
-                        AttemptRecord {
-                            index: idx,
-                            kind,
-                            target_model,
-                            target_model_id: target.id.clone(),
-                            provider_key_id: pk_id.clone(),
-                            status: success.response.status().as_u16(),
-                            success: true,
-                            error_class: String::new(),
-                            error_message: String::new(),
-                            latency_ms,
-                            dispatched: true,
-                        },
-                    );
+                    let terminal_status = success
+                        .terminal_failure
+                        .map(|failure| failure.bridge_error().http_status());
+                    let record = AttemptRecord {
+                        index: idx,
+                        kind,
+                        target_model,
+                        target_model_id: target.id.clone(),
+                        provider_key_id: pk_id.clone(),
+                        status: success.response.status().as_u16(),
+                        success: true,
+                        error_class: String::new(),
+                        error_message: String::new(),
+                        latency_ms,
+                        dispatched: true,
+                    };
+                    if success.usage_handled_by_stream {
+                        routing.stage(record);
+                        deferred_attempt.install(&routing, idx);
+                    } else if let Some(status) = terminal_status {
+                        // The handler emits the buffered winner's billed
+                        // UsageEvent below. Keep that winner as the single
+                        // attempt event, but classify the deployment metric
+                        // with the terminal stream failure discovered while
+                        // holding the body.
+                        routing.stage(record);
+                        routing.finish_staged(state, idx, status, false);
+                    } else {
+                        routing.record(state, record);
+                    }
                     success.routing = routing;
                     // #911 [21]: commit the reserved layers with the actual
                     // token cost so TPM/TPD is enforced for /v1/responses like
@@ -987,10 +1005,12 @@ fn responses_input_to_chat(model: &str, body: &Value) -> ChatFormat {
         _ => {}
     }
 
-    if let Some(tools) = body.get("tools") {
-        let text = serde_json::to_string(tools).expect("serde_json::Value always serializes");
-        if text != "null" && text != "[]" {
-            messages.push(ChatMessage::user(text));
+    for field in ["tools", "tool_choice", "text"] {
+        if let Some(value) = body.get(field) {
+            let text = serde_json::to_string(value).expect("serde_json::Value always serializes");
+            if text != "null" && text != "[]" {
+                messages.push(ChatMessage::user(text));
+            }
         }
     }
 
@@ -1003,7 +1023,8 @@ fn responses_input_to_chat(model: &str, body: &Value) -> ChatFormat {
 /// - `content` — message items;
 /// - `output` — tool-result items (`function_call_output`,
 ///   `custom_tool_call_output`, `*_call_output`) the caller feeds back;
-/// - `reason` — an `mcp_approval_response` justification.
+/// - `reason` — an `mcp_approval_response` justification;
+/// - `approval_request_id` — the structural identifier binding that response.
 ///
 /// All are user-controlled content entering the model — the
 /// `/v1/chat/completions` equivalent (a `role:"tool"` message) is
@@ -1015,13 +1036,18 @@ fn responses_input_to_chat(model: &str, body: &Value) -> ChatFormat {
 /// kind). Reading a key absent on other item types is a harmless no-op.
 /// <https://platform.openai.com/docs/api-reference/responses/create>
 fn responses_item_text(item: &Value) -> String {
-    [item.get("content"), item.get("output"), item.get("reason")]
-        .into_iter()
-        .flatten()
-        .map(responses_value_text)
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    [
+        item.get("content"),
+        item.get("output"),
+        item.get("reason"),
+        item.get("approval_request_id"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(responses_value_text)
+    .filter(|s| !s.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n")
 }
 
 /// Plain text of one Responses-API content slot: a bare string, or the
@@ -1081,6 +1107,7 @@ async fn responses_to_target(
     // Input-side monitor hits (AISIX-Cloud#562), same lifecycle as
     // `input_redactions`.
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    input_capture_safe: bool,
 ) -> Result<ResponseDispatchSuccess, ProxyError> {
     let chain_arc = chain;
     let applied_guardrails = chain_arc.applied().to_vec();
@@ -1117,6 +1144,11 @@ async fn responses_to_target(
     // traffic (AISIX-Cloud#867 follow-up). Apply order: renames → constraints
     // → defaults; each is a no-op when its configured map is empty.
     if let Some(r) = pk_entry.value.request.as_ref() {
+        aisix_provider_openai::overrides::validate_content_safe_request_overrides(r).map_err(
+            |message| {
+                ProxyError::Bridge(aisix_gateway::BridgeError::InvalidUpstreamConfig(message))
+            },
+        )?;
         aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
         if let Some(constraints) = &r.param_constraints {
             aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);
@@ -1221,19 +1253,32 @@ async fn responses_to_target(
     if !status.is_success() {
         let status_u16 = status.as_u16();
         let retry_after = aisix_gateway::parse_retry_after(upstream_resp.headers());
-        let message = upstream_resp.text().await.unwrap_or_default();
+        let preliminary = aisix_gateway::BridgeError::upstream_status_with_retry_after(
+            status_u16,
+            String::new(),
+            retry_after,
+        );
+        if preliminary.http_status() >= 500 {
+            state.health.record_failure(&model.display_name);
+        }
+        if let Some((ttl, reason)) =
+            crate::cooldown::decide_cooldown(&preliminary, model.cooldown.as_ref())
+        {
+            state.runtime_status.mark_cooldown(model_id, ttl, reason);
+        }
+        let message = aisix_gateway::read_body_capped_with_deadline(
+            upstream_resp,
+            aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES,
+            connect_deadline,
+        )
+        .await
+        .unwrap_or_default();
+        let message = String::from_utf8_lossy(&message);
         let err = aisix_gateway::BridgeError::upstream_status_with_retry_after(
             status_u16,
             message.chars().take(1024).collect::<String>(),
             retry_after,
         );
-        if err.http_status() >= 500 {
-            state.health.record_failure(&model.display_name);
-        }
-        if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
-        {
-            state.runtime_status.mark_cooldown(model_id, ttl, reason);
-        }
         return Err(ProxyError::Bridge(err));
     }
 
@@ -1289,11 +1334,11 @@ async fn responses_to_target(
                 // the buffer path hasn't sent anything to the client yet, so
                 // a read timeout is a retryable failure, not a truncation.
                 let next = match read_to {
-                    Some(d) => tokio::time::timeout(d, stream.next())
-                        .await
-                        .map_err(|_| {
+                    Some(d) => match tokio::time::timeout(d, stream.next()).await {
+                        Ok(item) => item,
+                        Err(_) => {
                             state.health.record_failure(&model.display_name);
-                            crate::cooldown::note_failure(
+                            let error = crate::cooldown::note_failure(
                                 &state.runtime_status,
                                 model_id,
                                 model.cooldown.as_ref(),
@@ -1301,9 +1346,17 @@ async fn responses_to_target(
                                     elapsed_ms: d.as_millis() as u64,
                                     cause: String::new(),
                                 },
-                            )
-                        })
-                        .map_err(ProxyError::Bridge)?,
+                            );
+                            if saw_chunk {
+                                observed_failure =
+                                    Some(crate::stream_timeout::RawStreamFailure::Timeout {
+                                        elapsed_ms: d.as_millis() as u64,
+                                    });
+                                break;
+                            }
+                            return Err(ProxyError::Bridge(error));
+                        }
+                    },
                     None => stream.next().await,
                 };
                 let Some(chunk) = next else {
@@ -1324,18 +1377,25 @@ async fn responses_to_target(
                     }
                     break;
                 };
-                saw_chunk = true;
-                let chunk = chunk
-                    .map_err(|e| {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
                         state.health.record_failure(&model.display_name);
-                        crate::cooldown::note_failure(
+                        let error = crate::cooldown::note_failure(
                             &state.runtime_status,
                             model_id,
                             model.cooldown.as_ref(),
-                            aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
-                        )
-                    })
-                    .map_err(ProxyError::Bridge)?;
+                            aisix_gateway::BridgeError::UpstreamDecode(error.to_string()),
+                        );
+                        if saw_chunk {
+                            observed_failure =
+                                Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode);
+                            break;
+                        }
+                        return Err(ProxyError::Bridge(error));
+                    }
+                };
+                saw_chunk = true;
                 // Parse/account every generated chunk before enforcing the
                 // security wire cap. Both side buffers are hard-bounded, so a
                 // single oversized provider chunk cannot force an equally
@@ -1415,7 +1475,8 @@ async fn responses_to_target(
                 }
                 buf.extend_from_slice(&chunk);
             }
-            let terminal_failure = responses_sse_terminal_failure(&buf);
+            let terminal_failure =
+                observed_failure.or_else(|| responses_sse_terminal_failure(&buf));
             if let Some(failure) = terminal_failure {
                 let error = failure.bridge_error();
                 state.health.record_failure(&model.display_name);
@@ -1433,6 +1494,11 @@ async fn responses_to_target(
                 terminal_failure,
                 Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode)
             );
+            // The held prefix has not passed a complete output moderation
+            // cycle when any terminal failure occurs. Preserve its usage for
+            // billing, but never release partially generated bytes alongside
+            // the gateway's terminal error.
+            let suppress_wire = terminal_failure.is_some();
             if malformed {
                 tracing::warn!(
                     model = %model.display_name,
@@ -1448,7 +1514,7 @@ async fn responses_to_target(
             let mut output_redactions = crate::redact::RedactionCounts::new();
             let mut response_capture_safe = false;
             let mut verdict = aisix_guardrails::GuardrailVerdict::Allow;
-            if !malformed {
+            if !suppress_wire {
                 let (non_segment, hits) =
                     aisix_guardrails::Guardrail::check_output_non_segment_observed(chain, &synth)
                         .await;
@@ -1528,14 +1594,12 @@ async fn responses_to_target(
             // read from the POST-redaction buffer so masked PII stays masked
             // in the exported content.
             let captured_content = match (&captured_prompt, content_cap) {
-                (Some(prompt), Some(cap)) if response_capture_safe => Some(CapturedContent::new(
-                    prompt,
-                    &responses_sse_output_text(&buf),
-                    cap as usize,
-                )),
+                (Some(prompt), Some(cap)) if input_capture_safe && response_capture_safe => Some(
+                    CapturedContent::new(prompt, &responses_sse_output_text(&buf), cap as usize),
+                ),
                 _ => None,
             };
-            if malformed {
+            if suppress_wire {
                 buf = responses_stream_error_body();
             }
             let mut response = axum::response::Response::new(axum::body::Body::from(buf));
@@ -1724,13 +1788,20 @@ async fn responses_to_target(
                     usage.reached_end,
                     200,
                 );
+                if let Some(deferred) = &attempt_c.deferred {
+                    deferred.finish(
+                        &state_c,
+                        terminal.status,
+                        terminal.error_class.is_empty() && terminal.status < 400,
+                    );
+                }
                 let mut terminal_attempt = attempt_c;
                 terminal_attempt.error_class = terminal.error_class;
                 // Content capture (AISIX-Cloud#947): prompt captured up front,
                 // output text assembled by the stream wrapper (empty when no
                 // exporter wants content).
                 let captured_content = match (&captured_prompt_c, content_cap) {
-                    (Some(prompt), Some(cap)) if output_capture_safe => {
+                    (Some(prompt), Some(cap)) if input_capture_safe && output_capture_safe => {
                         Some(CapturedContent::new(prompt, &out_text, cap as usize))
                     }
                     _ => None,
@@ -1937,7 +2008,9 @@ async fn responses_to_target(
                     // out of the log — blocking it and then archiving it would
                     // defeat the block.
                     captured_content: match (&captured_prompt, content_cap) {
-                        (Some(p), Some(cap)) => Some(CapturedContent::new(p, "", cap as usize)),
+                        (Some(p), Some(cap)) if input_capture_safe => {
+                            Some(CapturedContent::new(p, "", cap as usize))
+                        }
                         _ => None,
                     },
                     terminal_failure: None,
@@ -1951,11 +2024,9 @@ async fn responses_to_target(
         // text, read from the POST-redaction body so masked PII stays masked
         // in the exported content.
         let captured_content = match (&captured_prompt, content_cap) {
-            (Some(prompt), Some(cap)) if output_capture_safe => Some(CapturedContent::new(
-                prompt,
-                &responses_output_text(&json_body),
-                cap as usize,
-            )),
+            (Some(prompt), Some(cap)) if input_capture_safe && output_capture_safe => Some(
+                CapturedContent::new(prompt, &responses_output_text(&json_body), cap as usize),
+            ),
             _ => None,
         };
 
@@ -2014,6 +2085,7 @@ async fn responses_cross_provider_to_target(
     // Input-side monitor hits (AISIX-Cloud#562), same lifecycle as
     // `input_redactions`.
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    input_capture_safe: bool,
 ) -> Result<ResponseDispatchSuccess, ProxyError> {
     use aisix_gateway::Bridge;
 
@@ -2249,6 +2321,18 @@ async fn responses_cross_provider_to_target(
                     comp.reached_end || comp.guardrail_blocked,
                     if comp.guardrail_blocked { 422 } else { 200 },
                 );
+                if let Some(deferred) = &attempt_c.deferred {
+                    deferred.finish(
+                        &state_c,
+                        if comp.guardrail_blocked {
+                            200
+                        } else {
+                            terminal.status
+                        },
+                        comp.guardrail_blocked
+                            || (terminal.error_class.is_empty() && terminal.status < 400),
+                    );
+                }
                 let mut terminal_attempt = attempt_c;
                 terminal_attempt.error_class = terminal.error_class;
                 let status = terminal.status;
@@ -2257,9 +2341,15 @@ async fn responses_cross_provider_to_target(
                 // `comp.response_text` (empty when no exporter wants content
                 // or when the response was blocked before release).
                 let captured_content = match (&captured_prompt_c, content_cap) {
-                    (Some(prompt), Some(cap)) if comp.response_capture_safe => Some(
-                        CapturedContent::new(prompt, &comp.response_text, cap as usize),
-                    ),
+                    (Some(prompt), Some(cap))
+                        if input_capture_safe && comp.response_capture_safe =>
+                    {
+                        Some(CapturedContent::new(
+                            prompt,
+                            &comp.response_text,
+                            cap as usize,
+                        ))
+                    }
                     _ => None,
                 };
                 // SLO e2e histogram: full stream duration (bridge path).
@@ -2464,7 +2554,9 @@ async fn responses_cross_provider_to_target(
                 // out of the log — blocking it and then archiving it would
                 // defeat the block.
                 captured_content: match (&captured_prompt, content_cap) {
-                    (Some(p), Some(cap)) => Some(CapturedContent::new(p, "", cap as usize)),
+                    (Some(p), Some(cap)) if input_capture_safe => {
+                        Some(CapturedContent::new(p, "", cap as usize))
+                    }
                     _ => None,
                 },
                 terminal_failure: None,
@@ -2484,11 +2576,9 @@ async fn responses_cross_provider_to_target(
     // (post-redaction) is the source, so the exported text matches what the
     // caller received.
     let captured_content = match (&captured_prompt, content_cap) {
-        (Some(prompt), Some(cap)) if output_capture_safe => Some(CapturedContent::new(
-            prompt,
-            &responses_output_text(&json_body),
-            cap as usize,
-        )),
+        (Some(prompt), Some(cap)) if input_capture_safe && output_capture_safe => Some(
+            CapturedContent::new(prompt, &responses_output_text(&json_body), cap as usize),
+        ),
         _ => None,
     };
     let mut response = Json(json_body).into_response();
@@ -2615,23 +2705,33 @@ fn responses_sse_usage(bytes: &[u8]) -> Option<ResponseUsage> {
 }
 
 fn responses_sse_terminal_failure(bytes: &[u8]) -> Option<crate::stream_timeout::RawStreamFailure> {
-    let (events, malformed) = crate::redact::parse_sse_json_stream(bytes);
-    if malformed {
-        return Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode);
-    }
-    for event in events {
-        match event.get("type").and_then(Value::as_str) {
+    let mut remaining = bytes;
+    let mut initial_frame = true;
+    while !remaining.is_empty() {
+        let event_end = crate::redact::first_sse_event_end(remaining).unwrap_or(remaining.len());
+        let frame = &remaining[..event_end];
+        let (event, malformed) = crate::redact::parse_sse_json_event(frame, initial_frame);
+        if malformed {
+            return Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode);
+        }
+        match event
+            .as_ref()
+            .and_then(|event| event.get("type"))
+            .and_then(Value::as_str)
+        {
             Some("response.completed" | "response.incomplete") => return None,
             Some("response.failed" | "error") => {
                 return Some(crate::stream_timeout::RawStreamFailure::UpstreamInBand {
-                    status: responses_in_band_status(&event),
+                    status: event.as_ref().and_then(responses_in_band_status),
                     wire: aisix_gateway::UpstreamWire::OpenAI,
                 });
             }
             _ => {}
         }
+        remaining = &remaining[event_end..];
+        initial_frame = false;
     }
-    None
+    Some(crate::stream_timeout::RawStreamFailure::Upstream)
 }
 
 fn responses_in_band_status(event: &Value) -> Option<u16> {
@@ -2705,6 +2805,11 @@ fn drain_responses_sse_frames(
 ) {
     while let Some(end) = crate::redact::first_sse_event_end(buf) {
         let frame: Vec<u8> = buf.drain(..end).collect();
+        // A semantic terminal event owns the protocol outcome. Bytes after
+        // it cannot turn a completed response into a transport failure.
+        if acc.as_ref().is_some_and(|usage| usage.reached_end) {
+            continue;
+        }
         let (json, malformed) = crate::redact::parse_sse_json_event(&frame, !*first_frame_seen);
         if malformed {
             *failure = Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode);
@@ -2792,6 +2897,7 @@ struct SseTextCapture {
     cap: usize,
     deltas: String,
     terminal: Option<String>,
+    truncated: bool,
 }
 
 impl SseTextCapture {
@@ -2800,6 +2906,7 @@ impl SseTextCapture {
             cap,
             deltas: String::new(),
             terminal: None,
+            truncated: false,
         }
     }
 
@@ -2808,9 +2915,10 @@ impl SseTextCapture {
         match json.get("type").and_then(|t| t.as_str()) {
             Some("response.completed" | "response.incomplete" | "response.failed") => {
                 if let Some(resp) = json.get("response") {
-                    let full = responses_output_text(resp);
+                    let (full, truncated) = responses_output_text_capped(resp, self.cap);
                     if !full.is_empty() {
                         self.terminal = Some(full);
+                        self.truncated = truncated;
                     }
                 }
             }
@@ -2821,9 +2929,8 @@ impl SseTextCapture {
                 | "response.custom_tool_call_input.delta",
             ) => {
                 if let Some(d) = json.get("delta").and_then(|d| d.as_str()) {
-                    if self.deltas.len() < self.cap {
-                        self.deltas.push_str(d);
-                    }
+                    self.truncated |=
+                        crate::token_estimate::push_capped_to(&mut self.deltas, d, self.cap);
                 }
             }
             _ => {}
@@ -3076,18 +3183,34 @@ where
             if let Ok(bytes) = &item {
                 // Side-channel parse: copy into the frame buffer (the original
                 // `bytes` is yielded unchanged below) and drain complete frames.
-                buf.extend_from_slice(bytes);
-                let state = guard.state();
-                drain_responses_sse_frames(
-                    &mut buf,
-                    &mut state.usage,
-                    state.capture.as_mut(),
-                    &mut state.failure,
-                    attempt_started,
-                    &mut first_frame_seen,
-                );
-                if state.failure.is_some() {
-                    state.capture_safe = false;
+                for part in bytes.chunks(64 * 1024) {
+                    buf.extend_from_slice(part);
+                    let state = guard.state();
+                    drain_responses_sse_frames(
+                        &mut buf,
+                        &mut state.usage,
+                        state.capture.as_mut(),
+                        &mut state.failure,
+                        attempt_started,
+                        &mut first_frame_seen,
+                    );
+                    if state.failure.is_some()
+                        || state.capture.as_ref().is_some_and(|capture| capture.truncated)
+                    {
+                        state.capture_safe = false;
+                    }
+                    if buf.len() > crate::messages::MAX_SSE_FRAME_BUF_BYTES {
+                        tracing::warn!(
+                            buffered = buf.len(),
+                            "responses stream: SSE frame buffer exceeded cap without a \
+                             terminator; dropping buffer (usage parsing skipped)"
+                        );
+                        buf.clear();
+                        let state = guard.state();
+                        state.failure =
+                            Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode);
+                        state.capture_safe = false;
+                    }
                 }
                 // Bound the frame buffer: the happy path drains complete frames
                 // above so `buf` only holds a partial trailing frame. A
@@ -3095,18 +3218,6 @@ where
                 // terminator would otherwise grow `buf` unboundedly; drop it
                 // (losing usage parsing for that pathological case) rather than
                 // OOM. Bytes still forward verbatim — only telemetry is affected.
-                if buf.len() > crate::messages::MAX_SSE_FRAME_BUF_BYTES {
-                    tracing::warn!(
-                        buffered = buf.len(),
-                        "responses stream: SSE frame buffer exceeded cap without a \
-                         terminator; dropping buffer (usage parsing skipped)"
-                    );
-                    buf.clear();
-                    let state = guard.state();
-                    state.failure =
-                        Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode);
-                    state.capture_safe = false;
-                }
             }
             // Forward the original item verbatim (Ok bytes OR a mid-stream Err).
             // The first successful forward is what the caller waited for.
@@ -3168,6 +3279,9 @@ where
             },
         };
         if let Some((f, state)) = guard.slot.take() {
+            let capture_safe = observation.capture_safe
+                && state.capture_safe
+                && !state.capture.as_ref().is_some_and(|capture| capture.truncated);
             f(
                 state.usage.unwrap_or_default(),
                 state
@@ -3175,7 +3289,7 @@ where
                     .map(SseTextCapture::into_text)
                     .unwrap_or_default(),
                 observation.monitor_hits,
-                observation.capture_safe,
+                capture_safe,
                 state.failure,
             );
         }
@@ -3197,31 +3311,43 @@ where
 /// / `arguments`, so they're naturally skipped.
 /// <https://platform.openai.com/docs/api-reference/responses/object>
 fn responses_output_text(resp: &Value) -> String {
+    responses_output_text_capped(resp, usize::MAX).0
+}
+
+fn responses_output_text_capped(resp: &Value, cap: usize) -> (String, bool) {
     let Some(items) = resp.get("output").and_then(|v| v.as_array()) else {
-        return String::new();
+        return (String::new(), false);
     };
-    let mut parts: Vec<&str> = Vec::new();
+    let mut output = String::new();
+    let mut truncated = false;
     for it in items {
         if let Some(content) = it.get("content").and_then(|c| c.as_array()) {
-            parts.extend(
-                content
-                    .iter()
-                    .filter_map(|p| p.get("text").and_then(|t| t.as_str())),
-            );
+            for text in content
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .filter(|text| !text.is_empty())
+            {
+                if !output.is_empty() {
+                    truncated |= crate::token_estimate::push_capped_to(&mut output, "\n", cap);
+                }
+                truncated |= crate::token_estimate::push_capped_to(&mut output, text, cap);
+            }
         }
         // Tool-call items carry caller-visible model output under top-level
         // `name`/`arguments` (function_call) or `name`/`input` (custom tool).
         for key in ["name", "arguments", "input"] {
             if let Some(s) = it.get(key).and_then(|v| v.as_str()) {
-                parts.push(s);
+                if s.is_empty() {
+                    continue;
+                }
+                if !output.is_empty() {
+                    truncated |= crate::token_estimate::push_capped_to(&mut output, "\n", cap);
+                }
+                truncated |= crate::token_estimate::push_capped_to(&mut output, s, cap);
             }
         }
     }
-    parts
-        .into_iter()
-        .filter(|t| !t.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    (output, truncated)
 }
 
 /// Collect the assistant's streamed output text from a buffered
@@ -4182,6 +4308,8 @@ mod tests {
         let upstream = MockServer::start().await;
         let sse = "event: response.output_text.delta\n\
                    data: {\"type\":\"response.output_text.delta\",\"delta\":\"a clean answer\"}\n\n\
+                   event: response.completed\n\
+                   data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_clean\",\"status\":\"completed\",\"output\":[]}}\n\n\
                    data: [DONE]\n\n";
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
@@ -4860,20 +4988,21 @@ mod tests {
         assert_eq!(v["error"]["type"], "content_filter");
     }
 
-    /// #546 (audit HIGH): a stream that ends WITHOUT a terminal `response`
-    /// object but streamed tool-call argument deltas must still be scanned —
+    /// #546 (audit HIGH): streamed tool-call argument deltas must be scanned —
     /// args arrive via `response.function_call_arguments.delta`, not
     /// `output_text.delta`. The literal is split across two deltas to pin
     /// that they reassemble without a separator.
     #[tokio::test]
-    async fn output_guardrail_blocks_tool_call_delta_without_terminal() {
+    async fn output_guardrail_blocks_tool_call_delta() {
         let upstream = MockServer::start().await;
         let d1 = serde_json::json!({"type":"response.function_call_arguments.delta","delta":"{\"q\":\"BLOCK"});
         let d2 =
             serde_json::json!({"type":"response.function_call_arguments.delta","delta":"ME\"}"});
         let sse = format!(
             "event: response.function_call_arguments.delta\ndata: {d1}\n\n\
-             event: response.function_call_arguments.delta\ndata: {d2}\n\ndata: [DONE]\n\n"
+             event: response.function_call_arguments.delta\ndata: {d2}\n\n\
+             event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_tool\",\"status\":\"completed\",\"output\":[]}}}}\n\n\
+             data: [DONE]\n\n"
         );
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
@@ -4909,14 +5038,16 @@ mod tests {
     }
 
     /// #546 (re-audit): MCP tool-call argument deltas stream via their own
-    /// event too; a no-terminal stream of `response.mcp_call_arguments.delta`
-    /// carrying a blocked literal must still be scanned and held back.
+    /// event too and must still be scanned and held back.
     #[tokio::test]
-    async fn output_guardrail_blocks_mcp_tool_call_delta_without_terminal() {
+    async fn output_guardrail_blocks_mcp_tool_call_delta() {
         let upstream = MockServer::start().await;
         let d = serde_json::json!({"type":"response.mcp_call_arguments.delta","delta":"{\"q\":\"BLOCKME\"}"});
-        let sse =
-            format!("event: response.mcp_call_arguments.delta\ndata: {d}\n\ndata: [DONE]\n\n");
+        let sse = format!(
+            "event: response.mcp_call_arguments.delta\ndata: {d}\n\n\
+             event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_mcp\",\"status\":\"completed\",\"output\":[]}}}}\n\n\
+             data: [DONE]\n\n"
+        );
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .respond_with(
@@ -5450,6 +5581,22 @@ data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\"}}\n\n";
             super::responses_sse_terminal_failure(completed_then_error),
             None,
             "transport bytes after response.completed cannot overturn semantic success",
+        );
+        let completed_then_malformed = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+            "data: not-json\n\n",
+        );
+        assert_eq!(
+            super::responses_sse_terminal_failure(completed_then_malformed.as_bytes()),
+            None,
+            "malformed bytes after response.completed cannot overturn semantic success",
+        );
+        assert_eq!(
+            super::responses_sse_terminal_failure(
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"
+            ),
+            Some(RawStreamFailure::Upstream),
+            "EOF without a semantic terminal event is a truncated upstream stream",
         );
 
         let failed = serde_json::json!({
@@ -6143,9 +6290,7 @@ data: [DONE]\n\n";
                 "delta": "0123456789"
             }));
         }
-        let text = cap.into_text();
-        // One push may land after the buffer crosses the cap; the point is
-        // the accumulation stops near the cap instead of growing 100x.
-        assert!(text.len() <= 20, "delta buffer must stay near the cap");
+        assert!(cap.truncated);
+        assert_eq!(cap.into_text().len(), 10, "delta buffer must obey the cap");
     }
 }

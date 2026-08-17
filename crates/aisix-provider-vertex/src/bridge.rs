@@ -760,7 +760,7 @@ impl Bridge for VertexBridge {
         if let Some(dims) = req.dimensions {
             body["parameters"] = serde_json::json!({"outputDimensionality": dims});
         }
-        apply_body_overrides(&mut body, ctx);
+        apply_body_overrides(&mut body, ctx)?;
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
@@ -896,7 +896,7 @@ impl VertexBridge {
         // / default_headers still apply.
         let mut body = serde_json::to_value(&typed)
             .map_err(|e| BridgeError::Config(format!("serialize Gemini request body: {e}")))?;
-        apply_body_overrides(&mut body, ctx);
+        apply_body_overrides(&mut body, ctx)?;
         // Resolve bearer: pre-minted token verbatim, or mint+cache
         // via the in-process token minter from SA JSON. Failure
         // surfaces as a Config error (operator-actionable).
@@ -995,7 +995,7 @@ impl VertexBridge {
         // Vertex-specific shaping below, so the `model`/`stream` strip keeps
         // the final say and an override can never reintroduce a URL-borne
         // `model` into the `:rawPredict` body.
-        apply_body_overrides(&mut body_value, ctx);
+        apply_body_overrides(&mut body_value, ctx)?;
         if let Some(obj) = body_value.as_object_mut() {
             obj.remove("model");
             obj.remove("stream");
@@ -1091,7 +1091,7 @@ impl VertexBridge {
         // Apply the per-ProviderKey override pipeline (#339) before the
         // Vertex-specific shaping below (see the non-stream path). Here
         // `stream` is intentionally KEPT in the body.
-        apply_body_overrides(&mut body_value, ctx);
+        apply_body_overrides(&mut body_value, ctx)?;
         if let Some(obj) = body_value.as_object_mut() {
             obj.remove("model");
             obj.insert(
@@ -1136,7 +1136,10 @@ impl VertexBridge {
 
             while let Some(item) = byte_stream.next().await {
                 let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
-                for event in decoder.feed(bytes.as_ref()) {
+                for event in decoder
+                    .feed_checked(bytes.as_ref())
+                    .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
+                {
                     let SseEvent::Data(data) = event else { continue };
                     let parsed: AnthropicStreamEvent =
                         serde_json::from_str(&data).map_err(|e| {
@@ -1219,7 +1222,7 @@ impl VertexBridge {
         // Apply the per-ProviderKey override pipeline (#339). The shim
         // speaks the OpenAI wire, so renames / clamps / default fields all
         // apply directly; the model id is kept in the body.
-        apply_body_overrides(&mut body, ctx);
+        apply_body_overrides(&mut body, ctx)?;
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
@@ -1279,7 +1282,7 @@ impl VertexBridge {
             .map_err(|e| BridgeError::Config(format!("serialize OpenAI shim request body: {e}")))?;
         // Apply the per-ProviderKey override pipeline (#339); `stream: true`
         // stays in the body.
-        apply_body_overrides(&mut body, ctx);
+        apply_body_overrides(&mut body, ctx)?;
 
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
@@ -1310,7 +1313,10 @@ impl VertexBridge {
 
             while let Some(item) = byte_stream.next().await {
                 let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
-                for event in decoder.feed(bytes.as_ref()) {
+                for event in decoder
+                    .feed_checked(bytes.as_ref())
+                    .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
+                {
                     match event {
                         SseEvent::Data(data) => {
                             let parsed = parse_vertex_openai_stream_payload(
@@ -1327,7 +1333,10 @@ impl VertexBridge {
             }
             // Flush a partial trailing chunk if the connection drops
             // without a final blank line.
-            if let Some(SseEvent::Data(data)) = decoder.finish() {
+            if let Some(SseEvent::Data(data)) = decoder
+                .finish_checked()
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
+            {
                 let parsed = parse_vertex_openai_stream_payload(
                     &data,
                     "vertex openai-shim stream tail parse",
@@ -1423,7 +1432,7 @@ impl VertexBridge {
             .map_err(|e| BridgeError::Config(format!("serialize OpenAI request body: {e}")))?;
         // Apply the per-ProviderKey override pipeline (#339). The model id
         // is kept in the body (Mistral / AI21 expect it in both URL + body).
-        apply_body_overrides(&mut body, ctx);
+        apply_body_overrides(&mut body, ctx)?;
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
@@ -1500,7 +1509,7 @@ impl VertexBridge {
             .map_err(|e| BridgeError::Config(format!("serialize OpenAI request body: {e}")))?;
         // Apply the per-ProviderKey override pipeline (#339); `stream: true`
         // stays in the body (model id rides in both URL + body).
-        apply_body_overrides(&mut body, ctx);
+        apply_body_overrides(&mut body, ctx)?;
 
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
@@ -1531,7 +1540,10 @@ impl VertexBridge {
 
             while let Some(item) = byte_stream.next().await {
                 let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
-                for event in decoder.feed(bytes.as_ref()) {
+                for event in decoder
+                    .feed_checked(bytes.as_ref())
+                    .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
+                {
                     match event {
                         SseEvent::Data(data) => {
                             let parsed = parse_vertex_openai_stream_payload(
@@ -1546,7 +1558,10 @@ impl VertexBridge {
                     }
                 }
             }
-            if let Some(SseEvent::Data(data)) = decoder.finish() {
+            if let Some(SseEvent::Data(data)) = decoder
+                .finish_checked()
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
+            {
                 let parsed = parse_vertex_openai_stream_payload(
                     &data,
                     "vertex partner :streamRawPredict tail parse",
@@ -1620,7 +1635,7 @@ impl VertexBridge {
         // before sending (see the non-stream path for the rail caveat).
         let mut body = serde_json::to_value(&typed)
             .map_err(|e| BridgeError::Config(format!("serialize Gemini request body: {e}")))?;
-        apply_body_overrides(&mut body, ctx);
+        apply_body_overrides(&mut body, ctx)?;
         // Resolve bearer (pre-minted OR minted-from-SA) BEFORE
         // entering the stream future so token-mint errors surface
         // as a direct Err return rather than being yielded mid-stream.
@@ -1658,7 +1673,10 @@ impl VertexBridge {
 
             while let Some(item) = byte_stream.next().await {
                 let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
-                for event in decoder.feed(bytes.as_ref()) {
+                for event in decoder
+                    .feed_checked(bytes.as_ref())
+                    .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
+                {
                     if let SseEvent::Data(data) = event {
                         let parsed = parse_vertex_gemini_stream_payload(
                             &data,
@@ -1680,7 +1698,10 @@ impl VertexBridge {
             // cleanly so this rarely fires, but it covers a partial
             // last chunk if the upstream connection drops without a
             // final `\n\n`.
-            if let Some(SseEvent::Data(data)) = decoder.finish() {
+            if let Some(SseEvent::Data(data)) = decoder
+                .finish_checked()
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
+            {
                 let parsed = parse_vertex_gemini_stream_payload(
                     &data,
                     "vertex stream tail parse",
@@ -1845,8 +1866,13 @@ fn build_request_headers(
 /// shaping (e.g. the Anthropic `model`/`stream` strip), so the rail-invariant
 /// shaping always has the final say and the override block can never
 /// reintroduce a URL-borne `model` into a `:rawPredict` body.
-fn apply_body_overrides(body: &mut serde_json::Value, ctx: &BridgeContext) {
+fn apply_body_overrides(
+    body: &mut serde_json::Value,
+    ctx: &BridgeContext,
+) -> Result<(), BridgeError> {
     if let Some(r) = ctx.provider_key.request.as_ref() {
+        aisix_provider_openai::overrides::validate_content_safe_request_overrides(r)
+            .map_err(BridgeError::Config)?;
         apply_param_renames(body, &r.param_renames);
         if let Some(constraints) = &r.param_constraints {
             apply_param_constraints(body, constraints);
@@ -1861,6 +1887,7 @@ fn apply_body_overrides(body: &mut serde_json::Value, ctx: &BridgeContext) {
     {
         apply_content_list_to_string(body);
     }
+    Ok(())
 }
 
 // ─── Gemini wire shapes ────────────────────────────────────────────────

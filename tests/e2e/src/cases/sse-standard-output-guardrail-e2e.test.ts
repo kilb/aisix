@@ -57,6 +57,9 @@ const responsesSse =
   'data: {"type":"response.output_text.delta","item_id":"m","delta":"forbiddenstandard"}\r\r' +
   "event: response.output_text.delta\r" +
   'data: {"type":"response.output_text.delta","item_id":"m","delta":"token"}\r\r' +
+  "event: response.completed\r" +
+  'data: {"type":"response.completed",\r' +
+  'data: "response":{"id":"resp-standard","status":"completed","output":[]}}\r\r' +
   "data: [DONE]\r\r";
 
 describe("standards-compliant SSE output guardrails", () => {

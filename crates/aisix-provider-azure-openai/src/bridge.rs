@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use aisix_provider_openai::overrides::{
     apply_content_list_to_string, apply_default_body_fields, apply_param_constraints,
     apply_param_renames, apply_stream_done_marker_policy, extract_reasoning_field,
-    StreamDoneOutcome,
+    validate_content_safe_request_overrides, StreamDoneOutcome,
 };
 use aisix_provider_openai::wire::{
     build_request, messages_from, response_into_chat_response, stream_chunk_into_chat_chunk,
@@ -596,6 +596,7 @@ fn prepare_outbound_body<T: serde::Serialize>(
     let mut body = serde_json::to_value(typed)
         .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?;
     if let Some(r) = request {
+        validate_content_safe_request_overrides(r).map_err(BridgeError::Config)?;
         apply_param_renames(&mut body, &r.param_renames);
         if let Some(constraints) = &r.param_constraints {
             apply_param_constraints(&mut body, constraints);
@@ -860,7 +861,10 @@ where
             };
             let Some(next) = next else { break 'outer; };
             let chunk = next.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
-            for event in decoder.feed(chunk.as_ref()) {
+            for event in decoder
+                .feed_checked(chunk.as_ref())
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
+            {
                 match event {
                     SseEvent::Done => {
                         done_marker_seen = true;
@@ -873,7 +877,10 @@ where
                 }
             }
         }
-        match decoder.finish() {
+        match decoder
+            .finish_checked()
+            .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
+        {
             Some(SseEvent::Done) => {
                 done_marker_seen = true;
             }

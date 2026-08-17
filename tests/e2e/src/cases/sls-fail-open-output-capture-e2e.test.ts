@@ -36,6 +36,22 @@ const OUTPUTS = {
   messagesBridge: "raw-bridge-messages-output-must-not-be-exported-68b2",
   completions: "raw-completions-output-must-not-be-exported-75b3",
 };
+const INPUT_REQUEST_IDS = {
+  chat: "fail-open-input-chat-request-a196",
+  native: "fail-open-input-native-responses-request-b2a7",
+  bridge: "fail-open-input-bridge-responses-request-c3b8",
+  messages: "fail-open-input-messages-request-d4c9",
+  messagesBridge: "fail-open-input-bridge-messages-request-e5da",
+  completions: "fail-open-input-completions-request-f6eb",
+};
+const INPUTS = {
+  chat: "raw-chat-input-must-not-be-exported-17ac",
+  native: "raw-native-input-must-not-be-exported-28bd",
+  bridge: "raw-bridge-input-must-not-be-exported-39ce",
+  messages: "raw-messages-input-must-not-be-exported-4adf",
+  messagesBridge: "raw-bridge-messages-input-must-not-be-exported-5be0",
+  completions: "raw-completions-input-must-not-be-exported-6cf1",
+};
 
 interface FailingBedrock {
   url: string;
@@ -214,6 +230,23 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
       latency_mode: { kind: "serial" },
       enforcement_mode: "monitor",
     });
+    await seed.createGuardrail({
+      name: "bedrock-input-fail-open",
+      enabled: true,
+      hook_point: "input",
+      fail_open: true,
+      kind: "bedrock",
+      guardrail_id: "failopengr0002",
+      guardrail_version: "DRAFT",
+      region: "us-east-1",
+      aws_credentials: {
+        kind: "static",
+        access_key_id: "AKIDFAILOPEN0002",
+        secret_access_key: "secret-input-fail-open",
+      },
+      latency_mode: { kind: "serial" },
+      enforcement_mode: "enforce",
+    });
     await seed.createApiKey({
       key_hash: CALLER_HASH,
       allowed_models: [
@@ -366,6 +399,120 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
       }
       for (const output of Object.values(OUTPUTS)) {
         expect(exported).not.toContain(output);
+      }
+    },
+    90_000,
+  );
+
+  test(
+    "releases fail-open requests but omits uninspected input from full-content logs",
+    async (ctx) => {
+      if (!etcdReachable || !app || !sls || !bedrock) {
+        ctx.skip();
+        return;
+      }
+      const before = sls.requests.length;
+      const post = (path: string, requestId: string, body: unknown) =>
+        fetch(`${app!.proxyUrl}${path}`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${CALLER}`,
+            "content-type": "application/json",
+            "x-aisix-request-id": requestId,
+          },
+          body: JSON.stringify(body),
+        });
+
+      const chatResponse = await post(
+        "/v1/chat/completions",
+        INPUT_REQUEST_IDS.chat,
+        {
+          model: "fail-open-chat",
+          stream: true,
+          messages: [{ role: "user", content: INPUTS.chat }],
+        },
+      );
+      expect(chatResponse.status).toBe(200);
+      expect(await chatResponse.text()).toContain(OUTPUTS.chat);
+
+      const nativeResponse = await post(
+        "/v1/responses",
+        INPUT_REQUEST_IDS.native,
+        {
+          model: "fail-open-native-responses",
+          input: INPUTS.native,
+          stream: true,
+        },
+      );
+      expect(nativeResponse.status).toBe(200);
+      expect(await nativeResponse.text()).toContain(OUTPUTS.native);
+
+      const bridgeResponse = await post(
+        "/v1/responses",
+        INPUT_REQUEST_IDS.bridge,
+        {
+          model: "fail-open-bridge-responses",
+          input: INPUTS.bridge,
+          stream: true,
+        },
+      );
+      expect(bridgeResponse.status).toBe(200);
+      expect(await bridgeResponse.text()).toContain(OUTPUTS.bridge);
+
+      for (const [requestId, model, input, output] of [
+        [INPUT_REQUEST_IDS.messages, "fail-open-messages", INPUTS.messages, OUTPUTS.messages],
+        [
+          INPUT_REQUEST_IDS.messagesBridge,
+          "fail-open-bridge-messages",
+          INPUTS.messagesBridge,
+          OUTPUTS.messagesBridge,
+        ],
+      ] as const) {
+        const response = await fetch(`${app.proxyUrl}/v1/messages`, {
+          method: "POST",
+          headers: {
+            "x-api-key": CALLER,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+            "x-aisix-request-id": requestId,
+          },
+          body: JSON.stringify({
+            model,
+            messages: [{ role: "user", content: input }],
+            max_tokens: 16,
+            stream: true,
+          }),
+        });
+        expect(response.status).toBe(200);
+        expect(await response.text()).toContain(output);
+      }
+
+      const completionsResponse = await post(
+        "/v1/completions",
+        INPUT_REQUEST_IDS.completions,
+        {
+          model: "fail-open-completions",
+          prompt: INPUTS.completions,
+          max_tokens: 16,
+          stream: true,
+        },
+      );
+      expect(completionsResponse.status).toBe(200);
+      expect(await completionsResponse.text()).toContain(OUTPUTS.completions);
+
+      const guardrailRequests = bedrock.requestBodies.join("\n");
+      for (const input of Object.values(INPUTS)) {
+        expect(guardrailRequests).toContain(input);
+      }
+      for (const requestId of Object.values(INPUT_REQUEST_IDS)) {
+        await waitForToken(sls, LOGSTORE, requestId, 15_000, before);
+      }
+      const exported = decodedTextFor(sls, LOGSTORE, before);
+      for (const requestId of Object.values(INPUT_REQUEST_IDS)) {
+        expect(exported).toContain(requestId);
+      }
+      for (const input of Object.values(INPUTS)) {
+        expect(exported).not.toContain(input);
       }
     },
     90_000,
