@@ -411,6 +411,31 @@ fn redact_json_encoded_structured(
     }
 }
 
+fn redact_tool_arguments_value(
+    chain: &dyn Guardrail,
+    dir: Direction,
+    arguments: &mut Value,
+    counts: &mut RedactionCounts,
+    detect_keys: bool,
+) -> bool {
+    match arguments {
+        Value::String(encoded) => {
+            let mut owned = std::mem::take(encoded);
+            let unrewritable =
+                redact_json_encoded_structured(chain, dir, &mut owned, counts, detect_keys);
+            *encoded = owned;
+            unrewritable
+        }
+        Value::Object(_) | Value::Array(_) => {
+            let unrewritable =
+                detect_keys && detect_unrewritable_object_keys(chain, dir, arguments, counts);
+            redact_value_strings(chain, dir, arguments, counts);
+            unrewritable
+        }
+        _ => detect_keys,
+    }
+}
+
 // ─── Request side ────────────────────────────────────────────────────────────
 
 /// Mask the request messages of a normalised [`ChatFormat`] in place:
@@ -653,9 +678,13 @@ fn redact_tool_call_arguments(
 ) -> bool {
     let mut unrewritable_tool_key = false;
     let Some(items) = tool_calls.as_array_mut() else {
-        return false;
+        return detect_keys;
     };
     for tc in items {
+        if !tc.is_object() {
+            unrewritable_tool_key |= detect_keys;
+            continue;
+        }
         if detect_keys {
             unrewritable_tool_key |=
                 detect_named_structural_fields(chain, dir, tc, &["id", "type"], counts);
@@ -664,12 +693,16 @@ fn redact_tool_call_arguments(
                     detect_named_structural_fields(chain, dir, function, &["name"], counts);
             }
         }
-        if let Some(Value::String(s)) = tc.get_mut("function").and_then(|f| f.get_mut("arguments"))
-        {
-            let mut owned = std::mem::take(s);
+        let Some(function) = tc.get_mut("function") else {
+            continue;
+        };
+        if !function.is_object() {
+            unrewritable_tool_key |= detect_keys;
+            continue;
+        }
+        if let Some(arguments) = function.get_mut("arguments") {
             unrewritable_tool_key |=
-                redact_json_encoded_structured(chain, dir, &mut owned, counts, detect_keys);
-            *s = owned;
+                redact_tool_arguments_value(chain, dir, arguments, counts, detect_keys);
         }
     }
     unrewritable_tool_key
@@ -685,15 +718,16 @@ fn redact_legacy_function_call(
     counts: &mut RedactionCounts,
     detect_keys: bool,
 ) -> bool {
+    if !function_call.is_object() {
+        return detect_keys;
+    }
     let mut unrewritable = false;
     if detect_keys {
         unrewritable |=
             detect_named_structural_fields(chain, dir, function_call, &["name"], counts);
     }
-    if let Some(Value::String(arguments)) = function_call.get_mut("arguments") {
-        let mut owned = std::mem::take(arguments);
-        unrewritable |= redact_json_encoded_structured(chain, dir, &mut owned, counts, detect_keys);
-        *arguments = owned;
+    if let Some(arguments) = function_call.get_mut("arguments") {
+        unrewritable |= redact_tool_arguments_value(chain, dir, arguments, counts, detect_keys);
     }
     unrewritable
 }
@@ -2289,6 +2323,56 @@ fn redact_chat_chunks_impl(
         }
     }
 
+    // Compatible upstreams sometimes emit already-decoded argument objects
+    // even though OpenAI documents a JSON-encoded string. They are still
+    // forwarded on the raw wire, so recursively rewrite them before building
+    // the normal fragmented-string channels below.
+    for chunk in chunks.iter_mut() {
+        if let Some(tool_calls) = chunk.delta.tool_calls.as_mut() {
+            for tool_call in tool_calls {
+                if !tool_call.is_object() {
+                    unrewritable_tool_key |= detect_keys;
+                    continue;
+                }
+                let Some(function) = tool_call.get_mut("function") else {
+                    continue;
+                };
+                if !function.is_object() {
+                    unrewritable_tool_key |= detect_keys;
+                    continue;
+                }
+                if let Some(arguments) = function.get_mut("arguments") {
+                    if !arguments.is_string() {
+                        unrewritable_tool_key |= redact_tool_arguments_value(
+                            chain,
+                            Direction::Output,
+                            arguments,
+                            &mut counts,
+                            detect_keys,
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(function_call) = chunk.delta.function_call.as_mut() {
+            if !function_call.is_object() {
+                unrewritable_tool_key |= detect_keys;
+                continue;
+            }
+            if let Some(arguments) = function_call.get_mut("arguments") {
+                if !arguments.is_string() {
+                    unrewritable_tool_key |= redact_tool_arguments_value(
+                        chain,
+                        Direction::Output,
+                        arguments,
+                        &mut counts,
+                        detect_keys,
+                    );
+                }
+            }
+        }
+    }
+
     // Tool-call channels: fragments carry an `index` discriminator; the
     // concatenation of each channel's `function.arguments` strings is the
     // complete JSON-encoded argument document.
@@ -3691,6 +3775,56 @@ mod tests {
     }
 
     #[test]
+    fn structured_chat_masks_decoded_argument_values_and_rejects_invalid_shapes() {
+        let chain = both();
+        let sensitive_key = "owner-a@x.com";
+        let mut msg = ChatMessage::assistant("");
+        msg.extra.insert(
+            "tool_calls".into(),
+            json!([{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "arguments": {(sensitive_key): "b@y.org"}
+                }
+            }]),
+        );
+        msg.extra.insert(
+            "function_call".into(),
+            json!({"name": "legacy", "arguments": {"owner": "c@z.io"}}),
+        );
+        let mut response = ChatResponse {
+            id: "r".into(),
+            model: "m".into(),
+            message: msg,
+            finish_reason: aisix_gateway::FinishReason::Stop,
+            usage: aisix_gateway::UsageStats::new(0, 0),
+        };
+        let redaction = redact_chat_response_structured(chain.as_ref(), &mut response);
+        assert!(redaction.unrewritable_tool_key);
+        assert_eq!(
+            response.message.extra["tool_calls"][0]["function"]["arguments"][sensitive_key],
+            "[EMAIL_REDACTED]"
+        );
+        assert_eq!(
+            response.message.extra["function_call"]["arguments"]["owner"],
+            "[EMAIL_REDACTED]"
+        );
+
+        response
+            .message
+            .extra
+            .insert("tool_calls".into(), json!({}));
+        response
+            .message
+            .extra
+            .insert("function_call".into(), json!(42));
+        let malformed = redact_chat_response_structured(chain.as_ref(), &mut response);
+        assert!(malformed.unrewritable_tool_key);
+    }
+
+    #[test]
     fn structured_tool_identifiers_fail_closed_without_rewriting_contracts() {
         let chain = both();
         let secret = "sk-abcdefghijklmnopqrstuv";
@@ -4761,6 +4895,39 @@ mod tests {
         assert_eq!(
             chunks[1].delta.function_call.as_ref().unwrap()["arguments"],
             ""
+        );
+    }
+
+    #[test]
+    fn stream_chunks_mask_decoded_modern_and_legacy_arguments() {
+        let chain = both();
+        let mut chunks = vec![ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                tool_calls: Some(vec![json!({
+                    "index": 0,
+                    "function": {"name": "send", "arguments": {"to": "a@x.com"}}
+                })]),
+                function_call: Some(json!({
+                    "name": "legacy_send",
+                    "arguments": {"to": "b@y.org"}
+                })),
+                ..ChatDelta::default()
+            },
+            finish_reason: None,
+            usage: None,
+        }];
+        let redaction = redact_chat_chunks_structured(chain.as_ref(), &mut chunks);
+        assert!(!redaction.unrewritable_tool_key);
+        assert_eq!(redaction.counts.get("email"), Some(&2));
+        assert_eq!(
+            chunks[0].delta.tool_calls.as_ref().unwrap()[0]["function"]["arguments"]["to"],
+            "[EMAIL_REDACTED]"
+        );
+        assert_eq!(
+            chunks[0].delta.function_call.as_ref().unwrap()["arguments"]["to"],
+            "[EMAIL_REDACTED]"
         );
     }
 

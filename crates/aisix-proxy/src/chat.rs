@@ -4762,6 +4762,24 @@ fn bounded_json_len<T: serde::Serialize>(value: &T, limit: usize) -> Option<usiz
         .map(|()| writer.written)
 }
 
+fn visit_json_text(value: &serde_json::Value, visitor: &mut impl FnMut(&str)) {
+    match value {
+        serde_json::Value::String(text) => visitor(text),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                visit_json_text(item, visitor);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                visitor(key);
+                visit_json_text(child, visitor);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn observe_stream_usage(comp: &mut StreamCompletion, usage: &aisix_gateway::chat::UsageStats) {
     comp.prompt_tokens = comp.prompt_tokens.max(usage.prompt_tokens);
     comp.completion_tokens = comp.completion_tokens.max(usage.completion_tokens);
@@ -5109,16 +5127,20 @@ where
                                         f.get("arguments").and_then(|v| v.as_str())
                                     {
                                         push_capped(&mut comp.est_output_text, a);
+                                    } else if let Some(arguments) = f.get("arguments") {
+                                        visit_json_text(arguments, &mut |text| {
+                                            push_capped(&mut comp.est_output_text, text);
+                                        });
                                     }
                                 }
                             }
                         }
                         if let Some(function_call) = chunk.delta.function_call.as_ref() {
                             for field in ["name", "arguments"] {
-                                if let Some(text) =
-                                    function_call.get(field).and_then(serde_json::Value::as_str)
-                                {
-                                    push_capped(&mut comp.est_output_text, text);
+                                if let Some(value) = function_call.get(field) {
+                                    visit_json_text(value, &mut |text| {
+                                        push_capped(&mut comp.est_output_text, text);
+                                    });
                                 }
                             }
                         }
@@ -5277,6 +5299,26 @@ where
                                             aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
                                         );
                                     }
+                                } else if let Some(arguments) = f.get("arguments") {
+                                    visit_json_text(arguments, &mut |text| {
+                                        if matches!(
+                                            stream_policy,
+                                            aisix_guardrails::StreamOutputPolicy::Window { .. }
+                                        ) {
+                                            window_buf.push_str(text);
+                                        } else if matches!(
+                                            stream_policy,
+                                            aisix_guardrails::StreamOutputPolicy::BufferFull { .. }
+                                        ) {
+                                            buf.push_str(text);
+                                        } else {
+                                            scan_truncated |= push_to_byte_cap(
+                                                buf,
+                                                text,
+                                                aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
+                                            );
+                                        }
+                                    });
                                 }
                             }
                         }
@@ -5286,29 +5328,29 @@ where
                         tool_calls_buf.as_mut(),
                     ) {
                         for field in ["name", "arguments"] {
-                            let Some(text) = function_call
-                                .get(field)
-                                .and_then(serde_json::Value::as_str)
+                            let Some(value) = function_call.get(field)
                             else {
                                 continue;
                             };
-                            if matches!(
-                                stream_policy,
-                                aisix_guardrails::StreamOutputPolicy::Window { .. }
-                            ) {
-                                window_buf.push_str(text);
-                            } else if matches!(
-                                stream_policy,
-                                aisix_guardrails::StreamOutputPolicy::BufferFull { .. }
-                            ) {
-                                buf.push_str(text);
-                            } else {
-                                scan_truncated |= push_to_byte_cap(
-                                    buf,
-                                    text,
-                                    aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
-                                );
-                            }
+                            visit_json_text(value, &mut |text| {
+                                if matches!(
+                                    stream_policy,
+                                    aisix_guardrails::StreamOutputPolicy::Window { .. }
+                                ) {
+                                    window_buf.push_str(text);
+                                } else if matches!(
+                                    stream_policy,
+                                    aisix_guardrails::StreamOutputPolicy::BufferFull { .. }
+                                ) {
+                                    buf.push_str(text);
+                                } else {
+                                    scan_truncated |= push_to_byte_cap(
+                                        buf,
+                                        text,
+                                        aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
+                                    );
+                                }
+                            });
                         }
                     }
                     // #614: fold the ensemble panel's usage (`base_usage`) into

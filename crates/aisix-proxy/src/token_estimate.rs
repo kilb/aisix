@@ -304,11 +304,26 @@ fn count_tool_call_arguments(bpe: &CoreBPE, value: &Value) -> u32 {
             .get("function")
             .and_then(|f| f.get("arguments"))
             .or_else(|| call.get("arguments"));
-        if let Some(Value::String(s)) = args {
-            n = n.saturating_add(enc(bpe, s));
+        if let Some(args) = args {
+            n = n.saturating_add(count_json_text(bpe, args));
         }
     }
     n
+}
+
+fn count_json_text(bpe: &CoreBPE, value: &Value) -> u32 {
+    match value {
+        Value::String(text) => enc(bpe, text),
+        Value::Array(items) => items.iter().fold(0u32, |total, item| {
+            total.saturating_add(count_json_text(bpe, item))
+        }),
+        Value::Object(map) => map.iter().fold(0u32, |total, (key, child)| {
+            total
+                .saturating_add(enc(bpe, key))
+                .saturating_add(count_json_text(bpe, child))
+        }),
+        _ => 0,
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -789,6 +804,22 @@ mod tests {
             + count_text("gpt-4", "{\"city\":\"Paris\"}")
             + REPLY_PRIMING;
         assert_eq!(n, expected);
+
+        let mut decoded = msg(Role::Assistant, "");
+        decoded.content = None;
+        decoded.extra.insert(
+            "tool_calls".into(),
+            json!([{"function": {"arguments": {"city": "Paris"}}}]),
+        );
+        let decoded_n = chat_est("gpt-4", ChatFormat::new("gpt-4", vec![decoded])).count_prompt();
+        assert_eq!(
+            decoded_n,
+            TOKENS_PER_MESSAGE
+                + count_text("gpt-4", "assistant")
+                + count_text("gpt-4", "city")
+                + count_text("gpt-4", "Paris")
+                + REPLY_PRIMING
+        );
     }
 
     #[test]

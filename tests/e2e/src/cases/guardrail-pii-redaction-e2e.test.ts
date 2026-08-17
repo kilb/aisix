@@ -2170,8 +2170,15 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
                     content: null,
                     function_call: {
                       name: "lookup",
-                      arguments: JSON.stringify({ owner: EMAIL }),
+                      arguments: { owner: EMAIL },
                     },
+                    tool_calls: [
+                      {
+                        id: "call_object_args",
+                        type: "function",
+                        function: { name: "lookup", arguments: { owner: EMAIL } },
+                      },
+                    ],
                   },
                   finish_reason: "function_call",
                 },
@@ -2192,7 +2199,7 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
                     content: null,
                     function_call: {
                       name: "lookup",
-                      arguments: JSON.stringify({ owner: CN_ID }),
+                      arguments: { owner: CN_ID },
                     },
                   },
                   finish_reason: "function_call",
@@ -2204,8 +2211,8 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
           {
             streamEvents: [
               '{"id":"chat_legacy_function_stream","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}',
-              `{"id":"chat_legacy_function_stream","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"function_call":{"name":"lookup","arguments":"{\\"owner\\":\\"alice@exam"}},"finish_reason":null}]}`,
-              '{"id":"chat_legacy_function_stream","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"function_call":{"arguments":"ple.com\\"}"}},"finish_reason":null}]}',
+              `{"id":"chat_legacy_function_stream","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"function_call":{"name":"lookup","arguments":{"owner":"${EMAIL}"}},"tool_calls":[{"index":0,"id":"call_stream_object_args","type":"function","function":{"name":"lookup","arguments":"{\\"owner\\":\\"alice@exam"}}]},"finish_reason":null}]}`,
+              '{"id":"chat_legacy_function_stream","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ple.com\\"}"}}]},"finish_reason":null}]}',
               '{"id":"chat_legacy_function_stream","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"function_call"}]}',
               "[DONE]",
             ],
@@ -2340,8 +2347,15 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
             content: null,
             function_call: {
               name: "lookup",
-              arguments: JSON.stringify({ owner: EMAIL }),
+              arguments: { owner: EMAIL },
             },
+            tool_calls: [
+              {
+                id: "call_request_object_args",
+                type: "function",
+                function: { name: "lookup", arguments: { owner: EMAIL } },
+              },
+            ],
           },
         ],
         functions: [
@@ -2362,7 +2376,7 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
       let forwarded = structuredUpstream.receivedRequests.at(-1)!.body;
       expect(forwarded).toContain("chat structured marker");
       expect(forwarded).not.toContain(EMAIL);
-      expect(forwarded.match(/\[EMAIL_REDACTED\]/g)?.length).toBe(4);
+      expect(forwarded.match(/\[EMAIL_REDACTED\]/g)?.length).toBe(5);
 
       baseline = structuredUpstream.receivedRequests.length;
       const legacyOutputResponse = await post("/v1/chat/completions", {
@@ -2388,7 +2402,7 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
             content: null,
             function_call: {
               name: "lookup",
-              arguments: JSON.stringify({ owner: CN_ID }),
+              arguments: { owner: CN_ID },
             },
           },
         ],
