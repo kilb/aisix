@@ -104,8 +104,12 @@ async function seed(etcdRoot: string, upstreamBase: string, model: string) {
 
 /** Wait until `model` is visible on `proxyUrl` without spending the RPM=1
  *  budget (listModels does not consume a request slot). */
-async function waitModelLive(proxyUrl: string, model: string) {
-  const probe = new ProxyClient(proxyUrl, CALLER_PLAINTEXT);
+async function waitModelLive(
+  proxyUrl: string,
+  model: string,
+  caller = CALLER_PLAINTEXT,
+) {
+  const probe = new ProxyClient(proxyUrl, caller);
   await waitConfigPropagation(async () => {
     const res = await probe.listModels();
     if (res.status !== 200) return false;
@@ -168,6 +172,111 @@ describe("rate limit is shared across replicas with backend=redis (#798)", () =>
     // Retry-After is the load-bearing SDK back-off contract.
     expect(second.headers.get("retry-after")).toBeTruthy();
     await second.body?.cancel();
+  });
+});
+
+describe("Redis post-stream TPM is ordered in thread-per-core mode", () => {
+  let appA: SpawnedApp | undefined;
+  let appB: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let infraReady = false;
+  const prefix = `/aisix-e2e-rl-stream-${randomUUID()}`;
+  const model = "rl-stream-exact";
+  const caller = "sk-rl-stream-exact-caller";
+
+  beforeAll(async () => {
+    infraReady = (await new EtcdClient().ping()) && (await redisPing(REDIS_URL));
+    if (!infraReady) return;
+
+    upstream = await startOpenAiUpstream({
+      streamEvents: [
+        JSON.stringify({
+          id: "chatcmpl-rl-stream",
+          object: "chat.completion.chunk",
+          model: "gpt-4o-mini",
+          choices: [{ index: 0, delta: { content: "done" }, finish_reason: null }],
+        }),
+        JSON.stringify({
+          id: "chatcmpl-rl-stream",
+          object: "chat.completion.chunk",
+          model: "gpt-4o-mini",
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        }),
+        JSON.stringify({
+          id: "chatcmpl-rl-stream",
+          object: "chat.completion.chunk",
+          model: "gpt-4o-mini",
+          choices: [],
+          usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 },
+        }),
+        "[DONE]",
+      ],
+    });
+    const extra = {
+      etcd: sharedEtcd(prefix),
+      ratelimit: { backend: "redis", redis: { url: REDIS_URL } },
+    };
+    appA = await spawnApp({ extra, threadPerCore: true });
+    appB = await spawnApp({ extra, threadPerCore: true });
+
+    const seed = new SeedClient(new EtcdClient(), prefix);
+    const pk = await seed.createProviderKey({
+      display_name: `${model}-pk`,
+      secret: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: model,
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: pk.id,
+    });
+    await seed.createApiKey({
+      key_hash: createHash("sha256").update(caller).digest("hex"),
+      allowed_models: [model],
+      rate_limit: { tpm: 10 },
+    });
+    await waitModelLive(appA.proxyUrl, model, caller);
+    await waitModelLive(appB.proxyUrl, model, caller);
+  });
+
+  afterAll(async () => {
+    await appA?.exit();
+    await appB?.exit();
+    await upstream?.close();
+    if (infraReady) await new EtcdClient().deletePrefix(prefix);
+  });
+
+  const request = (proxyUrl: string) =>
+    fetch(`${proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${caller}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        stream: true,
+        messages: [{ role: "user", content: "use the exact stream budget" }],
+      }),
+    });
+
+  test("the immediate next replica request observes the terminal token commit", async (ctx) => {
+    if (!infraReady || !appA || !appB || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    const first = await request(appA.proxyUrl);
+    expect(first.status).toBe(200);
+    expect(await first.text()).toContain("[DONE]");
+    expect(upstream.receivedRequests).toHaveLength(1);
+
+    const second = await request(appB.proxyUrl);
+    expect(second.status).toBe(429);
+    expect(second.headers.get("retry-after")).toBeTruthy();
+    await second.text();
+    expect(upstream.receivedRequests).toHaveLength(1);
   });
 });
 

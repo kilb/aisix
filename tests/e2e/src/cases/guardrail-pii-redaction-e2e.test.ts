@@ -1668,17 +1668,52 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
         scriptedResponses: [
           {
             nonStreamBody: {
-              id: "resp_block_structural",
+              id: "resp_block_program_code",
               object: "response",
               status: "completed",
               model: "gpt-4o-mini",
               output: [
                 {
-                  type: "mcp_call",
-                  id: "item_safe",
+                  type: "program",
+                  id: "program_safe",
                   call_id: "call_safe",
-                  server_label: CN_ID,
-                  arguments: "{}",
+                  code: `text(${JSON.stringify(CN_ID)})`,
+                },
+              ],
+              usage: { input_tokens: 4, output_tokens: 6, total_tokens: 10 },
+            },
+          },
+          {
+            nonStreamBody: {
+              id: "resp_block_program_fingerprint",
+              object: "response",
+              status: "completed",
+              model: "gpt-4o-mini",
+              output: [
+                {
+                  type: "program",
+                  id: "program_safe",
+                  call_id: "call_safe",
+                  code: "text('clean')",
+                  fingerprint: CN_ID,
+                },
+              ],
+              usage: { input_tokens: 4, output_tokens: 6, total_tokens: 10 },
+            },
+          },
+          {
+            nonStreamBody: {
+              id: "resp_block_program_result",
+              object: "response",
+              status: "completed",
+              model: "gpt-4o-mini",
+              output: [
+                {
+                  type: "program_output",
+                  id: "program_output_safe",
+                  call_id: "call_safe",
+                  result: JSON.stringify({ owner: CN_ID }),
+                  status: "completed",
                 },
               ],
               usage: { input_tokens: 4, output_tokens: 6, total_tokens: 10 },
@@ -1694,12 +1729,12 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
                 type: "response.output_item.added",
                 output_index: 0,
                 item: {
-                  type: "custom_tool_call",
+                  type: "function_call",
                   id: "item_safe_stream",
                   call_id: "call_safe_stream",
                   name: "lookup",
-                  connector_id: CN_ID,
-                  input: "{}",
+                  arguments: "{}",
+                  caller: { type: "program", caller_id: CN_ID },
                 },
               }),
               JSON.stringify({
@@ -1753,6 +1788,13 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
         { type: "function_call", name: CN_ID },
         { type: "mcp_call", server_label: CN_ID },
         { type: "mcp_call", connector_id: CN_ID },
+        { type: "program", code: `text(${JSON.stringify(CN_ID)})` },
+        { type: "program", fingerprint: CN_ID },
+        { type: "program_output", result: JSON.stringify({ owner: CN_ID }) },
+        {
+          type: "function_call",
+          caller: { type: "program", caller_id: CN_ID },
+        },
       ];
       for (const item of blockedItems) {
         const baseline = blockUpstream.receivedRequests.length;
@@ -1767,11 +1809,12 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
         expect(blockUpstream.receivedRequests).toHaveLength(baseline);
       }
 
-      for (const stream of [false, true]) {
+      for (const [index, stream] of [false, false, false, true].entries()) {
+        const marker = `clean structural output ${index}`;
         const baseline = blockUpstream.receivedRequests.length;
         const response = await post({
           model: "pii-responses-block-fields",
-          input: `clean structural output ${stream}`,
+          input: marker,
           stream,
         });
         const responseBody = await response.text();
@@ -1779,6 +1822,7 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
         expect(responseBody).toContain("content_filter");
         expect(responseBody).not.toContain(CN_ID);
         expect(blockUpstream.receivedRequests).toHaveLength(baseline + 1);
+        expect(blockUpstream.receivedRequests.at(-1)?.body).toContain(marker);
       }
     } finally {
       await blockUpstream?.close();

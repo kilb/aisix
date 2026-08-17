@@ -18,7 +18,8 @@
 //! - **release** / **add_tokens** (after-the-fact, sync): concurrency
 //!   release on drop, and the streaming post-stream token add. These are
 //!   sync because they run from `Drop` and from the synchronous SSE
-//!   completion callback; the Redis impl makes them fire-and-forget.
+//!   completion callback. Redis release is best-effort; token accounting
+//!   waits for its store-owned I/O worker so acquire cannot overtake it.
 
 use aisix_core::RateLimit;
 use async_trait::async_trait;
@@ -125,7 +126,8 @@ pub trait RateStore: Send + Sync + 'static {
 
     /// Post-stream token accounting: add `tokens` to tpm/tpd only (no
     /// concurrency change). Sync so it can run from the synchronous SSE
-    /// completion callback; the Redis impl makes it fire-and-forget.
+    /// completion callback; distributed stores must not return before a
+    /// subsequent acquire can observe the update.
     fn add_tokens(&self, key: &str, tokens: u64);
 
     /// Read-only snapshot for the `x-ratelimit-*` headers. Returns `None`

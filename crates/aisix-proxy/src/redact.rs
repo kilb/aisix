@@ -1214,9 +1214,115 @@ fn redact_responses_text_value(
     }
 }
 
-/// One `/v1/responses` input/output item. The same `content`, `output`, and
-/// `reason` text slots used by the inspection projection are rewritten here;
-/// `function_call` additionally carries JSON-encoded `arguments`.
+const RESPONSES_ITEM_TEXT_FIELDS: &[&str] = &["content", "output", "reason"];
+const RESPONSES_ITEM_PAYLOAD_FIELDS: &[&str] = &[
+    "arguments",
+    "input",
+    "code",
+    "result",
+    "action",
+    "payload",
+    "operation",
+    "command",
+    "commands",
+];
+const RESPONSES_ITEM_STRUCTURAL_FIELDS: &[&str] = &[
+    "id",
+    "call_id",
+    "name",
+    "approval_request_id",
+    "server_label",
+    "connector_id",
+    "fingerprint",
+];
+
+/// The complete Responses item projection used by non-segment input/output
+/// checks and stream capture. Keep this field table shared with
+/// [`redact_responses_item_structured`] so a newly supported item cannot be
+/// inspected on one path but silently skipped by mask/segment handling.
+pub(crate) fn responses_item_inspection_text_capped(item: &Value, cap: usize) -> (String, bool) {
+    let mut output = String::new();
+    let mut truncated = false;
+    let mut push = |text: &str| {
+        if text.is_empty() {
+            return;
+        }
+        if !output.is_empty() {
+            truncated |= crate::token_estimate::push_capped_to(&mut output, "\n", cap);
+        }
+        truncated |= crate::token_estimate::push_capped_to(&mut output, text, cap);
+    };
+
+    for field in RESPONSES_ITEM_TEXT_FIELDS {
+        let Some(value) = item.get(*field) else {
+            continue;
+        };
+        match value {
+            Value::String(text) => push(text),
+            Value::Array(parts) => {
+                for part in parts {
+                    for text in ["text", "refusal"]
+                        .into_iter()
+                        .filter_map(|field| part.get(field).and_then(Value::as_str))
+                    {
+                        push(text);
+                    }
+                }
+            }
+            value if !value.is_null() => {
+                push(&serde_json::to_string(value).expect("serde_json::Value always serializes"));
+            }
+            _ => {}
+        }
+    }
+    for field in RESPONSES_ITEM_PAYLOAD_FIELDS
+        .iter()
+        .chain(RESPONSES_ITEM_STRUCTURAL_FIELDS)
+    {
+        let Some(value) = item.get(*field) else {
+            continue;
+        };
+        if let Some(text) = value.as_str() {
+            push(text);
+        } else if !value.is_null() {
+            push(&serde_json::to_string(value).expect("serde_json::Value always serializes"));
+        }
+    }
+    if let Some(caller_id) = item
+        .get("caller")
+        .and_then(|caller| caller.get("caller_id"))
+        .and_then(Value::as_str)
+    {
+        push(caller_id);
+    }
+    (output, truncated)
+}
+
+fn redact_responses_payload_value(
+    chain: &dyn Guardrail,
+    dir: Direction,
+    value: &mut Value,
+    counts: &mut RedactionCounts,
+    detect_keys: bool,
+    json_encoded: bool,
+) -> bool {
+    if json_encoded {
+        if let Value::String(encoded) = value {
+            let mut owned = std::mem::take(encoded);
+            let unrewritable =
+                redact_json_encoded_structured(chain, dir, &mut owned, counts, detect_keys);
+            *encoded = owned;
+            return unrewritable;
+        }
+    }
+    let unrewritable = detect_keys && detect_unrewritable_object_keys(chain, dir, value, counts);
+    redact_value_strings(chain, dir, value, counts);
+    unrewritable
+}
+
+/// One `/v1/responses` input/output item. This walks the same prose, tool
+/// payload, program payload, and structural identifier slots as the inspection
+/// projection above; JSON-encoded arguments and program results stay valid JSON.
 fn redact_responses_item_structured(
     chain: &dyn Guardrail,
     dir: Direction,
@@ -1225,9 +1331,14 @@ fn redact_responses_item_structured(
     detect_keys: bool,
 ) -> bool {
     let mut unrewritable_tool_key = false;
-    for field in ["content", "output", "reason"] {
+    for field in RESPONSES_ITEM_TEXT_FIELDS {
         if let Some(value) = item.get_mut(field) {
-            redact_responses_text_value(chain, dir, value, counts);
+            if *field == "output" && matches!(value, Value::String(_)) {
+                unrewritable_tool_key |=
+                    redact_responses_payload_value(chain, dir, value, counts, detect_keys, true);
+            } else {
+                redact_responses_text_value(chain, dir, value, counts);
+            }
         }
     }
     if detect_keys {
@@ -1235,32 +1346,25 @@ fn redact_responses_item_structured(
             chain,
             dir,
             item,
-            &[
-                "id",
-                "call_id",
-                "name",
-                "approval_request_id",
-                "server_label",
-                "connector_id",
-            ],
+            RESPONSES_ITEM_STRUCTURAL_FIELDS,
             counts,
         );
+        if let Some(caller) = item.get("caller") {
+            unrewritable_tool_key |=
+                detect_named_structural_fields(chain, dir, caller, &["caller_id"], counts);
+        }
     }
-    match item.get("type").and_then(Value::as_str) {
-        Some("function_call" | "mcp_call") => {
-            if let Some(Value::String(args)) = item.get_mut("arguments") {
-                let mut owned = std::mem::take(args);
-                unrewritable_tool_key |=
-                    redact_json_encoded_structured(chain, dir, &mut owned, counts, detect_keys);
-                *args = owned;
-            }
+    for field in RESPONSES_ITEM_PAYLOAD_FIELDS {
+        if let Some(value) = item.get_mut(*field) {
+            unrewritable_tool_key |= redact_responses_payload_value(
+                chain,
+                dir,
+                value,
+                counts,
+                detect_keys,
+                matches!(*field, "arguments" | "result"),
+            );
         }
-        Some("custom_tool_call") => {
-            if let Some(input) = item.get_mut("input") {
-                apply_to_value_string(chain, dir, input, counts);
-            }
-        }
-        _ => {}
     }
     unrewritable_tool_key
 }
@@ -4416,6 +4520,57 @@ mod tests {
         .await;
         assert!(moderation.verdict.is_block());
         assert!(!moderation.capture_safe);
+    }
+
+    #[test]
+    fn responses_program_payloads_are_masked_and_identifiers_fail_closed() {
+        let chain = both();
+        let mut payloads = json!({
+            "input": [
+                {"type":"program","code":"text('a@x.com')"},
+                {"type":"program_output","result":"{\"owner\":\"b@y.org\"}"},
+                {"type":"computer_call","action":{"description":"contact c@z.io"}}
+            ]
+        });
+        let redaction = redact_responses_request_structured(chain.as_ref(), &mut payloads);
+        assert!(!redaction.unrewritable_tool_key);
+        assert_eq!(payloads["input"][0]["code"], "text('[EMAIL_REDACTED]')");
+        assert_eq!(
+            payloads["input"][1]["result"],
+            "{\"owner\":\"[EMAIL_REDACTED]\"}"
+        );
+        assert_eq!(
+            payloads["input"][2]["action"]["description"],
+            "contact [EMAIL_REDACTED]"
+        );
+
+        let mut response = json!({
+            "output": [
+                {"type":"program","code":"text('a@x.com')"},
+                {"type":"program_output","result":"{\"owner\":\"b@y.org\"}"},
+                {"type":"computer_call","action":{"description":"contact c@z.io"}}
+            ]
+        });
+        let redaction = redact_responses_response_structured(chain.as_ref(), &mut response);
+        assert!(!redaction.unrewritable_tool_key);
+        assert!(!response.to_string().contains("@x.com"));
+        assert!(!response.to_string().contains("@y.org"));
+        assert!(!response.to_string().contains("@z.io"));
+
+        for item in [
+            json!({"type":"program","fingerprint":"a@x.com"}),
+            json!({"type":"function_call","caller":{"type":"program","caller_id":"a@x.com"}}),
+        ] {
+            let mut body = json!({"input":[item.clone()]});
+            let redaction = redact_responses_request_structured(chain.as_ref(), &mut body);
+            assert!(redaction.unrewritable_tool_key);
+            assert!(body.to_string().contains("a@x.com"));
+
+            let mut response = json!({"output":[item]});
+            let redaction = redact_responses_response_structured(chain.as_ref(), &mut response);
+            assert!(redaction.unrewritable_tool_key);
+            assert!(response.to_string().contains("a@x.com"));
+        }
     }
 
     #[tokio::test]

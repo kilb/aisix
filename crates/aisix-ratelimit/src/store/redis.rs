@@ -227,6 +227,7 @@ return {rpm, tpm, inflight, 60 - (now % 60)}
 
 pub struct RedisStore {
     conn: RedisConn,
+    post_stream_tx: tokio::sync::mpsc::UnboundedSender<PostStreamTokenAdd>,
     prefix: String,
     conc_ttl: u64,
     grace: u64,
@@ -235,6 +236,12 @@ pub struct RedisStore {
     /// One-shot guard so the degradation warning is logged once, not per
     /// request, while Redis stays down.
     degraded_logged: AtomicBool,
+}
+
+struct PostStreamTokenAdd {
+    prefix: String,
+    tokens: u64,
+    ack: std::sync::mpsc::SyncSender<Result<(), redis::RedisError>>,
 }
 
 impl std::fmt::Debug for RedisStore {
@@ -252,8 +259,10 @@ impl RedisStore {
     /// [`aisix_redis::connect`].
     pub async fn connect(cfg: &RedisConnConfig) -> Result<Self, redis::RedisError> {
         let conn = aisix_redis::connect(cfg).await?;
+        let post_stream_tx = spawn_post_stream_worker(cfg.clone(), DEFAULT_GRACE_SECS)?;
         Ok(Self {
             conn,
+            post_stream_tx,
             prefix: DEFAULT_PREFIX.into(),
             conc_ttl: DEFAULT_CONC_TTL_SECS,
             grace: DEFAULT_GRACE_SECS,
@@ -306,22 +315,79 @@ impl RedisStore {
     fn mark_ok(&self) {
         self.degraded_logged.store(false, Ordering::Relaxed);
     }
+}
 
-    async fn add_tokens_remote(&self, prefix: &str, tokens: u64) -> Result<(), redis::RedisError> {
-        let mut conn = self.conn.acquire().await?;
-        let result: Result<i64, redis::RedisError> = Script::new(ADD_TOKENS_LUA)
-            .key(prefix)
-            .arg(prefix)
-            .arg(tokens)
-            .arg(self.grace)
-            .invoke_async(&mut conn)
-            .await;
-        match result {
-            Ok(_) => Ok(()),
-            Err(err) => {
-                self.conn.note_error().await;
-                Err(err)
-            }
+fn post_stream_worker_error(detail: impl Into<String>) -> redis::RedisError {
+    redis::RedisError::from((
+        redis::ErrorKind::IoError,
+        "rate-limit post-stream worker unavailable",
+        detail.into(),
+    ))
+}
+
+fn spawn_post_stream_worker(
+    cfg: RedisConnConfig,
+    grace: u64,
+) -> Result<tokio::sync::mpsc::UnboundedSender<PostStreamTokenAdd>, redis::RedisError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| post_stream_worker_error(err.to_string()))?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PostStreamTokenAdd>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("aisix-ratelimit-commit".to_string())
+        .spawn(move || {
+            runtime.block_on(async move {
+                let conn = match aisix_redis::connect(&cfg).await {
+                    Ok(conn) => {
+                        let _ = ready_tx.send(Ok(()));
+                        conn
+                    }
+                    Err(err) => {
+                        let _ = ready_tx.send(Err(err));
+                        return;
+                    }
+                };
+                while let Some(command) = rx.recv().await {
+                    let conn = conn.clone();
+                    tokio::spawn(async move {
+                        let result =
+                            add_tokens_remote(&conn, &command.prefix, command.tokens, grace).await;
+                        let _ = command.ack.send(result);
+                    });
+                }
+            });
+        })
+        .map_err(|err| post_stream_worker_error(err.to_string()))?;
+    match ready_rx
+        .recv()
+        .unwrap_or_else(|err| Err(post_stream_worker_error(err.to_string())))
+    {
+        Ok(()) => Ok(tx),
+        Err(err) => Err(err),
+    }
+}
+
+async fn add_tokens_remote(
+    conn: &RedisConn,
+    prefix: &str,
+    tokens: u64,
+    grace: u64,
+) -> Result<(), redis::RedisError> {
+    let mut connection = conn.acquire().await?;
+    let result: Result<i64, redis::RedisError> = Script::new(ADD_TOKENS_LUA)
+        .key(prefix)
+        .arg(prefix)
+        .arg(tokens)
+        .arg(grace)
+        .invoke_async(&mut connection)
+        .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            conn.note_error().await;
+            Err(err)
         }
     }
 }
@@ -486,44 +552,26 @@ impl RateStore for RedisStore {
         // back during an outage.
         self.local.add_tokens(key, tokens);
         let prefix = self.bucket_prefix(key);
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
+        // The stream completion callbacks are synchronous, including on the
+        // production thread-per-core current-thread runtimes. Execute Redis I/O
+        // on the store-owned runtime and wait for its acknowledgement so the
+        // terminal callback cannot return before another replica's acquire can
+        // observe the token update.
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+        let send_result = self.post_stream_tx.send(PostStreamTokenAdd {
+            prefix,
+            tokens,
+            ack: ack_tx,
+        });
+        let outcome = match send_result {
+            Ok(()) => ack_rx
+                .recv()
+                .unwrap_or_else(|err| Err(post_stream_worker_error(err.to_string()))),
+            Err(err) => Err(post_stream_worker_error(err.to_string())),
         };
-
-        // Stream terminal callbacks are synchronous. On the production
-        // multi-thread runtime, `block_in_place` yields this worker while the
-        // Redis script completes, so a subsequent acquire cannot overtake the
-        // post-stream TPM/TPD update. Current-thread runtimes are used only by
-        // unit tests and cannot safely block their own I/O driver; retain the
-        // detached best-effort path there.
-        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
-            let result = tokio::task::block_in_place(|| {
-                handle.block_on(self.add_tokens_remote(&prefix, tokens))
-            });
-            match result {
-                Ok(()) => self.mark_ok(),
-                Err(err) => {
-                    self.warn_degraded("add_tokens", &err);
-                }
-            }
-        } else {
-            let conn = self.conn.clone();
-            let grace = self.grace;
-            handle.spawn(async move {
-                let Ok(mut c) = conn.acquire().await else {
-                    return;
-                };
-                let res: Result<i64, redis::RedisError> = Script::new(ADD_TOKENS_LUA)
-                    .key(&prefix)
-                    .arg(&prefix)
-                    .arg(tokens)
-                    .arg(grace)
-                    .invoke_async(&mut c)
-                    .await;
-                if res.is_err() {
-                    conn.note_error().await;
-                }
-            });
+        match outcome {
+            Ok(()) => self.mark_ok(),
+            Err(err) => self.warn_degraded("add_tokens", &err),
         }
     }
 

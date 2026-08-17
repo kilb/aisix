@@ -1054,66 +1054,7 @@ fn responses_input_to_chat(model: &str, body: &Value) -> ChatFormat {
 /// kind). Reading a key absent on other item types is a harmless no-op.
 /// <https://platform.openai.com/docs/api-reference/responses/create>
 fn responses_item_text(item: &Value) -> String {
-    responses_item_text_capped(item, usize::MAX).0
-}
-
-fn responses_item_text_capped(item: &Value, cap: usize) -> (String, bool) {
-    let mut output = String::new();
-    let mut truncated = false;
-    let mut push = |text: &str| {
-        if text.is_empty() {
-            return;
-        }
-        if !output.is_empty() {
-            truncated |= crate::token_estimate::push_capped_to(&mut output, "\n", cap);
-        }
-        truncated |= crate::token_estimate::push_capped_to(&mut output, text, cap);
-    };
-
-    for field in ["content", "output", "reason"] {
-        if let Some(value) = item.get(field) {
-            push(&responses_value_text(value));
-        }
-    }
-    for field in [
-        "arguments",
-        "input",
-        "id",
-        "call_id",
-        "name",
-        "approval_request_id",
-        "server_label",
-        "connector_id",
-    ] {
-        let Some(value) = item.get(field) else {
-            continue;
-        };
-        if let Some(text) = value.as_str() {
-            push(text);
-        } else if !value.is_null() {
-            push(&serde_json::to_string(value).expect("serde_json::Value always serializes"));
-        }
-    }
-    (output, truncated)
-}
-
-/// Plain text of one Responses-API content slot: a bare string, or the
-/// concatenated `text`/`refusal` of an array of typed parts.
-fn responses_value_text(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .flat_map(|part| {
-                ["text", "refusal"]
-                    .into_iter()
-                    .filter_map(|field| part.get(field).and_then(Value::as_str))
-            })
-            .filter(|t| !t.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    }
+    crate::redact::responses_item_inspection_text_capped(item, usize::MAX).0
 }
 
 /// Dispatch one concrete OpenAI target's Responses-API passthrough to
@@ -3064,7 +3005,8 @@ impl SseTextCapture {
             }
             Some("response.output_item.added" | "response.output_item.done") => {
                 if let Some(item) = json.get("item") {
-                    let (text, truncated) = responses_item_text_capped(item, self.cap);
+                    let (text, truncated) =
+                        crate::redact::responses_item_inspection_text_capped(item, self.cap);
                     if !text.is_empty() {
                         if !self.deltas.is_empty() {
                             self.truncated |= crate::token_estimate::push_capped_to(
@@ -3502,7 +3444,8 @@ fn responses_output_text_capped(resp: &Value, cap: usize) -> (String, bool) {
     let mut output = String::new();
     let mut truncated = false;
     for it in items {
-        let (item_text, item_truncated) = responses_item_text_capped(it, cap);
+        let (item_text, item_truncated) =
+            crate::redact::responses_item_inspection_text_capped(it, cap);
         if item_text.is_empty() {
             continue;
         }
@@ -4291,6 +4234,10 @@ mod tests {
             serde_json::json!({"type":"function_call","name":"BLOCKME"}),
             serde_json::json!({"type":"mcp_call","server_label":"BLOCKME"}),
             serde_json::json!({"type":"mcp_call","connector_id":"BLOCKME"}),
+            serde_json::json!({"type":"program","code":"text('BLOCKME')"}),
+            serde_json::json!({"type":"program","fingerprint":"BLOCKME"}),
+            serde_json::json!({"type":"program_output","result":"{\"owner\":\"BLOCKME\"}"}),
+            serde_json::json!({"type":"function_call","caller":{"type":"program","caller_id":"BLOCKME"}}),
         ];
         for item in items {
             let resp = app

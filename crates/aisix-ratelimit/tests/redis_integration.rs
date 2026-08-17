@@ -203,7 +203,7 @@ async fn token_usage_at_exact_limit_blocks_the_next_replica() {
     ));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn post_stream_token_usage_is_ordered_before_the_next_replica_acquire() {
     let Some(url) = redis_url() else {
         eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
