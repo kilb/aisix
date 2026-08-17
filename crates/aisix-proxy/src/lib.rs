@@ -1904,7 +1904,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatic_body_limit_is_finite_and_endpoint_aware() {
+    async fn omitted_body_limit_is_unlimited_across_endpoints() {
         let hub = Arc::new(Hub::new());
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
         let app = build_router(build_state_with_body_limit(snap, hub, None));
@@ -1920,49 +1920,27 @@ mod tests {
                 .unwrap()
         };
 
-        let exact_standard = run(
+        let large_standard = run(
             app.clone(),
             request(
                 "/v1/chat/completions",
-                crate::state::DEFAULT_REQUEST_BODY_LIMIT_BYTES,
+                600 * 1024 * 1024,
                 "application/json",
             ),
         )
         .await;
-        assert_ne!(exact_standard.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_ne!(large_standard.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
-        let over_standard = run(
-            app.clone(),
-            request(
-                "/v1/chat/completions",
-                crate::state::DEFAULT_REQUEST_BODY_LIMIT_BYTES + 1,
-                "application/json",
-            ),
-        )
-        .await;
-        assert_eq!(over_standard.status(), StatusCode::PAYLOAD_TOO_LARGE);
-
-        let same_size_file = run(
-            app.clone(),
-            request(
-                "/v1/files",
-                crate::state::DEFAULT_REQUEST_BODY_LIMIT_BYTES + 1,
-                "multipart/form-data; boundary=x",
-            ),
-        )
-        .await;
-        assert_ne!(same_size_file.status(), StatusCode::PAYLOAD_TOO_LARGE);
-
-        let over_file = run(
+        let large_file = run(
             app,
             request(
                 "/v1/files",
-                crate::state::DEFAULT_FILE_BODY_LIMIT_BYTES + 1,
+                600 * 1024 * 1024,
                 "multipart/form-data; boundary=x",
             ),
         )
         .await;
-        assert_eq!(over_file.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_ne!(large_file.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     /// An explicit `request_body_limit_bytes: 0` disables the cap entirely.

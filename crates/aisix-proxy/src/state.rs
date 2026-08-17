@@ -274,31 +274,12 @@ fn live_exporter_fan_out(snapshot: &SnapshotHandle<AisixSnapshot>) -> OtlpHttpFa
     fan_out
 }
 
-/// Default for JSON, passthrough, MCP, and A2A request bodies. This is
-/// deliberately expressed in binary bytes so it does not reject a provider's
-/// decimal 32 MB request at the boundary.
-pub(crate) const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
-/// The upstream transcription file limit plus room for multipart framing and
-/// the small text fields that accompany the file.
-pub(crate) const DEFAULT_AUDIO_BODY_LIMIT_BYTES: usize = 26 * 1024 * 1024;
-/// The upstream file limit plus room for multipart framing and routing fields.
-pub(crate) const DEFAULT_FILE_BODY_LIMIT_BYTES: usize = 513 * 1024 * 1024;
-
 impl ProxyState {
-    /// Resolve the body cap for one inbound path. A configured value always
-    /// wins; omitted configuration uses the protocol endpoint's upstream-
-    /// compatible finite default.
-    pub(crate) fn request_body_limit_for(&self, path: &str) -> usize {
-        match self.request_body_limit_bytes {
-            Some(limit) => limit,
-            None => match path.trim_end_matches('/') {
-                "/v1/audio/transcriptions" | "/v1/audio/translations" => {
-                    DEFAULT_AUDIO_BODY_LIMIT_BYTES
-                }
-                "/v1/files" => DEFAULT_FILE_BODY_LIMIT_BYTES,
-                _ => DEFAULT_REQUEST_BODY_LIMIT_BYTES,
-            },
-        }
+    /// Resolve the configured body cap. The path is retained at call sites so
+    /// a future explicit per-endpoint mode can be added without another
+    /// handler sweep; omission remains unlimited for backwards compatibility.
+    pub(crate) fn request_body_limit_for(&self, _path: &str) -> usize {
+        self.request_body_limit_bytes.unwrap_or(0)
     }
 
     pub fn new(snapshot: SnapshotHandle<AisixSnapshot>, hub: Arc<Hub>, cfg: &ProxyConfig) -> Self {
@@ -583,28 +564,10 @@ mod tests {
     }
 
     #[test]
-    fn automatic_body_limits_follow_the_endpoint_contract() {
-        let automatic = test_state_with_limit(None);
-        assert_eq!(
-            automatic.request_body_limit_for("/v1/messages"),
-            super::DEFAULT_REQUEST_BODY_LIMIT_BYTES
-        );
-        assert_eq!(
-            automatic.request_body_limit_for("/v1/messages/count_tokens"),
-            super::DEFAULT_REQUEST_BODY_LIMIT_BYTES
-        );
-        assert_eq!(
-            automatic.request_body_limit_for("/v1/audio/transcriptions"),
-            super::DEFAULT_AUDIO_BODY_LIMIT_BYTES
-        );
-        assert_eq!(
-            automatic.request_body_limit_for("/v1/audio/translations/"),
-            super::DEFAULT_AUDIO_BODY_LIMIT_BYTES
-        );
-        assert_eq!(
-            automatic.request_body_limit_for("/v1/files"),
-            super::DEFAULT_FILE_BODY_LIMIT_BYTES
-        );
+    fn omitted_body_limit_preserves_unlimited_compatibility() {
+        let omitted = test_state_with_limit(None);
+        assert_eq!(omitted.request_body_limit_for("/v1/messages"), 0);
+        assert_eq!(omitted.request_body_limit_for("/v1/files"), 0);
 
         let explicit = test_state_with_limit(Some(7));
         assert_eq!(explicit.request_body_limit_for("/v1/files"), 7);

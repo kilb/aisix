@@ -67,6 +67,11 @@ pub const DEFAULT_CONC_TTL_SECS: u64 = 300;
 /// Extra seconds added to each window counter's TTL so a counter doesn't
 /// expire a hair before its window mathematically closes.
 pub const DEFAULT_GRACE_SECS: u64 = 5;
+/// Post-stream accounting runs from synchronous stream-finalization callbacks.
+/// Bound Redis work so a half-open server cannot pin an executor worker.
+const POST_STREAM_REDIS_TIMEOUT: Duration = Duration::from_secs(1);
+/// Give the worker a small margin to deliver its timeout result.
+const POST_STREAM_ACK_TIMEOUT: Duration = Duration::from_millis(1_250);
 
 // Result codes returned by the acquire script's first element.
 const CODE_OK: i64 = 0;
@@ -339,21 +344,44 @@ fn spawn_post_stream_worker(
         .name("aisix-ratelimit-commit".to_string())
         .spawn(move || {
             runtime.block_on(async move {
-                let conn = match aisix_redis::connect(&cfg).await {
-                    Ok(conn) => {
+                let conn = match tokio::time::timeout(
+                    POST_STREAM_REDIS_TIMEOUT,
+                    aisix_redis::connect(&cfg),
+                )
+                .await
+                {
+                    Ok(Ok(conn)) => {
                         let _ = ready_tx.send(Ok(()));
                         conn
                     }
-                    Err(err) => {
+                    Ok(Err(err)) => {
                         let _ = ready_tx.send(Err(err));
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = ready_tx.send(Err(post_stream_worker_error(
+                            "Redis post-stream worker connection timed out",
+                        )));
                         return;
                     }
                 };
                 while let Some(command) = rx.recv().await {
                     let conn = conn.clone();
                     tokio::spawn(async move {
-                        let result =
-                            add_tokens_remote(&conn, &command.prefix, command.tokens, grace).await;
+                        let result = match tokio::time::timeout(
+                            POST_STREAM_REDIS_TIMEOUT,
+                            add_tokens_remote(&conn, &command.prefix, command.tokens, grace),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => {
+                                conn.note_error().await;
+                                Err(post_stream_worker_error(
+                                    "Redis post-stream token update timed out",
+                                ))
+                            }
+                        };
                         let _ = command.ack.send(result);
                     });
                 }
@@ -361,7 +389,7 @@ fn spawn_post_stream_worker(
         })
         .map_err(|err| post_stream_worker_error(err.to_string()))?;
     match ready_rx
-        .recv()
+        .recv_timeout(POST_STREAM_ACK_TIMEOUT)
         .unwrap_or_else(|err| Err(post_stream_worker_error(err.to_string())))
     {
         Ok(()) => Ok(tx),
@@ -399,6 +427,14 @@ fn push_dims(args: &mut Vec<String>, dims: &[Dim]) {
         args.push(d.window_secs.to_string());
         args.push(d.limit.to_string());
     }
+}
+
+fn wait_for_post_stream_ack(
+    ack_rx: std::sync::mpsc::Receiver<Result<(), redis::RedisError>>,
+) -> Result<(), redis::RedisError> {
+    ack_rx
+        .recv_timeout(POST_STREAM_ACK_TIMEOUT)
+        .unwrap_or_else(|err| Err(post_stream_worker_error(err.to_string())))
 }
 
 #[async_trait]
@@ -564,9 +600,7 @@ impl RateStore for RedisStore {
             ack: ack_tx,
         });
         let outcome = match send_result {
-            Ok(()) => ack_rx
-                .recv()
-                .unwrap_or_else(|err| Err(post_stream_worker_error(err.to_string()))),
+            Ok(()) => wait_for_post_stream_ack(ack_rx),
             Err(err) => Err(post_stream_worker_error(err.to_string())),
         };
         match outcome {
@@ -613,5 +647,31 @@ impl RateStore for RedisStore {
                 self.local.peek(key, limits).await
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_ack_wait_is_bounded() {
+        let (_ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+        let started = std::time::Instant::now();
+        let result = wait_for_post_stream_ack(ack_rx);
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "post-stream accounting must fail open within its fixed deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_stream_ack_wait_is_bounded_on_current_thread_runtime() {
+        assert_ack_wait_is_bounded();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_stream_ack_wait_is_bounded_on_multi_thread_runtime() {
+        assert_ack_wait_is_bounded();
     }
 }

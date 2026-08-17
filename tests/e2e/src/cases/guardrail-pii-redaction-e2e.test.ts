@@ -39,6 +39,9 @@ const ANTHROPIC_OUTPUT_KEY_START = "anthropic-output-key-start";
 const TOOL_IDENTIFIER = "sk-abcdefghijklmnopqrstuv";
 const ANTHROPIC_OUTPUT_IDENTIFIER_NONSTREAM = "anthropic-output-identifier-nonstream";
 const ANTHROPIC_OUTPUT_IDENTIFIER_STREAM = "anthropic-output-identifier-stream";
+const ANTHROPIC_DOCUMENT_INPUT = "anthropic-document-input";
+const ANTHROPIC_SERVER_RESULT_NONSTREAM = "anthropic-server-result-nonstream";
+const ANTHROPIC_SERVER_RESULT_STREAM = "anthropic-server-result-stream";
 
 async function waitForModels(app: SpawnedApp, apiKey: string, models: string[]) {
   await waitConfigPropagation(async () => {
@@ -403,6 +406,49 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
         };
         received.push(request);
         const requestText = JSON.stringify(request.messages ?? []);
+        if (requestText.includes(ANTHROPIC_SERVER_RESULT_STREAM)) {
+          const frames = [
+            {
+              type: "message_start",
+              message: {
+                id: "msg_server_result_stream",
+                type: "message",
+                role: "assistant",
+                model: "claude-3-5-haiku-20241022",
+                content: [],
+                stop_reason: null,
+                usage: { input_tokens: 4, output_tokens: 0 },
+              },
+            },
+            {
+              type: "content_block_start",
+              index: 0,
+              content_block: {
+                type: "bash_code_execution_tool_result",
+                tool_use_id: "toolu_server_result",
+                content: {
+                  type: "bash_code_execution_result",
+                  stdout: `stdout ${EMAIL}`,
+                  stderr: `stderr ${EMAIL}`,
+                },
+              },
+            },
+            { type: "content_block_stop", index: 0 },
+            {
+              type: "message_delta",
+              delta: { stop_reason: "end_turn" },
+              usage: { output_tokens: 6 },
+            },
+            { type: "message_stop" },
+          ];
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end(
+            frames
+              .map((frame) => `event: ${frame.type}\ndata: ${JSON.stringify(frame)}\n\n`)
+              .join(""),
+          );
+          return;
+        }
         if (requestText.includes(ANTHROPIC_OUTPUT_IDENTIFIER_STREAM)) {
           const frames = [
             {
@@ -540,7 +586,19 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
           return;
         }
 
-        const content = requestText.includes(ANTHROPIC_OUTPUT_KEY_NONSTREAM)
+        const content = requestText.includes(ANTHROPIC_SERVER_RESULT_NONSTREAM)
+          ? [
+              {
+                type: "bash_code_execution_tool_result",
+                tool_use_id: "toolu_server_result",
+                content: {
+                  type: "bash_code_execution_result",
+                  stdout: `stdout ${EMAIL}`,
+                  stderr: `stderr ${EMAIL}`,
+                },
+              },
+            ]
+          : requestText.includes(ANTHROPIC_OUTPUT_KEY_NONSTREAM)
           ? [
               {
                 type: "tool_use",
@@ -634,6 +692,70 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
     const upstreamBlob = JSON.stringify(lastReq);
     expect(upstreamBlob).toContain("[EMAIL_REDACTED]");
     expect(upstreamBlob).not.toContain(EMAIL);
+
+    const documentBaseline = received.length;
+    const documentResponse = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": anthCaller },
+      body: JSON.stringify({
+        model: "pii-anth-e2e",
+        max_tokens: 32,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: ANTHROPIC_DOCUMENT_INPUT },
+              {
+                type: "document",
+                source: { type: "text", media_type: "text/plain", data: EMAIL },
+                title: `owner ${EMAIL}`,
+                context: `contact ${EMAIL}`,
+              },
+            ],
+          },
+        ],
+      }),
+    });
+    expect(documentResponse.status).toBe(200);
+    await documentResponse.text();
+    expect(received).toHaveLength(documentBaseline + 1);
+    const documentWire = JSON.stringify(received.at(-1));
+    expect(documentWire).toContain(ANTHROPIC_DOCUMENT_INPUT);
+    expect(documentWire).not.toContain(EMAIL);
+    expect(documentWire.match(/\[EMAIL_REDACTED\]/g)?.length).toBe(3);
+
+    const serverResultBaseline = received.length;
+    const serverResult = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": anthCaller },
+      body: JSON.stringify({
+        model: "pii-anth-e2e",
+        max_tokens: 32,
+        messages: [{ role: "user", content: ANTHROPIC_SERVER_RESULT_NONSTREAM }],
+      }),
+    });
+    const serverResultBody = await serverResult.text();
+    expect(serverResult.status).toBe(200);
+    expect(serverResultBody).toContain("[EMAIL_REDACTED]");
+    expect(serverResultBody).not.toContain(EMAIL);
+    expect(received).toHaveLength(serverResultBaseline + 1);
+
+    const serverStreamBaseline = received.length;
+    const serverStream = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": anthCaller },
+      body: JSON.stringify({
+        model: "pii-anth-e2e",
+        max_tokens: 32,
+        stream: true,
+        messages: [{ role: "user", content: ANTHROPIC_SERVER_RESULT_STREAM }],
+      }),
+    });
+    const serverStreamBody = await serverStream.text();
+    expect(serverStream.status).toBe(200);
+    expect(serverStreamBody).toContain("[EMAIL_REDACTED]");
+    expect(serverStreamBody).not.toContain(EMAIL);
+    expect(received).toHaveLength(serverStreamBaseline + 1);
 
     const beforeRejectedRequest = received.length;
     const rejectedMetadata = await fetch(`${app.proxyUrl}/v1/messages`, {
@@ -2007,6 +2129,228 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
     } finally {
       await chatIdentifierUpstream?.close();
       await responsesIdentifierUpstream?.close();
+    }
+  });
+
+  test("current Chat and Responses structured fields are masked end to end", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+
+    let structuredUpstream: OpenAiUpstream | undefined;
+    try {
+      structuredUpstream = await startOpenAiUpstream({
+        scriptedResponses: [
+          {
+            nonStreamBody: {
+              id: "chat_structured_input",
+              object: "chat.completion",
+              model: "gpt-4o-mini",
+              choices: [
+                {
+                  index: 0,
+                  message: { role: "assistant", content: "clean" },
+                  finish_reason: "stop",
+                },
+              ],
+              usage: { prompt_tokens: 4, completion_tokens: 1, total_tokens: 5 },
+            },
+          },
+          {
+            nonStreamBody: {
+              id: "resp_prompt_input",
+              object: "response",
+              status: "completed",
+              model: "gpt-4o-mini",
+              output: [
+                {
+                  type: "message",
+                  role: "assistant",
+                  content: [{ type: "output_text", text: "clean" }],
+                },
+              ],
+              usage: { input_tokens: 4, output_tokens: 1, total_tokens: 5 },
+            },
+          },
+          {
+            nonStreamBody: {
+              id: "resp_official_output",
+              object: "response",
+              status: "completed",
+              model: "gpt-4o-mini",
+              output: [
+                {
+                  type: "file_search_call",
+                  id: "fs_1",
+                  status: "completed",
+                  queries: [`lookup ${EMAIL}`],
+                  results: [
+                    { file_id: "file_1", filename: "notes", text: EMAIL },
+                  ],
+                },
+                {
+                  type: "code_interpreter_call",
+                  id: "ci_1",
+                  status: "completed",
+                  code: `print(${JSON.stringify(EMAIL)})`,
+                  outputs: [{ type: "logs", logs: EMAIL }],
+                },
+                {
+                  type: "mcp_list_tools",
+                  id: "mcp_1",
+                  server_label: "server",
+                  tools: [
+                    {
+                      name: "lookup",
+                      description: `contact ${EMAIL}`,
+                      input_schema: {
+                        type: "object",
+                        properties: { owner: { default: EMAIL } },
+                      },
+                    },
+                  ],
+                  error: `failed for ${EMAIL}`,
+                },
+              ],
+              usage: { input_tokens: 4, output_tokens: 8, total_tokens: 12 },
+            },
+          },
+          {
+            streamEvents: [
+              JSON.stringify({
+                type: "response.output_item.added",
+                output_index: 0,
+                item: {
+                  type: "shell_call_output",
+                  id: "shell_output_1",
+                  call_id: "shell_1",
+                  output: [{ stdout: EMAIL, stderr: `error ${EMAIL}` }],
+                },
+              }),
+              JSON.stringify({
+                type: "response.completed",
+                response: {
+                  id: "resp_official_stream",
+                  status: "completed",
+                  output: [
+                    {
+                      type: "shell_call_output",
+                      id: "shell_output_1",
+                      call_id: "shell_1",
+                      output: [{ stdout: EMAIL, stderr: `error ${EMAIL}` }],
+                    },
+                  ],
+                  usage: { input_tokens: 4, output_tokens: 4, total_tokens: 8 },
+                },
+              }),
+              "[DONE]",
+            ],
+          },
+        ],
+      });
+
+      const pk = await seed.createProviderKey({
+        display_name: "pii-current-structured-pk",
+        secret: "sk-mock",
+        api_base: `${structuredUpstream.baseUrl}/v1`,
+      });
+      const modelNames = ["pii-current-chat", "pii-current-responses"];
+      for (const display_name of modelNames) {
+        await seed.createModel({
+          display_name,
+          provider: "openai",
+          model_name: "gpt-4o-mini",
+          provider_key_id: pk.id,
+        });
+      }
+      const caller = `${CALLER}-current-structured`;
+      await seed.createApiKey({ key_hash: hash(caller), allowed_models: modelNames });
+      await waitForModels(app, caller, modelNames);
+      const post = (path: string, body: unknown) =>
+        fetch(`${app!.proxyUrl}${path}`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${caller}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(body),
+        });
+
+      let baseline = structuredUpstream.receivedRequests.length;
+      const chatResponse = await post("/v1/chat/completions", {
+        model: "pii-current-chat",
+        messages: [{ role: "user", content: "chat structured marker" }],
+        functions: [
+          {
+            name: "lookup",
+            description: `contact ${EMAIL}`,
+            parameters: {
+              type: "object",
+              properties: { owner: { type: "string", default: EMAIL } },
+            },
+          },
+        ],
+        prediction: { type: "content", content: `cached ${EMAIL}` },
+      });
+      expect(chatResponse.status).toBe(200);
+      await chatResponse.text();
+      expect(structuredUpstream.receivedRequests).toHaveLength(baseline + 1);
+      let forwarded = structuredUpstream.receivedRequests.at(-1)!.body;
+      expect(forwarded).toContain("chat structured marker");
+      expect(forwarded).not.toContain(EMAIL);
+      expect(forwarded.match(/\[EMAIL_REDACTED\]/g)?.length).toBe(3);
+
+      baseline = structuredUpstream.receivedRequests.length;
+      const promptResponse = await post("/v1/responses", {
+        model: "pii-current-responses",
+        input: "prompt variables marker",
+        prompt: {
+          id: "pmpt_clean",
+          variables: {
+            recipient: EMAIL,
+            context: { type: "input_text", text: `mail ${EMAIL}` },
+          },
+        },
+      });
+      expect(promptResponse.status).toBe(200);
+      await promptResponse.text();
+      expect(structuredUpstream.receivedRequests).toHaveLength(baseline + 1);
+      forwarded = structuredUpstream.receivedRequests.at(-1)!.body;
+      expect(forwarded).toContain("prompt variables marker");
+      expect(forwarded).not.toContain(EMAIL);
+      expect(forwarded.match(/\[EMAIL_REDACTED\]/g)?.length).toBe(2);
+
+      baseline = structuredUpstream.receivedRequests.length;
+      const outputResponse = await post("/v1/responses", {
+        model: "pii-current-responses",
+        input: "official output marker",
+      });
+      const outputBody = await outputResponse.text();
+      expect(outputResponse.status).toBe(200);
+      expect(outputBody).toContain("[EMAIL_REDACTED]");
+      expect(outputBody).not.toContain(EMAIL);
+      expect(structuredUpstream.receivedRequests).toHaveLength(baseline + 1);
+      expect(structuredUpstream.receivedRequests.at(-1)!.body).toContain(
+        "official output marker",
+      );
+
+      baseline = structuredUpstream.receivedRequests.length;
+      const streamResponse = await post("/v1/responses", {
+        model: "pii-current-responses",
+        input: "official stream marker",
+        stream: true,
+      });
+      const streamBody = await streamResponse.text();
+      expect(streamResponse.status).toBe(200);
+      expect(streamBody).toContain("[EMAIL_REDACTED]");
+      expect(streamBody).not.toContain(EMAIL);
+      expect(structuredUpstream.receivedRequests).toHaveLength(baseline + 1);
+      expect(structuredUpstream.receivedRequests.at(-1)!.body).toContain(
+        "official stream marker",
+      );
+    } finally {
+      await structuredUpstream?.close();
     }
   });
 });

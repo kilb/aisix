@@ -210,6 +210,12 @@ pub struct Supervisor<P: ConfigProvider> {
     /// per-event because they only see one row.
     rejections: Mutex<Vec<RejectedEntry>>,
 
+    /// Every key whose latest bytes are rejected, including entries omitted
+    /// from the bounded heartbeat/reporting buffer above. This is serving
+    /// state, not reporting state: a rejected row with no last good must never
+    /// enter the served config hash merely because older diagnostics rotated.
+    rejected_keys: Mutex<HashSet<String>>,
+
     /// Rows currently served with unknown fields ignored (partially
     /// compatible, #871), keyed by etcd key so incremental watch events
     /// merge cleanly: a Put replaces (or clears) the key's entry, a
@@ -265,6 +271,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             status: WatchStatus::new(),
             config_status: ConfigStatus::new(SourceKind::Etcd),
             rejections: Mutex::new(Vec::new()),
+            rejected_keys: Mutex::new(HashSet::new()),
             partial_compat: Mutex::new(HashMap::new()),
             stale_serving: Mutex::new(HashMap::new()),
             cache_write_generation: AtomicU64::new(0),
@@ -312,7 +319,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             // observed etcd state.
             source_hash =
                 hash_entries(state.values().map(|e| (e.key.as_str(), e.value.as_slice())));
-            let rejected_keys: HashSet<&str> = rejections.iter().map(|r| r.key.as_str()).collect();
+            let rejected_keys = self.rejected_keys.lock().unwrap();
             // config_hash covers the bytes each key ACTUALLY serves: the
             // observed etcd bytes for accepted keys, the pinned last-known-
             // good bytes for stale-serving keys (#871), and nothing for a
@@ -323,9 +330,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             config_hash = hash_entries(
                 state
                     .values()
-                    .filter(|e| {
-                        !rejected_keys.contains(e.key.as_str()) && !stale.contains_key(&e.key)
-                    })
+                    .filter(|e| !rejected_keys.contains(&e.key) && !stale.contains_key(&e.key))
                     .map(|e| (e.key.as_str(), e.value.as_slice()))
                     .chain(
                         stale
@@ -423,6 +428,8 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// resync paths (load_once / apply_resync) which re-process every
     /// entry — old per-key rejections are no longer accurate.
     fn set_rejections(&self, mut new: Vec<RejectedEntry>) {
+        *self.rejected_keys.lock().unwrap() =
+            new.iter().map(|rejection| rejection.key.clone()).collect();
         if new.len() > MAX_RETAINED_REJECTIONS {
             // Keep the *newest* entries; tail of the vec is freshest.
             new.drain(..new.len() - MAX_RETAINED_REJECTIONS);
@@ -434,6 +441,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// Drops the oldest on overflow. Existing entries for the same
     /// key are replaced so heartbeat reports the latest error once.
     fn push_rejection(&self, r: RejectedEntry) {
+        self.rejected_keys.lock().unwrap().insert(r.key.clone());
         let mut guard = self.rejections.lock().unwrap();
         guard.retain(|existing| existing.key != r.key);
         if guard.len() >= MAX_RETAINED_REJECTIONS {
@@ -445,10 +453,11 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// Remove retained rejection signal for a key that was either
     /// successfully applied or deleted.
     fn remove_rejection_for_key(&self, key: &str) -> bool {
+        let removed_key = self.rejected_keys.lock().unwrap().remove(key);
         let mut guard = self.rejections.lock().unwrap();
         let before = guard.len();
         guard.retain(|existing| existing.key != key);
-        guard.len() != before
+        removed_key || guard.len() != before
     }
 
     /// Aggregated partially-compatible observations for the currently
@@ -2216,6 +2225,37 @@ mod tests {
             sup.recent_rejections().is_empty(),
             "delete must clear a rejection even when the bad row never entered the snapshot",
         );
+    }
+
+    #[tokio::test]
+    async fn rejection_report_rotation_does_not_change_served_config_hash() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+        let initial = sup.config_status().view().applied.unwrap();
+
+        for i in 0..=MAX_RETAINED_REJECTIONS {
+            assert!(!sup.apply_put(&entry(
+                &format!("/aisix/models/m-bad-{i}"),
+                BAD_PROVIDER_MODEL,
+                i as i64 + 1,
+            )));
+        }
+
+        assert_eq!(sup.recent_rejections().len(), MAX_RETAINED_REJECTIONS);
+        let after = sup.config_status().view().applied.unwrap();
+        assert_eq!(after.config_hash, initial.config_hash);
+        assert_eq!(after.apply_seq, initial.apply_seq);
+        assert_eq!(after.resource_counts.values().sum::<usize>(), 0);
+
+        assert!(sup.apply_put(&entry(
+            "/aisix/models/m-bad-0",
+            VALID_MODEL,
+            MAX_RETAINED_REJECTIONS as i64 + 2,
+        )));
+        let fixed = sup.config_status().view().applied.unwrap();
+        assert_ne!(fixed.config_hash, initial.config_hash);
+        assert_eq!(fixed.resource_counts.get("models"), Some(&1));
     }
 
     // ---- partially-compatible retention (issue #871) ----

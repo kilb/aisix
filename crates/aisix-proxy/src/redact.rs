@@ -497,9 +497,16 @@ fn redact_chat_format_impl(
     // forwarded through `ChatFormat::extra`. Structural fields (for example
     // function names and schema types) participate in DLP inspection but are
     // never rewritten because changing them would corrupt the tool contract.
-    if let Some(tools) = req.extra.get_mut("tools") {
-        unrewritable_tool_key |=
-            redact_tool_definitions(chain, Direction::Input, tools, &mut counts, detect_keys);
+    for field in ["tools", "functions"] {
+        if let Some(definitions) = req.extra.get_mut(field) {
+            unrewritable_tool_key |= redact_tool_definitions(
+                chain,
+                Direction::Input,
+                definitions,
+                &mut counts,
+                detect_keys,
+            );
+        }
     }
     if let Some(response_format) = req.extra.get_mut("response_format") {
         unrewritable_tool_key |= redact_tool_definitions(
@@ -511,15 +518,17 @@ fn redact_chat_format_impl(
         );
     }
     if detect_keys {
-        if let Some(tool_choice) = req.extra.get("tool_choice") {
-            unrewritable_tool_key |=
-                detect_unrewritable_object_keys(chain, Direction::Input, tool_choice, &mut counts);
-            unrewritable_tool_key |= detect_unrewritable_value_strings(
-                chain,
-                Direction::Input,
-                tool_choice,
-                &mut counts,
-            );
+        for field in ["tool_choice", "function_call"] {
+            if let Some(selector) = req.extra.get(field) {
+                unrewritable_tool_key |=
+                    detect_unrewritable_object_keys(chain, Direction::Input, selector, &mut counts);
+                unrewritable_tool_key |= detect_unrewritable_value_strings(
+                    chain,
+                    Direction::Input,
+                    selector,
+                    &mut counts,
+                );
+            }
         }
         for field in ["user", "safety_identifier", "prompt_cache_key"] {
             if let Some(value) = req.extra.get(field) {
@@ -533,6 +542,13 @@ fn redact_chat_format_impl(
             unrewritable_tool_key |=
                 detect_unrewritable_value_strings(chain, Direction::Input, metadata, &mut counts);
         }
+    }
+    if let Some(content) = req
+        .extra
+        .get_mut("prediction")
+        .and_then(|prediction| prediction.get_mut("content"))
+    {
+        redact_responses_text_value(chain, Direction::Input, content, &mut counts);
     }
     AnthropicRequestRedaction {
         counts,
@@ -594,8 +610,11 @@ pub fn chat_request_for_inspection(req: &ChatFormat) -> ChatFormat {
     }
     for field in [
         "tools",
+        "functions",
         "tool_choice",
+        "function_call",
         "response_format",
+        "prediction",
         "user",
         "safety_identifier",
         "prompt_cache_key",
@@ -973,6 +992,14 @@ pub async fn moderate_anthropic_request(
 /// projection closes that otherwise invisible provider-forwarded text surface.
 pub fn anthropic_request_for_inspection(body: &Value) -> Result<aisix_gateway::ChatFormat, ()> {
     let mut chat = aisix_provider_anthropic::parse_inbound_request(body).map_err(|_| ())?;
+    if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+        for content in messages.iter().filter_map(|message| message.get("content")) {
+            let text = anthropic_content_inspection_text_capped(content, usize::MAX).0;
+            if !text.is_empty() {
+                chat.messages.push(aisix_gateway::ChatMessage::user(text));
+            }
+        }
+    }
     for field in [
         "tools",
         "tool_choice",
@@ -990,60 +1017,116 @@ pub fn anthropic_request_for_inspection(body: &Value) -> Result<aisix_gateway::C
     Ok(chat)
 }
 
-/// Anthropic `content` is either a bare string or an array of typed
-/// blocks. Rewrites `text` blocks, `tool_result` nested content, and
-/// `tool_use` input objects; leaves image/document blocks alone.
+const ANTHROPIC_STRUCTURAL_FIELDS: &[&str] = &[
+    "id",
+    "name",
+    "tool_use_id",
+    "file_id",
+    "server_name",
+    "caller_id",
+];
+
+fn redact_anthropic_value(
+    chain: &dyn Guardrail,
+    dir: Direction,
+    value: &mut Value,
+    counts: &mut RedactionCounts,
+    parent_type: Option<&str>,
+) -> bool {
+    match value {
+        Value::String(_) => {
+            apply_to_value_string(chain, dir, value, counts);
+            false
+        }
+        Value::Array(items) => items.iter_mut().fold(false, |found, item| {
+            redact_anthropic_value(chain, dir, item, counts, parent_type) || found
+        }),
+        Value::Object(map) => {
+            let object_type = map
+                .get("type")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            if matches!(
+                object_type.as_deref(),
+                Some("thinking" | "redacted_thinking")
+            ) {
+                return false;
+            }
+            let mut unrewritable = false;
+            for (field, child) in map {
+                if field == "type" {
+                    continue;
+                }
+                let opaque = matches!(field.as_str(), "signature" | "encrypted_content")
+                    || (field == "data"
+                        && matches!(
+                            object_type.as_deref(),
+                            Some("base64" | "base64_pdf" | "redacted_thinking")
+                        ))
+                    || (field == "url"
+                        && matches!(
+                            object_type.as_deref(),
+                            Some("url" | "url_pdf" | "image" | "document")
+                        ));
+                if opaque {
+                    continue;
+                }
+                if let Some(redaction) = redact_str(chain, dir, field) {
+                    unrewritable |= redaction.text != *field;
+                    merge_counts(counts, redaction.counts);
+                }
+                if ANTHROPIC_STRUCTURAL_FIELDS.contains(&field.as_str())
+                    || (field == "source" && matches!(child, Value::String(_)))
+                {
+                    unrewritable |= detect_unrewritable_value_strings(chain, dir, child, counts);
+                    continue;
+                }
+                unrewritable |= redact_anthropic_value(
+                    chain,
+                    dir,
+                    child,
+                    counts,
+                    object_type.as_deref().or(parent_type),
+                );
+            }
+            unrewritable
+        }
+        _ => false,
+    }
+}
+
+/// Anthropic `content` is either a bare string or an array of typed blocks.
+/// Every official text-bearing request/result block is walked; opaque image,
+/// PDF, signature, and encrypted-thinking payloads are deliberately skipped.
 fn redact_anthropic_content(
     chain: &dyn Guardrail,
     dir: Direction,
     content: &mut Value,
     counts: &mut RedactionCounts,
 ) -> bool {
-    let mut unrewritable_tool_key = false;
-    match content {
-        Value::String(_) => apply_to_value_string(chain, dir, content, counts),
-        Value::Array(blocks) => {
-            for block in blocks {
-                match block.get("type").and_then(Value::as_str) {
-                    Some("text") => {
-                        if let Some(text) = block.get_mut("text") {
-                            apply_to_value_string(chain, dir, text, counts);
-                        }
-                    }
-                    Some("tool_result") => {
-                        unrewritable_tool_key |= detect_named_structural_fields(
-                            chain,
-                            dir,
-                            block,
-                            &["tool_use_id"],
-                            counts,
-                        );
-                        if let Some(inner) = block.get_mut("content") {
-                            unrewritable_tool_key |=
-                                redact_anthropic_content(chain, dir, inner, counts);
-                        }
-                    }
-                    Some("tool_use") => {
-                        unrewritable_tool_key |= detect_named_structural_fields(
-                            chain,
-                            dir,
-                            block,
-                            &["id", "name"],
-                            counts,
-                        );
-                        if let Some(input) = block.get_mut("input") {
-                            unrewritable_tool_key |=
-                                detect_unrewritable_object_keys(chain, dir, input, counts);
-                            redact_value_strings(chain, dir, input, counts);
-                        }
-                    }
-                    _ => {}
-                }
-            }
+    redact_anthropic_value(chain, dir, content, counts, None)
+}
+
+pub(crate) fn anthropic_content_inspection_text_capped(
+    content: &Value,
+    cap: usize,
+) -> (String, bool) {
+    let mut content = content.clone();
+    let collector = SegmentCollector::default();
+    let mut counts = RedactionCounts::new();
+    let _ = redact_anthropic_content(&collector, Direction::Input, &mut content, &mut counts);
+    let mut output = String::new();
+    let mut truncated = false;
+    for text in collector.take() {
+        if text.is_empty() {
+            continue;
         }
-        _ => {}
+        if !output.is_empty() {
+            truncated |= crate::token_estimate::push_capped_to(&mut output, "\n", cap);
+        }
+        truncated |= crate::token_estimate::push_capped_to(&mut output, &text, cap);
     }
-    unrewritable_tool_key
+    (output, truncated)
 }
 
 /// Mask an Anthropic-native `/v1/messages` RESPONSE body in place (the
@@ -1132,6 +1215,9 @@ fn redact_responses_request_impl(
         unrewritable_tool_key |=
             redact_tool_definitions(chain, Direction::Input, text, &mut counts, detect_keys);
     }
+    if let Some(prompt) = body.get_mut("prompt") {
+        unrewritable_tool_key |= redact_responses_prompt(chain, prompt, &mut counts, detect_keys);
+    }
     if detect_keys {
         if let Some(tool_choice) = body.get("tool_choice") {
             unrewritable_tool_key |=
@@ -1161,6 +1247,68 @@ fn redact_responses_request_impl(
         counts,
         unrewritable_tool_key,
     }
+}
+
+fn redact_responses_prompt(
+    chain: &dyn Guardrail,
+    prompt: &mut Value,
+    counts: &mut RedactionCounts,
+    detect_keys: bool,
+) -> bool {
+    let mut unrewritable = false;
+    if detect_keys {
+        unrewritable |= detect_named_structural_fields(
+            chain,
+            Direction::Input,
+            prompt,
+            &["id", "version"],
+            counts,
+        );
+    }
+    if let Some(variables) = prompt.get_mut("variables").and_then(Value::as_object_mut) {
+        for (name, value) in variables {
+            if detect_keys {
+                if let Some(redaction) = redact_str(chain, Direction::Input, name) {
+                    unrewritable |= redaction.text != *name;
+                    merge_counts(counts, redaction.counts);
+                }
+            }
+            match value {
+                Value::String(_) => apply_to_value_string(chain, Direction::Input, value, counts),
+                Value::Object(part)
+                    if part.get("type").and_then(Value::as_str) == Some("input_text") =>
+                {
+                    if let Some(text) = part.get_mut("text") {
+                        apply_to_value_string(chain, Direction::Input, text, counts);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    unrewritable
+}
+
+pub(crate) fn responses_prompt_inspection_text_capped(
+    prompt: &Value,
+    cap: usize,
+) -> (String, bool) {
+    let mut prompt = prompt.clone();
+    let collector = SegmentCollector::default();
+    let mut counts = RedactionCounts::new();
+    let _ = redact_responses_prompt(&collector, &mut prompt, &mut counts, true);
+    let mut output = String::new();
+    let mut truncated = false;
+    for text in collector.take() {
+        if text.is_empty() {
+            continue;
+        }
+        if !output.is_empty() {
+            truncated |= crate::token_estimate::push_capped_to(&mut output, "\n", cap);
+        }
+        truncated |= crate::token_estimate::push_capped_to(&mut output, &text, cap);
+    }
+    (output, truncated)
 }
 
 #[cfg(test)]
@@ -1214,19 +1362,7 @@ fn redact_responses_text_value(
     }
 }
 
-const RESPONSES_ITEM_TEXT_FIELDS: &[&str] = &["content", "output", "reason"];
-const RESPONSES_ITEM_PAYLOAD_FIELDS: &[&str] = &[
-    "arguments",
-    "input",
-    "code",
-    "result",
-    "action",
-    "payload",
-    "operation",
-    "command",
-    "commands",
-];
-const RESPONSES_ITEM_STRUCTURAL_FIELDS: &[&str] = &[
+const RESPONSES_STRUCTURAL_FIELDS: &[&str] = &[
     "id",
     "call_id",
     "name",
@@ -1234,66 +1370,140 @@ const RESPONSES_ITEM_STRUCTURAL_FIELDS: &[&str] = &[
     "server_label",
     "connector_id",
     "fingerprint",
+    "caller_id",
+    "file_id",
+    "container_id",
+    "created_by",
+    "namespace",
+    "path",
 ];
+
+const RESPONSES_ENUM_FIELDS: &[&str] = &["type", "status", "role", "outcome"];
+
+const RESPONSES_OPAQUE_FIELDS: &[&str] = &[
+    "encrypted_content",
+    "file_data",
+    "file_url",
+    "image_url",
+    "screenshot",
+    "signature",
+];
+
+fn responses_field_is_opaque(
+    item_type: Option<&str>,
+    field: &str,
+    parent_type: Option<&str>,
+) -> bool {
+    RESPONSES_OPAQUE_FIELDS.contains(&field)
+        || (item_type == Some("image_generation_call") && field == "result")
+        || (parent_type == Some("code_interpreter_call") && field == "url")
+}
+
+fn redact_responses_tree(
+    chain: &dyn Guardrail,
+    dir: Direction,
+    value: &mut Value,
+    counts: &mut RedactionCounts,
+    detect_keys: bool,
+    item_type: Option<&str>,
+    parent_type: Option<&str>,
+) -> bool {
+    match value {
+        Value::String(_) => {
+            apply_to_value_string(chain, dir, value, counts);
+            false
+        }
+        Value::Array(items) => items.iter_mut().fold(false, |found, item| {
+            redact_responses_tree(
+                chain,
+                dir,
+                item,
+                counts,
+                detect_keys,
+                item_type,
+                parent_type,
+            ) || found
+        }),
+        Value::Object(map) => {
+            let object_type = map
+                .get("type")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let mut unrewritable = false;
+            for (field, child) in map {
+                if responses_field_is_opaque(item_type, field, parent_type) {
+                    continue;
+                }
+                if RESPONSES_ENUM_FIELDS.contains(&field.as_str()) {
+                    continue;
+                }
+                if detect_keys {
+                    if let Some(redaction) = redact_str(chain, dir, field) {
+                        unrewritable |= redaction.text != *field;
+                        merge_counts(counts, redaction.counts);
+                    }
+                }
+                if RESPONSES_STRUCTURAL_FIELDS.contains(&field.as_str()) {
+                    if detect_keys {
+                        unrewritable |=
+                            detect_unrewritable_value_strings(chain, dir, child, counts);
+                    }
+                    continue;
+                }
+                if matches!(field.as_str(), "arguments" | "result" | "output")
+                    && matches!(child, Value::String(_))
+                {
+                    unrewritable |= redact_responses_payload_value(
+                        chain,
+                        dir,
+                        child,
+                        counts,
+                        detect_keys,
+                        true,
+                    );
+                    continue;
+                }
+                unrewritable |= redact_responses_tree(
+                    chain,
+                    dir,
+                    child,
+                    counts,
+                    detect_keys,
+                    item_type,
+                    object_type.as_deref().or(parent_type),
+                );
+            }
+            unrewritable
+        }
+        _ => false,
+    }
+}
 
 /// The complete Responses item projection used by non-segment input/output
 /// checks and stream capture. Keep this field table shared with
 /// [`redact_responses_item_structured`] so a newly supported item cannot be
 /// inspected on one path but silently skipped by mask/segment handling.
 pub(crate) fn responses_item_inspection_text_capped(item: &Value, cap: usize) -> (String, bool) {
+    let mut item = item.clone();
+    let collector = SegmentCollector::default();
+    let mut counts = RedactionCounts::new();
+    let _ = redact_responses_item_structured(
+        &collector,
+        Direction::Input,
+        &mut item,
+        &mut counts,
+        true,
+    );
     let mut output = String::new();
     let mut truncated = false;
-    let mut push = |text: &str| {
+    for text in collector.take() {
         if text.is_empty() {
-            return;
+            continue;
         }
         if !output.is_empty() {
             truncated |= crate::token_estimate::push_capped_to(&mut output, "\n", cap);
         }
-        truncated |= crate::token_estimate::push_capped_to(&mut output, text, cap);
-    };
-
-    for field in RESPONSES_ITEM_TEXT_FIELDS {
-        let Some(value) = item.get(*field) else {
-            continue;
-        };
-        match value {
-            Value::String(text) => push(text),
-            Value::Array(parts) => {
-                for part in parts {
-                    for text in ["text", "refusal"]
-                        .into_iter()
-                        .filter_map(|field| part.get(field).and_then(Value::as_str))
-                    {
-                        push(text);
-                    }
-                }
-            }
-            value if !value.is_null() => {
-                push(&serde_json::to_string(value).expect("serde_json::Value always serializes"));
-            }
-            _ => {}
-        }
-    }
-    for field in RESPONSES_ITEM_PAYLOAD_FIELDS
-        .iter()
-        .chain(RESPONSES_ITEM_STRUCTURAL_FIELDS)
-    {
-        let Some(value) = item.get(*field) else {
-            continue;
-        };
-        if let Some(text) = value.as_str() {
-            push(text);
-        } else if !value.is_null() {
-            push(&serde_json::to_string(value).expect("serde_json::Value always serializes"));
-        }
-    }
-    if let Some(caller_id) = item
-        .get("caller")
-        .and_then(|caller| caller.get("caller_id"))
-        .and_then(Value::as_str)
-    {
-        push(caller_id);
+        truncated |= crate::token_estimate::push_capped_to(&mut output, &text, cap);
     }
     (output, truncated)
 }
@@ -1330,43 +1540,19 @@ fn redact_responses_item_structured(
     counts: &mut RedactionCounts,
     detect_keys: bool,
 ) -> bool {
-    let mut unrewritable_tool_key = false;
-    for field in RESPONSES_ITEM_TEXT_FIELDS {
-        if let Some(value) = item.get_mut(field) {
-            if *field == "output" && matches!(value, Value::String(_)) {
-                unrewritable_tool_key |=
-                    redact_responses_payload_value(chain, dir, value, counts, detect_keys, true);
-            } else {
-                redact_responses_text_value(chain, dir, value, counts);
-            }
-        }
-    }
-    if detect_keys {
-        unrewritable_tool_key |= detect_named_structural_fields(
-            chain,
-            dir,
-            item,
-            RESPONSES_ITEM_STRUCTURAL_FIELDS,
-            counts,
-        );
-        if let Some(caller) = item.get("caller") {
-            unrewritable_tool_key |=
-                detect_named_structural_fields(chain, dir, caller, &["caller_id"], counts);
-        }
-    }
-    for field in RESPONSES_ITEM_PAYLOAD_FIELDS {
-        if let Some(value) = item.get_mut(*field) {
-            unrewritable_tool_key |= redact_responses_payload_value(
-                chain,
-                dir,
-                value,
-                counts,
-                detect_keys,
-                matches!(*field, "arguments" | "result"),
-            );
-        }
-    }
-    unrewritable_tool_key
+    let item_type = item
+        .get("type")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    redact_responses_tree(
+        chain,
+        dir,
+        item,
+        counts,
+        detect_keys,
+        item_type.as_deref(),
+        item_type.as_deref(),
+    )
 }
 
 /// Mask a `/v1/responses` non-streaming RESPONSE body in place: every
@@ -2511,44 +2697,33 @@ pub fn redact_anthropic_sse(chain: &dyn Guardrail, raw: &[u8]) -> AnthropicSseRe
         merge_counts(&mut counts, local);
     }
 
-    // A tool-use block may carry a complete non-empty input object in its
-    // start event instead of (or before) input_json_delta frames. Walk that
-    // object as the same structured channel: values may be rewritten, while
-    // a sensitive key must make the handler fail closed.
+    // A block start may carry complete text-bearing content (tool input,
+    // document/search text, or a server-tool result) instead of later deltas.
+    // Run the same official-block walker used by non-streaming Messages.
     for frame in &mut frames {
         let changed = {
             let Some(data) = frame.data.as_mut() else {
                 continue;
             };
-            if data.get("type").and_then(Value::as_str) != Some("content_block_start")
-                || data
-                    .get("content_block")
-                    .and_then(|block| block.get("type"))
-                    .and_then(Value::as_str)
-                    != Some("tool_use")
-            {
+            if data.get("type").and_then(Value::as_str) != Some("content_block_start") {
                 continue;
             }
-            if let Some(block) = data.get("content_block") {
-                unrewritable_tool_key |= detect_named_structural_fields(
-                    chain,
-                    Direction::Output,
-                    block,
-                    &["id", "name"],
-                    &mut counts,
-                );
-            }
-            let Some(input) = data
-                .get_mut("content_block")
-                .and_then(|block| block.get_mut("input"))
-            else {
+            let Some(block) = data.get_mut("content_block") else {
                 continue;
             };
-            let before = input.clone();
-            unrewritable_tool_key |=
-                detect_unrewritable_object_keys(chain, Direction::Output, input, &mut counts);
-            redact_value_strings(chain, Direction::Output, input, &mut counts);
-            *input != before
+            let before = block.clone();
+            let block_type = block
+                .get("type")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            unrewritable_tool_key |= redact_anthropic_value(
+                chain,
+                Direction::Output,
+                block,
+                &mut counts,
+                block_type.as_deref(),
+            );
+            *block != before
         };
         frame.dirty |= changed;
     }
@@ -3032,6 +3207,48 @@ mod tests {
     }
 
     #[test]
+    fn chat_request_masks_legacy_functions_and_prediction_content() {
+        let chain = both();
+        let mut req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "clean"}],
+            "functions": [{
+                "name": "lookup",
+                "description": "contact a@x.com",
+                "parameters": {"type": "object", "properties": {
+                    "owner": {"type": "string", "default": "b@y.org"}
+                }}
+            }],
+            "function_call": {"name": "c@z.io"},
+            "prediction": {"type": "content", "content": [
+                {"type": "text", "text": "cached d@w.dev"}
+            ]}
+        }))
+        .unwrap();
+
+        let inspection = chat_request_for_inspection(&req);
+        assert!(inspection
+            .messages
+            .iter()
+            .any(|message| message.content_str().contains("d@w.dev")));
+        let redaction = redact_chat_format_structured(chain.as_ref(), &mut req);
+        assert!(redaction.unrewritable_tool_key);
+        assert_eq!(
+            req.extra["functions"][0]["description"],
+            "contact [EMAIL_REDACTED]"
+        );
+        assert_eq!(
+            req.extra["functions"][0]["parameters"]["properties"]["owner"]["default"],
+            "[EMAIL_REDACTED]"
+        );
+        assert_eq!(
+            req.extra["prediction"]["content"][0]["text"],
+            "cached [EMAIL_REDACTED]"
+        );
+        assert_eq!(req.extra["function_call"]["name"], "c@z.io");
+    }
+
+    #[test]
     fn input_only_chain_skips_output_and_vice_versa() {
         let input_only = mask_chain(aisix_core::models::GuardrailHookPoint::Input);
         let mut resp = ChatResponse {
@@ -3451,6 +3668,61 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_walks_document_and_server_tool_result_text() {
+        let chain = both();
+        let mut request = json!({
+            "messages": [{"role": "user", "content": [{
+                "type": "document",
+                "source": {"type": "text", "media_type": "text/plain", "data": "a@x.com"},
+                "title": "owner b@y.org",
+                "context": "contact c@z.io"
+            }]}]
+        });
+        let redaction = redact_anthropic_request(chain.as_ref(), &mut request);
+        assert!(!redaction.unrewritable_tool_key);
+        assert_eq!(
+            request["messages"][0]["content"][0]["source"]["data"],
+            "[EMAIL_REDACTED]"
+        );
+        assert_eq!(
+            request["messages"][0]["content"][0]["title"],
+            "owner [EMAIL_REDACTED]"
+        );
+        assert_eq!(
+            request["messages"][0]["content"][0]["context"],
+            "contact [EMAIL_REDACTED]"
+        );
+
+        let mut response = json!({"content": [{
+            "type": "bash_code_execution_tool_result",
+            "tool_use_id": "toolu_1",
+            "content": {"type": "bash_code_execution_result", "stdout": "d@w.dev", "stderr": "e@v.net"}
+        }]});
+        let redaction = redact_anthropic_response(chain.as_ref(), &mut response);
+        assert!(!redaction.unrewritable_tool_key);
+        assert_eq!(
+            response["content"][0]["content"]["stdout"],
+            "[EMAIL_REDACTED]"
+        );
+        assert_eq!(
+            response["content"][0]["content"]["stderr"],
+            "[EMAIL_REDACTED]"
+        );
+    }
+
+    #[test]
+    fn anthropic_sse_masks_server_tool_result_block_start() {
+        let chain = both();
+        let raw = b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"bash_code_execution_tool_result\",\"tool_use_id\":\"toolu_1\",\"content\":{\"type\":\"bash_code_execution_result\",\"stdout\":\"a@x.com\",\"stderr\":\"b@y.org\"}}}\n\n";
+        let result = redact_anthropic_sse(chain.as_ref(), raw);
+        assert!(!result.unrewritable_tool_key);
+        let rendered = String::from_utf8(result.rewritten.unwrap()).unwrap();
+        assert!(!rendered.contains("a@x.com"));
+        assert!(!rendered.contains("b@y.org"));
+        assert_eq!(result.counts.get("email"), Some(&2));
+    }
+
+    #[test]
     fn anthropic_response_flags_sensitive_tool_input_keys_without_renaming_them() {
         let chain = both();
         let sensitive_key = "owner-a@x.com";
@@ -3505,6 +3777,76 @@ mod tests {
         let mut simple = json!({"model": "m", "input": "mail a@x.com"});
         redact_responses_request(chain.as_ref(), &mut simple);
         assert_eq!(simple["input"], "mail [EMAIL_REDACTED]");
+    }
+
+    #[test]
+    fn responses_request_masks_prompt_variables_without_touching_files() {
+        let chain = both();
+        let mut body = json!({
+            "model": "m",
+            "input": "clean",
+            "prompt": {
+                "id": "pmpt_a@x.com",
+                "version": "v1",
+                "variables": {
+                    "recipient": "b@y.org",
+                    "context": {"type": "input_text", "text": "mail c@z.io"},
+                    "attachment": {"type": "input_file", "file_data": "a@x.com"}
+                }
+            }
+        });
+        let inspection = responses_prompt_inspection_text_capped(&body["prompt"], usize::MAX).0;
+        assert!(inspection.contains("b@y.org"));
+        assert!(!inspection.contains("file_data"));
+        let redaction = redact_responses_request_structured(chain.as_ref(), &mut body);
+        assert!(redaction.unrewritable_tool_key);
+        assert_eq!(body["prompt"]["variables"]["recipient"], "[EMAIL_REDACTED]");
+        assert_eq!(
+            body["prompt"]["variables"]["context"]["text"],
+            "mail [EMAIL_REDACTED]"
+        );
+        assert_eq!(
+            body["prompt"]["variables"]["attachment"]["file_data"],
+            "a@x.com"
+        );
+    }
+
+    #[test]
+    fn responses_walks_official_tool_result_text_fields() {
+        let chain = both();
+        let mut response = json!({"output": [
+            {"type": "file_search_call", "id": "fs_1", "queries": ["mail a@x.com"],
+             "results": [{"file_id": "f_1", "filename": "notes", "text": "b@y.org"}]},
+            {"type": "code_interpreter_call", "id": "ci_1", "code": "print('c@z.io')",
+             "outputs": [{"type": "logs", "logs": "d@w.dev"}, {"type": "image", "url": "https://e@v.net"}]},
+            {"type": "shell_call_output", "call_id": "sh_1", "output": [
+                {"stdout": "f@u.net", "stderr": "g@t.net", "outcome": {"type": "exit", "exit_code": 0}}
+             ]},
+            {"type": "mcp_list_tools", "id": "mcp_1", "error": "h@s.net", "tools": [{
+                "name": "lookup", "description": "i@r.net",
+                "input_schema": {"type": "object", "properties": {"owner": {"default": "j@q.net"}}}
+             }]},
+            {"type": "mcp_call", "id": "mc_1", "name": "lookup", "error": {"type": "http_error", "message": "k@p.net"}}
+        ]});
+        let redaction = redact_responses_response_structured(chain.as_ref(), &mut response);
+        assert!(!redaction.unrewritable_tool_key);
+        let rendered = response.to_string();
+        for original in [
+            "a@x.com", "b@y.org", "c@z.io", "d@w.dev", "f@u.net", "g@t.net", "h@s.net", "i@r.net",
+            "j@q.net", "k@p.net",
+        ] {
+            assert!(
+                !rendered.contains(original),
+                "unmasked official field: {original}"
+            );
+        }
+        assert!(
+            rendered.contains("https://e@v.net"),
+            "opaque generated image URL must not be rewritten"
+        );
+        let inspection =
+            responses_item_inspection_text_capped(&response["output"][0], usize::MAX).0;
+        assert!(inspection.contains("[EMAIL_REDACTED]"));
     }
 
     #[test]

@@ -579,9 +579,10 @@ async fn dispatch(
                             );
                             let prefix =
                                 futures::stream::iter([Ok(bytes::Bytes::from(buffer)), Ok(chunk)]);
-                            return Ok(PreparedCompletionStream::Live(Box::pin(
-                                prefix.chain(stream),
-                            )));
+                            return Ok(PreparedCompletionStream::Live {
+                                stream: Box::pin(prefix.chain(stream)),
+                                capture_bypassed: true,
+                            });
                         }
                         tracing::warn!(
                             guardrail_hook = "output",
@@ -649,9 +650,10 @@ async fn dispatch(
                     return match stream.next().await {
                         Some(Ok(first)) => {
                             let prefix = futures::stream::once(std::future::ready(Ok(first)));
-                            Ok(PreparedCompletionStream::Live(Box::pin(
-                                prefix.chain(stream),
-                            )))
+                            Ok(PreparedCompletionStream::Live {
+                                stream: Box::pin(prefix.chain(stream)),
+                                capture_bypassed: false,
+                            })
                         }
                         Some(Err(error)) => Err(note_completion_failure(
                             &state.health,
@@ -672,7 +674,10 @@ async fn dispatch(
                     };
                 }
 
-                Ok(PreparedCompletionStream::Live(stream))
+                Ok(PreparedCompletionStream::Live {
+                    stream,
+                    capture_bypassed: false,
+                })
             })
             .await
         };
@@ -904,7 +909,10 @@ async fn dispatch(
                     usage_handled_by_stream: false,
                 });
             }
-            PreparedCompletionStream::Live(stream) => {
+            PreparedCompletionStream::Live {
+                stream,
+                capture_bypassed,
+            } => {
                 let post_stream_keys = reservation.keys();
                 let stream_hold = reservation.into_stream_hold();
                 let limiter = Arc::clone(&state.limiter);
@@ -990,7 +998,9 @@ async fn dispatch(
                         drop(stream_hold);
                         let captured_content = match (&captured_prompt_for_stream, content_cap) {
                             (Some(prompt), Some(cap))
-                                if input_capture_safe && output_observation.capture_safe =>
+                                if input_capture_safe
+                                    && !capture_bypassed
+                                    && output_observation.capture_safe =>
                             {
                                 Some(CapturedContent::new(prompt, &output_text, cap as usize))
                             }

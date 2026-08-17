@@ -34,9 +34,9 @@ etcd:
 proxy:
   addr: "0.0.0.0:3000"
   # Cap on inbound request bodies (JSON, multipart, passthrough, MCP,
-  # A2A). Omit it for endpoint-aware finite defaults. Set a positive
-  # value to override every endpoint, or 0 to disable the cap explicitly;
-  # over-limit requests get a 413 in the caller's error envelope.
+  # A2A). Omit it (or set 0) to keep bodies unlimited. Set a positive
+  # value to cap every endpoint; over-limit requests get a 413 in the
+  # caller's error envelope.
   # request_body_limit_bytes: 33554432
   # tls:
   #   cert_file: "/etc/aisix/tls/proxy.crt"

@@ -3443,33 +3443,20 @@ fn update_anthropic_usage(
                 );
             }
             if let Some(block) = json.get("content_block") {
-                if let Some(text) = block.get("text").and_then(Value::as_str) {
-                    acc.response_text_truncated |= crate::token_estimate::push_capped_to(
-                        &mut acc.response_text,
-                        text,
+                let (block_text, block_truncated) =
+                    crate::redact::anthropic_content_inspection_text_capped(
+                        &Value::Array(vec![block.clone()]),
                         response_text_cap,
                     );
-                    crate::token_estimate::push_capped(&mut acc.est_output_text, text);
-                }
-                if let Some(name) = block.get("name").and_then(Value::as_str) {
+                if !block_text.is_empty() {
                     acc.response_text_truncated |= crate::token_estimate::push_capped_to(
                         &mut acc.response_text,
-                        name,
+                        &block_text,
                         response_text_cap,
                     );
-                    crate::token_estimate::push_capped(&mut acc.est_output_text, name);
+                    crate::token_estimate::push_capped(&mut acc.est_output_text, &block_text);
                 }
-                if let Some(input) = block.get("input") {
-                    if !input.is_null() {
-                        let input = input.to_string();
-                        acc.response_text_truncated |= crate::token_estimate::push_capped_to(
-                            &mut acc.response_text,
-                            &input,
-                            response_text_cap,
-                        );
-                        crate::token_estimate::push_capped(&mut acc.est_output_text, &input);
-                    }
-                }
+                acc.response_text_truncated |= block_truncated;
             }
         }
         Some("content_block_delta") => {

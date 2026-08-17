@@ -9,7 +9,13 @@ use std::sync::Arc;
 
 pub(super) enum PreparedCompletionStream {
     Buffered(Vec<u8>),
-    Live(CompletionByteStream),
+    Live {
+        stream: CompletionByteStream,
+        /// True when hold-back overflow deliberately switched to wire
+        /// fail-open. The uninspected prefix may reach the caller but must
+        /// never enter a full-content exporter.
+        capture_bypassed: bool,
+    },
     BufferExceeded {
         accumulator: CompletionSseAccumulator,
         output_text: String,

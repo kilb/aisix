@@ -394,12 +394,11 @@ impl EtcdConfig {
 #[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     pub addr: String,
-    /// Optional cap on inbound request bodies across the whole proxy
-    /// surface (JSON, multipart, passthrough, MCP, A2A). When omitted,
-    /// the gateway applies endpoint-aware finite defaults. Set a positive
-    /// value to override every endpoint or `0` to disable the cap
-    /// explicitly. Over-limit requests get a 413 in the caller's error
-    /// envelope.
+    /// Optional cap on inbound request bodies across the whole proxy surface
+    /// (JSON, multipart, passthrough, MCP, A2A). Omission preserves the legacy
+    /// unlimited behavior. Set a positive value to cap every endpoint; `0`
+    /// also means unlimited. Over-limit requests get a 413 in the caller's
+    /// error envelope.
     #[serde(default)]
     pub request_body_limit_bytes: Option<usize>,
     #[serde(default)]
@@ -1639,7 +1638,7 @@ admin:
         );
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
         assert_eq!(cfg.etcd.endpoints, vec!["http://127.0.0.1:2379"]);
-        // An omitted limit selects the proxy's endpoint-aware safe defaults.
+        // An omitted limit preserves the legacy unlimited behavior.
         assert_eq!(cfg.proxy.request_body_limit_bytes, None);
         assert!(cfg.observability.metrics.prometheus.enabled);
         // The dedicated metrics listener defaults to 0.0.0.0:9090 in
@@ -1654,7 +1653,7 @@ admin:
     }
 
     #[test]
-    fn request_body_limit_distinguishes_automatic_from_explicit_unlimited() {
+    fn request_body_limit_accepts_explicit_unlimited() {
         let f = write_yaml(
             r#"
 etcd:

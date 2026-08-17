@@ -431,11 +431,10 @@ describe("body edges e2e: multi-turn, oversize body, empty messages", () => {
   });
 });
 
-// When `request_body_limit_bytes` is omitted, the gateway selects finite
-// endpoint-aware limits. The standard JSON limit admits realistic long
-// prompts while the Messages boundary follows the upstream 32 MB contract:
-// <https://platform.claude.com/docs/en/api/errors#request-size-limits>.
-describe("body edges e2e: automatic endpoint-aware defaults", () => {
+// Existing configurations that omit `request_body_limit_bytes` remain
+// unlimited. A finite default would be a breaking change for passthrough and
+// custom-compatible upstreams that do not share one universal body boundary.
+describe("body edges e2e: omitted limit compatibility", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let etcdReachable = false;
@@ -480,7 +479,7 @@ describe("body edges e2e: automatic endpoint-aware defaults", () => {
     }
 
     // Comfortably above both the harness's explicit 10 MiB test cap and
-    // axum's built-in 2 MiB fallback, but below the automatic JSON limit.
+    // axum's built-in 2 MiB fallback.
     const filler = "x".repeat(12 * 1024 * 1024);
     const upstreamHitsBefore = upstream.receivedRequests.length;
     const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
@@ -505,7 +504,7 @@ describe("body edges e2e: automatic endpoint-aware defaults", () => {
     expect(sentBody.messages?.[0]?.content?.length).toBe(filler.length);
   }, 60_000);
 
-  test("a Messages body above 32 MiB is rejected before dispatch", async (ctx) => {
+  test("a Messages body above 32 MiB still reaches dispatch", async (ctx) => {
     if (!etcdReachable || !app || !upstream) {
       ctx.skip();
       return;
@@ -527,14 +526,8 @@ describe("body edges e2e: automatic endpoint-aware defaults", () => {
       }),
     });
 
-    expect(res.status).toBe(413);
-    const body = (await res.json()) as {
-      type?: unknown;
-      error?: { type?: unknown; message?: unknown };
-    };
-    expect(body.type).toBe("error");
-    expect(body.error?.type).toBe("request_too_large");
-    expect(typeof body.error?.message).toBe("string");
-    expect(upstream.receivedRequests.length).toBe(upstreamHitsBefore);
+    expect(res.status).toBe(200);
+    await res.json();
+    expect(upstream.receivedRequests.length).toBe(upstreamHitsBefore + 1);
   }, 60_000);
 });

@@ -56,9 +56,13 @@ const GUARDED_CONTENT_FIELDS: &[&str] = &[
     "input",
     "instructions",
     "tools",
+    "functions",
     "tool_choice",
+    "function_call",
     "response_format",
+    "prediction",
     "text",
+    "prompt",
     "system",
     "output_config",
     "output_format",
@@ -737,17 +741,25 @@ mod tests {
 
     #[test]
     fn rejects_overrides_that_add_content_after_guardrail_inspection() {
-        let mut renames = aisix_core::RequestOverrides::default();
-        renames
-            .param_renames
-            .insert("smuggle".to_string(), "messages".to_string());
-        assert!(validate_content_safe_request_overrides(&renames).is_err());
+        for field in GUARDED_CONTENT_FIELDS {
+            let mut renames = aisix_core::RequestOverrides::default();
+            renames
+                .param_renames
+                .insert("smuggle".to_string(), (*field).to_string());
+            assert!(
+                validate_content_safe_request_overrides(&renames).is_err(),
+                "rename into `{field}` must be rejected"
+            );
 
-        let mut defaults = aisix_core::RequestOverrides::default();
-        defaults
-            .default_body_fields
-            .insert("instructions".to_string(), json!("hidden prompt"));
-        assert!(validate_content_safe_request_overrides(&defaults).is_err());
+            let mut defaults = aisix_core::RequestOverrides::default();
+            defaults
+                .default_body_fields
+                .insert((*field).to_string(), json!("hidden prompt"));
+            assert!(
+                validate_content_safe_request_overrides(&defaults).is_err(),
+                "default for `{field}` must be rejected"
+            );
+        }
 
         let mut safe = aisix_core::RequestOverrides::default();
         safe.param_renames.insert(

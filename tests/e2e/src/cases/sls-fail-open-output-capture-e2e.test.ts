@@ -57,12 +57,14 @@ const OVERFLOW_REQUEST_IDS = {
   bridgeResponses: "buffer-fail-open-bridge-responses-29e2",
   nativeMessages: "buffer-fail-open-native-messages-3af3",
   bridgeMessages: "buffer-fail-open-bridge-messages-4b04",
+  completions: "buffer-fail-open-completions-5c15",
 };
 const OVERFLOW_MARKERS = {
   nativeResponses: "native-responses-overflow-visible-18d1",
   bridgeResponses: "bridge-responses-overflow-visible-29e2",
   nativeMessages: "native-messages-overflow-visible-3af3",
   bridgeMessages: "bridge-messages-overflow-visible-4b04",
+  completions: "completions-overflow-visible-5c15",
 };
 const overflowOutput = (marker: string) => `${marker}:${"x".repeat(2_048)}`;
 
@@ -172,6 +174,7 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
   let overflowBridgeResponses: OpenAiUpstream | undefined;
   let overflowNativeMessages: OpenAiUpstream | undefined;
   let overflowBridgeMessages: OpenAiUpstream | undefined;
+  let overflowCompletions: OpenAiUpstream | undefined;
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
@@ -209,6 +212,11 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
       streamEvents: chatEvents(
         overflowOutput(OVERFLOW_MARKERS.bridgeMessages),
       ),
+    });
+    overflowCompletions = await startOpenAiUpstream({
+      rawSseChunks: [
+        completionsSse(overflowOutput(OVERFLOW_MARKERS.completions)),
+      ],
     });
     app = await spawnApp({
       extra: { bedrock_endpoint_url: bedrock.url },
@@ -255,6 +263,11 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
         "buffer-fail-open-bridge-messages",
         "deepseek",
         `${overflowBridgeMessages.baseUrl}/v1`,
+      ],
+      [
+        "buffer-fail-open-completions",
+        "openai",
+        `${overflowCompletions.baseUrl}/v1`,
       ],
     ] as const) {
       const pk = await seed.createProviderKey({
@@ -320,6 +333,7 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
       "buffer-fail-open-bridge-responses",
       "buffer-fail-open-native-messages",
       "buffer-fail-open-bridge-messages",
+      "buffer-fail-open-completions",
     ]) {
       const modelId = modelIds.get(modelName);
       if (!modelId) throw new Error(`missing model id for ${modelName}`);
@@ -348,6 +362,7 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
         "buffer-fail-open-bridge-responses",
         "buffer-fail-open-native-messages",
         "buffer-fail-open-bridge-messages",
+        "buffer-fail-open-completions",
       ],
     });
     await waitConfigPropagation(async () => {
@@ -388,6 +403,7 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
       overflowBridgeResponses?.close(),
       overflowNativeMessages?.close(),
       overflowBridgeMessages?.close(),
+      overflowCompletions?.close(),
     ]);
     await bedrock?.close();
     await sls?.close();
@@ -505,7 +521,7 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
   );
 
   test(
-    "buffer fail-open releases native and bridged Messages/Responses without capturing output",
+    "buffer fail-open releases all streaming families without capturing output",
     async (ctx) => {
       if (
         !etcdReachable ||
@@ -514,7 +530,8 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
         !overflowNativeResponses ||
         !overflowBridgeResponses ||
         !overflowNativeMessages ||
-        !overflowBridgeMessages
+        !overflowBridgeMessages ||
+        !overflowCompletions
       ) {
         ctx.skip();
         return;
@@ -525,6 +542,7 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
         bridgeResponses: overflowBridgeResponses.receivedRequests.length,
         nativeMessages: overflowNativeMessages.receivedRequests.length,
         bridgeMessages: overflowBridgeMessages.receivedRequests.length,
+        completions: overflowCompletions.receivedRequests.length,
       };
       const post = (path: string, requestId: string, body: unknown) =>
         fetch(`${app!.proxyUrl}${path}`, {
@@ -599,6 +617,21 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
       expect(bridgeMessagesWire).toContain(OVERFLOW_MARKERS.bridgeMessages);
       expect(bridgeMessagesWire).not.toContain("content_filter");
 
+      const completionsResponse = await post(
+        "/v1/completions",
+        OVERFLOW_REQUEST_IDS.completions,
+        {
+          model: "buffer-fail-open-completions",
+          prompt: "ordinary completions prompt",
+          max_tokens: 16,
+          stream: true,
+        },
+      );
+      expect(completionsResponse.status).toBe(200);
+      const completionsWire = await completionsResponse.text();
+      expect(completionsWire).toContain(OVERFLOW_MARKERS.completions);
+      expect(completionsWire).not.toContain("content_filter");
+
       expect(overflowNativeResponses.receivedRequests.length).toBe(
         baselines.nativeResponses + 1,
       );
@@ -610,6 +643,9 @@ describe("SLS full-content capture after output guardrail fail-open", () => {
       );
       expect(overflowBridgeMessages.receivedRequests.length).toBe(
         baselines.bridgeMessages + 1,
+      );
+      expect(overflowCompletions.receivedRequests.length).toBe(
+        baselines.completions + 1,
       );
 
       for (const requestId of Object.values(OVERFLOW_REQUEST_IDS)) {

@@ -1029,6 +1029,12 @@ fn responses_input_to_chat(model: &str, body: &Value) -> ChatFormat {
             }
         }
     }
+    if let Some(prompt) = body.get("prompt") {
+        let text = crate::redact::responses_prompt_inspection_text_capped(prompt, usize::MAX).0;
+        if !text.is_empty() {
+            messages.push(ChatMessage::user(text));
+        }
+    }
 
     ChatFormat::new(model, messages)
 }
