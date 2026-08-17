@@ -2086,9 +2086,13 @@ async fn responses_to_target(
         // text, read from the POST-redaction body so masked PII stays masked
         // in the exported content.
         let captured_content = match (&captured_prompt, content_cap) {
-            (Some(prompt), Some(cap)) if input_capture_safe && output_capture_safe => Some(
-                CapturedContent::new(prompt, &responses_output_text(&json_body), cap as usize),
-            ),
+            (Some(prompt), Some(cap)) if input_capture_safe && output_capture_safe => {
+                Some(CapturedContent::new(
+                    prompt,
+                    &responses_output_content_text_capped(&json_body, usize::MAX).0,
+                    cap as usize,
+                ))
+            }
             _ => None,
         };
 
@@ -2640,9 +2644,13 @@ async fn responses_cross_provider_to_target(
     // (post-redaction) is the source, so the exported text matches what the
     // caller received.
     let captured_content = match (&captured_prompt, content_cap) {
-        (Some(prompt), Some(cap)) if input_capture_safe && output_capture_safe => Some(
-            CapturedContent::new(prompt, &responses_output_text(&json_body), cap as usize),
-        ),
+        (Some(prompt), Some(cap)) if input_capture_safe && output_capture_safe => {
+            Some(CapturedContent::new(
+                prompt,
+                &responses_output_content_text_capped(&json_body, usize::MAX).0,
+                cap as usize,
+            ))
+        }
         _ => None,
     };
     let mut response = Json(json_body).into_response();
@@ -2990,7 +2998,7 @@ impl SseTextCapture {
         match json.get("type").and_then(|t| t.as_str()) {
             Some("response.completed" | "response.incomplete" | "response.failed") => {
                 if let Some(resp) = json.get("response") {
-                    let (full, truncated) = responses_output_text_capped(resp, self.cap);
+                    let (full, truncated) = responses_output_content_text_capped(resp, self.cap);
                     if !full.is_empty() {
                         self.terminal = Some(full);
                         self.truncated = truncated;
@@ -3012,7 +3020,7 @@ impl SseTextCapture {
             Some("response.output_item.added" | "response.output_item.done") => {
                 if let Some(item) = json.get("item") {
                     let (text, truncated) =
-                        crate::redact::responses_item_inspection_text_capped(item, self.cap);
+                        crate::redact::responses_item_content_text_capped(item, self.cap);
                     if !text.is_empty() {
                         if !self.deltas.is_empty() {
                             self.truncated |= crate::token_estimate::push_capped_to(
@@ -3452,6 +3460,27 @@ fn responses_output_text_capped(resp: &Value, cap: usize) -> (String, bool) {
     for it in items {
         let (item_text, item_truncated) =
             crate::redact::responses_item_inspection_text_capped(it, cap);
+        if item_text.is_empty() {
+            continue;
+        }
+        if !output.is_empty() {
+            truncated |= crate::token_estimate::push_capped_to(&mut output, "\n", cap);
+        }
+        truncated |= crate::token_estimate::push_capped_to(&mut output, &item_text, cap);
+        truncated |= item_truncated;
+    }
+    (output, truncated)
+}
+
+fn responses_output_content_text_capped(resp: &Value, cap: usize) -> (String, bool) {
+    let Some(items) = resp.get("output").and_then(|v| v.as_array()) else {
+        return (String::new(), false);
+    };
+    let mut output = String::new();
+    let mut truncated = false;
+    for item in items {
+        let (item_text, item_truncated) =
+            crate::redact::responses_item_content_text_capped(item, cap);
         if item_text.is_empty() {
             continue;
         }

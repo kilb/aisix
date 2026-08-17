@@ -1026,6 +1026,25 @@ const ANTHROPIC_STRUCTURAL_FIELDS: &[&str] = &[
     "caller_id",
 ];
 
+const ANTHROPIC_PROTOCOL_FIELDS: &[&str] = &[
+    "type",
+    "text",
+    "content",
+    "source",
+    "data",
+    "media_type",
+    "title",
+    "context",
+    "input",
+    "input_schema",
+    "description",
+    "output",
+    "stdout",
+    "stderr",
+    "error",
+    "is_error",
+];
+
 fn redact_anthropic_value(
     chain: &dyn Guardrail,
     dir: Direction,
@@ -1071,9 +1090,17 @@ fn redact_anthropic_value(
                 if opaque {
                     continue;
                 }
-                if let Some(redaction) = redact_str(chain, dir, field) {
-                    unrewritable |= redaction.text != *field;
-                    merge_counts(counts, redaction.counts);
+                // Protocol field names are not model content. Unknown keys
+                // inside tool inputs/results remain in scope because callers
+                // control those object keys and a mask cannot safely rename
+                // them without changing the tool contract.
+                if !ANTHROPIC_PROTOCOL_FIELDS.contains(&field.as_str())
+                    && !ANTHROPIC_STRUCTURAL_FIELDS.contains(&field.as_str())
+                {
+                    if let Some(redaction) = redact_str(chain, dir, field) {
+                        unrewritable |= redaction.text != *field;
+                        merge_counts(counts, redaction.counts);
+                    }
                 }
                 if ANTHROPIC_STRUCTURAL_FIELDS.contains(&field.as_str())
                     || (field == "source" && matches!(child, Value::String(_)))
@@ -1405,6 +1432,7 @@ fn redact_responses_tree(
     value: &mut Value,
     counts: &mut RedactionCounts,
     detect_keys: bool,
+    inspect_structural_values: bool,
     item_type: Option<&str>,
     parent_type: Option<&str>,
 ) -> bool {
@@ -1420,6 +1448,7 @@ fn redact_responses_tree(
                 item,
                 counts,
                 detect_keys,
+                inspect_structural_values,
                 item_type,
                 parent_type,
             ) || found
@@ -1444,7 +1473,7 @@ fn redact_responses_tree(
                     }
                 }
                 if RESPONSES_STRUCTURAL_FIELDS.contains(&field.as_str()) {
-                    if detect_keys {
+                    if inspect_structural_values {
                         unrewritable |=
                             detect_unrewritable_value_strings(chain, dir, child, counts);
                     }
@@ -1469,6 +1498,7 @@ fn redact_responses_tree(
                     child,
                     counts,
                     detect_keys,
+                    inspect_structural_values,
                     item_type,
                     object_type.as_deref().or(parent_type),
                 );
@@ -1493,6 +1523,42 @@ pub(crate) fn responses_item_inspection_text_capped(item: &Value, cap: usize) ->
         &mut item,
         &mut counts,
         true,
+    );
+    let mut output = String::new();
+    let mut truncated = false;
+    for text in collector.take() {
+        if text.is_empty() {
+            continue;
+        }
+        if !output.is_empty() {
+            truncated |= crate::token_estimate::push_capped_to(&mut output, "\n", cap);
+        }
+        truncated |= crate::token_estimate::push_capped_to(&mut output, &text, cap);
+    }
+    (output, truncated)
+}
+
+/// User-visible/billed item text without protocol object-key names. Stable
+/// identifiers remain included because tool names and call ids are part of
+/// the model exchange, while schema field names such as `content` and `text`
+/// are not assistant output and must not pollute capture or token estimates.
+pub(crate) fn responses_item_content_text_capped(item: &Value, cap: usize) -> (String, bool) {
+    let mut item = item.clone();
+    let collector = SegmentCollector::default();
+    let mut counts = RedactionCounts::new();
+    let item_type = item
+        .get("type")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let _ = redact_responses_tree(
+        &collector,
+        Direction::Input,
+        &mut item,
+        &mut counts,
+        false,
+        true,
+        item_type.as_deref(),
+        item_type.as_deref(),
     );
     let mut output = String::new();
     let mut truncated = false;
@@ -1549,6 +1615,7 @@ fn redact_responses_item_structured(
         dir,
         item,
         counts,
+        detect_keys,
         detect_keys,
         item_type.as_deref(),
         item_type.as_deref(),
