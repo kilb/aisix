@@ -889,6 +889,9 @@ pub struct ResponsesStreamCompletion {
     /// the generator is then dropped at a suspension point and the tail
     /// never runs — which the telemetry closure reports as `499`.
     pub reached_end: bool,
+    /// Typed upstream-body failure observed after the response was committed.
+    /// `None` with `reached_end == false` means the downstream consumer left.
+    pub terminal_failure: Option<aisix_gateway::BridgeError>,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub reasoning_tokens: u32,
@@ -924,6 +927,10 @@ pub struct ResponsesStreamCompletion {
     /// wants full content (bounded to the capture cap). Empty otherwise.
     /// Read by the on_complete telemetry closure; never reaches the CP sink.
     pub response_text: String,
+    /// Full-content capture is unsafe while a guarded response is held. It is
+    /// marked safe only after the complete held response passes moderation
+    /// and structural redaction, before the first released byte is yielded.
+    pub response_capture_safe: bool,
     /// True when the Drop guard filled any token counter from the local
     /// estimator (AISIX-Cloud#1074).
     pub usage_estimated: bool,
@@ -1034,6 +1041,9 @@ pub fn build_responses_bridge_stream(
         let mut upstream = upstream;
         let mut first_chunk_seen = false;
         let buffering = output_guardrail.is_some() && hold_back;
+        // A live monitor stream is still uninspected until its end-of-stream
+        // provider call completes. Only an unguarded stream starts safe.
+        guard.comp().response_capture_safe = output_guardrail.is_none();
         // Held SSE events when an output guardrail is attached; empty (and
         // unused) on the live-forward path.
         let mut held: Vec<bytes::Bytes> = Vec::new();
@@ -1129,11 +1139,17 @@ pub fn build_responses_bridge_stream(
                     }
                 }
                 Err(e) => {
+                    let error_type = e.error_type();
+                    let error_message = e.to_string();
                     let frame = format!(
                         "event: error\ndata: {{\"type\":\"error\",\"code\":\"{}\",\"message\":{}}}\n\n",
-                        e.error_type(),
-                        serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "\"error\"".into()),
+                        error_type,
+                        serde_json::to_string(&error_message).unwrap_or_else(|_| "\"error\"".into()),
                     );
+                    let comp = guard.comp();
+                    comp.response_capture_safe = false;
+                    comp.response_text.clear();
+                    comp.terminal_failure = Some(e);
                     yield Ok(bytes::Bytes::from(frame));
                     return;
                 }
@@ -1174,7 +1190,10 @@ pub fn build_responses_bridge_stream(
                 max_buffer_bytes,
                 "streaming /v1/responses (cross-provider) output exceeded buffer cap; failing closed",
             );
-            guard.comp().guardrail_blocked = true;
+            let comp = guard.comp();
+            comp.guardrail_blocked = true;
+            comp.response_capture_safe = false;
+            comp.response_text.clear();
             yield Ok(bytes::Bytes::from(guardrail_error_frame(None)));
             return;
         }
@@ -1188,6 +1207,7 @@ pub fn build_responses_bridge_stream(
         // `mandatory` unavailability is the one composition that can still
         // produce it) is signalled with a trailing error frame, mirroring the
         // chat surface's EndOfStreamCheck behavior.
+        let mut held_capture_safe = true;
         let (text, tool_calls) = encoder.assembled_assistant_message();
         if !text.is_empty() || !tool_calls.is_empty() {
             // Live mode releases oversized streams (that's the point of
@@ -1239,31 +1259,41 @@ pub fn build_responses_bridge_stream(
             for b in &held {
                 joined.extend_from_slice(b);
             }
-            let mut seg_rewrote = false;
-            let verdict = crate::redact::moderate_body(
-                chain.as_ref(),
-                crate::redact::Direction::Output,
-                verdict,
-                &mut seg_counts,
-                &mut seg_hits,
-                |g| match live_seg_text.as_deref() {
-                    // Live-forward: observation only — nothing to rewrite.
-                    Some(t) => {
+            let moderation = if let Some(t) = live_seg_text.as_deref() {
+                let moderation = crate::redact::moderate_body(
+                    chain.as_ref(),
+                    crate::redact::Direction::Output,
+                    verdict,
+                    &mut seg_counts,
+                    &mut seg_hits,
+                    |g| {
+                        // Live-forward: observation only — nothing to rewrite.
                         let _ = g.redact_output_text(t);
                         crate::redact::RedactionCounts::new()
-                    }
-                    None => match crate::redact::redact_responses_sse(g, &joined) {
-                        Some((rewritten, counts)) => {
-                            joined = rewritten;
-                            seg_rewrote = true;
-                            counts
-                        }
-                        None => crate::redact::RedactionCounts::new(),
                     },
-                },
-            )
-            .await;
+                )
+                .await;
+                crate::redact::AnthropicModeration {
+                    verdict: moderation.verdict,
+                    capture_safe: moderation.capture_safe,
+                }
+            } else {
+                crate::redact::moderate_responses_sse(
+                    chain.as_ref(),
+                    verdict,
+                    &mut joined,
+                    &mut seg_counts,
+                    &mut seg_hits,
+                )
+                .await
+            };
+            held_capture_safe = moderation.capture_safe;
             guard.comp().monitor_hits.extend(seg_hits);
+            if !moderation.capture_safe {
+                let comp = guard.comp();
+                comp.response_capture_safe = false;
+                comp.response_text.clear();
+            }
             // `buffering` gate: only the hold-back walk can actually rewrite
             // wire bytes — the live walk is read-only, so a masked outcome
             // there (unreachable today) must not clobber the capture with a
@@ -1286,48 +1316,53 @@ pub fn build_responses_bridge_stream(
                     seg_counts,
                 );
             }
-            if let aisix_guardrails::GuardrailVerdict::Block { reason, guardrail_name } = verdict {
+            if let aisix_guardrails::GuardrailVerdict::Block { reason, guardrail_name } =
+                moderation.verdict
+            {
                 tracing::warn!(
                     guardrail_hook = "output",
                     model = %model_label,
                     reason = %reason,
                     "guardrail blocked streaming /v1/responses (cross-provider) response",
                 );
-                guard.comp().guardrail_blocked = true;
+                let comp = guard.comp();
+                comp.guardrail_blocked = true;
+                comp.response_capture_safe = false;
+                comp.response_text.clear();
                 yield Ok(bytes::Bytes::from(guardrail_error_frame(guardrail_name.as_deref())));
                 return;
             }
-            if seg_rewrote {
+            if buffering {
+                let redaction =
+                    crate::redact::redact_responses_sse_structured(chain.as_ref(), &joined);
+                if redaction.unrewritable_tool_key {
+                    let comp = guard.comp();
+                    comp.guardrail_blocked = true;
+                    comp.response_capture_safe = false;
+                    comp.response_text.clear();
+                    yield Ok(bytes::Bytes::from(guardrail_error_frame(None)));
+                    return;
+                }
+                if let Some(rewritten) = redaction.rewritten {
+                    joined = rewritten;
+                }
+                if !redaction.counts.is_empty() {
+                    crate::redact::redact_captured_output(
+                        chain.as_ref(),
+                        &mut guard.comp().response_text,
+                    );
+                    crate::redact::merge_counts(
+                        &mut guard.comp().redacted_entity_counts,
+                        redaction.counts,
+                    );
+                }
                 held = vec![bytes::Bytes::from(joined)];
             }
         }
-        // Passed (#932): mask the held SSE frames (channel reassembly)
-        // before release, then hand them to the client.
-        if !held.is_empty() && aisix_guardrails::Guardrail::redacts_output(chain.as_ref()) {
-            let mut joined: Vec<u8> = Vec::with_capacity(held_bytes);
-            for b in &held {
-                joined.extend_from_slice(b);
-            }
-            if let Some((rewritten, counts)) =
-                crate::redact::redact_responses_sse(chain.as_ref(), &joined)
-            {
-                // The wire bytes were masked — mask the content-capture
-                // accumulator too, or the exported content would carry
-                // PII the client never saw (#932 × AISIX-Cloud#947).
-                crate::redact::redact_captured_output(
-                    chain.as_ref(),
-                    &mut guard.comp().response_text,
-                );
-                crate::redact::merge_counts(
-                    &mut guard.comp().redacted_entity_counts,
-                    counts,
-                );
-                downstream_mark!();
-                yield Ok(bytes::Bytes::from(rewritten));
-                return;
-            }
-        }
         // Release the held events verbatim.
+        if output_guardrail.is_some() {
+            guard.comp().response_capture_safe = held_capture_safe;
+        }
         for b in held {
             downstream_mark!();
             yield Ok(b);

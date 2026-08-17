@@ -1,0 +1,373 @@
+import { createHash } from "node:crypto";
+import { createServer, type Server } from "node:http";
+import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import {
+  decodedTextFor,
+  EtcdClient,
+  pickFreePort,
+  SeedClient,
+  spawnApp,
+  startMockSls,
+  startOpenAiUpstream,
+  waitConfigPropagation,
+  waitForToken,
+  type MockSls,
+  type OpenAiUpstream,
+  type SpawnedApp,
+} from "../harness/index.js";
+
+const CALLER = "sk-sls-fail-open-output-capture";
+const CALLER_HASH = createHash("sha256").update(CALLER).digest("hex");
+const CREDENTIAL_REF = "failopen";
+const LOGSTORE = "full-events-fail-open";
+const REQUEST_IDS = {
+  chat: "fail-open-chat-request-8f17",
+  native: "fail-open-native-responses-request-3a29",
+  bridge: "fail-open-bridge-responses-request-6c41",
+  messages: "fail-open-messages-request-5d73",
+  messagesBridge: "fail-open-bridge-messages-request-4e62",
+  completions: "fail-open-completions-request-7e85",
+};
+const OUTPUTS = {
+  chat: "raw-chat-output-must-not-be-exported-91ab",
+  native: "raw-native-output-must-not-be-exported-27cd",
+  bridge: "raw-bridge-output-must-not-be-exported-43ef",
+  messages: "raw-messages-output-must-not-be-exported-59a1",
+  messagesBridge: "raw-bridge-messages-output-must-not-be-exported-68b2",
+  completions: "raw-completions-output-must-not-be-exported-75b3",
+};
+
+interface FailingBedrock {
+  url: string;
+  calls: number;
+  requestBodies: string[];
+  close(): Promise<void>;
+}
+
+async function startFailingBedrock(): Promise<FailingBedrock> {
+  const mock = { calls: 0, requestBodies: [] as string[] } as FailingBedrock;
+  const server: Server = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      mock.calls += 1;
+      mock.requestBodies.push(Buffer.concat(chunks).toString("utf8"));
+      res.statusCode = 500;
+      res.end("mock Bedrock outage");
+    });
+  });
+  const port = await pickFreePort();
+  await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+  mock.url = `http://127.0.0.1:${port}`;
+  mock.close = async () => {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+  };
+  return mock;
+}
+
+function chatEvents(output: string): string[] {
+  return [
+    JSON.stringify({
+      id: "chat-fail-open",
+      object: "chat.completion.chunk",
+      model: "gpt-4o-mini",
+      choices: [{ index: 0, delta: { role: "assistant" } }],
+    }),
+    JSON.stringify({
+      id: "chat-fail-open",
+      object: "chat.completion.chunk",
+      model: "gpt-4o-mini",
+      choices: [{ index: 0, delta: { content: output }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+    }),
+    "[DONE]",
+  ];
+}
+
+function responsesEvents(output: string): string[] {
+  return [
+    JSON.stringify({ type: "response.output_text.delta", delta: output }),
+    JSON.stringify({
+      type: "response.completed",
+      response: {
+        id: "resp-fail-open",
+        object: "response",
+        status: "completed",
+        model: "gpt-4o-mini",
+        output: [
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: output }],
+          },
+        ],
+        usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 },
+      },
+    }),
+    "[DONE]",
+  ];
+}
+
+function messagesSse(output: string): string {
+  return (
+    `event: message_start\ndata: {"type":"message_start","message":{"id":"msg-fail-open","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"usage":{"input_tokens":5,"output_tokens":0}}}\n\n` +
+    `event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n` +
+    `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: output } })}\n\n` +
+    `event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n` +
+    `event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}\n\n` +
+    `event: message_stop\ndata: {"type":"message_stop"}\n\n`
+  );
+}
+
+function completionsSse(output: string): string {
+  return (
+    `data: ${JSON.stringify({ id: "cmpl-fail-open", object: "text_completion", choices: [{ index: 0, text: output, finish_reason: "stop" }], usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 } })}\n\n` +
+    "data: [DONE]\n\n"
+  );
+}
+
+describe("SLS full-content capture after output guardrail fail-open", () => {
+  let etcdReachable = false;
+  let app: SpawnedApp | undefined;
+  let sls: MockSls | undefined;
+  let bedrock: FailingBedrock | undefined;
+  let chat: OpenAiUpstream | undefined;
+  let native: OpenAiUpstream | undefined;
+  let bridge: OpenAiUpstream | undefined;
+  let messages: OpenAiUpstream | undefined;
+  let messagesBridge: OpenAiUpstream | undefined;
+  let completions: OpenAiUpstream | undefined;
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+
+    sls = await startMockSls();
+    bedrock = await startFailingBedrock();
+    chat = await startOpenAiUpstream({ streamEvents: chatEvents(OUTPUTS.chat) });
+    native = await startOpenAiUpstream({ streamEvents: responsesEvents(OUTPUTS.native) });
+    bridge = await startOpenAiUpstream({ streamEvents: chatEvents(OUTPUTS.bridge) });
+    messages = await startOpenAiUpstream({ rawSseChunks: [messagesSse(OUTPUTS.messages)] });
+    messagesBridge = await startOpenAiUpstream({
+      streamEvents: chatEvents(OUTPUTS.messagesBridge),
+    });
+    completions = await startOpenAiUpstream({
+      rawSseChunks: [completionsSse(OUTPUTS.completions)],
+    });
+    app = await spawnApp({
+      extra: { bedrock_endpoint_url: bedrock.url },
+      extraEnv: {
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-secret",
+      },
+    });
+    const seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createObservabilityExporter({
+      name: "sls-fail-open-full",
+      enabled: true,
+      kind: "aliyun_sls",
+      endpoint: sls.url,
+      project: "aisix-e2e-obs",
+      logstore: LOGSTORE,
+      credential_ref: CREDENTIAL_REF,
+      content_mode: "full",
+    });
+    for (const [name, provider, apiBase] of [
+      ["fail-open-chat", "openai", `${chat.baseUrl}/v1`],
+      ["fail-open-native-responses", "openai", `${native.baseUrl}/v1`],
+      ["fail-open-bridge-responses", "deepseek", `${bridge.baseUrl}/v1`],
+      ["fail-open-messages", "anthropic", messages.baseUrl],
+      ["fail-open-bridge-messages", "deepseek", `${messagesBridge.baseUrl}/v1`],
+      ["fail-open-completions", "openai", `${completions.baseUrl}/v1`],
+    ] as const) {
+      const pk = await seed.createProviderKey({
+        display_name: `${name}-pk`,
+        secret: "sk-mock",
+        api_base: apiBase,
+        ...(provider === "deepseek" ? { provider, adapter: "openai" } : {}),
+      });
+      await seed.createModel({
+        display_name: name,
+        provider,
+        model_name: "gpt-4o-mini",
+        provider_key_id: pk.id,
+      });
+    }
+    await seed.createGuardrail({
+      name: "bedrock-output-fail-open",
+      enabled: true,
+      hook_point: "output",
+      fail_open: false,
+      output_fail_open: true,
+      kind: "bedrock",
+      guardrail_id: "failopengr0001",
+      guardrail_version: "DRAFT",
+      region: "us-east-1",
+      aws_credentials: {
+        kind: "static",
+        access_key_id: "AKIDFAILOPEN0001",
+        secret_access_key: "secret-fail-open",
+      },
+      latency_mode: { kind: "serial" },
+      enforcement_mode: "monitor",
+    });
+    await seed.createApiKey({
+      key_hash: CALLER_HASH,
+      allowed_models: [
+        "fail-open-chat",
+        "fail-open-native-responses",
+        "fail-open-bridge-responses",
+        "fail-open-messages",
+        "fail-open-bridge-messages",
+        "fail-open-completions",
+      ],
+    });
+    await waitConfigPropagation(async () => {
+      const response = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER}` },
+      });
+      if (response.status === 401) return false;
+      if (response.status !== 200) {
+        throw new Error(`model propagation probe returned ${response.status}`);
+      }
+      const body = (await response.json()) as { data?: Array<{ id?: string }> };
+      const ids = new Set(body.data?.map((model) => model.id));
+      return [
+        "fail-open-chat",
+        "fail-open-native-responses",
+        "fail-open-bridge-responses",
+        "fail-open-messages",
+        "fail-open-bridge-messages",
+        "fail-open-completions",
+      ].every((model) => ids.has(model));
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await Promise.all([
+      chat?.close(),
+      native?.close(),
+      bridge?.close(),
+      messages?.close(),
+      messagesBridge?.close(),
+      completions?.close(),
+    ]);
+    await bedrock?.close();
+    await sls?.close();
+  });
+
+  test(
+    "releases fail-open responses but omits uninspected output from full-content logs",
+    async (ctx) => {
+      if (!etcdReachable || !app || !sls || !bedrock) {
+        ctx.skip();
+        return;
+      }
+      const before = sls.requests.length;
+      const post = (path: string, requestId: string, body: unknown) =>
+        fetch(`${app!.proxyUrl}${path}`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${CALLER}`,
+            "content-type": "application/json",
+            "x-aisix-request-id": requestId,
+          },
+          body: JSON.stringify(body),
+        });
+
+      const chatResponse = await post("/v1/chat/completions", REQUEST_IDS.chat, {
+        model: "fail-open-chat",
+        stream: true,
+        messages: [{ role: "user", content: "ordinary chat prompt" }],
+      });
+      expect(chatResponse.status).toBe(200);
+      expect(await chatResponse.text()).toContain(OUTPUTS.chat);
+
+      const nativeResponse = await post("/v1/responses", REQUEST_IDS.native, {
+        model: "fail-open-native-responses",
+        input: "ordinary native responses prompt",
+        stream: true,
+      });
+      expect(nativeResponse.status).toBe(200);
+      expect(await nativeResponse.text()).toContain(OUTPUTS.native);
+
+      const bridgeResponse = await post("/v1/responses", REQUEST_IDS.bridge, {
+        model: "fail-open-bridge-responses",
+        input: "ordinary bridge responses prompt",
+        stream: true,
+      });
+      expect(bridgeResponse.status).toBe(200);
+      expect(await bridgeResponse.text()).toContain(OUTPUTS.bridge);
+
+      const messagesResponse = await fetch(`${app.proxyUrl}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "x-api-key": CALLER,
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json",
+          "x-aisix-request-id": REQUEST_IDS.messages,
+        },
+        body: JSON.stringify({
+          model: "fail-open-messages",
+          messages: [{ role: "user", content: "ordinary messages prompt" }],
+          max_tokens: 16,
+          stream: true,
+        }),
+      });
+      expect(messagesResponse.status).toBe(200);
+      expect(await messagesResponse.text()).toContain(OUTPUTS.messages);
+
+      const messagesBridgeResponse = await fetch(`${app.proxyUrl}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "x-api-key": CALLER,
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json",
+          "x-aisix-request-id": REQUEST_IDS.messagesBridge,
+        },
+        body: JSON.stringify({
+          model: "fail-open-bridge-messages",
+          messages: [{ role: "user", content: "ordinary bridge messages prompt" }],
+          max_tokens: 16,
+          stream: true,
+        }),
+      });
+      expect(messagesBridgeResponse.status).toBe(200);
+      expect(await messagesBridgeResponse.text()).toContain(OUTPUTS.messagesBridge);
+
+      const completionsResponse = await post(
+        "/v1/completions",
+        REQUEST_IDS.completions,
+        {
+          model: "fail-open-completions",
+          prompt: "ordinary completions prompt",
+          max_tokens: 16,
+          stream: true,
+        },
+      );
+      expect(completionsResponse.status).toBe(200);
+      expect(await completionsResponse.text()).toContain(OUTPUTS.completions);
+      expect(bedrock.calls).toBeGreaterThanOrEqual(6);
+      const guardrailRequests = bedrock.requestBodies.join("\n");
+      for (const output of Object.values(OUTPUTS)) {
+        expect(guardrailRequests).toContain(output);
+      }
+
+      for (const requestId of Object.values(REQUEST_IDS)) {
+        await waitForToken(sls, LOGSTORE, requestId, 15_000, before);
+      }
+      const exported = decodedTextFor(sls, LOGSTORE, before);
+      for (const requestId of Object.values(REQUEST_IDS)) {
+        expect(exported).toContain(requestId);
+      }
+      for (const output of Object.values(OUTPUTS)) {
+        expect(exported).not.toContain(output);
+      }
+    },
+    90_000,
+  );
+});

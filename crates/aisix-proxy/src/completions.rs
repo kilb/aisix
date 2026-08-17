@@ -14,20 +14,42 @@
 //! 7. Call `bridge.complete(body, ctx)` → JSON response.
 //! 8. Providers that don't support completions return 501.
 
+mod stream;
+
 use aisix_gateway::{BridgeError, ChatMessage, ChatResponse, FinishReason, UsageStats};
-use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent};
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures::StreamExt;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use stream::{
+    build_completion_passthrough_stream, completion_usage_with_estimates, CompletionSseAccumulator,
+    CompletionStreamFailure, CompletionStreamOutcome, PreparedCompletionStream,
+};
 
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::{ErrorEnvelope, ProxyError};
 use crate::state::ProxyState;
+
+fn note_completion_failure(
+    health: &crate::health::HealthTracker,
+    runtime_status: &crate::health::ModelRuntimeStatusTracker,
+    model_display_name: &str,
+    model_id: &str,
+    cooldown: Option<&aisix_core::CooldownConfig>,
+    error: BridgeError,
+) -> BridgeError {
+    if error.http_status() >= 500 {
+        health.record_failure(model_display_name);
+    }
+    crate::cooldown::note_failure(runtime_status, model_id, cooldown, error)
+}
 
 /// Per-request payload from a successful dispatch — carries the
 /// response + provider + the bits the handler needs to emit a
@@ -74,6 +96,15 @@ struct CompletionDispatchSuccess {
     /// `content_mode = full`; threaded to `fan_out` via the handler's emit,
     /// never to the CP sink.
     captured_content: Option<CapturedContent>,
+    /// Live streams emit usage and end-to-end latency from their terminal
+    /// callback. Buffered and non-streaming responses emit in the handler.
+    usage_handled_by_stream: bool,
+}
+
+#[derive(Default)]
+struct CompletionDispatchTelemetry {
+    applied_guardrails: Vec<aisix_core::AppliedGuardrail>,
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 }
 
 /// Subset of the OpenAI legacy /v1/completions response `usage`
@@ -81,6 +112,7 @@ struct CompletionDispatchSuccess {
 /// `prompt_tokens` + `completion_tokens` are both present (unlike
 /// embeddings which has only prompt_tokens). Source:
 /// <https://platform.openai.com/docs/api-reference/completions/object>
+#[derive(Clone, Default)]
 struct CompletionUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
@@ -114,7 +146,10 @@ pub async fn completions(
                 Some(&auth.entry.id),
                 started,
                 crate::reject::Envelope::OpenAi,
-                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+                crate::error::proxy_error_from_json_rejection(
+                    rej,
+                    state.request_body_limit_for("/v1/completions"),
+                ),
             );
         }
     };
@@ -125,10 +160,22 @@ pub async fn completions(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
+    let is_stream = body.get("stream").and_then(Value::as_bool) == Some(true);
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
+    let mut telemetry = CompletionDispatchTelemetry::default();
 
-    match dispatch(&state, &snapshot, &auth, body, &request_id, &client).await {
+    match dispatch(
+        &state,
+        &snapshot,
+        &auth,
+        body,
+        &request_id,
+        &client,
+        &mut telemetry,
+    )
+    .await
+    {
         Ok(success) => {
             let elapsed = started.elapsed();
             // Audit MEDIUM-2 on PR #426: use the actual response
@@ -161,11 +208,25 @@ pub async fn completions(
                     model: &model_name,
                     upstream_model: &success.upstream_model,
                     pk: pk.labels(),
+                    stream: is_stream,
                     ..Default::default()
                 },
                 status,
                 elapsed,
             );
+            if !success.usage_handled_by_stream {
+                let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
+                state.metrics.record_request_e2e_latency(
+                    LatencyLabels {
+                        endpoint: "/v1/completions",
+                        model: metric_model.as_ref(),
+                        provider: &success.provider,
+                        status,
+                        streaming: is_stream,
+                    },
+                    elapsed,
+                );
+            }
             // Issue #403: emit UsageEvent so cp-api's budget ledger
             // and customer-facing /logs see /v1/completions spend.
             // Pre-#403 the legacy completions handler dropped the
@@ -188,7 +249,10 @@ pub async fn completions(
                     &usage,
                     &success.provider_request_id,
                     &client,
+                    is_stream,
+                    "",
                     success.guardrail_blocked,
+                    telemetry.applied_guardrails.clone(),
                     success.redactions.clone(),
                     success.monitor_hits.clone(),
                     success.captured_content.as_ref(),
@@ -216,14 +280,25 @@ pub async fn completions(
                 crate::request_metrics::Caller::new(&auth),
                 crate::request_metrics::Upstream {
                     model: metric_model.as_ref(),
+                    stream: is_stream,
                     ..Default::default()
                 },
                 status,
                 elapsed,
             );
+            state.metrics.record_request_e2e_latency(
+                LatencyLabels {
+                    endpoint: "/v1/completions",
+                    model: metric_model.as_ref(),
+                    provider: "unknown",
+                    status,
+                    streaming: is_stream,
+                },
+                elapsed,
+            );
             // Per #655 parity: surface the failed request in Logs with a
             // zero-token event (status + error class), instead of dropping it.
-            crate::usage_attr::emit_error_usage_event(
+            crate::usage_attr::emit_guardrail_error_usage_event(
                 &state,
                 &snapshot,
                 "completions",
@@ -234,6 +309,9 @@ pub async fn completions(
                 status,
                 err.kind(),
                 &client,
+                matches!(&err, ProxyError::ContentFiltered(_)),
+                telemetry.applied_guardrails,
+                telemetry.monitor_hits,
             );
             err.into_response()
         }
@@ -268,6 +346,7 @@ async fn dispatch(
     mut body: Value,
     request_id: &str,
     client_ctx: &ClientContext,
+    telemetry: &mut CompletionDispatchTelemetry,
 ) -> Result<CompletionDispatchSuccess, ProxyError> {
     let model_name = body
         .get("model")
@@ -299,27 +378,32 @@ async fn dispatch(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
-    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    let resolved_chain = Arc::new(state.guardrail_index.resolve(&guardrail_ctx));
+    telemetry.applied_guardrails = resolved_chain.applied().to_vec();
     let mut input_seg_counts = crate::redact::RedactionCounts::new();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     if !resolved_chain.is_empty() {
         let chat = completions_input_to_chat(model_name, &body);
-        let (verdict, hits) =
-            aisix_guardrails::Guardrail::check_input_non_segment_observed(&resolved_chain, &chat)
-                .await;
+        let (verdict, hits) = aisix_guardrails::Guardrail::check_input_non_segment_observed(
+            resolved_chain.as_ref(),
+            &chat,
+        )
+        .await;
         monitor_hits.extend(hits);
         // Segment pass: one Bedrock call over the prompt slots; an
         // ANONYMIZE disposition writes the masked text back into the body
         // (#932 bedrock follow-up).
         let verdict = crate::redact::moderate_body(
-            &resolved_chain,
+            resolved_chain.as_ref(),
             crate::redact::Direction::Input,
             verdict,
             &mut input_seg_counts,
             &mut monitor_hits,
             |g| crate::redact::redact_completions_request(g, &mut body),
         )
-        .await;
+        .await
+        .verdict;
+        telemetry.monitor_hits.clone_from(&monitor_hits);
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
@@ -340,7 +424,8 @@ async fn dispatch(
 
     // #932: mask-action PII rules rewrite the prompt in place AFTER the
     // block check passes, BEFORE the body is forwarded upstream.
-    let mut redactions = crate::redact::redact_completions_request(&resolved_chain, &mut body);
+    let mut redactions =
+        crate::redact::redact_completions_request(resolved_chain.as_ref(), &mut body);
     crate::redact::merge_counts(&mut redactions, input_seg_counts);
 
     // Content capture (AISIX-Cloud#947): the client-facing request body
@@ -366,7 +451,13 @@ async fn dispatch(
     let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
         .ok_or(ProxyError::ProviderUnavailable)?;
 
-    // #554: apply the configured request `timeout` as the upstream deadline.
+    // #554: apply the configured request timeout before response headers and
+    // the streaming timeout to every upstream body read. Legacy completions
+    // use a byte stream, but retain typed BridgeError failures so the first
+    // read can still retry/fail over and terminal telemetry can distinguish a
+    // later timeout from a downstream disconnect.
+    let is_stream = body.get("stream").and_then(Value::as_bool) == Some(true);
+    let timeouts = crate::routing::effective_timeouts(model, None, state.default_timeouts);
     let mut ctx = crate::dispatch::bridge_ctx(
         request_id,
         &model_entry.id,
@@ -375,26 +466,525 @@ async fn dispatch(
         Arc::new(pk_entry.value.clone()),
         Some(client_ctx),
     );
-    if let Some(d) = crate::routing::effective_timeouts(model, None, state.default_timeouts).request
-    {
+    if let Some(d) = if is_stream {
+        timeouts.stream
+    } else {
+        timeouts.request
+    } {
         ctx = ctx.with_deadline(d);
     }
 
     let provider_label = provider.to_ascii_lowercase();
+    let tracker = &state.runtime_status;
+    let cooldown_model_id: &str = &model_entry.id;
+    let cooldown_cfg = model.cooldown.as_ref();
+
+    if is_stream {
+        let output_policy =
+            aisix_guardrails::Guardrail::stream_output_policy(resolved_chain.as_ref());
+        let hold_back = aisix_guardrails::Guardrail::runs_on_output(resolved_chain.as_ref())
+            && output_policy.holds_back();
+        let prepared = if hold_back {
+            let (max_buffer_bytes, fail_open) = match output_policy {
+                aisix_guardrails::StreamOutputPolicy::BufferFull {
+                    max_buffer_bytes,
+                    on_exceeded_fail_open,
+                } => (max_buffer_bytes, on_exceeded_fail_open),
+                _ => (aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false),
+            };
+            crate::routing::retrying_dispatch(state, model, "/v1/completions", || async {
+                let stream = bridge.complete_stream(&body, &ctx).await.map_err(|error| {
+                    note_completion_failure(
+                        &state.health,
+                        tracker,
+                        &model.display_name,
+                        cooldown_model_id,
+                        cooldown_cfg,
+                        error,
+                    )
+                })?;
+                let mut stream =
+                    crate::stream_timeout::with_read_timeout_completion(stream, timeouts.stream);
+                let mut buffer = Vec::new();
+                let mut observed = CompletionSseAccumulator::default();
+                while let Some(item) = stream.next().await {
+                    let chunk = item.map_err(|error| {
+                        note_completion_failure(
+                            &state.health,
+                            tracker,
+                            &model.display_name,
+                            cooldown_model_id,
+                            cooldown_cfg,
+                            error,
+                        )
+                    })?;
+                    // The cap-triggering bytes were generated (and may be
+                    // billed) even though fail-closed policy withholds them.
+                    // Feed a separately bounded parser before enforcing the
+                    // wire-buffer limit so usage/token estimates include the
+                    // complete observed prefix without retaining it all.
+                    observed.push(&chunk);
+                    if buffer.len().saturating_add(chunk.len()) > max_buffer_bytes {
+                        if fail_open {
+                            tracing::warn!(
+                                guardrail_hook = "output",
+                                model = %model_name,
+                                max_buffer_bytes,
+                                "streaming /v1/completions output exceeded buffer cap; failing open"
+                            );
+                            let prefix =
+                                futures::stream::iter([Ok(bytes::Bytes::from(buffer)), Ok(chunk)]);
+                            return Ok(PreparedCompletionStream::Live(Box::pin(
+                                prefix.chain(stream),
+                            )));
+                        }
+                        tracing::warn!(
+                            guardrail_hook = "output",
+                            model = %model_name,
+                            max_buffer_bytes,
+                            "streaming /v1/completions output exceeded buffer cap; failing closed"
+                        );
+                        let output_text = observed.finish_for_overflow_estimate();
+                        return Ok(PreparedCompletionStream::BufferExceeded {
+                            accumulator: observed,
+                            output_text,
+                        });
+                    }
+                    buffer.extend_from_slice(&chunk);
+                }
+                let mut inspection = CompletionSseAccumulator::with_security_cap(buffer.len());
+                inspection.push(&buffer);
+                inspection.finish();
+                if inspection.malformed_data {
+                    return Err(note_completion_failure(
+                        &state.health,
+                        tracker,
+                        &model.display_name,
+                        cooldown_model_id,
+                        cooldown_cfg,
+                        BridgeError::UpstreamDecode(
+                            "malformed legacy completion SSE data event".to_string(),
+                        ),
+                    ));
+                }
+                Ok(PreparedCompletionStream::Buffered(buffer))
+            })
+            .await
+        } else {
+            crate::routing::retrying_dispatch(state, model, "/v1/completions", || async {
+                let stream = bridge.complete_stream(&body, &ctx).await.map_err(|error| {
+                    note_completion_failure(
+                        &state.health,
+                        tracker,
+                        &model.display_name,
+                        cooldown_model_id,
+                        cooldown_cfg,
+                        error,
+                    )
+                })?;
+                let mut stream =
+                    crate::stream_timeout::with_read_timeout_completion(stream, timeouts.stream);
+
+                // An explicitly configured per-model stream timeout is a
+                // failover contract: wait for the first body chunk before
+                // committing 200 so a TTFT timeout remains retryable. The
+                // deployment default still wraps subsequent reads, but does
+                // not add a pre-response wait to every legacy completion.
+                if timeouts.stream_configured {
+                    return match stream.next().await {
+                        Some(Ok(first)) => {
+                            let prefix = futures::stream::once(std::future::ready(Ok(first)));
+                            Ok(PreparedCompletionStream::Live(Box::pin(
+                                prefix.chain(stream),
+                            )))
+                        }
+                        Some(Err(error)) => Err(note_completion_failure(
+                            &state.health,
+                            tracker,
+                            &model.display_name,
+                            cooldown_model_id,
+                            cooldown_cfg,
+                            error,
+                        )),
+                        None => Err(note_completion_failure(
+                            &state.health,
+                            tracker,
+                            &model.display_name,
+                            cooldown_model_id,
+                            cooldown_cfg,
+                            BridgeError::StreamAborted,
+                        )),
+                    };
+                }
+
+                Ok(PreparedCompletionStream::Live(stream))
+            })
+            .await
+        };
+
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(BridgeError::Config(message)) if message.contains("text completions") => {
+                reservation.commit_tokens(0).await;
+                return Ok(CompletionDispatchSuccess {
+                    response: (
+                        StatusCode::NOT_IMPLEMENTED,
+                        Json(ErrorEnvelope::new(message, "not_implemented")),
+                    )
+                        .into_response(),
+                    provider: provider_label,
+                    model_id: model_entry.id.to_string(),
+                    provider_key_id: pk_entry.id.to_string(),
+                    upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
+                    provider_request_id: String::new(),
+                    usage: None,
+                    redactions,
+                    monitor_hits,
+                    guardrail_blocked: false,
+                    captured_content: None,
+                    usage_handled_by_stream: false,
+                });
+            }
+            Err(error) => {
+                reservation.commit_tokens(0).await;
+                return Err(ProxyError::Bridge(error));
+            }
+        };
+
+        let upstream_model = model.upstream_model().unwrap_or("unknown").to_string();
+
+        match prepared {
+            PreparedCompletionStream::Buffered(mut buffer) => {
+                state.health.record_success(&model_entry.value.display_name);
+                state.runtime_status.mark_healthy(&model_entry.id);
+                let mut accumulator = CompletionSseAccumulator::with_security_cap(buffer.len());
+                accumulator.push(&buffer);
+                accumulator.finish();
+                let output_text = accumulator.output_text();
+                let usage = completion_usage_with_estimates(
+                    accumulator.usage.unwrap_or_default(),
+                    &upstream_model,
+                    body.get("prompt"),
+                    &output_text,
+                );
+                reservation
+                    .commit_tokens(
+                        u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens),
+                    )
+                    .await;
+
+                let synth = ChatResponse {
+                    id: String::new(),
+                    model: model_name.to_string(),
+                    message: ChatMessage::assistant(output_text),
+                    finish_reason: FinishReason::Stop,
+                    usage: UsageStats::default(),
+                };
+                let (verdict, hits) =
+                    aisix_guardrails::Guardrail::check_output_non_segment_observed(
+                        resolved_chain.as_ref(),
+                        &synth,
+                    )
+                    .await;
+                monitor_hits.extend(hits);
+                let moderation = crate::redact::moderate_body(
+                    resolved_chain.as_ref(),
+                    crate::redact::Direction::Output,
+                    verdict,
+                    &mut redactions,
+                    &mut monitor_hits,
+                    |guardrail| match crate::redact::redact_completions_sse(guardrail, &buffer) {
+                        Some((rewritten, counts)) => {
+                            buffer = rewritten;
+                            counts
+                        }
+                        None => crate::redact::RedactionCounts::new(),
+                    },
+                )
+                .await;
+                let capture_safe = moderation.capture_safe;
+                let verdict = moderation.verdict;
+                telemetry.monitor_hits.clone_from(&monitor_hits);
+                if let aisix_guardrails::GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                } = verdict
+                {
+                    tracing::warn!(
+                        guardrail_hook = "output",
+                        model = %model_name,
+                        reason = %reason,
+                        "guardrail blocked streaming /v1/completions response"
+                    );
+                    return Ok(CompletionDispatchSuccess {
+                        response: ProxyError::ContentFiltered(
+                            crate::error::guardrail_block_message(
+                                "response",
+                                guardrail_name.as_deref(),
+                            ),
+                        )
+                        .into_response(),
+                        provider: provider_label,
+                        model_id: model_entry.id.to_string(),
+                        provider_key_id: pk_entry.id.to_string(),
+                        upstream_model,
+                        provider_request_id: accumulator.provider_request_id,
+                        usage: Some(usage),
+                        redactions,
+                        monitor_hits,
+                        guardrail_blocked: true,
+                        captured_content: None,
+                        usage_handled_by_stream: false,
+                    });
+                }
+
+                if let Some((rewritten, counts)) =
+                    crate::redact::redact_completions_sse(resolved_chain.as_ref(), &buffer)
+                {
+                    buffer = rewritten;
+                    crate::redact::merge_counts(&mut redactions, counts);
+                }
+                let final_output = {
+                    let mut parsed = CompletionSseAccumulator::with_security_cap(buffer.len());
+                    parsed.push(&buffer);
+                    parsed.finish();
+                    parsed.output_text()
+                };
+                let captured_content = match (&captured_prompt, content_cap) {
+                    (Some(prompt), Some(cap)) if capture_safe => {
+                        Some(CapturedContent::new(prompt, &final_output, cap as usize))
+                    }
+                    _ => None,
+                };
+                let mut response = Response::new(axum::body::Body::from(buffer));
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                return Ok(CompletionDispatchSuccess {
+                    response,
+                    provider: provider_label,
+                    model_id: model_entry.id.to_string(),
+                    provider_key_id: pk_entry.id.to_string(),
+                    upstream_model,
+                    provider_request_id: accumulator.provider_request_id,
+                    usage: Some(usage),
+                    redactions,
+                    monitor_hits,
+                    guardrail_blocked: false,
+                    captured_content,
+                    usage_handled_by_stream: false,
+                });
+            }
+            PreparedCompletionStream::BufferExceeded {
+                accumulator,
+                output_text,
+            } => {
+                state.health.record_success(&model_entry.value.display_name);
+                state.runtime_status.mark_healthy(&model_entry.id);
+                let usage = completion_usage_with_estimates(
+                    accumulator.usage.unwrap_or_default(),
+                    &upstream_model,
+                    body.get("prompt"),
+                    &output_text,
+                );
+                reservation
+                    .commit_tokens(
+                        u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens),
+                    )
+                    .await;
+                return Ok(CompletionDispatchSuccess {
+                    response: ProxyError::ContentFiltered(
+                        "response blocked by content policy".into(),
+                    )
+                    .into_response(),
+                    provider: provider_label,
+                    model_id: model_entry.id.to_string(),
+                    provider_key_id: pk_entry.id.to_string(),
+                    upstream_model,
+                    provider_request_id: accumulator.provider_request_id,
+                    usage: Some(usage),
+                    redactions,
+                    monitor_hits,
+                    guardrail_blocked: true,
+                    captured_content: None,
+                    usage_handled_by_stream: false,
+                });
+            }
+            PreparedCompletionStream::Live(stream) => {
+                let post_stream_keys = reservation.keys();
+                let stream_hold = reservation.into_stream_hold();
+                let limiter = Arc::clone(&state.limiter);
+                let state_for_stream = state.clone();
+                let request_id_for_stream = request_id.to_string();
+                let model_id_for_stream = model_entry.id.to_string();
+                let model_display_name_for_stream = model_entry.value.display_name.clone();
+                let cooldown_for_stream = model.cooldown.clone();
+                let requested_model = model_name.to_string();
+                let api_key_id = auth.entry.id.clone();
+                let provider_for_stream = provider_label.clone();
+                let provider_key_id = pk_entry.id.to_string();
+                let upstream_model_for_stream = upstream_model.clone();
+                let prompt = body.get("prompt").cloned();
+                let client = client_ctx.clone();
+                let captured_prompt_for_stream = captured_prompt.clone();
+                let input_redactions = redactions.clone();
+                let input_monitor_hits = monitor_hits.clone();
+                let applied_guardrails = telemetry.applied_guardrails.clone();
+                let stream_started = Instant::now();
+                let output_observer =
+                    aisix_guardrails::Guardrail::runs_on_output(resolved_chain.as_ref())
+                        .then(|| Arc::clone(&resolved_chain));
+                let parsed = build_completion_passthrough_stream(
+                    stream,
+                    output_observer,
+                    upstream_model.clone(),
+                    move |accumulator, outcome, output_observation| {
+                        let (terminal_status, error_class) = match outcome {
+                            CompletionStreamOutcome::CleanEof => {
+                                state_for_stream
+                                    .health
+                                    .record_success(&model_display_name_for_stream);
+                                state_for_stream
+                                    .runtime_status
+                                    .mark_healthy(&model_id_for_stream);
+                                (200, "")
+                            }
+                            CompletionStreamOutcome::UpstreamError {
+                                status,
+                                failure,
+                                error_class,
+                            } => {
+                                if status >= 500 {
+                                    state_for_stream
+                                        .health
+                                        .record_failure(&model_display_name_for_stream);
+                                }
+                                let error = match failure {
+                                    CompletionStreamFailure::Timeout => BridgeError::Timeout {
+                                        elapsed_ms: stream_started.elapsed().as_millis() as u64,
+                                        cause: "stream body".to_string(),
+                                    },
+                                    CompletionStreamFailure::Other => BridgeError::StreamAborted,
+                                };
+                                let _ = crate::cooldown::note_failure(
+                                    &state_for_stream.runtime_status,
+                                    &model_id_for_stream,
+                                    cooldown_for_stream.as_ref(),
+                                    error,
+                                );
+                                (status, error_class)
+                            }
+                            CompletionStreamOutcome::DownstreamDrop => {
+                                (crate::CLIENT_CLOSED_REQUEST, "")
+                            }
+                        };
+                        let output_text = accumulator.output_text();
+                        let usage = completion_usage_with_estimates(
+                            accumulator.usage.unwrap_or_default(),
+                            &upstream_model_for_stream,
+                            prompt.as_ref(),
+                            &output_text,
+                        );
+                        let total =
+                            u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens);
+                        for key in &post_stream_keys {
+                            limiter.add_tokens_post_stream(key, total);
+                        }
+                        drop(stream_hold);
+                        let captured_content = match (&captured_prompt_for_stream, content_cap) {
+                            (Some(prompt), Some(cap)) if output_observation.capture_safe => {
+                                Some(CapturedContent::new(prompt, &output_text, cap as usize))
+                            }
+                            _ => None,
+                        };
+                        let mut all_hits = input_monitor_hits;
+                        all_hits.extend(output_observation.monitor_hits);
+                        let snapshot = state_for_stream.snapshot.load();
+                        let pk =
+                            crate::usage_attr::ResolvedPk::resolve(&snapshot, &provider_key_id);
+                        let (metric_model, metric_upstream) =
+                            crate::usage_attr::metric_model_label_pair(
+                                &snapshot,
+                                &requested_model,
+                                &upstream_model_for_stream,
+                            );
+                        state_for_stream.metrics.record_request_e2e_latency(
+                            LatencyLabels {
+                                endpoint: "/v1/completions",
+                                model: metric_model.as_ref(),
+                                provider: &provider_for_stream,
+                                status: terminal_status,
+                                streaming: true,
+                            },
+                            stream_started.elapsed(),
+                        );
+                        emit_usage_event(
+                            &state_for_stream,
+                            &snapshot,
+                            &pk,
+                            &request_id_for_stream,
+                            &model_id_for_stream,
+                            &requested_model,
+                            &api_key_id,
+                            &provider_for_stream,
+                            metric_upstream.as_ref(),
+                            terminal_status,
+                            stream_started.elapsed(),
+                            &usage,
+                            &accumulator.provider_request_id,
+                            &client,
+                            true,
+                            error_class,
+                            false,
+                            applied_guardrails,
+                            input_redactions,
+                            all_hits,
+                            captured_content.as_ref(),
+                        );
+                    },
+                );
+                let parsed =
+                    crate::sse_keepalive::with_heartbeat(parsed, crate::sse_keepalive::interval());
+                let mut response = Response::new(axum::body::Body::from_stream(parsed));
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                return Ok(CompletionDispatchSuccess {
+                    response,
+                    provider: provider_label,
+                    model_id: model_entry.id.to_string(),
+                    provider_key_id: pk_entry.id.to_string(),
+                    upstream_model,
+                    provider_request_id: String::new(),
+                    usage: None,
+                    redactions,
+                    monitor_hits,
+                    guardrail_blocked: false,
+                    captured_content: None,
+                    usage_handled_by_stream: true,
+                });
+            }
+        }
+    }
 
     // #701: mark each failed attempt on the runtime status INSIDE the retry
     // loop, so the cooldown / circuit-breaker sees flapping upstreams even
     // when a later retry recovers the request — same per-attempt semantics
     // as chat.rs, where the cooldown decision is independent of the retry
     // decision. `note_failure` is a no-op for non-triggering categories.
-    let tracker = &state.runtime_status;
-    let cooldown_model_id: &str = &model_entry.id;
-    let cooldown_cfg = model.cooldown.as_ref();
     match crate::routing::retrying_dispatch(state, model, "/v1/completions", || async {
-        bridge
-            .complete(&body, &ctx)
-            .await
-            .map_err(|e| crate::cooldown::note_failure(tracker, cooldown_model_id, cooldown_cfg, e))
+        bridge.complete(&body, &ctx).await.map_err(|error| {
+            note_completion_failure(
+                &state.health,
+                tracker,
+                &model.display_name,
+                cooldown_model_id,
+                cooldown_cfg,
+                error,
+            )
+        })
     })
     .await
     {
@@ -462,6 +1052,7 @@ async fn dispatch(
             // already billed (tokens committed above), so a block surfaces a
             // redacted 422 rather than the response.
             let mut resp_json = resp_json;
+            let mut output_capture_safe = true;
             if !resolved_chain.is_empty() {
                 let synth = ChatResponse {
                     id: String::new(),
@@ -472,13 +1063,13 @@ async fn dispatch(
                 };
                 let (verdict, hits) =
                     aisix_guardrails::Guardrail::check_output_non_segment_observed(
-                        &resolved_chain,
+                        resolved_chain.as_ref(),
                         &synth,
                     )
                     .await;
                 monitor_hits.extend(hits);
-                let verdict = crate::redact::moderate_body(
-                    &resolved_chain,
+                let moderation = crate::redact::moderate_body(
+                    resolved_chain.as_ref(),
                     crate::redact::Direction::Output,
                     verdict,
                     &mut redactions,
@@ -486,6 +1077,9 @@ async fn dispatch(
                     |g| crate::redact::redact_completions_response(g, &mut resp_json),
                 )
                 .await;
+                output_capture_safe = moderation.capture_safe;
+                let verdict = moderation.verdict;
+                telemetry.monitor_hits.clone_from(&monitor_hits);
                 if let aisix_guardrails::GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
@@ -524,6 +1118,7 @@ async fn dispatch(
                         // Blocked responses never reached the client — no
                         // content capture, matching the chat surface.
                         captured_content: None,
+                        usage_handled_by_stream: false,
                     });
                 }
             }
@@ -532,14 +1127,14 @@ async fn dispatch(
             // block check passes.
             crate::redact::merge_counts(
                 &mut redactions,
-                crate::redact::redact_completions_response(&resolved_chain, &mut resp_json),
+                crate::redact::redact_completions_response(resolved_chain.as_ref(), &mut resp_json),
             );
 
             // Content capture (AISIX-Cloud#947): the completion text from the
             // POST-redaction body, so the exported content matches what the
             // caller received.
             let captured_content = match (&captured_prompt, content_cap) {
-                (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+                (Some(prompt), Some(cap)) if output_capture_safe => Some(CapturedContent::new(
                     prompt,
                     &completion_output_text(&resp_json),
                     cap as usize,
@@ -559,6 +1154,7 @@ async fn dispatch(
                 monitor_hits,
                 guardrail_blocked: false,
                 captured_content,
+                usage_handled_by_stream: false,
             })
         }
         Err(BridgeError::Config(msg)) if msg.contains("does not support text completions") => {
@@ -580,6 +1176,7 @@ async fn dispatch(
                 monitor_hits,
                 guardrail_blocked: false,
                 captured_content: None,
+                usage_handled_by_stream: false,
             })
         }
         Err(e) => {
@@ -690,7 +1287,10 @@ fn emit_usage_event(
     usage: &CompletionUsage,
     provider_request_id: &str,
     client: &ClientContext,
+    stream: bool,
+    error_class: &str,
     guardrail_blocked: bool,
+    applied_guardrails: Vec<aisix_core::AppliedGuardrail>,
     // Per-detector PII mask counts (#932). Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
     // Monitor-mode guardrail observations (AISIX-Cloud#562).
@@ -717,9 +1317,11 @@ fn emit_usage_event(
         inbound_protocol: "openai".to_string(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        error_class: error_class.to_string(),
         // #911 [23]: a billed-then-output-blocked completion surfaces on the
         // dashboard's Blocked tab while still carrying its billed token counts.
         guardrail_blocked,
+        applied_guardrails,
         redacted_entity_counts,
         guardrail_monitor_hits,
         ..Default::default()
@@ -728,9 +1330,12 @@ fn emit_usage_event(
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("completions", event.clone());
     let exporters = crate::usage_attr::live_exporters(state, snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, content, exporters.iter().map(|e| &e.value));
+    state.otlp_fan_out.fan_out(
+        &event,
+        content,
+        exporters.generation(),
+        exporters.iter().map(|e| &e.value),
+    );
     let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
     crate::request_metrics::record_usage(
         state,
@@ -741,6 +1346,7 @@ fn emit_usage_event(
             model: requested_model,
             upstream_model,
             pk: pk.labels(),
+            stream,
             ..Default::default()
         },
         crate::request_metrics::Tokens {
@@ -814,7 +1420,7 @@ mod tests {
     fn cfg() -> ProxyConfig {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: 1_048_576,
+            request_body_limit_bytes: Some(1_048_576),
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),
@@ -898,6 +1504,405 @@ mod tests {
         ResourceEntry::new("g-1", g, 1)
     }
 
+    fn keyword_input_monitor_guardrail(literal: &str) -> ResourceEntry<aisix_core::Guardrail> {
+        let json = format!(
+            r#"{{"name":"t-monitor","enabled":true,"hook_point":"input","enforcement_mode":"monitor","fail_open":false,"kind":"keyword","patterns":[{{"kind":"literal","value":"{literal}"}}]}}"#
+        );
+        let g: aisix_core::Guardrail = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("g-monitor", g, 1)
+    }
+
+    fn keyword_output_guardrail(literal: &str) -> ResourceEntry<aisix_core::Guardrail> {
+        let json = format!(
+            r#"{{"name":"t","enabled":true,"hook_point":"output","fail_open":false,"kind":"keyword","patterns":[{{"kind":"literal","value":"{literal}"}}]}}"#
+        );
+        let g: aisix_core::Guardrail = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("g-1", g, 1)
+    }
+
+    fn pii_output_guardrail(max_buffer_bytes: usize) -> ResourceEntry<aisix_core::Guardrail> {
+        pii_output_guardrail_with_policy(max_buffer_bytes, "fail_closed")
+    }
+
+    fn pii_output_guardrail_with_policy(
+        max_buffer_bytes: usize,
+        overflow_policy: &str,
+    ) -> ResourceEntry<aisix_core::Guardrail> {
+        let json = format!(
+            r#"{{"name":"pii","enabled":true,"hook_point":"output","kind":"pii","detectors":[{{"type":"email","action":"mask"}}],"max_buffer_bytes":{max_buffer_bytes},"on_buffer_exceeded":"{overflow_policy}"}}"#
+        );
+        let g: aisix_core::Guardrail = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("g-pii", g, 1)
+    }
+
+    /// #554: an output-hook guardrail must inspect the complete legacy
+    /// completion stream before any bytes reach the caller. A match returns a
+    /// normal OpenAI-style 422 envelope, not a late SSE error after the blocked
+    /// text has already leaked.
+    #[tokio::test]
+    async fn output_guardrail_blocks_stream_before_release_issue_554() {
+        let upstream = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"id\":\"cmpl-stream\",\"object\":\"text_completion\",",
+            "\"choices\":[{\"index\":0,\"text\":\"BLOCK\",\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"cmpl-stream\",\"object\":\"text_completion\",",
+            "\"choices\":[{\"index\":0,\"text\":\"ME\",\"finish_reason\":\"stop\"}],",
+            "\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2,\"total_tokens\":4}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("instruct"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(aisix_obs::UsageSink::new(tx));
+        let resp = tower::ServiceExt::oneshot(
+            crate::build_router(state),
+            make_req(serde_json::json!({
+                "model": "instruct",
+                "prompt": "hello",
+                "stream": true
+            })),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65_536).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "content_filter");
+        assert!(!String::from_utf8_lossy(&bytes).contains("BLOCKME"));
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("blocked stream must emit billed usage")
+            .expect("usage sink closed");
+        assert_eq!(event.status_code, 422);
+        assert!(event.guardrail_blocked);
+        assert_eq!(event.prompt_tokens, 2);
+        assert_eq!(event.completion_tokens, 2);
+        assert_eq!(event.applied_guardrails.len(), 1);
+        assert_eq!(event.applied_guardrails[0].kind, "keyword");
+        assert_eq!(event.applied_guardrails[0].hook, "output");
+    }
+
+    /// Clean held streams are released as SSE after the complete output passes
+    /// the output guardrail. The provider's frame order and done marker remain
+    /// intact.
+    #[tokio::test]
+    async fn output_guardrail_releases_clean_stream_as_sse_issue_554() {
+        let upstream = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"id\":\"cmpl-clean\",\"object\":\"text_completion\",",
+            "\"choices\":[{\"index\":0,\"text\":\"hello\",\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"cmpl-clean\",\"object\":\"text_completion\",",
+            "\"choices\":[{\"index\":0,\"text\":\" world\",\"finish_reason\":\"stop\"}],",
+            "\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2,\"total_tokens\":4}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("instruct"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+
+        let resp = tower::ServiceExt::oneshot(
+            build_app(snap),
+            make_req(serde_json::json!({
+                "model": "instruct",
+                "prompt": "hello",
+                "stream": true
+            })),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let bytes = to_bytes(resp.into_body(), 65_536).await.unwrap();
+        assert_eq!(bytes.as_ref(), sse.as_bytes());
+    }
+
+    /// Without a blocking output policy, completion bytes remain a live
+    /// passthrough and the terminal usage frame is accounted after body
+    /// consumption instead of being lost when the handler returns.
+    #[tokio::test]
+    async fn unguarded_stream_forwards_and_emits_terminal_usage() {
+        let upstream = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"id\":\"cmpl-live\",\"object\":\"text_completion\",",
+            "\"choices\":[{\"index\":0,\"text\":\"hello\",\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"cmpl-live\",\"object\":\"text_completion\",",
+            "\"choices\":[{\"index\":0,\"text\":\" world\",\"finish_reason\":\"stop\"}],",
+            "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("instruct"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(aisix_obs::UsageSink::new(tx));
+
+        let resp = tower::ServiceExt::oneshot(
+            crate::build_router(state),
+            make_req(serde_json::json!({
+                "model": "instruct",
+                "prompt": "hello",
+                "stream": true
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65_536).await.unwrap();
+        assert_eq!(bytes.as_ref(), sse.as_bytes());
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("live stream must emit usage at EOF")
+            .expect("usage sink closed");
+        assert_eq!(event.status_code, 200);
+        assert_eq!(event.prompt_tokens, 3);
+        assert_eq!(event.completion_tokens, 4);
+        assert_eq!(event.provider_request_id, "cmpl-live");
+    }
+
+    /// A maskable span may cross provider frames. The held stream must rebuild
+    /// the choice channel before redaction, then release only the masked value.
+    #[tokio::test]
+    async fn pii_mask_reassembles_text_across_completion_frames() {
+        let upstream = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"id\":\"cmpl-pii\",\"object\":\"text_completion\",",
+            "\"choices\":[{\"index\":0,\"text\":\"alice@\",\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"cmpl-pii\",\"object\":\"text_completion\",",
+            "\"choices\":[{\"index\":0,\"text\":\"example.com\",\"finish_reason\":\"stop\"}],",
+            "\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("instruct"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(pii_output_guardrail(65_536));
+        let resp = tower::ServiceExt::oneshot(
+            build_app(snap),
+            make_req(serde_json::json!({
+                "model": "instruct",
+                "prompt": "hello",
+                "stream": true
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65_536).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!text.contains("alice@example.com"));
+        assert!(text.contains("[EMAIL_REDACTED]"));
+        assert!(text.contains("data: [DONE]"));
+    }
+
+    /// BufferFull is bounded. A fail-closed output guardrail returns 422 before
+    /// releasing any upstream bytes when the configured cap is exceeded.
+    #[tokio::test]
+    async fn output_guardrail_stream_buffer_overflow_fails_closed() {
+        let upstream = MockServer::start().await;
+        let sse = format!(
+            "data: {{\"id\":\"cmpl-large\",\"object\":\"text_completion\",\"choices\":[{{\"index\":0,\"text\":\"{}\",\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n",
+            "x".repeat(256),
+        );
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("instruct"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(pii_output_guardrail(64));
+        let resp = tower::ServiceExt::oneshot(
+            build_app(snap),
+            make_req(serde_json::json!({
+                "model": "instruct",
+                "prompt": "hello",
+                "stream": true
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65_536).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!text.contains(&"x".repeat(64)));
+    }
+
+    /// The configured overflow action is part of the guardrail contract: a
+    /// fail-open BufferFull chain releases the prefix and remaining live stream
+    /// byte-for-byte instead of converting the overflow into a 422.
+    #[tokio::test]
+    async fn output_guardrail_stream_buffer_overflow_honors_fail_open() {
+        let upstream = MockServer::start().await;
+        let sse = format!(
+            "data: {{\"id\":\"cmpl-large\",\"object\":\"text_completion\",\"choices\":[{{\"index\":0,\"text\":\"{}\",\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n",
+            "x".repeat(256),
+        );
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse.clone(), "text/event-stream"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("instruct"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails
+            .insert(pii_output_guardrail_with_policy(64, "fail_open"));
+        let resp = tower::ServiceExt::oneshot(
+            build_app(snap),
+            make_req(serde_json::json!({
+                "model": "instruct",
+                "prompt": "hello",
+                "stream": true
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65_536).await.unwrap();
+        assert_eq!(bytes.as_ref(), sse.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn live_stream_transport_error_records_failure_status_and_cooldown() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            let event = b"data: {\"id\":\"cmpl-partial\",\"choices\":[{\"index\":0,\"text\":\"partial\"}]}\n\n";
+            let headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            socket.write_all(headers).await.unwrap();
+            socket
+                .write_all(format!("{:x}\r\n", event.len()).as_bytes())
+                .await
+                .unwrap();
+            socket.write_all(event).await.unwrap();
+            socket.write_all(b"\r\n").await.unwrap();
+            // Drop without the terminating zero-length chunk: reqwest yields
+            // one valid SSE item followed by a body transport error.
+        });
+
+        let snap = new_snap(&format!("http://{address}"));
+        snap.models.insert(model_entry("instruct"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let (usage_tx, mut usage_rx) = tokio::sync::mpsc::channel(4);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(aisix_obs::UsageSink::new(usage_tx));
+        let state_probe = state.clone();
+        let response = tower::ServiceExt::oneshot(
+            crate::build_router(state),
+            make_req(serde_json::json!({
+                "model": "instruct",
+                "prompt": "hello",
+                "stream": true
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            to_bytes(response.into_body(), 65_536).await.is_err(),
+            "truncated upstream stream must surface a body error"
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), usage_rx.recv())
+            .await
+            .expect("stream failure must emit usage")
+            .expect("usage sink closed");
+        assert_eq!(event.status_code, 502);
+        assert_eq!(event.error_class, "transport_error");
+        let runtime = state_probe.runtime_status.status("m-1");
+        assert_eq!(runtime.status, crate::health::RuntimeStatus::Cooldown);
+        assert_eq!(runtime.status_reason.as_deref(), Some("transport_error"));
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn precommit_timeout_records_health_and_runtime_failure() {
+        let health = crate::health::HealthTracker::new();
+        let runtime = crate::health::ModelRuntimeStatusTracker::new();
+        for _ in 0..3 {
+            health.record_failure("instruct");
+        }
+
+        let error = super::note_completion_failure(
+            &health,
+            &runtime,
+            "instruct",
+            "m-1",
+            Some(&aisix_core::CooldownConfig::default()),
+            aisix_gateway::BridgeError::Timeout {
+                elapsed_ms: 300,
+                cause: "first stream event".into(),
+            },
+        );
+
+        assert_eq!(error.http_status(), 504);
+        assert_eq!(
+            health.level("instruct"),
+            crate::health::HealthLevel::Degraded
+        );
+        let status = runtime.status("m-1");
+        assert_eq!(status.status, crate::health::RuntimeStatus::Cooldown);
+        assert_eq!(status.status_reason.as_deref(), Some("request_timeout"));
+    }
+
     /// #545: a configured input guardrail must fire on /v1/completions — a
     /// blocked `prompt` returns 422 content_filter and the upstream is never
     /// contacted (`expect(0)`).
@@ -933,6 +1938,54 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("BLOCKME"));
+    }
+
+    /// A monitor observation belongs to the request even if the later
+    /// provider call fails. The error UsageEvent must not silently discard it.
+    #[tokio::test]
+    async fn input_monitor_hit_survives_upstream_error() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("upstream failed"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("instruct"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails
+            .insert(keyword_input_monitor_guardrail("WATCHME"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(aisix_obs::UsageSink::new(tx));
+        let resp = tower::ServiceExt::oneshot(
+            crate::build_router(state),
+            make_req(serde_json::json!({
+                "model": "instruct",
+                "prompt": "please WATCHME"
+            })),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("failed request must emit usage")
+            .expect("usage sink closed");
+        assert!(!event.guardrail_blocked);
+        assert_eq!(event.applied_guardrails.len(), 1);
+        assert_eq!(event.guardrail_monitor_hits.len(), 1);
+        let hit = &event.guardrail_monitor_hits[0];
+        assert_eq!(hit.guardrail_name, "t-monitor");
+        assert_eq!(hit.hook, "input");
+        assert_eq!(hit.action, "would_block");
+        assert!(!hit.reason.contains("WATCHME"));
     }
 
     /// #545 companion: a benign prompt with a guardrail configured still

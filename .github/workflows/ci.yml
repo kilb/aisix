@@ -32,6 +32,16 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  security-audit:
+    name: dependency audit (RustSec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+      - name: reject known dependency vulnerabilities
+        run: cargo audit
+
   schema-drift:
     name: schema drift (resources)
     runs-on: ubuntu-latest
@@ -81,9 +91,10 @@ jobs:
     runs-on: ubuntu-latest
     services:
       redis:
-        # redis:8 ships the vector-search query engine the semantic
-        # cache needs; a superset of redis:7 for the exact-cache tests.
-        image: redis:8-alpine
+        # The Redis Stack image bundles the FT.* vector-search commands the
+        # semantic-cache tests probe. The plain redis image does not expose
+        # those commands, even at version 8, and would silently skip them.
+        image: redis/redis-stack-server:7.4.0-v8
         ports: ["6379:6379"]
       # Real etcd for crates/aisix-admin/tests/etcd_integration.rs —
       # exercises the full Admin handler → EtcdConfigStore →
@@ -212,9 +223,6 @@ jobs:
   build-bin:
     name: build aisix (instrumented)
     runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: "-C instrument-coverage"
-      LLVM_PROFILE_FILE: "coverage/aisix-%p-%m.profraw"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -222,12 +230,21 @@ jobs:
           components: llvm-tools-preview
       - uses: ./.github/actions/setup-protoc
       - uses: Swatinem/rust-cache@v2
-      - name: build
-        run: cargo build -p aisix-server --bin aisix
+      - name: install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: build coverage-instrumented binary
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/llvm-cov-target
+        run: |
+          # cargo-llvm-cov's official external-test flow supplies all required
+          # instrumentation flags, not just `-C instrument-coverage`.
+          source <(cargo llvm-cov show-env --sh)
+          cargo llvm-cov clean --workspace
+          cargo build -p aisix-server --bin aisix
       - uses: actions/upload-artifact@v7
         with:
           name: aisix-bin
-          path: target/debug/aisix
+          path: target/llvm-cov-target/debug/aisix
           # 72 MB binary × many runs will refill the quota quickly;
           # keep only as long as the downstream e2e job needs it.
           retention-days: 1
@@ -260,9 +277,9 @@ jobs:
           ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
         ports: ["2379:2379"]
       redis:
-        # redis:8 = vector-capable, so the semantic-cache redis e2e
-        # exercises the real path against AISIX_E2E_REDIS.
-        image: redis:8-alpine
+        # Redis Stack is vector-capable, so the semantic-cache redis e2e
+        # exercises the real FT.* path against AISIX_E2E_REDIS.
+        image: redis/redis-stack-server:7.4.0-v8
         ports: ["6379:6379"]
       redis-plain:
         # A vector-LESS redis so the semantic-cache degradation suite
@@ -293,6 +310,11 @@ jobs:
           # line unlocks — pnpm 9 rejects that file outright, so the two
           # must move together.
           version: 11
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # The e2e suite executes a coverage-instrumented Rust binary. These
+          # matching LLVM tools turn its profraw counters into LCOV.
+          components: llvm-tools-preview
       - name: check harness exists
         id: harness
         run: |
@@ -315,27 +337,44 @@ jobs:
         # mode and the second would prove nothing.
         env:
           E2E_THREAD_PER_CORE: ${{ matrix.thread_per_core }}
+          LLVM_PROFILE_FILE: ${{ github.workspace }}/coverage/aisix-${{ matrix.serving }}-%p-%m.profraw
           # Vector-less redis for the semantic-cache degradation suite;
           # the main 6379 service is redis:8 (vector-capable).
           AISIX_E2E_REDIS_PLAIN: redis://127.0.0.1:6377
-        run: pnpm test
-      - name: tag coverage by leg
-        # The gate downloads every leg with `merge-multiple: true`, which
-        # flattens same-named files to one — the legs must upload distinct
-        # filenames or only one leg's coverage survives the merge.
+        run: |
+          # LLVM creates the profile file, but not its parent directory.
+          mkdir -p "$GITHUB_WORKSPACE/coverage"
+          pnpm test
+      - name: export Rust e2e coverage
         if: always()
         run: |
-          if [ -f tests/e2e/coverage/lcov.info ]; then
-            mv tests/e2e/coverage/lcov.info "tests/e2e/coverage/lcov-${{ matrix.serving }}.info"
+          shopt -s nullglob
+          profiles=(coverage/aisix-${{ matrix.serving }}-*.profraw)
+          if [ "${#profiles[@]}" -eq 0 ]; then
+            echo "::error::The e2e binary emitted no LLVM coverage profiles"
+            exit 1
           fi
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          llvm_bin="$(rustc --print sysroot)/lib/rustlib/$host/bin"
+          "$llvm_bin/llvm-profdata" merge -sparse "${profiles[@]}" \
+            -o "coverage/aisix-${{ matrix.serving }}.profdata"
+          "$llvm_bin/llvm-cov" export --format=lcov \
+            --instr-profile="coverage/aisix-${{ matrix.serving }}.profdata" \
+            --ignore-filename-regex='/(\.cargo/(registry|git)|rustc|target|tests)/' \
+            target/debug/aisix \
+            > "coverage/lcov-${{ matrix.serving }}.info"
+          test -s "coverage/lcov-${{ matrix.serving }}.info" || {
+            echo "::error::LLVM exported an empty e2e coverage report"
+            exit 1
+          }
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           # Per leg: two uploads under one name is a hard conflict the
           # moment the suite starts emitting coverage.
           name: coverage-e2e-${{ matrix.serving }}
-          path: tests/e2e/coverage/lcov-${{ matrix.serving }}.info
-          if-no-files-found: ignore
+          path: coverage/lcov-${{ matrix.serving }}.info
+          if-no-files-found: error
           retention-days: 7
 
   e2e-gate:
@@ -408,22 +447,30 @@ jobs:
       - uses: actions/download-artifact@v8
         with: { name: coverage-unit, path: cov/unit }
       - uses: actions/download-artifact@v8
-        # The e2e job invokes `pnpm test` which is `vitest run` with no
-        # `--coverage` flag, so `tests/e2e/coverage/lcov.info` is never
-        # written and no `coverage-e2e` artifact is produced. The upload
-        # step at ~L182 has `if-no-files-found: ignore` so the absence
-        # is silent. Until the e2e job actually emits coverage (tracked
-        # follow-up), this download must remain soft — otherwise the
-        # coverage-gate hard-fails every run on `Artifact not found`.
-        continue-on-error: true
         with: { pattern: coverage-e2e-*, path: cov/e2e, merge-multiple: true }
       - name: merge + threshold
         run: |
           npm i -g lcov-result-merger @lcov-viewer/cli
           merged=cov/combined.info
-          files=(cov/unit/*.info)
-          [ -d cov/e2e ] && files+=(cov/e2e/*.info)
-          lcov-result-merger "${files[@]}" "$merged" || cp "${files[0]}" "$merged"
+          shopt -s nullglob
+          unit=(cov/unit/*.info)
+          e2e=(cov/e2e/*.info)
+          if [ "${#unit[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one Rust unit coverage report, found ${#unit[@]}"
+            exit 1
+          fi
+          if [ "${#e2e[@]}" -ne 2 ]; then
+            echo "::error::Expected both Rust e2e coverage reports, found ${#e2e[@]}"
+            exit 1
+          fi
+          # lcov-result-merger accepts one input glob followed by one output
+          # path. The exact-count checks above ensure this glob resolves to
+          # precisely the unit report and both serving-mode reports.
+          lcov-result-merger 'cov/{unit,e2e}/*.info' "$merged"
+          test -s "$merged" || {
+            echo "::error::Coverage merger produced an empty report"
+            exit 1
+          }
           pct=$(awk -F: '/^LF:/ {tot+=$2} /^LH:/ {hit+=$2} END {if (tot>0) printf "%.2f", hit/tot*100; else print 0}' "$merged")
           echo "Combined line coverage: ${pct}%"
           threshold=${COVERAGE_THRESHOLD:-90}

@@ -491,6 +491,19 @@ struct MonitorGuardrail {
 }
 
 impl MonitorGuardrail {
+    /// Keyword verdicts deliberately include the configured literal/regex in
+    /// their ops-only reason. Monitor hits leave the process through usage
+    /// telemetry, so that detail must be replaced with a stable category.
+    /// Other current guardrails construct reasons from detector/category
+    /// names only and retain that useful staging signal.
+    fn telemetry_reason(&self, reason: &str) -> String {
+        if self.inner.name() == "keyword_blocklist" {
+            "keyword policy matched".to_owned()
+        } else {
+            reason.to_owned()
+        }
+    }
+
     /// Log the mask counts a monitor-mode redacting guardrail WOULD have
     /// applied. Counts carry detector names only, never matched values.
     fn observe_redaction(&self, hook: &'static str, r: Option<Redaction>) {
@@ -525,7 +538,7 @@ impl MonitorGuardrail {
             guardrail_name: self.row_name.clone(),
             hook: hook.to_owned(),
             action: "would_block".to_owned(),
-            reason: reason.to_owned(),
+            reason: self.telemetry_reason(reason),
             counts: std::collections::BTreeMap::new(),
         }
     }
@@ -799,11 +812,11 @@ impl Guardrail for MandatoryGuardrail {
 }
 
 /// Adapter that wraps a snapshot handle and rebuilds the runtime
-/// chain whenever the snapshot pointer changes. The chat handler
+/// chain whenever the snapshot generation changes. The chat handler
 /// holds an `Arc<dyn Guardrail>` pointing at this; it never sees
 /// the rebuild.
 ///
-/// Cheap path (cache hit): one atomic load + one pointer compare,
+/// Cheap path (cache hit): one atomic load + one generation compare,
 /// then a clone of an `Arc<GuardrailChain>`. Rebuild path (cache
 /// miss): runs through the entries table and recompiles regexes.
 /// Compilation only happens on the first call after each snapshot
@@ -830,38 +843,33 @@ impl LiveGuardrailChain {
         snapshot: SnapshotHandle<AisixSnapshot>,
         bedrock_endpoint_url: Option<String>,
     ) -> Arc<Self> {
-        // Read version before load so that a concurrent store() between
-        // the two reads causes current() to see a version bump and rebuild,
-        // rather than caching stale data under the new version.
-        let last_version = snapshot.version();
-        let snap = snapshot.load();
+        let view = snapshot.load_versioned();
         let chain = Arc::new(build_chain_from_snapshot(
-            &snap.guardrails,
+            &view.snapshot.guardrails,
             bedrock_endpoint_url.as_deref(),
         ));
         Arc::new(Self {
             snapshot,
             bedrock_endpoint_url,
             cache: Mutex::new(Cache {
-                last_version,
+                last_version: view.version,
                 chain,
             }),
         })
     }
 
     fn current(&self) -> Arc<GuardrailChain> {
-        let cur_version = self.snapshot.version();
+        let view = self.snapshot.load_versioned();
         let mut cache = self
             .cache
             .lock()
             .expect("LiveGuardrailChain mutex poisoned");
-        if cache.last_version != cur_version {
-            let snap = self.snapshot.load();
+        if cache.last_version < view.version {
             cache.chain = Arc::new(build_chain_from_snapshot(
-                &snap.guardrails,
+                &view.snapshot.guardrails,
                 self.bedrock_endpoint_url.as_deref(),
             ));
-            cache.last_version = cur_version;
+            cache.last_version = view.version;
         }
         Arc::clone(&cache.chain)
     }
@@ -1079,11 +1087,11 @@ pub fn build_index_from_snapshot(
 // ---------------------------------------------------------------------------
 
 /// Wraps a snapshot handle and rebuilds the runtime index whenever the
-/// snapshot pointer changes. The proxy chat handler calls `resolve(ctx)`
+/// snapshot generation changes. The proxy chat handler calls `resolve(ctx)`
 /// on each request to get the applicable `GuardrailChain`.
 ///
 /// Rebuild semantics are identical to `LiveGuardrailChain`: one atomic
-/// load + one version compare on the hot path; a full index build (linear
+/// publication load + one generation compare on the hot path; a full index build (linear
 /// in the number of attachment rows) only on the first call after each
 /// snapshot swap.
 pub struct LiveGuardrailIndex {
@@ -1116,12 +1124,10 @@ impl LiveGuardrailIndex {
         bedrock_endpoint_url: Option<String>,
         metrics_sink: Option<Arc<dyn aisix_core::GuardrailMetricsSink>>,
     ) -> Arc<Self> {
-        // Read version before load — same ordering discipline as LiveGuardrailChain.
-        let last_version = snapshot.version();
-        let snap = snapshot.load();
+        let view = snapshot.load_versioned();
         let index = Arc::new(build_index_from_snapshot(
-            &snap.guardrails,
-            &snap.guardrail_attachments,
+            &view.snapshot.guardrails,
+            &view.snapshot.guardrail_attachments,
             bedrock_endpoint_url.as_deref(),
         ));
         Arc::new(Self {
@@ -1129,14 +1135,14 @@ impl LiveGuardrailIndex {
             bedrock_endpoint_url,
             metrics_sink,
             cache: Mutex::new(IndexCache {
-                last_version,
+                last_version: view.version,
                 index,
             }),
         })
     }
 
     fn current(&self) -> Arc<GuardrailIndex> {
-        let cur_version = self.snapshot.version();
+        let view = self.snapshot.load_versioned();
 
         // Fast path: return cached index without building.
         {
@@ -1144,17 +1150,16 @@ impl LiveGuardrailIndex {
                 .cache
                 .lock()
                 .expect("LiveGuardrailIndex mutex poisoned");
-            if cache.last_version == cur_version {
+            if cache.last_version >= view.version {
                 return Arc::clone(&cache.index);
             }
         }
 
         // Build the new index OUTSIDE the lock so a panic (e.g. from a
         // badly-behaved regex engine) does not poison the mutex.
-        let snap = self.snapshot.load();
         let new_index = Arc::new(build_index_from_snapshot(
-            &snap.guardrails,
-            &snap.guardrail_attachments,
+            &view.snapshot.guardrails,
+            &view.snapshot.guardrail_attachments,
             self.bedrock_endpoint_url.as_deref(),
         ));
 
@@ -1164,9 +1169,9 @@ impl LiveGuardrailIndex {
             .cache
             .lock()
             .expect("LiveGuardrailIndex mutex poisoned");
-        if cache.last_version != cur_version {
+        if cache.last_version < view.version {
             cache.index = new_index;
-            cache.last_version = cur_version;
+            cache.last_version = view.version;
         }
         Arc::clone(&cache.index)
     }
@@ -1336,6 +1341,34 @@ mod tests {
         let (v, hits) = chain.check_input_observed(&req("all fine")).await;
         assert_eq!(v, GuardrailVerdict::Allow);
         assert!(hits.is_empty(), "hits: {hits:?}");
+    }
+
+    #[tokio::test]
+    async fn keyword_monitor_hit_does_not_export_configured_pattern() {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "watch-keyword",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "watch-keyword",
+                    "enforcement_mode": "monitor",
+                    "kind": "keyword",
+                    "patterns": [{ "kind": "literal", "value": "tenant-secret-pattern" }]
+                }"#,
+            ),
+        ));
+        let chain = build_chain_from_snapshot(&table, None);
+
+        let (verdict, hits) = chain
+            .check_input_observed(&req("contains tenant-secret-pattern"))
+            .await;
+
+        assert_eq!(verdict, GuardrailVerdict::Allow);
+        assert_eq!(hits.len(), 1, "hits: {hits:?}");
+        assert_eq!(hits[0].action, "would_block");
+        assert_eq!(hits[0].reason, "keyword policy matched");
+        assert!(!format!("{hits:?}").contains("tenant-secret-pattern"));
     }
 
     /// An ENFORCING (block-mode) guardrail must not produce monitor hits —

@@ -605,9 +605,12 @@ fn emit_job_usage_event(
     crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
     state.usage_sink.try_emit(label, event.clone());
     let exporters = crate::usage_attr::live_exporters(state, snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, None, exporters.iter().map(|e| &e.value));
+    state.otlp_fan_out.fan_out(
+        &event,
+        None,
+        exporters.generation(),
+        exporters.iter().map(|e| &e.value),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -842,7 +845,7 @@ pub(crate) async fn create_file(
         while let Some(field) = multipart.next_field().await.map_err(|e| {
             crate::error::proxy_error_from_multipart(
                 e,
-                state.request_body_limit_bytes,
+                state.request_body_limit_for("/v1/files"),
                 "malformed multipart body",
             )
         })? {
@@ -851,7 +854,7 @@ pub(crate) async fn create_file(
                 let v = field.text().await.map_err(|e| {
                     crate::error::proxy_error_from_multipart(
                         e,
-                        state.request_body_limit_bytes,
+                        state.request_body_limit_for("/v1/files"),
                         "malformed multipart field",
                     )
                 })?;
@@ -866,7 +869,7 @@ pub(crate) async fn create_file(
                 let bytes = field.bytes().await.map_err(|e| {
                     crate::error::proxy_error_from_multipart(
                         e,
-                        state.request_body_limit_bytes,
+                        state.request_body_limit_for("/v1/files"),
                         "failed to read file field",
                     )
                 })?;
@@ -883,7 +886,7 @@ pub(crate) async fn create_file(
             let v = field.text().await.map_err(|e| {
                 crate::error::proxy_error_from_multipart(
                     e,
-                    state.request_body_limit_bytes,
+                    state.request_body_limit_for("/v1/files"),
                     "malformed multipart field",
                 )
             })?;
@@ -1094,7 +1097,10 @@ pub(crate) async fn create_batch(
                 Some(&auth.entry.id),
                 started,
                 crate::reject::Envelope::OpenAi,
-                crate::error::proxy_error_from_bytes_rejection(rej, state.request_body_limit_bytes),
+                crate::error::proxy_error_from_bytes_rejection(
+                    rej,
+                    state.request_body_limit_for("/v1/batches"),
+                ),
             );
         }
     };
@@ -1350,7 +1356,10 @@ pub(crate) async fn create_ft_job(
                 Some(&auth.entry.id),
                 started,
                 crate::reject::Envelope::OpenAi,
-                crate::error::proxy_error_from_bytes_rejection(rej, state.request_body_limit_bytes),
+                crate::error::proxy_error_from_bytes_rejection(
+                    rej,
+                    state.request_body_limit_for("/v1/fine_tuning/jobs"),
+                ),
             );
         }
     };
@@ -1849,9 +1858,12 @@ async fn attribute_batch_usage(
         // same caller the event's api_key_id already reflects.
         crate::usage_attr::apply_jwt_identity(&mut event, jwt);
         state.usage_sink.try_emit("batch", event.clone());
-        state
-            .otlp_fan_out
-            .fan_out(&event, None, exporters.iter().map(|e| &e.value));
+        state.otlp_fan_out.fan_out(
+            &event,
+            None,
+            exporters.generation(),
+            exporters.iter().map(|e| &e.value),
+        );
         tracing::info!(
             batch_id = %raw_batch_id,
             provider_model = %provider_model,
@@ -1882,7 +1894,7 @@ mod tests {
     fn cfg() -> ProxyConfig {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: 1_048_576,
+            request_body_limit_bytes: Some(1_048_576),
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),

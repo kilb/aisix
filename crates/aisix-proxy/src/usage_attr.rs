@@ -185,18 +185,37 @@ impl Default for PkLabels<'_> {
 /// requests that are still in flight. A frozen list would keep feeding it
 /// for as long as the longest request runs.
 ///
-/// The zero-config fast path still pays nothing: the emptiness check is
-/// one relaxed atomic load on the request's own snapshot
-/// (`ResourceTable::is_empty`), so a deployment with no exporters
-/// configured never reaches the reload.
+/// Always load current membership, even if the request began before the first
+/// exporter was added. Besides making additions immediate, this guarantees
+/// fan-out GC never mistakes a stale empty request snapshot for the live set.
+pub(crate) struct LiveExporters {
+    generation: u64,
+    entries: Vec<Arc<ResourceEntry<aisix_core::ObservabilityExporter>>>,
+}
+
+impl LiveExporters {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl std::ops::Deref for LiveExporters {
+    type Target = [Arc<ResourceEntry<aisix_core::ObservabilityExporter>>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
 pub(crate) fn live_exporters(
     state: &ProxyState,
-    snap: &AisixSnapshot,
-) -> Vec<Arc<ResourceEntry<aisix_core::ObservabilityExporter>>> {
-    if snap.observability_exporters.is_empty() {
-        return Vec::new();
+    _request_snapshot: &AisixSnapshot,
+) -> LiveExporters {
+    let view = state.snapshot.load_versioned();
+    LiveExporters {
+        generation: view.version,
+        entries: view.snapshot.observability_exporters.entries(),
     }
-    state.snapshot.load().observability_exporters.entries()
 }
 
 /// Total token cost of a request as committed against TPM/TPD rate limits
@@ -369,14 +388,102 @@ pub(crate) fn emit_error_usage_event(
     apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit(label, event.clone());
     let exporters = live_exporters(state, snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, None, exporters.iter().map(|e| &e.value));
+    state.otlp_fan_out.fan_out(
+        &event,
+        None,
+        exporters.generation(),
+        exporters.iter().map(|e| &e.value),
+    );
+}
+
+/// Error-event variant for handlers whose guardrail chain resolves inside
+/// dispatch. Keeping the common identity and exporter plumbing here ensures a
+/// pre-upstream content block is represented the same way as a successful
+/// guardrail-governed request.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_guardrail_error_usage_event(
+    state: &ProxyState,
+    snap: &AisixSnapshot,
+    label: &'static str,
+    inbound_protocol: &'static str,
+    request_id: &str,
+    requested_model: &str,
+    api_key_id: &str,
+    status_code: u16,
+    error_class: &str,
+    client: &ClientContext,
+    guardrail_blocked: bool,
+    applied_guardrails: Vec<aisix_core::AppliedGuardrail>,
+    guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+) {
+    let mut event = UsageEvent {
+        request_id: request_id.to_string(),
+        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        api_key_id: api_key_id.to_string(),
+        requested_model: requested_model.to_string(),
+        status_code,
+        inbound_protocol: inbound_protocol.to_string(),
+        error_class: error_class.to_string(),
+        client_source_ip: client.source_ip.clone(),
+        client_user_agent: client.user_agent.clone(),
+        guardrail_blocked,
+        applied_guardrails,
+        guardrail_monitor_hits,
+        ..Default::default()
+    };
+    apply_jwt_identity(&mut event, client.jwt.as_ref());
+    state.usage_sink.try_emit(label, event.clone());
+    let exporters = live_exporters(state, snap);
+    state.otlp_fan_out.fan_out(
+        &event,
+        None,
+        exporters.generation(),
+        exporters.iter().map(|e| &e.value),
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_exporters_uses_current_membership_when_the_request_started_empty() {
+        let frozen = AisixSnapshot::new();
+        let handle = aisix_core::snapshot::SnapshotHandle::new(frozen.clone());
+        let state = ProxyState::new(
+            handle.clone(),
+            std::sync::Arc::new(aisix_gateway::Hub::new()),
+            &aisix_core::ProxyConfig {
+                addr: "127.0.0.1:0".into(),
+                request_body_limit_bytes: None,
+                tls: None,
+                real_ip: Default::default(),
+                request_id: Default::default(),
+                thread_per_core: None,
+                workers: None,
+                url_rewrites: Vec::new(),
+            },
+        );
+        let current = AisixSnapshot::new();
+        let exporter = serde_json::from_value(serde_json::json!({
+            "name": "new-exporter",
+            "kind": "otlp_http",
+            "endpoint": "https://collector.example/v1/traces"
+        }))
+        .unwrap();
+        current
+            .observability_exporters
+            .insert(aisix_core::resource::ResourceEntry::new(
+                "exporter-id",
+                exporter,
+                2,
+            ));
+        handle.store(current);
+
+        let exporters = live_exporters(&state, &frozen);
+        assert_eq!(exporters.len(), 1);
+        assert_eq!(exporters[0].value.name, "new-exporter");
+    }
 
     #[test]
     fn metric_model_label_three_outcomes() {

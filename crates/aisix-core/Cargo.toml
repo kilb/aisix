@@ -34,6 +34,9 @@ ipnet.workspace = true
 # Header-name parsing/validation for proxy.request_id.accept_headers
 # (AISIX-Cloud#1288) — same role ipnet plays for real_ip.
 http.workspace = true
+# A2A endpoints are validated as absolute HTTP(S) URLs before they can enter a
+# runtime snapshot; this also lets validation reject embedded credentials.
+url.workspace = true
 # filesource: resources.yaml parsing + deterministic UUIDv5 resource ids
 yaml-rust2.workspace = true
 uuid.workspace = true

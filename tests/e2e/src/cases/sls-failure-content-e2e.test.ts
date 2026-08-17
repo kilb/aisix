@@ -25,7 +25,9 @@ import {
 //   3. 403 model-forbidden            → record exists WITHOUT `prompt`
 //      (auth-class failures stay body-less by design)
 //   4. /v1/messages upstream failure  → record carries `prompt`
-//   5. /v1/responses upstream failure → record carries `prompt`
+//   5. unrewritable sensitive tool key → record exists WITHOUT `prompt`
+//   6. malformed /v1/messages DLP shape → record exists WITHOUT `prompt`
+//   7. /v1/responses upstream failure → record carries `prompt`
 //
 // A metadata_only exporter runs alongside and must never see any prompt.
 
@@ -50,6 +52,12 @@ const RECOVER_SENTINEL = "group-recovered-prompt-3c7d1a";
 const EMAIL = "dana@example.com";
 const CN_ID = "11010519491231002X"; // valid ISO 7064 MOD 11-2 check digit
 const MASKED_BLOCK_SENTINEL = "masked-block-prompt-6a4e8b";
+const SENSITIVE_TOOL_KEY = "failure-key@example.com";
+const RESPONSES_GUARDRAIL_REQUEST_ID = "11111111-1111-4111-8111-111111111111";
+const EMBEDDINGS_GUARDRAIL_REQUEST_ID = "22222222-2222-4222-8222-222222222222";
+const TOOL_KEY_GUARDRAIL_REQUEST_ID = "33333333-3333-4333-8333-333333333333";
+const MALFORMED_MESSAGES_REQUEST_ID = "44444444-4444-4444-8444-444444444444";
+const MALFORMED_MESSAGES_SECRET = "malformed-messages@example.com";
 
 // --- Minimal SLS LogGroup protobuf reader (see sink/sls.rs encoder) -----
 // LogGroup { Logs = 1 (message) { Time = 1 (varint), Contents = 2 (message)
@@ -144,16 +152,17 @@ function logsFor(sls: MockSls, logstore: string): Map<string, string>[] {
   return logs;
 }
 
-/** Poll until a FULL_LOGSTORE log matching `pred` arrives (or time out). */
+/** Poll until a log in `logstore` matching `pred` arrives (or time out). */
 async function waitForLog(
   sls: MockSls,
   pred: (l: Map<string, string>) => boolean,
   what: string,
+  logstore = FULL_LOGSTORE,
   timeoutMs = 10_000,
 ): Promise<Map<string, string>> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const hit = logsFor(sls, FULL_LOGSTORE).find(pred);
+    const hit = logsFor(sls, logstore).find(pred);
     if (hit) return hit;
     await new Promise((r) => setTimeout(r, 100));
   }
@@ -291,16 +300,6 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
       },
     });
 
-    await seed.createApiKey({
-      key_hash: CALLER_KEY_HASH,
-      allowed_models: [
-        "failure-content-ok",
-        "failure-content-fail",
-        "failure-content-group",
-        "failure-content-recover",
-      ],
-    });
-
     // Input-side keyword guardrail (block mode) for the 422 case.
     await seed.createGuardrail({
       name: "failure-content-guard",
@@ -323,19 +322,34 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
       ],
     });
 
-    // Gate: benign chat succeeds, both guardrails are live (each blocks),
-    // and the routing groups resolved.
+    // The caller key is the final revision, so authenticated model listing is
+    // a barrier for every model, exporter, and guardrail written above without
+    // exercising any behavior asserted by the test cases.
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: [
+        "failure-content-ok",
+        "failure-content-fail",
+        "failure-content-group",
+        "failure-content-recover",
+      ],
+    });
     await waitConfigPropagation(async () => {
-      const ok = await chat("failure-content-ok", "a plain benign question");
-      if (ok.status !== 200) return false;
-      const blocked = await chat("failure-content-ok", `probe ${FORBIDDEN_WORD}`);
-      if (blocked.status !== 422) return false;
-      const pii = await chat("failure-content-ok", `probe id ${CN_ID}`);
-      if (pii.status !== 422) return false;
-      const grp = await chat("failure-content-group", "group probe");
-      if (grp.status === 404) return false;
-      const rec = await chat("failure-content-recover", "recover probe");
-      return rec.status === 200;
+      const response = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      if (response.status === 401) return false;
+      if (response.status !== 200) {
+        throw new Error(`model propagation probe returned ${response.status}`);
+      }
+      const body = (await response.json()) as { data?: Array<{ id?: string }> };
+      const ids = new Set(body.data?.map((model) => model.id));
+      return [
+        "failure-content-ok",
+        "failure-content-fail",
+        "failure-content-group",
+        "failure-content-recover",
+      ].every((model) => ids.has(model));
     });
   });
 
@@ -399,6 +413,70 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     expect(log.get("guardrail_blocked")).toBe("true");
   });
 
+  test("/v1/responses exports blocked and applied guardrail metadata", async (ctx) => {
+    if (!etcdReachable || !app || !sls) {
+      ctx.skip();
+      return;
+    }
+    const response = await fetch(`${app.proxyUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+        "x-aisix-request-id": RESPONSES_GUARDRAIL_REQUEST_ID,
+      },
+      body: JSON.stringify({
+        model: "failure-content-ok",
+        input: `responses ${FORBIDDEN_WORD}`,
+      }),
+    });
+    await response.text();
+    expect(response.status).toBe(422);
+
+    const log = await waitForLog(
+      sls,
+      (entry) => entry.get("request_id") === RESPONSES_GUARDRAIL_REQUEST_ID,
+      "blocked /v1/responses guardrail metadata",
+    );
+    expect(log.get("guardrail_blocked")).toBe("true");
+    expect(JSON.parse(log.get("applied_guardrails") ?? "[]")).toContainEqual({
+      kind: "keyword",
+      hook: "input",
+    });
+  });
+
+  test("/v1/embeddings exports blocked and applied guardrail metadata", async (ctx) => {
+    if (!etcdReachable || !app || !sls) {
+      ctx.skip();
+      return;
+    }
+    const response = await fetch(`${app.proxyUrl}/v1/embeddings`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+        "x-aisix-request-id": EMBEDDINGS_GUARDRAIL_REQUEST_ID,
+      },
+      body: JSON.stringify({
+        model: "failure-content-ok",
+        input: `embeddings ${FORBIDDEN_WORD}`,
+      }),
+    });
+    await response.text();
+    expect(response.status).toBe(422);
+
+    const log = await waitForLog(
+      sls,
+      (entry) => entry.get("request_id") === EMBEDDINGS_GUARDRAIL_REQUEST_ID,
+      "blocked /v1/embeddings guardrail metadata",
+    );
+    expect(log.get("guardrail_blocked")).toBe("true");
+    expect(JSON.parse(log.get("applied_guardrails") ?? "[]")).toContainEqual({
+      kind: "keyword",
+      hook: "input",
+    });
+  });
+
   test("403 model-forbidden: the record exists but stays body-less", async (ctx) => {
     if (!etcdReachable || !app || !sls) {
       ctx.skip();
@@ -449,6 +527,114 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
       "failed /v1/messages record with prompt",
     );
     expect(Number(log.get("status_code"))).toBeGreaterThanOrEqual(400);
+  });
+
+  test("/v1/messages prior block plus sensitive tool key never reaches upstream or logs", async (ctx) => {
+    if (!etcdReachable || !app || !sls || !okUpstream) {
+      ctx.skip();
+      return;
+    }
+    const upstreamBaseline = okUpstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "x-api-key": CALLER_PLAINTEXT,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+        "x-aisix-request-id": TOOL_KEY_GUARDRAIL_REQUEST_ID,
+      },
+      body: JSON.stringify({
+        model: "failure-content-ok",
+        max_tokens: 32,
+        messages: [
+          {
+            role: "user",
+            content: `${FORBIDDEN_WORD} must block before structured masking`,
+          },
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "toolu_failure_log",
+                name: "lookup",
+                input: { [SENSITIVE_TOOL_KEY]: "safe" },
+              },
+            ],
+          },
+        ],
+      }),
+    });
+    const responseBody = await res.text();
+    expect(res.status).toBe(422);
+    expect(responseBody).not.toContain(SENSITIVE_TOOL_KEY);
+    expect(okUpstream.receivedRequests).toHaveLength(upstreamBaseline);
+
+    const log = await waitForLog(
+      sls,
+      (entry) => entry.get("request_id") === TOOL_KEY_GUARDRAIL_REQUEST_ID,
+      "sensitive tool-key guardrail failure",
+    );
+    expect(log.get("status_code")).toBe("422");
+    expect(log.get("guardrail_blocked")).toBe("true");
+    expect(log.get("prompt")).toBeUndefined();
+    for (const entry of logsFor(sls, FULL_LOGSTORE)) {
+      for (const value of entry.values()) {
+        expect(value).not.toContain(SENSITIVE_TOOL_KEY);
+      }
+    }
+    const metadataLog = await waitForLog(
+      sls,
+      (entry) => entry.get("request_id") === TOOL_KEY_GUARDRAIL_REQUEST_ID,
+      "metadata-only sensitive tool-key guardrail failure",
+      META_LOGSTORE,
+    );
+    expect(metadataLog.get("status_code")).toBe("422");
+    expect(metadataLog.get("guardrail_blocked")).toBe("true");
+    expect(metadataLog.get("prompt")).toBeUndefined();
+    for (const value of metadataLog.values()) {
+      expect(value).not.toContain(SENSITIVE_TOOL_KEY);
+    }
+  });
+
+  test("malformed /v1/messages DLP shape fails closed without exporting its body", async (ctx) => {
+    if (!etcdReachable || !app || !sls || !okUpstream) {
+      ctx.skip();
+      return;
+    }
+    const upstreamBaseline = okUpstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "x-api-key": CALLER_PLAINTEXT,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+        "x-aisix-request-id": MALFORMED_MESSAGES_REQUEST_ID,
+      },
+      body: JSON.stringify({
+        model: "failure-content-ok",
+        max_tokens: 32,
+        messages: { hidden_text: MALFORMED_MESSAGES_SECRET },
+      }),
+    });
+    const responseBody = await res.text();
+    expect(res.status).toBe(400);
+    expect(responseBody).not.toContain(MALFORMED_MESSAGES_SECRET);
+    expect(okUpstream.receivedRequests).toHaveLength(upstreamBaseline);
+
+    for (const logstore of [FULL_LOGSTORE, META_LOGSTORE]) {
+      const log = await waitForLog(
+        sls,
+        (entry) => entry.get("request_id") === MALFORMED_MESSAGES_REQUEST_ID,
+        `malformed Messages failure in ${logstore}`,
+        logstore,
+      );
+      expect(log.get("status_code")).toBe("400");
+      expect(log.get("prompt")).toBeUndefined();
+      for (const value of log.values()) {
+        expect(value).not.toContain(MALFORMED_MESSAGES_SECRET);
+      }
+    }
   });
 
   test("/v1/responses upstream failure: the record carries the prompt", async (ctx) => {
@@ -600,6 +786,8 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
       GUARDRAIL_SENTINEL,
       MESSAGES_SENTINEL,
       RESPONSES_SENTINEL,
+      SENSITIVE_TOOL_KEY,
+      MALFORMED_MESSAGES_SECRET,
     ]) {
       expect(metaText).not.toContain(sentinel);
     }

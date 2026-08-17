@@ -109,7 +109,7 @@ async fn read_capped(resp: reqwest::Response) -> Result<Vec<u8>, A2aError> {
     let mut stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| A2aError::Request(e.to_string()))?;
+        let chunk = chunk.map_err(response_body_error)?;
         if buf.len() + chunk.len() > MAX_UPSTREAM_BODY_BYTES {
             return Err(A2aError::Request(
                 "upstream response exceeded size cap".to_string(),
@@ -118,6 +118,22 @@ async fn read_capped(resp: reqwest::Response) -> Result<Vec<u8>, A2aError> {
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
+}
+
+/// Convert reqwest failures without ever retaining the request URL. Reqwest's
+/// default Display includes it, including path/query values that may contain
+/// tenant secrets in rows written before URL validation was tightened.
+fn connect_error(error: reqwest::Error) -> A2aError {
+    let detail = if error.is_timeout() {
+        "upstream request timed out"
+    } else {
+        "upstream connection failed"
+    };
+    A2aError::Connect(detail.to_string())
+}
+
+fn response_body_error(_error: reqwest::Error) -> A2aError {
+    A2aError::Request("upstream response body failed".to_string())
 }
 
 /// How the gateway authenticates to an upstream A2A agent. The credential is
@@ -168,12 +184,24 @@ pub struct A2aUpstream {
 impl std::fmt::Debug for A2aUpstream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("A2aUpstream")
-            .field("url", &self.url)
+            .field("url", &redact_url_for_log(&self.url))
             .field("auth", &self.auth)
             .field("protocol_version", &self.protocol_version)
             .field("timeout", &self.timeout)
             .finish()
     }
+}
+
+fn redact_url_for_log(raw: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(raw) else {
+        return "<invalid URL>".to_string();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_path("/");
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
 }
 
 /// Warn — once per (agent, url) per process — when a credentialed agent is
@@ -200,10 +228,11 @@ fn warn_cleartext_credential(agent: &A2aAgent) {
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if warned.insert((agent.name.clone(), agent.url.clone())) {
+    let agent_url = redact_url_for_log(&agent.url);
+    if warned.insert((agent.name.clone(), agent_url.clone())) {
         tracing::warn!(
             agent = %agent.name,
-            url = %agent.url,
+            url = %agent_url,
             "the gateway-held A2A agent credential is sent over cleartext http; anyone \
              on the network path can read it — serve this agent over https"
         );
@@ -365,7 +394,7 @@ impl HttpBridge {
             .prepare(self.client.get(url).timeout(budget))
             .send()
             .await
-            .map_err(|e| A2aError::Connect(e.to_string()))?;
+            .map_err(connect_error)?;
         if !resp.status().is_success() {
             return Err(A2aError::Connect(format!(
                 "agent card fetch returned HTTP {}",
@@ -396,8 +425,9 @@ impl A2aBridge for HttpBridge {
         for url in self.agent_card_urls()? {
             let budget = deadline.saturating_duration_since(Instant::now());
             if budget.is_zero() {
+                let agent_url = redact_url_for_log(&self.upstream.url);
                 tracing::debug!(
-                    agent_url = %self.upstream.url,
+                    agent_url = %agent_url,
                     "A2A agent card fetch exhausted its deadline before trying every candidate"
                 );
                 break;
@@ -405,7 +435,8 @@ impl A2aBridge for HttpBridge {
             match self.fetch_card_at(url.clone(), budget).await {
                 Ok(card) => return Ok(card),
                 Err(err) => {
-                    tracing::debug!(%url, error = %err, "A2A agent card candidate did not answer");
+                    let candidate_url = redact_url_for_log(url.as_str());
+                    tracing::debug!(%candidate_url, error = %err, "A2A agent card candidate did not answer");
                     last_err = Some(err);
                 }
             }
@@ -426,7 +457,7 @@ impl A2aBridge for HttpBridge {
             )
             .send()
             .await
-            .map_err(|e| A2aError::Connect(e.to_string()))?;
+            .map_err(connect_error)?;
         if !resp.status().is_success() {
             // Surface the upstream STATUS only — never proxy the upstream error
             // body verbatim to the caller, which could leak upstream internals.
@@ -465,7 +496,7 @@ impl A2aBridge for HttpBridge {
         )
         .await
         .map_err(|_| A2aError::Connect("timed out opening the upstream stream".to_string()))?
-        .map_err(|e| A2aError::Connect(e.to_string()))?;
+        .map_err(connect_error)?;
 
         if !resp.status().is_success() {
             // Status only — never proxy the upstream's error body, same as
@@ -519,8 +550,8 @@ fn sse_events(resp: reqwest::Response) -> impl futures::Stream<Item = A2aEvent> 
         loop {
             let chunk = match bytes.next().await {
                 Some(Ok(chunk)) => chunk,
-                Some(Err(e)) => {
-                    yield Err(A2aError::Request(e.to_string()));
+                Some(Err(error)) => {
+                    yield Err(response_body_error(error));
                     return;
                 }
                 None => break,
@@ -635,6 +666,20 @@ mod tests {
             timeout: DEFAULT_UPSTREAM_TIMEOUT,
         };
         assert!(!format!("{up:?}").contains("super-secret"));
+
+        let credentialed_url = A2aUpstream {
+            url: "https://url-user:url-password@agents.example.com/a2a?access_token=query-secret"
+                .into(),
+            auth: A2aAuth::None,
+            protocol_version: A2aProtocolVersion::V1_0,
+            timeout: DEFAULT_UPSTREAM_TIMEOUT,
+        };
+        let debug = format!("{credentialed_url:?}");
+        for secret in ["url-user", "url-password", "query-secret", "access_token"] {
+            assert!(!debug.contains(secret), "URL credential leaked in {debug}");
+        }
+        assert!(debug.contains("https://agents.example.com/"));
+        assert!(!debug.contains("/a2a"));
     }
 
     fn bridge_at(url: &str) -> HttpBridge {
@@ -695,6 +740,37 @@ mod tests {
                 "http://127.0.0.1:8080/.well-known/agent.json",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn transport_errors_never_include_endpoint_path_or_query() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let path_secret = "path-secret-sentinel";
+        let query_secret = "query-secret-sentinel";
+        let bridge = HttpBridge::new(A2aUpstream {
+            url: format!("http://127.0.0.1:{port}/{path_secret}?tenant={query_secret}"),
+            auth: A2aAuth::None,
+            protocol_version: A2aProtocolVersion::V1_0,
+            timeout: Duration::from_millis(500),
+        });
+        let logged = redact_url_for_log(&bridge.upstream.url);
+        assert!(!logged.contains(path_secret), "log URL leaked: {logged}");
+        assert!(!logged.contains(query_secret), "log URL leaked: {logged}");
+
+        let unary = bridge.send(&serde_json::json!({})).await.unwrap_err();
+        let streaming = bridge
+            .send_stream(&serde_json::json!({}))
+            .await
+            .err()
+            .expect("refused stream must fail");
+        let card = bridge.fetch_agent_card().await.unwrap_err();
+        for error in [unary, streaming, card] {
+            let rendered = error.to_string();
+            assert!(!rendered.contains(path_secret), "path leaked: {rendered}");
+            assert!(!rendered.contains(query_secret), "query leaked: {rendered}");
+        }
     }
 
     #[test]

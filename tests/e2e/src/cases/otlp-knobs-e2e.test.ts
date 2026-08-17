@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
@@ -124,6 +124,68 @@ async function waitForSpan(
       `sample keys: ${JSON.stringify(recv.spanAttrs.slice(0, 2).map((a) => Object.keys(a)))}; ` +
       `prompts: ${JSON.stringify(recv.spanAttrs.slice(0, 3).map((a) => a["gen_ai.prompt"]))}`,
   );
+}
+
+async function waitForModel(app: SpawnedApp, caller: string): Promise<void> {
+  await waitConfigPropagation(async () => {
+    const response = await fetch(`${app.proxyUrl}/v1/models`, {
+      headers: { authorization: `Bearer ${caller}` },
+    });
+    if (response.status === 401) {
+      await response.text();
+      return false;
+    }
+    if (response.status !== 200) {
+      throw new Error(`model propagation probe returned ${response.status}`);
+    }
+    const body = (await response.json()) as { data?: Array<{ id?: string }> };
+    return body.data?.some((model) => model.id === "otlp-knobs-model") === true;
+  });
+}
+
+async function createConfigBarrier(
+  seed: SeedClient,
+  app: SpawnedApp,
+  label: string,
+): Promise<void> {
+  const caller = `sk-otlp-${label}-${randomUUID()}`;
+  await seed.createApiKey({
+    key_hash: createHash("sha256").update(caller).digest("hex"),
+    allowed_models: ["otlp-knobs-model"],
+  });
+  await waitForModel(app, caller);
+}
+
+async function getExporterStatus(app: SpawnedApp): Promise<{
+  applySeq: number;
+  count: number;
+}> {
+  const response = await fetch(`${app.metricsUrl}/status/config`);
+  expect(response.status).toBe(200);
+  const status = (await response.json()) as {
+    applied?: {
+      apply_seq?: number;
+      resource_counts?: { observability_exporters?: number };
+    };
+  };
+  return {
+    applySeq: status.applied?.apply_seq ?? 0,
+    count: status.applied?.resource_counts?.observability_exporters ?? 0,
+  };
+}
+
+async function expectNoSpanFor(
+  recv: OtlpReceiver,
+  predicate: (attrs: Record<string, string>) => boolean,
+  durationMs: number,
+): Promise<void> {
+  const deadline = Date.now() + durationMs;
+  while (Date.now() < deadline) {
+    if (recv.spanAttrs.some(predicate)) {
+      throw new Error("revoked OTLP receiver observed a matching span");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
 }
 
 describe("otlp exporter knobs e2e (#519 B.2): sample_rate + content capture", () => {
@@ -288,5 +350,125 @@ describe("otlp exporter knobs e2e (#519 B.2): sample_rate + content capture", ()
       expect(otlpZero.spanAttrs).toHaveLength(0);
     },
     60_000,
+  );
+
+  test(
+    "deleting an exporter revokes delivery for a request already in flight",
+    async (ctx) => {
+      if (!etcdReachable) {
+        ctx.skip();
+        return;
+      }
+      let released = false;
+      let releaseResponse = () => {};
+      const responseGate = new Promise<void>((resolve) => {
+        releaseResponse = () => {
+          if (released) return;
+          released = true;
+          resolve();
+        };
+      });
+      const gatedUpstream = await startOpenAiUpstream({
+        scriptedResponses: [{}, { responseGate }, {}],
+      });
+      let pendingResponse: Promise<Response> | undefined;
+      try {
+        const otlp = await startOtlpReceiver();
+        const control = await startOtlpReceiver();
+        receivers.push(otlp, control);
+        const app = await spawnApp();
+        apps.push(app);
+        const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
+        const exporter = await seed.createObservabilityExporter({
+          name: "otlp-delete-revocation",
+          enabled: true,
+          kind: "otlp_http",
+          endpoint: otlp.url,
+          content_mode: "full",
+        });
+        await seedRouting(seed, gatedUpstream);
+        await waitForModel(app, CALLER_PLAINTEXT);
+
+        const beforeMarker = `before-exporter-delete-${randomUUID()}`;
+        const before = await chat(app, beforeMarker);
+        expect(before.status).toBe(200);
+        await before.text();
+        await waitForSpan(otlp, (attrs) =>
+          (attrs["gen_ai.prompt"] ?? "").includes(beforeMarker),
+        );
+        const beforeStatus = await getExporterStatus(app);
+        expect(beforeStatus.count).toBe(1);
+
+        const inFlightMarker = `in-flight-exporter-delete-${randomUUID()}`;
+        pendingResponse = chat(app, inFlightMarker);
+        await waitConfigPropagation(async () =>
+          gatedUpstream.receivedRequests.some((request) =>
+            request.body.includes(inFlightMarker),
+          ),
+        );
+
+        await seed.delete("observability_exporters", exporter.id);
+        await createConfigBarrier(seed, app, "delete-barrier");
+        const deletedStatus = await getExporterStatus(app);
+        expect(deletedStatus.count).toBe(0);
+        expect(deletedStatus.applySeq).toBeGreaterThan(beforeStatus.applySeq);
+
+        await seed.createObservabilityExporter({
+          name: "otlp-delete-positive-control",
+          enabled: true,
+          kind: "otlp_http",
+          endpoint: control.url,
+          content_mode: "full",
+        });
+        await createConfigBarrier(seed, app, "control-barrier");
+        const controlStatus = await getExporterStatus(app);
+        expect(controlStatus.count).toBe(1);
+        expect(controlStatus.applySeq).toBeGreaterThan(deletedStatus.applySeq);
+
+        // Complete the request only after both newer revisions are observable.
+        // Completion must consult the live exporter set, not its start-time
+        // snapshot, so only the control receiver may see this marker.
+        releaseResponse();
+        const inFlight = await pendingResponse;
+        expect(inFlight.status).toBe(200);
+        await inFlight.text();
+        await waitForSpan(control, (attrs) =>
+          (attrs["gen_ai.prompt"] ?? "").includes(inFlightMarker),
+        );
+        await expectNoSpanFor(
+          otlp,
+          (attrs) => (attrs["gen_ai.prompt"] ?? "").includes(inFlightMarker),
+          1_250,
+        );
+
+        // A second control delivery forces a further normal batch-flush cycle
+        // before the final negative assertion on the independent old worker.
+        const fullCycleMarker = `full-cycle-after-delete-${randomUUID()}`;
+        const fullCycle = await chat(app, fullCycleMarker);
+        expect(fullCycle.status).toBe(200);
+        await fullCycle.text();
+        await waitForSpan(control, (attrs) =>
+          (attrs["gen_ai.prompt"] ?? "").includes(fullCycleMarker),
+        );
+        expect(
+          otlp.spanAttrs.some((attrs) => {
+            const prompt = attrs["gen_ai.prompt"] ?? "";
+            return prompt.includes(inFlightMarker) || prompt.includes(fullCycleMarker);
+          }),
+        ).toBe(false);
+      } finally {
+        releaseResponse();
+        if (pendingResponse) {
+          try {
+            const response = await pendingResponse;
+            if (!response.bodyUsed) await response.body?.cancel();
+          } catch {
+            // The test assertion carries the useful failure; cleanup is best effort.
+          }
+        }
+        await gatedUpstream.close();
+      }
+    },
+    150_000,
   );
 });

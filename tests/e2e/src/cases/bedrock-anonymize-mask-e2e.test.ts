@@ -27,12 +27,12 @@ import {
 //   masked before it reaches the caller.
 // - Hard block (BLOCKED entity) still blocks with the standard 422 /
 //   error-frame envelope.
-// - Defensive fallback (LiteLLM `_merge_masked_texts` semantics): masked
-//   outputs that don't align 1:1 with the input blocks are NOT applied —
-//   originals pass through, the request continues.
+// - Malformed anonymization: masked outputs that don't align 1:1 with the
+//   input blocks fail closed; originals never reach the model upstream.
 
 const CALLER = "sk-bedrock-mask-caller";
 const STREAM_CALLER = "sk-bedrock-mask-stream-caller";
+const BARRIER_CALLER = "sk-bedrock-mask-barrier-caller";
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 
 const EMAIL = "alice@example.com";
@@ -234,21 +234,27 @@ describe("bedrock guardrail ANONYMIZE write-back (#932 follow-up)", () => {
       },
       latency_mode: { kind: "serial" },
     });
+    await seed.createApiKey({
+      key_hash: hash(BARRIER_CALLER),
+      allowed_models: ["bmask-e2e", "bmask-stream-e2e"],
+    });
 
-    // Ready once a clean chat passes AND the guardrail fired on INPUT.
+    // The final API key is a revision barrier for both models and the
+    // guardrail without exercising any moderation behavior under test.
     await waitConfigPropagation(async () => {
-      try {
-        const r = await chat(CALLER, "bmask-e2e", [
-          { role: "user", content: "warmup all clean" },
-        ]);
-        await r.text();
-        return (
-          r.status === 200 &&
-          bedrock!.calls.some((c) => c.source === "INPUT")
-        );
-      } catch {
+      const response = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${BARRIER_CALLER}` },
+      });
+      if (response.status === 401) {
+        await response.text();
         return false;
       }
+      if (response.status !== 200) {
+        throw new Error(`model propagation probe returned ${response.status}`);
+      }
+      const body = (await response.json()) as { data?: Array<{ id?: string }> };
+      const ids = new Set(body.data?.map((model) => model.id));
+      return ["bmask-e2e", "bmask-stream-e2e"].every((model) => ids.has(model));
     });
   });
 
@@ -340,24 +346,30 @@ describe("bedrock guardrail ANONYMIZE write-back (#932 follow-up)", () => {
   );
 
   test(
-    "misaligned masked outputs are not applied — originals pass through",
+    "misaligned masked outputs fail closed without reaching the upstream",
     async (ctx) => {
       if (!etcdReachable) {
         ctx.skip();
         return;
       }
       const upstreamBefore = upstream!.receivedRequests.length;
+      const guardrailBefore = bedrock!.calls.length;
       // Two slots, but the mock answers with ONE merged output — the
-      // fallback must keep the originals and continue.
+      // gateway cannot map it safely and must not release the originals.
       const r = await chat(CALLER, "bmask-e2e", [
         { role: "user", content: `MISALIGN write to bob@example.org` },
         { role: "user", content: "second slot" },
       ]);
-      expect(r.status).toBe(200);
-      await r.text();
-      const sent = upstream!.receivedRequests.slice(upstreamBefore).at(-1)!;
-      expect(sent.body).toContain("bob@example.org");
-      expect(sent.body).not.toContain("{EMAIL}");
+      expect(r.status).toBe(422);
+      const body = await r.text();
+      expect(body).toContain("content policy");
+      expect(body).not.toContain("bob@example.org");
+      expect(body).not.toContain("MISALIGN");
+      expect(bedrock!.calls).toHaveLength(guardrailBefore + 1);
+      expect(bedrock!.calls.at(-1)?.texts).toContain(
+        "MISALIGN write to bob@example.org",
+      );
+      expect(upstream!.receivedRequests).toHaveLength(upstreamBefore);
     },
     60_000,
   );

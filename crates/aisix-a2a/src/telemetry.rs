@@ -294,8 +294,8 @@ impl A2aCallFacts {
 /// their bytes are not language, and a base64 blob would wreck both the token
 /// estimate and any captured content it lands in.
 ///
-/// `push` bounds the buffer; a request body has no size limit by default, and
-/// the result is retained for the lifetime of a streamed call.
+/// `push` bounds the buffer because the body limit can be disabled explicitly,
+/// and the result is retained for the lifetime of a streamed call.
 pub fn request_text(request: &Value, push: impl Fn(&mut String, &str)) -> String {
     let mut buf = String::new();
     if let Some(message) = request.pointer("/params/message") {

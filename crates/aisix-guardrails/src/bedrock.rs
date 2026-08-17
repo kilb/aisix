@@ -244,9 +244,9 @@ impl BedrockGuardrail {
     /// verdict + positional mask write-back. On an ANONYMIZE disposition
     /// Bedrock returns one `outputs[]` entry per input block; when that
     /// alignment holds the masked texts are returned for write-back.
-    /// When it doesn't (a provider quirk we can't attribute to slots),
-    /// keep the originals and continue — LiteLLM's `_merge_masked_texts`
-    /// fallback: never misapply masked content to the wrong slot.
+    /// When it doesn't, the successful anonymization result cannot be
+    /// attributed safely to the original slots, so fail closed rather than
+    /// release content that the provider said required anonymization.
     async fn apply_segments(
         &self,
         source: GuardrailContentSource,
@@ -276,7 +276,10 @@ impl BedrockGuardrail {
                             "bedrock masked outputs don't align with input \
                              blocks; skipping mask write-back",
                         );
-                        SegmentsOutcome::allow()
+                        SegmentsOutcome::from_verdict(GuardrailVerdict::block(format!(
+                            "bedrock guardrail {} returned misaligned masked outputs",
+                            self.guardrail_id,
+                        )))
                     }
                 }
             },
@@ -1296,11 +1299,11 @@ mod tests {
         );
     }
 
-    /// The defensive fallback (LiteLLM `_merge_masked_texts` semantics):
-    /// masked outputs that can't be aligned positionally are NOT applied
-    /// — originals stand, the request continues.
+    /// A successful anonymization response whose outputs cannot be aligned
+    /// positionally fails closed; releasing the originals would bypass the
+    /// provider's intervention.
     #[tokio::test]
-    async fn apply_segments_misaligned_outputs_keep_originals_and_allow() {
+    async fn apply_segments_misaligned_outputs_block() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
@@ -1316,7 +1319,7 @@ mod tests {
         let outcome = g
             .apply_segments(GuardrailContentSource::Input, &texts)
             .await;
-        assert_eq!(outcome.verdict, GuardrailVerdict::Allow);
+        assert!(outcome.verdict.is_block());
         assert_eq!(outcome.masked, None, "misaligned mask must not be applied");
     }
 

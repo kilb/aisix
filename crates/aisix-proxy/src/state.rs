@@ -205,7 +205,9 @@ pub struct ProxyStateInner {
     /// `reqwest::Client` connection pool. Always present (the
     /// no-exporters case = empty snapshot table = no spawned tasks).
     pub otlp_fan_out: OtlpHttpFanOut,
-    pub request_body_limit_bytes: usize,
+    /// `None` selects endpoint-aware finite defaults, `Some(0)` is an
+    /// explicit unlimited override, and `Some(n)` applies `n` globally.
+    pub request_body_limit_bytes: Option<usize>,
     /// Pre-parsed `proxy.real_ip` config for resolving the downstream
     /// client IP on each request (#492). Default = trust nothing → the
     /// logged source IP is the immediate TCP peer.
@@ -217,10 +219,10 @@ pub struct ProxyStateInner {
     /// Boot-compiled `proxy.url_rewrites` rules, applied in order to every
     /// request before routing (first match wins). Empty = layer no-ops.
     pub url_rewrites: Arc<[crate::rewrite::CompiledRewrite]>,
-    /// Optional config-freshness probe for `GET /readyz`: returns the time
-    /// since the etcd watch last applied config (`None` = never applied).
-    /// Wired from the watch supervisor in aisix-server; `None` here means
-    /// no freshness signal, so readiness gates on shutdown only (#591).
+    /// Config-freshness probe for `GET /readyz`: returns the time since the
+    /// config source last applied a snapshot (`None` = never applied). Every
+    /// constructor installs a fail-closed probe; server bootstrap must replace
+    /// it with its etcd/file source signal before serving traffic (#803).
     pub config_apply_age: Option<Arc<dyn Fn() -> Option<std::time::Duration> + Send + Sync>>,
     /// Batch ids whose completed output has already been attributed to
     /// UsageEvents by THIS process (#720). Process-local dedup only — the
@@ -262,11 +264,48 @@ impl std::ops::DerefMut for ProxyState {
 #[cfg(test)]
 const TEST_RATE_LIMIT_CLOCK_SECS: u64 = 1_763_000_000;
 
+fn live_exporter_fan_out(snapshot: &SnapshotHandle<AisixSnapshot>) -> OtlpHttpFanOut {
+    let fan_out = OtlpHttpFanOut::new();
+    let reconciler = fan_out.clone();
+    snapshot.subscribe_before_publish(move |view| {
+        let exporters = view.snapshot.observability_exporters.entries();
+        reconciler.reconcile(view.version, exporters.iter().map(|entry| &entry.value));
+    });
+    fan_out
+}
+
+/// Default for JSON, passthrough, MCP, and A2A request bodies. This is
+/// deliberately expressed in binary bytes so it does not reject a provider's
+/// decimal 32 MB request at the boundary.
+pub(crate) const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+/// The upstream transcription file limit plus room for multipart framing and
+/// the small text fields that accompany the file.
+pub(crate) const DEFAULT_AUDIO_BODY_LIMIT_BYTES: usize = 26 * 1024 * 1024;
+/// The upstream file limit plus room for multipart framing and routing fields.
+pub(crate) const DEFAULT_FILE_BODY_LIMIT_BYTES: usize = 513 * 1024 * 1024;
+
 impl ProxyState {
+    /// Resolve the body cap for one inbound path. A configured value always
+    /// wins; omitted configuration uses the protocol endpoint's upstream-
+    /// compatible finite default.
+    pub(crate) fn request_body_limit_for(&self, path: &str) -> usize {
+        match self.request_body_limit_bytes {
+            Some(limit) => limit,
+            None => match path.trim_end_matches('/') {
+                "/v1/audio/transcriptions" | "/v1/audio/translations" => {
+                    DEFAULT_AUDIO_BODY_LIMIT_BYTES
+                }
+                "/v1/files" => DEFAULT_FILE_BODY_LIMIT_BYTES,
+                _ => DEFAULT_REQUEST_BODY_LIMIT_BYTES,
+            },
+        }
+    }
+
     pub fn new(snapshot: SnapshotHandle<AisixSnapshot>, hub: Arc<Hub>, cfg: &ProxyConfig) -> Self {
         let metrics = Arc::new(Metrics::new(false));
         let guardrail_index =
             LiveGuardrailIndex::new_with_sink(snapshot.clone(), None, Some(metrics.clone()));
+        let otlp_fan_out = live_exporter_fan_out(&snapshot);
         // Unit tests get a frozen rate-limit clock: on the wall clock, any
         // "the next request 429s" assertion silently races the fixed-window
         // minute boundary — a test that straddles :00 lands its two requests
@@ -294,10 +333,10 @@ impl ProxyState {
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
-            config_apply_age: None,
+            config_apply_age: Some(Arc::new(|| None)),
             runtime_status: Arc::new(ModelRuntimeStatusTracker::new()),
             usage_sink: UsageSink::disabled(),
-            otlp_fan_out: OtlpHttpFanOut::new(),
+            otlp_fan_out,
             request_body_limit_bytes: cfg.request_body_limit_bytes,
             real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
             request_id_accept: cfg
@@ -324,6 +363,7 @@ impl ProxyState {
         let metrics = Arc::new(Metrics::new(false));
         let guardrail_index =
             LiveGuardrailIndex::new_with_sink(snapshot.clone(), None, Some(metrics.clone()));
+        let otlp_fan_out = live_exporter_fan_out(&snapshot);
         Self::from_inner(ProxyStateInner {
             snapshot,
             hub,
@@ -336,10 +376,10 @@ impl ProxyState {
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
-            config_apply_age: None,
+            config_apply_age: Some(Arc::new(|| None)),
             runtime_status: Arc::new(ModelRuntimeStatusTracker::new()),
             usage_sink: UsageSink::disabled(),
-            otlp_fan_out: OtlpHttpFanOut::new(),
+            otlp_fan_out,
             request_body_limit_bytes: cfg.request_body_limit_bytes,
             real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
             request_id_accept: cfg
@@ -368,6 +408,7 @@ impl ProxyState {
     ) -> Self {
         let guardrail_index =
             LiveGuardrailIndex::new_with_sink(snapshot.clone(), None, Some(metrics.clone()));
+        let otlp_fan_out = live_exporter_fan_out(&snapshot);
         // The bootstrap constructor is the one place the tracker gets a
         // metrics sink + snapshot handle, so cooldown transitions emit
         // `aisix_deployment_*`. Clone both before they are moved into the
@@ -392,10 +433,10 @@ impl ProxyState {
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::with_flags(bookkeeping_flags)),
             livez: Arc::new(LivezState::new()),
-            config_apply_age: None,
+            config_apply_age: Some(Arc::new(|| None)),
             runtime_status,
             usage_sink: UsageSink::disabled(),
-            otlp_fan_out: OtlpHttpFanOut::new(),
+            otlp_fan_out,
             request_body_limit_bytes: cfg.request_body_limit_bytes,
             real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
             request_id_accept: cfg
@@ -483,23 +524,31 @@ impl ProxyState {
         Arc::make_mut(&mut self.inner).config_apply_age = Some(probe);
         self
     }
+
+    /// Explicit opt-out for tests or embedded callers with no asynchronous
+    /// config source. Production bootstrap should wire the real source probe.
+    pub fn with_config_always_fresh(self) -> Self {
+        self.with_config_apply_age(Arc::new(|| Some(std::time::Duration::ZERO)))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::ProxyState;
+    use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;
     use aisix_core::{AisixSnapshot, ProxyConfig};
     use aisix_gateway::Hub;
+    use aisix_obs::UsageEvent;
     use std::sync::Arc;
 
-    fn test_state() -> ProxyState {
+    fn test_state_with_limit(request_body_limit_bytes: Option<usize>) -> ProxyState {
         ProxyState::new(
             SnapshotHandle::new(AisixSnapshot::new()),
             Arc::new(Hub::new()),
             &ProxyConfig {
                 addr: "127.0.0.1:0".into(),
-                request_body_limit_bytes: 1_048_576,
+                request_body_limit_bytes,
                 tls: None,
                 real_ip: Default::default(),
                 request_id: Default::default(),
@@ -508,6 +557,60 @@ mod tests {
                 url_rewrites: Vec::new(),
             },
         )
+    }
+
+    fn test_state() -> ProxyState {
+        test_state_with_limit(Some(1_048_576))
+    }
+
+    #[test]
+    fn config_freshness_defaults_fail_closed_and_opt_out_is_explicit() {
+        let state = test_state();
+        let probe = state
+            .config_apply_age
+            .as_ref()
+            .expect("constructors must install a config probe");
+        assert_eq!(probe(), None);
+
+        let always_fresh = state.with_config_always_fresh();
+        assert_eq!(
+            always_fresh
+                .config_apply_age
+                .as_ref()
+                .expect("explicit opt-out must keep a probe")(),
+            Some(std::time::Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn automatic_body_limits_follow_the_endpoint_contract() {
+        let automatic = test_state_with_limit(None);
+        assert_eq!(
+            automatic.request_body_limit_for("/v1/messages"),
+            super::DEFAULT_REQUEST_BODY_LIMIT_BYTES
+        );
+        assert_eq!(
+            automatic.request_body_limit_for("/v1/messages/count_tokens"),
+            super::DEFAULT_REQUEST_BODY_LIMIT_BYTES
+        );
+        assert_eq!(
+            automatic.request_body_limit_for("/v1/audio/transcriptions"),
+            super::DEFAULT_AUDIO_BODY_LIMIT_BYTES
+        );
+        assert_eq!(
+            automatic.request_body_limit_for("/v1/audio/translations/"),
+            super::DEFAULT_AUDIO_BODY_LIMIT_BYTES
+        );
+        assert_eq!(
+            automatic.request_body_limit_for("/v1/files"),
+            super::DEFAULT_FILE_BODY_LIMIT_BYTES
+        );
+
+        let explicit = test_state_with_limit(Some(7));
+        assert_eq!(explicit.request_body_limit_for("/v1/files"), 7);
+        assert_eq!(explicit.request_body_limit_for("/v1/messages"), 7);
+        let unlimited = test_state_with_limit(Some(0));
+        assert_eq!(unlimited.request_body_limit_for("/v1/messages"), 0);
     }
 
     #[test]
@@ -533,5 +636,62 @@ mod tests {
         assert!(!Arc::ptr_eq(&original.inner, &configured.inner));
         assert_ne!(original.default_retries, 99);
         assert_eq!(configured.default_retries, 99);
+    }
+
+    #[tokio::test]
+    async fn snapshot_publication_revokes_exporter_without_request_traffic() {
+        let initial = AisixSnapshot::new();
+        let exporter = serde_json::from_value(serde_json::json!({
+            "name": "revoked",
+            "enabled": true,
+            "kind": "otlp_http",
+            "endpoint": "http://127.0.0.1:9/v1/traces"
+        }))
+        .unwrap();
+        initial
+            .observability_exporters
+            .insert(ResourceEntry::new("exporter-id", exporter, 1));
+        let handle = SnapshotHandle::new(initial);
+        let state = ProxyState::new(
+            handle.clone(),
+            Arc::new(Hub::new()),
+            &ProxyConfig {
+                addr: "127.0.0.1:0".into(),
+                request_body_limit_bytes: None,
+                tls: None,
+                real_ip: Default::default(),
+                request_id: Default::default(),
+                thread_per_core: None,
+                workers: None,
+                url_rewrites: Vec::new(),
+            },
+        );
+        let view = handle.load_versioned();
+        let exporters = view.snapshot.observability_exporters.entries();
+        state.otlp_fan_out.fan_out(
+            &UsageEvent::default(),
+            None,
+            view.version,
+            exporters.iter().map(|entry| &entry.value),
+        );
+        assert!(state.otlp_fan_out.exporter_stats().contains_key("revoked"));
+
+        // No request/fan_out follows this publication. The snapshot listener
+        // itself must synchronously abort the worker and discard its queue.
+        handle.store(AisixSnapshot::new());
+        assert!(state.otlp_fan_out.exporter_stats().is_empty());
+
+        // A request may have captured the old view before the deletion and
+        // finish afterward. Once the new generation is visible, the
+        // pre-publication reconciliation watermark rejects that stale fanout
+        // instead of recreating the revoked pipeline.
+        state.otlp_fan_out.fan_out(
+            &UsageEvent::default(),
+            None,
+            view.version,
+            exporters.iter().map(|entry| &entry.value),
+        );
+        assert!(state.otlp_fan_out.exporter_stats().is_empty());
+        state.otlp_fan_out.shutdown().await;
     }
 }

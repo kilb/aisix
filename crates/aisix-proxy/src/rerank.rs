@@ -95,7 +95,10 @@ pub async fn rerank(
                 Some(&auth.entry.id),
                 started,
                 crate::reject::Envelope::OpenAi,
-                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+                crate::error::proxy_error_from_json_rejection(
+                    rej,
+                    state.request_body_limit_for("/v1/rerank"),
+                ),
             );
         }
     };
@@ -700,9 +703,12 @@ fn emit_usage_event(
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("rerank", event.clone());
     let exporters = crate::usage_attr::live_exporters(state, snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, content, exporters.iter().map(|e| &e.value));
+    state.otlp_fan_out.fan_out(
+        &event,
+        content,
+        exporters.generation(),
+        exporters.iter().map(|e| &e.value),
+    );
     let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
     crate::request_metrics::record_usage(
         state,
@@ -810,7 +816,7 @@ mod tests {
     fn cfg() -> ProxyConfig {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: 1_048_576,
+            request_body_limit_bytes: Some(1_048_576),
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),

@@ -42,11 +42,13 @@ pub struct A2aAgent {
 
     /// The upstream agent's A2A service endpoint, such as
     /// `https://agents.example.com/a2a`, where AISIX sends JSON-RPC 2.0 requests
-    /// over HTTP. AISIX looks for the agent card at the well-known path under
-    /// this URL's own path first, then under its origin, so both an agent that
-    /// owns its domain and one published under a path prefix are reachable
+    /// over HTTP. The value must be an absolute HTTP or HTTPS URL with a host
+    /// and must not embed credentials in user information or credential-like
+    /// query parameters. AISIX looks for the agent card at the well-known path
+    /// under this URL's own path first, then under its origin, so both an agent
+    /// that owns its domain and one published under a path prefix are reachable
     /// without extra configuration.
-    #[schemars(length(min = 1))]
+    #[schemars(url, length(min = 1))]
     pub url: String,
 
     /// The A2A wire-format version this agent speaks. AISIX announces it to the
@@ -243,6 +245,58 @@ mod tests {
     fn schema_accepts_none_auth_without_secret() {
         let doc = json!({"name": "agent", "url": "https://x/a2a"});
         crate::models::schema::validate_a2a_agent(&doc).expect("auth_type none needs no secret");
+    }
+
+    #[test]
+    fn schema_rejects_invalid_or_credentialed_agent_urls() {
+        for bad in [
+            "not-a-url",
+            "/relative/a2a",
+            "ftp://agents.example.com/a2a",
+            "https://user:password@agents.example.com/a2a",
+            "https://agents.example.com/a2a?access_token=secret",
+            "https://agents.example.com/a2a?accessToken=secret",
+            "https://agents.example.com/a2a?authToken=secret",
+            "https://agents.example.com/a2a?token=secret",
+            "https://agents.example.com/a2a?secret=secret",
+            "https://agents.example.com/a2a?password=secret",
+            "https://agents.example.com/a2a?access%5Ftoken=secret",
+            "https://agents.example.com/a2a?tenant%2Dsecret=secret",
+            "https://agents.example.com/a2a?tok%65n=secret",
+            "https://agents.example.com/a2a?tenant%5Fid=one",
+            "https://agents.example.com/a2a?API_KEY=secret",
+            "https://agents.example.com/a2a?tenant-secret=secret",
+            "https://agents.example.com/a2a?foo-secret-bar=secret",
+            "https://agents.example.com/a2a?foo.token.bar=secret",
+            "https://agents.example.com/a2a?a.p.i.k.e.y=secret",
+            "https://agents.example.com/a2a?X-Amz-Credential=secret",
+            "https://agents.example.com/a2a?X-Amz-Signature=secret",
+            "https://agents.example.com/a2a?sig=secret",
+        ] {
+            let doc = json!({"name": "agent", "url": bad});
+            crate::models::schema::validate_a2a_agent(&doc)
+                .expect_err(&format!("strict validation must reject {bad:?}"));
+            crate::models::schema::validate_a2a_agent_lenient(&doc)
+                .unwrap_or_else(|e| panic!("legacy row {bad:?} must keep loading: {e}"));
+        }
+
+        for good in [
+            "https://agents.example.com/a2a",
+            "http://127.0.0.1:8080/a2a",
+            "https://agents.example.com/a2a?tenant=one",
+            "https://agents.example.com/a2a?foo-secretish-bar=one&tenant.profile=two",
+            "https://agents.example.com/a2a?redirect=https%3A%2F%2Fsafe.example",
+        ] {
+            let doc = json!({"name": "agent", "url": good});
+            crate::models::schema::validate_a2a_agent(&doc)
+                .unwrap_or_else(|e| panic!("{good:?} should validate: {e}"));
+        }
+
+        crate::models::schema::validate_a2a_agent_lenient(&json!({
+            "name": "agent",
+            "url": ""
+        }))
+        .expect_err("the lenient path still enforces the pre-existing non-empty constraint");
     }
 
     #[test]

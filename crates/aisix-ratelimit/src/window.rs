@@ -90,13 +90,13 @@ impl FixedWindowCounter {
         self.count
     }
 
-    /// Peek at whether the current count already exceeds the limit. Used
+    /// Peek at whether the current count has reached the limit. Used
     /// on the *next* request's pre-commit to short-circuit before
     /// increment: TPM is checked-but-not-incremented at pre-commit, then
     /// incremented on post-deduct by the actual token usage.
     pub fn is_exceeded(&mut self, now_secs: u64, limit: u64) -> Option<u64> {
         self.roll_if_stale(now_secs);
-        if self.count > limit {
+        if self.count >= limit {
             let remainder = self
                 .window_secs
                 .saturating_sub(now_secs.saturating_sub(self.window_start));

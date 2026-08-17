@@ -394,16 +394,14 @@ impl EtcdConfig {
 #[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     pub addr: String,
-    /// Cap on inbound request bodies across the whole proxy surface
-    /// (JSON, multipart, passthrough, MCP, A2A). `0` — the default —
-    /// disables the cap, matching the reference LLM proxy's
-    /// out-of-box behaviour: providers accept larger requests than any
-    /// fixed gateway default (Anthropic takes 32 MB), so a gateway-side
-    /// cap rejects requests the upstream would have served. Set a value
-    /// to bound per-request memory; over-limit requests get a 413 in
-    /// the caller's error envelope.
-    #[serde(default = "ProxyConfig::default_body_limit")]
-    pub request_body_limit_bytes: usize,
+    /// Optional cap on inbound request bodies across the whole proxy
+    /// surface (JSON, multipart, passthrough, MCP, A2A). When omitted,
+    /// the gateway applies endpoint-aware finite defaults. Set a positive
+    /// value to override every endpoint or `0` to disable the cap
+    /// explicitly. Over-limit requests get a 413 in the caller's error
+    /// envelope.
+    #[serde(default)]
+    pub request_body_limit_bytes: Option<usize>,
     #[serde(default)]
     pub tls: Option<TlsConfig>,
     /// Real-client-IP resolution from forwarded headers (#492). Default
@@ -463,10 +461,6 @@ pub struct ProxyConfig {
 }
 
 impl ProxyConfig {
-    const fn default_body_limit() -> usize {
-        0
-    }
-
     /// Whether the proxy serves from thread-per-core workers, resolving
     /// the platform default when unset.
     pub fn thread_per_core_enabled(&self) -> bool {
@@ -1645,9 +1639,8 @@ admin:
         );
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
         assert_eq!(cfg.etcd.endpoints, vec!["http://127.0.0.1:2379"]);
-        // `0` = no request-body cap, the out-of-box behaviour of the
-        // reference LLM proxy.
-        assert_eq!(cfg.proxy.request_body_limit_bytes, 0);
+        // An omitted limit selects the proxy's endpoint-aware safe defaults.
+        assert_eq!(cfg.proxy.request_body_limit_bytes, None);
         assert!(cfg.observability.metrics.prometheus.enabled);
         // The dedicated metrics listener defaults to 0.0.0.0:9090 in
         // every mode — no admin-listener fallback to fall out of sync with.
@@ -1658,6 +1651,24 @@ admin:
         assert!(!cfg.proxy.real_ip.recursive);
         assert_eq!(cfg.proxy.real_ip.header, "x-forwarded-for");
         assert!(cfg.proxy.real_ip.parse_trusted().unwrap().is_empty());
+    }
+
+    #[test]
+    fn request_body_limit_distinguishes_automatic_from_explicit_unlimited() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+  request_body_limit_bytes: 0
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.proxy.request_body_limit_bytes, Some(0));
     }
 
     #[test]

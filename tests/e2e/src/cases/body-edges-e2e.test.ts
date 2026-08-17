@@ -27,7 +27,7 @@ import {
 //      `ECONNRESET` from a mid-write socket close (which is
 //      indistinguishable from a network failure or a gateway
 //      crash). The gateway's `request_body_limit_bytes` is set to
-//      10 MiB by the harness (matching production default).
+//      10 MiB by this suite's harness configuration.
 //
 //   3. Empty `messages: []` — OpenAI Chat Completions spec requires
 //      a non-empty messages array. Gateway must reject with a
@@ -54,6 +54,23 @@ const isRefusal = (line: string): boolean =>
 
 const countRefusals = (output: string): number =>
   output.split("\n").filter(isRefusal).length;
+
+async function waitForModel(app: SpawnedApp, apiKey: string, model: string) {
+  await waitConfigPropagation(async () => {
+    const response = await fetch(`${app.proxyUrl}/v1/models`, {
+      headers: { authorization: `Bearer ${apiKey}` },
+    });
+    if (response.status === 401) {
+      await response.text();
+      return false;
+    }
+    if (response.status !== 200) {
+      throw new Error(`model propagation probe returned ${response.status}`);
+    }
+    const body = (await response.json()) as { data?: Array<{ id?: string }> };
+    return body.data?.some((entry) => entry.id === model) === true;
+  });
+}
 
 describe("body edges e2e: multi-turn, oversize body, empty messages", () => {
   let app: SpawnedApp | undefined;
@@ -88,24 +105,9 @@ describe("body edges e2e: multi-turn, oversize body, empty messages", () => {
       allowed_models: ["body-edges"],
     });
 
-    // Confirm propagation with a one-message happy-path call so
-    // the downstream tests run against a fully-loaded snapshot.
-    const client = new OpenAI({
-      apiKey: CALLER_PLAINTEXT,
-      baseURL: `${app.proxyUrl}/v1`,
-      maxRetries: 0,
-    });
-    await waitConfigPropagation(async () => {
-      try {
-        const r = await client.chat.completions.create({
-          model: "body-edges",
-          messages: [{ role: "user", content: "ready-probe" }],
-        });
-        return r.choices[0]?.message.role === "assistant";
-      } catch {
-        return false;
-      }
-    });
+    // Authentication is seeded last; model discovery proves every earlier
+    // routing row is applied without exercising chat behavior under test.
+    await waitForModel(app, CALLER_PLAINTEXT, "body-edges");
   });
 
   afterAll(async () => {
@@ -429,13 +431,11 @@ describe("body edges e2e: multi-turn, oversize body, empty messages", () => {
   });
 });
 
-// The shipped default is `request_body_limit_bytes: 0` — NO cap, matching
-// the reference LLM proxy's out-of-box behaviour (its request-size guard
-// defaults to off): providers accept larger requests than any fixed
-// gateway default, so a gateway-side cap rejects requests the upstream
-// would have served. The suite above pins the behaviour WITH a cap (the
-// harness sets 10 MiB); this suite pins the default.
-describe("body edges e2e: unlimited default (request_body_limit_bytes: 0)", () => {
+// When `request_body_limit_bytes` is omitted, the gateway selects finite
+// endpoint-aware limits. The standard JSON limit admits realistic long
+// prompts while the Messages boundary follows the upstream 32 MB contract:
+// <https://platform.claude.com/docs/en/api/errors#request-size-limits>.
+describe("body edges e2e: automatic endpoint-aware defaults", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let etcdReachable = false;
@@ -446,41 +446,26 @@ describe("body edges e2e: unlimited default (request_body_limit_bytes: 0)", () =
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
-    app = await spawnApp({ requestBodyLimitBytes: 0 });
+    app = await spawnApp({ requestBodyLimitBytes: null });
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
     const pk = await seed.createProviderKey({
-      display_name: "body-unlimited-pk",
+      display_name: "body-automatic-pk",
       secret: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
-      display_name: "body-unlimited",
+      display_name: "body-automatic",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
-      allowed_models: ["body-unlimited"],
+      allowed_models: ["body-automatic"],
     });
 
-    const client = new OpenAI({
-      apiKey: CALLER_PLAINTEXT,
-      baseURL: `${app.proxyUrl}/v1`,
-      maxRetries: 0,
-    });
-    await waitConfigPropagation(async () => {
-      try {
-        const r = await client.chat.completions.create({
-          model: "body-unlimited",
-          messages: [{ role: "user", content: "ready-probe" }],
-        });
-        return r.choices[0]?.message.role === "assistant";
-      } catch {
-        return false;
-      }
-    });
+    await waitForModel(app, CALLER_PLAINTEXT, "body-automatic");
   });
 
   afterAll(async () => {
@@ -488,15 +473,14 @@ describe("body edges e2e: unlimited default (request_body_limit_bytes: 0)", () =
     await upstream?.close();
   });
 
-  test("a 12 MiB body sails through to the upstream", async (ctx) => {
+  test("a 12 MiB JSON body reaches the upstream", async (ctx) => {
     if (!etcdReachable || !app || !upstream) {
       ctx.skip();
       return;
     }
 
-    // Comfortably above both the old 10 MiB default and axum's
-    // built-in 2 MiB extractor fallback — proving the cap is OFF,
-    // not merely raised.
+    // Comfortably above both the harness's explicit 10 MiB test cap and
+    // axum's built-in 2 MiB fallback, but below the automatic JSON limit.
     const filler = "x".repeat(12 * 1024 * 1024);
     const upstreamHitsBefore = upstream.receivedRequests.length;
     const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
@@ -506,7 +490,7 @@ describe("body edges e2e: unlimited default (request_body_limit_bytes: 0)", () =
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        model: "body-unlimited",
+        model: "body-automatic",
         messages: [{ role: "user", content: filler }],
       }),
     });
@@ -519,5 +503,38 @@ describe("body edges e2e: unlimited default (request_body_limit_bytes: 0)", () =
       messages?: Array<{ content?: string }>;
     };
     expect(sentBody.messages?.[0]?.content?.length).toBe(filler.length);
+  }, 60_000);
+
+  test("a Messages body above 32 MiB is rejected before dispatch", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    const filler = "x".repeat(32 * 1024 * 1024 + 512 * 1024);
+    const upstreamHitsBefore = upstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "body-automatic",
+        max_tokens: 8,
+        messages: [{ role: "user", content: filler }],
+      }),
+    });
+
+    expect(res.status).toBe(413);
+    const body = (await res.json()) as {
+      type?: unknown;
+      error?: { type?: unknown; message?: unknown };
+    };
+    expect(body.type).toBe("error");
+    expect(body.error?.type).toBe("request_too_large");
+    expect(typeof body.error?.message).toBe("string");
+    expect(upstream.receivedRequests.length).toBe(upstreamHitsBefore);
   }, 60_000);
 });

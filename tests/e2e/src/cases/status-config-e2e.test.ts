@@ -57,6 +57,11 @@ interface StatusConfig {
     first_seen_at: string;
     last_seen_at: string;
   }>;
+  partially_compatible: Array<{
+    resource_kind: string;
+    field: string;
+    count: number;
+  }>;
 }
 
 async function getStatusConfig(app: SpawnedApp): Promise<StatusConfig> {
@@ -259,6 +264,95 @@ describe("status/config: etcd watch source", () => {
 
     await etcd.delete(`${app.etcdPrefix}/provider_keys/${leakId}`);
   });
+
+  test("legacy credentialed A2A URLs load with compatibility reporting and no secret leakage", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const USER_SECRET = "a2a-user-secret";
+    const PASSWORD_SECRET = "a2a-password-secret";
+    const QUERY_SECRET = "a2a-query-secret";
+    const agentId = randomUUID();
+    const signatureId = randomUUID();
+    const cleanId = randomUUID();
+    const SIGNATURE_SECRET = "a2a-signature-secret";
+    const etcd = new EtcdClient();
+    await etcd.put(
+      `${app.etcdPrefix}/a2a_agents/${agentId}`,
+      JSON.stringify({
+        name: "credentialed-agent",
+        url: `https://${USER_SECRET}:${PASSWORD_SECRET}@agents.example.com/a2a?access_token=${QUERY_SECRET}`,
+      }),
+    );
+    await etcd.put(
+      `${app.etcdPrefix}/a2a_agents/${signatureId}`,
+      JSON.stringify({
+        name: "signed-agent",
+        url: `https://agents.example.com/a2a?X-Amz-Signature=${SIGNATURE_SECRET}`,
+      }),
+    );
+    await etcd.put(
+      `${app.etcdPrefix}/a2a_agents/${cleanId}`,
+      JSON.stringify({
+        name: "clean-agent",
+        url: "https://agents.example.com/a2a",
+      }),
+    );
+
+    // A later authenticated resource is the revision barrier. This keeps the
+    // compatibility counters out of propagation readiness and proves the two
+    // legacy rows plus the clean negative control have all been observed.
+    const barrierCaller = `sk-status-a2a-barrier-${randomUUID()}`;
+    const barrier = await seed!.createApiKey({
+      key_hash: createHash("sha256").update(barrierCaller).digest("hex"),
+      allowed_models: ["status-model"],
+    });
+    await waitConfigPropagation(async () => {
+      const response = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${barrierCaller}` },
+      });
+      if (response.status === 401) {
+        await response.text();
+        return false;
+      }
+      if (response.status !== 200) {
+        throw new Error(`model propagation probe returned ${response.status}`);
+      }
+      const body = (await response.json()) as { data?: Array<{ id?: string }> };
+      return body.data?.some((model) => model.id === "status-model") === true;
+    });
+    const cfg = await getStatusConfig(app);
+
+    // Direct etcd writes represent rows from an older control plane. They
+    // remain loadable during a rolling upgrade, while the strict write/file
+    // validators reject the same URL shapes in their dedicated tests.
+    expect(cfg.applied?.resource_counts.a2a_agents).toBe(3);
+    expect(
+      cfg.partially_compatible.find(
+        (entry) =>
+          entry.resource_kind === "a2a_agents" && entry.field === "legacy:url_policy",
+      )?.count,
+    ).toBe(2);
+    expect(cfg.rejected.some((entry) => entry.resource_id === agentId)).toBe(false);
+    expect(cfg.rejected.some((entry) => entry.resource_id === signatureId)).toBe(false);
+    expect(cfg.rejected.some((entry) => entry.resource_id === cleanId)).toBe(false);
+
+    const status = await fetch(`${app.metricsUrl}/status/config`).then((r) => r.text());
+    const metrics = await scrape(app);
+    for (const secret of [USER_SECRET, PASSWORD_SECRET, QUERY_SECRET, SIGNATURE_SECRET]) {
+      expect(status).not.toContain(secret);
+      expect(metrics).not.toContain(secret);
+    }
+    expect(metrics).toMatch(
+      /aisix_config_partially_compatible_resources\{kind="a2a_agents"\} 2/,
+    );
+
+    await etcd.delete(`${app.etcdPrefix}/a2a_agents/${agentId}`);
+    await etcd.delete(`${app.etcdPrefix}/a2a_agents/${signatureId}`);
+    await etcd.delete(`${app.etcdPrefix}/a2a_agents/${cleanId}`);
+    await seed!.delete("api_keys", barrier.id);
+  });
 });
 
 describe("status/config: standalone file source", () => {
@@ -329,6 +423,7 @@ api_keys:
 // spawns the binary directly and gates only on the metrics/status listener,
 // which binds independently of the config source.
 interface MinimalApp {
+  proxyUrl: string;
   metricsUrl: string;
   stop(): Promise<void>;
 }
@@ -398,6 +493,7 @@ async function spawnPointedAtDeadEtcd(): Promise<MinimalApp> {
   }
 
   return {
+    proxyUrl: `http://127.0.0.1:${proxyPort}`,
     metricsUrl,
     async stop() {
       if (child.exitCode === null) child.kill("SIGTERM");
@@ -437,5 +533,12 @@ describe("status/ready: never_loaded before any config", () => {
     // The etcd source shows disconnected while it keeps retrying.
     expect(cfg.source.type).toBe("etcd");
     expect(cfg.source.connected).toBe(false);
+
+    // The proxy listener is the production readiness surface. It must use the
+    // same fail-closed config gate as the diagnostics listener before the
+    // first successful etcd apply.
+    const proxyReady = await fetch(`${app.proxyUrl}/readyz`);
+    expect(proxyReady.status).toBe(503);
+    expect(await proxyReady.text()).toContain("config failed");
   });
 });

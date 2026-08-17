@@ -431,7 +431,7 @@ mod tests {
             thread_per_core: None,
             workers: None,
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: 1 << 20,
+            request_body_limit_bytes: Some(1 << 20),
             tls: None,
             real_ip: Default::default(),
             request_id: Default::default(),

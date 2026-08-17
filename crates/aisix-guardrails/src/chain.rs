@@ -115,6 +115,31 @@ impl GuardrailChain {
         &self.applied
     }
 
+    /// Return only dedicated data-loss-prevention members. Mixed-purpose
+    /// providers are deliberately excluded: their remote policy may combine
+    /// PII detection with content moderation, which a caller cannot separate
+    /// at runtime. This subset is used by egress-only surfaces such as message
+    /// token counting, where content moderation is intentionally exempt but
+    /// sensitive data still must not leave the gateway unprotected.
+    pub fn dlp_only(&self) -> Self {
+        let mut members = Vec::new();
+        let mut applied = Vec::new();
+        for (index, member) in self.members.iter().enumerate() {
+            if !matches!(member.kind.as_str(), "pii" | "presidio") {
+                continue;
+            }
+            members.push(member.clone());
+            if let Some(metadata) = self.applied.get(index) {
+                applied.push(metadata.clone());
+            }
+        }
+        Self {
+            members,
+            applied,
+            sink: self.sink.clone(),
+        }
+    }
+
     /// The members' configured names, in evaluation order. The snapshot
     /// build points sort rows `created_at`-ascending (id-tiebreak) before
     /// building, so this order is deterministic and matches the dashboard
@@ -629,6 +654,24 @@ async fn fold_segments(
         } else {
             m.guardrail.moderate_output_segments(src).await
         };
+        if outcome
+            .masked
+            .as_ref()
+            .is_some_and(|masked| masked.len() != src.len())
+        {
+            tracing::warn!(
+                member = %m.name,
+                expected = src.len(),
+                got = outcome.masked.as_ref().map_or(0, Vec::len),
+                "segment moderation returned misaligned mask; failing closed",
+            );
+            outcome.masked = None;
+            outcome.counts.clear();
+            if !outcome.verdict.is_block() {
+                outcome.verdict =
+                    GuardrailVerdict::block("segment moderation returned misaligned mask");
+            }
+        }
         record_execution(
             sink,
             m,
@@ -659,22 +702,11 @@ async fn fold_segments(
             }
         }
         if let Some(new_masked) = outcome.masked {
-            // Implementations uphold alignment with THEIR input; refuse a
-            // drifted length here so a broken member can't desync slots.
-            // Counts merge ONLY with an accepted mask — they describe
-            // APPLIED anonymization (`redacted_entity_counts`), so a
-            // refused mask must not inflate them.
-            if new_masked.len() == src.len() {
-                masked = Some(new_masked);
-                Redaction::merge_counts(&mut counts, &outcome.counts);
-            } else {
-                tracing::warn!(
-                    member = %m.name,
-                    expected = src.len(),
-                    got = new_masked.len(),
-                    "segment moderation returned misaligned mask; keeping originals",
-                );
-            }
+            // Alignment was validated above before execution metrics and
+            // verdict folding. Counts therefore describe only replacements
+            // that are safe to apply positionally.
+            masked = Some(new_masked);
+            Redaction::merge_counts(&mut counts, &outcome.counts);
         }
     }
     SegmentsOutcome {
@@ -1089,10 +1121,10 @@ mod tests {
         }
     }
 
-    /// A member returning a mask whose length drifted from ITS input is
-    /// refused (originals kept) — the chain-level alignment guard.
+    /// A member returning a mask whose length drifted from its input fails
+    /// closed — the chain-level alignment guard.
     #[tokio::test]
-    async fn segment_fold_refuses_misaligned_member_mask() {
+    async fn segment_fold_blocks_misaligned_member_mask() {
         struct Drifting;
         #[async_trait]
         impl Guardrail for Drifting {
@@ -1122,7 +1154,12 @@ mod tests {
             "a refused mask's counts describe anonymization that was NOT \
              applied — they must not reach redacted_entity_counts",
         );
-        assert_eq!(out.verdict, GuardrailVerdict::Allow);
+        match out.verdict {
+            GuardrailVerdict::Block { guardrail_name, .. } => {
+                assert_eq!(guardrail_name.as_deref(), Some("drifting"))
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
     }
 
     #[test]

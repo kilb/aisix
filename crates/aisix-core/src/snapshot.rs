@@ -1,9 +1,10 @@
 //! Lock-free configuration snapshot.
 //!
-//! The data plane holds an `ArcSwap<Arc<Snapshot>>`. Reads are a single atomic
-//! load — no mutex, no RCU dance in user code. Writes build a fresh snapshot
-//! off the etcd watch thread and atomically replace the pointer (spec §2:
-//! "no mutex on the read path, atomic replace on write").
+//! The gateway holds an `ArcSwap` publication containing a snapshot and its
+//! generation. Reads are a single atomic load — no mutex, no RCU dance in user
+//! code. Writes build a fresh snapshot off the etcd watch thread and atomically
+//! replace the publication (spec §2: "no mutex on the read path, atomic replace
+//! on write").
 //!
 //! A [`Snapshot`] holds a [`ResourceTable<T>`] per entity kind. Each table
 //! provides:
@@ -18,8 +19,8 @@
 use crate::resource::{Resource, ResourceEntry};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Per-kind table with primary id-index and secondary name-index.
 ///
@@ -191,15 +192,62 @@ impl<T: Resource> ResourceTable<T> {
 /// handle only clones its inner `Arc`, the `S` is never duplicated.
 #[derive(Debug)]
 pub struct SnapshotHandle<S> {
-    inner: Arc<ArcSwap<S>>,
-    version: Arc<AtomicU64>,
+    inner: Arc<ArcSwap<PublishedSnapshot<S>>>,
+    listeners: Arc<SnapshotListeners<S>>,
+}
+
+type SnapshotListener<S> = dyn Fn(SnapshotView<S>) + Send + Sync + 'static;
+
+struct SnapshotListeners<S> {
+    /// Serializes publication with initial listener delivery so a newly
+    /// subscribed observer can never see generation N+1 before generation N.
+    publication: Mutex<()>,
+    before_publish_callbacks: Mutex<Vec<Arc<SnapshotListener<S>>>>,
+    callbacks: Mutex<Vec<Arc<SnapshotListener<S>>>>,
+}
+
+impl<S> std::fmt::Debug for SnapshotListeners<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotListeners")
+            .field(
+                "before_publish_count",
+                &self.before_publish_callbacks.lock().unwrap().len(),
+            )
+            .field("count", &self.callbacks.lock().unwrap().len())
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+struct PublishedSnapshot<S> {
+    version: u64,
+    snapshot: Arc<S>,
+}
+
+/// One atomically-observed snapshot generation.
+///
+/// Consumers that cache state derived from a snapshot must use this view so
+/// the generation and the data it names cannot come from different stores.
+#[derive(Debug)]
+pub struct SnapshotView<S> {
+    pub version: u64,
+    pub snapshot: Arc<S>,
+}
+
+impl<S> Clone for SnapshotView<S> {
+    fn clone(&self) -> Self {
+        Self {
+            version: self.version,
+            snapshot: Arc::clone(&self.snapshot),
+        }
+    }
 }
 
 impl<S> Clone for SnapshotHandle<S> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
-            version: Arc::clone(&self.version),
+            listeners: Arc::clone(&self.listeners),
         }
     }
 }
@@ -207,49 +255,116 @@ impl<S> Clone for SnapshotHandle<S> {
 impl<S> SnapshotHandle<S> {
     pub fn new(initial: S) -> Self {
         Self {
-            inner: Arc::new(ArcSwap::from_pointee(initial)),
-            version: Arc::new(AtomicU64::new(0)),
+            inner: Arc::new(ArcSwap::from_pointee(PublishedSnapshot {
+                version: 0,
+                snapshot: Arc::new(initial),
+            })),
+            listeners: Arc::new(SnapshotListeners {
+                publication: Mutex::new(()),
+                before_publish_callbacks: Mutex::new(Vec::new()),
+                callbacks: Mutex::new(Vec::new()),
+            }),
         }
     }
 
     /// Atomic load. Cheap (one Acquire load).
     pub fn load(&self) -> Arc<S> {
-        self.inner.load_full()
+        Arc::clone(&self.inner.load().snapshot)
+    }
+
+    /// Load the snapshot and its generation from one atomic publication.
+    pub fn load_versioned(&self) -> SnapshotView<S> {
+        let published = self.inner.load();
+        SnapshotView {
+            version: published.version,
+            snapshot: Arc::clone(&published.snapshot),
+        }
     }
 
     /// Monotonic version counter. Incremented on every `store` / `rcu`.
-    /// Consumers can compare this to detect snapshot changes without
-    /// relying on `Arc` pointer identity (which suffers from the ABA
-    /// problem when the allocator reuses addresses).
+    /// Consumers that also need the corresponding snapshot must use
+    /// [`Self::load_versioned`] instead of a separate `version` + `load` pair.
     pub fn version(&self) -> u64 {
-        self.version.load(Ordering::Acquire)
+        self.inner.load().version
+    }
+
+    /// Register a lightweight synchronous observer for snapshot publication.
+    /// The callback receives the current view immediately, then every newer
+    /// publication. It runs after the atomic swap and must not block or call
+    /// `store`/`rcu` recursively. This is for revocation-sensitive derived
+    /// state that cannot wait for request traffic to notice a new snapshot.
+    pub fn subscribe(&self, listener: impl Fn(SnapshotView<S>) + Send + Sync + 'static) {
+        let listener: Arc<SnapshotListener<S>> = Arc::new(listener);
+        let _publication = self.listeners.publication.lock().unwrap();
+        self.listeners
+            .callbacks
+            .lock()
+            .unwrap()
+            .push(Arc::clone(&listener));
+        listener(self.load_versioned());
+    }
+
+    /// Register a synchronous publication barrier. The callback receives the
+    /// current view immediately; for later stores it receives the next view
+    /// before that generation becomes visible to [`Self::load_versioned`].
+    /// It must not block or call `store`/`rcu` recursively.
+    ///
+    /// Use this only for revocation-sensitive derived state: once generation
+    /// N is observable, the callback has already revoked anything removed by
+    /// N. Ordinary observers should use [`Self::subscribe`].
+    pub fn subscribe_before_publish(
+        &self,
+        listener: impl Fn(SnapshotView<S>) + Send + Sync + 'static,
+    ) {
+        let listener: Arc<SnapshotListener<S>> = Arc::new(listener);
+        let _publication = self.listeners.publication.lock().unwrap();
+        self.listeners
+            .before_publish_callbacks
+            .lock()
+            .unwrap()
+            .push(Arc::clone(&listener));
+        listener(self.load_versioned());
+    }
+
+    fn notify(listeners: &Mutex<Vec<Arc<SnapshotListener<S>>>>, view: SnapshotView<S>) {
+        let listeners = listeners.lock().unwrap().clone();
+        for listener in listeners {
+            listener(view.clone());
+        }
+    }
+
+    fn publish(&self, snapshot: Arc<S>) {
+        let current = self.inner.load_full();
+        let published = Arc::new(PublishedSnapshot {
+            version: current.version.wrapping_add(1),
+            snapshot,
+        });
+        let view = SnapshotView {
+            version: published.version,
+            snapshot: Arc::clone(&published.snapshot),
+        };
+        Self::notify(&self.listeners.before_publish_callbacks, view.clone());
+        self.inner.store(published);
+        Self::notify(&self.listeners.callbacks, view);
     }
 
     /// Atomic store. Called by the etcd watch supervisor after building a
     /// fresh snapshot.
     pub fn store(&self, new: S) {
-        self.inner.store(Arc::new(new));
-        self.version.fetch_add(1, Ordering::Release);
+        let _publication = self.listeners.publication.lock().unwrap();
+        self.publish(Arc::new(new));
     }
 
-    /// Read-copy-update. Runs `f(current)` to produce a new snapshot,
-    /// then commits the result with a CAS. If a concurrent `store` /
-    /// `rcu` ran between the load and the CAS, the closure runs again
-    /// against the latest snapshot. This is the only safe way to do a
-    /// load-mutate-store on `ArcSwap`: the bare load + store sequence
-    /// silently loses concurrent updates (see arc-swap::ArcSwap::rcu
-    /// docs).
-    ///
-    /// `f` may be called more than once under contention, so it must
-    /// be idempotent w.r.t. its input — clone the current snapshot and
-    /// apply the same delta each time, do not pull side data from
-    /// outside the closure that depends on a single observation.
+    /// Read-copy-update. Publication is serialized with `store`, so `f` runs
+    /// once against the latest snapshot and its result is published without a
+    /// lost-update window.
     pub fn rcu<F>(&self, mut f: F)
     where
         F: FnMut(&S) -> S,
     {
-        self.inner.rcu(|current| f(current.as_ref()));
-        self.version.fetch_add(1, Ordering::Release);
+        let _publication = self.listeners.publication.lock().unwrap();
+        let current = self.inner.load_full();
+        self.publish(Arc::new(f(current.snapshot.as_ref())));
     }
 }
 
@@ -387,11 +502,194 @@ mod tests {
     }
 
     #[test]
+    fn publication_listener_observes_initial_store_and_rcu_views() {
+        let handle: SnapshotHandle<u64> = SnapshotHandle::new(3);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_listener = Arc::clone(&observed);
+        handle.subscribe(move |view| {
+            observed_for_listener
+                .lock()
+                .unwrap()
+                .push((view.version, *view.snapshot));
+        });
+
+        handle.store(5);
+        handle.rcu(|value| value + 2);
+
+        assert_eq!(&*observed.lock().unwrap(), &[(0, 3), (1, 5), (2, 7)]);
+    }
+
+    #[test]
+    fn subscription_delivers_initial_view_before_concurrent_publication() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let handle: SnapshotHandle<u64> = SnapshotHandle::new(0);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let (initial_entered_tx, initial_entered_rx) = mpsc::channel();
+        let (release_initial_tx, release_initial_rx) = mpsc::channel();
+        let release_initial_rx = Arc::new(Mutex::new(release_initial_rx));
+
+        std::thread::scope(|scope| {
+            let subscriber = handle.clone();
+            let listener_observed = Arc::clone(&observed);
+            let listener_release = Arc::clone(&release_initial_rx);
+            scope.spawn(move || {
+                subscriber.subscribe(move |view| {
+                    listener_observed
+                        .lock()
+                        .unwrap()
+                        .push((view.version, *view.snapshot));
+                    if view.version == 0 {
+                        initial_entered_tx.send(()).unwrap();
+                        listener_release.lock().unwrap().recv().unwrap();
+                    }
+                });
+            });
+
+            initial_entered_rx.recv().unwrap();
+            let publisher = handle.clone();
+            let (store_done_tx, store_done_rx) = mpsc::channel();
+            scope.spawn(move || {
+                publisher.store(1);
+                store_done_tx.send(()).unwrap();
+            });
+
+            assert!(
+                store_done_rx
+                    .recv_timeout(Duration::from_millis(50))
+                    .is_err(),
+                "publication must wait for the subscriber's initial delivery",
+            );
+            release_initial_tx.send(()).unwrap();
+            store_done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        });
+
+        assert_eq!(&*observed.lock().unwrap(), &[(0, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn before_publish_listener_finishes_before_new_generation_is_visible() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let handle: SnapshotHandle<u64> = SnapshotHandle::new(0);
+        let (next_entered_tx, next_entered_rx) = mpsc::channel();
+        let (release_next_tx, release_next_rx) = mpsc::channel();
+        let release_next_rx = Arc::new(Mutex::new(release_next_rx));
+        let listener_release = Arc::clone(&release_next_rx);
+        handle.subscribe_before_publish(move |view| {
+            if view.version == 1 {
+                next_entered_tx.send(()).unwrap();
+                listener_release.lock().unwrap().recv().unwrap();
+            }
+        });
+
+        std::thread::scope(|scope| {
+            let publisher = handle.clone();
+            let (store_done_tx, store_done_rx) = mpsc::channel();
+            scope.spawn(move || {
+                publisher.store(1);
+                store_done_tx.send(()).unwrap();
+            });
+
+            next_entered_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            let still_current = handle.load_versioned();
+            assert_eq!(still_current.version, 0);
+            assert_eq!(*still_current.snapshot, 0);
+            assert!(
+                store_done_rx
+                    .recv_timeout(Duration::from_millis(50))
+                    .is_err(),
+                "store must not return before its publication barrier",
+            );
+
+            release_next_tx.send(()).unwrap();
+            store_done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        });
+
+        let published = handle.load_versioned();
+        assert_eq!(published.version, 1);
+        assert_eq!(*published.snapshot, 1);
+    }
+
+    #[test]
     fn handle_is_clone_and_share_the_same_cell() {
         let a: SnapshotHandle<u64> = SnapshotHandle::new(1);
         let b = a.clone();
         a.store(99);
         // b sees a's write — same underlying ArcSwap.
         assert_eq!(*b.load(), 99);
+    }
+
+    #[test]
+    fn versioned_load_keeps_generation_and_snapshot_coherent() {
+        const READERS: usize = 4;
+        const UPDATES: u64 = 10_000;
+        const MIDPOINT: u64 = UPDATES / 2;
+        let handle = SnapshotHandle::new(0_u64);
+        let start = Arc::new(std::sync::Barrier::new(READERS + 1));
+        let midpoint = Arc::new(std::sync::Barrier::new(READERS + 1));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observations = Arc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            let writer = handle.clone();
+            let writer_start = Arc::clone(&start);
+            let writer_midpoint = Arc::clone(&midpoint);
+            let writer_done = Arc::clone(&done);
+            scope.spawn(move || {
+                writer_start.wait();
+                for value in 1..=MIDPOINT {
+                    writer.store(value);
+                }
+                // Hold the writer until every reader has observed at least one
+                // publication from the first half. The old uncoordinated loop
+                // could finish before a reader was ever scheduled.
+                writer_midpoint.wait();
+                for value in (MIDPOINT + 1)..=UPDATES {
+                    writer.store(value);
+                }
+                writer_done.store(true, Ordering::Release);
+            });
+
+            for _ in 0..READERS {
+                let reader = handle.clone();
+                let reader_start = Arc::clone(&start);
+                let reader_midpoint = Arc::clone(&midpoint);
+                let reader_done = Arc::clone(&done);
+                let reader_observations = Arc::clone(&observations);
+                scope.spawn(move || {
+                    reader_start.wait();
+                    loop {
+                        let view = reader.load_versioned();
+                        assert_eq!(*view.snapshot, view.version);
+                        reader_observations.fetch_add(1, Ordering::Relaxed);
+                        if view.version >= MIDPOINT {
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                    reader_midpoint.wait();
+
+                    while !reader_done.load(Ordering::Acquire) {
+                        let view = reader.load_versioned();
+                        assert_eq!(*view.snapshot, view.version);
+                        reader_observations.fetch_add(1, Ordering::Relaxed);
+                        std::thread::yield_now();
+                    }
+                });
+            }
+        });
+
+        assert!(
+            observations.load(Ordering::Relaxed) >= READERS,
+            "every reader must make an in-flight observation"
+        );
+        let view = handle.load_versioned();
+        assert_eq!(*view.snapshot, UPDATES);
+        assert_eq!(view.version, UPDATES);
     }
 }

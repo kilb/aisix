@@ -20,10 +20,11 @@ import {
 //     however long the model takes, so both halves are asserted here.
 //   - `downstream.sse_keepalive_interval_secs` keeps bytes moving on a
 //     streaming response while the model produces nothing, so a proxy in
-//     front doesn't call the connection abandoned. Asserted on all three
-//     SSE shapes, which reach the client through three different code
-//     paths: axum's `Sse` keep-alive (chat), the bridged Anthropic
-//     encoder (messages), and the raw byte passthrough (responses).
+//     front doesn't call the connection abandoned. Asserted on all four
+//     SSE shapes, which reach the client through different code paths:
+//     axum's `Sse` keep-alive (chat), legacy-completions byte passthrough,
+//     the bridged Anthropic encoder (messages), and the native Responses
+//     byte passthrough.
 
 const CALLER_PLAINTEXT = "sk-downstream-conn-1126";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -339,6 +340,30 @@ describe("downstream SSE heartbeat (AISIX-Cloud#1126)", () => {
     const sse = await readStream(res);
     expect(heartbeatCount(sse)).toBeGreaterThanOrEqual(1);
     // The heartbeat must not disturb the payload it interleaves with.
+    expect(sse).toContain("late reply");
+    expect(sse).toContain("data: [DONE]");
+  }, 30_000);
+
+  test("legacy completions heartbeat while the model is silent", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const res = await fetch(`${app.proxyUrl}/v1/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "hb-chat-model",
+        prompt: "hi",
+        stream: true,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const sse = await readStream(res);
+    expect(heartbeatCount(sse)).toBeGreaterThanOrEqual(1);
     expect(sse).toContain("late reply");
     expect(sse).toContain("data: [DONE]");
   }, 30_000);

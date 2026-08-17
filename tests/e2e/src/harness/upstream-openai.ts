@@ -7,8 +7,16 @@ export interface OpenAiUpstreamOptions {
   nonStreamBody?: unknown;
   /** Sequence of SSE event payloads (already-stringified JSON or `[DONE]`). */
   streamEvents?: string[];
+  /** Exact SSE transport chunks, for standards/framing edge cases. */
+  rawSseChunks?: string[];
   /** Inserted before the response is written (delays status + headers). */
   responseDelayMs?: number;
+  /**
+   * Explicit response latch for lifecycle/race E2Es. The request is recorded
+   * before awaiting this promise, letting a test mutate gateway state while
+   * one upstream call is known to be in flight, then release the response.
+   */
+  responseGate?: Promise<void>;
   /**
    * Inserted AFTER the SSE headers are flushed but BEFORE the first event.
    * Models "connection + headers fast, first token slow", i.e. the TTFT
@@ -18,6 +26,8 @@ export interface OpenAiUpstreamOptions {
   firstEventDelayMs?: number;
   /** Inserted between SSE events. */
   eventDelayMs?: number;
+  /** SSE line ending. Defaults to LF; CRLF exercises standards-compliant peers. */
+  sseLineEnding?: "\n" | "\r\n";
   /** Status code to return (default 200). */
   status?: number;
   /** Body to return when `status` >= 400. */
@@ -62,10 +72,16 @@ export interface OpenAiUpstreamOptions {
 export interface OpenAiUpstreamStep {
   nonStreamBody?: unknown;
   streamEvents?: string[];
+  /** See `OpenAiUpstreamOptions.rawSseChunks`. */
+  rawSseChunks?: string[];
   responseDelayMs?: number;
+  /** See `OpenAiUpstreamOptions.responseGate`. */
+  responseGate?: Promise<void>;
   /** See `OpenAiUpstreamOptions.firstEventDelayMs`. */
   firstEventDelayMs?: number;
   eventDelayMs?: number;
+  /** See `OpenAiUpstreamOptions.sseLineEnding`. */
+  sseLineEnding?: "\n" | "\r\n";
   status?: number;
   errorBody?: unknown;
   /** Content-Type for the error body (default `application/json`). See #543. */
@@ -131,6 +147,7 @@ export async function startOpenAiUpstream(
         body: raw,
       });
 
+      if (step.responseGate) await step.responseGate;
       if (step.responseDelayMs) await sleep(step.responseDelayMs);
 
       const extraHeaders = {
@@ -168,7 +185,7 @@ export async function startOpenAiUpstream(
         return;
       }
 
-      const isStream = !!step.streamEvents;
+      const isStream = !!step.streamEvents || !!step.rawSseChunks;
       if (isStream) {
         res.statusCode = 200;
         res.setHeader("content-type", "text/event-stream");
@@ -178,7 +195,18 @@ export async function startOpenAiUpstream(
         // first token (TTFT timeout) independently of the headers (#554).
         res.flushHeaders();
         if (step.firstEventDelayMs) await sleep(step.firstEventDelayMs);
+        const rawChunks = step.rawSseChunks;
+        if (rawChunks) {
+          for (const chunk of rawChunks) {
+            if (res.writableEnded || res.destroyed) return;
+            res.write(chunk);
+            if (step.eventDelayMs) await sleep(step.eventDelayMs);
+          }
+          if (!res.writableEnded && !res.destroyed) res.end();
+          return;
+        }
         const events = step.streamEvents ?? [];
+        const lineEnding = step.sseLineEnding ?? opts.sseLineEnding ?? "\n";
         for (let i = 0; i < events.length; i++) {
           // The gateway may have abandoned a stalled stream (#554 read
           // timeout) and closed the connection; stop writing rather than
@@ -191,7 +219,7 @@ export async function startOpenAiUpstream(
             res.destroy();
             return;
           }
-          res.write(`data: ${events[i]}\n\n`);
+          res.write(`data: ${events[i]}${lineEnding}${lineEnding}`);
           if (step.eventDelayMs) await sleep(step.eventDelayMs);
         }
         if (!res.writableEnded && !res.destroyed) res.end();

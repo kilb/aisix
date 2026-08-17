@@ -774,9 +774,12 @@ async fn run_session(
     crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
     state.usage_sink.try_emit("realtime", event.clone());
     let exporters = crate::usage_attr::live_exporters(&state, &snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, None, exporters.iter().map(|e| &e.value));
+    state.otlp_fan_out.fan_out(
+        &event,
+        None,
+        exporters.generation(),
+        exporters.iter().map(|e| &e.value),
+    );
     // A realtime session bills real tokens against a real model, and this is
     // the only place that knows the session's totals. Its cost is resolved
     // here too, unlike the other endpoints, so it is the one non-chat surface
@@ -915,7 +918,7 @@ mod tests {
     fn cfg() -> ProxyConfig {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: 1_048_576,
+            request_body_limit_bytes: Some(1_048_576),
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),

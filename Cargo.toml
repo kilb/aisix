@@ -29,7 +29,7 @@ version = "0.3.0"
 edition = "2021"
 rust-version = "1.93"
 license = "Apache-2.0"
-repository = "https://github.com/moonming/ai-gateway"
+repository = "https://github.com/api7/aisix"
 authors = ["moonming"]
 
 [workspace.dependencies]
@@ -157,7 +157,7 @@ redis = { version = "0.27", features = ["tokio-comp", "tokio-rustls-comp", "conn
 # the sink is written once, not per-provider. The cloud features pull reqwest
 # default-features=false + rustls, so this stays rustls-only — no OpenSSL /
 # native-tls (same posture as the SLS sub-crates above).
-object_store = { version = "0.13", default-features = false, features = ["aws", "gcp", "azure", "tls-webpki-roots"] }
+object_store = { version = "0.14", default-features = false, features = ["aws", "gcp", "azure"] }
 # NDJSON gzip for the object-storage sink. flate2's default miniz_oxide backend
 # is pure Rust — no zlib/C, consistent with the no-OpenSSL posture.
 flate2 = "1"

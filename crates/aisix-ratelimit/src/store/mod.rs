@@ -22,6 +22,7 @@
 
 use aisix_core::RateLimit;
 use async_trait::async_trait;
+use std::time::Duration;
 
 use crate::error::RateLimitError;
 use crate::limiter::RateLimitStatus;
@@ -104,6 +105,17 @@ pub trait RateStore: Send + Sync + 'static {
     /// always touches both token windows; the tpd counter is harmless
     /// when no tpd limit is configured (it simply expires unread).
     async fn commit(&self, key: &str, tokens: u64, member: &str);
+
+    /// How often an active distributed concurrency lease must be renewed.
+    /// Local stores return `None` because their slots do not expire.
+    fn concurrency_lease_renewal_interval(&self) -> Option<Duration> {
+        None
+    }
+
+    /// Refresh one active concurrency lease. Implementations must not create
+    /// a lease whose `member` no longer exists: release and renewal can race
+    /// on different connections when a request completes.
+    async fn renew_concurrency_lease(&self, _key: &str, _member: &str) {}
 
     /// Release the concurrency slot held by `member` without recording
     /// tokens. Sync so it can run from `Drop`; the Redis impl spawns a

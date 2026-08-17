@@ -117,7 +117,10 @@ pub async fn chat_completions(
                 Some(&auth.entry.id),
                 started,
                 crate::reject::Envelope::OpenAi,
-                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+                crate::error::proxy_error_from_json_rejection(
+                    rej,
+                    state.request_body_limit_for(path),
+                ),
             );
         }
     };
@@ -140,6 +143,7 @@ pub async fn chat_completions(
     // instead of loading their own, so a request sees ONE config generation
     // rather than one per emit.
     let snapshot = state.snapshot.load();
+    let mut failure_content_safe = true;
     let outcome = dispatch(
         &state,
         &snapshot,
@@ -151,6 +155,7 @@ pub async fn chat_completions(
         &mut applied_guardrails,
         &mut redaction_counts,
         &mut monitor_hits,
+        &mut failure_content_safe,
     )
     .await;
 
@@ -453,7 +458,7 @@ pub async fn chat_completions(
             // exists) — the body adds nothing to an authorization
             // failure and callers probing keys shouldn't get their
             // payloads archived.
-            let mut failure_content = if status == 401 || status == 403 {
+            let mut failure_content = if status == 401 || status == 403 || !failure_content_safe {
                 None
             } else {
                 content_capture_cap(
@@ -1183,6 +1188,9 @@ async fn dispatch(
     // Out-param: monitor-mode guardrail observations (AISIX-Cloud#562),
     // same lifecycle as `redactions_out`.
     monitor_hits_out: &mut Vec<aisix_core::GuardrailMonitorHit>,
+    // False when remote segment moderation could not prove a complete rewrite;
+    // the handler then omits the request from full-content failure exporters.
+    failure_content_safe_out: &mut bool,
 ) -> Result<Success, DispatchFailure> {
     if req.messages.is_empty() {
         return Err(DispatchFailure::new(
@@ -1256,17 +1264,29 @@ async fn dispatch(
     // Split moderation: local/blob members check first (on the original
     // text), then the segment pass runs the Bedrock call and writes
     // ANONYMIZE masks back into `req` (#932 bedrock follow-up).
-    let (input_verdict, hits) = resolved_chain.check_input_non_segment_observed(req).await;
+    let inspection = crate::redact::chat_request_for_inspection(req);
+    let (input_verdict, hits) = resolved_chain
+        .check_input_non_segment_observed(&inspection)
+        .await;
     monitor_hits_out.extend(hits);
-    let input_verdict = crate::redact::moderate_body(
+    let mut input_moderation = crate::redact::moderate_chat_format_structured(
         resolved_chain.as_ref(),
-        crate::redact::Direction::Input,
         input_verdict,
+        req,
         redactions_out,
         monitor_hits_out,
-        |g| crate::redact::redact_chat_format(g, req),
     )
     .await;
+    if !input_moderation.verdict.is_block() {
+        let redaction = crate::redact::redact_chat_format_structured(resolved_chain.as_ref(), req);
+        crate::redact::merge_counts(redactions_out, redaction.counts);
+        if redaction.unrewritable_tool_key {
+            input_moderation.verdict = crate::redact::unrewritable_tool_key_verdict();
+            input_moderation.capture_safe = false;
+        }
+    }
+    *failure_content_safe_out &= input_moderation.capture_safe;
+    let input_verdict = input_moderation.verdict;
     match input_verdict {
         GuardrailVerdict::Allow => {}
         GuardrailVerdict::Block {
@@ -1287,10 +1307,12 @@ async fn dispatch(
             // segment masks — moderate_body's Bedrock pass — are still
             // skipped: the request is dead, don't burn a provider call;
             // those entities were never locally detected.)
-            crate::redact::merge_counts(
-                redactions_out,
-                crate::redact::redact_chat_format(resolved_chain.as_ref(), req),
-            );
+            let redaction =
+                crate::redact::redact_chat_format_structured(resolved_chain.as_ref(), req);
+            crate::redact::merge_counts(redactions_out, redaction.counts);
+            if redaction.unrewritable_tool_key {
+                *failure_content_safe_out = false;
+            }
             tracing::warn!(
                 guardrail_hook = "input",
                 model = %req.model,
@@ -1306,15 +1328,8 @@ async fn dispatch(
         }
     }
 
-    // #932: mask-action PII rules rewrite the request in place AFTER the
-    // block check passes and BEFORE any downstream use — the semantic-
-    // routing embedding, the cache-key fingerprint, and the upstream
-    // dispatch all see the masked text, so the matched values never leave
-    // the gateway.
-    crate::redact::merge_counts(
-        redactions_out,
-        crate::redact::redact_chat_format(resolved_chain.as_ref(), req),
-    );
+    // The structured local rewrite above runs before any downstream use, so
+    // semantic routing, cache keys, and upstream dispatch see only masked text.
 
     // Budget pre-check via cp-api. The DP no longer owns budget state;
     // cp-api returns a cached/live decision per api_key.
@@ -1670,8 +1685,6 @@ async fn dispatch(
                 let latency_ms = attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                 match attempt_stream {
                     Ok(upstream) => {
-                        state.health.record_success(&model.display_name);
-                        state.runtime_status.mark_healthy(&attempt.id);
                         // Feed the least_latency EWMA. For streaming this is
                         // time-to-first-response (upstream stream established) —
                         // the routing-relevant latency signal.
@@ -1832,6 +1845,8 @@ async fn dispatch(
         // TARGET's id, not the group's — pricing resolves against the
         // target. (Equal for direct models.)
         let model_id_for_telem = winner_target_id;
+        let model_display_name_for_telem = model.display_name.clone();
+        let cooldown_for_telem = model.cooldown.clone();
         let api_key_id_for_telem = auth.entry.id.clone();
         let team_id_for_metrics = auth.key().team_id.clone();
         let user_id_for_metrics = auth.key().user_id.clone();
@@ -1938,7 +1953,7 @@ async fn dispatch(
             // Single upstream: nothing pre-incurred, so no usage to fold in.
             aisix_gateway::chat::UsageStats::default(),
             Some(estimator),
-            move |comp: StreamCompletion| {
+            move |mut comp: StreamCompletion| {
                 // Rate-limit accounting (TPM cap) for all layers.
                 for key in &post_stream_keys {
                     limiter.add_tokens_post_stream(key, comp.total_tokens);
@@ -1951,6 +1966,16 @@ async fn dispatch(
                 // own.
                 let snap = state_for_telem.snapshot.load();
                 let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &provider_key_id_for_telem);
+                let terminal = crate::stream_timeout::finish_bridge_stream(
+                    &state_for_telem.health,
+                    &state_for_telem.runtime_status,
+                    &model_display_name_for_telem,
+                    &model_id_for_telem,
+                    cooldown_for_telem.as_ref(),
+                    comp.terminal_failure.take(),
+                    comp.reached_end || comp.guardrail_blocked,
+                    if comp.guardrail_blocked { 422 } else { 200 },
+                );
                 // Telemetry: emit with the actual upstream-reported counts.
                 // cost_usd stays 0.0; cp-api recomputes server-side from
                 // its model_pricing catalog (same pattern as the non-
@@ -1963,15 +1988,9 @@ async fn dispatch(
                     &model_id_for_telem,
                     &model_for_metrics,
                     &api_key_id_for_telem,
-                    // A stream the consumer abandoned mid-flight is reported
-                    // as 499, matching what LiteLLM records for the same
-                    // event. The upstream work still happened, so the event
-                    // is emitted either way — only its outcome differs.
-                    if comp.reached_end {
-                        200
-                    } else {
-                        crate::CLIENT_CLOSED_REQUEST
-                    },
+                    // A typed upstream-body failure keeps its 5xx status;
+                    // only an actual consumer cancellation is reported 499.
+                    terminal.status,
                     // Scoped to the winning attempt, not the request: the
                     // failed attempts before it emit their own events and
                     // `started` would double-count them (plus the pre-dispatch
@@ -2018,7 +2037,7 @@ async fn dispatch(
                         attempt_index: winner_idx,
                         attempt_kind: winner_kind.to_string(),
                         attempt_model: attempt_model_for_telem.clone(),
-                        error_class: String::new(),
+                        error_class: terminal.error_class,
                         error_message: String::new(),
                         applied_guardrails: applied_guardrails_for_telem.clone(),
                         redacted_entity_counts: {
@@ -2038,11 +2057,9 @@ async fn dispatch(
                     // Prompt captured up front, response assembled across the
                     // stream into `comp.response_text`; both gated on the cap.
                     match (&captured_prompt_for_telem, content_cap) {
-                        (Some(prompt), Some(cap)) => Some(CapturedContent::new(
-                            prompt,
-                            &comp.response_text,
-                            cap as usize,
-                        )),
+                        (Some(prompt), Some(cap)) if comp.response_capture_safe => Some(
+                            CapturedContent::new(prompt, &comp.response_text, cap as usize),
+                        ),
                         _ => None,
                     },
                 );
@@ -2082,7 +2099,7 @@ async fn dispatch(
                         endpoint: "/v1/chat/completions",
                         model: &bounded_model_for_metrics,
                         provider: &provider_for_metrics,
-                        status: 200,
+                        status: terminal.status,
                         streaming: true,
                     },
                     started.elapsed(),
@@ -2092,7 +2109,7 @@ async fn dispatch(
                         endpoint: "/v1/chat/completions",
                         model: &bounded_model_for_metrics,
                         provider: &provider_for_metrics,
-                        status: 200,
+                        status: terminal.status,
                         streaming: true,
                     },
                     Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
@@ -2359,15 +2376,26 @@ async fn dispatch(
                     .check_output_non_segment_observed(&cached)
                     .await;
                 monitor_hits_out.extend(hits);
-                let cached_verdict = crate::redact::moderate_body(
+                let moderation = crate::redact::moderate_chat_response_structured(
                     resolved_chain.as_ref(),
-                    crate::redact::Direction::Output,
                     cached_verdict,
+                    &mut cached,
                     redactions_out,
                     monitor_hits_out,
-                    |g| crate::redact::redact_chat_response(g, &mut cached),
                 )
                 .await;
+                let cached_capture_safe = moderation.capture_safe;
+                let mut cached_verdict = moderation.verdict;
+                if !cached_verdict.is_block() {
+                    let redaction = crate::redact::redact_chat_response_structured(
+                        resolved_chain.as_ref(),
+                        &mut cached,
+                    );
+                    crate::redact::merge_counts(redactions_out, redaction.counts);
+                    if redaction.unrewritable_tool_key {
+                        cached_verdict = crate::redact::unrewritable_tool_key_verdict();
+                    }
+                }
                 match cached_verdict {
                     GuardrailVerdict::Block {
                         reason,
@@ -2393,14 +2421,8 @@ async fn dispatch(
                     }
                     _ => {}
                 }
-                // #932: cache hits are client-visible output like a fresh
-                // upstream response — mask them too. Entries are stored
-                // masked (see the write below), but entries written before
-                // a rule was added/tightened must still be caught here.
-                crate::redact::merge_counts(
-                    redactions_out,
-                    crate::redact::redact_chat_response(resolved_chain.as_ref(), &mut cached),
-                );
+                // The structured rewrite above also masks cache entries that
+                // predate a newly added or tightened rule.
                 let prompt = cached.usage.prompt_tokens as u64;
                 let completion = cached.usage.completion_tokens as u64;
                 let total = cached.usage.total_tokens as u64;
@@ -2472,7 +2494,7 @@ async fn dispatch(
                 // Capture the prompt + cached response for content-capturing
                 // exporters (gated). A cache hit still served content to the
                 // caller, so it's logged like a fresh response.
-                let captured_content = content_cap.map(|cap| {
+                let captured_content = content_cap.filter(|_| cached_capture_safe).map(|cap| {
                     CapturedContent::new(
                         &serde_json::to_string(req).unwrap_or_default(),
                         cached.message.content.as_deref().unwrap_or(""),
@@ -2943,15 +2965,24 @@ async fn dispatch(
         .check_output_non_segment_observed(&upstream)
         .await;
     monitor_hits_out.extend(hits);
-    let output_verdict = crate::redact::moderate_body(
+    let moderation = crate::redact::moderate_chat_response_structured(
         resolved_chain.as_ref(),
-        crate::redact::Direction::Output,
         output_verdict,
+        &mut upstream,
         redactions_out,
         monitor_hits_out,
-        |g| crate::redact::redact_chat_response(g, &mut upstream),
     )
     .await;
+    let output_capture_safe = moderation.capture_safe;
+    let mut output_verdict = moderation.verdict;
+    if !output_verdict.is_block() {
+        let redaction =
+            crate::redact::redact_chat_response_structured(resolved_chain.as_ref(), &mut upstream);
+        crate::redact::merge_counts(redactions_out, redaction.counts);
+        if redaction.unrewritable_tool_key {
+            output_verdict = crate::redact::unrewritable_tool_key_verdict();
+        }
+    }
     match output_verdict {
         GuardrailVerdict::Allow => {}
         GuardrailVerdict::Block {
@@ -3021,13 +3052,8 @@ async fn dispatch(
         }
     }
 
-    // #932: mask-action PII rules rewrite the response AFTER the block
-    // check passes and BEFORE the cache write below, so cached entries
-    // are stored masked — the matched values don't persist at rest.
-    crate::redact::merge_counts(
-        redactions_out,
-        crate::redact::redact_chat_response(resolved_chain.as_ref(), &mut upstream),
-    );
+    // The structured rewrite above runs before the cache write, so cached
+    // entries contain masked values and never persist sensitive tool keys.
 
     // Cache write is gated on the same policy as the lookup at the
     // top of dispatch — without a matching enabled cache_policy in
@@ -3093,7 +3119,7 @@ async fn dispatch(
     // `content_cap` is `None` when no exporter wants it). Built here, where both
     // the request and the upstream response text are in scope; threaded to
     // `fan_out` via `Success`, never to the CP sink.
-    let captured_content = content_cap.map(|cap| {
+    let captured_content = content_cap.filter(|_| output_capture_safe).map(|cap| {
         CapturedContent::new(
             &serde_json::to_string(req).unwrap_or_default(),
             upstream.message.content.as_deref().unwrap_or(""),
@@ -3956,15 +3982,25 @@ async fn dispatch_ensemble(
         .check_output_non_segment_observed(&outcome.response)
         .await;
     ensemble_monitor_hits.extend(hits);
-    let ensemble_verdict = crate::redact::moderate_body(
+    let moderation = crate::redact::moderate_chat_response_structured(
         resolved_chain.as_ref(),
-        crate::redact::Direction::Output,
         ensemble_verdict,
+        &mut outcome.response,
         &mut ensemble_redactions,
         &mut ensemble_monitor_hits,
-        |g| crate::redact::redact_chat_response(g, &mut outcome.response),
     )
     .await;
+    let mut ensemble_verdict = moderation.verdict;
+    if !ensemble_verdict.is_block() {
+        let redaction = crate::redact::redact_chat_response_structured(
+            resolved_chain.as_ref(),
+            &mut outcome.response,
+        );
+        crate::redact::merge_counts(&mut ensemble_redactions, redaction.counts);
+        if redaction.unrewritable_tool_key {
+            ensemble_verdict = crate::redact::unrewritable_tool_key_verdict();
+        }
+    }
     match ensemble_verdict {
         GuardrailVerdict::Allow => {}
         GuardrailVerdict::Block {
@@ -4002,14 +4038,7 @@ async fn dispatch_ensemble(
             }
         }
     }
-    // Allow / Bypass continuation: mask the synthesized answer (#932) —
-    // the check above ran on the original text, the client gets the masked
-    // one — then emit the (non-blocked) sub-call events with the final
-    // bypass value (which an output bypass above may have set).
-    crate::redact::merge_counts(
-        &mut ensemble_redactions,
-        crate::redact::redact_chat_response(resolved_chain.as_ref(), &mut outcome.response),
-    );
+    // The structured rewrite above already masked the synthesized answer.
     emit_subcalls(
         &outcome,
         false,
@@ -4301,9 +4330,12 @@ fn emit_usage_event(
     // no-op on the common path. Spawned tasks own the POST work and
     // never block the request return.
     let exporters = crate::usage_attr::live_exporters(state, snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, content.as_ref(), exporters.iter().map(|e| &e.value));
+    state.otlp_fan_out.fan_out(
+        &event,
+        content.as_ref(),
+        exporters.generation(),
+        exporters.iter().map(|e| &e.value),
+    );
 }
 
 /// Defence-in-depth sanitiser for operator-defined `ProviderKey
@@ -4632,6 +4664,10 @@ struct StreamCompletion {
     /// capture cap). Empty otherwise. Read by the on_complete telemetry
     /// closure; never reaches the CP sink.
     response_text: String,
+    /// Held output is unsafe for full-content exporters until the complete
+    /// output moderation and rewrite pass succeeds. Live-forward output is
+    /// safe because the caller already received the same bytes.
+    response_capture_safe: bool,
     /// Generated output (content + reasoning + tool-call text) accumulated
     /// for the token-estimation fallback (AISIX-Cloud#1074). Always on —
     /// the terminal usage chunk that would make it unnecessary arrives
@@ -4653,18 +4689,17 @@ struct StreamCompletion {
     /// output checks (AISIX-Cloud#562). Merged with the input-side hits
     /// by the on_complete telemetry closure.
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
-    /// `true` once the generator reached its own end — upstream EOF, an
-    /// error frame, or an output-guardrail block. It stays `false` only
-    /// when the consumer went away first, because `async_stream::stream!`
-    /// then simply stops resuming the body and the tail never runs. That
-    /// makes it the one signal at the Drop site that distinguishes a
-    /// delivered response from an abandoned one, which the telemetry
-    /// closure turns into `499` (see `CLIENT_CLOSED_REQUEST`).
+    /// `true` once the upstream reached EOF. It stays `false` for a typed
+    /// upstream-body failure and when the consumer went away first; the
+    /// separate `terminal_failure` field distinguishes those cases.
     ///
     /// Distinct from `chunks_delivered`: a stream can deliver chunks and
     /// still be abandoned midway, and a zero-chunk stream can still
     /// legitimately reach its end (an immediate error frame).
     reached_end: bool,
+    /// Typed upstream-body failure observed after the response was committed.
+    /// `None` with `reached_end == false` means the downstream consumer left.
+    terminal_failure: Option<BridgeError>,
 }
 
 /// Parameters needed to run output-guardrail evaluation at
@@ -4678,6 +4713,54 @@ struct StreamGuardrailContext {
     /// Surface in tracing only; the wire envelope is intentionally
     /// generic per #153 ("response blocked by content policy").
     model_name: String,
+}
+
+fn bounded_json_len<T: serde::Serialize>(value: &T, limit: usize) -> Option<usize> {
+    struct CountingWriter {
+        remaining: usize,
+        written: usize,
+    }
+
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.remaining {
+                return Err(std::io::Error::other("JSON exceeds hold-back budget"));
+            }
+            self.remaining -= bytes.len();
+            self.written += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = CountingWriter {
+        remaining: limit,
+        written: 0,
+    };
+    serde_json::to_writer(&mut writer, value)
+        .ok()
+        .map(|()| writer.written)
+}
+
+fn observe_stream_usage(comp: &mut StreamCompletion, usage: &aisix_gateway::chat::UsageStats) {
+    comp.prompt_tokens = comp.prompt_tokens.max(usage.prompt_tokens);
+    comp.completion_tokens = comp.completion_tokens.max(usage.completion_tokens);
+    comp.total_tokens = comp.total_tokens.max(u64::from(usage.total_tokens));
+    comp.cached_prompt_tokens = comp.cached_prompt_tokens.max(usage.cached_prompt_tokens);
+    comp.reasoning_tokens = comp.reasoning_tokens.max(usage.reasoning_tokens);
+    comp.cache_creation_tokens = comp.cache_creation_tokens.max(usage.cache_creation_tokens);
+    comp.cache_read_tokens = comp.cache_read_tokens.max(usage.cache_read_tokens);
+}
+
+fn push_to_byte_cap(buffer: &mut String, text: &str, cap: usize) {
+    let mut end = cap.saturating_sub(buffer.len()).min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    buffer.push_str(&text[..end]);
 }
 
 /// Fires `on_complete` with whatever `StreamCompletion` has been
@@ -4860,8 +4943,9 @@ where
         // The chat non-streaming path (`guardrail_output_text`) and /v1/messages
         // streaming already scan tool calls, but chat streaming buffered only
         // `delta.content` — a blocked literal in tool-call `arguments` leaked.
-        // Bounded to the same cap as the hold-back buffer so a huge tool-call
-        // stream can't grow it without limit. Allocated only with a guardrail.
+        // The complete held-chunk budget below bounds BufferFull accumulation;
+        // Window mode folds tool text into its bounded scan window. Allocated
+        // only with a guardrail.
         let mut tool_calls_buf = if output_guardrail.is_some() {
             Some(String::new())
         } else {
@@ -4877,17 +4961,30 @@ where
             .map(|ctx| ctx.chain.stream_output_policy())
             .unwrap_or_default();
         let hold_back = stream_policy.holds_back();
+        // Any output-guarded stream starts capture-unsafe. Hold-back paths opt
+        // in after moderation before release; live monitor paths opt in after
+        // their end-of-stream observation. A disconnect or upstream error
+        // before either point must not export uninspected output.
+        guard.comp().response_capture_safe = output_guardrail.is_none();
         // Content chunks withheld from the wire until their window (or the
         // whole response) scans clean. Hold-back path only. Held PRE-render
         // (#932): the BufferFull release rewrites masked spans across the
         // held chunks before they are rendered + serialised at drain time.
         let mut pending: Vec<aisix_gateway::ChatChunk> = Vec::new();
+        // Serialized bytes retained in `pending`. Counting through a bounded
+        // writer avoids allocating a second attacker-sized JSON buffer before
+        // enforcing the configured hold-back limit.
+        let mut held_bytes = 0usize;
         // Content accumulated since the last window flush (Window mode);
         // bounded to ~window_size, unlike content_buffer (whole response).
         let mut window_buf = String::new();
         // Set when a BufferFull cap is exceeded with fail-open: stop
         // holding and forward the remainder live.
         let mut cap_released = false;
+        // Monotonic capture-safety latch for Window mode. Once any window was
+        // released after a remote guardrail bypass, later successful scans
+        // cannot make the already-uninspected bytes safe for exporters.
+        let mut capture_bypassed = false;
         // Accumulate the upstream's `usage` block + per-chunk metadata
         // across the stream. Providers typically populate `usage` on
         // the terminal chunk only; using "max" rather than "last" makes
@@ -4944,6 +5041,110 @@ where
                         guard.comp().upstream_ttft_ms =
                             attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                     }
+                    if let Some(usage) = chunk.usage.as_ref() {
+                        observe_stream_usage(guard.comp(), usage);
+                    }
+                    // The gateway-requested usage-only terminal chunk is
+                    // accounting input, not a client-visible held chunk.
+                    if !client_requested_usage
+                        && chunk.usage.is_some()
+                        && chunk.finish_reason.is_none()
+                        && chunk.delta.role.is_none()
+                        && chunk.delta.content.is_none()
+                        && chunk.delta.tool_calls.is_none()
+                        && chunk.delta.reasoning_content.is_none()
+                    {
+                        continue;
+                    }
+                    // Fold panel usage before measuring the exact chunk that
+                    // may be retained and eventually rendered downstream.
+                    if let Some(usage) = chunk.usage.as_mut() {
+                        *usage = usage.saturating_add(&base_usage);
+                    }
+                    // Account for every generated chunk before the security
+                    // hold-back cap decision. The provider produced (and may
+                    // bill) the chunk that crosses the cap even though its
+                    // bytes are never released to the caller. This bounded
+                    // accumulator is independent of the held wire buffer.
+                    {
+                        use crate::token_estimate::push_capped;
+                        let comp = guard.comp();
+                        if let Some(text) = chunk.delta.content.as_deref() {
+                            push_capped(&mut comp.est_output_text, text);
+                        }
+                        if let Some(text) = chunk.delta.reasoning_content.as_deref() {
+                            push_capped(&mut comp.est_output_text, text);
+                        }
+                        if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
+                            for tc in tcs {
+                                if let Some(f) = tc.get("function") {
+                                    if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
+                                        push_capped(&mut comp.est_output_text, n);
+                                    }
+                                    if let Some(a) =
+                                        f.get("arguments").and_then(|v| v.as_str())
+                                    {
+                                        push_capped(&mut comp.est_output_text, a);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if hold_back && !cap_released {
+                        let hold_budget = match &stream_policy {
+                            aisix_guardrails::StreamOutputPolicy::BufferFull {
+                                max_buffer_bytes,
+                                on_exceeded_fail_open,
+                            } => Some((*max_buffer_bytes, *on_exceeded_fail_open)),
+                            aisix_guardrails::StreamOutputPolicy::Window { .. } => Some((
+                                aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
+                                false,
+                            )),
+                            aisix_guardrails::StreamOutputPolicy::EndOfStreamCheck => None,
+                        };
+                        if let Some((max_hold, fail_open)) = hold_budget {
+                            let remaining = max_hold.saturating_sub(held_bytes);
+                            match bounded_json_len(&chunk, remaining) {
+                                Some(chunk_bytes) => held_bytes += chunk_bytes,
+                                None if fail_open => {
+                                    // The operator explicitly chose to release
+                                    // an oversized BufferFull response. Drain
+                                    // already-held chunks before forwarding the
+                                    // current owned chunk on the live path.
+                                    cap_released = true;
+                                    held_bytes = 0;
+                                    let comp = guard.comp();
+                                    comp.response_capture_safe = false;
+                                    comp.response_text.clear();
+                                    for pending_chunk in pending.drain(..) {
+                                        let ev = chunk_event!(pending_chunk);
+                                        yield Ok::<_, Infallible>(ev);
+                                    }
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        guardrail_hook = "output",
+                                        max_buffer_bytes = max_hold,
+                                        "streaming response exceeded hold-back budget; failing closed",
+                                    );
+                                    errored = true;
+                                    let comp = guard.comp();
+                                    comp.guardrail_blocked = true;
+                                    comp.response_capture_safe = false;
+                                    comp.response_text.clear();
+                                    yield Ok::<_, Infallible>(
+                                        Event::default().event("error").data(
+                                            error_frame_payload(
+                                                "content_filter",
+                                                "response blocked by content policy",
+                                            ),
+                                        ),
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     let comp = guard.comp();
                     if !chunk.id.is_empty() {
                         comp.provider_request_id =
@@ -4972,35 +5173,10 @@ where
                         // observability fan-out, bounded to the cap so a long
                         // stream can't grow the buffer without limit. Only when
                         // an exporter wants full content.
-                        if let Some(cap) = content_cap {
-                            if comp.response_text.len() < cap as usize {
-                                comp.response_text.push_str(text);
-                            }
-                        }
-                    }
-                    // Token-estimation accumulator (AISIX-Cloud#1074): all
-                    // generated output — content, reasoning, tool-call text —
-                    // bounded to its own cap. Always on: whether the fallback
-                    // is needed is only known at end-of-stream.
-                    {
-                        use crate::token_estimate::push_capped;
-                        if let Some(text) = chunk.delta.content.as_deref() {
-                            push_capped(&mut comp.est_output_text, text);
-                        }
-                        if let Some(text) = chunk.delta.reasoning_content.as_deref() {
-                            push_capped(&mut comp.est_output_text, text);
-                        }
-                        if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
-                            for tc in tcs {
-                                if let Some(f) = tc.get("function") {
-                                    if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
-                                        push_capped(&mut comp.est_output_text, n);
-                                    }
-                                    if let Some(a) =
-                                        f.get("arguments").and_then(|v| v.as_str())
-                                    {
-                                        push_capped(&mut comp.est_output_text, a);
-                                    }
+                        if !capture_bypassed {
+                            if let Some(cap) = content_cap {
+                                if comp.response_text.len() < cap as usize {
+                                    comp.response_text.push_str(text);
                                 }
                             }
                         }
@@ -5013,57 +5189,51 @@ where
                         (chunk.delta.tool_calls.as_ref(), tool_calls_buf.as_mut())
                     {
                         for tc in tcs {
-                            if buf.len() >= aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES {
-                                break;
-                            }
                             if let Some(f) = tc.get("function") {
                                 if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
-                                    buf.push_str(n);
+                                    if matches!(
+                                        stream_policy,
+                                        aisix_guardrails::StreamOutputPolicy::Window { .. }
+                                    ) {
+                                        window_buf.push_str(n);
+                                    } else if matches!(
+                                        stream_policy,
+                                        aisix_guardrails::StreamOutputPolicy::BufferFull { .. }
+                                    ) {
+                                        // The serialized held-chunk budget was
+                                        // checked before this copy, so the
+                                        // reassembled tool channel fits under
+                                        // the same bound.
+                                        buf.push_str(n);
+                                    } else {
+                                        push_to_byte_cap(
+                                            buf,
+                                            n,
+                                            aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
+                                        );
+                                    }
                                 }
                                 if let Some(a) = f.get("arguments").and_then(|v| v.as_str()) {
-                                    buf.push_str(a);
+                                    if matches!(
+                                        stream_policy,
+                                        aisix_guardrails::StreamOutputPolicy::Window { .. }
+                                    ) {
+                                        window_buf.push_str(a);
+                                    } else if matches!(
+                                        stream_policy,
+                                        aisix_guardrails::StreamOutputPolicy::BufferFull { .. }
+                                    ) {
+                                        buf.push_str(a);
+                                    } else {
+                                        push_to_byte_cap(
+                                            buf,
+                                            a,
+                                            aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
+                                        );
+                                    }
                                 }
                             }
                         }
-                    }
-                    if let Some(u) = chunk.usage.as_ref() {
-                        if u.prompt_tokens > comp.prompt_tokens {
-                            comp.prompt_tokens = u.prompt_tokens;
-                        }
-                        if u.completion_tokens > comp.completion_tokens {
-                            comp.completion_tokens = u.completion_tokens;
-                        }
-                        let t = u.total_tokens as u64;
-                        if t > comp.total_tokens {
-                            comp.total_tokens = t;
-                        }
-                        if u.cached_prompt_tokens > comp.cached_prompt_tokens {
-                            comp.cached_prompt_tokens = u.cached_prompt_tokens;
-                        }
-                        if u.reasoning_tokens > comp.reasoning_tokens {
-                            comp.reasoning_tokens = u.reasoning_tokens;
-                        }
-                        if u.cache_creation_tokens > comp.cache_creation_tokens {
-                            comp.cache_creation_tokens = u.cache_creation_tokens;
-                        }
-                        if u.cache_read_tokens > comp.cache_read_tokens {
-                            comp.cache_read_tokens = u.cache_read_tokens;
-                        }
-                    }
-                    // #790: a usage-only terminal chunk (no delta payload, no
-                    // finish_reason) exists because the gateway injected
-                    // `include_usage` on the upstream leg. Its counts are
-                    // already folded into `comp` above — forward it only when
-                    // the client itself asked for usage.
-                    if !client_requested_usage
-                        && chunk.usage.is_some()
-                        && chunk.finish_reason.is_none()
-                        && chunk.delta.role.is_none()
-                        && chunk.delta.content.is_none()
-                        && chunk.delta.tool_calls.is_none()
-                        && chunk.delta.reasoning_content.is_none()
-                    {
-                        continue;
                     }
                     // #614: fold the ensemble panel's usage (`base_usage`) into
                     // the client-facing usage frame, AFTER `comp` captured the
@@ -5077,20 +5247,21 @@ where
                     // (Gemini/Vertex) would add the panel sum more than once —
                     // tracked in #617 (fix: synthesize one terminal usage frame
                     // from `comp + base_usage`).
-                    if let Some(u) = chunk.usage.as_mut() {
-                        *u = u.saturating_add(&base_usage);
-                    }
                     Some(chunk)
                 }
                 Err(err) => {
-                    errored = true;
                     let etype = err.error_type();
+                    let message = err.to_string();
+                    let comp = guard.comp();
+                    comp.response_capture_safe = false;
+                    comp.response_text.clear();
+                    comp.terminal_failure = Some(err);
                     yield Ok::<_, Infallible>(
                         Event::default()
                             .event("error")
-                            .data(error_frame_payload(etype, &err.to_string())),
+                            .data(error_frame_payload(etype, &message)),
                     );
-                    None
+                    return;
                 }
             };
             let Some(chunk) = maybe_chunk else {
@@ -5098,10 +5269,8 @@ where
             };
             if !hold_back || cap_released {
                 // The EndOfStreamCheck path and a released BufferFull cap
-                // forward straight to the wire. (Error frames yielded in
-                // the Err arm above also bypass the hold; the `errored`
-                // skip at end-of-stream then drops any held unscanned
-                // content — fail closed.)
+                // forward straight to the wire. The Err arm returns after
+                // yielding its error frame, dropping held unscanned content.
                 let ev = chunk_event!(chunk);
                 yield Ok::<_, Infallible>(ev);
             } else {
@@ -5157,7 +5326,10 @@ where
                                             "guardrail blocked streaming response (window)",
                                         );
                                         errored = true;
-                                        guard.comp().guardrail_blocked = true;
+                                        let comp = guard.comp();
+                                        comp.guardrail_blocked = true;
+                                        comp.response_capture_safe = false;
+                                        comp.response_text.clear();
                                         yield Ok::<_, Infallible>(
                                             Event::default().event("error").data(
                                                 error_frame_payload(
@@ -5172,7 +5344,10 @@ where
                                         break;
                                     }
                                     aisix_guardrails::GuardrailVerdict::Bypass { reason } => {
+                                        capture_bypassed = true;
                                         let comp = guard.comp();
+                                        comp.response_capture_safe = false;
+                                        comp.response_text.clear();
                                         if comp.bypass_reason.is_empty() {
                                             comp.bypass_reason = reason;
                                         }
@@ -5191,6 +5366,7 @@ where
                                     let ev = chunk_event!(chunk);
                                     yield Ok::<_, Infallible>(ev);
                                 }
+                                held_bytes = 0;
                                 // Clamp the retained overlap to cc-1 so a
                                 // misconfigured overlap >= window can't keep
                                 // the whole buffer and re-scan every
@@ -5205,40 +5381,7 @@ where
                             }
                         }
                     }
-                    aisix_guardrails::StreamOutputPolicy::BufferFull {
-                        max_buffer_bytes,
-                        on_exceeded_fail_open,
-                    } => {
-                        let buffered = content_buffer.as_ref().map_or(0, |b| b.len());
-                        if buffered > *max_buffer_bytes {
-                            if *on_exceeded_fail_open {
-                                // Fail-open overflow releases the held
-                                // chunks unscanned AND unmasked — the
-                                // operator opted into that trade-off via
-                                // `on_buffer_exceeded: fail_open`.
-                                cap_released = true;
-                                for chunk in pending.drain(..) {
-                                    let ev = chunk_event!(chunk);
-                                    yield Ok::<_, Infallible>(ev);
-                                }
-                            } else {
-                                tracing::warn!(
-                                    guardrail_hook = "output",
-                                    max_buffer_bytes = *max_buffer_bytes,
-                                    "streaming response exceeded max_buffer_bytes; failing closed",
-                                );
-                                errored = true;
-                                guard.comp().guardrail_blocked = true;
-                                yield Ok::<_, Infallible>(
-                                    Event::default().event("error").data(error_frame_payload(
-                                        "content_filter",
-                                        "response blocked by content policy",
-                                    )),
-                                );
-                                break;
-                            }
-                        }
-                    }
+                    aisix_guardrails::StreamOutputPolicy::BufferFull { .. } => {}
                     aisix_guardrails::StreamOutputPolicy::EndOfStreamCheck => {}
                 }
             }
@@ -5296,6 +5439,7 @@ where
                     } else {
                         format!("{content_part}\n{tc_part}")
                     };
+                    let mut moderation_capture_safe = true;
                     let blocked = if final_text.is_empty() {
                         false
                     } else {
@@ -5319,15 +5463,15 @@ where
                         guard.comp().monitor_hits.extend(hits);
                         let mut seg_counts = crate::redact::RedactionCounts::new();
                         let mut seg_hits = Vec::new();
-                        let verdict = crate::redact::moderate_body(
+                        let moderation = crate::redact::moderate_chat_chunks_structured(
                             ctx.chain.as_ref(),
-                            crate::redact::Direction::Output,
                             verdict,
+                            &mut pending,
                             &mut seg_counts,
                             &mut seg_hits,
-                            |g| crate::redact::redact_chat_chunks(g, &mut pending),
                         )
                         .await;
+                        moderation_capture_safe = moderation.capture_safe;
                         guard.comp().monitor_hits.extend(seg_hits);
                         if !seg_counts.is_empty() {
                             // Bedrock masked the held chunks — rebuild the
@@ -5352,7 +5496,12 @@ where
                                 seg_counts,
                             );
                         }
-                        match verdict {
+                        if !moderation.capture_safe {
+                            let comp = guard.comp();
+                            comp.response_capture_safe = false;
+                            comp.response_text.clear();
+                        }
+                        match moderation.verdict {
                             aisix_guardrails::GuardrailVerdict::Block { reason, guardrail_name } => {
                                 tracing::warn!(
                                     guardrail_hook = "output",
@@ -5361,7 +5510,10 @@ where
                                     "guardrail blocked streaming response",
                                 );
                                 errored = true;
-                                guard.comp().guardrail_blocked = true;
+                                let comp = guard.comp();
+                                comp.guardrail_blocked = true;
+                                comp.response_capture_safe = false;
+                                comp.response_text.clear();
                                 yield Ok::<_, Infallible>(
                                     Event::default().event("error").data(error_frame_payload(
                                         "content_filter",
@@ -5384,14 +5536,31 @@ where
                         }
                     };
                     if !blocked {
+                        let mut safe_to_release = true;
                         // #932: the whole response is held here, so mask-
                         // action PII rules rewrite the held chunks before
                         // anything reaches the wire (channel reassembly —
                         // a masked span can cross chunk boundaries).
                         if let Some(ctx) = output_guardrail.as_ref() {
-                            let counts =
-                                crate::redact::redact_chat_chunks(ctx.chain.as_ref(), &mut pending);
-                            if !counts.is_empty() {
+                            let redaction = crate::redact::redact_chat_chunks_structured(
+                                ctx.chain.as_ref(),
+                                &mut pending,
+                            );
+                            if redaction.unrewritable_tool_key {
+                                let comp = guard.comp();
+                                comp.guardrail_blocked = true;
+                                comp.response_capture_safe = false;
+                                comp.response_text.clear();
+                                errored = true;
+                                yield Ok::<_, Infallible>(
+                                    Event::default().event("error").data(error_frame_payload(
+                                        "content_filter",
+                                        "response blocked by content policy",
+                                    )),
+                                );
+                                safe_to_release = false;
+                            }
+                            if !redaction.counts.is_empty() {
                                 // The wire chunks were masked — mask the
                                 // content-capture accumulator too, or the
                                 // exported content would carry PII the client
@@ -5402,13 +5571,17 @@ where
                                 );
                                 crate::redact::merge_counts(
                                     &mut guard.comp().redacted_entity_counts,
-                                    counts,
+                                    redaction.counts,
                                 );
                             }
                         }
-                        for chunk in pending.drain(..) {
-                            let ev = chunk_event!(chunk);
-                            yield Ok::<_, Infallible>(ev);
+                        if safe_to_release {
+                            guard.comp().response_capture_safe =
+                                moderation_capture_safe && !capture_bypassed;
+                            for chunk in pending.drain(..) {
+                                let ev = chunk_event!(chunk);
+                                yield Ok::<_, Infallible>(ev);
+                            }
                         }
                     }
                 }
@@ -5424,7 +5597,7 @@ where
                 } else {
                     format!("{content}\n{tc_part}")
                 };
-                let synthesized = aisix_gateway::ChatResponse {
+                let mut synthesized = aisix_gateway::ChatResponse {
                     id: guard.comp().provider_request_id.clone(),
                     model: guard.comp().provider_model_version.clone(),
                     message: aisix_gateway::ChatMessage::assistant(scan_text),
@@ -5434,9 +5607,27 @@ where
                         guard.comp().completion_tokens,
                     ),
                 };
-                let (verdict, hits) = ctx.chain.check_output_observed(&synthesized).await;
+                let (verdict, hits) = ctx
+                    .chain
+                    .check_output_non_segment_observed(&synthesized)
+                    .await;
                 guard.comp().monitor_hits.extend(hits);
-                match verdict {
+                let mut seg_counts = crate::redact::RedactionCounts::new();
+                let mut seg_hits = Vec::new();
+                let moderation = crate::redact::moderate_chat_response_structured(
+                    ctx.chain.as_ref(),
+                    verdict,
+                    &mut synthesized,
+                    &mut seg_counts,
+                    &mut seg_hits,
+                )
+                .await;
+                guard.comp().monitor_hits.extend(seg_hits);
+                guard.comp().response_capture_safe = moderation.capture_safe;
+                if !moderation.capture_safe {
+                    guard.comp().response_text.clear();
+                }
+                match moderation.verdict {
                     aisix_guardrails::GuardrailVerdict::Block { reason, guardrail_name } => {
                         // Mirror the non-streaming path's #153
                         // redaction contract: the wire-level message
@@ -6072,6 +6263,207 @@ mod complete_on_drop_tests {
         assert_eq!(out.cached_prompt_tokens, 30);
         assert_eq!(out.reasoning_tokens, 50);
         assert_eq!(out.chunks_delivered, 42);
+    }
+}
+
+#[cfg(test)]
+mod fail_open_capture_tests {
+    use super::{build_sse_stream, StreamCompletion, StreamGuardrailContext};
+    use aisix_gateway::{ChatChunk, ChatDelta, ChatResponse};
+    use aisix_guardrails::{Guardrail, GuardrailVerdict, StreamOutputPolicy};
+    use async_trait::async_trait;
+    use futures::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    struct FailOpenHold;
+
+    impl Guardrail for FailOpenHold {
+        fn name(&self) -> &'static str {
+            "fail-open-hold"
+        }
+
+        fn stream_output_policy(&self) -> StreamOutputPolicy {
+            StreamOutputPolicy::BufferFull {
+                max_buffer_bytes: 1,
+                on_exceeded_fail_open: true,
+            }
+        }
+    }
+
+    struct BypassThenAllowWindow(AtomicUsize);
+
+    #[async_trait]
+    impl Guardrail for BypassThenAllowWindow {
+        fn name(&self) -> &'static str {
+            "bypass-then-allow-window"
+        }
+
+        fn stream_output_policy(&self) -> StreamOutputPolicy {
+            StreamOutputPolicy::Window {
+                size_chars: 4,
+                overlap_chars: 0,
+            }
+        }
+
+        async fn check_output(&self, _response: &ChatResponse) -> GuardrailVerdict {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                GuardrailVerdict::Bypass {
+                    reason: "remote_unavailable".into(),
+                }
+            } else {
+                GuardrailVerdict::Allow
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn window_bypass_remains_capture_unsafe_after_later_allow() {
+        let upstream = futures::stream::iter(vec![
+            Ok(ChatChunk {
+                id: "chunk-1".into(),
+                model: "upstream-model".into(),
+                delta: ChatDelta {
+                    content: Some("four".into()),
+                    ..ChatDelta::default()
+                },
+                finish_reason: None,
+                usage: None,
+            }),
+            Ok(ChatChunk {
+                id: "chunk-2".into(),
+                model: "upstream-model".into(),
+                delta: ChatDelta {
+                    content: Some("ok".into()),
+                    ..ChatDelta::default()
+                },
+                finish_reason: None,
+                usage: None,
+            }),
+        ])
+        .boxed();
+        let captured = Arc::new(Mutex::new(None::<StreamCompletion>));
+        let captured_for_callback = Arc::clone(&captured);
+        let stream = build_sse_stream(
+            upstream,
+            1,
+            Some(StreamGuardrailContext {
+                chain: Arc::new(BypassThenAllowWindow(AtomicUsize::new(0))),
+                model_name: "gateway-model".into(),
+            }),
+            Instant::now(),
+            Instant::now(),
+            "gateway-model".into(),
+            Some(1_024),
+            false,
+            aisix_gateway::chat::UsageStats::default(),
+            None,
+            move |completion| {
+                *captured_for_callback.lock().unwrap() = Some(completion);
+            },
+        );
+
+        let events: Vec<_> = stream.collect().await;
+        assert_eq!(events.len(), 3, "both chunks and [DONE] reach the caller");
+        let completion = captured.lock().unwrap().take().expect("on_complete fired");
+        assert_eq!(completion.bypass_reason, "remote_unavailable");
+        assert!(!completion.response_capture_safe);
+        assert!(completion.response_text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn buffer_overflow_fail_open_releases_wire_but_suppresses_capture() {
+        let upstream = futures::stream::iter(vec![Ok(ChatChunk {
+            id: "chunk-1".into(),
+            model: "upstream-model".into(),
+            delta: ChatDelta {
+                content: Some("uninspected output".into()),
+                ..ChatDelta::default()
+            },
+            finish_reason: None,
+            usage: None,
+        })])
+        .boxed();
+        let captured = Arc::new(Mutex::new(None::<StreamCompletion>));
+        let captured_for_callback = Arc::clone(&captured);
+        let stream = build_sse_stream(
+            upstream,
+            1,
+            Some(StreamGuardrailContext {
+                chain: Arc::new(FailOpenHold),
+                model_name: "gateway-model".into(),
+            }),
+            Instant::now(),
+            Instant::now(),
+            "gateway-model".into(),
+            Some(1_024),
+            false,
+            aisix_gateway::chat::UsageStats::default(),
+            None,
+            move |completion| {
+                *captured_for_callback.lock().unwrap() = Some(completion);
+            },
+        );
+
+        let events: Vec<_> = stream.collect().await;
+        assert_eq!(
+            events.len(),
+            2,
+            "chunk and [DONE] must still reach the caller"
+        );
+        let completion = captured.lock().unwrap().take().expect("on_complete fired");
+        assert!(!completion.response_capture_safe);
+    }
+
+    #[tokio::test]
+    async fn upstream_error_survives_the_error_frame_yield() {
+        let upstream = futures::stream::iter(vec![
+            Ok(ChatChunk {
+                id: "chunk-1".into(),
+                model: "upstream-model".into(),
+                delta: ChatDelta {
+                    content: Some("partial".into()),
+                    ..ChatDelta::default()
+                },
+                finish_reason: None,
+                usage: None,
+            }),
+            Err(aisix_gateway::BridgeError::Timeout {
+                elapsed_ms: 300,
+                cause: String::new(),
+            }),
+        ])
+        .boxed();
+        let captured = Arc::new(Mutex::new(None::<StreamCompletion>));
+        let captured_for_callback = Arc::clone(&captured);
+        let stream = build_sse_stream(
+            upstream,
+            1,
+            None,
+            Instant::now(),
+            Instant::now(),
+            "gateway-model".into(),
+            None,
+            false,
+            aisix_gateway::chat::UsageStats::default(),
+            None,
+            move |completion| {
+                *captured_for_callback.lock().unwrap() = Some(completion);
+            },
+        );
+
+        let events: Vec<_> = stream.collect().await;
+        assert_eq!(events.len(), 2, "partial chunk and error frame");
+        let completion = captured.lock().unwrap().take().expect("on_complete fired");
+        assert!(matches!(
+            completion.terminal_failure,
+            Some(aisix_gateway::BridgeError::Timeout {
+                elapsed_ms: 300,
+                ..
+            })
+        ));
+        assert!(!completion.reached_end);
     }
 }
 

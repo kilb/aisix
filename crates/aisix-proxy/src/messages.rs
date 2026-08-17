@@ -102,7 +102,10 @@ pub async fn messages(
                 Some(&auth.entry.id),
                 started,
                 crate::reject::Envelope::Anthropic,
-                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+                crate::error::proxy_error_from_json_rejection(
+                    rej,
+                    state.request_body_limit_for("/v1/messages"),
+                ),
             );
         }
     };
@@ -134,6 +137,10 @@ pub async fn messages(
     // Filled by `dispatch` with monitor-mode guardrail observations
     // (AISIX-Cloud#562), same lifecycle as `redaction_counts`.
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    // A sensitive JSON object key cannot be renamed without changing the tool
+    // contract. Such a fail-closed rejection must also suppress full-content
+    // failure export, which would otherwise retain the unchanged key.
+    let mut suppress_failure_content = false;
     // #890 req-1: capture the client's streaming intent before dispatch
     // (which mutates the body).
     let stream_requested = body
@@ -151,6 +158,7 @@ pub async fn messages(
         &mut applied_guardrails,
         &mut redaction_counts,
         &mut monitor_hits,
+        &mut suppress_failure_content,
     )
     .await
     {
@@ -287,6 +295,7 @@ pub async fn messages(
                     applied_guardrails.clone(),
                     redaction_counts.clone(),
                     monitor_hits.clone(),
+                    false,
                     captured_content,
                 );
             }
@@ -294,6 +303,7 @@ pub async fn messages(
         }
         Err(MessagesDispatchError { err, routing }) => {
             let status = err.status().as_u16();
+            let guardrail_blocked = matches!(&err, ProxyError::ContentFiltered(_));
             let elapsed = started.elapsed();
             emit_access_log(
                 &model_name,
@@ -339,7 +349,8 @@ pub async fn messages(
             // body-less (a 401 here is upstream-auth passthrough — caller
             // 401s are rejected by the auth extractor before any event
             // exists) (the body adds nothing to an authorization failure).
-            let mut failure_content = if status == 401 || status == 403 {
+            let mut failure_content = if status == 401 || status == 403 || suppress_failure_content
+            {
                 None
             } else {
                 content_capture_cap(
@@ -413,6 +424,7 @@ pub async fn messages(
                     // Input masking may have fired before the failure.
                     redaction_counts.clone(),
                     monitor_hits.clone(),
+                    guardrail_blocked,
                     failure_content.take(),
                 );
             }
@@ -488,6 +500,7 @@ fn emit_failed_attempts_anthropic(
             // terminal (winner / pre-dispatch) event does.
             crate::redact::RedactionCounts::new(),
             Vec::new(),
+            rec.error_class == "content_filter",
             content,
         );
     }
@@ -515,6 +528,7 @@ async fn dispatch(
     // Out-param: monitor-mode guardrail observations (AISIX-Cloud#562),
     // same lifecycle as `redactions_out`.
     monitor_hits_out: &mut Vec<aisix_core::GuardrailMonitorHit>,
+    suppress_failure_content_out: &mut bool,
 ) -> Result<DispatchOutcome, MessagesDispatchError> {
     // Extract and resolve model.
     let model_name = body
@@ -558,59 +572,75 @@ async fn dispatch(
     // check below blocks it (#379 / closes the anthropic gap in #519).
     *applied_out = resolved_chain.applied().to_vec();
     if !resolved_chain.is_empty() {
-        if let Ok(chat) = aisix_provider_anthropic::parse_inbound_request(body) {
-            let (verdict, hits) = aisix_guardrails::Guardrail::check_input_non_segment_observed(
-                resolved_chain.as_ref(),
-                &chat,
+        let chat = crate::redact::anthropic_request_for_inspection(body).map_err(|_| {
+            *suppress_failure_content_out = true;
+            ProxyError::InvalidRequest(
+                "request could not be inspected by the configured data-loss prevention policy"
+                    .to_string(),
             )
-            .await;
-            monitor_hits_out.extend(hits);
-            // Segment pass: one Bedrock call over the body's text slots;
-            // an ANONYMIZE disposition writes the masked text back into
-            // the Anthropic-native body (#932 bedrock follow-up).
-            let verdict = crate::redact::moderate_body(
-                resolved_chain.as_ref(),
-                crate::redact::Direction::Input,
-                verdict,
-                redactions_out,
-                monitor_hits_out,
-                |g| crate::redact::redact_anthropic_request(g, body),
-            )
-            .await;
-            if let aisix_guardrails::GuardrailVerdict::Block {
-                reason,
-                guardrail_name,
-            } = verdict
-            {
-                // AISIX-Cloud#1013: mask before returning so the failure
-                // content capture exports post-mask text (see chat.rs).
-                crate::redact::merge_counts(
-                    redactions_out,
-                    crate::redact::redact_anthropic_request(resolved_chain.as_ref(), body),
-                );
-                tracing::warn!(
-                    guardrail_hook = "input",
-                    model = %model_name,
-                    reason = %reason,
-                    "guardrail blocked /v1/messages request",
-                );
-                return Err(
-                    ProxyError::ContentFiltered(crate::error::guardrail_block_message(
-                        "request",
-                        guardrail_name.as_deref(),
-                    ))
-                    .into(),
-                );
-            }
+        })?;
+        let (verdict, hits) = aisix_guardrails::Guardrail::check_input_non_segment_observed(
+            resolved_chain.as_ref(),
+            &chat,
+        )
+        .await;
+        monitor_hits_out.extend(hits);
+        // Segment pass: one Bedrock call over the body's text slots;
+        // an ANONYMIZE disposition writes the masked text back into
+        // the Anthropic-native body (#932 bedrock follow-up).
+        let moderation = crate::redact::moderate_anthropic_request(
+            resolved_chain.as_ref(),
+            verdict,
+            body,
+            redactions_out,
+            monitor_hits_out,
+        )
+        .await;
+        *suppress_failure_content_out |= !moderation.capture_safe;
+        let verdict = moderation.verdict;
+        if let aisix_guardrails::GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+        } = verdict
+        {
+            // AISIX-Cloud#1013: mask before returning so the failure
+            // content capture exports post-mask text (see chat.rs).
+            let redaction = crate::redact::redact_anthropic_request(resolved_chain.as_ref(), body);
+            *suppress_failure_content_out |= redaction.unrewritable_tool_key;
+            crate::redact::merge_counts(redactions_out, redaction.counts);
+            tracing::warn!(
+                guardrail_hook = "input",
+                model = %model_name,
+                reason = %reason,
+                "guardrail blocked /v1/messages request",
+            );
+            return Err(
+                ProxyError::ContentFiltered(crate::error::guardrail_block_message(
+                    "request",
+                    guardrail_name.as_deref(),
+                ))
+                .into(),
+            );
         }
         // #932: mask-action PII rules rewrite the Anthropic-native body in
         // place AFTER the block check passes — both the passthrough and the
         // cross-provider bridge forward from this body, so the masked text
         // is what reaches the upstream.
-        crate::redact::merge_counts(
-            redactions_out,
-            crate::redact::redact_anthropic_request(resolved_chain.as_ref(), body),
-        );
+        let redaction = crate::redact::redact_anthropic_request(resolved_chain.as_ref(), body);
+        let unrewritable_tool_key = redaction.unrewritable_tool_key;
+        *suppress_failure_content_out |= unrewritable_tool_key;
+        crate::redact::merge_counts(redactions_out, redaction.counts);
+        if unrewritable_tool_key {
+            tracing::warn!(
+                guardrail_hook = "input",
+                model = %model_name,
+                "guardrail rejected /v1/messages request because a sensitive tool object key cannot be safely rewritten",
+            );
+            return Err(
+                ProxyError::ContentFiltered(crate::error::guardrail_block_message("request", None))
+                    .into(),
+            );
+        }
     }
 
     let model_rl =
@@ -1161,6 +1191,9 @@ async fn anthropic_passthrough_dispatch(
         crate::stream_timeout::send_with_deadline(req_builder, connect_deadline, send_started)
             .await
             .map_err(|be| {
+                if be.http_status() >= 500 {
+                    state.health.record_failure(&model.display_name);
+                }
                 crate::cooldown::note_failure(
                     &state.runtime_status,
                     model_id,
@@ -1182,6 +1215,9 @@ async fn anthropic_passthrough_dispatch(
             truncated,
             retry_after,
         );
+        if err.http_status() >= 500 {
+            state.health.record_failure(&model.display_name);
+        }
         // Apply the cross-request cooldown contract to the
         // Anthropic-passthrough path too — without this, a 401 / 429 /
         // 5xx via /v1/messages would never mark the direct model and
@@ -1193,15 +1229,6 @@ async fn anthropic_passthrough_dispatch(
         }
         return Err(ProxyError::Bridge(err));
     }
-
-    // Update health trackers on success — both the display-name-keyed
-    // observational signal AND the id-keyed runtime status that
-    // routing filters consult. Without `mark_healthy` here, a target
-    // that recovered via the Anthropic passthrough would stay in
-    // `cooldown` on /admin/v1/models/status until its TTL naturally
-    // expired (round-2 audit MEDIUM on PR #268).
-    state.health.record_success(&model.display_name);
-    state.runtime_status.mark_healthy(model_id);
 
     let provider_label = "anthropic".to_string();
 
@@ -1216,47 +1243,52 @@ async fn anthropic_passthrough_dispatch(
         // (pre-#554 behavior). A mid-stream stall truncates the forwarded
         // stream — there is no in-band error frame for an opaque passthrough.
         let stream_budget = timeouts.stream;
-        let wrapped: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> =
-            Box::pin(crate::stream_timeout::with_read_timeout_bytes(
-                upstream_resp.bytes_stream(),
-                stream_budget,
-            ));
-        let body_stream: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> =
-            if timeouts.stream_configured {
-                let mut wrapped = wrapped;
-                let first_bytes = match wrapped.next().await {
-                    Some(Ok(b)) => b,
-                    Some(Err(e)) => {
-                        let err = crate::dispatch::reqwest_error_to_bridge(&e, send_started);
-                        if let Some((ttl, reason)) =
-                            crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
-                        {
-                            state.runtime_status.mark_cooldown(model_id, ttl, reason);
-                        }
-                        return Err(ProxyError::Bridge(err));
+        let wrapped: std::pin::Pin<
+            Box<dyn Stream<Item = Result<Bytes, crate::stream_timeout::RawStreamError>> + Send>,
+        > = Box::pin(crate::stream_timeout::with_read_timeout_bytes(
+            upstream_resp.bytes_stream(),
+            stream_budget,
+        ));
+        let body_stream: std::pin::Pin<
+            Box<dyn Stream<Item = Result<Bytes, crate::stream_timeout::RawStreamError>> + Send>,
+        > = if timeouts.stream_configured {
+            let mut wrapped = wrapped;
+            let first_bytes = match wrapped.next().await {
+                Some(Ok(b)) => b,
+                Some(Err(e)) => {
+                    let err = e.into_bridge(send_started);
+                    state.health.record_failure(&model.display_name);
+                    if let Some((ttl, reason)) =
+                        crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+                    {
+                        state.runtime_status.mark_cooldown(model_id, ttl, reason);
                     }
-                    // Read timeout before the first byte (or an upstream that
-                    // closed immediately): retryable stream-abort so the
-                    // caller fails over.
-                    None => {
-                        let err = aisix_gateway::BridgeError::StreamAborted;
-                        if let Some((ttl, reason)) =
-                            crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
-                        {
-                            state.runtime_status.mark_cooldown(model_id, ttl, reason);
-                        }
-                        return Err(ProxyError::Bridge(err));
+                    return Err(ProxyError::Bridge(err));
+                }
+                // Read timeout before the first byte (or an upstream that
+                // closed immediately): retryable stream-abort so the
+                // caller fails over.
+                None => {
+                    let err = aisix_gateway::BridgeError::StreamAborted;
+                    state.health.record_failure(&model.display_name);
+                    if let Some((ttl, reason)) =
+                        crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+                    {
+                        state.runtime_status.mark_cooldown(model_id, ttl, reason);
                     }
-                };
-                Box::pin(
-                    futures::stream::once(std::future::ready(Ok::<Bytes, reqwest::Error>(
-                        first_bytes,
-                    )))
-                    .chain(wrapped),
-                )
-            } else {
-                wrapped
+                    return Err(ProxyError::Bridge(err));
+                }
             };
+            Box::pin(
+                futures::stream::once(std::future::ready(Ok::<
+                    Bytes,
+                    crate::stream_timeout::RawStreamError,
+                >(first_bytes)))
+                .chain(wrapped),
+            )
+        } else {
+            wrapped
+        };
 
         // Issue #245: parity with the OpenAI streaming fix (#225 /
         // #196). Pre-fix this path forwarded raw bytes and emitted a
@@ -1281,6 +1313,8 @@ async fn anthropic_passthrough_dispatch(
             crate::usage_attr::metric_model_label(&state.snapshot.load(), model_name).into_owned();
         let provider_key_id_c = pk_id.to_string();
         let upstream_model_c = upstream_model.clone();
+        let model_display_name_c = model.display_name.clone();
+        let cooldown_c = model.cooldown.clone();
         let team_id_c = team_id.clone();
         let user_id_c = user_id.clone();
         let user_name_c = user_name.clone();
@@ -1367,6 +1401,18 @@ async fn anthropic_passthrough_dispatch(
                 // in-flight.
                 drop(in_flight);
 
+                let terminal = crate::stream_timeout::finish_bridge_stream(
+                    &state_c.health,
+                    &state_c.runtime_status,
+                    &model_display_name_c,
+                    &model_id_c,
+                    cooldown_c.as_ref(),
+                    usage.stream_failure.map(|failure| failure.bridge_error()),
+                    usage.reached_end || usage.guardrail_blocked,
+                    anthropic_stream_status_code(usage.reached_end, usage.guardrail_blocked),
+                );
+                let mut terminal_attempt = attempt_c.clone();
+                terminal_attempt.error_class = terminal.error_class;
                 let metrics = AnthropicUsageMetrics {
                     prompt_tokens: usage.prompt_tokens,
                     completion_tokens: usage.completion_tokens,
@@ -1384,7 +1430,7 @@ async fn anthropic_passthrough_dispatch(
                         endpoint: "/v1/messages",
                         model: &bounded_model_c,
                         provider: &provider_c,
-                        status: 200,
+                        status: terminal.status,
                         streaming: true,
                     },
                     started.elapsed(),
@@ -1411,17 +1457,13 @@ async fn anthropic_passthrough_dispatch(
                     // as 499, matching LiteLLM. The upstream work still
                     // happened, so the event is emitted either way — only
                     // its outcome differs.
-                    if usage.reached_end {
-                        200
-                    } else {
-                        crate::CLIENT_CLOSED_REQUEST
-                    },
+                    terminal.status,
                     // Attempt-scoped, unlike the e2e histogram above: any
                     // failed attempt before this one emitted its own event.
                     attempt_started.elapsed(),
                     metrics,
                     &client_ctx_c,
-                    attempt_c.clone(),
+                    terminal_attempt,
                     applied_guardrails_c.clone(),
                     // #932: input-side mask counts captured before dispatch,
                     // merged with the hold-back release's output-side counts.
@@ -1435,12 +1477,18 @@ async fn anthropic_passthrough_dispatch(
                         merged.extend(usage.monitor_hits);
                         merged
                     },
+                    usage.guardrail_blocked,
                     // Prompt captured up front; response assembled by the frame
-                    // parser into `usage.response_text`. Both gated on the cap.
+                    // parser into `usage.response_text`. Held output is exposed
+                    // only after its complete moderation pass succeeds.
                     match (&captured_prompt_c, content_cap) {
                         (Some(prompt), Some(cap)) => Some(CapturedContent::new(
                             prompt,
-                            &usage.response_text,
+                            if usage.response_capture_safe {
+                                &usage.response_text
+                            } else {
+                                ""
+                            },
                             cap as usize,
                         )),
                         _ => None,
@@ -1501,6 +1549,7 @@ async fn anthropic_passthrough_dispatch(
             .json()
             .await
             .map_err(|e| {
+                state.health.record_failure(&model.display_name);
                 crate::cooldown::note_failure(
                     &state.runtime_status,
                     model_id,
@@ -1509,6 +1558,8 @@ async fn anthropic_passthrough_dispatch(
                 )
             })
             .map_err(ProxyError::Bridge)?;
+        state.health.record_success(&model.display_name);
+        state.runtime_status.mark_healthy(model_id);
 
         let mut metrics = anthropic_metrics_from_response_json(&json_body);
         // Token-estimation fallback (AISIX-Cloud#1074): an
@@ -1525,6 +1576,7 @@ async fn anthropic_passthrough_dispatch(
         // a synthetic ChatResponse for inspection before returning it.
         let mut output_seg_counts = crate::redact::RedactionCounts::new();
         let mut output_monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+        let mut output_capture_safe = true;
         if !resolved_chain.is_empty() {
             if let Some(content) = json_body.get("content").and_then(|v| v.as_array()) {
                 let mut out_text = String::new();
@@ -1555,15 +1607,16 @@ async fn anthropic_passthrough_dispatch(
                     )
                     .await;
                 output_monitor_hits.extend(hits);
-                let verdict = crate::redact::moderate_body(
+                let moderation = crate::redact::moderate_anthropic_response(
                     resolved_chain.as_ref(),
-                    crate::redact::Direction::Output,
                     verdict,
+                    &mut json_body,
                     &mut output_seg_counts,
                     &mut output_monitor_hits,
-                    |g| crate::redact::redact_anthropic_response(g, &mut json_body),
                 )
                 .await;
+                output_capture_safe = moderation.capture_safe;
+                let verdict = moderation.verdict;
                 if let aisix_guardrails::GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
@@ -1595,8 +1648,19 @@ async fn anthropic_passthrough_dispatch(
 
         // #932: mask-action PII rules rewrite the passthrough response body
         // (text blocks + tool_use input) AFTER the block check passes.
-        let mut output_redactions =
+        let redaction =
             crate::redact::redact_anthropic_response(resolved_chain.as_ref(), &mut json_body);
+        if redaction.unrewritable_tool_key {
+            tracing::warn!(
+                guardrail_hook = "output",
+                model = %model_name,
+                "guardrail rejected /v1/messages passthrough response because a sensitive tool object key cannot be safely rewritten",
+            );
+            return Err(ProxyError::ContentFiltered(
+                crate::error::guardrail_block_message("response", None),
+            ));
+        }
+        let mut output_redactions = redaction.counts;
         crate::redact::merge_counts(&mut output_redactions, output_seg_counts);
 
         // Capture the prompt (the outbound request body) + assembled assistant
@@ -1612,6 +1676,7 @@ async fn anthropic_passthrough_dispatch(
                 .iter()
                 .map(|e| &e.value),
         )
+        .filter(|_| output_capture_safe)
         .map(|cap| {
             CapturedContent::new(
                 &serde_json::to_string(&body).unwrap_or_default(),
@@ -1871,6 +1936,9 @@ async fn cross_provider_dispatch(
 
     if is_stream {
         let upstream = bridge.chat_stream(&chat, &ctx).await.map_err(|err| {
+            if err.http_status() >= 500 {
+                state.health.record_failure(&model.display_name);
+            }
             if let Some((ttl, reason)) =
                 crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
             {
@@ -1892,6 +1960,9 @@ async fn cross_provider_dispatch(
             let first_chunk = match upstream.next().await {
                 Some(Ok(chunk)) => chunk,
                 Some(Err(err)) => {
+                    if err.http_status() >= 500 {
+                        state.health.record_failure(&model.display_name);
+                    }
                     if let Some((ttl, reason)) =
                         crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
                     {
@@ -1901,6 +1972,7 @@ async fn cross_provider_dispatch(
                 }
                 None => {
                     let err = aisix_gateway::BridgeError::StreamAborted;
+                    state.health.record_failure(&model.display_name);
                     if let Some((ttl, reason)) =
                         crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
                     {
@@ -1920,9 +1992,6 @@ async fn cross_provider_dispatch(
         } else {
             upstream
         };
-        state.health.record_success(&model.display_name);
-        state.runtime_status.mark_healthy(model_id);
-
         let message_id = format!("msg_{}", Uuid::new_v4().simple());
         let encoder = AnthropicSseEncoder::new(message_id, model_name, 0);
         let state_for_telem = state.clone();
@@ -1944,6 +2013,8 @@ async fn cross_provider_dispatch(
         let client_for_telem = client.clone();
         // Winning-attempt classification (#655) for the stream-end emit.
         let attempt_for_telem = attempt.clone();
+        let model_display_name_for_telem = model.display_name.clone();
+        let cooldown_for_telem = model.cooldown.clone();
         // Applied guardrail set (#379), owned for the move into the
         // end-of-stream telemetry closure.
         let applied_guardrails_for_telem = resolved_chain.applied().to_vec();
@@ -1996,7 +2067,7 @@ async fn cross_provider_dispatch(
             model_name.to_string(),
             content_cap,
             Some(estimator),
-            move |comp| {
+            move |mut comp| {
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
                 // reservation's async `commit_tokens`, which this closure can't
@@ -2015,6 +2086,19 @@ async fn cross_provider_dispatch(
                 // in-flight.
                 drop(in_flight);
 
+                let mut terminal_attempt = attempt_for_telem.clone();
+                let terminal = crate::stream_timeout::finish_bridge_stream(
+                    &state_for_telem.health,
+                    &state_for_telem.runtime_status,
+                    &model_display_name_for_telem,
+                    &model_id_for_telem,
+                    cooldown_for_telem.as_ref(),
+                    comp.terminal_failure.take(),
+                    comp.reached_end || comp.guardrail_blocked,
+                    anthropic_stream_status_code(comp.reached_end, comp.guardrail_blocked),
+                );
+                terminal_attempt.error_class = terminal.error_class;
+
                 let metrics = AnthropicUsageMetrics {
                     prompt_tokens: comp.prompt_tokens,
                     completion_tokens: comp.completion_tokens,
@@ -2032,7 +2116,7 @@ async fn cross_provider_dispatch(
                         endpoint: "/v1/messages",
                         model: &bounded_model_for_telem,
                         provider: &provider_for_telem,
-                        status: 200,
+                        status: terminal.status,
                         streaming: true,
                     },
                     started_for_telem.elapsed(),
@@ -2054,18 +2138,14 @@ async fn cross_provider_dispatch(
                     team_id_for_telem.as_deref(),
                     user_id_for_telem.as_deref(),
                     user_name_for_telem.as_deref(),
-                    // See the sibling passthrough path: an abandoned stream
-                    // is reported as 499, matching LiteLLM.
-                    if comp.reached_end {
-                        200
-                    } else {
-                        crate::CLIENT_CLOSED_REQUEST
-                    },
+                    // Typed upstream-body failures retain their 5xx status;
+                    // only an actual consumer cancellation is reported 499.
+                    terminal.status,
                     // Attempt-scoped — see the sibling passthrough path.
                     attempt_started_for_telem.elapsed(),
                     metrics,
                     &client_for_telem,
-                    attempt_for_telem.clone(),
+                    terminal_attempt,
                     applied_guardrails_for_telem.clone(),
                     // #932: input-side mask counts captured before dispatch,
                     // merged with the hold-back release's output-side counts.
@@ -2079,12 +2159,18 @@ async fn cross_provider_dispatch(
                         merged.extend(comp.monitor_hits);
                         merged
                     },
+                    comp.guardrail_blocked,
                     // Prompt captured up front, response assembled across the
-                    // stream into `comp.response_text`; both gated on the cap.
+                    // stream into `comp.response_text`; held output is exposed
+                    // only after its complete moderation pass succeeds.
                     match (&captured_prompt_for_telem, content_cap) {
                         (Some(prompt), Some(cap)) => Some(CapturedContent::new(
                             prompt,
-                            &comp.response_text,
+                            if comp.response_capture_safe {
+                                &comp.response_text
+                            } else {
+                                ""
+                            },
                             cap as usize,
                         )),
                         _ => None,
@@ -2139,6 +2225,7 @@ async fn cross_provider_dispatch(
     // client-visible output just like /v1/chat/completions.
     let mut output_seg_counts = crate::redact::RedactionCounts::new();
     let mut output_monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    let mut output_capture_safe = true;
     if !resolved_chain.is_empty() {
         let (verdict, hits) = aisix_guardrails::Guardrail::check_output_non_segment_observed(
             resolved_chain.as_ref(),
@@ -2146,19 +2233,19 @@ async fn cross_provider_dispatch(
         )
         .await;
         output_monitor_hits.extend(hits);
-        let verdict = crate::redact::moderate_body(
+        let moderation = crate::redact::moderate_chat_response_structured(
             resolved_chain.as_ref(),
-            crate::redact::Direction::Output,
             verdict,
+            &mut resp,
             &mut output_seg_counts,
             &mut output_monitor_hits,
-            |g| crate::redact::redact_chat_response(g, &mut resp),
         )
         .await;
+        output_capture_safe = moderation.capture_safe;
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-        } = verdict
+        } = moderation.verdict
         {
             tracing::warn!(
                 guardrail_hook = "output",
@@ -2174,8 +2261,19 @@ async fn cross_provider_dispatch(
 
     // #932: mask-action PII rules rewrite the bridged response AFTER the
     // block check passes, BEFORE it is rendered back as Anthropic JSON.
-    let mut output_redactions =
-        crate::redact::redact_chat_response(resolved_chain.as_ref(), &mut resp);
+    let redaction =
+        crate::redact::redact_chat_response_structured(resolved_chain.as_ref(), &mut resp);
+    if redaction.unrewritable_tool_key {
+        tracing::warn!(
+            guardrail_hook = "output",
+            model = %model_name,
+            "guardrail rejected /v1/messages response because a sensitive tool object key cannot be safely rewritten",
+        );
+        return Err(ProxyError::ContentFiltered(
+            crate::error::guardrail_block_message("response", None),
+        ));
+    }
+    let mut output_redactions = redaction.counts;
     crate::redact::merge_counts(&mut output_redactions, output_seg_counts);
 
     let mut metrics = AnthropicUsageMetrics {
@@ -2207,6 +2305,7 @@ async fn cross_provider_dispatch(
             .iter()
             .map(|e| &e.value),
     )
+    .filter(|_| output_capture_safe)
     .map(|cap| {
         CapturedContent::new(
             &serde_json::to_string(body).unwrap_or_default(),
@@ -2286,8 +2385,14 @@ fn build_anthropic_sse_stream(
         }
     });
     let stream = async_stream::stream! {
+        // Live-forward output has already reached the caller. Held output is
+        // unsafe for exporters until the complete moderation pass succeeds.
+        let completion = AnthropicStreamCompletion {
+            response_capture_safe: output_guardrail.is_none(),
+            ..Default::default()
+        };
         let mut guard = CompleteAnthropicStreamOnDrop {
-            slot: Some((on_complete, AnthropicStreamCompletion::default())),
+            slot: Some((on_complete, completion)),
             estimator,
         };
         let mut upstream = upstream;
@@ -2319,16 +2424,6 @@ fn build_anthropic_sse_stream(
                             attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                     }
                     let comp = guard.comp();
-                    if !chunk.id.is_empty() {
-                        comp.provider_request_id =
-                        crate::usage_attr::sanitize_provider_response_id(&chunk.id);
-                    }
-                    if !chunk.model.is_empty() {
-                        comp.provider_model_version = chunk.model.clone();
-                    }
-                    if let Some(fr) = chunk.finish_reason.as_ref() {
-                        comp.finish_reason = finish_reason_label(fr);
-                    }
                     if let Some(u) = chunk.usage.as_ref() {
                         comp.prompt_tokens = comp.prompt_tokens.max(u.prompt_tokens);
                         comp.completion_tokens = comp.completion_tokens.max(u.completion_tokens);
@@ -2336,26 +2431,11 @@ fn build_anthropic_sse_stream(
                             comp.cache_creation_tokens.max(u.cache_creation_tokens);
                         comp.cache_read_tokens = comp.cache_read_tokens.max(u.cache_read_tokens);
                     }
-                    if output_guardrail.is_some() {
-                        if let Some(t) = chunk.delta.content.as_deref() {
-                            content_text.push_str(t);
-                        }
-                        if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
-                            tool_call_fragments.extend(tcs.iter().cloned());
-                        }
-                    }
-                    // Content capture: assemble the response (bounded to the
-                    // cap), only when an exporter wants full content.
-                    if let Some(cap) = content_cap {
-                        if let Some(t) = chunk.delta.content.as_deref() {
-                            if comp.response_text.len() < cap as usize {
-                                comp.response_text.push_str(t);
-                            }
-                        }
-                    }
                     // Token-estimation accumulator (AISIX-Cloud#1074): all
                     // generated output, always on (whether the fallback is
-                    // needed is only known at end-of-stream), bounded.
+                    // needed is only known at end-of-stream), bounded. This
+                    // precedes the hold-back check so the chunk that trips the
+                    // cap is still accounted for in terminal token limits.
                     {
                         use crate::token_estimate::push_capped;
                         if let Some(t) = chunk.delta.content.as_deref() {
@@ -2380,19 +2460,59 @@ fn build_anthropic_sse_stream(
                         }
                     }
                     if let Some(max_hold) = hold_policy {
-                        // Hold-back: withhold the chunk until the end-of-
-                        // stream scan clears it. Overflow fails closed —
-                        // unscannable content must not be released.
-                        held_bytes += chunk.delta.content.as_deref().map_or(0, str::len);
-                        if held_bytes > max_hold {
+                        // Bound everything retained below, including cloned
+                        // tool-call fragments. Counting the complete
+                        // normalized chunk prevents a tool-only stream from
+                        // bypassing the hold-back ceiling.
+                        let remaining = max_hold.saturating_sub(held_bytes);
+                        let Some(chunk_bytes) = bounded_json_len(&chunk, remaining) else {
                             tracing::warn!(
                                 guardrail_hook = "output",
                                 max_buffer_bytes = max_hold,
                                 "streaming /v1/messages response exceeded hold-back cap; failing closed",
                             );
+                            guard.comp().guardrail_blocked = true;
                             yield Ok(bytes::Bytes::from(guardrail_block_frame(None)));
                             return;
+                        };
+                        held_bytes += chunk_bytes;
+                    }
+                    // Copy upstream-controlled metadata only after a held
+                    // chunk passes the complete size check. An oversized id,
+                    // model or custom finish reason must not allocate a
+                    // second unbounded string before the stream fails closed.
+                    if !chunk.id.is_empty() {
+                        comp.provider_request_id =
+                            crate::usage_attr::sanitize_provider_response_id(&chunk.id);
+                    }
+                    if !chunk.model.is_empty() {
+                        comp.provider_model_version = chunk.model.clone();
+                    }
+                    if let Some(fr) = chunk.finish_reason.as_ref() {
+                        comp.finish_reason = finish_reason_label(fr);
+                    }
+                    if output_guardrail.is_some() {
+                        if let Some(t) = chunk.delta.content.as_deref() {
+                            content_text.push_str(t);
                         }
+                        if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
+                            tool_call_fragments.extend(tcs.iter().cloned());
+                        }
+                    }
+                    // Content capture: assemble the response (bounded to the
+                    // cap), only when an exporter wants full content.
+                    if let Some(cap) = content_cap {
+                        if let Some(t) = chunk.delta.content.as_deref() {
+                            if comp.response_text.len() < cap as usize {
+                                comp.response_text.push_str(t);
+                            }
+                        }
+                    }
+                    if let Some(max_hold) = hold_policy {
+                        // Hold-back: withhold the chunk until the end-of-
+                        // stream scan clears it. Overflow fails closed —
+                        // unscannable content must not be released.
+                        debug_assert!(held_bytes <= max_hold);
                         held_chunks.push(chunk);
                         continue;
                     }
@@ -2406,11 +2526,17 @@ fn build_anthropic_sse_stream(
                 Err(e) => {
                     // Hold-back: the held (unscanned) chunks are dropped —
                     // fail closed; only the error frame reaches the client.
+                    let error_type = e.error_type();
+                    let error_message = e.to_string();
                     let frame = format!(
                         "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"{}\",\"message\":{}}}}}\n\n",
-                        e.error_type(),
-                        serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "\"error\"".into()),
+                        error_type,
+                        serde_json::to_string(&error_message).unwrap_or_else(|_| "\"error\"".into()),
                     );
+                    let comp = guard.comp();
+                    comp.response_capture_safe = false;
+                    comp.response_text.clear();
+                    comp.terminal_failure = Some(e);
                     yield Ok(bytes::Bytes::from(frame));
                     return;
                 }
@@ -2423,6 +2549,7 @@ fn build_anthropic_sse_stream(
         // End-of-stream output guardrail (#448): scan the accumulated
         // assistant text and, on a block, emit a terminal Anthropic
         // `error` event instead of completing the stream cleanly.
+        let mut moderation_capture_safe = true;
         if let Some(chain) = output_guardrail.as_ref() {
             if !content_text.is_empty() || !tool_call_fragments.is_empty() {
                 let mut message =
@@ -2435,7 +2562,7 @@ fn build_anthropic_sse_stream(
                         serde_json::Value::Array(std::mem::take(&mut tool_call_fragments)),
                     );
                 }
-                let synth = aisix_gateway::ChatResponse {
+                let mut synth = aisix_gateway::ChatResponse {
                     id: String::new(),
                     model: model_label.clone(),
                     message,
@@ -2451,15 +2578,29 @@ fn build_anthropic_sse_stream(
                 guard.comp().monitor_hits.extend(hits);
                 let mut seg_counts = crate::redact::RedactionCounts::new();
                 let mut seg_hits = Vec::new();
-                let verdict = crate::redact::moderate_body(
-                    chain.as_ref(),
-                    crate::redact::Direction::Output,
-                    verdict,
-                    &mut seg_counts,
-                    &mut seg_hits,
-                    |g| crate::redact::redact_chat_chunks(g, &mut held_chunks),
-                )
-                .await;
+                let moderation = if hold_policy.is_some() {
+                    crate::redact::moderate_chat_chunks_structured(
+                        chain.as_ref(),
+                        verdict,
+                        &mut held_chunks,
+                        &mut seg_counts,
+                        &mut seg_hits,
+                    )
+                    .await
+                } else {
+                    // Live monitor mode has no held chunks. Moderate the
+                    // assembled response itself so segment providers are
+                    // still consulted and their Bypass can suppress capture.
+                    crate::redact::moderate_chat_response_structured(
+                        chain.as_ref(),
+                        verdict,
+                        &mut synth,
+                        &mut seg_counts,
+                        &mut seg_hits,
+                    )
+                    .await
+                };
+                moderation_capture_safe = moderation.capture_safe;
                 guard.comp().monitor_hits.extend(seg_hits);
                 if !seg_counts.is_empty() {
                     // Bedrock masked the held chunks — rebuild the content-
@@ -2484,10 +2625,15 @@ fn build_anthropic_sse_stream(
                         seg_counts,
                     );
                 }
+                if !moderation.capture_safe {
+                    let comp = guard.comp();
+                    comp.response_capture_safe = false;
+                    comp.response_text.clear();
+                }
                 if let aisix_guardrails::GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
-                } = verdict
+                } = moderation.verdict
                 {
                     tracing::warn!(
                         guardrail_hook = "output",
@@ -2497,20 +2643,37 @@ fn build_anthropic_sse_stream(
                     );
                     // Hold-back: the held chunks are dropped — the matched
                     // content never reached the wire.
+                    guard.comp().guardrail_blocked = true;
                     let frame = guardrail_block_frame(guardrail_name.as_deref());
                     yield Ok(bytes::Bytes::from(frame));
                     return;
                 }
             }
         }
+        if output_guardrail.is_some() {
+            guard.comp().response_capture_safe = moderation_capture_safe;
+        }
         // Hold-back release (#932): the scan cleared — mask the held
         // chunks (channel reassembly across chunk boundaries), then feed
         // them through the encoder as if they had streamed live.
         if !held_chunks.is_empty() {
             if let Some(chain) = output_guardrail.as_ref() {
-                let counts =
-                    crate::redact::redact_chat_chunks(chain.as_ref(), &mut held_chunks);
-                if !counts.is_empty() {
+                let redaction = crate::redact::redact_chat_chunks_structured(
+                    chain.as_ref(),
+                    &mut held_chunks,
+                );
+                if redaction.unrewritable_tool_key {
+                    guard.comp().response_text.clear();
+                    guard.comp().guardrail_blocked = true;
+                    tracing::warn!(
+                        guardrail_hook = "output",
+                        model = %model_label,
+                        "guardrail rejected streaming /v1/messages response because a sensitive tool object key cannot be safely rewritten",
+                    );
+                    yield Ok(bytes::Bytes::from(guardrail_block_frame(None)));
+                    return;
+                }
+                if !redaction.counts.is_empty() {
                     // The wire chunks were masked — mask the content-capture
                     // accumulator too, or the exported content would carry
                     // PII the client never saw (#932 × AISIX-Cloud#947).
@@ -2520,7 +2683,7 @@ fn build_anthropic_sse_stream(
                     );
                     crate::redact::merge_counts(
                         &mut guard.comp().redacted_entity_counts,
-                        counts,
+                        redaction.counts,
                     );
                 }
             }
@@ -2548,6 +2711,36 @@ fn build_anthropic_sse_stream(
     ))
 }
 
+fn bounded_json_len<T: serde::Serialize>(value: &T, limit: usize) -> Option<usize> {
+    struct CountingWriter {
+        remaining: usize,
+        written: usize,
+    }
+
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.remaining {
+                return Err(std::io::Error::other("JSON exceeds hold-back budget"));
+            }
+            self.remaining -= bytes.len();
+            self.written += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = CountingWriter {
+        remaining: limit,
+        written: 0,
+    };
+    serde_json::to_writer(&mut writer, value)
+        .ok()
+        .map(|()| writer.written)
+}
+
 /// Anthropic-shape SSE error frame for a streaming guardrail block. Built
 /// with serde_json so an operator-supplied guardrail name is JSON-escaped
 /// correctly; the message carries the firing guardrail's name (#519 B.4b)
@@ -2565,6 +2758,19 @@ fn guardrail_block_frame(guardrail_name: Option<&str>) -> String {
     )
 }
 
+fn upstream_stream_error_frame() -> String {
+    format!(
+        "event: error\ndata: {}\n\n",
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": "upstream stream failed",
+            }
+        })
+    )
+}
+
 fn finish_reason_label(reason: &aisix_gateway::FinishReason) -> String {
     use aisix_gateway::FinishReason;
     match reason {
@@ -2576,6 +2782,16 @@ fn finish_reason_label(reason: &aisix_gateway::FinishReason) -> String {
     }
 }
 
+fn anthropic_stream_status_code(reached_end: bool, guardrail_blocked: bool) -> u16 {
+    if guardrail_blocked {
+        422
+    } else if reached_end {
+        200
+    } else {
+        crate::CLIENT_CLOSED_REQUEST
+    }
+}
+
 #[derive(Default)]
 struct AnthropicStreamCompletion {
     /// `true` once the upstream stream reached its end, i.e. the response
@@ -2583,6 +2799,16 @@ struct AnthropicStreamCompletion {
     /// first — the generator is dropped at a suspension point and the tail
     /// never runs — which the telemetry closure reports as `499`.
     reached_end: bool,
+    /// Typed upstream-body failure observed after the response was committed.
+    /// `None` with `reached_end == false` means the downstream consumer left.
+    terminal_failure: Option<aisix_gateway::BridgeError>,
+    /// The stream ended with an in-band content-filter error after a
+    /// guardrail rejected held output.
+    guardrail_blocked: bool,
+    /// Whether `response_text` completed the hold-back moderation pass and is
+    /// safe to attach to a full-content exporter. Live-forward streams start
+    /// safe; held streams opt in only immediately before release.
+    response_capture_safe: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
     cache_creation_tokens: u32,
@@ -2780,6 +3006,7 @@ fn emit_anthropic_usage_event(
     // Monitor-mode guardrail observations (AISIX-Cloud#562), input +
     // output merged.
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    guardrail_blocked: bool,
     content: Option<CapturedContent>,
 ) {
     // Per-PK telemetry attribution (#302 M17 / AISIX-Cloud#436).
@@ -2824,6 +3051,7 @@ fn emit_anthropic_usage_event(
         applied_guardrails,
         redacted_entity_counts,
         guardrail_monitor_hits,
+        guardrail_blocked,
         ..Default::default()
     };
     // Handler label "messages" — Anthropic /v1/messages inbound
@@ -2831,9 +3059,12 @@ fn emit_anthropic_usage_event(
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("messages", event.clone());
     let exporters = crate::usage_attr::live_exporters(state, snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, content.as_ref(), exporters.iter().map(|e| &e.value));
+    state.otlp_fan_out.fan_out(
+        &event,
+        content.as_ref(),
+        exporters.generation(),
+        exporters.iter().map(|e| &e.value),
+    );
     // Cache-inclusive canonical total: Anthropic reports cache tokens as
     // counters separate from prompt_tokens, so prompt+completion undercounts
     // cached traffic (#995/#906). Shared by the LLM-usage total metric and the
@@ -2934,6 +3165,18 @@ struct AnthropicStreamUsage {
     /// first — the generator is dropped at a suspension point and the tail
     /// never runs — which the telemetry closure reports as `499`.
     reached_end: bool,
+    /// The stream ended with an in-band content-filter error after a
+    /// guardrail rejected held output.
+    guardrail_blocked: bool,
+    /// A typed upstream byte-stream failure. Distinct from a downstream
+    /// disconnect so telemetry/cooldown do not misclassify a read timeout as
+    /// a caller-aborted 499.
+    stream_failure: Option<crate::stream_timeout::RawStreamFailure>,
+    /// Whether `response_text` completed the hold-back moderation pass and is
+    /// safe to attach to a full-content exporter. Any output-guarded stream
+    /// starts unsafe and opts in only after its end-of-stream observation (or
+    /// held moderation pass) completes.
+    response_capture_safe: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
     cache_creation_tokens: u32,
@@ -2978,6 +3221,9 @@ struct AnthropicStreamUsage {
     /// check (AISIX-Cloud#562). Merged with the input-side hits by the
     /// on_complete emit.
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    /// A non-empty SSE data event that was neither `[DONE]` nor valid JSON.
+    /// A held security stream must fail closed rather than release it opaque.
+    malformed_sse_data: bool,
 }
 
 /// Update the accumulator from one parsed SSE `data:` JSON object.
@@ -3028,31 +3274,41 @@ fn update_anthropic_usage(
                 acc.provider_model_version = m.to_string();
             }
         }
-        Some("content_block_start") | Some("content_block_delta") => {
-            // Accumulate assistant output for the end-of-stream output
-            // guardrail (#448). text streams as `delta.text`; tool_use
-            // streams its name in `content_block.{name,input}` on
-            // content_block_start and its arguments as `delta.partial_json`
-            // on input_json_delta — scan all of it.
-            if let Some(delta) = json.get("delta") {
-                if let Some(t) = delta.get("text").and_then(Value::as_str) {
-                    acc.response_text.push('\n');
-                    acc.response_text.push_str(t);
+        Some("content_block_start") => {
+            // A content block is one logical channel. Separate it from the
+            // previous block once, then keep all provider deltas adjacent: a
+            // sensitive span may be split at any token boundary.
+            if !acc.response_text.is_empty() {
+                acc.response_text.push('\n');
+            }
+            if let Some(block) = json.get("content_block") {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    acc.response_text.push_str(text);
+                    crate::token_estimate::push_capped(&mut acc.est_output_text, text);
                 }
-                if let Some(pj) = delta.get("partial_json").and_then(Value::as_str) {
-                    acc.response_text.push_str(pj);
+                if let Some(name) = block.get("name").and_then(Value::as_str) {
+                    acc.response_text.push_str(name);
+                    crate::token_estimate::push_capped(&mut acc.est_output_text, name);
+                }
+                if let Some(input) = block.get("input") {
+                    if !input.is_null() {
+                        let input = input.to_string();
+                        acc.response_text.push_str(&input);
+                        crate::token_estimate::push_capped(&mut acc.est_output_text, &input);
+                    }
                 }
             }
-            if let Some(cb) = json.get("content_block") {
-                if let Some(name) = cb.get("name").and_then(Value::as_str) {
-                    acc.response_text.push('\n');
-                    acc.response_text.push_str(name);
+        }
+        Some("content_block_delta") => {
+            // Accumulate assistant output for the end-of-stream output
+            // guardrail (#448). Consecutive text / partial-JSON deltas are
+            // fragments of one channel and must not gain frame separators.
+            if let Some(delta) = json.get("delta") {
+                if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                    acc.response_text.push_str(text);
                 }
-                if let Some(input) = cb.get("input") {
-                    if !input.is_null() {
-                        acc.response_text.push('\n');
-                        acc.response_text.push_str(&input.to_string());
-                    }
+                if let Some(partial_json) = delta.get("partial_json").and_then(Value::as_str) {
+                    acc.response_text.push_str(partial_json);
                 }
             }
             // Token-estimation accumulator (AISIX-Cloud#1074): raw
@@ -3067,13 +3323,6 @@ fn update_anthropic_usage(
                             push_capped(&mut acc.est_output_text, t);
                         }
                     }
-                }
-                if let Some(name) = json
-                    .get("content_block")
-                    .and_then(|cb| cb.get("name"))
-                    .and_then(Value::as_str)
-                {
-                    push_capped(&mut acc.est_output_text, name);
                 }
             }
         }
@@ -3123,69 +3372,48 @@ fn update_anthropic_usage(
                 acc.finish_reason = sr.to_string();
             }
         }
+        Some("message_stop") => {
+            acc.reached_end = true;
+        }
+        Some("error") => {
+            if acc.reached_end {
+                return;
+            }
+            let status = json
+                .get("error")
+                .and_then(|error| error.get("type"))
+                .and_then(Value::as_str)
+                .and_then(|kind| {
+                    aisix_provider_anthropic::wire::anthropic_error_kind_status(Some(kind))
+                });
+            acc.stream_failure = Some(crate::stream_timeout::RawStreamFailure::UpstreamInBand {
+                status,
+                wire: aisix_gateway::UpstreamWire::Anthropic,
+            });
+            acc.response_capture_safe = false;
+            acc.response_text.clear();
+        }
         _ => {}
     }
 }
 
-/// Drain every complete SSE frame from `buf`, updating `acc`. A frame
-/// ends at the first blank line (`\n\n`). Incomplete trailing bytes are
-/// left in `buf` for the next chunk. The `data:` payload is parsed as
-/// JSON; non-JSON or non-`data` frames are skipped.
+/// Drain every complete SSE event from `buf`, updating `acc`. Incomplete
+/// trailing bytes are left for the next chunk. Framing and multi-`data`
+/// interpretation follow the shared WHATWG parser in `redact`.
 fn drain_anthropic_sse_frames(
     buf: &mut Vec<u8>,
     acc: &mut AnthropicStreamUsage,
     attempt_started: Instant,
     first_token_seen: &mut bool,
 ) {
-    // SSE event delimiter is a blank line. Anthropic emits `\n\n`;
-    // tolerate `\r\n\r\n` defensively by normalising the search.
-    while let Some(end) = find_frame_end(buf) {
+    while let Some(end) = crate::redact::first_sse_event_end(buf) {
         let frame: Vec<u8> = buf.drain(..end).collect();
-        if let Some(data) = extract_sse_data_line(&frame) {
-            if let Ok(json) = serde_json::from_slice::<Value>(data) {
-                update_anthropic_usage(acc, &json, attempt_started, first_token_seen);
-            }
+        let (json, malformed) = crate::redact::parse_sse_json_event(&frame, !*first_token_seen);
+        acc.malformed_sse_data |= malformed;
+        if let Some(json) = json {
+            update_anthropic_usage(acc, &json, attempt_started, first_token_seen);
         }
     }
-}
-
-/// Find the byte index just past the first SSE frame terminator
-/// (`\n\n` or `\r\n\r\n`). Returns the number of bytes to drain
-/// (frame + terminator), or `None` if no complete frame is buffered.
-/// Shared with the `/v1/responses` streaming usage parser (#808).
-pub(crate) fn find_frame_end(buf: &[u8]) -> Option<usize> {
-    let mut i = 0;
-    while i + 1 < buf.len() {
-        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
-            return Some(i + 2);
-        }
-        if i + 3 < buf.len()
-            && buf[i] == b'\r'
-            && buf[i + 1] == b'\n'
-            && buf[i + 2] == b'\r'
-            && buf[i + 3] == b'\n'
-        {
-            return Some(i + 4);
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Extract the `data:` payload bytes from one SSE frame. Returns the
-/// JSON slice (after `data:` and an optional leading space), or `None`
-/// if the frame has no data line. Only the first data line is read —
-/// Anthropic emits single-line data for the frames we care about.
-/// Shared with the `/v1/responses` streaming usage parser (#808).
-pub(crate) fn extract_sse_data_line(frame: &[u8]) -> Option<&[u8]> {
-    for line in frame.split(|&b| b == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if let Some(rest) = line.strip_prefix(b"data:") {
-            let rest = rest.strip_prefix(b" ").unwrap_or(rest);
-            return Some(rest);
-        }
-    }
-    None
 }
 
 /// Drop guard that fires `on_complete` exactly once with the
@@ -3256,21 +3484,24 @@ impl<F: FnOnce(AnthropicStreamUsage)> Drop for AnthropicStreamGuard<F> {
     }
 }
 
-/// Stream wrapper that counts delivered items (`poll_next ->
-/// Ready(Some)`) into a shared atomic, read by the Drop guard for the
-/// #419 cost-leak gate. Mirrors chat.rs's `DeliveryCounter`.
-struct AnthropicDeliveryCounter<T> {
-    inner: Pin<Box<dyn Stream<Item = T> + Send>>,
+/// Stream wrapper that counts successfully delivered byte chunks into a
+/// shared atomic, read by the Drop guard for the #419 cost-leak gate. A
+/// terminal body error is observable by the client but carries no generated
+/// content and therefore must not make a fully held response billable.
+struct AnthropicDeliveryCounter {
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, crate::stream_timeout::RawStreamError>> + Send>>,
     delivered: Arc<AtomicU32>,
 }
 
-impl<T> Stream for AnthropicDeliveryCounter<T> {
-    type Item = T;
+impl Stream for AnthropicDeliveryCounter {
+    type Item = Result<Bytes, crate::stream_timeout::RawStreamError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(item)) => {
-                self.delivered.fetch_add(1, Ordering::Relaxed);
+                if item.is_ok() {
+                    self.delivered.fetch_add(1, Ordering::Relaxed);
+                }
                 Poll::Ready(Some(item))
             }
             other => other,
@@ -3300,9 +3531,9 @@ fn build_anthropic_passthrough_stream<S, F>(
     // `AnthropicStreamGuard::estimator`.
     estimator: Option<crate::token_estimate::Estimator>,
     on_complete: F,
-) -> AnthropicDeliveryCounter<reqwest::Result<Bytes>>
+) -> AnthropicDeliveryCounter
 where
-    S: Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+    S: Stream<Item = Result<Bytes, crate::stream_timeout::RawStreamError>> + Send + 'static,
     F: FnOnce(AnthropicStreamUsage) + Send + 'static,
 {
     let delivered = Arc::new(AtomicU32::new(0));
@@ -3323,8 +3554,14 @@ where
         }
     });
     let inner = async_stream::stream! {
+        // Live-forward output has already reached the caller. Held output is
+        // unsafe for exporters until the complete moderation pass succeeds.
+        let usage = AnthropicStreamUsage {
+            response_capture_safe: output_guardrail.is_none(),
+            ..Default::default()
+        };
         let mut guard = AnthropicStreamGuard {
-            slot: Some((on_complete, AnthropicStreamUsage::default())),
+            slot: Some((on_complete, usage)),
             delivered: delivered_for_drop,
             estimator,
         };
@@ -3365,6 +3602,9 @@ where
                          terminator; dropping buffer (usage parsing skipped for the \
                          oversized frame)"
                     );
+                    if hold_policy.is_some() {
+                        guard.usage().malformed_sse_data = true;
+                    }
                     buf.clear();
                 }
                 if let Some(max_hold) = hold_policy {
@@ -3378,6 +3618,7 @@ where
                             max_buffer_bytes = max_hold,
                             "streaming /v1/messages passthrough exceeded hold-back cap; failing closed",
                         );
+                        guard.usage().guardrail_blocked = true;
                         yield Ok(Bytes::from(guardrail_block_frame(None)));
                         return;
                     }
@@ -3391,19 +3632,60 @@ where
             // hold-back mode an Err lands here too: it is forwarded and
             // the held (unscanned) content is dropped — fail closed.
             let errored = item.is_err();
+            if let Err(error) = &item {
+                let usage = guard.usage();
+                usage.stream_failure = Some(error.failure());
+                usage.response_capture_safe = false;
+                usage.response_text.clear();
+            }
             if !errored && guard.usage().downstream_latency_ms == 0 {
                 guard.usage().downstream_latency_ms =
                     started.elapsed().as_millis().min(u32::MAX as u128) as u32;
             }
             yield item;
-            if errored && hold_policy.is_some() {
+            if errored {
                 return;
             }
         }
-        // Upstream stream over — the response was forwarded in full. Record
-        // it before the scan below, which awaits a remote provider and is a
-        // routine drop point for clients that close on the terminal event.
-        guard.usage().reached_end = true;
+        // EOF dispatches a final SSE event even when the upstream omitted the
+        // blank-line terminator. Parse it before any held bytes can be released.
+        if !buf.is_empty() {
+            let frame = std::mem::take(&mut buf);
+            let (json, malformed) =
+                crate::redact::parse_sse_json_event(&frame, !first_token_seen);
+            guard.usage().malformed_sse_data |= malformed;
+            if let Some(json) = json {
+                update_anthropic_usage(
+                    guard.usage(),
+                    &json,
+                    attempt_started,
+                    &mut first_token_seen,
+                );
+            }
+        }
+        if guard.usage().malformed_sse_data {
+            tracing::warn!(
+                model = %model_label,
+                "upstream /v1/messages stream contained malformed SSE data",
+            );
+            let usage = guard.usage();
+            usage.stream_failure = Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode);
+            usage.response_capture_safe = false;
+            usage.response_text.clear();
+            yield Ok(Bytes::from(upstream_stream_error_frame()));
+            return;
+        }
+        // Transport EOF is successful only after the protocol's semantic
+        // terminal event. A clean socket close without `message_stop` is an
+        // upstream truncation, not a healthy completion.
+        if !guard.usage().reached_end && guard.usage().stream_failure.is_none() {
+            let usage = guard.usage();
+            usage.stream_failure = Some(crate::stream_timeout::RawStreamFailure::Upstream);
+            usage.response_capture_safe = false;
+            usage.response_text.clear();
+            yield Ok(Bytes::from(upstream_stream_error_frame()));
+            return;
+        }
         // End-of-stream output guardrail (#448): scan the accumulated
         // assistant text. On a block, emit a terminal Anthropic `error`
         // event. On the hold-back path (BufferFull) nothing has been
@@ -3412,6 +3694,7 @@ where
         // EndOfStreamCheck) the bytes were already forwarded verbatim
         // and the error frame is the trailing signal.
         let mut blocked = false;
+        let mut moderation_capture_safe = true;
         if let Some(chain) = output_guardrail.as_ref() {
             // Clone (not take) when content capture is on, so the assembled
             // response survives for the on_complete content capture below;
@@ -3422,7 +3705,7 @@ where
                 std::mem::take(&mut guard.usage().response_text)
             };
             if !text.is_empty() {
-                let synth = aisix_gateway::ChatResponse {
+                let mut synth = aisix_gateway::ChatResponse {
                     id: String::new(),
                     model: model_label.clone(),
                     message: aisix_gateway::ChatMessage::assistant(text),
@@ -3436,27 +3719,32 @@ where
                     )
                     .await;
                 guard.usage().monitor_hits.extend(hits);
-                // Segment pass over the held SSE bytes. Only meaningful in
-                // hold-back mode (`held` is empty otherwise — and a chain
-                // with a segment member always folds to BufferFull, so a
-                // live-forward stream never carries one).
+                // Segment pass over held SSE bytes, or over the assembled
+                // response in live monitor mode. Monitor decoration forces
+                // EndOfStreamCheck even for segment providers, so `held` is
+                // intentionally empty on that path.
                 let mut seg_counts = crate::redact::RedactionCounts::new();
                 let mut seg_hits = Vec::new();
-                let verdict = crate::redact::moderate_body(
-                    chain.as_ref(),
-                    crate::redact::Direction::Output,
-                    verdict,
-                    &mut seg_counts,
-                    &mut seg_hits,
-                    |g| match crate::redact::redact_anthropic_sse(g, &held) {
-                        Some((rewritten, counts)) => {
-                            held = rewritten;
-                            counts
-                        }
-                        None => crate::redact::RedactionCounts::new(),
-                    },
-                )
-                .await;
+                let moderation = if hold_policy.is_some() {
+                    crate::redact::moderate_anthropic_sse(
+                        chain.as_ref(),
+                        verdict,
+                        &mut held,
+                        &mut seg_counts,
+                        &mut seg_hits,
+                    )
+                    .await
+                } else {
+                    crate::redact::moderate_chat_response_structured(
+                        chain.as_ref(),
+                        verdict,
+                        &mut synth,
+                        &mut seg_counts,
+                        &mut seg_hits,
+                    )
+                    .await
+                };
+                moderation_capture_safe = moderation.capture_safe;
                 guard.usage().monitor_hits.extend(seg_hits);
                 if !seg_counts.is_empty() {
                     // Bedrock masked the held bytes — rebuild the content-
@@ -3477,10 +3765,15 @@ where
                         seg_counts,
                     );
                 }
+                if !moderation.capture_safe {
+                    let usage = guard.usage();
+                    usage.response_capture_safe = false;
+                    usage.response_text.clear();
+                }
                 if let aisix_guardrails::GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
-                } = verdict
+                } = moderation.verdict
                 {
                     tracing::warn!(
                         guardrail_hook = "output",
@@ -3489,45 +3782,59 @@ where
                         "guardrail blocked streaming /v1/messages passthrough response",
                     );
                     blocked = true;
+                    guard.usage().guardrail_blocked = true;
                     let frame = guardrail_block_frame(guardrail_name.as_deref());
                     yield Ok(Bytes::from(frame));
                 }
             }
         }
+        if output_guardrail.is_some() {
+            let usage = guard.usage();
+            usage.response_capture_safe =
+                moderation_capture_safe && usage.stream_failure.is_none();
+        }
         // Hold-back release (#932): the scan cleared — mask the held SSE
         // bytes (channel reassembly across frames) and release them.
         if hold_policy.is_some() && !blocked && !held.is_empty() {
-            match output_guardrail
-                .as_ref()
-                .and_then(|c| crate::redact::redact_anthropic_sse(c.as_ref(), &held))
-            {
-                Some((rewritten, counts)) => {
+            if let Some(chain) = output_guardrail.as_ref() {
+                let redaction = crate::redact::redact_anthropic_sse(chain.as_ref(), &held);
+                if redaction.unrewritable_tool_key {
+                    guard.usage().response_text.clear();
+                    guard.usage().guardrail_blocked = true;
+                    tracing::warn!(
+                        guardrail_hook = "output",
+                        model = %model_label,
+                        "guardrail rejected streaming /v1/messages passthrough response because a sensitive tool object key cannot be safely rewritten",
+                    );
+                    yield Ok(Bytes::from(guardrail_block_frame(None)));
+                    return;
+                }
+                if let Some(rewritten) = redaction.rewritten {
                     // The wire bytes were masked — mask the content-capture
                     // accumulator too, or the exported content would carry
                     // PII the client never saw (#932 × AISIX-Cloud#947).
-                    if let Some(c) = output_guardrail.as_ref() {
-                        crate::redact::redact_captured_output(
-                            c.as_ref(),
-                            &mut guard.usage().response_text,
-                        );
-                    }
+                    crate::redact::redact_captured_output(
+                        chain.as_ref(),
+                        &mut guard.usage().response_text,
+                    );
                     crate::redact::merge_counts(
                         &mut guard.usage().redacted_entity_counts,
-                        counts,
+                        redaction.counts,
                     );
                     if guard.usage().downstream_latency_ms == 0 {
                         guard.usage().downstream_latency_ms =
                             started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                     }
                     yield Ok(Bytes::from(rewritten));
-                }
-                None => {
+                } else {
                     if guard.usage().downstream_latency_ms == 0 {
                         guard.usage().downstream_latency_ms =
                             started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                     }
                     yield Ok(Bytes::from(std::mem::take(&mut held)));
                 }
+            } else {
+                yield Ok(Bytes::from(std::mem::take(&mut held)));
             }
         }
         // guard drops here → on_complete fires (delivery-gated).
@@ -3621,7 +3928,7 @@ mod tests {
     fn cfg() -> ProxyConfig {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: 1_048_576,
+            request_body_limit_bytes: Some(1_048_576),
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),
@@ -4966,13 +5273,508 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         assert!(buf.is_empty(), "buffer fully drained after both frames");
     }
 
+    #[test]
+    fn sse_frame_parser_accepts_bom_lone_cr_and_multi_data() {
+        use super::{drain_anthropic_sse_frames, AnthropicStreamUsage};
+
+        let raw = concat!(
+            "\u{feff}event: content_block_delta\r",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\r",
+            "data: \"delta\":{\"type\":\"text_delta\",\"text\":\"joined\"}}\r\r",
+        );
+        let mut acc = AnthropicStreamUsage::default();
+        let mut first_token_seen = false;
+        let started = std::time::Instant::now();
+        let mut buf = Vec::new();
+        for byte in raw.as_bytes() {
+            buf.push(*byte);
+            drain_anthropic_sse_frames(&mut buf, &mut acc, started, &mut first_token_seen);
+        }
+        assert!(buf.is_empty());
+        assert_eq!(acc.response_text, "joined");
+        assert!(!acc.malformed_sse_data);
+    }
+
+    #[test]
+    fn sse_frame_parser_marks_malformed_data() {
+        use super::{drain_anthropic_sse_frames, AnthropicStreamUsage};
+
+        let mut acc = AnthropicStreamUsage::default();
+        let mut first_token_seen = false;
+        let started = std::time::Instant::now();
+        let mut buf = b"data: not-json\r\r".to_vec();
+        drain_anthropic_sse_frames(&mut buf, &mut acc, started, &mut first_token_seen);
+        assert!(buf.is_empty());
+        assert!(acc.malformed_sse_data);
+    }
+
+    #[test]
+    fn streaming_guardrail_text_preserves_spans_across_provider_frames() {
+        use super::{update_anthropic_usage, AnthropicStreamUsage};
+
+        let mut acc = AnthropicStreamUsage::default();
+        let mut first_token_seen = false;
+        let started = std::time::Instant::now();
+
+        for event in [
+            serde_json::json!({
+                "type": "content_block_start",
+                "content_block": {"type": "text", "text": ""}
+            }),
+            serde_json::json!({
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "forbiddenstream"}
+            }),
+            serde_json::json!({
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "token"}
+            }),
+            serde_json::json!({
+                "type": "content_block_start",
+                "content_block": {"type": "text", "text": "next block"}
+            }),
+        ] {
+            update_anthropic_usage(&mut acc, &event, started, &mut first_token_seen);
+        }
+
+        assert_eq!(acc.response_text, "forbiddenstreamtoken\nnext block");
+        assert_eq!(acc.est_output_text, "forbiddenstreamtokennext block");
+    }
+
+    #[tokio::test]
+    async fn prior_stream_block_clears_unsanitized_full_content_capture() {
+        use aisix_core::models::GuardrailHookPoint;
+        use aisix_guardrails::{
+            builtin_rule, Guardrail, GuardrailChain, KeywordBlocklist, KeywordRule, PiiAction,
+            PiiGuardrail,
+        };
+        use futures::StreamExt;
+        use std::sync::{Arc, Mutex};
+
+        let keyword = KeywordBlocklist::output_only(vec![KeywordRule::literal("blocked phrase")]);
+        let pii = PiiGuardrail::new(
+            vec![builtin_rule("email", PiiAction::Mask).unwrap()],
+            GuardrailHookPoint::Output,
+            262_144,
+            false,
+        );
+        let chain = Arc::new(GuardrailChain::new(vec![
+            Arc::new(keyword) as Arc<dyn Guardrail>,
+            Arc::new(pii),
+        ]));
+        let raw = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_raw\",\"model\":\"claude\",\"usage\":{\"input_tokens\":1}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"blocked phrase\"}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"name\":\"lookup\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"alice@example.com\\\":\\\"safe\\\"}\"}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let upstream = futures::stream::iter(vec![Ok::<_, crate::stream_timeout::RawStreamError>(
+            bytes::Bytes::from(raw),
+        )]);
+        let captured = Arc::new(Mutex::new(None));
+        let captured_out = Arc::clone(&captured);
+        let now = std::time::Instant::now();
+        let mut stream = super::build_anthropic_passthrough_stream(
+            upstream,
+            now,
+            now,
+            Some(chain),
+            "relay-claude".into(),
+            Some(4096),
+            None,
+            move |usage| *captured_out.lock().unwrap() = Some(usage),
+        );
+
+        let mut wire = Vec::new();
+        while let Some(item) = stream.next().await {
+            wire.extend_from_slice(&item.unwrap());
+        }
+        drop(stream);
+        let usage = captured.lock().unwrap().take().expect("on_complete fired");
+        let wire = String::from_utf8(wire).unwrap();
+        assert!(usage.guardrail_blocked);
+        assert!(!usage.response_capture_safe);
+        assert!(usage.response_text.is_empty());
+        assert!(wire.contains("content_filter"));
+        assert!(!wire.contains("blocked phrase"));
+        assert!(!wire.contains("alice@example.com"));
+        assert!(!wire.contains("msg_raw"));
+    }
+
+    #[tokio::test]
+    async fn disconnected_held_stream_keeps_full_content_capture_unsafe() {
+        use aisix_core::models::GuardrailHookPoint;
+        use aisix_guardrails::{builtin_rule, Guardrail, GuardrailChain, PiiAction, PiiGuardrail};
+        use futures::StreamExt;
+        use std::sync::{Arc, Mutex};
+
+        let pii = PiiGuardrail::new(
+            vec![builtin_rule("email", PiiAction::Mask).unwrap()],
+            GuardrailHookPoint::Output,
+            262_144,
+            false,
+        );
+        let chain = Arc::new(GuardrailChain::new(vec![
+            Arc::new(pii) as Arc<dyn Guardrail>
+        ]));
+        let raw = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"alice@example.com\"}}\n\n",
+        );
+        let upstream = futures::stream::iter(vec![Ok::<_, crate::stream_timeout::RawStreamError>(
+            bytes::Bytes::from(raw),
+        )])
+        .chain(futures::stream::pending());
+        let captured = Arc::new(Mutex::new(None));
+        let captured_out = Arc::clone(&captured);
+        let now = std::time::Instant::now();
+        let mut stream = super::build_anthropic_passthrough_stream(
+            upstream,
+            now,
+            now,
+            Some(chain),
+            "relay-claude".into(),
+            Some(4096),
+            None,
+            move |usage| *captured_out.lock().unwrap() = Some(usage),
+        );
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), stream.next())
+                .await
+                .is_err(),
+            "held bytes must not be released before EOF moderation",
+        );
+        drop(stream);
+        let usage = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("on_complete fired on disconnect");
+        assert!(!usage.response_capture_safe);
+        assert!(usage.response_text.contains("alice@example.com"));
+    }
+
+    #[tokio::test]
+    async fn held_stream_timeout_does_not_count_error_as_delivered_content() {
+        use aisix_core::models::GuardrailHookPoint;
+        use aisix_guardrails::{builtin_rule, Guardrail, GuardrailChain, PiiAction, PiiGuardrail};
+        use futures::StreamExt;
+        use std::sync::{Arc, Mutex};
+
+        let pii = PiiGuardrail::new(
+            vec![builtin_rule("email", PiiAction::Mask).unwrap()],
+            GuardrailHookPoint::Output,
+            262_144,
+            false,
+        );
+        let chain = Arc::new(GuardrailChain::new(vec![
+            Arc::new(pii) as Arc<dyn Guardrail>
+        ]));
+        let held = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_timeout\",\"model\":\"claude\",\"usage\":{\"input_tokens\":30,\"output_tokens\":1}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"held output\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}\n\n",
+        );
+        let upstream = futures::stream::iter([
+            Ok::<_, crate::stream_timeout::RawStreamError>(bytes::Bytes::from_static(
+                held.as_bytes(),
+            )),
+            Err(crate::stream_timeout::RawStreamError::Timeout { elapsed_ms: 300 }),
+        ]);
+        let captured = Arc::new(Mutex::new(None));
+        let captured_out = Arc::clone(&captured);
+        let now = std::time::Instant::now();
+        let mut stream = super::build_anthropic_passthrough_stream(
+            upstream,
+            now,
+            now,
+            Some(chain),
+            "relay-claude".into(),
+            Some(4096),
+            None,
+            move |usage| *captured_out.lock().unwrap() = Some(usage),
+        );
+
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(crate::stream_timeout::RawStreamError::Timeout {
+                elapsed_ms: 300
+            }))
+        ));
+        assert!(stream.next().await.is_none());
+        drop(stream);
+
+        let usage = captured.lock().unwrap().take().expect("on_complete fired");
+        assert_eq!(usage.prompt_tokens, 30);
+        assert_eq!(usage.completion_tokens, 0);
+        assert_eq!(usage.chunks_delivered, 0);
+        assert!(!usage.reached_end);
+        assert!(matches!(
+            usage.stream_failure,
+            Some(crate::stream_timeout::RawStreamFailure::Timeout { elapsed_ms: 300 })
+        ));
+        assert!(!usage.response_capture_safe);
+        assert!(usage.response_text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cross_provider_tool_only_stream_counts_toward_holdback_cap() {
+        use aisix_core::models::GuardrailHookPoint;
+        use aisix_gateway::{ChatChunk, ChatChunkStream, ChatDelta, FinishReason};
+        use aisix_guardrails::{builtin_rule, Guardrail, GuardrailChain, PiiAction, PiiGuardrail};
+        use std::sync::{Arc, Mutex};
+
+        let pii = PiiGuardrail::new(
+            vec![builtin_rule("email", PiiAction::Mask).unwrap()],
+            GuardrailHookPoint::Output,
+            128,
+            false,
+        );
+        let chain = Arc::new(GuardrailChain::new(vec![
+            Arc::new(pii) as Arc<dyn Guardrail>
+        ]));
+        // Far above the hold-back cap: the bound must reject while counting
+        // the serializer output, without constructing another full encoded
+        // copy of this attacker-controlled argument.
+        let raw_argument = "x".repeat(1024 * 1024);
+        let chunk = ChatChunk {
+            id: "chunk_tool_only".into(),
+            model: "gpt-4o-mini".into(),
+            delta: ChatDelta {
+                tool_calls: Some(vec![serde_json::json!({
+                    "index": 0,
+                    "id": "call_oversize",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "arguments": serde_json::json!({"payload": raw_argument}).to_string(),
+                    }
+                })]),
+                ..ChatDelta::default()
+            },
+            finish_reason: Some(FinishReason::ToolCalls),
+            usage: None,
+        };
+        let upstream: ChatChunkStream = Box::pin(futures::stream::iter(vec![Ok(chunk)]));
+        let captured = Arc::new(Mutex::new(None));
+        let captured_out = Arc::clone(&captured);
+        let now = std::time::Instant::now();
+        let body = super::build_anthropic_sse_stream(
+            upstream,
+            aisix_provider_anthropic::AnthropicSseEncoder::new("msg_tool_only", "relay-openai", 0),
+            now,
+            now,
+            Some(chain),
+            "relay-openai".into(),
+            Some(4096),
+            Some(crate::token_estimate::Estimator::new(
+                "relay-openai",
+                crate::token_estimate::PromptInput::Anthropic(serde_json::json!({
+                    "model": "relay-openai",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "run the tool"}]
+                })),
+            )),
+            move |completion| *captured_out.lock().unwrap() = Some(completion),
+        );
+
+        let wire = String::from_utf8(to_bytes(body, usize::MAX).await.unwrap().to_vec()).unwrap();
+        let completion = captured.lock().unwrap().take().expect("on_complete fired");
+        assert!(completion.guardrail_blocked);
+        assert!(!completion.reached_end);
+        assert_eq!(
+            super::anthropic_stream_status_code(
+                completion.reached_end,
+                completion.guardrail_blocked
+            ),
+            422,
+        );
+        assert!(!completion.response_capture_safe);
+        assert!(completion.usage_estimated);
+        assert!(
+            completion.completion_tokens > 0,
+            "the rejected chunk must still count toward post-stream token accounting",
+        );
+        assert!(wire.contains("content_filter"));
+        assert!(!wire.contains("call_oversize"));
+        assert!(!wire.contains("chunk_tool_only"));
+    }
+
+    #[tokio::test]
+    async fn cross_provider_overflow_rejects_before_copying_upstream_metadata() {
+        use aisix_core::models::GuardrailHookPoint;
+        use aisix_gateway::{ChatChunk, ChatChunkStream, ChatDelta, FinishReason};
+        use aisix_guardrails::{builtin_rule, Guardrail, GuardrailChain, PiiAction, PiiGuardrail};
+        use std::sync::{Arc, Mutex};
+
+        let pii = PiiGuardrail::new(
+            vec![builtin_rule("email", PiiAction::Mask).unwrap()],
+            GuardrailHookPoint::Output,
+            128,
+            false,
+        );
+        let chain = Arc::new(GuardrailChain::new(vec![
+            Arc::new(pii) as Arc<dyn Guardrail>
+        ]));
+        let huge = "x".repeat(2 * 1024 * 1024);
+        let chunk = ChatChunk {
+            id: format!("oversized-id-{huge}"),
+            model: format!("oversized-model-{huge}"),
+            delta: ChatDelta::default(),
+            finish_reason: Some(FinishReason::Other(format!("oversized-reason-{huge}"))),
+            usage: None,
+        };
+        let upstream: ChatChunkStream = Box::pin(futures::stream::iter(vec![Ok(chunk)]));
+        let captured = Arc::new(Mutex::new(None));
+        let captured_out = Arc::clone(&captured);
+        let now = std::time::Instant::now();
+        let body = super::build_anthropic_sse_stream(
+            upstream,
+            aisix_provider_anthropic::AnthropicSseEncoder::new("msg_metadata", "relay-openai", 0),
+            now,
+            now,
+            Some(chain),
+            "relay-openai".into(),
+            Some(4096),
+            None,
+            move |completion| *captured_out.lock().unwrap() = Some(completion),
+        );
+
+        let wire = String::from_utf8(to_bytes(body, usize::MAX).await.unwrap().to_vec()).unwrap();
+        let completion = captured.lock().unwrap().take().expect("on_complete fired");
+        assert!(completion.guardrail_blocked);
+        assert!(completion.provider_request_id.is_empty());
+        assert!(completion.provider_model_version.is_empty());
+        assert!(completion.finish_reason.is_empty());
+        assert!(wire.contains("content_filter"));
+        assert!(!wire.contains("oversized-id"));
+        assert!(!wire.contains("oversized-model"));
+        assert!(!wire.contains("oversized-reason"));
+    }
+
+    #[tokio::test]
+    async fn native_holdback_overflow_is_a_blocked_stream_not_a_disconnect() {
+        use aisix_core::models::GuardrailHookPoint;
+        use aisix_guardrails::{builtin_rule, Guardrail, GuardrailChain, PiiAction, PiiGuardrail};
+        use futures::StreamExt;
+        use std::sync::{Arc, Mutex};
+
+        let pii = PiiGuardrail::new(
+            vec![builtin_rule("email", PiiAction::Mask).unwrap()],
+            GuardrailHookPoint::Output,
+            128,
+            false,
+        );
+        let chain = Arc::new(GuardrailChain::new(vec![
+            Arc::new(pii) as Arc<dyn Guardrail>
+        ]));
+        let raw = format!(
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{}\"}}}}\n\n",
+            "x".repeat(1024),
+        );
+        let upstream = futures::stream::iter(vec![Ok::<_, crate::stream_timeout::RawStreamError>(
+            bytes::Bytes::from(raw),
+        )]);
+        let captured = Arc::new(Mutex::new(None));
+        let captured_out = Arc::clone(&captured);
+        let now = std::time::Instant::now();
+        let mut stream = super::build_anthropic_passthrough_stream(
+            upstream,
+            now,
+            now,
+            Some(chain),
+            "relay-claude".into(),
+            Some(4096),
+            None,
+            move |usage| *captured_out.lock().unwrap() = Some(usage),
+        );
+
+        let mut wire = Vec::new();
+        while let Some(item) = stream.next().await {
+            wire.extend_from_slice(&item.unwrap());
+        }
+        drop(stream);
+        let usage = captured.lock().unwrap().take().expect("on_complete fired");
+        assert!(usage.guardrail_blocked);
+        assert!(!usage.reached_end);
+        assert_eq!(
+            super::anthropic_stream_status_code(usage.reached_end, usage.guardrail_blocked),
+            422,
+        );
+        assert!(String::from_utf8(wire).unwrap().contains("content_filter"));
+    }
+
+    #[tokio::test]
+    async fn native_malformed_held_sse_is_an_upstream_decode_failure() {
+        use aisix_core::models::GuardrailHookPoint;
+        use aisix_guardrails::{builtin_rule, Guardrail, GuardrailChain, PiiAction, PiiGuardrail};
+        use futures::StreamExt;
+        use std::sync::{Arc, Mutex};
+
+        let pii = PiiGuardrail::new(
+            vec![builtin_rule("email", PiiAction::Mask).unwrap()],
+            GuardrailHookPoint::Output,
+            4096,
+            false,
+        );
+        let chain = Arc::new(GuardrailChain::new(vec![
+            Arc::new(pii) as Arc<dyn Guardrail>
+        ]));
+        let upstream = futures::stream::iter(vec![Ok::<_, crate::stream_timeout::RawStreamError>(
+            bytes::Bytes::from("event: content_block_delta\ndata: not-json\n\n"),
+        )]);
+        let captured = Arc::new(Mutex::new(None));
+        let captured_out = Arc::clone(&captured);
+        let now = std::time::Instant::now();
+        let mut stream = super::build_anthropic_passthrough_stream(
+            upstream,
+            now,
+            now,
+            Some(chain),
+            "relay-claude".into(),
+            Some(4096),
+            None,
+            move |usage| *captured_out.lock().unwrap() = Some(usage),
+        );
+
+        let mut wire = Vec::new();
+        while let Some(item) = stream.next().await {
+            wire.extend_from_slice(&item.unwrap());
+        }
+        drop(stream);
+        let usage = captured.lock().unwrap().take().expect("on_complete fired");
+        assert!(!usage.guardrail_blocked);
+        assert!(!usage.reached_end);
+        assert!(matches!(
+            usage.stream_failure,
+            Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode)
+        ));
+        assert_eq!(
+            usage.stream_failure.unwrap().bridge_error().http_status(),
+            502,
+        );
+        let wire = String::from_utf8(wire).unwrap();
+        assert!(wire.contains("api_error"));
+        assert!(!wire.contains("content_filter"));
+    }
+
     /// Issue #245 (audit angle 8c): a stream that carries NO usage
     /// blocks at all — e.g. an Anthropic error stream — must drain
     /// cleanly leaving the accumulator at zeros, without panicking.
     /// Guards the best-effort parser against a frame shape it doesn't
     /// recognise.
     #[test]
-    fn sse_frame_parser_tolerates_streams_without_usage() {
+    fn sse_frame_parser_records_in_band_errors_without_usage() {
         use super::{drain_anthropic_sse_frames, AnthropicStreamUsage};
 
         let mut acc = AnthropicStreamUsage::default();
@@ -4994,7 +5796,30 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
             acc.provider_request_id.is_empty(),
             "no message_start → no provider_request_id",
         );
+        assert!(matches!(
+            acc.stream_failure,
+            Some(crate::stream_timeout::RawStreamFailure::UpstreamInBand {
+                status: Some(529),
+                wire: aisix_gateway::UpstreamWire::Anthropic,
+            })
+        ));
         assert!(buf.is_empty(), "both frames drained even without usage");
+    }
+
+    #[test]
+    fn message_stop_is_semantic_success_even_if_transport_has_later_error_bytes() {
+        use super::{drain_anthropic_sse_frames, AnthropicStreamUsage};
+
+        let mut acc = AnthropicStreamUsage::default();
+        let mut buf = b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n\
+event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\"}}\n\n"
+            .to_vec();
+        let mut first = false;
+
+        drain_anthropic_sse_frames(&mut buf, &mut acc, std::time::Instant::now(), &mut first);
+
+        assert!(acc.reached_end);
+        assert!(acc.stream_failure.is_none());
     }
 
     /// Issue #245 / #419 parity: the stream Drop guard must zero the

@@ -110,7 +110,10 @@ pub async fn embeddings(
                 Some(&api_key_id),
                 started,
                 crate::reject::Envelope::OpenAi,
-                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+                crate::error::proxy_error_from_json_rejection(
+                    rej,
+                    state.request_body_limit_for("/v1/embeddings"),
+                ),
             );
         }
     };
@@ -120,8 +123,19 @@ pub async fn embeddings(
     // loading their own. The request's view of config is therefore frozen
     // at entry — see the module note on `ProxyState::snapshot`.
     let snapshot = state.snapshot.load();
+    let mut telemetry = EmbedDispatchTelemetry::default();
 
-    match dispatch(&state, &snapshot, &auth, body, &request_id, &client).await {
+    match dispatch(
+        &state,
+        &snapshot,
+        &auth,
+        body,
+        &request_id,
+        &client,
+        &mut telemetry,
+    )
+    .await
+    {
         Ok(success) => {
             let elapsed = started.elapsed();
             // The actual response status, not a hardcoded 200: the 501
@@ -220,7 +234,7 @@ pub async fn embeddings(
             );
             // Per #655 parity: surface the failed request in Logs with a
             // zero-token event (status + error class), instead of dropping it.
-            crate::usage_attr::emit_error_usage_event(
+            crate::usage_attr::emit_guardrail_error_usage_event(
                 &state,
                 &snapshot,
                 "embeddings",
@@ -231,6 +245,9 @@ pub async fn embeddings(
                 status,
                 err.kind(),
                 &client,
+                matches!(&err, ProxyError::ContentFiltered(_)),
+                telemetry.applied_guardrails,
+                telemetry.monitor_hits,
             );
             err.into_response()
         }
@@ -281,6 +298,12 @@ struct EmbedDispatchSuccess {
     upstream_called: bool,
 }
 
+#[derive(Default)]
+struct EmbedDispatchTelemetry {
+    applied_guardrails: Vec<AppliedGuardrail>,
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+}
+
 async fn dispatch(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
@@ -288,6 +311,7 @@ async fn dispatch(
     mut body: EmbeddingRequestBody,
     request_id: &str,
     client_ctx: &ClientContext,
+    telemetry: &mut EmbedDispatchTelemetry,
 ) -> Result<EmbedDispatchSuccess, ProxyError> {
     let model_entry = crate::model_resolve::resolve_model(snapshot, &body.model)
         .ok_or_else(|| ProxyError::ModelNotFound(body.model.clone()))?;
@@ -328,13 +352,12 @@ async fn dispatch(
     // Record which guardrails govern this request (#379 parity) so the emitted
     // UsageEvent surfaces them in Logs, like chat / messages. Empty when no
     // guardrail is attached.
-    let applied_guardrails = resolved_chain.applied().to_vec();
-    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    telemetry.applied_guardrails = resolved_chain.applied().to_vec();
     if !resolved_chain.is_empty() {
         let chat = embeddings_input_to_chat(&body.model, &body.input);
         let (verdict, hits) =
             aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
-        monitor_hits.extend(hits);
+        telemetry.monitor_hits.extend(hits);
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
@@ -494,9 +517,9 @@ async fn dispatch(
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
                 upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
-                applied_guardrails: applied_guardrails.clone(),
+                applied_guardrails: telemetry.applied_guardrails.clone(),
                 redactions: redactions.clone(),
-                monitor_hits: monitor_hits.clone(),
+                monitor_hits: telemetry.monitor_hits.clone(),
                 prompt_tokens,
                 usage_estimated,
                 upstream_called: true,
@@ -518,9 +541,9 @@ async fn dispatch(
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
                 upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
-                applied_guardrails: applied_guardrails.clone(),
+                applied_guardrails: telemetry.applied_guardrails.clone(),
                 redactions: redactions.clone(),
-                monitor_hits: monitor_hits.clone(),
+                monitor_hits: telemetry.monitor_hits.clone(),
                 prompt_tokens: 0,
                 usage_estimated: false,
                 captured_content: None,
@@ -690,9 +713,12 @@ fn emit_usage_event(
     // snapshot's exporter table is empty for envs that haven't
     // configured any, so this is a cheap no-op on the common path.
     let exporters = crate::usage_attr::live_exporters(state, snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, content, exporters.iter().map(|e| &e.value));
+    state.otlp_fan_out.fan_out(
+        &event,
+        content,
+        exporters.generation(),
+        exporters.iter().map(|e| &e.value),
+    );
     let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
     crate::request_metrics::record_usage(
         state,
@@ -731,7 +757,7 @@ mod tests {
     fn cfg() -> ProxyConfig {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: 1_048_576,
+            request_body_limit_bytes: Some(1_048_576),
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),
@@ -995,6 +1021,8 @@ mod tests {
     /// upstream is never contacted (`expect(0)`).
     #[tokio::test]
     async fn input_guardrail_blocks_string_input_returns_422_content_filter() {
+        use aisix_obs::UsageSink;
+
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
@@ -1008,7 +1036,14 @@ mod tests {
         snap.apikeys.insert(apikey_entry(&["*"]));
         snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
 
-        let app = build_app(snap);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
         let body = serde_json::json!({"model": "my-embed", "input": "please BLOCKME now"});
         let resp = tower::ServiceExt::oneshot(app, make_req(body))
             .await
@@ -1021,6 +1056,16 @@ mod tests {
         // Per #153 the matched literal must not leak into the wire message.
         let msg = v["error"]["message"].as_str().unwrap_or_default();
         assert!(!msg.contains("BLOCKME"), "blocklist literal leaked: {msg}");
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("blocked request must emit a UsageEvent")
+            .expect("usage sink sender dropped");
+        assert!(ev.guardrail_blocked);
+        assert_eq!(ev.applied_guardrails.len(), 1);
+        assert_eq!(ev.applied_guardrails[0].kind, "keyword");
+        assert_eq!(ev.applied_guardrails[0].hook, "input");
+        assert_eq!(ev.status_code, 422);
     }
 
     /// #719: the array `input` form must be scanned too — a blocked literal

@@ -25,7 +25,7 @@ tracing.workspace = true
 # header types for the `api_key` transport headers.
 http.workspace = true
 reqwest.workspace = true
-# rmcp 1.8.0 builds its transport on the reqwest 0.13 line (the workspace is
+# rmcp 3.1.2 builds its transport on the reqwest 0.13 line (the workspace is
 # on 0.12) and does not re-export it. This renamed dep resolves to the same
 # crate version rmcp links, and is used for two things: naming
 # `StreamableHttpError<reqwest::Error>` when downcasting a connect failure to

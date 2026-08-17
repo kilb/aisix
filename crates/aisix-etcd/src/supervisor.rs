@@ -24,9 +24,9 @@ use aisix_core::AisixSnapshot;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
@@ -88,10 +88,7 @@ impl WatchStatus {
     /// caller stamps the highest revision it's seen so concurrent /
     /// out-of-order updates don't downgrade the published view.
     pub(crate) fn record_apply(&self, revision: i64) {
-        let prev = self.inner.revision.load(Ordering::Relaxed);
-        if revision > prev {
-            self.inner.revision.store(revision, Ordering::Relaxed);
-        }
+        self.inner.revision.fetch_max(revision, Ordering::Relaxed);
         *self.inner.last_apply_at.lock().unwrap() = Some(Instant::now());
     }
 
@@ -157,6 +154,19 @@ pub struct StaleServing {
     pub since_unix_secs: u64,
 }
 
+#[derive(Debug)]
+struct CacheWrite {
+    generation: u64,
+    entries: Vec<RawEntry>,
+    revision: i64,
+    stale: Vec<StaleServing>,
+}
+
+struct CacheWriter {
+    tx: tokio::sync::watch::Sender<Arc<CacheWrite>>,
+    task: JoinHandle<()>,
+}
+
 /// One supervisor instance. Consumers call [`Supervisor::run`] once and
 /// drop the returned handle on shutdown.
 pub struct Supervisor<P: ConfigProvider> {
@@ -170,6 +180,13 @@ pub struct Supervisor<P: ConfigProvider> {
     state: Mutex<HashMap<String, RawEntry>>,
     revision: Mutex<i64>,
     cache: SnapshotCache,
+
+    /// Serialises one complete logical apply: published snapshot, raw state,
+    /// revision/status signals, stale/partial metadata, and cache capture.
+    /// Individual fields retain their narrow locks for readers, but mutation
+    /// paths must hold this guard until their cache generation is enqueued so
+    /// a same-key Put/Delete cannot persist a hybrid of both transactions.
+    apply_transaction: Mutex<()>,
 
     /// Freshness signal exposed to /admin/v1/health. Updated on every
     /// successful apply path (load_once / apply_put / apply_delete /
@@ -211,19 +228,18 @@ pub struct Supervisor<P: ConfigProvider> {
     /// restarts. Independent of the capped `rejections` buffer — buffer
     /// overflow must never take a served resource offline.
     ///
-    /// Locking: never held together with another supervisor lock; every
-    /// user snapshots or mutates it in its own scope.
+    /// Locking: mutation paths do not hold it with another supervisor lock.
+    /// The cache writer mutex may guard a read-only snapshot of this map (and
+    /// of `state` / `revision`) so the persisted generation cannot be assigned
+    /// to a different logical state than the one it serialises.
     stale_serving: Mutex<HashMap<String, StaleServing>>,
 
-    // JoinHandles for in-flight `flush_cache` writes. Tests use
-    // [`Self::await_pending_cache_writes`] to deterministically wait
-    // for these without relying on a wall-clock sleep, which proved
-    // flaky on slow CI runners. Production code does not read this
-    // field; if a handle is dropped (e.g. during shutdown), the
-    // underlying write either completed or was cancelled — either
-    // way the on-disk cache is best-effort and the next live cycle
-    // re-publishes from etcd.
-    pending_writes: Mutex<Vec<JoinHandle<()>>>,
+    /// Latest-wins cache writer. A config burst replaces the queued state
+    /// instead of spawning one full serialisation + fsync per event.
+    cache_write_generation: AtomicU64,
+    cache_write_completed: Arc<AtomicU64>,
+    cache_write_completed_notify: Arc<tokio::sync::Notify>,
+    cache_writer: Mutex<Option<CacheWriter>>,
 }
 
 impl<P: ConfigProvider> Supervisor<P> {
@@ -245,12 +261,16 @@ impl<P: ConfigProvider> Supervisor<P> {
             state: Mutex::new(HashMap::new()),
             revision: Mutex::new(0),
             cache,
+            apply_transaction: Mutex::new(()),
             status: WatchStatus::new(),
             config_status: ConfigStatus::new(SourceKind::Etcd),
             rejections: Mutex::new(Vec::new()),
             partial_compat: Mutex::new(HashMap::new()),
             stale_serving: Mutex::new(HashMap::new()),
-            pending_writes: Mutex::new(Vec::new()),
+            cache_write_generation: AtomicU64::new(0),
+            cache_write_completed: Arc::new(AtomicU64::new(0)),
+            cache_write_completed_notify: Arc::new(tokio::sync::Notify::new()),
+            cache_writer: Mutex::new(None),
         }
     }
 
@@ -506,21 +526,22 @@ impl<P: ConfigProvider> Supervisor<P> {
         (aggregated, rows_by_kind)
     }
 
-    /// Drain the JoinHandles for any in-flight cache writes spawned
-    /// by [`Self::flush_cache`] and await them. Test-only synchroniser:
-    /// production code never needs to block on disk persistence.
+    /// Wait until the cache writer has persisted the latest state queued by
+    /// [`Self::flush_cache`]. Test-only synchroniser: production code never
+    /// needs to block on disk persistence.
     #[cfg(test)]
     pub async fn await_pending_cache_writes(&self) {
-        let handles: Vec<JoinHandle<()>> = {
-            let mut pending = self.pending_writes.lock().unwrap();
-            std::mem::take(&mut *pending)
-        };
-        for handle in handles {
-            // Failures here are not test failures — a write that
-            // panicked is its own bug surfaced separately. We only
-            // need the await to deterministically order against the
-            // disk read that follows.
-            let _ = handle.await;
+        if self.cache_writer.lock().unwrap().is_none() {
+            return;
+        }
+        let target = self.cache_write_generation.load(Ordering::Acquire);
+
+        loop {
+            let notified = self.cache_write_completed_notify.notified();
+            if self.cache_write_completed.load(Ordering::Acquire) >= target {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -594,6 +615,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// `WatchStatus.last_apply_at` so `/admin/v1/health` reflects the
     /// successful round-trip with etcd even on an empty config.
     fn set_revision_floor(&self, revision: i64) {
+        let transaction = self.apply_transaction.lock().unwrap();
         {
             let mut rev = self.revision.lock().unwrap();
             if revision > *rev {
@@ -605,6 +627,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         // apply_resync synced with the entry-max revision; this corrects it to
         // the load/watch header revision). Not itself a reload event.
         self.sync_config_status(false);
+        self.flush_cache(&transaction);
     }
 
     /// Pin the currently served bytes for `key` as its last known good
@@ -647,6 +670,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// Apply a single Put event on top of the current snapshot.
     /// Returns `true` if the apply succeeded (schema + parse passed).
     pub fn apply_put(&self, entry: &RawEntry) -> bool {
+        let transaction = self.apply_transaction.lock().unwrap();
         // Build a tiny snapshot out of just the new entry, then merge.
         let (tiny, mut stats) = loader::build_snapshot(&self.prefix, std::slice::from_ref(entry));
         if stats.accepted == 0 {
@@ -686,7 +710,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             // A rejected watch event still changes the reported state
             // (rejected[] gains this entry; last_reload flips unsuccessful).
             self.sync_config_status(false);
-            self.flush_cache();
+            self.flush_cache(&transaction);
             return false;
         }
 
@@ -737,7 +761,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         // resets on every event we successfully process.
         self.status.record_apply(entry.revision);
         self.sync_config_status(false);
-        self.flush_cache();
+        self.flush_cache(&transaction);
         true
     }
 
@@ -751,6 +775,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                 return false;
             }
         };
+        let transaction = self.apply_transaction.lock().unwrap();
 
         // Probe first — if the key isn't present in the current
         // snapshot we have nothing to do and don't want to take the
@@ -781,7 +806,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                 self.status.record_apply(cur_rev);
                 // Clearing a rejected key changes the reported state.
                 self.sync_config_status(false);
-                self.flush_cache();
+                self.flush_cache(&transaction);
             }
             return removed_rejection;
         }
@@ -849,7 +874,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         let cur_rev = *self.revision.lock().unwrap();
         self.status.record_apply(cur_rev);
         self.sync_config_status(false);
-        self.flush_cache();
+        self.flush_cache(&transaction);
         true
     }
 
@@ -862,6 +887,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// write that broke it. Retention ends when the key loads cleanly
     /// again or leaves etcd.
     pub fn apply_resync(&self, entries: &[RawEntry]) -> BuildStats {
+        let transaction = self.apply_transaction.lock().unwrap();
         let (snap, mut stats) = loader::build_snapshot(&self.prefix, entries);
 
         // Reconcile the last-known-good state against this build, then
@@ -978,7 +1004,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         // A full resync is a config reload — publish the observability view
         // (source/config hashes, counts, rejected list) and count it.
         self.sync_config_status(true);
-        self.flush_cache();
+        self.flush_cache(&transaction);
         stats
     }
 
@@ -988,7 +1014,17 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// via `tokio::spawn` — when called outside a runtime (tests that
     /// don't drive the cache), the write is silently dropped which is
     /// the desired no-op.
-    fn flush_cache(&self) {
+    fn flush_cache(&self, _transaction: &MutexGuard<'_, ()>) {
+        if !self.cache.is_enabled() {
+            return;
+        }
+        let Ok(rt_handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        // Serialise generation assignment and enqueue as one operation. The
+        // apply-transaction guard also guarantees the state/stale/revision
+        // capture below is one completed logical config update.
+        let mut writer = self.cache_writer.lock().unwrap();
         let entries: Vec<RawEntry> = {
             let state = self.state.lock().unwrap();
             state.values().cloned().collect()
@@ -998,19 +1034,32 @@ impl<P: ConfigProvider> Supervisor<P> {
             guard.values().cloned().collect()
         };
         let revision = *self.revision.lock().unwrap();
-        let cache = self.cache.clone();
-        // Spawn the actual write so the apply path stays sync. If we
-        // aren't inside a runtime (cache::disabled() tests), just skip.
-        // Track the JoinHandle so tests can deterministically await
-        // the write via [`Self::await_pending_cache_writes`] instead
-        // of leaning on `tokio::time::sleep`, which under CI load
-        // raced the spawn (~50ms wasn't enough on heavily loaded
-        // GitHub Actions runners).
-        if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
-            let join =
-                rt_handle.spawn(async move { cache.store(&entries, revision, &stale).await });
-            self.pending_writes.lock().unwrap().push(join);
+        let generation = self
+            .cache_write_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let write = Arc::new(CacheWrite {
+            generation,
+            entries,
+            revision,
+            stale,
+        });
+
+        if let Some(existing) = writer.as_ref() {
+            if !existing.task.is_finished() {
+                existing.tx.send_replace(write);
+                return;
+            }
         }
+
+        let (tx, rx) = tokio::sync::watch::channel(write);
+        let task = rt_handle.spawn(run_cache_writer(
+            self.cache.clone(),
+            rx,
+            Arc::clone(&self.cache_write_completed),
+            Arc::clone(&self.cache_write_completed_notify),
+        ));
+        *writer = Some(CacheWriter { tx, task });
     }
 
     /// Long-running loop. Handles exp-backoff reconnects and resync on
@@ -1144,12 +1193,30 @@ async fn wait_for_cancel(mut rx: tokio::sync::watch::Receiver<bool>) {
     }
 }
 
+async fn run_cache_writer(
+    cache: SnapshotCache,
+    mut rx: tokio::sync::watch::Receiver<Arc<CacheWrite>>,
+    completed: Arc<AtomicU64>,
+    completed_notify: Arc<tokio::sync::Notify>,
+) {
+    loop {
+        let write = Arc::clone(&rx.borrow_and_update());
+        cache
+            .store(&write.entries, write.revision, &write.stale)
+            .await;
+        completed.store(write.generation, Ordering::Release);
+        completed_notify.notify_waiters();
+
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 /// Shallow clone of every [`Arc<ResourceEntry>`] — fast and, importantly,
 /// it doesn't materialise a deep copy of the `T` payload.
 fn clone_snapshot(src: &AisixSnapshot) -> AisixSnapshot {
-    let out = AisixSnapshot::new();
-    merge_snapshot(&out, src);
-    out
+    src.clone()
 }
 
 /// Insert every entry of `src` into `dst` (replacing same-id entries).
@@ -1362,6 +1429,22 @@ mod tests {
         "model_name": "gpt-4o",
         "provider_key_id": "11111111-1111-1111-1111-111111111111"
     }"#;
+
+    #[test]
+    fn snapshot_clone_reuses_unchanged_resource_entries() {
+        let (snapshot, stats) =
+            loader::build_snapshot("/aisix", &[entry("/aisix/models/m-1", VALID_MODEL, 1)]);
+        assert_eq!(stats.accepted, 1);
+
+        let before = snapshot.models.get_by_id("m-1").unwrap();
+        let cloned = clone_snapshot(&snapshot);
+        let after = cloned.models.get_by_id("m-1").unwrap();
+
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "copy-on-write cloning must not deep-clone unchanged payloads",
+        );
+    }
 
     fn entry(key: &str, v: &[u8], rev: i64) -> RawEntry {
         RawEntry {
@@ -1827,6 +1910,126 @@ mod tests {
         assert_eq!(cached.entries[0].key, "/aisix/models/m-2");
     }
 
+    #[tokio::test]
+    async fn cache_writer_coalesces_a_synchronous_put_burst() {
+        const PUTS: usize = 32;
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("snap.json");
+        let cache = SnapshotCache::new(&cache_path);
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::with_cache(provider, "/aisix", cache.clone());
+
+        sup.load_once().await.unwrap();
+        sup.await_pending_cache_writes().await;
+        let writes_before = cache.write_count();
+
+        for i in 0..PUTS {
+            sup.apply_put(&entry(
+                &format!("/aisix/models/m-{i}"),
+                VALID_MODEL,
+                (i + 1) as i64,
+            ));
+        }
+        sup.await_pending_cache_writes().await;
+
+        assert_eq!(
+            cache.write_count() - writes_before,
+            1,
+            "one synchronous config burst should persist only its latest state",
+        );
+        let persisted = cache.load().expect("cache file present");
+        assert_eq!(persisted.entries.len(), PUTS);
+        assert_eq!(persisted.revision, PUTS as i64);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_puts_persist_the_latest_complete_state() {
+        const PUTS: usize = 64;
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("snap.json");
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Arc::new(Supervisor::with_cache(
+            provider,
+            "/aisix",
+            SnapshotCache::new(&cache_path),
+        ));
+
+        sup.load_once().await.unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..PUTS {
+            let sup = Arc::clone(&sup);
+            tasks.spawn(async move {
+                sup.apply_put(&entry(
+                    &format!("/aisix/models/m-{i}"),
+                    VALID_MODEL,
+                    (i + 1) as i64,
+                ));
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+        sup.await_pending_cache_writes().await;
+
+        let persisted = SnapshotCache::new(&cache_path)
+            .load()
+            .expect("cache file present");
+        assert_eq!(persisted.entries.len(), PUTS);
+        assert_eq!(persisted.revision, PUTS as i64);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_key_put_delete_persists_the_served_transaction() {
+        const PAIRS: usize = 64;
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("snap.json");
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Arc::new(Supervisor::with_cache(
+            provider,
+            "/aisix",
+            SnapshotCache::new(&cache_path),
+        ));
+        sup.load_once().await.unwrap();
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for revision in 1..=PAIRS {
+            let put_sup = Arc::clone(&sup);
+            tasks.spawn(async move {
+                put_sup.apply_put(&entry("/aisix/models/shared", VALID_MODEL, revision as i64));
+            });
+            let delete_sup = Arc::clone(&sup);
+            tasks.spawn(async move {
+                delete_sup.apply_delete("/aisix/models/shared");
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+        sup.await_pending_cache_writes().await;
+
+        let served = sup.handle().load().models.get_by_id("shared").is_some();
+        let observed = sup
+            .state
+            .lock()
+            .unwrap()
+            .contains_key("/aisix/models/shared");
+        let persisted = SnapshotCache::new(&cache_path)
+            .load()
+            .expect("cache file present")
+            .entries
+            .iter()
+            .any(|entry| entry.key == "/aisix/models/shared");
+
+        assert_eq!(
+            observed, served,
+            "raw etcd state diverged from served snapshot"
+        );
+        assert_eq!(
+            persisted, served,
+            "disk cache persisted a hybrid transaction"
+        );
+    }
+
     // ---- regression coverage for issue #114 -------------------------
     // /admin/v1/health needs to surface "etcd watch staleness". The
     // tests below pin: (1) WatchStatus reflects each apply path, and
@@ -1845,6 +2048,14 @@ mod tests {
             "last_apply_age should be None pre-first-apply; got {:?}",
             snap.last_apply_age,
         );
+    }
+
+    #[test]
+    fn watch_status_never_regresses_on_out_of_order_apply() {
+        let status = WatchStatus::new();
+        status.record_apply(12);
+        status.record_apply(7);
+        assert_eq!(status.snapshot().revision, 12);
     }
 
     #[tokio::test]

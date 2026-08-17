@@ -133,13 +133,20 @@ struct SegmentApplier {
 
 struct ApplierState {
     masked: Vec<String>,
+    originals: Vec<String>,
     cursor: usize,
+    mismatched_text: bool,
 }
 
 impl SegmentApplier {
-    fn new(masked: Vec<String>) -> Self {
+    fn new(masked: Vec<String>, originals: Vec<String>) -> Self {
         Self {
-            state: std::sync::Mutex::new(ApplierState { masked, cursor: 0 }),
+            state: std::sync::Mutex::new(ApplierState {
+                masked,
+                originals,
+                cursor: 0,
+                mismatched_text: false,
+            }),
         }
     }
 
@@ -147,6 +154,10 @@ impl SegmentApplier {
         let mut st = self.state.lock().expect("applier poisoned");
         let i = st.cursor;
         st.cursor += 1;
+        if st.originals.get(i).map(String::as_str) != Some(original) {
+            st.mismatched_text = true;
+            return None;
+        }
         match st.masked.get(i) {
             Some(m) if m != original => Some(aisix_guardrails::Redaction {
                 text: m.clone(),
@@ -156,19 +167,9 @@ impl SegmentApplier {
         }
     }
 
-    /// Warn when the apply walk offered a different slot count than the
-    /// mask carries — the extra/missing slots kept their originals (the
-    /// per-slot `get` above never misassigns), this is diagnostics only.
-    fn warn_if_misaligned(&self) {
+    fn is_aligned(&self) -> bool {
         let st = self.state.lock().expect("applier poisoned");
-        if st.cursor != st.masked.len() {
-            tracing::warn!(
-                offered = st.cursor,
-                masked = st.masked.len(),
-                "segment apply walk drifted from collect walk; \
-                 unmatched slots kept their original text",
-            );
-        }
+        !st.mismatched_text && st.cursor == st.masked.len() && st.originals.len() == st.masked.len()
     }
 }
 
@@ -198,6 +199,20 @@ impl Guardrail for SegmentApplier {
 /// Masked replacements are written back through `walk`; the provider's
 /// entity counts merge into `counts_out` (they feed
 /// `redacted_entity_counts`, names only — #932 no-leak).
+pub struct BodyModeration {
+    pub verdict: aisix_guardrails::GuardrailVerdict,
+    /// Safe to attach the walked body to a full-content exporter. False when
+    /// a remote segment block or collect/apply drift left the body without a
+    /// complete rewrite.
+    pub capture_safe: bool,
+}
+
+fn segment_walk_drift_verdict() -> aisix_guardrails::GuardrailVerdict {
+    aisix_guardrails::GuardrailVerdict::block(
+        "segment apply walk drifted from collect walk; blocking to avoid releasing unmasked text",
+    )
+}
+
 pub async fn moderate_body(
     chain: &dyn Guardrail,
     dir: Direction,
@@ -205,32 +220,69 @@ pub async fn moderate_body(
     counts_out: &mut RedactionCounts,
     monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
     mut walk: impl FnMut(&dyn Guardrail) -> RedactionCounts,
-) -> aisix_guardrails::GuardrailVerdict {
+) -> BodyModeration {
     if non_segment_verdict.is_block() || !chain.moderates_segments() {
-        return non_segment_verdict;
+        let capture_safe = if non_segment_verdict.is_block() {
+            !chain.moderates_segments()
+        } else {
+            !non_segment_verdict.is_bypass()
+        };
+        return BodyModeration {
+            verdict: non_segment_verdict,
+            capture_safe,
+        };
     }
     let collector = SegmentCollector::default();
     walk(&collector);
     let texts = collector.take();
     if texts.is_empty() {
-        return non_segment_verdict;
+        return BodyModeration {
+            capture_safe: !non_segment_verdict.is_bypass(),
+            verdict: non_segment_verdict,
+        };
     }
     let mut outcome = match dir {
         Direction::Input => chain.moderate_input_segments(&texts).await,
         Direction::Output => chain.moderate_output_segments(&texts).await,
     };
     monitor_hits_out.append(&mut outcome.monitor_hits);
-    if !outcome.verdict.is_block() {
-        if let Some(masked) = outcome.masked {
-            let applier = SegmentApplier::new(masked);
-            // Marker counts are plumbing (see SEGMENT_APPLY_MARKER) —
-            // discard them; the provider counts below are the real ones.
-            let _ = walk(&applier);
-            applier.warn_if_misaligned();
-            merge_counts(counts_out, outcome.counts);
-        }
+    let segment_capture_safe = !outcome.verdict.is_bypass();
+    if outcome.verdict.is_block() {
+        return BodyModeration {
+            verdict: non_segment_verdict.merged_with(outcome.verdict),
+            capture_safe: false,
+        };
     }
-    non_segment_verdict.merged_with(outcome.verdict)
+    if let Some(masked) = outcome.masked {
+        // Re-run the same walker without mutating anything and compare both
+        // order and count before applying positional masks. A mismatch is an
+        // internal boundary failure: retaining any original would violate the
+        // fail-closed DLP contract.
+        let verifier = SegmentCollector::default();
+        let _ = walk(&verifier);
+        if verifier.take() != texts || masked.len() != texts.len() {
+            return BodyModeration {
+                verdict: non_segment_verdict.merged_with(segment_walk_drift_verdict()),
+                capture_safe: false,
+            };
+        }
+        let applier = SegmentApplier::new(masked, texts);
+        // Marker counts are plumbing (see SEGMENT_APPLY_MARKER) — discard
+        // them; the provider counts below are the real ones.
+        let _ = walk(&applier);
+        if !applier.is_aligned() {
+            return BodyModeration {
+                verdict: non_segment_verdict.merged_with(segment_walk_drift_verdict()),
+                capture_safe: false,
+            };
+        }
+        merge_counts(counts_out, outcome.counts);
+    }
+    let verdict = non_segment_verdict.merged_with(outcome.verdict);
+    BodyModeration {
+        capture_safe: segment_capture_safe && !verdict.is_bypass(),
+        verdict,
+    }
 }
 
 /// Rewrite one owned text field in place. No-op (and no allocation) when
@@ -313,27 +365,51 @@ pub fn redact_captured_output(chain: &dyn Guardrail, text: &mut String) {
 /// stays untouched rather than becoming invalid JSON). Falls back to a
 /// raw text rewrite when the payload doesn't parse (a provider emitted
 /// malformed/partial args — best effort beats leaking).
+#[cfg(test)]
 pub fn redact_json_encoded(
     chain: &dyn Guardrail,
     dir: Direction,
     encoded: &mut String,
     counts: &mut RedactionCounts,
 ) {
+    let _ = redact_json_encoded_structured(chain, dir, encoded, counts, false);
+}
+
+fn redact_json_encoded_structured(
+    chain: &dyn Guardrail,
+    dir: Direction,
+    encoded: &mut String,
+    counts: &mut RedactionCounts,
+    detect_keys: bool,
+) -> bool {
     if encoded.is_empty() {
-        return;
+        return false;
     }
     match serde_json::from_str::<Value>(encoded) {
         Ok(mut v) => {
-            let mut local = RedactionCounts::new();
-            redact_value_strings(chain, dir, &mut v, &mut local);
-            if !local.is_empty() {
+            let unrewritable_tool_key = if detect_keys {
+                let mut key_counts = RedactionCounts::new();
+                let found = detect_unrewritable_object_keys(chain, dir, &v, &mut key_counts);
+                merge_counts(counts, key_counts);
+                found
+            } else {
+                false
+            };
+
+            let mut value_counts = RedactionCounts::new();
+            redact_value_strings(chain, dir, &mut v, &mut value_counts);
+            if !value_counts.is_empty() {
                 if let Ok(s) = serde_json::to_string(&v) {
                     *encoded = s;
-                    merge_counts(counts, local);
+                    merge_counts(counts, value_counts);
                 }
             }
+            unrewritable_tool_key
         }
-        Err(_) => apply_to_string(chain, dir, encoded, counts),
+        Err(_) => {
+            apply_to_string(chain, dir, encoded, counts);
+            false
+        }
     }
 }
 
@@ -344,11 +420,19 @@ pub fn redact_json_encoded(
 /// blocks — the same surface `check_input` scans (`message_scan_text`).
 /// Tool-call arguments replayed in history are covered too (they reach
 /// the upstream verbatim). Returns the merged counts (empty = untouched).
-pub fn redact_chat_format(chain: &dyn Guardrail, req: &mut ChatFormat) -> RedactionCounts {
+fn redact_chat_format_impl(
+    chain: &dyn Guardrail,
+    req: &mut ChatFormat,
+    detect_keys: bool,
+) -> AnthropicRequestRedaction {
     let mut counts = RedactionCounts::new();
     if !chain.redacts_input() {
-        return counts;
+        return AnthropicRequestRedaction {
+            counts,
+            unrewritable_tool_key: false,
+        };
     }
+    let mut unrewritable_tool_key = false;
     for msg in &mut req.messages {
         if let Some(content) = msg.content.as_mut() {
             apply_to_string(chain, Direction::Input, content, &mut counts);
@@ -365,54 +449,413 @@ pub fn redact_chat_format(chain: &dyn Guardrail, req: &mut ChatFormat) -> Redact
         // History-replay tool calls: arguments travel to the upstream
         // verbatim through `extra`, so mask them like fresh content.
         if let Some(tool_calls) = msg.extra.get_mut("tool_calls") {
-            redact_tool_call_arguments(chain, Direction::Input, tool_calls, &mut counts);
+            unrewritable_tool_key |= redact_tool_call_arguments(
+                chain,
+                Direction::Input,
+                tool_calls,
+                &mut counts,
+                detect_keys,
+            );
         }
     }
-    counts
+    // Tool descriptions and JSON-schema examples/defaults are prompt text
+    // forwarded through `ChatFormat::extra`. Structural fields (for example
+    // function names and schema types) participate in DLP inspection but are
+    // never rewritten because changing them would corrupt the tool contract.
+    if let Some(tools) = req.extra.get_mut("tools") {
+        unrewritable_tool_key |=
+            redact_tool_definitions(chain, Direction::Input, tools, &mut counts, detect_keys);
+    }
+    AnthropicRequestRedaction {
+        counts,
+        unrewritable_tool_key,
+    }
+}
+
+#[cfg(test)]
+pub fn redact_chat_format(chain: &dyn Guardrail, req: &mut ChatFormat) -> RedactionCounts {
+    redact_chat_format_impl(chain, req, false).counts
+}
+
+pub fn redact_chat_format_structured(
+    chain: &dyn Guardrail,
+    req: &mut ChatFormat,
+) -> AnthropicRequestRedaction {
+    redact_chat_format_impl(chain, req, true)
+}
+
+pub async fn moderate_chat_format_structured(
+    chain: &dyn Guardrail,
+    non_segment_verdict: aisix_guardrails::GuardrailVerdict,
+    req: &mut ChatFormat,
+    counts_out: &mut RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
+) -> AnthropicModeration {
+    moderate_structured_body(
+        chain,
+        Direction::Input,
+        non_segment_verdict,
+        counts_out,
+        monitor_hits_out,
+        |guardrail| redact_chat_format_structured(guardrail, req),
+    )
+    .await
+}
+
+/// Clone a chat request for non-segment input inspection and append tool
+/// declarations as prompt text. The original request remains the rewrite
+/// target for the structured moderation pass.
+pub fn chat_request_for_inspection(req: &ChatFormat) -> ChatFormat {
+    let mut inspection = req.clone();
+    if let Some(tools) = req.extra.get("tools") {
+        let text = serde_json::to_string(tools).expect("serde_json::Value always serializes");
+        if text != "null" && text != "[]" {
+            inspection
+                .messages
+                .push(aisix_gateway::ChatMessage::user(text));
+        }
+    }
+    inspection
 }
 
 /// Mask `function.arguments` (JSON-encoded string) on each element of an
-/// OpenAI-shaped `tool_calls` array. Names/ids are structural, not
-/// content, and stay untouched.
+/// OpenAI-shaped `tool_calls` array. Names/ids are structural: offer them to
+/// DLP inspection, but fail closed instead of rewriting them.
 fn redact_tool_call_arguments(
     chain: &dyn Guardrail,
     dir: Direction,
     tool_calls: &mut Value,
     counts: &mut RedactionCounts,
-) {
+    detect_keys: bool,
+) -> bool {
+    let mut unrewritable_tool_key = false;
     let Some(items) = tool_calls.as_array_mut() else {
-        return;
+        return false;
     };
     for tc in items {
+        if detect_keys {
+            unrewritable_tool_key |=
+                detect_named_structural_fields(chain, dir, tc, &["id", "type"], counts);
+            if let Some(function) = tc.get("function") {
+                unrewritable_tool_key |=
+                    detect_named_structural_fields(chain, dir, function, &["name"], counts);
+            }
+        }
         if let Some(Value::String(s)) = tc.get_mut("function").and_then(|f| f.get_mut("arguments"))
         {
             let mut owned = std::mem::take(s);
-            redact_json_encoded(chain, dir, &mut owned, counts);
+            unrewritable_tool_key |=
+                redact_json_encoded_structured(chain, dir, &mut owned, counts, detect_keys);
             *s = owned;
         }
+    }
+    unrewritable_tool_key
+}
+
+/// Result of rewriting an Anthropic request. JSON object keys cannot be
+/// renamed safely because doing so changes the tool contract; a sensitive key
+/// therefore requires the caller to reject the request before dispatch.
+pub struct AnthropicRequestRedaction {
+    pub counts: RedactionCounts,
+    pub unrewritable_tool_key: bool,
+}
+
+fn detect_unrewritable_object_keys(
+    chain: &dyn Guardrail,
+    dir: Direction,
+    value: &Value,
+    counts: &mut RedactionCounts,
+) -> bool {
+    match value {
+        Value::Array(items) => {
+            let mut found = false;
+            for item in items {
+                found |= detect_unrewritable_object_keys(chain, dir, item, counts);
+            }
+            found
+        }
+        Value::Object(map) => {
+            let mut found = false;
+            for (key, child) in map {
+                if let Some(redaction) = redact_str(chain, dir, key) {
+                    found |= redaction.text != *key;
+                    merge_counts(counts, redaction.counts);
+                }
+                found |= detect_unrewritable_object_keys(chain, dir, child, counts);
+            }
+            found
+        }
+        _ => false,
+    }
+}
+
+fn detect_unrewritable_value_strings(
+    chain: &dyn Guardrail,
+    dir: Direction,
+    value: &Value,
+    counts: &mut RedactionCounts,
+) -> bool {
+    match value {
+        Value::String(text) => redact_str(chain, dir, text).is_some_and(|redaction| {
+            let changed = redaction.text != *text;
+            merge_counts(counts, redaction.counts);
+            changed
+        }),
+        Value::Array(items) => items.iter().fold(false, |found, item| {
+            detect_unrewritable_value_strings(chain, dir, item, counts) || found
+        }),
+        Value::Object(map) => map.values().fold(false, |found, child| {
+            detect_unrewritable_value_strings(chain, dir, child, counts) || found
+        }),
+        _ => false,
+    }
+}
+
+fn detect_named_structural_fields(
+    chain: &dyn Guardrail,
+    dir: Direction,
+    value: &Value,
+    fields: &[&str],
+    counts: &mut RedactionCounts,
+) -> bool {
+    let Some(map) = value.as_object() else {
+        return false;
+    };
+    fields.iter().fold(false, |found, field| {
+        map.get(*field)
+            .is_some_and(|slot| detect_unrewritable_value_strings(chain, dir, slot, counts))
+            || found
+    })
+}
+
+fn is_tool_contract_field(field: &str) -> bool {
+    matches!(
+        field,
+        "name"
+            | "id"
+            | "type"
+            | "call_id"
+            | "tool_call_id"
+            | "tool_use_id"
+            | "item_id"
+            | "required"
+            | "enum"
+            | "const"
+            | "format"
+            | "pattern"
+            | "$ref"
+            | "$schema"
+    )
+}
+
+/// Rewrite prompt-bearing tool-definition values without changing protocol or
+/// JSON-schema identifiers. Object keys and structural string fields are
+/// inspected as unrewritable slots so local and remote masks fail closed.
+fn redact_tool_definitions(
+    chain: &dyn Guardrail,
+    dir: Direction,
+    value: &mut Value,
+    counts: &mut RedactionCounts,
+    detect_structural: bool,
+) -> bool {
+    match value {
+        Value::String(_) => {
+            apply_to_value_string(chain, dir, value, counts);
+            false
+        }
+        Value::Array(items) => items.iter_mut().fold(false, |found, item| {
+            redact_tool_definitions(chain, dir, item, counts, detect_structural) || found
+        }),
+        Value::Object(map) => {
+            let mut found = false;
+            for (key, child) in map {
+                if detect_structural {
+                    if let Some(redaction) = redact_str(chain, dir, key) {
+                        found |= redaction.text != *key;
+                        merge_counts(counts, redaction.counts);
+                    }
+                }
+                if detect_structural && is_tool_contract_field(key) {
+                    found |= detect_unrewritable_value_strings(chain, dir, child, counts);
+                } else {
+                    found |= redact_tool_definitions(chain, dir, child, counts, detect_structural);
+                }
+            }
+            found
+        }
+        _ => false,
     }
 }
 
 /// Mask an Anthropic-native `/v1/messages` request body in place:
 /// `system` (string or text blocks) and `messages[].content` (string or
 /// blocks — `text` blocks and nested `tool_result` content). `tool_use`
-/// input objects in history are walked as JSON strings.
-pub fn redact_anthropic_request(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
+/// input objects in history are walked as JSON strings. Tool object keys are
+/// inspected but never renamed; `unrewritable_tool_key` tells handlers to
+/// fail closed when a configured mask would change one.
+pub fn redact_anthropic_request(
+    chain: &dyn Guardrail,
+    body: &mut Value,
+) -> AnthropicRequestRedaction {
     let mut counts = RedactionCounts::new();
     if !chain.redacts_input() {
-        return counts;
+        return AnthropicRequestRedaction {
+            counts,
+            unrewritable_tool_key: false,
+        };
     }
+    let mut unrewritable_tool_key = false;
     if let Some(system) = body.get_mut("system") {
-        redact_anthropic_content(chain, Direction::Input, system, &mut counts);
+        unrewritable_tool_key |=
+            redact_anthropic_content(chain, Direction::Input, system, &mut counts);
     }
     if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
         for msg in messages {
             if let Some(content) = msg.get_mut("content") {
-                redact_anthropic_content(chain, Direction::Input, content, &mut counts);
+                unrewritable_tool_key |=
+                    redact_anthropic_content(chain, Direction::Input, content, &mut counts);
             }
         }
     }
-    counts
+    // Tool descriptions and JSON-schema examples/defaults are prompt text the
+    // provider receives. Structural fields participate in inspection but are
+    // never renamed or rewritten.
+    if let Some(tools) = body.get_mut("tools") {
+        unrewritable_tool_key |=
+            redact_tool_definitions(chain, Direction::Input, tools, &mut counts, true);
+    }
+    AnthropicRequestRedaction {
+        counts,
+        unrewritable_tool_key,
+    }
+}
+
+/// Run the remote segment pass over the Anthropic request walker. Object keys
+/// participate in the same positional moderation call as rewriteable values,
+/// but a changed key becomes a fail-closed verdict instead of being renamed.
+pub struct AnthropicModeration {
+    pub verdict: aisix_guardrails::GuardrailVerdict,
+    /// Safe to attach the walked body to a full-content exporter. False when
+    /// remote segment moderation blocked before a rewrite pass completed, or
+    /// when rewriting a structural key would change the tool contract. A
+    /// local-only input block stays safe because input callers run their
+    /// synchronous rewrite before exporting the failure body. Blocked output
+    /// is never capture-safe because output callers intentionally omit it.
+    pub capture_safe: bool,
+}
+
+async fn moderate_structured_body(
+    chain: &dyn Guardrail,
+    dir: Direction,
+    non_segment_verdict: aisix_guardrails::GuardrailVerdict,
+    counts_out: &mut RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
+    mut walk: impl FnMut(&dyn Guardrail) -> AnthropicRequestRedaction,
+) -> AnthropicModeration {
+    if non_segment_verdict.is_block() {
+        return AnthropicModeration {
+            verdict: non_segment_verdict,
+            capture_safe: dir == Direction::Input && !chain.moderates_segments(),
+        };
+    }
+    if !chain.moderates_segments() {
+        return AnthropicModeration {
+            capture_safe: !non_segment_verdict.is_bypass(),
+            verdict: non_segment_verdict,
+        };
+    }
+
+    let collector = SegmentCollector::default();
+    let _ = walk(&collector);
+    let texts = collector.take();
+    if texts.is_empty() {
+        return AnthropicModeration {
+            capture_safe: !non_segment_verdict.is_bypass(),
+            verdict: non_segment_verdict,
+        };
+    }
+    let mut outcome = match dir {
+        Direction::Input => chain.moderate_input_segments(&texts).await,
+        Direction::Output => chain.moderate_output_segments(&texts).await,
+    };
+    monitor_hits_out.append(&mut outcome.monitor_hits);
+    let segment_capture_safe = !outcome.verdict.is_bypass();
+    if outcome.verdict.is_block() {
+        return AnthropicModeration {
+            verdict: non_segment_verdict.merged_with(outcome.verdict),
+            capture_safe: false,
+        };
+    }
+
+    let mut unrewritable_tool_key = false;
+    if let Some(masked) = outcome.masked {
+        let verifier = SegmentCollector::default();
+        let _ = walk(&verifier);
+        if verifier.take() != texts || masked.len() != texts.len() {
+            return AnthropicModeration {
+                verdict: non_segment_verdict.merged_with(segment_walk_drift_verdict()),
+                capture_safe: false,
+            };
+        }
+        let applier = SegmentApplier::new(masked, texts);
+        let result = walk(&applier);
+        unrewritable_tool_key = result.unrewritable_tool_key;
+        if !applier.is_aligned() {
+            return AnthropicModeration {
+                verdict: non_segment_verdict.merged_with(segment_walk_drift_verdict()),
+                capture_safe: false,
+            };
+        }
+        merge_counts(counts_out, outcome.counts);
+    }
+    let verdict = if unrewritable_tool_key {
+        unrewritable_tool_key_verdict()
+    } else {
+        non_segment_verdict.merged_with(outcome.verdict)
+    };
+    AnthropicModeration {
+        capture_safe: !verdict.is_block() && !verdict.is_bypass() && segment_capture_safe,
+        verdict,
+    }
+}
+
+pub fn unrewritable_tool_key_verdict() -> aisix_guardrails::GuardrailVerdict {
+    aisix_guardrails::GuardrailVerdict::block(
+        "data-loss prevention matched a tool structural field that cannot be safely rewritten",
+    )
+}
+
+pub async fn moderate_anthropic_request(
+    chain: &dyn Guardrail,
+    non_segment_verdict: aisix_guardrails::GuardrailVerdict,
+    body: &mut Value,
+    counts_out: &mut RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
+) -> AnthropicModeration {
+    moderate_structured_body(
+        chain,
+        Direction::Input,
+        non_segment_verdict,
+        counts_out,
+        monitor_hits_out,
+        |guardrail| redact_anthropic_request(guardrail, body),
+    )
+    .await
+}
+
+/// Normalize an Anthropic request for input inspection and append its raw tool
+/// declarations as one synthetic message. The provider adapter intentionally
+/// keeps tools in `ChatFormat::extra`, while guardrails inspect messages; this
+/// projection closes that otherwise invisible provider-forwarded text surface.
+pub fn anthropic_request_for_inspection(body: &Value) -> Result<aisix_gateway::ChatFormat, ()> {
+    let mut chat = aisix_provider_anthropic::parse_inbound_request(body).map_err(|_| ())?;
+    if let Some(tools) = body.get("tools") {
+        let text = serde_json::to_string(tools).map_err(|_| ())?;
+        if text != "null" && text != "[]" {
+            chat.messages.push(aisix_gateway::ChatMessage::user(text));
+        }
+    }
+    Ok(chat)
 }
 
 /// Anthropic `content` is either a bare string or an array of typed
@@ -423,7 +866,8 @@ fn redact_anthropic_content(
     dir: Direction,
     content: &mut Value,
     counts: &mut RedactionCounts,
-) {
+) -> bool {
+    let mut unrewritable_tool_key = false;
     match content {
         Value::String(_) => apply_to_value_string(chain, dir, content, counts),
         Value::Array(blocks) => {
@@ -435,12 +879,29 @@ fn redact_anthropic_content(
                         }
                     }
                     Some("tool_result") => {
+                        unrewritable_tool_key |= detect_named_structural_fields(
+                            chain,
+                            dir,
+                            block,
+                            &["tool_use_id"],
+                            counts,
+                        );
                         if let Some(inner) = block.get_mut("content") {
-                            redact_anthropic_content(chain, dir, inner, counts);
+                            unrewritable_tool_key |=
+                                redact_anthropic_content(chain, dir, inner, counts);
                         }
                     }
                     Some("tool_use") => {
+                        unrewritable_tool_key |= detect_named_structural_fields(
+                            chain,
+                            dir,
+                            block,
+                            &["id", "name"],
+                            counts,
+                        );
                         if let Some(input) = block.get_mut("input") {
+                            unrewritable_tool_key |=
+                                detect_unrewritable_object_keys(chain, dir, input, counts);
                             redact_value_strings(chain, dir, input, counts);
                         }
                     }
@@ -450,106 +911,246 @@ fn redact_anthropic_content(
         }
         _ => {}
     }
+    unrewritable_tool_key
 }
 
 /// Mask an Anthropic-native `/v1/messages` RESPONSE body in place (the
 /// non-streaming passthrough JSON): top-level `content` blocks (`text` +
 /// `tool_use` input).
-pub fn redact_anthropic_response(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
+pub fn redact_anthropic_response(
+    chain: &dyn Guardrail,
+    body: &mut Value,
+) -> AnthropicRequestRedaction {
     let mut counts = RedactionCounts::new();
     if !chain.redacts_output() {
-        return counts;
+        return AnthropicRequestRedaction {
+            counts,
+            unrewritable_tool_key: false,
+        };
     }
-    if let Some(content) = body.get_mut("content") {
-        redact_anthropic_content(chain, Direction::Output, content, &mut counts);
+    let unrewritable_tool_key = body.get_mut("content").is_some_and(|content| {
+        redact_anthropic_content(chain, Direction::Output, content, &mut counts)
+    });
+    AnthropicRequestRedaction {
+        counts,
+        unrewritable_tool_key,
     }
-    counts
+}
+
+pub async fn moderate_anthropic_response(
+    chain: &dyn Guardrail,
+    non_segment_verdict: aisix_guardrails::GuardrailVerdict,
+    body: &mut Value,
+    counts_out: &mut RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
+) -> AnthropicModeration {
+    moderate_structured_body(
+        chain,
+        Direction::Output,
+        non_segment_verdict,
+        counts_out,
+        monitor_hits_out,
+        |guardrail| redact_anthropic_response(guardrail, body),
+    )
+    .await
 }
 
 /// Mask a `/v1/responses` request body in place: `instructions` and
 /// `input` (bare string, or item list whose `message` items carry
 /// `content` as a string or `input_text` parts). Function-call outputs
 /// replayed as `function_call_output` items are walked too.
-pub fn redact_responses_request(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
+fn redact_responses_request_impl(
+    chain: &dyn Guardrail,
+    body: &mut Value,
+    detect_keys: bool,
+) -> AnthropicRequestRedaction {
     let mut counts = RedactionCounts::new();
     if !chain.redacts_input() {
-        return counts;
+        return AnthropicRequestRedaction {
+            counts,
+            unrewritable_tool_key: false,
+        };
     }
     if let Some(instructions) = body.get_mut("instructions") {
         apply_to_value_string(chain, Direction::Input, instructions, &mut counts);
     }
+    let mut unrewritable_tool_key = false;
     match body.get_mut("input") {
         Some(v @ Value::String(_)) => {
             apply_to_value_string(chain, Direction::Input, v, &mut counts)
         }
         Some(Value::Array(items)) => {
             for item in items {
-                redact_responses_item(chain, Direction::Input, item, &mut counts);
+                unrewritable_tool_key |= redact_responses_item_structured(
+                    chain,
+                    Direction::Input,
+                    item,
+                    &mut counts,
+                    detect_keys,
+                );
             }
         }
         _ => {}
     }
-    counts
+    if let Some(tools) = body.get_mut("tools") {
+        unrewritable_tool_key |=
+            redact_tool_definitions(chain, Direction::Input, tools, &mut counts, detect_keys);
+    }
+    AnthropicRequestRedaction {
+        counts,
+        unrewritable_tool_key,
+    }
 }
 
-/// One `/v1/responses` input/output item. `message` items carry
-/// string-or-parts content (`input_text` / `output_text` / plain `text`);
-/// `function_call` carries JSON-encoded `arguments`;
-/// `function_call_output` carries a string `output`.
-fn redact_responses_item(
+#[cfg(test)]
+pub fn redact_responses_request(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
+    redact_responses_request_impl(chain, body, false).counts
+}
+
+pub fn redact_responses_request_structured(
+    chain: &dyn Guardrail,
+    body: &mut Value,
+) -> AnthropicRequestRedaction {
+    redact_responses_request_impl(chain, body, true)
+}
+
+pub async fn moderate_responses_request_structured(
+    chain: &dyn Guardrail,
+    non_segment_verdict: aisix_guardrails::GuardrailVerdict,
+    body: &mut Value,
+    counts_out: &mut RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
+) -> AnthropicModeration {
+    moderate_structured_body(
+        chain,
+        Direction::Input,
+        non_segment_verdict,
+        counts_out,
+        monitor_hits_out,
+        |guardrail| redact_responses_request_structured(guardrail, body),
+    )
+    .await
+}
+
+fn redact_responses_text_value(
+    chain: &dyn Guardrail,
+    dir: Direction,
+    value: &mut Value,
+    counts: &mut RedactionCounts,
+) {
+    match value {
+        Value::String(_) => apply_to_value_string(chain, dir, value, counts),
+        Value::Array(parts) => {
+            for part in parts {
+                if let Some(text) = part.get_mut("text") {
+                    apply_to_value_string(chain, dir, text, counts);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// One `/v1/responses` input/output item. The same `content`, `output`, and
+/// `reason` text slots used by the inspection projection are rewritten here;
+/// `function_call` additionally carries JSON-encoded `arguments`.
+fn redact_responses_item_structured(
     chain: &dyn Guardrail,
     dir: Direction,
     item: &mut Value,
     counts: &mut RedactionCounts,
-) {
+    detect_keys: bool,
+) -> bool {
+    let mut unrewritable_tool_key = false;
+    for field in ["content", "output", "reason"] {
+        if let Some(value) = item.get_mut(field) {
+            redact_responses_text_value(chain, dir, value, counts);
+        }
+    }
+    if detect_keys {
+        unrewritable_tool_key |=
+            detect_named_structural_fields(chain, dir, item, &["id", "call_id", "name"], counts);
+    }
     match item.get("type").and_then(Value::as_str) {
-        // An item without a `type` defaults to `message` on this API.
-        Some("message") | None => match item.get_mut("content") {
-            Some(v @ Value::String(_)) => apply_to_value_string(chain, dir, v, counts),
-            Some(Value::Array(parts)) => {
-                for part in parts {
-                    if matches!(
-                        part.get("type").and_then(Value::as_str),
-                        Some("input_text") | Some("output_text") | Some("text")
-                    ) {
-                        if let Some(text) = part.get_mut("text") {
-                            apply_to_value_string(chain, dir, text, counts);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        },
-        Some("function_call") => {
+        Some("function_call" | "mcp_call") => {
             if let Some(Value::String(args)) = item.get_mut("arguments") {
                 let mut owned = std::mem::take(args);
-                redact_json_encoded(chain, dir, &mut owned, counts);
+                unrewritable_tool_key |=
+                    redact_json_encoded_structured(chain, dir, &mut owned, counts, detect_keys);
                 *args = owned;
             }
         }
-        Some("function_call_output") => {
-            if let Some(output) = item.get_mut("output") {
-                apply_to_value_string(chain, dir, output, counts);
+        Some("custom_tool_call") => {
+            if let Some(input) = item.get_mut("input") {
+                apply_to_value_string(chain, dir, input, counts);
             }
         }
         _ => {}
     }
+    unrewritable_tool_key
 }
 
 /// Mask a `/v1/responses` non-streaming RESPONSE body in place: every
 /// item in `output` (message `output_text` parts, `function_call`
 /// arguments) — the same surface the output check scans.
+#[cfg(test)]
 pub fn redact_responses_response(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
+    redact_responses_response_impl(chain, body, false).counts
+}
+
+fn redact_responses_response_impl(
+    chain: &dyn Guardrail,
+    body: &mut Value,
+    detect_keys: bool,
+) -> AnthropicRequestRedaction {
     let mut counts = RedactionCounts::new();
     if !chain.redacts_output() {
-        return counts;
+        return AnthropicRequestRedaction {
+            counts,
+            unrewritable_tool_key: false,
+        };
     }
+    let mut unrewritable_tool_key = false;
     if let Some(Value::Array(items)) = body.get_mut("output") {
         for item in items {
-            redact_responses_item(chain, Direction::Output, item, &mut counts);
+            unrewritable_tool_key |= redact_responses_item_structured(
+                chain,
+                Direction::Output,
+                item,
+                &mut counts,
+                detect_keys,
+            );
         }
     }
-    counts
+    AnthropicRequestRedaction {
+        counts,
+        unrewritable_tool_key,
+    }
+}
+
+pub fn redact_responses_response_structured(
+    chain: &dyn Guardrail,
+    body: &mut Value,
+) -> AnthropicRequestRedaction {
+    redact_responses_response_impl(chain, body, true)
+}
+
+pub async fn moderate_responses_response_structured(
+    chain: &dyn Guardrail,
+    non_segment_verdict: aisix_guardrails::GuardrailVerdict,
+    body: &mut Value,
+    counts_out: &mut RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
+) -> AnthropicModeration {
+    moderate_structured_body(
+        chain,
+        Direction::Output,
+        non_segment_verdict,
+        counts_out,
+        monitor_hits_out,
+        |guardrail| redact_responses_response_structured(guardrail, body),
+    )
+    .await
 }
 
 /// Mask a legacy `/v1/completions` request body in place: `prompt` as a
@@ -689,18 +1290,71 @@ pub fn redact_completions_response(chain: &dyn Guardrail, body: &mut Value) -> R
 /// `tool_calls` function arguments (the same surface
 /// `guardrail_output_text` scans). Reasoning content is excluded from
 /// guardrail scope by design and stays untouched.
-pub fn redact_chat_response(chain: &dyn Guardrail, resp: &mut ChatResponse) -> RedactionCounts {
+fn redact_chat_response_impl(
+    chain: &dyn Guardrail,
+    resp: &mut ChatResponse,
+    detect_keys: bool,
+) -> AnthropicRequestRedaction {
     let mut counts = RedactionCounts::new();
     if !chain.redacts_output() {
-        return counts;
+        return AnthropicRequestRedaction {
+            counts,
+            unrewritable_tool_key: false,
+        };
     }
     if let Some(content) = resp.message.content.as_mut() {
         apply_to_string(chain, Direction::Output, content, &mut counts);
     }
-    if let Some(tool_calls) = resp.message.extra.get_mut("tool_calls") {
-        redact_tool_call_arguments(chain, Direction::Output, tool_calls, &mut counts);
+    let unrewritable_tool_key =
+        resp.message
+            .extra
+            .get_mut("tool_calls")
+            .is_some_and(|tool_calls| {
+                redact_tool_call_arguments(
+                    chain,
+                    Direction::Output,
+                    tool_calls,
+                    &mut counts,
+                    detect_keys,
+                )
+            });
+    AnthropicRequestRedaction {
+        counts,
+        unrewritable_tool_key,
     }
-    counts
+}
+
+#[cfg(test)]
+pub fn redact_chat_response(chain: &dyn Guardrail, resp: &mut ChatResponse) -> RedactionCounts {
+    redact_chat_response_impl(chain, resp, false).counts
+}
+
+/// Mask a normalised response before converting it to Anthropic JSON. Tool
+/// argument object keys cannot be renamed safely; a matching key therefore
+/// requires the Messages handler to fail closed.
+pub fn redact_chat_response_structured(
+    chain: &dyn Guardrail,
+    resp: &mut ChatResponse,
+) -> AnthropicRequestRedaction {
+    redact_chat_response_impl(chain, resp, true)
+}
+
+pub async fn moderate_chat_response_structured(
+    chain: &dyn Guardrail,
+    non_segment_verdict: aisix_guardrails::GuardrailVerdict,
+    resp: &mut ChatResponse,
+    counts_out: &mut RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
+) -> AnthropicModeration {
+    moderate_structured_body(
+        chain,
+        Direction::Output,
+        non_segment_verdict,
+        counts_out,
+        monitor_hits_out,
+        |guardrail| redact_chat_response_structured(guardrail, resp),
+    )
+    .await
 }
 
 // ─── Response side (streamed, buffered) ──────────────────────────────────────
@@ -717,11 +1371,19 @@ pub fn redact_chat_response(chain: &dyn Guardrail, resp: &mut ChatResponse) -> R
 /// empty deltas. The stream is already released en bloc at this point, so
 /// chunk-size distribution is not client-observable. Non-content fields
 /// (ids, usage, finish_reason, reasoning) are untouched.
-pub fn redact_chat_chunks(chain: &dyn Guardrail, chunks: &mut [ChatChunk]) -> RedactionCounts {
+fn redact_chat_chunks_impl(
+    chain: &dyn Guardrail,
+    chunks: &mut [ChatChunk],
+    detect_keys: bool,
+) -> AnthropicRequestRedaction {
     let mut counts = RedactionCounts::new();
     if !chain.redacts_output() {
-        return counts;
+        return AnthropicRequestRedaction {
+            counts,
+            unrewritable_tool_key: false,
+        };
     }
+    let mut unrewritable_tool_key = false;
 
     // Content channel: all chunks stream one assistant message.
     let content_sites: Vec<usize> = chunks
@@ -753,10 +1415,27 @@ pub fn redact_chat_chunks(chain: &dyn Guardrail, chunks: &mut [ChatChunk]) -> Re
     // concatenation of each channel's `function.arguments` strings is the
     // complete JSON-encoded argument document.
     let mut channels: BTreeMap<u64, Vec<(usize, usize)>> = BTreeMap::new();
+    let mut structural_channels: BTreeMap<(u64, &'static str), Vec<(usize, usize)>> =
+        BTreeMap::new();
     for (ci, chunk) in chunks.iter().enumerate() {
         if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
             for (ti, tc) in tcs.iter().enumerate() {
                 let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0);
+                for field in ["id", "type", "name"] {
+                    let value = match field {
+                        "name" => tc.get("function").and_then(|function| function.get("name")),
+                        _ => tc.get(field),
+                    };
+                    if value
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+                    {
+                        structural_channels
+                            .entry((idx, field))
+                            .or_default()
+                            .push((ci, ti));
+                    }
+                }
                 if tc
                     .get("function")
                     .and_then(|f| f.get("arguments"))
@@ -767,6 +1446,26 @@ pub fn redact_chat_chunks(chain: &dyn Guardrail, chunks: &mut [ChatChunk]) -> Re
                 }
             }
         }
+    }
+    for ((_, field), sites) in &structural_channels {
+        let joined: String = sites
+            .iter()
+            .map(|&(ci, ti)| {
+                let tc = &chunks[ci].delta.tool_calls.as_ref().unwrap()[ti];
+                match *field {
+                    "name" => tc.get("function").and_then(|function| function.get("name")),
+                    _ => tc.get(*field),
+                }
+                .and_then(Value::as_str)
+                .unwrap_or("")
+            })
+            .collect();
+        unrewritable_tool_key |= detect_unrewritable_value_strings(
+            chain,
+            Direction::Output,
+            &Value::String(joined),
+            &mut counts,
+        );
     }
     for sites in channels.values() {
         let joined: String = sites
@@ -781,7 +1480,13 @@ pub fn redact_chat_chunks(chain: &dyn Guardrail, chunks: &mut [ChatChunk]) -> Re
             .collect();
         let mut rewritten = joined.clone();
         let mut local = RedactionCounts::new();
-        redact_json_encoded(chain, Direction::Output, &mut rewritten, &mut local);
+        unrewritable_tool_key |= redact_json_encoded_structured(
+            chain,
+            Direction::Output,
+            &mut rewritten,
+            &mut local,
+            detect_keys,
+        );
         if local.is_empty() {
             continue;
         }
@@ -801,7 +1506,43 @@ pub fn redact_chat_chunks(chain: &dyn Guardrail, chunks: &mut [ChatChunk]) -> Re
         merge_counts(&mut counts, local);
     }
 
-    counts
+    AnthropicRequestRedaction {
+        counts,
+        unrewritable_tool_key,
+    }
+}
+
+#[cfg(test)]
+pub fn redact_chat_chunks(chain: &dyn Guardrail, chunks: &mut [ChatChunk]) -> RedactionCounts {
+    redact_chat_chunks_impl(chain, chunks, false).counts
+}
+
+/// Mask buffered OpenAI chunks before converting them to Anthropic SSE. Tool
+/// argument object keys cannot be renamed safely; a matching key therefore
+/// requires the Messages handler to fail closed.
+pub fn redact_chat_chunks_structured(
+    chain: &dyn Guardrail,
+    chunks: &mut [ChatChunk],
+) -> AnthropicRequestRedaction {
+    redact_chat_chunks_impl(chain, chunks, true)
+}
+
+pub async fn moderate_chat_chunks_structured(
+    chain: &dyn Guardrail,
+    non_segment_verdict: aisix_guardrails::GuardrailVerdict,
+    chunks: &mut [ChatChunk],
+    counts_out: &mut RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
+) -> AnthropicModeration {
+    moderate_structured_body(
+        chain,
+        Direction::Output,
+        non_segment_verdict,
+        counts_out,
+        monitor_hits_out,
+        |guardrail| redact_chat_chunks_structured(guardrail, chunks),
+    )
+    .await
 }
 
 // ─── Anthropic-native SSE (passthrough) rewrite ──────────────────────────────
@@ -813,13 +1554,22 @@ struct SseFrame {
     raw: Vec<u8>,
     /// Parsed `data:` payload, when the frame carries one.
     data: Option<Value>,
+    /// A non-empty, non-sentinel data payload that was not valid JSON.
+    malformed_data: bool,
+    /// True when the event's joined data payload is the `[DONE]` sentinel.
+    sentinel: bool,
+    /// Only the stream's first frame may ignore the UTF-8 BOM.
+    initial_frame: bool,
     dirty: bool,
+    /// Exact blank-line terminator. Empty only for the final frame when the
+    /// upstream closes without a trailing SSE separator.
+    separator: Vec<u8>,
 }
 
 impl SseFrame {
-    /// Re-render the frame: the first `data:` line is replaced with the
-    /// re-serialised payload (subsequent `data:` lines dropped); every
-    /// other line passes through untouched.
+    /// Re-render the frame: the first `data` field is replaced with the
+    /// re-serialised payload and subsequent data fields are removed; every
+    /// other field/comment and its original line ending pass through.
     fn render(&self) -> Vec<u8> {
         if !self.dirty {
             return self.raw.clone();
@@ -827,57 +1577,305 @@ impl SseFrame {
         let Some(data) = self.data.as_ref() else {
             return self.raw.clone();
         };
-        let text = String::from_utf8_lossy(&self.raw);
-        let mut out = String::new();
+        let encoded = serde_json::to_vec(data).unwrap_or_default();
+        let mut out = Vec::with_capacity(self.raw.len());
+        let mut position = 0usize;
+        let mut first_line = true;
         let mut data_written = false;
-        for line in text.split('\n') {
-            if line.starts_with("data:") {
+        while position < self.raw.len() {
+            let (content_end, next) = next_sse_line(&self.raw, position);
+            let (line, bom) = sse_field_line(
+                &self.raw[position..content_end],
+                self.initial_frame && first_line,
+            );
+            if sse_field_value(line, b"data").is_some() {
                 if !data_written {
-                    out.push_str("data: ");
-                    out.push_str(&serde_json::to_string(data).unwrap_or_default());
-                    out.push('\n');
+                    out.extend_from_slice(bom);
+                    out.extend_from_slice(b"data: ");
+                    out.extend_from_slice(&encoded);
+                    out.extend_from_slice(&self.raw[content_end..next]);
                     data_written = true;
                 }
             } else {
-                out.push_str(line);
-                out.push('\n');
+                out.extend_from_slice(&self.raw[position..next]);
             }
+            first_line = false;
+            if next == self.raw.len() {
+                break;
+            }
+            position = next;
         }
-        // Drop the final artificial newline added by the loop; the caller
-        // re-adds the frame separator.
-        if out.ends_with('\n') {
-            out.pop();
-        }
-        out.into_bytes()
+        out
     }
 }
 
-/// Split a buffered SSE byte stream into frames on the blank-line
-/// separator. Returns `(frames, trailing)` where `trailing` is a
-/// partial frame with no terminator yet (forwarded verbatim).
-fn split_sse_frames(raw: &[u8]) -> (Vec<SseFrame>, &[u8]) {
+const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
+
+/// Return the content end and the end of one physical SSE line. WHATWG SSE
+/// accepts CRLF, lone CR, and lone LF as line endings.
+fn next_sse_line(raw: &[u8], start: usize) -> (usize, usize) {
+    let Some(offset) = raw[start..]
+        .iter()
+        .position(|byte| matches!(byte, b'\r' | b'\n'))
+    else {
+        return (raw.len(), raw.len());
+    };
+    let content_end = start + offset;
+    let next = if raw[content_end] == b'\r'
+        && raw.get(content_end + 1).is_some_and(|byte| *byte == b'\n')
+    {
+        content_end + 2
+    } else {
+        content_end + 1
+    };
+    (content_end, next)
+}
+
+fn sse_field_line(line: &[u8], strip_bom: bool) -> (&[u8], &[u8]) {
+    if strip_bom && line.starts_with(UTF8_BOM) {
+        (&line[UTF8_BOM.len()..], &line[..UTF8_BOM.len()])
+    } else {
+        (line, &[])
+    }
+}
+
+/// Parse one SSE field according to the EventSource algorithm: the field name
+/// is the bytes before the first colon and one optional leading space is
+/// removed from the value.
+fn sse_field_value<'a>(line: &'a [u8], expected: &[u8]) -> Option<&'a [u8]> {
+    if line.starts_with(b":") {
+        return None;
+    }
+    let (field, value) = match line.iter().position(|byte| *byte == b':') {
+        Some(colon) => (&line[..colon], &line[colon + 1..]),
+        None => (line, &[][..]),
+    };
+    if field != expected {
+        return None;
+    }
+    Some(value.strip_prefix(b" ").unwrap_or(value))
+}
+
+fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+fn parse_sse_frame(raw: &[u8], separator: &[u8], initial_frame: bool) -> SseFrame {
+    let mut joined_data = Vec::new();
+    let mut position = 0usize;
+    let mut first_line = true;
+    let mut has_data = false;
+    while position < raw.len() {
+        let (content_end, next) = next_sse_line(raw, position);
+        let (line, _) = sse_field_line(&raw[position..content_end], initial_frame && first_line);
+        if let Some(value) = sse_field_value(line, b"data") {
+            if has_data {
+                joined_data.push(b'\n');
+            }
+            joined_data.extend_from_slice(value);
+            has_data = true;
+        }
+        first_line = false;
+        if next == raw.len() {
+            break;
+        }
+        position = next;
+    }
+
+    let payload = trim_ascii(&joined_data);
+    let sentinel = payload == b"[DONE]";
+    let parsed = if has_data && !payload.is_empty() && !sentinel {
+        serde_json::from_slice::<Value>(payload).ok()
+    } else {
+        None
+    };
+    let malformed_data = has_data && !payload.is_empty() && !sentinel && parsed.is_none();
+    SseFrame {
+        raw: raw.to_vec(),
+        data: parsed,
+        malformed_data,
+        sentinel,
+        initial_frame,
+        dirty: false,
+        separator: separator.to_vec(),
+    }
+}
+
+/// Locate the first complete SSE event and return `(frame_end, event_end)`.
+/// `frame_end` excludes the blank-line separator; `event_end` includes it.
+fn sse_event_boundary(raw: &[u8]) -> Option<(usize, usize)> {
+    let mut position = 0usize;
+    let mut previous_line_ending = None;
+    while position < raw.len() {
+        let line_start = position;
+        let (content_end, next) = next_sse_line(raw, position);
+        if next == content_end {
+            return None;
+        }
+        if content_end == line_start {
+            return Some((previous_line_ending.unwrap_or(line_start), next));
+        }
+        previous_line_ending = Some(content_end);
+        position = next;
+    }
+    None
+}
+
+/// Number of buffered bytes through the first complete SSE event, including
+/// its blank-line terminator.
+pub(crate) fn first_sse_event_end(raw: &[u8]) -> Option<usize> {
+    sse_event_boundary(raw).map(|(_, event_end)| event_end)
+}
+
+/// Parse one buffered event. The bool reports a non-empty data payload that
+/// was neither `[DONE]` nor valid JSON.
+pub(crate) fn parse_sse_json_event(raw: &[u8], initial_frame: bool) -> (Option<Value>, bool) {
+    let frame = match sse_event_boundary(raw) {
+        Some((frame_end, event_end)) if event_end == raw.len() => {
+            parse_sse_frame(&raw[..frame_end], &raw[frame_end..event_end], initial_frame)
+        }
+        _ => parse_sse_frame(raw, &[], initial_frame),
+    };
+    (frame.data, frame.malformed_data)
+}
+
+/// Whether one complete (or EOF-terminated) SSE event carries `[DONE]`.
+/// Uses the same WHATWG line joining, BOM, and whitespace rules as the JSON
+/// side-channel parser so terminal detection cannot drift from parsing.
+pub(crate) fn is_sse_done_event(raw: &[u8], initial_frame: bool) -> bool {
+    let frame = match sse_event_boundary(raw) {
+        Some((frame_end, event_end)) if event_end == raw.len() => {
+            parse_sse_frame(&raw[..frame_end], &raw[frame_end..event_end], initial_frame)
+        }
+        _ => parse_sse_frame(raw, &[], initial_frame),
+    };
+    frame.sentinel
+}
+
+/// Split a complete buffered SSE byte stream on every standards-compliant
+/// blank-line separator. A final unterminated frame is still parsed: EOF
+/// terminates an SSE event, so forwarding it as opaque bytes would let its
+/// payload bypass output inspection.
+fn split_sse_frames(raw: &[u8]) -> Vec<SseFrame> {
     let mut frames = Vec::new();
     let mut start = 0usize;
-    let mut i = 0usize;
-    while i + 1 < raw.len() {
-        if raw[i] == b'\n' && raw[i + 1] == b'\n' {
-            let frame_raw = &raw[start..i];
-            let data = String::from_utf8_lossy(frame_raw)
-                .split('\n')
-                .find(|l| l.starts_with("data:"))
-                .and_then(|l| serde_json::from_str::<Value>(l["data:".len()..].trim()).ok());
-            frames.push(SseFrame {
-                raw: frame_raw.to_vec(),
-                data,
-                dirty: false,
-            });
-            start = i + 2;
-            i += 2;
-        } else {
-            i += 1;
+    while start < raw.len() {
+        let remaining = &raw[start..];
+        let initial_frame = frames.is_empty();
+        let Some((frame_end, event_end)) = sse_event_boundary(remaining) else {
+            frames.push(parse_sse_frame(remaining, &[], initial_frame));
+            break;
+        };
+        frames.push(parse_sse_frame(
+            &remaining[..frame_end],
+            &remaining[frame_end..event_end],
+            initial_frame,
+        ));
+        start += event_end;
+    }
+    frames
+}
+
+/// Parse all JSON data events in a buffered SSE stream. The bool is true when
+/// any non-empty data event was not valid JSON.
+pub(crate) fn parse_sse_json_stream(raw: &[u8]) -> (Vec<Value>, bool) {
+    let frames = split_sse_frames(raw);
+    let malformed = frames.iter().any(|frame| frame.malformed_data);
+    let events = frames.into_iter().filter_map(|frame| frame.data).collect();
+    (events, malformed)
+}
+
+/// Mask a fully-buffered legacy `/v1/completions` SSE response. Choice text
+/// is reassembled by `index` before redaction so a sensitive span split across
+/// provider chunks cannot evade detection; the rewritten channel is emitted
+/// on its first carrying frame and later fragments become empty strings.
+pub fn redact_completions_sse(
+    chain: &dyn Guardrail,
+    raw: &[u8],
+) -> Option<(Vec<u8>, RedactionCounts)> {
+    if !chain.redacts_output() {
+        return None;
+    }
+    let mut frames = split_sse_frames(raw);
+    let mut channels: BTreeMap<u64, Vec<(usize, usize)>> = BTreeMap::new();
+    for (frame_index, frame) in frames.iter().enumerate() {
+        let Some(choices) = frame
+            .data
+            .as_ref()
+            .and_then(|data| data.get("choices"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for (choice_index, choice) in choices.iter().enumerate() {
+            if choice
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty())
+            {
+                channels
+                    .entry(choice.get("index").and_then(Value::as_u64).unwrap_or(0))
+                    .or_default()
+                    .push((frame_index, choice_index));
+            }
         }
     }
-    (frames, &raw[start..])
+
+    let mut counts = RedactionCounts::new();
+    for sites in channels.values() {
+        let joined: String = sites
+            .iter()
+            .map(|&(frame_index, choice_index)| {
+                frames[frame_index]
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("choices"))
+                    .and_then(Value::as_array)
+                    .and_then(|choices| choices.get(choice_index))
+                    .and_then(|choice| choice.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            })
+            .collect();
+        let Some(redaction) = chain.redact_output_text(&joined) else {
+            continue;
+        };
+        let mut first = true;
+        for &(frame_index, choice_index) in sites {
+            let text = frames[frame_index]
+                .data
+                .as_mut()
+                .and_then(|data| data.get_mut("choices"))
+                .and_then(Value::as_array_mut)
+                .and_then(|choices| choices.get_mut(choice_index))
+                .and_then(|choice| choice.get_mut("text"))
+                .expect("site was selected for having choice text");
+            *text = Value::String(if first {
+                first = false;
+                redaction.text.clone()
+            } else {
+                String::new()
+            });
+            frames[frame_index].dirty = true;
+        }
+        merge_counts(&mut counts, redaction.counts);
+    }
+    if counts.is_empty() {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(raw.len());
+    for frame in &frames {
+        out.extend_from_slice(&frame.render());
+        out.extend_from_slice(&frame.separator);
+    }
+    Some((out, counts))
 }
 
 /// Mask a fully-buffered Anthropic-native SSE response (the `/v1/messages`
@@ -885,17 +1883,27 @@ fn split_sse_frames(raw: &[u8]) -> (Vec<SseFrame>, &[u8]) {
 /// `index` (a masked span can cross frame boundaries), masked once, and
 /// the full masked text re-emitted on the channel's first frame;
 /// `input_json_delta` (tool-use arguments) channels are masked as complete
-/// JSON documents. `None` = nothing matched, forward the original bytes
-/// byte-identical.
-pub fn redact_anthropic_sse(
-    chain: &dyn Guardrail,
-    raw: &[u8],
-) -> Option<(Vec<u8>, RedactionCounts)> {
+/// JSON documents. `rewritten: None` means nothing was changed, so callers
+/// can forward the original bytes byte-identically. Sensitive JSON object
+/// keys are reported separately because renaming a tool argument would change
+/// its contract; handlers must fail closed instead.
+pub struct AnthropicSseRedaction {
+    pub rewritten: Option<Vec<u8>>,
+    pub counts: RedactionCounts,
+    pub unrewritable_tool_key: bool,
+}
+
+pub fn redact_anthropic_sse(chain: &dyn Guardrail, raw: &[u8]) -> AnthropicSseRedaction {
     if !chain.redacts_output() {
-        return None;
+        return AnthropicSseRedaction {
+            rewritten: None,
+            counts: RedactionCounts::new(),
+            unrewritable_tool_key: false,
+        };
     }
-    let (mut frames, trailing) = split_sse_frames(raw);
+    let mut frames = split_sse_frames(raw);
     let mut counts = RedactionCounts::new();
+    let mut unrewritable_tool_key = false;
 
     // channel key → ordered (frame_idx, kind) sites. Kind distinguishes the
     // JSON path to rewrite inside the frame payload.
@@ -1022,23 +2030,101 @@ pub fn redact_anthropic_sse(
             .collect();
         let mut rewritten = joined.clone();
         let mut local = RedactionCounts::new();
-        redact_json_encoded(chain, Direction::Output, &mut rewritten, &mut local);
-        if !local.is_empty() {
+        unrewritable_tool_key |= redact_json_encoded_structured(
+            chain,
+            Direction::Output,
+            &mut rewritten,
+            &mut local,
+            true,
+        );
+        if rewritten != joined {
             rewrite(&mut frames, sites, rewritten);
-            merge_counts(&mut counts, local);
         }
+        merge_counts(&mut counts, local);
     }
 
-    if counts.is_empty() {
-        return None;
+    // A tool-use block may carry a complete non-empty input object in its
+    // start event instead of (or before) input_json_delta frames. Walk that
+    // object as the same structured channel: values may be rewritten, while
+    // a sensitive key must make the handler fail closed.
+    for frame in &mut frames {
+        let changed = {
+            let Some(data) = frame.data.as_mut() else {
+                continue;
+            };
+            if data.get("type").and_then(Value::as_str) != Some("content_block_start")
+                || data
+                    .get("content_block")
+                    .and_then(|block| block.get("type"))
+                    .and_then(Value::as_str)
+                    != Some("tool_use")
+            {
+                continue;
+            }
+            if let Some(block) = data.get("content_block") {
+                unrewritable_tool_key |= detect_named_structural_fields(
+                    chain,
+                    Direction::Output,
+                    block,
+                    &["id", "name"],
+                    &mut counts,
+                );
+            }
+            let Some(input) = data
+                .get_mut("content_block")
+                .and_then(|block| block.get_mut("input"))
+            else {
+                continue;
+            };
+            let before = input.clone();
+            unrewritable_tool_key |=
+                detect_unrewritable_object_keys(chain, Direction::Output, input, &mut counts);
+            redact_value_strings(chain, Direction::Output, input, &mut counts);
+            *input != before
+        };
+        frame.dirty |= changed;
     }
-    let mut out = Vec::with_capacity(raw.len());
-    for frame in &frames {
-        out.extend_from_slice(&frame.render());
-        out.extend_from_slice(b"\n\n");
+
+    let rewritten = frames.iter().any(|frame| frame.dirty).then(|| {
+        let mut out = Vec::with_capacity(raw.len());
+        for frame in &frames {
+            out.extend_from_slice(&frame.render());
+            out.extend_from_slice(&frame.separator);
+        }
+        out
+    });
+    AnthropicSseRedaction {
+        rewritten,
+        counts,
+        unrewritable_tool_key,
     }
-    out.extend_from_slice(trailing);
-    Some((out, counts))
+}
+
+pub async fn moderate_anthropic_sse(
+    chain: &dyn Guardrail,
+    non_segment_verdict: aisix_guardrails::GuardrailVerdict,
+    held: &mut Vec<u8>,
+    counts_out: &mut RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
+) -> AnthropicModeration {
+    moderate_structured_body(
+        chain,
+        Direction::Output,
+        non_segment_verdict,
+        counts_out,
+        monitor_hits_out,
+        |guardrail| {
+            let result = redact_anthropic_sse(guardrail, held);
+            if let Some(rewritten) = result.rewritten {
+                *held = rewritten;
+            }
+            AnthropicRequestRedaction {
+                counts: result.counts,
+                unrewritable_tool_key: result.unrewritable_tool_key,
+            }
+        },
+    )
+    .await
 }
 
 /// The concatenated TEXT-channel content of a buffered Anthropic-native
@@ -1047,7 +2133,7 @@ pub fn redact_anthropic_sse(
 /// after a segment (provider-side) mask rewrote the held bytes — the
 /// sync redactor can't reproduce a provider mask (#932 × AISIX-Cloud#947).
 pub fn anthropic_sse_text(raw: &[u8]) -> String {
-    let (frames, _) = split_sse_frames(raw);
+    let frames = split_sse_frames(raw);
     let mut channels: BTreeMap<u64, String> = BTreeMap::new();
     for frame in &frames {
         let Some(data) = frame.data.as_ref() else {
@@ -1077,7 +2163,7 @@ pub fn anthropic_sse_text(raw: &[u8]) -> String {
 /// `/v1/responses` SSE stream (channel order). Same capture-rebuild role
 /// as [`anthropic_sse_text`].
 pub fn responses_sse_text(raw: &[u8]) -> String {
-    let (frames, _) = split_sse_frames(raw);
+    let frames = split_sse_frames(raw);
     // First-seen channel order (NOT key order): the rebuilt capture must
     // read in the order the client saw the channels emitted.
     let mut channels: Vec<(String, String)> = Vec::new();
@@ -1126,19 +2212,40 @@ pub fn responses_sse_text(raw: &[u8]) -> String {
 /// `response.completed`) carry complete texts and are masked directly —
 /// deterministic masking keeps them consistent with the delta channels.
 /// `None` = nothing matched, forward the original bytes byte-identical.
+#[cfg(test)]
 pub fn redact_responses_sse(
     chain: &dyn Guardrail,
     raw: &[u8],
 ) -> Option<(Vec<u8>, RedactionCounts)> {
+    let result = redact_responses_sse_impl(chain, raw, false);
+    result.rewritten.map(|rewritten| (rewritten, result.counts))
+}
+
+pub struct ResponsesSseRedaction {
+    pub rewritten: Option<Vec<u8>>,
+    pub counts: RedactionCounts,
+    pub unrewritable_tool_key: bool,
+}
+
+fn redact_responses_sse_impl(
+    chain: &dyn Guardrail,
+    raw: &[u8],
+    detect_keys: bool,
+) -> ResponsesSseRedaction {
     if !chain.redacts_output() {
-        return None;
+        return ResponsesSseRedaction {
+            rewritten: None,
+            counts: RedactionCounts::new(),
+            unrewritable_tool_key: false,
+        };
     }
-    let (mut frames, trailing) = split_sse_frames(raw);
+    let mut frames = split_sse_frames(raw);
     let mut counts = RedactionCounts::new();
+    let mut unrewritable_tool_key = false;
 
     // Delta channels: (event-type discriminant, channel key) → frame sites.
     let mut text_channels: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    let mut args_channels: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut args_channels: BTreeMap<(String, bool), Vec<usize>> = BTreeMap::new();
 
     fn channel_key(data: &Value) -> String {
         // item_id is the stable discriminator; fall back to output_index +
@@ -1176,13 +2283,21 @@ pub fn redact_responses_sse(
                     text_channels.entry(channel_key(data)).or_default().push(fi);
                 }
             }
-            Some("response.function_call_arguments.delta") => {
+            Some(
+                ty @ ("response.function_call_arguments.delta"
+                | "response.mcp_call_arguments.delta"
+                | "response.custom_tool_call_input.delta"),
+            ) => {
                 if data
                     .get("delta")
                     .and_then(Value::as_str)
                     .is_some_and(|t| !t.is_empty())
                 {
-                    args_channels.entry(channel_key(data)).or_default().push(fi);
+                    let json_encoded = ty != "response.custom_tool_call_input.delta";
+                    args_channels
+                        .entry((channel_key(data), json_encoded))
+                        .or_default()
+                        .push(fi);
                 }
             }
             _ => {}
@@ -1222,7 +2337,7 @@ pub fn redact_responses_sse(
             merge_counts(&mut counts, r.counts);
         }
     }
-    for sites in args_channels.values() {
+    for ((_, json_encoded), sites) in &args_channels {
         let joined: String = sites
             .iter()
             .map(|&fi| {
@@ -1236,7 +2351,17 @@ pub fn redact_responses_sse(
             .collect();
         let mut rewritten = joined.clone();
         let mut local = RedactionCounts::new();
-        redact_json_encoded(chain, Direction::Output, &mut rewritten, &mut local);
+        if *json_encoded {
+            unrewritable_tool_key |= redact_json_encoded_structured(
+                chain,
+                Direction::Output,
+                &mut rewritten,
+                &mut local,
+                detect_keys,
+            );
+        } else {
+            apply_to_string(chain, Direction::Output, &mut rewritten, &mut local);
+        }
         if !local.is_empty() {
             rewrite_channel(&mut frames, sites, rewritten);
             merge_counts(&mut counts, local);
@@ -1272,13 +2397,25 @@ pub fn redact_responses_sse(
             "response.function_call_arguments.done" => {
                 if let Some(Value::String(args)) = data.get_mut("arguments") {
                     let mut owned = std::mem::take(args);
-                    redact_json_encoded(chain, Direction::Output, &mut owned, &mut local);
+                    unrewritable_tool_key |= redact_json_encoded_structured(
+                        chain,
+                        Direction::Output,
+                        &mut owned,
+                        &mut local,
+                        detect_keys,
+                    );
                     *args = owned;
                 }
             }
-            "response.output_item.done" => {
+            "response.output_item.added" | "response.output_item.done" => {
                 if let Some(item) = data.get_mut("item") {
-                    redact_responses_item(chain, Direction::Output, item, &mut local);
+                    unrewritable_tool_key |= redact_responses_item_structured(
+                        chain,
+                        Direction::Output,
+                        item,
+                        &mut local,
+                        detect_keys,
+                    );
                 }
             }
             "response.completed" | "response.incomplete" | "response.failed" => {
@@ -1286,7 +2423,13 @@ pub fn redact_responses_sse(
                     data.get_mut("response").and_then(|r| r.get_mut("output"))
                 {
                     for item in items {
-                        redact_responses_item(chain, Direction::Output, item, &mut local);
+                        unrewritable_tool_key |= redact_responses_item_structured(
+                            chain,
+                            Direction::Output,
+                            item,
+                            &mut local,
+                            detect_keys,
+                        );
                     }
                 }
             }
@@ -1301,16 +2444,50 @@ pub fn redact_responses_sse(
     }
 
     let any_dirty = frames.iter().any(|f| f.dirty);
-    if !any_dirty {
-        return None;
+    let rewritten = any_dirty.then(|| {
+        let mut out = Vec::with_capacity(raw.len());
+        for frame in &frames {
+            out.extend_from_slice(&frame.render());
+            out.extend_from_slice(&frame.separator);
+        }
+        out
+    });
+    ResponsesSseRedaction {
+        rewritten,
+        counts,
+        unrewritable_tool_key,
     }
-    let mut out = Vec::with_capacity(raw.len());
-    for frame in &frames {
-        out.extend_from_slice(&frame.render());
-        out.extend_from_slice(b"\n\n");
-    }
-    out.extend_from_slice(trailing);
-    Some((out, counts))
+}
+
+pub fn redact_responses_sse_structured(chain: &dyn Guardrail, raw: &[u8]) -> ResponsesSseRedaction {
+    redact_responses_sse_impl(chain, raw, true)
+}
+
+pub async fn moderate_responses_sse(
+    chain: &dyn Guardrail,
+    non_segment_verdict: aisix_guardrails::GuardrailVerdict,
+    held: &mut Vec<u8>,
+    counts_out: &mut RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
+) -> AnthropicModeration {
+    moderate_structured_body(
+        chain,
+        Direction::Output,
+        non_segment_verdict,
+        counts_out,
+        monitor_hits_out,
+        |guardrail| {
+            let result = redact_responses_sse_structured(guardrail, held);
+            if let Some(rewritten) = result.rewritten {
+                *held = rewritten;
+            }
+            AnthropicRequestRedaction {
+                counts: result.counts,
+                unrewritable_tool_key: result.unrewritable_tool_key,
+            }
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1326,6 +2503,7 @@ mod tests {
             vec![
                 builtin_rule("email", PiiAction::Mask).unwrap(),
                 builtin_rule("china_mobile", PiiAction::Mask).unwrap(),
+                builtin_rule("api_key", PiiAction::Mask).unwrap(),
             ],
             hook,
             262_144,
@@ -1431,6 +2609,183 @@ mod tests {
     }
 
     #[test]
+    fn structured_chat_response_flags_tool_argument_keys() {
+        let chain = both();
+        let sensitive_key = "owner-a@x.com";
+        let mut msg = ChatMessage::assistant("");
+        msg.extra.insert(
+            "tool_calls".into(),
+            json!([{
+                "id": "call_1", "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "arguments": format!(r#"{{"{sensitive_key}":"b@y.org"}}"#)
+                }
+            }]),
+        );
+        let mut resp = ChatResponse {
+            id: "r".into(),
+            model: "m".into(),
+            message: msg,
+            finish_reason: aisix_gateway::FinishReason::Stop,
+            usage: aisix_gateway::UsageStats::new(0, 0),
+        };
+
+        let redaction = redact_chat_response_structured(chain.as_ref(), &mut resp);
+        let args = resp.message.extra["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        let parsed: Value = serde_json::from_str(args).unwrap();
+        assert!(redaction.unrewritable_tool_key);
+        assert_eq!(parsed[sensitive_key], "[EMAIL_REDACTED]");
+        assert_eq!(redaction.counts.get("email"), Some(&2));
+    }
+
+    #[test]
+    fn structured_tool_identifiers_fail_closed_without_rewriting_contracts() {
+        let chain = both();
+        let secret = "sk-abcdefghijklmnopqrstuv";
+
+        let mut chat: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": secret,
+                    "type": "function",
+                    "function": {"name": secret, "arguments": "{}"}
+                }]
+            }],
+            "tools": [{
+                "type": "function",
+                "function": {"name": secret, "description": "mail a@x.com"}
+            }]
+        }))
+        .unwrap();
+        let chat_redaction = redact_chat_format_structured(chain.as_ref(), &mut chat);
+        assert!(chat_redaction.unrewritable_tool_key);
+        assert_eq!(chat.extra["tools"][0]["function"]["name"], secret);
+        assert_eq!(
+            chat.extra["tools"][0]["function"]["description"],
+            "mail [EMAIL_REDACTED]"
+        );
+        assert_eq!(
+            chat.messages[0].extra["tool_calls"][0]["function"]["name"],
+            secret
+        );
+        assert_eq!(chat.messages[0].extra["tool_calls"][0]["id"], secret);
+
+        let mut anthropic = json!({
+            "model": "claude",
+            "messages": [{"role": "assistant", "content": [{
+                "type": "tool_use", "id": secret, "name": secret, "input": {}
+            }]}],
+            "tools": [{"name": secret, "description": "mail b@y.org"}]
+        });
+        let anthropic_redaction = redact_anthropic_request(chain.as_ref(), &mut anthropic);
+        assert!(anthropic_redaction.unrewritable_tool_key);
+        assert_eq!(anthropic["tools"][0]["name"], secret);
+        assert_eq!(anthropic["messages"][0]["content"][0]["name"], secret);
+
+        let mut responses = json!({
+            "model": "m",
+            "input": [{
+                "type": "function_call", "id": secret, "call_id": secret,
+                "name": secret, "arguments": "{}"
+            }],
+            "tools": [{"type": "function", "name": secret, "description": "mail c@z.io"}]
+        });
+        let responses_redaction =
+            redact_responses_request_structured(chain.as_ref(), &mut responses);
+        assert!(responses_redaction.unrewritable_tool_key);
+        assert_eq!(responses["tools"][0]["name"], secret);
+        assert_eq!(responses["input"][0]["name"], secret);
+    }
+
+    #[test]
+    fn structured_output_tool_identifiers_fail_closed_across_wire_shapes() {
+        let chain = both();
+        let secret = "sk-abcdefghijklmnopqrstuv";
+
+        let mut message = ChatMessage::assistant("");
+        message.extra.insert(
+            "tool_calls".into(),
+            json!([{
+                "id": secret,
+                "type": "function",
+                "function": {"name": secret, "arguments": "{}"}
+            }]),
+        );
+        let mut response = ChatResponse {
+            id: "r".into(),
+            model: "m".into(),
+            message,
+            finish_reason: aisix_gateway::FinishReason::ToolCalls,
+            usage: aisix_gateway::UsageStats::default(),
+        };
+        let redaction = redact_chat_response_structured(chain.as_ref(), &mut response);
+        assert!(redaction.unrewritable_tool_key);
+        assert_eq!(
+            response.message.extra["tool_calls"][0]["function"]["name"],
+            secret
+        );
+
+        let mut chunks = vec![
+            ChatChunk {
+                id: "c".into(),
+                model: "m".into(),
+                delta: ChatDelta {
+                    tool_calls: Some(vec![json!({
+                        "index": 0,
+                        "id": "sk-abcdefghij",
+                        "function": {"name": "sk-abcdefghij", "arguments": ""}
+                    })]),
+                    ..ChatDelta::default()
+                },
+                finish_reason: None,
+                usage: None,
+            },
+            ChatChunk {
+                id: "c".into(),
+                model: "m".into(),
+                delta: ChatDelta {
+                    tool_calls: Some(vec![json!({
+                        "index": 0,
+                        "id": "klmnopqrstuv",
+                        "function": {"name": "klmnopqrstuv", "arguments": "{}"}
+                    })]),
+                    ..ChatDelta::default()
+                },
+                finish_reason: None,
+                usage: None,
+            },
+        ];
+        let redaction = redact_chat_chunks_structured(chain.as_ref(), &mut chunks);
+        assert!(redaction.unrewritable_tool_key);
+        assert_eq!(
+            chunks[0].delta.tool_calls.as_ref().unwrap()[0]["id"],
+            "sk-abcdefghij"
+        );
+
+        let anthropic = format!(
+            "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"{secret}\",\"name\":\"{secret}\",\"input\":{{}}}}}}\n\n"
+        );
+        let redaction = redact_anthropic_sse(chain.as_ref(), anthropic.as_bytes());
+        assert!(redaction.unrewritable_tool_key);
+        assert!(
+            String::from_utf8_lossy(&redaction.rewritten.unwrap_or_else(|| anthropic.into()))
+                .contains(secret)
+        );
+
+        let responses = format!(
+            "event: response.output_item.added\ndata: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"{secret}\",\"arguments\":\"{{}}\"}}}}\n\n"
+        );
+        let redaction = redact_responses_sse_structured(chain.as_ref(), responses.as_bytes());
+        assert!(redaction.unrewritable_tool_key);
+    }
+
+    #[test]
     fn anthropic_request_masks_system_text_blocks_and_tool_result() {
         let chain = both();
         let mut body = json!({
@@ -1446,7 +2801,7 @@ mod tests {
                 ]}
             ]
         });
-        let counts = redact_anthropic_request(chain.as_ref(), &mut body);
+        let redaction = redact_anthropic_request(chain.as_ref(), &mut body);
         assert_eq!(body["system"][0]["text"], "user email [EMAIL_REDACTED]");
         assert_eq!(
             body["messages"][0]["content"],
@@ -1460,7 +2815,105 @@ mod tests {
             body["messages"][1]["content"][1]["content"][0]["text"],
             "result [EMAIL_REDACTED]",
         );
-        assert_eq!(counts.get("email"), Some(&3));
+        assert_eq!(redaction.counts.get("email"), Some(&3));
+        assert!(!redaction.unrewritable_tool_key);
+    }
+
+    #[test]
+    fn anthropic_request_masks_tool_description_and_schema_values() {
+        let chain = both();
+        let mut body = json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": "clean"}],
+            "tools": [{
+                "name": "lookup",
+                "description": "contact a@x.com",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "owner": {"type": "string", "default": "b@y.org"}
+                    }
+                }
+            }]
+        });
+        let redaction = redact_anthropic_request(chain.as_ref(), &mut body);
+        assert_eq!(body["tools"][0]["description"], "contact [EMAIL_REDACTED]");
+        assert_eq!(
+            body["tools"][0]["input_schema"]["properties"]["owner"]["default"],
+            "[EMAIL_REDACTED]"
+        );
+        assert_eq!(redaction.counts.get("email"), Some(&2));
+        assert!(!redaction.unrewritable_tool_key);
+    }
+
+    #[test]
+    fn anthropic_request_flags_sensitive_tool_keys_without_renaming_them() {
+        let chain = both();
+        let sensitive_key = "owner-a@x.com";
+        let mut body = json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": "clean"}],
+            "tools": [{
+                "name": "lookup",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        (sensitive_key): {"type": "string"}
+                    }
+                }
+            }]
+        });
+
+        let redaction = redact_anthropic_request(chain.as_ref(), &mut body);
+        assert!(redaction.unrewritable_tool_key);
+        assert!(body["tools"][0]["input_schema"]["properties"]
+            .get(sensitive_key)
+            .is_some());
+        assert_eq!(redaction.counts.get("email"), Some(&1));
+    }
+
+    #[test]
+    fn anthropic_request_flags_historical_tool_input_keys_without_renaming_them() {
+        let chain = both();
+        let sensitive_key = "owner-a@x.com";
+        let mut body = json!({
+            "model": "claude",
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "lookup",
+                    "input": {(sensitive_key): "safe"}
+                }]
+            }]
+        });
+
+        let redaction = redact_anthropic_request(chain.as_ref(), &mut body);
+        assert!(redaction.unrewritable_tool_key);
+        assert!(body["messages"][0]["content"][0]["input"]
+            .get(sensitive_key)
+            .is_some());
+        assert_eq!(redaction.counts.get("email"), Some(&1));
+    }
+
+    #[test]
+    fn anthropic_inspection_projection_includes_tools_and_rejects_bad_shape() {
+        let body = json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": "clean"}],
+            "tools": [{"name": "lookup", "description": "contact a@x.com"}]
+        });
+        let chat = anthropic_request_for_inspection(&body).unwrap();
+        assert!(chat.messages.iter().any(|message| message
+            .content
+            .as_deref()
+            .is_some_and(|text| text.contains("a@x.com"))));
+        assert!(anthropic_request_for_inspection(&json!({
+            "model": "claude",
+            "messages": "not-an-array"
+        }))
+        .is_err());
     }
 
     #[test]
@@ -1473,11 +2926,31 @@ mod tests {
                  "input": {"to": "b@y.org", "count": 3}}
             ]
         });
-        let counts = redact_anthropic_response(chain.as_ref(), &mut body);
+        let redaction = redact_anthropic_response(chain.as_ref(), &mut body);
         assert_eq!(body["content"][0]["text"], "email [EMAIL_REDACTED]");
         assert_eq!(body["content"][1]["input"]["to"], "[EMAIL_REDACTED]");
         assert_eq!(body["content"][1]["input"]["count"], 3);
-        assert_eq!(counts.get("email"), Some(&2));
+        assert_eq!(redaction.counts.get("email"), Some(&2));
+        assert!(!redaction.unrewritable_tool_key);
+    }
+
+    #[test]
+    fn anthropic_response_flags_sensitive_tool_input_keys_without_renaming_them() {
+        let chain = both();
+        let sensitive_key = "owner-a@x.com";
+        let mut body = json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "lookup",
+                "input": {(sensitive_key): "safe"}
+            }]
+        });
+
+        let redaction = redact_anthropic_response(chain.as_ref(), &mut body);
+        assert!(redaction.unrewritable_tool_key);
+        assert!(body["content"][0]["input"].get(sensitive_key).is_some());
+        assert_eq!(redaction.counts.get("email"), Some(&1));
     }
 
     #[test]
@@ -1491,7 +2964,11 @@ mod tests {
                 {"role": "user", "content": [
                     {"type": "input_text", "text": "mail b@y.org"}
                 ]},
-                {"type": "function_call_output", "call_id": "c", "output": "from c@z.io"}
+                {"type": "function_call_output", "call_id": "c", "output": "from c@z.io"},
+                {"type": "custom_tool_call_output", "call_id": "d", "output": [
+                    {"type": "input_text", "text": "custom d@w.dev"}
+                ]},
+                {"type": "mcp_approval_response", "reason": "approve e@v.net"}
             ]
         });
         let counts = redact_responses_request(chain.as_ref(), &mut body);
@@ -1502,11 +2979,118 @@ mod tests {
             "mail [EMAIL_REDACTED]"
         );
         assert_eq!(body["input"][2]["output"], "from [EMAIL_REDACTED]");
-        assert_eq!(counts.get("email"), Some(&3));
+        assert_eq!(
+            body["input"][3]["output"][0]["text"],
+            "custom [EMAIL_REDACTED]"
+        );
+        assert_eq!(body["input"][4]["reason"], "approve [EMAIL_REDACTED]");
+        assert_eq!(counts.get("email"), Some(&5));
 
         let mut simple = json!({"model": "m", "input": "mail a@x.com"});
         redact_responses_request(chain.as_ref(), &mut simple);
         assert_eq!(simple["input"], "mail [EMAIL_REDACTED]");
+    }
+
+    #[test]
+    fn structured_requests_cover_tool_definition_values_and_keys() {
+        let chain = both();
+        let sensitive_key = "owner-a@x.com";
+        let tools = json!([{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "contact b@y.org",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        (sensitive_key): {"type": "string", "default": "c@z.io"}
+                    }
+                }
+            }
+        }]);
+
+        let mut chat: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "clean"}],
+            "tools": tools.clone()
+        }))
+        .unwrap();
+        let inspection = chat_request_for_inspection(&chat);
+        assert!(inspection
+            .messages
+            .last()
+            .unwrap()
+            .content_str()
+            .contains(sensitive_key));
+        let chat_redaction = redact_chat_format_structured(chain.as_ref(), &mut chat);
+        assert!(chat_redaction.unrewritable_tool_key);
+        assert_eq!(
+            chat.extra["tools"][0]["function"]["description"],
+            "contact [EMAIL_REDACTED]"
+        );
+        assert_eq!(
+            chat.extra["tools"][0]["function"]["parameters"]["properties"][sensitive_key]
+                ["default"],
+            "[EMAIL_REDACTED]"
+        );
+
+        let mut responses = json!({
+            "model": "m",
+            "input": "clean",
+            "tools": tools
+        });
+        let responses_redaction =
+            redact_responses_request_structured(chain.as_ref(), &mut responses);
+        assert!(responses_redaction.unrewritable_tool_key);
+        assert_eq!(
+            responses["tools"][0]["function"]["description"],
+            "contact [EMAIL_REDACTED]"
+        );
+        assert_eq!(
+            responses["tools"][0]["function"]["parameters"]["properties"][sensitive_key]["default"],
+            "[EMAIL_REDACTED]"
+        );
+    }
+
+    #[test]
+    fn structured_requests_flag_historical_tool_argument_keys() {
+        let chain = both();
+        let sensitive_key = "owner-a@x.com";
+        let mut chat: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "arguments": format!(r#"{{"{sensitive_key}":"safe"}}"#)
+                    }
+                }]
+            }]
+        }))
+        .unwrap();
+        let chat_redaction = redact_chat_format_structured(chain.as_ref(), &mut chat);
+        assert!(chat_redaction.unrewritable_tool_key);
+
+        let mut responses = json!({
+            "model": "m",
+            "input": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "lookup",
+                "arguments": format!(r#"{{"{sensitive_key}":"safe"}}"#)
+            }]
+        });
+        let responses_redaction =
+            redact_responses_request_structured(chain.as_ref(), &mut responses);
+        assert!(responses_redaction.unrewritable_tool_key);
+        assert!(responses["input"][0]["arguments"]
+            .as_str()
+            .unwrap()
+            .contains(sensitive_key));
     }
 
     fn content_chunk(text: &str) -> ChatChunk {
@@ -1591,12 +3175,110 @@ mod tests {
     }
 
     #[test]
+    fn structured_stream_chunks_flag_split_tool_argument_keys() {
+        let chain = both();
+        let mut chunks = vec![
+            ChatChunk {
+                id: "c".into(),
+                model: "m".into(),
+                delta: ChatDelta {
+                    tool_calls: Some(vec![json!({
+                        "index": 0, "id": "call_1", "type": "function",
+                        "function": {"name": "send", "arguments": "{\"owner-a@"}
+                    })]),
+                    ..ChatDelta::default()
+                },
+                finish_reason: None,
+                usage: None,
+            },
+            ChatChunk {
+                id: "c".into(),
+                model: "m".into(),
+                delta: ChatDelta {
+                    tool_calls: Some(vec![json!({
+                        "index": 0,
+                        "function": {"arguments": "x.com\":\"b@y.org\"}"}
+                    })]),
+                    ..ChatDelta::default()
+                },
+                finish_reason: None,
+                usage: None,
+            },
+        ];
+
+        let redaction = redact_chat_chunks_structured(chain.as_ref(), &mut chunks);
+        let args = chunks[0].delta.tool_calls.as_ref().unwrap()[0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        let parsed: Value = serde_json::from_str(args).unwrap();
+        assert!(redaction.unrewritable_tool_key);
+        assert_eq!(parsed["owner-a@x.com"], "[EMAIL_REDACTED]");
+        assert_eq!(redaction.counts.get("email"), Some(&2));
+    }
+
+    #[test]
     fn stream_chunks_untouched_when_nothing_matches() {
         let chain = both();
         let mut chunks = vec![content_chunk("hello "), content_chunk("world")];
         assert!(redact_chat_chunks(chain.as_ref(), &mut chunks).is_empty());
         assert_eq!(chunks[0].delta.content.as_deref(), Some("hello "));
         assert_eq!(chunks[1].delta.content.as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn completions_sse_masks_crlf_frames_and_preserves_separator() {
+        let chain = both();
+        let raw = concat!(
+            "event: completion\r\ndata: {\"choices\":[{\"index\":0,\"text\":\"mail a@\"}]}\r\n\r\n",
+            "event: completion\r\ndata: {\"choices\":[{\"index\":0,\"text\":\"x.com\"}]}\r\n\r\n",
+        );
+        let (out, counts) = redact_completions_sse(chain.as_ref(), raw.as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("mail [EMAIL_REDACTED]"), "out: {out}");
+        assert!(!out.contains("a@x.com"), "out: {out}");
+        assert!(out.contains("\r\n\r\n"), "CRLF separator changed: {out:?}");
+        assert_eq!(counts.get("email"), Some(&1));
+    }
+
+    #[test]
+    fn completions_sse_masks_final_unterminated_frame() {
+        let chain = both();
+        let raw = "data: {\"choices\":[{\"index\":0,\"text\":\"mail a@x.com\"}]}";
+        let (out, counts) = redact_completions_sse(chain.as_ref(), raw.as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(
+            out,
+            "data: {\"choices\":[{\"index\":0,\"text\":\"mail [EMAIL_REDACTED]\"}]}"
+        );
+        assert_eq!(counts.get("email"), Some(&1));
+    }
+
+    #[test]
+    fn completions_sse_masks_bom_cr_mixed_and_multi_data_event() {
+        let chain = both();
+        let raw = concat!(
+            "\u{feff}event: completion\r",
+            "data: {\"choices\":\r\n",
+            "data: [{\"index\":0,\"text\":\"mail a@x.com\"}]}\n\r",
+        );
+        let (events, malformed) = parse_sse_json_stream(raw.as_bytes());
+        assert!(!malformed);
+        assert_eq!(events[0]["choices"][0]["text"], "mail a@x.com");
+
+        let (out, counts) = redact_completions_sse(chain.as_ref(), raw.as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.starts_with('\u{feff}'));
+        assert!(out.contains("mail [EMAIL_REDACTED]"), "out: {out:?}");
+        assert!(!out.contains("a@x.com"), "out: {out:?}");
+        assert_eq!(out.matches("data:").count(), 1, "out: {out:?}");
+        assert_eq!(counts.get("email"), Some(&1));
+    }
+
+    #[test]
+    fn sse_parser_flags_non_json_data_instead_of_treating_it_as_empty() {
+        let (events, malformed) = parse_sse_json_stream(b"data: not-json\r\r");
+        assert!(events.is_empty());
+        assert!(malformed);
     }
 
     #[test]
@@ -1609,7 +3291,9 @@ mod tests {
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x.com ok\"}}\n\n",
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         );
-        let (out, counts) = redact_anthropic_sse(chain.as_ref(), raw.as_bytes()).unwrap();
+        let redaction = redact_anthropic_sse(chain.as_ref(), raw.as_bytes());
+        let out = redaction.rewritten.unwrap();
+        let counts = redaction.counts;
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("mail [EMAIL_REDACTED] ok"), "out: {out}");
         assert!(!out.contains("a@x.com"));
@@ -1624,6 +3308,41 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_sse_masks_crlf_and_unterminated_final_frame() {
+        let chain = both();
+        let raw = concat!(
+            "event: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"mail a@\"}}\r\n\r\n",
+            "event: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x.com\"}}",
+        );
+        let redaction = redact_anthropic_sse(chain.as_ref(), raw.as_bytes());
+        let out = redaction.rewritten.unwrap();
+        let counts = redaction.counts;
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("mail [EMAIL_REDACTED]"), "out: {out}");
+        assert!(!out.contains("a@x.com"), "out: {out}");
+        assert!(out.contains("\r\n\r\n"), "CRLF separator changed: {out:?}");
+        assert!(!out.ends_with("\r\n\r\n"), "EOF terminator was invented");
+        assert_eq!(counts.get("email"), Some(&1));
+    }
+
+    #[test]
+    fn anthropic_sse_masks_lone_cr_multi_data_event() {
+        let chain = both();
+        let raw = concat!(
+            "event: content_block_delta\r",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\r",
+            "data: \"delta\":{\"type\":\"text_delta\",\"text\":\"a@x.com\"}}\r\r",
+        );
+        let redaction = redact_anthropic_sse(chain.as_ref(), raw.as_bytes());
+        let out = redaction.rewritten.unwrap();
+        let counts = redaction.counts;
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("[EMAIL_REDACTED]"), "out: {out:?}");
+        assert!(!out.contains("a@x.com"), "out: {out:?}");
+        assert_eq!(counts.get("email"), Some(&1));
+    }
+
+    #[test]
     fn anthropic_sse_masks_tool_use_input_json_channel() {
         let chain = both();
         let raw = concat!(
@@ -1631,11 +3350,51 @@ mod tests {
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"to\\\":\\\"a@\"}}\n\n",
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"x.com\\\"}\"}}\n\n",
         );
-        let (out, counts) = redact_anthropic_sse(chain.as_ref(), raw.as_bytes()).unwrap();
+        let redaction = redact_anthropic_sse(chain.as_ref(), raw.as_bytes());
+        let out = redaction.rewritten.unwrap();
+        let counts = redaction.counts;
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("[EMAIL_REDACTED]"), "out: {out}");
         assert!(!out.contains("a@"), "no split original fragments: {out}");
         assert_eq!(counts.get("email"), Some(&1));
+    }
+
+    #[test]
+    fn anthropic_sse_walks_nonempty_tool_use_start_input() {
+        let chain = both();
+        let raw = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"send\",\"input\":{\"owner-a@x.com\":\"safe\",\"to\":\"b@y.org\"}}}\n\n",
+        );
+
+        let redaction = redact_anthropic_sse(chain.as_ref(), raw.as_bytes());
+        let out = String::from_utf8(redaction.rewritten.unwrap()).unwrap();
+        assert!(redaction.unrewritable_tool_key);
+        assert!(
+            out.contains("owner-a@x.com"),
+            "structural key changed: {out}"
+        );
+        assert!(
+            out.contains("[EMAIL_REDACTED]"),
+            "value was not masked: {out}"
+        );
+        assert!(!out.contains("b@y.org"), "raw value leaked: {out}");
+        assert_eq!(redaction.counts.get("email"), Some(&2));
+    }
+
+    #[test]
+    fn anthropic_sse_flags_sensitive_tool_input_key_split_across_frames() {
+        let chain = both();
+        let raw = concat!(
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"send\",\"input\":{}}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"owner-a@\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"x.com\\\":\\\"safe\\\"}\"}}\n\n",
+        );
+
+        let redaction = redact_anthropic_sse(chain.as_ref(), raw.as_bytes());
+        assert!(redaction.unrewritable_tool_key);
+        assert!(redaction.rewritten.is_none());
+        assert_eq!(redaction.counts.get("email"), Some(&1));
     }
 
     #[test]
@@ -1665,6 +3424,22 @@ mod tests {
     }
 
     #[test]
+    fn responses_sse_masks_bom_and_lone_cr_event() {
+        let chain = both();
+        let raw = concat!(
+            "\u{feff}event: response.output_text.delta\r",
+            "data: {\"type\":\"response.output_text.delta\",\r",
+            "data: \"item_id\":\"m\",\"delta\":\"a@x.com\"}\r\r",
+        );
+        let (out, counts) = redact_responses_sse(chain.as_ref(), raw.as_bytes()).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.starts_with('\u{feff}'));
+        assert!(out.contains("[EMAIL_REDACTED]"), "out: {out:?}");
+        assert!(!out.contains("a@x.com"), "out: {out:?}");
+        assert_eq!(counts.get("email"), Some(&1));
+    }
+
+    #[test]
     fn responses_sse_masks_function_call_args_channel() {
         let chain = both();
         let raw = concat!(
@@ -1677,6 +3452,35 @@ mod tests {
         assert!(!out.contains("a@"), "original fragments gone: {out}");
         assert!(out.contains("[EMAIL_REDACTED]"), "out: {out}");
         assert_eq!(counts.get("email"), Some(&1));
+    }
+
+    #[test]
+    fn structured_responses_outputs_flag_function_argument_keys() {
+        let chain = both();
+        let sensitive_key = "owner-a@x.com";
+        let mut response = json!({
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "lookup",
+                "arguments": format!(r#"{{"{sensitive_key}":"safe"}}"#)
+            }]
+        });
+        let response_redaction =
+            redact_responses_response_structured(chain.as_ref(), &mut response);
+        assert!(response_redaction.unrewritable_tool_key);
+
+        let raw = concat!(
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\\\"owner-a@\"}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"x.com\\\":\\\"safe\\\"}\"}\n\n",
+        );
+        let stream_redaction = redact_responses_sse_structured(chain.as_ref(), raw.as_bytes());
+        assert!(stream_redaction.unrewritable_tool_key);
+        assert!(String::from_utf8(stream_redaction.rewritten.unwrap())
+            .unwrap()
+            .contains(sensitive_key));
     }
 
     #[test]
@@ -1715,7 +3519,9 @@ mod tests {
     fn anthropic_sse_returns_none_when_clean() {
         let chain = both();
         let raw = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n";
-        assert!(redact_anthropic_sse(chain.as_ref(), raw.as_bytes()).is_none());
+        let redaction = redact_anthropic_sse(chain.as_ref(), raw.as_bytes());
+        assert!(redaction.rewritten.is_none());
+        assert!(!redaction.unrewritable_tool_key);
     }
 
     #[test]
@@ -1890,7 +3696,8 @@ mod tests {
             &mut Vec::new(),
             |g| redact_chat_format(g, &mut req),
         )
-        .await;
+        .await
+        .verdict;
         assert_eq!(verdict, GuardrailVerdict::Allow);
         assert_eq!(
             req.messages[0].content.as_deref(),
@@ -1917,6 +3724,304 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn segment_mask_of_anthropic_historical_tool_input_key_fails_closed() {
+        let chain = seg_chain(StubSegments::masker());
+        let mut body = json!({
+            "model": "claude",
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "lookup",
+                    "input": {"sensitive-key": "safe"}
+                }]
+            }]
+        });
+        let mut counts = RedactionCounts::new();
+        let verdict = moderate_anthropic_request(
+            &chain,
+            GuardrailVerdict::Allow,
+            &mut body,
+            &mut counts,
+            &mut Vec::new(),
+        )
+        .await;
+
+        assert!(verdict.verdict.is_block());
+        assert!(!verdict.capture_safe);
+        assert!(body["messages"][0]["content"][0]["input"]
+            .get("sensitive-key")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn segment_mask_of_anthropic_response_tool_key_fails_closed() {
+        let chain = seg_chain(StubSegments::masker());
+        let mut body = json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "lookup",
+                "input": {"sensitive-key": "safe"}
+            }]
+        });
+        let mut counts = RedactionCounts::new();
+        let moderation = moderate_anthropic_response(
+            &chain,
+            GuardrailVerdict::Allow,
+            &mut body,
+            &mut counts,
+            &mut Vec::new(),
+        )
+        .await;
+
+        assert!(moderation.verdict.is_block());
+        assert!(!moderation.capture_safe);
+        assert!(body["content"][0]["input"].get("sensitive-key").is_some());
+    }
+
+    #[tokio::test]
+    async fn segment_masks_of_structured_chat_tool_keys_fail_closed() {
+        let mut msg = ChatMessage::assistant("");
+        msg.extra.insert(
+            "tool_calls".into(),
+            json!([{
+                "id": "call_1", "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "arguments": "{\"sensitive-key\":\"safe\"}"
+                }
+            }]),
+        );
+        let mut resp = ChatResponse {
+            id: "r".into(),
+            model: "m".into(),
+            message: msg,
+            finish_reason: aisix_gateway::FinishReason::Stop,
+            usage: aisix_gateway::UsageStats::new(0, 0),
+        };
+        let mut counts = RedactionCounts::new();
+        let moderation = moderate_chat_response_structured(
+            &seg_chain(StubSegments::masker()),
+            GuardrailVerdict::Allow,
+            &mut resp,
+            &mut counts,
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(moderation.verdict.is_block());
+        assert!(!moderation.capture_safe);
+
+        let mut chunks = vec![ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                tool_calls: Some(vec![json!({
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "arguments": "{\"sensitive-key\":\"safe\"}"
+                    }
+                })]),
+                ..ChatDelta::default()
+            },
+            finish_reason: None,
+            usage: None,
+        }];
+        let moderation = moderate_chat_chunks_structured(
+            &seg_chain(StubSegments::masker()),
+            GuardrailVerdict::Allow,
+            &mut chunks,
+            &mut counts,
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(moderation.verdict.is_block());
+        assert!(!moderation.capture_safe);
+    }
+
+    #[tokio::test]
+    async fn segment_masks_of_responses_tool_keys_fail_closed() {
+        let mut request = json!({
+            "model": "m",
+            "input": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "lookup",
+                "arguments": "{\"sensitive-key\":\"safe\"}"
+            }]
+        });
+        let mut counts = RedactionCounts::new();
+        let moderation = moderate_responses_request_structured(
+            &seg_chain(StubSegments::masker()),
+            GuardrailVerdict::Allow,
+            &mut request,
+            &mut counts,
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(moderation.verdict.is_block());
+        assert!(!moderation.capture_safe);
+
+        let mut response = json!({
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "lookup",
+                "arguments": "{\"sensitive-key\":\"safe\"}"
+            }]
+        });
+        let moderation = moderate_responses_response_structured(
+            &seg_chain(StubSegments::masker()),
+            GuardrailVerdict::Allow,
+            &mut response,
+            &mut counts,
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(moderation.verdict.is_block());
+        assert!(!moderation.capture_safe);
+
+        let mut stream = b"event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\\\"sensitive-key\\\":\\\"safe\\\"}\"}\n\n".to_vec();
+        let moderation = moderate_responses_sse(
+            &seg_chain(StubSegments::masker()),
+            GuardrailVerdict::Allow,
+            &mut stream,
+            &mut counts,
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(moderation.verdict.is_block());
+        assert!(!moderation.capture_safe);
+    }
+
+    #[tokio::test]
+    async fn segment_masks_of_tool_identifiers_fail_closed_without_rewriting_them() {
+        let chain = seg_chain(StubSegments::masker());
+
+        let mut chat: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "clean"}],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "lookup", "description": "clean"}
+            }]
+        }))
+        .unwrap();
+        let moderation = moderate_chat_format_structured(
+            &chain,
+            GuardrailVerdict::Allow,
+            &mut chat,
+            &mut RedactionCounts::new(),
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(moderation.verdict.is_block());
+        assert!(!moderation.capture_safe);
+        assert_eq!(chat.extra["tools"][0]["function"]["name"], "lookup");
+
+        let mut anthropic = json!({
+            "model": "claude",
+            "messages": [{"role": "assistant", "content": [{
+                "type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}
+            }]}]
+        });
+        let moderation = moderate_anthropic_request(
+            &chain,
+            GuardrailVerdict::Allow,
+            &mut anthropic,
+            &mut RedactionCounts::new(),
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(moderation.verdict.is_block());
+        assert_eq!(anthropic["messages"][0]["content"][0]["name"], "lookup");
+
+        let mut responses = json!({
+            "model": "m",
+            "input": [{
+                "type": "function_call", "call_id": "call_1",
+                "name": "lookup", "arguments": "{}"
+            }]
+        });
+        let moderation = moderate_responses_request_structured(
+            &chain,
+            GuardrailVerdict::Allow,
+            &mut responses,
+            &mut RedactionCounts::new(),
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(moderation.verdict.is_block());
+        assert_eq!(responses["input"][0]["name"], "lookup");
+    }
+
+    #[tokio::test]
+    async fn prior_and_remote_blocks_mark_structured_capture_unsafe() {
+        let panic_chain = seg_chain(StubSegments {
+            verdict: GuardrailVerdict::Allow,
+            mask: false,
+            panic_if_called: true,
+        });
+        let mut body = json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": "raw a@x.com"}]
+        });
+        let moderation = moderate_anthropic_request(
+            &panic_chain,
+            GuardrailVerdict::block("already blocked"),
+            &mut body,
+            &mut RedactionCounts::new(),
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(moderation.verdict.is_block());
+        assert!(!moderation.capture_safe);
+        assert_eq!(body["messages"][0]["content"], "raw a@x.com");
+
+        let remote_block_chain = seg_chain(StubSegments {
+            verdict: GuardrailVerdict::block("remote blocked"),
+            mask: true,
+            panic_if_called: false,
+        });
+        let moderation = moderate_anthropic_request(
+            &remote_block_chain,
+            GuardrailVerdict::Allow,
+            &mut body,
+            &mut RedactionCounts::new(),
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(moderation.verdict.is_block());
+        assert!(!moderation.capture_safe);
+        assert_eq!(body["messages"][0]["content"], "raw a@x.com");
+    }
+
+    #[tokio::test]
+    async fn local_prior_block_is_capture_safe_after_synchronous_rewrite() {
+        let chain = both();
+        let mut body = json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": "raw a@x.com"}]
+        });
+        let moderation = moderate_anthropic_request(
+            chain.as_ref(),
+            GuardrailVerdict::block("local keyword blocked"),
+            &mut body,
+            &mut RedactionCounts::new(),
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(moderation.verdict.is_block());
+        assert!(moderation.capture_safe);
+
+        let redaction = redact_anthropic_request(chain.as_ref(), &mut body);
+        assert!(!redaction.unrewritable_tool_key);
+        assert_eq!(body["messages"][0]["content"], "raw [EMAIL_REDACTED]");
+    }
+
     /// A Block from the segment pass leaves the body untouched (no mask
     /// write-back on a dead request) and propagates the verdict.
     #[tokio::test]
@@ -1941,9 +4046,136 @@ mod tests {
             |g| redact_chat_format(g, &mut req),
         )
         .await;
-        assert!(verdict.is_block());
+        assert!(verdict.verdict.is_block());
+        assert!(!verdict.capture_safe);
         assert_eq!(req.messages[0].content.as_deref(), Some("original"));
         assert!(counts.is_empty(), "no counts on a blocked request");
+    }
+
+    #[tokio::test]
+    async fn segment_bypass_releases_body_but_marks_capture_unsafe() {
+        let bypass = GuardrailVerdict::Bypass {
+            reason: "remote segment service unavailable".to_string(),
+        };
+        let chain = seg_chain(StubSegments {
+            verdict: bypass.clone(),
+            mask: false,
+            panic_if_called: false,
+        });
+        let mut response = ChatResponse {
+            id: "r".into(),
+            model: "m".into(),
+            message: ChatMessage::assistant("raw output"),
+            finish_reason: aisix_gateway::FinishReason::Stop,
+            usage: aisix_gateway::UsageStats::new(0, 0),
+        };
+        let moderation = moderate_chat_response_structured(
+            &chain,
+            GuardrailVerdict::Allow,
+            &mut response,
+            &mut RedactionCounts::new(),
+            &mut Vec::new(),
+        )
+        .await;
+
+        assert_eq!(moderation.verdict, bypass);
+        assert!(!moderation.capture_safe);
+        assert_eq!(response.message.content.as_deref(), Some("raw output"));
+
+        let mut responses_body = json!({
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "raw output"}]}]
+        });
+        let moderation = moderate_responses_response_structured(
+            &chain,
+            GuardrailVerdict::Allow,
+            &mut responses_body,
+            &mut RedactionCounts::new(),
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(moderation.verdict.is_bypass());
+        assert!(!moderation.capture_safe);
+        assert_eq!(
+            responses_body["output"][0]["content"][0]["text"],
+            "raw output"
+        );
+
+        let mut local_only_response = ChatResponse {
+            id: "r".into(),
+            model: "m".into(),
+            message: ChatMessage::assistant("raw output"),
+            finish_reason: aisix_gateway::FinishReason::Stop,
+            usage: aisix_gateway::UsageStats::new(0, 0),
+        };
+        let moderation = moderate_chat_response_structured(
+            both().as_ref(),
+            GuardrailVerdict::Bypass {
+                reason: "non-segment service unavailable".to_string(),
+            },
+            &mut local_only_response,
+            &mut RedactionCounts::new(),
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(moderation.verdict.is_bypass());
+        assert!(!moderation.capture_safe);
+    }
+
+    #[tokio::test]
+    async fn moderate_body_blocks_when_collect_and_apply_walks_drift() {
+        let chain = seg_chain(StubSegments::masker());
+        let walk_number = std::cell::Cell::new(0usize);
+        let mut counts = RedactionCounts::new();
+        let moderation = moderate_body(
+            &chain,
+            Direction::Input,
+            GuardrailVerdict::Allow,
+            &mut counts,
+            &mut Vec::new(),
+            |guardrail| {
+                let current = walk_number.get();
+                walk_number.set(current + 1);
+                let offered = if current == 0 { "original" } else { "drifted" };
+                let _ = guardrail.redact_input_text(offered);
+                RedactionCounts::new()
+            },
+        )
+        .await;
+
+        assert!(moderation.verdict.is_block());
+        assert!(!moderation.capture_safe);
+        assert!(counts.is_empty());
+        assert_eq!(walk_number.get(), 2, "drift blocks before mutation");
+    }
+
+    #[tokio::test]
+    async fn structured_moderation_blocks_when_collect_and_apply_walks_drift() {
+        let chain = seg_chain(StubSegments::masker());
+        let walk_number = std::cell::Cell::new(0usize);
+        let mut counts = RedactionCounts::new();
+        let moderation = moderate_structured_body(
+            &chain,
+            Direction::Input,
+            GuardrailVerdict::Allow,
+            &mut counts,
+            &mut Vec::new(),
+            |guardrail| {
+                let current = walk_number.get();
+                walk_number.set(current + 1);
+                let offered = if current == 0 { "original" } else { "drifted" };
+                let _ = guardrail.redact_input_text(offered);
+                AnthropicRequestRedaction {
+                    counts: RedactionCounts::new(),
+                    unrewritable_tool_key: false,
+                }
+            },
+        )
+        .await;
+
+        assert!(moderation.verdict.is_block());
+        assert!(!moderation.capture_safe);
+        assert!(counts.is_empty());
+        assert_eq!(walk_number.get(), 2, "drift blocks before mutation");
     }
 
     /// An already-blocked prior verdict skips the remote call entirely
@@ -1971,7 +4203,11 @@ mod tests {
             |g| redact_chat_format(g, &mut req),
         )
         .await;
-        assert!(verdict.is_block(), "prior Block passes through");
+        assert!(verdict.verdict.is_block(), "prior Block passes through");
+        assert!(
+            !verdict.capture_safe,
+            "skipping an attached remote segment pass makes capture unsafe"
+        );
 
         // A sync-only (non-segment) chain never enters the pass.
         let sync_only = both();
@@ -1984,7 +4220,7 @@ mod tests {
             |_| panic!("walk must not run when no segment member exists"),
         )
         .await;
-        assert_eq!(verdict, GuardrailVerdict::Allow);
+        assert_eq!(verdict.verdict, GuardrailVerdict::Allow);
     }
 
     /// The round trip through the Anthropic SSE walker: the masked
@@ -2003,22 +4239,15 @@ mod tests {
         .as_bytes()
         .to_vec();
         let mut counts = RedactionCounts::new();
-        let verdict = moderate_body(
+        let moderation = moderate_anthropic_sse(
             &chain,
-            Direction::Output,
             GuardrailVerdict::Allow,
+            &mut held,
             &mut counts,
             &mut Vec::new(),
-            |g| match redact_anthropic_sse(g, &held) {
-                Some((rewritten, c)) => {
-                    held = rewritten;
-                    c
-                }
-                None => RedactionCounts::new(),
-            },
         )
         .await;
-        assert_eq!(verdict, GuardrailVerdict::Allow);
+        assert_eq!(moderation.verdict, GuardrailVerdict::Allow);
         let out = String::from_utf8(held.clone()).unwrap();
         assert!(
             out.contains("<M0:HELLO WORLD>"),
@@ -2027,6 +4256,53 @@ mod tests {
         assert_eq!(counts.get("EMAIL"), Some(&1));
         // The capture-rebuild helper reads the masked channel back.
         assert_eq!(anthropic_sse_text(&held), "<M0:HELLO WORLD>");
+    }
+
+    #[tokio::test]
+    async fn segment_mask_of_anthropic_sse_tool_key_fails_closed() {
+        let chain = seg_chain(StubSegments::masker());
+        let mut held = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"sensitive-\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"key\\\":\\\"safe\\\"}\"}}\n\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let mut counts = RedactionCounts::new();
+        let moderation = moderate_anthropic_sse(
+            &chain,
+            GuardrailVerdict::Allow,
+            &mut held,
+            &mut counts,
+            &mut Vec::new(),
+        )
+        .await;
+
+        assert!(moderation.verdict.is_block());
+        assert!(!moderation.capture_safe);
+    }
+
+    #[tokio::test]
+    async fn segment_mask_of_anthropic_sse_start_input_key_fails_closed() {
+        let chain = seg_chain(StubSegments::masker());
+        let mut held = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"send\",\"input\":{\"sensitive-key\":\"safe\"}}}\n\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let moderation = moderate_anthropic_sse(
+            &chain,
+            GuardrailVerdict::Allow,
+            &mut held,
+            &mut RedactionCounts::new(),
+            &mut Vec::new(),
+        )
+        .await;
+
+        assert!(moderation.verdict.is_block());
+        assert!(!moderation.capture_safe);
     }
 
     /// `responses_sse_text` assembles `output_text` deltas per channel —

@@ -181,7 +181,7 @@ mod tests {
         use aisix_core::snapshot::SnapshotHandle;
         let cfg = aisix_core::ProxyConfig {
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: 0,
+            request_body_limit_bytes: Some(0),
             tls: None,
             real_ip: Default::default(),
             request_id: Default::default(),

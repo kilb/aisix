@@ -100,7 +100,7 @@ pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
         "rate_limit_policy" => rate_limit_policy_root_schema(),
         "mcp_server" => mcp_server_root_schema(),
         "mcp_policy" => mcp_policy_root_schema(),
-        "a2a_agent" => a2a_agent_root_schema(),
+        "a2a_agent" => a2a_agent_root_schema(strict),
         "oidc_provider" => oidc_provider_root_schema(),
         "claim_mapping" => claim_mapping_root_schema(),
         "passthrough_route" => passthrough_route_root_schema(),
@@ -303,7 +303,8 @@ pub fn validate_mcp_server(value: &Value) -> Result<(), SchemaError> {
 }
 
 pub fn validate_a2a_agent(value: &Value) -> Result<(), SchemaError> {
-    validate(&SCHEMAS.a2a_agent, value)
+    validate(&SCHEMAS.a2a_agent, value)?;
+    validate_a2a_agent_url(value)
 }
 
 pub fn validate_mcp_policy(value: &Value) -> Result<(), SchemaError> {
@@ -366,6 +367,133 @@ pub fn validate_mcp_server_lenient(value: &Value) -> Result<(), SchemaError> {
 
 pub fn validate_a2a_agent_lenient(value: &Value) -> Result<(), SchemaError> {
     validate(&LENIENT_SCHEMAS.a2a_agent, value)
+}
+
+/// Validate the URL policy for newly written A2A agents. The etcd loader calls
+/// this only to report a legacy row as partially compatible; it deliberately
+/// does not reject that already-stored row during a rolling upgrade.
+pub fn validate_a2a_agent_url(value: &Value) -> Result<(), SchemaError> {
+    let Some(raw) = value.get("url").and_then(Value::as_str) else {
+        // Required/type errors are reported by the JSON Schema validator.
+        return Ok(());
+    };
+    let parsed = url::Url::parse(raw).map_err(|_| SchemaError {
+        path: "/url".to_string(),
+        message: "must be an absolute HTTP or HTTPS URL".to_string(),
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(SchemaError {
+            path: "/url".to_string(),
+            message: "must be an absolute HTTP or HTTPS URL".to_string(),
+        });
+    }
+    let has_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
+    let has_credential_query = parsed
+        .query_pairs()
+        .any(|(key, _)| credential_query_key(&key));
+    // The published JSON Schema cannot safely normalize every possible
+    // percent-encoded spelling before applying its key denylist. Keep strict
+    // writes deterministic across validators by rejecting percent escapes in
+    // query parameter names (escaped values remain valid).
+    let has_encoded_query_key = parsed.query().is_some_and(|query| {
+        query.split('&').any(|pair| {
+            let key = pair.split_once('=').map_or(pair, |(key, _)| key);
+            key.as_bytes().windows(3).any(|window| {
+                window[0] == b'%' && window[1].is_ascii_hexdigit() && window[2].is_ascii_hexdigit()
+            })
+        })
+    });
+    if has_userinfo || has_credential_query || has_encoded_query_key {
+        return Err(SchemaError {
+            path: "/url".to_string(),
+            message: "must not embed credentials in user info or query parameters".to_string(),
+        });
+    }
+    Ok(())
+}
+
+const A2A_CREDENTIAL_COMPACT_KEYS: &[&str] = &[
+    "key",
+    "sig",
+    "jwt",
+    "auth",
+    "authorization",
+    "apikey",
+    "accesskey",
+    "accesstoken",
+    "authtoken",
+    "refreshtoken",
+    "idtoken",
+    "clientsecret",
+    "secretkey",
+    "privatekey",
+    "sessionkey",
+    "sessiontoken",
+    "subscriptionkey",
+    "xamzcredential",
+    "xamzsignature",
+    "xamzsecuritytoken",
+];
+
+const A2A_CREDENTIAL_COMPONENTS: &[&str] = &[
+    "key",
+    "secret",
+    "password",
+    "passwd",
+    "token",
+    "signature",
+    "credential",
+    "credentials",
+    "authorization",
+    "apikey",
+];
+
+fn credential_query_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    let compact: String = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect();
+    if A2A_CREDENTIAL_COMPACT_KEYS.contains(&compact.as_str()) {
+        return true;
+    }
+    key.split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|component| A2A_CREDENTIAL_COMPONENTS.contains(&component))
+}
+
+fn ascii_case_insensitive_pattern(value: &str, allow_separators: bool) -> String {
+    let mut pattern = String::new();
+    for (index, byte) in value.bytes().enumerate() {
+        if allow_separators && index > 0 {
+            pattern.push_str(r"[^A-Za-z0-9=&#]*");
+        }
+        if byte.is_ascii_alphabetic() {
+            pattern.push('[');
+            pattern.push(byte.to_ascii_uppercase() as char);
+            pattern.push(byte.to_ascii_lowercase() as char);
+            pattern.push(']');
+        } else {
+            pattern.push(byte as char);
+        }
+    }
+    pattern
+}
+
+fn a2a_credential_query_pattern() -> String {
+    let compact = A2A_CREDENTIAL_COMPACT_KEYS
+        .iter()
+        .map(|key| ascii_case_insensitive_pattern(key, true))
+        .collect::<Vec<_>>()
+        .join("|");
+    let components = A2A_CREDENTIAL_COMPONENTS
+        .iter()
+        .map(|key| ascii_case_insensitive_pattern(key, false))
+        .collect::<Vec<_>>()
+        .join("|");
+    let separator = r"[^A-Za-z0-9=&#]";
+    format!(
+        r"^[^?#]*\?(?:[^#&]*&)*(?:(?:{compact})|(?:(?:{components})(?:{separator}[^=&#]*)?|[^=&#]*{separator}(?:{components})(?:{separator}[^=&#]*)?)|[^=&#]*%[0-9A-Fa-f]{{2}}[^=&#]*)(?:=|&|#|$)"
+    )
 }
 
 pub fn validate_mcp_policy_lenient(value: &Value) -> Result<(), SchemaError> {
@@ -597,8 +725,39 @@ pub fn mcp_server_root_schema() -> Value {
 /// [`A2aAgent`](crate::models::A2aAgent) struct. The label is accepted under
 /// both its canonical name `name` and its former name `display_name` (see
 /// [`accept_renamed_field`]).
-pub fn a2a_agent_root_schema() -> Value {
+pub fn a2a_agent_root_schema(strict: bool) -> Value {
     let mut schema = struct_root_schema::<crate::models::A2aAgent>(true);
+    let url_schema = schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .and_then(|properties| properties.get_mut("url"))
+        .and_then(Value::as_object_mut)
+        .expect("A2aAgent schema defines url");
+    if strict {
+        // `format: uri` also admits non-HTTP schemes and URLs containing user
+        // information. Keep the write policy visible in the published schema
+        // so a schema-validating control plane cannot persist plaintext
+        // credential query keys. Generate the deny pattern from the same key
+        // policy as strict runtime validation so the two write boundaries do
+        // not drift.
+        url_schema.insert(
+            "pattern".to_string(),
+            Value::String(r"^[Hh][Tt][Tt][Pp][Ss]?://[^/?#@]+(?:[/?#]|$)".to_string()),
+        );
+        url_schema.insert(
+            "not".to_string(),
+            serde_json::json!({
+                "pattern": a2a_credential_query_pattern()
+            }),
+        );
+    } else {
+        // URL policy was added after A2A rows had shipped. Existing documents
+        // must remain loadable; the loader reports `legacy:url_policy` and all
+        // runtime/error logging sanitises the URL. The published/write schema
+        // retains the URI format, HTTP(S)/userinfo pattern, and the custom
+        // credential-query check.
+        url_schema.remove("format");
+    }
     schema
         .as_object_mut()
         .expect("a2a agent root schema is a JSON object")
@@ -3343,6 +3502,94 @@ mod tests {
         validate_a2a_agent(&json!({"name": "invoice", "url": "https://x/a2a"})).unwrap();
         validate_a2a_agent(&json!({"display_name": "invoice", "url": "https://x/a2a"})).unwrap();
         assert!(validate_a2a_agent(&json!({"url": "https://x/a2a"})).is_err());
+    }
+
+    #[test]
+    fn a2a_agent_published_schema_rejects_non_http_and_userinfo_urls() {
+        for bad in [
+            "ftp://agents.example.com/a2a",
+            "https://user:password@agents.example.com/a2a",
+        ] {
+            validate(&SCHEMAS.a2a_agent, &json!({"name": "invoice", "url": bad}))
+                .expect_err(&format!("published schema must reject {bad:?}"));
+        }
+
+        let url_schema = a2a_agent_root_schema(true)
+            .pointer("/properties/url")
+            .cloned()
+            .expect("A2A URL schema");
+        assert_eq!(url_schema["format"], "uri");
+        assert_eq!(
+            url_schema["pattern"],
+            r"^[Hh][Tt][Tt][Pp][Ss]?://[^/?#@]+(?:[/?#]|$)"
+        );
+        assert!(url_schema.get("not").is_some());
+        for bad in [
+            "https://agents.example.com/a2a?access_token=secret",
+            "https://agents.example.com/a2a?accessToken=secret",
+            "https://agents.example.com/a2a?authToken=secret",
+            "https://agents.example.com/a2a?token=secret",
+            "https://agents.example.com/a2a?secret=secret",
+            "https://agents.example.com/a2a?password=secret",
+            "https://agents.example.com/a2a?access%5Ftoken=secret",
+            "https://agents.example.com/a2a?tenant%2Dsecret=secret",
+            "https://agents.example.com/a2a?tok%65n=secret",
+            "https://agents.example.com/a2a?tenant%5Fid=one",
+            "https://agents.example.com/a2a?API_KEY=secret",
+            "https://agents.example.com/a2a?tenant-secret=secret",
+            "https://agents.example.com/a2a?foo-secret-bar=secret",
+            "https://agents.example.com/a2a?foo.token.bar=secret",
+            "https://agents.example.com/a2a?a.p.i.k.e.y=secret",
+            "https://agents.example.com/a2a?X-Amz-Signature=secret",
+        ] {
+            validate(&SCHEMAS.a2a_agent, &json!({"name": "invoice", "url": bad}))
+                .expect_err(&format!("published schema must reject {bad:?}"));
+        }
+        validate(
+            &SCHEMAS.a2a_agent,
+            &json!({"name": "invoice", "url": "HTTPS://agents.example.com/a2a"}),
+        )
+        .expect("URI schemes are case-insensitive");
+        validate(
+            &SCHEMAS.a2a_agent,
+            &json!({"name": "invoice", "url": "https://agents.example.com/a2a?redirect=https%3A%2F%2Fsafe.example"}),
+        )
+        .expect("percent escapes in query values remain valid");
+        validate(
+            &SCHEMAS.a2a_agent,
+            &json!({"name": "invoice", "url": "https://agents.example.com/a2a?foo-secretish-bar=one&tenant.profile=two"}),
+        )
+        .expect("non-credential components remain valid");
+
+        let legacy_url_schema = a2a_agent_root_schema(false)
+            .pointer("/properties/url")
+            .cloned()
+            .expect("legacy A2A URL schema");
+        assert!(legacy_url_schema.get("format").is_none());
+        assert!(legacy_url_schema.get("pattern").is_none());
+        assert!(legacy_url_schema.get("not").is_none());
+    }
+
+    #[test]
+    fn a2a_agent_published_schema_matches_runtime_query_policy() {
+        for url in [
+            "https://agents.example.com/a2a?foo-secret-bar=x",
+            "https://agents.example.com/a2a?foo.token.bar=x",
+            "https://agents.example.com/a2a?a.p.i.k.e.y=x",
+            "https://agents.example.com/a2a?tenant=one&authToken=x",
+            "https://agents.example.com/a2a?tenant.profile=one",
+            "https://agents.example.com/a2a?foo-secretish-bar=one",
+            "https://agents.example.com/a2a#?token=x",
+            "https://agents.example.com/a2a?redirect=https%3A%2F%2Fsafe.example",
+        ] {
+            let document = json!({"name": "invoice", "url": url});
+            let schema_accepts = validate(&SCHEMAS.a2a_agent, &document).is_ok();
+            let runtime_accepts = validate_a2a_agent_url(&document).is_ok();
+            assert_eq!(
+                schema_accepts, runtime_accepts,
+                "published schema and runtime URL policy disagree for {url:?}"
+            );
+        }
     }
 
     #[test]

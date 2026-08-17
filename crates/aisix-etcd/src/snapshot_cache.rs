@@ -57,6 +57,8 @@ struct Inner {
     /// race with itself. Reads are unguarded — they go through OS
     /// caches and the rename is atomic.
     write_lock: Mutex<()>,
+    #[cfg(test)]
+    write_count: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +113,8 @@ impl SnapshotCache {
             inner: Arc::new(Inner {
                 path: Some(path.into()),
                 write_lock: Mutex::new(()),
+                #[cfg(test)]
+                write_count: std::sync::atomic::AtomicUsize::new(0),
             }),
         }
     }
@@ -123,8 +127,14 @@ impl SnapshotCache {
             inner: Arc::new(Inner {
                 path: None,
                 write_lock: Mutex::new(()),
+                #[cfg(test)]
+                write_count: std::sync::atomic::AtomicUsize::new(0),
             }),
         }
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.inner.path.is_some()
     }
 
     /// Read the cached snapshot, or `None` if no usable file exists.
@@ -232,9 +242,20 @@ impl SnapshotCache {
             }
         };
         let _guard = self.inner.write_lock.lock().await;
+        #[cfg(test)]
+        self.inner
+            .write_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Err(e) = atomic_write(&path, &bytes).await {
             tracing::warn!(error = %e, path = %path.display(), "snapshot cache write failed");
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_count(&self) -> usize {
+        self.inner
+            .write_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

@@ -638,6 +638,12 @@ impl BridgeError {
 /// (the Hub holds `Arc<dyn Bridge>` values).
 pub type ChatChunkStream = BoxStream<'static, Result<ChatChunk, BridgeError>>;
 
+/// A live legacy-completions byte stream. Unlike [`ChatChunkStream`], this
+/// preserves the provider's OpenAI-compatible SSE frames verbatim: the proxy
+/// needs the original frames for `/v1/completions` passthrough and output
+/// guardrail hold-back.
+pub type CompletionByteStream = BoxStream<'static, Result<bytes::Bytes, BridgeError>>;
+
 /// The provider-agnostic chat operation. Implementors live in the
 /// individual `aisix-provider-*` crates.
 #[async_trait]
@@ -689,6 +695,19 @@ pub trait Bridge: Send + Sync + 'static {
     ) -> Result<serde_json::Value, BridgeError> {
         Err(BridgeError::Config(
             "this provider does not support text completions".into(),
+        ))
+    }
+
+    /// Streaming legacy text completions passthrough (`/v1/completions` with
+    /// `stream: true`). Providers that expose only the non-streaming endpoint
+    /// keep the default 501-mapped response.
+    async fn complete_stream(
+        &self,
+        _body: &serde_json::Value,
+        _ctx: &BridgeContext,
+    ) -> Result<CompletionByteStream, BridgeError> {
+        Err(BridgeError::Config(
+            "this provider does not support streaming text completions".into(),
         ))
     }
 

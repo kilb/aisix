@@ -59,10 +59,11 @@ export interface AppOverrides {
    * `proxy.request_body_limit_bytes`. A dedicated override (like
    * `realIp`) because `extra` replaces whole top-level blocks and the
    * proxy block carries the harness-picked listener addr. `0` disables
-   * the cap — the shipped default; the harness pins 10 MiB unless a
-   * test overrides it so the existing 413 suite keeps its subject.
+   * the cap explicitly; `null` omits the field and selects endpoint-aware
+   * defaults. The harness pins 10 MiB unless a test overrides it so the
+   * existing 413 suite keeps its subject.
    */
-  requestBodyLimitBytes?: number;
+  requestBodyLimitBytes?: number | null;
   /**
    * Extra environment variables for the spawned binary, applied AFTER the
    * `AISIX_*` strip. Use for non-config secrets the DP reads from its own
@@ -276,7 +277,12 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
         }),
     proxy: {
       addr: `127.0.0.1:${proxyPort}`,
-      request_body_limit_bytes: overrides.requestBodyLimitBytes ?? 10485760,
+      ...(overrides.requestBodyLimitBytes === null
+        ? {}
+        : {
+            request_body_limit_bytes:
+              overrides.requestBodyLimitBytes ?? 10485760,
+          }),
       ...(overrides.realIp ? { real_ip: overrides.realIp } : {}),
       ...(overrides.requestId ? { request_id: overrides.requestId } : {}),
       ...((overrides.threadPerCore ?? suiteThreadPerCore) !== undefined

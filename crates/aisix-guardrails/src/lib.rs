@@ -404,9 +404,9 @@ impl Redaction {
 ///
 /// `masked`, when present, is positionally aligned with the input
 /// `texts` slice: `masked[i]` replaces `texts[i]`. Implementations MUST
-/// uphold that alignment or return `masked: None` (the caller then keeps
-/// the originals — the LiteLLM `_merge_masked_texts` defensive fallback:
-/// never misapply masked content to the wrong slot).
+/// uphold that alignment. The chain fails closed if an implementation
+/// violates it, because retaining originals after a successful anonymization
+/// decision would release content the guardrail said required masking.
 ///
 /// `counts` mirrors [`Redaction::counts`]: entity NAMES only (e.g. a
 /// Bedrock PII entity type like `EMAIL`), never matched values, so it is

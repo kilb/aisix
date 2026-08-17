@@ -23,6 +23,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use aisix_core::RateLimit;
 
@@ -100,10 +101,23 @@ impl Limiter {
     ) -> Result<Reservation, RateLimitError> {
         let member = self.next_member();
         self.store.acquire(key, limits, &member).await?;
+        let renewal = limits.concurrency.and_then(|_| {
+            self.store
+                .concurrency_lease_renewal_interval()
+                .and_then(|interval| {
+                    spawn_lease_renewal(
+                        Arc::clone(&self.store),
+                        key.to_string(),
+                        member.clone(),
+                        interval,
+                    )
+                })
+        });
         Ok(Reservation {
             store: Arc::clone(&self.store),
             key: key.to_string(),
             member,
+            renewal,
             committed: false,
         })
     }
@@ -141,6 +155,7 @@ pub struct Reservation {
     store: Arc<dyn RateStore>,
     key: String,
     member: String,
+    renewal: Option<tokio::task::JoinHandle<()>>,
     committed: bool,
 }
 
@@ -157,6 +172,9 @@ impl Reservation {
     /// Post-deduct phase. Records the actual token cost against TPM/TPD
     /// and releases the concurrency slot.
     pub async fn commit_tokens(mut self, tokens: u64) {
+        if let Some(task) = self.renewal.take() {
+            task.abort();
+        }
         self.store.commit(&self.key, tokens, &self.member).await;
         self.committed = true;
     }
@@ -166,6 +184,9 @@ impl Drop for Reservation {
     fn drop(&mut self) {
         if self.committed {
             return;
+        }
+        if let Some(task) = self.renewal.take() {
+            task.abort();
         }
         self.store.release(&self.key, &self.member);
     }
@@ -217,6 +238,7 @@ impl MultiReservation {
     #[must_use = "dropping the returned guard immediately releases the concurrency \
                   slot, recreating the early-release bug this fixes"]
     pub fn into_stream_hold(mut self) -> StreamConcurrencyGuard {
+        let mut renewal_tasks = Vec::new();
         let holds = self
             .reservations
             .iter_mut()
@@ -224,11 +246,15 @@ impl MultiReservation {
                 // Defuse each reservation's Drop so it doesn't release the
                 // slot now; the returned guard owns release from here on.
                 r.committed = true;
+                if let Some(task) = r.renewal.take() {
+                    renewal_tasks.push(task);
+                }
                 (Arc::clone(&r.store), r.key.clone(), r.member.clone())
             })
             .collect();
         StreamConcurrencyGuard {
             holds,
+            renewal_tasks,
             released: false,
         }
     }
@@ -249,6 +275,7 @@ impl std::fmt::Debug for MultiReservation {
 pub struct StreamConcurrencyGuard {
     /// `(store, key, member)` per held layer.
     holds: Vec<(Arc<dyn RateStore>, String, String)>,
+    renewal_tasks: Vec<tokio::task::JoinHandle<()>>,
     released: bool,
 }
 
@@ -258,6 +285,9 @@ impl StreamConcurrencyGuard {
             return;
         }
         self.released = true;
+        for task in self.renewal_tasks.drain(..) {
+            task.abort();
+        }
         for (store, key, member) in &self.holds {
             store.release(key, member);
         }
@@ -268,6 +298,7 @@ impl std::fmt::Debug for StreamConcurrencyGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamConcurrencyGuard")
             .field("layers", &self.holds.len())
+            .field("renewal_tasks", &self.renewal_tasks.len())
             .field("released", &self.released)
             .finish()
     }
@@ -279,10 +310,65 @@ impl Drop for StreamConcurrencyGuard {
     }
 }
 
+fn spawn_lease_renewal(
+    store: Arc<dyn RateStore>,
+    key: String,
+    member: String,
+    interval: Duration,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    Some(runtime.spawn(async move {
+        let start = tokio::time::Instant::now() + interval;
+        let mut ticker = tokio::time::interval_at(start, interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            store.renew_concurrency_lease(&key, &member).await;
+        }
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::clock::TestClock;
+    use async_trait::async_trait;
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct RenewingStore {
+        renewals: AtomicU64,
+    }
+
+    #[async_trait]
+    impl RateStore for RenewingStore {
+        async fn acquire(
+            &self,
+            _key: &str,
+            _limits: &RateLimit,
+            _member: &str,
+        ) -> Result<(), RateLimitError> {
+            Ok(())
+        }
+
+        async fn commit(&self, _key: &str, _tokens: u64, _member: &str) {}
+
+        fn concurrency_lease_renewal_interval(&self) -> Option<Duration> {
+            Some(Duration::from_millis(10))
+        }
+
+        async fn renew_concurrency_lease(&self, _key: &str, _member: &str) {
+            self.renewals.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn release(&self, _key: &str, _member: &str) {}
+
+        fn add_tokens(&self, _key: &str, _tokens: u64) {}
+
+        async fn peek(&self, _key: &str, _limits: &RateLimit) -> Option<RateLimitStatus> {
+            None
+        }
+    }
 
     fn limits(rpm: Option<u64>, tpm: Option<u64>, concurrency: Option<u32>) -> RateLimit {
         RateLimit {
@@ -367,6 +453,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_guard_renews_distributed_concurrency_lease() {
+        let store = Arc::new(RenewingStore::default());
+        let limiter = Limiter::with_store(store.clone());
+        let reservation = limiter
+            .pre_commit("k1", &limits(None, None, Some(1)))
+            .await
+            .unwrap();
+        let guard = MultiReservation::new(vec![reservation]).into_stream_hold();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            store.renewals.load(Ordering::Relaxed) > 0,
+            "an active stream must renew before its distributed lease expires",
+        );
+
+        drop(guard);
+        let renewals_after_drop = store.renewals.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            store.renewals.load(Ordering::Relaxed),
+            renewals_after_drop,
+            "dropping the stream must stop its renewal task",
+        );
+    }
+
+    #[tokio::test]
     async fn token_commit_updates_post_deduct_counters() {
         let clock = TestClock::new(100);
         let limiter = Limiter::local_with_clock(clock.clone());
@@ -395,6 +507,25 @@ mod tests {
 
         clock.advance(61); // roll the window
         let _r2 = limiter.pre_commit("k1", &l).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tpm_blocks_next_request_at_the_exact_limit() {
+        let clock = TestClock::new(100);
+        let limiter = Limiter::local_with_clock(clock);
+        let l = limits(Some(10), Some(1_000), None);
+
+        limiter
+            .pre_commit("k1", &l)
+            .await
+            .unwrap()
+            .commit_tokens(1_000)
+            .await;
+
+        assert!(matches!(
+            limiter.pre_commit("k1", &l).await.unwrap_err(),
+            RateLimitError::Tokens { .. },
+        ));
     }
 
     #[tokio::test]

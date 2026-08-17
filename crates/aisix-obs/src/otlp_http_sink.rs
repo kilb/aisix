@@ -74,8 +74,8 @@ const USER_AGENT: &str = concat!("aisix-dp/", env!("CARGO_PKG_VERSION"));
 /// [`crate::sink::SinkPipeline`] (batched, retried, backpressured). Cheap
 /// clonable handle; the per-exporter pipelines and the shared `reqwest::Client`
 /// live behind an `Arc`. Pipelines start lazily on first sighting of an
-/// exporter (immediately consistent with the snapshot) and are GC'd by
-/// [`OtlpHttpFanOut::gc`] when an exporter leaves it.
+/// exporter (immediately consistent with the snapshot) and are reconciled when
+/// an exporter leaves or changes in the live snapshot.
 ///
 /// NOTE: the type name is historical — it drove only `otlp_http` originally
 /// and now fans out all kinds. A rename to `ExporterFanOut` (plus the
@@ -91,6 +91,10 @@ struct FanOutInner {
     exporters: ExporterPipelines,
     /// Shared HTTP client handed to every sink (connection-pool reuse).
     client: reqwest::Client,
+    /// Highest snapshot generation reconciled. Held through GC and enqueue so
+    /// an older in-flight request cannot recreate a deleted exporter after a
+    /// newer request observed the revocation.
+    reconciled_generation: parking_lot::Mutex<u64>,
 }
 
 /// Delivery tuning for otlp exporter pipelines. A short flush keeps a
@@ -116,6 +120,7 @@ impl OtlpHttpFanOut {
             inner: Arc::new(FanOutInner {
                 exporters: ExporterPipelines::new(exporter_pipeline_config()),
                 client,
+                reconciled_generation: parking_lot::Mutex::new(0),
             }),
         }
     }
@@ -136,10 +141,28 @@ impl OtlpHttpFanOut {
         &self,
         event: &UsageEvent,
         content: Option<&CapturedContent>,
+        snapshot_generation: u64,
         exporters: I,
     ) where
         I: IntoIterator<Item = &'a ObservabilityExporter>,
     {
+        let mut reconciled_generation = self.inner.reconciled_generation.lock();
+        if snapshot_generation < *reconciled_generation {
+            return;
+        }
+        *reconciled_generation = snapshot_generation;
+
+        let exporters: Vec<_> = exporters.into_iter().collect();
+        let desired: std::collections::HashMap<_, _> = exporters
+            .iter()
+            .filter(|exp| exp.enabled)
+            .map(|exp| (exp.name.clone(), fingerprint_exporter(exp)))
+            .collect();
+        // The caller supplies the current live-snapshot set. Reconcile before
+        // enqueuing so deleted or disabled exporters release their worker,
+        // queue, and sink on the first request that observes the change.
+        self.reconcile_pipelines(&desired);
+
         // The shared metadata-only record, built once on first sighting and
         // reused by every exporter that does not capture content.
         let mut metadata_record: Option<Arc<SinkRecord>> = None;
@@ -256,12 +279,33 @@ impl OtlpHttpFanOut {
         }
     }
 
-    /// Stop pipelines for exporters no longer present in `live` (the current
-    /// snapshot's enabled exporter names, across all kinds). Called
-    /// periodically by the server to GC pipelines for deleted / disabled
-    /// exporters.
-    pub fn gc(&self, live: &std::collections::HashSet<String>) {
-        self.inner.exporters.retain(live);
+    /// Reconcile running pipelines from a newly published config snapshot,
+    /// without waiting for another request to enter [`Self::fan_out`]. This
+    /// is the revocation path: deletion or disablement aborts the worker and
+    /// discards its queue synchronously with snapshot publication.
+    pub fn reconcile<'a, I>(&self, snapshot_generation: u64, exporters: I)
+    where
+        I: IntoIterator<Item = &'a ObservabilityExporter>,
+    {
+        let mut reconciled_generation = self.inner.reconciled_generation.lock();
+        if snapshot_generation < *reconciled_generation {
+            return;
+        }
+        *reconciled_generation = snapshot_generation;
+
+        let desired: std::collections::HashMap<_, _> = exporters
+            .into_iter()
+            .filter(|exporter| exporter.enabled)
+            .map(|exporter| (exporter.name.clone(), fingerprint_exporter(exporter)))
+            .collect();
+        self.reconcile_pipelines(&desired);
+    }
+
+    /// Stop pipelines that are absent from the desired live configuration or
+    /// whose delivery fingerprint changed. Called by [`Self::fan_out`] and by
+    /// the snapshot publication listener.
+    fn reconcile_pipelines(&self, desired: &std::collections::HashMap<String, u64>) {
+        self.inner.exporters.reconcile(desired);
     }
 
     /// Per-exporter delivery counters, keyed by exporter name. Read by the
@@ -285,6 +329,15 @@ impl Default for OtlpHttpFanOut {
     }
 }
 
+fn fingerprint_exporter(exporter: &ObservabilityExporter) -> u64 {
+    match &exporter.kind {
+        ExporterKind::OtlpHttp(cfg) => fingerprint_otlp(cfg),
+        ExporterKind::AliyunSls(cfg) => fingerprint_sls(cfg),
+        ExporterKind::ObjectStore(cfg) => fingerprint_object_store(cfg),
+        ExporterKind::Datadog(cfg) => fingerprint_datadog(cfg),
+    }
+}
+
 /// Hash an `otlp_http` exporter's delivery-relevant config. A change to any
 /// field — endpoint, headers, or the #519 B.2 knobs (sample_rate / content
 /// config) — yields a new fingerprint, so the manager rebuilds the exporter's
@@ -294,6 +347,7 @@ impl Default for OtlpHttpFanOut {
 fn fingerprint_otlp(cfg: &OtlpHttpConfig) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    0_u8.hash(&mut hasher);
     cfg.endpoint.hash(&mut hasher);
     cfg.headers.hash(&mut hasher);
     cfg.sample_rate.map(f64::to_bits).hash(&mut hasher);
@@ -373,10 +427,13 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 fn fingerprint_sls(cfg: &AliyunSlsConfig) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    1_u8.hash(&mut hasher);
     cfg.endpoint.hash(&mut hasher);
     cfg.project.hash(&mut hasher);
     cfg.logstore.hash(&mut hasher);
     cfg.credential_ref.hash(&mut hasher);
+    cfg.content_mode.hash(&mut hasher);
+    cfg.content_max_bytes.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -451,12 +508,14 @@ pub fn content_capture_cap<'a>(
 fn fingerprint_object_store(cfg: &ObjectStoreConfig) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    2_u8.hash(&mut hasher);
     cfg.provider.hash(&mut hasher);
     cfg.bucket.hash(&mut hasher);
     cfg.prefix.hash(&mut hasher);
     cfg.region.hash(&mut hasher);
     cfg.endpoint.hash(&mut hasher);
     cfg.compression.hash(&mut hasher);
+    cfg.auth_mode.hash(&mut hasher);
     cfg.credential_ref.hash(&mut hasher);
     hasher.finish()
 }
@@ -469,6 +528,7 @@ fn fingerprint_object_store(cfg: &ObjectStoreConfig) -> u64 {
 fn fingerprint_datadog(cfg: &DatadogConfig) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    3_u8.hash(&mut hasher);
     cfg.site.hash(&mut hasher);
     cfg.credential_ref.hash(&mut hasher);
     cfg.service.hash(&mut hasher);
@@ -914,9 +974,9 @@ fn attr_string(key: &str, value: &str) -> Value {
 ///
 /// The gateway-protocol attributes below are copied from the caller's own
 /// JSON-RPC envelope (the method it invoked, the ids it named), and the
-/// request body limit defaults to unlimited, so their length is the caller's
-/// choice. Every span rides in a batched export, so an unbounded value is a
-/// delivery problem as much as a storage one.
+/// request body limit can be disabled explicitly, so their length can still be
+/// the caller's choice. Every span rides in a batched export, so an unbounded
+/// value is a delivery problem as much as a storage one.
 const MAX_PROTOCOL_ATTR_BYTES: usize = 256;
 
 /// [`attr_string`] for a value a caller controls, cut to
@@ -1396,6 +1456,39 @@ mod tests {
         let mut moved = base.clone();
         moved.endpoint = "https://y/v1/traces".into();
         assert_ne!(fingerprint_otlp(&base), fingerprint_otlp(&moved));
+    }
+
+    #[test]
+    fn every_delivery_relevant_exporter_field_changes_its_fingerprint() {
+        let sls: AliyunSlsConfig = serde_json::from_value(serde_json::json!({
+            "endpoint": "ap-southeast-3.log.aliyuncs.com",
+            "project": "p",
+            "logstore": "l",
+            "credential_ref": "cred",
+        }))
+        .unwrap();
+        let mut sls_full = sls.clone();
+        sls_full.content_mode = SlsContentMode::Full;
+        assert_ne!(fingerprint_sls(&sls), fingerprint_sls(&sls_full));
+        let mut sls_capped = sls.clone();
+        sls_capped.content_max_bytes = 4096;
+        assert_ne!(fingerprint_sls(&sls), fingerprint_sls(&sls_capped));
+
+        let object_store: ObjectStoreConfig = serde_json::from_value(serde_json::json!({
+            "provider": "s3",
+            "bucket": "b",
+            "prefix": "p",
+            "auth_mode": "credential_ref",
+            "credential_ref": "cred",
+        }))
+        .unwrap();
+        let mut cloud_identity = object_store.clone();
+        cloud_identity.auth_mode =
+            aisix_core::models::observability_exporter::ObjectStoreAuthMode::CloudIdentity;
+        assert_ne!(
+            fingerprint_object_store(&object_store),
+            fingerprint_object_store(&cloud_identity),
+        );
     }
 
     #[test]
@@ -1899,7 +1992,7 @@ mod tests {
         // can't easily count spawned tasks, but if the call returned
         // and the test process didn't hang, we're good.
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, std::iter::empty());
+        f.fan_out(&sample_event(), None, 0, std::iter::empty());
     }
 
     #[test]
@@ -1913,7 +2006,104 @@ mod tests {
         let mut exp = sample_exporter();
         exp.enabled = false;
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, std::iter::once(&exp));
+        f.fan_out(&sample_event(), None, 0, std::iter::once(&exp));
+    }
+
+    #[tokio::test]
+    async fn fan_out_reaps_pipelines_absent_from_the_live_exporter_set() {
+        let exp = sample_exporter();
+        let f = OtlpHttpFanOut::new();
+        f.fan_out(&sample_event(), None, 1, std::iter::once(&exp));
+        assert!(f.exporter_stats().contains_key(&exp.name));
+
+        f.fan_out(&sample_event(), None, 2, std::iter::empty());
+        assert!(
+            f.exporter_stats().is_empty(),
+            "a deleted exporter must not retain its task, queue, and client"
+        );
+
+        f.fan_out(&sample_event(), None, 3, std::iter::once(&exp));
+        let mut disabled = exp.clone();
+        disabled.enabled = false;
+        f.fan_out(&sample_event(), None, 4, std::iter::once(&disabled));
+        assert!(
+            f.exporter_stats().is_empty(),
+            "a disabled exporter must release an already-running pipeline"
+        );
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_reconfiguration_revokes_the_old_queued_destination() {
+        let old_server = wiremock::MockServer::start().await;
+        let new_server = wiremock::MockServer::start().await;
+        for server in [&old_server, &new_server] {
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/v1/traces"))
+                .respond_with(wiremock::ResponseTemplate::new(200))
+                .mount(server)
+                .await;
+        }
+
+        let old: ObservabilityExporter = serde_json::from_value(serde_json::json!({
+            "name": "reconfigured",
+            "enabled": true,
+            "kind": "otlp_http",
+            "endpoint": format!("{}/v1/traces", old_server.uri()),
+            "headers": {}
+        }))
+        .unwrap();
+        let mut new = old.clone();
+        let ExporterKind::OtlpHttp(cfg) = &mut new.kind else {
+            unreachable!()
+        };
+        cfg.endpoint = format!("{}/v1/traces", new_server.uri());
+
+        let f = OtlpHttpFanOut::new();
+        f.fan_out(&sample_event(), None, 1, std::iter::once(&old));
+        f.reconcile(2, std::iter::once(&new));
+        assert!(
+            f.exporter_stats().is_empty(),
+            "the replacement pipeline must remain lazy",
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+        assert!(
+            old_server.received_requests().await.unwrap().is_empty(),
+            "the old queued event must not reach the revoked destination",
+        );
+
+        f.fan_out(&sample_event(), None, 2, std::iter::once(&new));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !new_server.received_requests().await.unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the new destination saw no OTLP POST within 5s",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stale_generation_cannot_recreate_a_removed_exporter() {
+        let exp = sample_exporter();
+        let f = OtlpHttpFanOut::new();
+        f.fan_out(&sample_event(), None, 7, std::iter::once(&exp));
+        assert!(f.exporter_stats().contains_key(&exp.name));
+
+        f.fan_out(&sample_event(), None, 8, std::iter::empty());
+        assert!(f.exporter_stats().is_empty());
+
+        f.fan_out(&sample_event(), None, 7, std::iter::once(&exp));
+        assert!(
+            f.exporter_stats().is_empty(),
+            "an older in-flight request recreated a revoked exporter"
+        );
+        f.shutdown().await;
     }
 
     #[tokio::test]
@@ -1946,7 +2136,7 @@ mod tests {
         let control = mk("control", &ctrl_srv.uri(), None);
 
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, [&zero, &control]);
+        f.fan_out(&sample_event(), None, 1, [&zero, &control]);
 
         // The control's span lands after the 1s flush…
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1991,7 +2181,7 @@ mod tests {
         .unwrap();
 
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, std::iter::once(&exp));
+        f.fan_out(&sample_event(), None, 1, std::iter::once(&exp));
 
         // Poll for the batched POST (flush_interval is 1s).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

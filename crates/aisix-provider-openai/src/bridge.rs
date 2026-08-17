@@ -23,8 +23,8 @@ use aisix_core::{RequestOverrides, ResponseOverrides, StreamDoneMarker};
 use aisix_gateway::url_cache::cached_endpoint_url;
 use aisix_gateway::{
     apply_request_headers, Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream,
-    ChatFormat, ChatResponse, EmbeddingRequest, EmbeddingResponse, SseDecoder, SseEvent,
-    UpstreamHeaderContext,
+    ChatFormat, ChatResponse, CompletionByteStream, EmbeddingRequest, EmbeddingResponse,
+    SseDecoder, SseEvent, UpstreamHeaderContext,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -88,6 +88,56 @@ impl OpenAiBridge {
             &self.client,
             ctx.provider_key.tls.as_ref(),
         )
+    }
+
+    /// Send a legacy `/completions` request and return the successful raw
+    /// response. JSON decoding and SSE forwarding deliberately live in the two
+    /// trait methods so request preparation cannot drift between modes.
+    async fn send_completion_raw(
+        &self,
+        body: &serde_json::Value,
+        ctx: &BridgeContext,
+        stream: bool,
+    ) -> Result<reqwest::Response, BridgeError> {
+        let key = api_key(ctx)?;
+        let upstream = upstream_model(ctx)?;
+
+        let mut outbound = body.clone();
+        if let Some(obj) = outbound.as_object_mut() {
+            obj.insert(
+                "model".to_string(),
+                serde_json::Value::String(upstream.to_string()),
+            );
+        }
+        let outbound = prepare_outbound_body(
+            &outbound,
+            ctx.provider_key.request.as_ref(),
+            ctx.provider_key.response.as_ref(),
+        )?;
+        let headers = build_request_headers(key, &ctx.request_id, stream, &ctx.header_ctx())?;
+        let url = cached_endpoint_url(
+            &ctx.provider_key_id,
+            "openai/completions",
+            &[
+                ctx.provider_key.api_base.as_deref().unwrap_or(""),
+                &ctx.provider_key.provider,
+            ],
+            || Ok(format!("{}/completions", self.resolve_base(ctx)?)),
+        )?;
+        let client = self.client_for(ctx);
+        let resp = url
+            .post_on(&client)
+            .headers(headers)
+            .json(&outbound)
+            .send()
+            .await
+            .map_err(aisix_gateway::send_error)?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(map_http_error(status, resp).await);
+        }
+        Ok(resp)
     }
 
     /// Resolve `ProviderKey.api_base` into the canonical base URL the
@@ -491,56 +541,31 @@ impl Bridge for OpenAiBridge {
         body: &serde_json::Value,
         ctx: &BridgeContext,
     ) -> Result<serde_json::Value, BridgeError> {
-        let key = api_key(ctx)?;
-        let upstream = upstream_model(ctx)?;
-
-        // Replace the `model` field with the upstream provider id.
-        let mut outbound = body.clone();
-        if let Some(obj) = outbound.as_object_mut() {
-            obj.insert(
-                "model".to_string(),
-                serde_json::Value::String(upstream.to_string()),
-            );
-        }
-        // Apply the PK's request overrides like `chat()` (#867 consistency
-        // follow-up); no-op when none are configured.
-        let outbound = prepare_outbound_body(
-            &outbound,
-            ctx.provider_key.request.as_ref(),
-            ctx.provider_key.response.as_ref(),
-        )?;
-        let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
-
-        let url = cached_endpoint_url(
-            &ctx.provider_key_id,
-            "openai/completions",
-            &[
-                ctx.provider_key.api_base.as_deref().unwrap_or(""),
-                &ctx.provider_key.provider,
-            ],
-            || Ok(format!("{}/completions", self.resolve_base(ctx)?)),
-        )?;
-        let client = self.client_for(ctx);
         let started = Instant::now();
-        with_deadline(ctx.deadline, started, async move {
-            let resp = url
-                .post_on(&client)
-                .headers(headers)
-                .json(&outbound)
-                .send()
-                .await
-                .map_err(aisix_gateway::send_error)?;
-
-            let status = resp.status();
-            if !status.is_success() {
-                return Err(map_http_error(status, resp).await);
-            }
-
-            resp.json::<serde_json::Value>()
+        with_deadline(ctx.deadline, started, async {
+            self.send_completion_raw(body, ctx, false)
+                .await?
+                .json::<serde_json::Value>()
                 .await
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
         })
         .await
+    }
+
+    async fn complete_stream(
+        &self,
+        body: &serde_json::Value,
+        ctx: &BridgeContext,
+    ) -> Result<CompletionByteStream, BridgeError> {
+        let started = Instant::now();
+        let response = with_deadline(ctx.deadline, started, async {
+            self.send_completion_raw(body, ctx, true).await
+        })
+        .await?;
+        let stream = response
+            .bytes_stream()
+            .map(|item| item.map_err(aisix_gateway::send_error));
+        Ok(Box::pin(stream))
     }
 
     async fn generate_image(

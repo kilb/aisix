@@ -24,6 +24,8 @@ import {
 
 const CALLER_PLAINTEXT = "sk-content-capture-masked-PLAINTEXT";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
+const BLOCK_CALLER = `${CALLER_PLAINTEXT}-block`;
+const BLOCK_CALLER_KEY_HASH = createHash("sha256").update(BLOCK_CALLER).digest("hex");
 const PROVIDER_SECRET = "sk-mock-content-capture-masked";
 
 const CREDENTIAL_REF = "mock";
@@ -36,6 +38,8 @@ const MASK = "[EMAIL_REDACTED]";
 const CHAT_PROMPT_TOKEN = "masked-chat-prompt-tok-1f2e3d";
 const BRIDGE_PROMPT_TOKEN = "masked-bridge-prompt-tok-4c5b6a";
 const DRAIN_TOKEN = "masked-drain-marker-tok-9a8b7c";
+const BLOCK_CHAT_REQUEST_ID = "masked-block-chat-request-7d6e5f";
+const BLOCK_BRIDGE_REQUEST_ID = "masked-block-bridge-request-4a3b2c";
 
 /** OpenAI chat chunks with the email split across two deltas (channel
  * reassembly): neither wire chunk carries the whole value; only the
@@ -253,6 +257,105 @@ describe("sls content capture e2e: streaming capture is post-mask (#932 × AISIX
       expect(metaText).not.toContain(EMAIL);
       expect(metaText).not.toContain(MASK);
       expect(metaText).not.toContain(CHAT_PROMPT_TOKEN);
+
+      // Add a block-action rule, then place a new authenticated API key after
+      // it in the ordered config stream. Exact model discovery through that
+      // key is the revision barrier; the requests below do not double as
+      // readiness probes for the behavior they verify.
+      await seed.createGuardrail({
+        name: "blocked-capture-guard",
+        enabled: true,
+        hook_point: "output",
+        kind: "pii",
+        detectors: [{ type: "email", action: "block" }],
+      });
+      await seed.createApiKey({
+        key_hash: BLOCK_CALLER_KEY_HASH,
+        allowed_models: ["masked-chat-model", "masked-bridge-model"],
+      });
+      await waitConfigPropagation(async () => {
+        const response = await fetch(`${app.proxyUrl}/v1/models`, {
+          headers: { authorization: `Bearer ${BLOCK_CALLER}` },
+        });
+        if (response.status === 401) {
+          await response.text();
+          return false;
+        }
+        if (response.status !== 200) {
+          throw new Error(`model propagation probe returned ${response.status}`);
+        }
+        const body = (await response.json()) as { data?: Array<{ id?: string }> };
+        const ids = new Set(body.data?.map((model) => model.id));
+        return (
+          ids.size === 2 &&
+          ids.has("masked-chat-model") &&
+          ids.has("masked-bridge-model")
+        );
+      });
+
+      // The previous bridge marker was awaited above, so the exporter has
+      // flushed every earlier record. Everything after this boundary belongs
+      // to the two blocked streams.
+      const beforeBlocked = sls.requests.length;
+      const blockedPost = (path: string, requestId: string, body: unknown) =>
+        fetch(`${app.proxyUrl}${path}`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${BLOCK_CALLER}`,
+            "content-type": "application/json",
+            "x-aisix-request-id": requestId,
+          },
+          body: JSON.stringify(body),
+        });
+
+      const blockedChat = await blockedPost(
+        "/v1/chat/completions",
+        BLOCK_CHAT_REQUEST_ID,
+        {
+          model: "masked-chat-model",
+          stream: true,
+          messages: [{ role: "user", content: "blocked chat capture" }],
+        },
+      );
+      expect(blockedChat.status).toBe(200);
+      const blockedChatBody = await blockedChat.text();
+      expect(blockedChatBody).toContain("content_filter");
+      expect(blockedChatBody).not.toContain(EMAIL);
+
+      const blockedBridge = await blockedPost(
+        "/v1/responses",
+        BLOCK_BRIDGE_REQUEST_ID,
+        {
+          model: "masked-bridge-model",
+          stream: true,
+          input: "blocked bridge capture",
+        },
+      );
+      expect(blockedBridge.status).toBe(200);
+      const blockedBridgeBody = await blockedBridge.text();
+      expect(blockedBridgeBody).toContain("content_filter");
+      expect(blockedBridgeBody).not.toContain(EMAIL);
+
+      await waitForToken(
+        sls,
+        FULL_LOGSTORE,
+        BLOCK_CHAT_REQUEST_ID,
+        10_000,
+        beforeBlocked,
+      );
+      await waitForToken(
+        sls,
+        FULL_LOGSTORE,
+        BLOCK_BRIDGE_REQUEST_ID,
+        10_000,
+        beforeBlocked,
+      );
+      const blockedFullText = decodedTextFor(sls, FULL_LOGSTORE, beforeBlocked);
+      expect(blockedFullText).toContain(BLOCK_CHAT_REQUEST_ID);
+      expect(blockedFullText).toContain(BLOCK_BRIDGE_REQUEST_ID);
+      expect(blockedFullText).not.toContain(EMAIL);
+      expect(blockedFullText).not.toContain("chat-reply");
+      expect(blockedFullText).not.toContain("bridge-reply");
     },
     120_000,
   );

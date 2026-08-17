@@ -382,7 +382,10 @@ pub async fn speech(
                 Some(&auth.entry.id),
                 started,
                 crate::reject::Envelope::OpenAi,
-                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+                crate::error::proxy_error_from_json_rejection(
+                    rej,
+                    state.request_body_limit_for("/v1/audio/speech"),
+                ),
             );
         }
     };
@@ -534,7 +537,7 @@ async fn multipart_dispatch(
     while let Some(field) = multipart.next_field().await.map_err(|e| {
         crate::error::proxy_error_from_multipart(
             e,
-            state.request_body_limit_bytes,
+            state.request_body_limit_for(upstream_path),
             "multipart read error",
         )
     })? {
@@ -544,7 +547,7 @@ async fn multipart_dispatch(
         let data = field.bytes().await.map_err(|e| {
             crate::error::proxy_error_from_multipart(
                 e,
-                state.request_body_limit_bytes,
+                state.request_body_limit_for(upstream_path),
                 "multipart field read error",
             )
         })?;
@@ -1552,9 +1555,12 @@ fn emit_usage_event(
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("audio", event.clone());
     let exporters = crate::usage_attr::live_exporters(state, snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, content, exporters.iter().map(|e| &e.value));
+    state.otlp_fan_out.fan_out(
+        &event,
+        content,
+        exporters.generation(),
+        exporters.iter().map(|e| &e.value),
+    );
     // Speech (TTS) reports no tokens at all, so this is a no-op there; the
     // transcription routes report them when the model supplies a usage block.
     let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
@@ -1648,7 +1654,7 @@ mod tests {
     fn cfg() -> ProxyConfig {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: 10_485_760, // 10 MB for audio
+            request_body_limit_bytes: Some(10_485_760), // 10 MB for audio
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),

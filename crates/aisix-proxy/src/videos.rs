@@ -1366,7 +1366,10 @@ async fn proxy_content(
     // request-id correlation, unlike every other streaming path in the crate
     // (chat / messages / responses / responses_bridge all wrap the same way).
     let wrapped: std::pin::Pin<
-        Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
+        Box<
+            dyn futures::Stream<Item = Result<bytes::Bytes, crate::stream_timeout::RawStreamError>>
+                + Send,
+        >,
     > = Box::pin(crate::request_id::in_request_span(
         crate::stream_timeout::with_read_timeout_bytes(resp.bytes_stream(), stream_budget),
     ));
@@ -1509,8 +1512,10 @@ pub async fn create_video(
             // Same discriminate-then-map convention as embeddings (#401):
             // a missing `model`/`prompt` must be a 400 OpenAI-shaped
             // invalid_request_error, not axum's stock 422.
-            let err =
-                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes);
+            let err = crate::error::proxy_error_from_json_rejection(
+                rej,
+                state.request_body_limit_for("/v1/videos"),
+            );
             telemetry.finish(
                 err.status().as_u16(),
                 "unknown",
@@ -2003,9 +2008,12 @@ fn emit_submit_usage_event(
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("videos", event.clone());
     let exporters = crate::usage_attr::live_exporters(state, snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, None, exporters.iter().map(|e| &e.value));
+    state.otlp_fan_out.fan_out(
+        &event,
+        None,
+        exporters.generation(),
+        exporters.iter().map(|e| &e.value),
+    );
 }
 
 #[cfg(test)]
@@ -2363,7 +2371,7 @@ mod tests {
     fn cfg() -> ProxyConfig {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: 1_048_576,
+            request_body_limit_bytes: Some(1_048_576),
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),

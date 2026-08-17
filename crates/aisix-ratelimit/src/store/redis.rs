@@ -11,7 +11,8 @@
 //! Cluster slot, keeping the per-bucket Lua atomic):
 //! - `aisix:rl:{<bucket>}:<rps|rpm|rph|rpd|tpm|tpd>:<window_start>` — plain
 //!   `INCR`/`GET` counters, `EXPIRE = window + grace`.
-//! - `aisix:rl:{<bucket>}:conc` — a ZSET (`member → score=now`) acting as a
+//! - `aisix:rl:{<bucket>}:conc` — a ZSET (`member → score=server_time_ms`)
+//!   acting as a
 //!   crash-safe distributed semaphore: acquire prunes entries older than
 //!   `conc_ttl` then counts, so a slot leaked by a crashed/hung replica is
 //!   reclaimed within `conc_ttl`. (LiteLLM's latest tracks parallel
@@ -21,6 +22,13 @@
 //!
 //! `now` is read from `redis.call('TIME')` inside every script so window
 //! boundaries are identical across replicas regardless of host clock skew.
+//! Redis returns seconds plus microseconds, which the concurrency scripts
+//! retain at millisecond precision:
+//! <https://redis.io/docs/latest/commands/time/>. Expiry pruning deliberately
+//! uses the inclusive deadline semantics of `ZREMRANGEBYSCORE`:
+//! <https://redis.io/docs/latest/commands/zremrangebyscore/>. Renewal uses
+//! `ZADD XX`, which updates an existing member but never creates one:
+//! <https://redis.io/docs/latest/commands/zadd/>.
 //!
 //! On any Redis error the store fails **open** to a per-process
 //! [`LocalStore`] (logged once): traffic keeps flowing with per-replica
@@ -38,6 +46,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use aisix_core::{RateLimit, RedisConnConfig};
 use aisix_redis::RedisConn;
@@ -76,10 +85,11 @@ local conc_ttl = tonumber(ARGV[4])
 local grace = tonumber(ARGV[5])
 local t = redis.call('TIME')
 local now = tonumber(t[1])
+local now_ms = now * 1000 + math.floor(tonumber(t[2]) / 1000)
 
 local conc_key = prefix .. ':conc'
 if conc_max >= 0 then
-  redis.call('ZREMRANGEBYSCORE', conc_key, 0, now - conc_ttl)
+  redis.call('ZREMRANGEBYSCORE', conc_key, 0, now_ms - conc_ttl * 1000)
   if redis.call('ZCARD', conc_key) >= conc_max then
     return {1, 0}
   end
@@ -103,7 +113,7 @@ for i = 1, ntok do
   local name, window, limit = tok[i][1], tok[i][2], tok[i][3]
   local ws = now - (now % window)
   local cur = tonumber(redis.call('GET', prefix .. ':' .. name .. ':' .. ws) or '0')
-  if cur > limit then
+  if cur >= limit then
     local retry = window - (now - ws); if retry < 1 then retry = 1 end
     return {2, retry}
   end
@@ -128,7 +138,7 @@ for i = 1, nreq do
   end
 end
 if conc_max >= 0 then
-  redis.call('ZADD', conc_key, now, member)
+  redis.call('ZADD', conc_key, now_ms, member)
   redis.call('EXPIRE', conc_key, conc_ttl)
 end
 return {0, 0}
@@ -155,6 +165,26 @@ if tokens > 0 then
   end
 end
 redis.call('ZREM', prefix .. ':conc', member)
+return 1
+"#;
+
+/// Refresh an existing concurrency member without recreating one that a
+/// racing completion already released. ARGV: prefix, member, conc_ttl.
+const RENEW_CONCURRENCY_LUA: &str = r#"
+local prefix = ARGV[1]
+local member = ARGV[2]
+local conc_ttl = tonumber(ARGV[3])
+local conc_key = prefix .. ':conc'
+if not redis.call('ZSCORE', conc_key, member) then
+  return 0
+end
+local t = redis.call('TIME')
+local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+-- XX is a second, command-level guarantee that a future refactor cannot
+-- recreate a member already removed by commit/release. The enclosing Lua
+-- script is atomic, so the ZSCORE result cannot change before this update.
+redis.call('ZADD', conc_key, 'XX', now_ms, member)
+redis.call('EXPIRE', conc_key, conc_ttl)
 return 1
 "#;
 
@@ -186,10 +216,11 @@ local prefix = ARGV[1]
 local conc_ttl = tonumber(ARGV[2])
 local t = redis.call('TIME')
 local now = tonumber(t[1])
+local now_ms = now * 1000 + math.floor(tonumber(t[2]) / 1000)
 local ws = now - (now % 60)
 local rpm = tonumber(redis.call('GET', prefix .. ':rpm:' .. ws) or '0')
 local tpm = tonumber(redis.call('GET', prefix .. ':tpm:' .. ws) or '0')
-redis.call('ZREMRANGEBYSCORE', prefix .. ':conc', 0, now - conc_ttl)
+redis.call('ZREMRANGEBYSCORE', prefix .. ':conc', 0, now_ms - conc_ttl * 1000)
 local inflight = redis.call('ZCARD', prefix .. ':conc')
 return {rpm, tpm, inflight, 60 - (now % 60)}
 "#;
@@ -370,6 +401,36 @@ impl RateStore for RedisStore {
                 self.warn_degraded("commit", &e);
                 self.conn.note_error().await;
                 self.local.commit(key, tokens, member).await;
+            }
+        }
+    }
+
+    fn concurrency_lease_renewal_interval(&self) -> Option<Duration> {
+        let millis = self.conc_ttl.saturating_mul(1_000) / 3;
+        Some(Duration::from_millis(millis.max(100)))
+    }
+
+    async fn renew_concurrency_lease(&self, key: &str, member: &str) {
+        let prefix = self.bucket_prefix(key);
+        let mut conn = match self.conn.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                self.warn_degraded("renew_concurrency_lease", &e);
+                return;
+            }
+        };
+        let res: Result<i64, redis::RedisError> = Script::new(RENEW_CONCURRENCY_LUA)
+            .key(&prefix)
+            .arg(&prefix)
+            .arg(member)
+            .arg(self.conc_ttl)
+            .invoke_async(&mut conn)
+            .await;
+        match res {
+            Ok(_) => self.mark_ok(),
+            Err(e) => {
+                self.warn_degraded("renew_concurrency_lease", &e);
+                self.conn.note_error().await;
             }
         }
     }

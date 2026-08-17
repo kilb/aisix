@@ -46,10 +46,6 @@ describe("sticky (A/B / canary) weighted routing e2e", () => {
 
     app = await spawnApp();
     seed = new SeedClient(etcd, app.etcdPrefix);
-    await seed.createApiKey({
-      key_hash: CALLER_KEY_HASH,
-      allowed_models: ["*"],
-    });
   });
 
   afterAll(async () => {
@@ -115,6 +111,12 @@ describe("sticky (A/B / canary) weighted routing e2e", () => {
     });
     await createOpenAiModel("canary-stable", stable);
     await createOpenAiModel("canary-new", canary);
+    // Seed the caller credential last. Authentication succeeding is then a
+    // revision barrier for every model resource written above.
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["*"],
+    });
 
     // Gate on the DP snapshot via /v1/models — authenticates only once the
     // caller key has propagated, lists the targets only once the snapshot

@@ -13,16 +13,15 @@
 //! (`/messages/count_tokens`), the absence of streaming, and the tiny
 //! `{"input_tokens": <int>}` response, which is forwarded verbatim.
 //!
-//! Guardrails: this surface is intentionally **exempt** from the
-//! content-moderation guardrail chain (#545). It is a pre-flight sizing
+//! Guardrails: this surface is intentionally **exempt** from
+//! content-moderation guardrails (#545). It is a pre-flight sizing
 //! call — no content reaches a model and the response is only an integer
 //! token count, never generated content — so there is nothing for a
 //! content-moderation hook to moderate on either side, and the same
 //! `messages` payload is scanned when the caller issues the actual
-//! `/v1/messages` request. (A DLP/egress policy is a separate concern: the
-//! `messages` are forwarded to the provider's count endpoint here before the
-//! real call, so a DLP guardrail attached at env-scope would not see them —
-//! tracked in #555, out of scope for #545.)
+//! `/v1/messages` request. Dedicated DLP kinds (`pii` and `presidio`) are the
+//! exception: the endpoint does forward messages to the provider, so they run
+//! on input and can block or mask sensitive data before egress (#555).
 //!
 //! Scope: Anthropic-backed models only. `count_tokens` has no upstream
 //! equivalent for OpenAI/Gemini/DeepSeek, so a non-Anthropic Model is
@@ -70,7 +69,7 @@ pub async fn count_tokens(
         Err(e) => return e.into_anthropic_response(),
     };
     let started = Instant::now();
-    let Json(body) = match body {
+    let Json(mut body) = match body {
         Ok(j) => j,
         // Answer through `reject` — see messages.rs.
         Err(rej) => {
@@ -82,7 +81,10 @@ pub async fn count_tokens(
                 Some(&auth.entry.id),
                 started,
                 crate::reject::Envelope::Anthropic,
-                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+                crate::error::proxy_error_from_json_rejection(
+                    rej,
+                    state.request_body_limit_for("/v1/messages/count_tokens"),
+                ),
             );
         }
     };
@@ -99,7 +101,7 @@ pub async fn count_tokens(
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
 
-    match dispatch(&state, &snapshot, &auth, &body, &request_id, &client).await {
+    match dispatch(&state, &snapshot, &auth, &mut body, &request_id, &client).await {
         Ok(success) => {
             let elapsed = started.elapsed();
             let status = success.response.status().as_u16();
@@ -176,7 +178,7 @@ async fn dispatch(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
-    body: &Value,
+    body: &mut Value,
     request_id: &str,
     client: &ClientContext,
 ) -> Result<CountTokensSuccess, ProxyError> {
@@ -195,6 +197,64 @@ async fn dispatch(
 
     // Client-IP allowlist gate (#557): reject before quota / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client.source_ip)?;
+
+    // #555: count_tokens remains exempt from content moderation, but it does
+    // send the prompt to a third party. Run only dedicated DLP kinds and apply
+    // their masks before any quota reservation or upstream attempt.
+    let guardrail_ctx = aisix_guardrails::RequestContext {
+        model_id: &model_entry.id,
+        mcp_server_id: "",
+        api_key_id: &auth.entry.id,
+        team_id: auth.key().team_id.as_deref(),
+    };
+    let dlp_chain = state.guardrail_index.resolve(&guardrail_ctx).dlp_only();
+    if !dlp_chain.is_empty() {
+        let chat = crate::redact::anthropic_request_for_inspection(body).map_err(|_| {
+            ProxyError::InvalidRequest(
+                "request could not be inspected by the configured data-loss prevention policy"
+                    .to_string(),
+            )
+        })?;
+        let (verdict, _) =
+            aisix_guardrails::Guardrail::check_input_non_segment_observed(&dlp_chain, &chat).await;
+        let mut redactions = crate::redact::RedactionCounts::new();
+        let mut monitor_hits = Vec::new();
+        let moderation = crate::redact::moderate_anthropic_request(
+            &dlp_chain,
+            verdict,
+            body,
+            &mut redactions,
+            &mut monitor_hits,
+        )
+        .await;
+        let verdict = moderation.verdict;
+        if let aisix_guardrails::GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+        } = verdict
+        {
+            tracing::warn!(
+                guardrail_hook = "input",
+                model = %model_name,
+                reason = %reason,
+                "DLP guardrail blocked /v1/messages/count_tokens request",
+            );
+            return Err(ProxyError::ContentFiltered(
+                crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
+            ));
+        }
+        let redaction = crate::redact::redact_anthropic_request(&dlp_chain, body);
+        if redaction.unrewritable_tool_key {
+            tracing::warn!(
+                guardrail_hook = "input",
+                model = %model_name,
+                "DLP guardrail rejected /v1/messages/count_tokens because a sensitive tool object key cannot be safely rewritten",
+            );
+            return Err(ProxyError::ContentFiltered(
+                crate::error::guardrail_block_message("request", None),
+            ));
+        }
+    }
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
@@ -600,7 +660,7 @@ mod tests {
     fn cfg() -> ProxyConfig {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: 1_048_576,
+            request_body_limit_bytes: Some(1_048_576),
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),
@@ -668,6 +728,128 @@ mod tests {
             .header("content-type", "application/json")
             .body(axum::body::Body::from(body.to_string()))
             .unwrap()
+    }
+
+    fn pii_mask_guardrail() -> ResourceEntry<aisix_core::Guardrail> {
+        let json = r#"{"name":"pii","enabled":true,"hook_point":"input","kind":"pii","detectors":[{"type":"email","action":"mask"}]}"#;
+        let guardrail = serde_json::from_str(json).unwrap();
+        ResourceEntry::new("g-pii", guardrail, 1)
+    }
+
+    fn pii_block_guardrail() -> ResourceEntry<aisix_core::Guardrail> {
+        let json = r#"{"name":"pii","enabled":true,"hook_point":"input","kind":"pii","detectors":[{"type":"email","action":"block"}]}"#;
+        let guardrail = serde_json::from_str(json).unwrap();
+        ResourceEntry::new("g-pii", guardrail, 1)
+    }
+
+    fn keyword_input_guardrail(literal: &str) -> ResourceEntry<aisix_core::Guardrail> {
+        let json = format!(
+            r#"{{"name":"moderation","enabled":true,"hook_point":"input","kind":"keyword","patterns":[{{"kind":"literal","value":"{literal}"}}]}}"#
+        );
+        let guardrail = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("g-keyword", guardrail, 1)
+    }
+
+    /// #555: token counting still sends the prompt to a third party, so a
+    /// dedicated DLP guardrail must mask sensitive input before that egress.
+    #[tokio::test]
+    async fn pii_dlp_masks_messages_before_count_tokens_egress() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens": 11})),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(anthropic_model("claude-haiku"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(pii_mask_guardrail());
+
+        let resp = build_app(snap)
+            .oneshot(make_req(serde_json::json!({
+                "model": "claude-haiku",
+                "messages": [{"role": "user", "content": "email alice@example.com"}]
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = upstream.received_requests().await.unwrap();
+        let sent: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        let content = sent["messages"][0]["content"].as_str().unwrap();
+        assert!(!content.contains("alice@example.com"));
+        assert!(content.contains("[EMAIL_REDACTED]"), "sent {content:?}");
+    }
+
+    /// The blocking half of the DLP contract: sensitive input must stop before
+    /// the provider count endpoint is called and retain Anthropic's envelope.
+    #[tokio::test]
+    async fn pii_dlp_blocks_count_tokens_before_egress() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens": 11})),
+            )
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(anthropic_model("claude-haiku"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(pii_block_guardrail());
+
+        let resp = build_app(snap)
+            .oneshot(make_req(serde_json::json!({
+                "model": "claude-haiku",
+                "messages": [{"role": "user", "content": "email alice@example.com"}]
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(!body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("alice@example.com"));
+    }
+
+    /// #555 preserves #545's explicit policy: generation/content moderation
+    /// does not run on a sizing-only endpoint. Only dedicated DLP kinds apply.
+    #[tokio::test]
+    async fn content_moderation_guardrail_remains_exempt_on_count_tokens() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens": 3})),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(anthropic_model("claude-haiku"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails
+            .insert(keyword_input_guardrail("MODERATION_BLOCK"));
+
+        let resp = build_app(snap)
+            .oneshot(make_req(serde_json::json!({
+                "model": "claude-haiku",
+                "messages": [{"role": "user", "content": "MODERATION_BLOCK"}]
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     /// Mixed group [anthropic, openai]: the openai target is `continue`d

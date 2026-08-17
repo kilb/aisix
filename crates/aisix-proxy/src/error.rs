@@ -774,10 +774,8 @@ pub(crate) fn proxy_error_from_multipart(
     }
 }
 
-/// Cap for manual `axum::body::to_bytes` reads: the configured
-/// `request_body_limit_bytes` with the `0` = "no cap" sentinel widened to
-/// `usize::MAX`, mirroring what `DefaultBodyLimit::disable()` does on the
-/// extractor path.
+/// Cap for manual `axum::body::to_bytes` reads: the effective endpoint limit
+/// with the explicit `0` = "no cap" sentinel widened to `usize::MAX`.
 pub(crate) fn body_read_cap(limit_bytes: usize) -> usize {
     if limit_bytes == 0 {
         usize::MAX

@@ -4,8 +4,8 @@
 //! resolves an exporter's pipeline with [`ExporterPipelines::get_or_create`]
 //! — lazily starting it on first sighting, and rebuilding it when the
 //! exporter's config changes — then enqueues into the returned handle. A
-//! periodic [`ExporterPipelines::retain`] stops pipelines for exporters that
-//! left the snapshot.
+//! [`ExporterPipelines::reconcile`] immediately aborts pipelines for exporters
+//! that left the live snapshot or whose delivery configuration changed.
 //!
 //! Lazy-on-first-sighting mirrors the previous `OtlpHttpFanOut` permit map:
 //! it is immediately consistent with the snapshot (a just-added exporter
@@ -16,7 +16,7 @@
 //! to an [`ObservabilitySink`], so the manager is shared by every
 //! pipeline-backed sink family (`otlp`, `http_batch`, …).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -78,9 +78,11 @@ impl ExporterPipelines {
             if existing.fingerprint == fingerprint {
                 return existing.handle.clone();
             }
-            // Config changed — stop the stale pipeline, then rebuild below.
+            // Config changed — drop queued records for the old destination
+            // immediately, then rebuild below. Draining here could deliver
+            // captured content after the operator revoked that config.
             if let Some(old) = running.remove(key) {
-                let _ = old.cancel.send(true);
+                old.worker.abort();
                 tracing::info!(exporter = %key, "rebuilding reconfigured exporter pipeline");
             }
         }
@@ -100,17 +102,20 @@ impl ExporterPipelines {
         handle
     }
 
-    /// Stop pipelines whose exporter key is not in `live`. Stopped pipelines
-    /// drain their queue and exit on their own (cancel signal); they are not
-    /// aborted. Called periodically to GC exporters that left the snapshot.
-    pub fn retain(&self, live: &HashSet<String>) {
+    /// Abort pipelines absent from `desired` or whose desired fingerprint no
+    /// longer matches the running configuration, discarding queued records.
+    /// Deletion, disablement, and reconfiguration are authorization
+    /// revocations; a graceful drain could send captured content to a stale
+    /// destination afterwards. Replacement pipelines remain lazy and start on
+    /// the next [`Self::get_or_create`] call.
+    pub fn reconcile(&self, desired: &HashMap<String, u64>) {
         let mut running = self.running.lock();
         running.retain(|key, pipeline| {
-            if live.contains(key) {
+            if desired.get(key) == Some(&pipeline.fingerprint) {
                 true
             } else {
-                let _ = pipeline.cancel.send(true);
-                tracing::info!(exporter = %key, "stopping removed exporter pipeline");
+                pipeline.worker.abort();
+                tracing::info!(exporter = %key, "stopping revoked exporter pipeline");
                 false
             }
         });
@@ -248,7 +253,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retain_stops_absent_exporters() {
+    async fn reconcile_stops_absent_exporters() {
         let mgr = manager();
         let builds = Arc::new(AtomicU32::new(0));
         let delivered = Arc::new(AtomicUsize::new(0));
@@ -256,8 +261,47 @@ mod tests {
         mgr.get_or_create("b", 1, counting(&builds, &delivered));
         assert_eq!(mgr.len(), 2);
 
-        let live: HashSet<String> = ["a".to_string()].into_iter().collect();
-        mgr.retain(&live);
+        let desired: HashMap<String, u64> = [("a".to_string(), 1)].into_iter().collect();
+        mgr.reconcile(&desired);
         assert_eq!(mgr.len(), 1, "exporter b's pipeline was stopped");
+    }
+
+    #[tokio::test]
+    async fn reconcile_discards_queued_records_for_removed_exporter() {
+        let mgr = manager();
+        let builds = Arc::new(AtomicU32::new(0));
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let handle = mgr.get_or_create("revoked", 1, counting(&builds, &delivered));
+        // Let the interval's immediate empty tick complete, then place one
+        // record in the long-lived batch and revoke the exporter.
+        tokio::task::yield_now().await;
+        assert!(handle.try_enqueue(rec()));
+        tokio::task::yield_now().await;
+
+        mgr.reconcile(&HashMap::new());
+        tokio::task::yield_now().await;
+        assert_eq!(delivered.load(Ordering::Relaxed), 0);
+        assert!(mgr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_discards_queued_records_for_reconfigured_exporter() {
+        let mgr = manager();
+        let builds = Arc::new(AtomicU32::new(0));
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let handle = mgr.get_or_create("changed", 1, counting(&builds, &delivered));
+        tokio::task::yield_now().await;
+        assert!(handle.try_enqueue(rec()));
+        tokio::task::yield_now().await;
+
+        let desired: HashMap<String, u64> = [("changed".to_string(), 2)].into_iter().collect();
+        mgr.reconcile(&desired);
+        tokio::task::yield_now().await;
+        assert_eq!(delivered.load(Ordering::Relaxed), 0);
+        assert!(mgr.is_empty(), "replacement remains lazy");
+
+        mgr.get_or_create("changed", 2, counting(&builds, &delivered));
+        assert_eq!(builds.load(Ordering::Relaxed), 2);
+        mgr.shutdown().await;
     }
 }

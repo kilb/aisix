@@ -535,7 +535,7 @@ async fn dispatch(
     // Buffer the request body under the configured cap (guardrails and
     // the protocol probe need the whole thing; the tunnel forwards it
     // verbatim).
-    let body_limit = state.request_body_limit_bytes;
+    let body_limit = state.request_body_limit_for(&path);
     let body_bytes: Bytes =
         axum::body::to_bytes(req.into_body(), crate::error::body_read_cap(body_limit))
             .await
@@ -1662,6 +1662,7 @@ impl RouteTelemetry {
         self.state.otlp_fan_out.fan_out(
             &event,
             content.as_ref(),
+            exporters.generation(),
             exporters.iter().map(|e| &e.value),
         );
     }

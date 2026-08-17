@@ -381,11 +381,10 @@ impl Entry {
 /// byte-identical behavior. Only when none holds do the trackers take the
 /// cheap read-first paths — writes whose consumers provably don't exist.
 ///
-/// The predicate set is recomputed at most once per snapshot version
-/// (packed with the version into one atomic so the pair can never be
-/// observed torn). A racing store between the version read and the table
-/// walk can cache bits against a stale version; the next call detects the
-/// mismatch and recomputes, so the value converges immediately.
+/// The predicate set is recomputed at most once per snapshot generation
+/// (packed with the generation into one atomic so the pair can never be
+/// observed torn). The generation and table contents come from one atomic
+/// snapshot publication.
 #[derive(Debug)]
 pub struct BookkeepingFlags {
     snapshot: SnapshotHandle<AisixSnapshot>,
@@ -414,14 +413,13 @@ impl BookkeepingFlags {
     }
 
     fn bits(&self) -> u64 {
-        let ver = self.snapshot.version();
+        let view = self.snapshot.load_versioned();
         let packed = self.packed.load(Ordering::Relaxed);
-        if packed != UNCOMPUTED && packed >> 3 == ver {
+        if packed != UNCOMPUTED && packed >> 3 == view.version {
             return packed & FLAG_BITS;
         }
-        let snap = self.snapshot.load();
         let mut bits = 0;
-        for entry in snap.models.entries() {
+        for entry in view.snapshot.models.entries() {
             let m = &entry.value;
             if let Some(routing) = &m.routing {
                 match routing.strategy {
@@ -434,7 +432,8 @@ impl BookkeepingFlags {
                 bits |= FLAG_HEALTH_CHECKS;
             }
         }
-        self.packed.store((ver << 3) | bits, Ordering::Relaxed);
+        self.packed
+            .store((view.version << 3) | bits, Ordering::Relaxed);
         bits
     }
 }

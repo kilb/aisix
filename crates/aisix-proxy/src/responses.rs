@@ -12,6 +12,7 @@
 //! Only OpenAI models support this endpoint. Non-OpenAI models receive a
 //! 400 with an explanatory message.
 
+use aisix_core::AppliedGuardrail;
 use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse, FinishReason, UsageStats};
 use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent};
 use axum::extract::State;
@@ -90,6 +91,10 @@ struct ResponseDispatchSuccess {
     /// Monitor-mode guardrail observations on the response side
     /// (AISIX-Cloud#562), same lifecycle as `output_redactions`.
     output_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    /// Provider/body failure discovered after an HTTP-200 streaming response
+    /// began. The wire response may remain 200, but health, metrics, and the
+    /// billed UsageEvent use this terminal outcome.
+    terminal_failure: Option<crate::stream_timeout::RawStreamFailure>,
 }
 
 /// Dispatch error carrying the per-attempt telemetry accumulated before
@@ -186,7 +191,10 @@ pub async fn responses(
                 Some(&auth.entry.id),
                 started,
                 crate::reject::Envelope::OpenAi,
-                crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes),
+                crate::error::proxy_error_from_json_rejection(
+                    rej,
+                    state.request_body_limit_for("/v1/responses"),
+                ),
             );
         }
     };
@@ -209,9 +217,13 @@ pub async fn responses(
     // Filled by `dispatch` with per-detector PII mask counts (#932); attached
     // to the terminal usage event on both the success and failure paths.
     let mut redaction_counts = crate::redact::RedactionCounts::new();
+    // Resolved-chain metadata must survive a pre-upstream input block so the
+    // terminal event identifies the policy that governed the request.
+    let mut applied_guardrails: Vec<AppliedGuardrail> = Vec::new();
     // Filled by `dispatch` with monitor-mode guardrail observations
     // (AISIX-Cloud#562), same lifecycle as `redaction_counts`.
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    let mut failure_content_safe = true;
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
     match dispatch(
@@ -222,8 +234,10 @@ pub async fn responses(
         &request_id,
         started,
         &client,
+        &mut applied_guardrails,
         &mut redaction_counts,
         &mut monitor_hits,
+        &mut failure_content_safe,
     )
     .await
     {
@@ -233,7 +247,10 @@ pub async fn responses(
             crate::redact::merge_counts(&mut redaction_counts, success.output_redactions.clone());
             monitor_hits.extend(success.output_monitor_hits.clone());
             let elapsed = started.elapsed();
-            let status = success.response.status().as_u16();
+            let status = success
+                .terminal_failure
+                .map(|failure| failure.bridge_error().http_status())
+                .unwrap_or_else(|| success.response.status().as_u16());
             emit_access_log(
                 &model_name,
                 &success.provider,
@@ -279,6 +296,7 @@ pub async fn responses(
                 &model_name,
                 &api_key_id,
                 &client,
+                &applied_guardrails,
                 &success.routing,
                 // The winner's success event carries the content.
                 /* content_for_last */
@@ -322,7 +340,10 @@ pub async fn responses(
                     // Winning-attempt classification (#655). Direct models
                     // have no recorded attempt → AttemptInfo defaults.
                     let winner = success.routing.winner();
-                    let attempt = winner.map(AttemptInfo::from_record).unwrap_or_default();
+                    let mut attempt = winner.map(AttemptInfo::from_record).unwrap_or_default();
+                    if let Some(failure) = success.terminal_failure {
+                        attempt.error_class = failure.bridge_error().error_type().to_string();
+                    }
                     // `latency_ms` is scoped to the winning attempt — the
                     // failed ones before it emitted their own events, so
                     // `elapsed` would double-count them. Access log keeps the
@@ -346,6 +367,7 @@ pub async fn responses(
                         &client,
                         attempt,
                         success.guardrail_blocked,
+                        applied_guardrails.clone(),
                         redaction_counts.clone(),
                         monitor_hits.clone(),
                         success.captured_content.as_ref(),
@@ -402,7 +424,7 @@ pub async fn responses(
             // body-less (a 401 here is upstream-auth passthrough — caller
             // 401s are rejected by the auth extractor before any event
             // exists) (the body adds nothing to an authorization failure).
-            let mut failure_content = if status == 401 || status == 403 {
+            let mut failure_content = if status == 401 || status == 403 || !failure_content_safe {
                 None
             } else {
                 content_capture_cap(
@@ -436,6 +458,7 @@ pub async fn responses(
                 &model_name,
                 &api_key_id,
                 &client,
+                &applied_guardrails,
                 &routing,
                 content_for_last,
             );
@@ -444,6 +467,7 @@ pub async fn responses(
             // class (`model_id` empty: the model never resolved). When
             // attempts were recorded, each was already emitted.
             if routing.attempts.is_empty() {
+                let guardrail_blocked = matches!(&err, ProxyError::ContentFiltered(_));
                 emit_zero_token_event(
                     &state,
                     &snapshot,
@@ -461,6 +485,8 @@ pub async fn responses(
                         error_class: err.kind().to_string(),
                         ..Default::default()
                     },
+                    guardrail_blocked,
+                    applied_guardrails.clone(),
                     // Input masking may have fired before the failure.
                     redaction_counts.clone(),
                     monitor_hits.clone(),
@@ -486,6 +512,9 @@ async fn dispatch(
     // end-of-stream UsageEvent it emits (#808).
     started: Instant,
     client: &ClientContext,
+    // Out-param: filled immediately after chain resolution so input-block
+    // telemetry retains the attached `{kind, hook}` set.
+    applied_out: &mut Vec<AppliedGuardrail>,
     // Out-param: per-detector PII mask counts (#932). Input-side counts land
     // here as soon as the request is rewritten; the non-streaming output side
     // arrives via `ResponseDispatchSuccess::output_redactions`; streaming
@@ -494,6 +523,9 @@ async fn dispatch(
     // Out-param: monitor-mode guardrail observations (AISIX-Cloud#562),
     // same lifecycle as `redactions_out`.
     monitor_hits_out: &mut Vec<aisix_core::GuardrailMonitorHit>,
+    // False when remote segment moderation could not prove a complete rewrite;
+    // the handler then omits the request from full-content failure exporters.
+    failure_content_safe_out: &mut bool,
 ) -> Result<ResponseDispatchSuccess, ResponsesDispatchError> {
     let model_name = body
         .get("model")
@@ -534,6 +566,7 @@ async fn dispatch(
     // response body (which outlives this handler) for end-of-stream output
     // guardrails (#825), mirroring /v1/messages.
     let resolved_chain = Arc::new(state.guardrail_index.resolve(&guardrail_ctx));
+    *applied_out = resolved_chain.applied().to_vec();
     if !resolved_chain.is_empty() {
         let chat = responses_input_to_chat(&model_name, body);
         let (verdict, hits) = aisix_guardrails::Guardrail::check_input_non_segment_observed(
@@ -545,15 +578,25 @@ async fn dispatch(
         // Segment pass: one Bedrock call over the body's text slots; an
         // ANONYMIZE disposition writes the masked text back into the
         // Responses body (#932 bedrock follow-up).
-        let verdict = crate::redact::moderate_body(
+        let mut moderation = crate::redact::moderate_responses_request_structured(
             resolved_chain.as_ref(),
-            crate::redact::Direction::Input,
             verdict,
+            body,
             redactions_out,
             monitor_hits_out,
-            |g| crate::redact::redact_responses_request(g, body),
         )
         .await;
+        if !moderation.verdict.is_block() {
+            let redaction =
+                crate::redact::redact_responses_request_structured(resolved_chain.as_ref(), body);
+            crate::redact::merge_counts(redactions_out, redaction.counts);
+            if redaction.unrewritable_tool_key {
+                moderation.verdict = crate::redact::unrewritable_tool_key_verdict();
+                moderation.capture_safe = false;
+            }
+        }
+        *failure_content_safe_out &= moderation.capture_safe;
+        let verdict = moderation.verdict;
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
@@ -565,10 +608,12 @@ async fn dispatch(
             // responses.
             // AISIX-Cloud#1013: mask before returning so the failure
             // content capture exports post-mask text (see chat.rs).
-            crate::redact::merge_counts(
-                redactions_out,
-                crate::redact::redact_responses_request(resolved_chain.as_ref(), body),
-            );
+            let redaction =
+                crate::redact::redact_responses_request_structured(resolved_chain.as_ref(), body);
+            crate::redact::merge_counts(redactions_out, redaction.counts);
+            if redaction.unrewritable_tool_key {
+                *failure_content_safe_out = false;
+            }
             tracing::warn!(
                 guardrail_hook = "input",
                 model = %model_name,
@@ -586,10 +631,9 @@ async fn dispatch(
         // #932: mask-action PII rules rewrite the Responses body in place
         // AFTER the block check passes — both the verbatim passthrough and
         // the cross-provider bridge forward from this body.
-        crate::redact::merge_counts(
-            redactions_out,
-            crate::redact::redact_responses_request(resolved_chain.as_ref(), body),
-        );
+        // The local structured rewrite already ran immediately after remote
+        // moderation so tool-argument object keys can fail closed before
+        // dispatch.
     }
 
     let model_rl =
@@ -943,6 +987,13 @@ fn responses_input_to_chat(model: &str, body: &Value) -> ChatFormat {
         _ => {}
     }
 
+    if let Some(tools) = body.get("tools") {
+        let text = serde_json::to_string(tools).expect("serde_json::Value always serializes");
+        if text != "null" && text != "[]" {
+            messages.push(ChatMessage::user(text));
+        }
+    }
+
     ChatFormat::new(model, messages)
 }
 
@@ -1032,6 +1083,7 @@ async fn responses_to_target(
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<ResponseDispatchSuccess, ProxyError> {
     let chain_arc = chain;
+    let applied_guardrails = chain_arc.applied().to_vec();
     let chain = chain_arc.as_ref();
     // Largest content cap any enabled content-capturing exporter wants, or
     // `None` when none do (AISIX-Cloud#947). The captured prompt is the
@@ -1152,6 +1204,9 @@ async fn responses_to_target(
         crate::stream_timeout::send_with_deadline(req, connect_deadline, send_started)
             .await
             .map_err(|be| {
+                if be.http_status() >= 500 {
+                    state.health.record_failure(&model.display_name);
+                }
                 crate::cooldown::note_failure(
                     &state.runtime_status,
                     model_id,
@@ -1172,15 +1227,15 @@ async fn responses_to_target(
             message.chars().take(1024).collect::<String>(),
             retry_after,
         );
+        if err.http_status() >= 500 {
+            state.health.record_failure(&model.display_name);
+        }
         if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
         {
             state.runtime_status.mark_cooldown(model_id, ttl, reason);
         }
         return Err(ProxyError::Bridge(err));
     }
-
-    state.health.record_success(&model.display_name);
-    state.runtime_status.mark_healthy(model_id);
 
     let provider_label = "openai".to_string();
 
@@ -1222,6 +1277,13 @@ async fn responses_to_target(
             let read_to = timeouts.stream;
             let mut buf: Vec<u8> = Vec::new();
             let mut saw_chunk = false;
+            let mut observed_frame = Vec::new();
+            let mut observed_usage: Option<ResponseUsage> = None;
+            let mut observed_capture =
+                SseTextCapture::new(crate::token_estimate::OUTPUT_ACCUMULATION_CAP);
+            let mut observed_failure = None;
+            let mut observed_first_frame = false;
+            let mut observed_raw = String::new();
             loop {
                 // #554: bound each read so a stalled upstream fails over —
                 // the buffer path hasn't sent anything to the client yet, so
@@ -1230,6 +1292,7 @@ async fn responses_to_target(
                     Some(d) => tokio::time::timeout(d, stream.next())
                         .await
                         .map_err(|_| {
+                            state.health.record_failure(&model.display_name);
                             crate::cooldown::note_failure(
                                 &state.runtime_status,
                                 model_id,
@@ -1250,6 +1313,7 @@ async fn responses_to_target(
                     // when a stream timeout is configured, so a model without
                     // one keeps the pre-#554 behavior.
                     if !saw_chunk && read_to.is_some() {
+                        state.health.record_failure(&model.display_name);
                         let err = crate::cooldown::note_failure(
                             &state.runtime_status,
                             model_id,
@@ -1263,6 +1327,7 @@ async fn responses_to_target(
                 saw_chunk = true;
                 let chunk = chunk
                     .map_err(|e| {
+                        state.health.record_failure(&model.display_name);
                         crate::cooldown::note_failure(
                             &state.runtime_status,
                             model_id,
@@ -1271,6 +1336,27 @@ async fn responses_to_target(
                         )
                     })
                     .map_err(ProxyError::Bridge)?;
+                // Parse/account every generated chunk before enforcing the
+                // security wire cap. Both side buffers are hard-bounded, so a
+                // single oversized provider chunk cannot force an equally
+                // large duplicate allocation before fail-closed rejection.
+                push_capped_lossy_bytes(&mut observed_raw, &chunk);
+                for part in chunk.chunks(64 * 1024) {
+                    observed_frame.extend_from_slice(part);
+                    drain_responses_sse_frames(
+                        &mut observed_frame,
+                        &mut observed_usage,
+                        Some(&mut observed_capture),
+                        &mut observed_failure,
+                        attempt_started,
+                        &mut observed_first_frame,
+                    );
+                    if observed_frame.len() > crate::messages::MAX_SSE_FRAME_BUF_BYTES {
+                        observed_frame.clear();
+                        observed_failure =
+                            Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode);
+                    }
+                }
                 if buf.len() + chunk.len() > max_buffer_bytes {
                     // Unlike chat's BufferFull, we always fail closed on
                     // overflow regardless of `on_exceeded_fail_open`: an
@@ -1284,36 +1370,110 @@ async fn responses_to_target(
                         max_buffer_bytes,
                         "streaming /v1/responses output exceeded buffer cap; failing closed",
                     );
-                    return Err(ProxyError::ContentFiltered(
-                        "response blocked by content policy".into(),
-                    ));
+                    state.health.record_success(&model.display_name);
+                    state.runtime_status.mark_healthy(model_id);
+                    let parsed_output = observed_capture.text();
+                    let output_text = if parsed_output.is_empty() {
+                        observed_raw.clone()
+                    } else {
+                        parsed_output
+                    };
+                    let mut usage = observed_usage.unwrap_or_default();
+                    let est = crate::token_estimate::Estimator::new(
+                        &upstream_model,
+                        crate::token_estimate::PromptInput::Responses(body.clone()),
+                    );
+                    let filled = crate::token_estimate::fill_missing(
+                        &est,
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                        Some(&output_text),
+                    );
+                    if filled.estimated {
+                        usage.prompt_tokens = filled.prompt_tokens;
+                        usage.completion_tokens = filled.completion_tokens;
+                        usage.usage_estimated = true;
+                    }
+                    return Ok(ResponseDispatchSuccess {
+                        response: ProxyError::ContentFiltered(
+                            "response blocked by content policy".into(),
+                        )
+                        .into_response(),
+                        provider: provider_label,
+                        usage: Some(usage),
+                        model_id: model_id.to_string(),
+                        provider_key_id: provider_key_id.clone(),
+                        upstream_model: upstream_model.clone(),
+                        routing: RoutingTelemetry::default(),
+                        guardrail_blocked: true,
+                        usage_handled_by_stream: false,
+                        output_redactions: crate::redact::RedactionCounts::new(),
+                        output_monitor_hits: Vec::new(),
+                        captured_content: None,
+                        terminal_failure: None,
+                    });
                 }
                 buf.extend_from_slice(&chunk);
             }
+            let terminal_failure = responses_sse_terminal_failure(&buf);
+            if let Some(failure) = terminal_failure {
+                let error = failure.bridge_error();
+                state.health.record_failure(&model.display_name);
+                let _ = crate::cooldown::note_failure(
+                    &state.runtime_status,
+                    model_id,
+                    model.cooldown.as_ref(),
+                    error,
+                );
+            } else {
+                state.health.record_success(&model.display_name);
+                state.runtime_status.mark_healthy(model_id);
+            }
+            let malformed = matches!(
+                terminal_failure,
+                Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode)
+            );
+            if malformed {
+                tracing::warn!(
+                    model = %model.display_name,
+                    "held /v1/responses stream contained malformed SSE data",
+                );
+            }
             let out_text = responses_sse_output_text(&buf);
             let synth = synth_chat_response(&upstream_model, out_text);
-            let (verdict, hits) =
-                aisix_guardrails::Guardrail::check_output_non_segment_observed(chain, &synth).await;
-            let mut output_monitor_hits = hits;
+            let mut output_monitor_hits = Vec::new();
             // Segment pass over the held SSE frames: one Bedrock call; an
             // ANONYMIZE disposition rewrites `buf` in place (#932 bedrock
             // follow-up). The capture below reads the post-mask buffer.
             let mut output_redactions = crate::redact::RedactionCounts::new();
-            let verdict = crate::redact::moderate_body(
-                chain,
-                crate::redact::Direction::Output,
-                verdict,
-                &mut output_redactions,
-                &mut output_monitor_hits,
-                |g| match crate::redact::redact_responses_sse(g, &buf) {
-                    Some((rewritten, counts)) => {
+            let mut response_capture_safe = false;
+            let mut verdict = aisix_guardrails::GuardrailVerdict::Allow;
+            if !malformed {
+                let (non_segment, hits) =
+                    aisix_guardrails::Guardrail::check_output_non_segment_observed(chain, &synth)
+                        .await;
+                output_monitor_hits = hits;
+                let moderation = crate::redact::moderate_responses_sse(
+                    chain,
+                    non_segment,
+                    &mut buf,
+                    &mut output_redactions,
+                    &mut output_monitor_hits,
+                )
+                .await;
+                response_capture_safe = moderation.capture_safe && terminal_failure.is_none();
+                verdict = moderation.verdict;
+                if !verdict.is_block() {
+                    let redaction = crate::redact::redact_responses_sse_structured(chain, &buf);
+                    if let Some(rewritten) = redaction.rewritten {
                         buf = rewritten;
-                        counts
                     }
-                    None => crate::redact::RedactionCounts::new(),
-                },
-            )
-            .await;
+                    crate::redact::merge_counts(&mut output_redactions, redaction.counts);
+                    if redaction.unrewritable_tool_key {
+                        verdict = crate::redact::unrewritable_tool_key_verdict();
+                    }
+                }
+            }
             if let aisix_guardrails::GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
@@ -1330,15 +1490,6 @@ async fn responses_to_target(
                     crate::error::guardrail_block_message("response", guardrail_name.as_deref()),
                 ));
             }
-            // #932: the whole SSE response is held here — mask the frames
-            // (channel reassembly) before anything reaches the wire.
-            let buf = match crate::redact::redact_responses_sse(chain, &buf) {
-                Some((rewritten, counts)) => {
-                    crate::redact::merge_counts(&mut output_redactions, counts);
-                    rewritten
-                }
-                None => buf,
-            };
             // #808: the whole SSE response is buffered here, so parse its
             // terminal event for usage and let the handler emit (the body is
             // a single complete chunk now, not a live stream).
@@ -1377,13 +1528,16 @@ async fn responses_to_target(
             // read from the POST-redaction buffer so masked PII stays masked
             // in the exported content.
             let captured_content = match (&captured_prompt, content_cap) {
-                (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+                (Some(prompt), Some(cap)) if response_capture_safe => Some(CapturedContent::new(
                     prompt,
                     &responses_sse_output_text(&buf),
                     cap as usize,
                 )),
                 _ => None,
             };
+            if malformed {
+                buf = responses_stream_error_body();
+            }
             let mut response = axum::response::Response::new(axum::body::Body::from(buf));
             apply_passthrough_headers(&mut response, &headers, request_id);
             return Ok(ResponseDispatchSuccess {
@@ -1399,6 +1553,7 @@ async fn responses_to_target(
                 output_redactions,
                 output_monitor_hits,
                 captured_content,
+                terminal_failure,
             });
         }
 
@@ -1410,19 +1565,28 @@ async fn responses_to_target(
         // an opaque byte passthrough).
         let stream_budget = timeouts.stream;
         let wrapped: std::pin::Pin<
-            Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
+            Box<
+                dyn futures::Stream<
+                        Item = Result<bytes::Bytes, crate::stream_timeout::RawStreamError>,
+                    > + Send,
+            >,
         > = Box::pin(crate::stream_timeout::with_read_timeout_bytes(
             upstream_resp.bytes_stream(),
             stream_budget,
         ));
         let body_stream: std::pin::Pin<
-            Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
+            Box<
+                dyn futures::Stream<
+                        Item = Result<bytes::Bytes, crate::stream_timeout::RawStreamError>,
+                    > + Send,
+            >,
         > = if timeouts.stream_configured {
             let mut wrapped = wrapped;
             let first_bytes = match wrapped.next().await {
                 Some(Ok(b)) => b,
                 Some(Err(e)) => {
-                    let err = crate::dispatch::reqwest_error_to_bridge(&e, send_started);
+                    let err = e.into_bridge(send_started);
+                    state.health.record_failure(&model.display_name);
                     if let Some((ttl, reason)) =
                         crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
                     {
@@ -1432,6 +1596,7 @@ async fn responses_to_target(
                 }
                 None => {
                     let err = aisix_gateway::BridgeError::StreamAborted;
+                    state.health.record_failure(&model.display_name);
                     if let Some((ttl, reason)) =
                         crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
                     {
@@ -1441,9 +1606,10 @@ async fn responses_to_target(
                 }
             };
             Box::pin(
-                futures::stream::once(std::future::ready(Ok::<bytes::Bytes, reqwest::Error>(
-                    first_bytes,
-                )))
+                futures::stream::once(std::future::ready(Ok::<
+                    bytes::Bytes,
+                    crate::stream_timeout::RawStreamError,
+                >(first_bytes)))
                 .chain(wrapped),
             )
         } else {
@@ -1468,7 +1634,10 @@ async fn responses_to_target(
         let provider_key_id_c = provider_key_id.clone();
         let provider_c = provider_label.clone();
         let upstream_model_c = upstream_model.clone();
+        let model_display_name_c = model.display_name.clone();
+        let cooldown_c = model.cooldown.clone();
         let client_c = client_ctx.clone();
+        let attempt_c = attempt.clone();
         // #688: carry the reservation into the end-of-stream guard — keys drive
         // post-stream TPM/TPD accounting, the hold keeps the concurrency slot(s)
         // until the stream ends. `take()` leaves the handler's `reservation` as
@@ -1507,7 +1676,7 @@ async fn responses_to_target(
             attempt_started,
             content_cap,
             eos_scan,
-            move |mut usage, out_text, output_hits| {
+            move |mut usage, out_text, output_hits, output_capture_safe, stream_failure| {
                 // Streams that reach here are committed 200s — the
                 // `!status.is_success()` guard above returned early on errors.
                 //
@@ -1545,11 +1714,23 @@ async fn responses_to_target(
                 // least_busy: stream over — this target is no longer
                 // in-flight.
                 drop(in_flight);
+                let terminal = crate::stream_timeout::finish_bridge_stream(
+                    &state_c.health,
+                    &state_c.runtime_status,
+                    &model_display_name_c,
+                    &model_id_c,
+                    cooldown_c.as_ref(),
+                    stream_failure.map(|failure| failure.bridge_error()),
+                    usage.reached_end,
+                    200,
+                );
+                let mut terminal_attempt = attempt_c;
+                terminal_attempt.error_class = terminal.error_class;
                 // Content capture (AISIX-Cloud#947): prompt captured up front,
                 // output text assembled by the stream wrapper (empty when no
                 // exporter wants content).
                 let captured_content = match (&captured_prompt_c, content_cap) {
-                    (Some(prompt), Some(cap)) => {
+                    (Some(prompt), Some(cap)) if output_capture_safe => {
                         Some(CapturedContent::new(prompt, &out_text, cap as usize))
                     }
                     _ => None,
@@ -1560,7 +1741,7 @@ async fn responses_to_target(
                         endpoint: "/v1/responses",
                         model: &bounded_model_c,
                         provider: &provider_c,
-                        status: 200,
+                        status: terminal.status,
                         streaming: true,
                     },
                     started.elapsed(),
@@ -1591,18 +1772,15 @@ async fn responses_to_target(
                     // as 499, matching LiteLLM. The upstream work still
                     // happened, so the event is emitted either way — only
                     // its outcome differs.
-                    if usage.reached_end {
-                        200
-                    } else {
-                        crate::CLIENT_CLOSED_REQUEST
-                    },
+                    terminal.status,
                     // Attempt-scoped, unlike the e2e histogram above: any
                     // failed attempt before this one emitted its own event.
                     attempt_started.elapsed(),
                     &usage,
                     &client_c,
-                    attempt,
+                    terminal_attempt,
                     /* guardrail_blocked */ false,
+                    applied_guardrails.clone(),
                     input_redactions.clone(),
                     monitor_hits,
                     captured_content.as_ref(),
@@ -1633,12 +1811,14 @@ async fn responses_to_target(
             output_monitor_hits: Vec::new(),
             // The Drop guard's emit carries the captured content too.
             captured_content: None,
+            terminal_failure: None,
         })
     } else {
         let json_body: Value = upstream_resp
             .json()
             .await
             .map_err(|e| {
+                state.health.record_failure(&model.display_name);
                 crate::cooldown::note_failure(
                     &state.runtime_status,
                     model_id,
@@ -1647,6 +1827,8 @@ async fn responses_to_target(
                 )
             })
             .map_err(ProxyError::Bridge)?;
+        state.health.record_success(&model.display_name);
+        state.runtime_status.mark_healthy(model_id);
 
         // Extract the upstream-reported usage block for telemetry
         // emission. Pulled here (before the response is moved into
@@ -1692,20 +1874,30 @@ async fn responses_to_target(
         let mut json_body = json_body;
         let mut output_seg_counts = crate::redact::RedactionCounts::new();
         let mut output_monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+        let mut output_capture_safe = true;
         if aisix_guardrails::Guardrail::runs_on_output(chain) {
             let synth = synth_chat_response(&upstream_model, responses_output_text(&json_body));
             let (verdict, hits) =
                 aisix_guardrails::Guardrail::check_output_non_segment_observed(chain, &synth).await;
             output_monitor_hits.extend(hits);
-            let verdict = crate::redact::moderate_body(
+            let moderation = crate::redact::moderate_responses_response_structured(
                 chain,
-                crate::redact::Direction::Output,
                 verdict,
+                &mut json_body,
                 &mut output_seg_counts,
                 &mut output_monitor_hits,
-                |g| crate::redact::redact_responses_response(g, &mut json_body),
             )
             .await;
+            output_capture_safe = moderation.capture_safe;
+            let mut verdict = moderation.verdict;
+            if !verdict.is_block() {
+                let redaction =
+                    crate::redact::redact_responses_response_structured(chain, &mut json_body);
+                crate::redact::merge_counts(&mut output_seg_counts, redaction.counts);
+                if redaction.unrewritable_tool_key {
+                    verdict = crate::redact::unrewritable_tool_key_verdict();
+                }
+            }
             if let aisix_guardrails::GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
@@ -1748,20 +1940,18 @@ async fn responses_to_target(
                         (Some(p), Some(cap)) => Some(CapturedContent::new(p, "", cap as usize)),
                         _ => None,
                     },
+                    terminal_failure: None,
                 });
             }
         }
 
-        // #932: mask-action PII rules rewrite the response body AFTER the
-        // block check passes.
-        let mut output_redactions = crate::redact::redact_responses_response(chain, &mut json_body);
-        crate::redact::merge_counts(&mut output_redactions, output_seg_counts);
+        let output_redactions = output_seg_counts;
 
         // Content capture (AISIX-Cloud#947): the assistant's assembled output
         // text, read from the POST-redaction body so masked PII stays masked
         // in the exported content.
         let captured_content = match (&captured_prompt, content_cap) {
-            (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+            (Some(prompt), Some(cap)) if output_capture_safe => Some(CapturedContent::new(
                 prompt,
                 &responses_output_text(&json_body),
                 cap as usize,
@@ -1782,6 +1972,7 @@ async fn responses_to_target(
             output_redactions,
             output_monitor_hits,
             captured_content,
+            terminal_failure: None,
         })
     }
 }
@@ -1825,6 +2016,8 @@ async fn responses_cross_provider_to_target(
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<ResponseDispatchSuccess, ProxyError> {
     use aisix_gateway::Bridge;
+
+    let applied_guardrails = chain.applied().to_vec();
 
     // Content capture (AISIX-Cloud#947), same contract as the verbatim
     // target: prompt = the client-facing Responses request body
@@ -1885,6 +2078,9 @@ async fn responses_cross_provider_to_target(
 
     if is_stream {
         let upstream = bridge.chat_stream(&chat, &ctx).await.map_err(|err| {
+            if err.http_status() >= 500 {
+                state.health.record_failure(&model.display_name);
+            }
             if let Some((ttl, reason)) =
                 crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
             {
@@ -1902,6 +2098,9 @@ async fn responses_cross_provider_to_target(
             let first_chunk = match upstream.next().await {
                 Some(Ok(chunk)) => chunk,
                 Some(Err(err)) => {
+                    if err.http_status() >= 500 {
+                        state.health.record_failure(&model.display_name);
+                    }
                     if let Some((ttl, reason)) =
                         crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
                     {
@@ -1911,6 +2110,7 @@ async fn responses_cross_provider_to_target(
                 }
                 None => {
                     let err = aisix_gateway::BridgeError::StreamAborted;
+                    state.health.record_failure(&model.display_name);
                     if let Some((ttl, reason)) =
                         crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
                     {
@@ -1928,11 +2128,6 @@ async fn responses_cross_provider_to_target(
         } else {
             upstream
         };
-        // Health tracks the concrete resolved target, not the (possibly
-        // group-alias) requested model — matching the non-streaming branch.
-        state.health.record_success(&model.display_name);
-        state.runtime_status.mark_healthy(model_id);
-
         let response_id = format!("resp_{}", Uuid::new_v4().simple());
         let created_at = chrono::Utc::now().timestamp();
         let encoder = crate::responses_bridge::ResponsesSseEncoder::new(
@@ -1973,6 +2168,8 @@ async fn responses_cross_provider_to_target(
         let upstream_model_c = model.upstream_model().unwrap_or("unknown").to_string();
         let client_c = client_ctx.clone();
         let attempt_c = attempt.clone();
+        let model_display_name_c = model.display_name.clone();
+        let cooldown_c = model.cooldown.clone();
         // #688: carry the reservation into the end-of-stream guard — keys drive
         // post-stream TPM/TPD accounting, the hold keeps the concurrency slot(s)
         // until the stream ends. `take()` leaves the handler's `reservation` as
@@ -2008,7 +2205,7 @@ async fn responses_cross_provider_to_target(
             requested_model.to_string(),
             content_cap,
             Some(estimator),
-            move |comp| {
+            move |mut comp| {
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
                 // reservation's async `commit_tokens`). Tokens count even on an
@@ -2039,17 +2236,28 @@ async fn responses_cross_provider_to_target(
                     downstream_latency_ms: comp.downstream_latency_ms,
                     provider_request_id: comp.provider_request_id,
                 };
-                // A clean stream is a committed 200; an output-guardrail block
-                // (or fail-closed overflow) bills the upstream tokens but is
-                // recorded as a 422 marked guardrail_blocked, matching the
-                // non-streaming path so the Blocked tab + ledger see it.
-                let status = if comp.guardrail_blocked { 422 } else { 200 };
+                // A typed upstream-body failure retains its 5xx status. A
+                // guardrail block is 422, a clean EOF is 200, and only an
+                // actual consumer cancellation is 499.
+                let terminal = crate::stream_timeout::finish_bridge_stream(
+                    &state_c.health,
+                    &state_c.runtime_status,
+                    &model_display_name_c,
+                    &model_id_c,
+                    cooldown_c.as_ref(),
+                    comp.terminal_failure.take(),
+                    comp.reached_end || comp.guardrail_blocked,
+                    if comp.guardrail_blocked { 422 } else { 200 },
+                );
+                let mut terminal_attempt = attempt_c;
+                terminal_attempt.error_class = terminal.error_class;
+                let status = terminal.status;
                 // Content capture (AISIX-Cloud#947): prompt captured up front,
                 // response assembled across the bridged stream into
                 // `comp.response_text` (empty when no exporter wants content
                 // or when the response was blocked before release).
                 let captured_content = match (&captured_prompt_c, content_cap) {
-                    (Some(prompt), Some(cap)) if !comp.guardrail_blocked => Some(
+                    (Some(prompt), Some(cap)) if comp.response_capture_safe => Some(
                         CapturedContent::new(prompt, &comp.response_text, cap as usize),
                     ),
                     _ => None,
@@ -2086,8 +2294,9 @@ async fn responses_cross_provider_to_target(
                     attempt_started.elapsed(),
                     &usage,
                     &client_c,
-                    attempt_c,
+                    terminal_attempt,
                     comp.guardrail_blocked,
+                    applied_guardrails.clone(),
                     // #932: input-side counts merged with the hold-back
                     // release's output-side counts.
                     {
@@ -2133,6 +2342,7 @@ async fn responses_cross_provider_to_target(
             output_monitor_hits: Vec::new(),
             // The stream's end-of-stream emit carries the captured content.
             captured_content: None,
+            terminal_failure: None,
         });
     }
 
@@ -2194,20 +2404,30 @@ async fn responses_cross_provider_to_target(
     // client-visible output, scanned the same way /v1/chat/completions does.
     let mut output_seg_counts = crate::redact::RedactionCounts::new();
     let mut output_monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    let mut output_capture_safe = true;
     if aisix_guardrails::Guardrail::runs_on_output(chain.as_ref()) {
         let (verdict, hits) =
             aisix_guardrails::Guardrail::check_output_non_segment_observed(chain.as_ref(), &resp)
                 .await;
         output_monitor_hits.extend(hits);
-        let verdict = crate::redact::moderate_body(
+        let moderation = crate::redact::moderate_chat_response_structured(
             chain.as_ref(),
-            crate::redact::Direction::Output,
             verdict,
+            &mut resp,
             &mut output_seg_counts,
             &mut output_monitor_hits,
-            |g| crate::redact::redact_chat_response(g, &mut resp),
         )
         .await;
+        output_capture_safe = moderation.capture_safe;
+        let mut verdict = moderation.verdict;
+        if !verdict.is_block() {
+            let redaction =
+                crate::redact::redact_chat_response_structured(chain.as_ref(), &mut resp);
+            crate::redact::merge_counts(&mut output_seg_counts, redaction.counts);
+            if redaction.unrewritable_tool_key {
+                verdict = crate::redact::unrewritable_tool_key_verdict();
+            }
+        }
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
@@ -2247,14 +2467,12 @@ async fn responses_cross_provider_to_target(
                     (Some(p), Some(cap)) => Some(CapturedContent::new(p, "", cap as usize)),
                     _ => None,
                 },
+                terminal_failure: None,
             });
         }
     }
 
-    // #932: mask-action PII rules rewrite the bridged response AFTER the
-    // block check passes, BEFORE it is re-encoded as Responses JSON.
-    let mut output_redactions = crate::redact::redact_chat_response(chain.as_ref(), &mut resp);
-    crate::redact::merge_counts(&mut output_redactions, output_seg_counts);
+    let output_redactions = output_seg_counts;
 
     let created_at = chrono::Utc::now().timestamp();
     let json_body = crate::responses_bridge::chat_response_to_responses_json(
@@ -2266,7 +2484,7 @@ async fn responses_cross_provider_to_target(
     // (post-redaction) is the source, so the exported text matches what the
     // caller received.
     let captured_content = match (&captured_prompt, content_cap) {
-        (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+        (Some(prompt), Some(cap)) if output_capture_safe => Some(CapturedContent::new(
             prompt,
             &responses_output_text(&json_body),
             cap as usize,
@@ -2292,6 +2510,7 @@ async fn responses_cross_provider_to_target(
         output_redactions,
         output_monitor_hits,
         captured_content,
+        terminal_failure: None,
     })
 }
 
@@ -2362,12 +2581,23 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
 /// gate is applied to `json.response`.
 /// <https://platform.openai.com/docs/api-reference/responses-streaming>
 fn parse_responses_terminal_usage(json: &Value) -> Option<ResponseUsage> {
+    let event_type = json.get("type").and_then(|t| t.as_str());
     matches!(
-        json.get("type").and_then(|t| t.as_str()),
+        event_type,
         Some("response.completed" | "response.incomplete" | "response.failed")
     )
     .then(|| json.get("response").and_then(extract_response_usage))
     .flatten()
+    .map(|mut usage| {
+        // `extract_response_usage` handles fully buffered JSON and therefore
+        // defaults `reached_end` to true. On SSE, `response.failed` is a
+        // billed terminal failure, not a healthy semantic completion.
+        usage.reached_end = matches!(
+            event_type,
+            Some("response.completed" | "response.incomplete")
+        );
+        usage
+    })
 }
 
 /// Scan a fully-buffered Responses-API SSE body for the terminal event's
@@ -2375,23 +2605,73 @@ fn parse_responses_terminal_usage(json: &Value) -> Option<ResponseUsage> {
 /// already holds the whole response. Returns `None` (skip emission, matching
 /// the non-streaming gate) when no terminal event carried a usage block.
 fn responses_sse_usage(bytes: &[u8]) -> Option<ResponseUsage> {
-    let text = String::from_utf8_lossy(bytes);
     let mut usage = None;
-    for line in text.lines() {
-        let data = match line.strip_prefix("data:") {
-            Some(d) => d.trim(),
-            None => continue,
-        };
-        if data.is_empty() || data == "[DONE]" {
-            continue;
-        }
-        if let Ok(json) = serde_json::from_str::<Value>(data) {
-            if let Some(u) = parse_responses_terminal_usage(&json) {
-                usage = Some(u);
-            }
+    for json in crate::redact::parse_sse_json_stream(bytes).0 {
+        if let Some(u) = parse_responses_terminal_usage(&json) {
+            usage = Some(u);
         }
     }
     usage
+}
+
+fn responses_sse_terminal_failure(bytes: &[u8]) -> Option<crate::stream_timeout::RawStreamFailure> {
+    let (events, malformed) = crate::redact::parse_sse_json_stream(bytes);
+    if malformed {
+        return Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode);
+    }
+    for event in events {
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.completed" | "response.incomplete") => return None,
+            Some("response.failed" | "error") => {
+                return Some(crate::stream_timeout::RawStreamFailure::UpstreamInBand {
+                    status: responses_in_band_status(&event),
+                    wire: aisix_gateway::UpstreamWire::OpenAI,
+                });
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn responses_in_band_status(event: &Value) -> Option<u16> {
+    event
+        .get("response")
+        .and_then(|response| response.get("error"))
+        .or_else(|| event.get("error"))
+        .and_then(|error| error.get("status").or_else(|| error.get("code")))
+        .and_then(Value::as_u64)
+        .and_then(|status| u16::try_from(status).ok())
+}
+
+fn responses_stream_error_body() -> Vec<u8> {
+    format!(
+        "event: error\ndata: {}\n\n",
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "upstream_error",
+                "message": "upstream stream failed",
+            }
+        })
+    )
+    .into_bytes()
+}
+
+fn push_capped_lossy_bytes(output: &mut String, bytes: &[u8]) {
+    let remaining = crate::token_estimate::OUTPUT_ACCUMULATION_CAP.saturating_sub(output.len());
+    if remaining == 0 {
+        return;
+    }
+    let prefix = &bytes[..bytes.len().min(remaining)];
+    output.push_str(&String::from_utf8_lossy(prefix));
+    if output.len() > crate::token_estimate::OUTPUT_ACCUMULATION_CAP {
+        let mut end = crate::token_estimate::OUTPUT_ACCUMULATION_CAP;
+        while !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.truncate(end);
+    }
 }
 
 /// The `resp_…` carried by any frame of a fully-buffered Responses-API SSE
@@ -2399,100 +2679,104 @@ fn responses_sse_usage(bytes: &[u8]) -> Option<ResponseUsage> {
 /// terminal frame reported no usage and therefore produced no
 /// [`ResponseUsage`] (AISIX-Cloud#1289).
 fn responses_sse_provider_request_id(bytes: &[u8]) -> String {
-    let text = String::from_utf8_lossy(bytes);
-    for line in text.lines() {
-        let Some(data) = line.strip_prefix("data:").map(str::trim) else {
-            continue;
-        };
-        if data.is_empty() || data == "[DONE]" {
-            continue;
-        }
-        if let Ok(json) = serde_json::from_str::<Value>(data) {
-            if let Some(r) = json.get("response") {
-                let id = crate::usage_attr::provider_response_id(r);
-                if !id.is_empty() {
-                    return id;
-                }
+    for json in crate::redact::parse_sse_json_stream(bytes).0 {
+        if let Some(r) = json.get("response") {
+            let id = crate::usage_attr::provider_response_id(r);
+            if !id.is_empty() {
+                return id;
             }
         }
     }
     String::new()
 }
 
-/// Drain every complete SSE frame from `buf`, updating `acc` with the latest
+/// Drain every complete SSE event from `buf`, updating `acc` with the latest
 /// terminal-event usage (#808) and feeding each parsed event to the optional
-/// content capture (AISIX-Cloud#947). A frame ends at the first blank line;
-/// an incomplete trailing frame is left in `buf` for the next chunk. Reuses
-/// the shared SSE framing helpers from the `/v1/messages` passthrough so the
-/// two surfaces parse identically.
+/// content capture (AISIX-Cloud#947). Incomplete trailing bytes remain for the
+/// next chunk; framing and multi-`data` interpretation use the shared WHATWG
+/// parser.
 fn drain_responses_sse_frames(
     buf: &mut Vec<u8>,
     acc: &mut Option<ResponseUsage>,
     mut capture: Option<&mut SseTextCapture>,
+    failure: &mut Option<crate::stream_timeout::RawStreamFailure>,
     attempt_started: Instant,
     first_frame_seen: &mut bool,
 ) {
-    while let Some(end) = crate::messages::find_frame_end(buf) {
+    while let Some(end) = crate::redact::first_sse_event_end(buf) {
         let frame: Vec<u8> = buf.drain(..end).collect();
-        if let Some(data) = crate::messages::extract_sse_data_line(&frame) {
-            if data == b"[DONE]" {
-                continue;
+        let (json, malformed) = crate::redact::parse_sse_json_event(&frame, !*first_frame_seen);
+        if malformed {
+            *failure = Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode);
+        }
+        if let Some(json) = json {
+            // First parsed frame of ANY type (`response.created`
+            // included) → upstream TTFT. The industry convention
+            // (LiteLLM, caller-side gateways) stamps the same event, so
+            // the figure matches external observers. A generated-output
+            // whitelist here reported the END of a silent thinking
+            // phase on hidden-reasoning upstreams — AISIX-Cloud#1225.
+            if !*first_frame_seen {
+                *first_frame_seen = true;
+                acc.get_or_insert_with(Default::default).upstream_ttft_ms =
+                    attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
             }
-            if let Ok(json) = serde_json::from_slice::<Value>(data) {
-                // First parsed frame of ANY type (`response.created`
-                // included) → upstream TTFT. The industry convention
-                // (LiteLLM, caller-side gateways) stamps the same event, so
-                // the figure matches external observers. A generated-output
-                // whitelist here reported the END of a silent thinking
-                // phase on hidden-reasoning upstreams — AISIX-Cloud#1225.
-                if !*first_frame_seen {
-                    *first_frame_seen = true;
-                    acc.get_or_insert_with(Default::default).upstream_ttft_ms =
-                        attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+            // `resp_…` off any frame that carries the response object —
+            // `response.created` is the first, so a stream that dies
+            // before its terminal frame still records which upstream call
+            // it was (AISIX-Cloud#1289).
+            if let Some(id) = json
+                .get("response")
+                .and_then(|r| r.get("id"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                acc.get_or_insert_with(Default::default).provider_request_id =
+                    crate::usage_attr::sanitize_provider_response_id(id);
+            }
+            if let Some(u) = parse_responses_terminal_usage(&json) {
+                // The terminal frame replaces the token counters; carry
+                // the latency figures and the id observed before it
+                // across — an upstream that stamps the id only on
+                // `response.created` would otherwise lose it here.
+                let (ttft, down, prev_id) = acc
+                    .as_ref()
+                    .map(|a| {
+                        (
+                            a.upstream_ttft_ms,
+                            a.downstream_latency_ms,
+                            a.provider_request_id.clone(),
+                        )
+                    })
+                    .unwrap_or_default();
+                let provider_request_id = if u.provider_request_id.is_empty() {
+                    prev_id
+                } else {
+                    u.provider_request_id.clone()
+                };
+                *acc = Some(ResponseUsage {
+                    upstream_ttft_ms: ttft,
+                    downstream_latency_ms: down,
+                    provider_request_id,
+                    ..u
+                });
+            }
+            match json.get("type").and_then(Value::as_str) {
+                Some("response.completed" | "response.incomplete") => {
+                    acc.get_or_insert_with(Default::default).reached_end = true;
                 }
-                // `resp_…` off any frame that carries the response object —
-                // `response.created` is the first, so a stream that dies
-                // before its terminal frame still records which upstream call
-                // it was (AISIX-Cloud#1289).
-                if let Some(id) = json
-                    .get("response")
-                    .and_then(|r| r.get("id"))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
+                Some("response.failed" | "error")
+                    if !acc.as_ref().is_some_and(|usage| usage.reached_end) =>
                 {
-                    acc.get_or_insert_with(Default::default).provider_request_id =
-                        crate::usage_attr::sanitize_provider_response_id(id);
-                }
-                if let Some(u) = parse_responses_terminal_usage(&json) {
-                    // The terminal frame replaces the token counters; carry
-                    // the latency figures and the id observed before it
-                    // across — an upstream that stamps the id only on
-                    // `response.created` would otherwise lose it here.
-                    let (ttft, down, prev_id) = acc
-                        .as_ref()
-                        .map(|a| {
-                            (
-                                a.upstream_ttft_ms,
-                                a.downstream_latency_ms,
-                                a.provider_request_id.clone(),
-                            )
-                        })
-                        .unwrap_or_default();
-                    let provider_request_id = if u.provider_request_id.is_empty() {
-                        prev_id
-                    } else {
-                        u.provider_request_id.clone()
-                    };
-                    *acc = Some(ResponseUsage {
-                        upstream_ttft_ms: ttft,
-                        downstream_latency_ms: down,
-                        provider_request_id,
-                        ..u
+                    *failure = Some(crate::stream_timeout::RawStreamFailure::UpstreamInBand {
+                        status: responses_in_band_status(&json),
+                        wire: aisix_gateway::UpstreamWire::OpenAI,
                     });
                 }
-                if let Some(c) = capture.as_deref_mut() {
-                    c.observe(&json);
-                }
+                _ => {}
+            }
+            if let Some(c) = capture.as_deref_mut() {
+                c.observe(&json);
             }
         }
     }
@@ -2572,31 +2856,74 @@ impl SseTextCapture {
 /// end-of-stream scan's monitor observations (AISIX-Cloud#1010) — the Drop
 /// (disconnect) path passes none: the response never completed, so there is
 /// nothing final to observe, matching the chat surface's disconnect behavior.
-struct ResponsesUsageGuard<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)> {
-    slot: Option<(F, Option<ResponseUsage>, Option<SseTextCapture>)>,
+struct ResponsesStreamState {
+    usage: Option<ResponseUsage>,
+    capture: Option<SseTextCapture>,
+    capture_safe: bool,
+    failure: Option<crate::stream_timeout::RawStreamFailure>,
 }
 
-impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)>
-    ResponsesUsageGuard<F>
+struct ResponsesUsageGuard<
+    F: FnOnce(
+        ResponseUsage,
+        String,
+        Vec<aisix_core::GuardrailMonitorHit>,
+        bool,
+        Option<crate::stream_timeout::RawStreamFailure>,
+    ),
+> {
+    slot: Option<(F, ResponsesStreamState)>,
+}
+
+impl<
+        F: FnOnce(
+            ResponseUsage,
+            String,
+            Vec<aisix_core::GuardrailMonitorHit>,
+            bool,
+            Option<crate::stream_timeout::RawStreamFailure>,
+        ),
+    > ResponsesUsageGuard<F>
 {
     fn parts(&mut self) -> (&mut Option<ResponseUsage>, Option<&mut SseTextCapture>) {
-        let slot = self
+        let state = &mut self
             .slot
             .as_mut()
-            .expect("ResponsesUsageGuard accessed after take");
-        (&mut slot.1, slot.2.as_mut())
+            .expect("ResponsesUsageGuard accessed after take")
+            .1;
+        (&mut state.usage, state.capture.as_mut())
+    }
+
+    fn state(&mut self) -> &mut ResponsesStreamState {
+        &mut self
+            .slot
+            .as_mut()
+            .expect("ResponsesUsageGuard accessed after take")
+            .1
     }
 }
 
-impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)> Drop
-    for ResponsesUsageGuard<F>
+impl<
+        F: FnOnce(
+            ResponseUsage,
+            String,
+            Vec<aisix_core::GuardrailMonitorHit>,
+            bool,
+            Option<crate::stream_timeout::RawStreamFailure>,
+        ),
+    > Drop for ResponsesUsageGuard<F>
 {
     fn drop(&mut self) {
-        if let Some((f, usage, capture)) = self.slot.take() {
+        if let Some((f, state)) = self.slot.take() {
             f(
-                usage.unwrap_or_default(),
-                capture.map(SseTextCapture::into_text).unwrap_or_default(),
+                state.usage.unwrap_or_default(),
+                state
+                    .capture
+                    .map(SseTextCapture::into_text)
+                    .unwrap_or_default(),
                 Vec::new(),
+                state.capture_safe,
+                state.failure,
             );
         }
     }
@@ -2615,7 +2942,7 @@ struct EosOutputScan {
 }
 
 impl EosOutputScan {
-    async fn observe(self, text: &str) -> Vec<aisix_core::GuardrailMonitorHit> {
+    async fn observe(self, text: &str) -> EosOutputObservation {
         // Bound the provider calls the same way the buffered branch's byte
         // cap does — scan at most the cap's worth of text.
         let mut end = text
@@ -2626,9 +2953,12 @@ impl EosOutputScan {
         }
         let scan_text = &text[..end];
         if scan_text.is_empty() {
-            return Vec::new();
+            return EosOutputObservation {
+                monitor_hits: Vec::new(),
+                capture_safe: true,
+            };
         }
-        let synth = synth_chat_response(&self.upstream_model, scan_text.to_string());
+        let mut synth = synth_chat_response(&self.upstream_model, scan_text.to_string());
         let (verdict, mut hits) = aisix_guardrails::Guardrail::check_output_non_segment_observed(
             self.chain.as_ref(),
             &synth,
@@ -2639,19 +2969,15 @@ impl EosOutputScan {
         // observations too. Masks are suppressed in monitor mode, and nothing
         // could be rewritten anyway — the counts are discarded.
         let mut seg_counts = crate::redact::RedactionCounts::new();
-        let verdict = crate::redact::moderate_body(
+        let moderation = crate::redact::moderate_chat_response_structured(
             self.chain.as_ref(),
-            crate::redact::Direction::Output,
             verdict,
+            &mut synth,
             &mut seg_counts,
             &mut hits,
-            |g| {
-                let _ = g.redact_output_text(scan_text);
-                crate::redact::RedactionCounts::new()
-            },
         )
         .await;
-        if let aisix_guardrails::GuardrailVerdict::Block { reason, .. } = verdict {
+        if let aisix_guardrails::GuardrailVerdict::Block { reason, .. } = &moderation.verdict {
             tracing::warn!(
                 guardrail_hook = "output",
                 model = %self.upstream_model,
@@ -2660,8 +2986,18 @@ impl EosOutputScan {
                  response already sent (EndOfStreamCheck policy)",
             );
         }
-        hits
+        EosOutputObservation {
+            monitor_hits: hits,
+            // A bounded prefix is an observation signal, not proof that the
+            // complete output was inspected for export.
+            capture_safe: moderation.capture_safe && end == text.len(),
+        }
     }
+}
+
+struct EosOutputObservation {
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    capture_safe: bool,
 }
 
 /// Wrap a Responses-API upstream byte stream so the terminal event's usage is
@@ -2680,10 +3016,19 @@ fn build_responses_passthrough_stream<S, F>(
     content_cap: Option<u32>,
     eos_scan: Option<EosOutputScan>,
     on_complete: F,
-) -> impl futures::Stream<Item = reqwest::Result<bytes::Bytes>>
+) -> impl futures::Stream<Item = Result<bytes::Bytes, crate::stream_timeout::RawStreamError>>
 where
-    S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
-    F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>) + Send + 'static,
+    S: futures::Stream<Item = Result<bytes::Bytes, crate::stream_timeout::RawStreamError>>
+        + Send
+        + 'static,
+    F: FnOnce(
+            ResponseUsage,
+            String,
+            Vec<aisix_core::GuardrailMonitorHit>,
+            bool,
+            Option<crate::stream_timeout::RawStreamFailure>,
+        ) + Send
+        + 'static,
 {
     // The scan and the token-estimation fallback read the same assembled
     // output text the capture produces, so the accumulator is now ALWAYS
@@ -2714,8 +3059,14 @@ where
         let mut guard = ResponsesUsageGuard {
             slot: Some((
                 on_complete,
-                None,
-                capture_cap.map(SseTextCapture::new),
+                ResponsesStreamState {
+                    usage: None,
+                    capture: capture_cap.map(SseTextCapture::new),
+                    // A live output-guarded response is uninspected until its
+                    // end-of-stream provider call completes.
+                    capture_safe: eos_scan.is_none(),
+                    failure: None,
+                },
             )),
         };
         futures::pin_mut!(upstream);
@@ -2726,14 +3077,18 @@ where
                 // Side-channel parse: copy into the frame buffer (the original
                 // `bytes` is yielded unchanged below) and drain complete frames.
                 buf.extend_from_slice(bytes);
-                let (usage_acc, capture) = guard.parts();
+                let state = guard.state();
                 drain_responses_sse_frames(
                     &mut buf,
-                    usage_acc,
-                    capture,
+                    &mut state.usage,
+                    state.capture.as_mut(),
+                    &mut state.failure,
                     attempt_started,
                     &mut first_frame_seen,
                 );
+                if state.failure.is_some() {
+                    state.capture_safe = false;
+                }
                 // Bound the frame buffer: the happy path drains complete frames
                 // above so `buf` only holds a partial trailing frame. A
                 // non-conformant upstream streaming bytes without a blank-line
@@ -2747,6 +3102,10 @@ where
                          terminator; dropping buffer (usage parsing skipped)"
                     );
                     buf.clear();
+                    let state = guard.state();
+                    state.failure =
+                        Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode);
+                    state.capture_safe = false;
                 }
             }
             // Forward the original item verbatim (Ok bytes OR a mid-stream Err).
@@ -2759,14 +3118,31 @@ where
                         started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                 }
             }
+            if let Err(error) = &item {
+                let state = guard.state();
+                state.failure = Some(error.failure());
+                state.capture_safe = false;
+            }
+            let errored = item.is_err();
             yield item;
+            if errored {
+                return;
+            }
         }
-        // Upstream EOF — the response was delivered in full. Record that
-        // before the scan below, which awaits a remote provider and is a
-        // routine drop point for clients that close on the terminal frame.
+        // A clean socket EOF is successful only after a semantic terminal
+        // event. Missing `response.completed`/`response.incomplete` is an
+        // upstream truncation; `response.failed` has already stored an
+        // in-band failure while preserving its billed usage.
         {
-            let (usage_acc, _) = guard.parts();
-            usage_acc.get_or_insert_with(Default::default).reached_end = true;
+            let state = guard.state();
+            let reached_terminal = state
+                .usage
+                .as_ref()
+                .is_some_and(|usage| usage.reached_end);
+            if !reached_terminal && state.failure.is_none() {
+                state.failure = Some(crate::stream_timeout::RawStreamFailure::Upstream);
+                state.capture_safe = false;
+            }
         }
         // Clean end-of-stream: run the monitor observation (needs async, so
         // it can't live in the Drop guard), then complete explicitly. The
@@ -2777,18 +3153,30 @@ where
         // the captured text, without hits — same as any disconnect). Taking
         // the slot before the await would silently lose the event for a
         // fully-delivered stream.
-        let hits = match eos_scan {
-            Some(scan) => {
+        let observation = match (guard.state().failure.is_some(), eos_scan) {
+            (true, _) => EosOutputObservation {
+                monitor_hits: Vec::new(),
+                capture_safe: false,
+            },
+            (false, Some(scan)) => {
                 let text = guard.parts().1.map(|c| c.text()).unwrap_or_default();
                 scan.observe(&text).await
             }
-            None => Vec::new(),
+            (false, None) => EosOutputObservation {
+                monitor_hits: Vec::new(),
+                capture_safe: true,
+            },
         };
-        if let Some((f, usage, capture)) = guard.slot.take() {
+        if let Some((f, state)) = guard.slot.take() {
             f(
-                usage.unwrap_or_default(),
-                capture.map(SseTextCapture::into_text).unwrap_or_default(),
-                hits,
+                state.usage.unwrap_or_default(),
+                state
+                    .capture
+                    .map(SseTextCapture::into_text)
+                    .unwrap_or_default(),
+                observation.monitor_hits,
+                observation.capture_safe,
+                state.failure,
             );
         }
     })
@@ -2850,20 +3238,8 @@ fn responses_output_text(resp: &Value) -> String {
 /// `data:` JSON line drives the dispatch.
 /// <https://platform.openai.com/docs/api-reference/responses-streaming>
 fn responses_sse_output_text(bytes: &[u8]) -> String {
-    let text = String::from_utf8_lossy(bytes);
     let mut deltas = String::new();
-    for line in text.lines() {
-        let data = match line.strip_prefix("data:") {
-            Some(d) => d.trim(),
-            None => continue,
-        };
-        if data.is_empty() || data == "[DONE]" {
-            continue;
-        }
-        let json: Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+    for json in crate::redact::parse_sse_json_stream(bytes).0 {
         match json.get("type").and_then(|t| t.as_str()) {
             Some("response.completed" | "response.incomplete" | "response.failed") => {
                 if let Some(resp) = json.get("response") {
@@ -2988,6 +3364,7 @@ fn emit_usage_event(
     client: &ClientContext,
     attempt: AttemptInfo,
     guardrail_blocked: bool,
+    applied_guardrails: Vec<AppliedGuardrail>,
     // Per-detector PII mask counts (#932), input + output merged. Detector
     // names only, never matched values. Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
@@ -3033,6 +3410,7 @@ fn emit_usage_event(
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         guardrail_blocked,
+        applied_guardrails,
         redacted_entity_counts,
         guardrail_monitor_hits,
         ..Default::default()
@@ -3040,9 +3418,12 @@ fn emit_usage_event(
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("responses", event.clone());
     let exporters = crate::usage_attr::live_exporters(state, snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, content, exporters.iter().map(|e| &e.value));
+    state.otlp_fan_out.fan_out(
+        &event,
+        content,
+        exporters.generation(),
+        exporters.iter().map(|e| &e.value),
+    );
     // AISIX-Cloud#1044: token volume by inbound client type × model. Codex
     // traffic arrives on /v1/responses, so leaving this endpoint out of the
     // by-client series made an allowlisted client invisible in it. All three
@@ -3096,6 +3477,8 @@ fn emit_zero_token_event(
     elapsed: Duration,
     client: &ClientContext,
     attempt: AttemptInfo,
+    guardrail_blocked: bool,
+    applied_guardrails: Vec<AppliedGuardrail>,
     // Per-detector PII mask counts (#932): input masking may have fired
     // before the failure. Empty for most failure classes.
     redacted_entity_counts: crate::redact::RedactionCounts,
@@ -3130,14 +3513,19 @@ fn emit_zero_token_event(
         byo_label: sanitize_tag(tags.byo_label.unwrap_or_default()),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        guardrail_blocked,
+        applied_guardrails,
         ..Default::default()
     };
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("responses", event.clone());
     let exporters = crate::usage_attr::live_exporters(state, snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, content.as_ref(), exporters.iter().map(|e| &e.value));
+    state.otlp_fan_out.fan_out(
+        &event,
+        content.as_ref(),
+        exporters.generation(),
+        exporters.iter().map(|e| &e.value),
+    );
 }
 
 /// Emit one zero-token `UsageEvent` per FAILED attempt of a `/v1/responses`
@@ -3150,6 +3538,7 @@ fn emit_failed_attempts(
     requested_model: &str,
     api_key_id: &str,
     client: &ClientContext,
+    applied_guardrails: &[AppliedGuardrail],
     routing: &RoutingTelemetry,
     // AISIX-Cloud#1013: when every target failed there is no terminal
     // event, so the captured request body rides the LAST failed attempt —
@@ -3183,6 +3572,8 @@ fn emit_failed_attempts(
             Duration::from_millis(u64::from(rec.latency_ms)),
             client,
             AttemptInfo::from_record(rec),
+            false,
+            applied_guardrails.to_vec(),
             // Failed attempts carry no per-request redaction detail; the
             // terminal event does.
             crate::redact::RedactionCounts::new(),
@@ -3266,7 +3657,7 @@ mod tests {
     fn cfg() -> ProxyConfig {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: 1_048_576,
+            request_body_limit_bytes: Some(1_048_576),
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),
@@ -3400,6 +3791,8 @@ mod tests {
     /// echoed back — and the upstream must never be contacted (`expect(0)`).
     #[tokio::test]
     async fn input_guardrail_blocks_string_input_returns_422_content_filter() {
+        use aisix_obs::UsageSink;
+
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
@@ -3416,7 +3809,15 @@ mod tests {
         snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
         snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
-        let app = build_app(snap);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
 
         let resp = app
             .oneshot(make_req(serde_json::json!({
@@ -3433,6 +3834,16 @@ mod tests {
         // Per #153 the matched literal must not leak into the wire message.
         let msg = v["error"]["message"].as_str().unwrap_or_default();
         assert!(!msg.contains("BLOCKME"), "blocklist literal leaked: {msg}");
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("blocked request must emit a UsageEvent")
+            .expect("usage sink sender dropped");
+        assert!(ev.guardrail_blocked);
+        assert_eq!(ev.applied_guardrails.len(), 1);
+        assert_eq!(ev.applied_guardrails[0].kind, "keyword");
+        assert_eq!(ev.applied_guardrails[0].hook, "input");
+        assert_eq!(ev.status_code, 422);
     }
 
     /// #719: the Responses `input` array form (message items with typed
@@ -5004,6 +5415,54 @@ data: [DONE]\n\n";
             super::responses_sse_provider_request_id(body),
             "resp_1289_buffered"
         );
+    }
+
+    #[test]
+    fn buffered_sse_helpers_accept_bom_lone_cr_and_multi_data() {
+        let body = concat!(
+            "\u{feff}event: response.created\r",
+            "data: {\"type\":\"response.created\",\r",
+            "data: \"response\":{\"id\":\"resp_standard_sse\"}}\r\r",
+            "event: response.output_text.delta\r",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"joined\"}\r\r",
+        );
+        assert_eq!(
+            super::responses_sse_provider_request_id(body.as_bytes()),
+            "resp_standard_sse"
+        );
+        assert_eq!(super::responses_sse_output_text(body.as_bytes()), "joined");
+        assert!(!crate::redact::parse_sse_json_stream(body.as_bytes()).1);
+    }
+
+    #[test]
+    fn responses_terminal_errors_fail_until_a_semantic_terminal_event() {
+        use crate::stream_timeout::RawStreamFailure;
+
+        let error = b"data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\"}}\n\n";
+        assert!(matches!(
+            super::responses_sse_terminal_failure(error),
+            Some(RawStreamFailure::UpstreamInBand { status: None, .. })
+        ));
+
+        let completed_then_error = b"data: {\"type\":\"response.completed\",\"response\":{}}\n\n\
+data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\"}}\n\n";
+        assert_eq!(
+            super::responses_sse_terminal_failure(completed_then_error),
+            None,
+            "transport bytes after response.completed cannot overturn semantic success",
+        );
+
+        let failed = serde_json::json!({
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {"code": "server_error"},
+                "usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7}
+            }
+        });
+        let usage = super::parse_responses_terminal_usage(&failed).unwrap();
+        assert_eq!(usage.completion_tokens, 4);
+        assert!(!usage.reached_end, "a failed response is not a healthy end");
     }
 
     /// AISIX-Cloud#1289, streaming: the id arrives on `response.created` and

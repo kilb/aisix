@@ -101,7 +101,6 @@ static SERVER_HEADER_VALUE: std::sync::LazyLock<HeaderValue> = std::sync::LazyLo
 /// Build the proxy router. Mounts `/livez` plus the
 /// OpenAI-compatible proxy surface.
 pub fn build_router(state: ProxyState) -> Router {
-    let body_limit = state.request_body_limit_bytes;
     let router = Router::new()
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
@@ -179,7 +178,7 @@ pub fn build_router(state: ProxyState) -> Router {
         // Registered before the layers so fallback traffic gets the same
         // body-limit / telemetry / Server-header treatment as the routes.
         .fallback(passthrough_route::entry);
-    let router = apply_shared_proxy_layers(router, &state, body_limit).with_state(state.clone());
+    let router = apply_shared_proxy_layers(router, &state).with_state(state.clone());
 
     // The host-dispatch target: the same fallback handler behind the SAME
     // shared layer stack, so a foreign-host request keeps the body-limit
@@ -189,7 +188,6 @@ pub fn build_router(state: ProxyState) -> Router {
     let host_entry_stack = apply_shared_proxy_layers(
         Router::new().fallback(passthrough_route::entry),
         &state,
-        body_limit,
     )
     .with_state(state.clone());
 
@@ -248,13 +246,8 @@ pub fn build_router(state: ProxyState) -> Router {
 /// drift (a layer added to one but not the other silently exempts
 /// foreign-host traffic from it). Innermost→outermost:
 ///
-/// - `DefaultBodyLimit`: wire the configured cap into axum's request-body
-///   extractor chain (`Json<T>` defers to `Bytes`, which honors this
-///   layer). Without it, axum 0.7 falls back to its built-in 2 MiB
-///   default, which silently rejects bodies in the 2 MiB-to-cap band with
-///   a stock `BytesRejection` (NOT the OpenAI envelope). `0` = no cap —
-///   `disable()` rather than omitting the layer, because omitting it
-///   would fall back to axum's 2 MiB, not to "unlimited".
+/// - `DefaultBodyLimit`: disable axum's static 2 MiB fallback. The
+///   middleware below installs the endpoint-specific dynamic cap.
 /// - `enforce_request_body_limit`: short-circuits the Content-Length-known
 ///   oversize case ahead of the extractors; the extractor-chain layer
 ///   above catches chunked / size-mismatched bodies.
@@ -272,14 +265,9 @@ pub fn build_router(state: ProxyState) -> Router {
 fn apply_shared_proxy_layers(
     router: Router<ProxyState>,
     state: &ProxyState,
-    body_limit: usize,
 ) -> Router<ProxyState> {
     router
-        .layer(if body_limit > 0 {
-            axum::extract::DefaultBodyLimit::max(body_limit)
-        } else {
-            axum::extract::DefaultBodyLimit::disable()
-        })
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             enforce_request_body_limit,
@@ -541,7 +529,7 @@ impl Drop for ClientCancelGuard {
 /// an oversize request actually costs the gateway.
 async fn enforce_request_body_limit(
     State(state): State<ProxyState>,
-    request: Request<axum::body::Body>,
+    mut request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
     let started = std::time::Instant::now();
@@ -561,6 +549,7 @@ async fn enforce_request_body_limit(
     // near-zero, but non-SDK callers (curl, custom clients) could
     // hit it. Accept both forms.
     let path = request.uri().path();
+    let body_limit = state.request_body_limit_for(path);
     let is_anthropic_path =
         path == "/v1/messages" || path == "/v1/messages/" || path == "/v1/messages/count_tokens";
     let envelope = if is_anthropic_path {
@@ -594,14 +583,14 @@ async fn enforce_request_body_limit(
             ProxyError::InvalidRequest("conflicting Content-Length headers".into()),
         );
     }
-    // `0` = the cap is disabled; the duplicate-Content-Length rejection
+    // `0` = the cap is explicitly disabled; the duplicate-Content-Length rejection
     // above still applies — that one is request-smuggling hygiene, not a
     // size limit.
     if let Some(declared) = first
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<usize>().ok())
     {
-        if state.request_body_limit_bytes > 0 && declared > state.request_body_limit_bytes {
+        if body_limit > 0 && declared > body_limit {
             // Capture what the logs need before the body move below
             // consumes the request.
             let method = request.method().clone();
@@ -613,12 +602,15 @@ async fn enforce_request_body_limit(
             let drain = drain_body(request.into_body()).await;
             record_body_limit_rejection(
                 &state,
-                endpoint,
-                method.as_str(),
-                &request_id,
-                declared,
-                &drain,
-                started,
+                BodyLimitRejectionRecord {
+                    endpoint,
+                    method: method.as_str(),
+                    request_id: &request_id,
+                    declared_content_length: declared,
+                    body_limit,
+                    drain: &drain,
+                    started,
+                },
             );
             return reject::reject_before_dispatch(
                 &state,
@@ -629,10 +621,15 @@ async fn enforce_request_body_limit(
                 started,
                 envelope,
                 ProxyError::RequestTooLarge {
-                    limit_bytes: state.request_body_limit_bytes,
+                    limit_bytes: body_limit,
                 },
             );
         }
+    }
+    if body_limit > 0 {
+        let (parts, body) = request.into_parts();
+        let body = axum::body::Body::new(http_body_util::Limited::new(body, body_limit));
+        request = Request::from_parts(parts, body);
     }
     next.run(request).await
 }
@@ -744,15 +741,26 @@ async fn drain_body(body: axum::body::Body) -> Drain {
 /// is rate limited per outcome so a flood of oversize requests can't
 /// amplify into a log flood; the counter above it is unconditional and
 /// keeps the true volume regardless of what the limiter drops.
-fn record_body_limit_rejection(
-    state: &ProxyState,
+struct BodyLimitRejectionRecord<'a> {
     endpoint: &'static str,
-    method: &str,
-    request_id: &str,
+    method: &'a str,
+    request_id: &'a str,
     declared_content_length: usize,
-    drain: &Drain,
+    body_limit: usize,
+    drain: &'a Drain,
     started: std::time::Instant,
-) {
+}
+
+fn record_body_limit_rejection(state: &ProxyState, record: BodyLimitRejectionRecord<'_>) {
+    let BodyLimitRejectionRecord {
+        endpoint,
+        method,
+        request_id,
+        declared_content_length,
+        body_limit,
+        drain,
+        started,
+    } = record;
     let inbound_protocol = inbound_protocol_for_endpoint(endpoint);
     state
         .metrics
@@ -767,7 +775,7 @@ fn record_body_limit_rejection(
             method,
             status = 413,
             declared_content_length,
-            configured_limit_bytes = state.request_body_limit_bytes,
+            configured_limit_bytes = body_limit,
             drained_bytes = drain.bytes,
             drain_outcome = drain.outcome.as_str(),
             elapsed_ms,
@@ -781,7 +789,7 @@ fn record_body_limit_rejection(
             method,
             status = 413,
             declared_content_length,
-            configured_limit_bytes = state.request_body_limit_bytes,
+            configured_limit_bytes = body_limit,
             drained_bytes = drain.bytes,
             drain_outcome = drain.outcome.as_str(),
             elapsed_ms,
@@ -890,7 +898,7 @@ mod tests {
     fn cfg() -> ProxyConfig {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: 1_048_576,
+            request_body_limit_bytes: Some(1_048_576),
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),
@@ -1387,16 +1395,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readyz_503s_when_the_config_probe_reports_no_apply_yet() {
-        // Pins the config_apply_age plumbing through the router: a wired
-        // probe reporting "no apply yet" must gate readiness with a 503.
-        // Without this, dropping the probe wiring would leave readyz
-        // reporting `[+]config ok` unconditionally (the field-None path),
-        // byte-identical to wired-and-fresh — a silent downgrade of
-        // readiness to shutdown-only that no other test would notice.
+    async fn readyz_503s_when_config_probe_wiring_is_missing() {
+        // The production constructor itself fails closed. A bootstrap
+        // regression that forgets to replace the probe must remain visible.
         let hub = Arc::new(Hub::new());
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
-        let state = build_state(snap, hub).with_config_apply_age(Arc::new(|| None));
+        let state = build_state(snap, hub);
         let app = build_router(state);
 
         let req = Request::builder()
@@ -1737,11 +1741,9 @@ mod tests {
         let app = build_router(build_state(snap, hub));
 
         // Build a streaming body that yields > 1 MiB chunk-by-chunk
-        // with NO upstream-set Content-Length. The middleware can't
-        // decide on size and will pass through; the per-extractor
-        // `DefaultBodyLimit` cap (set to `request_body_limit_bytes`
-        // in `build_router`) fires on the read, surfacing as
-        // `JsonRejection::BytesRejection`.
+        // with NO upstream-set Content-Length. The middleware wraps the
+        // stream in its dynamic endpoint cap, which fires during extractor
+        // buffering and surfaces as `JsonRejection::BytesRejection`.
         let chunk = vec![b'x'; 200 * 1024]; // 200 KiB per chunk
         let stream =
             futures::stream::iter((0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
@@ -1883,7 +1885,11 @@ mod tests {
         );
     }
 
-    fn build_state_with_limit(snapshot: AisixSnapshot, hub: Arc<Hub>, limit: usize) -> ProxyState {
+    fn build_state_with_body_limit(
+        snapshot: AisixSnapshot,
+        hub: Arc<Hub>,
+        limit: Option<usize>,
+    ) -> ProxyState {
         let handle = SnapshotHandle::new(snapshot);
         let cfg = ProxyConfig {
             addr: "127.0.0.1:0".into(),
@@ -1898,8 +1904,74 @@ mod tests {
         ProxyState::new(handle, hub, &cfg).without_cache()
     }
 
-    /// `request_body_limit_bytes: 0` (the default) disables the cap
-    /// entirely. The load-bearing detail is axum's BUILT-IN 2 MiB
+    fn build_state_with_limit(snapshot: AisixSnapshot, hub: Arc<Hub>, limit: usize) -> ProxyState {
+        build_state_with_body_limit(snapshot, hub, Some(limit))
+    }
+
+    #[tokio::test]
+    async fn automatic_body_limit_is_finite_and_endpoint_aware() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state_with_body_limit(snap, hub, None));
+
+        let request = |path: &str, declared: usize, content_type: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", content_type)
+                .header("content-length", declared.to_string())
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let exact_standard = run(
+            app.clone(),
+            request(
+                "/v1/chat/completions",
+                crate::state::DEFAULT_REQUEST_BODY_LIMIT_BYTES,
+                "application/json",
+            ),
+        )
+        .await;
+        assert_ne!(exact_standard.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let over_standard = run(
+            app.clone(),
+            request(
+                "/v1/chat/completions",
+                crate::state::DEFAULT_REQUEST_BODY_LIMIT_BYTES + 1,
+                "application/json",
+            ),
+        )
+        .await;
+        assert_eq!(over_standard.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let same_size_file = run(
+            app.clone(),
+            request(
+                "/v1/files",
+                crate::state::DEFAULT_REQUEST_BODY_LIMIT_BYTES + 1,
+                "multipart/form-data; boundary=x",
+            ),
+        )
+        .await;
+        assert_ne!(same_size_file.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let over_file = run(
+            app,
+            request(
+                "/v1/files",
+                crate::state::DEFAULT_FILE_BODY_LIMIT_BYTES + 1,
+                "multipart/form-data; boundary=x",
+            ),
+        )
+        .await;
+        assert_eq!(over_file.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// An explicit `request_body_limit_bytes: 0` disables the cap entirely.
+    /// The load-bearing detail is axum's BUILT-IN 2 MiB
     /// `DefaultBodyLimit`: merely skipping our `max(limit)` layer would
     /// still reject bodies over 2 MiB with a stock rejection, so the
     /// router must install `DefaultBodyLimit::disable()`. A 2.5 MiB body
@@ -3110,6 +3182,66 @@ data: [DONE]\n\n";
         let parsed: serde_json::Value =
             serde_json::from_str(&data_line["data: ".len()..]).expect("valid error envelope");
         assert_eq!(parsed["error"]["type"], "content_filter");
+    }
+
+    /// The BufferFull budget covers the complete held chunk, including tool
+    /// arguments. A benign tool-only prefix larger than the historical
+    /// scanner cap must fail closed before a later forbidden delta can be
+    /// omitted from inspection and released raw.
+    #[tokio::test]
+    async fn streaming_output_guardrail_counts_tool_only_chunks_toward_holdback_cap() {
+        let upstream = MockServer::start().await;
+        let prefix = "x".repeat(aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES + 1);
+        let first = serde_json::json!({"id":"up-tool-cap","model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":prefix}}]},"finish_reason":null}]});
+        let late = serde_json::json!({"id":"up-tool-cap","model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"late-secret-string"}}]},"finish_reason":null}]});
+        let done = serde_json::json!({"id":"up-tool-cap","model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]});
+        let sse = format!("data: {first}\n\ndata: {late}\n\ndata: {done}\n\ndata: [DONE]\n\n");
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub);
+        seed_guardrail(
+            &state.snapshot,
+            "g-stream-tool-cap",
+            r#"{"name":"stream-tool-cap","kind":"keyword","hook_point":"output","patterns":[{"kind":"literal","value":"late-secret-string"}]}"#,
+        );
+        let app = build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": "my-gpt4",
+                    "messages": [{"role": "user", "content": "tool-cap-marker"}],
+                    "stream": true
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let wire = to_bytes(resp.into_body(), 1_048_576).await.unwrap();
+        let wire = String::from_utf8(wire.to_vec()).unwrap();
+
+        assert!(
+            wire.contains("event: error"),
+            "overflow must fail closed: {wire}"
+        );
+        assert!(!wire.contains("late-secret-string"));
+        assert!(!wire.contains("data: [DONE]"));
     }
 
     /// P2 (#379): like the keyword guardrail above (which now holds back by

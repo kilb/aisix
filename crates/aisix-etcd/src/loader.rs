@@ -24,10 +24,10 @@
 //! rest."
 
 use aisix_core::models::{
-    validate_a2a_agent_lenient, validate_apikey_lenient, validate_cache_policy_lenient,
-    validate_claim_mapping_lenient, validate_guardrail_attachment_lenient,
-    validate_guardrail_lenient, validate_mcp_policy_lenient, validate_mcp_server_lenient,
-    validate_model_lenient, validate_observability_exporter_lenient,
+    validate_a2a_agent_lenient, validate_a2a_agent_url, validate_apikey_lenient,
+    validate_cache_policy_lenient, validate_claim_mapping_lenient,
+    validate_guardrail_attachment_lenient, validate_guardrail_lenient, validate_mcp_policy_lenient,
+    validate_mcp_server_lenient, validate_model_lenient, validate_observability_exporter_lenient,
     validate_oidc_provider_lenient, validate_passthrough_route_lenient,
     validate_provider_key_lenient, validate_rate_limit_policy_lenient, A2aAgent, ApiKey,
     CachePolicy, ClaimMapping, Guardrail, GuardrailAttachment, McpPolicy, McpServer, Model,
@@ -401,6 +401,7 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                 }
             }
             "a2a_agents" => {
+                let row_kind = parsed.kind;
                 if let Some(entry) = validate_and_parse::<A2aAgent>(
                     &raw.key,
                     raw.revision,
@@ -409,6 +410,15 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     validate_a2a_agent_lenient,
                     &mut stats,
                 ) {
+                    // Strict writes reject non-HTTP(S), relative, or
+                    // credential-bearing URLs, but rows written before that
+                    // policy shipped keep loading. Report the compatibility
+                    // exception without including the URL or its secrets.
+                    if validate_a2a_agent_url(&value).is_err() {
+                        let fields = vec!["legacy:url_policy".to_string()];
+                        warn_partial_compat_deduped(&raw.key, row_kind, &fields);
+                        merge_partial_compat_fields(&mut stats, &raw.key, row_kind, fields);
+                    }
                     snapshot.a2a_agents.insert(entry);
                 }
             }
@@ -940,6 +950,39 @@ mod tests {
             vec![PartialCompatEntry {
                 kind: "api_keys".into(),
                 field: "quota_profile".into(),
+                count: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn legacy_a2a_url_loads_and_reports_policy_compatibility() {
+        let entries = vec![raw(
+            "/aisix/a2a_agents/agent-legacy",
+            br#"{
+                "name": "legacy-agent",
+                "url": "https://url-user:url-password@agents.example.com/a2a?access_token=query-secret"
+            }"#,
+            1,
+        )];
+        let (snapshot, stats) = build_snapshot("/aisix", &entries);
+
+        assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
+        assert!(stats.rejections.is_empty());
+        assert_eq!(
+            snapshot
+                .a2a_agents
+                .get_by_id("agent-legacy")
+                .unwrap()
+                .value
+                .url,
+            "https://url-user:url-password@agents.example.com/a2a?access_token=query-secret"
+        );
+        assert_eq!(
+            stats.partially_compatible,
+            vec![PartialCompatEntry {
+                kind: "a2a_agents".into(),
+                field: "legacy:url_policy".into(),
                 count: 1,
             }]
         );

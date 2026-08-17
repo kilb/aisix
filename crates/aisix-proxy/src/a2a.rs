@@ -214,18 +214,14 @@ async fn dispatch(
     let upstream = upstream_from_a2a_agent(&entry.value);
 
     let (_parts, body) = request.into_parts();
-    let bytes = match to_bytes(
-        body,
-        crate::error::body_read_cap(state.request_body_limit_bytes),
-    )
-    .await
-    {
+    let body_limit = state.request_body_limit_for("/a2a/:agent");
+    let bytes = match to_bytes(body, crate::error::body_read_cap(body_limit)).await {
         Ok(bytes) => bytes,
         // Cap hit → 413 in the standard envelope, matching the
         // Content-Length middleware's answer on this route.
         Err(err) if crate::error::is_length_limit_error(&err) => {
             return crate::error::ProxyError::RequestTooLarge {
-                limit_bytes: state.request_body_limit_bytes,
+                limit_bytes: body_limit,
             }
             .into_response();
         }
@@ -788,6 +784,7 @@ fn emit_a2a_usage(
     state.otlp_fan_out.fan_out(
         &event,
         captured.as_ref(),
+        exporters.generation(),
         exporters.iter().map(|e| &e.value),
     );
 }
@@ -1538,7 +1535,7 @@ mod tests {
     fn proxy_cfg() -> ProxyConfig {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: 1_048_576,
+            request_body_limit_bytes: Some(1_048_576),
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),

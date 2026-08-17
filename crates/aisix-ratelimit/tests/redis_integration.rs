@@ -6,10 +6,11 @@
 //! replicas pointed at one Redis — the exact api7/AISIX-Cloud#798 shape:
 //! a limit hit on one replica must already be hit on the other.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use aisix_core::{RateLimit, RateLimitScope, RedisConnConfig, RedisMode};
-use aisix_ratelimit::{RateStore, RedisStore};
+use aisix_ratelimit::{Limiter, MultiReservation, RateStore, RedisStore};
 
 fn redis_url() -> Option<String> {
     std::env::var("RATELIMIT_TEST_REDIS_URL").ok()
@@ -65,6 +66,19 @@ async fn store(url: &str) -> RedisStore {
     RedisStore::connect(&single(url))
         .await
         .expect("redis connect")
+}
+
+async fn redis_subsecond_micros(url: &str) -> i64 {
+    let client = redis::Client::open(url).expect("redis client");
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("redis connection");
+    let time: Vec<i64> = redis::cmd("TIME")
+        .query_async(&mut conn)
+        .await
+        .expect("redis TIME");
+    *time.get(1).expect("TIME microseconds")
 }
 
 #[tokio::test]
@@ -165,6 +179,31 @@ async fn token_usage_is_shared_across_replicas() {
 }
 
 #[tokio::test]
+async fn token_usage_at_exact_limit_blocks_the_next_replica() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let a = store(&url).await;
+    let b = store(&url).await;
+    let key = unique_key("tpm-exact");
+    let limits = RateLimit {
+        tpm: Some(1_000),
+        ..rl()
+    };
+
+    a.acquire(&key, &limits, "a-1")
+        .await
+        .expect("first allowed");
+    a.commit(&key, 1_000, "a-1").await;
+
+    assert!(matches!(
+        b.acquire(&key, &limits, "b-1").await,
+        Err(aisix_ratelimit::RateLimitError::Tokens { .. }),
+    ));
+}
+
+#[tokio::test]
 async fn concurrency_slot_is_shared_and_released_across_replicas() {
     let Some(url) = redis_url() else {
         eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
@@ -234,6 +273,131 @@ async fn stale_concurrency_slot_is_reclaimed_after_ttl() {
     b.acquire(&key, &limits, "b-2")
         .await
         .expect("stale slot reclaimed after conc_ttl");
+}
+
+#[tokio::test]
+async fn concurrency_ttl_does_not_round_acquisition_down_to_the_second() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let a = store(&url).await.with_conc_ttl(1);
+    let b = store(&url).await.with_conc_ttl(1);
+    let key = unique_key("conc-ms");
+    let limits = RateLimit {
+        concurrency: Some(1),
+        ..rl()
+    };
+
+    // Acquire late in a Redis server second, then probe shortly after the
+    // boundary. A whole-second score makes this ~400ms-old lease look one
+    // second old and prunes it; a millisecond score keeps the full TTL.
+    loop {
+        let micros = redis_subsecond_micros(&url).await;
+        if (700_000..=800_000).contains(&micros) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    a.acquire(&key, &limits, "late-in-second")
+        .await
+        .expect("initial slot");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    assert!(matches!(
+        b.acquire(&key, &limits, "too-early").await,
+        Err(aisix_ratelimit::RateLimitError::Concurrency),
+    ));
+    a.release(&key, "late-in-second");
+}
+
+#[tokio::test]
+async fn late_renewal_cannot_recreate_a_released_concurrency_member() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let a = store(&url).await.with_conc_ttl(5);
+    let b = store(&url).await.with_conc_ttl(5);
+    let key = unique_key("conc-release-renew");
+    let limits = RateLimit {
+        concurrency: Some(1),
+        ..rl()
+    };
+
+    a.acquire(&key, &limits, "released-member")
+        .await
+        .expect("initial slot");
+    a.release(&key, "released-member");
+    for _ in 0..100 {
+        if a.peek(&key, &limits).await.unwrap().in_flight == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(a.peek(&key, &limits).await.unwrap().in_flight, 0);
+
+    // Force the hazardous ordering: renewal executes after ZREM completed.
+    a.renew_concurrency_lease(&key, "released-member").await;
+    assert_eq!(a.peek(&key, &limits).await.unwrap().in_flight, 0);
+    b.acquire(&key, &limits, "replacement")
+        .await
+        .expect("late renewal must not consume the freed slot");
+}
+
+#[tokio::test]
+async fn commit_racing_renewal_always_removes_the_concurrency_member() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let a = store(&url).await.with_conc_ttl(5);
+    let key = unique_key("conc-commit-renew");
+    let limits = RateLimit {
+        concurrency: Some(1),
+        ..rl()
+    };
+
+    a.acquire(&key, &limits, "committed-member")
+        .await
+        .expect("initial slot");
+    tokio::join!(
+        a.renew_concurrency_lease(&key, "committed-member"),
+        a.commit(&key, 0, "committed-member"),
+    );
+
+    assert_eq!(a.peek(&key, &limits).await.unwrap().in_flight, 0);
+    a.renew_concurrency_lease(&key, "committed-member").await;
+    assert_eq!(a.peek(&key, &limits).await.unwrap().in_flight, 0);
+}
+
+#[tokio::test]
+async fn active_stream_renews_its_concurrency_slot_past_ttl() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let limiter = Limiter::with_store(Arc::new(store(&url).await.with_conc_ttl(1)));
+    let other = store(&url).await.with_conc_ttl(1);
+    let key = unique_key("conc-renew");
+    let limits = RateLimit {
+        concurrency: Some(1),
+        ..rl()
+    };
+
+    let reservation = limiter
+        .pre_commit(&key, &limits)
+        .await
+        .expect("stream takes the slot");
+    let stream_guard = MultiReservation::new(vec![reservation]).into_stream_hold();
+
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(matches!(
+        other.acquire(&key, &limits, "other-1").await,
+        Err(aisix_ratelimit::RateLimitError::Concurrency),
+    ));
+
+    drop(stream_guard);
 }
 
 /// Redis Cluster: the multi-key acquire/commit Lua must route to the slot

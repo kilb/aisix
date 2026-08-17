@@ -78,16 +78,16 @@ pub use rate_limit::{McpRateLimit, RateLimit};
 pub use rate_limit_policy::{PolicyScope, PolicyWindow, RateLimitPolicy};
 pub use routing::{Routing, RoutingStrategy, RoutingTarget, WhenAllUnavailablePolicy};
 pub use schema::{
-    validate_a2a_agent, validate_a2a_agent_lenient, validate_apikey, validate_apikey_lenient,
-    validate_cache_policy, validate_cache_policy_lenient, validate_claim_mapping,
-    validate_claim_mapping_lenient, validate_guardrail, validate_guardrail_attachment,
-    validate_guardrail_attachment_lenient, validate_guardrail_lenient, validate_mcp_policy,
-    validate_mcp_policy_lenient, validate_mcp_server, validate_mcp_server_lenient, validate_model,
-    validate_model_lenient, validate_observability_exporter,
-    validate_observability_exporter_lenient, validate_oidc_provider,
-    validate_oidc_provider_lenient, validate_passthrough_route, validate_passthrough_route_lenient,
-    validate_provider_key, validate_provider_key_lenient, validate_rate_limit_policy,
-    validate_rate_limit_policy_lenient, SchemaError,
+    validate_a2a_agent, validate_a2a_agent_lenient, validate_a2a_agent_url, validate_apikey,
+    validate_apikey_lenient, validate_cache_policy, validate_cache_policy_lenient,
+    validate_claim_mapping, validate_claim_mapping_lenient, validate_guardrail,
+    validate_guardrail_attachment, validate_guardrail_attachment_lenient,
+    validate_guardrail_lenient, validate_mcp_policy, validate_mcp_policy_lenient,
+    validate_mcp_server, validate_mcp_server_lenient, validate_model, validate_model_lenient,
+    validate_observability_exporter, validate_observability_exporter_lenient,
+    validate_oidc_provider, validate_oidc_provider_lenient, validate_passthrough_route,
+    validate_passthrough_route_lenient, validate_provider_key, validate_provider_key_lenient,
+    validate_rate_limit_policy, validate_rate_limit_policy_lenient, SchemaError,
 };
 pub use semantic::{
     Aggregation, DistanceMetric, EmbeddingFailureMode, OnEmbeddingFailure, Semantic, SemanticMatch,

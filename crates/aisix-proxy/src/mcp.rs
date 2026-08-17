@@ -188,19 +188,15 @@ async fn dispatch(
     // Buffer the body so the JSON-RPC method can be inspected, then rebuilt for
     // the gateway. The global body-limit layer has already capped the size.
     let (parts, body) = request.into_parts();
-    let bytes = match to_bytes(
-        body,
-        crate::error::body_read_cap(state.request_body_limit_bytes),
-    )
-    .await
-    {
+    let body_limit = state.request_body_limit_for("/mcp");
+    let bytes = match to_bytes(body, crate::error::body_read_cap(body_limit)).await {
         Ok(bytes) => bytes,
         // A cap hit is a 413 in the standard envelope — consistent with
         // what the Content-Length middleware already answers on this
         // route; anything else reading the body is a client fault.
         Err(err) if crate::error::is_length_limit_error(&err) => {
             return crate::error::ProxyError::RequestTooLarge {
-                limit_bytes: state.request_body_limit_bytes,
+                limit_bytes: body_limit,
             }
             .into_response();
         }
@@ -372,7 +368,7 @@ async fn dispatch(
     // The deployment's body cap replaces rmcp's own 4 MiB default inside
     // the service; the proxy-level read above already enforced the same
     // limit, so the two layers can never disagree.
-    let service = aisix_mcp::streamable_http_service(gateway, state.request_body_limit_bytes);
+    let service = aisix_mcp::streamable_http_service(gateway, body_limit);
     let request = Request::from_parts(parts, Body::from(bytes));
     // `StreamableHttpService` is a tower service that dispatches on method and
     // never fails (`Error = Infallible`); map its boxed body back to axum's.
@@ -389,7 +385,7 @@ async fn dispatch(
         let (resp_parts, resp_body) = response.into_parts();
         let resp_bytes = match to_bytes(
             resp_body,
-            crate::error::body_read_cap(state.request_body_limit_bytes),
+            crate::error::body_read_cap(state.request_body_limit_for("/mcp")),
         )
         .await
         {
@@ -577,9 +573,12 @@ fn emit_tool_call_usage(
     // exporters never saw /mcp traffic. No content capture (tool args/results
     // are a separate surface from prompt/response).
     let exporters = crate::usage_attr::live_exporters(state, snap);
-    state
-        .otlp_fan_out
-        .fan_out(&event, None, exporters.iter().map(|e| &e.value));
+    state.otlp_fan_out.fan_out(
+        &event,
+        None,
+        exporters.generation(),
+        exporters.iter().map(|e| &e.value),
+    );
 }
 
 /// Reject a request whose `MCP-Protocol-Version` header names a version
@@ -683,7 +682,7 @@ mod tests {
     fn cfg() -> ProxyConfig {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: 1_048_576,
+            request_body_limit_bytes: Some(1_048_576),
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),
