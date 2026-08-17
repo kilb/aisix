@@ -42,8 +42,8 @@ etcd:
 
 proxy:
   addr: "0.0.0.0:3000"
-  # Omit for endpoint-aware finite request-body limits. Set a positive
-  # value to override every endpoint, or 0 to disable the cap explicitly.
+  # Omit or set 0 for unlimited request bodies. Set a positive value to
+  # apply the same request-body limit to every endpoint.
   # request_body_limit_bytes: 33554432
   # Serving topology; on for Linux by default. A managed deployment
   # reaches these through the environment rather than by editing this

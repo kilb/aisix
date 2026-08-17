@@ -994,7 +994,10 @@ pub fn anthropic_request_for_inspection(body: &Value) -> Result<aisix_gateway::C
     let mut chat = aisix_provider_anthropic::parse_inbound_request(body).map_err(|_| ())?;
     if let Some(messages) = body.get("messages").and_then(Value::as_array) {
         for content in messages.iter().filter_map(|message| message.get("content")) {
-            let text = anthropic_content_inspection_text_capped(content, usize::MAX).0;
+            let Some(additional) = anthropic_additional_content_for_inspection(content) else {
+                continue;
+            };
+            let text = anthropic_content_inspection_text_capped(&additional, usize::MAX).0;
             if !text.is_empty() {
                 chat.messages.push(aisix_gateway::ChatMessage::user(text));
             }
@@ -1017,18 +1020,62 @@ pub fn anthropic_request_for_inspection(body: &Value) -> Result<aisix_gateway::C
     Ok(chat)
 }
 
+/// Keep only Anthropic message surfaces that the provider adapter does not
+/// already materialize in `ChatFormat`. Ordinary strings, text blocks,
+/// tool-use payloads, and textual client tool results are already covered by
+/// the canonical adapter projection and must not be sent to guardrails twice.
+fn anthropic_additional_content_for_inspection(content: &Value) -> Option<Value> {
+    match content {
+        Value::String(_) => None,
+        Value::Array(items) => {
+            let additional: Vec<_> = items
+                .iter()
+                .filter_map(anthropic_additional_content_for_inspection)
+                .collect();
+            (!additional.is_empty()).then_some(Value::Array(additional))
+        }
+        Value::Object(map) => match map.get("type").and_then(Value::as_str) {
+            Some("text" | "image" | "tool_use") => None,
+            Some("tool_result") => match map.get("content") {
+                Some(Value::Array(items)) => {
+                    let additional: Vec<_> = items
+                        .iter()
+                        .filter_map(|item| match item.get("type").and_then(Value::as_str) {
+                            Some("text" | "image") => None,
+                            _ => Some(item.clone()),
+                        })
+                        .collect();
+                    (!additional.is_empty()).then_some(Value::Array(additional))
+                }
+                _ => None,
+            },
+            _ => Some(content.clone()),
+        },
+        _ => None,
+    }
+}
+
 const ANTHROPIC_STRUCTURAL_FIELDS: &[&str] = &[
     "id",
     "name",
     "tool_use_id",
+    "tool_id",
+    "tool_name",
     "file_id",
     "server_name",
     "caller_id",
+    "custom_tool_use_id",
+    "mcp_tool_use_id",
+    "session_thread_id",
+    "url",
 ];
 
 const ANTHROPIC_PROTOCOL_FIELDS: &[&str] = &[
     "type",
+    "cache_control",
+    "caller",
     "text",
+    "thinking",
     "content",
     "source",
     "data",
@@ -1042,7 +1089,36 @@ const ANTHROPIC_PROTOCOL_FIELDS: &[&str] = &[
     "stdout",
     "stderr",
     "error",
+    "error_message",
+    "message",
     "is_error",
+    "citations",
+    "cited_text",
+    "tool_references",
+];
+
+const ANTHROPIC_METADATA_FIELDS: &[&str] = &[
+    "enabled",
+    "error_code",
+    "file_type",
+    "from_",
+    "is_file_update",
+    "lines",
+    "new_lines",
+    "new_start",
+    "num_lines",
+    "old_lines",
+    "old_start",
+    "page_age",
+    "processed_at",
+    "retrieved_at",
+    "return_code",
+    "search_result_index",
+    "start_line",
+    "stop_reason",
+    "to",
+    "total_lines",
+    "trigger",
 ];
 
 fn redact_anthropic_value(
@@ -1050,7 +1126,7 @@ fn redact_anthropic_value(
     dir: Direction,
     value: &mut Value,
     counts: &mut RedactionCounts,
-    parent_type: Option<&str>,
+    user_defined_keys: bool,
 ) -> bool {
     match value {
         Value::String(_) => {
@@ -1058,7 +1134,7 @@ fn redact_anthropic_value(
             false
         }
         Value::Array(items) => items.iter_mut().fold(false, |found, item| {
-            redact_anthropic_value(chain, dir, item, counts, parent_type) || found
+            redact_anthropic_value(chain, dir, item, counts, user_defined_keys) || found
         }),
         Value::Object(map) => {
             let object_type = map
@@ -1076,12 +1152,14 @@ fn redact_anthropic_value(
                 if field == "type" {
                     continue;
                 }
-                let opaque = matches!(field.as_str(), "signature" | "encrypted_content")
-                    || (field == "data"
-                        && matches!(
-                            object_type.as_deref(),
-                            Some("base64" | "base64_pdf" | "redacted_thinking")
-                        ))
+                let opaque = matches!(
+                    field.as_str(),
+                    "signature" | "encrypted_content" | "encrypted_index" | "encrypted_stdout"
+                ) || (field == "data"
+                    && matches!(
+                        object_type.as_deref(),
+                        Some("base64" | "base64_pdf" | "redacted_thinking")
+                    ))
                     || (field == "url"
                         && matches!(
                             object_type.as_deref(),
@@ -1090,12 +1168,16 @@ fn redact_anthropic_value(
                 if opaque {
                     continue;
                 }
+                if !user_defined_keys && ANTHROPIC_METADATA_FIELDS.contains(&field.as_str()) {
+                    continue;
+                }
                 // Protocol field names are not model content. Unknown keys
                 // inside tool inputs/results remain in scope because callers
                 // control those object keys and a mask cannot safely rename
                 // them without changing the tool contract.
-                if !ANTHROPIC_PROTOCOL_FIELDS.contains(&field.as_str())
-                    && !ANTHROPIC_STRUCTURAL_FIELDS.contains(&field.as_str())
+                if user_defined_keys
+                    || (!ANTHROPIC_PROTOCOL_FIELDS.contains(&field.as_str())
+                        && !ANTHROPIC_STRUCTURAL_FIELDS.contains(&field.as_str()))
                 {
                     if let Some(redaction) = redact_str(chain, dir, field) {
                         unrewritable |= redaction.text != *field;
@@ -1108,13 +1190,13 @@ fn redact_anthropic_value(
                     unrewritable |= detect_unrewritable_value_strings(chain, dir, child, counts);
                     continue;
                 }
-                unrewritable |= redact_anthropic_value(
-                    chain,
-                    dir,
-                    child,
-                    counts,
-                    object_type.as_deref().or(parent_type),
-                );
+                let child_has_user_defined_keys = user_defined_keys
+                    || matches!(field.as_str(), "input" | "input_schema")
+                    || (object_type.as_deref() == Some("tool_result")
+                        && field == "content"
+                        && child.is_object());
+                unrewritable |=
+                    redact_anthropic_value(chain, dir, child, counts, child_has_user_defined_keys);
             }
             unrewritable
         }
@@ -1131,7 +1213,7 @@ fn redact_anthropic_content(
     content: &mut Value,
     counts: &mut RedactionCounts,
 ) -> bool {
-    redact_anthropic_value(chain, dir, content, counts, None)
+    redact_anthropic_value(chain, dir, content, counts, false)
 }
 
 pub(crate) fn anthropic_content_inspection_text_capped(
@@ -2778,17 +2860,8 @@ pub fn redact_anthropic_sse(chain: &dyn Guardrail, raw: &[u8]) -> AnthropicSseRe
                 continue;
             };
             let before = block.clone();
-            let block_type = block
-                .get("type")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            unrewritable_tool_key |= redact_anthropic_value(
-                chain,
-                Direction::Output,
-                block,
-                &mut counts,
-                block_type.as_deref(),
-            );
+            unrewritable_tool_key |=
+                redact_anthropic_value(chain, Direction::Output, block, &mut counts, false);
             *block != before
         };
         frame.dirty |= changed;
@@ -3716,6 +3789,53 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_inspection_does_not_duplicate_adapter_projected_text() {
+        for content in [
+            json!("ordinary text"),
+            json!([{
+                "type": "text",
+                "text": "ordinary text"
+            }]),
+        ] {
+            let body = json!({
+                "model": "claude",
+                "messages": [{"role": "user", "content": content}]
+            });
+            let chat = anthropic_request_for_inspection(&body).unwrap();
+            let occurrences = chat
+                .messages
+                .iter()
+                .filter_map(|message| message.content.as_deref())
+                .map(|text| text.matches("ordinary text").count())
+                .sum::<usize>();
+            assert_eq!(occurrences, 1, "messages: {:?}", chat.messages);
+        }
+
+        let body = json!({
+            "model": "claude",
+            "messages": [{"role": "assistant", "content": [{
+                "type": "web_fetch_tool_result",
+                "tool_use_id": "toolu_fetch",
+                "content": {
+                    "type": "web_fetch_result",
+                    "retrieved_at": "2026-08-18T00:00:00Z",
+                    "url": "https://example.test/page",
+                    "content": {
+                        "type": "document",
+                        "source": {"type": "text", "data": "server-only text"},
+                        "title": "fetched page"
+                    }
+                }
+            }]}]
+        });
+        let chat = anthropic_request_for_inspection(&body).unwrap();
+        assert!(chat.messages.iter().any(|message| message
+            .content
+            .as_deref()
+            .is_some_and(|text| text.contains("server-only text"))));
+    }
+
+    #[test]
     fn anthropic_response_masks_text_and_tool_use_input() {
         let chain = both();
         let mut body = json!({
@@ -3774,6 +3894,93 @@ mod tests {
             response["content"][0]["content"]["stderr"],
             "[EMAIL_REDACTED]"
         );
+    }
+
+    #[test]
+    fn anthropic_projection_excludes_server_tool_protocol_metadata_and_ciphertext() {
+        let content = json!([
+            {
+                "type": "web_search_tool_result",
+                "caller": {"type": "code_execution_20250825", "tool_id": "srvtool_1"},
+                "tool_use_id": "toolu_search",
+                "content": [{
+                    "type": "web_search_result",
+                    "encrypted_content": "cipher-a@x.com",
+                    "page_age": "1 day ago",
+                    "title": "search result",
+                    "url": "https://example.test/result"
+                }]
+            },
+            {
+                "type": "web_fetch_tool_result",
+                "tool_use_id": "toolu_fetch",
+                "content": {
+                    "type": "web_fetch_result",
+                    "retrieved_at": "2026-08-18T00:00:00Z",
+                    "url": "https://example.test/page",
+                    "content": {
+                        "type": "document",
+                        "source": {"type": "text", "data": "visible a@x.com"},
+                        "title": "fetched page"
+                    }
+                }
+            },
+            {
+                "type": "code_execution_tool_result",
+                "tool_use_id": "toolu_code",
+                "content": {
+                    "type": "encrypted_code_execution_result",
+                    "encrypted_stdout": "cipher-b@y.org",
+                    "return_code": 0,
+                    "stderr": "visible c@z.io",
+                    "content": []
+                }
+            }
+        ]);
+
+        let (projection, truncated) =
+            anthropic_content_inspection_text_capped(&content, usize::MAX);
+        assert!(!truncated);
+        assert!(projection.contains("visible a@x.com"));
+        assert!(projection.contains("visible c@z.io"));
+        for excluded in [
+            "caller",
+            "tool_id",
+            "page_age",
+            "retrieved_at",
+            "return_code",
+            "encrypted_stdout",
+            "cipher-a@x.com",
+            "cipher-b@y.org",
+        ] {
+            assert!(!projection.contains(excluded), "projection: {projection}");
+        }
+    }
+
+    #[test]
+    fn anthropic_protocol_field_names_remain_guarded_inside_tool_input() {
+        let chain = both();
+        let sensitive_key = "owner-a@x.com";
+        let mut body = json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "lookup",
+                "input": {
+                    (sensitive_key): "safe",
+                    "error_code": "b@y.org"
+                }
+            }]
+        });
+
+        let redaction = redact_anthropic_response(chain.as_ref(), &mut body);
+        assert!(redaction.unrewritable_tool_key);
+        assert!(body["content"][0]["input"].get(sensitive_key).is_some());
+        assert_eq!(
+            body["content"][0]["input"]["error_code"],
+            "[EMAIL_REDACTED]"
+        );
+        assert_eq!(redaction.counts.get("email"), Some(&2));
     }
 
     #[test]

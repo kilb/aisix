@@ -59,8 +59,8 @@ export interface AppOverrides {
    * `proxy.request_body_limit_bytes`. A dedicated override (like
    * `realIp`) because `extra` replaces whole top-level blocks and the
    * proxy block carries the harness-picked listener addr. `0` disables
-   * the cap explicitly; `null` omits the field and selects endpoint-aware
-   * defaults. The harness pins 10 MiB unless a test overrides it so the
+   * the cap explicitly; `null` omits the field and leaves request bodies
+   * unlimited. The harness pins 10 MiB unless a test overrides it so the
    * existing 413 suite keeps its subject.
    */
   requestBodyLimitBytes?: number | null;

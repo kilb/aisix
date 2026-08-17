@@ -245,7 +245,7 @@ pub fn build_router(state: ProxyState) -> Router {
 /// foreign-host traffic from it). Innermost→outermost:
 ///
 /// - `DefaultBodyLimit`: disable axum's static 2 MiB fallback. The
-///   middleware below installs the endpoint-specific dynamic cap.
+///   middleware below installs the configured global cap, when present.
 /// - `enforce_request_body_limit`: short-circuits the Content-Length-known
 ///   oversize case ahead of the extractors; the extractor-chain layer
 ///   above catches chunked / size-mismatched bodies.

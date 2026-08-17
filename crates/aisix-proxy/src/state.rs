@@ -205,8 +205,7 @@ pub struct ProxyStateInner {
     /// `reqwest::Client` connection pool. Always present (the
     /// no-exporters case = empty snapshot table = no spawned tasks).
     pub otlp_fan_out: OtlpHttpFanOut,
-    /// `None` selects endpoint-aware finite defaults, `Some(0)` is an
-    /// explicit unlimited override, and `Some(n)` applies `n` globally.
+    /// `None` and `Some(0)` are unlimited; `Some(n)` applies `n` globally.
     pub request_body_limit_bytes: Option<usize>,
     /// Pre-parsed `proxy.real_ip` config for resolving the downstream
     /// client IP on each request (#492). Default = trust nothing → the
