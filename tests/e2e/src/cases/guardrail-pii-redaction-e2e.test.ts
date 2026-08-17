@@ -1656,6 +1656,135 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
     }
   });
 
+  test("Responses block-action PII scans tool payloads and structural identifiers", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+
+    let blockUpstream: OpenAiUpstream | undefined;
+    try {
+      blockUpstream = await startOpenAiUpstream({
+        scriptedResponses: [
+          {
+            nonStreamBody: {
+              id: "resp_block_structural",
+              object: "response",
+              status: "completed",
+              model: "gpt-4o-mini",
+              output: [
+                {
+                  type: "mcp_call",
+                  id: "item_safe",
+                  call_id: "call_safe",
+                  server_label: CN_ID,
+                  arguments: "{}",
+                },
+              ],
+              usage: { input_tokens: 4, output_tokens: 6, total_tokens: 10 },
+            },
+          },
+          {
+            streamEvents: [
+              JSON.stringify({
+                type: "response.created",
+                response: { id: "resp_block_structural_stream", status: "in_progress" },
+              }),
+              JSON.stringify({
+                type: "response.output_item.added",
+                output_index: 0,
+                item: {
+                  type: "custom_tool_call",
+                  id: "item_safe_stream",
+                  call_id: "call_safe_stream",
+                  name: "lookup",
+                  connector_id: CN_ID,
+                  input: "{}",
+                },
+              }),
+              JSON.stringify({
+                type: "response.completed",
+                response: {
+                  id: "resp_block_structural_stream",
+                  status: "completed",
+                  output: [],
+                  usage: { input_tokens: 4, output_tokens: 6, total_tokens: 10 },
+                },
+              }),
+              "[DONE]",
+            ],
+          },
+        ],
+      });
+
+      const pk = await seed.createProviderKey({
+        display_name: "pii-responses-block-fields-pk",
+        secret: "sk-mock",
+        api_base: `${blockUpstream.baseUrl}/v1`,
+      });
+      await seed.createModel({
+        display_name: "pii-responses-block-fields",
+        provider: "openai",
+        model_name: "gpt-4o-mini",
+        provider_key_id: pk.id,
+      });
+      const caller = `${CALLER}-responses-block-fields`;
+      await seed.createApiKey({
+        key_hash: hash(caller),
+        allowed_models: ["pii-responses-block-fields"],
+      });
+      await waitForModels(app, caller, ["pii-responses-block-fields"]);
+
+      const post = (body: unknown) =>
+        fetch(`${app!.proxyUrl}/v1/responses`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${caller}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(body),
+        });
+      const blockedItems = [
+        { type: "function_call", arguments: JSON.stringify({ owner: CN_ID }) },
+        { type: "mcp_call", arguments: JSON.stringify({ owner: CN_ID }) },
+        { type: "custom_tool_call", input: CN_ID },
+        { type: "function_call", id: CN_ID },
+        { type: "function_call", call_id: CN_ID },
+        { type: "function_call", name: CN_ID },
+        { type: "mcp_call", server_label: CN_ID },
+        { type: "mcp_call", connector_id: CN_ID },
+      ];
+      for (const item of blockedItems) {
+        const baseline = blockUpstream.receivedRequests.length;
+        const response = await post({
+          model: "pii-responses-block-fields",
+          input: [item],
+        });
+        const responseBody = await response.text();
+        expect(response.status).toBe(422);
+        expect(responseBody).toContain("content_filter");
+        expect(responseBody).not.toContain(CN_ID);
+        expect(blockUpstream.receivedRequests).toHaveLength(baseline);
+      }
+
+      for (const stream of [false, true]) {
+        const baseline = blockUpstream.receivedRequests.length;
+        const response = await post({
+          model: "pii-responses-block-fields",
+          input: `clean structural output ${stream}`,
+          stream,
+        });
+        const responseBody = await response.text();
+        expect(response.status).toBe(422);
+        expect(responseBody).toContain("content_filter");
+        expect(responseBody).not.toContain(CN_ID);
+        expect(blockUpstream.receivedRequests).toHaveLength(baseline + 1);
+      }
+    } finally {
+      await blockUpstream?.close();
+    }
+  });
+
   test("chat and Responses reject mask-matching output tool names", async (ctx) => {
     if (!etcdReachable || !app || !seed) {
       ctx.skip();

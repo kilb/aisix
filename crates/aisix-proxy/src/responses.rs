@@ -1033,14 +1033,16 @@ fn responses_input_to_chat(model: &str, body: &Value) -> ChatFormat {
     ChatFormat::new(model, messages)
 }
 
-/// Collect the plain, caller-supplied text of one Responses-API input
-/// item, across every key on the `input`-item union that carries text the
-/// model will see:
+/// Collect the caller-supplied text and structural identifiers of one
+/// Responses-API input/output item across every forwarded key that a
+/// guardrail must inspect:
 /// - `content` — message items;
 /// - `output` — tool-result items (`function_call_output`,
 ///   `custom_tool_call_output`, `*_call_output`) the caller feeds back;
 /// - `reason` — an `mcp_approval_response` justification;
-/// - `approval_request_id` — the structural identifier binding that response.
+/// - `arguments` / `input` — function, MCP, and custom-tool payloads; and
+/// - stable protocol identifiers (`id`, `call_id`, `name`,
+///   `approval_request_id`, `server_label`, `connector_id`).
 ///
 /// All are user-controlled content entering the model — the
 /// `/v1/chat/completions` equivalent (a `role:"tool"` message) is
@@ -1052,18 +1054,47 @@ fn responses_input_to_chat(model: &str, body: &Value) -> ChatFormat {
 /// kind). Reading a key absent on other item types is a harmless no-op.
 /// <https://platform.openai.com/docs/api-reference/responses/create>
 fn responses_item_text(item: &Value) -> String {
-    [
-        item.get("content"),
-        item.get("output"),
-        item.get("reason"),
-        item.get("approval_request_id"),
-    ]
-    .into_iter()
-    .flatten()
-    .map(responses_value_text)
-    .filter(|s| !s.is_empty())
-    .collect::<Vec<_>>()
-    .join("\n")
+    responses_item_text_capped(item, usize::MAX).0
+}
+
+fn responses_item_text_capped(item: &Value, cap: usize) -> (String, bool) {
+    let mut output = String::new();
+    let mut truncated = false;
+    let mut push = |text: &str| {
+        if text.is_empty() {
+            return;
+        }
+        if !output.is_empty() {
+            truncated |= crate::token_estimate::push_capped_to(&mut output, "\n", cap);
+        }
+        truncated |= crate::token_estimate::push_capped_to(&mut output, text, cap);
+    };
+
+    for field in ["content", "output", "reason"] {
+        if let Some(value) = item.get(field) {
+            push(&responses_value_text(value));
+        }
+    }
+    for field in [
+        "arguments",
+        "input",
+        "id",
+        "call_id",
+        "name",
+        "approval_request_id",
+        "server_label",
+        "connector_id",
+    ] {
+        let Some(value) = item.get(field) else {
+            continue;
+        };
+        if let Some(text) = value.as_str() {
+            push(text);
+        } else if !value.is_null() {
+            push(&serde_json::to_string(value).expect("serde_json::Value always serializes"));
+        }
+    }
+    (output, truncated)
 }
 
 /// Plain text of one Responses-API content slot: a bare string, or the
@@ -3031,6 +3062,26 @@ impl SseTextCapture {
                         crate::token_estimate::push_capped_to(&mut self.deltas, d, self.cap);
                 }
             }
+            Some("response.output_item.added" | "response.output_item.done") => {
+                if let Some(item) = json.get("item") {
+                    let (text, truncated) = responses_item_text_capped(item, self.cap);
+                    if !text.is_empty() {
+                        if !self.deltas.is_empty() {
+                            self.truncated |= crate::token_estimate::push_capped_to(
+                                &mut self.deltas,
+                                "\n",
+                                self.cap,
+                            );
+                        }
+                        self.truncated |= crate::token_estimate::push_capped_to(
+                            &mut self.deltas,
+                            &text,
+                            self.cap,
+                        );
+                    }
+                    self.truncated |= truncated;
+                }
+            }
             _ => {}
         }
     }
@@ -3451,33 +3502,15 @@ fn responses_output_text_capped(resp: &Value, cap: usize) -> (String, bool) {
     let mut output = String::new();
     let mut truncated = false;
     for it in items {
-        if let Some(content) = it.get("content").and_then(|c| c.as_array()) {
-            for part in content {
-                for text in ["text", "refusal"]
-                    .into_iter()
-                    .filter_map(|field| part.get(field).and_then(Value::as_str))
-                    .filter(|text| !text.is_empty())
-                {
-                    if !output.is_empty() {
-                        truncated |= crate::token_estimate::push_capped_to(&mut output, "\n", cap);
-                    }
-                    truncated |= crate::token_estimate::push_capped_to(&mut output, text, cap);
-                }
-            }
+        let (item_text, item_truncated) = responses_item_text_capped(it, cap);
+        if item_text.is_empty() {
+            continue;
         }
-        // Tool-call items carry caller-visible model output under top-level
-        // `name`/`arguments` (function_call) or `name`/`input` (custom tool).
-        for key in ["name", "arguments", "input"] {
-            if let Some(s) = it.get(key).and_then(|v| v.as_str()) {
-                if s.is_empty() {
-                    continue;
-                }
-                if !output.is_empty() {
-                    truncated |= crate::token_estimate::push_capped_to(&mut output, "\n", cap);
-                }
-                truncated |= crate::token_estimate::push_capped_to(&mut output, s, cap);
-            }
+        if !output.is_empty() {
+            truncated |= crate::token_estimate::push_capped_to(&mut output, "\n", cap);
         }
+        truncated |= crate::token_estimate::push_capped_to(&mut output, &item_text, cap);
+        truncated |= item_truncated;
     }
     (output, truncated)
 }
@@ -3527,6 +3560,17 @@ fn responses_sse_output_text(bytes: &[u8]) -> String {
             ) => {
                 if let Some(d) = json.get("delta").and_then(|d| d.as_str()) {
                     deltas.push_str(d);
+                }
+            }
+            Some("response.output_item.added" | "response.output_item.done") => {
+                if let Some(item) = json.get("item") {
+                    let text = responses_item_text(item);
+                    if !text.is_empty() {
+                        if !deltas.is_empty() {
+                            deltas.push('\n');
+                        }
+                        deltas.push_str(&text);
+                    }
                 }
             }
             _ => {}
@@ -4219,6 +4263,50 @@ mod tests {
         assert_eq!(v["error"]["type"], "content_filter");
     }
 
+    #[tokio::test]
+    async fn input_guardrail_blocks_tool_payloads_and_structural_identifiers() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id":"x","object":"response","output":[]})),
+            )
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        let items = [
+            serde_json::json!({"type":"function_call","arguments":"{\"query\":\"BLOCKME\"}"}),
+            serde_json::json!({"type":"mcp_call","arguments":"{\"query\":\"BLOCKME\"}"}),
+            serde_json::json!({"type":"custom_tool_call","input":"BLOCKME"}),
+            serde_json::json!({"type":"function_call","id":"BLOCKME"}),
+            serde_json::json!({"type":"function_call","call_id":"BLOCKME"}),
+            serde_json::json!({"type":"function_call","name":"BLOCKME"}),
+            serde_json::json!({"type":"mcp_call","server_label":"BLOCKME"}),
+            serde_json::json!({"type":"mcp_call","connector_id":"BLOCKME"}),
+        ];
+        for item in items {
+            let resp = app
+                .clone()
+                .oneshot(make_req(serde_json::json!({
+                    "model": "gpt-4o-resp",
+                    "input": [item],
+                })))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains("BLOCKME"));
+        }
+    }
+
     /// #719: the top-level `instructions` field (the system-prompt analog)
     /// is caller-supplied and reaches the model, so it is scanned too. A
     /// blocked literal in `instructions` must 422. (Scanned via the
@@ -4351,6 +4439,44 @@ mod tests {
             !msg.contains("BLOCKME"),
             "model output leaked in error: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn output_guardrail_blocks_structural_tool_identifier() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_x",
+                "object": "response",
+                "output": [{
+                    "type": "mcp_call",
+                    "id": "item_1",
+                    "call_id": "call_1",
+                    "server_label": "BLOCKME",
+                    "arguments": "{}"
+                }],
+                "usage": {"input_tokens": 5, "output_tokens": 4}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"hi"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("BLOCKME"));
     }
 
     /// #719 companion: a clean non-streaming response with an output

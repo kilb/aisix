@@ -304,7 +304,6 @@ pub trait A2aBridge: Send + Sync {
 }
 
 /// The default [`A2aBridge`], built on the workspace HTTP client.
-#[derive(Debug)]
 pub struct HttpBridge {
     upstream: A2aUpstream,
     /// The agent's JSON-RPC endpoint, parsed once process-wide instead of
@@ -312,6 +311,14 @@ pub struct HttpBridge {
     /// is one cache lookup per request in place of one `Url` parse.
     endpoint: aisix_gateway::url_cache::EndpointUrl,
     client: reqwest::Client,
+}
+
+impl std::fmt::Debug for HttpBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpBridge")
+            .field("upstream", &self.upstream)
+            .finish_non_exhaustive()
+    }
 }
 
 impl HttpBridge {
@@ -770,6 +777,27 @@ mod tests {
             let rendered = error.to_string();
             assert!(!rendered.contains(path_secret), "path leaked: {rendered}");
             assert!(!rendered.contains(query_secret), "query leaked: {rendered}");
+        }
+    }
+
+    #[test]
+    fn http_bridge_debug_redacts_endpoint_secrets() {
+        let bridge = HttpBridge::new(A2aUpstream {
+            url: "https://alice:password@example.com/path-secret?token=query-secret".to_string(),
+            auth: A2aAuth::Bearer("bearer-secret".to_string()),
+            protocol_version: A2aProtocolVersion::V1_0,
+            timeout: Duration::from_secs(1),
+        });
+        let rendered = format!("{bridge:?}");
+        assert!(rendered.contains("https://example.com/"));
+        for secret in [
+            "alice",
+            "password",
+            "path-secret",
+            "query-secret",
+            "bearer-secret",
+        ] {
+            assert!(!rendered.contains(secret), "debug output leaked {secret}");
         }
     }
 
