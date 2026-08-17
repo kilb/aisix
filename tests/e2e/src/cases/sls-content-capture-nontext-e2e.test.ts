@@ -41,6 +41,8 @@ const SPEECH_PROMPT_TOKEN = "speech-prompt-tok-aa11bb";
 const TRANSCRIPT_PROMPT_TOKEN = "transcribe-prompt-tok-cc22dd";
 const TRANSCRIPT_RESPONSE_TOKEN = "transcribe-response-tok-ee33ff";
 const AUDIO_FILE_BYTES = "ID3fakeaudio-nontext";
+const AUXILIARY_EMAIL = "auxiliary.person@example.com";
+const IMAGES_BLOCK_REQUEST_ID = "cc700-images-structural-user-block";
 
 async function postJson(app: SpawnedApp, path: string, body: unknown): Promise<Response> {
   return fetch(`${app.proxyUrl}${path}`, {
@@ -83,7 +85,12 @@ describe("sls content capture e2e (#700): embeddings / rerank / images / audio",
     imagesUpstream = await startOpenAiUpstream({
       nonStreamBody: {
         created: 1_700_000_000,
-        data: [{ url: IMAGES_RESPONSE_URL }],
+        data: [
+          {
+            url: IMAGES_RESPONSE_URL,
+            revised_prompt: `portrait of ${AUXILIARY_EMAIL}`,
+          },
+        ],
       },
     });
     speechUpstream = await startOpenAiUpstream({
@@ -169,6 +176,13 @@ describe("sls content capture e2e (#700): embeddings / rerank / images / audio",
       await seed("cc700-images", "dall-e-3", imagesUpstream);
       await seed("cc700-speech", "tts-1", speechUpstream);
       await seed("cc700-transcribe", "whisper-1", transcribeUpstream);
+      await seedClient.createGuardrail({
+        name: "nontext-auxiliary-pii",
+        enabled: true,
+        hook_point: "both",
+        kind: "pii",
+        detectors: [{ type: "email", action: "mask" }],
+      });
       await seedClient.createApiKey({
         key_hash: CALLER_KEY_HASH,
         allowed_models: [
@@ -209,7 +223,12 @@ describe("sls content capture e2e (#700): embeddings / rerank / images / audio",
       const rerankRes = await postJson(app, "/v1/rerank", {
         model: "cc700-rerank",
         query: `find ${RERANK_PROMPT_TOKEN}`,
-        documents: [`doc about ${RERANK_DOC_TOKEN}`],
+        documents: [
+          {
+            text: `doc about ${RERANK_DOC_TOKEN}`,
+            metadata: { owner: AUXILIARY_EMAIL },
+          },
+        ],
       });
       expect(rerankRes.status).toBe(200);
       await rerankRes.text();
@@ -218,6 +237,11 @@ describe("sls content capture e2e (#700): embeddings / rerank / images / audio",
       expect(fullText).toContain(RERANK_PROMPT_TOKEN);
       expect(fullText).toContain(RERANK_DOC_TOKEN);
       expect(fullText).toContain(String(RERANK_RESPONSE_MARK));
+      const rerankWire = JSON.stringify(
+        rerankUpstream.receivedRequests.at(-1)?.body ?? {},
+      );
+      expect(rerankWire).toContain("[EMAIL_REDACTED]");
+      expect(rerankWire).not.toContain(AUXILIARY_EMAIL);
 
       // -- images: prompt captured, response url captured --
       const imagesRes = await postJson(app, "/v1/images/generations", {
@@ -225,21 +249,48 @@ describe("sls content capture e2e (#700): embeddings / rerank / images / audio",
         prompt: `paint ${IMAGES_PROMPT_TOKEN}`,
       });
       expect(imagesRes.status).toBe(200);
-      await imagesRes.text();
+      const imagesBody = await imagesRes.text();
+      expect(imagesBody).toContain("[EMAIL_REDACTED]");
+      expect(imagesBody).not.toContain(AUXILIARY_EMAIL);
       await waitForToken(sls, FULL_LOGSTORE, IMAGES_PROMPT_TOKEN);
       fullText = decodedTextFor(sls, FULL_LOGSTORE);
       expect(fullText).toContain(IMAGES_PROMPT_TOKEN);
       expect(fullText).toContain(IMAGES_RESPONSE_URL);
 
+      const imagesBaseline = imagesUpstream.receivedRequests.length;
+      const blockedImages = await fetch(`${app.proxyUrl}/v1/images/generations`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${CALLER_PLAINTEXT}`,
+          "content-type": "application/json",
+          "x-aisix-request-id": IMAGES_BLOCK_REQUEST_ID,
+        },
+        body: JSON.stringify({
+          model: "cc700-images",
+          prompt: "clean structural identifier check",
+          user: AUXILIARY_EMAIL,
+        }),
+      });
+      expect(blockedImages.status).toBe(422);
+      expect(await blockedImages.text()).not.toContain(AUXILIARY_EMAIL);
+      expect(imagesUpstream.receivedRequests.length).toBe(imagesBaseline);
+      await waitForToken(sls, FULL_LOGSTORE, IMAGES_BLOCK_REQUEST_ID);
+
       // -- audio speech: input text captured; binary response not logged --
       const speechRes = await postJson(app, "/v1/audio/speech", {
         model: "cc700-speech",
         input: `say ${SPEECH_PROMPT_TOKEN}`,
+        instructions: `speak softly to ${AUXILIARY_EMAIL}`,
         voice: "alloy",
       });
       expect(speechRes.status).toBe(200);
       await speechRes.arrayBuffer();
       await waitForToken(sls, FULL_LOGSTORE, SPEECH_PROMPT_TOKEN);
+      const speechWire = JSON.stringify(
+        speechUpstream.receivedRequests.at(-1)?.body ?? {},
+      );
+      expect(speechWire).toContain("[EMAIL_REDACTED]");
+      expect(speechWire).not.toContain(AUXILIARY_EMAIL);
 
       // -- audio transcription: file → sha256, prompt field + transcript --
       const form = new FormData();
@@ -260,6 +311,7 @@ describe("sls content capture e2e (#700): embeddings / rerank / images / audio",
       const expectedSha = createHash("sha256").update(AUDIO_FILE_BYTES).digest("hex");
       expect(fullText).toContain(expectedSha); // file represented by checksum
       expect(fullText).not.toContain(AUDIO_FILE_BYTES); // never the raw bytes
+      expect(decodedTextFor(sls, FULL_LOGSTORE)).not.toContain(AUXILIARY_EMAIL);
 
       // -- metadata_only exporter received none of the content --
       // Wait until the LAST request's metadata (its requested_model, which

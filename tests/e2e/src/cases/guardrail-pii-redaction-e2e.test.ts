@@ -636,6 +636,20 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
     expect(upstreamBlob).not.toContain(EMAIL);
 
     const beforeRejectedRequest = received.length;
+    const rejectedMetadata = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": anthCaller },
+      body: JSON.stringify({
+        model: "pii-anth-e2e",
+        max_tokens: 32,
+        messages: [{ role: "user", content: "clean" }],
+        metadata: { user_id: EMAIL },
+      }),
+    });
+    expect(rejectedMetadata.status).toBe(422);
+    expect(await rejectedMetadata.text()).not.toContain(EMAIL);
+    expect(received).toHaveLength(beforeRejectedRequest);
+
     const rejected = await fetch(`${app.proxyUrl}/v1/messages`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-api-key": anthCaller },
@@ -1203,6 +1217,30 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
           },
           body: JSON.stringify(body),
         });
+
+      const chatMetadataBaseline = chatUpstream.receivedRequests.length;
+      const rejectedChatMetadata = await post("/v1/chat/completions", {
+        model: "pii-chat-tool",
+        messages: [{ role: "user", content: "clean" }],
+        user: EMAIL,
+        metadata: { tenant: EMAIL },
+      });
+      expect(rejectedChatMetadata.status).toBe(422);
+      expect(await rejectedChatMetadata.text()).not.toContain(EMAIL);
+      expect(chatUpstream.receivedRequests).toHaveLength(chatMetadataBaseline);
+
+      const responsesMetadataBaseline = responsesUpstream.receivedRequests.length;
+      const rejectedResponsesMetadata = await post("/v1/responses", {
+        model: "pii-responses-tool",
+        input: "clean",
+        safety_identifier: EMAIL,
+        metadata: { tenant: EMAIL },
+      });
+      expect(rejectedResponsesMetadata.status).toBe(422);
+      expect(await rejectedResponsesMetadata.text()).not.toContain(EMAIL);
+      expect(responsesUpstream.receivedRequests).toHaveLength(
+        responsesMetadataBaseline,
+      );
 
       const chatTools = (
         property: string,

@@ -306,6 +306,24 @@ impl RedisStore {
     fn mark_ok(&self) {
         self.degraded_logged.store(false, Ordering::Relaxed);
     }
+
+    async fn add_tokens_remote(&self, prefix: &str, tokens: u64) -> Result<(), redis::RedisError> {
+        let mut conn = self.conn.acquire().await?;
+        let result: Result<i64, redis::RedisError> = Script::new(ADD_TOKENS_LUA)
+            .key(prefix)
+            .arg(prefix)
+            .arg(tokens)
+            .arg(self.grace)
+            .invoke_async(&mut conn)
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                self.conn.note_error().await;
+                Err(err)
+            }
+        }
+    }
 }
 
 fn push_dims(args: &mut Vec<String>, dims: &[Dim]) {
@@ -464,13 +482,33 @@ impl RateStore for RedisStore {
         if tokens == 0 {
             return;
         }
-        // Best-effort fire-and-forget to Redis; also record locally so the
-        // count is right if a later request falls back during an outage.
+        // Record locally too so the count is right if a later request falls
+        // back during an outage.
         self.local.add_tokens(key, tokens);
         let prefix = self.bucket_prefix(key);
-        let grace = self.grace;
-        let conn = self.conn.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+
+        // Stream terminal callbacks are synchronous. On the production
+        // multi-thread runtime, `block_in_place` yields this worker while the
+        // Redis script completes, so a subsequent acquire cannot overtake the
+        // post-stream TPM/TPD update. Current-thread runtimes are used only by
+        // unit tests and cannot safely block their own I/O driver; retain the
+        // detached best-effort path there.
+        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+            let result = tokio::task::block_in_place(|| {
+                handle.block_on(self.add_tokens_remote(&prefix, tokens))
+            });
+            match result {
+                Ok(()) => self.mark_ok(),
+                Err(err) => {
+                    self.warn_degraded("add_tokens", &err);
+                }
+            }
+        } else {
+            let conn = self.conn.clone();
+            let grace = self.grace;
             handle.spawn(async move {
                 let Ok(mut c) = conn.acquire().await else {
                     return;

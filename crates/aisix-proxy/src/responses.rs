@@ -1013,7 +1013,15 @@ fn responses_input_to_chat(model: &str, body: &Value) -> ChatFormat {
         _ => {}
     }
 
-    for field in ["tools", "tool_choice", "text"] {
+    for field in [
+        "tools",
+        "tool_choice",
+        "text",
+        "user",
+        "safety_identifier",
+        "prompt_cache_key",
+        "metadata",
+    ] {
         if let Some(value) = body.get(field) {
             let text = serde_json::to_string(value).expect("serde_json::Value always serializes");
             if text != "null" && text != "[]" {
@@ -1059,13 +1067,17 @@ fn responses_item_text(item: &Value) -> String {
 }
 
 /// Plain text of one Responses-API content slot: a bare string, or the
-/// concatenated `text` of an array of typed parts.
+/// concatenated `text`/`refusal` of an array of typed parts.
 fn responses_value_text(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Array(parts) => parts
             .iter()
-            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .flat_map(|part| {
+                ["text", "refusal"]
+                    .into_iter()
+                    .filter_map(|field| part.get(field).and_then(Value::as_str))
+            })
             .filter(|t| !t.is_empty())
             .collect::<Vec<_>>()
             .join("\n"),
@@ -1410,14 +1422,15 @@ async fn responses_to_target(
                     }
                 };
                 saw_chunk = true;
-                // Parse/account every generated chunk before enforcing the
-                // security wire cap. Both side buffers are hard-bounded, so a
-                // single oversized provider chunk cannot force an equally
-                // large duplicate allocation before fail-closed rejection.
-                push_capped_lossy_bytes(&mut observed_raw, &chunk);
+                // Parse/account through the exact semantic-terminal boundary.
+                // A provider may coalesce later frames into the same transport
+                // item; those bytes are not part of this response.
+                let mut processed = 0usize;
+                let mut wire_len = chunk.len();
                 for part in chunk.chunks(64 * 1024) {
                     observed_frame.extend_from_slice(part);
-                    drain_responses_sse_frames(
+                    processed += part.len();
+                    let terminal_seen = drain_responses_sse_frames(
                         &mut observed_frame,
                         &mut observed_usage,
                         Some(&mut observed_capture),
@@ -1425,12 +1438,21 @@ async fn responses_to_target(
                         attempt_started,
                         &mut observed_first_frame,
                     );
+                    if terminal_seen {
+                        wire_len = processed.saturating_sub(observed_frame.len());
+                        observed_frame.clear();
+                        break;
+                    }
                     if observed_frame.len() > crate::messages::MAX_SSE_FRAME_BUF_BYTES {
                         observed_frame.clear();
                         observed_failure =
                             Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode);
+                        wire_len = processed;
+                        break;
                     }
                 }
+                let chunk = chunk.slice(..wire_len);
+                push_capped_lossy_bytes(&mut observed_raw, &chunk);
                 let semantic_terminal = observed_failure.is_some()
                     || observed_usage
                         .as_ref()
@@ -2865,8 +2887,9 @@ fn responses_sse_provider_request_id(bytes: &[u8]) -> String {
 /// Drain every complete SSE event from `buf`, updating `acc` with the latest
 /// terminal-event usage (#808) and feeding each parsed event to the optional
 /// content capture (AISIX-Cloud#947). Incomplete trailing bytes remain for the
-/// next chunk; framing and multi-`data` interpretation use the shared WHATWG
-/// parser.
+/// next chunk. The function stops at a semantic terminal so callers can discard
+/// coalesced later frames. Framing and multi-`data` interpretation use the
+/// shared WHATWG parser.
 fn drain_responses_sse_frames(
     buf: &mut Vec<u8>,
     acc: &mut Option<ResponseUsage>,
@@ -2874,14 +2897,12 @@ fn drain_responses_sse_frames(
     failure: &mut Option<crate::stream_timeout::RawStreamFailure>,
     attempt_started: Instant,
     first_frame_seen: &mut bool,
-) {
+) -> bool {
+    if failure.is_some() || acc.as_ref().is_some_and(|usage| usage.reached_end) {
+        return true;
+    }
     while let Some(end) = crate::redact::first_sse_event_end(buf) {
         let frame: Vec<u8> = buf.drain(..end).collect();
-        // A semantic terminal event owns the protocol outcome. Bytes after
-        // it cannot turn a completed response into a transport failure.
-        if acc.as_ref().is_some_and(|usage| usage.reached_end) {
-            continue;
-        }
         let (json, malformed) = crate::redact::parse_sse_json_event(&frame, !*first_frame_seen);
         if malformed {
             *failure = Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode);
@@ -2956,7 +2977,11 @@ fn drain_responses_sse_frames(
                 c.observe(&json);
             }
         }
+        if failure.is_some() || acc.as_ref().is_some_and(|usage| usage.reached_end) {
+            return true;
+        }
     }
+    false
 }
 
 /// Streamed output-text accumulator for content-capturing exporters
@@ -2996,6 +3021,7 @@ impl SseTextCapture {
             }
             Some(
                 "response.output_text.delta"
+                | "response.refusal.delta"
                 | "response.function_call_arguments.delta"
                 | "response.mcp_call_arguments.delta"
                 | "response.custom_tool_call_input.delta",
@@ -3253,13 +3279,16 @@ where
         let mut buf: Vec<u8> = Vec::new();
         let mut first_frame_seen = false;
         while let Some(item) = upstream.next().await {
+            let mut wire_len = None;
             if let Ok(bytes) = &item {
-                // Side-channel parse: copy into the frame buffer (the original
-                // `bytes` is yielded unchanged below) and drain complete frames.
+                // Parse through the exact semantic-terminal boundary. Later
+                // frames coalesced into this transport item are discarded.
+                let mut processed = 0usize;
                 for part in bytes.chunks(64 * 1024) {
                     buf.extend_from_slice(part);
+                    processed += part.len();
                     let state = guard.state();
-                    drain_responses_sse_frames(
+                    let terminal_seen = drain_responses_sse_frames(
                         &mut buf,
                         &mut state.usage,
                         state.capture.as_mut(),
@@ -3267,6 +3296,11 @@ where
                         attempt_started,
                         &mut first_frame_seen,
                     );
+                    if terminal_seen {
+                        wire_len = Some(processed.saturating_sub(buf.len()));
+                        buf.clear();
+                        break;
+                    }
                     if state.failure.is_some()
                         || state.capture.as_ref().is_some_and(|capture| capture.truncated)
                     {
@@ -3283,6 +3317,8 @@ where
                         state.failure =
                             Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode);
                         state.capture_safe = false;
+                        wire_len = Some(processed);
+                        break;
                     }
                 }
                 // Bound the frame buffer: the happy path drains complete frames
@@ -3292,6 +3328,10 @@ where
                 // (losing usage parsing for that pathological case) rather than
                 // OOM. Bytes still forward verbatim — only telemetry is affected.
             }
+            let item = match (item, wire_len) {
+                (Ok(bytes), Some(len)) if len < bytes.len() => Ok(bytes.slice(..len)),
+                (item, _) => item,
+            };
             let (semantic_terminal, successful_terminal) = {
                 let state = guard.state();
                 let successful = state
@@ -3412,15 +3452,17 @@ fn responses_output_text_capped(resp: &Value, cap: usize) -> (String, bool) {
     let mut truncated = false;
     for it in items {
         if let Some(content) = it.get("content").and_then(|c| c.as_array()) {
-            for text in content
-                .iter()
-                .filter_map(|part| part.get("text").and_then(Value::as_str))
-                .filter(|text| !text.is_empty())
-            {
-                if !output.is_empty() {
-                    truncated |= crate::token_estimate::push_capped_to(&mut output, "\n", cap);
+            for part in content {
+                for text in ["text", "refusal"]
+                    .into_iter()
+                    .filter_map(|field| part.get(field).and_then(Value::as_str))
+                    .filter(|text| !text.is_empty())
+                {
+                    if !output.is_empty() {
+                        truncated |= crate::token_estimate::push_capped_to(&mut output, "\n", cap);
+                    }
+                    truncated |= crate::token_estimate::push_capped_to(&mut output, text, cap);
                 }
-                truncated |= crate::token_estimate::push_capped_to(&mut output, text, cap);
             }
         }
         // Tool-call items carry caller-visible model output under top-level
@@ -3465,7 +3507,7 @@ fn responses_sse_output_text(bytes: &[u8]) -> String {
                     }
                 }
             }
-            Some("response.output_text.delta") => {
+            Some("response.output_text.delta" | "response.refusal.delta") => {
                 if let Some(d) = json.get("delta").and_then(|d| d.as_str()) {
                     deltas.push_str(d);
                 }
@@ -4400,6 +4442,8 @@ mod tests {
                    data: {\"type\":\"response.output_text.delta\",\"delta\":\"a clean answer\"}\n\n\
                    event: response.completed\n\
                    data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_clean\",\"status\":\"completed\",\"output\":[]}}\n\n\
+                   event: response.output_text.delta\n\
+                   data: {\"type\":\"response.output_text.delta\",\"delta\":\"AFTER_RESPONSE_COMPLETED\"}\n\n\
                    data: [DONE]\n\n";
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
@@ -4431,6 +4475,11 @@ mod tests {
             body.contains("a clean answer"),
             "clean SSE body must be released in full",
         );
+        assert!(
+            !body.contains("AFTER_RESPONSE_COMPLETED"),
+            "frames after response.completed must be discarded",
+        );
+        assert!(body.contains("[DONE]"));
         assert!(
             body.starts_with("event: ") || body.starts_with("data: "),
             "SSE shape preserved on release",
@@ -5709,7 +5758,8 @@ data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\"}}\n\n";
 
         let upstream = futures::stream::iter([
             Ok::<_, crate::stream_timeout::RawStreamError>(bytes::Bytes::from_static(
-                b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+                b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n\
+event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"AFTER_RESPONSE_COMPLETED\"}\n\n",
             )),
             Err(crate::stream_timeout::RawStreamError::Timeout { elapsed_ms: 300 }),
         ]);
@@ -5730,7 +5780,9 @@ data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\"}}\n\n";
         futures::pin_mut!(stream);
 
         let terminal = stream.next().await.unwrap().unwrap();
-        assert!(String::from_utf8_lossy(&terminal).contains("response.completed"));
+        let terminal = String::from_utf8_lossy(&terminal);
+        assert!(terminal.contains("response.completed"));
+        assert!(!terminal.contains("AFTER_RESPONSE_COMPLETED"));
         assert_eq!(
             stream.next().await.unwrap().unwrap(),
             bytes::Bytes::from_static(b"data: [DONE]\n\n"),

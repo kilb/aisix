@@ -53,13 +53,15 @@ const responsesSse =
   "\uFEFFevent: response.created\r" +
   'data: {"type":"response.created",\r' +
   'data: "response":{"id":"resp-standard"}}\r\r' +
-  "event: response.output_text.delta\r" +
-  'data: {"type":"response.output_text.delta","item_id":"m","delta":"forbiddenstandard"}\r\r' +
-  "event: response.output_text.delta\r" +
-  'data: {"type":"response.output_text.delta","item_id":"m","delta":"token"}\r\r' +
+  "event: response.refusal.delta\r" +
+  'data: {"type":"response.refusal.delta","item_id":"m","content_index":0,"delta":"forbiddenstandard"}\r\r' +
+  "event: response.refusal.delta\r" +
+  'data: {"type":"response.refusal.delta","item_id":"m","content_index":0,"delta":"token"}\r\r' +
+  "event: response.refusal.done\r" +
+  'data: {"type":"response.refusal.done","item_id":"m","content_index":0,"refusal":"forbiddenstandardtoken"}\r\r' +
   "event: response.completed\r" +
   'data: {"type":"response.completed",\r' +
-  'data: "response":{"id":"resp-standard","status":"completed","output":[]}}\r\r' +
+  'data: "response":{"id":"resp-standard","status":"completed","output":[{"type":"message","content":[{"type":"refusal","refusal":"forbiddenstandardtoken"}]}]}}\r\r' +
   "data: [DONE]\r\r";
 
 describe("standards-compliant SSE output guardrails", () => {
@@ -231,6 +233,7 @@ describe("standards-compliant SSE output guardrails", () => {
     const body = await result.text();
     expect(body).toContain("content_filter");
     expect(body).not.toContain("forbiddenstandard");
+    expect(body).not.toContain("response.refusal");
     expect(body).not.toContain("resp-standard");
     expect(responses!.receivedRequests.length).toBe(baseline + 1);
     expect(responses!.receivedRequests[baseline]?.path).toBe("/v1/responses");

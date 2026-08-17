@@ -1032,10 +1032,12 @@ fn transcription_output_text(body: &[u8]) -> String {
 /// Build a [`ChatFormat`](aisix_gateway::ChatFormat) from the speech `input`
 /// text so the input guardrail chain can scan it (#545). Never sent upstream.
 fn speech_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat {
-    let messages = match body.get("input").and_then(|v| v.as_str()) {
-        Some(s) if !s.is_empty() => vec![aisix_gateway::ChatMessage::user(s.to_string())],
-        _ => Vec::new(),
-    };
+    let messages = ["input", "instructions"]
+        .into_iter()
+        .filter_map(|field| body.get(field).and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+        .map(|text| aisix_gateway::ChatMessage::user(text.to_string()))
+        .collect();
     aisix_gateway::ChatFormat::new(model, messages)
 }
 
@@ -1100,12 +1102,23 @@ async fn speech_dispatch(
     let applied_guardrails = resolved_chain.applied().to_vec();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut input_capture_safe = true;
+    let mut redactions = crate::redact::RedactionCounts::new();
     if !resolved_chain.is_empty() {
         let chat = speech_input_to_chat(&model_name, &body);
         let (verdict, hits) =
-            aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
+            aisix_guardrails::Guardrail::check_input_non_segment_observed(&resolved_chain, &chat)
+                .await;
         monitor_hits.extend(hits);
-        input_capture_safe = !verdict.is_bypass();
+        let moderation = crate::redact::moderate_speech_request_structured(
+            &resolved_chain,
+            verdict,
+            &mut body,
+            &mut redactions,
+            &mut monitor_hits,
+        )
+        .await;
+        input_capture_safe = moderation.capture_safe;
+        let verdict = moderation.verdict;
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
@@ -1123,11 +1136,8 @@ async fn speech_dispatch(
             ));
         }
     }
-
-    // #932/#696: mask-action PII rules rewrite the `input` text in place
-    // AFTER the block check passes, BEFORE the body is forwarded upstream.
-    // Pre-#696 a mask-action detector was a silent no-op here.
-    let redactions = crate::redact::redact_speech_request(&resolved_chain, &mut body);
+    let redaction = crate::redact::redact_speech_request_structured(&resolved_chain, &mut body);
+    crate::redact::merge_counts(&mut redactions, redaction.counts);
 
     // Content capture (#700, LiteLLM parity): the post-redaction request
     // body (the `input` text to synthesize) is the prompt; the binary audio

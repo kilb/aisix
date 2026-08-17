@@ -40,6 +40,8 @@ const BRIDGE_PROMPT_TOKEN = "masked-bridge-prompt-tok-4c5b6a";
 const DRAIN_TOKEN = "masked-drain-marker-tok-9a8b7c";
 const BLOCK_CHAT_REQUEST_ID = "masked-block-chat-request-7d6e5f";
 const BLOCK_BRIDGE_REQUEST_ID = "masked-block-bridge-request-4a3b2c";
+const AUDIO_REQUEST_ID = "masked-audio-transcript-request-8e7d6c";
+const REFUSAL_REQUEST_ID = "masked-responses-refusal-request-5b4a3f";
 
 /** OpenAI chat chunks with the email split across two deltas (channel
  * reassembly): neither wire chunk carries the whole value; only the
@@ -72,12 +74,18 @@ function chatStreamEvents(marker: string): string[] {
   ];
 }
 
-async function postJson(app: SpawnedApp, path: string, body: unknown): Promise<Response> {
+async function postJson(
+  app: SpawnedApp,
+  path: string,
+  body: unknown,
+  requestId?: string,
+): Promise<Response> {
   return fetch(`${app.proxyUrl}${path}`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${CALLER_PLAINTEXT}`,
       "content-type": "application/json",
+      ...(requestId ? { "x-aisix-request-id": requestId } : {}),
     },
     body: JSON.stringify(body),
   });
@@ -87,6 +95,8 @@ describe("sls content capture e2e: streaming capture is post-mask (#932 × AISIX
   let etcdReachable = false;
   let chatUpstream: OpenAiUpstream | undefined;
   let bridgeUpstream: OpenAiUpstream | undefined;
+  let audioUpstream: OpenAiUpstream | undefined;
+  let refusalUpstream: OpenAiUpstream | undefined;
   let sls: MockSls | undefined;
   const apps: SpawnedApp[] = [];
 
@@ -96,6 +106,50 @@ describe("sls content capture e2e: streaming capture is post-mask (#932 × AISIX
     chatUpstream = await startOpenAiUpstream({ streamEvents: chatStreamEvents("chat-reply") });
     // The /v1/responses cross-provider bridge consumes OpenAI chat chunks too.
     bridgeUpstream = await startOpenAiUpstream({ streamEvents: chatStreamEvents("bridge-reply") });
+    audioUpstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "chatcmpl-audio-dlp",
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: "gpt-audio",
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: null,
+              audio: {
+                id: "audio-dlp",
+                data: "UklGRiQAAABXQVZF",
+                transcript: `call ${EMAIL}`,
+                expires_at: 1_900_000_000,
+              },
+            },
+            finish_reason: "stop",
+          },
+        ],
+        usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+      },
+    });
+    refusalUpstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "resp-refusal-dlp",
+        object: "response",
+        created_at: Math.floor(Date.now() / 1000),
+        model: "gpt-4o-mini",
+        status: "completed",
+        output: [
+          {
+            id: "msg-refusal-dlp",
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "refusal", refusal: `contact ${EMAIL}` }],
+          },
+        ],
+        usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 },
+      },
+    });
     sls = await startMockSls();
   });
 
@@ -103,13 +157,22 @@ describe("sls content capture e2e: streaming capture is post-mask (#932 × AISIX
     await Promise.all(apps.map((a) => a.exit()));
     await chatUpstream?.close();
     await bridgeUpstream?.close();
+    await audioUpstream?.close();
+    await refusalUpstream?.close();
     await sls?.close();
   });
 
   test(
     "full-capture exporter receives the masked stream text, never the raw PII",
     async (ctx) => {
-      if (!etcdReachable || !chatUpstream || !bridgeUpstream || !sls) {
+      if (
+        !etcdReachable ||
+        !chatUpstream ||
+        !bridgeUpstream ||
+        !audioUpstream ||
+        !refusalUpstream ||
+        !sls
+      ) {
         ctx.skip();
         return;
       }
@@ -152,6 +215,28 @@ describe("sls content capture e2e: streaming capture is post-mask (#932 × AISIX
         model_name: "gpt-4o-mini",
         provider_key_id: chatPk.id,
       });
+      const audioPk = await seed.createProviderKey({
+        display_name: "masked-audio-pk",
+        secret: PROVIDER_SECRET,
+        api_base: `${audioUpstream.baseUrl}/v1`,
+      });
+      await seed.createModel({
+        display_name: "masked-audio-model",
+        provider: "openai",
+        model_name: "gpt-audio",
+        provider_key_id: audioPk.id,
+      });
+      const refusalPk = await seed.createProviderKey({
+        display_name: "masked-refusal-pk",
+        secret: PROVIDER_SECRET,
+        api_base: `${refusalUpstream.baseUrl}/v1`,
+      });
+      await seed.createModel({
+        display_name: "masked-refusal-model",
+        provider: "openai",
+        model_name: "gpt-4o-mini",
+        provider_key_id: refusalPk.id,
+      });
       const bridgePk = await seed.createProviderKey({
         display_name: "masked-bridge-pk",
         secret: PROVIDER_SECRET,
@@ -167,7 +252,12 @@ describe("sls content capture e2e: streaming capture is post-mask (#932 × AISIX
       });
       await seed.createApiKey({
         key_hash: CALLER_KEY_HASH,
-        allowed_models: ["masked-chat-model", "masked-bridge-model"],
+        allowed_models: [
+          "masked-chat-model",
+          "masked-bridge-model",
+          "masked-audio-model",
+          "masked-refusal-model",
+        ],
       });
       // Env-wide output-hook PII guardrail: email → mask. Its presence also
       // forces the streaming hold-back (BufferFull) path — the path where
@@ -252,6 +342,42 @@ describe("sls content capture e2e: streaming capture is post-mask (#932 × AISIX
       expect(fullText).toContain(BRIDGE_PROMPT_TOKEN);
       expect(fullText).not.toContain(EMAIL);
 
+      // Chat audio is one indivisible sensitive output: changing only its
+      // transcript would leave the spoken PII in `audio.data`, so a mask hit
+      // fails closed and neither wire nor exporter receives it.
+      const audioRes = await postJson(
+        app,
+        "/v1/chat/completions",
+        {
+          model: "masked-audio-model",
+          messages: [{ role: "user", content: "generate clean audio" }],
+          modalities: ["text", "audio"],
+          audio: { voice: "alloy", format: "wav" },
+        },
+        AUDIO_REQUEST_ID,
+      );
+      expect(audioRes.status).toBe(422);
+      expect(await audioRes.text()).not.toContain(EMAIL);
+
+      // Responses refusal text is ordinary caller-visible model output and
+      // is safe to rewrite in place.
+      const refusalRes = await postJson(
+        app,
+        "/v1/responses",
+        { model: "masked-refusal-model", input: "clean refusal request" },
+        REFUSAL_REQUEST_ID,
+      );
+      expect(refusalRes.status).toBe(200);
+      const refusalBody = await refusalRes.text();
+      expect(refusalBody).toContain(MASK);
+      expect(refusalBody).not.toContain(EMAIL);
+
+      await waitForToken(sls, FULL_LOGSTORE, AUDIO_REQUEST_ID, 10_000, afterWarmup);
+      await waitForToken(sls, FULL_LOGSTORE, REFUSAL_REQUEST_ID, 10_000, afterWarmup);
+      fullText = decodedTextFor(sls, FULL_LOGSTORE, afterWarmup);
+      expect(fullText).toContain(MASK);
+      expect(fullText).not.toContain(EMAIL);
+
       // metadata_only exporter never sees content at all.
       const metaText = decodedTextFor(sls, META_LOGSTORE, afterWarmup);
       expect(metaText).not.toContain(EMAIL);
@@ -271,7 +397,12 @@ describe("sls content capture e2e: streaming capture is post-mask (#932 × AISIX
       });
       await seed.createApiKey({
         key_hash: BLOCK_CALLER_KEY_HASH,
-        allowed_models: ["masked-chat-model", "masked-bridge-model"],
+        allowed_models: [
+          "masked-chat-model",
+          "masked-bridge-model",
+          "masked-audio-model",
+          "masked-refusal-model",
+        ],
       });
       await waitConfigPropagation(async () => {
         const response = await fetch(`${app.proxyUrl}/v1/models`, {
@@ -287,9 +418,11 @@ describe("sls content capture e2e: streaming capture is post-mask (#932 × AISIX
         const body = (await response.json()) as { data?: Array<{ id?: string }> };
         const ids = new Set(body.data?.map((model) => model.id));
         return (
-          ids.size === 2 &&
+          ids.size === 4 &&
           ids.has("masked-chat-model") &&
-          ids.has("masked-bridge-model")
+          ids.has("masked-bridge-model") &&
+          ids.has("masked-audio-model") &&
+          ids.has("masked-refusal-model")
         );
       });
 

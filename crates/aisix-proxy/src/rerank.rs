@@ -221,8 +221,9 @@ pub async fn rerank(
 
 /// Build a [`ChatFormat`](aisix_gateway::ChatFormat) of user messages from
 /// the rerank `query` + `documents` so the input guardrail chain can scan
-/// them (#545). Documents may be plain strings or `{ "text": ... }`
-/// objects; both are collected. Never sent upstream.
+/// them (#545). Object documents are serialized in full because providers
+/// forward their caller-authored metadata as well as `text`. Never sent
+/// upstream.
 fn rerank_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat {
     let mut messages = Vec::new();
     if let Some(q) = body.get("query").and_then(|v| v.as_str()) {
@@ -232,12 +233,14 @@ fn rerank_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat 
     }
     if let Some(docs) = body.get("documents").and_then(|v| v.as_array()) {
         for d in docs {
-            let text = d
-                .as_str()
-                .or_else(|| d.get("text").and_then(|t| t.as_str()))
-                .unwrap_or("");
-            if !text.is_empty() {
-                messages.push(aisix_gateway::ChatMessage::user(text.to_string()));
+            if let Some(text) = d.as_str() {
+                if !text.is_empty() {
+                    messages.push(aisix_gateway::ChatMessage::user(text.to_string()));
+                }
+            } else if d.is_object() {
+                messages.push(aisix_gateway::ChatMessage::user(
+                    serde_json::to_string(d).expect("serde_json::Value always serializes"),
+                ));
             }
         }
     }
@@ -288,12 +291,31 @@ async fn dispatch(
     let applied_guardrails = resolved_chain.applied().to_vec();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut input_capture_safe = true;
+    let mut redactions = crate::redact::RedactionCounts::new();
     if !resolved_chain.is_empty() {
         let chat = rerank_input_to_chat(&model_name, &*body);
         let (verdict, hits) =
-            aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
+            aisix_guardrails::Guardrail::check_input_non_segment_observed(&resolved_chain, &chat)
+                .await;
         monitor_hits.extend(hits);
-        input_capture_safe = !verdict.is_bypass();
+        let mut moderation = crate::redact::moderate_rerank_request_structured(
+            &resolved_chain,
+            verdict,
+            body,
+            &mut redactions,
+            &mut monitor_hits,
+        )
+        .await;
+        if !moderation.verdict.is_block() {
+            let redaction = crate::redact::redact_rerank_request_structured(&resolved_chain, body);
+            crate::redact::merge_counts(&mut redactions, redaction.counts);
+            if redaction.unrewritable_tool_key {
+                moderation.verdict = crate::redact::unrewritable_tool_key_verdict();
+                moderation.capture_safe = false;
+            }
+        }
+        input_capture_safe = moderation.capture_safe;
+        let verdict = moderation.verdict;
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
@@ -311,11 +333,6 @@ async fn dispatch(
             ));
         }
     }
-
-    // #932/#696: mask-action PII rules rewrite `query` + `documents[]` in
-    // place AFTER the block check passes, BEFORE the body is forwarded
-    // upstream. Pre-#696 a mask-action detector was a silent no-op here.
-    let redactions = crate::redact::redact_rerank_request(&resolved_chain, body);
 
     // Content capture (#700): the client-facing request body
     // (post-#932-redaction) is the prompt; the response is the upstream's

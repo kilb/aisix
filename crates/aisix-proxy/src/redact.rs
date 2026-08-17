@@ -222,11 +222,9 @@ pub async fn moderate_body(
     mut walk: impl FnMut(&dyn Guardrail) -> RedactionCounts,
 ) -> BodyModeration {
     if non_segment_verdict.is_block() || !chain.moderates_segments() {
-        let capture_safe = if non_segment_verdict.is_block() {
-            !chain.moderates_segments()
-        } else {
-            !non_segment_verdict.is_bypass()
-        };
+        // A block-only detector has no rewrite to remove the matched secret.
+        // Never attach that rejected input/output to a full-content exporter.
+        let capture_safe = !non_segment_verdict.is_block() && !non_segment_verdict.is_bypass();
         return BodyModeration {
             verdict: non_segment_verdict,
             capture_safe,
@@ -475,6 +473,25 @@ fn redact_chat_format_impl(
                 detect_keys,
             );
         }
+        if let Some(refusal) = msg.extra.get_mut("refusal") {
+            apply_to_value_string(chain, Direction::Input, refusal, &mut counts);
+        }
+        if let Some(transcript) = msg
+            .extra
+            .get_mut("audio")
+            .and_then(|audio| audio.get_mut("transcript"))
+        {
+            if detect_keys {
+                unrewritable_tool_key |= detect_unrewritable_value_strings(
+                    chain,
+                    Direction::Input,
+                    transcript,
+                    &mut counts,
+                );
+            } else {
+                apply_to_value_string(chain, Direction::Input, transcript, &mut counts);
+            }
+        }
     }
     // Tool descriptions and JSON-schema examples/defaults are prompt text
     // forwarded through `ChatFormat::extra`. Structural fields (for example
@@ -503,6 +520,18 @@ fn redact_chat_format_impl(
                 tool_choice,
                 &mut counts,
             );
+        }
+        for field in ["user", "safety_identifier", "prompt_cache_key"] {
+            if let Some(value) = req.extra.get(field) {
+                unrewritable_tool_key |=
+                    detect_unrewritable_value_strings(chain, Direction::Input, value, &mut counts);
+            }
+        }
+        if let Some(metadata) = req.extra.get("metadata") {
+            unrewritable_tool_key |=
+                detect_unrewritable_object_keys(chain, Direction::Input, metadata, &mut counts);
+            unrewritable_tool_key |=
+                detect_unrewritable_value_strings(chain, Direction::Input, metadata, &mut counts);
         }
     }
     AnthropicRequestRedaction {
@@ -546,7 +575,32 @@ pub async fn moderate_chat_format_structured(
 /// target for the structured moderation pass.
 pub fn chat_request_for_inspection(req: &ChatFormat) -> ChatFormat {
     let mut inspection = req.clone();
-    for field in ["tools", "tool_choice", "response_format"] {
+    for message in &req.messages {
+        for text in [
+            message.extra.get("refusal").and_then(Value::as_str),
+            message
+                .extra
+                .get("audio")
+                .and_then(|audio| audio.get("transcript"))
+                .and_then(Value::as_str),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            inspection
+                .messages
+                .push(aisix_gateway::ChatMessage::user(text.to_owned()));
+        }
+    }
+    for field in [
+        "tools",
+        "tool_choice",
+        "response_format",
+        "user",
+        "safety_identifier",
+        "prompt_cache_key",
+        "metadata",
+    ] {
         if let Some(value) = req.extra.get(field) {
             let text = serde_json::to_string(value).expect("serde_json::Value always serializes");
             if text != "null" && text != "[]" {
@@ -785,6 +839,15 @@ pub fn redact_anthropic_request(
         unrewritable_tool_key |=
             detect_unrewritable_value_strings(chain, Direction::Input, tool_choice, &mut counts);
     }
+    if let Some(metadata) = body.get("metadata") {
+        unrewritable_tool_key |= detect_named_structural_fields(
+            chain,
+            Direction::Input,
+            metadata,
+            &["user_id"],
+            &mut counts,
+        );
+    }
     AnthropicRequestRedaction {
         counts,
         unrewritable_tool_key,
@@ -816,7 +879,7 @@ async fn moderate_structured_body(
     if non_segment_verdict.is_block() {
         return AnthropicModeration {
             verdict: non_segment_verdict,
-            capture_safe: dir == Direction::Input && !chain.moderates_segments(),
+            capture_safe: false,
         };
     }
     if !chain.moderates_segments() {
@@ -910,7 +973,13 @@ pub async fn moderate_anthropic_request(
 /// projection closes that otherwise invisible provider-forwarded text surface.
 pub fn anthropic_request_for_inspection(body: &Value) -> Result<aisix_gateway::ChatFormat, ()> {
     let mut chat = aisix_provider_anthropic::parse_inbound_request(body).map_err(|_| ())?;
-    for field in ["tools", "tool_choice", "output_config", "output_format"] {
+    for field in [
+        "tools",
+        "tool_choice",
+        "output_config",
+        "output_format",
+        "metadata",
+    ] {
         if let Some(value) = body.get(field) {
             let text = serde_json::to_string(value).map_err(|_| ())?;
             if text != "null" && text != "[]" {
@@ -1074,6 +1143,19 @@ fn redact_responses_request_impl(
                 &mut counts,
             );
         }
+        unrewritable_tool_key |= detect_named_structural_fields(
+            chain,
+            Direction::Input,
+            body,
+            &["user", "safety_identifier", "prompt_cache_key"],
+            &mut counts,
+        );
+        if let Some(metadata) = body.get("metadata") {
+            unrewritable_tool_key |=
+                detect_unrewritable_object_keys(chain, Direction::Input, metadata, &mut counts);
+            unrewritable_tool_key |=
+                detect_unrewritable_value_strings(chain, Direction::Input, metadata, &mut counts);
+        }
     }
     AnthropicRequestRedaction {
         counts,
@@ -1121,8 +1203,10 @@ fn redact_responses_text_value(
         Value::String(_) => apply_to_value_string(chain, dir, value, counts),
         Value::Array(parts) => {
             for part in parts {
-                if let Some(text) = part.get_mut("text") {
-                    apply_to_value_string(chain, dir, text, counts);
+                for field in ["text", "refusal"] {
+                    if let Some(text) = part.get_mut(field) {
+                        apply_to_value_string(chain, dir, text, counts);
+                    }
                 }
             }
         }
@@ -1281,14 +1365,38 @@ pub fn redact_completions_request_structured(
     }
 }
 
-/// Mask a `/v1/rerank` request body in place: `query` plus `documents[]`
-/// (plain strings or `{"text": ...}` objects) — the same surface
-/// `check_input` scans via `rerank_input_to_chat` (#696).
-pub fn redact_rerank_request(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
+pub async fn moderate_completions_request_structured(
+    chain: &dyn Guardrail,
+    non_segment_verdict: aisix_guardrails::GuardrailVerdict,
+    body: &mut Value,
+    counts_out: &mut RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
+) -> AnthropicModeration {
+    moderate_structured_body(
+        chain,
+        Direction::Input,
+        non_segment_verdict,
+        counts_out,
+        monitor_hits_out,
+        |guardrail| redact_completions_request_structured(guardrail, body),
+    )
+    .await
+}
+
+/// Mask caller-authored `/v1/rerank` text and report document object keys
+/// that cannot be renamed safely.
+pub fn redact_rerank_request_structured(
+    chain: &dyn Guardrail,
+    body: &mut Value,
+) -> AnthropicRequestRedaction {
     let mut counts = RedactionCounts::new();
     if !chain.redacts_input() {
-        return counts;
+        return AnthropicRequestRedaction {
+            counts,
+            unrewritable_tool_key: false,
+        };
     }
+    let mut unrewritable_tool_key = false;
     if let Some(q) = body.get_mut("query") {
         apply_to_value_string(chain, Direction::Input, q, &mut counts);
     }
@@ -1299,43 +1407,173 @@ pub fn redact_rerank_request(chain: &dyn Guardrail, body: &mut Value) -> Redacti
                     apply_to_value_string(chain, Direction::Input, doc, &mut counts)
                 }
                 Value::Object(_) => {
-                    if let Some(text) = doc.get_mut("text") {
-                        apply_to_value_string(chain, Direction::Input, text, &mut counts);
-                    }
+                    unrewritable_tool_key |=
+                        detect_unrewritable_object_keys(chain, Direction::Input, doc, &mut counts);
+                    redact_value_strings(chain, Direction::Input, doc, &mut counts);
                 }
                 _ => {}
             }
         }
     }
-    counts
+    AnthropicRequestRedaction {
+        counts,
+        unrewritable_tool_key,
+    }
 }
 
-/// Mask a `/v1/images/generations` request body in place: the `prompt`
-/// field — the same surface `check_input` scans via `images_input_to_chat`
-/// (#696).
-pub fn redact_images_request(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
+#[cfg(test)]
+pub fn redact_rerank_request(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
+    redact_rerank_request_structured(chain, body).counts
+}
+
+pub async fn moderate_rerank_request_structured(
+    chain: &dyn Guardrail,
+    non_segment_verdict: aisix_guardrails::GuardrailVerdict,
+    body: &mut Value,
+    counts_out: &mut RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
+) -> AnthropicModeration {
+    moderate_structured_body(
+        chain,
+        Direction::Input,
+        non_segment_verdict,
+        counts_out,
+        monitor_hits_out,
+        |guardrail| redact_rerank_request_structured(guardrail, body),
+    )
+    .await
+}
+
+/// Mask an image-generation prompt and report the stable `user` identifier
+/// when a DLP rule would change it.
+pub fn redact_images_request_structured(
+    chain: &dyn Guardrail,
+    body: &mut Value,
+) -> AnthropicRequestRedaction {
     let mut counts = RedactionCounts::new();
     if !chain.redacts_input() {
-        return counts;
+        return AnthropicRequestRedaction {
+            counts,
+            unrewritable_tool_key: false,
+        };
     }
     if let Some(p) = body.get_mut("prompt") {
         apply_to_value_string(chain, Direction::Input, p, &mut counts);
     }
-    counts
+    let unrewritable_tool_key =
+        detect_named_structural_fields(chain, Direction::Input, body, &["user"], &mut counts);
+    AnthropicRequestRedaction {
+        counts,
+        unrewritable_tool_key,
+    }
 }
 
-/// Mask a `/v1/audio/speech` request body in place: the `input` field (the
-/// text to synthesize) — the same surface `check_input` scans via
-/// `speech_input_to_chat` (#696).
-pub fn redact_speech_request(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
+#[cfg(test)]
+pub fn redact_images_request(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
+    redact_images_request_structured(chain, body).counts
+}
+
+pub async fn moderate_images_request_structured(
+    chain: &dyn Guardrail,
+    non_segment_verdict: aisix_guardrails::GuardrailVerdict,
+    body: &mut Value,
+    counts_out: &mut RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
+) -> AnthropicModeration {
+    moderate_structured_body(
+        chain,
+        Direction::Input,
+        non_segment_verdict,
+        counts_out,
+        monitor_hits_out,
+        |guardrail| redact_images_request_structured(guardrail, body),
+    )
+    .await
+}
+
+/// Mask the two prompt-bearing `/v1/audio/speech` fields.
+pub fn redact_speech_request_structured(
+    chain: &dyn Guardrail,
+    body: &mut Value,
+) -> AnthropicRequestRedaction {
     let mut counts = RedactionCounts::new();
     if !chain.redacts_input() {
-        return counts;
+        return AnthropicRequestRedaction {
+            counts,
+            unrewritable_tool_key: false,
+        };
     }
-    if let Some(input) = body.get_mut("input") {
-        apply_to_value_string(chain, Direction::Input, input, &mut counts);
+    for field in ["input", "instructions"] {
+        if let Some(value) = body.get_mut(field) {
+            apply_to_value_string(chain, Direction::Input, value, &mut counts);
+        }
     }
-    counts
+    AnthropicRequestRedaction {
+        counts,
+        unrewritable_tool_key: false,
+    }
+}
+
+#[cfg(test)]
+pub fn redact_speech_request(chain: &dyn Guardrail, body: &mut Value) -> RedactionCounts {
+    redact_speech_request_structured(chain, body).counts
+}
+
+pub async fn moderate_speech_request_structured(
+    chain: &dyn Guardrail,
+    non_segment_verdict: aisix_guardrails::GuardrailVerdict,
+    body: &mut Value,
+    counts_out: &mut RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
+) -> AnthropicModeration {
+    moderate_structured_body(
+        chain,
+        Direction::Input,
+        non_segment_verdict,
+        counts_out,
+        monitor_hits_out,
+        |guardrail| redact_speech_request_structured(guardrail, body),
+    )
+    .await
+}
+
+/// Mask the textual part of an image-generation response.
+pub fn redact_images_response_structured(
+    chain: &dyn Guardrail,
+    body: &mut Value,
+) -> AnthropicRequestRedaction {
+    let mut counts = RedactionCounts::new();
+    if chain.redacts_output() {
+        if let Some(Value::Array(items)) = body.get_mut("data") {
+            for item in items {
+                if let Some(prompt) = item.get_mut("revised_prompt") {
+                    apply_to_value_string(chain, Direction::Output, prompt, &mut counts);
+                }
+            }
+        }
+    }
+    AnthropicRequestRedaction {
+        counts,
+        unrewritable_tool_key: false,
+    }
+}
+
+pub async fn moderate_images_response_structured(
+    chain: &dyn Guardrail,
+    non_segment_verdict: aisix_guardrails::GuardrailVerdict,
+    body: &mut Value,
+    counts_out: &mut RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
+) -> AnthropicModeration {
+    moderate_structured_body(
+        chain,
+        Direction::Output,
+        non_segment_verdict,
+        counts_out,
+        monitor_hits_out,
+        |guardrail| redact_images_response_structured(guardrail, body),
+    )
+    .await
 }
 
 /// Mask an audio transcription/translation RESPONSE in place (#696). The
@@ -1410,19 +1648,40 @@ fn redact_chat_response_impl(
     if let Some(content) = resp.message.content.as_mut() {
         apply_to_string(chain, Direction::Output, content, &mut counts);
     }
-    let unrewritable_tool_key =
-        resp.message
-            .extra
-            .get_mut("tool_calls")
-            .is_some_and(|tool_calls| {
-                redact_tool_call_arguments(
-                    chain,
-                    Direction::Output,
-                    tool_calls,
-                    &mut counts,
-                    detect_keys,
-                )
-            });
+    if let Some(refusal) = resp.message.extra.get_mut("refusal") {
+        apply_to_value_string(chain, Direction::Output, refusal, &mut counts);
+    }
+    let mut unrewritable_tool_key = false;
+    if let Some(transcript) = resp
+        .message
+        .extra
+        .get_mut("audio")
+        .and_then(|audio| audio.get_mut("transcript"))
+    {
+        if detect_keys {
+            unrewritable_tool_key |= detect_unrewritable_value_strings(
+                chain,
+                Direction::Output,
+                transcript,
+                &mut counts,
+            );
+        } else {
+            apply_to_value_string(chain, Direction::Output, transcript, &mut counts);
+        }
+    }
+    unrewritable_tool_key |= resp
+        .message
+        .extra
+        .get_mut("tool_calls")
+        .is_some_and(|tool_calls| {
+            redact_tool_call_arguments(
+                chain,
+                Direction::Output,
+                tool_calls,
+                &mut counts,
+                detect_keys,
+            )
+        });
     AnthropicRequestRedaction {
         counts,
         unrewritable_tool_key,
@@ -2276,7 +2535,10 @@ pub fn responses_sse_text(raw: &[u8]) -> String {
         let Some(data) = frame.data.as_ref() else {
             continue;
         };
-        if data.get("type").and_then(Value::as_str) != Some("response.output_text.delta") {
+        if !matches!(
+            data.get("type").and_then(Value::as_str),
+            Some("response.output_text.delta" | "response.refusal.delta")
+        ) {
             continue;
         }
         let Some(t) = data.get("delta").and_then(Value::as_str) else {
@@ -2379,7 +2641,7 @@ fn redact_responses_sse_impl(
             continue;
         };
         match data.get("type").and_then(Value::as_str) {
-            Some("response.output_text.delta") => {
+            Some("response.output_text.delta" | "response.refusal.delta") => {
                 if data
                     .get("delta")
                     .and_then(Value::as_str)
@@ -2494,9 +2756,18 @@ fn redact_responses_sse_impl(
                     apply_to_value_string(chain, Direction::Output, text, &mut local);
                 }
             }
-            "response.content_part.done" => {
-                if let Some(text) = data.get_mut("part").and_then(|p| p.get_mut("text")) {
+            "response.refusal.done" => {
+                if let Some(text) = data.get_mut("refusal") {
                     apply_to_value_string(chain, Direction::Output, text, &mut local);
+                }
+            }
+            "response.content_part.done" => {
+                if let Some(part) = data.get_mut("part") {
+                    for field in ["text", "refusal"] {
+                        if let Some(text) = part.get_mut(field) {
+                            apply_to_value_string(chain, Direction::Output, text, &mut local);
+                        }
+                    }
                 }
             }
             "response.function_call_arguments.done" => {
@@ -2692,6 +2963,8 @@ mod tests {
                 "function": {"name": "f", "arguments": "{\"phone\":13800138000,\"mail\":\"b@y.org\"}"}
             }]),
         );
+        msg.extra
+            .insert("refusal".into(), json!("cannot help c@z.io"));
         let mut resp = ChatResponse {
             id: "r".into(),
             model: "m".into(),
@@ -2710,7 +2983,31 @@ mod tests {
         let parsed: Value = serde_json::from_str(args).expect("args stay valid JSON");
         assert_eq!(parsed["phone"], json!(13800138000u64));
         assert_eq!(parsed["mail"], json!("[EMAIL_REDACTED]"));
-        assert_eq!(counts.get("email"), Some(&2));
+        assert_eq!(
+            resp.message.extra["refusal"],
+            "cannot help [EMAIL_REDACTED]"
+        );
+        assert_eq!(counts.get("email"), Some(&3));
+    }
+
+    #[test]
+    fn chat_audio_transcript_is_unrewritable_sensitive_output() {
+        let chain = both();
+        let mut msg = ChatMessage::assistant("");
+        msg.extra.insert(
+            "audio".into(),
+            json!({"id": "audio_1", "data": "encoded", "transcript": "call a@x.com"}),
+        );
+        let mut resp = ChatResponse {
+            id: "r".into(),
+            model: "m".into(),
+            message: msg,
+            finish_reason: aisix_gateway::FinishReason::Stop,
+            usage: aisix_gateway::UsageStats::new(0, 0),
+        };
+        let redaction = redact_chat_response_structured(chain.as_ref(), &mut resp);
+        assert!(redaction.unrewritable_tool_key);
+        assert_eq!(resp.message.extra["audio"]["transcript"], "call a@x.com");
     }
 
     #[test]
@@ -3665,13 +3962,34 @@ mod tests {
     }
 
     #[test]
+    fn responses_sse_masks_split_refusal_and_done_forms() {
+        let chain = both();
+        let raw = concat!(
+            "event: response.refusal.delta\n",
+            "data: {\"type\":\"response.refusal.delta\",\"item_id\":\"m\",\"content_index\":0,\"delta\":\"mail a@\"}\n\n",
+            "event: response.refusal.delta\n",
+            "data: {\"type\":\"response.refusal.delta\",\"item_id\":\"m\",\"content_index\":0,\"delta\":\"x.com\"}\n\n",
+            "event: response.refusal.done\n",
+            "data: {\"type\":\"response.refusal.done\",\"item_id\":\"m\",\"content_index\":0,\"refusal\":\"mail a@x.com\"}\n\n",
+        );
+        let (rewritten, counts) =
+            redact_responses_sse(chain.as_ref(), raw.as_bytes()).expect("must rewrite");
+        let text = String::from_utf8(rewritten).unwrap();
+        assert!(!text.contains("a@x.com"));
+        assert!(!text.contains("mail a@"));
+        assert!(text.contains("[EMAIL_REDACTED]"));
+        assert_eq!(counts.get("email"), Some(&1));
+    }
+
+    #[test]
     fn responses_response_json_masks_output_items() {
         let chain = both();
         let mut body = json!({
             "id": "resp_1",
             "output": [
                 {"type": "message", "role": "assistant", "content": [
-                    {"type": "output_text", "text": "mail a@x.com"}
+                    {"type": "output_text", "text": "mail a@x.com"},
+                    {"type": "refusal", "refusal": "cannot help c@z.io"}
                 ]},
                 {"type": "function_call", "call_id": "c", "name": "send",
                  "arguments": "{\"to\":\"b@y.org\"}"}
@@ -3683,10 +4001,14 @@ mod tests {
             "mail [EMAIL_REDACTED]"
         );
         assert_eq!(
+            body["output"][0]["content"][1]["refusal"],
+            "cannot help [EMAIL_REDACTED]"
+        );
+        assert_eq!(
             body["output"][1]["arguments"],
             "{\"to\":\"[EMAIL_REDACTED]\"}"
         );
-        assert_eq!(counts.get("email"), Some(&2));
+        assert_eq!(counts.get("email"), Some(&3));
     }
 
     #[test]
@@ -3715,13 +4037,21 @@ mod tests {
         let mut body = json!({
             "model": "m",
             "query": "who is a@x.com",
-            "documents": ["contact b@y.org", {"text": "reach c@z.io"}, 42]
+            "documents": [
+                "contact b@y.org",
+                {"text": "reach c@z.io", "metadata": {"owner": "d@w.dev"}},
+                42
+            ]
         });
         let counts = redact_rerank_request(chain.as_ref(), &mut body);
         assert_eq!(body["query"], "who is [EMAIL_REDACTED]");
         assert_eq!(body["documents"][0], "contact [EMAIL_REDACTED]");
         assert_eq!(body["documents"][1]["text"], "reach [EMAIL_REDACTED]");
-        assert_eq!(counts.get("email"), Some(&3));
+        assert_eq!(
+            body["documents"][1]["metadata"]["owner"],
+            "[EMAIL_REDACTED]"
+        );
+        assert_eq!(counts.get("email"), Some(&4));
     }
 
     /// #696: images request masking covers `prompt`.
@@ -3738,10 +4068,27 @@ mod tests {
     #[test]
     fn speech_request_masks_input() {
         let chain = both();
-        let mut body = json!({"model": "m", "input": "read a@x.com aloud", "voice": "alloy"});
+        let mut body = json!({
+            "model": "m",
+            "input": "read a@x.com aloud",
+            "instructions": "whisper to b@y.org",
+            "voice": "alloy"
+        });
         let counts = redact_speech_request(chain.as_ref(), &mut body);
         assert_eq!(body["input"], "read [EMAIL_REDACTED] aloud");
-        assert_eq!(counts.get("email"), Some(&1));
+        assert_eq!(body["instructions"], "whisper to [EMAIL_REDACTED]");
+        assert_eq!(counts.get("email"), Some(&2));
+    }
+
+    #[test]
+    fn images_response_masks_revised_prompt() {
+        let chain = both();
+        let mut body = json!({
+            "data": [{"url": "https://example.test/image.png", "revised_prompt": "mail a@x.com"}]
+        });
+        let redaction = redact_images_response_structured(chain.as_ref(), &mut body);
+        assert_eq!(body["data"][0]["revised_prompt"], "mail [EMAIL_REDACTED]");
+        assert_eq!(redaction.counts.get("email"), Some(&1));
     }
 
     /// #696: transcription response masking rewrites the JSON `text` +
@@ -4098,6 +4445,7 @@ mod tests {
 
         let mut anthropic = json!({
             "model": "claude",
+            "metadata": {"user_id": "stable-user"},
             "messages": [{"role": "assistant", "content": [{
                 "type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}
             }]}]
@@ -4112,9 +4460,11 @@ mod tests {
         .await;
         assert!(moderation.verdict.is_block());
         assert_eq!(anthropic["messages"][0]["content"][0]["name"], "lookup");
+        assert_eq!(anthropic["metadata"]["user_id"], "stable-user");
 
         let mut responses = json!({
             "model": "m",
+            "safety_identifier": "stable-user",
             "input": [{
                 "type": "function_call", "call_id": "call_1",
                 "name": "lookup", "arguments": "{}"
@@ -4130,6 +4480,113 @@ mod tests {
         .await;
         assert!(moderation.verdict.is_block());
         assert_eq!(responses["input"][0]["name"], "lookup");
+        assert_eq!(responses["safety_identifier"], "stable-user");
+
+        let mut completions = json!({
+            "model": "m",
+            "prompt": "clean",
+            "user": "alice@example.com"
+        });
+        let moderation = moderate_completions_request_structured(
+            &chain,
+            GuardrailVerdict::Allow,
+            &mut completions,
+            &mut RedactionCounts::new(),
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(moderation.verdict.is_block());
+        assert!(!moderation.capture_safe);
+        assert_eq!(completions["user"], "alice@example.com");
+
+        let mut images = json!({"model": "m", "prompt": "clean", "user": "stable-user"});
+        let moderation = moderate_images_request_structured(
+            &chain,
+            GuardrailVerdict::Allow,
+            &mut images,
+            &mut RedactionCounts::new(),
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(moderation.verdict.is_block());
+        assert!(!moderation.capture_safe);
+        assert_eq!(images["user"], "stable-user");
+    }
+
+    #[test]
+    fn structural_request_metadata_is_detected_without_rewriting() {
+        let chain = both();
+
+        let mut chat: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "clean"}],
+            "user": "chat@example.com",
+            "metadata": {"tenant": "meta@example.com"},
+            "prompt_cache_key": "cache@example.com"
+        }))
+        .unwrap();
+        let redaction = redact_chat_format_structured(chain.as_ref(), &mut chat);
+        assert!(redaction.unrewritable_tool_key);
+        assert_eq!(chat.extra["user"], "chat@example.com");
+
+        let mut messages = json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": "clean"}],
+            "metadata": {"user_id": "messages@example.com"}
+        });
+        let redaction = redact_anthropic_request(chain.as_ref(), &mut messages);
+        assert!(redaction.unrewritable_tool_key);
+        assert_eq!(messages["metadata"]["user_id"], "messages@example.com");
+
+        let mut responses = json!({
+            "model": "m",
+            "input": "clean",
+            "safety_identifier": "safety@example.com",
+            "metadata": {"tenant": "responses@example.com"}
+        });
+        let redaction = redact_responses_request_structured(chain.as_ref(), &mut responses);
+        assert!(redaction.unrewritable_tool_key);
+        assert_eq!(responses["safety_identifier"], "safety@example.com");
+
+        let mut images = json!({"model": "m", "prompt": "clean", "user": "images@example.com"});
+        let redaction = redact_images_request_structured(chain.as_ref(), &mut images);
+        assert!(redaction.unrewritable_tool_key);
+        assert_eq!(images["user"], "images@example.com");
+    }
+
+    #[tokio::test]
+    async fn segment_masks_raw_json_auxiliary_text_and_image_output() {
+        let chain = seg_chain(StubSegments::masker());
+        let mut speech = json!({
+            "model": "m",
+            "input": "clean input",
+            "instructions": "quiet instructions"
+        });
+        let moderation = moderate_speech_request_structured(
+            &chain,
+            GuardrailVerdict::Allow,
+            &mut speech,
+            &mut RedactionCounts::new(),
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(!moderation.verdict.is_block());
+        assert_eq!(speech["input"], "<M0:CLEAN INPUT>");
+        assert_eq!(speech["instructions"], "<M1:QUIET INSTRUCTIONS>");
+
+        let mut image = json!({
+            "data": [{"url": "https://example.test/image.png", "revised_prompt": "new prompt"}]
+        });
+        let moderation = moderate_images_response_structured(
+            &chain,
+            GuardrailVerdict::Allow,
+            &mut image,
+            &mut RedactionCounts::new(),
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(!moderation.verdict.is_block());
+        assert_eq!(image["data"][0]["revised_prompt"], "<M0:NEW PROMPT>");
     }
 
     #[tokio::test]
@@ -4174,7 +4631,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_prior_block_is_capture_safe_after_synchronous_rewrite() {
+    async fn local_prior_block_is_capture_unsafe_even_after_synchronous_mask_pass() {
         let chain = both();
         let mut body = json!({
             "model": "claude",
@@ -4189,7 +4646,7 @@ mod tests {
         )
         .await;
         assert!(moderation.verdict.is_block());
-        assert!(moderation.capture_safe);
+        assert!(!moderation.capture_safe);
 
         let redaction = redact_anthropic_request(chain.as_ref(), &mut body);
         assert!(!redaction.unrewritable_tool_key);

@@ -148,7 +148,7 @@ describe("native stream protocol failures are not healthy completions", () => {
       rawSseChunks: [
         'event: message_start\ndata: {"type":"message_start","message":{"id":"msg-malformed","type":"message","role":"assistant","model":"claude","content":[],"usage":{"input_tokens":3,"output_tokens":1}}}\n\n',
         'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"billed malformed output"}}\n\n',
-        "event: content_block_delta\ndata: not-json\n\n",
+        'event: content_block_delta\ndata: not-json\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
       ],
     });
     upstreams.messagesInBand = await startOpenAiUpstream({
@@ -163,7 +163,7 @@ describe("native stream protocol failures are not healthy completions", () => {
       rawSseChunks: [
         'data: {"type":"response.created","response":{"id":"resp-malformed","status":"in_progress"}}\n\n',
         'data: {"type":"response.output_text.delta","delta":"billed malformed output"}\n\n',
-        "data: not-json\n\n",
+        'data: not-json\n\ndata: {"type":"response.completed","response":{"id":"resp-malformed","status":"completed","output":[],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}\n\ndata: [DONE]\n\n',
       ],
     });
     upstreams.responsesTruncated = await startOpenAiUpstream({
@@ -312,6 +312,9 @@ describe("native stream protocol failures are not healthy completions", () => {
       expect(body).toContain("upstream stream failed");
       expect(body).not.toContain(scenario.rawMarker);
       expect(body).not.toContain("not-json");
+      expect(body).not.toContain('"type":"message_stop"');
+      expect(body).not.toContain("response.completed");
+      expect(body).not.toContain("[DONE]");
       expect(scenario.upstream.receivedRequests).toHaveLength(baseline + 1);
       try {
         await waitForFailure(

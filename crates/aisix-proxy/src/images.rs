@@ -58,6 +58,8 @@ struct ImageDispatchSuccess {
     redactions: crate::redact::RedactionCounts,
     /// Monitor-mode guardrail observations (AISIX-Cloud#562).
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    /// True when an output guardrail replaced the upstream success with 422.
+    guardrail_blocked: bool,
     /// Captured request/response content for content-capturing exporters
     /// (#700, LiteLLM parity: the full image response JSON — url or
     /// b64_json — truncated at the capture cap). `Some` only when an
@@ -161,13 +163,14 @@ pub async fn image_generations(
                     &success.provider,
                     &success.upstream_model,
                     &success.applied_guardrails,
-                    200,
+                    status,
                     elapsed,
                     prompt_tokens,
                     completion_tokens,
                     &client,
                     success.redactions.clone(),
                     success.monitor_hits.clone(),
+                    success.guardrail_blocked,
                     success.captured_content.as_ref(),
                 );
             }
@@ -220,11 +223,31 @@ pub async fn image_generations(
 /// generation `prompt` so the input guardrail chain can scan it (#545).
 /// Never sent upstream.
 fn images_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat {
-    let messages = match body.get("prompt").and_then(|v| v.as_str()) {
-        Some(s) if !s.is_empty() => vec![aisix_gateway::ChatMessage::user(s.to_string())],
-        _ => Vec::new(),
-    };
+    let messages = ["prompt", "user"]
+        .into_iter()
+        .filter_map(|field| body.get(field).and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+        .map(|text| aisix_gateway::ChatMessage::user(text.to_string()))
+        .collect();
     aisix_gateway::ChatFormat::new(model, messages)
+}
+
+fn images_output_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatResponse {
+    let text = body
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("revised_prompt").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    aisix_gateway::ChatResponse {
+        id: String::new(),
+        model: model.to_string(),
+        message: aisix_gateway::ChatMessage::assistant(text),
+        finish_reason: aisix_gateway::FinishReason::Stop,
+        usage: aisix_gateway::UsageStats::default(),
+    }
 }
 
 async fn dispatch(
@@ -274,12 +297,32 @@ async fn dispatch(
     let applied_guardrails = resolved_chain.applied().to_vec();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut input_capture_safe = true;
+    let mut redactions = crate::redact::RedactionCounts::new();
     if !resolved_chain.is_empty() {
         let chat = images_input_to_chat(model_name, &body);
         let (verdict, hits) =
-            aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
+            aisix_guardrails::Guardrail::check_input_non_segment_observed(&resolved_chain, &chat)
+                .await;
         monitor_hits.extend(hits);
-        input_capture_safe = !verdict.is_bypass();
+        let mut moderation = crate::redact::moderate_images_request_structured(
+            &resolved_chain,
+            verdict,
+            &mut body,
+            &mut redactions,
+            &mut monitor_hits,
+        )
+        .await;
+        if !moderation.verdict.is_block() {
+            let redaction =
+                crate::redact::redact_images_request_structured(&resolved_chain, &mut body);
+            crate::redact::merge_counts(&mut redactions, redaction.counts);
+            if redaction.unrewritable_tool_key {
+                moderation.verdict = crate::redact::unrewritable_tool_key_verdict();
+                moderation.capture_safe = false;
+            }
+        }
+        input_capture_safe = moderation.capture_safe;
+        let verdict = moderation.verdict;
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
@@ -297,11 +340,6 @@ async fn dispatch(
             ));
         }
     }
-
-    // #932/#696: mask-action PII rules rewrite the `prompt` in place AFTER
-    // the block check passes, BEFORE the body is forwarded upstream.
-    // Pre-#696 a mask-action detector was a silent no-op here.
-    let redactions = crate::redact::redact_images_request(&resolved_chain, &mut body);
 
     // Content capture (#700): the client-facing request body
     // (post-#932-redaction) is the prompt; the response is the image JSON
@@ -374,7 +412,7 @@ async fn dispatch(
     })
     .await
     {
-        Ok(resp_json) => {
+        Ok(mut resp_json) => {
             // #701: clear any cooldown/unhealthy mark now the upstream
             // answered — same recovery signal as rerank/audio/chat.
             state.health.record_success(&model_entry.value.display_name);
@@ -390,18 +428,56 @@ async fn dispatch(
                 .map(|(prompt, completion)| u64::from(prompt) + u64::from(completion))
                 .unwrap_or(0);
             reservation.commit_tokens(total_tokens).await;
+            let mut output_capture_safe = true;
+            let mut guardrail_blocked = false;
+            if !resolved_chain.is_empty() {
+                let synth = images_output_to_chat(model_name, &resp_json);
+                let (verdict, hits) =
+                    aisix_guardrails::Guardrail::check_output_non_segment_observed(
+                        &resolved_chain,
+                        &synth,
+                    )
+                    .await;
+                monitor_hits.extend(hits);
+                let moderation = crate::redact::moderate_images_response_structured(
+                    &resolved_chain,
+                    verdict,
+                    &mut resp_json,
+                    &mut redactions,
+                    &mut monitor_hits,
+                )
+                .await;
+                output_capture_safe = moderation.capture_safe;
+                if moderation.verdict.is_block() {
+                    guardrail_blocked = true;
+                } else {
+                    let redaction = crate::redact::redact_images_response_structured(
+                        &resolved_chain,
+                        &mut resp_json,
+                    );
+                    crate::redact::merge_counts(&mut redactions, redaction.counts);
+                }
+            }
             // Content capture (#700): the full response JSON (LiteLLM
             // parity); CapturedContent::new truncates to the cap.
             let captured_content = match (&captured_prompt, content_cap) {
-                (Some(prompt), Some(cap)) if input_capture_safe => Some(CapturedContent::new(
-                    prompt,
-                    &serde_json::to_string(&resp_json).unwrap_or_default(),
-                    cap as usize,
-                )),
+                (Some(prompt), Some(cap)) if input_capture_safe && output_capture_safe => {
+                    Some(CapturedContent::new(
+                        prompt,
+                        &serde_json::to_string(&resp_json).unwrap_or_default(),
+                        cap as usize,
+                    ))
+                }
                 _ => None,
             };
+            let response = if guardrail_blocked {
+                ProxyError::ContentFiltered(crate::error::guardrail_block_message("response", None))
+                    .into_response()
+            } else {
+                Json(resp_json).into_response()
+            };
             Ok(ImageDispatchSuccess {
-                response: Json(resp_json).into_response(),
+                response,
                 provider: provider_label,
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
@@ -411,6 +487,7 @@ async fn dispatch(
                 upstream_called: true,
                 redactions,
                 monitor_hits: monitor_hits.clone(),
+                guardrail_blocked,
                 captured_content,
             })
         }
@@ -430,6 +507,7 @@ async fn dispatch(
                 upstream_called: false,
                 redactions,
                 monitor_hits: monitor_hits.clone(),
+                guardrail_blocked: false,
                 captured_content: None,
             })
         }
@@ -494,6 +572,7 @@ fn emit_usage_event(
     redacted_entity_counts: crate::redact::RedactionCounts,
     // Monitor-mode guardrail observations (AISIX-Cloud#562).
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    guardrail_blocked: bool,
     // Captured request/response content (#700). Forwarded only to `fan_out`,
     // never to the CP sink.
     content: Option<&CapturedContent>,
@@ -517,6 +596,7 @@ fn emit_usage_event(
         client_user_agent: client.user_agent.clone(),
         redacted_entity_counts,
         guardrail_monitor_hits,
+        guardrail_blocked,
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);
@@ -1236,6 +1316,86 @@ mod tests {
         let json = r#"{"name":"pii","enabled":true,"hook_point":"input","kind":"pii","detectors":[{"type":"email","action":"mask"}]}"#;
         let g: aisix_core::Guardrail = serde_json::from_str(json).unwrap();
         ResourceEntry::new("g-pii", g, 1)
+    }
+
+    fn pii_output_mask_guardrail() -> ResourceEntry<aisix_core::Guardrail> {
+        let json = r#"{"name":"pii-output","enabled":true,"hook_point":"output","kind":"pii","detectors":[{"type":"email","action":"mask"}]}"#;
+        let g: aisix_core::Guardrail = serde_json::from_str(json).unwrap();
+        ResourceEntry::new("g-pii-output", g, 1)
+    }
+
+    #[tokio::test]
+    async fn pii_mask_on_structural_user_fails_closed_before_upstream() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/images/generations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("img"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(pii_mask_guardrail());
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            make_req(serde_json::json!({
+                "model": "img",
+                "prompt": "a clean portrait",
+                "user": "alice@example.com"
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("alice@example.com"));
+    }
+
+    #[tokio::test]
+    async fn pii_mask_rewrites_revised_prompt_before_response_and_usage() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/images/generations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "created": 1_700_000_000,
+                "data": [{
+                    "url": "https://img.example/1.png",
+                    "revised_prompt": "portrait of alice@example.com"
+                }]
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("img"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(pii_output_mask_guardrail());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            make_req(serde_json::json!({"model": "img", "prompt": "clean"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("[EMAIL_REDACTED]"), "body: {text}");
+        assert!(!text.contains("alice@example.com"), "body: {text}");
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.redacted_entity_counts.get("email"), Some(&1));
+        assert!(!event.guardrail_blocked);
     }
 
     /// #696: a mask-action PII detector must rewrite the `prompt` before the

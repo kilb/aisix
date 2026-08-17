@@ -420,13 +420,12 @@ async fn dispatch(
         // Segment pass: one Bedrock call over the prompt slots; an
         // ANONYMIZE disposition writes the masked text back into the body
         // (#932 bedrock follow-up).
-        let moderation = crate::redact::moderate_body(
+        let moderation = crate::redact::moderate_completions_request_structured(
             resolved_chain.as_ref(),
-            crate::redact::Direction::Input,
             verdict,
+            &mut body,
             &mut input_seg_counts,
             &mut monitor_hits,
-            |g| crate::redact::redact_completions_request_structured(g, &mut body).counts,
         )
         .await;
         input_capture_safe = moderation.capture_safe;

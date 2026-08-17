@@ -58,6 +58,22 @@ async function usage5xxCounter(): Promise<number> {
   return line ? Number(line.trim().split(/\s+/).at(-1)) : 0;
 }
 
+async function usage2xxCounter(): Promise<number> {
+  const response = await fetch(`${app!.metricsUrl}/metrics`);
+  if (response.status !== 200) {
+    throw new Error(`metrics probe returned ${response.status}`);
+  }
+  const line = (await response.text())
+    .split("\n")
+    .find(
+      (candidate) =>
+        candidate.startsWith("aisix_usage_events_emitted_total{") &&
+        candidate.includes('handler="completions"') &&
+        candidate.includes('status_code="2xx"'),
+    );
+  return line ? Number(line.trim().split(/\s+/).at(-1)) : 0;
+}
+
 async function outputTokenCounter(model: string): Promise<number> {
   const response = await fetch(`${app!.metricsUrl}/metrics`);
   if (response.status !== 200) {
@@ -148,6 +164,7 @@ describe("legacy completions stream timeout", () => {
   let truncated: OpenAiUpstream | undefined;
   let malformed: OpenAiUpstream | undefined;
   let malformedDone: OpenAiUpstream | undefined;
+  let doneTrailer: OpenAiUpstream | undefined;
   let slowModelId = "";
   let midModelId = "";
   let truncatedModelId = "";
@@ -186,6 +203,11 @@ describe("legacy completions stream timeout", () => {
         "data: [DONE]\n\n",
       ],
     });
+    doneTrailer = await startOpenAiUpstream({
+      rawSseChunks: [
+        `data: ${chunk("complete-before-done")}\n\ndata: [DONE]\n\ndata: not-json-after-done\n\n`,
+      ],
+    });
 
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
@@ -205,6 +227,10 @@ describe("legacy completions stream timeout", () => {
     const malformedDonePk = await providerKey(
       "legacy-malformed-before-done",
       malformedDone,
+    );
+    const doneTrailerPk = await providerKey(
+      "legacy-done-with-trailer",
+      doneTrailer,
     );
 
     const slowModel = await seed.createModel({
@@ -255,6 +281,14 @@ describe("legacy completions stream timeout", () => {
       cooldown: { default_seconds: 60 },
     });
     malformedDoneModelId = malformedDoneModel.id;
+    await seed.createModel({
+      display_name: "legacy-done-with-trailer",
+      provider: "openai",
+      model_name: "gpt-3.5-turbo-instruct",
+      provider_key_id: doneTrailerPk,
+      retries: 0,
+      cooldown: { default_seconds: 60 },
+    });
 
     // The caller key is the final revision. Authenticated model listing is a
     // propagation barrier without exercising the timeout behavior under test.
@@ -266,6 +300,7 @@ describe("legacy completions stream timeout", () => {
         "legacy-truncated",
         "legacy-malformed",
         "legacy-malformed-before-done",
+        "legacy-done-with-trailer",
       ],
     });
     await waitConfigPropagation(async () => {
@@ -283,7 +318,8 @@ describe("legacy completions stream timeout", () => {
         ids.has("legacy-timeout-mid") &&
         ids.has("legacy-truncated") &&
         ids.has("legacy-malformed") &&
-        ids.has("legacy-malformed-before-done")
+        ids.has("legacy-malformed-before-done") &&
+        ids.has("legacy-done-with-trailer")
       );
     });
   });
@@ -296,6 +332,7 @@ describe("legacy completions stream timeout", () => {
       truncated?.close(),
       malformed?.close(),
       malformedDone?.close(),
+      doneTrailer?.close(),
     ]);
   });
 
@@ -440,5 +477,27 @@ describe("legacy completions stream timeout", () => {
         (await outputTokenCounter("legacy-malformed-before-done")) >
         outputBaseline,
     );
+  });
+
+  test("DONE cuts off malformed data coalesced into the same upstream chunk", async (ctx) => {
+    if (!etcdReachable || !app || !doneTrailer) {
+      ctx.skip();
+      return;
+    }
+
+    const upstreamBaseline = doneTrailer.receivedRequests.length;
+    const successBaseline = await usage2xxCounter();
+    const failureBaseline = await usage5xxCounter();
+    const response = await completion("legacy-done-with-trailer");
+    expect(response.status).toBe(200);
+    const body = await readCommittedStream(response);
+    expect(body).toContain("complete-before-done");
+    expect(body).toContain("[DONE]");
+    expect(body).not.toContain("not-json-after-done");
+    expect(doneTrailer.receivedRequests).toHaveLength(upstreamBaseline + 1);
+    await waitConfigPropagation(
+      async () => (await usage2xxCounter()) === successBaseline + 1,
+    );
+    expect(await usage5xxCounter()).toBe(failureBaseline);
   });
 });

@@ -452,6 +452,22 @@ impl ChatResponse {
                 out.push_str(&tool_calls.to_string());
             }
         }
+        for text in [
+            self.message.extra.get("refusal").and_then(Value::as_str),
+            self.message
+                .extra
+                .get("audio")
+                .and_then(|audio| audio.get("transcript"))
+                .and_then(Value::as_str),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(text);
+        }
         out
     }
 }

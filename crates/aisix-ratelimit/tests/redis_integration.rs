@@ -203,6 +203,28 @@ async fn token_usage_at_exact_limit_blocks_the_next_replica() {
     ));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_stream_token_usage_is_ordered_before_the_next_replica_acquire() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let a = Limiter::with_store(Arc::new(store(&url).await));
+    let b = Limiter::with_store(Arc::new(store(&url).await));
+    let key = unique_key("tpm-stream-exact");
+    let limits = RateLimit {
+        tpm: Some(1_000),
+        ..rl()
+    };
+
+    a.add_tokens_post_stream(&key, 1_000);
+
+    assert!(matches!(
+        b.pre_commit(&key, &limits).await,
+        Err(aisix_ratelimit::RateLimitError::Tokens { .. }),
+    ));
+}
+
 #[tokio::test]
 async fn concurrency_slot_is_shared_and_released_across_replicas() {
     let Some(url) = redis_url() else {

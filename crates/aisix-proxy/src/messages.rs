@@ -3579,22 +3579,30 @@ fn update_anthropic_usage(
 }
 
 /// Drain every complete SSE event from `buf`, updating `acc`. Incomplete
-/// trailing bytes are left for the next chunk. Framing and multi-`data`
-/// interpretation follow the shared WHATWG parser in `redact`.
+/// trailing bytes are left for the next chunk. On a terminal, returns the
+/// number of bytes in its frame that must be excluded from the wire: zero for
+/// a valid protocol terminal, the malformed frame length for a decode failure.
+/// Coalesced later frames remain in `buf` for the caller to discard.
 fn drain_anthropic_sse_frames(
     buf: &mut Vec<u8>,
     acc: &mut AnthropicStreamUsage,
     attempt_started: Instant,
     first_token_seen: &mut bool,
     response_text_cap: usize,
-) {
+) -> Option<usize> {
+    if acc.reached_end || acc.stream_failure.is_some() {
+        return Some(0);
+    }
     while let Some(end) = crate::redact::first_sse_event_end(buf) {
         let frame: Vec<u8> = buf.drain(..end).collect();
-        if acc.reached_end {
-            continue;
-        }
         let (json, malformed) = crate::redact::parse_sse_json_event(&frame, !*first_token_seen);
         acc.malformed_sse_data |= malformed;
+        if malformed {
+            acc.stream_failure = Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode);
+            acc.response_capture_safe = false;
+            acc.response_text.clear();
+            return Some(frame.len());
+        }
         if let Some(json) = json {
             update_anthropic_usage(
                 acc,
@@ -3604,7 +3612,11 @@ fn drain_anthropic_sse_frames(
                 response_text_cap,
             );
         }
+        if acc.reached_end || acc.stream_failure.is_some() {
+            return Some(0);
+        }
     }
+    None
 }
 
 /// Drop guard that fires `on_complete` exactly once with the
@@ -3771,11 +3783,49 @@ where
         let mut cap_released = false;
         while let Some(item) = upstream.next().await {
             let mut terminal_seen = false;
+            let mut wire_len = None;
             if let Ok(bytes) = &item {
+                // Side-channel parse and locate the exact semantic-terminal
+                // boundary. A provider may coalesce later frames into the same
+                // transport item; those bytes are not part of this response.
+                let mut processed = 0usize;
+                for part in bytes.chunks(64 * 1024) {
+                    buf.extend_from_slice(part);
+                    processed += part.len();
+                    if let Some(excluded_frame_len) = drain_anthropic_sse_frames(
+                        &mut buf,
+                        guard.usage(),
+                        attempt_started,
+                        &mut first_token_seen,
+                        response_text_cap,
+                    ) {
+                        terminal_seen = true;
+                        wire_len = Some(
+                            processed
+                                .saturating_sub(buf.len())
+                                .saturating_sub(excluded_frame_len),
+                        );
+                        buf.clear();
+                        break;
+                    }
+                    if buf.len() > MAX_SSE_FRAME_BUF_BYTES {
+                        tracing::warn!(
+                            buffered = buf.len(),
+                            "anthropic stream: SSE frame buffer exceeded cap without a \
+                             terminator; dropping buffer (usage parsing skipped for the \
+                             oversized frame)"
+                        );
+                        let usage = guard.usage();
+                        usage.response_text_truncated = true;
+                        if hold_policy.is_some() && !cap_released {
+                            usage.malformed_sse_data = true;
+                        }
+                        buf.clear();
+                    }
+                }
+                let wire_bytes = bytes.slice(..wire_len.unwrap_or(bytes.len()));
                 if let Some((max_hold, fail_open)) = hold_policy.filter(|_| !cap_released) {
-                    // Enforce the security buffer before any side-channel
-                    // parser copies or deserializes this untrusted chunk.
-                    if held.len().saturating_add(bytes.len()) > max_hold {
+                    if held.len().saturating_add(wire_bytes.len()) > max_hold {
                         if fail_open {
                             tracing::warn!(
                                 guardrail_hook = "output",
@@ -3811,35 +3861,6 @@ where
                         }
                     }
                 }
-                // Side-channel parse: copy into the frame buffer (the
-                // original `bytes` is yielded unchanged below) and drain
-                // any complete SSE frames into the accumulator.
-                for part in bytes.chunks(64 * 1024) {
-                    buf.extend_from_slice(part);
-                    drain_anthropic_sse_frames(
-                        &mut buf,
-                        guard.usage(),
-                        attempt_started,
-                        &mut first_token_seen,
-                        response_text_cap,
-                    );
-                    if buf.len() > MAX_SSE_FRAME_BUF_BYTES {
-                        tracing::warn!(
-                            buffered = buf.len(),
-                            "anthropic stream: SSE frame buffer exceeded cap without a \
-                             terminator; dropping buffer (usage parsing skipped for the \
-                             oversized frame)"
-                        );
-                        let usage = guard.usage();
-                        usage.response_text_truncated = true;
-                        if hold_policy.is_some() && !cap_released {
-                            usage.malformed_sse_data = true;
-                        }
-                        buf.clear();
-                    }
-                }
-                terminal_seen = guard.usage().reached_end
-                    || guard.usage().stream_failure.is_some();
                 // Bound the frame buffer (PR #436 audit MEDIUM-2). The
                 // happy path drains complete frames above, so `buf`
                 // only retains a partial trailing frame — normally a
@@ -3858,31 +3879,37 @@ where
                     // scan clears (and masks) them. Overflow fails closed —
                     // content that can't be fully buffered to scan must not
                     // be released (mirrors /v1/responses).
-                    debug_assert!(held.len().saturating_add(bytes.len()) <= max_hold);
-                    held.extend_from_slice(bytes);
+                    debug_assert!(held.len().saturating_add(wire_bytes.len()) <= max_hold);
+                    held.extend_from_slice(&wire_bytes);
                     if terminal_seen {
                         break;
                     }
                     continue;
                 }
             }
-            // Forward the original item verbatim (Ok bytes OR Err — an
-            // upstream error mid-stream is passed through; the
-            // accumulator keeps whatever was captured before it). In
+            let item = match (item, wire_len) {
+                (Ok(bytes), Some(len)) if len < bytes.len() => Ok(bytes.slice(..len)),
+                (item, _) => item,
+            };
+            // Forward the item through the semantic terminal boundary (or an
+            // Err — an upstream error mid-stream is passed through). In
             // hold-back mode an Err lands here too: it is forwarded and
             // the held (unscanned) content is dropped — fail closed.
             let errored = item.is_err();
+            let empty_terminal = terminal_seen && item.as_ref().is_ok_and(Bytes::is_empty);
             if let Err(error) = &item {
                 let usage = guard.usage();
                 usage.stream_failure = Some(error.failure());
                 usage.response_capture_safe = false;
                 usage.response_text.clear();
             }
-            if !errored && guard.usage().downstream_latency_ms == 0 {
+            if !errored && !empty_terminal && guard.usage().downstream_latency_ms == 0 {
                 guard.usage().downstream_latency_ms =
                     started.elapsed().as_millis().min(u32::MAX as u128) as u32;
             }
-            yield item;
+            if !empty_terminal {
+                yield item;
+            }
             if errored {
                 return;
             }
@@ -6028,7 +6055,10 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             Arc::new(pii) as Arc<dyn Guardrail>
         ]));
         let upstream = futures::stream::iter(vec![Ok::<_, crate::stream_timeout::RawStreamError>(
-            bytes::Bytes::from("event: content_block_delta\ndata: not-json\n\n"),
+            bytes::Bytes::from(
+                "event: content_block_delta\ndata: not-json\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            ),
         )]);
         let captured = Arc::new(Mutex::new(None));
         let captured_out = Arc::clone(&captured);
@@ -6063,6 +6093,53 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         let wire = String::from_utf8(wire).unwrap();
         assert!(wire.contains("api_error"));
         assert!(!wire.contains("content_filter"));
+        assert!(!wire.contains("not-json"));
+        assert!(!wire.contains("message_stop"));
+    }
+
+    #[tokio::test]
+    async fn native_live_malformed_sse_cannot_be_overturned_by_message_stop() {
+        use futures::StreamExt;
+        use std::sync::{Arc, Mutex};
+
+        let upstream = futures::stream::iter([Ok::<
+            _,
+            crate::stream_timeout::RawStreamError,
+        >(bytes::Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n\
+event: content_block_delta\ndata: not-json\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ))]);
+        let captured = Arc::new(Mutex::new(None));
+        let captured_out = Arc::clone(&captured);
+        let now = std::time::Instant::now();
+        let mut stream = super::build_anthropic_passthrough_stream(
+            upstream,
+            now,
+            now,
+            None,
+            "relay-claude".into(),
+            None,
+            None,
+            move |usage| *captured_out.lock().unwrap() = Some(usage),
+        );
+
+        let mut wire = Vec::new();
+        while let Some(item) = stream.next().await {
+            wire.extend_from_slice(&item.unwrap());
+        }
+        drop(stream);
+        let wire = String::from_utf8(wire).unwrap();
+        assert!(wire.contains("message_start"));
+        assert!(!wire.contains("not-json"));
+        assert!(!wire.contains("message_stop"));
+        assert_eq!(wire.matches("event: error").count(), 1);
+        let usage = captured.lock().unwrap().take().expect("on_complete fired");
+        assert!(!usage.reached_end);
+        assert!(matches!(
+            usage.stream_failure,
+            Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode)
+        ));
     }
 
     /// Issue #245 (audit angle 8c): a stream that carries NO usage
@@ -6119,7 +6196,7 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\"}}\n\n"
             .to_vec();
         let mut first = false;
 
-        drain_anthropic_sse_frames(
+        let terminal = drain_anthropic_sse_frames(
             &mut buf,
             &mut acc,
             std::time::Instant::now(),
@@ -6129,6 +6206,8 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\"}}\n\n"
 
         assert!(acc.reached_end);
         assert!(acc.stream_failure.is_none());
+        assert_eq!(terminal, Some(0));
+        assert!(String::from_utf8_lossy(&buf).contains("api_error"));
     }
 
     #[tokio::test]
@@ -6138,7 +6217,8 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\"}}\n\n"
 
         let upstream = futures::stream::iter([
             Ok::<_, crate::stream_timeout::RawStreamError>(bytes::Bytes::from_static(
-                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"AFTER_MESSAGE_STOP\"}}\n\n",
             )),
             Err(crate::stream_timeout::RawStreamError::Timeout { elapsed_ms: 300 }),
         ]);
@@ -6157,7 +6237,9 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\"}}\n\n"
         );
 
         let terminal = stream.next().await.unwrap().unwrap();
-        assert!(String::from_utf8_lossy(&terminal).contains("message_stop"));
+        let terminal = String::from_utf8_lossy(&terminal);
+        assert!(terminal.contains("message_stop"));
+        assert!(!terminal.contains("AFTER_MESSAGE_STOP"));
         assert!(stream.next().await.is_none());
         drop(stream);
 

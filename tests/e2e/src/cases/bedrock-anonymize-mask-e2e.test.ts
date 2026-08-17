@@ -17,7 +17,7 @@ import {
 // Bedrock reports `action=GUARDRAIL_INTERVENED` for BOTH a hard block and
 // a PII anonymization; the per-entity `assessments[]` actions tell them
 // apart. Pre-fix the DP blocked on ANY intervention. Now, on the
-// chat-shaped families, an ANONYMIZE disposition masks-and-continues:
+// text-generating families, an ANONYMIZE disposition masks-and-continues:
 //
 // - INPUT: the request's text slots go up as one content block each in a
 //   single ApplyGuardrail call, and Bedrock's `outputs[i]` replaces slot i
@@ -369,6 +369,42 @@ describe("bedrock guardrail ANONYMIZE write-back (#932 follow-up)", () => {
       expect(bedrock!.calls.at(-1)?.texts).toContain(
         "MISALIGN write to bob@example.org",
       );
+      expect(upstream!.receivedRequests).toHaveLength(upstreamBefore);
+    },
+    60_000,
+  );
+
+  test(
+    "/v1/completions fails closed when remote masking targets structural user",
+    async (ctx) => {
+      if (!etcdReachable) {
+        ctx.skip();
+        return;
+      }
+      const upstreamBefore = upstream!.receivedRequests.length;
+      const guardrailBefore = bedrock!.calls.length;
+      const response = await fetch(`${app!.proxyUrl}/v1/completions`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${CALLER}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "bmask-e2e",
+          prompt: "clean prompt",
+          user: EMAIL,
+        }),
+      });
+
+      expect(response.status).toBe(422);
+      const body = await response.text();
+      expect(body).toContain("content policy");
+      expect(body).not.toContain(EMAIL);
+      expect(bedrock!.calls).toHaveLength(guardrailBefore + 1);
+      expect(bedrock!.calls.at(-1)).toEqual({
+        source: "INPUT",
+        texts: ["clean prompt", EMAIL],
+      });
       expect(upstream!.receivedRequests).toHaveLength(upstreamBefore);
     },
     60_000,

@@ -312,14 +312,16 @@ describe("stream timeout terminal state across handler families", () => {
     messagesTerminal = await startOpenAiUpstream({
       eventDelayMs: STALL_MS,
       rawSseChunks: [
-        messagesFrames(OUTPUT_MARKERS.messagesTerminal)[0]!,
+        messagesFrames(OUTPUT_MARKERS.messagesTerminal)[0]! +
+          `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: OUTPUT_MARKERS.messagesAfterTerminal } })}\n\n`,
         `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: OUTPUT_MARKERS.messagesAfterTerminal } })}\n\n`,
       ],
     });
     responsesTerminal = await startOpenAiUpstream({
       eventDelayMs: STALL_MS,
       rawSseChunks: [
-        responsesFrames(OUTPUT_MARKERS.responsesTerminal)[0]!,
+        responsesFrames(OUTPUT_MARKERS.responsesTerminal)[0]! +
+          `data: ${JSON.stringify({ type: "response.output_text.delta", delta: OUTPUT_MARKERS.responsesAfterTerminal })}\n\n`,
         `data: ${JSON.stringify({ type: "response.output_text.delta", delta: OUTPUT_MARKERS.responsesAfterTerminal })}\n\n`,
       ],
     });

@@ -113,9 +113,15 @@ impl CompletionSseAccumulator {
         }
     }
 
-    pub(super) fn push(&mut self, bytes: &[u8]) {
+    /// Observe bytes until the first `[DONE]` event and return the wire prefix
+    /// ending at that event. Bytes after the semantic terminal belong to no
+    /// completion and must neither affect telemetry nor reach the caller.
+    pub(super) fn push(&mut self, bytes: &[u8]) -> usize {
+        if self.saw_done {
+            return 0;
+        }
         self.observed_bytes |= !bytes.is_empty();
-        for byte in bytes {
+        for (offset, byte) in bytes.iter().enumerate() {
             loop {
                 match self.boundary.feed(*byte) {
                     SseBoundary::None => {
@@ -124,15 +130,22 @@ impl CompletionSseAccumulator {
                     SseBoundary::EndAfterByte => {
                         self.push_frame_byte(*byte);
                         self.finish_frame();
+                        if self.saw_done {
+                            return offset + 1;
+                        }
                     }
                     SseBoundary::EndBeforeByte => {
                         self.finish_frame();
+                        if self.saw_done {
+                            return offset;
+                        }
                         continue;
                     }
                 }
                 break;
             }
         }
+        bytes.len()
     }
 
     pub(super) fn has_observed_bytes(&self) -> bool {
@@ -178,9 +191,14 @@ impl CompletionSseAccumulator {
     }
 
     fn observe_frame(&mut self, frame: &[u8]) {
-        self.saw_done |= crate::redact::is_sse_done_event(frame, self.first_frame);
-        let (json, malformed) = crate::redact::parse_sse_json_event(frame, self.first_frame);
+        let first_frame = self.first_frame;
+        let saw_done = crate::redact::is_sse_done_event(frame, first_frame);
         self.first_frame = false;
+        if saw_done {
+            self.saw_done = true;
+            return;
+        }
+        let (json, malformed) = crate::redact::parse_sse_json_event(frame, first_frame);
         self.malformed_data |= malformed;
         let Some(json) = json else {
             return;
@@ -398,10 +416,11 @@ where
         futures::pin_mut!(upstream);
         let mut outcome = CompletionStreamOutcome::CleanEof;
         while let Some(item) = upstream.next().await {
+            let mut wire_len = None;
             match &item {
                 Ok(bytes) => {
                     if let Some((_, accumulator)) = guard.slot.as_mut() {
-                        accumulator.push(bytes);
+                        wire_len = Some(accumulator.push(bytes));
                     }
                 }
                 Err(error) => {
@@ -420,6 +439,10 @@ where
                     }
                 }
             }
+            let item = match (item, wire_len) {
+                (Ok(bytes), Some(len)) if len < bytes.len() => Ok(bytes.slice(..len)),
+                (item, _) => item,
+            };
             let reached_done = guard
                 .slot
                 .as_ref()
@@ -872,7 +895,9 @@ mod tests {
         let upstream: CompletionByteStream = Box::pin(
             futures::stream::iter([
                 Ok(bytes::Bytes::from(frame("complete", true))),
-                Ok(bytes::Bytes::from_static(b"data: [DONE]\r\n\r\n")),
+                Ok(bytes::Bytes::from_static(
+                    b"data: [DONE]\r\n\r\ndata: not-json-after-done\n\n",
+                )),
             ])
             .chain(futures::stream::pending()),
         );
@@ -894,7 +919,10 @@ mod tests {
             );
             futures::pin_mut!(stream);
             assert!(stream.next().await.unwrap().is_ok());
-            assert!(stream.next().await.unwrap().is_ok());
+            let done = stream.next().await.unwrap().unwrap();
+            let done = String::from_utf8_lossy(&done);
+            assert!(done.contains("[DONE]"));
+            assert!(!done.contains("not-json-after-done"));
             // Deliberately do not poll for EOF. OpenAI SDKs commonly stop as
             // soon as the DONE-bearing item has been consumed.
         }

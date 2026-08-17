@@ -21,7 +21,7 @@ import {
 // keyword guardrail, and reads the delivered SLS protobuf back:
 //
 //   1. upstream failure (chat)        → record carries `prompt`
-//   2. guardrail input block 422      → record carries `prompt`
+//   2. guardrail input block 422      → record exists WITHOUT `prompt`
 //   3. 403 model-forbidden            → record exists WITHOUT `prompt`
 //      (auth-class failures stay body-less by design)
 //   4. /v1/messages upstream failure  → record carries `prompt`
@@ -58,6 +58,8 @@ const EMBEDDINGS_GUARDRAIL_REQUEST_ID = "22222222-2222-4222-8222-222222222222";
 const TOOL_KEY_GUARDRAIL_REQUEST_ID = "33333333-3333-4333-8333-333333333333";
 const MALFORMED_MESSAGES_REQUEST_ID = "44444444-4444-4444-8444-444444444444";
 const MALFORMED_MESSAGES_SECRET = "malformed-messages@example.com";
+const KEYWORD_BLOCK_REQUEST_ID = "55555555-5555-4555-8555-555555555555";
+const PII_BLOCK_REQUEST_ID = "66666666-6666-4666-8666-666666666666";
 
 // --- Minimal SLS LogGroup protobuf reader (see sink/sls.rs encoder) -----
 // LogGroup { Logs = 1 (message) { Time = 1 (varint), Contents = 2 (message)
@@ -360,12 +362,13 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     await sls?.close();
   });
 
-  async function chat(model: string, content: string): Promise<Response> {
+  async function chat(model: string, content: string, requestId?: string): Promise<Response> {
     const res = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
       method: "POST",
       headers: {
         authorization: `Bearer ${CALLER_PLAINTEXT}`,
         "content-type": "application/json",
+        ...(requestId ? { "x-aisix-request-id": requestId } : {}),
       },
       body: JSON.stringify({ model, messages: [{ role: "user", content }] }),
     });
@@ -396,21 +399,27 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     expect(prompt.messages[0]!.content).toContain(UPSTREAM_FAIL_SENTINEL);
   });
 
-  test("guardrail input block (422): the record carries the prompt", async (ctx) => {
+  test("guardrail input block (422): the record suppresses the prompt", async (ctx) => {
     if (!etcdReachable || !app || !sls) {
       ctx.skip();
       return;
     }
-    const res = await chat("failure-content-ok", GUARDRAIL_SENTINEL);
+    const res = await chat(
+      "failure-content-ok",
+      GUARDRAIL_SENTINEL,
+      KEYWORD_BLOCK_REQUEST_ID,
+    );
     expect(res.status).toBe(422);
 
     const log = await waitForLog(
       sls,
-      (l) => (l.get("prompt") ?? "").includes(GUARDRAIL_SENTINEL),
-      "guardrail-blocked record with prompt",
+      (l) => l.get("request_id") === KEYWORD_BLOCK_REQUEST_ID,
+      "guardrail-blocked record without prompt",
     );
     expect(log.get("status_code")).toBe("422");
     expect(log.get("guardrail_blocked")).toBe("true");
+    expect(log.has("prompt")).toBe(false);
+    expect([...log.values()].join("\n")).not.toContain(GUARDRAIL_SENTINEL);
   });
 
   test("/v1/responses exports blocked and applied guardrail metadata", async (ctx) => {
@@ -439,6 +448,10 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
       "blocked /v1/responses guardrail metadata",
     );
     expect(log.get("guardrail_blocked")).toBe("true");
+    expect(log.get("prompt")).toBeUndefined();
+    for (const value of log.values()) {
+      expect(value).not.toContain(FORBIDDEN_WORD);
+    }
     expect(JSON.parse(log.get("applied_guardrails") ?? "[]")).toContainEqual({
       kind: "keyword",
       hook: "input",
@@ -664,33 +677,29 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     expect(Number(log.get("status_code"))).toBeGreaterThanOrEqual(400);
   });
 
-  test("blocked request carrying maskable PII captures the POST-mask body", async (ctx) => {
+  test("blocked request carrying PII never exports the rejected body", async (ctx) => {
     if (!etcdReachable || !app || !sls) {
       ctx.skip();
       return;
     }
-    // The china_id_card detector blocks; the email detector masks. The
-    // captured prompt must show what the success path would have sent —
-    // the masked email — never the raw address.
     const res = await chat(
       "failure-content-ok",
       `${MASKED_BLOCK_SENTINEL} write to ${EMAIL} about id ${CN_ID}`,
+      PII_BLOCK_REQUEST_ID,
     );
     expect(res.status).toBe(422);
 
     const log = await waitForLog(
       sls,
-      (l) => (l.get("prompt") ?? "").includes(MASKED_BLOCK_SENTINEL),
-      "pii-blocked record with prompt",
+      (l) => l.get("request_id") === PII_BLOCK_REQUEST_ID,
+      "pii-blocked record without prompt",
     );
     expect(log.get("guardrail_blocked")).toBe("true");
-    const prompt = log.get("prompt")!;
-    expect(prompt).toContain("[EMAIL_REDACTED]");
-    expect(prompt).not.toContain(EMAIL);
-    // And the raw address never reaches the logstore in any record.
+    expect(log.has("prompt")).toBe(false);
     for (const l of logsFor(sls, FULL_LOGSTORE)) {
       for (const v of l.values()) {
         expect(v).not.toContain(EMAIL);
+        expect(v).not.toContain(CN_ID);
       }
     }
   });
