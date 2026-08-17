@@ -1094,11 +1094,16 @@ const ANTHROPIC_PROTOCOL_FIELDS: &[&str] = &[
     "is_error",
     "citations",
     "cited_text",
+    "document_title",
     "tool_references",
 ];
 
 const ANTHROPIC_METADATA_FIELDS: &[&str] = &[
+    "document_index",
     "enabled",
+    "end_block_index",
+    "end_char_index",
+    "end_page_number",
     "error_code",
     "file_type",
     "from_",
@@ -1114,19 +1119,30 @@ const ANTHROPIC_METADATA_FIELDS: &[&str] = &[
     "retrieved_at",
     "return_code",
     "search_result_index",
+    "start_block_index",
+    "start_char_index",
     "start_line",
+    "start_page_number",
     "stop_reason",
     "to",
     "total_lines",
     "trigger",
+    "ttl",
 ];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnthropicKeyContext {
+    Protocol,
+    UserDefined,
+    ServerToolInput,
+}
 
 fn redact_anthropic_value(
     chain: &dyn Guardrail,
     dir: Direction,
     value: &mut Value,
     counts: &mut RedactionCounts,
-    user_defined_keys: bool,
+    key_context: AnthropicKeyContext,
 ) -> bool {
     match value {
         Value::String(_) => {
@@ -1134,49 +1150,55 @@ fn redact_anthropic_value(
             false
         }
         Value::Array(items) => items.iter_mut().fold(false, |found, item| {
-            redact_anthropic_value(chain, dir, item, counts, user_defined_keys) || found
+            redact_anthropic_value(chain, dir, item, counts, key_context) || found
         }),
         Value::Object(map) => {
             let object_type = map
                 .get("type")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
-            if matches!(
-                object_type.as_deref(),
-                Some("thinking" | "redacted_thinking")
-            ) {
+            if key_context == AnthropicKeyContext::Protocol
+                && matches!(
+                    object_type.as_deref(),
+                    Some("thinking" | "redacted_thinking")
+                )
+            {
                 return false;
             }
             let mut unrewritable = false;
             for (field, child) in map {
-                if field == "type" {
+                if key_context != AnthropicKeyContext::UserDefined && field == "type" {
                     continue;
                 }
-                let opaque = matches!(
-                    field.as_str(),
-                    "signature" | "encrypted_content" | "encrypted_index" | "encrypted_stdout"
-                ) || (field == "data"
-                    && matches!(
-                        object_type.as_deref(),
-                        Some("base64" | "base64_pdf" | "redacted_thinking")
-                    ))
-                    || (field == "url"
+                let opaque = key_context == AnthropicKeyContext::Protocol
+                    && (matches!(
+                        field.as_str(),
+                        "signature" | "encrypted_content" | "encrypted_index" | "encrypted_stdout"
+                    ) || (field == "data"
                         && matches!(
                             object_type.as_deref(),
-                            Some("url" | "url_pdf" | "image" | "document")
-                        ));
+                            Some("base64" | "base64_pdf" | "redacted_thinking")
+                        ))
+                        || (field == "url"
+                            && matches!(
+                                object_type.as_deref(),
+                                Some("url" | "url_pdf" | "image" | "document")
+                            )));
                 if opaque {
                     continue;
                 }
-                if !user_defined_keys && ANTHROPIC_METADATA_FIELDS.contains(&field.as_str()) {
+                if key_context == AnthropicKeyContext::Protocol
+                    && ANTHROPIC_METADATA_FIELDS.contains(&field.as_str())
+                {
                     continue;
                 }
                 // Protocol field names are not model content. Unknown keys
                 // inside tool inputs/results remain in scope because callers
                 // control those object keys and a mask cannot safely rename
                 // them without changing the tool contract.
-                if user_defined_keys
-                    || (!ANTHROPIC_PROTOCOL_FIELDS.contains(&field.as_str())
+                if key_context == AnthropicKeyContext::UserDefined
+                    || (key_context == AnthropicKeyContext::Protocol
+                        && !ANTHROPIC_PROTOCOL_FIELDS.contains(&field.as_str())
                         && !ANTHROPIC_STRUCTURAL_FIELDS.contains(&field.as_str()))
                 {
                     if let Some(redaction) = redact_str(chain, dir, field) {
@@ -1184,19 +1206,30 @@ fn redact_anthropic_value(
                         merge_counts(counts, redaction.counts);
                     }
                 }
-                if ANTHROPIC_STRUCTURAL_FIELDS.contains(&field.as_str())
-                    || (field == "source" && matches!(child, Value::String(_)))
+                if key_context == AnthropicKeyContext::Protocol
+                    && (ANTHROPIC_STRUCTURAL_FIELDS.contains(&field.as_str())
+                        || (field == "source" && matches!(child, Value::String(_))))
                 {
                     unrewritable |= detect_unrewritable_value_strings(chain, dir, child, counts);
                     continue;
                 }
-                let child_has_user_defined_keys = user_defined_keys
-                    || matches!(field.as_str(), "input" | "input_schema")
-                    || (object_type.as_deref() == Some("tool_result")
-                        && field == "content"
-                        && child.is_object());
-                unrewritable |=
-                    redact_anthropic_value(chain, dir, child, counts, child_has_user_defined_keys);
+                let child_context = match (key_context, field.as_str()) {
+                    (AnthropicKeyContext::UserDefined, _) => AnthropicKeyContext::UserDefined,
+                    (AnthropicKeyContext::ServerToolInput, _) => {
+                        AnthropicKeyContext::ServerToolInput
+                    }
+                    (_, "input") if object_type.as_deref() == Some("server_tool_use") => {
+                        AnthropicKeyContext::ServerToolInput
+                    }
+                    (_, "input" | "input_schema") => AnthropicKeyContext::UserDefined,
+                    (_, "content")
+                        if object_type.as_deref() == Some("tool_result") && child.is_object() =>
+                    {
+                        AnthropicKeyContext::UserDefined
+                    }
+                    _ => AnthropicKeyContext::Protocol,
+                };
+                unrewritable |= redact_anthropic_value(chain, dir, child, counts, child_context);
             }
             unrewritable
         }
@@ -1213,7 +1246,7 @@ fn redact_anthropic_content(
     content: &mut Value,
     counts: &mut RedactionCounts,
 ) -> bool {
-    redact_anthropic_value(chain, dir, content, counts, false)
+    redact_anthropic_value(chain, dir, content, counts, AnthropicKeyContext::Protocol)
 }
 
 pub(crate) fn anthropic_content_inspection_text_capped(
@@ -2860,8 +2893,13 @@ pub fn redact_anthropic_sse(chain: &dyn Guardrail, raw: &[u8]) -> AnthropicSseRe
                 continue;
             };
             let before = block.clone();
-            unrewritable_tool_key |=
-                redact_anthropic_value(chain, Direction::Output, block, &mut counts, false);
+            unrewritable_tool_key |= redact_anthropic_value(
+                chain,
+                Direction::Output,
+                block,
+                &mut counts,
+                AnthropicKeyContext::Protocol,
+            );
             *block != before
         };
         frame.dirty |= changed;
@@ -3935,6 +3973,19 @@ mod tests {
                     "stderr": "visible c@z.io",
                     "content": []
                 }
+            },
+            {
+                "type": "text",
+                "text": "answer text",
+                "cache_control": {"type": "ephemeral", "ttl": "5m"},
+                "citations": [{
+                    "type": "char_location",
+                    "cited_text": "quoted h@s.dev",
+                    "document_index": 0,
+                    "document_title": "title i@r.net",
+                    "start_char_index": 1,
+                    "end_char_index": 2
+                }]
             }
         ]);
 
@@ -3943,6 +3994,8 @@ mod tests {
         assert!(!truncated);
         assert!(projection.contains("visible a@x.com"));
         assert!(projection.contains("visible c@z.io"));
+        assert!(projection.contains("quoted h@s.dev"));
+        assert!(projection.contains("title i@r.net"));
         for excluded in [
             "caller",
             "tool_id",
@@ -3950,6 +4003,12 @@ mod tests {
             "retrieved_at",
             "return_code",
             "encrypted_stdout",
+            "cache_control",
+            "ttl",
+            "document_index",
+            "document_title",
+            "start_char_index",
+            "end_char_index",
             "cipher-a@x.com",
             "cipher-b@y.org",
         ] {
@@ -3978,6 +4037,116 @@ mod tests {
         assert!(body["content"][0]["input"].get(sensitive_key).is_some());
         assert_eq!(
             body["content"][0]["input"]["error_code"],
+            "[EMAIL_REDACTED]"
+        );
+        assert_eq!(redaction.counts.get("email"), Some(&2));
+    }
+
+    #[test]
+    fn anthropic_server_tool_input_excludes_protocol_keys_but_scans_values() {
+        let content = json!([{
+            "type": "server_tool_use",
+            "id": "srvtoolu_1",
+            "name": "web_search",
+            "input": {
+                "query": "weather for a@x.com",
+                "max_uses": 3,
+                "options": {"domain": "example.test"}
+            }
+        }]);
+        let (projection, truncated) =
+            anthropic_content_inspection_text_capped(&content, usize::MAX);
+        assert!(!truncated);
+        assert!(projection.contains("weather for a@x.com"));
+        assert!(projection.lines().all(|line| line != "query"));
+        assert!(projection.lines().all(|line| line != "max_uses"));
+        assert!(projection.lines().all(|line| line != "options"));
+        assert!(projection.lines().all(|line| line != "domain"));
+
+        let chain = both();
+        let mut response = json!({"content": content});
+        let redaction = redact_anthropic_response(chain.as_ref(), &mut response);
+        assert!(!redaction.unrewritable_tool_key);
+        assert_eq!(
+            response["content"][0]["input"]["query"],
+            "weather for [EMAIL_REDACTED]"
+        );
+        assert_eq!(redaction.counts.get("email"), Some(&1));
+    }
+
+    #[test]
+    fn anthropic_tool_payload_keys_do_not_inherit_official_opaque_exemptions() {
+        let chain = both();
+        let mut response = json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "lookup",
+                "input": {
+                    "encrypted_content": "a@x.com",
+                    "encrypted_stdout": "b@y.org",
+                    "nested_thinking": {"type": "thinking", "owner": "c@z.io"},
+                    "nested_url": {"type": "url", "data": "d@w.dev"},
+                    "id": "e@v.net"
+                }
+            }]
+        });
+        let redaction = redact_anthropic_response(chain.as_ref(), &mut response);
+        assert!(!redaction.unrewritable_tool_key);
+        for field in [
+            &response["content"][0]["input"]["encrypted_content"],
+            &response["content"][0]["input"]["encrypted_stdout"],
+            &response["content"][0]["input"]["nested_thinking"]["owner"],
+            &response["content"][0]["input"]["nested_url"]["data"],
+            &response["content"][0]["input"]["id"],
+        ] {
+            assert_eq!(field, "[EMAIL_REDACTED]");
+        }
+        assert_eq!(redaction.counts.get("email"), Some(&5));
+
+        let collector = SegmentCollector::default();
+        let mut segment_body = json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_2",
+                "name": "lookup",
+                "input": {
+                    "encrypted_content": "f@u.org",
+                    "nested": {"type": "redacted_thinking", "owner": "g@t.io"}
+                }
+            }]
+        });
+        let result = redact_anthropic_response(&collector, &mut segment_body);
+        assert!(!result.unrewritable_tool_key);
+        let segments = collector.take();
+        assert!(segments.iter().any(|segment| segment == "f@u.org"));
+        assert!(segments.iter().any(|segment| segment == "g@t.io"));
+    }
+
+    #[test]
+    fn anthropic_tool_schema_keys_do_not_inherit_official_opaque_exemptions() {
+        let chain = both();
+        let mut request = json!({
+            "tools": [{
+                "name": "lookup",
+                "description": "clean",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "encrypted_content": {"type": "string", "default": "a@x.com"},
+                        "thinking": {"type": "string", "default": "b@y.org"}
+                    }
+                }
+            }]
+        });
+        let redaction = redact_anthropic_request(chain.as_ref(), &mut request);
+        assert!(!redaction.unrewritable_tool_key);
+        assert_eq!(
+            request["tools"][0]["input_schema"]["properties"]["encrypted_content"]["default"],
+            "[EMAIL_REDACTED]"
+        );
+        assert_eq!(
+            request["tools"][0]["input_schema"]["properties"]["thinking"]["default"],
             "[EMAIL_REDACTED]"
         );
         assert_eq!(redaction.counts.get("email"), Some(&2));
