@@ -9,6 +9,7 @@ authors.workspace = true
 description = "aisix: response cache (in-memory / Redis / semantic)"
 
 [dependencies]
+sha2.workspace = true
 aisix-gateway = { path = "../aisix-gateway" }
 aisix-core = { path = "../aisix-core" }
 aisix-redis = { path = "../aisix-redis", optional = true }

@@ -456,13 +456,19 @@ impl RoutingRegistry {
     /// initial target; subsequent elements are later fallback targets (in
     /// declaration order, wrapping if needed). Length is bounded by the
     /// initial target plus `routing.max_fallbacks_or_default()`.
+    /// `targets` is the request-eligible subset (tag filter, then client-IP
+    /// filter), passed alongside `routing` rather than spliced into a clone
+    /// of it: the strategy knobs come from `routing`, the candidate list from
+    /// here, and rebuilding a whole `Routing` just to swap one field copied
+    /// its own target vector only to drop it.
     pub fn pick_targets(
         &self,
         virtual_name: &str,
         routing: &Routing,
+        targets: &[RoutingTarget],
         stability_key: Option<&str>,
     ) -> Vec<String> {
-        if routing.targets.is_empty() {
+        if targets.is_empty() {
             return Vec::new();
         }
         // Metric-ordered strategies (least_cost, …) can't be ranked here:
@@ -471,25 +477,22 @@ impl RoutingRegistry {
         // back the full declaration-order list; ranking and `max_fallbacks`
         // truncation happen there instead.
         if routing.strategy.is_metric_based() {
-            return routing.targets.iter().map(|t| t.model.clone()).collect();
+            return targets.iter().map(|t| t.model.clone()).collect();
         }
-        let start = self.starting_index(virtual_name, routing, stability_key);
-        attempt_order(
-            &routing.targets,
-            start,
-            routing.max_fallbacks_or_default() + 1,
-        )
+        let start = self.starting_index(virtual_name, routing, targets, stability_key);
+        attempt_order(targets, start, routing.max_fallbacks_or_default() + 1)
     }
 
     fn starting_index(
         &self,
         virtual_name: &str,
         routing: &Routing,
+        targets: &[RoutingTarget],
         stability_key: Option<&str>,
     ) -> usize {
         match routing.strategy {
             RoutingStrategy::Failover => 0,
-            RoutingStrategy::RoundRobin => self.advance_cursor(virtual_name, routing.targets.len()),
+            RoutingStrategy::RoundRobin => self.advance_cursor(virtual_name, targets.len()),
             RoutingStrategy::Weighted => {
                 // Sticky (A/B / canary) routing makes the weighted pick
                 // deterministic in the request's stability key; otherwise each
@@ -498,7 +501,7 @@ impl RoutingRegistry {
                     .sticky_or_default()
                     .then_some(stability_key)
                     .flatten();
-                weighted_pick(&routing.targets, sticky_key)
+                weighted_pick(targets, sticky_key)
             }
             // Metric-ordered strategies never reach here — `pick_targets`
             // short-circuits them before computing a start index.
@@ -530,12 +533,17 @@ impl std::fmt::Debug for RoutingRegistry {
 ///     none match, fall back to `"default"`-tagged targets.
 ///   * Request has no tags → `"default"`-tagged targets if any, else all.
 ///
-/// Returns owned clones so the caller runs the normal strategy over the
-/// surviving subset. An empty result means the request asked for a tag tier
-/// with no matching target and no default — the caller turns that into an error.
-fn eligible_targets(targets: &[RoutingTarget], request_tags: &[String]) -> Vec<RoutingTarget> {
+/// Borrows whenever nothing is filtered out — the default, since tag routing
+/// is opt-in — and only allocates for the subset when it actually narrows.
+/// An empty result means the request asked for a tag tier with no matching
+/// target and no default; the caller turns that into an error.
+fn eligible_targets<'a>(
+    targets: &'a [RoutingTarget],
+    request_tags: &[String],
+) -> std::borrow::Cow<'a, [RoutingTarget]> {
+    use std::borrow::Cow;
     if !targets.iter().any(RoutingTarget::has_tags) {
-        return targets.to_vec();
+        return Cow::Borrowed(targets);
     }
     let defaults = || -> Vec<RoutingTarget> {
         targets
@@ -546,18 +554,22 @@ fn eligible_targets(targets: &[RoutingTarget], request_tags: &[String]) -> Vec<R
     };
     if request_tags.is_empty() {
         let d = defaults();
-        return if d.is_empty() { targets.to_vec() } else { d };
+        return if d.is_empty() {
+            Cow::Borrowed(targets)
+        } else {
+            Cow::Owned(d)
+        };
     }
     let matched: Vec<RoutingTarget> = targets
         .iter()
         .filter(|t| t.matches_request_tags(request_tags))
         .cloned()
         .collect();
-    if matched.is_empty() {
+    Cow::Owned(if matched.is_empty() {
         defaults()
     } else {
         matched
-    }
+    })
 }
 
 /// Build the target-order vector starting at `start_idx`, walking forward
@@ -677,7 +689,10 @@ fn order_attempts_by_metric(
 #[derive(Clone)]
 pub(crate) struct AttemptModel {
     pub id: String,
-    pub model: Model,
+    /// Shared with the snapshot row rather than deep-copied: the dispatch
+    /// only reads it, and a routing group used to clone the whole `Model`
+    /// once per target just to hand it to the bridge.
+    pub model: std::sync::Arc<Model>,
 }
 
 /// Outcome of routing-candidate filtering. Lifts the "all candidates
@@ -780,23 +795,26 @@ pub(crate) struct RoutingRequest<'a> {
 /// `when_all_unavailable: try_anyway` policy hands back the *unfiltered*
 /// candidate list, which would send a request to a target the operator just
 /// declared off-limits for this caller. An allowlist has no "try anyway".
-fn targets_allowed_for_ip(
+/// Stays borrowed when no target is excluded — the common case — so the
+/// default path through routing copies no target at all.
+fn targets_allowed_for_ip<'a>(
     snapshot: &AisixSnapshot,
-    targets: Vec<RoutingTarget>,
+    targets: std::borrow::Cow<'a, [RoutingTarget]>,
     source_ip: &str,
-) -> Vec<RoutingTarget> {
-    targets
-        .into_iter()
-        .filter(|t| {
-            // An unresolvable name is left in place so the resolution loop
-            // below still reports it as a config error, rather than being
-            // silently swallowed here as an IP rejection.
-            snapshot
-                .models
-                .get_by_name(&t.model)
-                .is_none_or(|entry| entry.value.ip_allowed(source_ip))
-        })
-        .collect()
+) -> std::borrow::Cow<'a, [RoutingTarget]> {
+    // An unresolvable name is left in place so the resolution loop below
+    // still reports it as a config error, rather than being silently
+    // swallowed here as an IP rejection.
+    let allowed = |t: &RoutingTarget| {
+        snapshot
+            .models
+            .get_by_name(&t.model)
+            .is_none_or(|entry| entry.value.ip_allowed(source_ip))
+    };
+    if targets.iter().all(allowed) {
+        return targets;
+    }
+    std::borrow::Cow::Owned(targets.iter().filter(|t| allowed(t)).cloned().collect())
 }
 
 /// Resolve the ordered list of concrete Models a request will attempt.
@@ -814,13 +832,13 @@ pub(crate) fn resolve_attempt_models(
     snapshot: &AisixSnapshot,
     virtual_name: &str,
     virtual_id: &str,
-    virtual_model: &Model,
+    virtual_model: &std::sync::Arc<Model>,
     req: RoutingRequest<'_>,
 ) -> Result<Vec<AttemptModel>, ProxyError> {
     let Some(routing) = virtual_model.routing.as_ref() else {
         return Ok(vec![AttemptModel {
             id: virtual_id.to_string(),
-            model: virtual_model.clone(),
+            model: std::sync::Arc::clone(virtual_model),
         }]);
     };
 
@@ -847,13 +865,7 @@ pub(crate) fn resolve_attempt_models(
         // matching `ModelForbidden`, and without disclosing group internals.
         return Err(ProxyError::ModelIpRestricted(virtual_name.to_string()));
     }
-    let filtered_routing = Routing {
-        targets: eligible,
-        ..routing.clone()
-    };
-    let routing = &filtered_routing;
-
-    let names = routing_registry.pick_targets(virtual_name, routing, req.stability_key);
+    let names = routing_registry.pick_targets(virtual_name, routing, &eligible, req.stability_key);
     if names.is_empty() {
         return Err(ProxyError::InvalidRequest(
             "routing model has no targets".into(),
@@ -981,10 +993,13 @@ mod tests {
             Some(0), // only the chosen start target
         );
         routing.sticky = Some(true);
-        let first = reg.pick_targets("v", &routing, Some("user-42"));
+        let first = reg.pick_targets("v", &routing, &routing.targets, Some("user-42"));
         assert_eq!(first.len(), 1);
         for _ in 0..20 {
-            assert_eq!(reg.pick_targets("v", &routing, Some("user-42")), first);
+            assert_eq!(
+                reg.pick_targets("v", &routing, &routing.targets, Some("user-42")),
+                first
+            );
         }
     }
 
@@ -1062,12 +1077,20 @@ mod tests {
 
         // In range → both stay candidates.
         assert_eq!(
-            model_names(&targets_allowed_for_ip(&snap, targets.clone(), "10.1.2.3")),
+            model_names(&targets_allowed_for_ip(
+                &snap,
+                std::borrow::Cow::Owned(targets.clone()),
+                "10.1.2.3"
+            )),
             vec!["restricted", "open"]
         );
         // Out of range → the restricted member drops out, the group still serves.
         assert_eq!(
-            model_names(&targets_allowed_for_ip(&snap, targets, "8.8.8.8")),
+            model_names(&targets_allowed_for_ip(
+                &snap,
+                std::borrow::Cow::Owned(targets),
+                "8.8.8.8"
+            )),
             vec!["open"]
         );
     }
@@ -1080,7 +1103,9 @@ mod tests {
             ("b", Some(vec!["192.168.0.0/16"])),
         ]);
         let targets = vec![tagged("a", &[]), tagged("b", &[])];
-        assert!(targets_allowed_for_ip(&snap, targets, "8.8.8.8").is_empty());
+        assert!(
+            targets_allowed_for_ip(&snap, std::borrow::Cow::Owned(targets), "8.8.8.8").is_empty()
+        );
     }
 
     #[test]
@@ -1090,7 +1115,7 @@ mod tests {
         // was lost must not reach a restricted target.
         let snap = ip_snapshot(&[("restricted", Some(vec!["10.0.0.0/8"]))]);
         let targets = vec![tagged("restricted", &[])];
-        assert!(targets_allowed_for_ip(&snap, targets, "").is_empty());
+        assert!(targets_allowed_for_ip(&snap, std::borrow::Cow::Owned(targets), "").is_empty());
     }
 
     #[test]
@@ -1101,7 +1126,11 @@ mod tests {
         let snap = ip_snapshot(&[("known", None)]);
         let targets = vec![tagged("ghost", &[])];
         assert_eq!(
-            model_names(&targets_allowed_for_ip(&snap, targets, "8.8.8.8")),
+            model_names(&targets_allowed_for_ip(
+                &snap,
+                std::borrow::Cow::Owned(targets),
+                "8.8.8.8"
+            )),
             vec!["ghost"]
         );
     }
@@ -1111,7 +1140,11 @@ mod tests {
         let snap = ip_snapshot(&[("a", None), ("b", None)]);
         let targets = vec![tagged("a", &[]), tagged("b", &[])];
         assert_eq!(
-            model_names(&targets_allowed_for_ip(&snap, targets, "8.8.8.8")),
+            model_names(&targets_allowed_for_ip(
+                &snap,
+                std::borrow::Cow::Owned(targets),
+                "8.8.8.8"
+            )),
             vec!["a", "b"]
         );
     }
@@ -1136,7 +1169,7 @@ mod tests {
             None,
         );
         for _ in 0..5 {
-            let order = reg.pick_targets("v", &routing, None);
+            let order = reg.pick_targets("v", &routing, &routing.targets, None);
             assert_eq!(order, vec!["primary", "secondary", "tertiary"]);
         }
     }
@@ -1155,7 +1188,7 @@ mod tests {
         );
         let mut firsts = Vec::new();
         for _ in 0..6 {
-            let order = reg.pick_targets("v", &routing, None);
+            let order = reg.pick_targets("v", &routing, &routing.targets, None);
             firsts.push(order[0].clone());
         }
         // Two full cycles of a→b→c.
@@ -1171,10 +1204,22 @@ mod tests {
             Some(1),
         );
         // Two distinct virtual models advance independently.
-        assert_eq!(reg.pick_targets("v1", &routing, None)[0], "a");
-        assert_eq!(reg.pick_targets("v2", &routing, None)[0], "a");
-        assert_eq!(reg.pick_targets("v1", &routing, None)[0], "b");
-        assert_eq!(reg.pick_targets("v2", &routing, None)[0], "b");
+        assert_eq!(
+            reg.pick_targets("v1", &routing, &routing.targets, None)[0],
+            "a"
+        );
+        assert_eq!(
+            reg.pick_targets("v2", &routing, &routing.targets, None)[0],
+            "a"
+        );
+        assert_eq!(
+            reg.pick_targets("v1", &routing, &routing.targets, None)[0],
+            "b"
+        );
+        assert_eq!(
+            reg.pick_targets("v2", &routing, &routing.targets, None)[0],
+            "b"
+        );
     }
 
     #[test]
@@ -1190,9 +1235,15 @@ mod tests {
             Some(2),
         );
         // First call starts at a → a, b, c
-        assert_eq!(reg.pick_targets("v", &routing, None), vec!["a", "b", "c"]);
+        assert_eq!(
+            reg.pick_targets("v", &routing, &routing.targets, None),
+            vec!["a", "b", "c"]
+        );
         // Second call starts at b → b, c, a
-        assert_eq!(reg.pick_targets("v", &routing, None), vec!["b", "c", "a"]);
+        assert_eq!(
+            reg.pick_targets("v", &routing, &routing.targets, None),
+            vec!["b", "c", "a"]
+        );
     }
 
     #[test]
@@ -1210,7 +1261,7 @@ mod tests {
         // exactly two attempts, distinct targets, both targets covered.
         // (Aggregate distribution is pinned by the dedicated tests
         // below.)
-        let order = reg.pick_targets("v", &routing, None);
+        let order = reg.pick_targets("v", &routing, &routing.targets, None);
         assert_eq!(order.len(), 2);
         assert!(order.iter().any(|t| t == "a"));
         assert!(order.iter().any(|t| t == "b"));
@@ -1372,7 +1423,7 @@ mod tests {
             vec![RoutingTarget::new("a"), RoutingTarget::new("b")],
             Some(0),
         );
-        let order = reg.pick_targets("v", &routing, None);
+        let order = reg.pick_targets("v", &routing, &routing.targets, None);
         assert_eq!(order, vec!["a"]);
     }
 
@@ -1380,7 +1431,9 @@ mod tests {
     fn empty_targets_yields_empty_order() {
         let reg = RoutingRegistry::new();
         let routing = r(RoutingStrategy::Failover, vec![], None);
-        assert!(reg.pick_targets("v", &routing, None).is_empty());
+        assert!(reg
+            .pick_targets("v", &routing, &routing.targets, None)
+            .is_empty());
     }
 
     #[test]
@@ -1920,7 +1973,7 @@ mod tests {
         .unwrap();
         AttemptModel {
             id: id.to_string(),
-            model,
+            model: std::sync::Arc::new(model),
         }
     }
 
@@ -1938,7 +1991,7 @@ mod tests {
         .unwrap();
         AttemptModel {
             id: id.to_string(),
-            model,
+            model: std::sync::Arc::new(model),
         }
     }
 
@@ -2067,7 +2120,10 @@ mod tests {
         );
         // Ranking needs resolved Models, so pick_targets hands back every
         // target untouched regardless of max_fallbacks.
-        assert_eq!(reg.pick_targets("v", &routing, None), vec!["a", "b", "c"]);
+        assert_eq!(
+            reg.pick_targets("v", &routing, &routing.targets, None),
+            vec!["a", "b", "c"]
+        );
     }
 
     #[test]

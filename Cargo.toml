@@ -82,7 +82,9 @@ rustls-pemfile = "2"
 webpki-roots = "0.26"
 
 # Serialization / validation
-serde = { version = "1", features = ["derive"] }
+# `rc` so `ResourceEntry` can hold its payload behind an `Arc` and still
+# round-trip through etcd and the snapshot cache unchanged.
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 # Collects the paths of fields serde ignored during deserialization —
 # how the etcd loader reports unknown fields from a newer control plane

@@ -84,30 +84,35 @@ pub trait SemanticCacheStore: Send + Sync + 'static {
     ) -> Result<(), CacheError>;
 }
 
-/// Cosine similarity of two equal-length vectors. Returns `0.0` for a
-/// length mismatch or a zero-magnitude vector so a degenerate embedding
-/// can never produce `NaN` (which would poison the max-tracking scan).
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() {
+/// Scale `v` to unit length, so the scan below is a dot product instead of a
+/// cosine: the magnitude of a stored embedding never changes, and the query's
+/// changes once per lookup, so recomputing both norms inside every comparison
+/// is pure repeated work.
+///
+/// A zero-magnitude vector is returned unchanged (all zeros). It then dots to
+/// `0.0` against anything, which is exactly the degenerate answer the cosine
+/// form produced — and never `NaN`, which would poison the max-tracking scan.
+fn unit_vector(v: &[f32]) -> Vec<f32> {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm == 0.0 || !norm.is_finite() {
+        return v.to_vec();
+    }
+    v.iter().map(|x| x / norm).collect()
+}
+
+/// Cosine similarity of two vectors already scaled by [`unit_vector`].
+/// Returns `0.0` on a length mismatch, matching the cosine form.
+fn unit_similarity(query: &[f32], stored: &[f32]) -> f32 {
+    if query.len() != stored.len() {
         return 0.0;
     }
-    let mut dot = 0.0f32;
-    let mut na = 0.0f32;
-    let mut nb = 0.0f32;
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
-    if na == 0.0 || nb == 0.0 {
-        return 0.0;
-    }
-    dot / (na.sqrt() * nb.sqrt())
+    query.iter().zip(stored.iter()).map(|(x, y)| x * y).sum()
 }
 
 struct SemanticEntry {
     scope_fp: String,
     exact_key: String,
+    /// Unit-length (see [`unit_vector`]) so the lookup scan is a dot product.
     embedding: Vec<f32>,
     response: ChatResponse,
     expires_at: Instant,
@@ -162,12 +167,19 @@ impl SemanticCacheStore for MemorySemanticCache {
             return Ok(None);
         }
         let now = Instant::now();
+        // Once per lookup, not once per candidate.
+        let query = unit_vector(embedding);
         let mut best: Option<SemanticHit> = None;
+        // The shard read guard is deliberately held across the scan: DashMap
+        // read guards do not block other readers, so this only contends with
+        // `store`, which runs on upstream misses. Copying the candidates out
+        // first would trade that for one atomic refcount bump per entry on
+        // every lookup — the more frequent operation.
         for entry in &policy.entries {
             if entry.scope_fp != scope_fp || entry.expires_at <= now {
                 continue;
             }
-            let similarity = cosine_similarity(embedding, &entry.embedding);
+            let similarity = unit_similarity(&query, &entry.embedding);
             // `> 0.0` (not just `>= threshold`): 0.0 is the degenerate
             // fold — see the trait docs.
             if similarity >= threshold
@@ -242,7 +254,7 @@ impl SemanticCacheStore for MemorySemanticCache {
         policy.entries.push_back(SemanticEntry {
             scope_fp: scope_fp.to_string(),
             exact_key: exact_key.to_string(),
-            embedding,
+            embedding: unit_vector(&embedding),
             response,
             expires_at: now + ttl,
         });
@@ -255,6 +267,48 @@ impl SemanticCacheStore for MemorySemanticCache {
 
 #[cfg(test)]
 mod tests {
+
+    /// Pre-normalizing at store time must not move any similarity: the
+    /// scan's comparisons, its degenerate cases, and its threshold decisions
+    /// all have to match a from-scratch cosine.
+    #[test]
+    fn unit_scan_matches_cosine_including_degenerate_cases() {
+        fn reference_cosine(a: &[f32], b: &[f32]) -> f32 {
+            if a.len() != b.len() {
+                return 0.0;
+            }
+            let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+            for (x, y) in a.iter().zip(b.iter()) {
+                dot += x * y;
+                na += x * x;
+                nb += y * y;
+            }
+            if na == 0.0 || nb == 0.0 {
+                return 0.0;
+            }
+            dot / (na.sqrt() * nb.sqrt())
+        }
+
+        let cases: &[(&[f32], &[f32])] = &[
+            (&[1.0, 0.0], &[1.0, 0.0]),
+            (&[1.0, 0.0], &[0.0, 1.0]),
+            (&[3.0, 4.0], &[6.0, 8.0]),
+            (&[1.0, 2.0, 3.0], &[-1.0, 0.5, 2.0]),
+            (&[0.0, 0.0], &[1.0, 1.0]),
+            (&[1.0, 1.0], &[0.0, 0.0]),
+            (&[1.0, 2.0], &[1.0, 2.0, 3.0]),
+        ];
+        for (a, b) in cases {
+            let expected = reference_cosine(a, b);
+            let stored = unit_vector(b);
+            let query = unit_vector(a);
+            let actual = unit_similarity(&query, &stored);
+            assert!(
+                (actual - expected).abs() < 1e-6,
+                "cosine drift for {a:?} vs {b:?}: {actual} != {expected}"
+            );
+        }
+    }
     use super::*;
     use aisix_gateway::{ChatMessage, FinishReason, UsageStats};
 
@@ -558,9 +612,12 @@ mod tests {
 
     #[test]
     fn cosine_degenerate_inputs_are_zero_not_nan() {
-        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
-        assert_eq!(cosine_similarity(&[1.0, 2.0, 3.0], &[1.0, 2.0]), 0.0);
-        assert!((cosine_similarity(&[1.0, 1.0], &[5.0, 5.0]) - 1.0).abs() < 1e-6);
-        assert!(!cosine_similarity(&[0.0], &[0.0]).is_nan());
+        fn similarity(a: &[f32], b: &[f32]) -> f32 {
+            unit_similarity(&unit_vector(a), &unit_vector(b))
+        }
+        assert_eq!(similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
+        assert_eq!(similarity(&[1.0, 2.0, 3.0], &[1.0, 2.0]), 0.0);
+        assert!((similarity(&[1.0, 1.0], &[5.0, 5.0]) - 1.0).abs() < 1e-6);
+        assert!(!similarity(&[0.0], &[0.0]).is_nan());
     }
 }

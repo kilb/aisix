@@ -66,56 +66,66 @@ pub const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
 /// transport, never client-wide).
 fn shared_http_client() -> rmcp_reqwest::Client {
     static CLIENT: std::sync::OnceLock<rmcp_reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            let cfg = aisix_gateway::upstream_http::config();
-            let mut b = rmcp_reqwest::Client::builder()
-                .pool_idle_timeout(cfg.pool_idle_timeout)
-                .tcp_keepalive(cfg.tcp_keepalive);
-            if let Some(d) = cfg.connect_timeout {
-                b = b.connect_timeout(d);
-            }
-            if let Some(d) = cfg.tcp_keepalive_interval {
-                b = b.tcp_keepalive_interval(d);
-            }
-            if let Some(n) = cfg.tcp_keepalive_retries {
-                b = b.tcp_keepalive_retries(n);
-            }
-            if let Some(n) = cfg.pool_max_idle_per_host {
-                b = b.pool_max_idle_per_host(n);
-            }
-            if let Some(pem) = &cfg.tls.extra_ca_pem {
-                // Already validated at boot by `TlsSettings::load`; a
-                // failure here would mean rmcp's reqwest disagrees with
-                // ours about the same bytes, which is worth a loud line
-                // rather than a silently untrusting client.
-                match rmcp_reqwest::Certificate::from_pem_bundle(pem) {
-                    Ok(roots) => {
-                        for root in roots {
-                            b = b.add_root_certificate(root);
-                        }
-                    }
-                    Err(e) => tracing::error!(
-                        error = %e,
-                        "upstream.tls.ca_file not applied to MCP upstream connections"
-                    ),
+    CLIENT.get_or_init(|| build_http_client(false)).clone()
+}
+
+/// Build an MCP upstream client from `upstream.*`.
+///
+/// `disable_env_proxy` is for tests only: an egress proxy is a real
+/// deployment shape, so the shared client stays proxy-aware. A dial that
+/// lands on a proxy connects immediately and the wait moves to the proxy,
+/// where `connect_timeout` no longer applies — so a test measuring that
+/// timeout has to opt out of ambient `HTTP_PROXY`.
+fn build_http_client(disable_env_proxy: bool) -> rmcp_reqwest::Client {
+    let cfg = aisix_gateway::upstream_http::config();
+    let mut b = rmcp_reqwest::Client::builder()
+        .pool_idle_timeout(cfg.pool_idle_timeout)
+        .tcp_keepalive(cfg.tcp_keepalive);
+    if let Some(d) = cfg.connect_timeout {
+        b = b.connect_timeout(d);
+    }
+    if let Some(d) = cfg.tcp_keepalive_interval {
+        b = b.tcp_keepalive_interval(d);
+    }
+    if let Some(n) = cfg.tcp_keepalive_retries {
+        b = b.tcp_keepalive_retries(n);
+    }
+    if let Some(n) = cfg.pool_max_idle_per_host {
+        b = b.pool_max_idle_per_host(n);
+    }
+    if let Some(pem) = &cfg.tls.extra_ca_pem {
+        // Already validated at boot by `TlsSettings::load`; a
+        // failure here would mean rmcp's reqwest disagrees with
+        // ours about the same bytes, which is worth a loud line
+        // rather than a silently untrusting client.
+        match rmcp_reqwest::Certificate::from_pem_bundle(pem) {
+            Ok(roots) => {
+                for root in roots {
+                    b = b.add_root_certificate(root);
                 }
             }
-            if let Some(configured) = &cfg.tls.client_identity {
-                match rmcp_reqwest::Identity::from_pem(&configured.joined()) {
-                    Ok(identity) => b = b.identity(identity),
-                    Err(e) => tracing::error!(
-                        error = %e,
-                        "upstream.tls client identity not applied to MCP upstream connections"
-                    ),
-                }
-            }
-            if !cfg.tls.verify {
-                b = b.danger_accept_invalid_certs(true);
-            }
-            b.build().unwrap_or_else(|_| rmcp_reqwest::Client::new())
-        })
-        .clone()
+            Err(e) => tracing::error!(
+                error = %e,
+                "upstream.tls.ca_file not applied to MCP upstream connections"
+            ),
+        }
+    }
+    if let Some(configured) = &cfg.tls.client_identity {
+        match rmcp_reqwest::Identity::from_pem(&configured.joined()) {
+            Ok(identity) => b = b.identity(identity),
+            Err(e) => tracing::error!(
+                error = %e,
+                "upstream.tls client identity not applied to MCP upstream connections"
+            ),
+        }
+    }
+    if !cfg.tls.verify {
+        b = b.danger_accept_invalid_certs(true);
+    }
+    if disable_env_proxy {
+        b = b.no_proxy();
+    }
+    b.build().unwrap_or_else(|_| rmcp_reqwest::Client::new())
 }
 
 /// Header carrying the gateway-held key for `api_key` upstream auth.
@@ -802,18 +812,45 @@ mod tests {
     /// black-hole address; on networks that answer with an immediate
     /// "unreachable" the call fails fast either way — the assertion is
     /// the upper bound, which only the connect timeout guarantees.
+    /// The timing half, made independent of ambient proxy configuration.
+    /// With `HTTP_PROXY` set, reqwest connects to the proxy — which accepts
+    /// immediately — and the wait moves to the proxy, where `connect_timeout`
+    /// does not apply; the dial then runs to the outer deadline and this
+    /// assertion would fail for a reason that is not a product defect.
     #[tokio::test]
-    async fn connect_timeout_bounds_an_unreachable_upstream() {
-        let mut upstream = McpUpstream::new("http://203.0.113.1:81/mcp");
-        upstream.timeout = Duration::from_secs(12);
+    async fn connect_timeout_bounds_a_direct_dial_to_a_black_holed_address() {
+        let client = build_http_client(/* disable_env_proxy */ true);
         let started = std::time::Instant::now();
-        let err = RmcpBridge::connect(&upstream)
+        let err = client
+            .get("http://203.0.113.1:81/mcp")
+            .timeout(Duration::from_secs(12))
+            .send()
             .await
-            .err()
-            .expect("dial to a black-holed upstream must fail");
+            .expect_err("dial to a black-holed upstream must fail");
         assert!(
             started.elapsed() < Duration::from_secs(8),
             "dial was not bounded by connect_timeout: took {:?} ({err})",
+            started.elapsed()
+        );
+    }
+
+    /// The wiring half: `connect` must dial through the shared client rather
+    /// than rmcp's default reqwest, which has no connect timeout at all. Kept
+    /// separate from the timing assertion above so an egress proxy in CI
+    /// cannot turn a real regression into a red test, or hide one behind a
+    /// silent skip.
+    #[tokio::test]
+    async fn connect_fails_fast_for_an_unreachable_upstream() {
+        let mut upstream = McpUpstream::new("http://203.0.113.1:81/mcp");
+        upstream.timeout = Duration::from_secs(12);
+        let started = std::time::Instant::now();
+        assert!(
+            RmcpBridge::connect(&upstream).await.is_err(),
+            "dial to a black-holed upstream must fail"
+        );
+        assert!(
+            started.elapsed() < upstream.timeout + Duration::from_secs(2),
+            "connect must be bounded by the upstream deadline: took {:?}",
             started.elapsed()
         );
     }

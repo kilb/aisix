@@ -137,9 +137,9 @@ impl ModelCaller for ProxyModelCaller<'_> {
         let mut ctx = crate::dispatch::bridge_ctx(
             self.request_id,
             &entry.id,
-            Arc::new(model.clone()),
+            Arc::clone(model),
             &pk_entry.id,
-            Arc::new(pk_entry.value.clone()),
+            Arc::clone(&pk_entry.value),
             Some(self.client),
         );
         if let Some(deadline) =

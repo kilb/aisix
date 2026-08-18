@@ -30,10 +30,13 @@ struct KeyState {
     tpm: FixedWindowCounter,
     tpd: FixedWindowCounter,
     in_flight: u32,
+    /// Unix seconds of the last operation on this bucket, so [`LocalStore::reap`]
+    /// can tell a live key from one whose config row was deleted hours ago.
+    last_touched: u64,
 }
 
 impl KeyState {
-    fn new() -> Self {
+    fn new(now: u64) -> Self {
         Self {
             rps: FixedWindowCounter::new(SECOND_SECS),
             rpm: FixedWindowCounter::new(MINUTE_SECS),
@@ -42,6 +45,7 @@ impl KeyState {
             tpm: FixedWindowCounter::new(MINUTE_SECS),
             tpd: FixedWindowCounter::new(DAY_SECS),
             in_flight: 0,
+            last_touched: now,
         }
     }
 }
@@ -73,13 +77,31 @@ impl<C: Clock> LocalStore<C> {
     }
 
     fn state_for(&self, key: &str) -> Arc<Mutex<KeyState>> {
+        let now = self.clock.unix_secs();
         if let Some(entry) = self.states.get(key) {
             return entry.clone();
         }
         self.states
             .entry(key.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(KeyState::new())))
+            .or_insert_with(|| Arc::new(Mutex::new(KeyState::new(now))))
             .clone()
+    }
+
+    /// Drop buckets untouched for longer than `idle_for`, so state for
+    /// api keys, models and policies the control plane deleted does not
+    /// accrue for the process lifetime. Bucket keys are config-derived, so
+    /// this is bounded by configuration cardinality rather than by traffic —
+    /// a slow leak whose only other remedy is a restart.
+    ///
+    /// A bucket still holding a concurrency permit is never dropped: the
+    /// permit is released from a `Drop`, and releasing into a bucket that no
+    /// longer exists would leave the next reservation seeing a fresh zero.
+    pub fn reap(&self, idle_for: std::time::Duration) {
+        let cutoff = self.clock.unix_secs().saturating_sub(idle_for.as_secs());
+        self.states.retain(|_, state| {
+            let s = state.lock();
+            s.in_flight > 0 || s.last_touched >= cutoff
+        });
     }
 }
 
@@ -185,6 +207,7 @@ impl<C: Clock> RateStore for LocalStore<C> {
         }
 
         s.in_flight += 1;
+        s.last_touched = now;
         Ok(())
     }
 
@@ -195,6 +218,7 @@ impl<C: Clock> RateStore for LocalStore<C> {
         s.tpm.add(now, tokens);
         s.tpd.add(now, tokens);
         s.in_flight = s.in_flight.saturating_sub(1);
+        s.last_touched = now;
     }
 
     fn release(&self, key: &str, _member: &str) {
@@ -204,7 +228,12 @@ impl<C: Clock> RateStore for LocalStore<C> {
         if let Some(state) = self.states.get(key) {
             let mut s = state.lock();
             s.in_flight = s.in_flight.saturating_sub(1);
+            s.last_touched = self.clock.unix_secs();
         }
+    }
+
+    fn reap(&self, idle_for: std::time::Duration) {
+        LocalStore::reap(self, idle_for);
     }
 
     fn add_tokens(&self, key: &str, tokens: u64) {
@@ -216,6 +245,7 @@ impl<C: Clock> RateStore for LocalStore<C> {
         let mut s = state.lock();
         s.tpm.add(now, tokens);
         s.tpd.add(now, tokens);
+        s.last_touched = now;
     }
 
     async fn peek(&self, key: &str, limits: &RateLimit) -> Option<RateLimitStatus> {
@@ -241,5 +271,62 @@ impl<C: Clock> RateStore for LocalStore<C> {
             concurrency_limit: limits.concurrency,
             in_flight,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::TestClock;
+    use std::time::Duration;
+
+    fn limits() -> RateLimit {
+        RateLimit {
+            rpm: Some(10),
+            ..Default::default()
+        }
+    }
+
+    /// Buckets are keyed by config cardinality (api key × model × policy),
+    /// so a long-lived process accumulates state for rows the control plane
+    /// deleted hours ago. A bucket still holding a concurrency permit must
+    /// survive: dropping it would leave the `Drop`-based release
+    /// decrementing a bucket that no longer exists, and the next
+    /// reservation would see a fresh zero.
+    #[tokio::test]
+    async fn reap_drops_idle_buckets_but_never_one_holding_a_permit() {
+        let clock = TestClock::new(1_000);
+        let store = LocalStore::with_clock(clock.clone());
+        let l = limits();
+
+        store.acquire("idle", &l, "m1").await.unwrap();
+        store.release("idle", "m1");
+        store.acquire("busy", &l, "m2").await.unwrap();
+
+        clock.advance(DAY_SECS + 1);
+        store.reap(Duration::from_secs(DAY_SECS));
+
+        assert!(
+            store.peek("idle", &l).await.is_none(),
+            "an idle bucket must be reclaimed"
+        );
+        assert!(
+            store.peek("busy", &l).await.is_some(),
+            "a bucket with a live concurrency permit must be kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn reap_keeps_a_recently_touched_bucket() {
+        let clock = TestClock::new(1_000);
+        let store = LocalStore::with_clock(clock.clone());
+        let l = limits();
+
+        store.acquire("recent", &l, "m1").await.unwrap();
+        store.release("recent", "m1");
+        clock.advance(60);
+        store.reap(Duration::from_secs(DAY_SECS));
+
+        assert!(store.peek("recent", &l).await.is_some());
     }
 }

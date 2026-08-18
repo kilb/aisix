@@ -252,7 +252,11 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     // report through the same partially-compatible channel
                     // as unknown fields — the strict write path rejects
                     // these shapes, stored rows must keep loading.
-                    let stripped = entry.value.strip_kind_inapplicable();
+                    // Sole owner at this point (the entry was just built from
+                    // the raw row), so `make_mut` edits in place rather than
+                    // copying.
+                    let stripped =
+                        std::sync::Arc::make_mut(&mut entry.value).strip_kind_inapplicable();
                     if !stripped.is_empty() {
                         let fields: Vec<String> = stripped
                             .iter()

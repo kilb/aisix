@@ -89,7 +89,7 @@ async fn run_one(
     hub: Arc<Hub>,
     tracker: Arc<ModelRuntimeStatusTracker>,
     id: &str,
-    model: &Model,
+    model: &Arc<Model>,
     cfg: &BackgroundModelCheck,
     request_id: &str,
 ) {
@@ -114,7 +114,7 @@ async fn check_direct_model(
     snapshot: &AisixSnapshot,
     hub: &Hub,
     model_id: &str,
-    model: &Model,
+    model: &Arc<Model>,
     cfg: &BackgroundModelCheck,
     request_id: &str,
 ) -> Result<(), BridgeError> {
@@ -138,9 +138,9 @@ async fn check_direct_model(
     let ctx = dispatch::bridge_ctx(
         request_id,
         model_id,
-        Arc::new(model.clone()),
+        Arc::clone(model),
         &pk_entry.id,
-        Arc::new(pk_entry.value.clone()),
+        Arc::clone(&pk_entry.value),
         None,
     )
     .with_deadline(timeout(cfg));

@@ -62,12 +62,15 @@ const GUARDED_CONTENT_FIELDS: &[&str] = &[
     "response_format",
     "prediction",
     "text",
-    "prompt",
     "system",
     "output_config",
     "output_format",
     "metadata",
     "user",
+    // Inspected as DLP surfaces by the request redactor, so an override that
+    // injects them would add caller-visible content after inspection.
+    "safety_identifier",
+    "prompt_cache_key",
     "query",
     "documents",
 ];

@@ -392,7 +392,7 @@ pub(crate) fn emit_error_usage_event(
         &event,
         None,
         exporters.generation(),
-        exporters.iter().map(|e| &e.value),
+        exporters.iter().map(|e| &*e.value),
     );
 }
 
@@ -438,7 +438,7 @@ pub(crate) fn emit_guardrail_error_usage_event(
         &event,
         None,
         exporters.generation(),
-        exporters.iter().map(|e| &e.value),
+        exporters.iter().map(|e| &*e.value),
     );
 }
 

@@ -9,6 +9,7 @@ authors.workspace = true
 description = "aisix: pluggable guardrails (pre_call / during_call / post_call)"
 
 [dependencies]
+arc-swap.workspace = true
 aisix-core = { path = "../aisix-core" }
 aisix-gateway = { path = "../aisix-gateway" }
 tokio.workspace = true

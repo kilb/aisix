@@ -195,6 +195,25 @@ impl AutoPromptCaching {
     }
 }
 
+/// Lazily-parsed form of [`Model::allowed_cidrs`], so the per-request IP gate
+/// does not re-parse the operator's strings on every check — `routing.rs`
+/// calls it once per target, so a group multiplies the cost.
+///
+/// Cloning deliberately produces an EMPTY cache rather than sharing the
+/// parsed vector. A `Model` is cloned exactly where it may then be edited
+/// (the admin update path, tests), and a parse cache that outlived an edit
+/// would let a security gate answer from the previous allowlist. Rebuilding
+/// costs one parse on the copy's first check; being wrong costs an incorrect
+/// allow or deny.
+#[derive(Debug, Default)]
+pub struct ParsedCidrCache(std::sync::OnceLock<Vec<ipnet::IpNet>>);
+
+impl Clone for ParsedCidrCache {
+    fn clone(&self) -> Self {
+        Self(std::sync::OnceLock::new())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Model {
     /// Operator-facing unique label. Surfaces on `/v1/models`,
@@ -243,6 +262,12 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(inner(length(min = 1)))]
     pub allowed_cidrs: Option<Vec<String>>,
+
+    /// Parse cache for [`Model::allowed_cidrs`]. Never serialized and never
+    /// part of the schema — derived state, rebuilt on demand.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub allowed_cidrs_parsed: ParsedCidrCache,
 
     /// Virtual routing configuration. When set, the gateway selects a target
     /// from `routing.targets` and uses that target model's `provider`,
@@ -392,10 +417,22 @@ impl Model {
             Ok(ip) => ip,
             Err(_) => return false,
         };
-        ranges
-            .iter()
-            .filter_map(|cidr| cidr.parse::<ipnet::IpNet>().ok())
-            .any(|net| net.contains(&ip))
+        // A dual-stack listener reports an IPv4 client as `::ffff:a.b.c.d`,
+        // which no IPv4 CIDR contains — without this the same allowlist
+        // rejects every IPv4 caller on `[::]` while working on `0.0.0.0`.
+        // A no-op for genuine IPv6.
+        let ip = ip.to_canonical();
+        // An entry that does not parse is skipped, which narrows the
+        // allowlist rather than widening it. `validate_model` rejects that
+        // shape on the write path, so this only tolerates rows stored by an
+        // older build.
+        let nets = self.allowed_cidrs_parsed.0.get_or_init(|| {
+            ranges
+                .iter()
+                .filter_map(|cidr| cidr.parse::<ipnet::IpNet>().ok())
+                .collect()
+        });
+        nets.iter().any(|net| net.contains(&ip))
     }
 }
 
@@ -677,6 +714,33 @@ mod tests {
         );
     }
 
+    /// The parse cache must never outlive the strings it was built from: a
+    /// stale allowlist on a security gate is worse than re-parsing.
+    #[test]
+    fn ip_allowed_cache_cannot_go_stale_across_a_mutated_clone() {
+        fn model_with(cidrs: &[&str]) -> Model {
+            let mut m: Model = serde_json::from_str(sample_json()).unwrap();
+            m.allowed_cidrs = Some(cidrs.iter().map(|c| (*c).to_string()).collect());
+            m
+        }
+
+        let original = model_with(&["10.0.0.0/8"]);
+        assert!(original.ip_allowed("10.1.2.3"));
+        assert!(!original.ip_allowed("192.168.1.5"));
+
+        // Warm cache, then clone and point the copy at a different range.
+        let mut changed = original.clone();
+        changed.allowed_cidrs = Some(vec!["192.168.1.0/24".to_string()]);
+        assert!(
+            changed.ip_allowed("192.168.1.5"),
+            "the clone must honour its own allowed_cidrs, not the original's cache"
+        );
+        assert!(!changed.ip_allowed("10.1.2.3"));
+
+        // The original is unaffected.
+        assert!(original.ip_allowed("10.1.2.3"));
+    }
+
     #[test]
     fn ip_allowed_matrix() {
         fn model_with(cidrs: Option<Vec<&str>>) -> Model {
@@ -699,6 +763,12 @@ mod tests {
         assert!(v4.ip_allowed("192.168.1.42"));
         assert!(!v4.ip_allowed("114.114.114.114"));
         assert!(!v4.ip_allowed("192.168.2.1"));
+
+        // Dual-stack listener: an IPv4 client arrives as `::ffff:a.b.c.d`,
+        // which must match the operator's IPv4 CIDR rather than 403.
+        assert!(v4.ip_allowed("::ffff:10.1.2.3"));
+        assert!(!v4.ip_allowed("::ffff:114.114.114.114"));
+        assert!(model_with(Some(vec!["0.0.0.0/0"])).ip_allowed("::ffff:1.2.3.4"));
 
         // Fail closed: a restriction set but the client IP is empty/garbage.
         assert!(!v4.ip_allowed(""));

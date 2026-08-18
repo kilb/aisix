@@ -2012,7 +2012,7 @@ fn emit_submit_usage_event(
         &event,
         None,
         exporters.generation(),
-        exporters.iter().map(|e| &e.value),
+        exporters.iter().map(|e| &*e.value),
     );
 }
 

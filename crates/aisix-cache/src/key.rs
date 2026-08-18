@@ -5,13 +5,76 @@
 //! id, deadlines, the caller's ApiKey, custom headers) is excluded so
 //! two callers asking the same question hit the same entry.
 //!
-//! Hash function is `std::hash::DefaultHasher` (SipHash-1-3, u64). For an
-//! in-memory exact-match cache that's fine: collisions over the bounded
-//! request space are exceedingly rare, and a stronger hash would be a
-//! single-line drop-in if we ever need it.
+//! The fingerprint is the low 128 bits of SHA-256 over the hashed fields.
+//! Two properties matter and neither is satisfied by `DefaultHasher`:
+//!
+//! - **Version stability.** Rust documents `DefaultHasher`'s algorithm as
+//!   unspecified across releases. The Redis backend is shared between
+//!   replicas and persists, so a rolling upgrade that crossed a change in
+//!   that implementation would have replicas computing different keys for
+//!   identical requests — the hit rate collapses, and nothing distinguishes
+//!   that from a cold cache.
+//! - **Collision margin.** Neither backend stores the originating key, so a
+//!   lookup that lands on an entry serves it. Under `scope: env` entries are
+//!   shared across callers, where a 64-bit collision means one caller
+//!   receives another's completion. 128 bits puts that out of reach.
+//!
+//! Integer fields are fed little-endian rather than native-endian so the
+//! fingerprint does not depend on the host's byte order either.
 
 use aisix_gateway::{ChatFormat, ChatMessage, Role};
+use sha2::{Digest, Sha256};
 use std::hash::{Hash, Hasher};
+
+/// [`Hasher`] adapter over SHA-256, used only to derive cache fingerprints.
+///
+/// The integer writes are pinned little-endian; the `Hasher` defaults use
+/// native-endian, which would make the fingerprint host-dependent for a
+/// cache shared across machines.
+#[derive(Default)]
+struct FingerprintHasher {
+    digest: Sha256,
+}
+
+impl FingerprintHasher {
+    /// Low 128 bits of the digest, hex-encoded.
+    fn finalize_hex(self) -> String {
+        let out = self.digest.finalize();
+        out[..16]
+            .iter()
+            .fold(String::with_capacity(32), |mut acc, b| {
+                use std::fmt::Write;
+                let _ = write!(acc, "{b:02x}");
+                acc
+            })
+    }
+}
+
+macro_rules! write_le {
+    ($($method:ident: $ty:ty),* $(,)?) => {
+        $(fn $method(&mut self, value: $ty) { self.digest.update(value.to_le_bytes()); })*
+    };
+}
+
+impl Hasher for FingerprintHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        self.digest.update(bytes);
+    }
+
+    /// Required by the trait and deliberately unused: the fingerprint is read
+    /// through [`FingerprintHasher::finalize_hex`], which keeps 128 bits.
+    fn finish(&self) -> u64 {
+        let out = self.digest.clone().finalize();
+        u64::from_le_bytes(out[..8].try_into().expect("sha256 yields 32 bytes"))
+    }
+
+    write_le! {
+        write_u8: u8, write_u16: u16, write_u32: u32, write_u64: u64,
+        write_u128: u128, write_usize: usize,
+        write_i8: i8, write_i16: i16, write_i32: i32, write_i64: i64,
+        write_i128: i128, write_isize: isize,
+    }
+}
 
 /// Stable fingerprint of a chat request — the inputs to the upstream call.
 /// We hash this struct (not the whole `ChatFormat`) so caching policy is
@@ -87,11 +150,12 @@ impl CacheKey {
         self
     }
 
-    /// Hex-encoded u64 hash, used as the cache backend's lookup key.
+    /// Hex-encoded 128-bit fingerprint, used as the cache backend's lookup
+    /// key. See the module docs for why it is not `DefaultHasher`.
     pub fn fingerprint(&self) -> String {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut h = FingerprintHasher::default();
         self.hash(&mut h);
-        format!("{:016x}", h.finish())
+        h.finalize_hex()
     }
 
     /// Fingerprint of everything EXCEPT the messages — the semantic
@@ -101,9 +165,9 @@ impl CacheKey {
     /// embedding similarity. This is what keeps a tool-calling request
     /// from ever being answered by a similar-but-toolless entry.
     pub fn scope_fingerprint(&self) -> String {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut h = FingerprintHasher::default();
         self.hash_scope(&mut h);
-        format!("{:016x}", h.finish())
+        h.finalize_hex()
     }
 
     /// Hash the non-message fields. Shared by [`Hash`] and
@@ -300,6 +364,53 @@ fn quantise_milli(v: f32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// The Redis backend is shared and persistent, so the fingerprint must be
+    /// stable by construction — not merely stable within one build. Rust
+    /// documents `DefaultHasher`'s algorithm as unspecified across releases;
+    /// replicas on either side of a toolchain bump would then compute
+    /// different keys for identical requests and the hit rate would collapse
+    /// with nothing to distinguish it from a cold cache.
+    #[test]
+    fn fingerprint_is_128_bit_and_endian_independent() {
+        let key = CacheKey {
+            model: "gpt-4o".into(),
+            messages: vec![("user".into(), "hello".into())],
+            temperature_milli: Some(700),
+            top_p_milli: None,
+            max_tokens: Some(256),
+            extras: vec![("seed".into(), "42".into())],
+            policy_id: "policy-1".into(),
+            purge_generation: 3,
+            scope_api_key: Some("key-1".into()),
+        };
+
+        let fp = key.fingerprint();
+        assert_eq!(fp.len(), 32, "128 bits of hex, got {fp}");
+        // Characterization pin: the fingerprint format is a wire contract with
+        // every entry already in a shared Redis. If a change here is
+        // intentional, updating these constants is the moment to note in the
+        // release that the existing cache becomes unreachable (a flush, not a
+        // correctness event).
+        assert_eq!(fp, "9906d6c9018861f530d1b8e30d488f1d");
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(fp, key.fingerprint(), "must be deterministic");
+
+        let scope = key.scope_fingerprint();
+        assert_eq!(scope.len(), 32);
+        assert_eq!(scope, "9b5385c3cfa507a7d69286d4cbaab23a");
+        assert_ne!(scope, fp, "the scope fingerprint excludes the messages");
+
+        // Distinct requests stay distinct.
+        let mut other = key.clone();
+        other.messages = vec![("user".into(), "hello!".into())];
+        assert_ne!(other.fingerprint(), fp);
+        assert_eq!(
+            other.scope_fingerprint(),
+            scope,
+            "only the messages changed"
+        );
+    }
     use super::*;
 
     fn req(model: &str, messages: Vec<ChatMessage>, temp: Option<f32>) -> ChatFormat {
@@ -418,10 +529,10 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_is_16_hex_chars() {
+    fn fingerprint_is_32_hex_chars() {
         let f = req("m", vec![ChatMessage::user("hi")], None);
         let fp = CacheKey::from_request(&f).fingerprint();
-        assert_eq!(fp.len(), 16);
+        assert_eq!(fp.len(), 32, "128 bits — see the module docs");
         assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
     }
 

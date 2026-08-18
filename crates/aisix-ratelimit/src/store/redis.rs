@@ -68,10 +68,20 @@ pub const DEFAULT_CONC_TTL_SECS: u64 = 300;
 /// expire a hair before its window mathematically closes.
 pub const DEFAULT_GRACE_SECS: u64 = 5;
 /// Post-stream accounting runs from synchronous stream-finalization callbacks.
-/// Bound Redis work so a half-open server cannot pin an executor worker.
+/// Bound Redis work so a half-open server cannot pin the worker's own runtime.
 const POST_STREAM_REDIS_TIMEOUT: Duration = Duration::from_secs(1);
-/// Give the worker a small margin to deliver its timeout result.
-const POST_STREAM_ACK_TIMEOUT: Duration = Duration::from_millis(1_250);
+/// Depth of the post-stream accounting queue.
+///
+/// Bounded on purpose. Token accounting is after-the-fact billing and must
+/// never back-pressure a request, so the serving path offers an update and
+/// returns; if Redis is wedged long enough to fill this queue the update is
+/// shed with a warning rather than stalling the stream-completion callback —
+/// which runs on the serving thread, and in thread-per-core mode that thread
+/// is the whole core's event loop.
+const POST_STREAM_QUEUE_DEPTH: usize = 8192;
+/// How long `connect` waits for the accounting worker to report its Redis
+/// connection. Boot-time only — no request path ever waits on this.
+const POST_STREAM_WORKER_READY_TIMEOUT: Duration = Duration::from_millis(1_250);
 
 // Result codes returned by the acquire script's first element.
 const CODE_OK: i64 = 0;
@@ -232,7 +242,7 @@ return {rpm, tpm, inflight, 60 - (now % 60)}
 
 pub struct RedisStore {
     conn: RedisConn,
-    post_stream_tx: tokio::sync::mpsc::UnboundedSender<PostStreamTokenAdd>,
+    post_stream_tx: tokio::sync::mpsc::Sender<PostStreamTokenAdd>,
     prefix: String,
     conc_ttl: u64,
     grace: u64,
@@ -241,12 +251,32 @@ pub struct RedisStore {
     /// One-shot guard so the degradation warning is logged once, not per
     /// request, while Redis stays down.
     degraded_logged: AtomicBool,
+    shed_logged: AtomicBool,
 }
 
 struct PostStreamTokenAdd {
     prefix: String,
     tokens: u64,
-    ack: std::sync::mpsc::SyncSender<Result<(), redis::RedisError>>,
+}
+
+/// What happened to one update offered to the accounting queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Enqueued {
+    Accepted,
+    /// Queue full or worker gone. Dropped deliberately: the request path
+    /// never waits on billing.
+    Dropped,
+}
+
+/// Offer one post-stream update to the worker without ever blocking.
+fn offer_post_stream(
+    tx: &tokio::sync::mpsc::Sender<PostStreamTokenAdd>,
+    command: PostStreamTokenAdd,
+) -> Enqueued {
+    match tx.try_send(command) {
+        Ok(()) => Enqueued::Accepted,
+        Err(_) => Enqueued::Dropped,
+    }
 }
 
 impl std::fmt::Debug for RedisStore {
@@ -273,6 +303,7 @@ impl RedisStore {
             grace: DEFAULT_GRACE_SECS,
             local: Arc::new(LocalStore::new()),
             degraded_logged: AtomicBool::new(false),
+            shed_logged: AtomicBool::new(false),
         })
     }
 
@@ -303,6 +334,22 @@ impl RedisStore {
     }
 
     /// Log the fail-open transition once per outage.
+    /// Report shed post-stream updates. Deliberately not an error on the
+    /// request path: billing is decoupled, so a wedged Redis costs accuracy
+    /// on this replica's shared counters, never request latency. Logged once
+    /// per outage so it cannot be mistaken for silence.
+    fn note_shed_post_stream(&self, dropped: usize) {
+        if !self.shed_logged.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                target: "aisix::ratelimit",
+                dropped,
+                queue_depth = POST_STREAM_QUEUE_DEPTH,
+                "post-stream token accounting queue full; shedding updates rather than \
+                 delaying requests (shared token counters undercount until it drains)"
+            );
+        }
+    }
+
     fn warn_degraded(&self, op: &str, err: &redis::RedisError) {
         if !self.degraded_logged.swap(true, Ordering::Relaxed) {
             tracing::warn!(
@@ -319,6 +366,7 @@ impl RedisStore {
     /// Mark Redis healthy again after a successful op (re-arms the warn).
     fn mark_ok(&self) {
         self.degraded_logged.store(false, Ordering::Relaxed);
+        self.shed_logged.store(false, Ordering::Relaxed);
     }
 }
 
@@ -333,12 +381,12 @@ fn post_stream_worker_error(detail: impl Into<String>) -> redis::RedisError {
 fn spawn_post_stream_worker(
     cfg: RedisConnConfig,
     grace: u64,
-) -> Result<tokio::sync::mpsc::UnboundedSender<PostStreamTokenAdd>, redis::RedisError> {
+) -> Result<tokio::sync::mpsc::Sender<PostStreamTokenAdd>, redis::RedisError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|err| post_stream_worker_error(err.to_string()))?;
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PostStreamTokenAdd>();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<PostStreamTokenAdd>(POST_STREAM_QUEUE_DEPTH);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("aisix-ratelimit-commit".to_string())
@@ -382,14 +430,23 @@ fn spawn_post_stream_worker(
                                 ))
                             }
                         };
-                        let _ = command.ack.send(result);
+                        // Nobody is waiting on this: report it here or it is
+                        // invisible.
+                        if let Err(err) = result {
+                            tracing::warn!(
+                                target: "aisix::ratelimit",
+                                error = %err,
+                                "post-stream token accounting failed; the local counter still \
+                                 reflects it but this replica's Redis total does not"
+                            );
+                        }
                     });
                 }
             });
         })
         .map_err(|err| post_stream_worker_error(err.to_string()))?;
     match ready_rx
-        .recv_timeout(POST_STREAM_ACK_TIMEOUT)
+        .recv_timeout(POST_STREAM_WORKER_READY_TIMEOUT)
         .unwrap_or_else(|err| Err(post_stream_worker_error(err.to_string())))
     {
         Ok(()) => Ok(tx),
@@ -427,14 +484,6 @@ fn push_dims(args: &mut Vec<String>, dims: &[Dim]) {
         args.push(d.window_secs.to_string());
         args.push(d.limit.to_string());
     }
-}
-
-fn wait_for_post_stream_ack(
-    ack_rx: std::sync::mpsc::Receiver<Result<(), redis::RedisError>>,
-) -> Result<(), redis::RedisError> {
-    ack_rx
-        .recv_timeout(POST_STREAM_ACK_TIMEOUT)
-        .unwrap_or_else(|err| Err(post_stream_worker_error(err.to_string())))
 }
 
 #[async_trait]
@@ -580,32 +629,44 @@ impl RateStore for RedisStore {
         }
     }
 
+    /// Redis expires its own buckets server-side; the local fallback map
+    /// this store keeps for outages does not, so reap that.
+    fn reap(&self, idle_for: std::time::Duration) {
+        self.local.reap(idle_for);
+    }
+
     fn add_tokens(&self, key: &str, tokens: u64) {
-        if tokens == 0 {
+        let keys = [key.to_owned()];
+        self.add_tokens_all(&keys, tokens);
+    }
+
+    fn add_tokens_all(&self, keys: &[String], tokens: u64) {
+        if tokens == 0 || keys.is_empty() {
             return;
         }
-        // Record locally too so the count is right if a later request falls
-        // back during an outage.
-        self.local.add_tokens(key, tokens);
-        let prefix = self.bucket_prefix(key);
-        // The stream completion callbacks are synchronous, including on the
-        // production thread-per-core current-thread runtimes. Execute Redis I/O
-        // on the store-owned runtime and wait for its acknowledgement so the
-        // terminal callback cannot return before another replica's acquire can
-        // observe the token update.
-        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
-        let send_result = self.post_stream_tx.send(PostStreamTokenAdd {
-            prefix,
-            tokens,
-            ack: ack_tx,
-        });
-        let outcome = match send_result {
-            Ok(()) => wait_for_post_stream_ack(ack_rx),
-            Err(err) => Err(post_stream_worker_error(err.to_string())),
-        };
-        match outcome {
-            Ok(()) => self.mark_ok(),
-            Err(err) => self.warn_degraded("add_tokens", &err),
+        // Post-hoc billing, fully decoupled from the request: hand every
+        // layer's update to the store-owned worker and return. Nothing here
+        // waits on Redis, so a slow or half-open server cannot add latency to
+        // the stream that just finished — nor to any other request sharing
+        // this thread, which in thread-per-core mode is the whole core.
+        let mut shed = 0usize;
+        for key in keys {
+            // Record locally too so the count is right if a later request
+            // falls back during an outage.
+            self.local.add_tokens(key, tokens);
+            if offer_post_stream(
+                &self.post_stream_tx,
+                PostStreamTokenAdd {
+                    prefix: self.bucket_prefix(key),
+                    tokens,
+                },
+            ) == Enqueued::Dropped
+            {
+                shed += 1;
+            }
+        }
+        if shed > 0 {
+            self.note_shed_post_stream(shed);
         }
     }
 
@@ -654,24 +715,39 @@ impl RateStore for RedisStore {
 mod tests {
     use super::*;
 
-    fn assert_ack_wait_is_bounded() {
-        let (_ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+    fn add(prefix: &str) -> PostStreamTokenAdd {
+        PostStreamTokenAdd {
+            prefix: prefix.to_string(),
+            tokens: 10,
+        }
+    }
+
+    /// Billing is after-the-fact: offering an update must return at once
+    /// whatever the worker or Redis is doing. A full queue sheds the update
+    /// rather than making the serving thread wait for it.
+    #[test]
+    fn offering_post_stream_work_never_blocks_the_caller() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(2);
+        assert_eq!(offer_post_stream(&tx, add("a")), Enqueued::Accepted);
+        assert_eq!(offer_post_stream(&tx, add("b")), Enqueued::Accepted);
+
         let started = std::time::Instant::now();
-        let result = wait_for_post_stream_ack(ack_rx);
-        assert!(result.is_err());
+        assert_eq!(
+            offer_post_stream(&tx, add("c")),
+            Enqueued::Dropped,
+            "a full queue must shed, not wait"
+        );
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "post-stream accounting must fail open within its fixed deadline"
+            started.elapsed() < Duration::from_millis(50),
+            "the request path must never wait on billing, waited {:?}",
+            started.elapsed()
         );
     }
 
-    #[tokio::test]
-    async fn post_stream_ack_wait_is_bounded_on_current_thread_runtime() {
-        assert_ack_wait_is_bounded();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn post_stream_ack_wait_is_bounded_on_multi_thread_runtime() {
-        assert_ack_wait_is_bounded();
+    #[test]
+    fn offering_post_stream_work_sheds_when_the_worker_is_gone() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        drop(rx);
+        assert_eq!(offer_post_stream(&tx, add("a")), Enqueued::Dropped);
     }
 }

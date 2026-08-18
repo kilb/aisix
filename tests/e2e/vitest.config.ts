@@ -16,7 +16,12 @@ export default defineConfig({
       forks: { singleFork: false, minForks: 1, maxForks: 2 },
     },
     testTimeout: 60_000,
-    hookTimeout: 60_000,
+    // Above (spawns per hook × READY_TIMEOUT_MS in `harness/app.ts`): a few
+    // specs stand up five apps in one `beforeAll`, and each spawn carries its
+    // own bind budget. Too low here turns a slow cold start into a hook
+    // timeout, which reports as the hook failing rather than as the spawn
+    // that was actually slow.
+    hookTimeout: 150_000,
     globals: false,
     coverage: {
       provider: "v8",

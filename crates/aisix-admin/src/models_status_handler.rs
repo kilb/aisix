@@ -70,7 +70,7 @@ pub(crate) fn render_models_status(
             if let Some(kind) = virtual_kind {
                 ModelStatusView {
                     id: entry.id,
-                    display_name: entry.value.display_name,
+                    display_name: entry.value.display_name.clone(),
                     kind,
                     details: RuntimeStatusSnapshot {
                         status: RuntimeStatus::NotApplicable,
@@ -90,7 +90,7 @@ pub(crate) fn render_models_status(
                     .unwrap_or_default();
                 ModelStatusView {
                     id: entry.id,
-                    display_name: entry.value.display_name,
+                    display_name: entry.value.display_name.clone(),
                     kind: ModelKind::Direct,
                     details,
                 }

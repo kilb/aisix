@@ -221,9 +221,39 @@ pub fn validate(validator: &Validator, value: &Value) -> Result<(), SchemaError>
 /// AND an independent violation keeps the original error, which points
 /// at the other problem and is the more useful of the two — replacing it
 /// would leave `path` and `message` describing different fields.
+/// Reject an `allowed_cidrs` entry that is not a CIDR.
+///
+/// `Model::ip_allowed` skips anything that fails to parse, which fails
+/// closed — but silently: a typo narrows the allowlist while the row keeps
+/// working, and nothing surfaces it. JSON Schema cannot express "parses as an
+/// IpNet", so the check lives here, on the write path only. The lenient load
+/// path deliberately does not call this: a row already written by an older
+/// build must still load, and `ip_allowed` still refuses to honour the
+/// malformed entry.
+fn validate_allowed_cidrs(value: &Value) -> Result<(), SchemaError> {
+    let Some(entries) = value.get("allowed_cidrs").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (index, entry) in entries.iter().enumerate() {
+        let malformed = match entry.as_str() {
+            Some(text) => text.parse::<ipnet::IpNet>().is_err(),
+            None => true,
+        };
+        if malformed {
+            return Err(SchemaError {
+                path: format!("/allowed_cidrs/{index}"),
+                message: "must be an IPv4 or IPv6 CIDR, for example `10.0.0.0/8` or \
+                          `2001:db8::/32`"
+                    .to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_model(value: &Value) -> Result<(), SchemaError> {
     let err = match validate(&SCHEMAS.model, value) {
-        Ok(()) => return Ok(()),
+        Ok(()) => return validate_allowed_cidrs(value),
         Err(err) => err,
     };
     let Ok(mut model) = serde_json::from_value::<Model>(value.clone()) else {
@@ -1451,6 +1481,34 @@ pub fn guardrail_attachment_root_schema() -> Value {
 
 #[cfg(test)]
 mod tests {
+
+    /// A typo in `allowed_cidrs` silently narrows the allowlist: `ip_allowed`
+    /// skips anything that does not parse, so the row keeps working while
+    /// quietly rejecting the range the operator meant to permit. The write
+    /// path must reject it instead. (Loads stay lenient — a row already in
+    /// etcd must still load.)
+    #[test]
+    fn write_path_rejects_a_malformed_allowed_cidr() {
+        let mut doc = serde_json::json!({
+            "display_name": "m",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "pk-1",
+            "allowed_cidrs": ["10.0.0.0/8", "192.168.1.0/33"]
+        });
+        let err = validate_model(&doc).expect_err("a /33 prefix is not a CIDR");
+        assert!(err.path.contains("allowed_cidrs"), "path: {}", err.path);
+
+        doc["allowed_cidrs"] = serde_json::json!(["10.0.0.0/8", "not-a-cidr"]);
+        assert!(validate_model(&doc).is_err());
+
+        doc["allowed_cidrs"] = serde_json::json!(["10.0.0.0/8", "2001:db8::/32"]);
+        validate_model(&doc).expect("well-formed v4 and v6 CIDRs are accepted");
+
+        // Lenient load path keeps accepting what is already stored.
+        doc["allowed_cidrs"] = serde_json::json!(["192.168.1.0/33"]);
+        validate_model_lenient(&doc).expect("stored rows must still load");
+    }
     use super::*;
     use serde_json::json;
 

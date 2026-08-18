@@ -651,7 +651,7 @@ async fn multipart_dispatch(
             .observability_exporters
             .entries()
             .iter()
-            .map(|e| &e.value),
+            .map(|e| &*e.value),
     );
     let captured_prompt = content_cap.map(|_| {
         use sha2::Digest;
@@ -1147,7 +1147,7 @@ async fn speech_dispatch(
             .observability_exporters
             .entries()
             .iter()
-            .map(|e| &e.value),
+            .map(|e| &*e.value),
     )
     .filter(|_| input_capture_safe)
     .map(|cap| {
@@ -1579,7 +1579,7 @@ fn emit_usage_event(
         &event,
         content,
         exporters.generation(),
-        exporters.iter().map(|e| &e.value),
+        exporters.iter().map(|e| &*e.value),
     );
     // Speech (TTS) reports no tokens at all, so this is a no-op there; the
     // transcription routes report them when the model supplies a usage block.

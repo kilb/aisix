@@ -609,7 +609,7 @@ fn emit_job_usage_event(
         &event,
         None,
         exporters.generation(),
-        exporters.iter().map(|e| &e.value),
+        exporters.iter().map(|e| &*e.value),
     );
 }
 
@@ -1690,7 +1690,12 @@ fn maybe_attribute_batch(
         tracing::warn!(batch_id = %raw_batch_id, "batch output_file_id failed charset guard; skipping attribution");
         return;
     }
-    if !state.billed_batches.insert(raw_batch_id.to_string()) {
+    if !crate::state::remember_billed_batch(
+        &state.billed_batches,
+        raw_batch_id,
+        std::time::Instant::now(),
+        crate::state::BILLED_BATCH_DEDUP_WINDOW,
+    ) {
         return; // already attributed by this process
     }
 
@@ -1862,7 +1867,7 @@ async fn attribute_batch_usage(
             &event,
             None,
             exporters.generation(),
-            exporters.iter().map(|e| &e.value),
+            exporters.iter().map(|e| &*e.value),
         );
         tracing::info!(
             batch_id = %raw_batch_id,

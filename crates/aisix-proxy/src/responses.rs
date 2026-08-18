@@ -382,7 +382,23 @@ pub async fn responses(
                     );
                 }
             }
-            success.response
+            // Same window the OpenAI SDK reads on /v1/chat/completions, so a
+            // Codex client driving /v1/responses can schedule back-off from
+            // real numbers instead of blind-retrying into a 429.
+            let mut response = success.response;
+            let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
+            crate::request_metrics::publish_rate_limit_window(
+                &state.metrics,
+                &state.limiter,
+                &snapshot,
+                &api_key_id,
+                &rl_limits,
+                &model_name,
+                &success.upstream_model,
+                &mut response,
+            )
+            .await;
+            response
         }
         Err(ResponsesDispatchError { err, routing }) => {
             let status = err.status().as_u16();
@@ -440,7 +456,7 @@ pub async fn responses(
                         .observability_exporters
                         .entries()
                         .iter()
-                        .map(|e| &e.value),
+                        .map(|e| &*e.value),
                 )
                 .map(|cap| {
                     CapturedContent::new(
@@ -1071,7 +1087,7 @@ async fn responses_to_target(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     body: &Value,
-    model: &aisix_core::Model,
+    model: &Arc<aisix_core::Model>,
     model_id: &str,
     // Deadlines resolved by the caller across target → group → deployment
     // default (`routing::effective_timeouts`); this fn only applies them.
@@ -1119,7 +1135,7 @@ async fn responses_to_target(
             .observability_exporters
             .entries()
             .iter()
-            .map(|e| &e.value),
+            .map(|e| &*e.value),
     );
     let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
     let mut body = body.clone();
@@ -1833,9 +1849,7 @@ async fn responses_to_target(
                     usage.cache_creation_tokens,
                     usage.cache_read_tokens,
                 );
-                for key in &post_stream_keys {
-                    limiter_c.add_tokens_post_stream(key, streamed_tokens);
-                }
+                limiter_c.add_tokens_post_stream_all(&post_stream_keys, streamed_tokens);
                 drop(stream_hold);
                 // least_busy: stream over — this target is no longer
                 // in-flight.
@@ -2125,7 +2139,7 @@ async fn responses_cross_provider_to_target(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     body: &Value,
-    model: &aisix_core::Model,
+    model: &Arc<aisix_core::Model>,
     model_id: &str,
     // Deadlines resolved by the caller across target → group → deployment
     // default (`routing::effective_timeouts`); this fn only applies them.
@@ -2165,7 +2179,7 @@ async fn responses_cross_provider_to_target(
             .observability_exporters
             .entries()
             .iter()
-            .map(|e| &e.value),
+            .map(|e| &*e.value),
     );
     let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
 
@@ -2192,9 +2206,9 @@ async fn responses_cross_provider_to_target(
     let mut ctx = crate::dispatch::bridge_ctx(
         request_id,
         model_id,
-        Arc::new(model.clone()),
+        Arc::clone(model),
         &provider_key_id,
-        Arc::new(pk_entry.value.clone()),
+        Arc::clone(&pk_entry.value),
         Some(client_ctx),
     );
     let connect_deadline = if is_stream {
@@ -2356,9 +2370,7 @@ async fn responses_cross_provider_to_target(
                     comp.cache_creation_tokens,
                     comp.cache_read_tokens,
                 );
-                for key in &post_stream_keys {
-                    limiter_c.add_tokens_post_stream(key, streamed_tokens);
-                }
+                limiter_c.add_tokens_post_stream_all(&post_stream_keys, streamed_tokens);
                 drop(stream_hold);
                 // least_busy: stream over — this target is no longer
                 // in-flight.
@@ -3702,7 +3714,7 @@ fn emit_usage_event(
         &event,
         content,
         exporters.generation(),
-        exporters.iter().map(|e| &e.value),
+        exporters.iter().map(|e| &*e.value),
     );
     // AISIX-Cloud#1044: token volume by inbound client type × model. Codex
     // traffic arrives on /v1/responses, so leaving this endpoint out of the
@@ -3804,7 +3816,7 @@ fn emit_zero_token_event(
         &event,
         content.as_ref(),
         exporters.generation(),
-        exporters.iter().map(|e| &e.value),
+        exporters.iter().map(|e| &*e.value),
     );
 }
 

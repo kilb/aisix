@@ -436,9 +436,9 @@ pub(crate) async fn embed_texts(
         let base = crate::dispatch::bridge_ctx(
             request_id,
             &embed_entry.id,
-            Arc::new(model.clone()),
+            Arc::clone(model),
             &pk_entry.id,
-            Arc::new(pk_entry.value.clone()),
+            Arc::clone(&pk_entry.value),
             None,
         );
         match timeout {

@@ -94,7 +94,7 @@ describe("cache scenarios e2e: different prompt → miss", () => {
 
     await waitConfigPropagation(async () => {
       try {
-        const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+        const res = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
           method: "POST",
           headers: {
             authorization: `Bearer ${CALLER_PLAINTEXT}`,

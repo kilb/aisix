@@ -57,7 +57,11 @@ impl From<ResourceEntry<ApiKey>> for PublicApiKeyEntry {
     fn from(value: ResourceEntry<ApiKey>) -> Self {
         Self {
             id: value.id,
-            value: PublicApiKey::from(value.value),
+            // Admin read path (cold): unwrap the shared row into an owned
+            // copy for the public projection.
+            value: PublicApiKey::from(
+                std::sync::Arc::try_unwrap(value.value).unwrap_or_else(|shared| (*shared).clone()),
+            ),
             revision: value.revision,
         }
     }

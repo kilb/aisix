@@ -382,6 +382,11 @@ fn select_managed_boot_path(bundle_on_disk: bool, bundle_provided: bool) -> Mana
     }
 }
 
+/// How long a rate-limit bucket may sit untouched before
+/// [`aisix_ratelimit::Limiter::reap`] reclaims it. One day plus a margin, so
+/// it can never drop a bucket whose daily window is still open.
+const RATE_LIMIT_BUCKET_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60 + 300);
+
 async fn run_metrics_upkeep<F>(mut cancel: watch::Receiver<bool>, period: Duration, upkeep: F)
 where
     F: Fn(),
@@ -771,6 +776,19 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             cancel_rx.clone(),
             Duration::from_secs(5),
             move || metrics.run_upkeep(),
+        ))
+    };
+    // Rate-limit buckets are keyed by configuration (api key × model ×
+    // policy), so a long-lived process holds state for rows the control
+    // plane deleted unless something reclaims it. The idle threshold has to
+    // exceed the widest window (rpd/tpd, one day): a bucket untouched for
+    // longer than that has already rolled and carries nothing worth keeping.
+    let ratelimit_upkeep_task = {
+        let limiter = limiter.clone();
+        tokio::spawn(run_metrics_upkeep(
+            cancel_rx.clone(),
+            Duration::from_secs(300),
+            move || limiter.reap(RATE_LIMIT_BUCKET_IDLE_TTL),
         ))
     };
     // Cache backends (#519 B.8). The memory cache is always built
@@ -1171,6 +1189,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         let _ = task.await;
     }
     let _ = metrics_upkeep_task.await;
+    let _ = ratelimit_upkeep_task.await;
     let _ = background_check_task.await;
     tracing::info!("aisix shut down cleanly");
     Ok(())

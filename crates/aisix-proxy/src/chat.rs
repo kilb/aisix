@@ -294,15 +294,17 @@ pub async fn chat_completions(
             // current window state. We peek *after* the commit so
             // remaining-requests reflects the post-dispatch tally.
             let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
-            if let Some(rl_status) = state.limiter.peek(&api_key_id, &rl_limits).await {
-                crate::render::inject_ratelimit_headers(&mut success.response, &rl_status);
-                state.metrics.set_rate_limit_remaining(
-                    &api_key_id,
-                    &model_name,
-                    rl_status.rpm_remaining(),
-                    rl_status.tpm_remaining(),
-                );
-            }
+            crate::request_metrics::publish_rate_limit_window(
+                &state.metrics,
+                &state.limiter,
+                &snapshot,
+                &api_key_id,
+                &rl_limits,
+                &model_name,
+                &success.upstream_model,
+                &mut success.response,
+            )
+            .await;
             // Correlation / routing headers.
             if let Ok(v) = axum::http::HeaderValue::try_from(request_id.as_str()) {
                 success.response.headers_mut().insert("x-aisix-call-id", v);
@@ -466,7 +468,7 @@ pub async fn chat_completions(
                         .observability_exporters
                         .entries()
                         .iter()
-                        .map(|e| &e.value),
+                        .map(|e| &*e.value),
                 )
                 .map(|cap| {
                     CapturedContent::new(
@@ -1208,7 +1210,7 @@ async fn dispatch(
             .observability_exporters
             .entries()
             .iter()
-            .map(|e| &e.value),
+            .map(|e| &*e.value),
     );
     let virtual_entry =
         crate::model_resolve::resolve_model(snapshot, &req.model).ok_or_else(|| {
@@ -1264,11 +1266,22 @@ async fn dispatch(
     // Split moderation: local/blob members check first (on the original
     // text), then the segment pass runs the Bedrock call and writes
     // ANONYMIZE masks back into `req` (#932 bedrock follow-up).
-    let inspection = crate::redact::chat_request_for_inspection(req);
-    let (input_verdict, hits) = resolved_chain
-        .check_input_non_segment_observed(&inspection)
-        .await;
-    monitor_hits_out.extend(hits);
+    // `chat_request_for_inspection` deep-copies the whole request to append
+    // the tool-declaration surface, so skip it entirely when nothing is
+    // attached — the same gate `/v1/messages` and `/v1/responses` already
+    // apply. The two calls below stay unguarded: both already return at
+    // their own `!chain.redacts_input()` / `!chain.moderates_segments()`
+    // fast path, so an empty chain costs nothing there.
+    let input_verdict = if resolved_chain.is_empty() {
+        GuardrailVerdict::Allow
+    } else {
+        let inspection = crate::redact::chat_request_for_inspection(req);
+        let (verdict, hits) = resolved_chain
+            .check_input_non_segment_observed(&inspection)
+            .await;
+        monitor_hits_out.extend(hits);
+        verdict
+    };
     let mut input_moderation = crate::redact::moderate_chat_format_structured(
         resolved_chain.as_ref(),
         input_verdict,
@@ -1490,7 +1503,7 @@ async fn dispatch(
         let mut last_reserve_reject: Option<ProxyError> = None;
 
         struct StreamWin {
-            model: aisix_core::Model,
+            model: std::sync::Arc<aisix_core::Model>,
             /// Snapshot id of the winning target — the emitted event's
             /// `model_id` (AISIX-Cloud#790). Equals the requested
             /// entry's id for direct (non-routing) requests.
@@ -1541,9 +1554,9 @@ async fn dispatch(
             let mut ctx = crate::dispatch::bridge_ctx(
                 request_id,
                 &attempt.id,
-                Arc::new(model.clone()),
+                Arc::clone(model),
                 &pk_entry.id,
-                Arc::new(pk_entry.value.clone()),
+                Arc::clone(&pk_entry.value),
                 Some(client),
             );
             // Effective streaming budget, resolved target → group →
@@ -1951,9 +1964,7 @@ async fn dispatch(
             Some(estimator),
             move |mut comp: StreamCompletion| {
                 // Rate-limit accounting (TPM cap) for all layers.
-                for key in &post_stream_keys {
-                    limiter.add_tokens_post_stream(key, comp.total_tokens);
-                }
+                limiter.add_tokens_post_stream_all(&post_stream_keys, comp.total_tokens);
                 // A stream can outlive several config generations, so the
                 // terminal emits read a FRESH snapshot rather than the one
                 // the request started on (#941) — one load and one
@@ -2674,9 +2685,9 @@ async fn dispatch(
         let mut ctx = crate::dispatch::bridge_ctx(
             request_id,
             &attempt.id,
-            Arc::new(model.clone()),
+            Arc::clone(model),
             &pk_entry.id,
-            Arc::new(pk_entry.value.clone()),
+            Arc::clone(&pk_entry.value),
             Some(client),
         );
         if let Some(d) = crate::routing::effective_timeouts(
@@ -3472,9 +3483,9 @@ async fn dispatch_ensemble(
         let mut judge_ctx = crate::dispatch::bridge_ctx(
             request_id,
             &judge_entry.id,
-            Arc::new(judge_model.clone()),
+            Arc::clone(judge_model),
             &judge_pk.id,
-            Arc::new(judge_pk.value.clone()),
+            Arc::clone(&judge_pk.value),
             Some(client),
         );
         if let Some(deadline) =
@@ -3661,14 +3672,11 @@ async fn dispatch_ensemble(
             move |comp: StreamCompletion| {
                 // Rate-limit accounting: the panel tokens (already round-tripped)
                 // plus the streamed judge's final total, against every layer.
-                for key in &post_stream_keys {
-                    limiter.add_tokens_post_stream(key, panel_total + comp.total_tokens);
-                }
+                limiter
+                    .add_tokens_post_stream_all(&post_stream_keys, panel_total + comp.total_tokens);
                 // #620: the judge's own model bucket gets only the judge's
                 // streamed tokens (each panel member was billed per-member).
-                for key in &judge_post_stream_keys {
-                    limiter.add_tokens_post_stream(key, comp.total_tokens);
-                }
+                limiter.add_tokens_post_stream_all(&judge_post_stream_keys, comp.total_tokens);
                 // Fresh snapshot at stream end, shared by every emit in this
                 // closure (#941) — see the single-model streaming path.
                 let snap = state_for_telem.snapshot.load();
@@ -4351,7 +4359,7 @@ fn emit_usage_event(
         &event,
         content.as_ref(),
         exporters.generation(),
-        exporters.iter().map(|e| &e.value),
+        exporters.iter().map(|e| &*e.value),
     );
 }
 

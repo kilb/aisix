@@ -30,9 +30,11 @@ pub(crate) fn resolve_model(
         return Some(exact);
     }
     let (entry, upstream) = best_wildcard_row(snapshot, requested)?;
-    let mut model = entry.value.clone();
-    model.model_name = Some(upstream);
-    Some(Arc::new(ResourceEntry::new(
+    // The wildcard row is shared; this materialises the one concrete copy
+    // that carries the resolved `model_name`.
+    let mut model = Arc::clone(&entry.value);
+    Arc::make_mut(&mut model).model_name = Some(upstream);
+    Some(Arc::new(ResourceEntry::from_arc(
         entry.id.clone(),
         model,
         entry.revision,

@@ -11,7 +11,7 @@
 //! patterns are logged and skipped (the DP refuses to apply a rule
 //! it can't compile, so a typo doesn't silently disarm the policy).
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use aisix_core::models::{
     AisixSnapshot, AppliedGuardrail, Guardrail as DomainGuardrail, GuardrailAttachment,
@@ -830,7 +830,10 @@ impl Guardrail for MandatoryGuardrail {
 pub struct LiveGuardrailChain {
     snapshot: SnapshotHandle<AisixSnapshot>,
     bedrock_endpoint_url: Option<String>,
-    cache: Mutex<Cache>,
+    /// `ArcSwap` for the same reason as [`LiveGuardrailIndex::cache`]: the
+    /// hit path is a version compare and an `Arc` clone, and a process-wide
+    /// lock there serializes an otherwise lock-free read path.
+    cache: arc_swap::ArcSwap<Cache>,
 }
 
 struct Cache {
@@ -851,7 +854,7 @@ impl LiveGuardrailChain {
         Arc::new(Self {
             snapshot,
             bedrock_endpoint_url,
-            cache: Mutex::new(Cache {
+            cache: arc_swap::ArcSwap::from_pointee(Cache {
                 last_version: view.version,
                 chain,
             }),
@@ -860,18 +863,21 @@ impl LiveGuardrailChain {
 
     fn current(&self) -> Arc<GuardrailChain> {
         let view = self.snapshot.load_versioned();
-        let mut cache = self
-            .cache
-            .lock()
-            .expect("LiveGuardrailChain mutex poisoned");
-        if cache.last_version < view.version {
-            cache.chain = Arc::new(build_chain_from_snapshot(
-                &view.snapshot.guardrails,
-                self.bedrock_endpoint_url.as_deref(),
-            ));
-            cache.last_version = view.version;
+        let cached = self.cache.load();
+        if cached.last_version >= view.version {
+            return Arc::clone(&cached.chain);
         }
-        Arc::clone(&cache.chain)
+        let chain = Arc::new(build_chain_from_snapshot(
+            &view.snapshot.guardrails,
+            self.bedrock_endpoint_url.as_deref(),
+        ));
+        // Last writer wins; concurrent rebuilds from the same version are
+        // equivalent.
+        self.cache.store(Arc::new(Cache {
+            last_version: view.version,
+            chain: Arc::clone(&chain),
+        }));
+        chain
     }
 }
 
@@ -1101,7 +1107,13 @@ pub struct LiveGuardrailIndex {
     /// (AISIX-Cloud#1076). `None` (tests, standalone construction) records
     /// nothing; the server bootstrap wires the metrics layer's sink.
     metrics_sink: Option<Arc<dyn aisix_core::GuardrailMetricsSink>>,
-    cache: Mutex<IndexCache>,
+    /// `ArcSwap`, not a `Mutex`: `current()` runs on every request just to
+    /// compare a version and clone an `Arc`, and on a thread-per-core
+    /// deployment a process-wide lock there is the one place the otherwise
+    /// lock-free read path serializes. A concurrent rebuild is harmless —
+    /// both writers build an equivalent index from the same snapshot
+    /// version — so last-writer-wins needs no extra synchronization.
+    cache: arc_swap::ArcSwap<IndexCache>,
 }
 
 struct IndexCache {
@@ -1134,7 +1146,7 @@ impl LiveGuardrailIndex {
             snapshot,
             bedrock_endpoint_url,
             metrics_sink,
-            cache: Mutex::new(IndexCache {
+            cache: arc_swap::ArcSwap::from_pointee(IndexCache {
                 last_version: view.version,
                 index,
             }),
@@ -1144,41 +1156,30 @@ impl LiveGuardrailIndex {
     fn current(&self) -> Arc<GuardrailIndex> {
         let view = self.snapshot.load_versioned();
 
-        // Fast path: return cached index without building.
-        {
-            let cache = self
-                .cache
-                .lock()
-                .expect("LiveGuardrailIndex mutex poisoned");
-            if cache.last_version >= view.version {
-                return Arc::clone(&cache.index);
-            }
+        // Fast path: one atomic load, no lock.
+        let cached = self.cache.load();
+        if cached.last_version >= view.version {
+            return Arc::clone(&cached.index);
         }
 
-        // Build the new index OUTSIDE the lock so a panic (e.g. from a
-        // badly-behaved regex engine) does not poison the mutex.
         let new_index = Arc::new(build_index_from_snapshot(
             &view.snapshot.guardrails,
             &view.snapshot.guardrail_attachments,
             self.bedrock_endpoint_url.as_deref(),
         ));
 
-        // Re-acquire and store. A concurrent rebuild (rare) is harmless —
-        // both produce equivalent indexes from the same snapshot version.
-        let mut cache = self
-            .cache
-            .lock()
-            .expect("LiveGuardrailIndex mutex poisoned");
-        if cache.last_version < view.version {
-            cache.index = new_index;
-            cache.last_version = view.version;
-        }
-        Arc::clone(&cache.index)
+        // Last writer wins; both writers built from the same version, and a
+        // stale-but-newer entry can only be replaced by an equal one.
+        self.cache.store(Arc::new(IndexCache {
+            last_version: view.version,
+            index: Arc::clone(&new_index),
+        }));
+        new_index
     }
 
     /// Resolve the guardrail chain applicable to `ctx`.
     ///
-    /// Cheap on the cache-hit path (one lock acquire + version compare +
+    /// Cheap on the cache-hit path (one atomic load + version compare +
     /// arc clone + `O(n)` linear walk over attachment rows). Rebuilds only
     /// on snapshot version change.
     ///

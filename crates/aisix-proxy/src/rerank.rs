@@ -173,7 +173,23 @@ pub async fn rerank(
                     success.captured_content.as_ref(),
                 );
             }
-            success.response
+            // Same window /v1/chat/completions publishes, so an SDK client
+            // on this endpoint can schedule back-off from real numbers
+            // instead of blind-retrying into a 429.
+            let mut response = success.response;
+            let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
+            crate::request_metrics::publish_rate_limit_window(
+                &state.metrics,
+                &state.limiter,
+                &snapshot,
+                &api_key_id,
+                &rl_limits,
+                &model_name,
+                &success.upstream_model,
+                &mut response,
+            )
+            .await;
+            response
         }
         Err(err) => {
             let status = err.status().as_u16();
@@ -342,7 +358,7 @@ async fn dispatch(
             .observability_exporters
             .entries()
             .iter()
-            .map(|e| &e.value),
+            .map(|e| &*e.value),
     );
     let captured_prompt = content_cap.map(|_| serde_json::to_string(&*body).unwrap_or_default());
 
@@ -731,7 +747,7 @@ fn emit_usage_event(
         &event,
         content,
         exporters.generation(),
-        exporters.iter().map(|e| &e.value),
+        exporters.iter().map(|e| &*e.value),
     );
     let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
     crate::request_metrics::record_usage(

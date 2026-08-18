@@ -261,7 +261,23 @@ pub async fn completions(
                     success.captured_content.as_ref(),
                 );
             }
-            success.response
+            // Same window /v1/chat/completions publishes, so an SDK client
+            // on this endpoint can schedule back-off from real numbers
+            // instead of blind-retrying into a 429.
+            let mut response = success.response;
+            let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
+            crate::request_metrics::publish_rate_limit_window(
+                &state.metrics,
+                &state.limiter,
+                &snapshot,
+                &api_key_id,
+                &rl_limits,
+                &model_name,
+                &success.upstream_model,
+                &mut response,
+            )
+            .await;
+            response
         }
         Err(err) => {
             let status = err.status().as_u16();
@@ -469,7 +485,7 @@ async fn dispatch(
             .observability_exporters
             .entries()
             .iter()
-            .map(|e| &e.value),
+            .map(|e| &*e.value),
     );
     let captured_prompt = content_cap.map(|_| serde_json::to_string(&body).unwrap_or_default());
 
@@ -494,9 +510,9 @@ async fn dispatch(
     let mut ctx = crate::dispatch::bridge_ctx(
         request_id,
         &model_entry.id,
-        Arc::new(model.clone()),
+        Arc::clone(model),
         &pk_entry.id,
-        Arc::new(pk_entry.value.clone()),
+        Arc::clone(&pk_entry.value),
         Some(client_ctx),
     );
     if let Some(d) = if is_stream {
@@ -992,9 +1008,7 @@ async fn dispatch(
                         );
                         let total =
                             u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens);
-                        for key in &post_stream_keys {
-                            limiter.add_tokens_post_stream(key, total);
-                        }
+                        limiter.add_tokens_post_stream_all(&post_stream_keys, total);
                         drop(stream_hold);
                         let captured_content = match (&captured_prompt_for_stream, content_cap) {
                             (Some(prompt), Some(cap))
@@ -1444,7 +1458,7 @@ fn emit_usage_event(
         &event,
         content,
         exporters.generation(),
-        exporters.iter().map(|e| &e.value),
+        exporters.iter().map(|e| &*e.value),
     );
     let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
     crate::request_metrics::record_usage(

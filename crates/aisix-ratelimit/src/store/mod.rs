@@ -18,8 +18,16 @@
 //! - **release** / **add_tokens** (after-the-fact, sync): concurrency
 //!   release on drop, and the streaming post-stream token add. These are
 //!   sync because they run from `Drop` and from the synchronous SSE
-//!   completion callback. Redis release is best-effort; token accounting
-//!   waits for its store-owned I/O worker so acquire cannot overtake it.
+//!   completion callback, both of which run on the serving thread.
+//!
+//! Both after-the-fact operations are **best-effort and never block**.
+//! Token accounting is post-hoc billing: it is decoupled from the request so
+//! a slow or half-open Redis costs counter accuracy, never latency. The
+//! serving thread is the whole core's event loop under thread-per-core, so a
+//! wait there would stall every other in-flight request on that core, not
+//! just the stream that ended. A distributed store therefore hands the update
+//! to its own I/O worker and returns; the shared counters converge shortly
+//! after, not synchronously.
 
 use aisix_core::RateLimit;
 use async_trait::async_trait;
@@ -125,10 +133,33 @@ pub trait RateStore: Send + Sync + 'static {
     fn release(&self, key: &str, member: &str);
 
     /// Post-stream token accounting: add `tokens` to tpm/tpd only (no
-    /// concurrency change). Sync so it can run from the synchronous SSE
-    /// completion callback; distributed stores must not return before a
-    /// subsequent acquire can observe the update.
+    /// concurrency change).
+    ///
+    /// Sync so it can run from the synchronous SSE completion callback, and
+    /// **must return without waiting on I/O**. A distributed store queues the
+    /// update for its own worker, so a subsequent acquire — on this replica or
+    /// another — converges shortly after rather than immediately.
     fn add_tokens(&self, key: &str, tokens: u64);
+
+    /// Post-stream token accounting for every reservation layer at once.
+    ///
+    /// A distributed store queues every layer's write and returns; it must
+    /// not wait, per [`RateStore::add_tokens`]. The default is the per-key
+    /// loop, which is correct for a local store because it does no I/O.
+    fn add_tokens_all(&self, keys: &[String], tokens: u64) {
+        for key in keys {
+            self.add_tokens(key, tokens);
+        }
+    }
+
+    /// Drop per-key state untouched for longer than `idle_for`.
+    ///
+    /// Bucket keys are config-derived (api key, model, policy), so a
+    /// long-lived process otherwise accumulates state for rows the control
+    /// plane deleted and only a restart reclaims it. Called from the
+    /// server's periodic upkeep task. Default is a no-op for stores that
+    /// hold no in-process state.
+    fn reap(&self, _idle_for: std::time::Duration) {}
 
     /// Read-only snapshot for the `x-ratelimit-*` headers. Returns `None`
     /// when there is nothing meaningful to report for the bucket.

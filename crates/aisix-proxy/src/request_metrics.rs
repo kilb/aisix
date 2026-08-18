@@ -98,7 +98,7 @@ impl<'a> Caller<'a> {
         api_key_id: &'a str,
     ) -> Owned<'a> {
         let entry = snap.apikeys.get_by_id(api_key_id);
-        let key = entry.as_ref().map(|e| &e.value);
+        let key = entry.as_ref().map(|e| &*e.value);
         Owned {
             api_key_id,
             team_id: key.and_then(|k| k.team_id.clone()),
@@ -369,8 +369,126 @@ pub(crate) fn record_usage(
     );
 }
 
+/// Publish the caller's current rate-limit window: inject the
+/// `x-ratelimit-*` response headers the OpenAI and Anthropic SDKs read to
+/// schedule back-off, and record the remaining-quota gauges.
+///
+/// One function for both so an endpoint cannot ship the header without the
+/// metric, or the metric with an unbounded label. `model` is collapsed
+/// through [`crate::usage_attr::metric_model_label_pair`] here rather than at
+/// the call site: a wildcard row serves arbitrary caller-minted names, every
+/// distinct `(api_key_id, model)` pair registers a new Prometheus series, and
+/// the recorder sets no idle timeout — so a raw request string is
+/// attacker-controlled cardinality that is never reclaimed (#451).
+///
+/// No-op when the key has no limit configured: `peek` returns `None` and the
+/// caller should not read an absent header as "unlimited".
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn publish_rate_limit_window(
+    metrics: &aisix_obs::Metrics,
+    limiter: &aisix_ratelimit::Limiter,
+    snapshot: &aisix_core::AisixSnapshot,
+    api_key_id: &str,
+    limits: &aisix_core::RateLimit,
+    requested_model: &str,
+    upstream_model: &str,
+    response: &mut axum::response::Response,
+) {
+    let Some(status) = limiter.peek(api_key_id, limits).await else {
+        return;
+    };
+    crate::render::inject_ratelimit_headers(response, &status);
+    let (model, _) =
+        crate::usage_attr::metric_model_label_pair(snapshot, requested_model, upstream_model);
+    metrics.set_rate_limit_remaining(
+        api_key_id,
+        model.as_ref(),
+        status.rpm_remaining(),
+        status.tpm_remaining(),
+    );
+}
+
 #[cfg(test)]
 mod tests {
+    /// H-01 / L-11: the `x-ratelimit-*` headers and the remaining-quota
+    /// gauges ship from one call so an endpoint cannot emit one without the
+    /// other — and the gauge's `model` label is collapsed to the resolved
+    /// row. A wildcard row serves arbitrary caller-minted names, and nothing
+    /// evicts a Prometheus series, so labelling with the raw request string
+    /// is unbounded cardinality (#451).
+    #[tokio::test]
+    async fn publish_rate_limit_window_bounds_the_model_label_and_sets_headers() {
+        use aisix_core::resource::ResourceEntry;
+        use aisix_core::snapshot::ResourceTable;
+
+        let table = ResourceTable::default();
+        let wildcard: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "openai/*",
+            "provider": "openai",
+            "model_name": "*",
+            "provider_key_id": "pk-1",
+        }))
+        .unwrap();
+        table.insert(ResourceEntry::new("m-star", wildcard, 1));
+        let snapshot = aisix_core::AisixSnapshot {
+            models: table,
+            ..Default::default()
+        };
+
+        let metrics = aisix_obs::Metrics::new(false);
+        let limiter = aisix_ratelimit::Limiter::new();
+        let limits = aisix_core::RateLimit {
+            rpm: Some(100),
+            tpm: Some(10_000),
+            ..Default::default()
+        };
+
+        // Two different caller-minted names the same wildcard row serves.
+        for requested in ["openai/gpt-4o", "openai/anything-else"] {
+            // Production peeks after the commit, so the bucket exists.
+            let _reservation = limiter.pre_commit("key-1", &limits).await.unwrap();
+            let mut response = axum::response::Response::new(axum::body::Body::empty());
+            publish_rate_limit_window(
+                &metrics,
+                &limiter,
+                &snapshot,
+                "key-1",
+                &limits,
+                requested,
+                "gpt-4o",
+                &mut response,
+            )
+            .await;
+            assert!(
+                response
+                    .headers()
+                    .contains_key("x-ratelimit-limit-requests"),
+                "the window must reach the client as headers too"
+            );
+        }
+
+        let scrape = metrics.render();
+        let series: Vec<&str> = scrape
+            .lines()
+            .filter(|line| line.starts_with("aisix_ratelimit_remaining_requests{"))
+            .collect();
+        assert_eq!(
+            series.len(),
+            1,
+            "two caller-minted names served by one wildcard row must collapse \
+             to a single series, got: {series:?}"
+        );
+        assert!(
+            series[0].contains("model=\"openai/*\""),
+            "label must be the resolved row, got: {}",
+            series[0]
+        );
+        assert!(
+            !scrape.contains("openai/gpt-4o"),
+            "the raw caller-supplied model must never reach a metric label"
+        );
+    }
+
     use super::*;
 
     /// Every registered proxy route, as its raw request path. Adding a route

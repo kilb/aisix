@@ -820,7 +820,7 @@ mod tests {
         store
             .put_model(ResourceEntry {
                 id: "direct-1".into(),
-                value: direct,
+                value: std::sync::Arc::new(direct),
                 revision: 1,
             })
             .await
@@ -835,7 +835,7 @@ mod tests {
         store
             .put_model(ResourceEntry {
                 id: "routing-1".into(),
-                value: routing,
+                value: std::sync::Arc::new(routing),
                 revision: 1,
             })
             .await
@@ -1365,7 +1365,7 @@ mod tests {
         store
             .put_model(ResourceEntry {
                 id: "direct-1".into(),
-                value: direct,
+                value: std::sync::Arc::new(direct),
                 revision: 1,
             })
             .await
@@ -1381,7 +1381,7 @@ mod tests {
         store
             .put_model(ResourceEntry {
                 id: "routing-1".into(),
-                value: routing,
+                value: std::sync::Arc::new(routing),
                 revision: 1,
             })
             .await

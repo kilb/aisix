@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   AdminClient,
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -599,6 +600,16 @@ describe("filter contract (H3) — all candidates unhealthy returns 503", () => 
     }
 
     // Wait for the background probe to mark both candidates unhealthy.
+    // Two independent conditions, gated in order. `listModelStatuses` runs on
+    // the ADMIN key, so an unhealthy row proves the model landed but says
+    // nothing about the caller key — which is seeded last and would answer
+    // 401 until it propagates. Gate on the caller key first, per
+    // `tests/e2e/AGENTS.md`: that single condition implies the whole seed set
+    // is in the snapshot. Then wait for the runtime health transition.
+    await waitConfigPropagation(async () => {
+      const probe = new ProxyClient(app!.proxyUrl, CALLER_PLAINTEXT);
+      return (await probe.listModels()).status === 200;
+    });
     await waitConfigPropagation(async () => {
       const statuses = await admin!.listModelStatuses();
       const a = statuses.find((row) => row.display_name === "h3-down-a");
@@ -707,6 +718,13 @@ describe("filter contract (H3 escape hatch) — try_anyway sends to known-bad", 
       return;
     }
 
+    // Caller key first — see the H3 gate above for why the unhealthy probe
+    // alone is not enough (it runs on the admin key, so it can pass while the
+    // caller key is still propagating and the request 401s).
+    await waitConfigPropagation(async () => {
+      const probe = new ProxyClient(app!.proxyUrl, CALLER_PLAINTEXT);
+      return (await probe.listModels()).status === 200;
+    });
     await waitConfigPropagation(async () => {
       const statuses = await admin!.listModelStatuses();
       const row = statuses.find((r) => r.display_name === "h3-escape-down");

@@ -256,6 +256,15 @@ pub async fn moderate_body(
         // order and count before applying positional masks. A mismatch is an
         // internal boundary failure: retaining any original would violate the
         // fail-closed DLP contract.
+        //
+        // Belt-and-braces, deliberately: `SegmentApplier` already compares
+        // each slot against its recorded original and `is_aligned()` already
+        // catches a short, long or reordered walk, so drift is blocked either
+        // way. What this pass buys is that the body is left UNTOUCHED on
+        // drift rather than half-masked — worth one extra traversal on the
+        // segment-moderating path only. Don't remove it without deciding that
+        // a partially-rewritten (but blocked, so never forwarded) body is
+        // acceptable.
         let verifier = SegmentCollector::default();
         let _ = walk(&verifier);
         if verifier.take() != texts || masked.len() != texts.len() {
@@ -432,6 +441,11 @@ fn redact_tool_arguments_value(
             redact_value_strings(chain, dir, arguments, counts);
             unrewritable
         }
+        // `null` is the wire encoding for an absent optional field, not a
+        // shape we failed to understand: it carries no text, so there is
+        // nothing to fail closed over. Matches `message_scan_text` and the
+        // OpenAI response ingress, which both skip it.
+        Value::Null => false,
         _ => detect_keys,
     }
 }
@@ -510,6 +524,11 @@ fn redact_chat_format_impl(
         if let Some(refusal) = msg.extra.get_mut("refusal") {
             apply_to_value_string(chain, Direction::Input, refusal, &mut counts);
         }
+        // Fail closed rather than mask: the transcript travels with opaque
+        // audio the redactor cannot reach, so rewriting only the text would
+        // leave the same PII spoken in `audio.data` and hand the operator a
+        // masked transcript as false assurance. Pinned by
+        // `chat_audio_transcript_is_unrewritable_sensitive_output`.
         if let Some(transcript) = msg
             .extra
             .get_mut("audio")
@@ -677,6 +696,9 @@ fn redact_tool_call_arguments(
     detect_keys: bool,
 ) -> bool {
     let mut unrewritable_tool_key = false;
+    if tool_calls.is_null() {
+        return false;
+    }
     let Some(items) = tool_calls.as_array_mut() else {
         return detect_keys;
     };
@@ -718,6 +740,9 @@ fn redact_legacy_function_call(
     counts: &mut RedactionCounts,
     detect_keys: bool,
 ) -> bool {
+    if function_call.is_null() {
+        return false;
+    }
     if !function_call.is_object() {
         return detect_keys;
     }
@@ -3564,6 +3589,36 @@ mod tests {
 
     fn both() -> Arc<dyn Guardrail> {
         mask_chain(aisix_core::models::GuardrailHookPoint::Both)
+    }
+
+    /// `null` is OpenAI's documented "absent" encoding for the optional
+    /// `tool_calls` / `function_call` message fields and for a tool call's
+    /// `arguments`. `message_scan_text` and the OpenAI response ingress both
+    /// already skip it, so the structured walker must not treat it as an
+    /// un-inspectable shape and reject a request carrying no sensitive data.
+    #[test]
+    fn structured_chat_treats_explicit_null_tool_fields_as_absent() {
+        let chain = both();
+        for body in [
+            json!({"model": "m", "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi", "function_call": null}]}),
+            json!({"model": "m", "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi", "tool_calls": null}]}),
+            json!({"model": "m", "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "f", "arguments": null}}]}]}),
+        ] {
+            let mut req: ChatFormat = serde_json::from_value(body.clone()).unwrap();
+            let redaction = redact_chat_format_structured(chain.as_ref(), &mut req);
+            assert!(
+                !redaction.unrewritable_tool_key,
+                "an explicit null carries no text to fail closed over: {body}"
+            );
+            assert!(redaction.counts.is_empty(), "nothing was detected: {body}");
+        }
     }
 
     #[test]

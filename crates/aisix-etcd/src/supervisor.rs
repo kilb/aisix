@@ -12,8 +12,19 @@
 //! 5. Reconnect with exponential backoff (1→60s) on transport failure
 //!
 //! The apply step is *copy-on-write* per batch: we clone the current
-//! snapshot into a new one, mutate, and `store` it. That keeps the
-//! read path reading a fully-formed `Arc<Snapshot>` the whole time.
+//! snapshot into a new one, mutate, and `store` it. That keeps the read path
+//! reading a fully-formed `Arc<Snapshot>` the whole time.
+//!
+//! The batch is real, not one event dressed up as one. The watch loop takes
+//! the event it blocked for and then drains, strictly non-blocking, whatever
+//! else has already arrived (up to [`MAX_APPLY_BATCH`]); every event does its
+//! own per-key bookkeeping and contributes a delta, and the run then clones
+//! the snapshot once, folds the deltas in wire order, and publishes once.
+//! A single event still applies immediately — the batch only forms when the
+//! control plane is genuinely ahead of us, which is exactly when applying one
+//! at a time hurt: a bulk operation (rotating a thousand keys, seeding an
+//! environment) used to cost one clone of every resource table and one cache
+//! flush per write, i.e. O(N²) for the operation.
 
 use aisix_core::config_status::{
     hash_entries, AppliedSnapshot, ConfigStatus, IncomingRejection, LoadObservation,
@@ -22,7 +33,7 @@ use aisix_core::config_status::{
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::AisixSnapshot;
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -625,6 +636,19 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// successful round-trip with etcd even on an empty config.
     fn set_revision_floor(&self, revision: i64) {
         let transaction = self.apply_transaction.lock().unwrap();
+        self.stage_revision_floor(revision);
+        // Reflect the finalised revision on the status view (the preceding
+        // apply_resync synced with the entry-max revision; this corrects it to
+        // the load/watch header revision). Not itself a reload event.
+        self.sync_config_status(false);
+        self.flush_cache(&transaction);
+    }
+
+    /// Revision-floor bookkeeping without the publish, for callers that
+    /// already hold the apply transaction and commit once for the batch.
+    /// `apply_transaction` is a plain non-reentrant mutex, so a staged caller
+    /// must NOT go through [`Supervisor::set_revision_floor`].
+    fn stage_revision_floor(&self, revision: i64) {
         {
             let mut rev = self.revision.lock().unwrap();
             if revision > *rev {
@@ -632,11 +656,6 @@ impl<P: ConfigProvider> Supervisor<P> {
             }
         }
         self.status.record_apply(revision);
-        // Reflect the finalised revision on the status view (the preceding
-        // apply_resync synced with the entry-max revision; this corrects it to
-        // the load/watch header revision). Not itself a reload event.
-        self.sync_config_status(false);
-        self.flush_cache(&transaction);
     }
 
     /// Pin the currently served bytes for `key` as its last known good
@@ -651,14 +670,18 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// mirroring the rejected bytes into `state`, and a resync that
     /// rejects a key either stale-tracks it or drops it from the
     /// snapshot).
-    fn capture_last_good(&self, key_str: &str) {
+    ///
+    /// `earlier` is the current batch's already-staged events, so a row
+    /// written earlier in the SAME batch counts as serving — the publish is
+    /// deferred, but the decision must not read a pre-batch view.
+    fn capture_last_good(&self, key_str: &str, earlier: &[Staged]) {
         if self.stale_serving.lock().unwrap().contains_key(key_str) {
             return;
         }
         let Ok(parsed) = key::parse(&self.prefix, key_str) else {
             return;
         };
-        if !snapshot_has(&self.handle.load(), parsed.kind, parsed.id) {
+        if !self.staged_has(earlier, parsed.kind, parsed.id) {
             return;
         }
         let Some(good) = self.state.lock().unwrap().get(key_str).cloned() else {
@@ -680,6 +703,24 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// Returns `true` if the apply succeeded (schema + parse passed).
     pub fn apply_put(&self, entry: &RawEntry) -> bool {
         let transaction = self.apply_transaction.lock().unwrap();
+        let staged = self.stage_put(entry, &[]);
+        self.commit(&staged, &transaction);
+        staged.result
+    }
+
+    /// The per-key half of a put: schema/parse, last-known-good pinning,
+    /// rejection bookkeeping, the observed-state map, the revision floor and
+    /// the partial-compat signal.
+    ///
+    /// Deliberately does NOT touch the published snapshot, the reported
+    /// config status, or the cache file — [`Supervisor::commit`] does those
+    /// once per batch, which is what keeps a bulk control-plane write from
+    /// costing one full snapshot clone and one disk flush per event.
+    ///
+    /// `earlier` is what the same batch has already staged; presence probes
+    /// read through it so a decision inside a batch sees the batch's own
+    /// prior effects rather than the pre-batch snapshot.
+    fn stage_put(&self, entry: &RawEntry, earlier: &[Staged]) -> Staged {
         // Build a tiny snapshot out of just the new entry, then merge.
         let (tiny, mut stats) = loader::build_snapshot(&self.prefix, std::slice::from_ref(entry));
         if stats.accepted == 0 {
@@ -688,7 +729,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             // needs the pinned bytes to keep this row alive. Must run
             // BEFORE the state-map update below, which overwrites the
             // serving bytes with the rejected ones.
-            self.capture_last_good(&entry.key);
+            self.capture_last_good(&entry.key, earlier);
             // Mirror the rejected bytes into the observed-state map and
             // the cache like any other observed etcd write: source_hash
             // reflects the observed etcd state immediately, and a
@@ -717,30 +758,11 @@ impl<P: ConfigProvider> Supervisor<P> {
                 self.push_rejection(r);
             }
             // A rejected watch event still changes the reported state
-            // (rejected[] gains this entry; last_reload flips unsuccessful).
-            self.sync_config_status(false);
-            self.flush_cache(&transaction);
-            return false;
+            // (rejected[] gains this entry; last_reload flips unsuccessful),
+            // so it still needs a commit even though it publishes no delta.
+            return Staged::changed(None, false);
         }
 
-        // RCU: load → clone → mutate → CAS, retrying the closure if a
-        // concurrent apply_put / apply_delete / apply_resync raced our
-        // CAS. The previous implementation used a bare load-mutate-
-        // store sequence which silently dropped events under
-        // concurrency (see issue #112). The closure body must be
-        // idempotent w.r.t. its input — `tiny` is captured by reference
-        // and the same delta is applied each retry, which is fine
-        // because the operation is "merge tiny into current".
-        self.handle.rcu(|current| {
-            let new = clone_snapshot(current);
-            // Move any entries from `tiny` into `new`. `merge_snapshot`
-            // must cover every ResourceTable on AisixSnapshot — a
-            // missing kind there means a watch event silently drops on
-            // the floor and the snapshot never sees the new entry, even
-            // though the loader and the proxy both know about it.
-            merge_snapshot(&new, &tiny);
-            new
-        });
         self.remove_rejection_for_key(&entry.key);
         // The key's latest bytes load again — retention ends (#871).
         self.stale_serving.lock().unwrap().remove(&entry.key);
@@ -769,32 +791,43 @@ impl<P: ConfigProvider> Supervisor<P> {
         // /admin/v1/health reads this — record the apply so `last_apply_age`
         // resets on every event we successfully process.
         self.status.record_apply(entry.revision);
-        self.sync_config_status(false);
-        self.flush_cache(&transaction);
-        true
+        let placed = key::parse(&self.prefix, &entry.key)
+            .ok()
+            .map(|parsed| (parsed.kind.to_string(), parsed.id.to_string()));
+        Staged::changed(
+            Some(Delta::Merge {
+                placed,
+                tiny: Box::new(tiny),
+            }),
+            true,
+        )
     }
 
     /// Apply a Delete event. Returns `true` if anything was actually
     /// removed (the kind/id was present).
     pub fn apply_delete(&self, key_str: &str) -> bool {
+        let transaction = self.apply_transaction.lock().unwrap();
+        let staged = self.stage_delete(key_str, &[]);
+        self.commit(&staged, &transaction);
+        staged.result
+    }
+
+    /// The per-key half of a delete — see [`Supervisor::stage_put`] for why
+    /// the publish is deferred to [`Supervisor::commit`].
+    fn stage_delete(&self, key_str: &str, earlier: &[Staged]) -> Staged {
         let parsed = match key::parse(&self.prefix, key_str) {
             Ok(k) => k,
             Err(err) => {
                 tracing::warn!(key = %key_str, error = %err, "ignoring delete with bad key");
-                return false;
+                return Staged::unchanged(false);
             }
         };
-        let transaction = self.apply_transaction.lock().unwrap();
 
-        // Probe first — if the key isn't present in the current
-        // snapshot we have nothing to do and don't want to take the
-        // RCU CAS path (which would still publish a no-op clone and
-        // race against concurrent applies). The probe + RCU cycle
-        // produces an idempotent "removed" return value: a parallel
-        // delete that wins the race observes the same key already
-        // gone, so this caller returns false (nothing left to remove).
-        let snap = self.handle.load();
-        let present = snapshot_has(&snap, parsed.kind, parsed.id);
+        // Probe first — if the key isn't present we have nothing to remove
+        // from the snapshot. The probe reads through `earlier` so a delete
+        // that follows a put of the same key inside one batch still sees it
+        // as present.
+        let present = self.staged_has(earlier, parsed.kind, parsed.id);
         let removed_rejection = self.remove_rejection_for_key(key_str);
         // A deleted key no longer serves, so its partially-compatible
         // signal (if any) goes with it — and so does its last-known-good
@@ -808,73 +841,16 @@ impl<P: ConfigProvider> Supervisor<P> {
         // in source_hash until the next resync and persist the deleted
         // document in the cache file.
         let removed_state = self.state.lock().unwrap().remove(key_str).is_some();
-        drop(snap);
         if !present {
             if removed_rejection || removed_state {
                 let cur_rev = *self.revision.lock().unwrap();
                 self.status.record_apply(cur_rev);
                 // Clearing a rejected key changes the reported state.
-                self.sync_config_status(false);
-                self.flush_cache(&transaction);
+                return Staged::changed(None, removed_rejection);
             }
-            return removed_rejection;
+            return Staged::unchanged(removed_rejection);
         }
 
-        // RCU: load → clone → remove → CAS, retrying under contention.
-        // The closure body re-checks `removed` from its own clone so
-        // the eventual CAS reflects the latest snapshot's state — if a
-        // sibling apply_delete won the race, the kind.remove on our
-        // clone returns None and we still publish a coherent (no-op)
-        // result.
-        self.handle.rcu(|current| {
-            let new = clone_snapshot(current);
-            match parsed.kind {
-                "models" => {
-                    new.models.remove(parsed.id);
-                }
-                "api_keys" => {
-                    new.apikeys.remove(parsed.id);
-                }
-                "provider_keys" => {
-                    new.provider_keys.remove(parsed.id);
-                }
-                "guardrails" => {
-                    new.guardrails.remove(parsed.id);
-                }
-                "guardrail_attachments" => {
-                    new.guardrail_attachments.remove(parsed.id);
-                }
-                "cache_policies" => {
-                    new.cache_policies.remove(parsed.id);
-                }
-                "observability_exporters" => {
-                    new.observability_exporters.remove(parsed.id);
-                }
-                "rate_limit_policies" => {
-                    new.rate_limit_policies.remove(parsed.id);
-                }
-                "mcp_servers" => {
-                    new.mcp_servers.remove(parsed.id);
-                }
-                "mcp_policies" => {
-                    new.mcp_policies.remove(parsed.id);
-                }
-                "a2a_agents" => {
-                    new.a2a_agents.remove(parsed.id);
-                }
-                "oidc_providers" => {
-                    new.oidc_providers.remove(parsed.id);
-                }
-                "claim_mappings" => {
-                    new.claim_mappings.remove(parsed.id);
-                }
-                "passthrough_routes" => {
-                    new.passthrough_routes.remove(parsed.id);
-                }
-                _ => {}
-            }
-            new
-        });
         // Stamp /admin/v1/health freshness on a successful delete. We
         // don't have a per-event revision on the wire delete
         // (the etcd watch revision is held at the cycle level);
@@ -882,9 +858,132 @@ impl<P: ConfigProvider> Supervisor<P> {
         // resets even if the revision number doesn't move.
         let cur_rev = *self.revision.lock().unwrap();
         self.status.record_apply(cur_rev);
+        Staged::changed(
+            Some(Delta::Remove {
+                kind: parsed.kind.to_string(),
+                id: parsed.id.to_string(),
+            }),
+            true,
+        )
+    }
+
+    /// Apply a run of watch events under one publish.
+    ///
+    /// The apply step is copy-on-write *per batch*: every event still does its
+    /// own per-key bookkeeping (so rejections, last-known-good pinning and the
+    /// partial-compat signal behave exactly as they do one at a time), and the
+    /// batch then clones the snapshot once, folds every delta in wire order,
+    /// and publishes once. Applying the same run event by event costs one
+    /// clone of all fourteen resource tables and one cache flush each —
+    /// O(total resources) per single write, which turns a bulk control-plane
+    /// operation into O(N²).
+    ///
+    /// A `Resync` replaces the whole snapshot rather than contributing a
+    /// delta, so it ends the current run and is applied on its own.
+    pub fn apply_batch(&self, events: &[WatchEvent]) {
+        let mut run: Vec<&WatchEvent> = Vec::with_capacity(events.len());
+        for event in events {
+            match event {
+                WatchEvent::Resync { entries, revision } => {
+                    self.apply_run(&run);
+                    run.clear();
+                    self.apply_resync(entries);
+                    // Same rationale as the delete floor below: the resync's
+                    // header revision is the "consistent as of" point even
+                    // when the entry set is empty.
+                    self.set_revision_floor(*revision);
+                }
+                other => run.push(other),
+            }
+        }
+        self.apply_run(&run);
+    }
+
+    /// One transaction, one publish, for a run of Put/Delete events.
+    fn apply_run(&self, events: &[&WatchEvent]) {
+        if events.is_empty() {
+            return;
+        }
+        let transaction = self.apply_transaction.lock().unwrap();
+        let mut staged: Vec<Staged> = Vec::with_capacity(events.len());
+        for event in events {
+            let one = match event {
+                WatchEvent::Put(raw) => self.stage_put(raw, &staged),
+                WatchEvent::Delete { key, revision } => {
+                    let mut one = self.stage_delete(key, &staged);
+                    // Advance the applied-revision floor to the delete's
+                    // mod_revision even when the key wasn't present —
+                    // "processed everything up to rev X" must cover deletes,
+                    // otherwise the heartbeat-reported applied_revision
+                    // (#519 B.3) stalls after a CP delete until the next put
+                    // arrives. That floor is itself reportable state, so the
+                    // batch must commit even for a no-op delete.
+                    self.stage_revision_floor(*revision);
+                    one.changed = true;
+                    one
+                }
+                // Filtered out by `apply_batch`, which cannot fold a whole
+                // snapshot replacement into a delta list.
+                WatchEvent::Resync { .. } => continue,
+            };
+            staged.push(one);
+        }
+        self.commit_all(&staged, &transaction);
+    }
+
+    /// Whether `(kind, id)` is serving, as of the published snapshot plus
+    /// whatever the current batch has already staged. Last write wins, so a
+    /// key put and then deleted inside one batch reads as absent.
+    fn staged_has(&self, earlier: &[Staged], kind: &str, id: &str) -> bool {
+        for one in earlier.iter().rev() {
+            match &one.delta {
+                Some(Delta::Merge {
+                    placed: Some((k, i)),
+                    ..
+                }) if k == kind && i == id => return true,
+                Some(Delta::Remove { kind: k, id: i }) if k == kind && i == id => return false,
+                _ => {}
+            }
+        }
+        snapshot_has(&self.handle.load(), kind, id)
+    }
+
+    /// Publish one event's staged outcome. Thin wrapper over
+    /// [`Supervisor::commit_all`] for the single-event entry points.
+    fn commit(&self, staged: &Staged, transaction: &MutexGuard<'_, ()>) {
+        self.commit_all(std::slice::from_ref(staged), transaction);
+    }
+
+    /// One RCU, one status sync and one cache flush for a whole batch.
+    ///
+    /// Skips entirely when nothing changed, matching the single-event path's
+    /// early return: a delete of an absent, un-rejected key must not publish
+    /// a no-op clone or rewrite the cache file.
+    fn commit_all(&self, staged: &[Staged], transaction: &MutexGuard<'_, ()>) {
+        if !staged.iter().any(|one| one.changed) {
+            return;
+        }
+        let deltas: Vec<&Delta> = staged.iter().filter_map(|one| one.delta.as_ref()).collect();
+        if !deltas.is_empty() {
+            // RCU: load → clone → apply every delta in order → publish,
+            // serialised against concurrent applies by the handle's own
+            // publication lock (#112).
+            self.handle.rcu(|current| {
+                let new = clone_snapshot(current);
+                for delta in &deltas {
+                    match delta {
+                        // `merge_snapshot` must cover every ResourceTable on
+                        // AisixSnapshot — a missing kind means a watch event
+                        // silently drops on the floor.
+                        Delta::Merge { tiny, .. } => merge_snapshot(&new, tiny),
+                        Delta::Remove { kind, id } => remove_from_snapshot(&new, kind, id),
+                    }
+                }
+                new
+            });
+        }
         self.sync_config_status(false);
-        self.flush_cache(&transaction);
-        true
+        self.flush_cache(transaction);
     }
 
     /// Replace the current snapshot with a freshly loaded set (resync).
@@ -1149,40 +1248,119 @@ impl<P: ConfigProvider> Supervisor<P> {
                 }
             };
 
-            match next {
-                None => return Ok(()),
-                Some(Err(ProviderError::Compacted)) => {
-                    tracing::warn!("etcd compaction detected — resyncing");
-                    // Break out so `run` re-enters `cycle` cleanly; the
-                    // next iteration re-loads from scratch. We don't want
-                    // to treat compaction as a backoff-worthy failure.
-                    return Ok(());
+            let first = match next {
+                Some(Ok(event)) => event,
+                terminal => match watch_stop(terminal) {
+                    Some(outcome) => return outcome,
+                    None => unreachable!("an Ok item is matched above"),
+                },
+            };
+
+            // Coalesce whatever else has already arrived. A bulk
+            // control-plane operation — rotating a thousand keys, seeding an
+            // environment, a migration — lands as a burst of watch events,
+            // and applying them one at a time costs one full snapshot clone
+            // and one cache flush each. Draining is strictly non-blocking
+            // (`now_or_never`), so a single event still applies immediately
+            // and the batch only forms when the writer is genuinely ahead of
+            // us; the cap keeps a hot writer from starving the apply.
+            let mut batch = vec![first];
+            let mut stop = None;
+            while batch.len() < MAX_APPLY_BATCH {
+                match stream.next().now_or_never() {
+                    Some(Some(Ok(event))) => batch.push(event),
+                    // Stream end or error surfaced mid-drain. It is already
+                    // off the stream, so hold it: apply what we have first —
+                    // those events are real config — then act on it. Dropping
+                    // it here would silently swallow a stream failure.
+                    Some(terminal) => {
+                        stop = watch_stop(terminal);
+                        break;
+                    }
+                    // Nothing more is ready right now.
+                    None => break,
                 }
-                Some(Err(err)) => return Err(SupervisorError::Provider(err)),
-                Some(Ok(WatchEvent::Put(raw))) => {
-                    self.apply_put(&raw);
-                }
-                Some(Ok(WatchEvent::Delete { key, revision })) => {
-                    self.apply_delete(&key);
-                    // Advance the applied-revision floor to the delete's
-                    // mod_revision even when the key wasn't present —
-                    // "processed everything up to rev X" must cover
-                    // deletes, otherwise the heartbeat-reported
-                    // applied_revision (#519 B.3) stalls after a CP
-                    // delete until the next put arrives.
-                    self.set_revision_floor(revision);
-                }
-                Some(Ok(WatchEvent::Resync { entries, revision })) => {
-                    self.apply_resync(&entries);
-                    // Same rationale: the resync's header revision is the
-                    // "consistent as of" point even when the entry set
-                    // is empty or only contains older mod_revisions.
-                    self.set_revision_floor(revision);
-                }
+            }
+            self.apply_batch(&batch);
+            if let Some(outcome) = stop {
+                return outcome;
             }
         }
     }
 }
+
+/// What one staged watch event contributes to the batch's single publish.
+#[derive(Debug)]
+enum Delta {
+    /// An accepted put. `placed` is the `(kind, id)` the row landed on, used
+    /// by the in-batch presence probe; `None` only for a key that parsed
+    /// during load but not here, which cannot happen for an accepted row.
+    Merge {
+        placed: Option<(String, String)>,
+        /// Boxed: a whole `AisixSnapshot` inline would size every `Delta`,
+        /// including the far smaller `Remove`.
+        tiny: Box<AisixSnapshot>,
+    },
+    /// A delete of a row that was serving.
+    Remove { kind: String, id: String },
+}
+
+/// One event's staged outcome.
+#[derive(Debug)]
+struct Staged {
+    /// The snapshot change to publish, if any. `None` for a rejected put or
+    /// a delete that only cleared rejection/observed state.
+    delta: Option<Delta>,
+    /// Whether the reported state changed, i.e. whether the batch has to
+    /// sync config status and rewrite the cache file at all.
+    changed: bool,
+    /// The value the single-event entry point returns.
+    result: bool,
+}
+
+impl Staged {
+    fn changed(delta: Option<Delta>, result: bool) -> Self {
+        Self {
+            delta,
+            changed: true,
+            result,
+        }
+    }
+
+    fn unchanged(result: bool) -> Self {
+        Self {
+            delta: None,
+            changed: false,
+            result,
+        }
+    }
+}
+
+/// Classify a pulled watch item that is not a deliverable event.
+///
+/// `None` means the item WAS an event and the caller should apply it; a
+/// `Some` is the cycle's terminal outcome. One place so the drain loop and
+/// the blocking receive cannot disagree about what ends a watch cycle.
+fn watch_stop(
+    item: Option<Result<WatchEvent, ProviderError>>,
+) -> Option<Result<(), SupervisorError>> {
+    match item {
+        None => Some(Ok(())),
+        Some(Err(ProviderError::Compacted)) => {
+            tracing::warn!("etcd compaction detected — resyncing");
+            // `run` re-enters `cycle` cleanly and re-loads from scratch;
+            // compaction is not a backoff-worthy failure.
+            Some(Ok(()))
+        }
+        Some(Err(err)) => Some(Err(SupervisorError::Provider(err))),
+        Some(Ok(_)) => None,
+    }
+}
+
+/// Most watch events folded into one publish. Bounds the work done under a
+/// single apply transaction so a continuously-writing control plane cannot
+/// starve the apply loop.
+const MAX_APPLY_BATCH: usize = 256;
 
 #[derive(Debug)]
 enum SupervisorError {
@@ -1298,6 +1476,57 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
 /// kind reads as absent. Exhaustively destructured for the same
 /// drift-guard reason as [`merge_snapshot`]: a kind added to the
 /// snapshot but missed here would silently never pin a last known good.
+/// Remove `(kind, id)` from `snap`. Mirrors [`merge_snapshot`]'s
+/// exhaustiveness requirement: a kind missing here means a watch delete
+/// silently leaves the row serving.
+fn remove_from_snapshot(snap: &AisixSnapshot, kind: &str, id: &str) {
+    match kind {
+        "models" => {
+            snap.models.remove(id);
+        }
+        "api_keys" => {
+            snap.apikeys.remove(id);
+        }
+        "provider_keys" => {
+            snap.provider_keys.remove(id);
+        }
+        "guardrails" => {
+            snap.guardrails.remove(id);
+        }
+        "guardrail_attachments" => {
+            snap.guardrail_attachments.remove(id);
+        }
+        "cache_policies" => {
+            snap.cache_policies.remove(id);
+        }
+        "observability_exporters" => {
+            snap.observability_exporters.remove(id);
+        }
+        "rate_limit_policies" => {
+            snap.rate_limit_policies.remove(id);
+        }
+        "mcp_servers" => {
+            snap.mcp_servers.remove(id);
+        }
+        "mcp_policies" => {
+            snap.mcp_policies.remove(id);
+        }
+        "a2a_agents" => {
+            snap.a2a_agents.remove(id);
+        }
+        "oidc_providers" => {
+            snap.oidc_providers.remove(id);
+        }
+        "claim_mappings" => {
+            snap.claim_mappings.remove(id);
+        }
+        "passthrough_routes" => {
+            snap.passthrough_routes.remove(id);
+        }
+        _ => {}
+    }
+}
+
 fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
     let AisixSnapshot {
         models,
@@ -1432,6 +1661,19 @@ mod tests {
         }
     }
 
+    /// Eight distinct display names — the table indexes by name, so the
+    /// batch test needs one row per key rather than eight of the same.
+    const VALID_MODEL_NAMED: [&[u8]; 8] = [
+        br#"{"display_name":"n1","provider":"openai","model_name":"g","provider_key_id":"pk"}"#,
+        br#"{"display_name":"n2","provider":"openai","model_name":"g","provider_key_id":"pk"}"#,
+        br#"{"display_name":"n3","provider":"openai","model_name":"g","provider_key_id":"pk"}"#,
+        br#"{"display_name":"n4","provider":"openai","model_name":"g","provider_key_id":"pk"}"#,
+        br#"{"display_name":"n5","provider":"openai","model_name":"g","provider_key_id":"pk"}"#,
+        br#"{"display_name":"n6","provider":"openai","model_name":"g","provider_key_id":"pk"}"#,
+        br#"{"display_name":"n7","provider":"openai","model_name":"g","provider_key_id":"pk"}"#,
+        br#"{"display_name":"n8","provider":"openai","model_name":"g","provider_key_id":"pk"}"#,
+    ];
+
     const VALID_MODEL: &[u8] = br#"{
         "display_name": "my-gpt4",
         "provider": "openai",
@@ -1474,6 +1716,93 @@ mod tests {
         assert_eq!(stats.accepted, 1);
         let snap = sup.handle().load();
         assert_eq!(snap.models.len(), 1);
+    }
+
+    /// A bulk control-plane operation (rotating keys, seeding an
+    /// environment) arrives as many watch events. Applying them one at a
+    /// time costs one full snapshot clone and one cache flush per event —
+    /// O(total resources) per single write. One batch must publish once.
+    #[tokio::test]
+    async fn apply_batch_publishes_once_for_many_events() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+        let before = sup.handle().version();
+
+        let events: Vec<WatchEvent> = (1..=8)
+            .map(|i| {
+                WatchEvent::Put(entry(
+                    &format!("/aisix/models/m-{i}"),
+                    VALID_MODEL_NAMED[i - 1],
+                    i as i64 + 1,
+                ))
+            })
+            .collect();
+        sup.apply_batch(&events);
+
+        assert_eq!(sup.handle().load().models.len(), 8, "every put must land");
+        assert_eq!(
+            sup.handle().version() - before,
+            1,
+            "a batch must publish exactly one snapshot, not one per event"
+        );
+    }
+
+    /// Order inside the batch is the wire order: the last write to a key
+    /// wins, exactly as it would applying them one at a time.
+    #[tokio::test]
+    async fn apply_batch_respects_event_order_within_the_batch() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+
+        sup.apply_batch(&[
+            WatchEvent::Put(entry("/aisix/models/m-1", VALID_MODEL, 2)),
+            WatchEvent::Delete {
+                key: "/aisix/models/m-1".into(),
+                revision: 3,
+            },
+        ]);
+        assert_eq!(
+            sup.handle().load().models.len(),
+            0,
+            "put-then-delete in one batch must end deleted"
+        );
+
+        sup.apply_batch(&[
+            WatchEvent::Delete {
+                key: "/aisix/models/m-1".into(),
+                revision: 4,
+            },
+            WatchEvent::Put(entry("/aisix/models/m-1", VALID_MODEL, 5)),
+        ]);
+        assert_eq!(
+            sup.handle().load().models.len(),
+            1,
+            "delete-then-put in one batch must end present"
+        );
+    }
+
+    /// #871 across a batch: a row accepted earlier in the SAME batch is
+    /// serving by the time a later rejected write for that key is staged,
+    /// so its bytes must be pinned as last-known-good. Deferring the
+    /// publish must not make the pin decision read a pre-batch view.
+    #[tokio::test]
+    async fn apply_batch_pins_last_good_written_earlier_in_the_same_batch() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+
+        sup.apply_batch(&[
+            WatchEvent::Put(entry("/aisix/models/m-1", VALID_MODEL, 2)),
+            WatchEvent::Put(entry("/aisix/models/m-1", b"{ not json", 3)),
+        ]);
+
+        assert_eq!(
+            sup.handle().load().models.len(),
+            1,
+            "the rejected write must leave the earlier good row serving"
+        );
     }
 
     #[tokio::test]
@@ -1741,6 +2070,37 @@ mod tests {
         // synchronously relative to the event stream being in-memory.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(handle.load().models.len(), 1);
+
+        tx.send(true).unwrap();
+        join.await.unwrap();
+    }
+
+    /// The drain pulls items off the stream itself, so a stream error or end
+    /// that surfaces mid-drain has already been consumed. Events buffered
+    /// ahead of it are real config and must still be applied; the terminal
+    /// item must still end the cycle rather than being dropped on the floor.
+    #[tokio::test]
+    async fn drained_events_apply_before_a_stream_error_ends_the_cycle() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0).with_events(vec![
+            Ok(WatchEvent::Put(entry("/aisix/models/m-1", VALID_MODEL, 2))),
+            Ok(WatchEvent::Put(entry(
+                "/aisix/models/m-2",
+                VALID_MODEL_NAMED[1],
+                3,
+            ))),
+            Err(ProviderError::Compacted),
+        ]));
+        let sup = Arc::new(Supervisor::new(provider, "/aisix"));
+        let handle = sup.handle();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+
+        let join = tokio::spawn(sup.clone().run(rx));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            handle.load().models.len(),
+            2,
+            "events pulled before the terminal item must still be applied"
+        );
 
         tx.send(true).unwrap();
         join.await.unwrap();

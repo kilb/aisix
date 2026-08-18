@@ -122,15 +122,15 @@ describe("request id e2e: gateway-generated request IDs are UUIDs", () => {
     await waitConfigPropagation(async () => {
       try {
         const [chat, embeddings, messages] = await Promise.all([
-          postJson(app.proxyUrl, "/v1/chat/completions", {
+          postJson(app!.proxyUrl, "/v1/chat/completions", {
             model: "request-id-chat",
             messages: [{ role: "user", content: "ready" }],
           }),
-          postJson(app.proxyUrl, "/v1/embeddings", {
+          postJson(app!.proxyUrl, "/v1/embeddings", {
             model: "request-id-embeddings",
             input: "ready",
           }),
-          postJson(app.proxyUrl, "/v1/messages", {
+          postJson(app!.proxyUrl, "/v1/messages", {
             model: "request-id-messages",
             messages: [{ role: "user", content: "ready" }],
             max_tokens: 16,

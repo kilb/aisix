@@ -39,16 +39,35 @@ pub trait Resource: Send + Sync + 'static {
 
 /// Generic wrapper over a typed resource with its etcd coordinates.
 ///
-/// Cheap to clone (fields are small / already Arc'd for nested payloads).
+/// The payload sits behind an `Arc` so a dispatch can share the row the
+/// snapshot already holds instead of deep-copying it. Before this, every
+/// request cloned the whole `Model` (and `ProviderKey`) out of the snapshot
+/// only to wrap the copy in a fresh `Arc` — the refcount bought nothing and
+/// the copy was pure allocator pressure on the hot path.
+///
+/// `Serialize`/`Deserialize` pass through `Arc<T>` transparently (serde's
+/// `rc` feature), so the etcd loader and the snapshot cache are unaffected.
+/// A caller that needs to edit a row clones the inner value or uses
+/// [`std::sync::Arc::make_mut`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceEntry<T> {
     pub id: String,
-    pub value: T,
+    pub value: std::sync::Arc<T>,
     pub revision: i64,
 }
 
 impl<T> ResourceEntry<T> {
     pub fn new(id: impl Into<String>, value: T, revision: i64) -> Self {
+        Self {
+            id: id.into(),
+            value: std::sync::Arc::new(value),
+            revision,
+        }
+    }
+
+    /// Build from an already-shared payload, so a caller holding an
+    /// `Arc<T>` does not have to unwrap and re-wrap it.
+    pub fn from_arc(id: impl Into<String>, value: std::sync::Arc<T>, revision: i64) -> Self {
         Self {
             id: id.into(),
             value,

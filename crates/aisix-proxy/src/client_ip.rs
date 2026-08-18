@@ -55,6 +55,12 @@ pub fn resolve_client_ip(
     trusted: &[IpNet],
     recursive: bool,
 ) -> IpAddr {
+    // A dual-stack listener reports an IPv4 peer as `::ffff:a.b.c.d`, which
+    // no IPv4 CIDR contains. Compare in canonical form so the same
+    // `set_real_ip_from` config behaves identically on `0.0.0.0` and `[::]`.
+    // A no-op for genuine IPv6. Forwarded entries are canonicalized where
+    // they are parsed, in `parse_forwarded_token`.
+    let peer = peer.to_canonical();
     let is_trusted = |ip: &IpAddr| trusted.iter().any(|n| n.contains(ip));
     // nginx only rewrites $remote_addr when the connection itself comes
     // from a trusted proxy. An untrusted peer IS the client.
@@ -100,17 +106,17 @@ fn parse_forwarded_token(tok: &str) -> Option<IpAddr> {
     // Bracketed IPv6, optionally with a port: `[::1]` or `[::1]:443`.
     if let Some(rest) = tok.strip_prefix('[') {
         let inner = rest.split(']').next().unwrap_or("");
-        return inner.parse().ok();
+        return inner.parse::<IpAddr>().ok().map(|ip| ip.to_canonical());
     }
     // Bare address first; fall back to stripping a single `:port` (IPv4
     // or hostname:port form). A bare IPv6 contains multiple colons and
     // parses directly, so only strip when there's exactly one colon.
     if let Ok(ip) = tok.parse::<IpAddr>() {
-        return Some(ip);
+        return Some(ip.to_canonical());
     }
     if tok.matches(':').count() == 1 {
         if let Some((host, _port)) = tok.rsplit_once(':') {
-            return host.parse().ok();
+            return host.parse::<IpAddr>().ok().map(|ip| ip.to_canonical());
         }
     }
     None
@@ -273,6 +279,37 @@ mod tests {
         );
         assert!(parse_routing_tags("").is_empty());
         assert!(parse_routing_tags("  ,  ").is_empty());
+    }
+
+    /// A dual-stack listener (`[::]`, routine under Docker and Kubernetes)
+    /// reports an IPv4 peer as `::ffff:a.b.c.d`, which no IPv4 CIDR matches.
+    /// Without canonicalization the trusted-proxy gate never fires and every
+    /// caller is attributed to the load balancer's address.
+    #[test]
+    fn ipv4_mapped_peer_and_forwarded_entries_are_canonicalized() {
+        let trusted = nets(&["10.0.0.0/8"]);
+        let peer = ip("::ffff:10.0.0.1");
+        let fwd = [ip("203.0.113.7")];
+        assert_eq!(
+            resolve_client_ip(peer, &fwd, &trusted, true),
+            ip("203.0.113.7"),
+            "a v4-mapped peer inside a trusted v4 CIDR must be trusted"
+        );
+
+        assert_eq!(
+            parse_forwarded_token("::ffff:203.0.113.7"),
+            Some(ip("203.0.113.7")),
+            "a v4-mapped forwarded entry must resolve to its IPv4 form"
+        );
+        assert_eq!(
+            parse_forwarded_token("[::ffff:203.0.113.7]:443"),
+            Some(ip("203.0.113.7"))
+        );
+        // Genuine IPv6 is untouched.
+        assert_eq!(
+            parse_forwarded_token("2001:db8::1"),
+            Some(ip("2001:db8::1"))
+        );
     }
 
     #[test]

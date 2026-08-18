@@ -577,7 +577,7 @@ fn emit_tool_call_usage(
         &event,
         None,
         exporters.generation(),
-        exporters.iter().map(|e| &e.value),
+        exporters.iter().map(|e| &*e.value),
     );
 }
 

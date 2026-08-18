@@ -135,6 +135,26 @@ impl Limiter {
         self.store.add_tokens(key, tokens);
     }
 
+    /// Credit every reservation layer in one batch. Prefer this over a loop
+    /// of [`Limiter::add_tokens_post_stream`]: a distributed store waits
+    /// once for the whole batch instead of once per layer, and this runs
+    /// from the synchronous stream-completion callback on the serving
+    /// thread. No-op on zero tokens or an empty key list.
+    pub fn add_tokens_post_stream_all(&self, keys: &[String], tokens: u64) {
+        if tokens == 0 || keys.is_empty() {
+            return;
+        }
+        self.store.add_tokens_all(keys, tokens);
+    }
+
+    /// Reclaim per-key state idle for longer than `idle_for`. Called from
+    /// the server's periodic upkeep task so a long-lived process does not
+    /// hold buckets for api keys, models and policies that were deleted
+    /// from the control plane hours ago.
+    pub fn reap(&self, idle_for: std::time::Duration) {
+        self.store.reap(idle_for);
+    }
+
     /// Snapshot of the current rate-limit state for a key, used to inject
     /// `x-ratelimit-*` response headers. Returns `None` when there is
     /// nothing meaningful to report. Read-only — affects no counters.
@@ -698,6 +718,52 @@ mod tests {
             limiter.peek("k1", &l).await.unwrap().tpm_used,
             750,
             "TPM should reflect the post-stream commit",
+        );
+    }
+
+    #[tokio::test]
+    async fn add_tokens_post_stream_all_credits_every_layer() {
+        let clock = TestClock::new(100);
+        let limiter = Limiter::local_with_clock(clock);
+        let l = limits(Some(10), Some(1_000), None);
+        for key in ["key-layer", "model-layer", "policy-layer"] {
+            let _r = limiter.pre_commit(key, &l).await.unwrap();
+        }
+
+        limiter.add_tokens_post_stream_all(
+            &[
+                "key-layer".to_string(),
+                "model-layer".to_string(),
+                "policy-layer".to_string(),
+            ],
+            750,
+        );
+
+        for key in ["key-layer", "model-layer", "policy-layer"] {
+            assert_eq!(
+                limiter.peek(key, &l).await.unwrap().tpm_used,
+                750,
+                "{key} must be credited by the batched post-stream commit"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reap_reclaims_idle_state_through_the_limiter() {
+        let clock = TestClock::new(1_000);
+        let limiter = Limiter::local_with_clock(clock.clone());
+        let l = limits(Some(10), Some(1_000), None);
+        {
+            let _r = limiter.pre_commit("gone-from-config", &l).await.unwrap();
+        }
+        assert!(limiter.peek("gone-from-config", &l).await.is_some());
+
+        clock.advance(24 * 60 * 60 + 1);
+        limiter.reap(std::time::Duration::from_secs(24 * 60 * 60));
+
+        assert!(
+            limiter.peek("gone-from-config", &l).await.is_none(),
+            "state for a deleted config row must not survive the process"
         );
     }
 

@@ -778,7 +778,7 @@ async fn run_session(
         &event,
         None,
         exporters.generation(),
-        exporters.iter().map(|e| &e.value),
+        exporters.iter().map(|e| &*e.value),
     );
     // A realtime session bills real tokens against a real model, and this is
     // the only place that knows the session's totals. Its cost is resolved

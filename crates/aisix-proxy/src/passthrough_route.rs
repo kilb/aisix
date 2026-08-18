@@ -603,7 +603,7 @@ async fn dispatch(
             .observability_exporters
             .entries()
             .iter()
-            .map(|e| &e.value),
+            .map(|e| &*e.value),
     );
     let captured_prompt = content_cap.map(|_| request_guardrail_text(route.protocol, &body_bytes));
 
@@ -1663,7 +1663,7 @@ impl RouteTelemetry {
             &event,
             content.as_ref(),
             exporters.generation(),
-            exporters.iter().map(|e| &e.value),
+            exporters.iter().map(|e| &*e.value),
         );
     }
 }

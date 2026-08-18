@@ -158,6 +158,30 @@ impl CacheBackends {
     }
 }
 
+/// How long a completed batch's id stays in the process-local dedup map.
+/// Long enough to cover any realistic re-poll of the same terminal batch,
+/// short enough that the map cannot grow for the life of the process.
+pub(crate) const BILLED_BATCH_DEDUP_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(3600);
+
+/// Record that this process has attributed `batch_id`, returning `false` when
+/// it was already recorded inside the dedup window.
+///
+/// Entries older than `ttl` are reclaimed on the way through. The set is an
+/// optimization, not the correctness mechanism — the deterministic
+/// `request_id = "batch-<id>"` on the emitted events is what keeps
+/// re-emission idempotent across a restart (#720) — so expiring an entry can
+/// at worst cost one redundant, already-idempotent emit.
+pub(crate) fn remember_billed_batch(
+    seen: &dashmap::DashMap<String, std::time::Instant>,
+    batch_id: &str,
+    now: std::time::Instant,
+    ttl: std::time::Duration,
+) -> bool {
+    seen.retain(|_, recorded| now.duration_since(*recorded) <= ttl);
+    seen.insert(batch_id.to_string(), now).is_none()
+}
+
 #[derive(Clone)]
 pub struct ProxyState {
     // Axum clones state for several layers on every request. Keep the many
@@ -227,7 +251,7 @@ pub struct ProxyStateInner {
     /// UsageEvents by THIS process (#720). Process-local dedup only — the
     /// deterministic `request_id = "batch-<id>"` on the emitted events is
     /// what keeps cross-restart re-emission idempotent on the cp-api side.
-    pub billed_batches: Arc<dashmap::DashSet<String>>,
+    pub billed_batches: Arc<dashmap::DashMap<String, std::time::Instant>>,
     /// Boot-compiled User-Agent → `client_type` classifier: operator
     /// rules from `observability.metrics.client_type_rules` first, then
     /// the built-in allowlist (AISIX-Cloud#1045). Default = built-ins
@@ -268,7 +292,7 @@ fn live_exporter_fan_out(snapshot: &SnapshotHandle<AisixSnapshot>) -> OtlpHttpFa
     let reconciler = fan_out.clone();
     snapshot.subscribe_before_publish(move |view| {
         let exporters = view.snapshot.observability_exporters.entries();
-        reconciler.reconcile(view.version, exporters.iter().map(|entry| &entry.value));
+        reconciler.reconcile(view.version, exporters.iter().map(|entry| &*entry.value));
     });
     fan_out
 }
@@ -325,7 +349,7 @@ impl ProxyState {
                 .unwrap_or_default()
                 .into(),
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
-            billed_batches: Arc::new(dashmap::DashSet::new()),
+            billed_batches: Arc::new(dashmap::DashMap::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
             default_timeouts: crate::routing::TimeoutDefaults::default(),
@@ -368,7 +392,7 @@ impl ProxyState {
                 .unwrap_or_default()
                 .into(),
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
-            billed_batches: Arc::new(dashmap::DashSet::new()),
+            billed_batches: Arc::new(dashmap::DashMap::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
             default_timeouts: crate::routing::TimeoutDefaults::default(),
@@ -425,7 +449,7 @@ impl ProxyState {
                 .unwrap_or_default()
                 .into(),
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
-            billed_batches: Arc::new(dashmap::DashSet::new()),
+            billed_batches: Arc::new(dashmap::DashMap::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
             default_timeouts: crate::routing::TimeoutDefaults::default(),
@@ -514,7 +538,38 @@ impl ProxyState {
 
 #[cfg(test)]
 mod tests {
-    use super::ProxyState;
+
+    /// #720's dedup set is an optimization — the deterministic
+    /// `request_id = "batch-<id>"` is what actually makes re-emission
+    /// idempotent — so it must not grow for the life of the process. Entries
+    /// past the dedup window are reclaimed; a re-poll inside the window is
+    /// still suppressed.
+    #[test]
+    fn billed_batch_dedup_is_bounded_by_its_window() {
+        let seen = dashmap::DashMap::new();
+        let ttl = std::time::Duration::from_secs(3600);
+        let t0 = std::time::Instant::now();
+
+        assert!(
+            remember_billed_batch(&seen, "batch-a", t0, ttl),
+            "first sighting attributes"
+        );
+        assert!(
+            !remember_billed_batch(&seen, "batch-a", t0, ttl),
+            "a re-poll inside the window is suppressed"
+        );
+
+        let later = t0 + ttl + std::time::Duration::from_secs(1);
+        assert!(
+            remember_billed_batch(&seen, "batch-b", later, ttl),
+            "an unrelated batch still records"
+        );
+        assert!(
+            !seen.contains_key("batch-a"),
+            "an entry past its window must be reclaimed, not kept forever"
+        );
+    }
+    use super::{remember_billed_batch, ProxyState};
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;
     use aisix_core::{AisixSnapshot, ProxyConfig};
@@ -634,7 +689,7 @@ mod tests {
             &UsageEvent::default(),
             None,
             view.version,
-            exporters.iter().map(|entry| &entry.value),
+            exporters.iter().map(|entry| &*entry.value),
         );
         assert!(state.otlp_fan_out.exporter_stats().contains_key("revoked"));
 
@@ -651,7 +706,7 @@ mod tests {
             &UsageEvent::default(),
             None,
             view.version,
-            exporters.iter().map(|entry| &entry.value),
+            exporters.iter().map(|entry| &*entry.value),
         );
         assert!(state.otlp_fan_out.exporter_stats().is_empty());
         state.otlp_fan_out.shutdown().await;

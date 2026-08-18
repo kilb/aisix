@@ -169,8 +169,31 @@ export interface SpawnedApp {
 
 const BIN_PATH =
   process.env.AISIX_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "aisix");
-const READY_TIMEOUT_MS = 10_000;
+/**
+ * How long to wait for a spawned binary to bind its listeners.
+ *
+ * This budget only covers "the process is alive but has not bound yet": a
+ * non-zero exit is raced separately (`exitedEarly` below) and rejects at
+ * once, so a genuine boot failure never waits this out. What it has to
+ * absorb is cold start — the debug binary is ~600 MB, and the first spawn
+ * after a build faults it in from disk while sibling forks do the same.
+ * 10s was not enough for that and produced a spawn failure whose stderr was
+ * empty, which reads like a product fault rather than a slow start.
+ *
+ * Raising it has a second-order cost: `hookTimeout` in `vitest.config.ts`
+ * must stay above (spawns per hook × this budget), and some specs spawn five
+ * apps in one `beforeAll`. Keep the two in step.
+ */
+const READY_TIMEOUT_MS = positiveIntEnv("AISIX_E2E_READY_TIMEOUT_MS", 20_000);
 const SHUTDOWN_GRACE_MS = 3_000;
+
+/** Read a positive-integer override, falling back when unset or unusable. */
+function positiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
 
 /**
  * Suite-wide `proxy.thread_per_core`, from `E2E_THREAD_PER_CORE`, so CI
@@ -477,7 +500,8 @@ async function waitForReady(url: string, timeoutMs: number, bearer?: string): Pr
     await sleep(100);
   }
   throw new Error(
-    `timed out waiting for ${url} after ${attempts} attempts (lastStatus=${lastStatus ?? "n/a"}): ${lastErr ?? "no response"}`,
+    `timed out waiting for ${url} after ${attempts} attempts over ${timeoutMs}ms ` +
+      `(lastStatus=${lastStatus ?? "n/a"}): ${lastErr ?? "no response"}`,
   );
 }
 

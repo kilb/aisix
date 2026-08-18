@@ -299,6 +299,22 @@ pub async fn messages(
                     captured_content,
                 );
             }
+            // Same window /v1/chat/completions publishes, so an Anthropic-SDK
+            // client (Claude Code) can schedule back-off from real numbers
+            // instead of blind-retrying into a 429.
+            let mut response = response;
+            let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
+            crate::request_metrics::publish_rate_limit_window(
+                &state.metrics,
+                &state.limiter,
+                &snapshot,
+                &api_key_id,
+                &rl_limits,
+                &model_name,
+                &upstream_model,
+                &mut response,
+            )
+            .await;
             response
         }
         Err(MessagesDispatchError { err, routing }) => {
@@ -358,7 +374,7 @@ pub async fn messages(
                         .observability_exporters
                         .entries()
                         .iter()
-                        .map(|e| &e.value),
+                        .map(|e| &*e.value),
                 )
                 .map(|cap| {
                     CapturedContent::new(
@@ -648,19 +664,14 @@ async fn dispatch(
     // `Option` so the winning streaming attempt can `take()` the reservation
     // and carry it into the end-of-stream guard (#688); non-streaming / failed
     // attempts leave it in place for the post-dispatch commit or a retry.
+    // `quota::enforce` runs the cp-api budget gate itself (`check_budget`),
+    // producing this same `BudgetExceeded` and additionally refreshing the
+    // budget gauges — so an inline second check here would be unreachable
+    // for the exceeded case and silently skip the gauge sync.
+    // `/v1/chat/completions` is the deliberate exception: it uses
+    // `enforce_rate_limit` and owns its budget check.
     let mut reservation =
         Some(crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?);
-
-    // Budget pre-check via cp-api (mirrors /v1/chat/completions).
-    let budget_decision = state.budgets.check(&auth.entry.id).await;
-    if !budget_decision.allowed {
-        return Err(
-            ProxyError::BudgetExceeded(Box::new(budget_decision.reason.unwrap_or_else(|| {
-                crate::budget::BudgetReason::message_only(auth.entry.id.clone())
-            })))
-            .into(),
-        );
-    }
 
     // Resolve the attempt list. For a Model Group (routing model) this
     // walks `routing.targets` and health-filters them; for a direct
@@ -1362,7 +1373,7 @@ async fn anthropic_passthrough_dispatch(
                 .observability_exporters
                 .entries()
                 .iter()
-                .map(|e| &e.value),
+                .map(|e| &*e.value),
         );
         let captured_prompt_c =
             content_cap.map(|_| serde_json::to_string(&body).unwrap_or_default());
@@ -1416,9 +1427,7 @@ async fn anthropic_passthrough_dispatch(
                     usage.cache_creation_tokens,
                     usage.cache_read_tokens,
                 );
-                for key in &post_stream_keys {
-                    limiter_c.add_tokens_post_stream(key, streamed_tokens);
-                }
+                limiter_c.add_tokens_post_stream_all(&post_stream_keys, streamed_tokens);
                 drop(stream_hold);
                 // least_busy: stream over — this target is no longer
                 // in-flight.
@@ -1709,7 +1718,7 @@ async fn anthropic_passthrough_dispatch(
                 .observability_exporters
                 .entries()
                 .iter()
-                .map(|e| &e.value),
+                .map(|e| &*e.value),
         )
         .filter(|_| input_capture_safe && output_capture_safe)
         .map(|cap| {
@@ -1876,10 +1885,10 @@ async fn cross_provider_dispatch(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     body: &Value,
-    model: &aisix_core::Model,
+    model: &Arc<aisix_core::Model>,
     model_id: &str,
     timeouts: crate::routing::TimeoutBudget,
-    provider_key: &aisix_core::ProviderKey,
+    provider_key: &Arc<aisix_core::ProviderKey>,
     provider_key_id: &str,
     model_name: &str,
     request_id: &str,
@@ -1946,9 +1955,9 @@ async fn cross_provider_dispatch(
     let mut ctx = crate::dispatch::bridge_ctx(
         request_id,
         model_id,
-        Arc::new(model.clone()),
+        Arc::clone(model),
         provider_key_id,
-        Arc::new(provider_key.clone()),
+        Arc::clone(provider_key),
         Some(client),
     );
     let connect_deadline = if is_stream {
@@ -2066,7 +2075,7 @@ async fn cross_provider_dispatch(
                 .observability_exporters
                 .entries()
                 .iter()
-                .map(|e| &e.value),
+                .map(|e| &*e.value),
         );
         let captured_prompt_for_telem =
             content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
@@ -2114,9 +2123,7 @@ async fn cross_provider_dispatch(
                     comp.cache_creation_tokens,
                     comp.cache_read_tokens,
                 );
-                for key in &post_stream_keys {
-                    limiter_for_stream.add_tokens_post_stream(key, streamed_tokens);
-                }
+                limiter_for_stream.add_tokens_post_stream_all(&post_stream_keys, streamed_tokens);
                 drop(stream_hold);
                 // least_busy: stream over — this target is no longer
                 // in-flight.
@@ -2351,7 +2358,7 @@ async fn cross_provider_dispatch(
             .observability_exporters
             .entries()
             .iter()
-            .map(|e| &e.value),
+            .map(|e| &*e.value),
     )
     .filter(|_| input_capture_safe && output_capture_safe)
     .map(|cap| {
@@ -3215,7 +3222,7 @@ fn emit_anthropic_usage_event(
         &event,
         content.as_ref(),
         exporters.generation(),
-        exporters.iter().map(|e| &e.value),
+        exporters.iter().map(|e| &*e.value),
     );
     // Cache-inclusive canonical total: Anthropic reports cache tokens as
     // counters separate from prompt_tokens, so prompt+completion undercounts

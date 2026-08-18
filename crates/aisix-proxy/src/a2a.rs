@@ -779,13 +779,13 @@ fn emit_a2a_usage(
     // only. The captured text is the message parts, not the JSON-RPC
     // envelopes, so it reads as a prompt and a completion rather than as
     // protocol scaffolding.
-    let captured = content_capture_cap(exporters.iter().map(|e| &e.value))
+    let captured = content_capture_cap(exporters.iter().map(|e| &*e.value))
         .map(|cap| CapturedContent::new(&call.text.request, &response_text, cap as usize));
     state.otlp_fan_out.fan_out(
         &event,
         captured.as_ref(),
         exporters.generation(),
-        exporters.iter().map(|e| &e.value),
+        exporters.iter().map(|e| &*e.value),
     );
 }
 
