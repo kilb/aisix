@@ -13,9 +13,29 @@
 //! address makes an *in-process* retry reuse the **same** key (the pipeline
 //! retries the same batch on a transient error), so a downstream Snowpipe /
 //! Auto Loader dedups that retry by filename and does not double-load — the
-//! load-bearing property in AISIX-Cloud#689 §8. This is at-least-once across a
-//! DP restart (a re-batch yields a new key); restart-stable `FileSequence`
-//! markers and org/env partitioning are tracked as follow-ups.
+//! load-bearing property in AISIX-Cloud#689 §8. Two identical bodies always
+//! land on the same key, restart or not, so that dedup survives a restart for
+//! any batch that re-forms identically.
+//!
+//! What it is NOT is exactly-once across a restart: a re-batch that groups the
+//! same records differently has a different body, hence a different key, and
+//! the overlapping records load twice.
+//!
+//! [`IdempotencyScheme::FileSequence`] is deliberately NOT adopted here, and
+//! that is a design position rather than an unfinished wiring. Its documented
+//! shape is `{dp_node}-{worker}-{seq}`, which is only restart-stable if the
+//! sequence itself survives a restart — and this data plane keeps no durable
+//! state of its own by design (it reads configuration from etcd and holds
+//! everything else in memory). A sequence that restarts from zero is worse
+//! than the content address it would replace: a fresh batch would reuse a key
+//! already uploaded, and a downstream loader deduping by filename would
+//! silently DROP the new records. Losing data is a worse failure than loading
+//! it twice, so the sink keeps the content address and declares the guarantee
+//! it actually has. Making `FileSequence` sound needs a durable sequence
+//! store, which is a new failure domain (disk, ephemeral volumes, pod
+//! identity) and its own design decision.
+//!
+//! Org/env partitioning of the key prefix remains a genuine follow-up.
 
 use std::sync::Arc;
 
@@ -113,11 +133,12 @@ impl ObservabilitySink for ObjectStoreSink {
     fn capabilities(&self) -> SinkCapabilities {
         SinkCapabilities {
             // At-least-once. Content-addressed keys let a downstream loader
-            // dedup an *in-process* pipeline retry by filename (same batch →
-            // same body → same key), but this is NOT a restart-stable monotonic
-            // sequence: a re-batch after a DP restart yields a new key. So it
-            // declares `None` (like the SLS sink) until real `FileSequence`
-            // markers land (follow-up) — don't overstate the guarantee here.
+            // dedup a pipeline retry by filename (same batch → same body →
+            // same key), but that is not the monotonic sequence
+            // `FileSequence` describes, and a re-batch that groups records
+            // differently produces a different key. `None` is the guarantee
+            // this sink actually has; see the module docs for why a file
+            // sequence would be weaker here rather than stronger.
             idempotency: IdempotencyScheme::None,
             // One object per flush; no cross-object ordering requirement.
             ordering: OrderingScope::None,

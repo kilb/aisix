@@ -9,7 +9,7 @@
 //!
 //! Key layout (hash-tagged so every key for a bucket shares one Redis
 //! Cluster slot, keeping the per-bucket Lua atomic):
-//! - `aisix:rl:{<bucket>}:<rps|rpm|rph|rpd|tpm|tpd>:<window_start>` — plain
+//! - `aisix:rl:{<bucket>}:<rps|rpm|rph|rpd|tpm|tph|tpd>:<window_start>` — plain
 //!   `INCR`/`GET` counters, `EXPIRE = window + grace`.
 //! - `aisix:rl:{<bucket>}:conc` — a ZSET (`member → score=server_time_ms`)
 //!   acting as a
@@ -159,9 +159,9 @@ end
 return {0, 0}
 "#;
 
-/// Post-deduct: add `tokens` to the tpm/tpd windows AND release the
-/// concurrency slot held by `member`. Both token windows are always
-/// touched (matching the local backend); an unread tpd counter just
+/// Post-deduct: add `tokens` to the tpm/tph/tpd windows AND release the
+/// concurrency slot held by `member`. Every token window is always
+/// touched (matching the local backend); an unread counter just
 /// expires. ARGV: prefix, member, tokens, grace.
 const COMMIT_LUA: &str = r#"
 local prefix = ARGV[1]
@@ -171,7 +171,7 @@ local grace = tonumber(ARGV[4])
 local t = redis.call('TIME')
 local now = tonumber(t[1])
 if tokens > 0 then
-  for _, d in ipairs({{'tpm', 60}, {'tpd', 86400}}) do
+  for _, d in ipairs({{'tpm', 60}, {'tph', 3600}, {'tpd', 86400}}) do
     local ws = now - (now % d[2])
     local k = prefix .. ':' .. d[1] .. ':' .. ws
     if redis.call('INCRBY', k, tokens) == tokens then
@@ -203,8 +203,10 @@ redis.call('EXPIRE', conc_key, conc_ttl)
 return 1
 "#;
 
-/// Post-stream token add only (no concurrency change). ARGV: prefix,
-/// tokens, grace.
+/// Post-stream token add only (no concurrency change). Touches the same
+/// token windows as `COMMIT_LUA` — the two must stay in step, or a streamed
+/// request would move a different set of counters than a unary one. ARGV:
+/// prefix, tokens, grace.
 const ADD_TOKENS_LUA: &str = r#"
 local prefix = ARGV[1]
 local tokens = tonumber(ARGV[2])
@@ -212,7 +214,7 @@ local grace = tonumber(ARGV[3])
 local t = redis.call('TIME')
 local now = tonumber(t[1])
 if tokens > 0 then
-  for _, d in ipairs({{'tpm', 60}, {'tpd', 86400}}) do
+  for _, d in ipairs({{'tpm', 60}, {'tph', 3600}, {'tpd', 86400}}) do
     local ws = now - (now % d[2])
     local k = prefix .. ':' .. d[1] .. ':' .. ws
     if redis.call('INCRBY', k, tokens) == tokens then

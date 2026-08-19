@@ -397,6 +397,7 @@ mod tests {
             rph: None,
             rpd: None,
             tpm,
+            tph: None,
             tpd: None,
             concurrency,
         }
@@ -415,6 +416,7 @@ mod tests {
             rph,
             rpd,
             tpm: None,
+            tph: None,
             tpd: None,
             concurrency: None,
         }
@@ -641,6 +643,7 @@ mod tests {
             rph: None,
             rpd: Some(20),
             tpm: None,
+            tph: None,
             tpd: None,
             concurrency: None,
         };
@@ -680,6 +683,7 @@ mod tests {
             rph: None,
             rpd: Some(5),
             tpm: None,
+            tph: None,
             tpd: None,
             concurrency: None,
         };

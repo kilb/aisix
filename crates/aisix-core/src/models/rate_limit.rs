@@ -19,6 +19,10 @@ pub struct RateLimit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tpm: Option<u64>,
 
+    /// Tokens per 3,600-second window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tph: Option<u64>,
+
     /// Tokens per 86,400-second window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tpd: Option<u64>,
@@ -31,7 +35,7 @@ pub struct RateLimit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpm: Option<u64>,
 
-    /// Requests per 3,600-second window. There is no per-hour token limit field.
+    /// Requests per 3,600-second window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rph: Option<u64>,
 
@@ -47,6 +51,7 @@ pub struct RateLimit {
 impl RateLimit {
     pub const fn is_unrestricted(&self) -> bool {
         self.tpm.is_none()
+            && self.tph.is_none()
             && self.tpd.is_none()
             && self.rps.is_none()
             && self.rpm.is_none()
@@ -100,6 +105,7 @@ impl From<&McpRateLimit> for RateLimit {
     fn from(mcp: &McpRateLimit) -> Self {
         Self {
             tpm: None,
+            tph: None,
             tpd: None,
             rps: mcp.rps,
             rpm: mcp.rpm,

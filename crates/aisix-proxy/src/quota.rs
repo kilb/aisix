@@ -298,10 +298,15 @@ fn classic_rate_limit(policy: &RateLimitPolicy) -> Option<RateLimit> {
             // single 1-second window.
             // Post-fix: native rps via `FixedWindowCounter::new(1)`.
             //
-            // Tokens (`tps`) intentionally NOT wired — at a 1s window
-            // the post-deduct add pattern races the window roll-over
-            // and silently grants freebies on every cross-boundary
-            // request. Tracked separately in api7/ai-gateway#396.
+            // Tokens (`tps`) intentionally NOT wired, and this is a
+            // decision rather than a gap waiting to be filled. A token
+            // count is only known once the upstream has answered, so
+            // every token window is charged after the fact; at a 1s
+            // window essentially every request commits after the bucket
+            // it was admitted against has rolled, so the cap would lag
+            // by about its own width. A cap that reads as enforced and
+            // is not is worse than an absent one, so the sub-minute case
+            // is refused loudly below. See api7/ai-gateway#396.
             rl.rps = policy.max_requests;
             // Audit M1 (#399): warn loudly when an operator set
             // `max_tokens` on a sub-minute window. Without the warn,
@@ -323,11 +328,13 @@ fn classic_rate_limit(policy: &RateLimitPolicy) -> Option<RateLimit> {
             // counterpart of the "second" bug).
             // Post-fix: native rph via `FixedWindowCounter::new(3600)`.
             //
-            // Tokens (`tph`) intentionally NOT wired — see ai-gateway#396.
             rl.rph = policy.max_requests;
-            if policy.max_tokens.is_some() {
-                warn_inert_max_tokens_once(&policy.name, "hour");
-            }
+            // `tph` is a native counter now, same as `tpd`: a token cap on an
+            // hour window is honoured rather than warned about. The
+            // post-response commit skews attribution by at most one request's
+            // duration, which against 3,600 seconds is the same negligible
+            // skew `tpm` and `tpd` already carry.
+            rl.tph = policy.max_tokens;
         }
         PolicyWindow::Day => {
             // Both counters are native (`token_dims`, `KeyState`, and
@@ -796,7 +803,8 @@ mod tests {
             rl.tpm.is_none(),
             "second window MUST NOT populate tpm (would 60× the cap)"
         );
-        // tps intentionally deferred — see ai-gateway#396.
+        // tps is a deliberate non-feature — see the branch comment and
+        // `second_window_still_carries_no_token_cap`.
     }
 
     #[test]
@@ -816,7 +824,24 @@ mod tests {
             rl.tpd.is_none(),
             "hour window MUST NOT populate tpd (would 24× the cap)"
         );
-        // tph intentionally deferred — see ai-gateway#396.
+        assert_eq!(
+            rl.tph,
+            Some(500_000),
+            "an hour window's token cap is a native tph counter (#396)"
+        );
+    }
+
+    /// A sub-minute window still refuses to carry a token cap, and the
+    /// warn-once path is what tells the operator. Pinned so wiring `tph`
+    /// cannot be mistaken for having wired `tps` too.
+    #[test]
+    fn second_window_still_carries_no_token_cap() {
+        let rl = classic_rate_limit(&make_policy("second", Some(10), Some(1000))).unwrap();
+        assert!(
+            rl.tph.is_none() && rl.tpm.is_none() && rl.tpd.is_none(),
+            "a per-second policy's max_tokens must not leak into a wider window, \
+             which would enforce a cap the operator never asked for",
+        );
     }
 
     #[test]

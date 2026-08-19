@@ -28,6 +28,7 @@ struct KeyState {
     rph: FixedWindowCounter,
     rpd: FixedWindowCounter,
     tpm: FixedWindowCounter,
+    tph: FixedWindowCounter,
     tpd: FixedWindowCounter,
     in_flight: u32,
     /// Unix seconds of the last operation on this bucket, so [`LocalStore::reap`]
@@ -43,6 +44,7 @@ impl KeyState {
             rph: FixedWindowCounter::new(HOUR_SECS),
             rpd: FixedWindowCounter::new(DAY_SECS),
             tpm: FixedWindowCounter::new(MINUTE_SECS),
+            tph: FixedWindowCounter::new(HOUR_SECS),
             tpd: FixedWindowCounter::new(DAY_SECS),
             in_flight: 0,
             last_touched: now,
@@ -125,9 +127,17 @@ impl<C: Clock> RateStore for LocalStore<C> {
         }
 
         // Token limits — checked but not incremented. We refuse new
-        // requests if the previous minute/day already overran the cap.
+        // requests if the previous minute/hour/day already overran the cap.
         if let Some(max) = limits.tpm {
             if let Some(retry) = s.tpm.is_exceeded(now, max) {
+                return Err(RateLimitError::Tokens {
+                    scope: RateLimitScope::Tokens,
+                    retry_after_secs: retry,
+                });
+            }
+        }
+        if let Some(max) = limits.tph {
+            if let Some(retry) = s.tph.is_exceeded(now, max) {
                 return Err(RateLimitError::Tokens {
                     scope: RateLimitScope::Tokens,
                     retry_after_secs: retry,
@@ -216,6 +226,7 @@ impl<C: Clock> RateStore for LocalStore<C> {
         let state = self.state_for(key);
         let mut s = state.lock();
         s.tpm.add(now, tokens);
+        s.tph.add(now, tokens);
         s.tpd.add(now, tokens);
         s.in_flight = s.in_flight.saturating_sub(1);
         s.last_touched = now;
@@ -244,6 +255,7 @@ impl<C: Clock> RateStore for LocalStore<C> {
         let state = self.state_for(key);
         let mut s = state.lock();
         s.tpm.add(now, tokens);
+        s.tph.add(now, tokens);
         s.tpd.add(now, tokens);
         s.last_touched = now;
     }
@@ -285,6 +297,75 @@ mod tests {
             rpm: Some(10),
             ..Default::default()
         }
+    }
+
+    /// An hour token cap enforces, and resets when its window rolls.
+    ///
+    /// `tph` was accepted by the control plane and silently ignored by the
+    /// gateway (#396): an operator could set an hourly token budget, see it
+    /// stored, and have it never refuse anything. The `tpd` counter beside it
+    /// worked the whole time, which is what made the gap invisible — the
+    /// feature looked present because its sibling was.
+    #[tokio::test]
+    async fn an_hour_token_cap_refuses_once_the_hour_is_spent_and_frees_on_roll() {
+        let clock = TestClock::new(1_000);
+        let store = LocalStore::with_clock(clock.clone());
+        let l = RateLimit {
+            tph: Some(100),
+            ..Default::default()
+        };
+
+        // Token windows are checked, not incremented, at admission — so the
+        // first request is always admitted and the cap bites on the next one.
+        store.acquire("k", &l, "m1").await.unwrap();
+        store.commit("k", 100, "m1").await;
+
+        let err = store
+            .acquire("k", &l, "m2")
+            .await
+            .expect_err("the hour's tokens are spent");
+        assert!(
+            matches!(err, RateLimitError::Tokens { .. }),
+            "the refusal must name the token dimension, not concurrency: {err:?}",
+        );
+
+        // Same hour, one second later: still refused.
+        clock.advance(1);
+        assert!(store.acquire("k", &l, "m3").await.is_err());
+
+        // The window rolls and the budget is fresh again.
+        clock.advance(HOUR_SECS);
+        store
+            .acquire("k", &l, "m4")
+            .await
+            .expect("a new hour starts with an unspent budget");
+    }
+
+    /// The hour counter is its own bucket: spending the hourly budget must not
+    /// consume the daily one, or a `tph` + `tpd` pair would refuse at the
+    /// tighter cap forever.
+    #[tokio::test]
+    async fn the_hour_and_day_token_counters_are_independent() {
+        let clock = TestClock::new(1_000);
+        let store = LocalStore::with_clock(clock.clone());
+        let l = RateLimit {
+            tph: Some(100),
+            tpd: Some(1_000),
+            ..Default::default()
+        };
+
+        store.acquire("k", &l, "m1").await.unwrap();
+        store.commit("k", 100, "m1").await;
+        assert!(
+            store.acquire("k", &l, "m2").await.is_err(),
+            "the hour is spent",
+        );
+
+        clock.advance(HOUR_SECS);
+        store
+            .acquire("k", &l, "m3")
+            .await
+            .expect("the day still has 900 tokens left, so the next hour serves");
     }
 
     /// Buckets are keyed by config cardinality (api key × model × policy),

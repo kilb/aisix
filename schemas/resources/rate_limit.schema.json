@@ -22,7 +22,7 @@
       "minimum": 0.0
     },
     "rph": {
-      "description": "Requests per 3,600-second window. There is no per-hour token limit field.",
+      "description": "Requests per 3,600-second window.",
       "type": [
         "integer",
         "null"
@@ -50,6 +50,15 @@
     },
     "tpd": {
       "description": "Tokens per 86,400-second window.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "tph": {
+      "description": "Tokens per 3,600-second window.",
       "type": [
         "integer",
         "null"

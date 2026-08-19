@@ -72,10 +72,19 @@ pub(crate) fn request_dims(limits: &RateLimit) -> Vec<Dim> {
     .collect()
 }
 
-/// Token-count dimensions (tpm/tpd) that carry a limit.
+/// Token-count dimensions (tpm/tph/tpd) that carry a limit.
+///
+/// There is deliberately no `tps`. Token counts are only known once the
+/// upstream has answered, so every token window is charged after the fact; at
+/// a 1-second window essentially every request commits after the bucket it was
+/// admitted against has rolled, which makes a per-second token cap lag by
+/// about its own width. A cap that looks enforced and is not is worse than an
+/// absent one, so the sub-minute case stays refused loudly (see
+/// `quota::warn_inert_max_tokens_once`) rather than half-honoured.
 pub(crate) fn token_dims(limits: &RateLimit) -> Vec<Dim> {
     [
         ("tpm", MINUTE_SECS, limits.tpm),
+        ("tph", HOUR_SECS, limits.tph),
         ("tpd", DAY_SECS, limits.tpd),
     ]
     .into_iter()

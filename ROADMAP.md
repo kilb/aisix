@@ -21,6 +21,7 @@ The **Surface** column shows where a capability lands: **Gateway** is the AISIX 
 | Directory sync (SCIM) | Provision and deprovision users and groups from your identity provider. | Cloud |
 | Service accounts | Login-less, first-class principals for automated callers. | Cloud |
 | Semantic caching | Serve responses for prompts close in meaning, on top of today's exact-match cache. | Gateway |
+| Hourly token limits on keys and models | Set a per-hour token budget directly on an API key or a model, alongside today's per-minute and per-day figures. The gateway enforces it today — including through an hourly rate-limit policy, which needs no further Cloud work — so what remains is exposing the inline field. | Cloud |
 | Network allowlists for MCP servers and A2A agents | Restrict which client networks may reach a registered MCP server or A2A agent, the way model network allowlists already work. The gateway enforces the restriction today; setting it from the dashboard and Cloud Admin API is what remains. | Cloud |
 
 ## Next
