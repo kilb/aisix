@@ -1566,7 +1566,25 @@ pub async fn create_video(
                     started.elapsed(),
                 );
             }
-            success.response
+            // Same window the other model-dispatch endpoints publish, so an
+            // SDK client here can schedule back-off from real numbers.
+            let mut response = success.response;
+            let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
+            crate::request_metrics::publish_rate_limit_window(
+                &state.metrics,
+                &state.limiter,
+                &snapshot,
+                &auth.entry.id,
+                &rl_limits,
+                &model_name,
+                // Videos resolves no distinct upstream name on the success
+                // struct; the helper uses only the requested half for the
+                // label, so passing it twice is exact rather than a stand-in.
+                &model_name,
+                &mut response,
+            )
+            .await;
+            response
         }
         Err(err) => {
             let status = err.status().as_u16();

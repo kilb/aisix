@@ -109,6 +109,14 @@ fn exporter_pipeline_config() -> PipelineConfig {
 
 impl OtlpHttpFanOut {
     pub fn new() -> Self {
+        Self::with_metrics(None)
+    }
+
+    /// Like [`OtlpHttpFanOut::new`], publishing per-exporter drop and
+    /// delivery-failure counters to `metrics`. The server bootstrap passes
+    /// the process handle so telemetry loss is visible on `/metrics`; tests
+    /// pass `None`.
+    pub fn with_metrics(metrics: Option<Arc<crate::Metrics>>) -> Self {
         let client = aisix_gateway::client_builder()
             .timeout(REQUEST_TIMEOUT)
             .user_agent(USER_AGENT)
@@ -118,7 +126,13 @@ impl OtlpHttpFanOut {
             .expect("reqwest::Client default config is valid");
         Self {
             inner: Arc::new(FanOutInner {
-                exporters: ExporterPipelines::new(exporter_pipeline_config()),
+                exporters: {
+                    let pipelines = ExporterPipelines::new(exporter_pipeline_config());
+                    match metrics {
+                        Some(m) => pipelines.with_metrics(m),
+                        None => pipelines,
+                    }
+                },
                 client,
                 reconciled_generation: parking_lot::Mutex::new(0),
             }),

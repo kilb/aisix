@@ -1331,11 +1331,13 @@ async fn dispatch(
 /// <https://platform.openai.com/docs/api-reference/completions/object>
 fn extract_completion_usage(body: &Value) -> Option<CompletionUsage> {
     let usage = body.get("usage")?;
-    let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64())? as u32;
+    let prompt_tokens =
+        crate::usage_attr::token_count(usage.get("prompt_tokens").and_then(|v| v.as_u64())?);
     let completion_tokens = usage
         .get("completion_tokens")
         .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
+        .map(crate::usage_attr::token_count)
+        .unwrap_or(0);
     Some(CompletionUsage {
         prompt_tokens,
         completion_tokens,

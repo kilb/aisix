@@ -448,6 +448,12 @@ pub struct RoutingRegistry {
 }
 
 impl RoutingRegistry {
+    /// Drop round-robin cursors for routing models the snapshot no longer
+    /// carries. Keyed by configuration, so nothing else reclaims them.
+    pub fn retain_configured(&self, is_configured: &dyn Fn(&str) -> bool) {
+        self.cursors.retain(|name, _| is_configured(name));
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

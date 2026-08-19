@@ -90,14 +90,6 @@ describe("cache edges: model in fingerprint + enabled:false bypass", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await seed.createApiKey({
-      key_hash: CALLER_KEY_HASH,
-      allowed_models: [
-        "cache-edges-A",
-        "cache-edges-B",
-        "cache-edges-disabled",
-      ],
-    });
     // Two enabled policies scoped narrowly to A and B respectively
     // so test (1) has caching ON for those Models, plus one
     // disabled policy scoped to the third Model. Crucially the
@@ -119,6 +111,19 @@ describe("cache edges: model in fingerprint + enabled:false bypass", () => {
       enabled: false,
       applies_to: "model:cache-edges-disabled",
     });
+    // Seeded LAST on purpose (`tests/e2e/AGENTS.md`): the readiness gate waits
+    // on this key, and that only implies the rest of the seed set when nothing
+    // is written after it. A resource seeded afterwards can still be
+    // propagating when the gate opens.
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: [
+        "cache-edges-A",
+        "cache-edges-B",
+        "cache-edges-disabled",
+      ],
+    });
+
   });
 
   afterAll(async () => {

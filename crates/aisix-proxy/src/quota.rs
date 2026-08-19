@@ -250,6 +250,44 @@ fn escape_bucket_segment(value: &str) -> std::borrow::Cow<'_, str> {
 /// Convert a classic row's `window` + `max_*` into the 7-field
 /// [`RateLimit`]. `None` when the row carries no window (formless rows
 /// are rejected at load; this is the total fallback).
+/// Warn once per `(policy, window)` that its `max_tokens` is inert.
+///
+/// `classic_rate_limit` runs per request through `match_policy_layer`, so an
+/// unconditional warn here is one line per request for the life of the
+/// deployment — at warn level, where it drowns the events an operator needs
+/// to see. The gap itself is real and tracked (api7/ai-gateway#396); what has
+/// to be bounded is the telling. Mirrors `warn_partial_compat_deduped` in the
+/// etcd loader, including its poison tolerance: this set only dedupes log
+/// lines, so a panic under the lock must not wedge the request path.
+fn warn_inert_max_tokens_once(policy_name: &str, window: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    // Bounded by policy count, which is operator-configured and small; the
+    // cap is a backstop against a pathological config, not a working limit.
+    const MAX_REMEMBERED: usize = 1024;
+    static WARNED: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+
+    let entry = (policy_name.to_string(), window.to_string());
+    let mut warned = WARNED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if warned.contains(&entry) {
+        return;
+    }
+    tracing::warn!(
+        policy_name = %entry.0,
+        window = %entry.1,
+        "max_tokens ignored: per-{} token-rate counter not yet implemented; \
+         see api7/ai-gateway#396",
+        entry.1,
+    );
+    if warned.len() < MAX_REMEMBERED {
+        warned.insert(entry);
+    }
+}
+
 fn classic_rate_limit(policy: &RateLimitPolicy) -> Option<RateLimit> {
     let mut rl = RateLimit::default();
     match policy.window? {
@@ -270,12 +308,7 @@ fn classic_rate_limit(policy: &RateLimitPolicy) -> Option<RateLimit> {
             // the policy looks accepted at cp-api but the token cap
             // is silently inert until ai-gateway#396 lands.
             if policy.max_tokens.is_some() {
-                tracing::warn!(
-                    policy_name = %policy.name,
-                    window = "second",
-                    "max_tokens ignored: per-second token-rate counter not yet implemented; \
-                     see api7/ai-gateway#396"
-                );
+                warn_inert_max_tokens_once(&policy.name, "second");
             }
         }
         PolicyWindow::Minute => {
@@ -293,12 +326,7 @@ fn classic_rate_limit(policy: &RateLimitPolicy) -> Option<RateLimit> {
             // Tokens (`tph`) intentionally NOT wired — see ai-gateway#396.
             rl.rph = policy.max_requests;
             if policy.max_tokens.is_some() {
-                tracing::warn!(
-                    policy_name = %policy.name,
-                    window = "hour",
-                    "max_tokens ignored: per-hour token-rate counter not yet implemented; \
-                     see api7/ai-gateway#396"
-                );
+                warn_inert_max_tokens_once(&policy.name, "hour");
             }
         }
         PolicyWindow::Day => {

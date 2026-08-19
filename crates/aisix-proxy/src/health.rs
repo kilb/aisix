@@ -499,6 +499,18 @@ impl Drop for InFlightGuard {
 }
 
 impl HealthTracker {
+    /// Drop tracked state for models the snapshot no longer carries.
+    ///
+    /// Entries are keyed by configuration, so nothing traffic-driven bounds
+    /// them: a row deleted from the control plane leaves its counters behind
+    /// for the life of the process. Keyed by `display_name`, which is
+    /// reusable — so without this a model deleted and recreated under the
+    /// same name inherits the old row's failure count and reports Degraded
+    /// until one success clears it.
+    pub fn retain_configured(&self, is_configured: &dyn Fn(&str) -> bool) {
+        self.entries.retain(|name, _| is_configured(name));
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -567,6 +579,16 @@ impl HealthTracker {
 }
 
 impl ModelRuntimeStatusTracker {
+    /// Drop runtime state for target ids the snapshot no longer carries.
+    /// A target with a live in-flight count is kept: the count is released by
+    /// a guard's `Drop`, and releasing into an entry that no longer exists
+    /// would leave the next routing decision reading a fresh zero.
+    pub fn retain_configured(&self, is_configured: &dyn Fn(&str) -> bool) {
+        self.entries.retain(|id, entry| {
+            entry.in_flight.load(std::sync::atomic::Ordering::Relaxed) > 0 || is_configured(id)
+        });
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -906,6 +928,53 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use std::thread;
+
+    /// Health entries are keyed by configuration, not traffic, so a deleted
+    /// row's counters would otherwise outlive it for the process lifetime.
+    /// The key is `display_name`, which is reusable — so a model deleted and
+    /// recreated under the same name must not inherit the old failure count.
+    #[test]
+    fn retain_configured_drops_state_for_deleted_models() {
+        let t = HealthTracker::new();
+        for _ in 0..DOWN_THRESHOLD {
+            t.record_failure("gone");
+            t.record_failure("kept");
+        }
+        assert_eq!(t.level("gone"), HealthLevel::Down);
+
+        t.retain_configured(&|name| name == "kept");
+
+        assert_eq!(
+            t.level("gone"),
+            HealthLevel::Healthy,
+            "a recreated model must start clean, not inherit the deleted row"
+        );
+        assert_eq!(
+            t.level("kept"),
+            HealthLevel::Down,
+            "configured rows survive"
+        );
+    }
+
+    /// The runtime tracker keys on row id and holds concurrency counts. A
+    /// target with a live in-flight guard must survive reclamation: the count
+    /// is released by that guard's `Drop`, and releasing into an entry that
+    /// no longer exists would leave the next routing decision reading zero.
+    #[test]
+    fn retain_configured_keeps_a_target_with_work_in_flight() {
+        let t = ModelRuntimeStatusTracker::default();
+        let _busy = t.begin_in_flight("busy-target");
+        t.begin_in_flight("idle-target");
+
+        t.retain_configured(&|_| false);
+
+        assert_eq!(
+            t.in_flight("busy-target"),
+            1,
+            "a target still holding a permit must not be reclaimed"
+        );
+        assert_eq!(t.in_flight("idle-target"), 0);
+    }
 
     #[test]
     fn new_model_is_healthy() {

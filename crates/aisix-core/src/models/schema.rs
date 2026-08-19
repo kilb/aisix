@@ -231,7 +231,17 @@ pub fn validate(validator: &Validator, value: &Value) -> Result<(), SchemaError>
 /// build must still load, and `ip_allowed` still refuses to honour the
 /// malformed entry.
 fn validate_allowed_cidrs(value: &Value) -> Result<(), SchemaError> {
-    let Some(entries) = value.get("allowed_cidrs").and_then(Value::as_array) else {
+    validate_cidr_field(value, "allowed_cidrs")
+}
+
+/// The same check for a passthrough route's `source_cidrs`, which is the whole
+/// source gate for an anonymous route.
+fn validate_source_cidrs(value: &Value) -> Result<(), SchemaError> {
+    validate_cidr_field(value, "source_cidrs")
+}
+
+fn validate_cidr_field(value: &Value, field: &str) -> Result<(), SchemaError> {
+    let Some(entries) = value.get(field).and_then(Value::as_array) else {
         return Ok(());
     };
     for (index, entry) in entries.iter().enumerate() {
@@ -241,7 +251,7 @@ fn validate_allowed_cidrs(value: &Value) -> Result<(), SchemaError> {
         };
         if malformed {
             return Err(SchemaError {
-                path: format!("/allowed_cidrs/{index}"),
+                path: format!("/{field}/{index}"),
                 message: "must be an IPv4 or IPv6 CIDR, for example `10.0.0.0/8` or \
                           `2001:db8::/32`"
                     .to_string(),
@@ -300,6 +310,46 @@ pub fn validate_model(value: &Value) -> Result<(), SchemaError> {
     })
 }
 
+/// Reject an MCP server URL that is not a URL.
+///
+/// The A2A sibling constrains its `url` in the schema (`format: uri`) and MCP
+/// does not, so a malformed value was accepted on write. This matters more
+/// than a shape nit: the row's `auth` credential — api key, bearer, or an
+/// OAuth2 client secret — is sent to whatever that field names. Strict on
+/// write only; a row already in etcd keeps loading, per the lenient-load rule.
+fn validate_mcp_urls(value: &Value) -> Result<(), SchemaError> {
+    for field in ["url", "token_url"] {
+        let Some(raw) = value
+            .get(field)
+            .or_else(|| value.get("auth").and_then(|a| a.get(field)))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let ok = raw.starts_with("http://") || raw.starts_with("https://");
+        let host = raw
+            .split_once("://")
+            .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or(""))
+            .unwrap_or("");
+        if !ok || host.is_empty() {
+            return Err(SchemaError {
+                path: format!("/{field}"),
+                message: "must be an http(s) URL with a host".to_string(),
+            });
+        }
+        if host.contains('@') {
+            // Userinfo here redirects the row's credential to a host the
+            // config does not appear to name — the same shape the provider
+            // bridges refuse on `api_base`.
+            return Err(SchemaError {
+                path: format!("/{field}"),
+                message: "must not embed userinfo (@); put the credential in `auth`".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_apikey(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.apikey, value)
 }
@@ -329,7 +379,8 @@ pub fn validate_guardrail_attachment(value: &Value) -> Result<(), SchemaError> {
 }
 
 pub fn validate_mcp_server(value: &Value) -> Result<(), SchemaError> {
-    validate(&SCHEMAS.mcp_server, value)
+    validate(&SCHEMAS.mcp_server, value)?;
+    validate_mcp_urls(value)
 }
 
 pub fn validate_a2a_agent(value: &Value) -> Result<(), SchemaError> {
@@ -350,7 +401,8 @@ pub fn validate_claim_mapping(value: &Value) -> Result<(), SchemaError> {
 }
 
 pub fn validate_passthrough_route(value: &Value) -> Result<(), SchemaError> {
-    validate(&SCHEMAS.passthrough_route, value)
+    validate(&SCHEMAS.passthrough_route, value)?;
+    validate_source_cidrs(value)
 }
 
 // ---- lenient variants (etcd snapshot loader only, issue #871) ----
@@ -1482,11 +1534,63 @@ pub fn guardrail_attachment_root_schema() -> Value {
 #[cfg(test)]
 mod tests {
 
+    /// The A2A sibling constrains its `url` as a URI and MCP did not, so a
+    /// malformed value was accepted on write — for a row whose `auth`
+    /// credential is sent to exactly that address.
+    #[test]
+    fn write_path_rejects_a_malformed_mcp_url() {
+        let mut doc = serde_json::json!({
+            "display_name": "m",
+            "url": "not a url at all",
+        });
+        let err = validate_mcp_server(&doc).expect_err("a bare string is not a URL");
+        assert!(err.path.contains("url"), "path: {}", err.path);
+
+        doc["url"] = serde_json::json!("https://mcp.example.com/mcp");
+        validate_mcp_server(&doc).expect("a well-formed URL is accepted");
+
+        // Reads as one host, resolves to another — the credential follows.
+        doc["url"] = serde_json::json!("https://mcp.example.com@evil.example/mcp");
+        let err = validate_mcp_server(&doc).expect_err("userinfo must be refused");
+        assert!(err.message.contains("userinfo"), "{}", err.message);
+
+        // Stored rows keep loading.
+        doc["url"] = serde_json::json!("not a url at all");
+        validate_mcp_server_lenient(&doc).expect("lenient load is unchanged");
+    }
+
     /// A typo in `allowed_cidrs` silently narrows the allowlist: `ip_allowed`
     /// skips anything that does not parse, so the row keeps working while
     /// quietly rejecting the range the operator meant to permit. The write
     /// path must reject it instead. (Loads stay lenient — a row already in
     /// etcd must still load.)
+    /// `source_cidrs` gates anonymous passthrough routes, so a typo there
+    /// silently narrows the only boundary those routes have. Same treatment
+    /// as `allowed_cidrs`: strict on write, lenient on load.
+    #[test]
+    fn write_path_rejects_a_malformed_source_cidr() {
+        let mut doc = serde_json::json!({
+            "name": "r",
+            "path_prefix": "/passthrough/x",
+            "target_url": "http://u.invalid",
+            "provider_key_id": "11111111-1111-1111-1111-111111111111",
+            "source_cidrs": ["10.0.0.0/8", "192.168.1.0/33"]
+        });
+        let err = validate_passthrough_route(&doc).expect_err("a /33 prefix is not a CIDR");
+        assert!(
+            err.path.contains("source_cidrs"),
+            "path: {} message: {}",
+            err.path,
+            err.message
+        );
+
+        doc["source_cidrs"] = serde_json::json!(["10.0.0.0/8", "2001:db8::/32"]);
+        validate_passthrough_route(&doc).expect("well-formed CIDRs are accepted");
+
+        doc["source_cidrs"] = serde_json::json!(["192.168.1.0/33"]);
+        validate_passthrough_route_lenient(&doc).expect("stored rows must still load");
+    }
+
     #[test]
     fn write_path_rejects_a_malformed_allowed_cidr() {
         let mut doc = serde_json::json!({

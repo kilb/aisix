@@ -48,12 +48,17 @@ describe("cache hit runs output guardrails (#448)", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await seed.createApiKey({ key_hash: HASH, allowed_models: ["cache-gr"] });
     await seed.createCachePolicy({
       name: "cache-gr-policy",
       enabled: true,
       applies_to: "all",
     });
+    // Seeded LAST on purpose (`tests/e2e/AGENTS.md`): the readiness gate waits
+    // on this key, and that only implies the rest of the seed set when nothing
+    // is written after it. A resource seeded afterwards can still be
+    // propagating when the gate opens.
+    await seed.createApiKey({ key_hash: HASH, allowed_models: ["cache-gr"] });
+
   });
 
   afterAll(async () => {

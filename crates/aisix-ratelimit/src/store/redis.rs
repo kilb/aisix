@@ -252,6 +252,11 @@ pub struct RedisStore {
     /// request, while Redis stays down.
     degraded_logged: AtomicBool,
     shed_logged: AtomicBool,
+    /// Optional observability seam. Failing open to per-replica counting is
+    /// the event an operator alerts on, and until this existed the store
+    /// could only log it — `aisix-ratelimit` sits below `aisix-obs`, so the
+    /// metric that exists for this could never be emitted from here.
+    metrics: Option<Arc<dyn aisix_core::RateLimitMetricsSink>>,
 }
 
 struct PostStreamTokenAdd {
@@ -304,6 +309,7 @@ impl RedisStore {
             local: Arc::new(LocalStore::new()),
             degraded_logged: AtomicBool::new(false),
             shed_logged: AtomicBool::new(false),
+            metrics: None,
         })
     }
 
@@ -350,7 +356,19 @@ impl RedisStore {
         }
     }
 
+    /// Publish this store's degradations to `metrics`. Wired by the server
+    /// bootstrap; absent in tests.
+    pub fn with_metrics(mut self, metrics: Arc<dyn aisix_core::RateLimitMetricsSink>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     fn warn_degraded(&self, op: &str, err: &redis::RedisError) {
+        // Counted on every failure, not once per outage: the warn below is
+        // deduplicated for log volume, but a rate needs every sample.
+        if let Some(m) = &self.metrics {
+            m.record_redis_failure(op);
+        }
         if !self.degraded_logged.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 target: "aisix::ratelimit",

@@ -250,8 +250,14 @@ pub async fn chat_completions(
                     &api_key_id,
                     status,
                     winner_latency,
-                    success.prompt_tokens.unwrap_or(0) as u32,
-                    success.completion_tokens.unwrap_or(0) as u32,
+                    success
+                        .prompt_tokens
+                        .map(crate::usage_attr::token_count)
+                        .unwrap_or(0),
+                    success
+                        .completion_tokens
+                        .map(crate::usage_attr::token_count)
+                        .unwrap_or(0),
                     UsageExtras {
                         cached_prompt_tokens: success.cached_prompt_tokens,
                         reasoning_tokens: success.reasoning_tokens,

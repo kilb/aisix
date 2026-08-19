@@ -62,6 +62,19 @@ const AZURE_OPENAI_SCOPE: &str = "https://cognitiveservices.azure.com/.default";
 /// expires while the request is mid-flight.
 const TOKEN_REFRESH_SAFETY_MARGIN: Duration = Duration::from_secs(60);
 
+/// How long a freshly minted token may be served from cache.
+///
+/// Normally `expires_in` minus the refresh margin, so a request never picks
+/// up a token that expires mid-flight. Subtracting outright would yield a
+/// zero lifetime for any token shorter-lived than the margin, and a
+/// zero-lifetime entry never satisfies a lookup — every request would
+/// re-mint. Keep at least half the token's life in that case.
+fn cache_lifetime(expires_in_secs: u64) -> Duration {
+    let full = Duration::from_secs(expires_in_secs);
+    full.saturating_sub(TOKEN_REFRESH_SAFETY_MARGIN)
+        .max(full / 2)
+}
+
 /// AAD app-registration credentials for the `client_credentials`
 /// grant. Field names match the JSON shape an operator pastes
 /// directly from the Azure portal's "Certificates & secrets" view.
@@ -213,6 +226,13 @@ struct CachedToken {
 pub(crate) struct TokenMinter {
     client: Client,
     cache: Arc<RwLock<HashMap<String, CachedToken>>>,
+    /// One gate per cache key, so concurrent callers that miss the cache
+    /// mint once between them instead of once each. A cold cache — and
+    /// every expiry after it — is hit by everything in flight for that
+    /// credential at the same instant, and AAD throttles its token
+    /// endpoint: a throttled mint fails the request rather than slowing
+    /// it. Bounded by credential count, like the cache beside it.
+    mint_gates: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Test-only override for the AAD token endpoint. In production
     /// the URL is derived from the tenant id; tests substitute a
     /// wiremock URI here.
@@ -225,6 +245,7 @@ impl TokenMinter {
         Self {
             client,
             cache: Arc::new(RwLock::new(HashMap::new())),
+            mint_gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
             token_endpoint_override: None,
         }
@@ -245,22 +266,44 @@ impl TokenMinter {
     /// and caches it.
     pub async fn get_token(&self, creds: &AadCredentials) -> Result<String, BridgeError> {
         let key = creds.cache_key();
-        {
-            let cache = self.cache.read().await;
-            if let Some(cached) = cache.get(&key) {
-                if cached.expires_at > Instant::now() {
-                    return Ok(cached.access_token.clone());
-                }
-            }
+        if let Some(token) = self.cached(&key).await {
+            return Ok(token);
+        }
+        // Single-flight per credential. The gate is a separate lock from the
+        // cache: holding the cache's write lock across the mint would block
+        // every OTHER credential's reads for a network round trip.
+        let gate = self.gate_for(&key);
+        let _minting = gate.lock().await;
+        // A caller ahead of us in the queue may have just filled the cache.
+        if let Some(token) = self.cached(&key).await {
+            return Ok(token);
         }
         let (access_token, expires_in_secs) = self.mint(creds).await?;
         let cached = CachedToken {
             access_token: access_token.clone(),
-            expires_at: Instant::now()
-                + Duration::from_secs(expires_in_secs).saturating_sub(TOKEN_REFRESH_SAFETY_MARGIN),
+            expires_at: Instant::now() + cache_lifetime(expires_in_secs),
         };
         self.cache.write().await.insert(key, cached);
         Ok(access_token)
+    }
+
+    /// The cached token for `key`, when one is present and unexpired.
+    async fn cached(&self, key: &str) -> Option<String> {
+        let cache = self.cache.read().await;
+        cache
+            .get(key)
+            .filter(|cached| cached.expires_at > Instant::now())
+            .map(|cached| cached.access_token.clone())
+    }
+
+    /// The mint gate for `key`, creating it on first use.
+    fn gate_for(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.mint_gates
+            .lock()
+            .expect("aad mint gate registry poisoned")
+            .entry(key.to_string())
+            .or_default()
+            .clone()
     }
 
     /// Mint a fresh token by POSTing the client_credentials grant
@@ -409,6 +452,83 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(minter.get_token(&creds).await.unwrap(), "aad.cache-hit");
         }
+    }
+
+    /// A cold or just-expired cache is hit by every in-flight request at
+    /// once, and both identity providers throttle their token endpoints —
+    /// a throttled mint surfaces as a failed request, not a slow one. The
+    /// mint has to be single-flight: one POST per credential, the rest
+    /// waiting on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_get_token_mints_once_not_once_per_caller() {
+        let server = MockServer::start().await;
+        let mints = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = mints.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |_: &Request| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // A real identity provider takes tens of ms; without the
+                // delay the callers serialize by luck rather than by design.
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(120))
+                    .set_body_json(serde_json::json!({
+                        "access_token": "aad.single-flight",
+                        "expires_in": 3600,
+                        "token_type": "Bearer"
+                    }))
+            })
+            .mount(&server)
+            .await;
+
+        let minter =
+            Arc::new(TokenMinter::new(Client::new()).with_token_endpoint_override(server.uri()));
+        let creds = Arc::new(sample_creds());
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let minter = minter.clone();
+            let creds = creds.clone();
+            tasks.push(tokio::spawn(async move { minter.get_token(&creds).await }));
+        }
+        for task in tasks {
+            assert_eq!(task.await.unwrap().unwrap(), "aad.single-flight");
+        }
+        assert_eq!(
+            mints.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "16 concurrent callers must produce one token mint, not a herd"
+        );
+    }
+
+    /// A token whose lifetime is shorter than the refresh margin must still
+    /// be cached for part of its life. Subtracting the margin outright
+    /// yields a zero TTL, so every request re-mints — a hot loop against
+    /// the identity provider.
+    #[tokio::test]
+    async fn a_short_lived_token_is_still_cached() {
+        let server = MockServer::start().await;
+        let mints = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = mints.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |_: &Request| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "aad.short-lived",
+                    "expires_in": 30,
+                    "token_type": "Bearer"
+                }))
+            })
+            .mount(&server)
+            .await;
+        let minter = TokenMinter::new(Client::new()).with_token_endpoint_override(server.uri());
+        let creds = sample_creds();
+        for _ in 0..3 {
+            assert_eq!(minter.get_token(&creds).await.unwrap(), "aad.short-lived");
+        }
+        assert_eq!(
+            mints.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a 30s token must not re-mint on every call"
+        );
     }
 
     #[tokio::test]

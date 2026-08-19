@@ -40,6 +40,10 @@ struct Running {
 pub struct ExporterPipelines {
     running: Mutex<HashMap<String, Running>>,
     cfg: PipelineConfig,
+    /// Handed to every pipeline this manager starts, so telemetry drops and
+    /// hard delivery failures reach the Prometheus scrape and not only the
+    /// heartbeat. `None` in tests and standalone construction.
+    metrics: Option<Arc<crate::Metrics>>,
 }
 
 impl ExporterPipelines {
@@ -49,7 +53,14 @@ impl ExporterPipelines {
         Self {
             running: Mutex::new(HashMap::new()),
             cfg,
+            metrics: None,
         }
+    }
+
+    /// Publish every pipeline's drop / failure counters to `metrics`.
+    pub fn with_metrics(mut self, metrics: Arc<crate::Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Number of running pipelines.
@@ -87,7 +98,8 @@ impl ExporterPipelines {
             }
         }
         let sink = build();
-        let (handle, pipeline) = SinkPipeline::new(sink, self.cfg.clone());
+        let (handle, pipeline) =
+            SinkPipeline::new_with_metrics(sink, self.cfg.clone(), self.metrics.clone());
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let worker = tokio::spawn(pipeline.run(cancel_rx));
         running.insert(

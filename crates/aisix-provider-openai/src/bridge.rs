@@ -198,6 +198,9 @@ impl OpenAiBridge {
                 return Ok(OPENAI_DEFAULT_BASE.to_string());
             }
         };
+        // #390 landed this on Vertex and Azure and stopped there; an
+        // OpenAI-compatible base is the one operators paste most often.
+        aisix_gateway::validate_api_base("openai-compatible", &raw)?;
         Ok(normalize_api_base(&raw))
     }
 }

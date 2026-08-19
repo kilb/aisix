@@ -73,10 +73,6 @@ describe("guardrail disabled-bypass e2e: enabled:false → no block", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await seed.createApiKey({
-      key_hash: CALLER_KEY_HASH,
-      allowed_models: ["gr-disabled-model"],
-    });
     // Same keyword guardrail shape as guardrail-keyword-e2e —
     // hook_point:"input", literal pattern. ONLY difference:
     // `enabled:false`. If the operator switch works, this rule
@@ -88,6 +84,15 @@ describe("guardrail disabled-bypass e2e: enabled:false → no block", () => {
       kind: "keyword",
       patterns: [{ kind: "literal", value: FORBIDDEN_WORD }],
     });
+    // Seeded LAST on purpose (`tests/e2e/AGENTS.md`): the readiness gate waits
+    // on this key, and that only implies the rest of the seed set when nothing
+    // is written after it. A resource seeded afterwards can still be
+    // propagating when the gate opens.
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["gr-disabled-model"],
+    });
+
   });
 
   afterAll(async () => {

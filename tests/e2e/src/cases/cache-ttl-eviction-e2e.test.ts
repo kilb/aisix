@@ -72,10 +72,6 @@ describe("cache TTL eviction e2e: entry expires after ttl_seconds", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await seed.createApiKey({
-      key_hash: CALLER_KEY_HASH,
-      allowed_models: ["cache-ttl-model"],
-    });
     // CachePolicy with a short TTL so the test can wait it out
     // synchronously instead of mocking the clock.
     await seed.createCachePolicy({
@@ -84,6 +80,15 @@ describe("cache TTL eviction e2e: entry expires after ttl_seconds", () => {
       applies_to: "all",
       ttl_seconds: TTL_SECONDS,
     });
+    // Seeded LAST on purpose (`tests/e2e/AGENTS.md`): the readiness gate waits
+    // on this key, and that only implies the rest of the seed set when nothing
+    // is written after it. A resource seeded afterwards can still be
+    // propagating when the gate opens.
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["cache-ttl-model"],
+    });
+
   });
 
   afterAll(async () => {

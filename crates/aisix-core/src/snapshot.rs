@@ -30,6 +30,16 @@ use std::sync::{Arc, Mutex};
 pub struct ResourceTable<T: Resource> {
     by_id: DashMap<String, Arc<ResourceEntry<T>>>,
     by_name: DashMap<String, String>,
+    /// Ids of the entries whose name carries a `*`, maintained alongside
+    /// `by_name` so it cannot drift from it.
+    ///
+    /// Wildcard rows are a handful; the table is not. Resolving a name that
+    /// no exact entry serves used to walk every row — and materialise a
+    /// `Vec` of the whole table to do it — on the model-resolution path AND
+    /// on the metric-label path, which every endpoint reaches. Requests
+    /// naming a model that resolves to nothing paid the same full scan
+    /// before landing on the sentinel.
+    wildcards: DashMap<String, Arc<ResourceEntry<T>>>,
     /// Cached entry count, maintained by [`ResourceTable::insert`] /
     /// [`ResourceTable::remove`]. DashMap's own `len()` / `is_empty()`
     /// visit every shard (a CAS pair per shard), so per-request
@@ -48,6 +58,7 @@ impl<T: Resource> Clone for ResourceTable<T> {
         Self {
             by_id,
             by_name: self.by_name.clone(),
+            wildcards: self.wildcards.clone(),
             count,
         }
     }
@@ -58,6 +69,7 @@ impl<T: Resource> Default for ResourceTable<T> {
         Self {
             by_id: DashMap::new(),
             by_name: DashMap::new(),
+            wildcards: DashMap::new(),
             count: AtomicUsize::new(0),
         }
     }
@@ -92,14 +104,21 @@ impl<T: Resource> ResourceTable<T> {
             }
         }
 
-        self.by_name.insert(name, id.clone());
+        self.by_name.insert(name.clone(), id.clone());
         // Provisional increment BEFORE the map insert, corrected after a
         // replace. Orders the count so it can only ever read high during
         // a mutation window, never low: the empty fast paths may take
         // one redundant full scan, but can never skip an entry that is
         // already visible in the map.
         self.count.fetch_add(1, Ordering::Relaxed);
-        if self.by_id.insert(id, Arc::new(entry)).is_some() {
+        let entry = Arc::new(entry);
+        if name.contains('*') {
+            self.wildcards.insert(id.clone(), Arc::clone(&entry));
+        } else {
+            // A rename off a wildcard name must not leave the old row behind.
+            self.wildcards.remove(&id);
+        }
+        if self.by_id.insert(id, entry).is_some() {
             self.count.fetch_sub(1, Ordering::Relaxed);
         }
     }
@@ -107,6 +126,7 @@ impl<T: Resource> ResourceTable<T> {
     /// Remove by id; also removes the matching name index entry.
     pub fn remove(&self, id: &str) -> Option<Arc<ResourceEntry<T>>> {
         let (_, entry) = self.by_id.remove(id)?;
+        self.wildcards.remove(id);
         self.count.fetch_sub(1, Ordering::Relaxed);
         let name = entry.value.name().to_string();
         self.by_name.remove_if(&name, |_, v| v == id);
@@ -139,6 +159,15 @@ impl<T: Resource> ResourceTable<T> {
     /// does not hold DashMap shards. O(1) when the table is empty — the
     /// per-request callers (exporter fan-out, policy scans) skip the
     /// all-shards walk on unconfigured deployments.
+    /// The entries whose name carries a `*`, for callers resolving a name no
+    /// exact entry serves. Typically a handful, versus the whole table.
+    pub fn wildcard_entries(&self) -> Vec<Arc<ResourceEntry<T>>> {
+        if self.wildcards.is_empty() {
+            return Vec::new();
+        }
+        self.wildcards.iter().map(|kv| kv.value().clone()).collect()
+    }
+
     pub fn entries(&self) -> Vec<Arc<ResourceEntry<T>>> {
         if self.is_empty() {
             return Vec::new();
@@ -399,6 +428,64 @@ mod tests {
             },
             1,
         )
+    }
+
+    /// The wildcard index is a second index over the same rows, so the only
+    /// way it can be wrong is by drifting from `by_name`. Every mutation the
+    /// table supports has to keep the two agreeing.
+    #[test]
+    fn wildcard_index_tracks_insert_rename_replace_and_remove() {
+        fn names(t: &ResourceTable<Item>) -> Vec<String> {
+            let mut n: Vec<String> = t
+                .wildcard_entries()
+                .iter()
+                .map(|e| e.value.name.clone())
+                .collect();
+            n.sort();
+            n
+        }
+
+        let t = ResourceTable::<Item>::new();
+        t.insert(entry("a-1", "openai/*"));
+        t.insert(entry("b-2", "gpt-4o"));
+        t.insert(entry("c-3", "anthropic/*"));
+        assert_eq!(names(&t), vec!["anthropic/*", "openai/*"]);
+
+        // Rename ONTO a wildcard name: the row joins the index.
+        t.insert(entry("b-2", "azure/*"));
+        assert_eq!(names(&t), vec!["anthropic/*", "azure/*", "openai/*"]);
+
+        // Rename OFF a wildcard name: it leaves, rather than lingering with
+        // a stale name that would serve requests it no longer matches.
+        t.insert(entry("b-2", "gpt-4o"));
+        assert_eq!(names(&t), vec!["anthropic/*", "openai/*"]);
+
+        // Replace in place keeps one entry, not two.
+        t.insert(entry("a-1", "openai/*"));
+        assert_eq!(names(&t), vec!["anthropic/*", "openai/*"]);
+        assert_eq!(t.len(), 3, "replacing must not inflate the count");
+
+        t.remove("a-1");
+        assert_eq!(names(&t), vec!["anthropic/*"]);
+        t.remove("c-3");
+        assert!(t.wildcard_entries().is_empty());
+    }
+
+    /// A clone is what the etcd supervisor publishes; the derived index has
+    /// to come with it or the first request after a config change rebuilds
+    /// nothing and resolves no wildcard.
+    #[test]
+    fn wildcard_index_survives_a_table_clone() {
+        let t = ResourceTable::<Item>::new();
+        t.insert(entry("a-1", "openai/*"));
+        let cloned = t.clone();
+        assert_eq!(cloned.wildcard_entries().len(), 1);
+        cloned.remove("a-1");
+        assert_eq!(
+            t.wildcard_entries().len(),
+            1,
+            "the clone must not share the original's index"
+        );
     }
 
     #[test]

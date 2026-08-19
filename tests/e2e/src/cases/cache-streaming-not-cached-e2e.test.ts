@@ -109,13 +109,6 @@ describe("cache streaming bypass e2e: streaming responses are never cached", () 
       provider_key_id: pkNon.id,
     });
 
-    await seed.createApiKey({
-      key_hash: CALLER_KEY_HASH,
-      allowed_models: [
-        "stream-nocache-stream-model",
-        "stream-nocache-non-model",
-      ],
-    });
     // Single enabled policy applies to all — both Models are in
     // its scope. The streaming Model should bypass it anyway; the
     // non-streaming Model uses it normally.
@@ -124,6 +117,18 @@ describe("cache streaming bypass e2e: streaming responses are never cached", () 
       enabled: true,
       applies_to: "all",
     });
+    // Seeded LAST on purpose (`tests/e2e/AGENTS.md`): the readiness gate waits
+    // on this key, and that only implies the rest of the seed set when nothing
+    // is written after it. A resource seeded afterwards can still be
+    // propagating when the gate opens.
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: [
+        "stream-nocache-stream-model",
+        "stream-nocache-non-model",
+      ],
+    });
+
   });
 
   afterAll(async () => {

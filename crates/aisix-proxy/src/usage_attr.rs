@@ -260,6 +260,20 @@ pub(crate) const UNRESOLVED_MODEL_LABEL: &str = "unresolved";
 /// `PASSTHROUGH_MODEL_LABEL` guard (#451); `request_metrics::record` /
 /// `record_usage` apply it at the emit chokepoint so no handler family
 /// member can drift.
+/// Narrow an upstream-reported token count to the `u32` the usage event and
+/// the token metrics carry.
+///
+/// `as u32` wraps, and wrapping **understates**: a provider reporting
+/// `4_294_967_297` would be billed as 1 token. That matters because the
+/// upstream is not always a trusted party — a ProviderKey's `api_base` points
+/// wherever the operator says, including at a caller's own endpoint — so a
+/// count that silently collapses to a plausible small number is a billing
+/// integrity hole rather than a rounding detail. Saturating instead pins the
+/// ceiling: absurd input stays absurd and visible.
+pub(crate) fn token_count(raw: u64) -> u32 {
+    u32::try_from(raw).unwrap_or(u32::MAX)
+}
+
 pub(crate) fn metric_model_label<'a>(snap: &AisixSnapshot, model_name: &'a str) -> Cow<'a, str> {
     if snap.models.get_by_name(model_name).is_some() {
         return Cow::Borrowed(model_name);
@@ -444,6 +458,22 @@ pub(crate) fn emit_guardrail_error_usage_event(
 
 #[cfg(test)]
 mod tests {
+
+    /// Wrapping a token count understates usage, and the upstream that
+    /// reported it is not always a trusted party (`api_base` points wherever
+    /// the operator configured). Saturate rather than wrap.
+    #[test]
+    fn token_count_saturates_instead_of_wrapping() {
+        assert_eq!(token_count(0), 0);
+        assert_eq!(token_count(1_000), 1_000);
+        assert_eq!(token_count(u32::MAX as u64), u32::MAX);
+        assert_eq!(
+            token_count(u32::MAX as u64 + 1),
+            u32::MAX,
+            "one past the ceiling must clamp, not become 0"
+        );
+        assert_eq!(token_count(u64::MAX), u32::MAX);
+    }
     use super::*;
 
     #[test]

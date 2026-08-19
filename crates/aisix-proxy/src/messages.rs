@@ -1838,19 +1838,23 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
         prompt_tokens: usage
             .and_then(|u| u.get("input_tokens"))
             .and_then(Value::as_u64)
-            .unwrap_or(0) as u32,
+            .map(crate::usage_attr::token_count)
+            .unwrap_or(0),
         completion_tokens: usage
             .and_then(|u| u.get("output_tokens"))
             .and_then(Value::as_u64)
-            .unwrap_or(0) as u32,
+            .map(crate::usage_attr::token_count)
+            .unwrap_or(0),
         cache_creation_tokens: usage
             .and_then(|u| u.get("cache_creation_input_tokens"))
             .and_then(Value::as_u64)
-            .unwrap_or(0) as u32,
+            .map(crate::usage_attr::token_count)
+            .unwrap_or(0),
         cache_read_tokens: usage
             .and_then(|u| u.get("cache_read_input_tokens"))
             .and_then(Value::as_u64)
-            .unwrap_or(0) as u32,
+            .map(crate::usage_attr::token_count)
+            .unwrap_or(0),
         provider_request_id: crate::usage_attr::provider_response_id(body),
         provider_model_version: body
             .get("model")

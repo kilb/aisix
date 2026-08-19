@@ -3,6 +3,7 @@ import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   AdminClient,
+  ProxyClient,
   EtcdClient,
   SeedClient,
   spawnApp,
@@ -165,6 +166,14 @@ describe("runtime mixed filtering e2e", () => {
       maxRetries: 0,
     });
 
+    // Gate on the caller key first, per `tests/e2e/AGENTS.md`: the runtime
+    // probe below runs on the ADMIN key, so it can pass while the caller key
+    // — seeded last, at a higher etcd revision — has not propagated, and the
+    // request then fails with 401 instead of exercising anything.
+    await waitConfigPropagation(async () => {
+      const probe = new ProxyClient(app!.proxyUrl, CALLER_PLAINTEXT);
+      return (await probe.listModels()).status === 200;
+    });
     await waitConfigPropagation(async () => {
       const statuses = await admin!.listModelStatuses();
       const unhealthy = statuses.find((row) => row.display_name === "mixed-unhealthy");

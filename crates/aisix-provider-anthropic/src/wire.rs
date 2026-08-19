@@ -1354,7 +1354,11 @@ pub fn parse_inbound_request(
         chat.top_p = Some(t as f32);
     }
     if let Some(t) = obj.get("max_tokens").and_then(Value::as_u64) {
-        chat.max_tokens = Some(t as u32);
+        // Saturate rather than wrap: `as u32` turns a caller's oversized
+        // `max_tokens` into a small valid-looking number, so a request the
+        // upstream would have rejected instead runs with a silently
+        // different budget.
+        chat.max_tokens = Some(u32::try_from(t).unwrap_or(u32::MAX));
     }
     if let Some(s) = obj.get("stream").and_then(Value::as_bool) {
         chat.stream = Some(s);

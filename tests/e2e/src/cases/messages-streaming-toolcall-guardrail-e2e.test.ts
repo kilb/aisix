@@ -56,7 +56,6 @@ describe("streaming /v1/messages tool_use output guardrail (#448)", () => {
       model_name: "claude-3-5-haiku-20241022",
       provider_key_id: pk.id,
     });
-    await seed.createApiKey({ key_hash: HASH, allowed_models: ["msgtool-gr"] });
     await seed.createGuardrail({
       name: "msgtool-gr-output-keyword",
       enabled: true,
@@ -64,6 +63,12 @@ describe("streaming /v1/messages tool_use output guardrail (#448)", () => {
       kind: "keyword",
       patterns: [{ kind: "literal", value: FORBIDDEN }],
     });
+    // Seeded LAST on purpose (`tests/e2e/AGENTS.md`): the readiness gate waits
+    // on this key, and that only implies the rest of the seed set when nothing
+    // is written after it. A resource seeded afterwards can still be
+    // propagating when the gate opens.
+    await seed.createApiKey({ key_hash: HASH, allowed_models: ["msgtool-gr"] });
+
   });
 
   afterAll(async () => {

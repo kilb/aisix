@@ -255,13 +255,17 @@ describe("presidio guardrail e2e: block, input/output redaction, operators", () 
       model_name: "gpt-4o-mini",
       provider_key_id: streamPk.id,
     });
+    const created = await seed.createGuardrail(guardrailBody("replace"));
+    guardrailId = created.id;
+    // Seeded LAST on purpose (`tests/e2e/AGENTS.md`): the readiness gate waits
+    // on this key, and that only implies the rest of the seed set when nothing
+    // is written after it. A resource seeded afterwards can still be
+    // propagating when the gate opens.
     await seed.createApiKey({
       key_hash: hash(CALLER),
       allowed_models: ["presidio-e2e", "presidio-stream-e2e"],
     });
 
-    const created = await seed.createGuardrail(guardrailBody("replace"));
-    guardrailId = created.id;
   });
 
   afterAll(async () => {

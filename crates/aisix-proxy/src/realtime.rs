@@ -54,6 +54,12 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as TgMessage;
 
 use crate::auth::AuthenticatedKey;
+
+/// Largest realtime message the gateway will assemble, and the largest single
+/// frame within it. Both match the current tungstenite defaults; naming them
+/// keeps the bound stable if that default moves, and makes it reviewable.
+const REALTIME_MAX_MESSAGE_BYTES: usize = 64 << 20;
+const REALTIME_MAX_FRAME_BYTES: usize = 16 << 20;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::state::ProxyState;
@@ -151,13 +157,26 @@ pub(crate) async fn realtime(
             // inherited — without it the session's guardrail checks log
             // without a `request_id` (AISIX-Cloud#1060).
             let span = tracing::Span::current();
-            ws.protocols(["realtime"]).on_upgrade(move |socket| {
-                use tracing::Instrument as _;
-                async move {
-                    run_session(state2, prep, socket, client2, request_id, started).await;
-                }
-                .instrument(span)
-            })
+            ws.protocols(["realtime"])
+                // State the frame bounds rather than inheriting them. These
+                // are today's tungstenite defaults, so this changes nothing
+                // now — the point is that a DoS-relevant bound on a
+                // long-lived, caller-driven socket should be a decision here,
+                // not whatever a transitive dependency happens to default to.
+                //
+                // Deliberately NOT `proxy.request_body_limit_bytes`: that caps
+                // one HTTP body, while a realtime session streams base64 audio
+                // in `input_audio_buffer.append` frames, so an operator's
+                // (reasonable) 1 MB request cap would break audio outright.
+                .max_message_size(REALTIME_MAX_MESSAGE_BYTES)
+                .max_frame_size(REALTIME_MAX_FRAME_BYTES)
+                .on_upgrade(move |socket| {
+                    use tracing::Instrument as _;
+                    async move {
+                        run_session(state2, prep, socket, client2, request_id, started).await;
+                    }
+                    .instrument(span)
+                })
         }
         Err((auth, err)) => {
             let status = err.status().as_u16();

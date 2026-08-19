@@ -209,8 +209,17 @@ describe("rate limit policy schedules e2e (AISIX-Cloud#1104)", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    // api_key scope matches on the key's etcd entry id, so the key
-    // needs a fixed id — seed it straight to etcd.
+    // Start from the pre-`schedules` shape (field absent).
+    await seed.update("rate_limit_policies", SCHED_POLICY_ID, policyDoc());
+    // The caller key goes LAST, per `tests/e2e/AGENTS.md`: the readiness gate
+    // below waits on this key, and that only implies the rest of the seed set
+    // if nothing is written after it. With the policy seeded afterwards the
+    // gate could pass before the limit existed, and the first assertion — a
+    // second call returning 429 — would see 200 because nothing was limiting
+    // yet.
+    //
+    // api_key scope matches on the key's etcd entry id, so the key needs a
+    // fixed id — seed it straight to etcd.
     await etcd.put(
       `${app.etcdPrefix}/api_keys/${SCHED_KEY_ID}`,
       JSON.stringify({
@@ -218,8 +227,6 @@ describe("rate limit policy schedules e2e (AISIX-Cloud#1104)", () => {
         allowed_models: ["rlp-sched"],
       }),
     );
-    // Start from the pre-`schedules` shape (field absent).
-    await seed.update("rate_limit_policies", SCHED_POLICY_ID, policyDoc());
   });
 
   afterAll(async () => {

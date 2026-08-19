@@ -287,8 +287,38 @@ impl std::ops::DerefMut for ProxyState {
 #[cfg(test)]
 const TEST_RATE_LIMIT_CLOCK_SECS: u64 = 1_763_000_000;
 
-fn live_exporter_fan_out(snapshot: &SnapshotHandle<AisixSnapshot>) -> OtlpHttpFanOut {
-    let fan_out = OtlpHttpFanOut::new();
+/// `metrics` is `Some` only on the bootstrap constructor, which is what puts
+/// each exporter's drops and hard delivery failures on the Prometheus scrape;
+/// the lightweight constructors leave the pipelines counting internally.
+/// Reclaim runtime state for config rows the snapshot no longer carries.
+///
+/// Health counters, per-target runtime status and round-robin cursors are all
+/// keyed by configuration rather than by traffic, so nothing bounds them: a
+/// row deleted from the control plane leaves its state behind until the
+/// process restarts. The publication hook is the natural place to notice —
+/// it already drives exporter reconciliation — and it is the only signal that
+/// says *which* rows still exist.
+fn reconcile_runtime_state(
+    snapshot: &SnapshotHandle<AisixSnapshot>,
+    health: Arc<crate::health::HealthTracker>,
+    runtime_status: Arc<ModelRuntimeStatusTracker>,
+    routing: Arc<RoutingRegistry>,
+) {
+    snapshot.subscribe_before_publish(move |view| {
+        let models = &view.snapshot.models;
+        // Health and routing cursors key on the operator-facing name;
+        // per-target runtime status keys on the row id.
+        health.retain_configured(&|name| models.get_by_name(name).is_some());
+        routing.retain_configured(&|name| models.get_by_name(name).is_some());
+        runtime_status.retain_configured(&|id| models.get_by_id(id).is_some());
+    });
+}
+
+fn live_exporter_fan_out(
+    snapshot: &SnapshotHandle<AisixSnapshot>,
+    metrics: Option<Arc<Metrics>>,
+) -> OtlpHttpFanOut {
+    let fan_out = OtlpHttpFanOut::with_metrics(metrics);
     let reconciler = fan_out.clone();
     snapshot.subscribe_before_publish(move |view| {
         let exporters = view.snapshot.observability_exporters.entries();
@@ -309,7 +339,7 @@ impl ProxyState {
         let metrics = Arc::new(Metrics::new(false));
         let guardrail_index =
             LiveGuardrailIndex::new_with_sink(snapshot.clone(), None, Some(metrics.clone()));
-        let otlp_fan_out = live_exporter_fan_out(&snapshot);
+        let otlp_fan_out = live_exporter_fan_out(&snapshot, None);
         // Unit tests get a frozen rate-limit clock: on the wall clock, any
         // "the next request 429s" assertion silently races the fixed-window
         // minute boundary — a test that straddles :00 lands its two requests
@@ -367,7 +397,7 @@ impl ProxyState {
         let metrics = Arc::new(Metrics::new(false));
         let guardrail_index =
             LiveGuardrailIndex::new_with_sink(snapshot.clone(), None, Some(metrics.clone()));
-        let otlp_fan_out = live_exporter_fan_out(&snapshot);
+        let otlp_fan_out = live_exporter_fan_out(&snapshot, None);
         Self::from_inner(ProxyStateInner {
             snapshot,
             hub,
@@ -412,7 +442,7 @@ impl ProxyState {
     ) -> Self {
         let guardrail_index =
             LiveGuardrailIndex::new_with_sink(snapshot.clone(), None, Some(metrics.clone()));
-        let otlp_fan_out = live_exporter_fan_out(&snapshot);
+        let otlp_fan_out = live_exporter_fan_out(&snapshot, Some(metrics.clone()));
         // The bootstrap constructor is the one place the tracker gets a
         // metrics sink + snapshot handle, so cooldown transitions emit
         // `aisix_deployment_*`. Clone both before they are moved into the
@@ -425,17 +455,27 @@ impl ProxyState {
             snapshot.clone(),
             Arc::clone(&bookkeeping_flags),
         ));
+        let health = Arc::new(HealthTracker::with_flags(bookkeeping_flags));
+        let routing = Arc::new(RoutingRegistry::new());
+        // Bootstrap only: the lightweight constructors publish no config and
+        // are dropped with their process, so nothing accrues there.
+        reconcile_runtime_state(
+            &snapshot,
+            Arc::clone(&health),
+            Arc::clone(&runtime_status),
+            Arc::clone(&routing),
+        );
         Self::from_inner(ProxyStateInner {
             snapshot,
             hub,
             limiter,
             metrics,
             cache,
-            routing: Arc::new(RoutingRegistry::new()),
+            routing,
             semantic_cache: Arc::new(crate::semantic::SemanticVectorCache::default()),
             guardrail_index,
             budgets: Arc::new(BudgetClient::disabled()),
-            health: Arc::new(HealthTracker::with_flags(bookkeeping_flags)),
+            health,
             livez: Arc::new(LivezState::new()),
             config_apply_age: Some(Arc::new(|| None)),
             runtime_status,

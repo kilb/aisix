@@ -542,11 +542,12 @@ async fn dispatch(
 /// <https://platform.openai.com/docs/api-reference/images/object>
 fn extract_token_usage(body: &Value) -> Option<(u32, u32)> {
     let usage = body.get("usage")?;
-    let input = usage.get("input_tokens").and_then(Value::as_u64)? as u32;
+    let input = crate::usage_attr::token_count(usage.get("input_tokens").and_then(Value::as_u64)?);
     let output = usage
         .get("output_tokens")
         .and_then(Value::as_u64)
-        .unwrap_or(0) as u32;
+        .map(crate::usage_attr::token_count)
+        .unwrap_or(0);
     Some((input, output))
 }
 

@@ -752,8 +752,84 @@ pub trait Bridge: Send + Sync + 'static {
     }
 }
 
+/// Reject a `ProviderKey.api_base` shape that would send the key's secret
+/// somewhere other than where the config appears to say.
+///
+/// `https://api.openai.com@evil.example/v1` reads like OpenAI to a human and
+/// resolves to `evil.example`, which then receives the Authorization header —
+/// which is why userinfo is refused outright. A query or fragment on the base
+/// is refused for the same family of reasons: the bridge appends a fixed path
+/// suffix, and a `?` or `#` in the base makes that suffix land inside the
+/// query string instead of the path.
+///
+/// Vertex and Azure each grew this check locally (#390); the OpenAI-compatible
+/// and Anthropic bridges did not, so it lives here now and every bridge calls
+/// the same one.
+pub fn validate_api_base(provider: &str, base: &str) -> Result<(), BridgeError> {
+    let Some(rest) = base
+        .strip_prefix("https://")
+        .or_else(|| base.strip_prefix("http://"))
+    else {
+        return Err(BridgeError::InvalidUpstreamConfig(format!(
+            "{provider} provider_key api_base must use http:// or https:// scheme, got {base:?}"
+        )));
+    };
+    // Everything below reports the SCHEME-STRIPPED prefix, never the whole
+    // value: an embedded credential is exactly what may be in there.
+    let host_part = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host_part.contains('@') {
+        return Err(BridgeError::InvalidUpstreamConfig(format!(
+            "{provider} provider_key api_base must not embed userinfo (@); put the              credential in `provider_key.api_key` instead"
+        )));
+    }
+    if host_part.is_empty() {
+        return Err(BridgeError::InvalidUpstreamConfig(format!(
+            "{provider} provider_key api_base has no host, got {base:?}"
+        )));
+    }
+    if base.contains('?') || base.contains('#') {
+        return Err(BridgeError::InvalidUpstreamConfig(format!(
+            "{provider} provider_key api_base must not carry a query or fragment; the              bridge appends the endpoint path to it"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// `api_base` decides where the ProviderKey's secret is sent, so a shape
+    /// that reads like one host and resolves to another has to be refused
+    /// rather than normalised.
+    #[test]
+    fn validate_api_base_refuses_credential_redirecting_shapes() {
+        validate_api_base("openai", "https://api.openai.com/v1").unwrap();
+        validate_api_base("openai", "http://127.0.0.1:8080/v1").unwrap();
+
+        // Reads as OpenAI, resolves to evil.example — which would then
+        // receive the Authorization header.
+        let err = validate_api_base("openai", "https://api.openai.com@evil.example/v1")
+            .expect_err("userinfo must be refused");
+        assert!(format!("{err}").contains("userinfo"), "{err}");
+        // The rejection must not echo the value back: it may carry a secret.
+        assert!(
+            !format!("{err}").contains("evil.example"),
+            "the error must not repeat a base that may embed a credential: {err}"
+        );
+
+        for bad in [
+            "ftp://api.openai.com/v1",
+            "api.openai.com/v1",
+            "https://",
+            "https://api.openai.com/v1?api-version=2020-01-01",
+            "https://api.openai.com/v1#frag",
+        ] {
+            assert!(
+                validate_api_base("openai", bad).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
     use super::*;
 
     #[test]

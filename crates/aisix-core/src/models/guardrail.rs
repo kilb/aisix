@@ -870,6 +870,21 @@ pub trait GuardrailMetricsSink: Send + Sync + 'static {
     fn record_guardrail_execution(&self, exec: &GuardrailExecution<'_>);
 }
 
+/// Observability seam for the shared rate-limit store, mirroring
+/// [`GuardrailMetricsSink`].
+///
+/// `aisix-ratelimit` sits below `aisix-obs` in the dependency graph, so it
+/// can log a Redis degradation but cannot measure one — and failing open to
+/// per-replica counting during an outage is exactly the event an operator
+/// alerts on. An injected sink closes that without inverting the graph: the
+/// trait lives here, `Metrics` implements it, and the server bootstrap wires
+/// it. `None` in tests leaves the store a pure state machine.
+pub trait RateLimitMetricsSink: Send + Sync + 'static {
+    /// One failed Redis operation. `op` is the store call that degraded
+    /// (`acquire`, `commit`, `peek`, …) — never the key or its contents.
+    fn record_redis_failure(&self, op: &str);
+}
+
 /// Content policy evaluated before or after upstream calls.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct Guardrail {

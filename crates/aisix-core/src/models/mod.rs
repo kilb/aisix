@@ -51,6 +51,7 @@ pub use guardrail::{
     GuardrailHookPoint, GuardrailKind, GuardrailMetricsSink, GuardrailMonitorHit,
     GuardrailScopeType, KeywordConfig, KeywordPattern, LakeraConfig, OpenaiModerationConfig,
     PiiConfig, PiiCustomPattern, PiiDetectorConfig, PresidioConfig, PresidioEntityConfig,
+    RateLimitMetricsSink,
 };
 pub use mcp_policy::{McpAccess, McpAccessMode, McpPolicy, McpPolicyMode, McpPolicyScope};
 pub use mcp_server::{McpAuthType, McpProtocolVersion, McpServer, McpServerType, McpTransport};

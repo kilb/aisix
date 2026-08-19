@@ -58,10 +58,6 @@ describe("cache policy e2e: identical request hits cache", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await seed.createApiKey({
-      key_hash: CALLER_KEY_HASH,
-      allowed_models: ["cache-e2e"],
-    });
     // A policy requires `name`, `enabled`, and `applies_to` to take
     // effect.
     await seed.createCachePolicy({
@@ -69,6 +65,15 @@ describe("cache policy e2e: identical request hits cache", () => {
       enabled: true,
       applies_to: "all",
     });
+    // Seeded LAST on purpose (`tests/e2e/AGENTS.md`): the readiness gate waits
+    // on this key, and that only implies the rest of the seed set when nothing
+    // is written after it. A resource seeded afterwards can still be
+    // propagating when the gate opens.
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["cache-e2e"],
+    });
+
   });
 
   afterAll(async () => {

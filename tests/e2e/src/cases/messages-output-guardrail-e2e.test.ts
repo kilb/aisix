@@ -46,7 +46,6 @@ describe("/v1/messages output guardrail (#448)", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await seed.createApiKey({ key_hash: HASH, allowed_models: ["msgout-gr"] });
     await seed.createGuardrail({
       name: "msgout-gr-output-keyword",
       enabled: true,
@@ -54,6 +53,12 @@ describe("/v1/messages output guardrail (#448)", () => {
       kind: "keyword",
       patterns: [{ kind: "literal", value: "reply" }],
     });
+    // Seeded LAST on purpose (`tests/e2e/AGENTS.md`): the readiness gate waits
+    // on this key, and that only implies the rest of the seed set when nothing
+    // is written after it. A resource seeded afterwards can still be
+    // propagating when the gate opens.
+    await seed.createApiKey({ key_hash: HASH, allowed_models: ["msgout-gr"] });
+
   });
 
   afterAll(async () => {

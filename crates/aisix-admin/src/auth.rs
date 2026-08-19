@@ -43,9 +43,31 @@ where
 /// carries a valid admin key.
 pub(crate) fn is_admin_authorized(headers: &axum::http::HeaderMap, admin_keys: &[String]) -> bool {
     match extract_bearer(headers) {
-        Ok(token) => admin_keys.iter().any(|k| k == &token),
+        // Compare digests, not the secrets themselves, and compare them
+        // without short-circuiting. `String::eq` stops at the first differing
+        // byte, so comparing plaintext admin keys leaks a prefix oracle in its
+        // timing; the proxy's own API-key path already avoids this by looking
+        // the caller up under `hash_bearer`, and this is the same idea. The
+        // fold keeps the digest comparison itself constant-time.
+        Ok(token) => {
+            let presented = aisix_core::ApiKey::hash_bearer(&token);
+            admin_keys.iter().fold(false, |seen, k| {
+                seen | digests_match(&presented, &aisix_core::ApiKey::hash_bearer(k))
+            })
+        }
         Err(_) => false,
     }
+}
+
+/// Byte-compare two hex digests without an early exit.
+fn digests_match(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 fn extract_bearer(headers: &axum::http::HeaderMap) -> Result<String, AdminError> {
@@ -80,6 +102,44 @@ mod tests {
         let mut req = Request::builder().uri("/").body(()).unwrap();
         *req.headers_mut() = headers;
         req.into_parts().0
+    }
+
+    /// The admin key is a secret compared against attacker-supplied input.
+    /// A short-circuiting compare of the plaintext leaks a prefix oracle in
+    /// its timing, so the check goes through a digest and does not exit
+    /// early — the same shape the proxy's API-key lookup already has.
+    #[test]
+    fn admin_key_check_matches_exactly_and_rejects_prefixes() {
+        fn authorized(token: &str, keys: &[String]) -> bool {
+            let mut h = HeaderMap::new();
+            h.insert(
+                axum::http::header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+            );
+            is_admin_authorized(&h, keys)
+        }
+
+        let keys = vec!["admin-secret".to_string(), "second-key".to_string()];
+        assert!(authorized("admin-secret", &keys));
+        assert!(
+            authorized("second-key", &keys),
+            "every configured key works"
+        );
+
+        assert!(!authorized("admin-secre", &keys), "a prefix is not the key");
+        assert!(!authorized("admin-secretX", &keys), "nor is a superstring");
+        assert!(!authorized("", &keys));
+        assert!(
+            !authorized("admin-secret", &[]),
+            "no keys configured = deny"
+        );
+    }
+
+    #[test]
+    fn digests_match_is_length_safe() {
+        assert!(digests_match("abcd", "abcd"));
+        assert!(!digests_match("abcd", "abce"));
+        assert!(!digests_match("abc", "abcd"));
     }
 
     #[test]

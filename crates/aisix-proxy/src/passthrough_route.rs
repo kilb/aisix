@@ -969,6 +969,16 @@ fn source_allowed(route: &PassthroughRoute, source_ip: &str) -> bool {
         Ok(ip) => ip,
         Err(_) => return false,
     };
+    // Same canonicalization `Model::ip_allowed` applies: a dual-stack
+    // listener reports an IPv4 client as `::ffff:a.b.c.d`, which no IPv4
+    // CIDR contains. A no-op for genuine IPv6. This gate is the whole
+    // boundary for an anonymous route, so it must not depend on which
+    // address family the listener happened to bind.
+    let ip = ip.to_canonical();
+    // An entry that does not parse is skipped, which narrows the allowlist
+    // rather than widening it. `validate_passthrough_route` rejects that
+    // shape on the write path, so this only tolerates rows stored by an
+    // older build.
     ranges
         .iter()
         .filter_map(|cidr| cidr.parse::<ipnet::IpNet>().ok())
@@ -1792,6 +1802,32 @@ mod tests {
         );
         let k: ApiKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new("k-1", k, 1)
+    }
+
+    /// `source_cidrs` is the whole security boundary for an anonymous route,
+    /// so it has to behave exactly like `Model::allowed_cidrs`: a dual-stack
+    /// listener hands it `::ffff:a.b.c.d` for an IPv4 client, which no IPv4
+    /// CIDR contains. Without canonicalization the same config admits nobody
+    /// on `[::]` and everybody's traffic on `0.0.0.0`.
+    #[test]
+    fn source_allowed_canonicalizes_ipv4_mapped_addresses() {
+        let route: PassthroughRoute = serde_json::from_value(serde_json::json!({
+            "name": "r",
+            "match": {"path_prefix": "/x"},
+            "upstream": {"url": "http://u.invalid"},
+            "source_cidrs": ["10.0.0.0/8"],
+        }))
+        .expect("fixture route parses");
+
+        assert!(source_allowed(&route, "10.1.2.3"));
+        assert!(
+            source_allowed(&route, "::ffff:10.1.2.3"),
+            "a v4-mapped client inside the allowlist must be admitted"
+        );
+        assert!(!source_allowed(&route, "203.0.113.7"));
+        assert!(!source_allowed(&route, "::ffff:203.0.113.7"));
+        // Genuine IPv6 is unaffected.
+        assert!(!source_allowed(&route, "2001:db8::1"));
     }
 
     fn route_entry(id: &str, json: serde_json::Value) -> ResourceEntry<PassthroughRoute> {

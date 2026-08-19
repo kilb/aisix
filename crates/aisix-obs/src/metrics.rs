@@ -2026,6 +2026,12 @@ impl Metrics {
 /// The injection point the guardrail chain records through
 /// (AISIX-Cloud#1076): `aisix-guardrails` sees only this core trait, so it
 /// stays free of a metrics dependency.
+impl aisix_core::RateLimitMetricsSink for Metrics {
+    fn record_redis_failure(&self, op: &str) {
+        Metrics::record_redis_failure(self, op);
+    }
+}
+
 impl aisix_core::GuardrailMetricsSink for Metrics {
     fn record_guardrail_execution(&self, exec: &aisix_core::GuardrailExecution<'_>) {
         Metrics::record_guardrail_execution(self, exec);

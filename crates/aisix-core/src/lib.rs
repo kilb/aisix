@@ -50,9 +50,9 @@ pub use models::{
     GuardrailMonitorHit, KeywordConfig, KeywordPattern, McpAuthType, McpProtocolVersion,
     McpRateLimit, McpServer, McpServerType, McpTransport, Model, ObservabilityExporter,
     ParamConstraints, PassthroughAuthMode, PassthroughCredentialMode, PassthroughProtocol,
-    PassthroughRoute, PolicyScope, PolicyWindow, ProviderKey, RateLimit, RateLimitPolicy,
-    RequestOverrides, ResponseOverrides, Routing, RoutingStrategy, RoutingTarget, SchemaError,
-    StreamDoneMarker, TelemetryKind, TelemetryTags, WhenAllUnavailablePolicy,
+    PassthroughRoute, PolicyScope, PolicyWindow, ProviderKey, RateLimit, RateLimitMetricsSink,
+    RateLimitPolicy, RequestOverrides, ResponseOverrides, Routing, RoutingStrategy, RoutingTarget,
+    SchemaError, StreamDoneMarker, TelemetryKind, TelemetryTags, WhenAllUnavailablePolicy,
     DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use resource::{Resource, ResourceEntry};

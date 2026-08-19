@@ -2706,21 +2706,25 @@ async fn responses_cross_provider_to_target(
 /// <https://platform.openai.com/docs/api-reference/responses/object>
 fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
     let usage = body.get("usage")?;
-    let prompt_tokens = usage.get("input_tokens").and_then(|v| v.as_u64())? as u32;
+    let prompt_tokens =
+        crate::usage_attr::token_count(usage.get("input_tokens").and_then(|v| v.as_u64())?);
     let completion_tokens = usage
         .get("output_tokens")
         .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
+        .map(crate::usage_attr::token_count)
+        .unwrap_or(0);
     let reasoning_tokens = usage
         .get("output_tokens_details")
         .and_then(|d| d.get("reasoning_tokens"))
         .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
+        .map(crate::usage_attr::token_count)
+        .unwrap_or(0);
     let cached_prompt_tokens = usage
         .get("input_tokens_details")
         .and_then(|d| d.get("cached_tokens"))
         .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
+        .map(crate::usage_attr::token_count)
+        .unwrap_or(0);
     Some(ResponseUsage {
         // Parsed from a fully buffered response body, so by definition the
         // response was delivered in full.

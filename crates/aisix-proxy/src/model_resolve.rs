@@ -49,11 +49,12 @@ fn best_wildcard_row(
     requested: &str,
 ) -> Option<(Arc<ResourceEntry<Model>>, String)> {
     let mut best: Option<(usize, Arc<ResourceEntry<Model>>, String)> = None;
-    for entry in snapshot.models.entries() {
+    // Only the wildcard rows, not the whole catalog. This runs on the
+    // model-resolution path AND on the metric-label path that every endpoint
+    // reaches — including for a name that resolves to nothing, which reaches
+    // the sentinel only after the search completes.
+    for entry in snapshot.models.wildcard_entries() {
         let model = &entry.value;
-        if !model.display_name.contains('*') {
-            continue;
-        }
         // Only direct Models can serve a wildcard alias — routers / ensembles /
         // semantic routers have no upstream `model_name` to dispatch.
         if model.is_routing() || model.is_ensemble() || model.is_semantic() {

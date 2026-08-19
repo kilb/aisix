@@ -112,7 +112,11 @@ fn normalize_api_base(base: &str) -> String {
 
 fn resolve_base(ctx: &BridgeContext) -> Result<String, BridgeError> {
     match ctx.provider_key.api_base.as_deref() {
-        Some(b) if !b.trim().is_empty() => Ok(normalize_api_base(b.trim())),
+        Some(b) if !b.trim().is_empty() => {
+            // Same check the Vertex and Azure bridges grew in #390.
+            aisix_gateway::validate_api_base("anthropic", b.trim())?;
+            Ok(normalize_api_base(b.trim()))
+        }
         _ => {
             // Family-bridge safety: when `AnthropicBridge` is the
             // family registration (registered via

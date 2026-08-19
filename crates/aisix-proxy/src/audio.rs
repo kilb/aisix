@@ -172,7 +172,21 @@ pub async fn transcriptions(
                 elapsed,
                 &client,
             );
-            success.response
+            // Same window the other model-dispatch endpoints publish.
+            let mut response = success.response;
+            let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
+            crate::request_metrics::publish_rate_limit_window(
+                &state.metrics,
+                &state.limiter,
+                &snapshot,
+                &auth.entry.id,
+                &rl_limits,
+                &success.model_name,
+                &success.upstream_model,
+                &mut response,
+            )
+            .await;
+            response
         }
         Err(err) => {
             // The dispatch can fail before it ever loaded one (a malformed
@@ -310,7 +324,21 @@ pub async fn translations(
                 elapsed,
                 &client,
             );
-            success.response
+            // Same window the other model-dispatch endpoints publish.
+            let mut response = success.response;
+            let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
+            crate::request_metrics::publish_rate_limit_window(
+                &state.metrics,
+                &state.limiter,
+                &snapshot,
+                &auth.entry.id,
+                &rl_limits,
+                &success.model_name,
+                &success.upstream_model,
+                &mut response,
+            )
+            .await;
+            response
         }
         Err(err) => {
             // The dispatch can fail before it ever loaded one (a malformed
@@ -462,7 +490,21 @@ pub async fn speech(
                 /* guardrail_blocked */ false,
                 success.captured_content.as_ref(),
             );
-            success.response
+            // Same window the other model-dispatch endpoints publish.
+            let mut response = success.response;
+            let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
+            crate::request_metrics::publish_rate_limit_window(
+                &state.metrics,
+                &state.limiter,
+                &snapshot,
+                &auth.entry.id,
+                &rl_limits,
+                &model_name,
+                &success.upstream_model,
+                &mut response,
+            )
+            .await;
+            response
         }
         Err(err) => {
             let status = err.status().as_u16();
@@ -1374,11 +1416,13 @@ fn extract_sse_token_usage(headers: &HeaderMap, body: &[u8]) -> Option<(u32, u32
 
 fn extract_token_usage(body: &Value) -> Option<(u32, u32)> {
     let usage = body.get("usage")?;
-    let input = usage.get("input_tokens").and_then(Value::as_u64)? as u32;
-    let output = usage
-        .get("output_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as u32;
+    let input = crate::usage_attr::token_count(usage.get("input_tokens").and_then(Value::as_u64)?);
+    let output = crate::usage_attr::token_count(
+        usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    );
     Some((input, output))
 }
 

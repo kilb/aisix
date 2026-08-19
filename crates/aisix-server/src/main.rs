@@ -727,6 +727,20 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
 
     // Steps 7-8: build Hub, shared components, then routers.
     let hub = Arc::new(build_hub());
+    // env_id is resolved by now (managed provisioning / sidecar restore
+    // above); it becomes the constant `env_id` label on the SLO latency
+    // histograms. Standalone DPs leave it empty → "unknown".
+    // AISIX-Cloud#1226: operator bucket overrides. Validation errors are
+    // boot-fatal — a silently ignored override would leave the deployment
+    // reading quantiles off bucket edges it did not choose.
+    let histogram_buckets =
+        aisix_obs::HistogramBuckets::from_config(&cfg.observability.metrics.buckets)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    let metrics = Arc::new(Metrics::new_with_buckets(
+        &cfg.etcd.env_id,
+        &histogram_buckets,
+    ));
+
     // Rate-limit backend (#798). Default `memory` keeps per-process
     // counters; `redis` shares them across every replica so a cluster
     // enforces one global window instead of one-per-replica. The
@@ -752,24 +766,14 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                     anyhow::anyhow!("redis rate-limit connect failed (ratelimit.redis): {e}")
                 })?
                 .with_conc_ttl(cfg.ratelimit.concurrency_ttl_secs)
-                .with_env_namespace(&cfg.etcd.env_id);
+                .with_env_namespace(&cfg.etcd.env_id)
+                // Failing open to per-replica counting is the event to alert
+                // on; without this the store could only log it.
+                .with_metrics(metrics.clone());
             Limiter::with_store(Arc::new(store))
         }
         RateLimitBackend::Memory => Limiter::new(),
     });
-    // env_id is resolved by now (managed provisioning / sidecar restore
-    // above); it becomes the constant `env_id` label on the SLO latency
-    // histograms. Standalone DPs leave it empty → "unknown".
-    // AISIX-Cloud#1226: operator bucket overrides. Validation errors are
-    // boot-fatal — a silently ignored override would leave the deployment
-    // reading quantiles off bucket edges it did not choose.
-    let histogram_buckets =
-        aisix_obs::HistogramBuckets::from_config(&cfg.observability.metrics.buckets)
-            .map_err(|e| anyhow::anyhow!(e))?;
-    let metrics = Arc::new(Metrics::new_with_buckets(
-        &cfg.etcd.env_id,
-        &histogram_buckets,
-    ));
     let metrics_upkeep_task = {
         let metrics = metrics.clone();
         tokio::spawn(run_metrics_upkeep(

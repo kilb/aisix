@@ -53,6 +53,23 @@ impl Default for PipelineConfig {
     }
 }
 
+/// The `Metrics` handle plus the exporter label one pipeline emits under.
+///
+/// Hand-written `Debug`: `Metrics` owns a recorder handle and is not `Debug`,
+/// and the label alone is what a `SinkStats` dump needs anyway.
+struct DropEmitter {
+    metrics: Arc<crate::Metrics>,
+    exporter: Arc<str>,
+}
+
+impl std::fmt::Debug for DropEmitter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DropEmitter")
+            .field("exporter", &self.exporter)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Live delivery counters for one sink, shared between the producer handle
 /// and the worker. Cheap atomics; read via [`SinkStats::snapshot`].
 ///
@@ -63,6 +80,12 @@ impl Default for PipelineConfig {
 /// treat the counters as resettable, not lifetime-of-process totals.
 #[derive(Debug, Default)]
 pub struct SinkStats {
+    /// Prometheus face for the two counters an operator alerts on: telemetry
+    /// dropped, and a batch that failed for good. `None` in tests and
+    /// standalone construction. Without it the drop is countable only through
+    /// the heartbeat, so a deployment with no control plane watches telemetry
+    /// drain away with nothing on `/metrics` to say so.
+    emitter: Option<DropEmitter>,
     sent: AtomicU64,
     dropped: AtomicU64,
     retries: AtomicU64,
@@ -112,6 +135,9 @@ impl SinkStats {
         self.sent.fetch_add(n, Ordering::Relaxed);
     }
     fn add_dropped(&self, n: u64) {
+        if let Some(e) = &self.emitter {
+            e.metrics.record_otlp_fanout_drop(&e.exporter, "queue_full");
+        }
         self.dropped.fetch_add(n, Ordering::Relaxed);
     }
     fn add_retries(&self, n: u64) {
@@ -123,6 +149,9 @@ impl SinkStats {
             .store(now_unix_secs(), Ordering::Relaxed);
     }
     fn record_batch_failed(&self) {
+        if let Some(e) = &self.emitter {
+            e.metrics.record_otlp_fanout_failure(&e.exporter);
+        }
         self.failed_batches.fetch_add(1, Ordering::Relaxed);
         self.last_failure_unix
             .store(now_unix_secs(), Ordering::Relaxed);
@@ -206,8 +235,26 @@ impl SinkPipeline {
         sink: Arc<dyn ObservabilitySink>,
         cfg: PipelineConfig,
     ) -> (SinkHandle, SinkPipeline) {
+        Self::new_with_metrics(sink, cfg, None)
+    }
+
+    /// Like [`SinkPipeline::new`], also publishing this pipeline's drops and
+    /// hard delivery failures to `metrics`. The server bootstrap wires it;
+    /// tests and standalone construction pass `None`.
+    pub fn new_with_metrics(
+        sink: Arc<dyn ObservabilitySink>,
+        cfg: PipelineConfig,
+        metrics: Option<Arc<crate::Metrics>>,
+    ) -> (SinkHandle, SinkPipeline) {
         let (tx, rx) = mpsc::channel(cfg.queue_capacity);
-        let stats = Arc::new(SinkStats::default());
+        let exporter: Arc<str> = Arc::from(sink.name());
+        let stats = Arc::new(SinkStats {
+            emitter: metrics.map(|metrics| DropEmitter {
+                metrics,
+                exporter: Arc::clone(&exporter),
+            }),
+            ..SinkStats::default()
+        });
         let handle = SinkHandle {
             name: Arc::from(sink.name()),
             tx,
@@ -596,6 +643,63 @@ mod tests {
             last.contains("failed to lookup address information"),
             "the cause at the end of the detail must survive masking, got: {last}"
         );
+    }
+
+    /// Telemetry loss must be visible on the scrape, not only through the
+    /// heartbeat: a deployment with no control plane has nowhere else to see
+    /// it. Asserting the rendered series (rather than that the emit function
+    /// exists) is what catches the "emit with no caller" class — this pair
+    /// shipped uncalled and was invisible to every other check.
+    #[tokio::test]
+    async fn drops_and_failures_reach_the_prometheus_scrape() {
+        let metrics = Arc::new(crate::Metrics::new(false));
+        let sink = FakeSink::new(Mode::Ok);
+        let mut c = cfg();
+        c.queue_capacity = 1;
+        let (handle, _worker) = SinkPipeline::new_with_metrics(sink, c, Some(Arc::clone(&metrics)));
+
+        assert!(handle.try_enqueue(rec(0)));
+        assert!(!handle.try_enqueue(rec(1)), "over-capacity enqueue drops");
+
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("aisix_otlp_fanout_drops_total"),
+            "a dropped record must appear on the scrape, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("reason=\"queue_full\""),
+            "the drop reason distinguishes backpressure from delivery failure"
+        );
+    }
+
+    /// The delivery-failure counterpart: a batch that exhausts its retries is
+    /// data loss and has to surface as its own series.
+    #[tokio::test]
+    async fn retry_exhausted_batch_surfaces_as_a_fanout_failure() {
+        let metrics = Arc::new(crate::Metrics::new(false));
+        let sink = FakeSink::new(Mode::AlwaysTransient);
+        let mut c = cfg();
+        c.max_retries = 0;
+        let (handle, worker) = SinkPipeline::new_with_metrics(sink, c, Some(Arc::clone(&metrics)));
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let jh = tokio::spawn(worker.run(cancel_rx));
+
+        assert!(handle.try_enqueue(rec(0)));
+        let failed = wait_for(
+            || handle.stats().failed_batches == 1,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(failed, "the batch must be given up on");
+
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("aisix_otlp_fanout_failures_total"),
+            "a batch dropped after retries must appear on the scrape, got:\n{rendered}"
+        );
+
+        cancel_tx.send(true).unwrap();
+        jh.await.unwrap();
     }
 
     #[tokio::test]

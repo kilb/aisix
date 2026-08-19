@@ -3,6 +3,7 @@ import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   AdminClient,
+  ProxyClient,
   EtcdClient,
   SeedClient,
   spawnApp,
@@ -166,6 +167,14 @@ describe("background health e2e", () => {
 
     let lastStatuses: Array<Record<string, unknown>> = [];
     try {
+    // Gate on the caller key first, per `tests/e2e/AGENTS.md`: the runtime
+    // probe below runs on the ADMIN key, so it can pass while the caller key
+    // — seeded last, at a higher etcd revision — has not propagated, and the
+    // request then fails with 401 instead of exercising anything.
+    await waitConfigPropagation(async () => {
+      const probe = new ProxyClient(app!.proxyUrl, CALLER_PLAINTEXT);
+      return (await probe.listModels()).status === 200;
+    });
       await waitConfigPropagation(async () => {
         lastStatuses = await admin!.listModelStatuses();
         const unhealthy = lastStatuses.find((row) => row.id === unhealthyModelID);
@@ -253,11 +262,27 @@ describe("background health e2e", () => {
     // the status listing only after the snapshot refresh. Poll for the
     // row instead of asserting eagerly — on a loaded CI runner the
     // immediate read raced the watch and failed with `undefined`.
+    // Gate on the caller key first, per `tests/e2e/AGENTS.md`: the runtime
+    // probe below runs on the ADMIN key, so it can pass while the caller key
+    // — seeded last, at a higher etcd revision — has not propagated, and the
+    // request then fails with 401 instead of exercising anything.
+    await waitConfigPropagation(async () => {
+      const probe = new ProxyClient(app!.proxyUrl, CALLER_PLAINTEXT);
+      return (await probe.listModels()).status === 200;
+    });
     await waitConfigPropagation(async () => {
       const rows = await admin!.listModelStatuses();
       return rows.some((row) => row.display_name === "bg-stale-short");
     });
 
+    // Gate on the caller key first, per `tests/e2e/AGENTS.md`: the runtime
+    // probe below runs on the ADMIN key, so it can pass while the caller key
+    // — seeded last, at a higher etcd revision — has not propagated, and the
+    // request then fails with 401 instead of exercising anything.
+    await waitConfigPropagation(async () => {
+      const probe = new ProxyClient(app!.proxyUrl, CALLER_PLAINTEXT);
+      return (await probe.listModels()).status === 200;
+    });
     await waitConfigPropagation(async () => {
       const rows = await admin!.listModelStatuses();
       const row = rows.find((item) => item.display_name === "bg-stale-short");
