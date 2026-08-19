@@ -161,11 +161,12 @@ impl<'a> AnthropicMessage<'a> {
     /// block-level fields Anthropic accepts (notably `cache_control`
     /// prompt-cache markers) ride along in place. Flattening through the
     /// concatenated-text path would silently strip them (AISIX-Cloud#1110
-    /// Gap A); see [`anthropic_text_blocks`] for the per-block filter.
+    /// Gap A). Image parts map to Anthropic `image` / `document` blocks in
+    /// their original position; see [`anthropic_content_blocks`].
     /// Degrades to a single empty text block when nothing survives,
     /// because Anthropic rejects an empty `content` array.
     pub(crate) fn from_blocks(role: &'a str, blocks: &[serde_json::Value]) -> Self {
-        let mut content = anthropic_text_blocks(blocks);
+        let mut content = anthropic_content_blocks(blocks);
         if content.is_empty() {
             content.push(serde_json::json!({"type": "text", "text": ""}));
         }
@@ -182,9 +183,9 @@ impl<'a> AnthropicMessage<'a> {
     /// prior tool calls before sending the matching tool results; without
     /// translating `tool_calls` here the following `tool_result` would
     /// reference a `tool_use` the upstream never saw and 400. When the
-    /// caller sent typed content blocks, their text blocks map 1:1
-    /// (preserving `cache_control` markers) instead of the
-    /// flattened text. Empty content with no tool calls degrades to an
+    /// caller sent typed content blocks, they map through
+    /// [`anthropic_content_blocks`] (preserving `cache_control` markers
+    /// and carrying media parts) instead of the flattened text. Empty content with no tool calls degrades to an
     /// empty text block so the message isn't dropped (Anthropic rejects
     /// an empty `content` array).
     pub(crate) fn assistant(
@@ -193,7 +194,7 @@ impl<'a> AnthropicMessage<'a> {
         tool_calls: Option<&[serde_json::Value]>,
     ) -> Self {
         let mut content: Vec<serde_json::Value> = match blocks {
-            Some(blocks) => anthropic_text_blocks(blocks),
+            Some(blocks) => anthropic_content_blocks(blocks),
             None => Vec::new(),
         };
         if content.is_empty() && !text.is_empty() {
@@ -228,8 +229,10 @@ impl<'a> AnthropicMessage<'a> {
 ///   per-block upstream — both previously vanished in the flatten, so
 ///   forwarding them would break requests that worked before.
 ///
-/// Non-text blocks (images/audio) are dropped — the documented
-/// cross-provider content limitation, unchanged by this helper.
+/// Non-text blocks are dropped HERE because this filter serves the
+/// top-level `system` field, which Anthropic defines as text-only. Message
+/// content goes through [`anthropic_content_blocks`], which carries images
+/// and documents.
 fn anthropic_text_blocks(blocks: &[serde_json::Value]) -> Vec<serde_json::Value> {
     const KEEP: &[&str] = &["type", "text", "cache_control", "citations"];
     blocks
@@ -249,6 +252,165 @@ fn anthropic_text_blocks(blocks: &[serde_json::Value]) -> Vec<serde_json::Value>
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             serde_json::Value::Object(kept)
+        })
+        .collect()
+}
+
+/// Anthropic image media types, per
+/// <https://platform.claude.com/docs/en/api/messages>. Anything else is not
+/// an image to Anthropic, so a part carrying it cannot become an `image`
+/// block.
+const ANTHROPIC_IMAGE_MEDIA_TYPES: &[&str] =
+    &["image/jpeg", "image/png", "image/gif", "image/webp"];
+
+/// Media type implied by the first bytes of a base64 payload.
+///
+/// Anthropic validates the DECLARED `media_type` against the actual bytes
+/// and rejects a mismatch outright, so a caller whose data URI says `png`
+/// over JPEG bytes would lose the whole request. The magic numbers are read
+/// off the base64 prefix rather than the decoded image: base64 maps each
+/// 3 input bytes onto 4 output chars, so the first four characters pin the
+/// first three bytes without decoding — and without allocating a copy of an
+/// image that may be megabytes.
+///
+/// `None` means "no confident opinion", and the caller keeps what the data
+/// URI declared. Guessing beyond these four would be worse than trusting
+/// the caller.
+fn media_type_from_base64_prefix(data: &str) -> Option<&'static str> {
+    // 0x89 'P' 'N' 'G' → "iVBO"; 0xFF 0xD8 0xFF → "/9j/"; "GIF8" → "R0lG";
+    // "%PDF" → "JVBE".
+    match data.as_bytes().get(..4)? {
+        b"iVBO" => Some("image/png"),
+        b"/9j/" => Some("image/jpeg"),
+        b"R0lG" => Some("image/gif"),
+        b"JVBE" => Some("application/pdf"),
+        _ => None,
+    }
+}
+
+/// Split a `data:` URI into `(media_type, base64_payload)`.
+///
+/// Only the base64 form is recognised; a percent-encoded `data:` URI is not
+/// something either provider's SDK emits for an image, and decoding one
+/// here would be inventing a shape neither side documents.
+fn split_data_uri(url: &str) -> Option<(&str, &str)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    let media_type = meta.strip_suffix(";base64")?;
+    (!media_type.is_empty() && !payload.is_empty()).then_some((media_type, payload))
+}
+
+/// Translate an OpenAI `image_url` content part into the Anthropic block
+/// that carries the same bytes — the inverse of
+/// [`openai_media_part_from_anthropic`], which has mapped the other
+/// direction since #722.
+///
+/// Without this an OpenAI-shape caller dispatched to an Anthropic upstream
+/// lost every image: the turn degraded to text, and the model answered
+/// about a picture it was never shown. That failure is invisible from the
+/// outside — a plausible answer to a question the model could not actually
+/// see.
+///
+/// Two source forms, matching what Anthropic accepts:
+///
+///   - a `data:` URI becomes a `base64` source, with the media type taken
+///     from the URI unless the payload's own magic bytes contradict it;
+///   - an `http(s)` URL becomes a `url` source, forwarded as a URL.
+///
+/// The gateway deliberately does NOT fetch a remote image to re-encode it.
+/// Anthropic accepts URLs natively, base64 inflates the payload by a third
+/// against a per-image size limit, and a gateway that downloads caller-named
+/// URLs takes on egress, latency and an SSRF surface that belong to the
+/// provider. This is the mistake the ecosystem already made and walked back.
+///
+/// `detail` has no Anthropic equivalent and is dropped: it is a
+/// quality/cost hint about how the image is processed, so losing it changes
+/// the bill, never the answer's subject.
+fn anthropic_media_block_from_openai(part: &serde_json::Value) -> Option<serde_json::Value> {
+    let url = part
+        .get("image_url")
+        .and_then(|i| i.get("url"))
+        .and_then(serde_json::Value::as_str)?;
+
+    let source = match split_data_uri(url) {
+        Some((declared, payload)) => {
+            let media_type = media_type_from_base64_prefix(payload).unwrap_or(declared);
+            serde_json::json!({
+                "type": "base64",
+                "media_type": media_type,
+                "data": payload,
+            })
+        }
+        // A non-`data:` URL. Only http(s) is forwarded — anything else
+        // (`file:`, `gs:`, a bare path) is not something Anthropic fetches,
+        // and passing it on would trade a dropped image for a 400.
+        None if url.starts_with("http://") || url.starts_with("https://") => {
+            serde_json::json!({"type": "url", "url": url})
+        }
+        _ => return None,
+    };
+
+    // The block type follows the media type: Anthropic carries a PDF as a
+    // `document`, not an `image`, and rejects an `image` block whose media
+    // type is not one of the four it renders.
+    let media_type = source
+        .get("media_type")
+        .and_then(serde_json::Value::as_str)
+        // A `url` source declares no media type; Anthropic sniffs it, and an
+        // image is the only thing a caller can name through `image_url`.
+        .unwrap_or("image/*");
+    let block_type = if media_type == "application/pdf" {
+        "document"
+    } else if media_type == "image/*" || ANTHROPIC_IMAGE_MEDIA_TYPES.contains(&media_type) {
+        "image"
+    } else {
+        return None;
+    };
+
+    let mut block = serde_json::Map::new();
+    block.insert("type".into(), block_type.into());
+    block.insert("source".into(), source);
+    // A prompt-cache marker on the part rides along, same as on a text
+    // block — Anthropic accepts `cache_control` on image and document
+    // blocks too.
+    if let Some(cc) = part.get("cache_control") {
+        block.insert("cache_control".into(), cc.clone());
+    }
+    Some(serde_json::Value::Object(block))
+}
+
+/// Message content for the Anthropic wire: the text blocks
+/// [`anthropic_text_blocks`] keeps, plus the media parts
+/// [`anthropic_media_block_from_openai`] can carry, in the caller's
+/// original order.
+///
+/// Order matters and is why this is one pass rather than two: "what is in
+/// this image?" before the image and after it are different prompts.
+///
+/// Only for MESSAGE content. The top-level `system` field takes text blocks
+/// alone, so `build_system` stays on the text-only filter.
+fn anthropic_content_blocks(blocks: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    blocks
+        .iter()
+        .filter_map(|b| match b.get("type").and_then(|t| t.as_str()) {
+            Some("text") => anthropic_text_blocks(std::slice::from_ref(b)).pop(),
+            Some("image_url") => {
+                let mapped = anthropic_media_block_from_openai(b);
+                if mapped.is_none() {
+                    tracing::warn!(
+                        "dropping image part with an unusable source on cross-provider \
+                         dispatch: the model answers without having seen it",
+                    );
+                }
+                mapped
+            }
+            other => {
+                tracing::debug!(
+                    block_type = ?other,
+                    "dropping unsupported OpenAI content part on cross-provider dispatch",
+                );
+                None
+            }
         })
         .collect()
 }
@@ -556,12 +718,81 @@ fn block_has_cache_control(block: &serde_json::Value) -> bool {
 ///    function: {name, description,             description,
 ///               parameters}}                   input_schema}
 ///
-/// Only `type: "function"` tools translate today; OpenAI's other
-/// tool kinds (`code_interpreter`, `file_search`, …) have no
-/// Anthropic equivalent and are dropped silently. Returns `None`
-/// when the input isn't an array or when no entries translated —
-/// keeping the field absent from the upstream wire shape so
+/// Two kinds of entry survive:
+///
+///   - `type: "function"`, translated field-by-field as above;
+///   - an entry ALREADY in Anthropic's own shape, forwarded verbatim.
+///     Anthropic's server tools are declared as
+///     `{"type": "web_search_20250305", "name": "web_search", …}` — a
+///     versioned type plus a name, with no `function` wrapper
+///     (<https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool>),
+///     and its client tools as `{name, description, input_schema}`. A
+///     caller that declares one is not asking for a translation; it is
+///     already speaking the target's language, and passing it through is
+///     lossless.
+///
+/// Nothing is invented across vendors. An OpenAI built-in tool
+/// (`code_interpreter`, `file_search`, the Responses `web_search`) is NOT
+/// rewritten into an Anthropic server tool: the two run different indexes
+/// and return different citation shapes, so a mapping would look
+/// successful while answering from somewhere else. Those entries are
+/// dropped — and, unlike before, the drop is logged, because a request
+/// that loses a tool declaration gets an answer the model could not
+/// actually support.
+///
+/// Returns `None` when the input isn't an array or when no entries
+/// survived — keeping the field absent from the upstream wire shape so
 /// Anthropic doesn't reject for empty-tools.
+/// Recognise a tool entry the caller already wrote in Anthropic's shape and
+/// forward it unchanged.
+///
+/// Two accepted forms, both from
+/// <https://platform.claude.com/docs/en/api/messages>:
+///
+///   - a server tool — a `type` that is not one of OpenAI's own tool kinds,
+///     plus a `name` (e.g. `web_search_20250305` / `web_search`);
+///   - a client tool — a `name` plus an `input_schema`, with no `type`.
+///
+/// `type: "custom"` is OpenAI's freeform-tool kind, not an Anthropic one, so
+/// it is excluded explicitly rather than mistaken for a server tool.
+///
+/// Forwarding verbatim is deliberate: these declarations carry optional
+/// fields the gateway has no reason to model (`max_uses`, `allowed_domains`,
+/// `user_location`, `allowed_callers`, …), and a re-serialising translation
+/// would silently drop whichever ones it did not know about — the failure
+/// this whole function exists to remove.
+fn anthropic_native_tool(tool: &serde_json::Value) -> Option<serde_json::Value> {
+    let obj = tool.as_object()?;
+    let named = obj
+        .get("name")
+        .and_then(|n| n.as_str())
+        .is_some_and(|n| !n.is_empty());
+    if !named {
+        tracing::warn!(
+            tool_type = ?obj.get("type").and_then(|v| v.as_str()),
+            "dropping unrecognised tool declaration on cross-provider dispatch",
+        );
+        return None;
+    }
+    let native = match obj.get("type").and_then(|v| v.as_str()) {
+        // A versioned Anthropic server tool (`web_search_20250305`,
+        // `web_fetch_20250910`, `code_execution_20260120`, …).
+        Some(t) => t != "custom" && !obj.contains_key("function"),
+        // No `type` at all: an Anthropic client tool is `{name,
+        // description, input_schema}`.
+        None => obj.contains_key("input_schema"),
+    };
+    if !native {
+        tracing::warn!(
+            tool_type = ?obj.get("type").and_then(|v| v.as_str()),
+            "dropping tool with no Anthropic equivalent on cross-provider dispatch: \
+             the model answers without it",
+        );
+        return None;
+    }
+    Some(tool.clone())
+}
+
 pub fn translate_openai_tools_to_anthropic(
     tools: serde_json::Value,
 ) -> Option<Vec<serde_json::Value>> {
@@ -570,10 +801,9 @@ pub fn translate_openai_tools_to_anthropic(
         .iter()
         .filter_map(|t| {
             // OpenAI: `{type: "function", function: {name, description,
-            // parameters}}`. Skip entries that don't fit this shape
-            // (defensive — non-function tools have no Anthropic mapping).
+            // parameters}}`.
             if t.get("type").and_then(|v| v.as_str()) != Some("function") {
-                return None;
+                return anthropic_native_tool(t);
             }
             let function = t.get("function")?.as_object()?;
             let name = function.get("name")?.as_str()?;
@@ -2425,17 +2655,17 @@ mod tests {
     }
 
     #[test]
-    fn user_message_with_only_non_text_blocks_degrades_to_empty_text_block() {
-        // Image-only content: non-text blocks are skipped on this
-        // bridge (documented cross-provider limitation), and the
-        // message must still carry a non-empty content array —
-        // Anthropic rejects `content: []`.
+    fn user_message_with_no_mappable_block_degrades_to_empty_text_block() {
+        // The message must still carry a non-empty content array —
+        // Anthropic rejects `content: []`. An audio part has no Anthropic
+        // equivalent, so it is the shape that still degrades now that
+        // images map.
         let req = ChatFormat::new(
             "claude",
             vec![block_message(
                 Role::User,
                 serde_json::json!([
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,xyz"}},
+                    {"type": "input_audio", "input_audio": {"data": "xyz", "format": "wav"}},
                 ]),
             )],
         );
@@ -2444,6 +2674,160 @@ mod tests {
         assert_eq!(
             msgs[0].content,
             vec![serde_json::json!({"type": "text", "text": ""})]
+        );
+    }
+
+    /// An OpenAI-shape caller dispatched to an Anthropic upstream used to
+    /// lose every image: the turn degraded to text and the model answered
+    /// about a picture it was never shown — a plausible answer to a
+    /// question it could not see, indistinguishable from a real one.
+    #[test]
+    fn image_parts_reach_anthropic_as_image_blocks_in_place() {
+        let req = ChatFormat::new(
+            "claude",
+            vec![block_message(
+                Role::User,
+                serde_json::json!([
+                    {"type": "text", "text": "what is in"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
+                    {"type": "text", "text": "this picture?"},
+                ]),
+            )],
+        );
+        let (_system, msgs) = split_system(&req).unwrap();
+        // Order is preserved: "what is in" BEFORE the image and
+        // "this picture?" after it is a different prompt from any other
+        // arrangement.
+        assert_eq!(msgs[0].content.len(), 3);
+        assert_eq!(msgs[0].content[0]["text"], "what is in");
+        assert_eq!(msgs[0].content[2]["text"], "this picture?");
+        assert_eq!(
+            msgs[0].content[1],
+            serde_json::json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgo="
+                }
+            })
+        );
+    }
+
+    /// A remote image is forwarded as a URL, never fetched and re-encoded.
+    /// Base64 inflates the payload by a third against a per-image size
+    /// limit, and a gateway that downloads caller-named URLs takes on
+    /// egress, latency and an SSRF surface that belong to the provider.
+    #[test]
+    fn a_remote_image_forwards_as_a_url_source() {
+        let req = ChatFormat::new(
+            "claude",
+            vec![block_message(
+                Role::User,
+                serde_json::json!([
+                    {"type": "image_url", "image_url": {"url": "https://x.example/cat.png"}},
+                ]),
+            )],
+        );
+        let (_system, msgs) = split_system(&req).unwrap();
+        assert_eq!(
+            msgs[0].content[0],
+            serde_json::json!({
+                "type": "image",
+                "source": {"type": "url", "url": "https://x.example/cat.png"}
+            })
+        );
+    }
+
+    /// Anthropic validates the declared media type against the actual
+    /// bytes and rejects a mismatch outright, so a caller whose data URI
+    /// mislabels its payload would lose the whole request. The magic
+    /// bytes win.
+    #[test]
+    fn a_mislabelled_data_uri_is_corrected_from_its_magic_bytes() {
+        let req = ChatFormat::new(
+            "claude",
+            vec![block_message(
+                Role::User,
+                // Declares PNG, carries JPEG bytes ("/9j/" is 0xFF 0xD8 0xFF).
+                serde_json::json!([
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,/9j/4AAQ"}},
+                ]),
+            )],
+        );
+        let (_system, msgs) = split_system(&req).unwrap();
+        assert_eq!(
+            msgs[0].content[0]["source"]["media_type"], "image/jpeg",
+            "the declared type must yield to the bytes, or Anthropic 400s the request",
+        );
+    }
+
+    /// A PDF is a `document` to Anthropic, not an `image` — an `image`
+    /// block carrying `application/pdf` is rejected.
+    #[test]
+    fn a_pdf_data_uri_becomes_a_document_block() {
+        let req = ChatFormat::new(
+            "claude",
+            vec![block_message(
+                Role::User,
+                serde_json::json!([
+                    {"type": "image_url",
+                     "image_url": {"url": "data:application/pdf;base64,JVBERi0xLjQ="}},
+                ]),
+            )],
+        );
+        let (_system, msgs) = split_system(&req).unwrap();
+        assert_eq!(msgs[0].content[0]["type"], "document");
+        assert_eq!(
+            msgs[0].content[0]["source"]["media_type"],
+            "application/pdf"
+        );
+    }
+
+    /// A media type Anthropic does not render cannot become an `image`
+    /// block — forwarding it would trade a dropped image for a 400 on the
+    /// whole request.
+    #[test]
+    fn an_unrenderable_media_type_is_not_forwarded_as_an_image() {
+        let req = ChatFormat::new(
+            "claude",
+            vec![block_message(
+                Role::User,
+                serde_json::json!([
+                    {"type": "text", "text": "look"},
+                    {"type": "image_url", "image_url": {"url": "data:image/tiff;base64,SUkqAA=="}},
+                ]),
+            )],
+        );
+        let (_system, msgs) = split_system(&req).unwrap();
+        assert_eq!(msgs[0].content.len(), 1);
+        assert_eq!(msgs[0].content[0]["text"], "look");
+    }
+
+    /// The system prompt stays text-only: Anthropic defines the top-level
+    /// `system` field as text blocks, so an image there must not be
+    /// promoted into it.
+    #[test]
+    fn an_image_in_a_system_message_does_not_reach_the_system_field() {
+        let req = ChatFormat::new(
+            "claude",
+            vec![
+                block_message(
+                    Role::System,
+                    serde_json::json!([
+                        {"type": "text", "text": "be brief"},
+                        {"type": "image_url",
+                         "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
+                    ]),
+                ),
+                ChatMessage::user("hi"),
+            ],
+        );
+        let (system, _msgs) = split_system(&req).unwrap();
+        let rendered = serde_json::to_string(&system).unwrap();
+        assert!(
+            !rendered.contains("image"),
+            "the system field must carry text blocks only: {rendered}",
         );
     }
 
@@ -2530,6 +2914,72 @@ mod tests {
             serde_json::json!({"type": "ephemeral", "ttl": "1h"})
         );
         assert!(translated[2].get("cache_control").is_none());
+    }
+
+    /// A caller that declares an Anthropic server tool is not asking for a
+    /// translation — it already wrote the target's shape. Dropping it left
+    /// the model answering without the tool, which for `web_search` means
+    /// answering from stale training data while the caller believes it
+    /// searched.
+    #[test]
+    fn an_anthropic_server_tool_is_forwarded_verbatim() {
+        let tools = serde_json::json!([
+            {"type": "web_search_20250305", "name": "web_search", "max_uses": 5,
+             "allowed_domains": ["example.com"]},
+            {"type": "web_fetch_20250910", "name": "web_fetch"},
+            {"type": "function", "function": {"name": "get_weather"}},
+        ]);
+        let translated = translate_openai_tools_to_anthropic(tools).unwrap();
+        assert_eq!(translated.len(), 3);
+        // Verbatim, including the optional fields the gateway does not
+        // model — a re-serialising translation would drop whichever ones
+        // it did not know about.
+        assert_eq!(
+            translated[0],
+            serde_json::json!({
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 5,
+                "allowed_domains": ["example.com"]
+            })
+        );
+        assert_eq!(translated[1]["type"], "web_fetch_20250910");
+        // The function tool still translates into Anthropic's client-tool
+        // shape alongside it.
+        assert_eq!(translated[2]["name"], "get_weather");
+    }
+
+    /// An Anthropic client tool (`{name, description, input_schema}`, no
+    /// `type`) is the other shape a caller may already have written.
+    #[test]
+    fn an_anthropic_client_tool_shape_is_forwarded_verbatim() {
+        let tools = serde_json::json!([
+            {"name": "lookup", "description": "d",
+             "input_schema": {"type": "object", "properties": {}}},
+        ]);
+        let translated = translate_openai_tools_to_anthropic(tools).unwrap();
+        assert_eq!(translated[0]["name"], "lookup");
+        assert_eq!(translated[0]["input_schema"]["type"], "object");
+    }
+
+    /// The mirror: an OpenAI built-in tool is NOT rewritten into an
+    /// Anthropic server tool. The two run different indexes and return
+    /// different citation shapes, so a mapping would look successful while
+    /// answering from somewhere else.
+    #[test]
+    fn an_openai_builtin_tool_is_not_invented_into_an_anthropic_one() {
+        let tools = serde_json::json!([
+            {"type": "code_interpreter", "container": {"type": "auto"}},
+            {"type": "custom", "custom": {"name": "freeform"}},
+            {"type": "function", "function": {"name": "kept"}},
+        ]);
+        let translated = translate_openai_tools_to_anthropic(tools).unwrap();
+        assert_eq!(
+            translated.len(),
+            1,
+            "only the function tool survives: {translated:?}",
+        );
+        assert_eq!(translated[0]["name"], "kept");
     }
 
     /// Build a request from `req`, run injection with `ttl`, and return
@@ -2643,10 +3093,10 @@ mod tests {
 
     #[test]
     fn inject_skips_empty_text_final_block() {
-        // An image-only final user turn flattens to a single empty text
-        // block (images dropped on this bridge). Anthropic 400s on
-        // cache_control attached to an empty text block, so the injector
-        // must leave it unmarked.
+        // A final user turn carrying nothing mappable degrades to a single
+        // empty text block. Anthropic 400s on cache_control attached to an
+        // empty text block, so the injector must leave it unmarked.
+        // (Audio, not an image: images map to real blocks now.)
         let req = ChatFormat::new(
             "claude",
             vec![
@@ -2654,7 +3104,7 @@ mod tests {
                 block_message(
                     Role::User,
                     serde_json::json!([
-                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,xyz"}},
+                        {"type": "input_audio", "input_audio": {"data": "xyz", "format": "wav"}},
                     ]),
                 ),
             ],

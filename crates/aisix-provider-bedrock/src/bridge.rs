@@ -33,9 +33,10 @@ use aws_sdk_bedrockruntime::primitives::Blob;
 use aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError;
 use aws_sdk_bedrockruntime::types::{
     AnyToolChoice, ContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole,
-    ConverseStreamOutput, InferenceConfiguration, Message as BedrockMessage, SpecificToolChoice,
-    StopReason as SdkStopReason, SystemContentBlock, Tool, ToolChoice, ToolConfiguration,
-    ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolSpecification, ToolUseBlock,
+    ConverseStreamOutput, ImageBlock, ImageFormat, ImageSource, InferenceConfiguration,
+    Message as BedrockMessage, SpecificToolChoice, StopReason as SdkStopReason, SystemContentBlock,
+    Tool, ToolChoice, ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock,
+    ToolSpecification, ToolUseBlock,
 };
 use aws_sdk_bedrockruntime::Client as BedrockClient;
 use aws_smithy_runtime_api::client::result::ServiceError;
@@ -1107,7 +1108,7 @@ fn build_converse_inputs(
             Role::User => {
                 messages.push(build_message(
                     ConversationRole::User,
-                    vec![ContentBlock::Text(msg.content_str().to_string())],
+                    user_content_blocks(msg),
                 )?);
             }
             Role::Assistant => {
@@ -1156,6 +1157,93 @@ fn build_message(
     builder
         .build()
         .map_err(|e| BridgeError::Config(format!("bedrock converse: build message: {e}")))
+}
+
+/// Converse image formats, per the `ImageFormat` enum the SDK generates
+/// from the Bedrock model. A media type outside this set is not an image
+/// Converse renders, and sending it would 400 the whole request.
+fn converse_image_format(media_type: &str) -> Option<ImageFormat> {
+    match media_type {
+        "image/gif" => Some(ImageFormat::Gif),
+        "image/jpeg" => Some(ImageFormat::Jpeg),
+        "image/png" => Some(ImageFormat::Png),
+        "image/webp" => Some(ImageFormat::Webp),
+        _ => None,
+    }
+}
+
+/// Translate an OpenAI `image_url` content part into a Converse image
+/// block.
+///
+/// Only a `data:` URI maps. Converse addresses an image either by raw
+/// bytes or by an S3 object (`ImageSource::S3Location`) — an arbitrary web
+/// URL is neither, so a caller's `https://…` image has nowhere to go here.
+/// The gateway does not fetch it: downloading caller-named URLs would take
+/// on egress, latency and an SSRF surface that belong to the provider.
+///
+/// Unlike the JSON providers, Converse wants the DECODED bytes — the SDK
+/// does its own base64 on the wire — so this is the one bridge that pays a
+/// decode.
+fn converse_image_block(part: &serde_json::Value) -> Option<ContentBlock> {
+    use base64::Engine as _;
+
+    let url = part
+        .get("image_url")
+        .and_then(|i| i.get("url"))
+        .and_then(serde_json::Value::as_str)?;
+    let rest = url.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    let media_type = meta.strip_suffix(";base64")?;
+    let format = converse_image_format(media_type)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .ok()?;
+    Some(ContentBlock::Image(
+        ImageBlock::builder()
+            .format(format)
+            .source(ImageSource::Bytes(::aws_smithy_types::Blob::new(bytes)))
+            .build()
+            .ok()?,
+    ))
+}
+
+/// Content blocks for a user turn: its text, plus any media the caller
+/// attached, in the order written — the text around an image is what makes
+/// it a question about that image.
+///
+/// Degrades to a single text block when the message carries no typed
+/// blocks, which is the common case and the historical shape.
+fn user_content_blocks(msg: &ChatMessage) -> Vec<ContentBlock> {
+    let Some(blocks) = msg.content_blocks.as_deref() else {
+        return vec![ContentBlock::Text(msg.content_str().to_string())];
+    };
+    let mut out: Vec<ContentBlock> = Vec::new();
+    for block in blocks {
+        match block.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    if !text.trim().is_empty() {
+                        out.push(ContentBlock::Text(text.to_string()));
+                    }
+                }
+            }
+            Some("image_url") => match converse_image_block(block) {
+                Some(image) => out.push(image),
+                None => tracing::warn!(
+                    "dropping image part this provider cannot address on cross-provider \
+                     dispatch: the model answers without having seen it",
+                ),
+            },
+            other => tracing::debug!(
+                block_type = ?other,
+                "dropping unsupported content part on cross-provider dispatch",
+            ),
+        }
+    }
+    if out.is_empty() {
+        out.push(ContentBlock::Text(msg.content_str().to_string()));
+    }
+    out
 }
 
 /// Translate an assistant [`ChatMessage`] into Converse content blocks:
@@ -1829,6 +1917,87 @@ fn map_tool_choice(choice: &serde_json::Value) -> Option<ToolChoice> {
 
 #[cfg(test)]
 mod tests {
+
+    /// An OpenAI-shape caller dispatched to a Converse upstream used to
+    /// lose every image: the turn flattened to text and the model answered
+    /// about a picture it was never shown.
+    ///
+    /// Converse wants DECODED bytes — the SDK does its own base64 on the
+    /// wire — so this is the one bridge that pays a decode.
+    #[test]
+    fn image_parts_reach_converse_as_image_blocks_in_place() {
+        let mut msg = ChatMessage::user("what is in this?");
+        msg.content_blocks = Some(vec![
+            serde_json::json!({"type": "text", "text": "what is in"}),
+            // "aGk=" decodes to "hi".
+            serde_json::json!({"type": "image_url",
+                               "image_url": {"url": "data:image/png;base64,aGk="}}),
+            serde_json::json!({"type": "text", "text": "this?"}),
+        ]);
+        let req = ChatFormat::new("m", vec![msg]);
+        let (_systems, messages) = build_converse_inputs(&req).unwrap();
+        let blocks = messages[0].content();
+        assert_eq!(blocks.len(), 3);
+        // Order preserved — the text around an image is what makes it a
+        // question about that image.
+        assert!(matches!(&blocks[0], ContentBlock::Text(t) if t == "what is in"));
+        assert!(matches!(&blocks[2], ContentBlock::Text(t) if t == "this?"));
+        match &blocks[1] {
+            ContentBlock::Image(image) => {
+                assert_eq!(image.format(), &ImageFormat::Png);
+                match image.source() {
+                    Some(ImageSource::Bytes(blob)) => assert_eq!(blob.as_ref(), b"hi"),
+                    other => panic!("expected decoded bytes, got {other:?}"),
+                }
+            }
+            other => panic!("expected an image block, got {other:?}"),
+        }
+    }
+
+    /// Converse addresses an image by bytes or by an S3 object, never by an
+    /// arbitrary web URL — and the gateway will not fetch it on the
+    /// caller's behalf. The turn keeps its text rather than failing.
+    #[test]
+    fn a_remote_image_url_cannot_be_addressed_and_leaves_the_text_intact() {
+        let mut msg = ChatMessage::user("describe");
+        msg.content_blocks = Some(vec![
+            serde_json::json!({"type": "text", "text": "describe"}),
+            serde_json::json!({"type": "image_url",
+                               "image_url": {"url": "https://x.example/cat.png"}}),
+        ]);
+        let req = ChatFormat::new("m", vec![msg]);
+        let (_systems, messages) = build_converse_inputs(&req).unwrap();
+        let blocks = messages[0].content();
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], ContentBlock::Text(t) if t == "describe"));
+    }
+
+    /// A media type Converse does not render cannot become an image block —
+    /// forwarding it would trade a dropped image for a 400 on the whole
+    /// request.
+    #[test]
+    fn an_unrenderable_media_type_is_not_forwarded_as_an_image() {
+        let mut msg = ChatMessage::user("look");
+        msg.content_blocks = Some(vec![
+            serde_json::json!({"type": "text", "text": "look"}),
+            serde_json::json!({"type": "image_url",
+                               "image_url": {"url": "data:image/tiff;base64,SUkqAA=="}}),
+        ]);
+        let req = ChatFormat::new("m", vec![msg]);
+        let (_systems, messages) = build_converse_inputs(&req).unwrap();
+        assert_eq!(messages[0].content().len(), 1);
+    }
+
+    /// A message with no typed blocks keeps the historical single-text-block
+    /// shape — the common case must not change.
+    #[test]
+    fn a_plain_user_message_still_builds_one_text_block() {
+        let req = ChatFormat::new("m", vec![ChatMessage::user("hi")]);
+        let (_systems, messages) = build_converse_inputs(&req).unwrap();
+        let blocks = messages[0].content();
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], ContentBlock::Text(t) if t == "hi"));
+    }
     use super::*;
 
     // ─── Mid-stream event errors (AISIX-Cloud#1222) ──────────────────

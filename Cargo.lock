@@ -307,10 +307,12 @@ dependencies = [
  "aws-smithy-async",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
+ "base64 0.22.1",
  "http 1.4.0",
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
  "wiremock",
 ]
 
@@ -351,6 +353,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
  "wiremock",
 ]
 

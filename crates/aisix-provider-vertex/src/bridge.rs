@@ -1916,11 +1916,106 @@ struct GeminiContent {
     parts: Vec<GeminiPart>,
 }
 
+/// One part of a Gemini `contents` entry.
+///
+/// `inlineData` carries the bytes themselves, base64-encoded — the same
+/// encoding an OpenAI `data:` URI already uses, so the payload passes
+/// through without a decode/re-encode round trip
+/// (<https://ai.google.dev/api/generate-content>).
 #[derive(Debug, Serialize)]
-struct GeminiPart {
-    /// Single text part. Vision / multimodal parts (`inlineData`,
-    /// `fileData`) deferred to a follow-up.
-    text: String,
+#[serde(untagged)]
+enum GeminiPart {
+    Text {
+        text: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    InlineData {
+        inline_data: GeminiBlob,
+    },
+}
+
+impl GeminiPart {
+    fn text(text: impl Into<String>) -> Self {
+        Self::Text { text: text.into() }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiBlob {
+    mime_type: String,
+    /// Base64, exactly as the caller's `data:` URI carried it.
+    data: String,
+}
+
+/// Translate an OpenAI `image_url` content part into a Gemini part.
+///
+/// Only a `data:` URI maps. Gemini's other media form, `fileData.fileUri`,
+/// addresses a Google-managed URI (a Files API or Cloud Storage object) —
+/// not an arbitrary web URL — so a caller's `https://…` image has nowhere
+/// to go here. The gateway does not fetch it: downloading caller-named
+/// URLs would take on egress, latency and an SSRF surface that belong to
+/// the provider.
+///
+/// That is a real asymmetry with the Anthropic bridge, which accepts a URL
+/// natively, and it is a property of the providers rather than of this
+/// code.
+fn gemini_part_from_openai_media(part: &serde_json::Value) -> Option<GeminiPart> {
+    let url = part
+        .get("image_url")
+        .and_then(|i| i.get("url"))
+        .and_then(serde_json::Value::as_str)?;
+    let rest = url.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    let mime_type = meta.strip_suffix(";base64")?;
+    if mime_type.is_empty() || payload.is_empty() {
+        return None;
+    }
+    Some(GeminiPart::InlineData {
+        inline_data: GeminiBlob {
+            mime_type: mime_type.to_string(),
+            data: payload.to_string(),
+        },
+    })
+}
+
+/// Parts for one message: its text, plus any media the caller attached, in
+/// the order they were written — "what is in this image?" before and after
+/// the image are different prompts.
+///
+/// Degrades to a single text part when the message carries no typed
+/// blocks, which is the common case and the historical shape.
+fn gemini_parts_for(msg: &ChatMessage) -> Vec<GeminiPart> {
+    let Some(blocks) = msg.content_blocks.as_deref() else {
+        return vec![GeminiPart::text(msg.content_str())];
+    };
+    let mut parts: Vec<GeminiPart> = Vec::new();
+    for block in blocks {
+        match block.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    if !text.trim().is_empty() {
+                        parts.push(GeminiPart::text(text));
+                    }
+                }
+            }
+            Some("image_url") => match gemini_part_from_openai_media(block) {
+                Some(part) => parts.push(part),
+                None => tracing::warn!(
+                    "dropping image part this provider cannot address on cross-provider \
+                     dispatch: the model answers without having seen it",
+                ),
+            },
+            other => tracing::debug!(
+                block_type = ?other,
+                "dropping unsupported content part on cross-provider dispatch",
+            ),
+        }
+    }
+    if parts.is_empty() {
+        parts.push(GeminiPart::text(msg.content_str()));
+    }
+    parts
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -1953,15 +2048,11 @@ fn build_gemini_request(req: &ChatFormat) -> GeminiGenerateContentRequest {
             Role::System => system_parts.push(m.content_str().to_string()),
             Role::User | Role::Tool => contents.push(GeminiContent {
                 role: "user",
-                parts: vec![GeminiPart {
-                    text: m.content_str().to_string(),
-                }],
+                parts: gemini_parts_for(m),
             }),
             Role::Assistant => contents.push(GeminiContent {
                 role: "model",
-                parts: vec![GeminiPart {
-                    text: m.content_str().to_string(),
-                }],
+                parts: gemini_parts_for(m),
             }),
         }
     }
@@ -1970,9 +2061,7 @@ fn build_gemini_request(req: &ChatFormat) -> GeminiGenerateContentRequest {
     } else {
         Some(GeminiContent {
             role: "user", // Gemini ignores `role` inside systemInstruction; "user" is the convention.
-            parts: vec![GeminiPart {
-                text: system_parts.join("\n\n"),
-            }],
+            parts: vec![GeminiPart::text(system_parts.join("\n\n"))],
         })
     };
     let generation_config =
@@ -2647,13 +2736,82 @@ mod tests {
 
     // ─── Gemini request body translation ───────────────────────────────
 
+    /// An OpenAI-shape caller dispatched to a Gemini upstream used to lose
+    /// every image: the turn flattened to text and the model answered about
+    /// a picture it was never shown.
+    #[test]
+    fn image_parts_reach_gemini_as_inline_data_in_place() {
+        let mut msg = ChatMessage::user("what is in this?");
+        msg.content_blocks = Some(vec![
+            serde_json::json!({"type": "text", "text": "what is in"}),
+            serde_json::json!({"type": "image_url",
+                               "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}),
+            serde_json::json!({"type": "text", "text": "this?"}),
+        ]);
+        let req = ChatFormat::new("my-gemini", vec![msg]);
+        let body = build_gemini_request(&req);
+        let wire = serde_json::to_value(&body).unwrap();
+        let parts = wire["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 3);
+        // Order preserved — the text around an image is what makes it a
+        // question about that image.
+        assert_eq!(parts[0]["text"], "what is in");
+        assert_eq!(parts[2]["text"], "this?");
+        assert_eq!(
+            parts[1],
+            serde_json::json!({
+                "inlineData": {"mimeType": "image/png", "data": "iVBORw0KGgo="}
+            }),
+            "the wire spelling is camelCase `inlineData`/`mimeType`: {parts:?}",
+        );
+    }
+
+    /// Gemini addresses media by Google-managed URI, not by arbitrary web
+    /// URL, so an `https://` image has nowhere to go — and the gateway will
+    /// not fetch it on the caller's behalf. The turn keeps its text rather
+    /// than failing.
+    #[test]
+    fn a_remote_image_url_cannot_be_addressed_and_leaves_the_text_intact() {
+        let mut msg = ChatMessage::user("describe");
+        msg.content_blocks = Some(vec![
+            serde_json::json!({"type": "text", "text": "describe"}),
+            serde_json::json!({"type": "image_url",
+                               "image_url": {"url": "https://x.example/cat.png"}}),
+        ]);
+        let req = ChatFormat::new("my-gemini", vec![msg]);
+        let wire = serde_json::to_value(build_gemini_request(&req)).unwrap();
+        let parts = wire["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["text"], "describe");
+    }
+
+    /// A message with no typed blocks keeps the historical single-text-part
+    /// shape — the common case must not grow a wrapper.
+    #[test]
+    fn a_plain_message_still_serializes_as_one_text_part() {
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        let wire = serde_json::to_value(build_gemini_request(&req)).unwrap();
+        assert_eq!(
+            wire["contents"][0]["parts"],
+            serde_json::json!([{"text": "hi"}])
+        );
+    }
+
+    /// Text of a part, for assertions that predate multimodal parts.
+    fn part_text(part: &GeminiPart) -> &str {
+        match part {
+            GeminiPart::Text { text } => text,
+            GeminiPart::InlineData { .. } => panic!("expected a text part, got inline data"),
+        }
+    }
+
     #[test]
     fn build_gemini_request_translates_user_turn() {
         let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
         let body = build_gemini_request(&req);
         assert_eq!(body.contents.len(), 1);
         assert_eq!(body.contents[0].role, "user");
-        assert_eq!(body.contents[0].parts[0].text, "hi");
+        assert_eq!(part_text(&body.contents[0].parts[0]), "hi");
         assert!(body.system_instruction.is_none());
         assert!(body.generation_config.is_none());
     }
@@ -2689,7 +2847,7 @@ mod tests {
         assert_eq!(body.contents[0].role, "user");
         // System lifted to systemInstruction.
         let sys = body.system_instruction.as_ref().unwrap();
-        assert_eq!(sys.parts[0].text, "you are helpful");
+        assert_eq!(part_text(&sys.parts[0]), "you are helpful");
     }
 
     #[test]
@@ -2704,7 +2862,7 @@ mod tests {
         );
         let body = build_gemini_request(&req);
         let sys = body.system_instruction.as_ref().unwrap();
-        assert_eq!(sys.parts[0].text, "rule 1\n\nrule 2");
+        assert_eq!(part_text(&sys.parts[0]), "rule 1\n\nrule 2");
     }
 
     #[test]
