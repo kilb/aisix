@@ -121,9 +121,14 @@ async fn guard_cached_response(
     model_name: &str,
     model: &aisix_core::Model,
     body: Vec<u8>,
-) -> Result<Vec<u8>, ResponsesDispatchError> {
+    redactions_out: &mut crate::redact::RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::GuardrailMonitorHit>,
+) -> Result<GuardedCache, ResponsesDispatchError> {
     if !aisix_guardrails::Guardrail::runs_on_output(chain) {
-        return Ok(body);
+        return Ok(GuardedCache {
+            body,
+            capture_safe: true,
+        });
     }
     // A stored body that no longer parses cannot be moderated, so it is not
     // served: failing closed on an unreadable cache entry is the only safe
@@ -142,20 +147,23 @@ async fn guard_cached_response(
     let synth = synth_chat_response(&upstream_model, responses_output_text(&json_body));
     let (verdict, hits) =
         aisix_guardrails::Guardrail::check_output_non_segment_observed(chain, &synth).await;
-    let _ = hits;
-    let mut counts = crate::redact::RedactionCounts::new();
-    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    // Threaded out, not dropped: a monitor guardrail that fires on a cached
+    // body has to appear in the request's hits, and a mask applied to it has
+    // to appear in the redaction counts — otherwise every cache-served
+    // request reports zero of both.
+    monitor_hits_out.extend(hits);
     let moderation = crate::redact::moderate_responses_response_structured(
         chain,
         verdict,
         &mut json_body,
-        &mut counts,
-        &mut monitor_hits,
+        redactions_out,
+        monitor_hits_out,
     )
     .await;
     let mut verdict = moderation.verdict;
     if !verdict.is_block() {
         let redaction = crate::redact::redact_responses_response_structured(chain, &mut json_body);
+        crate::redact::merge_counts(redactions_out, redaction.counts);
         if redaction.unrewritable_tool_key {
             verdict = crate::redact::unrewritable_tool_key_verdict();
         }
@@ -179,7 +187,18 @@ async fn guard_cached_response(
             .into(),
         );
     }
-    Ok(serde_json::to_vec(&json_body).unwrap_or(body))
+    Ok(GuardedCache {
+        body: serde_json::to_vec(&json_body).unwrap_or(body),
+        capture_safe: moderation.capture_safe,
+    })
+}
+
+/// A cached body that has been through the output chain, and whether the
+/// chain left it safe to hand to a content-capturing exporter. Mirrors the
+/// `/v1/messages` twin.
+struct GuardedCache {
+    body: Vec<u8>,
+    capture_safe: bool,
 }
 
 /// Write path of the `/v1/responses` cache gate — the same shape
@@ -826,9 +845,6 @@ async fn dispatch(
     };
     if let Some(gate) = cache_gate.as_ref() {
         if let Some(hit) = gate.lookup().await {
-            // The request as the caller sent it (post-redaction), for the
-            // capture below — taken before anything downstream rewrites it.
-            let body_for_capture = body.to_string();
             if let Some(r) = reservation.take() {
                 r.commit_tokens(0).await;
             }
@@ -840,13 +856,21 @@ async fn dispatch(
             // covers the case that matters, a policy TIGHTENED afterwards,
             // which would otherwise keep serving now-forbidden content for
             // the whole TTL.
-            let body = guard_cached_response(
+            // Accumulated into the dispatch's out-params, not locals: a
+            // guardrail that BLOCKS the hit still made observations, and the
+            // `?` below would drop locals on the floor — the monitor-mode
+            // record of why the replay was withheld is exactly the row an
+            // operator goes looking for.
+            let guarded = guard_cached_response(
                 resolved_chain.as_ref(),
                 &model_name,
                 &model_entry.value,
                 hit.body,
+                redactions_out,
+                monitor_hits_out,
             )
             .await?;
+            let served = guarded.body;
             // A hit served content to the caller, so it is logged like a
             // fresh response — otherwise a content-capturing exporter's
             // audit trail simply omits every cached answer. Gated on an
@@ -859,11 +883,20 @@ async fn dispatch(
                     .iter()
                     .map(|e| &*e.value),
             )
+            // Same two-sided gate the fresh response passes through
+            // (`input_capture_safe && output_capture_safe`): a guardrail that
+            // withholds content from export must withhold the replay too, on
+            // either side. The input half is already settled here — the
+            // request chain ran before the cache was consulted.
+            .filter(|_| *failure_content_safe_out && guarded.capture_safe)
             .map(|cap| {
-                let text = serde_json::from_slice::<Value>(&body)
+                let text = serde_json::from_slice::<Value>(&served)
                     .map(|v| responses_output_text(&v))
                     .unwrap_or_default();
-                CapturedContent::new(&body_for_capture, &text, cap as usize)
+                // Serialized HERE, not on the hot path above: with no
+                // content-capturing exporter — the common deployment — a hit
+                // pays nothing.
+                CapturedContent::new(&body.to_string(), &text, cap as usize)
             });
             // Recorded only once the hit actually reaches the caller —
             // a hit the output chain blocks is not one the cache served,
@@ -871,7 +904,7 @@ async fn dispatch(
             // endpoint that counted it differently would make the family's
             // totals mean different things per endpoint.
             gate.record(state, crate::chat::CacheStatus::Hit);
-            let mut response = Response::new(axum::body::Body::from(body));
+            let mut response = Response::new(axum::body::Body::from(served));
             if let Ok(ct) = axum::http::HeaderValue::from_str(&hit.content_type) {
                 response
                     .headers_mut()
@@ -906,6 +939,8 @@ async fn dispatch(
                 guardrail_blocked: false,
                 usage_handled_by_stream: false,
                 captured_content,
+                // Already folded into the out-params above; returning them
+                // here too would double-count every mask on a hit.
                 output_redactions: crate::redact::RedactionCounts::new(),
                 output_monitor_hits: Vec::new(),
                 terminal_failure: None,

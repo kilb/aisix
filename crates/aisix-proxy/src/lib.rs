@@ -305,10 +305,10 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         "/v1/files" => "/v1/files",
         "/v1/batches" => "/v1/batches",
         "/v1/fine_tuning/jobs" => "/v1/fine_tuning/jobs",
+        _ if path.starts_with("/v1/models/") => "/v1/models/:id",
         // `/v1/videos/:id` and `/v1/videos/:id/content` collapse together:
         // the id is the only thing that varies and neither is worth its own
         // series.
-        _ if path.starts_with("/v1/models/") => "/v1/models/:id",
         _ if path.starts_with("/v1/videos/") => "/v1/videos/:id",
         _ if path.starts_with("/v1/files/") => "/v1/files/:id",
         _ if path.starts_with("/v1/batches/") => "/v1/batches/:id",

@@ -48,13 +48,15 @@
 //! most recent first; with no release date to sort on, a stable
 //! alphabetical order is the only ordering the gateway can promise, and a
 //! stable one matters more here than a plausible one — cursor pagination is
-//! only correct over a total order that does not shift between pages.
+//! only correct over a total order that does not shift between pages. A
+//! total order also needs distinct ids, which is why the name list is
+//! deduplicated: two model rows may carry the same `display_name`.
 
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::auth::AuthenticatedKey;
 use crate::error::ProxyError;
@@ -139,11 +141,41 @@ pub struct AnthropicModelList {
 
 /// Cursor pagination, per Anthropic's list contract. Ignored by the OpenAI
 /// shape, whose own list endpoint defines no pagination.
-#[derive(Debug, Default, Deserialize)]
+///
+/// Parsed by hand from a string map rather than through a typed extractor:
+/// a typed one rejects `?limit=abc` before the handler runs, and axum's own
+/// rejection is plain text that neither SDK's error type can read — the same
+/// client-side-only failure this module exists to remove.
+#[derive(Debug, Default)]
 pub struct ListParams {
     limit: Option<usize>,
     after_id: Option<String>,
     before_id: Option<String>,
+}
+
+impl ListParams {
+    fn parse(raw: &std::collections::HashMap<String, String>) -> Result<Self, ProxyError> {
+        let limit = match raw.get("limit") {
+            None => None,
+            Some(v) => Some(v.trim().parse::<usize>().map_err(|_| {
+                ProxyError::InvalidRequest(format!(
+                    "`limit` must be a whole number between 1 and {ANTHROPIC_MAX_LIMIT}, got {v:?}"
+                ))
+            })?),
+        };
+        if let Some(n) = limit {
+            if n == 0 || n > ANTHROPIC_MAX_LIMIT {
+                return Err(ProxyError::InvalidRequest(format!(
+                    "`limit` must be between 1 and {ANTHROPIC_MAX_LIMIT}, got {n}"
+                )));
+            }
+        }
+        Ok(Self {
+            limit,
+            after_id: raw.get("after_id").cloned(),
+            before_id: raw.get("before_id").cloned(),
+        })
+    }
 }
 
 /// Names the caller may put in a request's `model` field, sorted.
@@ -170,6 +202,13 @@ fn permitted_model_names(
         .map(str::to_string)
         .collect();
     names.sort();
+    // Two rows may carry the same `display_name`: the name index keeps only
+    // the last, but `entries()` walks the id index, which holds both. A
+    // duplicate would advertise the same id twice AND wedge cursor
+    // pagination — `position()` on a repeated name always returns the first
+    // occurrence, so a client that pages past it is handed the same page
+    // forever.
+    names.dedup();
     names
 }
 
@@ -214,10 +253,7 @@ fn anthropic_model(name: &str) -> AnthropicModelObject {
 /// exists) yields an empty page rather than silently restarting from the
 /// top, which would make a paginating client loop forever.
 fn paginate(names: &[String], params: &ListParams) -> (Vec<String>, bool) {
-    let limit = params
-        .limit
-        .unwrap_or(ANTHROPIC_DEFAULT_LIMIT)
-        .clamp(1, ANTHROPIC_MAX_LIMIT);
+    let limit = params.limit.unwrap_or(ANTHROPIC_DEFAULT_LIMIT);
 
     if let Some(before) = params.before_id.as_deref() {
         let Some(at) = names.iter().position(|n| n == before) else {
@@ -243,8 +279,12 @@ pub async fn list_models(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     headers: HeaderMap,
-    Query(params): Query<ListParams>,
+    Query(raw): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
+    let params = match ListParams::parse(&raw) {
+        Ok(p) => p,
+        Err(e) => return dialect_error(&headers, e),
+    };
     let snapshot = state.snapshot.load();
     let names = permitted_model_names(&snapshot, &auth);
 
@@ -772,6 +812,125 @@ mod tests {
             cursor = Some(v["last_id"].as_str().unwrap().to_string());
         }
         assert_eq!(seen, vec!["alpha", "bravo", "charlie"]);
+    }
+
+    /// Two rows may carry the same `display_name` — the id index holds both
+    /// while the name index keeps only the last. Listing them twice would
+    /// advertise a duplicate id AND wedge the cursor: `after_id` resolves to
+    /// the FIRST occurrence, so the page after it repeats forever.
+    #[tokio::test]
+    async fn two_models_sharing_a_display_name_are_listed_once() {
+        let snap = AisixSnapshot::new();
+        snap.models.insert(model_entry("m-1", "shared"));
+        snap.models.insert(model_entry("m-2", "shared"));
+        snap.models.insert(model_entry("m-3", "zulu"));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["*"]));
+        let app = build_app(snap);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("authorization", "Bearer sk-caller")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let ids: Vec<&str> = v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["shared", "zulu"], "duplicate names collapse: {v}");
+    }
+
+    /// A cursor walk over a catalogue containing a duplicated name still
+    /// terminates. This is the failure the dedup above prevents: without it
+    /// `after_id=shared` lands on the first `shared` every time and the
+    /// client re-reads the same page until it gives up.
+    #[tokio::test]
+    async fn a_duplicated_name_does_not_wedge_the_cursor() {
+        let snap = AisixSnapshot::new();
+        snap.models.insert(model_entry("m-1", "shared"));
+        snap.models.insert(model_entry("m-2", "shared"));
+        snap.models.insert(model_entry("m-3", "zulu"));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["*"]));
+        let app = build_app(snap);
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..6 {
+            let uri = match &cursor {
+                Some(c) => format!("/v1/models?limit=1&after_id={c}"),
+                None => "/v1/models?limit=1".to_string(),
+            };
+            let req = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("x-api-key", "sk-caller")
+                .header("anthropic-version", "2023-06-01")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+            let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let page = v["data"].as_array().unwrap();
+            if page.is_empty() {
+                break;
+            }
+            seen.push(page[0]["id"].as_str().unwrap().to_string());
+            if !v["has_more"].as_bool().unwrap() {
+                break;
+            }
+            cursor = Some(v["last_id"].as_str().unwrap().to_string());
+        }
+        assert_eq!(seen, vec!["shared", "zulu"]);
+    }
+
+    /// A malformed `limit` must come back in the caller's own error shape.
+    /// A typed extractor rejects it before the handler runs, and axum's
+    /// rejection is plain text — which neither SDK's error type can parse,
+    /// so the client raises a decode error instead of the 400 it was sent.
+    #[tokio::test]
+    async fn a_bad_limit_is_rejected_in_the_caller_dialect() {
+        let snap = AisixSnapshot::new();
+        snap.models.insert(model_entry("m-1", "gpt-4o"));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["*"]));
+        let app = build_app(snap);
+
+        for (headers, probe) in [
+            (vec![("authorization", "Bearer sk-caller")], "openai"),
+            (
+                vec![
+                    ("x-api-key", "sk-caller"),
+                    ("anthropic-version", "2023-06-01"),
+                ],
+                "anthropic",
+            ),
+        ] {
+            for uri in ["/v1/models?limit=abc", "/v1/models?limit=0"] {
+                let mut b = Request::builder().method("GET").uri(uri);
+                for (k, v) in &headers {
+                    b = b.header(*k, *v);
+                }
+                let resp = tower::ServiceExt::oneshot(
+                    app.clone(),
+                    b.body(axum::body::Body::empty()).unwrap(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{probe} {uri}");
+                let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+                let v: serde_json::Value = serde_json::from_slice(&bytes)
+                    .unwrap_or_else(|e| panic!("{probe} {uri} must be JSON: {e}"));
+                // Both dialects nest the machine-readable code under `error`.
+                assert!(
+                    v.get("error").and_then(|e| e.get("type")).is_some(),
+                    "{probe} {uri} lost its error envelope: {v}"
+                );
+            }
+        }
     }
 
     /// A cursor naming something the caller cannot see yields an empty page

@@ -497,6 +497,8 @@ mod tests {
     /// are what force a new endpoint's `endpoint` label and LLM-vs-proxy
     /// tier to be decided rather than defaulted.
     const ROUTES: &[&str] = &[
+        "/v1/models",
+        "/v1/models/gpt-4o",
         "/v1/chat/completions",
         "/v1/completions",
         "/v1/embeddings",

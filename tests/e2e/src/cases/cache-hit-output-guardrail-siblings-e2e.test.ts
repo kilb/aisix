@@ -42,6 +42,15 @@ describe("cache hits run output guardrails on the sibling endpoints", () => {
 
     // Both endpoints answer with a body containing the literal "confidential",
     // which the guardrail attached mid-test will block.
+    //
+    // The two bodies hide it in different places on purpose. `/v1/responses`
+    // puts it in plain output text — the obvious shape. `/v1/messages` puts
+    // it ONLY inside a `tool_use` argument, where a narrower text extractor
+    // never looks: the visible text is innocuous. That is the same bypass one
+    // layer down — the fresh response is inspected over the content array
+    // (so tool arguments count), and a hit path that moderates only the
+    // joined text blocks would block the response that STORES the entry and
+    // then pass every replay of it.
     upstream = await startOpenAiUpstream({
       pathBodies: {
         "/v1/messages": {
@@ -49,8 +58,16 @@ describe("cache hits run output guardrails on the sibling endpoints", () => {
           type: "message",
           role: "assistant",
           model: "claude-3-5-haiku-20241022",
-          content: [{ type: "text", text: "this is confidential material" }],
-          stop_reason: "end_turn",
+          content: [
+            { type: "text", text: "here is the lookup you asked for" },
+            {
+              type: "tool_use",
+              id: "toolu_cgs",
+              name: "search_docs",
+              input: { query: "confidential material" },
+            },
+          ],
+          stop_reason: "tool_use",
           usage: { input_tokens: 5, output_tokens: 4 },
         },
         "/v1/responses": {
@@ -133,6 +150,16 @@ describe("cache hits run output guardrails on the sibling endpoints", () => {
     expect(r1.status, "first /v1/responses call populates the cache").toBe(200);
     expect(r1.headers.get("x-aisix-cache")).toBe("miss");
 
+    // 1b) Prove the entries are actually SERVED before the guardrail exists.
+    //     Without this, step 3's 422 is ambiguous: a cache that quietly
+    //     stopped matching would send the request upstream and the FRESH
+    //     output chain would block it with the same status — a green test
+    //     that proves nothing about the hit path.
+    const mWarm = await messages(cachedPrompt);
+    expect(mWarm.headers.get("x-aisix-cache"), "the /v1/messages entry is served").toBe("hit");
+    const rWarm = await responses(cachedPrompt);
+    expect(rWarm.headers.get("x-aisix-cache"), "the /v1/responses entry is served").toBe("hit");
+
     // 2) Attach an output guardrail the stored bodies violate.
     await seed.createGuardrail({
       name: "cgs-output-keyword",
@@ -149,11 +176,20 @@ describe("cache hits run output guardrails on the sibling endpoints", () => {
 
     // 3) The cached requests are hits — and must now be blocked rather than
     //    replayed. A pass here is a policy bypass with a TTL-long window.
+    //
+    //    The upstream call count is the discriminator: a hit answers without
+    //    touching the provider, so a 422 with the count UNCHANGED can only
+    //    have come from the hit path. A 422 that moved the count is a miss
+    //    blocked on the fresh chain, which is a different code path and
+    //    would leave the bug this spec exists for undetected.
+    const upstreamCallsBefore = upstream!.receivedRequests.length;
+
     const mHit = await messages(cachedPrompt);
     expect(
       mHit.status,
-      "a /v1/messages cache hit must run the output chain, not replay the " +
-        "stored body past a guardrail the operator has since added",
+      "a /v1/messages cache hit must run the output chain over the SAME text " +
+        "the fresh response is inspected with — the match lives in a tool_use " +
+        "argument, so a hit moderated over joined text blocks alone replays it",
     ).toBe(422);
 
     const rHit = await responses(cachedPrompt);
@@ -162,6 +198,12 @@ describe("cache hits run output guardrails on the sibling endpoints", () => {
       "a /v1/responses cache hit must run the output chain, not replay the " +
         "stored body past a guardrail the operator has since added",
     ).toBe(422);
+
+    expect(
+      upstream!.receivedRequests.length,
+      "both blocked responses came from the cache: neither call reached the " +
+        "provider, so the 422s prove the HIT path ran the output chain",
+    ).toBe(upstreamCallsBefore);
   }, 120_000);
 
   function messages(text: string) {

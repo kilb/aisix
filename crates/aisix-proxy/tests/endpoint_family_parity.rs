@@ -137,6 +137,73 @@ fn a_handler_that_caches_also_guards_its_cache_hits() {
     );
 }
 
+/// A cache HIT that is exported to a content-capturing observability sink
+/// must pass the same capture-safety gate the FRESH response passes.
+///
+/// The gate is two-sided — `input_capture_safe && output_capture_safe` — and
+/// it exists because a guardrail can decide that content is unsafe to hand to
+/// an exporter without blocking the request. Skip it on the hit path and the
+/// exporter records, on every replay, exactly the text the policy refused to
+/// record on the miss that stored it. Nothing errors; the leak is only
+/// visible by reading the sink.
+///
+/// Structural, not by name: the check reads the slice between the handler's
+/// cache-hit read and the capture it builds from that hit, and requires a
+/// capture-safety term inside it. Deleting the gate empties that slice.
+#[test]
+fn a_cached_response_is_captured_under_the_same_safety_gate() {
+    // Last occurrence, so a helper's *definition* earlier in the file does
+    // not anchor the slice ahead of the real hit path.
+    const READS_A_CACHE: &[&str] = &["resolve_cache_hit(", "gate.lookup()"];
+
+    let dir = handlers_dir();
+    let mut ungated: Vec<String> = Vec::new();
+
+    for handler in MODEL_DISPATCH_HANDLERS {
+        let src = std::fs::read_to_string(dir.join(handler)).expect("handler is readable");
+        // Same documented exemption as the guardrail rule above: an
+        // embedding response carries no text to capture.
+        if *handler == "embeddings.rs" {
+            continue;
+        }
+        let Some(hit_at) = READS_A_CACHE.iter().filter_map(|m| src.rfind(m)).max() else {
+            continue;
+        };
+        // A handler that caches but exports no content has nothing to gate.
+        let Some(rel) = src[hit_at..].find("CapturedContent::new(") else {
+            continue;
+        };
+        // The term has to appear in a CONDITION, not just anywhere in the
+        // slice. Two weaker readings both pass while the gate is gone: the
+        // comment explaining it survives deletion, and so does the `let
+        // cached_capture_safe = …` binding it used to feed — the compiler
+        // reports that as an unused variable, which is a warning nobody
+        // fails a build on.
+        let gated = src[hit_at..hit_at + rel]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .any(|l| {
+                l.contains("capture_safe")
+                    && (l.contains("filter(")
+                        || l.contains("&&")
+                        || l.trim_start().starts_with("if "))
+            });
+        if !gated {
+            ungated.push(format!("  {handler}"));
+        }
+    }
+
+    assert!(
+        ungated.is_empty(),
+        "these handlers export a cache hit to a content-capturing sink \
+         without the capture-safety gate the fresh path applies:\n{}\n\nGate \
+         it on `input_capture_safe && output_capture_safe`, as \
+         `/v1/chat/completions` does — otherwise a guardrail that withheld \
+         the content from export is bypassed for the whole TTL.",
+        ungated.join("\n"),
+    );
+}
+
 /// The list itself rots: a handler deleted or renamed must not leave the guard
 /// silently checking nothing.
 #[test]

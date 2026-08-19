@@ -234,10 +234,11 @@ impl<'a> AnthropicMessage<'a> {
 ///   per-block upstream — both previously vanished in the flatten, so
 ///   forwarding them would break requests that worked before.
 ///
-/// Non-text blocks are dropped HERE because this filter serves the
-/// top-level `system` field, which Anthropic defines as text-only. Message
-/// content goes through [`anthropic_content_blocks`], which carries images
-/// and documents.
+/// Non-text blocks are dropped HERE because both callers are roles that
+/// Anthropic defines without media: the top-level `system` field, which is
+/// text-only, and the replayed assistant turn, which carries only what a
+/// model can produce. User message content goes through
+/// [`anthropic_content_blocks`], which carries images and documents.
 fn anthropic_text_blocks(blocks: &[serde_json::Value]) -> Vec<serde_json::Value> {
     const KEEP: &[&str] = &["type", "text", "cache_control", "citations"];
     blocks

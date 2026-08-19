@@ -704,9 +704,6 @@ async fn dispatch(
     };
     if let Some(gate) = cache_gate.as_ref() {
         if let Some(hit) = gate.lookup().await {
-            // The request as the caller sent it (post-redaction), for the
-            // capture below — taken before anything downstream rewrites it.
-            let body_for_capture = body.to_string();
             // No upstream call, so nothing was consumed.
             if let Some(r) = reservation.take() {
                 r.commit_tokens(0).await;
@@ -719,8 +716,7 @@ async fn dispatch(
             // covers the case that matters, a policy TIGHTENED afterwards,
             // which would otherwise keep serving now-forbidden content for
             // the whole TTL.
-            let body = guard_cached_response(
-                state,
+            let guarded = guard_cached_response(
                 resolved_chain.as_ref(),
                 &model_name,
                 hit.body,
@@ -728,6 +724,7 @@ async fn dispatch(
                 monitor_hits_out,
             )
             .await?;
+            let served = guarded.body;
             // A hit served content to the caller, so it is logged like a
             // fresh response — otherwise a content-capturing exporter's
             // audit trail simply omits every cached answer. Gated on an
@@ -740,11 +737,19 @@ async fn dispatch(
                     .iter()
                     .map(|e| &*e.value),
             )
+            // Same gate the fresh response passes through: a guardrail that
+            // withholds content from export must withhold the replay too,
+            // or the exporter records on a hit what the policy refused to
+            // record on the miss.
+            .filter(|_| guarded.capture_safe && !*suppress_failure_content_out)
             .map(|cap| {
-                let text = serde_json::from_slice::<Value>(&body)
+                let text = serde_json::from_slice::<Value>(&served)
                     .map(|v| anthropic_response_text(&v))
                     .unwrap_or_default();
-                CapturedContent::new(&body_for_capture, &text, cap as usize)
+                // Serialized HERE, not on the hot path above: with no
+                // content-capturing exporter — the common deployment — a hit
+                // pays nothing.
+                CapturedContent::new(&body.to_string(), &text, cap as usize)
             });
             // Recorded only once the hit actually reaches the caller —
             // a hit the output chain blocks is not one the cache served,
@@ -752,7 +757,7 @@ async fn dispatch(
             // endpoint that counted it differently would make the family's
             // totals mean different things per endpoint.
             gate.record(state, crate::chat::CacheStatus::Hit);
-            let mut response = Response::new(axum::body::Body::from(body));
+            let mut response = Response::new(axum::body::Body::from(served));
             if let Ok(ct) = axum::http::HeaderValue::from_str(&hit.content_type) {
                 response
                     .headers_mut()
@@ -1748,64 +1753,51 @@ async fn anthropic_passthrough_dispatch(
         let mut output_seg_counts = crate::redact::RedactionCounts::new();
         let mut output_monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
         let mut output_capture_safe = true;
-        if !resolved_chain.is_empty() {
-            if let Some(content) = json_body.get("content").and_then(|v| v.as_array()) {
-                let mut out_text = String::new();
-                for block in content {
-                    if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
-                        if !out_text.is_empty() {
-                            out_text.push('\n');
-                        }
-                        out_text.push_str(t);
-                    }
-                }
-                if !out_text.is_empty() {
-                    out_text.push('\n');
-                }
-                out_text.push_str(&Value::Array(content.clone()).to_string());
+        if !resolved_chain.is_empty()
+            && json_body
+                .get("content")
+                .and_then(|v| v.as_array())
+                .is_some()
+        {
+            let out_text = anthropic_inspection_text(&json_body);
 
-                let synth = aisix_gateway::ChatResponse {
-                    id: String::new(),
-                    model: model_name.to_string(),
-                    message: aisix_gateway::ChatMessage::assistant(out_text),
-                    finish_reason: aisix_gateway::FinishReason::Stop,
-                    usage: aisix_gateway::UsageStats::new(0, 0),
-                };
-                let (verdict, hits) =
-                    aisix_guardrails::Guardrail::check_output_non_segment_observed(
-                        resolved_chain.as_ref(),
-                        &synth,
-                    )
-                    .await;
-                output_monitor_hits.extend(hits);
-                let moderation = crate::redact::moderate_anthropic_response(
-                    resolved_chain.as_ref(),
-                    verdict,
-                    &mut json_body,
-                    &mut output_seg_counts,
-                    &mut output_monitor_hits,
-                )
-                .await;
-                output_capture_safe = moderation.capture_safe;
-                let verdict = moderation.verdict;
-                if let aisix_guardrails::GuardrailVerdict::Block {
-                    reason,
-                    guardrail_name,
-                } = verdict
-                {
-                    tracing::warn!(
-                        guardrail_hook = "output",
-                        model = %model_name,
-                        reason = %reason,
-                        "guardrail blocked /v1/messages passthrough response",
-                    );
-                    return Err(ProxyError::ContentFiltered(
-                        crate::error::guardrail_block_message(
-                            "response",
-                            guardrail_name.as_deref(),
-                        ),
-                    ));
-                }
+            let synth = aisix_gateway::ChatResponse {
+                id: String::new(),
+                model: model_name.to_string(),
+                message: aisix_gateway::ChatMessage::assistant(out_text),
+                finish_reason: aisix_gateway::FinishReason::Stop,
+                usage: aisix_gateway::UsageStats::new(0, 0),
+            };
+            let (verdict, hits) = aisix_guardrails::Guardrail::check_output_non_segment_observed(
+                resolved_chain.as_ref(),
+                &synth,
+            )
+            .await;
+            output_monitor_hits.extend(hits);
+            let moderation = crate::redact::moderate_anthropic_response(
+                resolved_chain.as_ref(),
+                verdict,
+                &mut json_body,
+                &mut output_seg_counts,
+                &mut output_monitor_hits,
+            )
+            .await;
+            output_capture_safe = moderation.capture_safe;
+            let verdict = moderation.verdict;
+            if let aisix_guardrails::GuardrailVerdict::Block {
+                reason,
+                guardrail_name,
+            } = verdict
+            {
+                tracing::warn!(
+                    guardrail_hook = "output",
+                    model = %model_name,
+                    reason = %reason,
+                    "guardrail blocked /v1/messages passthrough response",
+                );
+                return Err(ProxyError::ContentFiltered(
+                    crate::error::guardrail_block_message("response", guardrail_name.as_deref()),
+                ));
             }
         }
 
@@ -1964,16 +1956,17 @@ fn anthropic_response_text(body: &Value) -> String {
 /// A no-op (and no re-serialisation) when no output guardrail is attached,
 /// which is the common deployment.
 async fn guard_cached_response(
-    state: &ProxyState,
     chain: &aisix_guardrails::GuardrailChain,
     model_name: &str,
     body: Vec<u8>,
     redactions_out: &mut crate::redact::RedactionCounts,
     monitor_hits_out: &mut Vec<aisix_core::GuardrailMonitorHit>,
-) -> Result<Vec<u8>, MessagesDispatchError> {
-    let _ = state;
+) -> Result<GuardedCache, MessagesDispatchError> {
     if !aisix_guardrails::Guardrail::runs_on_output(chain) {
-        return Ok(body);
+        return Ok(GuardedCache {
+            body,
+            capture_safe: true,
+        });
     }
     // A stored body that no longer parses cannot be moderated, so it is not
     // served: failing closed on an unreadable cache entry is the only safe
@@ -1988,10 +1981,14 @@ async fn guard_cached_response(
                 .into(),
         );
     };
+    // The SAME text the fresh response is inspected with. Moderating the
+    // replay against a narrower view is the #448 bypass in a subtler form:
+    // a rule that matches inside a `tool_use` argument blocks the response
+    // that stored the entry, then passes every replay of it.
     let synth = aisix_gateway::ChatResponse {
         id: String::new(),
         model: model_name.to_string(),
-        message: aisix_gateway::ChatMessage::assistant(anthropic_response_text(&json_body)),
+        message: aisix_gateway::ChatMessage::assistant(anthropic_inspection_text(&json_body)),
         finish_reason: aisix_gateway::FinishReason::Stop,
         usage: aisix_gateway::UsageStats::new(0, 0),
     };
@@ -2033,7 +2030,53 @@ async fn guard_cached_response(
         );
     }
     crate::redact::merge_counts(redactions_out, redaction.counts);
-    Ok(serde_json::to_vec(&json_body).unwrap_or(body))
+    Ok(GuardedCache {
+        body: serde_json::to_vec(&json_body).unwrap_or(body),
+        capture_safe: moderation.capture_safe,
+    })
+}
+
+/// A cached body that has been through the output chain, and whether the
+/// chain left it safe to hand to a content-capturing exporter.
+///
+/// `capture_safe` rides back out because a guardrail that withholds content
+/// from export on a fresh response must withhold it on the replay too —
+/// otherwise the exporter records on a hit exactly what the policy refused
+/// to record on the miss.
+struct GuardedCache {
+    body: Vec<u8>,
+    capture_safe: bool,
+}
+
+/// Everything in an Anthropic response body an output guardrail must see.
+///
+/// The assistant's text blocks joined with newlines, PLUS the raw content
+/// array serialized — the second half is what carries `tool_use` arguments,
+/// `server_tool_use` inputs and any block type the gateway does not model,
+/// none of which appear in the text blocks.
+///
+/// Shared by the fresh passthrough and the cache-hit path deliberately: a
+/// cache hit that inspected strictly less text than the response it replays
+/// would let exactly the blocks the fresh path catches through, which is the
+/// bypass the hit-side guarding exists to close.
+fn anthropic_inspection_text(body: &Value) -> String {
+    let Some(content) = body.get("content").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for block in content {
+        if let Some(t) = block.get("text").and_then(Value::as_str) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(t);
+        }
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&Value::Array(content.clone()).to_string());
+    out
 }
 
 /// One counter out of an Anthropic `usage.server_tool_use` block.

@@ -62,6 +62,17 @@ describe("model discovery in both dialects", () => {
         provider_key_id: pk.id,
       });
     }
+    // A SECOND row carrying an existing display name. Two rows may share
+    // one: the id index holds both while the name index keeps only the last.
+    // Listed twice, it advertises a duplicate id and wedges the cursor —
+    // `after_id=md-bravo` resolves to the first occurrence, so the page after
+    // it repeats forever and the pagination walk below never terminates.
+    await seed.createModel({
+      display_name: "md-bravo",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: pk.id,
+    });
     // A model this key may NOT reach, to pin the ACL and the 404 fold.
     await seed.createModel({
       display_name: "md-secret",
@@ -157,6 +168,42 @@ describe("model discovery in both dialects", () => {
       "md-bravo",
       "md-charlie",
     ]);
+  }, 60_000);
+
+  test("a name carried by two rows is listed once", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+
+    const list = (await (await get("/v1/models")).json()) as OpenAiList;
+    const ids = list.data!.map((m) => m.id);
+    expect(ids, "the catalogue is a set of names, not a row dump").toEqual([
+      "md-alpha",
+      "md-bravo",
+      "md-charlie",
+    ]);
+  }, 60_000);
+
+  test("a malformed `limit` comes back in the caller's own error shape", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+
+    // A typed extractor rejects this before the handler runs, and the
+    // framework's rejection is plain text. Neither SDK can parse that, so
+    // the client raises a decode error instead of surfacing the 400 it was
+    // actually sent — the same client-side-only break as the wrong list
+    // envelope.
+    for (const dialect of [{}, { "anthropic-version": "2023-06-01" }]) {
+      for (const qs of ["limit=abc", "limit=0", "limit=99999"]) {
+        const r = await get(`/v1/models?${qs}`, dialect);
+        expect(r.status, `${qs} ${JSON.stringify(dialect)}`).toBe(400);
+        const body = await r.json();
+        expect(body?.error?.type, `${qs} kept its error envelope`).toBeTruthy();
+      }
+    }
   }, 60_000);
 
   test("retrieve serves both dialects, and hides what the key may not reach", async (ctx) => {
