@@ -1989,6 +1989,14 @@ async fn dispatch(
                     comp.reached_end || comp.guardrail_blocked,
                     if comp.guardrail_blocked { 422 } else { 200 },
                 );
+                // One figure for both the usage event and the spend metric —
+                // computing it twice is how the two drift.
+                let stream_cost_usd = crate::usage_attr::request_cost_usd(
+                    &snap,
+                    &model_id_for_telem,
+                    u64::from(comp.prompt_tokens),
+                    u64::from(comp.completion_tokens),
+                );
                 let deployment_success = terminal.error_class.is_empty() && terminal.status < 400;
                 routing_for_terminal.finish_staged(
                     &state_for_telem,
@@ -2000,10 +2008,12 @@ async fn dispatch(
                     },
                     deployment_success || comp.guardrail_blocked,
                 );
-                // Telemetry: emit with the actual upstream-reported counts.
-                // cost_usd stays 0.0; cp-api recomputes server-side from
-                // its model_pricing catalog (same pattern as the non-
-                // streaming path's cost_usd handling).
+                // Telemetry: emit with the actual upstream-reported counts,
+                // priced from the dispatched row when the operator configured
+                // `Model.cost` (same rule as the non-streaming path). A fresh
+                // snapshot is already loaded above — a long stream may outlive
+                // the generation it started on, and the price to apply is the
+                // one in force when the usage is recorded.
                 emit_usage_event(
                     &state_for_telem,
                     &snap,
@@ -2075,7 +2085,7 @@ async fn dispatch(
                             merged
                         },
                     },
-                    /* cost_usd */ 0.0,
+                    stream_cost_usd,
                     comp.guardrail_blocked,
                     &client_for_telem,
                     // Prompt captured up front, response assembled across the
@@ -2120,7 +2130,7 @@ async fn dispatch(
                         input: comp.prompt_tokens,
                         output: comp.completion_tokens,
                         total: comp.total_tokens.min(u64::from(u32::MAX)) as u32,
-                        spend_usd: 0.0,
+                        spend_usd: stream_cost_usd,
                         client_type: &client_type_for_metrics,
                     },
                 );
@@ -2989,9 +2999,12 @@ async fn dispatch(
     }
     reservation.commit_tokens(total).await;
 
-    // cp-api recomputes cost server-side from its pricing catalog when
-    // ingesting telemetry; the DP just records 0.0 on the wire.
-    let cost_usd = 0.0;
+    // Price from the DISPATCHED row's `Model.cost` when the operator set one;
+    // `0.0` otherwise, which is what a control plane recomputing from its own
+    // pricing catalog expects. Without this an open-source deployment — no
+    // control plane to recompute anything — saw cost 0 however it configured
+    // the field.
+    let cost_usd = crate::usage_attr::request_cost_usd(snapshot, &model_id, prompt, completion);
 
     let (output_verdict, hits) = resolved_chain
         .check_output_non_segment_observed(&upstream)
@@ -3364,7 +3377,12 @@ async fn dispatch_ensemble(
                     applied_guardrails: applied_guardrails.to_vec(),
                     ..UsageExtras::default()
                 },
-                /* cost_usd */ 0.0,
+                crate::usage_attr::request_cost_usd(
+                    snapshot,
+                    &sub_model_id,
+                    u64::from(prompt_tokens),
+                    u64::from(completion_tokens),
+                ),
                 blocked,
                 client,
                 /* content */ None,
@@ -3732,7 +3750,12 @@ async fn dispatch_ensemble(
                             applied_guardrails: applied_guardrails_for_telem.clone(),
                             ..UsageExtras::default()
                         },
-                        /* cost_usd */ 0.0,
+                        crate::usage_attr::request_cost_usd(
+                            &snap,
+                            &member.model_id,
+                            u64::from(prompt_tokens),
+                            u64::from(completion_tokens),
+                        ),
                         comp.guardrail_blocked,
                         &client_for_telem,
                         /* content */ None,
@@ -3788,7 +3811,12 @@ async fn dispatch_ensemble(
                         },
                         ..UsageExtras::default()
                     },
-                    /* cost_usd */ 0.0,
+                    crate::usage_attr::request_cost_usd(
+                        &snap,
+                        &judge_model_id,
+                        u64::from(comp.prompt_tokens),
+                        u64::from(comp.completion_tokens),
+                    ),
                     comp.guardrail_blocked,
                     &client_for_telem,
                     /* content */ None,

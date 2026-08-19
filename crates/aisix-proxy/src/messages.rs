@@ -3188,6 +3188,14 @@ fn emit_anthropic_usage_event(
         requested_model: model.to_string(),
         prompt_tokens: metrics.prompt_tokens,
         completion_tokens: metrics.completion_tokens,
+        // Priced from the dispatched row's `Model.cost` when the operator set
+        // one, `0.0` otherwise — see `usage_attr::request_cost_usd`.
+        cost_usd: crate::usage_attr::request_cost_usd(
+            snap,
+            model_id,
+            u64::from(metrics.prompt_tokens),
+            u64::from(metrics.completion_tokens),
+        ),
         cache_creation_tokens: metrics.cache_creation_tokens,
         cache_read_tokens: metrics.cache_read_tokens,
         usage_estimated: metrics.usage_estimated,
@@ -3260,7 +3268,7 @@ fn emit_anthropic_usage_event(
             input: metrics.prompt_tokens,
             output: metrics.completion_tokens,
             total: total_tokens_all.min(u64::from(u32::MAX)) as u32,
-            spend_usd: 0.0,
+            spend_usd: event.cost_usd,
             client_type: state.client_classifier.classify(&client.user_agent),
         },
     );

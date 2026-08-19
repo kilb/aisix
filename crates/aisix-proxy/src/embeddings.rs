@@ -638,9 +638,10 @@ fn emit_access_log(
 ///     none of these concepts apply to the embeddings endpoint;
 ///     cp-api reads these UsageEvent fields with `omitempty`-equivalent
 ///     defaults so leaving them zero is the same as omitting.
-///   - `cost_usd = 0.0` — cp-api computes cost server-side from
-///     pricing catalog + token counts on ingestion (same convention
-///     as every chat.rs emit site).
+///   - `cost_usd` — priced locally from the dispatched row's
+///     `Model.cost` when the operator set one, `0.0` otherwise, so
+///     cp-api's own pricing catalog stays authoritative when it is
+///     the one billing (same convention as every chat.rs emit site).
 ///
 /// Issue #226. /v1/embeddings is the first non-chat handler to gain
 /// emission; follow-ups for completions / responses / rerank /
@@ -686,7 +687,6 @@ fn emit_usage_event(
     //     no completion side and no cache token concepts
     //   - provider_request_id / provider_model_version / finish_reason
     //     — not exposed by the OpenAI embeddings response shape
-    //   - cost_usd — cp-api computes server-side from pricing catalog
     //   - guardrail_blocked — a blocked input short-circuits before this
     //     emit (success-only path), so it is never set here
     //   - guardrail_bypassed_reason — embeddings now run input guardrails
@@ -710,6 +710,14 @@ fn emit_usage_event(
         requested_model: requested_model.to_string(),
         prompt_tokens,
         usage_estimated,
+        // Priced from the dispatched row's `Model.cost` when the operator set
+        // one, `0.0` otherwise — see `usage_attr::request_cost_usd`.
+        cost_usd: crate::usage_attr::request_cost_usd(
+            snap,
+            model_id,
+            u64::from(prompt_tokens),
+            u64::from(0u32),
+        ),
         // Single-attempt endpoint: the attempt spans the whole request, so
         // the upstream figure and what the caller waited for coincide.
         upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
@@ -753,7 +761,7 @@ fn emit_usage_event(
             input: prompt_tokens,
             output: 0,
             total: prompt_tokens,
-            spend_usd: 0.0,
+            spend_usd: event.cost_usd,
             client_type: state.client_classifier.classify(&client.user_agent),
         },
     );

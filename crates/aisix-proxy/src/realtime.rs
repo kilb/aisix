@@ -801,8 +801,8 @@ async fn run_session(
     );
     // A realtime session bills real tokens against a real model, and this is
     // the only place that knows the session's totals. Its cost is resolved
-    // here too, unlike the other endpoints, so it is the one non-chat surface
-    // that also feeds `aisix_llm_spend_micro_usd_total`.
+    // from the model row, same as every other endpoint, and feeds
+    // `aisix_llm_spend_micro_usd_total`.
     crate::request_metrics::record_usage(
         &state,
         "/v1/realtime",

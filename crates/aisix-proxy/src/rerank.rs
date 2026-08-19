@@ -722,6 +722,14 @@ fn emit_usage_event(
         api_key_id: api_key_id.to_string(),
         requested_model: requested_model.to_string(),
         prompt_tokens: usage.prompt_tokens,
+        // Priced from the dispatched row's `Model.cost` when the operator set
+        // one, `0.0` otherwise — see `usage_attr::request_cost_usd`.
+        cost_usd: crate::usage_attr::request_cost_usd(
+            snap,
+            model_id,
+            u64::from(usage.prompt_tokens),
+            u64::from(0u32),
+        ),
         // Single-attempt endpoint: the attempt spans the whole request, so
         // the upstream figure and what the caller waited for coincide.
         upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
@@ -765,7 +773,7 @@ fn emit_usage_event(
             input: usage.prompt_tokens,
             output: 0,
             total: usage.prompt_tokens,
-            spend_usd: 0.0,
+            spend_usd: event.cost_usd,
             client_type: state.client_classifier.classify(&client.user_agent),
         },
     );

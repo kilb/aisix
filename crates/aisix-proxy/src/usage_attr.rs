@@ -274,6 +274,33 @@ pub(crate) fn token_count(raw: u64) -> u32 {
     u32::try_from(raw).unwrap_or(u32::MAX)
 }
 
+/// USD cost for one request, from the price the operator configured on the
+/// **dispatched** model (`Model.cost`).
+///
+/// `model_id` is the winning target's row id, not the caller-addressed entry:
+/// `cost` is a direct-model knob, so a routing group's price is whichever
+/// member actually served the request.
+///
+/// Returns `0.0` when the row carries no `cost`. That is deliberate rather
+/// than a fallback: a control plane recomputes spend server-side from its own
+/// pricing catalog, so a DP-side number is only wanted where the operator
+/// asked for one by setting the field. Before this existed the main LLM
+/// endpoints always emitted `0.0`, which left an open-source deployment — one
+/// with no control plane to recompute anything — with no cost signal at all
+/// even after configuring `cost`.
+pub(crate) fn request_cost_usd(
+    snap: &AisixSnapshot,
+    model_id: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) -> f64 {
+    snap.models
+        .get_by_id(model_id)
+        .and_then(|entry| entry.value.cost.clone())
+        .map(|cost| cost.calculate(prompt_tokens, completion_tokens))
+        .unwrap_or(0.0)
+}
+
 pub(crate) fn metric_model_label<'a>(snap: &AisixSnapshot, model_name: &'a str) -> Cow<'a, str> {
     if snap.models.get_by_name(model_name).is_some() {
         return Cow::Borrowed(model_name);
@@ -458,6 +485,54 @@ pub(crate) fn emit_guardrail_error_usage_event(
 
 #[cfg(test)]
 mod tests {
+
+    /// `Model.cost` had two live readers (`least_cost` ranking, and the jobs
+    /// and realtime emits) and was ignored by every main LLM endpoint, which
+    /// emitted a hard-coded `0.0`. A deployment with no control plane to
+    /// recompute spend therefore saw no cost at all.
+    #[test]
+    fn request_cost_uses_the_dispatched_row_price() {
+        use aisix_core::resource::ResourceEntry;
+        use aisix_core::snapshot::ResourceTable;
+
+        let table = ResourceTable::default();
+        let priced: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "priced",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "pk-1",
+            "cost": { "input_per_1k": 2.5, "output_per_1k": 10.0 },
+        }))
+        .unwrap();
+        table.insert(ResourceEntry::new("m-priced", priced, 1));
+        let unpriced: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "unpriced",
+            "provider": "openai",
+            "model_name": "gpt-4o-mini",
+            "provider_key_id": "pk-1",
+        }))
+        .unwrap();
+        table.insert(ResourceEntry::new("m-unpriced", unpriced, 1));
+        let snap = AisixSnapshot {
+            models: table,
+            ..Default::default()
+        };
+
+        // 1000 prompt + 500 completion = 2.5 + 5.0
+        let cost = request_cost_usd(&snap, "m-priced", 1_000, 500);
+        assert!((cost - 7.5).abs() < 1e-9, "got {cost}");
+
+        assert_eq!(
+            request_cost_usd(&snap, "m-unpriced", 1_000, 500),
+            0.0,
+            "no configured price means the control plane owns the number"
+        );
+        assert_eq!(
+            request_cost_usd(&snap, "m-missing", 1_000, 500),
+            0.0,
+            "a row that no longer resolves must not panic or guess"
+        );
+    }
 
     /// Wrapping a token count understates usage, and the upstream that
     /// reported it is not always a trusted party (`api_base` points wherever
