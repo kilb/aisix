@@ -106,6 +106,7 @@ pub fn build_router(state: ProxyState) -> Router {
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
         .route("/v1/models", get(models::list_models))
+        .route("/v1/models/:id", get(models::get_model))
         .route("/v1/chat/completions", post(chat::chat_completions))
         .route("/v1/completions", post(completions::completions))
         .route("/v1/embeddings", post(embeddings::embeddings))
@@ -307,6 +308,7 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         // `/v1/videos/:id` and `/v1/videos/:id/content` collapse together:
         // the id is the only thing that varies and neither is worth its own
         // series.
+        _ if path.starts_with("/v1/models/") => "/v1/models/:id",
         _ if path.starts_with("/v1/videos/") => "/v1/videos/:id",
         _ if path.starts_with("/v1/files/") => "/v1/files/:id",
         _ if path.starts_with("/v1/batches/") => "/v1/batches/:id",

@@ -1,4 +1,16 @@
-//! `GET /v1/models` — OpenAI-compatible model listing.
+//! `GET /v1/models` and `GET /v1/models/{id}` — model discovery.
+//!
+//! Served in TWO wire shapes from the same routes, because the gateway
+//! fronts both SDK families and each defines these endpoints at the same
+//! paths. The request's `anthropic-version` header decides: the Anthropic
+//! SDK sets it on every call and an OpenAI-shaped client never does.
+//! (`x-api-key` is NOT the discriminator — this gateway accepts it as a
+//! convenience credential on every endpoint, so it says nothing about which
+//! SDK is calling.)
+//!
+//! Without this, an Anthropic SDK doing `client.models.list()` against the
+//! gateway received OpenAI's envelope and failed to deserialize — the same
+//! silent, client-side-only failure shape as any other endpoint-family gap.
 //!
 //! Returns the subset of Models in the current snapshot that the
 //! authenticated ApiKey is permitted to use. The response shape
@@ -12,29 +24,74 @@
 //! to use, and the same `allowed_models` ACL that authorizes the request
 //! decides whether it appears here.
 //!
-//! Each Model surfaces as:
-//! ```json
-//! {
-//!   "id":       "<model.name>",
-//!   "object":   "model",
-//!   "created":  <unix seconds>,
-//!   "owned_by": "<provider>"
-//! }
-//! ```
+//! OpenAI shape (<https://platform.openai.com/docs/api-reference/models>):
+//! `{"id", "object": "model", "created", "owned_by"}` inside
+//! `{"object": "list", "data": [...]}`.
 //!
-//! The wrapping list object follows OpenAI's `ListResponse` envelope:
-//! ```json
-//! { "object": "list", "data": [ ... ] }
-//! ```
+//! Anthropic shape (<https://platform.claude.com/docs/en/api/models/list>):
+//! `{"id", "type": "model", "display_name", "created_at"}` inside
+//! `{"data": [...], "first_id", "last_id", "has_more"}`, with `limit` /
+//! `after_id` / `before_id` cursor pagination.
+//!
+//! ## Two divergences from upstream, both forced
+//!
+//! **Creation time is the epoch.** No Model carries one: the resource has no
+//! such field and the control plane writes none, so there is nothing
+//! truthful to report. It was previously stamped with `now`, which was both
+//! false and unstable — the same model reported a different `created` on
+//! every call, breaking any client that diffs or caches the list. The epoch
+//! is what Anthropic's own spec prescribes for this case ("May be set to an
+//! epoch value if the release date is unknown"), and the OpenAI shape uses
+//! the same value for the same reason.
+//!
+//! **Ordering is alphabetical by id.** Anthropic orders by release date,
+//! most recent first; with no release date to sort on, a stable
+//! alphabetical order is the only ordering the gateway can promise, and a
+//! stable one matters more here than a plausible one — cursor pagination is
+//! only correct over a total order that does not shift between pages.
 
-use axum::extract::State;
-use axum::response::IntoResponse;
+use axum::extract::{Query, State};
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde::Serialize;
-use std::time::{SystemTime, UNIX_EPOCH};
+use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthenticatedKey;
+use crate::error::ProxyError;
 use crate::state::ProxyState;
+
+/// Creation time reported for every Model, in both shapes.
+///
+/// Nothing records when a Model was created — the resource has no such
+/// field and the control plane writes none — so the epoch is the honest
+/// answer, and the one Anthropic's spec names for exactly this case. It is
+/// also STABLE, which the previous `now` was not: a value that changes on
+/// every call breaks any client that diffs or caches the list.
+const UNKNOWN_CREATED_UNIX: i64 = 0;
+const UNKNOWN_CREATED_RFC3339: &str = "1970-01-01T00:00:00Z";
+
+/// Anthropic's documented page size: default 20, clamped to 1..=1000.
+const ANTHROPIC_DEFAULT_LIMIT: usize = 20;
+const ANTHROPIC_MAX_LIMIT: usize = 1000;
+
+/// Whether the caller is speaking Anthropic's dialect.
+///
+/// `anthropic-version` is required on every Anthropic API request and is
+/// never sent by an OpenAI-shaped client, which makes it the one header
+/// that identifies the dialect rather than merely the credential.
+fn wants_anthropic_shape(headers: &HeaderMap) -> bool {
+    headers.contains_key("anthropic-version")
+}
+
+/// Render an error in whichever dialect the caller asked in, so an SDK sees
+/// the envelope its own error type deserializes.
+fn dialect_error(headers: &HeaderMap, err: ProxyError) -> Response {
+    if wants_anthropic_shape(headers) {
+        err.into_anthropic_response()
+    } else {
+        err.into_response()
+    }
+}
 
 /// A single model entry in the `/v1/models` response.
 #[derive(Debug, Serialize)]
@@ -52,58 +109,192 @@ pub struct ModelList {
     pub data: Vec<ModelObject>,
 }
 
-pub async fn list_models(
-    State(state): State<ProxyState>,
-    auth: AuthenticatedKey,
-) -> impl IntoResponse {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+/// A single model in Anthropic's shape.
+///
+/// The three nullable fields are emitted explicitly rather than omitted:
+/// the gateway does not track an upstream model's capabilities or context
+/// limits, and a present `null` says that, where an absent key says nothing
+/// and deserializes to `undefined` in the SDKs that type them as
+/// `T | null`.
+#[derive(Debug, Serialize)]
+pub struct AnthropicModelObject {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub display_name: String,
+    pub created_at: &'static str,
+    pub capabilities: Option<()>,
+    pub max_input_tokens: Option<u32>,
+    pub max_tokens: Option<u32>,
+}
 
-    let snapshot = state.snapshot.load();
+/// Anthropic's paginated list envelope.
+#[derive(Debug, Serialize)]
+pub struct AnthropicModelList {
+    pub data: Vec<AnthropicModelObject>,
+    pub first_id: Option<String>,
+    pub last_id: Option<String>,
+    pub has_more: bool,
+}
 
-    // Collect every model name a caller can request. Wildcard aliases
-    // (`provider/*`) are patterns rather than concrete ids, so they're the one
-    // exclusion. Then filter to what the authenticated key may access.
-    let all_names: Vec<String> = snapshot
+/// Cursor pagination, per Anthropic's list contract. Ignored by the OpenAI
+/// shape, whose own list endpoint defines no pagination.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListParams {
+    limit: Option<usize>,
+    after_id: Option<String>,
+    before_id: Option<String>,
+}
+
+/// Names the caller may put in a request's `model` field, sorted.
+///
+/// Wildcard aliases (`provider/*`) are patterns rather than requestable
+/// ids, so they are the one exclusion. The same `allowed_models` ACL that
+/// authorizes a request decides what appears here, so the list never
+/// advertises a name the caller cannot then use.
+fn permitted_model_names(
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+) -> Vec<String> {
+    let all: Vec<String> = snapshot
         .models
         .entries()
         .into_iter()
         .filter(|e| !e.value.display_name.contains('*'))
         .map(|e| e.value.display_name.clone())
         .collect();
-
-    let api_key = auth.key();
-    let permitted: Vec<&str> =
-        api_key.accessible_models(all_names.iter().map(|s: &String| s.as_str()));
-
-    let mut data: Vec<ModelObject> = permitted
+    let mut names: Vec<String> = auth
+        .key()
+        .accessible_models(all.iter().map(|s: &String| s.as_str()))
         .into_iter()
-        .map(|name| {
-            // owner = provider name if we can resolve it, otherwise "aisix".
-            let owned_by = snapshot
-                .models
-                .get_by_name(name)
-                .and_then(|e| e.value.provider.as_ref().cloned())
-                .unwrap_or_else(|| "aisix".to_string());
-
-            ModelObject {
-                id: name.to_string(),
-                object: "model",
-                created: now,
-                owned_by,
-            }
-        })
+        .map(str::to_string)
         .collect();
+    names.sort();
+    names
+}
 
-    // Stable ordering so clients see a deterministic list.
-    data.sort_by(|a, b| a.id.cmp(&b.id));
+/// `owned_by` for the OpenAI shape: the model's vendor when it has one.
+/// A routing / ensemble / semantic alias has no single vendor — it is the
+/// gateway's own construct — so it is owned by the gateway.
+fn owned_by(snapshot: &aisix_core::AisixSnapshot, name: &str) -> String {
+    snapshot
+        .models
+        .get_by_name(name)
+        .and_then(|e| e.value.provider.clone())
+        .unwrap_or_else(|| "aisix".to_string())
+}
 
-    Json(ModelList {
-        object: "list",
-        data,
+fn openai_model(snapshot: &aisix_core::AisixSnapshot, name: &str) -> ModelObject {
+    ModelObject {
+        id: name.to_string(),
+        object: "model",
+        created: UNKNOWN_CREATED_UNIX,
+        owned_by: owned_by(snapshot, name),
+    }
+}
+
+fn anthropic_model(name: &str) -> AnthropicModelObject {
+    AnthropicModelObject {
+        id: name.to_string(),
+        kind: "model",
+        // The gateway's model name IS the human-readable name an operator
+        // chose; there is no second, prettier one to report.
+        display_name: name.to_string(),
+        created_at: UNKNOWN_CREATED_RFC3339,
+        capabilities: None,
+        max_input_tokens: None,
+        max_tokens: None,
+    }
+}
+
+/// Apply Anthropic's cursor pagination to the sorted name list.
+///
+/// `after_id` and `before_id` are positions in that order, not filters: a
+/// cursor naming something the caller cannot see (or that no longer
+/// exists) yields an empty page rather than silently restarting from the
+/// top, which would make a paginating client loop forever.
+fn paginate(names: &[String], params: &ListParams) -> (Vec<String>, bool) {
+    let limit = params
+        .limit
+        .unwrap_or(ANTHROPIC_DEFAULT_LIMIT)
+        .clamp(1, ANTHROPIC_MAX_LIMIT);
+
+    if let Some(before) = params.before_id.as_deref() {
+        let Some(at) = names.iter().position(|n| n == before) else {
+            return (Vec::new(), false);
+        };
+        let start = at.saturating_sub(limit);
+        return (names[start..at].to_vec(), start > 0);
+    }
+
+    let start = match params.after_id.as_deref() {
+        Some(after) => match names.iter().position(|n| n == after) {
+            Some(at) => at + 1,
+            None => return (Vec::new(), false),
+        },
+        None => 0,
+    };
+    let end = (start + limit).min(names.len());
+    let page = names.get(start..end).unwrap_or_default().to_vec();
+    (page, end < names.len())
+}
+
+pub async fn list_models(
+    State(state): State<ProxyState>,
+    auth: AuthenticatedKey,
+    headers: HeaderMap,
+    Query(params): Query<ListParams>,
+) -> Response {
+    let snapshot = state.snapshot.load();
+    let names = permitted_model_names(&snapshot, &auth);
+
+    if !wants_anthropic_shape(&headers) {
+        // OpenAI's list endpoint defines no pagination — every permitted
+        // model, in one page.
+        return Json(ModelList {
+            object: "list",
+            data: names.iter().map(|n| openai_model(&snapshot, n)).collect(),
+        })
+        .into_response();
+    }
+
+    let (page, has_more) = paginate(&names, &params);
+    Json(AnthropicModelList {
+        first_id: page.first().cloned(),
+        last_id: page.last().cloned(),
+        data: page.iter().map(|n| anthropic_model(n)).collect(),
+        has_more,
     })
+    .into_response()
+}
+
+/// `GET /v1/models/{id}` — both SDK families define a retrieve-one endpoint
+/// at this path, so one route serves both and the dialect decides the shape.
+///
+/// A model the caller may not reach answers 404, not 403: the list omits it
+/// entirely, and an endpoint that distinguished "no such model" from "not
+/// yours" would let a caller enumerate an environment's models through the
+/// error code alone. Same existence fold `/v1/videos` and `/mcp` apply.
+pub async fn get_model(
+    State(state): State<ProxyState>,
+    auth: AuthenticatedKey,
+    headers: HeaderMap,
+    crate::reject::AisixPath(id): crate::reject::AisixPath<String>,
+) -> Response {
+    let snapshot = state.snapshot.load();
+    let known = snapshot
+        .models
+        .get_by_name(&id)
+        .is_some_and(|e| !e.value.display_name.contains('*'));
+    if !known || !auth.key().can_access(&id) {
+        return dialect_error(&headers, ProxyError::ModelNotFound(id));
+    }
+
+    if wants_anthropic_shape(&headers) {
+        Json(anthropic_model(&id)).into_response()
+    } else {
+        Json(openai_model(&snapshot, &id)).into_response()
+    }
 }
 
 #[cfg(test)]
@@ -449,7 +640,228 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let item = &v["data"][0];
         assert_eq!(item["object"], "model");
-        assert!(item["created"].as_i64().unwrap() > 0);
         assert_eq!(item["owned_by"], "openai");
+        // `created` is the epoch, not `now`. Nothing records when a Model
+        // was created, and the previous per-request timestamp was both
+        // false and — the part that actually broke clients — different on
+        // every call. This asserts the property that matters, which the
+        // old `> 0` check could not have caught: it is STABLE.
+        assert_eq!(item["created"].as_i64().unwrap(), 0);
+    }
+
+    /// The list must not change between identical calls. A `created` stamped
+    /// per request made every response differ, so any client diffing or
+    /// caching the catalogue saw churn that was not there.
+    #[tokio::test]
+    async fn the_list_is_byte_identical_across_calls() {
+        let snap = AisixSnapshot::new();
+        snap.models.insert(model_entry("m-1", "gpt-4o"));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["*"]));
+        let app = build_app(snap);
+
+        let call = || {
+            let app = app.clone();
+            async move {
+                let req = Request::builder()
+                    .method("GET")
+                    .uri("/v1/models")
+                    .header("authorization", "Bearer sk-caller")
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+                to_bytes(resp.into_body(), 65536).await.unwrap()
+            }
+        };
+        assert_eq!(call().await, call().await);
+    }
+
+    /// An Anthropic SDK reaches the same route and must get its own
+    /// envelope: `data` + cursor fields, entries typed `model` with a
+    /// `display_name` and an RFC 3339 `created_at`. Served OpenAI's shape,
+    /// its `client.models.list()` fails to deserialize — a break that only
+    /// ever surfaces on the client.
+    #[tokio::test]
+    async fn an_anthropic_client_gets_the_anthropic_envelope() {
+        let snap = AisixSnapshot::new();
+        snap.models.insert(model_entry("m-1", "gpt-4o"));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["*"]));
+        let app = build_app(snap);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("x-api-key", "sk-caller")
+            .header("anthropic-version", "2023-06-01")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert!(
+            v.get("object").is_none(),
+            "OpenAI's envelope key must be absent: {v}"
+        );
+        assert_eq!(v["has_more"], false);
+        assert_eq!(v["first_id"], "gpt-4o");
+        assert_eq!(v["last_id"], "gpt-4o");
+        let item = &v["data"][0];
+        assert_eq!(item["type"], "model");
+        assert_eq!(item["id"], "gpt-4o");
+        assert_eq!(item["display_name"], "gpt-4o");
+        assert_eq!(item["created_at"], "1970-01-01T00:00:00Z");
+    }
+
+    /// `x-api-key` alone must NOT select the Anthropic shape: this gateway
+    /// accepts it as a convenience credential on every endpoint, so it says
+    /// nothing about which SDK is calling. Only `anthropic-version` does.
+    #[tokio::test]
+    async fn x_api_key_alone_still_gets_the_openai_envelope() {
+        let snap = AisixSnapshot::new();
+        snap.models.insert(model_entry("m-1", "gpt-4o"));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["*"]));
+        let app = build_app(snap);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("x-api-key", "sk-caller")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["object"], "list");
+    }
+
+    /// A paginating client walks the whole catalogue and terminates. With
+    /// `limit=1` it must see each model exactly once and stop — the loop a
+    /// mis-implemented cursor turns infinite.
+    #[tokio::test]
+    async fn cursor_pagination_walks_every_model_once_and_stops() {
+        let snap = AisixSnapshot::new();
+        for (i, name) in ["alpha", "bravo", "charlie"].iter().enumerate() {
+            snap.models.insert(model_entry(&format!("m-{i}"), name));
+        }
+        snap.apikeys.insert(apikey_entry("sk-caller", &["*"]));
+        let app = build_app(snap);
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..10 {
+            let uri = match &cursor {
+                Some(c) => format!("/v1/models?limit=1&after_id={c}"),
+                None => "/v1/models?limit=1".to_string(),
+            };
+            let req = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("x-api-key", "sk-caller")
+                .header("anthropic-version", "2023-06-01")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+            let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let page = v["data"].as_array().unwrap();
+            assert_eq!(page.len(), 1, "limit=1 must yield one entry: {v}");
+            seen.push(page[0]["id"].as_str().unwrap().to_string());
+            if !v["has_more"].as_bool().unwrap() {
+                break;
+            }
+            cursor = Some(v["last_id"].as_str().unwrap().to_string());
+        }
+        assert_eq!(seen, vec!["alpha", "bravo", "charlie"]);
+    }
+
+    /// A cursor naming something the caller cannot see yields an empty page
+    /// rather than restarting from the top — restarting is what makes a
+    /// paginating client loop forever.
+    #[tokio::test]
+    async fn an_unknown_cursor_ends_the_walk_instead_of_restarting() {
+        let snap = AisixSnapshot::new();
+        snap.models.insert(model_entry("m-1", "gpt-4o"));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["*"]));
+        let app = build_app(snap);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/models?after_id=nothing-by-this-name")
+            .header("x-api-key", "sk-caller")
+            .header("anthropic-version", "2023-06-01")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["data"].as_array().unwrap().len(), 0);
+        assert_eq!(v["has_more"], false);
+    }
+
+    /// `GET /v1/models/{id}` serves both dialects from one route.
+    #[tokio::test]
+    async fn retrieve_serves_both_dialects() {
+        let snap = AisixSnapshot::new();
+        snap.models.insert(model_entry("m-1", "gpt-4o"));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["*"]));
+        let app = build_app(snap);
+
+        let openai = Request::builder()
+            .method("GET")
+            .uri("/v1/models/gpt-4o")
+            .header("authorization", "Bearer sk-caller")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app.clone(), openai)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["object"], "model");
+        assert_eq!(v["id"], "gpt-4o");
+
+        let anthropic = Request::builder()
+            .method("GET")
+            .uri("/v1/models/gpt-4o")
+            .header("x-api-key", "sk-caller")
+            .header("anthropic-version", "2023-06-01")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, anthropic).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["type"], "model");
+        assert_eq!(v["display_name"], "gpt-4o");
+    }
+
+    /// A model the caller may not reach answers 404, not 403 — the same
+    /// existence fold the list applies by omitting it. A 403 would let a
+    /// caller enumerate an environment's models through the error code.
+    #[tokio::test]
+    async fn retrieving_a_forbidden_model_is_indistinguishable_from_a_missing_one() {
+        let snap = AisixSnapshot::new();
+        snap.models.insert(model_entry("m-1", "gpt-4o"));
+        snap.models.insert(model_entry("m-2", "secret"));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["gpt-4o"]));
+        let app = build_app(snap);
+
+        let mut statuses = Vec::new();
+        for name in ["secret", "does-not-exist"] {
+            let req = Request::builder()
+                .method("GET")
+                .uri(format!("/v1/models/{name}"))
+                .header("authorization", "Bearer sk-caller")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = tower::ServiceExt::oneshot(app.clone(), req).await.unwrap();
+            statuses.push(resp.status());
+        }
+        assert_eq!(
+            statuses,
+            vec![StatusCode::NOT_FOUND, StatusCode::NOT_FOUND],
+            "a forbidden model and a missing one must be indistinguishable",
+        );
     }
 }
