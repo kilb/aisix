@@ -102,6 +102,8 @@ struct CompletionDispatchSuccess {
     /// Live streams emit usage and end-to-end latency from their terminal
     /// callback. Buffered and non-streaming responses emit in the handler.
     usage_handled_by_stream: bool,
+    /// Which group member served and what the walk cost.
+    routing: crate::routing::RoutingAttribution,
 }
 
 #[derive(Default)]
@@ -197,6 +199,7 @@ pub async fn completions(
                 elapsed,
                 &request_id,
                 Some(success.provider_request_id.as_str()),
+                Some(&success.routing),
                 None,
             );
             // One ProviderKey lookup for the metric emit + the usage event
@@ -251,6 +254,7 @@ pub async fn completions(
                     elapsed,
                     &usage,
                     &success.provider_request_id,
+                    &success.routing,
                     &client,
                     is_stream,
                     &success.error_class,
@@ -289,6 +293,7 @@ pub async fn completions(
                 status,
                 elapsed,
                 &request_id,
+                None,
                 None,
                 Some(&err),
             );
@@ -491,83 +496,99 @@ async fn dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(model_name, &model_entry.id, &model_entry.value);
-    let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
+    let mut reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
-    let model = &model_entry.value;
-    let provider = crate::dispatch::require_provider(model)?;
-    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
-
-    let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
-        .ok_or(ProxyError::ProviderUnavailable)?;
-
-    // #554: apply the configured request timeout before response headers and
-    // the streaming timeout to every upstream body read. Legacy completions
-    // use a byte stream, but retain typed BridgeError failures so the first
-    // read can still retry/fail over and terminal telemetry can distinguish a
-    // later timeout from a downstream disconnect.
+    // A Model Group has no provider of its own — the group walk resolves one
+    // per target, so the bridge, credential, deadlines and upstream model
+    // are all bound inside the walk rather than hoisted out of it.
+    crate::dispatch::require_dispatchable_entry(&model_entry.value)?;
     let is_stream = body.get("stream").and_then(Value::as_bool) == Some(true);
-    let timeouts = crate::routing::effective_timeouts(model, None, state.default_timeouts);
-    let mut ctx = crate::dispatch::bridge_ctx(
-        request_id,
-        &model_entry.id,
-        Arc::clone(model),
-        &pk_entry.id,
-        Arc::clone(&pk_entry.value),
-        Some(client_ctx),
-    );
-    if let Some(d) = if is_stream {
-        timeouts.stream
-    } else {
-        timeouts.request
-    } {
-        ctx = ctx.with_deadline(d);
-    }
-
-    let provider_label = provider.to_ascii_lowercase();
-    let tracker = &state.runtime_status;
-    let cooldown_model_id: &str = &model_entry.id;
-    let cooldown_cfg = model.cooldown.as_ref();
+    let group_entry = crate::routing::GroupEntry {
+        endpoint: "/v1/completions",
+        name: model_name,
+        id: &model_entry.id,
+        model: &model_entry.value,
+    };
+    // #554: the request deadline bounds a non-streaming call; the streaming
+    // deadline bounds every body read. Legacy completions use a byte stream
+    // but retain typed BridgeError failures, so the first read can still
+    // retry / fail over and terminal telemetry can distinguish a later
+    // timeout from a downstream disconnect.
+    let attempt_ctx =
+        |att: &crate::routing::GroupAttempt,
+         pk: &aisix_core::ResourceEntry<aisix_core::ProviderKey>| {
+            let mut ctx = crate::dispatch::bridge_ctx(
+                request_id,
+                &att.id,
+                Arc::clone(&att.model),
+                &pk.id,
+                Arc::clone(&pk.value),
+                Some(client_ctx),
+            );
+            if let Some(d) = if is_stream {
+                att.timeouts.stream
+            } else {
+                att.timeouts.request
+            } {
+                ctx = ctx.with_deadline(d);
+            }
+            ctx
+        };
 
     if is_stream {
         let output_policy =
             aisix_guardrails::Guardrail::stream_output_policy(resolved_chain.as_ref());
         let hold_back = aisix_guardrails::Guardrail::runs_on_output(resolved_chain.as_ref())
             && output_policy.holds_back();
-        let prepared = if hold_back {
-            let (max_buffer_bytes, fail_open) = match output_policy {
-                aisix_guardrails::StreamOutputPolicy::BufferFull {
-                    max_buffer_bytes,
-                    on_exceeded_fail_open,
-                } => (max_buffer_bytes, on_exceeded_fail_open),
-                _ => (aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false),
-            };
-            crate::routing::retrying_dispatch(state, model, "/v1/completions", || async {
-                let stream = bridge.complete_stream(&body, &ctx).await.map_err(|error| {
-                    note_completion_failure(
-                        &state.health,
-                        tracker,
-                        &model.display_name,
-                        cooldown_model_id,
-                        cooldown_cfg,
-                        error,
-                    )
-                })?;
+        let (max_buffer_bytes, fail_open) = match output_policy {
+            aisix_guardrails::StreamOutputPolicy::BufferFull {
+                max_buffer_bytes,
+                on_exceeded_fail_open,
+            } => (max_buffer_bytes, on_exceeded_fail_open),
+            _ => (aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false),
+        };
+        let walk = crate::routing::dispatch_over_group(
+            state,
+            snapshot,
+            auth,
+            client_ctx,
+            group_entry,
+            |att| {
+                let body = &body;
+                async move {
+                    let provider = crate::dispatch::require_provider(&att.model)?;
+                    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, &att.model)?;
+                    let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
+                        .ok_or(ProxyError::ProviderUnavailable)?;
+                    let ctx = attempt_ctx(&att, &pk_entry);
+                    let facts = CompletionAttemptFacts {
+                        provider: provider.to_ascii_lowercase(),
+                        provider_key_id: pk_entry.id.to_string(),
+                        upstream_model: crate::dispatch::require_upstream_model(&att.model)?
+                            .to_string(),
+                    };
+                    let prepared = if hold_back {
+                        async {
+                        let stream = bridge
+                            .complete_stream(body, &ctx)
+                            .await
+                            .map_err(ProxyError::Bridge)?;
                 let mut stream =
-                    crate::stream_timeout::with_read_timeout_completion(stream, timeouts.stream);
+                            crate::stream_timeout::with_read_timeout_completion(
+                                stream,
+                                att.timeouts.stream,
+                            );
                 let mut buffer = Vec::new();
                 let mut observed = CompletionSseAccumulator::default();
                 while let Some(item) = stream.next().await {
                     let chunk = match item {
                         Ok(chunk) => chunk,
                         Err(error) => {
-                            let error = note_completion_failure(
-                                &state.health,
-                                tracker,
-                                &model.display_name,
-                                cooldown_model_id,
-                                cooldown_cfg,
-                                error,
-                            );
+                            // A stream that died after generating output is
+                            // still an answer: the tokens were billed, so it
+                            // comes back as `Failed` rather than as an error,
+                            // and the arm that handles it marks the target's
+                            // health itself.
                             if observed.has_observed_bytes() {
                                 let output_text = observed.finish_for_overflow_estimate();
                                 return Ok(PreparedCompletionStream::Failed {
@@ -576,7 +597,7 @@ async fn dispatch(
                                     output_text,
                                 });
                             }
-                            return Err(error);
+                            return Err(ProxyError::Bridge(error));
                         }
                     };
                     // The cap-triggering bytes were generated (and may be
@@ -618,122 +639,87 @@ async fn dispatch(
                 inspection.push(&buffer);
                 inspection.finish();
                 if inspection.malformed_data {
-                    return Err(note_completion_failure(
-                        &state.health,
-                        tracker,
-                        &model.display_name,
-                        cooldown_model_id,
-                        cooldown_cfg,
-                        BridgeError::UpstreamDecode(
-                            "malformed legacy completion SSE data event".to_string(),
-                        ),
-                    ));
+                    return Err(ProxyError::Bridge(BridgeError::UpstreamDecode(
+                        "malformed legacy completion SSE data event".to_string(),
+                    )));
                 }
                 if !inspection.saw_done {
-                    return Err(note_completion_failure(
-                        &state.health,
-                        tracker,
-                        &model.display_name,
-                        cooldown_model_id,
-                        cooldown_cfg,
-                        BridgeError::StreamAborted,
-                    ));
+                    return Err(ProxyError::Bridge(BridgeError::StreamAborted));
                 }
                 Ok(PreparedCompletionStream::Buffered(buffer))
-            })
-            .await
-        } else {
-            crate::routing::retrying_dispatch(state, model, "/v1/completions", || async {
-                let stream = bridge.complete_stream(&body, &ctx).await.map_err(|error| {
-                    note_completion_failure(
-                        &state.health,
-                        tracker,
-                        &model.display_name,
-                        cooldown_model_id,
-                        cooldown_cfg,
-                        error,
-                    )
-                })?;
-                let mut stream =
-                    crate::stream_timeout::with_read_timeout_completion(stream, timeouts.stream);
+                    }
+                    .await
+                    } else {
+                        async {
+                            let stream = bridge
+                                .complete_stream(body, &ctx)
+                                .await
+                                .map_err(ProxyError::Bridge)?;
+                            let mut stream = crate::stream_timeout::with_read_timeout_completion(
+                                stream,
+                                att.timeouts.stream,
+                            );
 
-                // An explicitly configured per-model stream timeout is a
-                // failover contract: wait for the first body chunk before
-                // committing 200 so a TTFT timeout remains retryable. The
-                // deployment default still wraps subsequent reads, but does
-                // not add a pre-response wait to every legacy completion.
-                if timeouts.stream_configured {
-                    return match stream.next().await {
-                        Some(Ok(first)) => {
-                            let prefix = futures::stream::once(std::future::ready(Ok(first)));
+                            // An explicitly configured per-model stream timeout is a
+                            // failover contract: wait for the first body chunk before
+                            // committing 200 so a TTFT timeout remains retryable. The
+                            // deployment default still wraps subsequent reads, but does
+                            // not add a pre-response wait to every legacy completion.
+                            if att.timeouts.stream_configured {
+                                return match stream.next().await {
+                                    Some(Ok(first)) => {
+                                        let prefix =
+                                            futures::stream::once(std::future::ready(Ok(first)));
+                                        Ok(PreparedCompletionStream::Live {
+                                            stream: Box::pin(prefix.chain(stream)),
+                                            capture_bypassed: false,
+                                        })
+                                    }
+                                    Some(Err(error)) => Err(ProxyError::Bridge(error)),
+                                    None => Err(ProxyError::Bridge(BridgeError::StreamAborted)),
+                                };
+                            }
+
                             Ok(PreparedCompletionStream::Live {
-                                stream: Box::pin(prefix.chain(stream)),
+                                stream,
                                 capture_bypassed: false,
                             })
                         }
-                        Some(Err(error)) => Err(note_completion_failure(
-                            &state.health,
-                            tracker,
-                            &model.display_name,
-                            cooldown_model_id,
-                            cooldown_cfg,
-                            error,
-                        )),
-                        None => Err(note_completion_failure(
-                            &state.health,
-                            tracker,
-                            &model.display_name,
-                            cooldown_model_id,
-                            cooldown_cfg,
-                            BridgeError::StreamAborted,
-                        )),
-                    };
+                        .await
+                    }?;
+                    Ok((prepared, facts))
                 }
+            },
+        )
+        .await;
 
-                Ok(PreparedCompletionStream::Live {
-                    stream,
-                    capture_bypassed: false,
-                })
-            })
-            .await
-        };
-
-        let prepared = match prepared {
-            Ok(prepared) => prepared,
-            Err(BridgeError::Config(message)) if message.contains("text completions") => {
+        let outcome = match walk {
+            Ok(o) => o,
+            Err(failure) => {
                 reservation.commit_tokens(0).await;
-                return Ok(CompletionDispatchSuccess {
-                    response: (
-                        StatusCode::NOT_IMPLEMENTED,
-                        Json(ErrorEnvelope::new(message, "not_implemented")),
-                    )
-                        .into_response(),
-                    provider: provider_label,
-                    model_id: model_entry.id.to_string(),
-                    provider_key_id: pk_entry.id.to_string(),
-                    upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
-                    provider_request_id: String::new(),
-                    usage: None,
+                return completion_unsupported_or_error(
+                    failure,
+                    &model_entry,
                     redactions,
                     monitor_hits,
-                    error_class: String::new(),
-                    guardrail_blocked: false,
-                    captured_content: None,
-                    usage_handled_by_stream: false,
-                });
-            }
-            Err(error) => {
-                reservation.commit_tokens(0).await;
-                return Err(ProxyError::Bridge(error));
+                );
             }
         };
-
-        let upstream_model = model.upstream_model().unwrap_or("unknown").to_string();
+        // Everything below attributes to the row that SERVED — for a group
+        // that is a member, not the entry the caller addressed.
+        let routing = outcome.attribution();
+        let model = std::sync::Arc::clone(&outcome.target);
+        let model_entry_id = outcome.target_id.clone();
+        if let Some(member) = outcome.member_reservation {
+            reservation.merge(member);
+        }
+        let (prepared, facts) = outcome.value;
+        let provider_label = facts.provider;
+        let provider_key_id = facts.provider_key_id;
+        let upstream_model = facts.upstream_model;
 
         match prepared {
             PreparedCompletionStream::Buffered(mut buffer) => {
-                state.health.record_success(&model_entry.value.display_name);
-                state.runtime_status.mark_healthy(&model_entry.id);
                 let mut accumulator = CompletionSseAccumulator::with_security_cap(buffer.len());
                 accumulator.push(&buffer);
                 accumulator.finish();
@@ -802,8 +788,8 @@ async fn dispatch(
                         )
                         .into_response(),
                         provider: provider_label,
-                        model_id: model_entry.id.to_string(),
-                        provider_key_id: pk_entry.id.to_string(),
+                        model_id: model_entry_id.clone(),
+                        provider_key_id: provider_key_id.clone(),
                         upstream_model,
                         provider_request_id: accumulator.provider_request_id,
                         usage: Some(usage),
@@ -813,6 +799,7 @@ async fn dispatch(
                         guardrail_blocked: true,
                         captured_content: None,
                         usage_handled_by_stream: false,
+                        routing: routing.clone(),
                     });
                 }
 
@@ -842,8 +829,8 @@ async fn dispatch(
                 return Ok(CompletionDispatchSuccess {
                     response,
                     provider: provider_label,
-                    model_id: model_entry.id.to_string(),
-                    provider_key_id: pk_entry.id.to_string(),
+                    model_id: model_entry_id.clone(),
+                    provider_key_id: provider_key_id.clone(),
                     upstream_model,
                     provider_request_id: accumulator.provider_request_id,
                     usage: Some(usage),
@@ -853,14 +840,13 @@ async fn dispatch(
                     guardrail_blocked: false,
                     captured_content,
                     usage_handled_by_stream: false,
+                    routing: routing.clone(),
                 });
             }
             PreparedCompletionStream::BufferExceeded {
                 accumulator,
                 output_text,
             } => {
-                state.health.record_success(&model_entry.value.display_name);
-                state.runtime_status.mark_healthy(&model_entry.id);
                 let usage = completion_usage_with_estimates(
                     accumulator.usage.unwrap_or_default(),
                     &upstream_model,
@@ -878,8 +864,8 @@ async fn dispatch(
                     )
                     .into_response(),
                     provider: provider_label,
-                    model_id: model_entry.id.to_string(),
-                    provider_key_id: pk_entry.id.to_string(),
+                    model_id: model_entry_id.clone(),
+                    provider_key_id: provider_key_id.clone(),
                     upstream_model,
                     provider_request_id: accumulator.provider_request_id,
                     usage: Some(usage),
@@ -889,6 +875,7 @@ async fn dispatch(
                     guardrail_blocked: true,
                     captured_content: None,
                     usage_handled_by_stream: false,
+                    routing: routing.clone(),
                 });
             }
             PreparedCompletionStream::Failed {
@@ -908,12 +895,24 @@ async fn dispatch(
                     )
                     .await;
                 let error_class = error.error_type().to_string();
+                // A stream that died after generating output came back as
+                // an answer, so the walker marked the target healthy. It
+                // was not: record the failure against the row that served
+                // and let its cooldown rules see it.
+                let error = note_completion_failure(
+                    &state.health,
+                    &state.runtime_status,
+                    &model.display_name,
+                    &model_entry_id,
+                    model.cooldown.as_ref(),
+                    error,
+                );
                 let response = ProxyError::Bridge(error).into_response();
                 return Ok(CompletionDispatchSuccess {
                     response,
                     provider: provider_label,
-                    model_id: model_entry.id.to_string(),
-                    provider_key_id: pk_entry.id.to_string(),
+                    model_id: model_entry_id.clone(),
+                    provider_key_id: provider_key_id.clone(),
                     upstream_model,
                     provider_request_id: accumulator.provider_request_id,
                     usage: Some(usage),
@@ -923,6 +922,7 @@ async fn dispatch(
                     guardrail_blocked: false,
                     captured_content: None,
                     usage_handled_by_stream: false,
+                    routing: routing.clone(),
                 });
             }
             PreparedCompletionStream::Live {
@@ -934,13 +934,14 @@ async fn dispatch(
                 let limiter = Arc::clone(&state.limiter);
                 let state_for_stream = state.clone();
                 let request_id_for_stream = request_id.to_string();
-                let model_id_for_stream = model_entry.id.to_string();
-                let model_display_name_for_stream = model_entry.value.display_name.clone();
+                let model_id_for_stream = model_entry_id.clone();
+                let model_display_name_for_stream = model.display_name.clone();
                 let cooldown_for_stream = model.cooldown.clone();
                 let requested_model = model_name.to_string();
                 let api_key_id = auth.entry.id.clone();
                 let provider_for_stream = provider_label.clone();
-                let provider_key_id = pk_entry.id.to_string();
+                let provider_key_id_for_stream = provider_key_id.clone();
+                let routing_for_stream = routing.clone();
                 let upstream_model_for_stream = upstream_model.clone();
                 let prompt = body.get("prompt").cloned();
                 let client = client_ctx.clone();
@@ -1023,8 +1024,10 @@ async fn dispatch(
                         let mut all_hits = input_monitor_hits;
                         all_hits.extend(output_observation.monitor_hits);
                         let snapshot = state_for_stream.snapshot.load();
-                        let pk =
-                            crate::usage_attr::ResolvedPk::resolve(&snapshot, &provider_key_id);
+                        let pk = crate::usage_attr::ResolvedPk::resolve(
+                            &snapshot,
+                            &provider_key_id_for_stream,
+                        );
                         let (metric_model, metric_upstream) =
                             crate::usage_attr::metric_model_label_pair(
                                 &snapshot,
@@ -1055,6 +1058,7 @@ async fn dispatch(
                             stream_started.elapsed(),
                             &usage,
                             &accumulator.provider_request_id,
+                            &routing_for_stream,
                             &client,
                             true,
                             error_class,
@@ -1076,8 +1080,8 @@ async fn dispatch(
                 return Ok(CompletionDispatchSuccess {
                     response,
                     provider: provider_label,
-                    model_id: model_entry.id.to_string(),
-                    provider_key_id: pk_entry.id.to_string(),
+                    model_id: model_entry_id.clone(),
+                    provider_key_id: provider_key_id.clone(),
                     upstream_model,
                     provider_request_id: String::new(),
                     usage: None,
@@ -1087,35 +1091,56 @@ async fn dispatch(
                     guardrail_blocked: false,
                     captured_content: None,
                     usage_handled_by_stream: true,
+                    routing: routing.clone(),
                 });
             }
         }
     }
 
-    // #701: mark each failed attempt on the runtime status INSIDE the retry
-    // loop, so the cooldown / circuit-breaker sees flapping upstreams even
-    // when a later retry recovers the request — same per-attempt semantics
-    // as chat.rs, where the cooldown decision is independent of the retry
-    // decision. `note_failure` is a no-op for non-triggering categories.
-    match crate::routing::retrying_dispatch(state, model, "/v1/completions", || async {
-        bridge.complete(&body, &ctx).await.map_err(|error| {
-            note_completion_failure(
-                &state.health,
-                tracker,
-                &model.display_name,
-                cooldown_model_id,
-                cooldown_cfg,
-                error,
-            )
-        })
-    })
-    .await
-    {
-        Ok(resp_json) => {
-            // #701: clear any cooldown/unhealthy mark now the upstream
-            // answered — same recovery signal as rerank/audio/chat.
-            state.health.record_success(&model_entry.value.display_name);
-            state.runtime_status.mark_healthy(&model_entry.id);
+    // The walk marks each failed attempt on the target's runtime status, so
+    // the cooldown / circuit-breaker sees a flapping upstream even when a
+    // later retry recovers the request.
+    let walk = crate::routing::dispatch_over_group(
+        state,
+        snapshot,
+        auth,
+        client_ctx,
+        group_entry,
+        |att| {
+            let body = &body;
+            async move {
+                let provider = crate::dispatch::require_provider(&att.model)?;
+                let pk_entry = crate::dispatch::resolve_provider_key(snapshot, &att.model)?;
+                let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
+                    .ok_or(ProxyError::ProviderUnavailable)?;
+                let ctx = attempt_ctx(&att, &pk_entry);
+                let facts = CompletionAttemptFacts {
+                    provider: provider.to_ascii_lowercase(),
+                    provider_key_id: pk_entry.id.to_string(),
+                    upstream_model: crate::dispatch::require_upstream_model(&att.model)?
+                        .to_string(),
+                };
+                let resp_json = bridge
+                    .complete(body, &ctx)
+                    .await
+                    .map_err(ProxyError::Bridge)?;
+                Ok((resp_json, facts))
+            }
+        },
+    )
+    .await;
+
+    match walk {
+        Ok(outcome) => {
+            let routing = outcome.attribution();
+            let model_entry_id = outcome.target_id.clone();
+            if let Some(member) = outcome.member_reservation {
+                reservation.merge(member);
+            }
+            let (resp_json, facts) = outcome.value;
+            let provider_label = facts.provider;
+            let provider_key_id = facts.provider_key_id;
+            let upstream_model = facts.upstream_model;
             // Extract usage BEFORE moving resp_json into the Response
             // so the success struct carries typed counters rather
             // than re-parsing JSON downstream.
@@ -1135,7 +1160,7 @@ async fn dispatch(
                     completion_tokens: 0,
                     usage_estimated: false,
                 });
-                let est_model = model.upstream_model().unwrap_or("unknown");
+                let est_model = upstream_model.as_str();
                 if u.prompt_tokens == 0 {
                     let n = count_completion_prompt(est_model, body.get("prompt"));
                     if n > 0 {
@@ -1230,9 +1255,9 @@ async fn dispatch(
                         )
                         .into_response(),
                         provider: provider_label,
-                        model_id: model_entry.id.to_string(),
-                        provider_key_id: pk_entry.id.to_string(),
-                        upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
+                        model_id: model_entry_id.clone(),
+                        provider_key_id: provider_key_id.clone(),
+                        upstream_model: upstream_model.clone(),
                         usage,
                         provider_request_id,
                         redactions,
@@ -1243,6 +1268,7 @@ async fn dispatch(
                         // content capture, matching the chat surface.
                         captured_content: None,
                         usage_handled_by_stream: false,
+                        routing: routing.clone(),
                     });
                 }
             }
@@ -1267,9 +1293,9 @@ async fn dispatch(
             Ok(CompletionDispatchSuccess {
                 response: Json(resp_json).into_response(),
                 provider: provider_label,
-                model_id: model_entry.id.to_string(),
-                provider_key_id: pk_entry.id.to_string(),
-                upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
+                model_id: model_entry_id.clone(),
+                provider_key_id: provider_key_id.clone(),
+                upstream_model: upstream_model.clone(),
                 usage,
                 provider_request_id,
                 redactions,
@@ -1278,35 +1304,15 @@ async fn dispatch(
                 guardrail_blocked: false,
                 captured_content,
                 usage_handled_by_stream: false,
+                routing: routing.clone(),
             })
         }
-        Err(BridgeError::Config(msg)) if msg.contains("does not support text completions") => {
-            // No upstream call → no tokens to count; release the reservation.
+        Err(failure) => {
+            // No upstream answer → no tokens to count; release the
+            // reservation. Cooldown / health were noted per attempt by the
+            // walker.
             reservation.commit_tokens(0).await;
-            let env = ErrorEnvelope::new(msg, "not_implemented");
-            Ok(CompletionDispatchSuccess {
-                response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
-                provider: provider_label,
-                model_id: model_entry.id.to_string(),
-                provider_key_id: pk_entry.id.to_string(),
-                upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
-                // No upstream call → no usage to attribute. Handler
-                // gates emission on `usage.is_some()` so 501 stays
-                // out of /logs noise (same convention as #402).
-                usage: None,
-                provider_request_id: String::new(),
-                redactions,
-                monitor_hits,
-                error_class: String::new(),
-                guardrail_blocked: false,
-                captured_content: None,
-                usage_handled_by_stream: false,
-            })
-        }
-        Err(e) => {
-            reservation.commit_tokens(0).await;
-            // Cooldown was already noted per attempt inside the retry loop.
-            Err(ProxyError::Bridge(e))
+            completion_unsupported_or_error(failure, &model_entry, redactions, monitor_hits)
         }
     }
 }
@@ -1412,6 +1418,8 @@ fn emit_usage_event(
     elapsed: Duration,
     usage: &CompletionUsage,
     provider_request_id: &str,
+    // Which group member served and how many attempts it took.
+    routing: &crate::routing::RoutingAttribution,
     client: &ClientContext,
     stream: bool,
     error_class: &str,
@@ -1433,6 +1441,9 @@ fn emit_usage_event(
         requested_model: requested_model.to_string(),
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
+        attempt_index: routing.attempt_index,
+        attempt_kind: routing.attempt_kind.to_string(),
+        attempt_model: routing.served_by_model.clone(),
         // Priced from the dispatched row's `Model.cost` when the operator set
         // one, `0.0` otherwise — see `usage_attr::request_cost_usd`.
         cost_usd: crate::usage_attr::request_cost_usd(
@@ -1493,6 +1504,74 @@ fn emit_usage_event(
     );
 }
 #[allow(clippy::too_many_arguments)]
+/// Per-target facts a Model Group resolves differently per member, so none
+/// of them can be read off the caller-addressed entry.
+struct CompletionAttemptFacts {
+    provider: String,
+    provider_key_id: String,
+    upstream_model: String,
+}
+
+/// Render a walk that produced no answer.
+///
+/// A provider that does not implement legacy completions is a 501 rather
+/// than a 502: the request was well-formed and the gateway reached a
+/// decision without the upstream failing. Attribution goes to the row that
+/// refused — with several group members, only one of them may lack the
+/// surface.
+fn completion_unsupported_or_error(
+    failure: crate::routing::GroupFailure,
+    entry: &aisix_core::ResourceEntry<aisix_core::Model>,
+    redactions: crate::redact::RedactionCounts,
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+) -> Result<CompletionDispatchSuccess, ProxyError> {
+    let msg = match &failure.err {
+        ProxyError::Bridge(BridgeError::Config(msg))
+            if msg.contains("does not support text completions")
+                || msg.contains("text completions") =>
+        {
+            msg.clone()
+        }
+        _ => return Err(failure.err),
+    };
+    let target = failure
+        .target
+        .clone()
+        .unwrap_or_else(|| std::sync::Arc::clone(&entry.value));
+    Ok(CompletionDispatchSuccess {
+        response: (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(ErrorEnvelope::new(msg, "not_implemented")),
+        )
+            .into_response(),
+        provider: target
+            .provider
+            .as_deref()
+            .unwrap_or("unknown")
+            .to_ascii_lowercase(),
+        model_id: if failure.target_id.is_empty() {
+            entry.id.to_string()
+        } else {
+            failure.target_id.clone()
+        },
+        provider_key_id: String::new(),
+        upstream_model: target.upstream_model().unwrap_or("unknown").to_string(),
+        // No upstream call → no usage to attribute. The handler gates
+        // emission on `usage.is_some()` so a 501 stays out of /logs noise
+        // (same convention as #402).
+        usage: None,
+        provider_request_id: String::new(),
+        redactions,
+        monitor_hits,
+        error_class: String::new(),
+        guardrail_blocked: false,
+        captured_content: None,
+        usage_handled_by_stream: false,
+        routing: failure.attribution(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_access_log(
     model: &str,
     provider: &str,
@@ -1502,6 +1581,9 @@ fn emit_access_log(
     request_id: &str,
     // Provider response id; `None`/empty when the call produced none.
     provider_request_id: Option<&str>,
+    // Which group member served and what the walk cost; `None` for a
+    // failed request.
+    routing: Option<&crate::routing::RoutingAttribution>,
     error: Option<&ProxyError>,
 ) {
     let (error_kind, error) = match error {
@@ -1528,9 +1610,11 @@ fn emit_access_log(
         total_tokens: None,
         request_id,
         provider_request_id: provider_request_id.filter(|s| !s.is_empty()),
-        served_by_model: None,
-        routing_attempt_count: None,
-        routing_fallback_count: None,
+        served_by_model: routing
+            .map(|r| r.served_by_model.as_str())
+            .filter(|s| !s.is_empty()),
+        routing_attempt_count: routing.map(|r| r.attempt_count),
+        routing_fallback_count: routing.map(|r| r.fallback_count),
         error_kind,
         error: error.as_deref(),
     }
@@ -2124,6 +2208,128 @@ mod tests {
 
     /// #545 companion: a benign prompt with a guardrail configured still
     /// forwards (`expect(1)`) and returns 200.
+    /// A Model Group addressed on /v1/completions dispatches its targets and
+    /// falls over — both for a plain call and for a streamed one.
+    ///
+    /// Streaming is the half that would silently rot: the walk has to commit
+    /// the 200 to one target only after its first chunk arrives, so a target
+    /// that accepts the connection and then dies still fails over instead of
+    /// handing the caller a broken stream.
+    fn group_snapshot(dead: &str, live: &str) -> AisixSnapshot {
+        const PK_B: &str = "33333333-3333-3333-3333-333333333333";
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(provider_key_entry(dead));
+        let pk_b: aisix_core::ProviderKey = serde_json::from_str(&format!(
+            r#"{{"display_name":"openai-b","secret":"sk-up","api_base":"{live}","provider":"openai","adapter":"openai"}}"#
+        ))
+        .unwrap();
+        snap.provider_keys.insert(ResourceEntry::new(PK_B, pk_b, 1));
+        for (id, name, pk) in [
+            ("m-dead", "cmpl-dead", PK_ID),
+            ("m-live", "cmpl-live", PK_B),
+        ] {
+            let m: Model = serde_json::from_str(&format!(
+                r#"{{"display_name":"{name}","provider":"openai","model_name":"gpt-3.5-turbo-instruct","provider_key_id":"{pk}"}}"#
+            ))
+            .unwrap();
+            snap.models.insert(ResourceEntry::new(id, m, 1));
+        }
+        let group: Model = serde_json::from_str(
+            r#"{
+                "display_name": "cmpl-group",
+                "routing": {
+                    "targets": [{"model": "cmpl-dead"}, {"model": "cmpl-live"}]
+                }
+            }"#,
+        )
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-group", group, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap
+    }
+
+    #[tokio::test]
+    async fn model_group_fails_over_on_completions() {
+        let dead = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("overloaded"))
+            .expect(1)
+            .mount(&dead)
+            .await;
+        let live = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "text_completion",
+                "choices": [{"text": "ok", "index": 0, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&live)
+            .await;
+
+        let app = build_app(group_snapshot(&dead.uri(), &live.uri()));
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            make_req(serde_json::json!({"model": "cmpl-group", "prompt": "hi"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a Model Group must serve /v1/completions from a healthy target",
+        );
+    }
+
+    #[tokio::test]
+    async fn model_group_fails_over_on_streaming_completions() {
+        let dead = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("overloaded"))
+            .expect(1)
+            .mount(&dead)
+            .await;
+        let live = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"object\":\"text_completion\",\"choices\":[{\"text\":\"ok\",\"index\":0}]}\n\ndata: [DONE]\n\n",
+                    ),
+            )
+            .expect(1)
+            .mount(&live)
+            .await;
+
+        let app = build_app(group_snapshot(&dead.uri(), &live.uri()));
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            make_req(serde_json::json!({
+                "model": "cmpl-group",
+                "prompt": "hi",
+                "stream": true
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a streamed Model Group request must fail over to a healthy target",
+        );
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("[DONE]"),
+            "the surviving target's stream must reach the caller: {text}",
+        );
+    }
+
     #[tokio::test]
     async fn input_guardrail_allows_benign_prompt_forwards_200() {
         let upstream = MockServer::start().await;

@@ -5,6 +5,15 @@ import { pickFreePort } from "./ports.js";
 export interface OpenAiUpstreamOptions {
   /** Returned for non-streaming chat/completions. */
   nonStreamBody?: unknown;
+  /**
+   * Per-path 200 bodies, keyed by the request path's suffix (e.g.
+   * `/v1/embeddings`). Lets ONE mock serve several endpoints in the same
+   * spec with the body each one's response shape requires, instead of a
+   * server per endpoint. A string value is sent as a raw body (for the
+   * binary surfaces like `/v1/audio/speech`); anything else is JSON.
+   * Falls back to `nonStreamBody` when no key matches.
+   */
+  pathBodies?: Record<string, unknown>;
   /** Sequence of SSE event payloads (already-stringified JSON or `[DONE]`). */
   streamEvents?: string[];
   /** Exact SSE transport chunks, for standards/framing edge cases. */
@@ -91,6 +100,8 @@ export interface OpenAiUpstreamStep {
   responseHeaders?: Record<string, string>;
   /** Raw (non-JSON) 200 body — see `OpenAiUpstreamOptions.rawBody`. */
   rawBody?: string;
+  /** Per-path 200 bodies — see `OpenAiUpstreamOptions.pathBodies`. */
+  pathBodies?: Record<string, unknown>;
   /** Content-Type for `rawBody` (default `application/octet-stream`). */
   rawContentType?: string;
 }
@@ -223,6 +234,21 @@ export async function startOpenAiUpstream(
           if (step.eventDelayMs) await sleep(step.eventDelayMs);
         }
         if (!res.writableEnded && !res.destroyed) res.end();
+        return;
+      }
+
+      const byPath = Object.entries(step.pathBodies ?? opts.pathBodies ?? {}).find(
+        ([suffix]) => (req.url ?? "").endsWith(suffix),
+      )?.[1];
+      if (byPath !== undefined) {
+        res.statusCode = 200;
+        if (typeof byPath === "string") {
+          res.setHeader("content-type", "application/octet-stream");
+          res.end(Buffer.from(byPath));
+        } else {
+          res.setHeader("content-type", "application/json");
+          res.end(JSON.stringify(byPath));
+        }
         return;
       }
 

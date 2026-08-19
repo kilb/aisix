@@ -65,6 +65,8 @@ struct ImageDispatchSuccess {
     /// b64_json — truncated at the capture cap). `Some` only when an
     /// exporter opted into `content_mode = full`.
     captured_content: Option<CapturedContent>,
+    /// Which group member served and what the walk cost.
+    routing: crate::routing::RoutingAttribution,
 }
 
 pub async fn image_generations(
@@ -122,6 +124,7 @@ pub async fn image_generations(
                 status,
                 elapsed,
                 &request_id,
+                Some(&success.routing),
                 None,
             );
             // One ProviderKey lookup for the metric emit + the usage event
@@ -167,6 +170,7 @@ pub async fn image_generations(
                     elapsed,
                     prompt_tokens,
                     completion_tokens,
+                    &success.routing,
                     &client,
                     success.redactions.clone(),
                     success.monitor_hits.clone(),
@@ -202,6 +206,7 @@ pub async fn image_generations(
                 status,
                 elapsed,
                 &request_id,
+                None,
                 Some(&err),
             );
             let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
@@ -372,67 +377,90 @@ async fn dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(model_name, &model_entry.id, &model_entry.value);
-    let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
+    let mut reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
-    let model = &model_entry.value;
+    // A Model Group has no provider of its own — the walk resolves one per
+    // target, and every provider-shape check below binds to the target that
+    // is about to be called.
+    crate::dispatch::require_dispatchable_entry(&model_entry.value)?;
+    let walk = crate::routing::dispatch_over_group(
+        state,
+        snapshot,
+        auth,
+        client_ctx,
+        crate::routing::GroupEntry {
+            endpoint: "/v1/images/generations",
+            name: model_name,
+            id: &model_entry.id,
+            model: &model_entry.value,
+        },
+        |att| {
+            let body = &body;
+            async move {
+                let model = &att.model;
+                // Per #168: only OpenAI's API has the documented
+                // `/v1/images/generations` route + body shape. Anthropic has
+                // no image-generation API at all; Gemini's image generation
+                // lives at a different URL
+                // (`/v1beta/models/...:generateContent`) with a different
+                // body shape; DeepSeek doesn't expose image generation.
+                // Dispatching a non-OpenAI Model here would silently hit an
+                // upstream that 404s — a confusing failure for callers who
+                // follow the configuration guide verbatim. Reject explicitly
+                // with 400 so the configuration error is visible at the
+                // gateway boundary.
+                if model.provider.as_deref() != Some("openai") {
+                    return Err(ProxyError::InvalidRequest(format!(
+                        "model `{}` is not an OpenAI provider; \
+                         /v1/images/generations requires OpenAI",
+                        model.display_name
+                    )));
+                }
+                let provider = crate::dispatch::require_provider(model)?;
+                let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
+                let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
+                    .ok_or(ProxyError::ProviderUnavailable)?;
+                // #554: apply the resolved request `timeout` as the upstream
+                // deadline.
+                let mut ctx = crate::dispatch::bridge_ctx(
+                    request_id,
+                    &att.id,
+                    Arc::clone(model),
+                    &pk_entry.id,
+                    Arc::clone(&pk_entry.value),
+                    Some(client_ctx),
+                );
+                if let Some(d) = att.timeouts.request {
+                    ctx = ctx.with_deadline(d);
+                }
+                let resp_json = bridge
+                    .generate_image(body, &ctx)
+                    .await
+                    .map_err(ProxyError::Bridge)?;
+                Ok(ImageAttempt {
+                    resp_json,
+                    provider: provider.to_ascii_lowercase(),
+                    provider_key_id: pk_entry.id.to_string(),
+                    upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
+                })
+            }
+        },
+    )
+    .await;
 
-    // Per #168: only OpenAI's API has the documented
-    // `/v1/images/generations` route + body shape. Anthropic has no
-    // image-generation API at all; Gemini's image generation lives
-    // at a different URL (`/v1beta/models/...:generateContent`) with
-    // a different body shape; DeepSeek doesn't expose image
-    // generation. Routing a non-OpenAI Model here would silently
-    // dispatch to an upstream that 404s — a confusing failure for
-    // callers who follow `docs/api-proxy.md` §4.9 configuration
-    // verbatim. Reject explicitly with 400 (parallel to
-    // /v1/responses §4.6) so the configuration error is visible
-    // at the gateway boundary.
-    if model.provider.as_deref() != Some("openai") {
-        return Err(ProxyError::InvalidRequest(format!(
-            "model `{model_name}` is not an OpenAI provider; \
-             /v1/images/generations requires OpenAI"
-        )));
-    }
-
-    let provider = crate::dispatch::require_provider(model)?.to_string();
-    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
-
-    let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
-        .ok_or(ProxyError::ProviderUnavailable)?;
-
-    // #554: apply the configured request `timeout` as the upstream deadline.
-    let mut ctx = crate::dispatch::bridge_ctx(
-        request_id,
-        &model_entry.id,
-        Arc::clone(model),
-        &pk_entry.id,
-        Arc::clone(&pk_entry.value),
-        Some(client_ctx),
-    );
-    if let Some(d) = crate::routing::effective_timeouts(model, None, state.default_timeouts).request
-    {
-        ctx = ctx.with_deadline(d);
-    }
-
-    let provider_label = provider.to_ascii_lowercase();
-
-    // #701: per-attempt cooldown accounting — see completions.rs.
-    let tracker = &state.runtime_status;
-    let cooldown_model_id: &str = &model_entry.id;
-    let cooldown_cfg = model.cooldown.as_ref();
-    match crate::routing::retrying_dispatch(state, model, "/v1/images/generations", || async {
-        bridge
-            .generate_image(&body, &ctx)
-            .await
-            .map_err(|e| crate::cooldown::note_failure(tracker, cooldown_model_id, cooldown_cfg, e))
-    })
-    .await
-    {
-        Ok(mut resp_json) => {
-            // #701: clear any cooldown/unhealthy mark now the upstream
-            // answered — same recovery signal as rerank/audio/chat.
-            state.health.record_success(&model_entry.value.display_name);
-            state.runtime_status.mark_healthy(&model_entry.id);
+    match walk {
+        Ok(outcome) => {
+            let routing = outcome.attribution();
+            let target_id = outcome.target_id.clone();
+            if let Some(member) = outcome.member_reservation {
+                reservation.merge(member);
+            }
+            let ImageAttempt {
+                mut resp_json,
+                provider: provider_label,
+                provider_key_id,
+                upstream_model,
+            } = outcome.value;
             // Extract usage tokens (gpt-image-1 returns a `usage` block;
             // dall-e-3 doesn't) BEFORE moving resp_json into the
             // Response, so the success struct carries typed counters.
@@ -495,9 +523,11 @@ async fn dispatch(
             Ok(ImageDispatchSuccess {
                 response,
                 provider: provider_label,
-                model_id: model_entry.id.to_string(),
-                provider_key_id: pk_entry.id.to_string(),
-                upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
+                // The DISPATCHED row, so pricing and per-model analytics
+                // resolve against the member that served.
+                model_id: target_id,
+                provider_key_id,
+                upstream_model,
                 applied_guardrails: applied_guardrails.clone(),
                 usage,
                 upstream_called: true,
@@ -505,18 +535,43 @@ async fn dispatch(
                 monitor_hits: monitor_hits.clone(),
                 guardrail_blocked,
                 captured_content,
+                routing,
             })
         }
-        Err(BridgeError::Config(msg)) if msg.contains("does not support image generation") => {
-            // No upstream call → no tokens to count; release the reservation.
+        Err(failure) => {
+            // No upstream answer → no tokens to count; release the
+            // reservation. Cooldown / health were noted per attempt by the
+            // walker.
             reservation.commit_tokens(0).await;
+            let msg = match &failure.err {
+                ProxyError::Bridge(BridgeError::Config(msg))
+                    if msg.contains("does not support image generation") =>
+                {
+                    msg.clone()
+                }
+                _ => return Err(failure.err),
+            };
+            // Attribute the refusal to the row that refused: with several
+            // members only one of them may lack image generation.
+            let target = failure
+                .target
+                .clone()
+                .unwrap_or_else(|| Arc::clone(&model_entry.value));
             let env = ErrorEnvelope::new(msg, "not_implemented");
             Ok(ImageDispatchSuccess {
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
-                provider: provider_label,
-                model_id: model_entry.id.to_string(),
-                provider_key_id: pk_entry.id.to_string(),
-                upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
+                provider: target
+                    .provider
+                    .as_deref()
+                    .unwrap_or("unknown")
+                    .to_ascii_lowercase(),
+                model_id: if failure.target_id.is_empty() {
+                    model_entry.id.to_string()
+                } else {
+                    failure.target_id.clone()
+                },
+                provider_key_id: String::new(),
+                upstream_model: target.upstream_model().unwrap_or("unknown").to_string(),
                 applied_guardrails: applied_guardrails.clone(),
                 usage: None,
                 // No upstream call happened → handler skips emit.
@@ -525,14 +580,19 @@ async fn dispatch(
                 monitor_hits: monitor_hits.clone(),
                 guardrail_blocked: false,
                 captured_content: None,
+                routing: failure.attribution(),
             })
         }
-        Err(e) => {
-            reservation.commit_tokens(0).await;
-            // Cooldown was already noted per attempt inside the retry loop.
-            Err(ProxyError::Bridge(e))
-        }
     }
+}
+
+/// One attempt's answer plus the per-target facts the handler attributes
+/// telemetry with.
+struct ImageAttempt {
+    resp_json: Value,
+    provider: String,
+    provider_key_id: String,
+    upstream_model: String,
 }
 
 /// Pull `(prompt_tokens, completion_tokens)` from an OpenAI image
@@ -584,6 +644,8 @@ fn emit_usage_event(
     elapsed: Duration,
     prompt_tokens: u32,
     completion_tokens: u32,
+    // Which group member served and how many attempts it took.
+    routing: &crate::routing::RoutingAttribution,
     client: &ClientContext,
     // Per-detector PII mask counts (#932/#696). Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
@@ -602,6 +664,9 @@ fn emit_usage_event(
         requested_model: requested_model.to_string(),
         prompt_tokens,
         completion_tokens,
+        attempt_index: routing.attempt_index,
+        attempt_kind: routing.attempt_kind.to_string(),
+        attempt_model: routing.served_by_model.clone(),
         // Priced from the dispatched row's `Model.cost` when the operator set
         // one, `0.0` otherwise — see `usage_attr::request_cost_usd`.
         cost_usd: crate::usage_attr::request_cost_usd(
@@ -656,6 +721,7 @@ fn emit_usage_event(
         },
     );
 }
+#[allow(clippy::too_many_arguments)]
 fn emit_access_log(
     model: &str,
     provider: &str,
@@ -663,6 +729,9 @@ fn emit_access_log(
     status: u16,
     latency: Duration,
     request_id: &str,
+    // Which group member served and what the walk cost; `None` for a
+    // failed request.
+    routing: Option<&crate::routing::RoutingAttribution>,
     error: Option<&ProxyError>,
 ) {
     let (error_kind, error) = match error {
@@ -687,9 +756,11 @@ fn emit_access_log(
         // No provider response id: the images response is
         // `{created, data, usage}` — no id on the wire (AISIX-Cloud#1289).
         provider_request_id: None,
-        served_by_model: None,
-        routing_attempt_count: None,
-        routing_fallback_count: None,
+        served_by_model: routing
+            .map(|r| r.served_by_model.as_str())
+            .filter(|s| !s.is_empty()),
+        routing_attempt_count: routing.map(|r| r.attempt_count),
+        routing_fallback_count: routing.map(|r| r.fallback_count),
         error_kind,
         error: error.as_deref(),
     }

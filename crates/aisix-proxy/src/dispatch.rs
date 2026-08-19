@@ -118,6 +118,24 @@ pub(crate) fn require_provider(model: &Model) -> Result<&str, ProxyError> {
     })
 }
 
+/// Entry-level guard for the endpoints that serve one response from one
+/// upstream call (embeddings, rerank, completions, images, audio).
+///
+/// Only the shapes those endpoints genuinely cannot serve are refused here.
+/// A Model Group is NOT one of them: `routing::dispatch_over_group` walks
+/// its targets, and each target passes [`require_provider`] on its own. An
+/// ensemble entry is refused, because a panel plus a judge is a
+/// chat-completions-shaped conversation and nothing else.
+pub(crate) fn require_dispatchable_entry(model: &Model) -> Result<(), ProxyError> {
+    if model.is_ensemble() {
+        return Err(ProxyError::InvalidRequest(format!(
+            "model `{}` is an ensemble model; only /v1/chat/completions is supported",
+            model.display_name
+        )));
+    }
+    Ok(())
+}
+
 /// Enforce a Model's client-IP allowlist (`allowed_cidrs`, #557).
 ///
 /// Called by every request-serving endpoint right after the requested Model

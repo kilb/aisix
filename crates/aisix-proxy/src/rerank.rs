@@ -58,6 +58,8 @@ struct RerankDispatchSuccess {
     /// (#700, LiteLLM parity: the full rerank response JSON). `Some` only
     /// when an exporter opted into `content_mode = full`.
     captured_content: Option<CapturedContent>,
+    /// Which group member served and what the walk cost.
+    routing: crate::routing::RoutingAttribution,
 }
 
 /// Rerank has no completion side — only the input (query + docs)
@@ -126,6 +128,7 @@ pub async fn rerank(
                 elapsed,
                 &request_id,
                 Some(success.provider_request_id.as_str()),
+                Some(&success.routing),
                 None,
             );
             // One ProviderKey lookup for the metric emit + the usage event
@@ -167,6 +170,7 @@ pub async fn rerank(
                     elapsed,
                     &usage,
                     &success.provider_request_id,
+                    &success.routing,
                     &client,
                     success.redactions.clone(),
                     success.monitor_hits.clone(),
@@ -201,6 +205,7 @@ pub async fn rerank(
                 status,
                 elapsed,
                 &request_id,
+                None,
                 None,
                 Some(&err),
             );
@@ -364,9 +369,11 @@ async fn dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
+    let mut reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
-    let model = &model_entry.value;
+    // A Model Group has no provider of its own — the walk below resolves one
+    // per target.
+    crate::dispatch::require_dispatchable_entry(&model_entry.value)?;
 
     // Provider routing key, derived from `Model.provider` as a
     // lowercase string. Per #302 Phase A this dispatch path
@@ -380,151 +387,171 @@ async fn dispatch(
     // `Model.provider`. The string values ("openai", "cohere",
     // "jina") are the same labels emitted in metrics/access logs
     // today, so dashboards keep working unchanged.
-    let provider_label = model
-        .provider
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
-
-    // Per #168 + #213 Phases 1–2: `/v1/rerank` accepts OpenAI-,
-    // Cohere-, and Jina-shape upstreams. All three speak the same
-    // body shape (`{model, query, documents, top_n, ...}`) at
-    // `…/v1/rerank` with `Authorization: Bearer …` auth, so the
-    // gateway forwards verbatim with only the `model` field
-    // rewritten. Anthropic, Gemini, and DeepSeek do not expose
-    // this surface — routing a Model with one of those providers
-    // here would silently 404 upstream, so reject explicitly at
-    // the gateway boundary (parallel to `/v1/responses` §4.6).
-    //
-    // Voyage AI is intentionally NOT in this set despite also
-    // having `/v1/rerank` — Voyage uses `top_k` (not `top_n`) on
-    // request and `data` (not `results`) on response, so it
-    // requires a request/response adapter that's out of scope
-    // for this phase. Tracked in the #213 follow-up.
-    let provider_allowed = matches!(provider_label.as_str(), "openai" | "cohere" | "jina");
-    if !provider_allowed {
-        return Err(ProxyError::InvalidRequest(format!(
-            "model `{model_name}` is not an OpenAI, Cohere, or Jina provider; \
-             /v1/rerank requires OpenAI, Cohere, or Jina"
-        )));
-    }
-
-    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
-    let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
-    let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
-
-    // Rewrite model field.
-    if let Some(m) = body.get_mut("model") {
-        *m = Value::String(upstream_model.clone());
-    }
-
-    // Apply the PK's `request.*` body overrides, matching the OpenAI bridge's
-    // chat() path and /v1/messages passthrough (AISIX-Cloud#867 follow-up). The
-    // /v1/rerank path builds the request directly, so without this the override
-    // pipeline silently no-ops here. No-op when the PK carries none.
-    if let Some(r) = pk_entry.value.request.as_ref() {
-        aisix_provider_openai::overrides::validate_content_safe_request_overrides(r).map_err(
-            |message| {
-                ProxyError::Bridge(aisix_gateway::BridgeError::InvalidUpstreamConfig(message))
-            },
-        )?;
-        aisix_provider_openai::overrides::apply_param_renames(body, &r.param_renames);
-        if let Some(constraints) = &r.param_constraints {
-            aisix_provider_openai::overrides::apply_param_constraints(body, constraints);
-        }
-        aisix_provider_openai::overrides::apply_default_body_fields(body, &r.default_body_fields);
-    }
-
-    // The provider arm of `default_base_for_provider` is guaranteed to
-    // return `Some` here because the gate above already rejected any
-    // provider label outside `{"openai", "cohere", "jina"}` — all three
-    // have explicit arms in the helper. The `unwrap_or_else` is
-    // defensive against a future provider string that gets through the
-    // gate without an arm in the helper; the audit-trail-friendly
-    // default is OpenAI's host (it's a 4xx-from-OpenAI rather than
-    // dispatching to a stale legacy domain).
-    let url = aisix_gateway::url_cache::cached_endpoint_url(
-        &pk_entry.id,
-        "proxy/rerank",
-        &[
-            pk_entry.value.api_base.as_deref().unwrap_or(""),
-            &provider_label,
-        ],
-        || {
-            let base = match pk_entry.value.api_base.as_deref() {
-                Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
-                _ => default_base_for_provider(&provider_label)
-                    .unwrap_or_else(|| "https://api.openai.com".to_string()),
-            };
-            Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(&base, "/rerank"))
+    // Everything from here to the send is resolved PER TARGET: in a Model
+    // Group each member names its own provider, credential, upstream model
+    // and base URL, so none of it can be hoisted out of the walk.
+    let walk = crate::routing::dispatch_over_group(
+        state,
+        snapshot,
+        auth,
+        client_ctx,
+        crate::routing::GroupEntry {
+            endpoint: "/v1/rerank",
+            name: &model_name,
+            id: &model_entry.id,
+            model: &model_entry.value,
         },
-    )?;
-
-    // Build headers explicitly so the PK's `request.default_headers` and
-    // `request.forward_client_headers` can inject operator/client headers
-    // (reserved auth headers are protected by the apply step).
-    let mut headers = axum::http::HeaderMap::new();
-    let auth_hv = HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
-        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
-            "api key contains invalid header chars: {e}"
-        )))
-    })?;
-    headers.insert(axum::http::header::AUTHORIZATION, auth_hv);
-    headers.insert(
-        axum::http::header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    let rid_hv = HeaderValue::from_str(request_id).map_err(|e| {
-        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
-            "request_id contains invalid header chars: {e}"
-        )))
-    })?;
-    headers.insert(
-        axum::http::header::HeaderName::from_static("x-aisix-request-id"),
-        rid_hv,
-    );
-    aisix_gateway::apply_request_headers(
-        &mut headers,
-        &crate::dispatch::upstream_header_ctx(
-            &pk_entry.value,
-            &pk_entry.id,
-            model,
-            &model_entry.id,
-            client_ctx,
-        ),
-    );
-
-    let client = crate::http_client::client_for(pk_entry.value.tls.as_ref());
-    // Send, check the status, and read the body as one retryable unit, so a
-    // transient fault anywhere in that sequence is retried rather than
-    // surfacing to the caller. `note_failure` runs per attempt, matching
-    // chat.rs: the cooldown decision is independent of the retry decision —
-    // a target that just failed should be deprioritised for the NEXT
-    // request even if this one recovers on retry.
-    let tracker = &state.runtime_status;
-    let model_id: &str = &model_entry.id;
-    let cooldown_cfg = model.cooldown.as_ref();
-    let (upstream_headers, body_bytes) =
-        match crate::routing::retrying_dispatch(state, model, "/v1/rerank", || {
-            let mut req = url
-                .clone()
-                .post_on(&client)
-                .headers(headers.clone())
-                .json(body);
-            // #554: rerank is non-streaming; apply the E2E request timeout.
-            if let Some(d) =
-                crate::routing::effective_timeouts(model, None, state.default_timeouts).request
-            {
-                req = req.timeout(d);
-            }
+        |att| {
+            // The `model` field is rewritten to the target's own upstream
+            // name, so each attempt needs its own body. The relayed
+            // documents are already re-serialised per attempt by the HTTP
+            // client, so this adds one clone on top of work that was
+            // per-attempt anyway.
+            let mut body = body.clone();
+            let model_name = model_name.clone();
             async move {
+                let model = &att.model;
+                let provider_label = model
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                // Per #168 + #213 Phases 1–2: `/v1/rerank` accepts OpenAI-,
+                // Cohere-, and Jina-shape upstreams. All three speak the same
+                // body shape (`{model, query, documents, top_n, ...}`) at
+                // `…/v1/rerank` with `Authorization: Bearer …` auth, so the
+                // gateway forwards verbatim with only the `model` field
+                // rewritten. Anthropic, Gemini, and DeepSeek do not expose
+                // this surface — routing a Model with one of those providers
+                // here would silently 404 upstream, so reject explicitly at
+                // the gateway boundary (parallel to `/v1/responses` §4.6).
+                //
+                // Voyage AI is intentionally NOT in this set despite also
+                // having `/v1/rerank` — Voyage uses `top_k` (not `top_n`) on
+                // request and `data` (not `results`) on response, so it
+                // requires a request/response adapter that's out of scope
+                // for this phase. Tracked in the #213 follow-up.
+                let provider_allowed =
+                    matches!(provider_label.as_str(), "openai" | "cohere" | "jina");
+                if !provider_allowed {
+                    return Err(ProxyError::InvalidRequest(format!(
+                        "model `{model_name}` is not an OpenAI, Cohere, or Jina provider; \
+                         /v1/rerank requires OpenAI, Cohere, or Jina"
+                    )));
+                }
+
+                let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
+                let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
+                let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
+
+                // Rewrite model field.
+                if let Some(m) = body.get_mut("model") {
+                    *m = Value::String(upstream_model.clone());
+                }
+
+                // Apply the PK's `request.*` body overrides, matching the OpenAI bridge's
+                // chat() path and /v1/messages passthrough (AISIX-Cloud#867 follow-up). The
+                // /v1/rerank path builds the request directly, so without this the override
+                // pipeline silently no-ops here. No-op when the PK carries none.
+                if let Some(r) = pk_entry.value.request.as_ref() {
+                    aisix_provider_openai::overrides::validate_content_safe_request_overrides(r)
+                        .map_err(|message| {
+                            ProxyError::Bridge(aisix_gateway::BridgeError::InvalidUpstreamConfig(
+                                message,
+                            ))
+                        })?;
+                    aisix_provider_openai::overrides::apply_param_renames(
+                        &mut body,
+                        &r.param_renames,
+                    );
+                    if let Some(constraints) = &r.param_constraints {
+                        aisix_provider_openai::overrides::apply_param_constraints(
+                            &mut body,
+                            constraints,
+                        );
+                    }
+                    aisix_provider_openai::overrides::apply_default_body_fields(
+                        &mut body,
+                        &r.default_body_fields,
+                    );
+                }
+
+                // The provider arm of `default_base_for_provider` is guaranteed to
+                // return `Some` here because the gate above already rejected any
+                // provider label outside `{"openai", "cohere", "jina"}` — all three
+                // have explicit arms in the helper. The `unwrap_or_else` is
+                // defensive against a future provider string that gets through the
+                // gate without an arm in the helper; the audit-trail-friendly
+                // default is OpenAI's host (it's a 4xx-from-OpenAI rather than
+                // dispatching to a stale legacy domain).
+                let url = aisix_gateway::url_cache::cached_endpoint_url(
+                    &pk_entry.id,
+                    "proxy/rerank",
+                    &[
+                        pk_entry.value.api_base.as_deref().unwrap_or(""),
+                        &provider_label,
+                    ],
+                    || {
+                        let base = match pk_entry.value.api_base.as_deref() {
+                            Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
+                            _ => default_base_for_provider(&provider_label)
+                                .unwrap_or_else(|| "https://api.openai.com".to_string()),
+                        };
+                        Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
+                            &base, "/rerank",
+                        ))
+                    },
+                )?;
+
+                // Build headers explicitly so the PK's `request.default_headers` and
+                // `request.forward_client_headers` can inject operator/client headers
+                // (reserved auth headers are protected by the apply step).
+                let mut headers = axum::http::HeaderMap::new();
+                let auth_hv = HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
+                    ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+                        "api key contains invalid header chars: {e}"
+                    )))
+                })?;
+                headers.insert(axum::http::header::AUTHORIZATION, auth_hv);
+                headers.insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                let rid_hv = HeaderValue::from_str(request_id).map_err(|e| {
+                    ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+                        "request_id contains invalid header chars: {e}"
+                    )))
+                })?;
+                headers.insert(
+                    axum::http::header::HeaderName::from_static("x-aisix-request-id"),
+                    rid_hv,
+                );
+                aisix_gateway::apply_request_headers(
+                    &mut headers,
+                    &crate::dispatch::upstream_header_ctx(
+                        &pk_entry.value,
+                        &pk_entry.id,
+                        model,
+                        // The TARGET's row id: a header template resolves
+                        // against the model that is about to be called.
+                        &att.id,
+                        client_ctx,
+                    ),
+                );
+
+                let client = crate::http_client::client_for(pk_entry.value.tls.as_ref());
+                // Send, check the status and read the body as one unit so a
+                // transient fault anywhere in that sequence is one failed
+                // attempt. Retries, fall-over and the cooldown decision all
+                // belong to the walker, which applies them per target.
+                let mut req = url.post_on(&client).headers(headers).json(&body);
+                // #554: rerank is non-streaming; apply the E2E request timeout.
+                if let Some(d) = att.timeouts.request {
+                    req = req.timeout(d);
+                }
                 let send_started = Instant::now();
                 let upstream_resp = req.send().await.map_err(|e| {
-                    crate::cooldown::note_failure(
-                        tracker,
-                        model_id,
-                        cooldown_cfg,
-                        crate::dispatch::reqwest_error_to_bridge(&e, send_started),
-                    )
+                    ProxyError::Bridge(crate::dispatch::reqwest_error_to_bridge(&e, send_started))
                 })?;
 
                 let status = upstream_resp.status();
@@ -532,10 +559,7 @@ async fn dispatch(
                     let status_u16 = status.as_u16();
                     let retry_after = aisix_gateway::parse_retry_after(upstream_resp.headers());
                     let message = upstream_resp.text().await.unwrap_or_default();
-                    return Err(crate::cooldown::note_failure(
-                        tracker,
-                        model_id,
-                        cooldown_cfg,
+                    return Err(ProxyError::Bridge(
                         aisix_gateway::BridgeError::upstream_status_with_retry_after(
                             status_u16,
                             message.chars().take(1024).collect::<String>(),
@@ -546,24 +570,39 @@ async fn dispatch(
 
                 let upstream_headers = upstream_resp.headers().clone();
                 let body_bytes = upstream_resp.bytes().await.map_err(|e| {
-                    crate::cooldown::note_failure(
-                        tracker,
-                        model_id,
-                        cooldown_cfg,
-                        aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
-                    )
+                    ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(e.to_string()))
                 })?;
-                Ok((upstream_headers, body_bytes))
+                Ok(RerankAttempt {
+                    upstream_headers,
+                    body_bytes,
+                    provider: provider_label,
+                    provider_key_id: pk_entry.id.to_string(),
+                    upstream_model,
+                })
             }
-        })
-        .await
-        {
-            Ok(v) => v,
-            Err(err) => return Err(ProxyError::Bridge(err)),
-        };
+        },
+    )
+    .await;
 
-    state.health.record_success(&model_entry.value.display_name);
-    state.runtime_status.mark_healthy(&model_entry.id);
+    let outcome = match walk {
+        Ok(o) => o,
+        // Cooldown / health were already noted per attempt by the walker.
+        Err(failure) => return Err(failure.err),
+    };
+    let routing = outcome.attribution();
+    let target_id = outcome.target_id.clone();
+    if let Some(member) = outcome.member_reservation {
+        // Fold the winning target's own model layers in (AISIX-Cloud#1087)
+        // so one commit bills the member's TPM/TPD too.
+        reservation.merge(member);
+    }
+    let RerankAttempt {
+        upstream_headers,
+        body_bytes,
+        provider: provider_label,
+        provider_key_id,
+        upstream_model,
+    } = outcome.value;
 
     // Extract usage from the upstream body BEFORE handing the bytes
     // off to the response builder. We parse for telemetry but still
@@ -629,8 +668,10 @@ async fn dispatch(
     Ok(RerankDispatchSuccess {
         response: resp,
         provider: provider_label,
-        model_id: model_entry.id.to_string(),
-        provider_key_id: pk_entry.id.to_string(),
+        // The DISPATCHED row, so pricing and per-model analytics resolve
+        // against the member that served rather than a group id.
+        model_id: target_id,
+        provider_key_id,
         upstream_model,
         applied_guardrails: applied_guardrails.clone(),
         usage,
@@ -638,7 +679,19 @@ async fn dispatch(
         redactions,
         monitor_hits,
         captured_content,
+        routing,
     })
+}
+
+/// One attempt's answer plus the per-target facts the handler attributes
+/// telemetry with — a Model Group resolves a different provider key,
+/// provider label and upstream model per member.
+struct RerankAttempt {
+    upstream_headers: axum::http::HeaderMap,
+    body_bytes: bytes::Bytes,
+    provider: String,
+    provider_key_id: String,
+    upstream_model: String,
 }
 
 /// Pull the input token counter out of a rerank response body.
@@ -706,6 +759,8 @@ fn emit_usage_event(
     elapsed: Duration,
     usage: &RerankUsage,
     provider_request_id: &str,
+    // Which group member served and how many attempts it took.
+    routing: &crate::routing::RoutingAttribution,
     client: &ClientContext,
     // Per-detector PII mask counts (#932/#696). Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
@@ -722,6 +777,9 @@ fn emit_usage_event(
         api_key_id: api_key_id.to_string(),
         requested_model: requested_model.to_string(),
         prompt_tokens: usage.prompt_tokens,
+        attempt_index: routing.attempt_index,
+        attempt_kind: routing.attempt_kind.to_string(),
+        attempt_model: routing.served_by_model.clone(),
         // Priced from the dispatched row's `Model.cost` when the operator set
         // one, `0.0` otherwise — see `usage_attr::request_cost_usd`.
         cost_usd: crate::usage_attr::request_cost_usd(
@@ -816,6 +874,9 @@ fn emit_access_log(
     request_id: &str,
     // Provider response id; `None`/empty when the call produced none.
     provider_request_id: Option<&str>,
+    // Which group member served and what the walk cost; `None` for a
+    // failed request.
+    routing: Option<&crate::routing::RoutingAttribution>,
     error: Option<&ProxyError>,
 ) {
     let (error_kind, error) = match error {
@@ -838,9 +899,11 @@ fn emit_access_log(
         total_tokens: None,
         request_id,
         provider_request_id: provider_request_id.filter(|s| !s.is_empty()),
-        served_by_model: None,
-        routing_attempt_count: None,
-        routing_fallback_count: None,
+        served_by_model: routing
+            .map(|r| r.served_by_model.as_str())
+            .filter(|s| !s.is_empty()),
+        routing_attempt_count: routing.map(|r| r.attempt_count),
+        routing_fallback_count: routing.map(|r| r.fallback_count),
         error_kind,
         error: error.as_deref(),
     }

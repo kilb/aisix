@@ -441,6 +441,395 @@ where
     Err(last_err.unwrap_or_else(|| BridgeError::Config("retry loop produced no error".into())))
 }
 
+/// The caller-addressed model entry a group dispatch starts from.
+pub(crate) struct GroupEntry<'a> {
+    pub endpoint: &'static str,
+    /// Name the caller asked for — a wildcard alias resolves to its row's
+    /// `display_name` before reaching here, matching every other
+    /// model-keyed gate.
+    pub name: &'a str,
+    pub id: &'a str,
+    pub model: &'a std::sync::Arc<Model>,
+}
+
+/// One attempt's resolved target, handed to the endpoint's dispatch closure.
+/// It carries only what the closure cannot derive on its own: which row to
+/// dispatch to and the deadlines resolved across target → group → default.
+/// Owned rather than borrowed from the walker's target list: the closure
+/// body is an `async move` block, and a borrowed argument would tie the
+/// returned future's lifetime to the call's own — which no `FnMut` bound
+/// can express.
+pub(crate) struct GroupAttempt {
+    pub id: String,
+    pub model: std::sync::Arc<Model>,
+    pub timeouts: TimeoutBudget,
+}
+
+/// A dispatch that reached an upstream and got an answer.
+pub(crate) struct GroupOutcome<T> {
+    pub value: T,
+    pub target_id: String,
+    pub target: std::sync::Arc<Model>,
+    /// Group member that served the request. Empty for a direct model,
+    /// where `target_id` already identifies it — same convention as
+    /// [`crate::attempt::AttemptRecord::target_model`].
+    pub served_by_model: String,
+    /// 0-based index of the attempt that won, and how it was classified —
+    /// the per-attempt telemetry an endpoint puts on its usage event.
+    pub attempt_index: u32,
+    pub attempt_kind: &'static str,
+    /// How many attempts the request spent in total (`attempt_index + 1`).
+    pub attempt_count: u32,
+    pub fallback_count: u32,
+    /// The winning target's own model-layer reservation, for the caller to
+    /// merge into the request-level one before committing tokens. `None`
+    /// for a direct dispatch, where the entry's layers were already
+    /// reserved pre-dispatch.
+    pub member_reservation: Option<aisix_ratelimit::MultiReservation>,
+}
+
+/// Which target served a request and what the walk cost — the routing
+/// columns on the access log and the per-attempt fields on the usage event.
+///
+/// One struct rather than five loose parameters threaded through each
+/// endpoint's success type: they are always read together, and a handler
+/// that forgets one of them produces a log line that under-reports the
+/// fall-over it just performed.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RoutingAttribution {
+    /// Group member that served. Empty for a direct model.
+    pub served_by_model: String,
+    pub attempt_index: u32,
+    pub attempt_kind: &'static str,
+    pub attempt_count: u32,
+    pub fallback_count: u32,
+}
+
+impl<T> GroupOutcome<T> {
+    pub(crate) fn attribution(&self) -> RoutingAttribution {
+        RoutingAttribution {
+            served_by_model: self.served_by_model.clone(),
+            attempt_index: self.attempt_index,
+            attempt_kind: self.attempt_kind,
+            attempt_count: self.attempt_count,
+            fallback_count: self.fallback_count,
+        }
+    }
+}
+
+impl GroupFailure {
+    /// Attribution for a request that produced no answer: no member served,
+    /// so only the attempt counts are meaningful.
+    pub(crate) fn attribution(&self) -> RoutingAttribution {
+        RoutingAttribution {
+            attempt_count: self.attempt_count,
+            fallback_count: self.fallback_count,
+            ..RoutingAttribution::default()
+        }
+    }
+}
+
+/// A dispatch that produced no answer from any target.
+///
+/// Carries the last target attempted, because a caller that renders a
+/// specific failure (a provider that does not implement the endpoint, say)
+/// needs to attribute it to the row that refused rather than to the group.
+pub(crate) struct GroupFailure {
+    pub err: ProxyError,
+    /// Last target attempted. `None` when the walk failed before any
+    /// attempt — no candidate survived filtering.
+    pub target: Option<std::sync::Arc<Model>>,
+    pub target_id: String,
+    pub attempt_count: u32,
+    pub fallback_count: u32,
+}
+
+impl From<GroupFailure> for ProxyError {
+    fn from(f: GroupFailure) -> Self {
+        f.err
+    }
+}
+
+/// Walk a Model Group's targets for one non-streaming request, or dispatch
+/// the single row of a direct model — the two are the same walk with one
+/// candidate.
+///
+/// THE group-dispatch chokepoint for every endpoint that returns one
+/// response from one upstream call: embeddings, rerank, completions,
+/// images, audio. Chat / messages / responses keep their own loops, which
+/// additionally commit a stream to one target mid-flight and emit a usage
+/// event per attempt; neither applies here.
+///
+/// Everything a per-target gate must bind to the TARGET rather than to the
+/// caller-addressed entry lives in this function, so an endpoint cannot
+/// half-adopt group support:
+///
+///   - the target's own rate-limit layers ([`crate::quota::reserve_routing_target`]),
+///     with an over-limit target recorded as a refused attempt and skipped
+///     rather than failing the request;
+///   - its retry budget and deadlines, resolved target → group → default;
+///   - its cooldown / health marks, so one bad member is what gets
+///     cooled down;
+///   - its latency EWMA, which is what `least_latency` later ranks on;
+///   - its per-attempt deployment metrics, via
+///     [`crate::attempt::RoutingTelemetry`].
+///
+/// The closure's error type is [`ProxyError`] so a gateway-side refusal
+/// (a guardrail block, an unusable provider) is distinguishable from an
+/// upstream failure: only `ProxyError::Bridge` is eligible for a retry or
+/// a fall-over, and only when the group's `retry_on_429` /
+/// `fallback_on_statuses` say so.
+pub(crate) async fn dispatch_over_group<F, Fut, T>(
+    state: &crate::ProxyState,
+    snapshot: &AisixSnapshot,
+    auth: &crate::auth::AuthenticatedKey,
+    client: &crate::client_ip::ClientContext,
+    entry: GroupEntry<'_>,
+    mut call: F,
+) -> Result<GroupOutcome<T>, GroupFailure>
+where
+    F: FnMut(GroupAttempt) -> Fut,
+    Fut: std::future::Future<Output = Result<T, ProxyError>>,
+{
+    let no_attempt = |err: ProxyError| GroupFailure {
+        err,
+        target: None,
+        target_id: String::new(),
+        attempt_count: 0,
+        fallback_count: 0,
+    };
+    let attempts = match resolve_attempt_models(
+        &state.routing,
+        &state.runtime_status,
+        snapshot,
+        entry.name,
+        entry.id,
+        entry.model,
+        RoutingRequest {
+            tags: &client.routing_tags,
+            stability_key: Some(
+                client
+                    .routing_key
+                    .as_deref()
+                    .unwrap_or(auth.entry.id.as_str()),
+            ),
+            source_ip: &client.source_ip,
+        },
+    ) {
+        Ok(a) => a,
+        Err(e) => return Err(no_attempt(e)),
+    };
+
+    let is_group = entry.model.routing.is_some();
+    let retry_on_429 = entry
+        .model
+        .routing
+        .as_ref()
+        .map(|r| r.retry_on_429_or_default())
+        .unwrap_or(false);
+    let fallback_statuses: &[u16] = entry
+        .model
+        .routing
+        .as_ref()
+        .map(|r| r.fallback_on_statuses_or_default())
+        .unwrap_or(&[]);
+    let mut telemetry = crate::attempt::RoutingTelemetry::for_request(&entry.model.display_name);
+    let mut fallback_count = 0u32;
+    let mut attempt_count = 0u32;
+    let mut last: Option<(ProxyError, std::sync::Arc<Model>, String)> = None;
+    let n = attempts.len();
+
+    'targets: for (i, target) in attempts.iter().enumerate() {
+        let pk_id = crate::dispatch::resolve_provider_key(snapshot, &target.model)
+            .map(|e| e.id.clone())
+            .unwrap_or_default();
+        let budget = effective_retries(
+            &target.model,
+            group_retries_of(entry.model),
+            state.default_retries,
+            i + 1 < n,
+        );
+        let timeouts = effective_timeouts(&target.model, Some(entry.model), state.default_timeouts);
+        for attempt_idx in 0..=budget.attempts {
+            // Upstream `Retry-After` when the last failure carried one, else
+            // exponential backoff + jitter — before re-hitting the SAME
+            // target. Cross-target fall-over stays immediate.
+            if attempt_idx > 0 {
+                let hint = last.as_ref().and_then(|(e, _, _)| match e {
+                    ProxyError::Bridge(be) => retry_after_hint(be),
+                    _ => None,
+                });
+                tokio::time::sleep(retry_backoff(attempt_idx as u32, hint)).await;
+            }
+            let (idx, kind) = telemetry.begin_attempt(&target.model.display_name);
+            attempt_count = idx + 1;
+            if kind == "fallback" {
+                fallback_count += 1;
+            }
+            let target_model = if is_group {
+                target.model.display_name.clone()
+            } else {
+                String::new()
+            };
+            let mut member = match crate::quota::reserve_routing_target(
+                state,
+                snapshot,
+                auth,
+                is_group.then_some(crate::quota::RoutingParent {
+                    name: &entry.model.display_name,
+                    entry_id: entry.id,
+                }),
+                &target.model.display_name,
+                &target.id,
+                &target.model,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    telemetry.record(
+                        state,
+                        crate::attempt::AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model,
+                            target_model_id: target.id.clone(),
+                            provider_key_id: pk_id.clone(),
+                            status: 429,
+                            success: false,
+                            error_class: "rate_limit_exceeded".to_string(),
+                            error_message: e.to_string(),
+                            latency_ms: 0,
+                            dispatched: false,
+                        },
+                    );
+                    last = Some((e, std::sync::Arc::clone(&target.model), target.id.clone()));
+                    // Same-target retries cannot help: the window will not
+                    // reset mid-loop.
+                    continue 'targets;
+                }
+            };
+            let started = std::time::Instant::now();
+            match call(GroupAttempt {
+                id: target.id.clone(),
+                model: std::sync::Arc::clone(&target.model),
+                timeouts,
+            })
+            .await
+            {
+                Ok(value) => {
+                    let latency_ms = crate::attempt::ms_since(started);
+                    state.runtime_status.record_latency(&target.id, latency_ms);
+                    telemetry.record(
+                        state,
+                        crate::attempt::AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model: target_model.clone(),
+                            target_model_id: target.id.clone(),
+                            provider_key_id: pk_id.clone(),
+                            status: 200,
+                            success: true,
+                            error_class: String::new(),
+                            error_message: String::new(),
+                            latency_ms,
+                            dispatched: true,
+                        },
+                    );
+                    // Recovery signal for the target that answered.
+                    state.health.record_success(&target.model.display_name);
+                    state.runtime_status.mark_healthy(&target.id);
+                    return Ok(GroupOutcome {
+                        value,
+                        target_id: target.id.clone(),
+                        target: std::sync::Arc::clone(&target.model),
+                        served_by_model: target_model,
+                        attempt_index: idx,
+                        attempt_kind: kind,
+                        attempt_count,
+                        fallback_count,
+                        member_reservation: member.take(),
+                    });
+                }
+                Err(e) => {
+                    let latency_ms = crate::attempt::ms_since(started);
+                    // Failure attribution is per TARGET: a group whose one
+                    // bad member gets cooled down keeps serving from the
+                    // rest, which is the whole point of the group.
+                    let e = match e {
+                        ProxyError::Bridge(be) => {
+                            state.health.record_failure(&target.model.display_name);
+                            ProxyError::Bridge(crate::cooldown::note_failure(
+                                &state.runtime_status,
+                                &target.id,
+                                target.model.cooldown.as_ref(),
+                                be,
+                            ))
+                        }
+                        other => other,
+                    };
+                    let (error_class, error_message) = crate::attempt::attempt_error_from_proxy(&e);
+                    telemetry.record(
+                        state,
+                        crate::attempt::AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model,
+                            target_model_id: target.id.clone(),
+                            provider_key_id: pk_id.clone(),
+                            status: e.status().as_u16(),
+                            success: false,
+                            error_class,
+                            error_message,
+                            latency_ms,
+                            dispatched: crate::attempt::attempt_reached_upstream(&e),
+                        },
+                    );
+                    let (retryable, budget_covers) = match &e {
+                        ProxyError::Bridge(be) => (
+                            is_retryable(be, retry_on_429, fallback_statuses),
+                            budget.covers(be),
+                        ),
+                        // A gateway-side refusal is the answer, not a
+                        // transient fault — another target would refuse it
+                        // identically.
+                        _ => (false, true),
+                    };
+                    tracing::debug!(
+                        endpoint = entry.endpoint,
+                        requested = %entry.model.display_name,
+                        target = %target.model.display_name,
+                        attempt = idx + 1,
+                        retryable,
+                        error = %e,
+                        "group dispatch attempt failed",
+                    );
+                    last = Some((e, std::sync::Arc::clone(&target.model), target.id.clone()));
+                    if !retryable {
+                        break 'targets;
+                    }
+                    if attempt_idx == budget.attempts || !budget_covers {
+                        continue 'targets;
+                    }
+                }
+            }
+        }
+    }
+
+    match last {
+        Some((err, target, target_id)) => Err(GroupFailure {
+            err,
+            target: Some(target),
+            target_id,
+            attempt_count,
+            fallback_count,
+        }),
+        // `resolve_attempt_models` never returns an empty list — it errors
+        // instead — so this is defensive only.
+        None => Err(no_attempt(ProxyError::ProviderUnavailable)),
+    }
+}
+
 #[derive(Default)]
 pub struct RoutingRegistry {
     // virtual model name → atomic round-robin cursor
