@@ -1,0 +1,17 @@
+[package]
+name = "aisix-console"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+argon2 = "0.5.3"
+axum = "0.8"
+base64 = "0.23.1"
+cookie = "0.18.2"
+rand_core = { version = "0.6", features = ["getrandom"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "query"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+serde_yaml_ng = "0.10.0"
+tokio = { version = "1.53.1", features = ["full"] }
+tower-http = { version = "0.7.0", features = ["fs", "compression-gzip"] }
