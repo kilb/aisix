@@ -140,6 +140,7 @@ fn meters_content(operation: &str) -> bool {
 /// emitted either way.
 pub async fn a2a_endpoint(
     auth: AuthenticatedKey,
+    client: crate::client_ip::ClientContext,
     AisixPath(agent): AisixPath<String>,
     State(state): State<ProxyState>,
     request: Request,
@@ -156,7 +157,7 @@ pub async fn a2a_endpoint(
     // the caller's team / user labels (the handle is an `Arc` clone).
     let caller_auth = auth.clone();
 
-    let response = dispatch(auth, &agent, &state, request, &request_id).await;
+    let response = dispatch(auth, &client, &agent, &state, request, &request_id).await;
 
     let elapsed = started.elapsed();
     let status = response.status().as_u16();
@@ -202,6 +203,7 @@ pub async fn a2a_endpoint(
 
 async fn dispatch(
     auth: AuthenticatedKey,
+    client: &crate::client_ip::ClientContext,
     agent: &str,
     state: &ProxyState,
     request: Request,
@@ -221,6 +223,23 @@ async fn dispatch(
         return (
             StatusCode::FORBIDDEN,
             format!("this key may not reach A2A agent: {agent}"),
+        )
+            .into_response();
+    }
+
+    // Client IP allowlist. A 403 rather than the absent-fold `/mcp` uses:
+    // this endpoint already discloses that an agent exists by answering the
+    // ACL denial above with 403, so hiding only the IP case would buy nothing
+    // and would make two refusals for the same agent answer differently.
+    if !entry.value.ip_allowed(&client.source_ip) {
+        tracing::warn!(
+            agent = %agent,
+            source_ip = %client.source_ip,
+            "A2A request rejected: client IP not in agent allowed_cidrs",
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            format!("client IP not allowed for A2A agent: {agent}"),
         )
             .into_response();
     }
@@ -1802,6 +1821,84 @@ mod tests {
             .body(Body::from(body.to_string()))
             .unwrap();
         let response = router_with(snap).oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// An agent carrying `allowed_cidrs` refuses a caller outside them.
+    ///
+    /// Model rows have had this gate since #557; MCP servers and A2A agents
+    /// did not, so an operator who restricted a model by source network found
+    /// the same restriction unavailable for the agent sitting beside it.
+    #[tokio::test]
+    async fn an_agent_outside_the_ip_allowlist_refuses_the_caller() {
+        let agent = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "task"}}),
+            ))
+            // The hard contract: the agent is never contacted.
+            .expect(0)
+            .mount(&agent)
+            .await;
+
+        let snap = snapshot_with(&agent.uri(), true, serde_json::json!(["*"]));
+        // Rewrite the agent row with an allowlist that excludes any caller a
+        // oneshot test can present (it has no peer address at all, which the
+        // gate fails closed on).
+        let restricted: A2aAgent = serde_json::from_value(serde_json::json!({
+            "display_name": "invoice",
+            "url": agent.uri(),
+            "enabled": true,
+            "allowed_cidrs": ["10.99.0.0/24"],
+        }))
+        .expect("valid a2a agent");
+        snap.a2a_agents
+            .insert(ResourceEntry::new("ag-1", restricted, 2));
+
+        let response = router_with(snap)
+            .oneshot(a2a_post("invoice", true))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a caller outside the allowlist must be refused before the agent is called",
+        );
+    }
+
+    /// The mirror case: an EMPTY allowlist is not a deny-all. The field is
+    /// opt-in, so a row that carries it without entries must serve exactly as
+    /// a row without the field does — otherwise adding the field to the
+    /// resource model would silently break every agent on upgrade.
+    ///
+    /// A matching allowlist admitting the caller needs a real socket to have a
+    /// peer address at all; that half is pinned by the e2e.
+    #[tokio::test]
+    async fn an_empty_allowlist_is_not_a_deny_all() {
+        let agent = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "task"}}),
+            ))
+            .expect(1)
+            .mount(&agent)
+            .await;
+
+        let snap = snapshot_with(&agent.uri(), true, serde_json::json!(["*"]));
+        let unrestricted: A2aAgent = serde_json::from_value(serde_json::json!({
+            "display_name": "invoice",
+            "url": agent.uri(),
+            "enabled": true,
+            "allowed_cidrs": [],
+        }))
+        .expect("valid a2a agent");
+        snap.a2a_agents
+            .insert(ResourceEntry::new("ag-1", unrestricted, 2));
+
+        let response = router_with(snap)
+            .oneshot(a2a_post("invoice", true))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 

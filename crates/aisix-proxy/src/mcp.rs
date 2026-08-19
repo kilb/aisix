@@ -62,10 +62,11 @@ struct PeekParams {
 /// methods pass through ungated and unmetered.
 pub async fn mcp_endpoint(
     auth: AuthenticatedKey,
+    client: crate::client_ip::ClientContext,
     State(state): State<ProxyState>,
     request: Request,
 ) -> Response {
-    serve(auth, state, request, None).await
+    serve(auth, client, state, request, None).await
 }
 
 /// Serve a `/mcp/{server}` request: the single-server variant of
@@ -78,15 +79,17 @@ pub async fn mcp_endpoint(
 /// nothing about which servers exist).
 pub async fn mcp_scoped_endpoint(
     auth: AuthenticatedKey,
+    client: crate::client_ip::ClientContext,
     crate::reject::AisixPath(server): crate::reject::AisixPath<String>,
     State(state): State<ProxyState>,
     request: Request,
 ) -> Response {
-    serve(auth, state, request, Some(server)).await
+    serve(auth, client, state, request, Some(server)).await
 }
 
 async fn serve(
     auth: AuthenticatedKey,
+    client: crate::client_ip::ClientContext,
     state: ProxyState,
     request: Request,
     scope: Option<String>,
@@ -107,7 +110,15 @@ async fn serve(
     // the caller's team / user labels (the handle is an `Arc` clone).
     let caller_auth = auth.clone();
 
-    let response = dispatch(auth, scope.as_deref(), &state, request, &request_id).await;
+    let response = dispatch(
+        auth,
+        &client,
+        scope.as_deref(),
+        &state,
+        request,
+        &request_id,
+    )
+    .await;
 
     let elapsed = started.elapsed();
     let status = response.status().as_u16();
@@ -158,6 +169,7 @@ async fn serve(
 
 async fn dispatch(
     auth: AuthenticatedKey,
+    client: &crate::client_ip::ClientContext,
     scope: Option<&str>,
     state: &ProxyState,
     request: Request,
@@ -172,10 +184,15 @@ async fn dispatch(
     // disabled server is treated as absent — not served, same as the
     // aggregated endpoint skipping it (and same as `/a2a/:agent`).
     if let Some(server) = scope {
+        // A server whose `allowed_cidrs` excludes this caller is absent for
+        // them, exactly as a disabled one is. Same existence fold `/v1/videos`
+        // applies to an ACL denial: telling a caller a private server exists
+        // but is not theirs to reach hands them the inventory the allowlist
+        // was configured to withhold.
         let known = snapshot
             .mcp_servers
             .get_by_name(server)
-            .is_some_and(|entry| entry.value.enabled);
+            .is_some_and(|entry| entry.value.enabled && entry.value.ip_allowed(&client.source_ip));
         if !known {
             return (
                 StatusCode::NOT_FOUND,
@@ -352,7 +369,11 @@ async fn dispatch(
     let acl = aisix_mcp::ToolAcl::resolve(&snapshot, auth.key());
     let gateway = match scope {
         // Same snapshot as the resolution above, so the entry is still there.
-        Some(server) => match aisix_mcp::McpGateway::from_snapshot_scoped(&snapshot, server) {
+        Some(server) => match aisix_mcp::McpGateway::from_snapshot_scoped_for_client(
+            &snapshot,
+            server,
+            &client.source_ip,
+        ) {
             Some(gateway) => gateway,
             None => {
                 return (
@@ -362,7 +383,9 @@ async fn dispatch(
                     .into_response()
             }
         },
-        None => aisix_mcp::McpGateway::from_snapshot(&snapshot),
+        // Aggregated: a server this caller may not reach is filtered out of
+        // the gateway entirely, so its tools are neither listed nor callable.
+        None => aisix_mcp::McpGateway::from_snapshot_for_client(&snapshot, &client.source_ip),
     }
     .with_tool_acl(acl);
     // The deployment's body cap replaces rmcp's own 4 MiB default inside
@@ -1784,6 +1807,75 @@ mod tests {
             .insert(ResourceEntry::new("ak-1", apikey, 1));
         insert_mcp_server(&snapshot, "mcp-1", "alpha", true);
         snapshot
+    }
+
+    /// A server carrying `allowed_cidrs` is ABSENT for a caller outside them —
+    /// the scoped route 404s exactly as it does for a disabled server.
+    ///
+    /// Absent rather than forbidden on purpose: telling a caller a private MCP
+    /// server exists but is not theirs hands them the inventory the allowlist
+    /// exists to withhold. `/v1/videos` folds an ACL denial the same way.
+    #[tokio::test]
+    async fn scoped_endpoint_hides_a_server_the_caller_may_not_reach() {
+        let snapshot = scoped_snapshot();
+        let restricted: aisix_core::McpServer = serde_json::from_value(serde_json::json!({
+            "display_name": "alpha",
+            "url": "http://127.0.0.1:9/mcp",
+            "enabled": true,
+            "allowed_cidrs": ["10.99.0.0/24"],
+        }))
+        .expect("valid mcp server");
+        snapshot
+            .mcp_servers
+            .insert(ResourceEntry::new("mcp-1", restricted, 2));
+
+        let response = router_with(snapshot)
+            .oneshot(scoped_tools_call("alpha", "tool"))
+            .await
+            .expect("router responds");
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "a server outside the caller's allowlist must read as absent",
+        );
+    }
+
+    /// An EMPTY allowlist is not a deny-all: the field is opt-in, so a row
+    /// carrying it without entries serves exactly as a row without the field.
+    /// Otherwise adding it to the resource model would break every registered
+    /// server on upgrade.
+    #[tokio::test]
+    async fn an_empty_mcp_allowlist_is_not_a_deny_all() {
+        let snapshot = scoped_snapshot();
+        let unrestricted: aisix_core::McpServer = serde_json::from_value(serde_json::json!({
+            "display_name": "alpha",
+            "url": "http://127.0.0.1:9/mcp",
+            "enabled": true,
+            "allowed_cidrs": [],
+        }))
+        .expect("valid mcp server");
+        snapshot
+            .mcp_servers
+            .insert(ResourceEntry::new("mcp-1", unrestricted, 2));
+
+        let response = router_with(snapshot)
+            .oneshot(scoped_request(
+                "alpha",
+                Some(TOKEN),
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "t", "version": "1"}
+                }),
+            ))
+            .await
+            .expect("router responds");
+        assert_ne!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "an unrestricted server must stay reachable",
+        );
     }
 
     #[tokio::test]

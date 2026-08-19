@@ -271,6 +271,17 @@
     }
   },
   "properties": {
+    "allowed_cidrs": {
+      "description": "Client IP allowlist in CIDR notation. Empty or absent allows all clients.",
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
     "api_key_header": {
       "description": "Header name the API key is sent under when `type` is `openapi` and `auth_type` is `api_key`. Defaults to `x-api-key` when unset. Ignored for `type: mcp`, whose API-key header is fixed.",
       "minLength": 1,

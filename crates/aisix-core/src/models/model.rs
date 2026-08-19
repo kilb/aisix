@@ -195,7 +195,7 @@ impl AutoPromptCaching {
     }
 }
 
-/// Lazily-parsed form of [`Model::allowed_cidrs`], so the per-request IP gate
+/// Lazily-parsed form of a resource's `allowed_cidrs`, so the per-request IP gate
 /// does not re-parse the operator's strings on every check — `routing.rs`
 /// calls it once per target, so a group multiplies the cost.
 ///
@@ -213,6 +213,19 @@ impl Clone for ParsedCidrCache {
         Self(std::sync::OnceLock::new())
     }
 }
+
+/// The cache is derived state, so two resources are equal when their
+/// `allowed_cidrs` are — whether either has parsed them yet says nothing
+/// about the configuration. Without this, a resource carrying the cache
+/// could not derive `PartialEq`, and the equality checks that decide whether
+/// a watch event actually changed anything would have to be hand-written.
+impl PartialEq for ParsedCidrCache {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ParsedCidrCache {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Model {
@@ -402,38 +415,53 @@ impl Model {
 
     /// Whether a client at `source_ip` may access this model (#557).
     ///
-    /// Returns `true` when no `allowed_cidrs` restriction is configured (the
-    /// common case). When a restriction is set, returns `true` only if
-    /// `source_ip` parses as an IP address contained in at least one range.
-    /// Malformed CIDR entries are skipped; an empty or unparseable `source_ip`
-    /// against a configured restriction returns `false` (fail closed) so an
-    /// unattributable request can never slip past an allowlist.
+    /// See [`cidr_allows`] for the rules — this is the model-scoped call of
+    /// the one implementation every resource with an IP allowlist shares.
     pub fn ip_allowed(&self, source_ip: &str) -> bool {
-        let ranges = match self.allowed_cidrs.as_deref() {
-            Some(r) if !r.is_empty() => r,
-            _ => return true,
-        };
-        let ip: std::net::IpAddr = match source_ip.parse() {
-            Ok(ip) => ip,
-            Err(_) => return false,
-        };
-        // A dual-stack listener reports an IPv4 client as `::ffff:a.b.c.d`,
-        // which no IPv4 CIDR contains — without this the same allowlist
-        // rejects every IPv4 caller on `[::]` while working on `0.0.0.0`.
-        // A no-op for genuine IPv6.
-        let ip = ip.to_canonical();
-        // An entry that does not parse is skipped, which narrows the
-        // allowlist rather than widening it. `validate_model` rejects that
-        // shape on the write path, so this only tolerates rows stored by an
-        // older build.
-        let nets = self.allowed_cidrs_parsed.0.get_or_init(|| {
-            ranges
-                .iter()
-                .filter_map(|cidr| cidr.parse::<ipnet::IpNet>().ok())
-                .collect()
-        });
-        nets.iter().any(|net| net.contains(&ip))
+        cidr_allows(
+            self.allowed_cidrs.as_deref(),
+            &self.allowed_cidrs_parsed,
+            source_ip,
+        )
     }
+}
+
+/// Whether a client at `source_ip` is inside a resource's CIDR allowlist.
+///
+/// THE implementation for every resource that carries one — Model, MCP
+/// server, A2A agent. A security gate copied per resource drifts: the
+/// IPv4-mapped-IPv6 canonicalisation below was a real bug fixed once, and a
+/// second copy would still have it.
+///
+/// Returns `true` when no restriction is configured (the common case). When
+/// one is set, returns `true` only if `source_ip` parses as an address
+/// contained in at least one range. An empty or unparseable `source_ip`
+/// against a configured restriction returns `false` — fail closed, so an
+/// unattributable request can never slip past an allowlist.
+pub fn cidr_allows(ranges: Option<&[String]>, cache: &ParsedCidrCache, source_ip: &str) -> bool {
+    let ranges = match ranges {
+        Some(r) if !r.is_empty() => r,
+        _ => return true,
+    };
+    let ip: std::net::IpAddr = match source_ip.parse() {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
+    // A dual-stack listener reports an IPv4 client as `::ffff:a.b.c.d`,
+    // which no IPv4 CIDR contains — without this the same allowlist
+    // rejects every IPv4 caller on `[::]` while working on `0.0.0.0`.
+    // A no-op for genuine IPv6.
+    let ip = ip.to_canonical();
+    // An entry that does not parse is skipped, which narrows the allowlist
+    // rather than widening it. The write-path validators reject that shape,
+    // so this only tolerates rows stored by an older build.
+    let nets = cache.0.get_or_init(|| {
+        ranges
+            .iter()
+            .filter_map(|cidr| cidr.parse::<ipnet::IpNet>().ok())
+            .collect()
+    });
+    nets.iter().any(|net| net.contains(&ip))
 }
 
 /// The one cross-field invariant the runtime schema enforces that

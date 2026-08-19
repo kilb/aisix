@@ -339,11 +339,30 @@ impl McpGateway {
     /// iteration order; duplicate names are deduped (first wins) by
     /// [`McpGateway::new`], though the Admin API already enforces uniqueness.
     pub fn from_snapshot(snapshot: &AisixSnapshot) -> Self {
+        Self::from_snapshot_for_client(snapshot, "")
+    }
+
+    /// Build the aggregated gateway as ONE caller sees it: a server whose
+    /// `allowed_cidrs` excludes `source_ip` is absent for them — its tools are
+    /// not listed and a call naming one cannot resolve.
+    ///
+    /// Filtering here rather than at the call site is what makes the allowlist
+    /// whole: a gate applied only when a tool is invoked would still publish
+    /// the server's entire tool inventory to a caller who may not reach it,
+    /// and an inventory is exactly what an attacker probing a private MCP
+    /// server wants. Absent-for-this-caller is the same treatment a disabled
+    /// server gets, and the same existence fold `/v1/videos` applies to an
+    /// ACL denial.
+    ///
+    /// An empty `source_ip` means the caller's address is unknown, which
+    /// `McpServer::ip_allowed` fails closed on — so a restricted server stays
+    /// absent rather than becoming reachable when attribution is missing.
+    pub fn from_snapshot_for_client(snapshot: &AisixSnapshot, source_ip: &str) -> Self {
         let upstreams = snapshot
             .mcp_servers
             .entries()
             .into_iter()
-            .filter(|entry| entry.value.enabled)
+            .filter(|entry| entry.value.enabled && entry.value.ip_allowed(source_ip))
             .map(|entry| {
                 // Here, not inside one bridge constructor: `type: mcp` and
                 // `type: openapi` rows share the credential fields, so the
@@ -368,7 +387,20 @@ impl McpGateway {
     /// registered or is disabled — a disabled server is treated as absent,
     /// same as the aggregated endpoint skipping it.
     pub fn from_snapshot_scoped(snapshot: &AisixSnapshot, server: &str) -> Option<Self> {
+        Self::from_snapshot_scoped_for_client(snapshot, server, "")
+    }
+
+    /// [`McpGateway::from_snapshot_scoped`] for one caller: `None` also when
+    /// the server's `allowed_cidrs` excludes `source_ip`.
+    pub fn from_snapshot_scoped_for_client(
+        snapshot: &AisixSnapshot,
+        server: &str,
+        source_ip: &str,
+    ) -> Option<Self> {
         let entry = snapshot.mcp_servers.get_by_name(server)?;
+        if !entry.value.ip_allowed(source_ip) {
+            return None;
+        }
         if !entry.value.enabled {
             return None;
         }

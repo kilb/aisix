@@ -89,6 +89,17 @@ pub struct A2aAgent {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
+    /// Client IP allowlist in CIDR notation. Empty or absent allows all clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(inner(length(min = 1)))]
+    pub allowed_cidrs: Option<Vec<String>>,
+
+    /// Parse cache for `allowed_cidrs`. Never serialized and never part of
+    /// the schema — derived state, rebuilt on demand.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub allowed_cidrs_parsed: crate::models::model::ParsedCidrCache,
+
     /// Filled in by the snapshot loader from the etcd key path.
     #[serde(skip)]
     pub(crate) runtime_id: String,
@@ -139,6 +150,22 @@ pub enum A2aAuthType {
     /// API key authentication. The key is supplied in `secret` and sent as an
     /// `x-api-key: <secret>` header on every upstream request.
     ApiKey,
+}
+
+impl A2aAgent {
+    /// Whether a client at `source_ip` may reach this A2A agent.
+    ///
+    /// Delegates to [`crate::models::model::cidr_allows`], the one
+    /// implementation every resource with an IP allowlist shares — including
+    /// its fail-closed handling of an unattributable caller and its
+    /// IPv4-mapped-IPv6 canonicalisation.
+    pub fn ip_allowed(&self, source_ip: &str) -> bool {
+        crate::models::model::cidr_allows(
+            self.allowed_cidrs.as_deref(),
+            &self.allowed_cidrs_parsed,
+            source_ip,
+        )
+    }
 }
 
 impl Resource for A2aAgent {
@@ -456,6 +483,8 @@ mod tests {
             secret: None,
             timeout_ms: None,
             enabled: true,
+            allowed_cidrs: None,
+            allowed_cidrs_parsed: Default::default(),
             runtime_id: String::new(),
         };
         let s = serde_json::to_string(&original).unwrap();

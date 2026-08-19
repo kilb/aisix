@@ -116,6 +116,17 @@
     }
   },
   "properties": {
+    "allowed_cidrs": {
+      "description": "Client IP allowlist in CIDR notation. Empty or absent allows all clients.",
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
     "auth_type": {
       "allOf": [
         {

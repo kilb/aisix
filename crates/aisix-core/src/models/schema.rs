@@ -380,11 +380,13 @@ pub fn validate_guardrail_attachment(value: &Value) -> Result<(), SchemaError> {
 
 pub fn validate_mcp_server(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.mcp_server, value)?;
+    validate_cidr_field(value, "allowed_cidrs")?;
     validate_mcp_urls(value)
 }
 
 pub fn validate_a2a_agent(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.a2a_agent, value)?;
+    validate_cidr_field(value, "allowed_cidrs")?;
     validate_a2a_agent_url(value)
 }
 
