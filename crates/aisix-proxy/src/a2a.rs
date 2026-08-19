@@ -12,8 +12,15 @@
 //! pipeline as an LLM request, keyed on the caller's API key: per-agent access
 //! control (the key's `allowed_agents`), rate-limit + budget (`quota::enforce`),
 //! and a usage event into the shared sink. The upstream credential is held
-//! gateway-side and never reaches the caller. Guardrails over A2A message
-//! content are a later step.
+//! gateway-side and never reaches the caller. Content policy applies too: the
+//! request text is scanned before the call and a unary answer after it, so a
+//! rule that blocks a phrase on an LLM endpoint is not bypassable by asking
+//! an agent the same thing. The chain resolves with no model and no MCP
+//! server — an A2A call has neither — so `env`, `api_key` and `team` scoped
+//! policies govern it; a per-agent scope would need a new attachment
+//! dimension in the resource model. A STREAMED answer is not scanned: an A2A
+//! task streams progress for minutes and buffering it to scan would defeat
+//! the method.
 //!
 //! The request body is forwarded verbatim to the upstream agent, so the caller
 //! speaks whichever A2A wire version the agent is pinned to; the gateway does
@@ -71,6 +78,13 @@ struct A2aCall {
     stream: A2aStreamProgress,
     /// What was said, for token metering and opt-in content capture.
     text: A2aCallText,
+    /// Set when a content policy blocked this call, so the usage event
+    /// records it the way a blocked LLM request is recorded.
+    guardrail_blocked: bool,
+    /// The `{kind, hook}` set of policies that governed the call, and any
+    /// monitor-mode observations they made.
+    applied_guardrails: Vec<aisix_core::AppliedGuardrail>,
+    guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 }
 
 /// The words exchanged on one A2A call.
@@ -257,10 +271,75 @@ async fn dispatch(
             },
             response: ResultText::default(),
         },
+        guardrail_blocked: false,
+        applied_guardrails: Vec::new(),
+        guardrail_monitor_hits: Vec::new(),
     };
     // Read before the upstream is contacted, so a call that never lands still
     // records which task the caller was asking about.
     call.facts.observe_request(&value);
+
+    // Content policy over the words. A2A had auth, access control, rate
+    // limiting and budget — every gate except the one about what is being
+    // said — so a rule that blocked a phrase on /v1/chat/completions was
+    // bypassable by asking an agent the same thing.
+    //
+    // The chain resolves with no model and no MCP server, because an A2A call
+    // has neither: `env`, `api_key` and `team` scoped policies therefore
+    // govern it, which is what "a global content policy applies everywhere"
+    // means. A per-agent scope would need a new attachment dimension in the
+    // resource model and the paired control-plane work; it is not something
+    // this can invent locally.
+    let guardrail_chain = state
+        .guardrail_index
+        .resolve(&aisix_guardrails::RequestContext {
+            passthrough_route_id: "",
+            model_id: "",
+            mcp_server_id: "",
+            api_key_id: &auth.entry.id,
+            team_id: auth.key().team_id.as_deref(),
+        });
+    call.applied_guardrails = guardrail_chain.applied().to_vec();
+    // Run BEFORE the quota gate so a content-policy refusal does not burn an
+    // RPM slot, matching /v1/chat/completions (#542).
+    if !guardrail_chain.is_empty() && !call.text.request.is_empty() {
+        let chat = aisix_gateway::ChatFormat::new(
+            "",
+            vec![aisix_gateway::ChatMessage::user(call.text.request.clone())],
+        );
+        let (verdict, hits) =
+            aisix_guardrails::Guardrail::check_input_observed(&guardrail_chain, &chat).await;
+        call.guardrail_monitor_hits.extend(hits);
+        if let aisix_guardrails::GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+        } = verdict
+        {
+            tracing::warn!(
+                guardrail_hook = "input",
+                agent = %agent,
+                operation = %call.operation,
+                reason = %reason,
+                "guardrail blocked A2A request",
+            );
+            call.guardrail_blocked = true;
+            emit_a2a_usage(
+                state,
+                &snapshot,
+                &auth,
+                request_id,
+                agent,
+                &call,
+                StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+                Duration::ZERO,
+            );
+            return a2a_error_response(
+                rpc_id,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
+            );
+        }
+    }
 
     // Reuse the LLM path's rate-limit + budget gate. The reservation is held
     // for the call and released without committing tokens: the counts this
@@ -317,6 +396,67 @@ async fn dispatch(
                 call.text
                     .response
                     .observe(&response_value, crate::token_estimate::push_capped);
+            }
+            // Output policy over the agent's answer. The agent has already
+            // done the work by now, so a block replaces the answer rather
+            // than preventing it — the same trade the LLM output hook makes,
+            // and the reason the usage event is still emitted.
+            //
+            // Streaming calls are NOT scanned: an A2A task streams progress
+            // for minutes and buffering it to scan would defeat the point of
+            // the method. That is a real gap, named here rather than papered
+            // over — closing it needs the incremental scan the chat streaming
+            // path uses.
+            if !guardrail_chain.is_empty() {
+                let answer = call.text.response.joined();
+                if !answer.is_empty() {
+                    let synth = aisix_gateway::ChatResponse {
+                        id: String::new(),
+                        model: String::new(),
+                        message: aisix_gateway::ChatMessage::assistant(answer),
+                        finish_reason: aisix_gateway::FinishReason::Stop,
+                        usage: aisix_gateway::UsageStats::default(),
+                    };
+                    let (verdict, hits) =
+                        aisix_guardrails::Guardrail::check_output_non_segment_observed(
+                            &guardrail_chain,
+                            &synth,
+                        )
+                        .await;
+                    call.guardrail_monitor_hits.extend(hits);
+                    if let aisix_guardrails::GuardrailVerdict::Block {
+                        reason,
+                        guardrail_name,
+                    } = verdict
+                    {
+                        tracing::warn!(
+                            guardrail_hook = "output",
+                            agent = %agent,
+                            operation = %call.operation,
+                            reason = %reason,
+                            "guardrail blocked A2A response",
+                        );
+                        call.guardrail_blocked = true;
+                        emit_a2a_usage(
+                            state,
+                            &snapshot,
+                            &auth,
+                            request_id,
+                            agent,
+                            &call,
+                            StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+                            latency,
+                        );
+                        return a2a_error_response(
+                            rpc_id,
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            &crate::error::guardrail_block_message(
+                                "response",
+                                guardrail_name.as_deref(),
+                            ),
+                        );
+                    }
+                }
             }
             emit_a2a_usage(
                 state,
@@ -732,6 +872,12 @@ fn emit_a2a_usage(
         // the gateway's own count too, so a consumer filtering for
         // provider-billed exactness must not pick these up as exact.
         usage_estimated: true,
+        // The content policies that governed the call, and whether one of
+        // them blocked it — the same fields the Blocked tab reads for an LLM
+        // request, so an A2A block is visible in the same place.
+        applied_guardrails: call.applied_guardrails.clone(),
+        guardrail_blocked: call.guardrail_blocked,
+        guardrail_monitor_hits: call.guardrail_monitor_hits.clone(),
         upstream_ttft_ms: call
             .stream
             .ttfb
@@ -1571,6 +1717,92 @@ mod tests {
         snap.apikeys.insert(ResourceEntry::new("ak-1", apikey, 1));
         snap.a2a_agents.insert(ResourceEntry::new("ag-1", agent, 1));
         snap
+    }
+
+    /// A2A had every gate except the one about what is being said, so a rule
+    /// that blocked a phrase on `/v1/chat/completions` was bypassable by
+    /// asking an agent the same thing. An `env`-scoped keyword guardrail must
+    /// refuse the call — and never contact the agent.
+    #[tokio::test]
+    async fn an_env_guardrail_blocks_an_a2a_message_before_the_agent_is_called() {
+        let agent = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "task"}}),
+            ))
+            // The hard contract: a content refusal never reaches the agent.
+            .expect(0)
+            .mount(&agent)
+            .await;
+
+        let snap = snapshot_with(&agent.uri(), true, serde_json::json!(["*"]));
+        let guardrail: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"kw","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"BLOCKME"}]}"#,
+        )
+        .unwrap();
+        snap.guardrails
+            .insert(ResourceEntry::new("g-1", guardrail, 1));
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "message/send",
+            "params": {"message": {"role": "user", "parts": [{"kind": "text", "text": "please BLOCKME"}]}}
+        });
+        let req = HttpRequest::post("/a2a/invoice")
+            .header("host", "a2a.aisix.example.com")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = router_with(snap).oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["error"]["code"], -32000,
+            "the refusal must be a JSON-RPC error the caller's client understands: {v}",
+        );
+    }
+
+    /// The mirror case: a benign message reaches the agent with the same
+    /// guardrail attached, so the block above is the policy firing rather
+    /// than the endpoint refusing everything once a policy exists.
+    #[tokio::test]
+    async fn a_benign_a2a_message_passes_the_guardrail_through_to_the_agent() {
+        let agent = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "task"}}),
+            ))
+            .expect(1)
+            .mount(&agent)
+            .await;
+
+        let snap = snapshot_with(&agent.uri(), true, serde_json::json!(["*"]));
+        let guardrail: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"kw","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"BLOCKME"}]}"#,
+        )
+        .unwrap();
+        snap.guardrails
+            .insert(ResourceEntry::new("g-1", guardrail, 1));
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "message/send",
+            "params": {"message": {"role": "user", "parts": [{"kind": "text", "text": "an ordinary question"}]}}
+        });
+        let req = HttpRequest::post("/a2a/invoice")
+            .header("host", "a2a.aisix.example.com")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = router_with(snap).oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     fn router_with(snap: AisixSnapshot) -> axum::Router {
