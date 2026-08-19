@@ -398,26 +398,41 @@ async fn dispatch(
             let body = &body;
             async move {
                 let model = &att.model;
-                // Per #168: only OpenAI's API has the documented
-                // `/v1/images/generations` route + body shape. Anthropic has
-                // no image-generation API at all; Gemini's image generation
+                let provider = crate::dispatch::require_provider(model)?;
+                let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
+                // Per #168: the documented `/v1/images/generations` route +
+                // body shape exists on OpenAI's API and on Azure OpenAI,
+                // which serves the same shape with the deployment in the URL.
+                // Anthropic has no image-generation API at all; Gemini's
                 // lives at a different URL
                 // (`/v1beta/models/...:generateContent`) with a different
-                // body shape; DeepSeek doesn't expose image generation.
-                // Dispatching a non-OpenAI Model here would silently hit an
-                // upstream that 404s — a confusing failure for callers who
-                // follow the configuration guide verbatim. Reject explicitly
-                // with 400 so the configuration error is visible at the
-                // gateway boundary.
-                if model.provider.as_deref() != Some("openai") {
+                // body; DeepSeek doesn't expose it. Dispatching one of those
+                // would silently hit an upstream that 404s, so reject
+                // explicitly with 400 and name the configuration error.
+                //
+                // The gate stays deliberately narrow — it is not "any
+                // OpenAI-compatible vendor". A long-tail compat vendor
+                // (deepseek, groq, …) speaks OpenAI's chat route but has no
+                // image route, so admitting it would trade a clear 400 for a
+                // 404 from the provider. Azure is admitted by its ADAPTER
+                // rather than its vendor string: an Azure deployment serves
+                // exactly this body shape, and gating on the string refused
+                // every one of them because its `provider` is not the literal
+                // "openai".
+                //
+                // Vertex (Imagen) and Bedrock (Titan Image / SDXL) are NOT
+                // admitted: each takes a per-model-family request and returns
+                // base64 payloads under its own key names, so serving them
+                // needs a real adapter rather than a routing change. Same
+                // shape of gap as the Voyage rerank note in `rerank.rs`.
+                let azure = pk_entry.value.adapter == Some(aisix_core::Adapter::AzureOpenai);
+                if model.provider.as_deref() != Some("openai") && !azure {
                     return Err(ProxyError::InvalidRequest(format!(
                         "model `{}` is not an OpenAI provider; \
-                         /v1/images/generations requires OpenAI",
+                         /v1/images/generations requires OpenAI or Azure OpenAI",
                         model.display_name
                     )));
                 }
-                let provider = crate::dispatch::require_provider(model)?;
-                let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
                 let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
                     .ok_or(ProxyError::ProviderUnavailable)?;
                 // #554: apply the resolved request `timeout` as the upstream

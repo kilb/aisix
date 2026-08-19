@@ -489,7 +489,7 @@ pub fn stream_chunk_into_chat_chunk(mut raw: OpenAiStreamChunk) -> ChatChunk {
 /// "both pass through" and #162.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
-pub(crate) enum OpenAiEmbedInput<'a> {
+pub enum OpenAiEmbedInput<'a> {
     /// Single-string form. Used when the caller's request body had
     /// `input: "..."` (string), preserving the wire shape on the
     /// upstream side.
@@ -502,7 +502,7 @@ pub(crate) enum OpenAiEmbedInput<'a> {
 
 /// Request body forwarded to OpenAI `/v1/embeddings`.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct OpenAiEmbedRequest<'a> {
+pub struct OpenAiEmbedRequest<'a> {
     pub model: &'a str,
     pub input: OpenAiEmbedInput<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -523,7 +523,7 @@ pub(crate) struct OpenAiEmbedRequest<'a> {
 /// `502 upstream_decode_error` because the deserializer rejected
 /// the string shape.
 #[derive(Debug, Deserialize)]
-pub(crate) struct OpenAiEmbeddingObject {
+pub struct OpenAiEmbeddingObject {
     pub index: u32,
     pub object: String,
     pub embedding: EmbeddingVector,
@@ -535,14 +535,14 @@ pub(crate) struct OpenAiEmbeddingObject {
 /// `502 upstream_decode_error` (#474).
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-pub(crate) struct OpenAiEmbedUsage {
+pub struct OpenAiEmbedUsage {
     pub prompt_tokens: u32,
     pub total_tokens: u32,
 }
 
 /// Full response body from OpenAI `/v1/embeddings`.
 #[derive(Debug, Deserialize)]
-pub(crate) struct OpenAiEmbedResponse {
+pub struct OpenAiEmbedResponse {
     pub object: String,
     pub model: String,
     pub data: Vec<OpenAiEmbeddingObject>,
@@ -550,7 +550,7 @@ pub(crate) struct OpenAiEmbedResponse {
     pub usage: Option<OpenAiEmbedUsage>,
 }
 
-pub(crate) fn embed_request_body<'a>(
+pub fn embed_request_body<'a>(
     req: &'a EmbeddingRequest,
     upstream_model: &'a str,
 ) -> OpenAiEmbedRequest<'a> {
@@ -578,7 +578,7 @@ pub(crate) fn embed_request_body<'a>(
     }
 }
 
-pub(crate) fn embed_response_into(raw: OpenAiEmbedResponse) -> EmbeddingResponse {
+pub fn embed_response_into(raw: OpenAiEmbedResponse) -> EmbeddingResponse {
     let usage = raw.usage.unwrap_or_default();
     EmbeddingResponse {
         object: raw.object,

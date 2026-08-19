@@ -17,7 +17,8 @@
 use aisix_core::{RequestOverrides, ResponseOverrides, StreamDoneMarker};
 use aisix_gateway::{
     apply_request_headers, Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream,
-    ChatFormat, ChatResponse, SseDecoder, SseEvent, UpstreamHeaderContext,
+    ChatFormat, ChatResponse, EmbeddingRequest, EmbeddingResponse, SseDecoder, SseEvent,
+    UpstreamHeaderContext,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -35,8 +36,9 @@ use aisix_provider_openai::overrides::{
     validate_content_safe_request_overrides, StreamDoneOutcome,
 };
 use aisix_provider_openai::wire::{
-    build_request, messages_from, response_into_chat_response, stream_chunk_into_chat_chunk,
-    OpenAiResponse, OpenAiStreamChunk,
+    build_request, embed_request_body, embed_response_into, messages_from,
+    response_into_chat_response, stream_chunk_into_chat_chunk, OpenAiEmbedResponse, OpenAiResponse,
+    OpenAiStreamChunk,
 };
 
 use crate::aad_token_mint::TokenMinter;
@@ -128,6 +130,21 @@ impl AzureOpenAiBridge {
         ctx: &BridgeContext,
         upstream: &AzureUpstreamRef,
     ) -> aisix_gateway::url_cache::EndpointUrl {
+        self.resolve_route_url(ctx, upstream, "azure/chat", || {
+            upstream.chat_completions_url()
+        })
+    }
+
+    /// Cached URL for one Azure route on one deployment. The cache key
+    /// carries the route, so the chat and embeddings URLs for the same
+    /// deployment cannot overwrite each other.
+    fn resolve_route_url(
+        &self,
+        ctx: &BridgeContext,
+        upstream: &AzureUpstreamRef,
+        cache_key: &'static str,
+        build: impl FnOnce() -> String,
+    ) -> aisix_gateway::url_cache::EndpointUrl {
         #[cfg(test)]
         if let Some(u) = &self.url_override {
             // Uncached, and handed over as a raw string so reqwest
@@ -138,10 +155,10 @@ impl AzureOpenAiBridge {
         }
         aisix_gateway::url_cache::cached_model_endpoint_url(
             &ctx.provider_key_id,
-            "azure/chat",
+            cache_key,
             &upstream.deployment,
             &[ctx.provider_key.api_base.as_deref().unwrap_or("")],
-            || Ok::<_, std::convert::Infallible>(upstream.chat_completions_url()),
+            || Ok::<_, std::convert::Infallible>(build()),
         )
         .unwrap_or_else(|never| match never {})
     }
@@ -368,13 +385,35 @@ impl AzureUpstreamRef {
     /// never a full chat-completions URL (the `?` / `#` rejection
     /// in `resolve()` enforces this).
     pub fn chat_completions_url(&self) -> String {
+        self.deployment_url("chat/completions")
+    }
+
+    /// `POST {base}/openai/deployments/{deployment}/images/generations?api-version=…`
+    /// — Azure's image-generation route for a DALL·E deployment.
+    /// <https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#image-generation>
+    pub fn images_url(&self) -> String {
+        self.deployment_url("images/generations")
+    }
+
+    /// `POST {base}/openai/deployments/{deployment}/embeddings?api-version=…`
+    /// — Azure's embeddings route, which differs from OpenAI's only in
+    /// carrying the deployment in the path instead of the model in the body.
+    /// <https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#embeddings>
+    pub fn embeddings_url(&self) -> String {
+        self.deployment_url("embeddings")
+    }
+
+    /// Shared path builder. Both routes hang off the same
+    /// `/openai/deployments/{deployment}` prefix and carry the same pinned
+    /// `api-version`, so a new route cannot accidentally drop either.
+    fn deployment_url(&self, route: &str) -> String {
         let base = self
             .upstream_override
             .clone()
             .unwrap_or_else(|| format!("https://{}.openai.azure.com", self.resource));
         format!(
-            "{}/openai/deployments/{}/chat/completions?api-version={}",
-            base, self.deployment, self.api_version,
+            "{}/openai/deployments/{}/{}?api-version={}",
+            base, self.deployment, route, self.api_version,
         )
     }
 }
@@ -823,6 +862,112 @@ impl Bridge for AzureOpenAiBridge {
             per_chunk_timeout,
         );
         Ok(Box::pin(stream))
+    }
+
+    /// Azure speaks OpenAI's embeddings wire shape — the deployment name
+    /// moves from the body to the URL path, and everything else is
+    /// identical, so the request/response structs are the OpenAI ones.
+    ///
+    /// Without this, an Azure-backed model on `/v1/embeddings` hit the
+    /// trait's default and came back "this provider does not support
+    /// embeddings" as a 501: an operator whose whole estate is Azure could
+    /// serve chat and nothing else, from a Model row that looked no
+    /// different from a working one.
+    async fn embed(
+        &self,
+        req: &EmbeddingRequest,
+        ctx: &BridgeContext,
+    ) -> Result<EmbeddingResponse, BridgeError> {
+        let deployment = upstream_model(ctx)?;
+        let upstream = AzureUpstreamRef::resolve(deployment, ctx.provider_key.api_base.as_deref())?;
+        // Resolve auth BEFORE the request future so an AAD mint failure
+        // surfaces as itself rather than as a transport timeout.
+        let auth = self.resolve_auth(ctx).await?;
+        // The deployment is the model as far as Azure is concerned; the
+        // body's `model` is ignored, and is set to the deployment name for
+        // log-trace clarity, matching `chat()`.
+        let body = prepare_outbound_body(
+            &embed_request_body(req, deployment),
+            ctx.provider_key.request.as_ref(),
+            ctx.provider_key.response.as_ref(),
+        )?;
+        let headers = build_request_headers(&auth, &ctx.request_id, false, &ctx.header_ctx())?;
+        let url = self.resolve_route_url(ctx, &upstream, "azure/embeddings", || {
+            upstream.embeddings_url()
+        });
+        let client = self.client_for(ctx);
+        let started = Instant::now();
+
+        with_deadline(ctx.deadline, started, async move {
+            let resp = url
+                .post_on(&client)
+                .headers(headers)
+                .json(&body)
+                .send()
+                .await
+                .map_err(aisix_gateway::send_error)?;
+
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(map_http_error(status, resp).await);
+            }
+
+            let parsed: OpenAiEmbedResponse = resp
+                .json()
+                .await
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+            Ok(embed_response_into(parsed))
+        })
+        .await
+    }
+
+    /// Azure's image-generation route for a DALL·E deployment. Same body and
+    /// response as OpenAI's, with the deployment in the path — so, like
+    /// `embed`, this is a routing difference rather than a wire difference.
+    async fn generate_image(
+        &self,
+        body: &Value,
+        ctx: &BridgeContext,
+    ) -> Result<Value, BridgeError> {
+        let deployment = upstream_model(ctx)?;
+        let upstream = AzureUpstreamRef::resolve(deployment, ctx.provider_key.api_base.as_deref())?;
+        let auth = self.resolve_auth(ctx).await?;
+        // Azure reads the deployment from the URL and ignores the body's
+        // `model`; it is set to the deployment name for log-trace clarity,
+        // matching `chat()` and `embed()`.
+        let mut outbound = body.clone();
+        if let Some(obj) = outbound.as_object_mut() {
+            obj.insert("model".to_string(), Value::String(deployment.to_string()));
+        }
+        let outbound = prepare_outbound_body(
+            &outbound,
+            ctx.provider_key.request.as_ref(),
+            ctx.provider_key.response.as_ref(),
+        )?;
+        let headers = build_request_headers(&auth, &ctx.request_id, false, &ctx.header_ctx())?;
+        let url = self.resolve_route_url(ctx, &upstream, "azure/images", || upstream.images_url());
+        let client = self.client_for(ctx);
+        let started = Instant::now();
+
+        with_deadline(ctx.deadline, started, async move {
+            let resp = url
+                .post_on(&client)
+                .headers(headers)
+                .json(&outbound)
+                .send()
+                .await
+                .map_err(aisix_gateway::send_error)?;
+
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(map_http_error(status, resp).await);
+            }
+
+            resp.json::<Value>()
+                .await
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
+        })
+        .await
     }
 }
 
@@ -1535,6 +1680,54 @@ mod tests {
         }
     }
 
+    /// Azure image generation: deployment in the path, pinned
+    /// `api-version`, and the caller's body relayed with `model` set to the
+    /// deployment. Same route family as chat and embeddings.
+    #[tokio::test]
+    async fn generate_image_uses_the_deployment_images_route() {
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default().with_response(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "created": 0,
+                "data": [{"url": "https://example.invalid/cat.png"}]
+            })),
+        );
+        Mock::given(method("POST"))
+            .and(path("/openai/deployments/dalle-prod/images/generations"))
+            .and(query_param("api-version", "2024-10-21"))
+            .and(header("api-key", "az-key"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = AzureOpenAiBridge::new().with_url_override(format!(
+            "{}/openai/deployments/dalle-prod/images/generations?api-version=2024-10-21",
+            server.uri()
+        ));
+        let ctx = BridgeContext::new(
+            "req-azure-image",
+            model_for_deployment("dalle-prod"),
+            sample_pk(Some("https://acme-west.openai.azure.com")),
+        );
+        let out = bridge
+            .generate_image(
+                &serde_json::json!({"model": "ignored", "prompt": "a cat", "n": 1}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["data"][0]["url"], "https://example.invalid/cat.png");
+
+        let body = responder.captured_body.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            body.get("model").and_then(|v| v.as_str()),
+            Some("dalle-prod"),
+            "the body's model carries the deployment name: {body}",
+        );
+        assert_eq!(body.get("prompt").and_then(|v| v.as_str()), Some("a cat"));
+    }
+
     #[tokio::test]
     async fn chat_with_empty_secret_errors_before_dispatch() {
         let bridge = AzureOpenAiBridge::new();
@@ -1608,6 +1801,73 @@ mod tests {
     // (header building, body building, override apply, error mapping,
     // SSE decoding, deadline handling) is exercised; only the final
     // hostname is different from production.
+
+    /// Azure embeddings dispatch: deployment in the path, pinned
+    /// `api-version`, `api-key` header — and an OpenAI-shaped body/response.
+    ///
+    /// Before this the bridge had no `embed`, so the trait default answered
+    /// "this provider does not support embeddings" and an Azure-only estate
+    /// could not serve `/v1/embeddings` at all.
+    #[tokio::test]
+    async fn embed_dispatch_uses_the_deployment_embeddings_route() {
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default().with_response(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "model": "text-embed-prod",
+                "data": [{"object": "embedding", "index": 0, "embedding": [0.5, 0.25]}],
+                "usage": {"prompt_tokens": 4, "total_tokens": 4}
+            })),
+        );
+        Mock::given(method("POST"))
+            .and(path("/openai/deployments/text-embed-prod/embeddings"))
+            .and(query_param("api-version", "2024-10-21"))
+            .and(header("api-key", "az-key"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = AzureOpenAiBridge::new().with_url_override(format!(
+            "{}/openai/deployments/text-embed-prod/embeddings?api-version=2024-10-21",
+            server.uri()
+        ));
+        let mut ctx = BridgeContext::new(
+            "req-azure-embed",
+            model_for_deployment("text-embed-prod"),
+            sample_pk(Some("https://acme-west.openai.azure.com")),
+        );
+        ctx.model = model_for_deployment("text-embed-prod");
+        let req = EmbeddingRequest {
+            model: "ignored-by-azure".to_string(),
+            input: vec!["hello".to_string()],
+            input_was_single: true,
+            encoding_format: None,
+            dimensions: None,
+        };
+        let out = bridge.embed(&req, &ctx).await.unwrap();
+        assert_eq!(out.data.len(), 1);
+        match &out.data[0].embedding {
+            aisix_gateway::EmbeddingVector::Float(v) => assert_eq!(v, &vec![0.5_f32, 0.25_f32]),
+            other => panic!("expected a float vector, got {other:?}"),
+        }
+        assert_eq!(out.usage.prompt_tokens, 4);
+
+        // The caller sent a single string, so the wire body must carry a
+        // single string — the same "both pass through" contract the OpenAI
+        // bridge honours (#162).
+        let body = responder.captured_body.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            body.get("input").and_then(|v| v.as_str()),
+            Some("hello"),
+            "single-string input must not be array-wrapped on the wire: {body}",
+        );
+        assert_eq!(
+            body.get("model").and_then(|v| v.as_str()),
+            Some("text-embed-prod"),
+            "the body's model carries the deployment name, matching chat()",
+        );
+    }
 
     #[tokio::test]
     async fn chat_dispatch_sends_api_key_header_and_deployment_url() {
