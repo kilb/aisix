@@ -59,6 +59,7 @@ mod render;
 mod request_id;
 mod request_metrics;
 mod rerank;
+mod response_cache;
 mod responses;
 mod responses_bridge;
 mod rewrite;

@@ -14,7 +14,7 @@ use moka::future::Cache as MokaCache;
 use moka::Expiry;
 use std::time::{Duration, Instant};
 
-use crate::cache::{Cache, CacheError};
+use crate::cache::{Cache, CacheError, CachedBody};
 
 pub const DEFAULT_TTL: Duration = Duration::from_secs(300);
 pub const DEFAULT_CAPACITY: u64 = 10_000;
@@ -28,9 +28,35 @@ struct Entry {
     ttl: Duration,
 }
 
+/// Same per-entry-TTL shape as [`Entry`], for the non-chat endpoints whose
+/// responses are stored as bytes.
+#[derive(Debug, Clone)]
+struct BodyEntry {
+    body: CachedBody,
+    ttl: Duration,
+}
+
+struct PerBodyEntryExpiry;
+
+impl Expiry<String, BodyEntry> for PerBodyEntryExpiry {
+    fn expire_after_create(
+        &self,
+        _key: &String,
+        value: &BodyEntry,
+        _current_time: Instant,
+    ) -> Option<Duration> {
+        Some(value.ttl)
+    }
+}
+
 #[derive(Debug)]
 pub struct MemoryCache {
     inner: MokaCache<String, Entry>,
+    /// Separate store for the byte-bodied endpoints. A second moka cache
+    /// rather than an enum value: the two have different sizes and eviction
+    /// pressure, and a shared capacity would let a burst of embedding
+    /// matrices evict every chat entry.
+    bodies: MokaCache<String, BodyEntry>,
     /// Fallback TTL used by the no-override `put` path. Kept for the
     /// `ttl()` accessor + tests; not consulted by the Expiry impl.
     ttl: Duration,
@@ -59,7 +85,11 @@ impl MemoryCache {
             .max_capacity(capacity)
             .expire_after(PerEntryExpiry)
             .build();
-        Self { inner, ttl }
+        let bodies = MokaCache::builder()
+            .max_capacity(capacity)
+            .expire_after(PerBodyEntryExpiry)
+            .build();
+        Self { inner, bodies, ttl }
     }
 
     pub fn with_defaults() -> Self {
@@ -113,11 +143,71 @@ impl Cache for MemoryCache {
             .await;
         Ok(())
     }
+
+    async fn get_body(&self, key: &str) -> Result<Option<CachedBody>, CacheError> {
+        Ok(self.bodies.get(key).await.map(|e| e.body))
+    }
+
+    async fn put_body_with_ttl(
+        &self,
+        key: &str,
+        value: CachedBody,
+        ttl: Duration,
+    ) -> Result<(), CacheError> {
+        self.bodies
+            .insert(key.to_string(), BodyEntry { body: value, ttl })
+            .await;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_body() -> CachedBody {
+        CachedBody {
+            content_type: "application/json".into(),
+            // Deliberately not valid UTF-8: the binary surfaces (TTS audio,
+            // image bytes) go through this same store, and a String-typed
+            // field would have silently mangled them.
+            body: vec![0x00, 0xff, 0x7b, 0x7d],
+            prompt_tokens: 7,
+            completion_tokens: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn body_entries_round_trip_bytes_and_token_counts() {
+        let cache = MemoryCache::with_defaults();
+        assert!(cache.get_body("k").await.unwrap().is_none());
+        cache
+            .put_body_with_ttl("k", sample_body(), Duration::from_secs(60))
+            .await
+            .unwrap();
+        let got = cache.get_body("k").await.unwrap().expect("stored body");
+        assert_eq!(got.body, vec![0x00, 0xff, 0x7b, 0x7d]);
+        assert_eq!(got.content_type, "application/json");
+        assert_eq!(got.prompt_tokens, 7);
+    }
+
+    /// Chat responses and bodies share a key namespace at the call site, so
+    /// the two stores must not answer each other's lookups — a chat hit
+    /// decoded as a body (or the reverse) would serve one endpoint's answer
+    /// on another.
+    #[tokio::test]
+    async fn body_and_chat_entries_do_not_answer_each_other() {
+        let cache = MemoryCache::with_defaults();
+        cache.put("same-key", sample_response()).await.unwrap();
+        assert!(cache.get_body("same-key").await.unwrap().is_none());
+
+        let fresh = MemoryCache::with_defaults();
+        fresh
+            .put_body_with_ttl("same-key", sample_body(), Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(fresh.get("same-key").await.unwrap().is_none());
+    }
     use aisix_gateway::{ChatMessage, FinishReason, UsageStats};
 
     fn sample_response() -> ChatResponse {

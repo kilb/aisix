@@ -203,6 +203,7 @@ pub async fn embeddings(
                     success.prompt_tokens,
                     success.usage_estimated,
                     &success.routing,
+                    success.cache,
                     &client,
                     success.redactions.clone(),
                     success.monitor_hits.clone(),
@@ -318,6 +319,9 @@ struct EmbedDispatchSuccess {
     upstream_called: bool,
     /// Which group member served and what the walk cost.
     routing: RoutingAttribution,
+    /// Whether a cache policy covered this request, how it was answered,
+    /// and what a hit saved.
+    cache: crate::response_cache::CacheTelemetry,
 }
 
 #[derive(Default)]
@@ -441,6 +445,76 @@ async fn dispatch(
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&body.model, &model_entry.id, &model_entry.value);
     let mut reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
+
+    // Cache gate. An embedding is the most cacheable thing this gateway
+    // serves — the same text always maps to the same vector — and it was
+    // the endpoint with no cache at all. Key material is the request
+    // identity: which model, which texts, and the two knobs that change the
+    // returned vectors.
+    let gate = crate::response_cache::BodyCache::resolve(
+        state,
+        snapshot,
+        auth,
+        Some(client_ctx.headers.as_ref()),
+        "/v1/embeddings",
+        &body.model,
+        &serde_json::json!({
+            "input": &body.input,
+            "encoding_format": &body.encoding_format,
+            "dimensions": &body.dimensions,
+        })
+        .to_string(),
+    );
+    if let Some(gate) = gate.as_ref() {
+        if let Some(hit) = gate.lookup().await {
+            // The upstream was never called, so nothing was consumed —
+            // release the reservation without spending tokens, exactly as
+            // the chat gate does, and report the tokens the entry saved.
+            reservation.commit_tokens(0).await;
+            gate.record(state, crate::chat::CacheStatus::Hit);
+            let cache = crate::response_cache::CacheTelemetry::hit(&hit);
+            let mut response = axum::response::Response::new(axum::body::Body::from(hit.body));
+            if let Ok(ct) = axum::http::HeaderValue::from_str(&hit.content_type) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_TYPE, ct);
+            }
+            crate::response_cache::apply_cache_headers(
+                &mut response,
+                crate::chat::CacheStatus::Hit,
+            );
+            return Ok(EmbedDispatchSuccess {
+                response,
+                // The entry is decoupled from whichever target produced it,
+                // so the hit is attributed to the requested row rather than
+                // to a target it may no longer have.
+                provider: model_entry
+                    .value
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                model_id: model_entry.id.to_string(),
+                provider_key_id: String::new(),
+                upstream_model: model_entry
+                    .value
+                    .upstream_model()
+                    .unwrap_or("unknown")
+                    .to_string(),
+                applied_guardrails: telemetry.applied_guardrails.clone(),
+                redactions,
+                monitor_hits: telemetry.monitor_hits.clone(),
+                prompt_tokens: hit.prompt_tokens,
+                usage_estimated: false,
+                // A hit IS a served request and belongs in the ledger —
+                // that is how the cache's value becomes visible — so unlike
+                // the 501 branch this emits.
+                upstream_called: true,
+                captured_content: None,
+                routing: RoutingAttribution::default(),
+                cache,
+            });
+        }
+    }
 
     // Preserve the caller's original `input` shape per #162 /
     // `docs/api-proxy.md` §4.4 "both pass through". The bridge will
@@ -572,8 +646,32 @@ async fn dispatch(
                 )),
                 _ => None,
             };
+            // Write path: store the client-facing body so the next identical
+            // request is answered without an upstream call. Only a real 200
+            // is stored — an error body cached for the policy's TTL would
+            // turn one upstream hiccup into minutes of replayed failure.
+            let body_bytes = serde_json::to_vec(&embed_resp).unwrap_or_default();
+            let cache_status = match gate.as_ref() {
+                Some(gate) => {
+                    if !body_bytes.is_empty() {
+                        gate.store(aisix_cache::CachedBody {
+                            content_type: "application/json".to_string(),
+                            body: body_bytes.clone(),
+                            prompt_tokens,
+                            completion_tokens: 0,
+                        })
+                        .await;
+                    }
+                    let status = gate.miss_status();
+                    gate.record(state, status);
+                    status
+                }
+                None => crate::chat::CacheStatus::Disabled,
+            };
+            let mut response = Json(embed_resp).into_response();
+            crate::response_cache::apply_cache_headers(&mut response, cache_status);
             Ok(EmbedDispatchSuccess {
-                response: Json(embed_resp).into_response(),
+                response,
                 provider,
                 // The DISPATCHED row, so pricing and per-model analytics
                 // resolve against the member that served rather than
@@ -589,6 +687,7 @@ async fn dispatch(
                 upstream_called: true,
                 captured_content,
                 routing,
+                cache: crate::response_cache::CacheTelemetry::of(cache_status),
             })
         }
         Err(failure) => {
@@ -647,6 +746,9 @@ async fn dispatch(
                 // reports zero tokens still emits.
                 upstream_called: false,
                 routing: failure.attribution(),
+                // The gate never got to answer: no upstream call happened,
+                // so there is nothing to store and nothing was replayed.
+                cache: crate::response_cache::CacheTelemetry::default(),
             })
         }
     }
@@ -759,6 +861,8 @@ fn emit_usage_event(
     usage_estimated: bool,
     // Which group member served and how many attempts it took.
     routing: &RoutingAttribution,
+    // Whether a cache policy answered this request, and what it saved.
+    cache: crate::response_cache::CacheTelemetry,
     client: &ClientContext,
     // Per-detector PII mask counts (#932) applied to the input.
     redacted_entity_counts: crate::redact::RedactionCounts,
@@ -783,7 +887,6 @@ fn emit_usage_event(
     //   - guardrail_bypassed_reason — embeddings now run input guardrails
     //     (#719); fail-open bypass telemetry is not yet plumbed for the
     //     non-chat handlers (follow-up, same as the per-PK fields below)
-    //   - cache_status / cache_hit_saved_* — no caching on embeddings
     //   - ttft_ms — embeddings are not streamed
     //
     // The per-PK attribution tags (provider_kind / provider_featured /
@@ -807,6 +910,9 @@ fn emit_usage_event(
         attempt_index: routing.attempt_index,
         attempt_kind: routing.attempt_kind.to_string(),
         attempt_model: routing.served_by_model.clone(),
+        cache_status: cache.status.as_str().to_string(),
+        cache_hit_layer: cache.layer(),
+        cache_hit_saved_input_tokens: cache.saved_input_tokens,
         // Priced from the dispatched row's `Model.cost` when the operator set
         // one, `0.0` otherwise — see `usage_attr::request_cost_usd`.
         cost_usd: crate::usage_attr::request_cost_usd(
@@ -944,6 +1050,17 @@ mod tests {
         );
         let k: ApiKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new("k-1", k, 1)
+    }
+
+    /// `build_app` disables the cache backends; the cache tests need them on.
+    fn build_app_with_cache(snap: AisixSnapshot) -> axum::Router {
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        crate::build_router(crate::ProxyState::new(
+            SnapshotHandle::new(snap),
+            hub,
+            &cfg(),
+        ))
     }
 
     fn build_app(snap: AisixSnapshot) -> axum::Router {
@@ -1745,6 +1862,113 @@ mod tests {
             "the retry must recover the request",
         );
         // The `.expect(1)` on both mocks asserts exactly two upstream calls.
+    }
+
+    /// An identical embeddings request is answered from the cache, without a
+    /// second upstream call.
+    ///
+    /// Embeddings are the most cacheable thing this gateway serves — the
+    /// same text always maps to the same vector, and providers charge for
+    /// every repeat — and the endpoint had no cache at all: a policy an
+    /// operator wrote for a model covered that model on chat and quietly
+    /// did nothing here.
+    #[tokio::test]
+    async fn identical_embeddings_request_is_served_from_cache() {
+        let upstream = MockServer::start().await;
+        // ONE upstream call for TWO requests: the mock's `.expect(1)` is the
+        // assertion that the second never left the gateway.
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("cached-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let policy: aisix_core::CachePolicy = serde_json::from_str(
+            r#"{"name":"embed-cache","enabled":true,"backend":"memory","ttl_seconds":60,"applies_to":"all"}"#,
+        )
+        .unwrap();
+        snap.cache_policies
+            .insert(ResourceEntry::new("cp-1", policy, 1));
+
+        let app = build_app_with_cache(snap);
+        let body = serde_json::json!({"model": "cached-embed", "input": "hello"});
+
+        let first = tower::ServiceExt::oneshot(app.clone(), make_req(body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            first
+                .headers()
+                .get(crate::chat::CACHE_HEADER)
+                .map(|v| v.to_str().unwrap()),
+            Some("miss"),
+            "the first request must report a miss so a client can tell the two apart",
+        );
+        let first_body = to_bytes(first.into_body(), 65536).await.unwrap();
+
+        let second = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            second
+                .headers()
+                .get(crate::chat::CACHE_HEADER)
+                .map(|v| v.to_str().unwrap()),
+            Some("hit"),
+        );
+        let second_body = to_bytes(second.into_body(), 65536).await.unwrap();
+        assert_eq!(
+            first_body, second_body,
+            "a cache hit must replay the stored body byte for byte",
+        );
+    }
+
+    /// A different `input` under the same policy is a different entry — the
+    /// key has to cover the request, not just the model.
+    #[tokio::test]
+    async fn a_different_input_does_not_hit_the_cached_entry() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .expect(2)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("cached-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let policy: aisix_core::CachePolicy = serde_json::from_str(
+            r#"{"name":"embed-cache","enabled":true,"backend":"memory","ttl_seconds":60,"applies_to":"all"}"#,
+        )
+        .unwrap();
+        snap.cache_policies
+            .insert(ResourceEntry::new("cp-1", policy, 1));
+
+        let app = build_app_with_cache(snap);
+        for text in ["first text", "second text"] {
+            let resp = tower::ServiceExt::oneshot(
+                app.clone(),
+                make_req(serde_json::json!({"model": "cached-embed", "input": text})),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()
+                    .get(crate::chat::CACHE_HEADER)
+                    .map(|v| v.to_str().unwrap()),
+                Some("miss"),
+                "`{text}` must not be answered by the other input's entry",
+            );
+        }
+        // `.expect(2)` asserts both reached the upstream.
     }
 
     /// A Model Group addressed on /v1/embeddings dispatches its targets and

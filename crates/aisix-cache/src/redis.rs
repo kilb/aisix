@@ -20,7 +20,7 @@ use aisix_redis::RedisConn;
 use async_trait::async_trait;
 use redis::AsyncCommands;
 
-use crate::cache::{Cache, CacheError};
+use crate::cache::{Cache, CacheError, CachedBody};
 
 /// Default TTL — matches [`crate::DEFAULT_TTL`] so swapping memory ↔
 /// redis backends doesn't change observable behaviour for the common case.
@@ -143,6 +143,52 @@ impl Cache for RedisCache {
             .await
             .map_err(|e| CacheError::Backend(format!("redis acquire: {e}")))?;
         let full = self.full_key(key);
+        let secs = ttl.as_secs().max(1);
+        if let Err(e) = conn.set_ex::<_, _, ()>(&full, json, secs).await {
+            self.conn.note_error().await;
+            return Err(CacheError::Backend(format!("redis SET EX: {e}")));
+        }
+        Ok(())
+    }
+    /// Body entries live under their own key namespace (`:body:`) so a chat
+    /// fingerprint and a non-chat one can never be decoded as each other's
+    /// shape, even if a future key derivation made them collide.
+    async fn get_body(&self, key: &str) -> Result<Option<CachedBody>, CacheError> {
+        let mut conn = self
+            .conn
+            .acquire()
+            .await
+            .map_err(|e| CacheError::Backend(format!("redis acquire: {e}")))?;
+        let full = self.full_key(&format!("body:{key}"));
+        let raw: Option<String> = match conn.get(&full).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.conn.note_error().await;
+                return Err(CacheError::Backend(format!("redis GET: {e}")));
+            }
+        };
+        match raw {
+            None => Ok(None),
+            Some(json) => serde_json::from_str::<CachedBody>(&json)
+                .map(Some)
+                .map_err(|e| CacheError::Backend(format!("redis decode: {e}"))),
+        }
+    }
+
+    async fn put_body_with_ttl(
+        &self,
+        key: &str,
+        value: CachedBody,
+        ttl: Duration,
+    ) -> Result<(), CacheError> {
+        let json = serde_json::to_string(&value)
+            .map_err(|e| CacheError::Backend(format!("redis encode: {e}")))?;
+        let mut conn = self
+            .conn
+            .acquire()
+            .await
+            .map_err(|e| CacheError::Backend(format!("redis acquire: {e}")))?;
+        let full = self.full_key(&format!("body:{key}"));
         let secs = ttl.as_secs().max(1);
         if let Err(e) = conn.set_ex::<_, _, ()>(&full, json, secs).await {
             self.conn.note_error().await;

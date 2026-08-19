@@ -729,10 +729,11 @@ struct Success {
 /// Cache decision attached to every successful request. Wire shape
 /// (lowercase string) is what cp-api persists in
 /// `dpmgr_usage_events.cache_status`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum CacheStatus {
     /// No enabled cache policy in snapshot — gate skipped the lookup.
     /// Stage 3 will refine this to "no policy matched applies_to".
+    #[default]
     Disabled,
     /// Cache consulted, no entry matched. The successful upstream
     /// response is stored on the way out so future identical requests
@@ -788,6 +789,17 @@ impl CacheHitLayer {
 struct CacheControlDirectives {
     no_cache: bool,
     no_store: bool,
+}
+
+/// `(no_cache, no_store)` for a possibly-absent header map — the shape the
+/// non-chat gate needs, so both surfaces honour the same directives from one
+/// parser.
+pub(crate) fn cache_control_directives_of(headers: Option<&axum::http::HeaderMap>) -> (bool, bool) {
+    let Some(headers) = headers else {
+        return (false, false);
+    };
+    let d = cache_control_directives(headers);
+    (d.no_cache, d.no_store)
 }
 
 fn cache_control_directives(headers: &axum::http::HeaderMap) -> CacheControlDirectives {

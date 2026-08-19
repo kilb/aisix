@@ -173,6 +173,7 @@ pub async fn messages(
             captured_content,
             output_redactions,
             output_monitor_hits,
+            cache,
         }) => {
             // #932: fold the non-streaming response-side mask counts into
             // the per-request total before the terminal emit below.
@@ -290,6 +291,7 @@ pub async fn messages(
                     status,
                     winner_latency,
                     metrics,
+                    cache,
                     &client,
                     attempt,
                     applied_guardrails.clone(),
@@ -430,6 +432,8 @@ pub async fn messages(
                     status,
                     elapsed,
                     AnthropicUsageMetrics::default(),
+                    // A failed request was never cached and never replayed.
+                    crate::response_cache::CacheTelemetry::default(),
                     &client,
                     AttemptInfo {
                         kind: "initial".to_string(),
@@ -509,6 +513,9 @@ fn emit_failed_attempts_anthropic(
             rec.status,
             Duration::from_millis(u64::from(rec.latency_ms)),
             AnthropicUsageMetrics::default(),
+            // A per-attempt failure event: the cache neither answered it nor
+            // stored it.
+            crate::response_cache::CacheTelemetry::default(),
             client,
             AttemptInfo::from_record(rec),
             applied_guardrails.to_vec(),
@@ -672,6 +679,76 @@ async fn dispatch(
     // `enforce_rate_limit` and owns its budget check.
     let mut reservation =
         Some(crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?);
+
+    // Cache gate. Non-streaming only, for the same reason the chat gate is:
+    // there is no stored shape for a stream yet, and pretending otherwise
+    // would mis-bucket streamed responses as uncached.
+    //
+    // The key is taken from the POST-redaction body — the bytes actually
+    // sent upstream — matching the chat gate, so two callers whose requests
+    // differ only in masked PII share an entry. That sharing is contained by
+    // the policy's default `scope: api_key`; an operator who opts into
+    // `scope: env` is asking for cross-caller reuse.
+    let cache_gate = if body.get("stream").and_then(Value::as_bool) == Some(true) {
+        None
+    } else {
+        crate::response_cache::BodyCache::resolve(
+            state,
+            snapshot,
+            auth,
+            Some(client.headers.as_ref()),
+            "/v1/messages",
+            &model_name,
+            &body.to_string(),
+        )
+    };
+    if let Some(gate) = cache_gate.as_ref() {
+        if let Some(hit) = gate.lookup().await {
+            // No upstream call, so nothing was consumed.
+            if let Some(r) = reservation.take() {
+                r.commit_tokens(0).await;
+            }
+            gate.record(state, crate::chat::CacheStatus::Hit);
+            let cache = crate::response_cache::CacheTelemetry::hit(&hit);
+            let mut response = Response::new(axum::body::Body::from(hit.body));
+            if let Ok(ct) = axum::http::HeaderValue::from_str(&hit.content_type) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_TYPE, ct);
+            }
+            crate::response_cache::apply_cache_headers(
+                &mut response,
+                crate::chat::CacheStatus::Hit,
+            );
+            return Ok(DispatchOutcome {
+                response,
+                // The entry is decoupled from whichever target produced it,
+                // so a hit is attributed to the requested row.
+                provider_label: model_entry
+                    .value
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                provider_key_id: String::new(),
+                upstream_model: model_entry
+                    .value
+                    .upstream_model()
+                    .unwrap_or("unknown")
+                    .to_string(),
+                metrics: AnthropicUsageMetrics {
+                    prompt_tokens: hit.prompt_tokens,
+                    completion_tokens: hit.completion_tokens,
+                    ..Default::default()
+                },
+                usage_handled_by_stream: false,
+                routing: RoutingTelemetry::default(),
+                captured_content: None,
+                output_redactions: crate::redact::RedactionCounts::new(),
+                output_monitor_hits: Vec::new(),
+                cache,
+            });
+        }
+    }
 
     // Resolve the attempt list. For a Model Group (routing model) this
     // walks `routing.targets` and health-filters them; for a direct
@@ -894,6 +971,9 @@ async fn dispatch(
                             );
                             r.commit_tokens(total).await;
                         }
+                    }
+                    if let Some(gate) = cache_gate.as_ref() {
+                        outcome = store_in_cache(state, gate, outcome).await;
                     }
                     return Ok(outcome);
                 }
@@ -1506,6 +1586,8 @@ async fn anthropic_passthrough_dispatch(
                     // failed attempt before this one emitted its own event.
                     attempt_started.elapsed(),
                     metrics,
+                    // Streaming is outside the cache gate.
+                    crate::response_cache::CacheTelemetry::default(),
                     &client_ctx_c,
                     terminal_attempt,
                     applied_guardrails_c.clone(),
@@ -1583,6 +1665,7 @@ async fn anthropic_passthrough_dispatch(
             // Streaming: the end-of-stream closure owns the counts.
             output_redactions: crate::redact::RedactionCounts::new(),
             output_monitor_hits: Vec::new(),
+            cache: crate::response_cache::CacheTelemetry::default(),
         })
     } else {
         // Non-streaming: deserialise and re-serialise as JSON. Decode
@@ -1740,6 +1823,7 @@ async fn anthropic_passthrough_dispatch(
             captured_content,
             output_redactions,
             output_monitor_hits,
+            cache: crate::response_cache::CacheTelemetry::default(),
         })
     }
 }
@@ -2203,6 +2287,8 @@ async fn cross_provider_dispatch(
                     // Attempt-scoped — see the sibling passthrough path.
                     attempt_started_for_telem.elapsed(),
                     metrics,
+                    // Streaming is outside the cache gate.
+                    crate::response_cache::CacheTelemetry::default(),
                     &client_for_telem,
                     terminal_attempt,
                     applied_guardrails_for_telem.clone(),
@@ -2265,6 +2351,7 @@ async fn cross_provider_dispatch(
             // Streaming: the end-of-stream closure owns the counts.
             output_redactions: crate::redact::RedactionCounts::new(),
             output_monitor_hits: Vec::new(),
+            cache: crate::response_cache::CacheTelemetry::default(),
         });
     }
 
@@ -2384,6 +2471,7 @@ async fn cross_provider_dispatch(
         captured_content,
         output_redactions,
         output_monitor_hits,
+        cache: crate::response_cache::CacheTelemetry::default(),
     })
 }
 
@@ -3053,6 +3141,67 @@ impl<F: FnOnce(AnthropicStreamCompletion)> Drop for CompleteAnthropicStreamOnDro
 /// What `dispatch` produces alongside the wire response: enough
 /// metadata for the outer wrapper to emit a UsageEvent with the
 /// proper token counts and provider-detail fields.
+/// Write path of the `/v1/messages` cache gate.
+///
+/// The body has to be buffered to be stored, so this runs ONLY when a policy
+/// matched — an uncached deployment keeps handing the caller the response it
+/// was already holding. Only a 200 is stored: caching an error body for the
+/// policy's TTL would turn one upstream hiccup into minutes of replayed
+/// failure.
+async fn store_in_cache(
+    state: &ProxyState,
+    gate: &crate::response_cache::BodyCache,
+    outcome: DispatchOutcome,
+) -> DispatchOutcome {
+    let status = gate.miss_status();
+    gate.record(state, status);
+    let mut outcome = outcome;
+    outcome.cache = crate::response_cache::CacheTelemetry::of(status);
+    if outcome.response.status() != axum::http::StatusCode::OK || outcome.usage_handled_by_stream {
+        crate::response_cache::apply_cache_headers(&mut outcome.response, status);
+        return outcome;
+    }
+    let content_type = outcome
+        .response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let (parts, body) = outcome.response.into_parts();
+    // The cap matches the response-body limit the gateway already accepts,
+    // so a body it relayed cannot fail to buffer here.
+    let bytes = match axum::body::to_bytes(body, crate::response_cache::MAX_CACHED_BODY_BYTES).await
+    {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            // The body is consumed either way, so this cannot fall back to
+            // relaying it — surface the failure rather than a silent empty
+            // 200.
+            tracing::warn!(
+                target: "aisix::cache",
+                error = %err,
+                "response body could not be buffered for caching",
+            );
+            outcome.response = ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(
+                "response body too large to relay".to_string(),
+            ))
+            .into_response();
+            return outcome;
+        }
+    };
+    gate.store(aisix_cache::CachedBody {
+        content_type,
+        body: bytes.to_vec(),
+        prompt_tokens: outcome.metrics.prompt_tokens,
+        completion_tokens: outcome.metrics.completion_tokens,
+    })
+    .await;
+    outcome.response = Response::from_parts(parts, axum::body::Body::from(bytes));
+    crate::response_cache::apply_cache_headers(&mut outcome.response, status);
+    outcome
+}
+
 struct DispatchOutcome {
     response: Response,
     provider_label: String,
@@ -3077,6 +3226,8 @@ struct DispatchOutcome {
     /// Monitor-mode guardrail observations on the response side
     /// (AISIX-Cloud#562), same lifecycle as `output_redactions`.
     output_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    /// Whether a cache policy answered this request, and what a hit saved.
+    cache: crate::response_cache::CacheTelemetry,
 }
 
 /// Dispatch error carrying the per-attempt telemetry accumulated before
@@ -3158,6 +3309,8 @@ fn emit_anthropic_usage_event(
     status_code: u16,
     elapsed: Duration,
     metrics: AnthropicUsageMetrics,
+    // Whether a cache policy answered this request, and what a hit saved.
+    cache: crate::response_cache::CacheTelemetry,
     client: &ClientContext,
     attempt: AttemptInfo,
     // The `{kind, hook}` set of guardrails that governed this request (#379).
@@ -3188,6 +3341,10 @@ fn emit_anthropic_usage_event(
         requested_model: model.to_string(),
         prompt_tokens: metrics.prompt_tokens,
         completion_tokens: metrics.completion_tokens,
+        cache_status: cache.status.as_str().to_string(),
+        cache_hit_layer: cache.layer(),
+        cache_hit_saved_input_tokens: cache.saved_input_tokens,
+        cache_hit_saved_output_tokens: cache.saved_output_tokens,
         // Priced from the dispatched row's `Model.cost` when the operator set
         // one, `0.0` otherwise — see `usage_attr::request_cost_usd`.
         cost_usd: crate::usage_attr::request_cost_usd(
@@ -4398,6 +4555,140 @@ mod tests {
             serde_json::json!({"type": "ephemeral", "ttl": "5m"}),
             "the caller's cache_control must reach the upstream unchanged"
         );
+    }
+
+    /// `build_app` disables the cache backends; the cache tests need them on.
+    fn build_app_with_cache(snap: AisixSnapshot) -> axum::Router {
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        crate::build_router(crate::ProxyState::new(
+            SnapshotHandle::new(snap),
+            hub,
+            &cfg(),
+        ))
+    }
+
+    fn memory_cache_policy() -> ResourceEntry<aisix_core::CachePolicy> {
+        let policy: aisix_core::CachePolicy = serde_json::from_str(
+            r#"{"name":"msg-cache","enabled":true,"backend":"memory","ttl_seconds":60,"applies_to":"all"}"#,
+        )
+        .unwrap();
+        ResourceEntry::new("cp-1", policy, 1)
+    }
+
+    /// An identical `/v1/messages` request is answered from the cache.
+    ///
+    /// The endpoint had no cache at all, so a policy an operator wrote for a
+    /// model covered that model on `/v1/chat/completions` and quietly did
+    /// nothing for the Anthropic SDK traffic hitting the same model — the
+    /// endpoint most of this gateway's coding-agent traffic arrives on.
+    #[tokio::test]
+    async fn identical_messages_request_is_served_from_cache() {
+        let upstream = MockServer::start().await;
+        // ONE upstream call for TWO requests.
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_response()))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("claude-haiku"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.cache_policies.insert(memory_cache_policy());
+
+        let app = build_app_with_cache(snap);
+        let body = serde_json::json!({
+            "model": "claude-haiku",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 100
+        });
+
+        let first = app.clone().oneshot(make_req(body.clone())).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            first
+                .headers()
+                .get(crate::chat::CACHE_HEADER)
+                .map(|v| v.to_str().unwrap()),
+            Some("miss"),
+        );
+        let first_body = to_bytes(first.into_body(), 65536).await.unwrap();
+
+        let second = app.oneshot(make_req(body)).await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            second
+                .headers()
+                .get(crate::chat::CACHE_HEADER)
+                .map(|v| v.to_str().unwrap()),
+            Some("hit"),
+        );
+        let second_body = to_bytes(second.into_body(), 65536).await.unwrap();
+        assert_eq!(
+            first_body, second_body,
+            "the Anthropic envelope must be replayed byte for byte — a hit \
+             rebuilt from a chat-shaped struct would drop whatever fields \
+             the gateway does not itself read",
+        );
+    }
+
+    /// A streamed request is never answered from the cache, even when an
+    /// identical non-streamed one is stored: there is no stored shape for a
+    /// stream, and serving a buffered body to a client waiting on SSE would
+    /// break the protocol rather than save it a call.
+    #[tokio::test]
+    async fn a_streaming_request_bypasses_the_cache() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_response()))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(wiremock::matchers::body_string_contains("\"stream\":true"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+            )
+            .expect(1)
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("claude-haiku"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.cache_policies.insert(memory_cache_policy());
+
+        let app = build_app_with_cache(snap);
+        let non_stream = serde_json::json!({
+            "model": "claude-haiku",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 100
+        });
+        assert_eq!(
+            app.clone()
+                .oneshot(make_req(non_stream.clone()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK,
+        );
+
+        let mut streaming = non_stream;
+        streaming["stream"] = serde_json::Value::Bool(true);
+        let resp = app.oneshot(make_req(streaming)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get(crate::chat::CACHE_HEADER).is_none(),
+            "a streamed request is outside the gate, so it carries no cache header",
+        );
+        // Both mocks' `.expect(1)` assert the stream reached the upstream.
     }
 
     #[tokio::test]

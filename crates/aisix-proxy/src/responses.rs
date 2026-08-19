@@ -102,10 +102,74 @@ struct ResponseDispatchSuccess {
     /// began. The wire response may remain 200, but health, metrics, and the
     /// billed UsageEvent use this terminal outcome.
     terminal_failure: Option<crate::stream_timeout::RawStreamFailure>,
+    /// Whether a cache policy answered this request, and what a hit saved.
+    cache: crate::response_cache::CacheTelemetry,
 }
 
 /// Dispatch error carrying the per-attempt telemetry accumulated before
 /// the request ultimately failed (#655). Mirrors `chat::DispatchFailure`.
+/// Write path of the `/v1/responses` cache gate — the same shape
+/// `/v1/messages` uses. See `messages::store_in_cache` for why the body is
+/// buffered only when a policy matched and why non-200s are not stored.
+async fn store_in_cache(
+    state: &ProxyState,
+    gate: &crate::response_cache::BodyCache,
+    success: ResponseDispatchSuccess,
+) -> ResponseDispatchSuccess {
+    let status = gate.miss_status();
+    gate.record(state, status);
+    let mut success = success;
+    success.cache = crate::response_cache::CacheTelemetry::of(status);
+    // A blocked response carries a 422 and a guardrail body; storing it would
+    // replay the block to a caller whose policy may have changed since.
+    if success.response.status() != axum::http::StatusCode::OK
+        || success.usage_handled_by_stream
+        || success.guardrail_blocked
+    {
+        crate::response_cache::apply_cache_headers(&mut success.response, status);
+        return success;
+    }
+    let content_type = success
+        .response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let (parts, body) = success.response.into_parts();
+    let bytes = match axum::body::to_bytes(body, crate::response_cache::MAX_CACHED_BODY_BYTES).await
+    {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(
+                target: "aisix::cache",
+                error = %err,
+                "response body could not be buffered for caching",
+            );
+            success.response = ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(
+                "response body too large to relay".to_string(),
+            ))
+            .into_response();
+            return success;
+        }
+    };
+    let (prompt_tokens, completion_tokens) = success
+        .usage
+        .as_ref()
+        .map(|u| (u.prompt_tokens, u.completion_tokens))
+        .unwrap_or((0, 0));
+    gate.store(aisix_cache::CachedBody {
+        content_type,
+        body: bytes.to_vec(),
+        prompt_tokens,
+        completion_tokens,
+    })
+    .await;
+    success.response = Response::from_parts(parts, axum::body::Body::from(bytes));
+    crate::response_cache::apply_cache_headers(&mut success.response, status);
+    success
+}
+
 struct ResponsesDispatchError {
     err: ProxyError,
     routing: RoutingTelemetry,
@@ -372,6 +436,7 @@ pub async fn responses(
                         status,
                         winner_latency,
                         &usage,
+                        success.cache,
                         &client,
                         attempt,
                         success.guardrail_blocked,
@@ -668,6 +733,73 @@ async fn dispatch(
     let mut reservation =
         Some(crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?);
 
+    // Cache gate. Non-streaming only, matching the chat and messages gates:
+    // a stream has no stored shape yet. Keyed on the post-redaction body —
+    // what actually goes upstream — so entries follow the bytes the provider
+    // saw.
+    let cache_gate = if body.get("stream").and_then(Value::as_bool) == Some(true) {
+        None
+    } else {
+        crate::response_cache::BodyCache::resolve(
+            state,
+            snapshot,
+            auth,
+            Some(client.headers.as_ref()),
+            "/v1/responses",
+            &model_name,
+            &body.to_string(),
+        )
+    };
+    if let Some(gate) = cache_gate.as_ref() {
+        if let Some(hit) = gate.lookup().await {
+            if let Some(r) = reservation.take() {
+                r.commit_tokens(0).await;
+            }
+            gate.record(state, crate::chat::CacheStatus::Hit);
+            let cache = crate::response_cache::CacheTelemetry::hit(&hit);
+            let mut response = Response::new(axum::body::Body::from(hit.body));
+            if let Ok(ct) = axum::http::HeaderValue::from_str(&hit.content_type) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_TYPE, ct);
+            }
+            crate::response_cache::apply_cache_headers(
+                &mut response,
+                crate::chat::CacheStatus::Hit,
+            );
+            return Ok(ResponseDispatchSuccess {
+                response,
+                // The entry is decoupled from whichever target produced it,
+                // so a hit is attributed to the requested row.
+                provider: model_entry
+                    .value
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                usage: Some(ResponseUsage {
+                    prompt_tokens: hit.prompt_tokens,
+                    completion_tokens: hit.completion_tokens,
+                    ..Default::default()
+                }),
+                model_id: model_entry.id.to_string(),
+                provider_key_id: String::new(),
+                upstream_model: model_entry
+                    .value
+                    .upstream_model()
+                    .unwrap_or("unknown")
+                    .to_string(),
+                routing: RoutingTelemetry::default(),
+                guardrail_blocked: false,
+                usage_handled_by_stream: false,
+                captured_content: None,
+                output_redactions: crate::redact::RedactionCounts::new(),
+                output_monitor_hits: Vec::new(),
+                terminal_failure: None,
+                cache,
+            });
+        }
+    }
+
     // Resolve the attempt list (routing-aware). A Model Group walks its
     // targets in order; a direct model resolves to itself (#471). OpenAI
     // targets take the verbatim Responses passthrough; every other provider
@@ -924,6 +1056,9 @@ async fn dispatch(
                                 .unwrap_or(0);
                             r.commit_tokens(total).await;
                         }
+                    }
+                    if let Some(gate) = cache_gate.as_ref() {
+                        success = store_in_cache(state, gate, success).await;
                     }
                     return Ok(success);
                 }
@@ -1517,6 +1652,7 @@ async fn responses_to_target(
                         output_monitor_hits: Vec::new(),
                         captured_content: None,
                         terminal_failure: None,
+                        cache: crate::response_cache::CacheTelemetry::default(),
                     });
                 }
                 buf.extend_from_slice(&chunk);
@@ -1685,6 +1821,7 @@ async fn responses_to_target(
                     output_monitor_hits,
                     captured_content,
                     terminal_failure,
+                    cache: crate::response_cache::CacheTelemetry::default(),
                 });
             }
         }
@@ -1924,6 +2061,8 @@ async fn responses_to_target(
                     // failed attempt before this one emitted its own event.
                     attempt_started.elapsed(),
                     &usage,
+                    // Streaming is outside the cache gate.
+                    crate::response_cache::CacheTelemetry::default(),
                     &client_c,
                     terminal_attempt,
                     /* guardrail_blocked */ false,
@@ -1959,6 +2098,7 @@ async fn responses_to_target(
             // The Drop guard's emit carries the captured content too.
             captured_content: None,
             terminal_failure: None,
+            cache: crate::response_cache::CacheTelemetry::default(),
         })
     } else {
         let json_body: Value = upstream_resp
@@ -2090,6 +2230,7 @@ async fn responses_to_target(
                         _ => None,
                     },
                     terminal_failure: None,
+                    cache: crate::response_cache::CacheTelemetry::default(),
                 });
             }
         }
@@ -2124,6 +2265,7 @@ async fn responses_to_target(
             output_monitor_hits,
             captured_content,
             terminal_failure: None,
+            cache: crate::response_cache::CacheTelemetry::default(),
         })
     }
 }
@@ -2463,6 +2605,8 @@ async fn responses_cross_provider_to_target(
                     // Attempt-scoped — see the sibling verbatim path.
                     attempt_started.elapsed(),
                     &usage,
+                    // Streaming is outside the cache gate.
+                    crate::response_cache::CacheTelemetry::default(),
                     &client_c,
                     terminal_attempt,
                     comp.guardrail_blocked,
@@ -2513,6 +2657,7 @@ async fn responses_cross_provider_to_target(
             // The stream's end-of-stream emit carries the captured content.
             captured_content: None,
             terminal_failure: None,
+            cache: crate::response_cache::CacheTelemetry::default(),
         });
     }
 
@@ -2640,6 +2785,7 @@ async fn responses_cross_provider_to_target(
                     _ => None,
                 },
                 terminal_failure: None,
+                cache: crate::response_cache::CacheTelemetry::default(),
             });
         }
     }
@@ -2685,6 +2831,7 @@ async fn responses_cross_provider_to_target(
         output_monitor_hits,
         captured_content,
         terminal_failure: None,
+        cache: crate::response_cache::CacheTelemetry::default(),
     })
 }
 
@@ -3657,6 +3804,8 @@ fn emit_usage_event(
     status_code: u16,
     elapsed: Duration,
     usage: &ResponseUsage,
+    // Whether a cache policy answered this request, and what a hit saved.
+    cache: crate::response_cache::CacheTelemetry,
     client: &ClientContext,
     attempt: AttemptInfo,
     guardrail_blocked: bool,
@@ -3680,6 +3829,10 @@ fn emit_usage_event(
         requested_model: requested_model.to_string(),
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
+        cache_status: cache.status.as_str().to_string(),
+        cache_hit_layer: cache.layer(),
+        cache_hit_saved_input_tokens: cache.saved_input_tokens,
+        cache_hit_saved_output_tokens: cache.saved_output_tokens,
         // Priced from the dispatched row's `Model.cost` when the operator set
         // one, `0.0` otherwise — see `usage_attr::request_cost_usd`.
         cost_usd: crate::usage_attr::request_cost_usd(
@@ -4087,6 +4240,87 @@ mod tests {
         );
         let g: aisix_core::Guardrail = serde_json::from_str(&json).unwrap();
         ResourceEntry::new("g-1", g, 1)
+    }
+
+    /// `build_app` disables the cache backends; the cache test needs them on.
+    fn build_app_with_cache(snap: AisixSnapshot) -> axum::Router {
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        crate::build_router(crate::ProxyState::new(
+            SnapshotHandle::new(snap),
+            hub,
+            &cfg(),
+        ))
+    }
+
+    /// An identical `/v1/responses` request is answered from the cache.
+    ///
+    /// This is where Codex traffic arrives, and it had no cache at all: a
+    /// policy written for a model covered that model on
+    /// `/v1/chat/completions` and quietly did nothing here.
+    #[tokio::test]
+    async fn identical_responses_request_is_served_from_cache() {
+        let upstream = MockServer::start().await;
+        // ONE upstream call for TWO requests.
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_cached",
+                "object": "response",
+                "created_at": 0,
+                "status": "completed",
+                "model": "gpt-4o",
+                "output": [{
+                    "id": "msg_cached",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hello"}]
+                }],
+                "usage": {"input_tokens": 9, "output_tokens": 4, "total_tokens": 13}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let policy: aisix_core::CachePolicy = serde_json::from_str(
+            r#"{"name":"resp-cache","enabled":true,"backend":"memory","ttl_seconds":60,"applies_to":"all"}"#,
+        )
+        .unwrap();
+        snap.cache_policies
+            .insert(ResourceEntry::new("cp-1", policy, 1));
+
+        let app = build_app_with_cache(snap);
+        let body = serde_json::json!({"model": "gpt-4o-resp", "input": "hi"});
+
+        let first = app.clone().oneshot(make_req(body.clone())).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            first
+                .headers()
+                .get(crate::chat::CACHE_HEADER)
+                .map(|v| v.to_str().unwrap()),
+            Some("miss"),
+        );
+        let first_body = to_bytes(first.into_body(), 65536).await.unwrap();
+
+        let second = app.oneshot(make_req(body)).await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            second
+                .headers()
+                .get(crate::chat::CACHE_HEADER)
+                .map(|v| v.to_str().unwrap()),
+            Some("hit"),
+        );
+        let second_body = to_bytes(second.into_body(), 65536).await.unwrap();
+        assert_eq!(
+            first_body, second_body,
+            "the Responses object must be replayed byte for byte",
+        );
     }
 
     /// #719 (the core fix): a configured INPUT guardrail that blocks on

@@ -251,6 +251,25 @@ pub fn semantic_prompt_text(req: &ChatFormat) -> Option<String> {
     has_text.then_some(out)
 }
 
+/// Fingerprint for a cache entry on an endpoint whose body the gateway
+/// relays rather than models.
+///
+/// Hashed with the same [`FingerprintHasher`] the chat key uses, so both
+/// key families inherit its collision properties and its golden tests. The
+/// caller supplies the material in a fixed order; the ENDPOINT must be part
+/// of it, because `/v1/messages` and `/v1/chat/completions` differ by little
+/// more than their envelope and must never read each other's entries.
+pub fn body_fingerprint(parts: &[&str]) -> String {
+    let mut h = FingerprintHasher::default();
+    for part in parts {
+        // Length-prefixed: without it, ("ab", "c") and ("a", "bc") hash
+        // identically, which would let a model name bleed into a body.
+        (part.len() as u64).hash(&mut h);
+        part.hash(&mut h);
+    }
+    h.finalize_hex()
+}
+
 /// Sort `extra` by key (recursively, into nested objects too) and emit
 /// a stable canonical-JSON string per value. The recursion matters: two
 /// callers can send byte-different JSON for `tools=[{...}]` if they
