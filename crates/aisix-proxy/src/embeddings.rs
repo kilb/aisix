@@ -544,6 +544,8 @@ async fn dispatch(
         auth,
         client_ctx,
         crate::routing::GroupEntry {
+            // Non-streaming: `Ok` means the upstream answered in full.
+            defer_outcome: false,
             endpoint: "/v1/embeddings",
             name: &body.model,
             id: &model_entry.id,

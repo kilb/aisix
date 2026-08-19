@@ -389,6 +389,8 @@ async fn dispatch(
         auth,
         client_ctx,
         crate::routing::GroupEntry {
+            // Non-streaming: `Ok` means the upstream answered in full.
+            defer_outcome: false,
             endpoint: "/v1/images/generations",
             name: model_name,
             id: &model_entry.id,
@@ -427,10 +429,13 @@ async fn dispatch(
                 // shape of gap as the Voyage rerank note in `rerank.rs`.
                 let azure = pk_entry.value.adapter == Some(aisix_core::Adapter::AzureOpenai);
                 if model.provider.as_deref() != Some("openai") && !azure {
+                    // Names what the CALLER asked for, never the group member
+                    // that failed the check — matching `ModelForbidden` and
+                    // the routing filter, which report the requested name
+                    // without disclosing group internals.
                     return Err(ProxyError::InvalidRequest(format!(
-                        "model `{}` is not an OpenAI provider; \
-                         /v1/images/generations requires OpenAI or Azure OpenAI",
-                        model.display_name
+                        "model `{model_name}` is not an OpenAI provider; \
+                         /v1/images/generations requires OpenAI or Azure OpenAI"
                     )));
                 }
                 let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)

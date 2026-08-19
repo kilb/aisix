@@ -704,13 +704,55 @@ async fn dispatch(
     };
     if let Some(gate) = cache_gate.as_ref() {
         if let Some(hit) = gate.lookup().await {
+            // The request as the caller sent it (post-redaction), for the
+            // capture below — taken before anything downstream rewrites it.
+            let body_for_capture = body.to_string();
             // No upstream call, so nothing was consumed.
             if let Some(r) = reservation.take() {
                 r.commit_tokens(0).await;
             }
-            gate.record(state, crate::chat::CacheStatus::Hit);
             let cache = crate::response_cache::CacheTelemetry::hit(&hit);
-            let mut response = Response::new(axum::body::Body::from(hit.body));
+            // #448: a cache hit is client-visible output just like a fresh
+            // upstream response, so it runs the output chain before being
+            // returned rather than bypassing it. The stored body was already
+            // moderated under the policy in force when it was written — this
+            // covers the case that matters, a policy TIGHTENED afterwards,
+            // which would otherwise keep serving now-forbidden content for
+            // the whole TTL.
+            let body = guard_cached_response(
+                state,
+                resolved_chain.as_ref(),
+                &model_name,
+                hit.body,
+                redactions_out,
+                monitor_hits_out,
+            )
+            .await?;
+            // A hit served content to the caller, so it is logged like a
+            // fresh response — otherwise a content-capturing exporter's
+            // audit trail simply omits every cached answer. Gated on an
+            // exporter actually wanting content, so the common path pays no
+            // parse.
+            let captured_content = content_capture_cap(
+                snapshot
+                    .observability_exporters
+                    .entries()
+                    .iter()
+                    .map(|e| &*e.value),
+            )
+            .map(|cap| {
+                let text = serde_json::from_slice::<Value>(&body)
+                    .map(|v| anthropic_response_text(&v))
+                    .unwrap_or_default();
+                CapturedContent::new(&body_for_capture, &text, cap as usize)
+            });
+            // Recorded only once the hit actually reaches the caller —
+            // a hit the output chain blocks is not one the cache served,
+            // and `/v1/chat/completions` counts it the same way. An
+            // endpoint that counted it differently would make the family's
+            // totals mean different things per endpoint.
+            gate.record(state, crate::chat::CacheStatus::Hit);
+            let mut response = Response::new(axum::body::Body::from(body));
             if let Ok(ct) = axum::http::HeaderValue::from_str(&hit.content_type) {
                 response
                     .headers_mut()
@@ -742,7 +784,7 @@ async fn dispatch(
                 },
                 usage_handled_by_stream: false,
                 routing: RoutingTelemetry::default(),
-                captured_content: None,
+                captured_content,
                 output_redactions: crate::redact::RedactionCounts::new(),
                 output_monitor_hits: Vec::new(),
                 cache,
@@ -1911,6 +1953,87 @@ fn anthropic_response_text(body: &Value) -> String {
                 .join("")
         })
         .unwrap_or_default()
+}
+
+/// Run the output chain over a cached `/v1/messages` body, returning the
+/// bytes to serve.
+///
+/// The same five steps the fresh passthrough response takes — extract the
+/// assistant text, check the non-segment output verdict, moderate, block,
+/// then apply PII masking — so a hit and a miss are governed identically.
+/// A no-op (and no re-serialisation) when no output guardrail is attached,
+/// which is the common deployment.
+async fn guard_cached_response(
+    state: &ProxyState,
+    chain: &aisix_guardrails::GuardrailChain,
+    model_name: &str,
+    body: Vec<u8>,
+    redactions_out: &mut crate::redact::RedactionCounts,
+    monitor_hits_out: &mut Vec<aisix_core::GuardrailMonitorHit>,
+) -> Result<Vec<u8>, MessagesDispatchError> {
+    let _ = state;
+    if !aisix_guardrails::Guardrail::runs_on_output(chain) {
+        return Ok(body);
+    }
+    // A stored body that no longer parses cannot be moderated, so it is not
+    // served: failing closed on an unreadable cache entry is the only safe
+    // reading when the alternative is relaying it unchecked.
+    let Ok(mut json_body) = serde_json::from_slice::<Value>(&body) else {
+        tracing::warn!(
+            model = %model_name,
+            "cached response body did not parse; refusing to serve it unchecked",
+        );
+        return Err(
+            ProxyError::ContentFiltered(crate::error::guardrail_block_message("response", None))
+                .into(),
+        );
+    };
+    let synth = aisix_gateway::ChatResponse {
+        id: String::new(),
+        model: model_name.to_string(),
+        message: aisix_gateway::ChatMessage::assistant(anthropic_response_text(&json_body)),
+        finish_reason: aisix_gateway::FinishReason::Stop,
+        usage: aisix_gateway::UsageStats::new(0, 0),
+    };
+    let (verdict, hits) =
+        aisix_guardrails::Guardrail::check_output_non_segment_observed(chain, &synth).await;
+    monitor_hits_out.extend(hits);
+    let moderation = crate::redact::moderate_anthropic_response(
+        chain,
+        verdict,
+        &mut json_body,
+        redactions_out,
+        monitor_hits_out,
+    )
+    .await;
+    if let aisix_guardrails::GuardrailVerdict::Block {
+        reason,
+        guardrail_name,
+    } = moderation.verdict
+    {
+        tracing::warn!(
+            guardrail_hook = "output",
+            model = %model_name,
+            reason = %reason,
+            "guardrail blocked a cached /v1/messages response",
+        );
+        return Err(
+            ProxyError::ContentFiltered(crate::error::guardrail_block_message(
+                "response",
+                guardrail_name.as_deref(),
+            ))
+            .into(),
+        );
+    }
+    let redaction = crate::redact::redact_anthropic_response(chain, &mut json_body);
+    if redaction.unrewritable_tool_key {
+        return Err(
+            ProxyError::ContentFiltered(crate::error::guardrail_block_message("response", None))
+                .into(),
+        );
+    }
+    crate::redact::merge_counts(redactions_out, redaction.counts);
+    Ok(serde_json::to_vec(&json_body).unwrap_or(body))
 }
 
 /// One counter out of an Anthropic `usage.server_tool_use` block.

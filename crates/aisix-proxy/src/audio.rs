@@ -759,6 +759,8 @@ async fn multipart_dispatch(
         auth,
         client_ctx,
         crate::routing::GroupEntry {
+            // Non-streaming: `Ok` means the upstream answered in full.
+            defer_outcome: false,
             endpoint: retry_endpoint_label,
             name: &model_name,
             id: &model_entry.id,
@@ -1257,6 +1259,8 @@ async fn speech_dispatch(
         auth,
         client_ctx,
         crate::routing::GroupEntry {
+            // Non-streaming: `Ok` means the upstream answered in full.
+            defer_outcome: false,
             endpoint: "/v1/audio/speech",
             name: &model_name,
             id: &model_entry.id,

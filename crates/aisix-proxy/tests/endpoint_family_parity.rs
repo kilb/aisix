@@ -77,6 +77,66 @@ fn every_model_dispatch_handler_carries_the_shared_mechanisms() {
     );
 }
 
+/// A cache HIT is client-visible output, so it must run the output chain
+/// before being returned — the contract #448 established for
+/// `/v1/chat/completions`.
+///
+/// This is a CONDITIONAL rule, unlike the ones above, and that is the point.
+/// The bug it guards is not "an endpoint forgot a mechanism every endpoint
+/// needs"; it is "an endpoint grew a cache and did not carry the obligation
+/// that comes with one". When caching was extended to `/v1/messages` and
+/// `/v1/responses`, both hit paths returned the stored bytes verbatim,
+/// re-introducing exactly the bypass #448 had fixed — and nothing failed,
+/// because the contract lived only in chat's own e2e.
+///
+/// The stored body is moderated under the policy in force when it is
+/// WRITTEN, so the hole is a policy TIGHTENED afterwards: until the entry's
+/// TTL expires (schema max seven days) the gateway keeps serving content the
+/// operator has since forbidden.
+#[test]
+fn a_handler_that_caches_also_guards_its_cache_hits() {
+    // Markers for "this handler reads from a cache" and "this handler runs
+    // the output chain over what it read".
+    const READS_A_CACHE: &[&str] = &["resolve_cache_hit", "gate.lookup()"];
+    const GUARDS_THE_HIT: &[&str] = &[
+        // chat moderates the typed response in place;
+        "check_output_non_segment_observed(&cached)",
+        // the byte-bodied endpoints route it through a shared helper.
+        "guard_cached_response",
+    ];
+
+    let dir = handlers_dir();
+    let mut unguarded: Vec<String> = Vec::new();
+
+    for handler in MODEL_DISPATCH_HANDLERS {
+        let src = std::fs::read_to_string(dir.join(handler)).expect("handler is readable");
+        let caches = READS_A_CACHE.iter().any(|m| src.contains(m));
+        if !caches {
+            continue;
+        }
+        // `/v1/embeddings` is the documented exception: its response is a
+        // vector, not text, so there is no output hook to run. It is listed
+        // by name rather than inferred, so a future text-bearing endpoint
+        // cannot inherit the exemption by accident.
+        if *handler == "embeddings.rs" {
+            continue;
+        }
+        if !GUARDS_THE_HIT.iter().any(|m| src.contains(m)) {
+            unguarded.push(format!("  {handler}"));
+        }
+    }
+
+    assert!(
+        unguarded.is_empty(),
+        "these handlers serve responses from a cache without running the \
+         output chain over what they serve:\n{}\n\nA response stored before \
+         a guardrail existed — or before one was tightened — is replayed \
+         past it for the whole TTL. Run the output chain on the hit, as \
+         `/v1/chat/completions` does (#448).",
+        unguarded.join("\n"),
+    );
+}
+
 /// The list itself rots: a handler deleted or renamed must not leave the guard
 /// silently checking nothing.
 #[test]

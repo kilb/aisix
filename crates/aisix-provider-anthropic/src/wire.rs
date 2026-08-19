@@ -183,9 +183,9 @@ impl<'a> AnthropicMessage<'a> {
     /// prior tool calls before sending the matching tool results; without
     /// translating `tool_calls` here the following `tool_result` would
     /// reference a `tool_use` the upstream never saw and 400. When the
-    /// caller sent typed content blocks, they map through
-    /// [`anthropic_content_blocks`] (preserving `cache_control` markers
-    /// and carrying media parts) instead of the flattened text. Empty content with no tool calls degrades to an
+    /// caller sent typed content blocks, their TEXT blocks map 1:1
+    /// (preserving `cache_control` markers) instead of the flattened text —
+    /// media parts are not carried on this role, see the note below. Empty content with no tool calls degrades to an
     /// empty text block so the message isn't dropped (Anthropic rejects
     /// an empty `content` array).
     pub(crate) fn assistant(
@@ -193,8 +193,13 @@ impl<'a> AnthropicMessage<'a> {
         blocks: Option<&[serde_json::Value]>,
         tool_calls: Option<&[serde_json::Value]>,
     ) -> Self {
+        // Text only, deliberately: an Anthropic assistant turn carries what
+        // the model produced (text / tool_use / thinking), and `image` is not
+        // among those shapes. Mapping a media part into one — as the user
+        // turn does — would turn a replay that previously worked into an
+        // upstream 400.
         let mut content: Vec<serde_json::Value> = match blocks {
-            Some(blocks) => anthropic_content_blocks(blocks),
+            Some(blocks) => anthropic_text_blocks(blocks),
             None => Vec::new(),
         };
         if content.is_empty() && !text.is_empty() {

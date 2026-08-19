@@ -444,6 +444,13 @@ where
 /// The caller-addressed model entry a group dispatch starts from.
 pub(crate) struct GroupEntry<'a> {
     pub endpoint: &'static str,
+    /// Set by an endpoint whose `Ok` means "the stream is PREPARED", not
+    /// "the request succeeded" — streaming completions. The winning attempt
+    /// is then staged rather than recorded: booking a deployment success at
+    /// prepare time counts a stream that may still die, and nothing
+    /// afterwards corrects it. The caller finishes it through
+    /// [`GroupOutcome::deferred`] once the terminal outcome is known.
+    pub defer_outcome: bool,
     /// Name the caller asked for — a wildcard alias resolves to its row's
     /// `display_name` before reaching here, matching every other
     /// model-keyed gate.
@@ -486,6 +493,11 @@ pub(crate) struct GroupOutcome<T> {
     /// for a direct dispatch, where the entry's layers were already
     /// reserved pre-dispatch.
     pub member_reservation: Option<aisix_ratelimit::MultiReservation>,
+    /// Present when the entry asked to defer the outcome: call
+    /// [`crate::attempt::DeferredAttempt::finish`] on it once the stream's
+    /// real terminal status is known, or the winning attempt never reaches
+    /// the deployment counters at all.
+    pub deferred: Option<crate::attempt::DeferredAttempt>,
 }
 
 /// Which target served a request and what the walk cost — the routing
@@ -720,25 +732,37 @@ where
                 Ok(value) => {
                     let latency_ms = crate::attempt::ms_since(started);
                     state.runtime_status.record_latency(&target.id, latency_ms);
-                    telemetry.record(
-                        state,
-                        crate::attempt::AttemptRecord {
-                            index: idx,
-                            kind,
-                            target_model: target_model.clone(),
-                            target_model_id: target.id.clone(),
-                            provider_key_id: pk_id.clone(),
-                            status: 200,
-                            success: true,
-                            error_class: String::new(),
-                            error_message: String::new(),
-                            latency_ms,
-                            dispatched: true,
-                        },
-                    );
-                    // Recovery signal for the target that answered.
-                    state.health.record_success(&target.model.display_name);
-                    state.runtime_status.mark_healthy(&target.id);
+                    let record = crate::attempt::AttemptRecord {
+                        index: idx,
+                        kind,
+                        target_model: target_model.clone(),
+                        target_model_id: target.id.clone(),
+                        provider_key_id: pk_id.clone(),
+                        status: 200,
+                        success: true,
+                        error_class: String::new(),
+                        error_message: String::new(),
+                        latency_ms,
+                        dispatched: true,
+                    };
+                    let deferred = if entry.defer_outcome {
+                        // `Ok` here only means the stream opened. Stage the
+                        // attempt and let the caller finish it from the
+                        // terminal event, so a stream that dies is not
+                        // already counted as a success.
+                        telemetry.stage(record);
+                        let handle = crate::attempt::DeferredAttempt::default();
+                        handle.install(&telemetry, idx);
+                        Some(handle)
+                    } else {
+                        telemetry.record(state, record);
+                        // Recovery signal for the target that answered. Held
+                        // back on the deferred path for the same reason the
+                        // metric is: the answer is not in yet.
+                        state.health.record_success(&target.model.display_name);
+                        state.runtime_status.mark_healthy(&target.id);
+                        None
+                    };
                     return Ok(GroupOutcome {
                         value,
                         target_id: target.id.clone(),
@@ -749,6 +773,7 @@ where
                         attempt_count,
                         fallback_count,
                         member_reservation: member.take(),
+                        deferred,
                     });
                 }
                 Err(e) => {

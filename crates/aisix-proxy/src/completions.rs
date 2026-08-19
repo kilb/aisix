@@ -504,6 +504,9 @@ async fn dispatch(
     crate::dispatch::require_dispatchable_entry(&model_entry.value)?;
     let is_stream = body.get("stream").and_then(Value::as_bool) == Some(true);
     let group_entry = crate::routing::GroupEntry {
+        // A streamed dispatch returns `Ok` when the stream OPENS, so its
+        // outcome is settled from the terminal event instead.
+        defer_outcome: is_stream,
         endpoint: "/v1/completions",
         name: model_name,
         id: &model_entry.id,
@@ -713,6 +716,7 @@ async fn dispatch(
         if let Some(member) = outcome.member_reservation {
             reservation.merge(member);
         }
+        let deferred = outcome.deferred;
         let (prepared, facts) = outcome.value;
         let provider_label = facts.provider;
         let provider_key_id = facts.provider_key_id;
@@ -720,6 +724,15 @@ async fn dispatch(
 
         match prepared {
             PreparedCompletionStream::Buffered(mut buffer) => {
+                // The whole stream was consumed inside the walk and reached
+                // its end, so the staged attempt settles as the success it
+                // is — and the target earns its recovery signal here rather
+                // than at prepare time.
+                if let Some(deferred) = &deferred {
+                    deferred.finish(state, 200, true);
+                }
+                state.health.record_success(&model.display_name);
+                state.runtime_status.mark_healthy(&model_entry_id);
                 let mut accumulator = CompletionSseAccumulator::with_security_cap(buffer.len());
                 accumulator.push(&buffer);
                 accumulator.finish();
@@ -847,6 +860,16 @@ async fn dispatch(
                 accumulator,
                 output_text,
             } => {
+                // The UPSTREAM delivered fine — the gateway's own fail-closed
+                // buffer cap is what withheld the answer. The deployment
+                // counters read as upstream health, so this settles as the
+                // success it was for the provider; the block is carried by
+                // `guardrail_blocked` on the event instead.
+                if let Some(deferred) = &deferred {
+                    deferred.finish(state, 200, true);
+                }
+                state.health.record_success(&model.display_name);
+                state.runtime_status.mark_healthy(&model_entry_id);
                 let usage = completion_usage_with_estimates(
                     accumulator.usage.unwrap_or_default(),
                     &upstream_model,
@@ -895,10 +918,10 @@ async fn dispatch(
                     )
                     .await;
                 let error_class = error.error_type().to_string();
-                // A stream that died after generating output came back as
-                // an answer, so the walker marked the target healthy. It
-                // was not: record the failure against the row that served
-                // and let its cooldown rules see it.
+                // A stream that died after generating output came back from
+                // the walk as an answer. It was not one: settle the staged
+                // attempt as the failure it is, and record it against the
+                // row that served so its cooldown rules see it.
                 let error = note_completion_failure(
                     &state.health,
                     &state.runtime_status,
@@ -907,7 +930,11 @@ async fn dispatch(
                     model.cooldown.as_ref(),
                     error,
                 );
-                let response = ProxyError::Bridge(error).into_response();
+                let failed = ProxyError::Bridge(error);
+                if let Some(deferred) = &deferred {
+                    deferred.finish(state, failed.status().as_u16(), false);
+                }
+                let response = failed.into_response();
                 return Ok(CompletionDispatchSuccess {
                     response,
                     provider: provider_label,
@@ -942,6 +969,10 @@ async fn dispatch(
                 let provider_for_stream = provider_label.clone();
                 let provider_key_id_for_stream = provider_key_id.clone();
                 let routing_for_stream = routing.clone();
+                // Settles the staged winning attempt once the stream's real
+                // terminal status is known — without this the attempt never
+                // reaches the deployment counters at all.
+                let deferred_for_stream = deferred.clone();
                 let upstream_model_for_stream = upstream_model.clone();
                 let prompt = body.get("prompt").cloned();
                 let client = client_ctx.clone();
@@ -1000,6 +1031,13 @@ async fn dispatch(
                                 (crate::CLIENT_CLOSED_REQUEST, "")
                             }
                         };
+                        if let Some(deferred) = &deferred_for_stream {
+                            deferred.finish(
+                                &state_for_stream,
+                                terminal_status,
+                                terminal_status < 400,
+                            );
+                        }
                         let output_text = accumulator.output_text();
                         let usage = completion_usage_with_estimates(
                             accumulator.usage.unwrap_or_default(),

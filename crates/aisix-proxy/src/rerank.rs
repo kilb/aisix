@@ -396,6 +396,8 @@ async fn dispatch(
         auth,
         client_ctx,
         crate::routing::GroupEntry {
+            // Non-streaming: `Ok` means the upstream answered in full.
+            defer_outcome: false,
             endpoint: "/v1/rerank",
             name: &model_name,
             id: &model_entry.id,

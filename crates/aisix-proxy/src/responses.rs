@@ -108,6 +108,80 @@ struct ResponseDispatchSuccess {
 
 /// Dispatch error carrying the per-attempt telemetry accumulated before
 /// the request ultimately failed (#655). Mirrors `chat::DispatchFailure`.
+/// Run the output chain over a cached `/v1/responses` body, returning the
+/// bytes to serve.
+///
+/// The same steps the fresh non-streaming response takes — synthesize the
+/// output text, check the non-segment verdict, moderate, block, then apply
+/// PII masking — so a hit and a miss are governed identically. A no-op (and
+/// no re-serialisation) when no output guardrail is attached, which is the
+/// common deployment.
+async fn guard_cached_response(
+    chain: &aisix_guardrails::GuardrailChain,
+    model_name: &str,
+    model: &aisix_core::Model,
+    body: Vec<u8>,
+) -> Result<Vec<u8>, ResponsesDispatchError> {
+    if !aisix_guardrails::Guardrail::runs_on_output(chain) {
+        return Ok(body);
+    }
+    // A stored body that no longer parses cannot be moderated, so it is not
+    // served: failing closed on an unreadable cache entry is the only safe
+    // reading when the alternative is relaying it unchecked.
+    let Ok(mut json_body) = serde_json::from_slice::<Value>(&body) else {
+        tracing::warn!(
+            model = %model_name,
+            "cached response body did not parse; refusing to serve it unchecked",
+        );
+        return Err(
+            ProxyError::ContentFiltered(crate::error::guardrail_block_message("response", None))
+                .into(),
+        );
+    };
+    let upstream_model = model.upstream_model().unwrap_or("unknown").to_string();
+    let synth = synth_chat_response(&upstream_model, responses_output_text(&json_body));
+    let (verdict, hits) =
+        aisix_guardrails::Guardrail::check_output_non_segment_observed(chain, &synth).await;
+    let _ = hits;
+    let mut counts = crate::redact::RedactionCounts::new();
+    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    let moderation = crate::redact::moderate_responses_response_structured(
+        chain,
+        verdict,
+        &mut json_body,
+        &mut counts,
+        &mut monitor_hits,
+    )
+    .await;
+    let mut verdict = moderation.verdict;
+    if !verdict.is_block() {
+        let redaction = crate::redact::redact_responses_response_structured(chain, &mut json_body);
+        if redaction.unrewritable_tool_key {
+            verdict = crate::redact::unrewritable_tool_key_verdict();
+        }
+    }
+    if let aisix_guardrails::GuardrailVerdict::Block {
+        reason,
+        guardrail_name,
+    } = verdict
+    {
+        tracing::warn!(
+            guardrail_hook = "output",
+            model = %model_name,
+            reason = %reason,
+            "guardrail blocked a cached /v1/responses response",
+        );
+        return Err(
+            ProxyError::ContentFiltered(crate::error::guardrail_block_message(
+                "response",
+                guardrail_name.as_deref(),
+            ))
+            .into(),
+        );
+    }
+    Ok(serde_json::to_vec(&json_body).unwrap_or(body))
+}
+
 /// Write path of the `/v1/responses` cache gate — the same shape
 /// `/v1/messages` uses. See `messages::store_in_cache` for why the body is
 /// buffered only when a policy matched and why non-200s are not stored.
@@ -752,12 +826,52 @@ async fn dispatch(
     };
     if let Some(gate) = cache_gate.as_ref() {
         if let Some(hit) = gate.lookup().await {
+            // The request as the caller sent it (post-redaction), for the
+            // capture below — taken before anything downstream rewrites it.
+            let body_for_capture = body.to_string();
             if let Some(r) = reservation.take() {
                 r.commit_tokens(0).await;
             }
-            gate.record(state, crate::chat::CacheStatus::Hit);
             let cache = crate::response_cache::CacheTelemetry::hit(&hit);
-            let mut response = Response::new(axum::body::Body::from(hit.body));
+            // #448: a cache hit is client-visible output just like a fresh
+            // upstream response, so it runs the output chain before being
+            // returned rather than bypassing it. The stored body was already
+            // moderated under the policy in force when it was written — this
+            // covers the case that matters, a policy TIGHTENED afterwards,
+            // which would otherwise keep serving now-forbidden content for
+            // the whole TTL.
+            let body = guard_cached_response(
+                resolved_chain.as_ref(),
+                &model_name,
+                &model_entry.value,
+                hit.body,
+            )
+            .await?;
+            // A hit served content to the caller, so it is logged like a
+            // fresh response — otherwise a content-capturing exporter's
+            // audit trail simply omits every cached answer. Gated on an
+            // exporter actually wanting content, so the common path pays no
+            // parse.
+            let captured_content = content_capture_cap(
+                snapshot
+                    .observability_exporters
+                    .entries()
+                    .iter()
+                    .map(|e| &*e.value),
+            )
+            .map(|cap| {
+                let text = serde_json::from_slice::<Value>(&body)
+                    .map(|v| responses_output_text(&v))
+                    .unwrap_or_default();
+                CapturedContent::new(&body_for_capture, &text, cap as usize)
+            });
+            // Recorded only once the hit actually reaches the caller —
+            // a hit the output chain blocks is not one the cache served,
+            // and `/v1/chat/completions` counts it the same way. An
+            // endpoint that counted it differently would make the family's
+            // totals mean different things per endpoint.
+            gate.record(state, crate::chat::CacheStatus::Hit);
+            let mut response = Response::new(axum::body::Body::from(body));
             if let Ok(ct) = axum::http::HeaderValue::from_str(&hit.content_type) {
                 response
                     .headers_mut()
@@ -791,7 +905,7 @@ async fn dispatch(
                 routing: RoutingTelemetry::default(),
                 guardrail_blocked: false,
                 usage_handled_by_stream: false,
-                captured_content: None,
+                captured_content,
                 output_redactions: crate::redact::RedactionCounts::new(),
                 output_monitor_hits: Vec::new(),
                 terminal_failure: None,
