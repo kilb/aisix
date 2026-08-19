@@ -199,12 +199,20 @@ impl BodyCache {
         }
     }
 
-    /// Record the request's outcome on `aisix_cache_events_total`, the same
-    /// series the chat gate feeds, so one dashboard covers every endpoint.
+    /// Record the request's outcome on `aisix_cache_requests_total`, the
+    /// same series the chat gate feeds, so one dashboard covers every
+    /// endpoint.
+    ///
+    /// The label comes from [`CacheStatus::metric_outcome`], never from
+    /// `as_str()`: that is the cp-api wire value, and feeding it here
+    /// emitted `outcome="hit"` where chat emits `hit_exact` — one series,
+    /// two vocabularies, so a dashboard covered chat and silently showed
+    /// nothing for these endpoints.
     pub(crate) fn record(&self, state: &ProxyState, status: CacheStatus) {
-        state
-            .metrics
-            .record_cache_event(&self.policy_name, status.as_str());
+        // These endpoints run the exact layer only; `None` says so.
+        if let Some(outcome) = status.metric_outcome(None) {
+            state.metrics.record_cache_event(&self.policy_name, outcome);
+        }
     }
 }
 

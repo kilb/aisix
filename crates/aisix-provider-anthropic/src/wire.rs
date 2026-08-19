@@ -163,8 +163,15 @@ impl<'a> AnthropicMessage<'a> {
     /// concatenated-text path would silently strip them (AISIX-Cloud#1110
     /// Gap A). Image parts map to Anthropic `image` / `document` blocks in
     /// their original position; see [`anthropic_content_blocks`].
-    /// Degrades to a single empty text block when nothing survives,
-    /// because Anthropic rejects an empty `content` array.
+    /// Degrades to a single empty text block when nothing survives, so the
+    /// turn is not dropped from the conversation. An empty `content` array
+    /// is the shape being avoided; Anthropic's reference documents no
+    /// minimum length for either `content` or a text block's `text`, so
+    /// this is a conservative choice rather than a documented requirement.
+    /// The one empty-text rule that IS documented — `cache_control` cannot
+    /// be set on such a block — is handled by [`is_empty_text_block`],
+    /// which the breakpoint injector consults so this degrade never
+    /// acquires a marker upstream would reject.
     pub(crate) fn from_blocks(role: &'a str, blocks: &[serde_json::Value]) -> Self {
         let mut content = anthropic_content_blocks(blocks);
         if content.is_empty() {
@@ -185,9 +192,11 @@ impl<'a> AnthropicMessage<'a> {
     /// reference a `tool_use` the upstream never saw and 400. When the
     /// caller sent typed content blocks, their TEXT blocks map 1:1
     /// (preserving `cache_control` markers) instead of the flattened text —
-    /// media parts are not carried on this role, see the note below. Empty content with no tool calls degrades to an
-    /// empty text block so the message isn't dropped (Anthropic rejects
-    /// an empty `content` array).
+    /// media parts are not carried on this role, see the note below. Empty
+    /// content with no tool calls degrades to an empty text block so the
+    /// message isn't dropped — the same conservative degrade
+    /// [`AnthropicMessage::from_blocks`] applies, and with the same caveat
+    /// about what upstream actually documents.
     pub(crate) fn assistant(
         text: &str,
         blocks: Option<&[serde_json::Value]>,
@@ -230,9 +239,11 @@ impl<'a> AnthropicMessage<'a> {
 ///   what the flattened-text path always guaranteed: stray caller
 ///   metadata (e.g. an OpenAI streaming `index` replayed from assembled
 ///   history) 400s at Anthropic's strict request validator, and
-///   degenerate blocks (missing or whitespace-only `text`) are rejected
-///   per-block upstream — both previously vanished in the flatten, so
-///   forwarding them would break requests that worked before.
+///   degenerate blocks (missing or whitespace-only `text`) carry nothing
+///   worth forwarding. Both previously vanished in the flatten, so
+///   forwarding them now would change requests that already worked —
+///   that, not a documented upstream rejection, is why they are dropped:
+///   the reference states no minimum length for a text block's `text`.
 ///
 /// Non-text blocks are dropped HERE because both callers are roles that
 /// Anthropic defines without media: the top-level `system` field, which is

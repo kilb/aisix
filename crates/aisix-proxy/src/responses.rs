@@ -849,6 +849,11 @@ async fn dispatch(
                 r.commit_tokens(0).await;
             }
             let cache = crate::response_cache::CacheTelemetry::hit(&hit);
+            // Counted at the gate's decision, before the output chain runs:
+            // a hit the chain BLOCKS reached an enabled policy and must land
+            // somewhere on the series, or cache events stop summing to gated
+            // requests. `/v1/chat/completions` counts it at the same point.
+            gate.record(state, crate::chat::CacheStatus::Hit);
             // #448: a cache hit is client-visible output just like a fresh
             // upstream response, so it runs the output chain before being
             // returned rather than bypassing it. The stored body was already
@@ -856,11 +861,12 @@ async fn dispatch(
             // covers the case that matters, a policy TIGHTENED afterwards,
             // which would otherwise keep serving now-forbidden content for
             // the whole TTL.
-            // Accumulated into the dispatch's out-params, not locals: a
-            // guardrail that BLOCKS the hit still made observations, and the
-            // `?` below would drop locals on the floor — the monitor-mode
-            // record of why the replay was withheld is exactly the row an
-            // operator goes looking for.
+            //
+            // Its counts accumulate into the dispatch's out-params, not
+            // locals: a guardrail that BLOCKS the hit still made
+            // observations, and the `?` below would drop locals on the
+            // floor — the monitor-mode record of why the replay was
+            // withheld is exactly the row an operator goes looking for.
             let guarded = guard_cached_response(
                 resolved_chain.as_ref(),
                 &model_name,
@@ -898,12 +904,6 @@ async fn dispatch(
                 // pays nothing.
                 CapturedContent::new(&body.to_string(), &text, cap as usize)
             });
-            // Recorded only once the hit actually reaches the caller —
-            // a hit the output chain blocks is not one the cache served,
-            // and `/v1/chat/completions` counts it the same way. An
-            // endpoint that counted it differently would make the family's
-            // totals mean different things per endpoint.
-            gate.record(state, crate::chat::CacheStatus::Hit);
             let mut response = Response::new(axum::body::Body::from(served));
             if let Ok(ct) = axum::http::HeaderValue::from_str(&hit.content_type) {
                 response

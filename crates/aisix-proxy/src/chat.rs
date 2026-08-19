@@ -765,6 +765,31 @@ impl CacheStatus {
             CacheStatus::Bypass => "bypass",
         }
     }
+
+    /// Label for `aisix_cache_requests_total{outcome}`, whose documented
+    /// value set is `hit_exact` / `hit_semantic` / `miss` / `bypass`.
+    ///
+    /// Deliberately NOT [`Self::as_str`]. That is the `cache_status` value
+    /// shipped to cp-api, where a hit is plain `hit`; feeding it to the
+    /// metric instead emitted an `outcome="hit"` that is not in the series'
+    /// value set, so every dashboard written against the documented labels
+    /// (`outcome=~"hit_.*"`) reported zero hits for the byte-bodied
+    /// endpoints while chat reported them correctly. Two contracts, two
+    /// mappings — collapsing them is what broke it.
+    ///
+    /// `None` for `Disabled`: the gate never opened, and the series
+    /// documents those as not counted.
+    pub(crate) fn metric_outcome(self, layer: Option<CacheHitLayer>) -> Option<&'static str> {
+        Some(match (self, layer) {
+            (CacheStatus::Hit, Some(CacheHitLayer::Semantic)) => "hit_semantic",
+            // A hit with no layer comes from an endpoint that runs the
+            // exact layer only, so it is an exact hit.
+            (CacheStatus::Hit, _) => "hit_exact",
+            (CacheStatus::Miss, _) => "miss",
+            (CacheStatus::Bypass, _) => "bypass",
+            (CacheStatus::Disabled, _) => return None,
+        })
+    }
 }
 
 /// Which matching layer served a cache hit. Surfaced on the
@@ -2436,6 +2461,23 @@ async fn dispatch(
         match resolved {
             Some((mut cached, hit_layer, hit_similarity)) => {
                 reservation.commit_tokens(0).await;
+                // Counted HERE, at the gate's decision — the same rule the
+                // `None` arm below already states. Recorded after the output
+                // chain instead, a hit the chain BLOCKS increments nothing at
+                // all: not `hit`, not `miss`. The series documents one
+                // increment per request that reached an enabled policy, and
+                // a blocked hit reached one, so it must land somewhere. That
+                // the response was withheld is already carried by the usage
+                // event's `guardrail_blocked`.
+                if let Some(outcome) = CacheStatus::Hit.metric_outcome(Some(hit_layer)) {
+                    state.metrics.record_cache_event(
+                        matched_policy
+                            .as_ref()
+                            .map(|e| e.value.name.as_str())
+                            .unwrap_or_default(),
+                        outcome,
+                    );
+                }
                 // #448: a cache hit is client-visible output just like a
                 // fresh upstream response, so it must run output guardrails
                 // before being returned — not bypass them.
@@ -2570,16 +2612,6 @@ async fn dispatch(
                             cap as usize,
                         )
                     });
-                state.metrics.record_cache_event(
-                    matched_policy
-                        .as_ref()
-                        .map(|e| e.value.name.as_str())
-                        .unwrap_or_default(),
-                    match hit_layer {
-                        CacheHitLayer::Exact => "hit_exact",
-                        CacheHitLayer::Semantic => "hit_semantic",
-                    },
-                );
                 let mut response = Json(render_response(now, cached, &req.model)).into_response();
                 response
                     .headers_mut()
@@ -2648,13 +2680,15 @@ async fn dispatch(
                 // Consulted-but-not-served: count the outcome now
                 // (`miss` or `bypass`) so the metric reflects every gate
                 // decision, including requests that later fail upstream.
-                state.metrics.record_cache_event(
-                    matched_policy
-                        .as_ref()
-                        .map(|e| e.value.name.as_str())
-                        .unwrap_or_default(),
-                    cache_status.as_str(),
-                );
+                if let Some(outcome) = cache_status.metric_outcome(None) {
+                    state.metrics.record_cache_event(
+                        matched_policy
+                            .as_ref()
+                            .map(|e| e.value.name.as_str())
+                            .unwrap_or_default(),
+                        outcome,
+                    );
+                }
             }
         }
     }
