@@ -1542,6 +1542,8 @@ async fn anthropic_passthrough_dispatch(
                     completion_tokens: usage.completion_tokens,
                     cache_creation_tokens: usage.cache_creation_tokens,
                     cache_read_tokens: usage.cache_read_tokens,
+                    web_search_requests: usage.web_search_requests,
+                    web_fetch_requests: usage.web_fetch_requests,
                     usage_estimated: usage.usage_estimated,
                     provider_request_id: usage.provider_request_id,
                     provider_model_version: usage.provider_model_version,
@@ -1911,10 +1913,23 @@ fn anthropic_response_text(body: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// One counter out of an Anthropic `usage.server_tool_use` block.
+///
+/// Absent on any request that declared no server tool, which is the
+/// overwhelming majority — so a missing block is 0, not an error.
+fn server_tool_count(usage: Option<&Value>, field: &str) -> u32 {
+    usage
+        .and_then(|u| u.get("server_tool_use"))
+        .and_then(|s| s.get(field))
+        .and_then(Value::as_u64)
+        .map(crate::usage_attr::token_count)
+        .unwrap_or(0)
+}
+
 /// Pull `usage.input_tokens` / `output_tokens` / `cache_creation_input_tokens`
-/// / `cache_read_input_tokens`, plus `id`, `model`, `stop_reason` from
-/// an Anthropic non-streaming response body. Best-effort: missing
-/// fields land as zero / empty string.
+/// / `cache_read_input_tokens` / `server_tool_use`, plus `id`, `model`,
+/// `stop_reason` from an Anthropic non-streaming response body.
+/// Best-effort: missing fields land as zero / empty string.
 fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
     let usage = body.get("usage");
     AnthropicUsageMetrics {
@@ -1939,6 +1954,10 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
             .and_then(Value::as_u64)
             .map(crate::usage_attr::token_count)
             .unwrap_or(0),
+        // `usage.server_tool_use` — a cost basis of its own, not a token
+        // class, so it is read here and never folded into a token total.
+        web_search_requests: server_tool_count(usage, "web_search_requests"),
+        web_fetch_requests: server_tool_count(usage, "web_fetch_requests"),
         provider_request_id: crate::usage_attr::provider_response_id(body),
         provider_model_version: body
             .get("model")
@@ -2247,6 +2266,8 @@ async fn cross_provider_dispatch(
                     completion_tokens: comp.completion_tokens,
                     cache_creation_tokens: comp.cache_creation_tokens,
                     cache_read_tokens: comp.cache_read_tokens,
+                    web_search_requests: comp.web_search_requests,
+                    web_fetch_requests: comp.web_fetch_requests,
                     usage_estimated: comp.usage_estimated,
                     provider_request_id: comp.provider_request_id,
                     provider_model_version: comp.provider_model_version,
@@ -2427,6 +2448,8 @@ async fn cross_provider_dispatch(
         completion_tokens: resp.usage.completion_tokens,
         cache_creation_tokens: resp.usage.cache_creation_tokens,
         cache_read_tokens: resp.usage.cache_read_tokens,
+        web_search_requests: resp.usage.web_search_requests,
+        web_fetch_requests: resp.usage.web_fetch_requests,
         usage_estimated: false,
         provider_request_id: crate::usage_attr::sanitize_provider_response_id(&resp.id),
         provider_model_version: resp.model.clone(),
@@ -2589,6 +2612,10 @@ fn build_anthropic_sse_stream(
                                 comp.cache_creation_tokens.max(u.cache_creation_tokens);
                             comp.cache_read_tokens =
                                 comp.cache_read_tokens.max(u.cache_read_tokens);
+                            comp.web_search_requests =
+                                comp.web_search_requests.max(u.web_search_requests);
+                            comp.web_fetch_requests =
+                                comp.web_fetch_requests.max(u.web_fetch_requests);
                         }
                         // Token-estimation accumulator (AISIX-Cloud#1074): all
                         // generated output, always on (whether the fallback is
@@ -3064,6 +3091,10 @@ struct AnthropicStreamCompletion {
     completion_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// Server tools the provider ran, carried on the same terminal chunk
+    /// as the final token counts.
+    web_search_requests: u32,
+    web_fetch_requests: u32,
     /// True when the Drop guard filled any token counter from the local
     /// estimator (AISIX-Cloud#1074).
     usage_estimated: bool,
@@ -3265,6 +3296,10 @@ struct AnthropicUsageMetrics {
     completion_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// Server tools the provider ran. Billed per search on top of tokens
+    /// for web search; free but worth recording for web fetch.
+    web_search_requests: u32,
+    web_fetch_requests: u32,
     /// True when any token counter was filled by the local estimator
     /// because the upstream reported no usage (AISIX-Cloud#1074).
     usage_estimated: bool,
@@ -3341,6 +3376,11 @@ fn emit_anthropic_usage_event(
         requested_model: model.to_string(),
         prompt_tokens: metrics.prompt_tokens,
         completion_tokens: metrics.completion_tokens,
+        // A cost basis of its own: the provider bills per search on top of
+        // tokens, so an event without this understates what the request
+        // actually cost.
+        web_search_requests: metrics.web_search_requests,
+        web_fetch_requests: metrics.web_fetch_requests,
         cache_status: cache.status.as_str().to_string(),
         cache_hit_layer: cache.layer(),
         cache_hit_saved_input_tokens: cache.saved_input_tokens,
@@ -3509,6 +3549,10 @@ struct AnthropicStreamUsage {
     completion_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// Server tools the provider ran, read off the same terminal
+    /// `message_delta` that carries the final token counts.
+    web_search_requests: u32,
+    web_fetch_requests: u32,
     /// True once a `message_delta` carried a numeric `output_tokens`.
     /// Without it, `completion_tokens` holds only the `message_start`
     /// placeholder floor (often 1) — the token-estimation fallback
@@ -3706,6 +3750,16 @@ fn update_anthropic_usage(
                 }
                 if let Some(t) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
                     acc.cache_read_tokens = acc.cache_read_tokens.max(t as u32);
+                }
+                // Cumulative for the turn, same as the counters above, so a
+                // later frame's figure supersedes an earlier one.
+                if let Some(stu) = usage.get("server_tool_use") {
+                    if let Some(n) = stu.get("web_search_requests").and_then(Value::as_u64) {
+                        acc.web_search_requests = acc.web_search_requests.max(n as u32);
+                    }
+                    if let Some(n) = stu.get("web_fetch_requests").and_then(Value::as_u64) {
+                        acc.web_fetch_requests = acc.web_fetch_requests.max(n as u32);
+                    }
                 }
             }
             if let Some(sr) = json

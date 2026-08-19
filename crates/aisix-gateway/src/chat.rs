@@ -327,6 +327,16 @@ pub struct UsageStats {
     /// counter on top of input_tokens.
     #[serde(default)]
     pub cache_read_tokens: u32,
+    /// Provider-run web searches (`usage.server_tool_use.web_search_requests`).
+    /// Billed PER SEARCH on top of tokens, so a request can cost money no
+    /// token counter accounts for.
+    #[serde(default)]
+    pub web_search_requests: u32,
+    /// Provider-run web fetches (`usage.server_tool_use.web_fetch_requests`).
+    /// Carries no additional charge, but records that the model reached out
+    /// to a URL.
+    #[serde(default)]
+    pub web_fetch_requests: u32,
     /// DeepSeek-native `prompt_cache_hit_tokens`, preserved verbatim
     /// for client passthrough (#542). The canonical `cached_prompt_tokens`
     /// above carries the *normalized* (OpenAI-shape) cache-hit count for
@@ -406,6 +416,14 @@ impl UsageStats {
             cache_read_tokens: self
                 .cache_read_tokens
                 .saturating_add(other.cache_read_tokens),
+            // Ensemble/panel merges: each sub-call's searches are its own
+            // billable events, so they sum rather than max.
+            web_search_requests: self
+                .web_search_requests
+                .saturating_add(other.web_search_requests),
+            web_fetch_requests: self
+                .web_fetch_requests
+                .saturating_add(other.web_fetch_requests),
             prompt_cache_hit_tokens: add_opt(
                 self.prompt_cache_hit_tokens,
                 other.prompt_cache_hit_tokens,
@@ -791,6 +809,8 @@ mod tests {
             reasoning_tokens: 3,
             cache_creation_tokens: 1,
             cache_read_tokens: 4,
+            web_search_requests: 2,
+            web_fetch_requests: 1,
             prompt_cache_hit_tokens: Some(2),
             prompt_cache_miss_tokens: None,
         };
@@ -802,6 +822,8 @@ mod tests {
             reasoning_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 6,
+            web_search_requests: 3,
+            web_fetch_requests: 0,
             prompt_cache_hit_tokens: None,
             prompt_cache_miss_tokens: Some(8),
         };
@@ -810,6 +832,10 @@ mod tests {
         assert_eq!(sum.completion_tokens, 12);
         assert_eq!(sum.total_tokens, 42);
         assert_eq!(sum.cached_prompt_tokens, 3);
+        // Each sub-call's searches are its own billable events, so an
+        // ensemble's aggregate sums them rather than taking a maximum.
+        assert_eq!(sum.web_search_requests, 5);
+        assert_eq!(sum.web_fetch_requests, 1);
         assert_eq!(sum.reasoning_tokens, 3);
         assert_eq!(sum.cache_creation_tokens, 1);
         assert_eq!(sum.cache_read_tokens, 10);

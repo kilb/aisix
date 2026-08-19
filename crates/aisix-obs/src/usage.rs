@@ -123,6 +123,34 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub audio_duration_seconds: f64,
 
+    /// Web searches the PROVIDER ran server-side for this request
+    /// (Anthropic `usage.server_tool_use.web_search_requests`).
+    ///
+    /// A cost basis of its own, not a token class: the provider bills per
+    /// search on top of tokens, so a request carrying searches costs more
+    /// than any token counter here accounts for. Same shape as
+    /// `audio_duration_seconds` — the DP reports the quantity and cp-api
+    /// multiplies it by the rate. Deliberately NOT folded into
+    /// `total_tokens`, which would both inflate the token figure and hide
+    /// the charge.
+    ///
+    /// 0 elsewhere and omitted from the wire, so token-only events are
+    /// unchanged; cp-api's `/dp/telemetry` binds JSON leniently, so older
+    /// CP images ignore the unknown field.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub web_search_requests: u32,
+
+    /// Web fetches the provider ran server-side
+    /// (`usage.server_tool_use.web_fetch_requests`).
+    ///
+    /// Carries no additional charge — the fetched content bills as ordinary
+    /// input tokens. Recorded anyway because it says the model reached out
+    /// to a URL, which is the signal an operator wants when the tool's own
+    /// documentation calls it a data-exfiltration vector. Same wire
+    /// treatment as the counter above.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub web_fetch_requests: u32,
+
     /// How long THIS attempt spent on the upstream, in milliseconds:
     /// from the moment the attempt began to the moment it settled —
     /// end-of-stream for a streamed attempt, not first-chunk.

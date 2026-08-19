@@ -1059,11 +1059,34 @@ pub enum AnthropicResponseBlock {
 // `#[serde(default)]` at the container level so a response missing any
 // token counter deserializes to 0 rather than failing the whole body
 // decode (same bug class as OpenAI usage, #474).
+
+/// Server-side tool invocations the provider ran and reports separately
+/// from tokens, per
+/// <https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool>
+/// and its web-fetch sibling.
+///
+/// Both counters are recorded, though only one costs money: web search is
+/// billed per search on top of tokens, while web fetch carries no
+/// additional charge. The free one is still worth carrying — it says the
+/// model reached out to a URL, which is the signal an operator wants when
+/// the tool's own documentation calls it an exfiltration vector.
+#[derive(Debug, Default, Deserialize)]
+pub struct AnthropicServerToolUse {
+    #[serde(default)]
+    pub web_search_requests: u32,
+    #[serde(default)]
+    pub web_fetch_requests: u32,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct AnthropicUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Server tools the provider ran for this request. Absent on a
+    /// request that declared none.
+    #[serde(default)]
+    pub server_tool_use: Option<AnthropicServerToolUse>,
     /// Tokens written to the prompt cache (1.25× input rate). Optional
     /// — present only on requests with cache_control segments.
     #[serde(default)]
@@ -1149,12 +1172,21 @@ pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
             // in — `input + output` alone under-counts (#906). Cache
             // counters stay separate; Anthropic doesn't use OpenAI's
             // cached-prompt / reasoning taxonomy (those default to 0).
-            UsageStats::with_cache(
+            let mut usage = UsageStats::with_cache(
                 u.input_tokens,
                 u.output_tokens,
                 u.cache_creation_input_tokens,
                 u.cache_read_input_tokens,
-            )
+            );
+            // Server-tool counters are NOT token classes and deliberately
+            // stay out of `total_tokens`: web search bills per search on
+            // top of tokens, so folding it into a token total would both
+            // inflate the token figure and hide the charge.
+            if let Some(stu) = u.server_tool_use.as_ref() {
+                usage.web_search_requests = stu.web_search_requests;
+                usage.web_fetch_requests = stu.web_fetch_requests;
+            }
+            usage
         })
         .unwrap_or_default();
 
@@ -1322,6 +1354,10 @@ pub struct AnthropicStreamMessageDelta {
 pub struct AnthropicStreamUsage {
     #[serde(default)]
     pub output_tokens: Option<u32>,
+    /// Server-tool counters ride the terminal `message_delta` alongside
+    /// the final token counts.
+    #[serde(default)]
+    pub server_tool_use: Option<AnthropicServerToolUse>,
     /// Cumulative input/cache counts on the terminal `message_delta` —
     /// newer Anthropic wire sends them there too, and for some relay
     /// backends it is the ONLY frame that carries them (AISIX-Cloud#952:
@@ -1422,12 +1458,19 @@ impl StreamState {
                     .map(|r| map_stop_reason(Some(r)));
                 let usage = usage.as_ref().and_then(|u| {
                     u.output_tokens.map(|n| {
-                        UsageStats::with_cache(
+                        let mut stats = UsageStats::with_cache(
                             self.input_tokens,
                             n,
                             self.cache_creation_tokens,
                             self.cache_read_tokens,
-                        )
+                        );
+                        // Server-tool counters ride this terminal frame, the
+                        // same one that carries the final token counts.
+                        if let Some(stu) = u.server_tool_use.as_ref() {
+                            stats.web_search_requests = stu.web_search_requests;
+                            stats.web_fetch_requests = stu.web_fetch_requests;
+                        }
+                        stats
                     })
                 });
                 if finish.is_none() && usage.is_none() {
@@ -2914,6 +2957,52 @@ mod tests {
             serde_json::json!({"type": "ephemeral", "ttl": "1h"})
         );
         assert!(translated[2].get("cache_control").is_none());
+    }
+
+    /// Web search is billed PER SEARCH on top of tokens
+    /// (<https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool>),
+    /// so a response carrying searches costs more than any token counter
+    /// accounts for. Without reading this the spend is invisible.
+    #[test]
+    fn server_tool_counters_are_read_off_a_non_streaming_response() {
+        let raw: AnthropicResponse = serde_json::from_value(serde_json::json!({
+            "id": "msg_1",
+            "model": "claude-opus-5",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 4,
+                "server_tool_use": {"web_search_requests": 3, "web_fetch_requests": 2}
+            }
+        }))
+        .unwrap();
+        let resp = response_into_chat_response(raw);
+        assert_eq!(resp.usage.web_search_requests, 3);
+        assert_eq!(resp.usage.web_fetch_requests, 2);
+        // NOT a token class: folding a per-search charge into a token total
+        // would both inflate the token figure and hide the charge.
+        assert_eq!(
+            resp.usage.total_tokens, 14,
+            "server-tool counts must stay out of the token total",
+        );
+    }
+
+    /// The overwhelming majority of requests declare no server tool, so an
+    /// absent block is zero rather than a parse failure.
+    #[test]
+    fn an_absent_server_tool_block_reads_as_zero() {
+        let raw: AnthropicResponse = serde_json::from_value(serde_json::json!({
+            "id": "msg_1",
+            "model": "claude-opus-5",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 4}
+        }))
+        .unwrap();
+        let resp = response_into_chat_response(raw);
+        assert_eq!(resp.usage.web_search_requests, 0);
+        assert_eq!(resp.usage.web_fetch_requests, 0);
     }
 
     /// A caller that declares an Anthropic server tool is not asking for a

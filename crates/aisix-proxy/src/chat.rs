@@ -263,6 +263,8 @@ pub async fn chat_completions(
                         reasoning_tokens: success.reasoning_tokens,
                         cache_creation_tokens: success.cache_creation_tokens,
                         cache_read_tokens: success.cache_read_tokens,
+                        web_search_requests: success.web_search_requests,
+                        web_fetch_requests: success.web_fetch_requests,
                         usage_estimated: success.usage_estimated,
                         provider_request_id: success.provider_request_id.clone(),
                         provider_model_version: success.provider_model_version.clone(),
@@ -546,6 +548,8 @@ pub async fn chat_completions(
                             reasoning_tokens: c.reasoning_tokens,
                             cache_creation_tokens: c.cache_creation_tokens,
                             cache_read_tokens: c.cache_read_tokens,
+                            web_search_requests: c.web_search_requests,
+                            web_fetch_requests: c.web_fetch_requests,
                             usage_estimated: c.usage_estimated,
                             provider_request_id: c.provider_request_id,
                             provider_model_version: c.provider_model_version,
@@ -648,6 +652,9 @@ struct Success {
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// Server tools the provider ran, billed outside the token counters.
+    web_search_requests: u32,
+    web_fetch_requests: u32,
     /// Provider response `id` (OpenAI chat.completion.id or Anthropic
     /// message id) — empty when the cached path served the request
     /// (re-using a stored response's id would mislead reconciliation).
@@ -1162,6 +1169,10 @@ struct UpstreamCharge {
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// Server tools the provider ran, carried from the upstream charge to
+    /// the emitted event.
+    web_search_requests: u32,
+    web_fetch_requests: u32,
     provider_request_id: String,
     provider_model_version: String,
     finish_reason: String,
@@ -2050,6 +2061,8 @@ async fn dispatch(
                         reasoning_tokens: comp.reasoning_tokens,
                         cache_creation_tokens: comp.cache_creation_tokens,
                         cache_read_tokens: comp.cache_read_tokens,
+                        web_search_requests: comp.web_search_requests,
+                        web_fetch_requests: comp.web_fetch_requests,
                         usage_estimated: comp.usage_estimated,
                         provider_request_id: comp.provider_request_id,
                         provider_model_version: comp.provider_model_version,
@@ -2212,6 +2225,8 @@ async fn dispatch(
             reasoning_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            web_search_requests: 0,
+            web_fetch_requests: 0,
             provider_request_id: String::new(),
             provider_model_version: String::new(),
             provider_key_id: pk_id.clone(),
@@ -2590,6 +2605,10 @@ async fn dispatch(
                     reasoning_tokens,
                     cache_creation_tokens,
                     cache_read_tokens,
+                    // A cache hit never reached a provider, so it ran no
+                    // server tools.
+                    web_search_requests: 0,
+                    web_fetch_requests: 0,
                     // The cache stored the original provider response;
                     // a stable id here would mislead reconciliation
                     // (the request didn't actually hit the upstream),
@@ -3000,6 +3019,8 @@ async fn dispatch(
     let reasoning_tokens = upstream.usage.reasoning_tokens;
     let cache_creation_tokens = upstream.usage.cache_creation_tokens;
     let cache_read_tokens = upstream.usage.cache_read_tokens;
+    let web_search_requests = upstream.usage.web_search_requests;
+    let web_fetch_requests = upstream.usage.web_fetch_requests;
     let provider_request_id = crate::usage_attr::sanitize_provider_response_id(&upstream.id);
     let provider_model_version = upstream.model.clone();
     let finish_reason = finish_reason_label(&upstream.finish_reason);
@@ -3068,6 +3089,8 @@ async fn dispatch(
                 reasoning_tokens,
                 cache_creation_tokens,
                 cache_read_tokens,
+                web_search_requests,
+                web_fetch_requests,
                 provider_request_id: provider_request_id.clone(),
                 provider_model_version: provider_model_version.clone(),
                 finish_reason: finish_reason.clone(),
@@ -3226,6 +3249,8 @@ async fn dispatch(
         reasoning_tokens,
         cache_creation_tokens,
         cache_read_tokens,
+        web_search_requests,
+        web_fetch_requests,
         provider_request_id,
         provider_model_version,
         provider_key_id,
@@ -3885,6 +3910,8 @@ async fn dispatch_ensemble(
             reasoning_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            web_search_requests: 0,
+            web_fetch_requests: 0,
             provider_request_id: String::new(),
             provider_model_version: String::new(),
             provider_key_id: String::new(),
@@ -4150,6 +4177,8 @@ async fn dispatch_ensemble(
         reasoning_tokens: 0,
         cache_creation_tokens: 0,
         cache_read_tokens: 0,
+        web_search_requests: 0,
+        web_fetch_requests: 0,
         provider_request_id: String::new(),
         provider_model_version: String::new(),
         provider_key_id: String::new(),
@@ -4336,6 +4365,11 @@ fn emit_usage_event(
         reasoning_tokens: extras.reasoning_tokens,
         cache_creation_tokens: extras.cache_creation_tokens,
         cache_read_tokens: extras.cache_read_tokens,
+        // A cost basis of its own: the provider bills per search on top of
+        // tokens, so an event without this understates what the request
+        // actually cost.
+        web_search_requests: extras.web_search_requests,
+        web_fetch_requests: extras.web_fetch_requests,
         usage_estimated: extras.usage_estimated,
         upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         downstream_latency_ms: extras.downstream_latency_ms,
@@ -4458,6 +4492,11 @@ struct UsageExtras {
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// Server tools the provider ran, billed outside the token counters.
+    /// Reachable on this endpoint because an Anthropic-shaped tool
+    /// declaration now passes through to an Anthropic upstream.
+    web_search_requests: u32,
+    web_fetch_requests: u32,
     /// True when any token counter was filled by the local estimator
     /// because the upstream reported no usage (AISIX-Cloud#1074). Lands
     /// on `UsageEvent::usage_estimated`.
@@ -4694,6 +4733,10 @@ struct StreamCompletion {
     reasoning_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// Server tools the provider ran, carried on the terminal chunk with
+    /// the final token counts.
+    web_search_requests: u32,
+    web_fetch_requests: u32,
     provider_request_id: String,
     provider_model_version: String,
     finish_reason: String,
@@ -4842,6 +4885,8 @@ fn observe_stream_usage(comp: &mut StreamCompletion, usage: &aisix_gateway::chat
     comp.reasoning_tokens = comp.reasoning_tokens.max(usage.reasoning_tokens);
     comp.cache_creation_tokens = comp.cache_creation_tokens.max(usage.cache_creation_tokens);
     comp.cache_read_tokens = comp.cache_read_tokens.max(usage.cache_read_tokens);
+    comp.web_search_requests = comp.web_search_requests.max(usage.web_search_requests);
+    comp.web_fetch_requests = comp.web_fetch_requests.max(usage.web_fetch_requests);
 }
 
 fn push_to_byte_cap(buffer: &mut String, text: &str, cap: usize) -> bool {

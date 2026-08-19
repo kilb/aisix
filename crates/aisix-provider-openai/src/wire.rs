@@ -351,6 +351,11 @@ fn into_usage(u: OpenAiUsage) -> UsageStats {
         prompt_tokens: u.prompt_tokens,
         completion_tokens: u.completion_tokens,
         total_tokens: u.total_tokens,
+        // Server-tool counters are an Anthropic `usage` concept; OpenAI's
+        // built-in tools bill through their own surface and report nothing
+        // here.
+        web_search_requests: 0,
+        web_fetch_requests: 0,
         // Normalize the cache-hit count into the canonical field for
         // ALL providers (#542): OpenAI nests it under
         // `prompt_tokens_details.cached_tokens`; DeepSeek puts it at the
