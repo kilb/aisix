@@ -132,11 +132,6 @@ pub const M_ROUTING_SUCCESSFUL_FALLBACKS_TOTAL: &str = "aisix_routing_successful
 pub const M_ROUTING_FAILED_FALLBACKS_TOTAL: &str = "aisix_routing_failed_fallbacks_total";
 pub const M_RATELIMIT_REMAINING_REQUESTS: &str = "aisix_ratelimit_remaining_requests";
 pub const M_RATELIMIT_REMAINING_TOKENS: &str = "aisix_ratelimit_remaining_tokens";
-pub const M_BUDGET_LIMIT_USD: &str = "aisix_budget_limit_usd";
-pub const M_BUDGET_SPENT_USD: &str = "aisix_budget_spent_usd";
-pub const M_BUDGET_REMAINING_USD: &str = "aisix_budget_remaining_usd";
-pub const M_BUDGET_RESET_SECONDS: &str = "aisix_budget_reset_seconds";
-pub const M_BUDGET_DETAILS_PRESENT: &str = "aisix_budget_details_present";
 /// Requests admitted under a policy that sets a spend ceiling while the
 /// dispatched model has no configured price, so the request contributes
 /// nothing to the ceiling. Labels: `policy` (the policy's name), `model`
@@ -1876,53 +1871,12 @@ impl Metrics {
         }
     }
 
-    /// Shared cached emit for the budget gauge family.
-    fn cached_budget_gauge(&self, metric: &'static str, labels: BudgetLabels<'_>, value: f64) {
-        self.cached_gauge(
-            metric,
-            value,
-            |k| {
-                k.label(labels.api_key_id);
-                k.label(labels.team_id);
-                k.label(labels.user_id);
-            },
-            || {
-                metrics::gauge!(
-                    metric,
-                    "api_key_id" => labels.api_key_id.to_string(),
-                    "team_id" => labels.team_id.to_string(),
-                    "user_id" => labels.user_id.to_string(),
-                )
-            },
-        );
-    }
-
-    pub fn set_budget_gauges(&self, labels: BudgetLabels<'_>, budget: BudgetGauges) {
-        self.cached_budget_gauge(M_BUDGET_DETAILS_PRESENT, labels, 1.0);
-        if let Some(value) = budget.limit_usd {
-            self.cached_budget_gauge(M_BUDGET_LIMIT_USD, labels, value);
-        }
-        if let Some(value) = budget.spent_usd {
-            self.cached_budget_gauge(M_BUDGET_SPENT_USD, labels, value);
-        }
-        if let Some(value) = budget.remaining_usd {
-            self.cached_budget_gauge(M_BUDGET_REMAINING_USD, labels, value);
-        }
-        if let Some(value) = budget.reset_seconds {
-            self.cached_budget_gauge(M_BUDGET_RESET_SECONDS, labels, value as f64);
-        }
-    }
-
     /// Publish how many spend ceilings are configured. Called on boot and on
     /// every config reload so the series tracks the live snapshot.
     pub fn set_budget_policies_configured(&self, count: usize) {
         metrics::with_local_recorder(&self.inner.recorder, || {
             metrics::gauge!(M_BUDGET_POLICIES_CONFIGURED).set(count as f64);
         });
-    }
-
-    pub fn clear_budget_gauges(&self, labels: BudgetLabels<'_>) {
-        self.cached_budget_gauge(M_BUDGET_DETAILS_PRESENT, labels, 0.0);
     }
 
     pub fn record_redis_failure(&self, operation: &str) {
@@ -2562,31 +2516,6 @@ impl DeploymentState {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct BudgetLabels<'a> {
-    pub api_key_id: &'a str,
-    pub team_id: &'a str,
-    pub user_id: &'a str,
-}
-
-impl Default for BudgetLabels<'_> {
-    fn default() -> Self {
-        Self {
-            api_key_id: "unknown",
-            team_id: "unknown",
-            user_id: "unknown",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct BudgetGauges {
-    pub limit_usd: Option<f64>,
-    pub spent_usd: Option<f64>,
-    pub remaining_usd: Option<f64>,
-    pub reset_seconds: Option<u64>,
-}
-
 /// Canonical outcome label for [`Metrics::record_request`]. Keeps the
 /// `outcome` dimension bounded so Prometheus cardinality stays sane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3169,80 +3098,6 @@ mod tests {
         assert!(series(M_ROUTING_FAILED_FALLBACKS_TOTAL, "target-b").is_none());
     }
 
-    /// Pins the budget gauge family's values, field gating and clear
-    /// semantics. (Key-drift protection is NOT this test's job — its two
-    /// label sets differ in every dimension, so dropping one key label
-    /// still yields distinct keys; `budget_gauge_key_covers_every_label`
-    /// below is the drift guard.)
-    #[test]
-    fn budget_gauges_stay_distinct_per_label_set_and_clear() {
-        let metrics = Metrics::new(false);
-        let key_a = BudgetLabels {
-            api_key_id: "ak-a",
-            team_id: "team-a",
-            user_id: "user-a",
-        };
-        let key_b = BudgetLabels {
-            api_key_id: "ak-b",
-            team_id: "team-b",
-            user_id: "user-b",
-        };
-        metrics.set_budget_gauges(
-            key_a,
-            BudgetGauges {
-                limit_usd: Some(100.0),
-                spent_usd: Some(40.0),
-                remaining_usd: Some(60.0),
-                reset_seconds: Some(3600),
-            },
-        );
-        metrics.set_budget_gauges(
-            key_b,
-            BudgetGauges {
-                spent_usd: Some(7.0),
-                ..BudgetGauges::default()
-            },
-        );
-
-        let rendered = metrics.render();
-        let series = |metric: &str, team: &str| {
-            rendered
-                .lines()
-                .find(|l| l.starts_with(metric) && l.contains(&format!("team_id=\"{team}\"")))
-                .map(str::to_owned)
-        };
-        for (metric, value) in [
-            (M_BUDGET_DETAILS_PRESENT, "1"),
-            (M_BUDGET_LIMIT_USD, "100"),
-            (M_BUDGET_SPENT_USD, "40"),
-            (M_BUDGET_REMAINING_USD, "60"),
-            (M_BUDGET_RESET_SECONDS, "3600"),
-        ] {
-            let line = series(metric, "team-a")
-                .unwrap_or_else(|| panic!("{metric} missing for team-a:\n{rendered}"));
-            assert!(line.ends_with(&format!(" {value}")), "got: {line}");
-            assert!(line.contains("api_key_id=\"ak-a\"") && line.contains("user_id=\"user-a\""));
-        }
-        // Key B must have its OWN spent series, not overwrite A's.
-        assert!(series(M_BUDGET_SPENT_USD, "team-b").is_some_and(|l| l.ends_with(" 7")));
-        // Unset dimensions register nothing for B.
-        assert!(series(M_BUDGET_LIMIT_USD, "team-b").is_none());
-
-        metrics.clear_budget_gauges(key_a);
-        let rendered = metrics.render();
-        let details = |team: &str| {
-            rendered
-                .lines()
-                .find(|l| {
-                    l.starts_with(M_BUDGET_DETAILS_PRESENT)
-                        && l.contains(&format!("team_id=\"{team}\""))
-                })
-                .map(str::to_owned)
-        };
-        assert!(details("team-a").is_some_and(|l| l.ends_with(" 0")));
-        assert!(details("team-b").is_some_and(|l| l.ends_with(" 1")));
-    }
-
     /// Pins the legacy spec-7 pair's full label sets, accumulation, and
     /// the outcome-stays-off-durations invariant. (Its two label sets
     /// differ in several dimensions at once, so this test cannot catch a
@@ -3523,49 +3378,6 @@ mod tests {
         assert_eq!(
             dur.iter().filter(|l| l.ends_with(" 3")).count(),
             1,
-            "{rendered}"
-        );
-    }
-
-    #[test]
-    fn budget_gauge_key_covers_every_label() {
-        let m = Metrics::new(false);
-        let base = BudgetLabels {
-            api_key_id: "ak",
-            team_id: "t",
-            user_id: "u",
-        };
-        let variants = [
-            BudgetLabels {
-                api_key_id: "ak2",
-                ..base
-            },
-            BudgetLabels {
-                team_id: "t2",
-                ..base
-            },
-            BudgetLabels {
-                user_id: "u2",
-                ..base
-            },
-        ];
-        let spend = |v| BudgetGauges {
-            spent_usd: Some(v),
-            ..BudgetGauges::default()
-        };
-        m.set_budget_gauges(base, spend(1.0));
-        for (i, v) in variants.iter().enumerate() {
-            m.set_budget_gauges(*v, spend(2.0 + i as f64));
-        }
-        let rendered = m.render();
-        let series = series_lines(&rendered, M_BUDGET_SPENT_USD);
-        assert_eq!(series.len(), 1 + variants.len(), "{rendered}");
-        // Gauges overwrite rather than sum: a dropped key label makes the
-        // LAST variant's value land on the base series instead.
-        assert!(
-            series.iter().any(|l| l.contains("api_key_id=\"ak\"")
-                && l.contains("team_id=\"t\"")
-                && l.ends_with(" 1")),
             "{rendered}"
         );
     }

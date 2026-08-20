@@ -342,38 +342,30 @@ renames 规则同样适用于这里。
 
 ## 跟进项
 
-- `set_budget_gauges`、`clear_budget_gauges`（`crates/aisix-obs/src/metrics.rs`）
-  自本任务（Task 6，删除控制平面预算 HTTP 客户端）起没有生产调用方：它们
-  唯一的数据来源是控制平面预算判定返回的 `Decision.budget: Option<BudgetDetails>`
-  （`limit_usd`/`spent_usd`/`remaining_usd` 是 dollar f64，`reset_seconds`
-  是 u64 秒数），这个来源已随 HTTP 客户端一起删除。两者已记入
-  `crates/aisix-obs/tests/every_emit_has_a_caller.rs` 的 `ALLOWED_UNCALLED`，
-  附带下面这条阻塞说明。
-- 因此 `aisix_budget_details_present`、`aisix_budget_limit_usd`、
-  `aisix_budget_spent_usd`、`aisix_budget_remaining_usd`、
-  `aisix_budget_reset_seconds` 这五条 gauge 系列目前完全不再产生任何数据点——
-  `/metrics` 上看不到它们（与仍然存活的计数器
-  `aisix_budget_unpriced_requests_total` 无关，那条走的是未定价模型的另一条
-  路径，不受本任务影响）。
+`set_budget_gauges` / `clear_budget_gauges` 与它们的五条系列
+（`aisix_budget_details_present` / `limit_usd` / `spent_usd` / `remaining_usd` /
+`reset_seconds`）**已随本设计一并删除**，不再是待办。
 
-  **为什么不顺手把它们接回本地花费层，而是留作独立跟进：**
+删而不是接回本地花费层，理由是逐条看下来它们各自都没有存在价值：
 
-  1.（主要阻塞）标签集不匹配。gauge 的标签是
-     `BudgetLabels{api_key_id, team_id, user_id}`，而花费桶的键是
-     `spend:{scope}:{scope_ref}:{policy_id}`（`quota.rs:426` 的
-     `spend_bucket_key`）。一条 `scope: team` 的策略压根没有 `api_key_id`——
-     它的花费桶从来不按 api_key 切分，所以不存在一种"保留原标签集"的方式
-     把它读回 `BudgetLabels`。要接上，得先回答 gauge 该用什么标签集（桶的
-     `scope`/`scope_ref`？还是仍按调用方的 api_key/team/user，即使策略本身
-     按别的维度分桶？），这是一次独立的语义设计，不是接线活。
-  2.（次要阻塞）就算标签集有了答案，读取现值意味着要在请求路径上对
-     `Limiter::peek` 做一次额外查询——在 `RedisStore` 后端下，这正是本任务
-     刚刚删掉的那种"每请求一次网络往返"，只是换了个目标而已。
+- `spent_usd` 与既有的 `aisix_llm_spend_micro_usd_total` 重复，而后者是计数器
+  ——gauge 形态在抓取间隙会丢数据，是更差的形状。
+- `remaining_usd` 可由 limit 减 spent 在查询侧算出。
+- `reset_seconds` 的窗口是 epoch 对齐的固定配置，可算。
+- `details_present` 原本表示「控制平面是否回了预算信息」，那个来源已经不存在。
+- `limit_usd` 是唯一有独立价值的一条，但它的标签集
+  （`api_key_id`/`team_id`/`user_id`，美元 f64）与花费桶的维度
+  （`spend:{scope}:{scope_ref}:{policy_id}`）对不上：一条 `scope: team` 的策略
+  根本没有 `api_key_id`。按策略维度重做是**新增一个指标族**，不是把旧的接回来。
 
-  跟进任务需要：先定下 gauge 的标签集语义，再决定是从 `Limiter::peek` 同步
-  读、还是异步/采样读；同时决定是否保留 dollar-f64 的对外形状，还是改成
-  micro-USD u64（与本设计其余部分保持一致）。本仓库 issue 已关闭，所以这里
-  的记录就是唯一的记录。
+删除不构成破坏性变更：仓库从未发版（无 tag），这五条名字也从未出现在对外
+文档里，而且喂它们的数据源在同一批未发布改动里就已经删掉了——它们不存在
+「曾经有数据、现在没有」的窗口。
+
+**留作独立决策**：要不要新增一条按策略维度的花费上限 gauge
+（`{scope, scope_ref, policy}`，micro-USD）。它可以从快照订阅钩子发布，请求
+路径零成本——这一点当初被记成阻塞是判断错了，因为上限是静态配置，不需要
+读计数器。但它是一个新指标族，属于功能决策，不该混在本次清理里。
 
 ## 备注：本文件位置
 

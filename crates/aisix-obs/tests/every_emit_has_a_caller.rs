@@ -19,40 +19,13 @@ use std::path::{Path, PathBuf};
 
 /// Emits that are deliberately uncalled. Each entry must say why, and each is
 /// a debt to clear rather than a permanent exemption.
-const ALLOWED_UNCALLED: &[(&str, &str)] = &[
-    (
-        "record_llm_request",
-        "Superseded by `record_proxy_and_llm_request`, which emits the same \
+const ALLOWED_UNCALLED: &[(&str, &str)] = &[(
+    "record_llm_request",
+    "Superseded by `record_proxy_and_llm_request`, which emits the same \
          family alongside the proxy tier. Pre-existing dead code, kept only \
          because a unit test still exercises it — that test asserts behaviour \
          no production path takes. Delete both together.",
-    ),
-    (
-        "set_budget_gauges",
-        "Its only data source was the control-plane budget HTTP decision \
-         (`Decision.budget: Option<BudgetDetails>`: `limit_usd`/`spent_usd`/ \
-         `remaining_usd` as f64 dollars, `reset_seconds` as a u64 second \
-         count), which the spend-budget-plan Task 6 removed in favor of \
-         local `RateLimitPolicy.max_spend_micro_usd` enforcement (micro-USD \
-         u64 counters). Re-wiring it is blocked, primarily, by a label-set \
-         mismatch: the gauge's `BudgetLabels{api_key_id, team_id, user_id}` \
-         has no counterpart in the spend bucket key \
-         `spend:{scope}:{scope_ref}:{policy_id}` (`quota.rs:426`) — a \
-         team-scoped policy carries no `api_key_id` at all, so there is no \
-         label-preserving way to repopulate it. Secondarily, even with a \
-         label scheme, reading the live value means an extra per-request \
-         `Limiter::peek`, which on `RedisStore` reinstates the exact \
-         per-request network hop this task deleted. See the Follow-ups \
-         section of docs/design/2026-08-20-spend-budget-design.md.",
-    ),
-    (
-        "clear_budget_gauges",
-        "Same dead family as `set_budget_gauges` — its only two call sites \
-         were the same two control-plane budget-gate blocks Task 6 \
-         removed. See that entry's reason and the Follow-ups section of \
-         docs/design/2026-08-20-spend-budget-design.md.",
-    ),
-];
+)];
 
 fn workspace_root() -> PathBuf {
     // CARGO_MANIFEST_DIR is crates/aisix-obs.
