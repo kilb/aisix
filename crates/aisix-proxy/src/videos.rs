@@ -1728,7 +1728,7 @@ async fn dispatch_create(
     .await;
     // Zero tokens on the videos surface — commit releases the
     // concurrency permit and finalises RPM.
-    reservation.commit_tokens(0).await;
+    reservation.commit_tokens_no_spend(0).await;
     let resp = result?;
 
     state
@@ -1832,7 +1832,7 @@ pub async fn get_video(
         // Key-level layers still apply.
         let reservation = crate::quota::enforce(&state, &snapshot, &auth, None).await?;
         let result = poll_task(&state, &target, &task_id, &client.request_id).await;
-        reservation.commit_tokens(0).await;
+        reservation.commit_tokens_no_spend(0).await;
         let poll = result?;
         let video = video_object_from_poll(&video_id, target.display_name(), &poll);
         Ok((
@@ -1885,7 +1885,7 @@ pub async fn video_content(
         // Same model-layer exemption as the poll route (see get_video).
         let reservation = crate::quota::enforce(&state, &snapshot, &auth, None).await?;
         let result = poll_task(&state, &target, &task_id, &client.request_id).await;
-        reservation.commit_tokens(0).await;
+        reservation.commit_tokens_no_spend(0).await;
         let poll = result?;
 
         let response = match poll.status {

@@ -8411,7 +8411,7 @@ data: [DONE]\n\n";
         );
     }
 
-    /// #620 (audit M-1): the per-member `commit_tokens` must accrue to the
+    /// #620 (audit M-1): the per-member `commit_tokens_no_spend` must accrue to the
     /// member's OWN `model:` TPM bucket. Panel member capped at tpm:10 returns
     /// 16 tokens: request 1 succeeds and commits 16 (overshoot allowed for the
     /// in-flight call); request 2's pre-commit sees tpm 16 ≥ 10 and refuses, so

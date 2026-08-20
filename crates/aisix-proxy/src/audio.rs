@@ -1444,7 +1444,7 @@ async fn speech_dispatch(
     // per input character — so there are no tokens to add to TPM/TPD. Commit 0
     // to release the reservation the same way the other handlers do, keeping
     // the "every reserve is committed" invariant explicit.
-    reservation.commit_tokens(0).await;
+    reservation.commit_tokens_no_spend(0).await;
 
     let mut out = axum::response::Response::new(axum::body::Body::from(body_bytes));
     copy_response_header(&upstream_headers, &mut out, header::CONTENT_TYPE);

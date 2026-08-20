@@ -190,7 +190,7 @@ impl ModelCaller for ProxyModelCaller<'_> {
         })
         .await?;
         reservation
-            .commit_tokens(u64::from(response.usage.total_tokens))
+            .commit_tokens_no_spend(u64::from(response.usage.total_tokens))
             .await;
         Ok(response)
     }

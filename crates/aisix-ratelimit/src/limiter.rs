@@ -268,9 +268,13 @@ impl MultiReservation {
         }
     }
 
-    /// 等价于 `commit(tokens, 0)`。保留是因为 44 处既有调用点只关心 token，
-    /// 且它们本来就拿不到花费数字——一次性改签名会把这个改动摊到十几个文件。
-    pub async fn commit_tokens(self, tokens: u64) {
+    /// 等价于 `commit(tokens, 0)`——如果这个预留带花费层，花费桶记的是 0。
+    /// 名字刻意长一点：调用它就是在断言"这个调用点没有花费数字要记"，
+    /// 而不是顺手图省事漏记了钱。适用场景——命中缓存（没有真实上游花费）、
+    /// 错误路径（没跑到能算出花费的地方）、以及任何本来就拿不到花费数字的
+    /// 调用点。44 处既有调用点都属于这几类之一；新调用点如果**有**花费数字，
+    /// 应该用 [`Self::commit`]，不要为了省事套用这个。
+    pub async fn commit_tokens_no_spend(self, tokens: u64) {
         self.commit(tokens, 0).await;
     }
 
@@ -299,7 +303,7 @@ impl MultiReservation {
     }
 
     /// Absorb another reservation's layers into this one, so a single
-    /// `commit_tokens` / `into_stream_hold` finalises both. Used by the
+    /// `commit_tokens_no_spend` / `into_stream_hold` finalises both. Used by the
     /// routing dispatch to fold the winning target's model-layer
     /// reservation into the request-level reservation once the winner
     /// is known.
@@ -868,7 +872,7 @@ mod tests {
     // --- MultiReservation tests ----------------------------------------
 
     #[tokio::test]
-    async fn multi_reservation_commit_tokens_updates_all_layers() {
+    async fn multi_reservation_commit_tokens_no_spend_updates_all_layers() {
         let clock = TestClock::new(100);
         let limiter = Limiter::local_with_clock(clock.clone());
         let l = limits(None, Some(1000), None);
@@ -877,7 +881,7 @@ mod tests {
         let r2 = limiter.pre_commit("model:gpt-4o", &l).await.unwrap();
         let multi = MultiReservation::new(vec![r1, r2]);
 
-        multi.commit_tokens(500).await;
+        multi.commit_tokens_no_spend(500).await;
 
         let s1 = limiter.peek("api_key:k1", &l).await.unwrap();
         let s2 = limiter.peek("model:gpt-4o", &l).await.unwrap();
@@ -961,7 +965,7 @@ mod tests {
 
         // One commit finalises both layers: tokens land on each and the
         // absorbed layer's concurrency slot is released.
-        multi.commit_tokens(300).await;
+        multi.commit_tokens_no_spend(300).await;
         let s = limiter.peek("model:target", &l).await.unwrap();
         assert_eq!(s.tpm_used, 300);
         assert!(limiter.pre_commit("model:target", &l).await.is_ok());
@@ -1144,7 +1148,7 @@ mod tests {
     /// 旧入口保持原语义：全部按 token 层处理，花费为 0。
     /// 44 处既有调用点依赖这一点。
     #[tokio::test]
-    async fn commit_tokens_still_treats_every_layer_as_tokens() {
+    async fn commit_tokens_no_spend_still_treats_every_layer_as_tokens() {
         let store = Arc::new(LocalStore::new());
         let limiter = Limiter::with_store(Arc::clone(&store) as Arc<dyn RateStore>);
         let limits = RateLimit {
@@ -1155,7 +1159,9 @@ mod tests {
             .pre_commit("legacy", &limits)
             .await
             .expect("reserves");
-        MultiReservation::new(vec![r]).commit_tokens(77).await;
+        MultiReservation::new(vec![r])
+            .commit_tokens_no_spend(77)
+            .await;
         assert_eq!(store.committed_tokens("legacy"), 77);
     }
 }

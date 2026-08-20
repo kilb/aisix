@@ -574,7 +574,7 @@ async fn dispatch(
             // No upstream answer → no tokens to count; release the
             // reservation. Cooldown / health were noted per attempt by the
             // walker.
-            reservation.commit_tokens(0).await;
+            reservation.commit_tokens_no_spend(0).await;
             let msg = match &failure.err {
                 ProxyError::Bridge(BridgeError::Config(msg))
                     if msg.contains("does not support image generation") =>

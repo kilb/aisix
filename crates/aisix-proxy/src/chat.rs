@@ -2462,7 +2462,7 @@ async fn dispatch(
         };
         match resolved {
             Some((mut cached, hit_layer, hit_similarity)) => {
-                reservation.commit_tokens(0).await;
+                reservation.commit_tokens_no_spend(0).await;
                 // Counted HERE, at the gate's decision — the same rule the
                 // `None` arm below already states. Recorded after the output
                 // chain instead, a hit the chain BLOCKS increments nothing at
@@ -3510,10 +3510,10 @@ async fn dispatch_ensemble(
         // non-streaming error paths. `charge: None` — the per-member events
         // already carry the bill.
         //
-        // The token commit is NOT done here: `MultiReservation::commit_tokens`
+        // The token commit is NOT done here: `MultiReservation::commit_tokens_no_spend`
         // is async (#607's cluster-Redis path), and this helper is sync so
         // `emit_panel_member` stays callable across every exit. Each call site
-        // therefore `.await`s `reservation.commit_tokens(survivor_total)`
+        // therefore `.await`s `reservation.commit_tokens_no_spend(survivor_total)`
         // inline FIRST (mirroring the non-streaming ensemble path), then calls
         // this for the emit + `DispatchFailure`. `panel` is borrowed so the
         // call site still owns it to compute `survivor_total`.
@@ -3537,7 +3537,9 @@ async fn dispatch_ensemble(
             match crate::ensemble::run_ensemble_panel(req, ensemble_cfg, &caller).await {
                 Ok(triple) => triple,
                 Err(crate::ensemble::EnsembleError::InsufficientPanel { panel, .. }) => {
-                    reservation.commit_tokens(survivor_total(&panel)).await;
+                    reservation
+                        .commit_tokens_no_spend(survivor_total(&panel))
+                        .await;
                     return Err(emit_panel_then_fail(
                         &panel,
                         ProxyError::Bridge(BridgeError::upstream_status(
@@ -3549,7 +3551,9 @@ async fn dispatch_ensemble(
                 // `run_ensemble_panel` never returns `Judge` (it stops before
                 // the judge call), but the enum is non-exhaustive to us here.
                 Err(crate::ensemble::EnsembleError::Judge { panel, source }) => {
-                    reservation.commit_tokens(survivor_total(&panel)).await;
+                    reservation
+                        .commit_tokens_no_spend(survivor_total(&panel))
+                        .await;
                     return Err(emit_panel_then_fail(&panel, ProxyError::Bridge(source)));
                 }
             };
@@ -3564,7 +3568,9 @@ async fn dispatch_ensemble(
         // snapshot, and the judge is required config), but stay total: bill the
         // panel + fail rather than panic if the entry vanished mid-request.
         let Some(judge_entry) = snapshot.models.get_by_name(&ensemble_cfg.judge.model) else {
-            reservation.commit_tokens(survivor_total(&panel)).await;
+            reservation
+                .commit_tokens_no_spend(survivor_total(&panel))
+                .await;
             return Err(emit_panel_then_fail(
                 &panel,
                 ProxyError::Bridge(BridgeError::InvalidUpstreamConfig(
@@ -3577,7 +3583,9 @@ async fn dispatch_ensemble(
             Ok(pk) => pk,
             Err(e) => {
                 tracing::warn!(error = %e, "ensemble judge provider key unresolved");
-                reservation.commit_tokens(survivor_total(&panel)).await;
+                reservation
+                    .commit_tokens_no_spend(survivor_total(&panel))
+                    .await;
                 return Err(emit_panel_then_fail(
                     &panel,
                     ProxyError::Bridge(BridgeError::InvalidUpstreamConfig(
@@ -3588,7 +3596,9 @@ async fn dispatch_ensemble(
         };
         let Some(judge_bridge) = crate::dispatch::resolve_bridge(&state.hub, &judge_pk.value)
         else {
-            reservation.commit_tokens(survivor_total(&panel)).await;
+            reservation
+                .commit_tokens_no_spend(survivor_total(&panel))
+                .await;
             return Err(emit_panel_then_fail(
                 &panel,
                 ProxyError::Bridge(BridgeError::Config(
@@ -3634,7 +3644,9 @@ async fn dispatch_ensemble(
         {
             Ok(r) => r,
             Err(_) => {
-                reservation.commit_tokens(survivor_total(&panel)).await;
+                reservation
+                    .commit_tokens_no_spend(survivor_total(&panel))
+                    .await;
                 return Err(emit_panel_then_fail(
                     &panel,
                     ProxyError::Bridge(BridgeError::upstream_status(
@@ -3655,7 +3667,9 @@ async fn dispatch_ensemble(
             // panel (same invariant as the non-streaming judge-failure path),
             // then surface the bridge error (5xx → 502, 4xx preserved).
             Err(be) => {
-                reservation.commit_tokens(survivor_total(&panel)).await;
+                reservation
+                    .commit_tokens_no_spend(survivor_total(&panel))
+                    .await;
                 return Err(emit_panel_then_fail(&panel, ProxyError::Bridge(be)));
             }
         };
@@ -4033,7 +4047,7 @@ async fn dispatch_ensemble(
                 ),
             };
             let survivor_total: u64 = panel.iter().map(|p| u64::from(p.usage.total_tokens)).sum();
-            reservation.commit_tokens(survivor_total).await;
+            reservation.commit_tokens_no_spend(survivor_total).await;
             for (index, member) in panel.iter().enumerate() {
                 emit_panel_member(
                     member, index, /* blocked */ false, /* bypass */ "",
@@ -4057,7 +4071,7 @@ async fn dispatch_ensemble(
         .sum();
     let judge_usage = outcome.response.usage.clone();
     let total_tokens = panel_total + u64::from(judge_usage.total_tokens);
-    reservation.commit_tokens(total_tokens).await;
+    reservation.commit_tokens_no_spend(total_tokens).await;
 
     // Emit one usage event per sub-call (each panel member + the judge),
     // all sharing `request_id`. `attempt_kind` is `"panel"` / `"judge"`;
@@ -4743,7 +4757,7 @@ fn created_ts() -> i64 {
 /// most recently seen `total_tokens` and, on stream end, hand it to
 /// `on_complete` so the caller can post-account it against TPM/TPD.
 ///
-/// Pre-fix the streaming path called `reservation.commit_tokens(0)`
+/// Pre-fix the streaming path called `reservation.commit_tokens_no_spend(0)`
 /// up front and never revisited the counter, leaving TPM caps silently
 /// bypassed for all streaming traffic and the cost/usage telemetry
 /// reporting `$0`. See issue #108.

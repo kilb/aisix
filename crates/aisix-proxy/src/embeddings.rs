@@ -470,7 +470,7 @@ async fn dispatch(
             // The upstream was never called, so nothing was consumed —
             // release the reservation without spending tokens, exactly as
             // the chat gate does, and report the tokens the entry saved.
-            reservation.commit_tokens(0).await;
+            reservation.commit_tokens_no_spend(0).await;
             gate.record(state, crate::chat::CacheStatus::Hit);
             let cache = crate::response_cache::CacheTelemetry::hit(&hit);
             let mut response = axum::response::Response::new(axum::body::Body::from(hit.body));
@@ -702,7 +702,7 @@ async fn dispatch(
             })
         }
         Err(failure) => {
-            reservation.commit_tokens(0).await;
+            reservation.commit_tokens_no_spend(0).await;
             // Attribute the refusal to the row that refused, not to the
             // group: with several members only one of them may lack embed
             // support.

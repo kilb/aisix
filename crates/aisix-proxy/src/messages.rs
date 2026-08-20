@@ -706,7 +706,7 @@ async fn dispatch(
         if let Some(hit) = gate.lookup().await {
             // No upstream call, so nothing was consumed.
             if let Some(r) = reservation.take() {
-                r.commit_tokens(0).await;
+                r.commit_tokens_no_spend(0).await;
             }
             let cache = crate::response_cache::CacheTelemetry::hit(&hit);
             // Counted at the gate's decision, before the output chain runs:
@@ -1520,7 +1520,7 @@ async fn anthropic_passthrough_dispatch(
         // The winning streaming attempt owns it now; the keys drive post-stream
         // TPM/TPD accounting and `into_stream_hold` keeps the concurrency slot(s)
         // until the stream ends (mirrors chat.rs). `take()` leaves the handler's
-        // `reservation` as `None`, so it won't also `commit_tokens`.
+        // `reservation` as `None`, so it won't also `commit_tokens_no_spend`.
         //
         // Fold this target's model-layer reservation in first (#1087)
         // so the guard covers the member's limits too; `take()` leaves it `None`
@@ -1566,7 +1566,7 @@ async fn anthropic_passthrough_dispatch(
                 //
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended. `add_tokens_post_stream`
-                // is the sync analog of the reservation's async `commit_tokens`
+                // is the sync analog of the reservation's async `commit_tokens_no_spend`
                 // (this end-of-stream closure can't await); dropping the hold frees
                 // the concurrency slot(s) held for the stream's full lifetime.
                 let streamed_tokens = total_tokens_with_cache(
@@ -2394,7 +2394,7 @@ async fn cross_provider_dispatch(
         // #688: carry the rate-limit reservation into the end-of-stream guard —
         // keys drive post-stream TPM/TPD accounting, the hold keeps the
         // concurrency slot(s) until the stream ends. `take()` leaves the
-        // handler's `reservation` as `None` so it won't also `commit_tokens`.
+        // handler's `reservation` as `None` so it won't also `commit_tokens_no_spend`.
         //
         // Fold this target's model-layer reservation in first (#1087)
         // so the guard covers the member's limits too; `take()` leaves it `None`
@@ -2436,7 +2436,7 @@ async fn cross_provider_dispatch(
             move |mut comp| {
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
-                // reservation's async `commit_tokens`, which this closure can't
+                // reservation's async `commit_tokens_no_spend`, which this closure can't
                 // await).
                 let streamed_tokens = total_tokens_with_cache(
                     comp.prompt_tokens,

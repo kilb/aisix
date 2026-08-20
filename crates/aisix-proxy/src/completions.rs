@@ -699,7 +699,7 @@ async fn dispatch(
         let outcome = match walk {
             Ok(o) => o,
             Err(failure) => {
-                reservation.commit_tokens(0).await;
+                reservation.commit_tokens_no_spend(0).await;
                 return completion_unsupported_or_error(
                     failure,
                     &model_entry,
@@ -1366,7 +1366,7 @@ async fn dispatch(
             // No upstream answer → no tokens to count; release the
             // reservation. Cooldown / health were noted per attempt by the
             // walker.
-            reservation.commit_tokens(0).await;
+            reservation.commit_tokens_no_spend(0).await;
             completion_unsupported_or_error(failure, &model_entry, redactions, monitor_hits)
         }
     }
