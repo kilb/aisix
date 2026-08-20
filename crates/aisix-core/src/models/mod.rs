@@ -56,7 +56,8 @@ pub use guardrail::{
 pub use mcp_policy::{McpAccess, McpAccessMode, McpPolicy, McpPolicyMode, McpPolicyScope};
 pub use mcp_server::{McpAuthType, McpProtocolVersion, McpServer, McpServerType, McpTransport};
 pub use model::{
-    Adapter, BackgroundModelCheck, CooldownConfig, Model, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
+    Adapter, BackgroundModelCheck, CooldownConfig, InputTokens, Model, ModelCost,
+    DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use observability_exporter::{
     AliyunSlsConfig, DatadogConfig, ExporterKind, ObjectStoreCompression, ObjectStoreConfig,

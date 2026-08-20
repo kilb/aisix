@@ -258,8 +258,20 @@
     },
     "ModelCost": {
       "additionalProperties": false,
-      "description": "Per-token cost for budget tracking. Both values are in USD per 1,000 tokens.",
+      "description": "Per-token cost for budget tracking. Every value is in USD per 1,000 tokens.\n\nPrompt-cached tokens are priced separately because providers charge a different rate for them, in both directions: a cache read is cheaper than fresh input, while writing a prompt into the cache costs more. Priced with `input_per_1k` alone, cached traffic is mis-billed either way.",
       "properties": {
+        "cache_write_per_1k": {
+          "description": "Cost in USD per 1,000 prompt tokens written INTO the provider's cache. Omitted, cache writes are charged at `input_per_1k`.\n\nWrites are the direction that costs more than plain input — one provider prices a five-minute write at 1.25x its input rate and a one-hour write at 2x. A deployment that caches heavily and prices writes at the plain input rate under-reports its spend.",
+          "format": "double",
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "cached_input_per_1k": {
+          "description": "Cost in USD per 1,000 prompt tokens served from the provider's prompt cache. Omitted, cache reads are charged at `input_per_1k`.\n\nAn absolute price rather than a discount factor, because the discount is not the same across providers: one charges a tenth of the input rate for a cache read, another about half.",
+          "format": "double",
+          "minimum": 0.0,
+          "type": "number"
+        },
         "input_per_1k": {
           "description": "Prompt token cost in USD per 1,000 tokens.",
           "format": "double",

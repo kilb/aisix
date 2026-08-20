@@ -1685,7 +1685,8 @@ fn emit_usage_event(
         cost_usd: crate::usage_attr::request_cost_usd(
             snap,
             model_id,
-            u64::from(prompt_tokens),
+            // 这个表面没有提示缓存，全部按新鲜输入计价。
+            aisix_core::InputTokens::uncached_only(u64::from(prompt_tokens)),
             u64::from(completion_tokens),
         ),
         // Single-attempt endpoint: the attempt spans the whole request, so

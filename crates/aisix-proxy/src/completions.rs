@@ -1487,7 +1487,12 @@ fn emit_usage_event(
         cost_usd: crate::usage_attr::request_cost_usd(
             snap,
             model_id,
-            u64::from(usage.prompt_tokens),
+            // Priced as all-fresh input because this path's `CompletionUsage`
+            // carries no cache counters at all — not because the legacy
+            // completions surface is exempt from prompt caching upstream. If
+            // those counters are ever plumbed onto this struct, switch this to
+            // `input_tokens_for_pricing` like the chat surfaces.
+            aisix_core::InputTokens::uncached_only(u64::from(usage.prompt_tokens)),
             u64::from(usage.completion_tokens),
         ),
         usage_estimated: usage.usage_estimated,

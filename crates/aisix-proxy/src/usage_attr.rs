@@ -291,14 +291,42 @@ pub(crate) fn token_count(raw: u64) -> u32 {
 pub(crate) fn request_cost_usd(
     snap: &AisixSnapshot,
     model_id: &str,
-    prompt_tokens: u64,
+    input: aisix_core::InputTokens,
     completion_tokens: u64,
 ) -> f64 {
     snap.models
         .get_by_id(model_id)
         .and_then(|entry| entry.value.cost.clone())
-        .map(|cost| cost.calculate(prompt_tokens, completion_tokens))
+        .map(|cost| cost.calculate_with_cache(input, completion_tokens))
         .unwrap_or(0.0)
+}
+
+/// Split the canonical usage counters into the disjoint buckets pricing
+/// needs. The ONLY place that arithmetic lives.
+///
+/// The two upstream shapes disagree about what `prompt_tokens` contains, and
+/// `UsageStats` carries both vocabularies side by side:
+///
+/// - `cached_prompt_tokens` is OpenAI's, a SUBSET of `prompt_tokens`.
+/// - `cache_read_tokens` / `cache_creation_tokens` are Anthropic's, counters
+///   SEPARATE from `prompt_tokens`.
+///
+/// So the fresh portion subtracts only the subset one. Getting this backwards
+/// is silent in both directions — double-charging the cached half on one
+/// provider, or pricing six thousand billed tokens at nothing on the other —
+/// and no request fails either way, which is why it is derived once here
+/// rather than at each of the ten call sites.
+pub(crate) fn input_tokens_for_pricing(
+    prompt_tokens: u64,
+    cached_prompt_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+) -> aisix_core::InputTokens {
+    aisix_core::InputTokens {
+        uncached: prompt_tokens.saturating_sub(cached_prompt_tokens),
+        cache_read: cached_prompt_tokens.saturating_add(cache_read_tokens),
+        cache_write: cache_creation_tokens,
+    }
 }
 
 pub(crate) fn metric_model_label<'a>(snap: &AisixSnapshot, model_name: &'a str) -> Cow<'a, str> {
@@ -519,16 +547,31 @@ mod tests {
         };
 
         // 1000 prompt + 500 completion = 2.5 + 5.0
-        let cost = request_cost_usd(&snap, "m-priced", 1_000, 500);
+        let cost = request_cost_usd(
+            &snap,
+            "m-priced",
+            aisix_core::InputTokens::uncached_only(1_000),
+            500,
+        );
         assert!((cost - 7.5).abs() < 1e-9, "got {cost}");
 
         assert_eq!(
-            request_cost_usd(&snap, "m-unpriced", 1_000, 500),
+            request_cost_usd(
+                &snap,
+                "m-unpriced",
+                aisix_core::InputTokens::uncached_only(1_000),
+                500
+            ),
             0.0,
             "no configured price means the control plane owns the number"
         );
         assert_eq!(
-            request_cost_usd(&snap, "m-missing", 1_000, 500),
+            request_cost_usd(
+                &snap,
+                "m-missing",
+                aisix_core::InputTokens::uncached_only(1_000),
+                500
+            ),
             0.0,
             "a row that no longer resolves must not panic or guess"
         );

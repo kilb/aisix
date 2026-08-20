@@ -2042,7 +2042,12 @@ async fn dispatch(
                 let stream_cost_usd = crate::usage_attr::request_cost_usd(
                     &snap,
                     &model_id_for_telem,
-                    u64::from(comp.prompt_tokens),
+                    crate::usage_attr::input_tokens_for_pricing(
+                        u64::from(comp.prompt_tokens),
+                        u64::from(comp.cached_prompt_tokens),
+                        u64::from(comp.cache_read_tokens),
+                        u64::from(comp.cache_creation_tokens),
+                    ),
                     u64::from(comp.completion_tokens),
                 );
                 let deployment_success = terminal.error_class.is_empty() && terminal.status < 400;
@@ -3071,7 +3076,17 @@ async fn dispatch(
     // pricing catalog expects. Without this an open-source deployment — no
     // control plane to recompute anything — saw cost 0 however it configured
     // the field.
-    let cost_usd = crate::usage_attr::request_cost_usd(snapshot, &model_id, prompt, completion);
+    let cost_usd = crate::usage_attr::request_cost_usd(
+        snapshot,
+        &model_id,
+        crate::usage_attr::input_tokens_for_pricing(
+            prompt,
+            u64::from(cached_prompt_tokens),
+            u64::from(cache_read_tokens),
+            u64::from(cache_creation_tokens),
+        ),
+        completion,
+    );
 
     let (output_verdict, hits) = resolved_chain
         .check_output_non_segment_observed(&upstream)
@@ -3451,7 +3466,12 @@ async fn dispatch_ensemble(
                 crate::usage_attr::request_cost_usd(
                     snapshot,
                     &sub_model_id,
-                    u64::from(prompt_tokens),
+                    crate::usage_attr::input_tokens_for_pricing(
+                        u64::from(prompt_tokens),
+                        u64::from(member.usage.cached_prompt_tokens),
+                        u64::from(member.usage.cache_read_tokens),
+                        u64::from(member.usage.cache_creation_tokens),
+                    ),
                     u64::from(completion_tokens),
                 ),
                 blocked,
@@ -3824,7 +3844,12 @@ async fn dispatch_ensemble(
                         crate::usage_attr::request_cost_usd(
                             &snap,
                             &member.model_id,
-                            u64::from(prompt_tokens),
+                            crate::usage_attr::input_tokens_for_pricing(
+                                u64::from(prompt_tokens),
+                                u64::from(comp.cached_prompt_tokens),
+                                u64::from(comp.cache_read_tokens),
+                                u64::from(comp.cache_creation_tokens),
+                            ),
                             u64::from(completion_tokens),
                         ),
                         comp.guardrail_blocked,
@@ -3885,7 +3910,12 @@ async fn dispatch_ensemble(
                     crate::usage_attr::request_cost_usd(
                         &snap,
                         &judge_model_id,
-                        u64::from(comp.prompt_tokens),
+                        crate::usage_attr::input_tokens_for_pricing(
+                            u64::from(comp.prompt_tokens),
+                            u64::from(comp.cached_prompt_tokens),
+                            u64::from(comp.cache_read_tokens),
+                            u64::from(comp.cache_creation_tokens),
+                        ),
                         u64::from(comp.completion_tokens),
                     ),
                     comp.guardrail_blocked,

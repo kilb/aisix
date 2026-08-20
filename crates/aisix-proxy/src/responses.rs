@@ -3987,7 +3987,15 @@ fn emit_usage_event(
         cost_usd: crate::usage_attr::request_cost_usd(
             snap,
             model_id,
-            u64::from(usage.prompt_tokens),
+            // `/v1/responses` carries BOTH vocabularies: the OpenAI subset
+            // counter on the verbatim path, the Anthropic separate counters on
+            // the cross-provider bridge (#825). The splitter handles either.
+            crate::usage_attr::input_tokens_for_pricing(
+                u64::from(usage.prompt_tokens),
+                u64::from(usage.cached_prompt_tokens),
+                u64::from(usage.cache_read_tokens),
+                u64::from(usage.cache_creation_tokens),
+            ),
             u64::from(usage.completion_tokens),
         ),
         cached_prompt_tokens: usage.cached_prompt_tokens,

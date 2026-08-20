@@ -39,7 +39,12 @@ pub enum Adapter {
     AzureOpenai,
 }
 
-/// Per-token cost for budget tracking. Both values are in USD per 1,000 tokens.
+/// Per-token cost for budget tracking. Every value is in USD per 1,000 tokens.
+///
+/// Prompt-cached tokens are priced separately because providers charge a
+/// different rate for them, in both directions: a cache read is cheaper than
+/// fresh input, while writing a prompt into the cache costs more. Priced with
+/// `input_per_1k` alone, cached traffic is mis-billed either way.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct ModelCost {
     /// Prompt token cost in USD per 1,000 tokens.
@@ -48,14 +53,114 @@ pub struct ModelCost {
     /// Completion token cost in USD per 1,000 tokens.
     #[schemars(range(min = 0.0))]
     pub output_per_1k: f64,
+    /// Cost in USD per 1,000 prompt tokens served from the provider's prompt
+    /// cache. Omitted, cache reads are charged at `input_per_1k`.
+    ///
+    /// An absolute price rather than a discount factor, because the discount
+    /// is not the same across providers: one charges a tenth of the input
+    /// rate for a cache read, another about half.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0.0))]
+    pub cached_input_per_1k: Option<f64>,
+    /// Cost in USD per 1,000 prompt tokens written INTO the provider's cache.
+    /// Omitted, cache writes are charged at `input_per_1k`.
+    ///
+    /// Writes are the direction that costs more than plain input — one
+    /// provider prices a five-minute write at 1.25x its input rate and a
+    /// one-hour write at 2x. A deployment that caches heavily and prices
+    /// writes at the plain input rate under-reports its spend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0.0))]
+    pub cache_write_per_1k: Option<f64>,
+}
+
+/// The three input-token buckets pricing needs, guaranteed DISJOINT.
+///
+/// This type exists because the two upstream shapes report cached tokens
+/// incompatibly, and the difference is invisible at the call site:
+///
+/// - Anthropic reports `cache_creation_input_tokens` and
+///   `cache_read_input_tokens` as counters SEPARATE from `input_tokens`
+///   (<https://platform.claude.com/docs/en/docs/build-with-claude/prompt-caching>:
+///   "input_tokens: Number of input tokens which were not read from or used
+///   to create a cache").
+/// - OpenAI reports `prompt_tokens_details.cached_tokens` as tokens "present
+///   in the prompt" — a SUBSET of `prompt_tokens`
+///   (`openai-python: src/openai/types/completion_usage.py`).
+///
+/// Subtracting on the first shape under-counts input; not subtracting on the
+/// second double-charges the cached half. Neither mistake fails a request or
+/// shows up in a test that only checks a total, so the shape is named at the
+/// constructor instead of being re-derived per handler.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InputTokens {
+    /// Fresh prompt tokens, neither read from nor written to the cache.
+    pub uncached: u64,
+    /// Prompt tokens served from the cache.
+    pub cache_read: u64,
+    /// Prompt tokens written into the cache.
+    pub cache_write: u64,
+}
+
+impl InputTokens {
+    /// Anthropic-shaped usage: the three counters are already disjoint, so
+    /// they are taken as given.
+    pub fn from_disjoint_counters(input: u64, cache_read: u64, cache_write: u64) -> Self {
+        Self {
+            uncached: input,
+            cache_read,
+            cache_write,
+        }
+    }
+
+    /// OpenAI-shaped usage: `cached` and `cache_write` are subsets of
+    /// `prompt`, so the fresh portion is what remains after both are removed.
+    /// Saturating, because a provider that reports a cached count exceeding
+    /// its own prompt total must not wrap into a huge charge.
+    pub fn from_prompt_superset(prompt: u64, cached: u64, cache_write: u64) -> Self {
+        Self {
+            uncached: prompt.saturating_sub(cached).saturating_sub(cache_write),
+            cache_read: cached,
+            cache_write,
+        }
+    }
+
+    /// No cache involved: every prompt token is fresh.
+    pub fn uncached_only(prompt: u64) -> Self {
+        Self {
+            uncached: prompt,
+            ..Self::default()
+        }
+    }
+
+    /// Total prompt tokens across all three buckets.
+    pub fn total(&self) -> u64 {
+        self.uncached + self.cache_read + self.cache_write
+    }
 }
 
 impl ModelCost {
-    /// Calculate USD cost for the given token counts.
+    /// Calculate USD cost, charging every input bucket at its own rate.
+    pub fn calculate_with_cache(&self, input: InputTokens, output_tokens: u64) -> f64 {
+        // Absent cache rates fall back to the plain input rate, which is what
+        // this priced before the fields existed — an existing `cost` block
+        // keeps reporting exactly what it reported yesterday.
+        let cached_rate = self.cached_input_per_1k.unwrap_or(self.input_per_1k);
+        let write_rate = self.cache_write_per_1k.unwrap_or(self.input_per_1k);
+        (self.input_per_1k * (input.uncached as f64)
+            + cached_rate * (input.cache_read as f64)
+            + write_rate * (input.cache_write as f64)
+            + self.output_per_1k * (output_tokens as f64))
+            / 1000.0
+    }
+
+    /// Calculate USD cost treating every prompt token as fresh input.
+    ///
+    /// Kept for the surfaces with no prompt cache at all (embeddings, audio,
+    /// rerank, images). A text-completion path should use
+    /// [`Self::calculate_with_cache`] so cached traffic is priced correctly.
     pub fn calculate(&self, input_tokens: u64, output_tokens: u64) -> f64 {
-        let input_cost = self.input_per_1k * (input_tokens as f64) / 1000.0;
-        let output_cost = self.output_per_1k * (output_tokens as f64) / 1000.0;
-        input_cost + output_cost
+        self.calculate_with_cache(InputTokens::uncached_only(input_tokens), output_tokens)
     }
 }
 
@@ -593,6 +698,92 @@ impl Resource for Model {
 
 #[cfg(test)]
 mod tests {
+    use super::{InputTokens, ModelCost};
+
+    /// Rates chosen so each bucket is distinguishable in the total: mixing
+    /// two of them up cannot produce the same number by coincidence.
+    fn cost() -> ModelCost {
+        ModelCost {
+            input_per_1k: 1.0,
+            output_per_1k: 10.0,
+            cached_input_per_1k: Some(0.1),
+            cache_write_per_1k: Some(1.25),
+        }
+    }
+
+    /// An existing `cost` block with no cache rates must price exactly as it
+    /// did before those fields existed — upgrading the gateway must not move
+    /// anyone's reported spend.
+    #[test]
+    fn absent_cache_rates_fall_back_to_the_input_rate() {
+        let c = ModelCost {
+            input_per_1k: 2.0,
+            output_per_1k: 4.0,
+            cached_input_per_1k: None,
+            cache_write_per_1k: None,
+        };
+        // 1000 fresh + 1000 read + 1000 write, all at the input rate.
+        let with_cache =
+            c.calculate_with_cache(InputTokens::from_disjoint_counters(1000, 1000, 1000), 0);
+        assert!((with_cache - 6.0).abs() < 1e-9, "got {with_cache}");
+        // And the plain entry point is unchanged.
+        assert!((c.calculate(1000, 500) - (2.0 + 2.0)).abs() < 1e-9);
+    }
+
+    /// Anthropic reports cache tokens as counters SEPARATE from
+    /// `input_tokens`, so all three buckets are additive. Pricing them as a
+    /// subset would subtract tokens the provider is charging for.
+    #[test]
+    fn anthropic_shaped_counters_are_additive() {
+        let got = cost()
+            .calculate_with_cache(InputTokens::from_disjoint_counters(1000, 2000, 4000), 1000);
+        // 1000*1.0 + 2000*0.1 + 4000*1.25 + 1000*10.0, per 1k.
+        let want = (1000.0 * 1.0 + 2000.0 * 0.1 + 4000.0 * 1.25 + 1000.0 * 10.0) / 1000.0;
+        assert!((got - want).abs() < 1e-9, "got {got}, want {want}");
+    }
+
+    /// OpenAI reports `cached_tokens` as a SUBSET of `prompt_tokens`. Failing
+    /// to subtract it charges the cached half twice — once at the fresh rate
+    /// and once at the cached rate.
+    #[test]
+    fn openai_shaped_cached_tokens_are_not_double_charged() {
+        let input = InputTokens::from_prompt_superset(1000, 800, 0);
+        assert_eq!(input.uncached, 200);
+        assert_eq!(input.cache_read, 800);
+        // The buckets must still add up to the prompt the provider reported.
+        assert_eq!(input.total(), 1000);
+        let got = cost().calculate_with_cache(input, 0);
+        let want = (200.0 * 1.0 + 800.0 * 0.1) / 1000.0;
+        assert!((got - want).abs() < 1e-9, "got {got}, want {want}");
+        // Charging the whole prompt at the fresh rate — today's behaviour —
+        // is strictly more expensive, which is the bug being fixed.
+        assert!(got < cost().calculate(1000, 0));
+    }
+
+    /// A provider reporting a cached count larger than its own prompt total
+    /// must not wrap the fresh bucket into an astronomically large charge.
+    #[test]
+    fn an_impossible_cached_count_cannot_wrap_into_a_huge_charge() {
+        let input = InputTokens::from_prompt_superset(100, 999, 0);
+        assert_eq!(input.uncached, 0);
+        assert!(cost().calculate_with_cache(input, 0) < 1.0);
+    }
+
+    /// Reading from the cache is cheaper than fresh input; writing to it is
+    /// dearer. A configuration that got the two rates the wrong way round is
+    /// the operator's business, but the arithmetic must keep them distinct.
+    #[test]
+    fn read_and_write_rates_are_applied_to_their_own_buckets() {
+        let read_only =
+            cost().calculate_with_cache(InputTokens::from_disjoint_counters(0, 1000, 0), 0);
+        let write_only =
+            cost().calculate_with_cache(InputTokens::from_disjoint_counters(0, 0, 1000), 0);
+        let fresh_only =
+            cost().calculate_with_cache(InputTokens::from_disjoint_counters(1000, 0, 0), 0);
+        assert!(read_only < fresh_only, "cache read must be cheaper");
+        assert!(write_only > fresh_only, "cache write must be dearer");
+    }
+
     use super::*;
 
     fn sample_json() -> &'static str {
