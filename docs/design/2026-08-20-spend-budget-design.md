@@ -217,6 +217,16 @@ etcd 中的 `RateLimitPolicy` 决定。**未配置带 `max_spend_micro_usd` 的�
   本仓库的 issue 已关闭，所以这里的记录就是唯一的记录：补这一面时，token 与
   花费必须一起接，并且要覆盖 batch 与 fine-tuning 两条。
 
+- **虚拟父级（routing / ensemble / semantic）调度到的真正未定价目标不产生信号**。
+  `aisix_budget_unpriced_requests_total` 只在直接模型（含 embedding）上断言：
+  预留花费层的那一刻还不知道会调度到哪个具体目标，而虚拟父级这一行结构上
+  永远不带 `cost`——对它断言"未定价"是没有依据的假信号，因为真实花费是按
+  *调度到的目标* 定价的（`usage_attr::request_cost_usd` 吃的是实际调度目标
+  的 model_id），完全可能非零。所以通过 Model Group / ensemble / 语义路由
+  调度到一个确实没配价的目标时，这条 metric 什么都不会记录——这是已知盲区，
+  不是 bug。一个假的"未生效"信号比沉默更糟：会教会运维忽略这条 series，
+  代价比留白更高。
+
 ## 备注：本文件位置
 
 本仓库的 `CLAUDE.md` 规定不在 `docs/` 下放散文档，理由是用户文档已外迁、

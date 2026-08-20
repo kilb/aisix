@@ -561,20 +561,30 @@ async fn reserve_policy_layers(
 
             // 未定价模型对花费计数器贡献 0，所以这个上限对它无效。
             // 放行，但不静默——拒绝会把一个配置疏漏变成流量中断。
-            // 取已解析的模型行判断是否定价——不是请求里的模型名：
-            // 通配符路径下两者不同，取错会让告警漏报或误报。
+            //
+            // R10：只在能给出准确结论的地方断言"未定价"。
+            // 直接模型（含 embedding）：`cost` 就是它自己的定价，直接判断。
+            // 虚拟父级（routing/ensemble/semantic）：此刻还不知道会调度到
+            // 哪个具体目标，而这类行结构上永远不带 `cost`——真实花费是按
+            // *调度到的目标* 定价的（`usage_attr::request_cost_usd` 吃的是
+            // 实际调度目标的 model_id，不是这里的父级 id），可能非零。对
+            // 父级断言"未定价"会把一条计费正常的请求错误地标成"预算失
+            // 效"，这是假信号，比留白更糟——见
+            // docs/design/2026-08-20-spend-budget-design.md 的 Non-goals：
+            // 通过虚拟父级调度到的、真正未定价的目标，这里不会产生任何
+            // 信号，是已知盲区。
             if let (Some(model_id), Some(model_name)) = (input.model, input.model_name) {
-                let unpriced = snap
-                    .models
-                    .get_by_id(model_id)
-                    .map(|e| e.value.cost.is_none())
-                    .unwrap_or(true);
-                if unpriced {
-                    // 标签必须用已解析的行名：通配符路径下调用方能自造模型名，
-                    // 直接打标签会让这个 series 基数无上限。
-                    let label = crate::usage_attr::metric_model_label(snap, model_name);
-                    state.metrics.record_budget_unpriced(&policy.name, &label);
-                    warn_unpriced_model_once(&policy.name, &label);
+                if let Some(resolved) = snap.models.get_by_id(model_id) {
+                    let model = &resolved.value;
+                    let is_virtual_parent =
+                        model.is_routing() || model.is_ensemble() || model.is_semantic();
+                    if !is_virtual_parent && model.cost.is_none() {
+                        // 标签必须用已解析的行名：通配符路径下调用方能自造模型名，
+                        // 直接打标签会让这个 series 基数无上限。
+                        let label = crate::usage_attr::metric_model_label(snap, model_name);
+                        state.metrics.record_budget_unpriced(&policy.name, &label);
+                        warn_unpriced_model_once(&policy.name, &label);
+                    }
                 }
             }
         }
@@ -1549,6 +1559,42 @@ mod tests {
         assert!(
             !rendered.contains(aisix_obs::metrics::M_BUDGET_UNPRICED_REQUESTS_TOTAL),
             "定价模型不该产生未定价告警: {rendered}"
+        );
+    }
+
+    /// R10：虚拟父级（routing/ensemble/semantic）在预留这一刻还不知道会
+    /// 调度到哪个具体目标，而这类行结构上永远不带 `cost`。真实花费是按
+    /// *调度到的目标* 定价的（可能非零），对父级断言"未定价"是假信号，
+    /// 比留白更糟——这里必须什么都不产生。
+    #[tokio::test]
+    async fn virtual_parent_dispatch_emits_no_unpriced_signal() {
+        let snap = snapshot_with_policy(make_spend_policy(
+            "api_key",
+            "k1",
+            "day",
+            None,
+            Some(5_000_000),
+        ));
+        let parent: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "chat-group",
+            "routing": { "targets": [{ "model": "gpt-4o" }] },
+        }))
+        .unwrap();
+        snap.models.insert(aisix_core::resource::ResourceEntry::new(
+            "group-1", parent, 1,
+        ));
+        let state = test_state(&snap);
+        let auth = test_auth_key("k1");
+        let mrl = make_model_rl("chat-group", "group-1", None);
+
+        reserve_layers(&state, &snap, &auth, Some(&mrl), None)
+            .await
+            .expect("应放行");
+
+        let rendered = state.metrics.render();
+        assert!(
+            !rendered.contains(aisix_obs::metrics::M_BUDGET_UNPRICED_REQUESTS_TOTAL),
+            "虚拟父级不该产生未定价告警——此刻不知道会调度到哪个具体目标: {rendered}"
         );
     }
 }
