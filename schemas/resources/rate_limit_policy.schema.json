@@ -321,6 +321,11 @@
           "required": [
             "max_tokens"
           ]
+        },
+        {
+          "required": [
+            "max_spend_micro_usd"
+          ]
         }
       ],
       "not": {
@@ -379,6 +384,11 @@
           {
             "required": [
               "max_tokens"
+            ]
+          },
+          {
+            "required": [
+              "max_spend_micro_usd"
             ]
           }
         ]

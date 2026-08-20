@@ -346,7 +346,13 @@ impl RateLimitPolicy {
             || self.scope_ref.is_some()
             || self.window.is_some()
             || self.max_requests.is_some()
-            || self.max_tokens.is_some();
+            || self.max_tokens.is_some()
+            // `max_spend_micro_usd` is a classic-form dimension: it needs
+            // `window` to project onto a counter, and the conditional form
+            // has no `window`. Listing it here is what makes a conditional
+            // row carrying it fail as a form mix rather than load and never
+            // be read.
+            || self.max_spend_micro_usd.is_some();
         let conditional = self.conditions.is_some()
             || self.group_by.is_some()
             || self.limits.is_some()
@@ -383,8 +389,14 @@ impl RateLimitPolicy {
         if self.scope.is_none() || self.scope_ref.is_none() || self.window.is_none() {
             return Err("classic policy requires `scope`, `scope_ref` and `window`".into());
         }
-        if self.max_requests.is_none() && self.max_tokens.is_none() {
-            return Err("classic policy requires `max_requests` or `max_tokens`".into());
+        if self.max_requests.is_none()
+            && self.max_tokens.is_none()
+            && self.max_spend_micro_usd.is_none()
+        {
+            return Err(
+                "classic policy requires `max_requests`, `max_tokens` or `max_spend_micro_usd`"
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -393,16 +405,17 @@ impl RateLimitPolicy {
 /// The form XOR `schemars` can't derive, injected as a top-level `oneOf` by
 /// [`crate::models::schema::rate_limit_policy_root_schema`]: a row is either
 /// the classic form (scope/scope_ref/window required, at least one of
-/// `max_requests`/`max_tokens`, none of the conditional fields) or the
-/// conditional form (`limits` required, none of the classic fields).
-/// Pre-#892 rows satisfy the classic branch byte-for-byte.
+/// `max_requests`/`max_tokens`/`max_spend_micro_usd`, none of the conditional
+/// fields) or the conditional form (`limits` required, none of the classic
+/// fields). Pre-#892 rows satisfy the classic branch byte-for-byte.
 pub fn rate_limit_policy_form_one_of() -> Value {
     json!([
         {
             "required": ["scope", "scope_ref", "window"],
             "anyOf": [
                 { "required": ["max_requests"] },
-                { "required": ["max_tokens"] }
+                { "required": ["max_tokens"] },
+                { "required": ["max_spend_micro_usd"] }
             ],
             "not": { "anyOf": [
                 { "required": ["conditions"] },
@@ -418,7 +431,8 @@ pub fn rate_limit_policy_form_one_of() -> Value {
                 { "required": ["scope_ref"] },
                 { "required": ["window"] },
                 { "required": ["max_requests"] },
-                { "required": ["max_tokens"] }
+                { "required": ["max_tokens"] },
+                { "required": ["max_spend_micro_usd"] }
             ]}
         }
     ])
@@ -645,6 +659,83 @@ mod tests {
             .validate_semantics()
             .unwrap_err()
             .contains("repeats"));
+    }
+
+    /// 只配了 `max_spend_micro_usd` 的经典行必须能通过校验——预算的
+    /// 典型形态就是「不限 token、只限钱」。校验器早先要求
+    /// `max_requests`/`max_tokens` 二选一，会把整条策略在加载期拒掉，
+    /// 于是花费上限根本配不进来（执行侧的单测直接构造结构体，绕过校验，
+    /// 全绿也发现不了）。
+    #[test]
+    fn spend_only_classic_policy_validates() {
+        let p: RateLimitPolicy = serde_json::from_value(json!({
+            "name": "daily-budget",
+            "scope": "api_key",
+            "scope_ref": "k1",
+            "window": "day",
+            "max_spend_micro_usd": 5_000_000
+        }))
+        .unwrap();
+        p.validate_semantics().expect("纯预算策略必须能加载");
+    }
+
+    /// 三个维度一个都不配仍然要拒——放宽的是「哪些维度算数」，
+    /// 不是「可以一个都不配」。
+    #[test]
+    fn classic_policy_with_no_ceiling_at_all_is_still_rejected() {
+        let p: RateLimitPolicy = serde_json::from_value(json!({
+            "name": "none",
+            "scope": "api_key",
+            "scope_ref": "k1",
+            "window": "day"
+        }))
+        .unwrap();
+        assert!(p
+            .validate_semantics()
+            .unwrap_err()
+            .contains("max_spend_micro_usd"));
+    }
+
+    /// 条件形态的行带 `max_spend_micro_usd` 必须被拒。
+    ///
+    /// 花费上限要靠 `window` 才能投影到某个计数器，而条件形态没有
+    /// `window`（它用自带 7 维的 `limits`），所以执行侧永远读不到这个字段。
+    /// 收下它就是仓库点名的「accepted-but-unread config」那一类：
+    /// 一个旋钮要么按写的执行，要么被拒，不能半生效。
+    #[test]
+    fn conditional_policy_carrying_max_spend_is_rejected() {
+        let p: RateLimitPolicy = serde_json::from_value(json!({
+            "name": "cond-spend",
+            "conditions": [
+                { "dimension": "team", "operator": "==", "value": "t-1" }
+            ],
+            "limits": { "rpm": 5 },
+            "max_spend_micro_usd": 5_000_000
+        }))
+        .unwrap();
+        assert!(p.validate_semantics().unwrap_err().contains("mixes"));
+    }
+
+    /// schema 的 `oneOf` 要和 `validate_semantics` 说同一件事：经典分支把
+    /// 花费当作合格维度，条件分支把它列进禁用字段。两者不一致时，
+    /// 严格写入路径与加载校验会各拒各的。
+    #[test]
+    fn form_one_of_lists_max_spend_on_both_branches() {
+        let one_of = rate_limit_policy_form_one_of();
+        let classic_any_of = one_of[0]["anyOf"].as_array().unwrap();
+        assert!(
+            classic_any_of
+                .iter()
+                .any(|b| b["required"][0] == "max_spend_micro_usd"),
+            "经典分支未把花费上限算作合格维度: {classic_any_of:?}"
+        );
+        let conditional_not = one_of[1]["not"]["anyOf"].as_array().unwrap();
+        assert!(
+            conditional_not
+                .iter()
+                .any(|b| b["required"][0] == "max_spend_micro_usd"),
+            "条件分支未禁用花费上限: {conditional_not:?}"
+        );
     }
 
     #[test]

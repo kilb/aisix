@@ -278,6 +278,66 @@ rate_limit_policies:
 }
 
 #[test]
+fn spend_only_policy_loads_through_the_file_source() {
+    // The whole point of the spend budget is a policy that caps money and
+    // nothing else. The loader used to require `max_requests`/`max_tokens`,
+    // so this exact row was rejected before it ever reached the gate — the
+    // enforcement-side unit tests construct the struct directly and would
+    // have stayed green while the feature was unconfigurable.
+    let file = r#"
+_format_version: "1"
+
+rate_limit_policies:
+  - name: team-daily-budget
+    scope: team
+    scope_ref: team-1
+    window: day
+    max_spend_micro_usd: 5000000
+"#;
+    let snap = load(file, &env_of(&[])).expect("spend-only policy must load");
+    assert_eq!(snap.rate_limit_policies.len(), 1);
+    let policy = snap
+        .rate_limit_policies
+        .entries()
+        .into_iter()
+        .find(|e| e.value.name == "team-daily-budget")
+        .expect("policy row");
+    assert_eq!(policy.value.max_spend_micro_usd, Some(5_000_000));
+    assert_eq!(policy.value.max_requests, None);
+    assert_eq!(policy.value.max_tokens, None);
+}
+
+#[test]
+fn conditional_policy_carrying_max_spend_fails_the_load() {
+    // `max_spend_micro_usd` needs `window` to project onto a counter and
+    // the conditional form has none, so the gate can never read it.
+    // Loading it would be a knob that is accepted and never enforced.
+    let file = r#"
+_format_version: "1"
+
+rate_limit_policies:
+  - name: cond-spend
+    conditions:
+      - dimension: team
+        operator: "=="
+        value: team-1
+    limits:
+      rpm: 5
+    max_spend_micro_usd: 5000000
+"#;
+    let errors = errors_of(load(file, &env_of(&[])));
+    // The strict schema's form XOR fires first (before `validate_semantics`,
+    // which would call the same shape a form mix). Either way the row never
+    // reaches the snapshot.
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("cond-spend") && e.contains("oneOf")),
+        "should fail the form XOR: {errors:?}"
+    );
+}
+
+#[test]
 fn dead_knob_on_a_group_is_a_declarative_load_error() {
     // The strict write path (declarative resources file) rejects a knob
     // the kind never resolves — a silently-dead `cost` on a Model Group

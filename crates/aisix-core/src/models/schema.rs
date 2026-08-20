@@ -3381,6 +3381,39 @@ mod tests {
     }
 
     #[test]
+    fn rate_limit_policy_accepts_a_spend_only_classic_row() {
+        // A budget is typically "no token cap, just a money cap". The
+        // classic branch used to require max_requests or max_tokens, so
+        // such a row failed the write path and the ceiling was
+        // unconfigurable.
+        let v = json!({
+            "name": "daily-budget",
+            "scope": "api_key",
+            "scope_ref": "k1",
+            "window": "day",
+            "max_spend_micro_usd": 5_000_000u64
+        });
+        assert!(validate_rate_limit_policy(&v).is_ok());
+        assert!(validate_rate_limit_policy_lenient(&v).is_ok());
+    }
+
+    #[test]
+    fn rate_limit_policy_rejects_max_spend_on_a_conditional_row() {
+        // `max_spend_micro_usd` projects onto a counter through `window`,
+        // which the conditional form does not have — so the gate could
+        // never read it. Accepting it would be a knob that loads and is
+        // never enforced; the form XOR rejects it instead.
+        let v = json!({
+            "name": "cond-spend",
+            "conditions": [ { "dimension": "team", "operator": "==", "value": "t-1" } ],
+            "limits": { "rpm": 5 },
+            "max_spend_micro_usd": 5_000_000u64
+        });
+        assert!(validate_rate_limit_policy(&v).is_err());
+        assert!(validate_rate_limit_policy_lenient(&v).is_err());
+    }
+
+    #[test]
     fn rate_limit_policy_rejects_unknown_field_inside_condition_node() {
         // ConditionNode is #[serde(untagged)]: serde silently swallows
         // unknown fields inside untagged content, so the schema closure

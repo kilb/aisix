@@ -665,7 +665,15 @@ async fn dispatch(
         .as_ref()
         .map(|u| u64::from(u.prompt_tokens))
         .unwrap_or(0);
-    reservation.commit_tokens(total_tokens).await;
+    // 花费与本端点用量事件的 cost_usd 同源：按调度到的目标行定价，
+    // 重排没有提示缓存也没有输出 token。
+    let spend = crate::usage_attr::request_spend_micro_usd(
+        snapshot,
+        &target_id,
+        aisix_core::InputTokens::uncached_only(total_tokens),
+        0,
+    );
+    reservation.commit(total_tokens, spend).await;
 
     Ok(RerankDispatchSuccess {
         response: resp,

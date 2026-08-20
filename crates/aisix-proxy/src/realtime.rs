@@ -733,7 +733,16 @@ async fn run_session(
 
     let elapsed = started.elapsed();
     let total_tokens = usage.input_tokens + usage.output_tokens;
-    reservation.commit_tokens(total_tokens).await;
+    // 会话的花费：算在提交之前，同一个数字既进花费桶也进下面的用量事件。
+    let cost_usd = model_entry
+        .value
+        .cost
+        .as_ref()
+        .map(|c| c.calculate(usage.input_tokens, usage.output_tokens))
+        .unwrap_or(0.0);
+    reservation
+        .commit(total_tokens, crate::usage_attr::spend_micro_usd(cost_usd))
+        .await;
 
     emit_access_log(
         &Method::GET,
@@ -777,12 +786,7 @@ async fn run_session(
         // the upstream figure and what the caller waited for coincide.
         upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
-        cost_usd: model_entry
-            .value
-            .cost
-            .as_ref()
-            .map(|c| c.calculate(usage.input_tokens, usage.output_tokens))
-            .unwrap_or(0.0),
+        cost_usd,
         inbound_protocol: "realtime".to_string(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),

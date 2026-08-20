@@ -491,7 +491,19 @@ async fn dispatch(
             let total_tokens = usage
                 .map(|(prompt, completion)| u64::from(prompt) + u64::from(completion))
                 .unwrap_or(0);
-            reservation.commit_tokens(total_tokens).await;
+            // 花费与本端点用量事件的 cost_usd 同源：按调度到的目标行定价，
+            // 输入全按新鲜计（这个表面没有提示缓存）。
+            let spend = usage
+                .map(|(prompt, completion)| {
+                    crate::usage_attr::request_spend_micro_usd(
+                        snapshot,
+                        &target_id,
+                        aisix_core::InputTokens::uncached_only(u64::from(prompt)),
+                        u64::from(completion),
+                    )
+                })
+                .unwrap_or(0);
+            reservation.commit(total_tokens, spend).await;
             let mut output_capture_safe = true;
             let mut guardrail_blocked = false;
             if !resolved_chain.is_empty() {

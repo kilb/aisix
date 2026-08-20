@@ -632,10 +632,19 @@ async fn dispatch(
             if let Some(member) = member_reservation {
                 reservation.merge(member);
             }
+            // 花费与本端点用量事件的 cost_usd 同源：按调度到的目标行定价，
+            // 输入全按新鲜计（这个表面没有提示缓存），无输出 token。
+            let spend = crate::usage_attr::request_spend_micro_usd(
+                snapshot,
+                &target_id,
+                aisix_core::InputTokens::uncached_only(u64::from(prompt_tokens)),
+                0,
+            );
             reservation
-                .commit_tokens(u64::from(
-                    (embed_resp.usage.total_tokens).max(prompt_tokens),
-                ))
+                .commit(
+                    u64::from((embed_resp.usage.total_tokens).max(prompt_tokens)),
+                    spend,
+                )
                 .await;
             // Content capture (#700): the full response JSON, vectors
             // included (LiteLLM parity); CapturedContent::new truncates to
