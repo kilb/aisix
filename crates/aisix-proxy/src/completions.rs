@@ -744,8 +744,9 @@ async fn dispatch(
                     &output_text,
                 );
                 reservation
-                    .commit_tokens(
+                    .commit(
                         u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens),
+                        completion_spend_micro_usd(snapshot, &model_entry_id, &usage),
                     )
                     .await;
 
@@ -877,8 +878,9 @@ async fn dispatch(
                     &output_text,
                 );
                 reservation
-                    .commit_tokens(
+                    .commit(
                         u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens),
+                        completion_spend_micro_usd(snapshot, &model_entry_id, &usage),
                     )
                     .await;
                 return Ok(CompletionDispatchSuccess {
@@ -913,8 +915,9 @@ async fn dispatch(
                     &output_text,
                 );
                 reservation
-                    .commit_tokens(
+                    .commit(
                         u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens),
+                        completion_spend_micro_usd(snapshot, &model_entry_id, &usage),
                     )
                     .await;
                 let error_class = error.error_type().to_string();
@@ -956,7 +959,10 @@ async fn dispatch(
                 stream,
                 capture_bypassed,
             } => {
-                let post_stream_keys = reservation.keys();
+                // 花费层的桶记 micro-USD，和 token 桶不能共用一张键表——同一批键
+                // 加同一个数字会把 token 数当成钱记进去。
+                let post_stream_keys = reservation.token_keys();
+                let spend_post_stream_keys = reservation.spend_keys();
                 let stream_hold = reservation.into_stream_hold();
                 let limiter = Arc::clone(&state.limiter);
                 let state_for_stream = state.clone();
@@ -1062,6 +1068,13 @@ async fn dispatch(
                         let mut all_hits = input_monitor_hits;
                         all_hits.extend(output_observation.monitor_hits);
                         let snapshot = state_for_stream.snapshot.load();
+                        // 花费层记账（micro-USD），与上面的 token 记账成对。
+                        // 一个流可能跨过几代配置，所以按流结束时生效的价格算，
+                        // 和下面用量事件读的是同一份快照。
+                        limiter.add_tokens_post_stream_all(
+                            &spend_post_stream_keys,
+                            completion_spend_micro_usd(&snapshot, &model_id_for_stream, &usage),
+                        );
                         let pk = crate::usage_attr::ResolvedPk::resolve(
                             &snapshot,
                             &provider_key_id_for_stream,
@@ -1227,7 +1240,11 @@ async fn dispatch(
                 .as_ref()
                 .map(|u| u64::from(u.prompt_tokens) + u64::from(u.completion_tokens))
                 .unwrap_or(0);
-            reservation.commit_tokens(total_tokens).await;
+            let spend = usage
+                .as_ref()
+                .map(|u| completion_spend_micro_usd(snapshot, &model_entry_id, u))
+                .unwrap_or(0);
+            reservation.commit(total_tokens, spend).await;
 
             // #911 [23]: /v1/completions must run OUTPUT guardrails too. The
             // input hook above scans the prompt, but pre-fix the model's reply
@@ -1353,6 +1370,25 @@ async fn dispatch(
             completion_unsupported_or_error(failure, &model_entry, redactions, monitor_hits)
         }
     }
+}
+
+/// 这次 `/v1/completions` 调用要记进花费桶的量（micro-USD）。
+///
+/// 与本文件用量事件里的 `cost_usd` 取同一组入参：`CompletionUsage` 上根本
+/// 没有缓存计数器，所以整份输入按未缓存计价——不是说这个端点不受上游的
+/// prompt 缓存影响。哪天这些计数器接上来了，这里和用量事件都要改成
+/// `input_tokens_for_pricing`。
+fn completion_spend_micro_usd(
+    snap: &aisix_core::AisixSnapshot,
+    model_id: &str,
+    usage: &CompletionUsage,
+) -> u64 {
+    crate::usage_attr::request_spend_micro_usd(
+        snap,
+        model_id,
+        aisix_core::InputTokens::uncached_only(u64::from(usage.prompt_tokens)),
+        u64::from(usage.completion_tokens),
+    )
 }
 
 /// Pull the usage counters out of a legacy /v1/completions response

@@ -301,6 +301,26 @@ pub(crate) fn request_cost_usd(
         .unwrap_or(0.0)
 }
 
+/// USD → micro-USD，花费计数器用的整数单位（1 USD = 1_000_000）。
+///
+/// 四舍五入而非截断：单次调用常在 1e-4 美元量级，一律截断会让花费系统性
+/// 偏低。`max(0.0)` 兜住负价与 NaN（`f64::max` 在一侧为 NaN 时返回另一侧），
+/// `as u64` 在 Rust 里是饱和转换，不会回绕。
+pub(crate) fn spend_micro_usd(cost_usd: f64) -> u64 {
+    (cost_usd * 1_000_000.0).round().max(0.0) as u64
+}
+
+/// 这次调用要记进花费桶的量（micro-USD）。与 [`request_cost_usd`] 同源同参，
+/// 只是换成计数器用的整数单位——两处各算一遍才是它们漂移的方式。
+pub(crate) fn request_spend_micro_usd(
+    snap: &AisixSnapshot,
+    model_id: &str,
+    input: aisix_core::InputTokens,
+    completion_tokens: u64,
+) -> u64 {
+    spend_micro_usd(request_cost_usd(snap, model_id, input, completion_tokens))
+}
+
 /// Split the canonical usage counters into the disjoint buckets pricing
 /// needs. The ONLY place that arithmetic lives.
 ///
@@ -513,6 +533,29 @@ pub(crate) fn emit_guardrail_error_usage_event(
 
 #[cfg(test)]
 mod tests {
+
+    /// USD→micro-USD 必须四舍五入。单次调用常在 1e-4 美元量级（这里是
+    /// 0.00012345 USD = 123.45 micro-USD），一律截断会让每一次调用都少记
+    /// 不到 1 micro-USD——单看无所谓，跨几十万次调用就是系统性偏低。
+    #[test]
+    fn spend_rounds_rather_than_truncating() {
+        use super::spend_micro_usd;
+        assert_eq!(spend_micro_usd(0.000_123_45), 123);
+        assert_eq!(spend_micro_usd(0.000_123_65), 124);
+        // 比 1 micro-USD 还小的一次调用记成 1 而不是 0。
+        assert_eq!(spend_micro_usd(0.000_000_6), 1);
+        assert_eq!(spend_micro_usd(0.0), 0);
+        // 未定价模型返回 0.0，对花费桶的贡献就是 0。
+        assert_eq!(spend_micro_usd(1.0), 1_000_000);
+    }
+
+    /// 负价与 NaN 都不能变成一个巨大的正数记进桶里。
+    #[test]
+    fn spend_clamps_negative_and_nan_to_zero() {
+        use super::spend_micro_usd;
+        assert_eq!(spend_micro_usd(-1.0), 0);
+        assert_eq!(spend_micro_usd(f64::NAN), 0);
+    }
 
     /// `Model.cost` had two live readers (`least_cost` ranking, and the jobs
     /// and realtime emits) and was ignored by every main LLM endpoint, which

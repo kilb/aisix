@@ -1884,7 +1884,10 @@ async fn dispatch(
         if let Some(member) = won_member_reservation.take() {
             reservation.merge(member);
         }
-        let post_stream_keys = reservation.keys();
+        let post_stream_keys = reservation.token_keys();
+        // 花费层的桶记 micro-USD，和 token 桶不能共用一张键表——同一批键
+        // 加同一个数字会把 token 数当成钱记进去。
+        let spend_post_stream_keys = reservation.spend_keys();
         let stream_concurrency_hold = reservation.into_stream_hold();
         // least_busy: keep this target counted as in-flight for the stream's
         // full lifetime. Like `stream_concurrency_hold`, the guard is moved
@@ -2049,6 +2052,12 @@ async fn dispatch(
                         u64::from(comp.cache_creation_tokens),
                     ),
                     u64::from(comp.completion_tokens),
+                );
+                // 花费层的 TPM/TPD 记账（单位是 micro-USD）。与上面的 token
+                // 记账成对：两批键各记各的数字。
+                limiter.add_tokens_post_stream_all(
+                    &spend_post_stream_keys,
+                    crate::usage_attr::spend_micro_usd(stream_cost_usd),
                 );
                 let deployment_success = terminal.error_class.is_empty() && terminal.status < 400;
                 routing_for_terminal.finish_staged(
@@ -3069,13 +3078,14 @@ async fn dispatch(
     if let Some(member) = won_member_reservation.take() {
         reservation.merge(member);
     }
-    reservation.commit_tokens(total).await;
 
     // Price from the DISPATCHED row's `Model.cost` when the operator set one;
     // `0.0` otherwise, which is what a control plane recomputing from its own
     // pricing catalog expects. Without this an open-source deployment — no
     // control plane to recompute anything — saw cost 0 however it configured
     // the field.
+    //
+    // 算在提交之前：同一个数字既进用量事件，也进花费层的计数器。
     let cost_usd = crate::usage_attr::request_cost_usd(
         snapshot,
         &model_id,
@@ -3087,6 +3097,9 @@ async fn dispatch(
         ),
         completion,
     );
+    reservation
+        .commit(total, crate::usage_attr::spend_micro_usd(cost_usd))
+        .await;
 
     let (output_verdict, hits) = resolved_chain
         .check_output_non_segment_observed(&upstream)
@@ -3754,12 +3767,14 @@ async fn dispatch_ensemble(
 
         // Hold concurrency for the stream's full lifetime (#450). Snapshot the
         // keys BEFORE consuming the reservation into the owned guard.
-        let post_stream_keys = reservation.keys();
+        // ensemble 的花费归属是本仓库登记在案的待办（`CLAUDE.md`），这里只
+        // 取 token 层的键：花费层如果混进来，会被记上 token 数而不是钱。
+        let post_stream_keys = reservation.token_keys();
         let stream_concurrency_hold = reservation.into_stream_hold();
         // #620: hold the judge's own concurrency slot for the stream lifetime
         // and add its tokens post-stream, the same way the entry reservation is
         // handled (snapshot keys before consuming into the owned guard).
-        let judge_post_stream_keys = judge_reservation.keys();
+        let judge_post_stream_keys = judge_reservation.token_keys();
         let judge_concurrency_hold = judge_reservation.into_stream_hold();
         let limiter = Arc::clone(&state.limiter);
 

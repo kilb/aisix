@@ -1015,7 +1015,20 @@ async fn dispatch(
                                 outcome.metrics.cache_creation_tokens,
                                 outcome.metrics.cache_read_tokens,
                             );
-                            r.commit_tokens(total).await;
+                            // 花费按调度到的目标行定价——和这次请求的用量
+                            // 事件用的是同一个 model_id。
+                            let spend = crate::usage_attr::request_spend_micro_usd(
+                                snapshot,
+                                &target.id,
+                                crate::usage_attr::input_tokens_for_pricing(
+                                    u64::from(outcome.metrics.prompt_tokens),
+                                    0,
+                                    u64::from(outcome.metrics.cache_read_tokens),
+                                    u64::from(outcome.metrics.cache_creation_tokens),
+                                ),
+                                u64::from(outcome.metrics.completion_tokens),
+                            );
+                            r.commit(total, spend).await;
                         }
                     }
                     if let Some(gate) = cache_gate.as_ref() {
@@ -1518,7 +1531,16 @@ async fn anthropic_passthrough_dispatch(
                 None => *reservation = Some(member),
             }
         }
-        let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
+        // 花费层的桶记 micro-USD，和 token 桶不能共用一张键表——同一批键
+        // 加同一个数字会把 token 数当成钱记进去。
+        let post_stream_keys = reservation
+            .as_ref()
+            .map(|r| r.token_keys())
+            .unwrap_or_default();
+        let spend_post_stream_keys = reservation
+            .as_ref()
+            .map(|r| r.spend_keys())
+            .unwrap_or_default();
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_c = std::sync::Arc::clone(&state.limiter);
         // Token-estimation fallback context (#1074): the inbound
@@ -1611,6 +1633,24 @@ async fn anthropic_passthrough_dispatch(
                 // end-of-stream emit reads a FRESH snapshot rather than the
                 // one the request started on (#941).
                 let snap_c = state_c.snapshot.load();
+                // 花费层记账（micro-USD），与上面的 token 记账成对。价格与
+                // 下面用量事件里的 cost_usd 同源：同一个快照、同一份 metrics。
+                limiter_c.add_tokens_post_stream_all(
+                    &spend_post_stream_keys,
+                    crate::usage_attr::request_spend_micro_usd(
+                        &snap_c,
+                        &model_id_c,
+                        crate::usage_attr::input_tokens_for_pricing(
+                            u64::from(metrics.prompt_tokens),
+                            // `/v1/messages` 是原生 Anthropic：这条路径上没有
+                            // OpenAI 那个「子集」计数器。
+                            0,
+                            u64::from(metrics.cache_read_tokens),
+                            u64::from(metrics.cache_creation_tokens),
+                        ),
+                        u64::from(metrics.completion_tokens),
+                    ),
+                );
                 let pk_c = crate::usage_attr::ResolvedPk::resolve(&snap_c, &provider_key_id_c);
                 emit_anthropic_usage_event(
                     &state_c,
@@ -2365,7 +2405,16 @@ async fn cross_provider_dispatch(
                 None => *reservation = Some(member),
             }
         }
-        let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
+        // 花费层的桶记 micro-USD，和 token 桶不能共用一张键表——同一批键
+        // 加同一个数字会把 token 数当成钱记进去。
+        let post_stream_keys = reservation
+            .as_ref()
+            .map(|r| r.token_keys())
+            .unwrap_or_default();
+        let spend_post_stream_keys = reservation
+            .as_ref()
+            .map(|r| r.spend_keys())
+            .unwrap_or_default();
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_for_stream = std::sync::Arc::clone(&state.limiter);
         // Token-estimation fallback context (#1074): the inbound
@@ -2452,6 +2501,21 @@ async fn cross_provider_dispatch(
                 );
                 // Fresh snapshot at stream end — see the passthrough path.
                 let snap_telem = state_for_telem.snapshot.load();
+                // 花费层记账（micro-USD），与上面的 token 记账成对。
+                limiter_for_stream.add_tokens_post_stream_all(
+                    &spend_post_stream_keys,
+                    crate::usage_attr::request_spend_micro_usd(
+                        &snap_telem,
+                        &model_id_for_telem,
+                        crate::usage_attr::input_tokens_for_pricing(
+                            u64::from(metrics.prompt_tokens),
+                            0,
+                            u64::from(metrics.cache_read_tokens),
+                            u64::from(metrics.cache_creation_tokens),
+                        ),
+                        u64::from(metrics.completion_tokens),
+                    ),
+                );
                 let pk_telem =
                     crate::usage_attr::ResolvedPk::resolve(&snap_telem, &provider_key_id_for_telem);
                 emit_anthropic_usage_event(

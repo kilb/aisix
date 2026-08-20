@@ -26,7 +26,7 @@ use aisix_core::models::{
     ConditionInput, GroupByDimension, PolicyScope, PolicyWindow, RateLimitPolicy,
 };
 use aisix_core::RateLimit;
-use aisix_ratelimit::MultiReservation;
+use aisix_ratelimit::{CounterUnit, MultiReservation};
 
 use crate::auth::AuthenticatedKey;
 use crate::error::ProxyError;
@@ -131,6 +131,17 @@ enum PolicyPhase {
 struct PolicyLayer {
     bucket_key: String,
     limits: RateLimit,
+    /// 花费层：与 token 层同一条策略、同一个窗口，但独立的桶和独立的
+    /// 计数单位。两层都要过——任一超限即拒，和多层限流的语义一致。
+    /// `None` = 该策略没设 `max_spend_micro_usd`，或窗口投影为空
+    /// （`second` 窗口，已在 [`classic_rate_limit`] 里报警）。
+    spend: Option<SpendLayer>,
+}
+
+/// [`PolicyLayer`] 的花费侧。桶键与限额都独立于 token 侧。
+struct SpendLayer {
+    bucket_key: String,
+    limits: RateLimit,
 }
 
 /// Decide whether `policy` applies at this phase and build its bucket
@@ -170,20 +181,38 @@ fn match_policy_layer(
         return None;
     }
     let limits = classic_rate_limit(policy)?;
-    if limits.is_unrestricted() {
-        return None;
-    }
     // Most scopes share one counter across every key the policy matches
     // (`policy:<scope>:<scope_ref>:<id>`). `team_member` appends the
     // request's `user_id` so each member of the team counts against an
     // independent identical bucket (LiteLLM's `{team_id}:{user_id}`).
-    let mut bucket_key = format!("policy:{scope}:{scope_ref}:{policy_entry_id}");
-    if scope == PolicyScope::TeamMember {
-        if let Some(member) = input.member {
-            bucket_key = format!("{bucket_key}:{member}");
-        }
+    //
+    // 花费桶跟着同一个后缀：token 上限在 `team_member` 下是每人一份，
+    // 花费桶不拆就会变成全队共用一份预算——两个维度的拆分方式必须一致。
+    let member_suffix = match (scope, input.member) {
+        (PolicyScope::TeamMember, Some(member)) => format!(":{member}"),
+        _ => String::new(),
+    };
+    let bucket_key = format!("policy:{scope}:{scope_ref}:{policy_entry_id}{member_suffix}");
+    let spend = policy.max_spend_micro_usd.and_then(|max_spend| {
+        let limits = spend_limits_for(policy.window?, max_spend);
+        // second 窗口投影为空，此时不预留（已在 `classic_rate_limit` 报警）。
+        (!limits.is_unrestricted()).then(|| SpendLayer {
+            bucket_key: format!(
+                "{}{member_suffix}",
+                spend_bucket_key(scope.as_str(), scope_ref, policy_entry_id)
+            ),
+            limits,
+        })
+    });
+    // 只设了花费上限的策略也要生效：token 侧无限制不代表整条策略无限制。
+    if limits.is_unrestricted() && spend.is_none() {
+        return None;
     }
-    Some(PolicyLayer { bucket_key, limits })
+    Some(PolicyLayer {
+        bucket_key,
+        limits,
+        spend,
+    })
 }
 
 fn match_conditional_layer(
@@ -226,7 +255,14 @@ fn match_conditional_layer(
     if limits.is_unrestricted() {
         return None;
     }
-    Some(PolicyLayer { bucket_key, limits })
+    Some(PolicyLayer {
+        bucket_key,
+        limits,
+        // 花费上限是经典形态的字段：它要靠 `window` 才能投影到某个计数器，
+        // 而条件形态的行没有 `window`（`limits` 自带 7 个维度）。两种形态
+        // 互斥，所以条件行永远不带花费层。
+        spend: None,
+    })
 }
 
 /// Escape a `group_by` segment value for the bucket key. CP-written
@@ -356,18 +392,13 @@ fn classic_rate_limit(policy: &RateLimitPolicy) -> Option<RateLimit> {
 /// 花费层的桶键。与 token 层的 `policy:` 前缀分开：同一策略的两个维度
 /// 共用一个桶，token 数会把花费额度吃掉，且不会有任何报错。
 ///
-/// 尚未接入 `reserve_layers`——由后续任务完成接线，这里先落地纯函数并
-/// 用单元测试钉住其行为。
-#[allow(dead_code)]
+/// `team_member` 作用域的成员后缀由调用方拼接，与 token 桶保持同一形状。
 fn spend_bucket_key(scope: &str, scope_ref: &str, policy_entry_id: &str) -> String {
     format!("spend:{scope}:{scope_ref}:{policy_entry_id}")
 }
 
 /// 把花费上限投影到与 token 相同的窗口字段。
 /// `second` 返回全空——见 [`warn_inert_dimension_once`] 的调用点。
-///
-/// 尚未接入 `classic_rate_limit`——由后续任务完成接线。
-#[allow(dead_code)]
 fn spend_limits_for(window: PolicyWindow, max_spend_micro_usd: u64) -> RateLimit {
     let mut rl = RateLimit::default();
     match window {
@@ -479,12 +510,25 @@ async fn reserve_policy_layers(
         let Some(layer) = match_policy_layer(policy, &entry.id, input, phase) else {
             continue;
         };
-        let r = state
-            .limiter
-            .pre_commit(&layer.bucket_key, &layer.limits)
-            .await
-            .map_err(|e| reject(state, e, "policy", Some((&entry.id, &policy.name))))?;
-        reservations.push(r);
+        // 只设了花费上限的策略在 token 侧是无限制的，不必占一个空层。
+        if !layer.limits.is_unrestricted() {
+            let r = state
+                .limiter
+                .pre_commit(&layer.bucket_key, &layer.limits)
+                .await
+                .map_err(|e| reject(state, e, "policy", Some((&entry.id, &policy.name))))?;
+            reservations.push(r);
+        }
+        if let Some(spend) = layer.spend {
+            // 与 token 层同策略同窗口，独立桶与单位；任一超限即拒。
+            // 错误暂时沿用策略限流的形状——Task 7 会换成预算错误。
+            let r = state
+                .limiter
+                .pre_commit_with_unit(&spend.bucket_key, &spend.limits, CounterUnit::MicroUsd)
+                .await
+                .map_err(|e| reject(state, e, "policy", Some((&entry.id, &policy.name))))?;
+            reservations.push(r);
+        }
     }
     Ok(())
 }
@@ -749,6 +793,67 @@ mod tests {
             limits: None,
             provider: provider.map(str::to_owned),
             routing_parent: false,
+        }
+    }
+
+    /// 只带花费上限（可选叠加 token 上限）的经典策略。`RateLimitPolicy` 的
+    /// `runtime_id` 是 `pub(crate)`，本 crate 构造不出结构体字面量，所以和
+    /// 同模块的其他 helper 一样走 serde。
+    fn make_spend_policy(
+        scope: &str,
+        scope_ref: &str,
+        window: &str,
+        max_tokens: Option<u64>,
+        max_spend_micro_usd: Option<u64>,
+    ) -> RateLimitPolicy {
+        serde_json::from_value(serde_json::json!({
+            "name": "both",
+            "scope": scope,
+            "scope_ref": scope_ref,
+            "window": window,
+            "max_tokens": max_tokens,
+            "max_spend_micro_usd": max_spend_micro_usd,
+        }))
+        .unwrap()
+    }
+
+    /// 装了一条策略的快照。
+    fn snapshot_with_policy(policy: RateLimitPolicy) -> aisix_core::AisixSnapshot {
+        let snap = aisix_core::AisixSnapshot::new();
+        snap.rate_limit_policies
+            .insert(aisix_core::resource::ResourceEntry::new("pol-1", policy, 1));
+        snap
+    }
+
+    /// 带上述快照的 ProxyState。测试构建下 `ProxyState::new` 会装一个冻结时钟，
+    /// 所以同一个测试里的多次请求必定落在同一个窗口内。
+    fn test_state(snap: &aisix_core::AisixSnapshot) -> crate::state::ProxyState {
+        crate::state::ProxyState::new(
+            aisix_core::snapshot::SnapshotHandle::new(snap.clone()),
+            std::sync::Arc::new(aisix_gateway::Hub::new()),
+            &aisix_core::ProxyConfig {
+                addr: "127.0.0.1:0".into(),
+                request_body_limit_bytes: None,
+                tls: None,
+                real_ip: Default::default(),
+                request_id: Default::default(),
+                thread_per_core: None,
+                workers: None,
+                url_rewrites: Vec::new(),
+            },
+        )
+    }
+
+    /// 指定资源 id 的 api key。策略 `scope: api_key` 时 `scope_ref` 要对上它。
+    fn test_auth_key(entry_id: &str) -> AuthenticatedKey {
+        let key: aisix_core::ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": "h",
+            "allowed_models": [],
+        }))
+        .unwrap();
+        AuthenticatedKey {
+            entry: std::sync::Arc::new(aisix_core::resource::ResourceEntry::new(entry_id, key, 1)),
+            jwt: None,
         }
     }
 
@@ -1177,5 +1282,141 @@ mod tests {
         let layer = match_policy_layer(&model_policy, "pol-8", &input, PolicyPhase::ModelTarget)
             .expect("model scope follows the target");
         assert_eq!(layer.bucket_key, "policy:model:model-1:pol-8");
+    }
+
+    /// 一个同时设了 max_tokens 与 max_spend 的策略要预留两层，
+    /// 且花费层带 MicroUsd 单位。只留一层会让其中一个上限静默失效。
+    #[tokio::test]
+    async fn a_policy_with_both_ceilings_reserves_a_token_layer_and_a_spend_layer() {
+        let snap = snapshot_with_policy(make_spend_policy(
+            "api_key",
+            "k1",
+            "day",
+            Some(1_000),
+            Some(5_000_000),
+        ));
+        let state = test_state(&snap);
+        let auth = test_auth_key("k1");
+
+        let res = reserve_layers(&state, &snap, &auth, None, None)
+            .await
+            .expect("两层都应预留成功");
+
+        assert_eq!(
+            res.token_keys(),
+            vec!["policy:api_key:k1:pol-1".to_string()],
+            "缺 token 层"
+        );
+        assert_eq!(
+            res.spend_keys(),
+            vec!["spend:api_key:k1:pol-1".to_string()],
+            "缺花费层"
+        );
+    }
+
+    /// 只设花费上限的策略——预算的典型形态——也必须预留花费层。
+    /// token 侧无限制不等于整条策略无限制；早退会让预算完全不执行。
+    #[tokio::test]
+    async fn a_spend_only_policy_still_reserves_its_spend_layer() {
+        let snap = snapshot_with_policy(make_spend_policy(
+            "api_key",
+            "k1",
+            "day",
+            None,
+            Some(5_000_000),
+        ));
+        let state = test_state(&snap);
+        let auth = test_auth_key("k1");
+
+        let res = reserve_layers(&state, &snap, &auth, None, None)
+            .await
+            .expect("花费层应预留成功");
+
+        assert!(res.token_keys().is_empty(), "不该占一个空的 token 层");
+        assert_eq!(res.spend_keys(), vec!["spend:api_key:k1:pol-1".to_string()]);
+    }
+
+    /// 花费层真的会被消耗：提交一次超过上限的花费之后，同一窗口的下一次
+    /// 请求必须被拒。只预留不消耗的话桶永远是空的，预算看起来配了却从不
+    /// 触发——和「没超预算」在外部完全无法区分。
+    #[tokio::test]
+    async fn a_committed_spend_consumes_the_spend_bucket() {
+        let snap = snapshot_with_policy(make_spend_policy(
+            "api_key",
+            "k1",
+            "day",
+            None, // token 侧不设限，只验花费维度
+            Some(1_000),
+        ));
+        let state = test_state(&snap);
+        let auth = test_auth_key("k1");
+
+        // 第一次放行，并按 micro-USD 提交一笔超过上限的花费。
+        reserve_layers(&state, &snap, &auth, None, None)
+            .await
+            .expect("首次应放行")
+            .commit(0, 5_000)
+            .await;
+
+        let err = reserve_layers(&state, &snap, &auth, None, None)
+            .await
+            .expect_err("花费已超上限，应被拒");
+        // Task 7 会把这里换成 BudgetExceeded；当下沿用策略限流的形状。
+        assert!(
+            matches!(err, ProxyError::PolicyRateLimit { .. }),
+            "应带策略归属，实际 {err:?}"
+        );
+    }
+
+    /// token 数不能记进花费桶：两种桶的键表必须分开取。混在一起时数字看着
+    /// 正常、量纲完全不对，且没有任何报错。
+    #[tokio::test]
+    async fn token_and_spend_bucket_keys_never_share_one_list() {
+        let snap = snapshot_with_policy(make_spend_policy(
+            "api_key",
+            "k1",
+            "day",
+            Some(1_000),
+            Some(5_000_000),
+        ));
+        let state = test_state(&snap);
+        let auth = test_auth_key("k1");
+
+        let res = reserve_layers(&state, &snap, &auth, None, None)
+            .await
+            .expect("两层都应预留成功");
+
+        let tokens = res.token_keys();
+        let spend = res.spend_keys();
+        assert!(!tokens.is_empty() && !spend.is_empty());
+        assert!(
+            tokens.iter().all(|k| !spend.contains(k)),
+            "两张键表重叠: {tokens:?} / {spend:?}"
+        );
+    }
+
+    /// `team_member` 的花费桶要和 token 桶一样按成员拆分。不拆的话
+    /// token 上限是每人一份、预算却是全队共用一份，且没有任何报错。
+    #[test]
+    fn team_member_spend_bucket_is_per_user_like_the_token_bucket() {
+        let policy = make_spend_policy("team_member", "team-1", "day", Some(1_000), Some(1));
+        let keys = |user: &str| {
+            let auth = make_auth(Some("team-1"), Some(user));
+            let layer = match_policy_layer(
+                &policy,
+                "pol-1",
+                &condition_input(&auth, None, None),
+                REQUEST,
+            )
+            .expect("policy applies");
+            let spend = layer.spend.expect("花费层缺失");
+            (layer.bucket_key, spend.bucket_key)
+        };
+        let (tok_a, spend_a) = keys("user-a");
+        let (tok_b, spend_b) = keys("user-b");
+        assert_eq!(tok_a, "policy:team_member:team-1:pol-1:user-a");
+        assert_eq!(spend_a, "spend:team_member:team-1:pol-1:user-a");
+        assert_ne!(tok_a, tok_b);
+        assert_ne!(spend_a, spend_b);
     }
 }

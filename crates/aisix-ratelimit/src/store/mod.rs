@@ -80,7 +80,7 @@ pub(crate) fn request_dims(limits: &RateLimit) -> Vec<Dim> {
 /// admitted against has rolled, which makes a per-second token cap lag by
 /// about its own width. A cap that looks enforced and is not is worse than an
 /// absent one, so the sub-minute case stays refused loudly (see
-/// `quota::warn_inert_max_tokens_once`) rather than half-honoured.
+/// `quota::warn_inert_dimension_once`) rather than half-honoured.
 pub(crate) fn token_dims(limits: &RateLimit) -> Vec<Dim> {
     [
         ("tpm", MINUTE_SECS, limits.tpm),

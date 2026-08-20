@@ -1203,7 +1203,26 @@ async fn dispatch(
                                     )
                                 })
                                 .unwrap_or(0);
-                            r.commit_tokens(total).await;
+                            // 花费按调度到的目标行定价——和这次请求的用量
+                            // 事件用的是同一个 model_id。
+                            let spend = success
+                                .usage
+                                .as_ref()
+                                .map(|u| {
+                                    crate::usage_attr::request_spend_micro_usd(
+                                        snapshot,
+                                        &target.id,
+                                        crate::usage_attr::input_tokens_for_pricing(
+                                            u64::from(u.prompt_tokens),
+                                            u64::from(u.cached_prompt_tokens),
+                                            u64::from(u.cache_read_tokens),
+                                            u64::from(u.cache_creation_tokens),
+                                        ),
+                                        u64::from(u.completion_tokens),
+                                    )
+                                })
+                                .unwrap_or(0);
+                            r.commit(total, spend).await;
                         }
                     }
                     if let Some(gate) = cache_gate.as_ref() {
@@ -2075,7 +2094,16 @@ async fn responses_to_target(
                 None => *reservation = Some(member),
             }
         }
-        let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
+        // 花费层的桶记 micro-USD，和 token 桶不能共用一张键表——同一批键
+        // 加同一个数字会把 token 数当成钱记进去。
+        let post_stream_keys = reservation
+            .as_ref()
+            .map(|r| r.token_keys())
+            .unwrap_or_default();
+        let spend_post_stream_keys = reservation
+            .as_ref()
+            .map(|r| r.spend_keys())
+            .unwrap_or_default();
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_c = std::sync::Arc::clone(&state.limiter);
         let captured_prompt_c = captured_prompt.clone();
@@ -2190,6 +2218,22 @@ async fn responses_to_target(
                 // end-of-stream emit reads a FRESH snapshot rather than the
                 // one the request started on (#941).
                 let snap_c = state_c.snapshot.load();
+                // 花费层记账（micro-USD），与上面的 token 记账成对。取值与
+                // 下面用量事件里的 cost_usd 同源：同一个快照、同一份 usage。
+                limiter_c.add_tokens_post_stream_all(
+                    &spend_post_stream_keys,
+                    crate::usage_attr::request_spend_micro_usd(
+                        &snap_c,
+                        &model_id_c,
+                        crate::usage_attr::input_tokens_for_pricing(
+                            u64::from(usage.prompt_tokens),
+                            u64::from(usage.cached_prompt_tokens),
+                            u64::from(usage.cache_read_tokens),
+                            u64::from(usage.cache_creation_tokens),
+                        ),
+                        u64::from(usage.completion_tokens),
+                    ),
+                );
                 let pk_c = ResolvedPk::resolve(&snap_c, &provider_key_id_c);
                 emit_usage_event(
                     &state_c,
@@ -2627,7 +2671,16 @@ async fn responses_cross_provider_to_target(
                 None => *reservation = Some(member),
             }
         }
-        let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
+        // 花费层的桶记 micro-USD，和 token 桶不能共用一张键表——同一批键
+        // 加同一个数字会把 token 数当成钱记进去。
+        let post_stream_keys = reservation
+            .as_ref()
+            .map(|r| r.token_keys())
+            .unwrap_or_default();
+        let spend_post_stream_keys = reservation
+            .as_ref()
+            .map(|r| r.spend_keys())
+            .unwrap_or_default();
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_c = std::sync::Arc::clone(&state.limiter);
         let captured_prompt_c = captured_prompt.clone();
@@ -2739,6 +2792,22 @@ async fn responses_cross_provider_to_target(
                 // end-of-stream emit reads a FRESH snapshot rather than the
                 // one the request started on (#941).
                 let snap_c = state_c.snapshot.load();
+                // 花费层记账（micro-USD），与上面的 token 记账成对。取值与
+                // 下面用量事件里的 cost_usd 同源：同一个快照、同一份 usage。
+                limiter_c.add_tokens_post_stream_all(
+                    &spend_post_stream_keys,
+                    crate::usage_attr::request_spend_micro_usd(
+                        &snap_c,
+                        &model_id_c,
+                        crate::usage_attr::input_tokens_for_pricing(
+                            u64::from(usage.prompt_tokens),
+                            u64::from(usage.cached_prompt_tokens),
+                            u64::from(usage.cache_read_tokens),
+                            u64::from(usage.cache_creation_tokens),
+                        ),
+                        u64::from(usage.completion_tokens),
+                    ),
+                );
                 let pk_c = ResolvedPk::resolve(&snap_c, &provider_key_id_c);
                 emit_usage_event(
                     &state_c,

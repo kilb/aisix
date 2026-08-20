@@ -274,9 +274,28 @@ impl MultiReservation {
         self.commit(tokens, 0).await;
     }
 
-    /// Return owned keys for post-stream token accounting.
-    pub fn keys(&self) -> Vec<String> {
-        self.reservations.iter().map(|r| r.key.clone()).collect()
+    /// 流结束后要记 token 数的桶键（[`CounterUnit::Tokens`] 那些层）。
+    ///
+    /// 刻意不提供「所有层的键」这一种取法：流式路径拿到键之后是用
+    /// [`Limiter::add_tokens_post_stream_all`] 一次批量加同一个数字，
+    /// 把两种单位的桶混在一张表里，就会把 token 数记进花费桶——数字看着
+    /// 正常，量纲完全不对，且不会有任何报错。
+    pub fn token_keys(&self) -> Vec<String> {
+        self.keys_of_unit(CounterUnit::Tokens)
+    }
+
+    /// 流结束后要记 micro-USD 的桶键（[`CounterUnit::MicroUsd`] 那些层）。
+    /// 与 [`Self::token_keys`] 成对使用，各记各的数字。
+    pub fn spend_keys(&self) -> Vec<String> {
+        self.keys_of_unit(CounterUnit::MicroUsd)
+    }
+
+    fn keys_of_unit(&self, unit: CounterUnit) -> Vec<String> {
+        self.reservations
+            .iter()
+            .filter(|r| r.unit == unit)
+            .map(|r| r.key.clone())
+            .collect()
     }
 
     /// Absorb another reservation's layers into this one, so a single
@@ -909,18 +928,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multi_reservation_keys_returns_all_held_keys() {
+    async fn multi_reservation_keys_are_split_by_counter_unit() {
         let clock = TestClock::new(100);
         let limiter = Limiter::local_with_clock(clock.clone());
         let l = limits(Some(10), None, None);
 
         let r1 = limiter.pre_commit("api_key:k1", &l).await.unwrap();
         let r2 = limiter.pre_commit("model:m1", &l).await.unwrap();
-        let r3 = limiter.pre_commit("team:t1", &l).await.unwrap();
+        let r3 = limiter
+            .pre_commit_with_unit("spend:api_key:k1", &l, CounterUnit::MicroUsd)
+            .await
+            .unwrap();
         let multi = MultiReservation::new(vec![r1, r2, r3]);
 
-        let keys = multi.keys();
-        assert_eq!(keys, vec!["api_key:k1", "model:m1", "team:t1"]);
+        // 流式路径按单位分两批记账。混在一起会把 token 数记进花费桶。
+        assert_eq!(multi.token_keys(), vec!["api_key:k1", "model:m1"]);
+        assert_eq!(multi.spend_keys(), vec!["spend:api_key:k1"]);
     }
 
     #[tokio::test]
@@ -934,7 +957,7 @@ mod tests {
 
         let mut multi = MultiReservation::new(vec![main]);
         multi.merge(MultiReservation::new(vec![member]));
-        assert_eq!(multi.keys(), vec!["api_key:k1", "model:target"]);
+        assert_eq!(multi.token_keys(), vec!["api_key:k1", "model:target"]);
 
         // One commit finalises both layers: tokens land on each and the
         // absorbed layer's concurrency slot is released.
