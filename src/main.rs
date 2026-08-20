@@ -47,6 +47,18 @@ struct AppState {
     password_hash: String,
     /// 活跃会话 token -> 过期时间（unix 秒）。
     sessions: Arc<RwLock<HashMap<String, u64>>>,
+    /// 串行化整个「写临时文件 → 校验 → 替换 → SIGHUP」序列。
+    ///
+    /// 没有它，两个并发保存会用同一条路径：A 写好、B 覆盖、A 校验到的是 B 的
+    /// 内容、A 再把它 rename 上线——界面上承诺的「校验不通过就不落盘」在并发
+    /// 下就是假的。两个浏览器标签页即可触发。
+    save_lock: Arc<tokio::sync::Mutex<()>>,
+    /// 限制同时进行的口令校验数。
+    ///
+    /// argon2 默认单次校验占 19 MiB，而这个服务跑在 MemoryMax=120M 下：
+    /// 几个并发登录请求就能把它 OOM 掉，且完全不需要凭据。登录后的 600ms
+    /// 延迟挡不住这个——它在计算之后，并发连接直接绕过。
+    login_gate: Arc<tokio::sync::Semaphore>,
     http: reqwest::Client,
 }
 
@@ -104,13 +116,29 @@ struct LoginReq {
 }
 
 async fn login(State(st): State<AppState>, Json(req): Json<LoginReq>) -> Response {
-    let ok = PasswordHash::new(&st.password_hash)
-        .map(|parsed| {
-            Argon2::default()
-                .verify_password(req.password.as_bytes(), &parsed)
-                .is_ok()
-        })
-        .unwrap_or(false);
+    // 未登录即可触达的最贵操作。argon2 默认单次占 19 MiB，本服务 MemoryMax=120M，
+    // 所以几个并发请求就能 OOM 掉它——闸住并发数，拿不到许可直接 429。
+    let Ok(_permit) = st.login_gate.try_acquire() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": "登录校验繁忙，请稍后重试"})),
+        )
+            .into_response();
+    };
+    // argon2 是 CPU+内存密集的同步计算，放在异步 worker 上会卡住整个 runtime。
+    let hash = st.password_hash.clone();
+    let pw = req.password.clone();
+    let ok = tokio::task::spawn_blocking(move || {
+        PasswordHash::new(&hash)
+            .map(|parsed| {
+                Argon2::default()
+                    .verify_password(pw.as_bytes(), &parsed)
+                    .is_ok()
+            })
+            .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false);
     if !ok {
         // 固定延迟，避免把「口令错」和「解析失败」在时间上区分开。
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
@@ -233,8 +261,11 @@ async fn api_metrics(
     if let Err(r) = require_auth(&st, &headers).await {
         return r;
     }
-    // 只允许本控制台自己构造的查询前缀，避免把 Prometheus 变成任意查询代理。
-    if !q.query.starts_with("aisix_") && !q.query.contains("aisix_") {
+    // 之前写的是 `!starts_with(..) && !contains(..)`——contains 那一半让前缀
+    // 检查彻底失效，`{__name__=~".+"} or aisix_x` 照样通过，等于把这里变成
+    // 任意 Prometheus 代理（能读同一台机上任何抓取目标，还能用高基数查询打挂它）。
+    // 改成真正的限制：查询里出现的每一个指标名都必须是 aisix_ 前缀。
+    if !promql_only_touches_aisix(&q.query) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "只允许查询 aisix_* 指标"})),
@@ -279,6 +310,51 @@ async fn api_metrics(
     }
 }
 
+/// 查询里出现的每个指标名是否都带 `aisix_` 前缀。
+///
+/// 做法是取出所有看起来像指标名的标识符（排除 PromQL 关键字与函数名），
+/// 要求它们全部以 `aisix_` 开头。宁可误拒也不放过：这个端点只服务本控制台
+/// 自己构造的几条查询，没有必要支持完整的 PromQL 表面。
+fn promql_only_touches_aisix(q: &str) -> bool {
+    const ALLOWED_WORDS: &[&str] = &[
+        "sum", "rate", "by", "avg", "max", "min", "count", "increase", "irate",
+        "topk", "bottomk", "without", "on", "group_left", "group_right", "or",
+        "and", "unless", "offset", "le", "quantile", "histogram_quantile",
+    ];
+    let mut ident = String::new();
+    let mut idents: Vec<String> = Vec::new();
+    for ch in q.chars().chain(std::iter::once(' ')) {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == ':' {
+            ident.push(ch);
+        } else if !ident.is_empty() {
+            idents.push(std::mem::take(&mut ident));
+        }
+    }
+    let mut saw_metric = false;
+    for id in idents {
+        if id.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            continue; // 数字字面量
+        }
+        if ALLOWED_WORDS.contains(&id.as_str()) {
+            continue;
+        }
+        if id.starts_with("aisix_") {
+            saw_metric = true;
+            continue;
+        }
+        // 标签名与标签值也会落到这里；只允许已知的标签维度。
+        const LABELS: &[&str] = &[
+            "api_key_id", "model", "provider", "endpoint", "policy", "outcome",
+            "status", "team_id", "user_id", "scope", "layer", "job", "instance",
+        ];
+        if LABELS.contains(&id.as_str()) {
+            continue;
+        }
+        return false;
+    }
+    saw_metric
+}
+
 // ── 资源写（resources.yaml + SIGHUP）──────────────────────────────────
 
 /// 资源文件按原样 `Value` 透传，不映射成强类型：控制台不该比网关更懂
@@ -311,46 +387,99 @@ async fn api_file_get(State(st): State<AppState>, headers: HeaderMap) -> Respons
 async fn save_resources(st: &AppState, doc: &Value) -> Result<String, String> {
     let yaml = serde_yaml_ng::to_string(doc).map_err(|e| format!("序列化失败: {e}"))?;
 
-    let tmp = st.resources_path.with_extension("yaml.console-tmp");
-    tokio::fs::write(&tmp, &yaml)
-        .await
-        .map_err(|e| format!("写临时文件失败: {e}"))?;
+    // 整个序列串行执行。并发下共用一条临时路径会让 A 校验到 B 的内容
+    // 再把它上线——界面承诺的「校验不通过就不落盘」正是死在这里。
+    let _guard = st.save_lock.lock().await;
 
-    let out = tokio::process::Command::new(&st.aisix_bin)
+    // 随机后缀：即便将来锁被绕过，两个请求也不会踩同一个文件。
+    let tmp = st
+        .resources_path
+        .with_extension(format!("yaml.console-tmp.{}", &random_token()[..16]));
+
+    // 0600 建文件：这份内容和正式配置一样含明文上游密钥。用 fs::write 会按
+    // umask 建成 0644，而 rename 会把这个权限一并带到正式文件上——运维设的
+    // 0600 会在第一次保存后被静默降级。
+    {
+        let mut f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .await
+            .map_err(|e| format!("建临时文件失败: {e}"))?;
+        use tokio::io::AsyncWriteExt;
+        f.write_all(yaml.as_bytes())
+            .await
+            .map_err(|e| format!("写临时文件失败: {e}"))?;
+        // rename 之前落盘：崩溃在写与 rename 之间会让网关读到半截文件。
+        f.sync_all().await.map_err(|e| format!("落盘失败: {e}"))?;
+    }
+
+    // 失败路径统一清理，避免留下一份 0600 但内容是废稿的密钥副本。
+    let cleanup = |t: std::path::PathBuf| async move {
+        let _ = tokio::fs::remove_file(t).await;
+    };
+
+    let out = match tokio::process::Command::new(&st.aisix_bin)
         .arg("validate")
         .arg("--resources")
         .arg(&tmp)
         .output()
         .await
-        .map_err(|e| format!("无法执行 aisix validate: {e}"))?;
+    {
+        Ok(o) => o,
+        Err(e) => {
+            cleanup(tmp).await;
+            return Err(format!("无法执行 aisix validate: {e}"));
+        }
+    };
     if !out.status.success() {
-        let _ = tokio::fs::remove_file(&tmp).await;
         let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
         let msg = if msg.is_empty() {
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         } else {
             msg
         };
+        cleanup(tmp).await;
         return Err(format!("配置校验未通过，未改动网关：\n{msg}"));
     }
 
-    // 校验通过才覆盖。原子替换，避免网关读到写了一半的文件。
-    tokio::fs::rename(&tmp, &st.resources_path)
-        .await
-        .map_err(|e| format!("替换 resources.yaml 失败: {e}"))?;
+    if let Err(e) = tokio::fs::rename(&tmp, &st.resources_path).await {
+        cleanup(tmp).await;
+        return Err(format!("替换 resources.yaml 失败: {e}"));
+    }
 
-    // 同用户进程，直接 SIGHUP，不需要 sudo。
     let hup = tokio::process::Command::new("pkill")
         .arg("-HUP")
         .arg("-x")
         .arg("aisix")
         .output()
-        .await
-        .map_err(|e| format!("发送 SIGHUP 失败: {e}"))?;
-    if !hup.status.success() {
-        return Err("配置已保存，但 SIGHUP 未送达网关；请手动 systemctl reload aisix".into());
+        .await;
+    // 配置已经上线了——SIGHUP 没送到只是「还没热加载」，不是保存失败。
+    // 当成失败返回会让调用方以为什么都没发生，而铸密钥那条路径会因此
+    // 丢掉刚生成的明文，留下一把没人持有的活密钥。
+    let reload_ok = matches!(&hup, Ok(o) if o.status.success());
+    let detail = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    // 配置改写留痕：谁在什么时候改了网关配置，此前无处可查。
+    tracing_line(&format!(
+        "resources.yaml rewritten ({} bytes), reload_signal={}",
+        yaml.len(),
+        if reload_ok { "sent" } else { "FAILED" }
+    ));
+
+    if reload_ok {
+        Ok(detail)
+    } else {
+        Ok(format!(
+            "{detail}\n注意：配置已保存，但 SIGHUP 未送达网关，需要手动 systemctl reload aisix"
+        ))
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// 单行审计输出，交给 systemd 收进 journal。
+fn tracing_line(msg: &str) {
+    println!("[audit] {msg}");
 }
 
 #[derive(Deserialize)]
@@ -413,26 +542,15 @@ async fn api_mint_key(State(st): State<AppState>, headers: HeaderMap) -> Respons
     Json(json!({"plaintext": plaintext, "key_hash": hash})).into_response()
 }
 
+/// key_hash 用的 sha256。
+///
+/// 之前是 shell 出去调 `sha256sum`，二进制缺失时返回空串——于是会铸出一把
+/// `key_hash: ""` 的密钥写进配置。凭据计算不能有「失败即空」这种路径。
 fn sha256_hex(bytes: &[u8]) -> String {
-    // 只为算 key_hash，不值得为此多拉一个依赖。
-    use std::process::Command;
-    let out = Command::new("sha256sum")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut c| {
-            use std::io::Write;
-            c.stdin.as_mut().unwrap().write_all(bytes)?;
-            c.wait_with_output()
-        });
-    match out {
-        Ok(o) => String::from_utf8_lossy(&o.stdout)
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .to_string(),
-        Err(_) => String::new(),
-    }
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ── 调用日志（journald）────────────────────────────────────────────────
@@ -614,7 +732,21 @@ async fn api_upstream_models(
     let provider = pk.get("provider").and_then(Value::as_str).unwrap_or("openai");
     let raw_key = pk.get("api_key").and_then(Value::as_str).unwrap_or_default();
     // resources.yaml 支持 ${VAR}，这里要解出真实值才能调上游。
+    //
+    // 但变量名必须限定前缀：不限定的话，任何能编辑配置的人写一条
+    // `api_key: ${AISIX_ADMIN_KEY_FOR_CONSOLE}` 加上自己的 api_base，
+    // 点一下「拉取清单」就能把本服务的管理密钥（或口令散列，拿去离线爆破）
+    // 当 Bearer 发到他自己的服务器上。
     let api_key = if let Some(var) = raw_key.strip_prefix("${").and_then(|v| v.strip_suffix("}")) {
+        if !var.starts_with("PROVIDER_KEY_") {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!(
+                    "只允许引用 PROVIDER_KEY_ 前缀的环境变量，收到 {var:?}——                     这条限制是为了让上游凭据无法被用来读取本服务自己的密钥"
+                )})),
+            )
+                .into_response();
+        }
         std::env::var(var).unwrap_or_default()
     } else {
         raw_key.to_string()
@@ -629,6 +761,12 @@ async fn api_upstream_models(
             _ => "https://api.openai.com/v1".into(),
         });
 
+    // 上游地址必须是 https 且不能指向内网：否则同一个入口就是一把 SSRF——
+    // 把 api_base 指向 169.254.169.254 或 127.0.0.1:8081 就能借本服务的
+    // 身份去读云元数据或网关自己的管理面。
+    if let Err(e) = guard_outbound_base(&base) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+    }
     let url = format!("{base}/models");
     let mut rb = st.http.get(&url);
     // 两家的鉴权头不同，用错了会拿到 401 而不是清单。
@@ -657,9 +795,11 @@ async fn api_upstream_models(
                         .unwrap_or_default();
                     Json(json!({"models": ids, "provider": provider})).into_response()
                 }
-                Ok(v) => (
+                // 只回状态码，不回显上游响应体：body 可能是被 SSRF 探到的
+                // 内网响应，原样吐回去等于把读取结果送给发起者。
+                Ok(_) => (
                     StatusCode::BAD_GATEWAY,
-                    Json(json!({"error": format!("上游 {status}: {v}")})),
+                    Json(json!({"error": format!("上游返回 {status}")})),
                 )
                     .into_response(),
                 Err(e) => (
@@ -675,6 +815,42 @@ async fn api_upstream_models(
         )
             .into_response(),
     }
+}
+
+/// 出站地址防护：只允许 https，且解析后的地址不得落在回环 / 链路本地 /
+/// 私网段。DNS 在这里解析一次用于判断——这不能完全消除 DNS rebinding，
+/// 但挡住了直接写内网地址这一类，而那才是这个入口的现实风险。
+fn guard_outbound_base(base: &str) -> Result<(), String> {
+    let rest = base
+        .strip_prefix("https://")
+        .ok_or_else(|| format!("上游地址必须是 https://，收到 {base:?}"))?;
+    let hostport = rest.split('/').next().unwrap_or("");
+    let host = hostport.rsplit_once(':').map(|(h, _)| h).unwrap_or(hostport);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+
+    use std::net::ToSocketAddrs;
+    let addrs: Vec<_> = (host, 443_u16)
+        .to_socket_addrs()
+        .map_err(|e| format!("无法解析上游主机 {host:?}: {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("上游主机 {host:?} 没有解析到任何地址"));
+    }
+    for a in addrs {
+        let ip = a.ip();
+        let bad = match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+            }
+            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+        };
+        if bad {
+            return Err(format!(
+                "上游主机 {host:?} 解析到内网地址 {ip}，已拒绝——这个入口不允许指向内部服务"
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ── 静态页面 ──────────────────────────────────────────────────────────
@@ -727,6 +903,8 @@ async fn main() {
         aisix_bin: PathBuf::from(env("AISIX_BIN", "/usr/local/bin/aisix")),
         password_hash,
         sessions: Arc::new(RwLock::new(HashMap::new())),
+        save_lock: Arc::new(tokio::sync::Mutex::new(())),
+        login_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
             .build()
@@ -740,7 +918,15 @@ async fn main() {
         .route("/api/logout", post(logout))
         .route("/api/session", get(session_state))
         .route("/api/resources", get(api_resources))
-        .route("/api/file", get(api_file_get).put(api_file_put))
+        // 原文入口收的是 YAML 文本，而 YAML 的 alias 展开可以把 2KB 变成 GB
+        // （billion laughs）。默认 2MB 的 body 限制远大于这里需要的尺寸，
+        // 收紧到 256KB——真实配置离这个量级很远。
+        .route(
+            "/api/file",
+            get(api_file_get)
+                .put(api_file_put)
+                .layer(axum::extract::DefaultBodyLimit::max(256 * 1024)),
+        )
         .route("/api/mint-key", post(api_mint_key))
         .route("/api/metrics", post(api_metrics))
         .route("/api/logs", post(api_logs))

@@ -278,9 +278,25 @@ async function boot(){
 async function loadResources(){
   const [r1, r2] = await Promise.all([
     api("/api/resources").then(r => r.json()),
-    api("/api/file").then(r => r.json()),
+    api("/api/file"),
   ]);
-  RES = r1; DOC = r2.doc || {_format_version:"1"};
+  // 这里绝不能退化成一份空文档。之前写的是 `DOC = r2.doc || {…}`：
+  // /api/file 返回 500 时 DOC 静默变空，界面显示「还没有配置任何东西」，
+  // 运维加一条再保存，这份只含一条的文档就通过校验并覆盖了真实配置——
+  // 所有模型、密钥、策略、护栏一次消失，而且不需要任何攻击者。
+  if (!r2.ok) {
+    const err = await r2.json().catch(() => ({}));
+    DOC = null;
+    document.body.insertAdjacentHTML("afterbegin",
+      `<div class="note crit" style="margin:0;border-radius:0;position:sticky;top:0;z-index:9">
+         <strong>读取配置失败，已停止一切编辑操作。</strong>
+         在配置能被正常读取之前保存任何改动，都会用一份不完整的文档覆盖线上配置。<br>
+         ${esc(err.error || `HTTP ${r2.status}`)}
+       </div>`);
+    throw new Error(err.error || "读取配置失败");
+  }
+  const j = await r2.json();
+  RES = r1; DOC = j.doc || {_format_version:"1"};
   const st = RES.model_status;
   const healthy = st && !st.error;
   $("#healthPill").className = "pill " + (healthy ? "ok" : "crit");
@@ -717,13 +733,19 @@ async function syncModels(){
           <td>${have.has(id) ? '<span style="color:var(--ok)">已接入</span>' : '<span style="color:var(--muted)">未接入</span>'}</td>
         </tr>`).join("")}</tbody></table></div>
       <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
-        <button class="act" onclick="addPicked('${esc(j.provider)}')">接入勾选的</button>
-        <button class="ghost" onclick="addWildcard('${esc(j.provider)}')">改用通配符一次接全部</button>
+        <!-- 用 data 属性 + addEventListener，不用内联 onclick：
+             HTML 解析器会先把 &#39; 解码回 '，之后 JS 才解析，所以 esc()
+             在「属性里的 JS 字符串」这个位置提供的保护是零。provider 的值
+             来自配置文件，原文编辑器能把它设成任意内容。 -->
+        <button class="act" data-provider="${esc(j.provider)}" data-act="picked">接入勾选的</button>
+        <button class="ghost" data-provider="${esc(j.provider)}" data-act="wildcard">改用通配符一次接全部</button>
       </div>
       <div class="note">通配符行 <code>${esc(j.provider)}/*</code> 一行服务上游<strong>所有</strong>模型，
         <code>cost</code>、限流、护栏都从这一行继承。代价：通配符行<strong>不会出现在
         <code>/v1/models</code> 列表里</strong>，客户端发现不到具体型号。</div>
       <div id="syncMsg"></div>`;
+    out.querySelectorAll("button[data-act]").forEach(b => b.addEventListener("click", () =>
+      b.dataset.act === "picked" ? addPicked(b.dataset.provider) : addWildcard(b.dataset.provider)));
   } catch(e){ out.innerHTML = `<div class="note crit">${esc(e.message)}</div>`; }
 }
 async function addPicked(provider){
@@ -778,7 +800,7 @@ function renderKeys(){
           <td>${esc((k.allowed_models||["*"]).join(", "))}</td>
           <td class="num" style="font-size:12px">${esc(fmtRl(k.rate_limit))}</td>
           <td class="num" style="font-size:12px">${sp
-            ? "$" + (sp.max_spend_micro_usd/1e6).toFixed(2) + " / " + esc(sp.window||"day")
+            ? fmtUsd(sp.max_spend_micro_usd) + " / " + esc(sp.window||"day")
             : '<span style="color:var(--muted)">不限</span>'}</td>
           <td class="num" style="font-size:11px;color:var(--muted)">${esc((k.key_hash||"").slice(0,16))}…</td>
           <td class="r"><button class="ghost" onclick="delKey(${i})">删除</button></td>
@@ -854,6 +876,22 @@ function spendPolicyFor(keyName){
     p.scope === "api_key" && p.scope_ref === keyName && p.max_spend_micro_usd != null);
 }
 
+/// 只接受纯整数字面量。Number() 而非 parseInt()：后者对 "1e3" 返回 1、
+/// 对 "60.9" 返回 60，两者都会静默给出一个不是运维想要的限制。
+function intOrNull(v){
+  const s = String(v ?? "").trim();
+  if (!s) return null;
+  const n = Number(s);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+/// 空的可用模型列表等于「拒绝所有模型」，而运维清空这个框想表达的
+/// 几乎肯定是「不限制」。空则回到 ["*"]。
+function modelsOrAll(v){
+  const list = String(v ?? "").split(",").map(x => x.trim()).filter(Boolean);
+  return list.length ? list : ["*"];
+}
+
 const fmtRl = rl => !rl ? "不限" :
   Object.entries(rl).filter(([,v]) => v != null).map(([k,v]) => `${k}=${v}`).join(" ") || "不限";
 
@@ -881,8 +919,10 @@ async function mintKey(){
   const r = await api("/api/mint-key", {method:"POST"});
   const {plaintext, key_hash} = await r.json();
   const item = {display_name:name, key_hash,
-    allowed_models: $("#kModels").value.split(",").map(s=>s.trim()).filter(Boolean)};
-  const rpm = parseInt($("#kRpm").value), tpm = parseInt($("#kTpm").value);
+    allowed_models: modelsOrAll($("#kModels").value)};
+  // parseInt("1e3") 是 1，不是 1000——运维填科学计数法会得到一个紧 1000 倍
+  // 的限制且毫无提示。Number() 才按字面量解析。
+  const rpm = intOrNull($("#kRpm").value), tpm = intOrNull($("#kTpm").value);
   const rl = {}; if (rpm>0) rl.rpm = rpm; if (tpm>0) rl.tpm = tpm;
   if (Object.keys(rl).length) item.rate_limit = rl;
   DOC.api_keys = DOC.api_keys || []; DOC.api_keys.push(item);
@@ -890,6 +930,10 @@ async function mintKey(){
   // 花费上限是独立的策略资源，不是 key 上的内联字段——
   // 网关按 scope/scope_ref 把它绑到这个 key 上。
   const usd = parseFloat($("#kSpend").value);
+  if (!isNaN(usd) && usd > 0 && Math.round(usd * 1e6) < 1) {
+    return msg("#kMsg", `花费上限 $${usd} 小于最小可表示单位（0.000001 美元），\
+      四舍五入后会变成 0——那等于禁止这把密钥花任何钱。请填更大的值或留空。`, "crit");
+  }
   if (!isNaN(usd) && usd > 0) {
     DOC.rate_limit_policies = DOC.rate_limit_policies || [];
     DOC.rate_limit_policies.push({
@@ -900,10 +944,16 @@ async function mintKey(){
     });
   }
 
+  // 明文先展示再保存。反过来的话，只要保存返回非 2xx（哪怕配置其实已经
+  // 写进去了，例如只是 SIGHUP 没送达），这把密钥的明文就永久丢失——
+  // 而它已经在网关配置里生效了，等于一把没人持有的活密钥。
+  $("#kMsg").innerHTML = `<div class="note"><strong>密钥明文——只显示这一次，请立即保存：</strong>
+    <pre style="margin-top:8px">${esc(plaintext)}</pre></div>`;
+  const prior = $("#kMsg").innerHTML;
   const ok = await saveDoc("#kMsg", null);
-  if (ok) $("#kMsg").innerHTML = `<div class="note"><strong>密钥已生成——明文只显示这一次：</strong>
-    <pre style="margin-top:8px">${esc(plaintext)}</pre></div>` + $("#kMsg").innerHTML;
-  else renderKeys();
+  $("#kMsg").innerHTML = prior + $("#kMsg").innerHTML;
+  if (!ok) $("#kMsg").innerHTML += `<div class="note crit">保存未成功。
+    如果这把密钥其实已经写进配置，请用上面的明文；否则请重新生成。</div>`;
 }
 
 // ── 限流与预算（完整的策略资源，花费只是其中一个维度）──────────
@@ -925,10 +975,10 @@ function renderLimits(){
           <td>${esc(p.scope||"—")}</td>
           <td class="num" style="font-size:12px">${esc(p.scope_ref||"—")}</td>
           <td>${esc(p.window||"—")}</td>
-          <td class="r num">${p.max_requests ?? unset()}</td>
-          <td class="r num">${p.max_tokens ?? unset()}</td>
+          <td class="r num">${p.max_requests != null ? esc(p.max_requests) : unset()}</td>
+          <td class="r num">${p.max_tokens != null ? esc(p.max_tokens) : unset()}</td>
           <td class="r num">${p.max_spend_micro_usd != null
-            ? "$" + (p.max_spend_micro_usd/1e6).toFixed(2) : unset()}</td>
+            ? fmtUsd(p.max_spend_micro_usd) : unset()}</td>
           <td class="r"><button class="ghost" onclick="delItem('rate_limit_policies',${i})">删除</button></td>
         </tr>`).join("") : `<tr><td colspan="8" style="color:var(--muted)">还没有策略。</td></tr>`}
       </tbody></table></div>
@@ -989,7 +1039,7 @@ function limitScopeChanged(){
 async function addLimitPolicy(){
   const name = $("#pmName").value.trim();
   if (!name) return msg("#pmMsg","名称不能为空","crit");
-  const req = parseInt($("#pmReq").value), tok = parseInt($("#pmTok").value);
+  const req = intOrNull($("#pmReq").value), tok = intOrNull($("#pmTok").value);
   const usd = parseFloat($("#pmSpend").value);
   if (!(req>0) && !(tok>0) && !(usd>0))
     return msg("#pmMsg","三个上限至少要填一个——不填任何上限的策略网关会拒绝加载","crit");
@@ -1094,23 +1144,38 @@ function msg(sel, text, kind){
 async function delItem(kind, i){
   if (!confirm("确认删除？会立即重写配置并重载网关。")) return;
   DOC[kind].splice(i,1);
-  await saveDoc(null, kind === "provider_keys" ? "providers"
-    : kind === "api_keys" ? "keys" : "models");
+  // 重渲染「当前所在的页」而不是猜一个：之前 rate_limit_policies 被映射到
+  // models 页，于是策略表删除后从不重画，表里烘焙的索引全部过期——
+  // 下一次点删除，删掉的是另一条策略。
+  const cur = document.querySelector('nav.tabs button[aria-selected="true"]');
+  await saveDoc(null, cur ? cur.dataset.tab : null);
 }
 async function saveDoc(msgSel, rerenderTab){
+  // 读失败时 DOC 是 null——此时保存等于用残缺文档覆盖线上配置。
+  if (!DOC) {
+    const m = "配置未能读取，拒绝保存：保存会用一份不完整的文档覆盖线上配置。";
+    if (msgSel) msg(msgSel, m, "crit"); else alert(m);
+    return false;
+  }
   DOC._format_version = DOC._format_version || "1";
   const r = await api("/api/file", {method:"PUT",
     headers:{"content-type":"application/json"}, body: JSON.stringify({doc: DOC})});
-  const j = await r.json();
-  if (!r.ok){
-    if (msgSel) msg(msgSel, j.error || "保存失败", "crit"); else alert(j.error||"保存失败");
-    await loadResources();          // 回滚到盘上的真实状态
+  // 传输层失败或 nginx 502 时 r.json() 会抛——之前没有 catch，被拒的编辑
+  // 就留在内存里，下一次保存会把它连同新改动一起再提交一遍（重复条目）。
+  let j = {};
+  try { j = await r.json(); } catch (_) { j = {error:`服务端返回了非 JSON 响应（HTTP ${r.status}）`}; }
+  const okResp = r.ok;
+  try {
+    if (!okResp && msgSel) msg(msgSel, j.error || "保存失败", "crit");
+    else if (!okResp) alert(j.error || "保存失败");
+  } finally {
+    // 成功或失败都以磁盘为准重新载入：失败时这是回滚，成功时这是确认。
+    await loadResources();
     if (rerenderTab) render(rerenderTab);
-    return false;
   }
-  await loadResources();
-  if (rerenderTab) render(rerenderTab);
-  if (msgSel) msg(msgSel, "已保存，网关已重载。", "");
+  if (!okResp) return false;
+  if (msgSel) msg(msgSel, j.detail && j.detail.includes("SIGHUP")
+    ? "已保存，但网关未热加载——" + esc(j.detail) : "已保存，网关已重载。", "");
   return true;
 }
 
