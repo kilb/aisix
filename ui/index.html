@@ -168,6 +168,7 @@ pre{font-family:var(--mono);font-size:11.5px;background:var(--raise);border:1px 
     <button role="tab" data-tab="providers" aria-selected="false">供应商</button>
     <button role="tab" data-tab="models" aria-selected="false">模型与定价</button>
     <button role="tab" data-tab="keys" aria-selected="false">调用方密钥</button>
+    <button role="tab" data-tab="logs" aria-selected="false">调用日志</button>
     <button role="tab" data-tab="raw" aria-selected="false">配置原文</button>
   </nav>
 
@@ -176,6 +177,7 @@ pre{font-family:var(--mono);font-size:11.5px;background:var(--raise);border:1px 
   <section id="tab-providers" hidden></section>
   <section id="tab-models" hidden></section>
   <section id="tab-keys" hidden></section>
+  <section id="tab-logs" hidden></section>
   <section id="tab-raw" hidden></section>
 </div>
 
@@ -251,7 +253,7 @@ try { const t = localStorage.getItem("aisix-theme");
   if (t) document.documentElement.setAttribute("data-theme", t); } catch(_){}
 
 // ── 标签页 ──────────────────────────────────────────────────
-const TABS = ["overview","usage","providers","models","keys","raw"];
+const TABS = ["overview","usage","providers","models","keys","logs","raw"];
 document.querySelectorAll("nav.tabs button").forEach(b => {
   b.addEventListener("click", () => {
     document.querySelectorAll("nav.tabs button")
@@ -295,6 +297,7 @@ function render(tab){
   if (tab === "providers") return renderProviders();
   if (tab === "models")    return renderModels();
   if (tab === "keys")      return renderKeys();
+  if (tab === "logs")      return renderLogs();
   if (tab === "raw")       return renderRaw();
 }
 
@@ -362,8 +365,13 @@ async function renderUsage(){
       </tr></thead><tbody><tr><td colspan="5">读取中…</td></tr></tbody></table></div>
     </div>
     <div class="panel">
-      <h2>近 24 小时 Token 速率</h2>
+      <h2>近 24 小时 Token 速率（按模型）</h2>
       <div id="uChart">读取中…</div>
+    </div>
+    <div class="panel">
+      <h2>近 24 小时 Token 速率（按调用方密钥）</h2>
+      <p class="hint">图例是 <code>api_key_id</code>：指标里只有 id，曲线上无法替换成名称。</p>
+      <div id="uKeyChart">读取中…</div>
     </div>`;
 
   // api_key_id -> 显示名。两跳：指标只有 id；管理 API 有 id 和 key_hash，
@@ -431,7 +439,71 @@ async function renderUsage(){
     $("#uChart").innerHTML = s.length ? multiLine(s, v => v.toFixed(1) + " tok/s")
       : `<p class="hint">该时段没有 token 流量。</p>`;
   } catch(e){ $("#uChart").innerHTML = `<div class="note crit">${esc(e.message)}</div>`; }
+
+  try {
+    const s2 = await prom('sum by (api_key_id) (rate(aisix_llm_total_tokens_total[10m]))', 24);
+    $("#uKeyChart").innerHTML = s2.length ? multiLine(s2, v => v.toFixed(1) + " tok/s")
+      : `<p class="hint">该时段没有 token 流量。</p>`;
+  } catch(e){ $("#uKeyChart").innerHTML = `<div class="note crit">${esc(e.message)}</div>`; }
 }
+
+// ── 调用日志 ────────────────────────────────────────────────
+async function renderLogs(){
+  const el = $("#tab-logs");
+  const keys = (DOC.api_keys || []);
+  el.innerHTML = `
+    <div class="panel">
+      <h2>逐请求日志</h2>
+      <p class="hint">来自网关写进 journald 的结构化访问日志，每个请求一行。</p>
+      <div class="grid g2">
+        <label class="f"><span>筛选密钥</span>
+          <select id="lgKey"><option value="">全部</option>${
+            keys.map(k => `<option value="${esc(hashToId(k.key_hash) || "")}">${esc(k.display_name||"（未命名）")}</option>`).join("")
+          }</select></label>
+        <label class="f"><span>条数</span>
+          <select id="lgN"><option>50</option><option selected>100</option><option>200</option></select></label>
+      </div>
+      <button class="act" onclick="loadLogs()">读取</button>
+      <div class="note warn">两个限制照实说：<strong>流式请求</strong>的这一行是在
+        SSE 开始推送之前写的，所以 token 数为空；<strong>journald 有留存上限</strong>，
+        不是无限历史。要长期留存需要配 observability exporter。</div>
+      <div id="lgOut" style="margin-top:14px"></div>
+    </div>`;
+  loadLogs();
+}
+/** key_hash -> 网关侧的 api_key_id（指标和日志用的都是它）。 */
+function hashToId(hash){
+  const m = listOf(RES.api_keys).find(k => k.key_hash === hash);
+  return m && m.id;
+}
+async function loadLogs(){
+  const out = $("#lgOut"); out.innerHTML = "读取中…";
+  try {
+    const r = await api("/api/logs", {method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({api_key_id: $("#lgKey").value, limit: Number($("#lgN").value)})});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "读取失败");
+    const rows = j.rows || [];
+    out.innerHTML = rows.length ? `<div class="scroll"><table><thead><tr>
+      <th>时间</th><th>路径</th><th class="r">状态</th><th class="r">耗时</th>
+      <th>模型</th><th class="r">Token</th><th>request id</th>
+    </tr></thead><tbody>${rows.map(x => `
+      <tr><td class="num" style="font-size:11px">${esc((x._ts||"").replace("T"," ").slice(0,19))}</td>
+        <td class="num" style="font-size:12px">${esc(x.path||"")}</td>
+        <td class="r num">${statusPill(x.status)}</td>
+        <td class="r num">${esc(x.latency_ms||"")}ms</td>
+        <td>${esc(x.model||"")}</td>
+        <td class="r num">${x.total_tokens && x.total_tokens !== "0" ? esc(x.total_tokens) : "—"}</td>
+        <td class="num" style="font-size:11px;color:var(--muted)">${esc((x.request_id||"").slice(0,8))}</td>
+      </tr>`).join("")}</tbody></table></div>`
+      : `<p class="hint">没有匹配的记录。</p>`;
+  } catch(e){ out.innerHTML = `<div class="note crit">${esc(e.message)}</div>`; }
+}
+const statusPill = s => {
+  const n = Number(s);
+  const c = n >= 500 ? "crit" : n >= 400 ? "warn" : "ok";
+  return `<span style="color:var(--${c})">${esc(s||"")}</span>`;
+};
 
 /** 多序列折线图。手绘 SVG——外部图表库既加载不进来也不值得。 */
 function multiLine(series, fmt){
@@ -516,27 +588,58 @@ async function addProvider(){
 }
 
 // ── 模型与定价 ──────────────────────────────────────────────
+
+/// 参考折扣：上游对缓存 token 的计价相对于输入价的倍率。
+/// 这些是各家公开文档写明的倍率，填价时用来一键换算，不是网关行为。
+const CACHE_FACTORS = {
+  anthropic: {read: 0.1,  write: 1.25, note: "读 0.1×、5 分钟写 1.25×（1 小时写为 2×）"},
+  openai:    {read: 0.5,  write: 1.0,  note: "缓存输入约为输入价的一半"},
+  deepseek:  {read: 0.1,  write: 1.0,  note: "命中缓存约为未命中的十分之一"},
+  gemini:    {read: 0.25, write: 1.0,  note: "缓存读取按折扣计，另有存储费"},
+};
+
 function renderModels(){
   const el = $("#tab-models");
   const ms = DOC.models || [], pks = DOC.provider_keys || [];
   el.innerHTML = `
     <div class="panel">
       <h2>模型与定价</h2>
-      <p class="hint">定价即网关折算花费所用的数字（USD / 千 token）。没填价的模型，
-        花费统计恒为 0——不是没花钱，是没有价可算。</p>
+      <p class="hint">这里的价就是网关折算花费用的数字（USD / 千 token）。
+        没填价的模型，花费统计恒为 0 —— 不是没花钱，是没有价可算。</p>
       <div class="scroll"><table><thead><tr>
         <th>模型</th><th>供应商</th><th>上游名</th>
-        <th class="r">输入 /1k</th><th class="r">输出 /1k</th><th></th>
-      </tr></thead><tbody>${ms.length ? ms.map((m,i) => `
-        <tr><td><strong>${esc(m.display_name)}</strong></td>
+        <th class="r">输入</th><th class="r">输出</th>
+        <th class="r">缓存读</th><th class="r">缓存写</th><th></th>
+      </tr></thead><tbody>${ms.length ? ms.map((m,i) => {
+        const c = m.cost, unset = '<span style="color:var(--muted)">未设</span>';
+        const p = v => v == null ? unset : "$" + Number(v).toFixed(5);
+        return `<tr><td><strong>${esc(m.display_name)}</strong></td>
           <td>${esc(m.provider||"")}</td>
           <td class="num" style="font-size:12px">${esc(m.model_name||"")}</td>
-          <td class="r num">${m.cost ? "$"+Number(m.cost.input_per_1k).toFixed(5) : '<span style="color:var(--muted)">未设</span>'}</td>
-          <td class="r num">${m.cost ? "$"+Number(m.cost.output_per_1k).toFixed(5) : '<span style="color:var(--muted)">未设</span>'}</td>
+          <td class="r num">${c ? p(c.input_per_1k) : unset}</td>
+          <td class="r num">${c ? p(c.output_per_1k) : unset}</td>
+          <td class="r num">${c ? p(c.cached_input_per_1k) : unset}</td>
+          <td class="r num">${c ? p(c.cache_write_per_1k) : unset}</td>
           <td class="r"><button class="ghost" onclick="delItem('models',${i})">删除</button></td>
-        </tr>`).join("") : `<tr><td colspan="6" style="color:var(--muted)">还没有配置模型。</td></tr>`}
+        </tr>`;
+      }).join("") : `<tr><td colspan="8" style="color:var(--muted)">还没有配置模型。</td></tr>`}
       </tbody></table></div>
+      <div class="note">缓存读/写未设时，网关按<strong>输入价</strong>计缓存 token。
+        上游对缓存的计价是打折（读）和加价（写）的，所以不填这两项，缓存流量的花费统计会偏。</div>
     </div>
+
+    <div class="panel">
+      <h2>从上游同步模型</h2>
+      <p class="hint">网关不知道上游有哪些模型 —— 它只按配置转发。这里直接问上游要清单。</p>
+      ${pks.length ? `<div class="grid g2">
+        <label class="f"><span>供应商</span>
+          <select id="syncPk">${pks.map(p => `<option>${esc(p.display_name)}</option>`).join("")}</select></label>
+      </div>
+      <button class="act" onclick="syncModels()">拉取清单</button>` :
+      `<div class="note warn">先添加一个供应商。</div>`}
+      <div id="syncOut" style="margin-top:14px"></div>
+    </div>
+
     <div class="panel">
       <h2>新增模型</h2>
       ${pks.length ? "" : `<div class="note warn">先添加一个供应商，模型需要绑定到它。</div>`}
@@ -545,27 +648,110 @@ function renderModels(){
         <label class="f"><span>绑定供应商</span>
           <select id="mPk">${pks.map(p => `<option value="${esc(p.display_name)}">${esc(p.display_name)}</option>`).join("")}</select></label>
         <label class="f"><span>供应商类型</span>
-          <select id="mProv">
-            <option value="openai">openai</option><option value="anthropic">anthropic</option>
-            <option value="gemini">gemini</option><option value="deepseek">deepseek</option>
+          <select id="mProv" onchange="applyFactors()">
+            ${Object.keys(CACHE_FACTORS).map(k => `<option value="${k}">${k}</option>`).join("")}
           </select></label>
         <label class="f"><span>上游模型名</span><input type="text" id="mUp" placeholder="gpt-4o-mini"></label>
-        <label class="f"><span>输入价 USD / 1k token</span>
-          <input type="number" id="mIn" step="0.00001" min="0" placeholder="0.00015"></label>
-        <label class="f"><span>输出价 USD / 1k token</span>
-          <input type="number" id="mOut" step="0.00001" min="0" placeholder="0.0006"></label>
       </div>
+      <h3 style="font-size:13px;margin:18px 0 10px">定价</h3>
+      <div class="grid g2">
+        <label class="f"><span>输入 USD / 1k</span>
+          <input type="number" id="mIn" step="0.00001" min="0" placeholder="0.00015" oninput="applyFactors()"></label>
+        <label class="f"><span>输出 USD / 1k</span>
+          <input type="number" id="mOut" step="0.00001" min="0" placeholder="0.0006"></label>
+        <label class="f"><span>缓存读 USD / 1k</span><input type="number" id="mCacheR" step="0.000001" min="0"></label>
+        <label class="f"><span>缓存写 USD / 1k</span><input type="number" id="mCacheW" step="0.000001" min="0"></label>
+      </div>
+      <div class="note" id="factorNote"></div>
+      <label class="f" style="max-width:320px"><span>加价 / 折扣系数（对全部四个价生效）</span>
+        <input type="number" id="mMul" step="0.01" min="0" value="1" oninput="applyFactors()"></label>
       <button class="act" onclick="addModel()" ${pks.length?"":"disabled"}>保存并重载网关</button>
       <div id="mMsg"></div>
     </div>`;
+  applyFactors();
 }
+
+/// 输入价一填，按所选供应商的公开倍率把缓存两项算出来，再统一乘系数。
+/// 只在缓存两格为空或由本函数填过时才覆盖，避免抹掉手工输入。
+let factorsOwned = true;
+function applyFactors(){
+  const prov = $("#mProv")?.value; if (!prov) return;
+  const f = CACHE_FACTORS[prov] || {read:1, write:1, note:""};
+  const mul = parseFloat($("#mMul")?.value);
+  const m = isNaN(mul) || mul < 0 ? 1 : mul;
+  const base = parseFloat($("#mIn")?.value);
+  $("#factorNote").innerHTML = `<strong>${esc(prov)}</strong> 的公开缓存倍率：${esc(f.note)}。` +
+    `填好输入价后自动换算；系数 ${m} 会同时乘到四个价上。这些倍率是上游的计价规则，不是网关行为。`;
+  if (!isNaN(base) && base >= 0 && factorsOwned){
+    const r = $("#mCacheR"), w = $("#mCacheW");
+    if (r) r.value = (base * f.read * m).toFixed(8).replace(/0+$/,"").replace(/\.$/,"");
+    if (w) w.value = (base * f.write * m).toFixed(8).replace(/0+$/,"").replace(/\.$/,"");
+  }
+}
+document.addEventListener("input", e => {
+  if (e.target && (e.target.id === "mCacheR" || e.target.id === "mCacheW")) factorsOwned = false;
+});
+
+async function syncModels(){
+  const out = $("#syncOut"); out.innerHTML = "拉取中…";
+  try {
+    const r = await api("/api/upstream-models", {method:"POST",
+      headers:{"content-type":"application/json"},
+      body: JSON.stringify({provider_key: $("#syncPk").value})});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "拉取失败");
+    const have = new Set((DOC.models||[]).map(m => m.model_name));
+    out.innerHTML = `<p class="hint">上游报告 ${j.models.length} 个模型。勾选要接入的，
+      或用下方的通配符一次性全接。</p>
+      <div class="scroll" style="max-height:320px"><table><thead><tr>
+        <th style="width:36px"></th><th>上游模型 id</th><th>状态</th>
+      </tr></thead><tbody>${j.models.map(id => `
+        <tr><td><input type="checkbox" class="syncPick" value="${esc(id)}" ${have.has(id)?"disabled":""}></td>
+          <td class="num" style="font-size:12px">${esc(id)}</td>
+          <td>${have.has(id) ? '<span style="color:var(--ok)">已接入</span>' : '<span style="color:var(--muted)">未接入</span>'}</td>
+        </tr>`).join("")}</tbody></table></div>
+      <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+        <button class="act" onclick="addPicked('${esc(j.provider)}')">接入勾选的</button>
+        <button class="ghost" onclick="addWildcard('${esc(j.provider)}')">改用通配符一次接全部</button>
+      </div>
+      <div class="note">通配符行 <code>${esc(j.provider)}/*</code> 一行服务上游<strong>所有</strong>模型，
+        <code>cost</code>、限流、护栏都从这一行继承。代价：通配符行<strong>不会出现在
+        <code>/v1/models</code> 列表里</strong>，客户端发现不到具体型号。</div>
+      <div id="syncMsg"></div>`;
+  } catch(e){ out.innerHTML = `<div class="note crit">${esc(e.message)}</div>`; }
+}
+async function addPicked(provider){
+  const picked = [...document.querySelectorAll(".syncPick:checked")].map(x => x.value);
+  if (!picked.length) return msg("#syncMsg","没有勾选任何模型","warn");
+  const pk = $("#syncPk").value;
+  DOC.models = DOC.models || [];
+  picked.forEach(id => DOC.models.push({
+    display_name: id, provider, model_name: id, provider_key: pk}));
+  msg("#syncMsg", `正在接入 ${picked.length} 个模型…`, "");
+  await saveDoc("#syncMsg", "models");
+}
+async function addWildcard(provider){
+  const pk = $("#syncPk").value;
+  DOC.models = DOC.models || [];
+  if (DOC.models.some(m => m.display_name === provider + "/*"))
+    return msg("#syncMsg", "该通配符行已存在", "warn");
+  DOC.models.push({display_name: provider + "/*", provider,
+    model_name: "*", provider_key: pk});
+  await saveDoc("#syncMsg", "models");
+}
+
 async function addModel(){
   const name = $("#mName").value.trim(), up = $("#mUp").value.trim();
   if (!name || !up) return msg("#mMsg","模型名和上游模型名都不能为空","crit");
   const item = {display_name:name, provider:$("#mProv").value,
     model_name:up, provider_key:$("#mPk").value};
-  const i = parseFloat($("#mIn").value), o = parseFloat($("#mOut").value);
-  if (!isNaN(i) && !isNaN(o)) item.cost = {input_per_1k:i, output_per_1k:o};
+  const num = id => { const v = parseFloat($(id).value); return isNaN(v) ? null : v; };
+  const i = num("#mIn"), o = num("#mOut"), cr = num("#mCacheR"), cw = num("#mCacheW");
+  if (i != null && o != null){
+    item.cost = {input_per_1k:i, output_per_1k:o};
+    if (cr != null) item.cost.cached_input_per_1k = cr;
+    if (cw != null) item.cost.cache_write_per_1k = cw;
+  }
   DOC.models = DOC.models || []; DOC.models.push(item);
   await saveDoc("#mMsg", "models");
 }
@@ -600,16 +786,49 @@ function renderKeys(){
         <label class="f"><span>每分钟 token 上限（留空不限）</span>
           <input type="number" id="kTpm" min="1" placeholder="100000"></label>
       </div>
+
+      <h3 style="font-size:13px;margin:18px 0 10px">日额度</h3>
+      <div class="grid g2">
+        <label class="f"><span>每日 token 上限（留空不限）</span>
+          <input type="number" id="kTpd" min="1" placeholder="2000000"></label>
+        <label class="f"><span>或按金额估算：每日上限 USD</span>
+          <input type="number" id="kBudget" step="0.01" min="0" placeholder="5.00" oninput="budgetToTpd()"></label>
+        <label class="f"><span>按哪个模型的价换算</span>
+          <select id="kBudgetModel" onchange="budgetToTpd()">
+            ${(DOC.models||[]).filter(m => m.cost).map(m =>
+              `<option value="${esc(m.display_name)}">${esc(m.display_name)}</option>`).join("")
+              || '<option value="">（没有已定价的模型）</option>'}
+          </select></label>
+      </div>
+      <div class="note warn" id="budgetNote">
+        <strong>这是按 token 的近似额度，不是金额闸。</strong>
+        网关能强制执行的是 token 数，不是金额 —— 按金额的硬预算由控制平面下发，
+        独立部署下没有这个数据源。换算取所选模型的输入/输出均价；一个 key 若能用
+        多个不同价位的模型，实际花费会偏离这个估算。真正的花费以「用量」页为准。
+      </div>
+
       <button class="act" onclick="mintKey()">生成并重载网关</button>
       <div id="kMsg"></div>
-    </div>
-    <div class="panel">
-      <h2>额度说明</h2>
-      <div class="note warn">这台机器上<strong>没有按金额的硬预算</strong>。
-        网关的花费预算由控制平面下发，独立部署下不存在该数据源。
-        上面的限流是真实生效的（请求数 / token 数），花费只做统计不做拦截。</div>
     </div>`;
 }
+/// 金额 → tpd。网关的闸是 token 数，所以这里必须换算，且只能是估算：
+/// 取该模型输入价与输出价的均值，因为请求的输入/输出配比事先不知道。
+function budgetToTpd(){
+  const usd = parseFloat($("#kBudget")?.value);
+  const name = $("#kBudgetModel")?.value;
+  const m = (DOC.models||[]).find(x => x.display_name === name);
+  if (isNaN(usd) || usd <= 0 || !m || !m.cost) return;
+  const avgPer1k = (Number(m.cost.input_per_1k) + Number(m.cost.output_per_1k)) / 2;
+  if (!(avgPer1k > 0)) return;
+  const tpd = Math.floor(usd / avgPer1k * 1000);
+  const f = $("#kTpd"); if (f) f.value = tpd;
+  $("#budgetNote").innerHTML = `按 <strong>${esc(name)}</strong> 的输入/输出均价
+    $${avgPer1k.toFixed(6)}/1k 换算，$${usd} ≈ <strong>${tpd.toLocaleString()}</strong> token/天，
+    已填入上方。<br><strong>这是按 token 的近似额度，不是金额闸。</strong>
+    网关能强制执行的是 token 数；按金额的硬预算由控制平面下发，独立部署下没有该数据源。
+    一个 key 若能用多个不同价位的模型，实际花费会偏离这个估算。`;
+}
+
 const fmtRl = rl => !rl ? "不限" :
   Object.entries(rl).filter(([,v]) => v != null).map(([k,v]) => `${k}=${v}`).join(" ") || "不限";
 
@@ -621,7 +840,8 @@ async function mintKey(){
   const item = {display_name:name, key_hash,
     allowed_models: $("#kModels").value.split(",").map(s=>s.trim()).filter(Boolean)};
   const rpm = parseInt($("#kRpm").value), tpm = parseInt($("#kTpm").value);
-  const rl = {}; if (rpm>0) rl.rpm = rpm; if (tpm>0) rl.tpm = tpm;
+  const tpd = parseInt($("#kTpd").value);
+  const rl = {}; if (rpm>0) rl.rpm = rpm; if (tpm>0) rl.tpm = tpm; if (tpd>0) rl.tpd = tpd;
   if (Object.keys(rl).length) item.rate_limit = rl;
   DOC.api_keys = DOC.api_keys || []; DOC.api_keys.push(item);
   const ok = await saveDoc("#kMsg", null);

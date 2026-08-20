@@ -403,6 +403,248 @@ fn sha256_hex(bytes: &[u8]) -> String {
     }
 }
 
+// ── 调用日志（journald）────────────────────────────────────────────────
+
+/// 每个请求一行的结构化访问日志，从 journald 读回来。
+///
+/// 网关把它写到 stdout，systemd 收进 journal —— 独立部署下这是唯一不需要
+/// 外部服务就能拿到的逐请求记录。两个限制照实说，不在界面上假装没有：
+/// 流式请求的行是在 SSE body 开始推之前写的，所以没有 token 数；journald
+/// 的留存是它自己的配置，不是无限历史。
+#[derive(Deserialize)]
+struct LogQuery {
+    /// 只看这个 api_key_id 的记录；空则全部。
+    #[serde(default)]
+    api_key_id: String,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// 从一行 tracing 输出里取出 `key=value` / `key="value"` 对。
+fn parse_kv(line: &str) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        // 找一个 `=`，向左回溯出键名
+        if b[i] != b'=' {
+            i += 1;
+            continue;
+        }
+        let mut ks = i;
+        while ks > 0 && (b[ks - 1].is_ascii_alphanumeric() || b[ks - 1] == b'_') {
+            ks -= 1;
+        }
+        if ks == i {
+            i += 1;
+            continue;
+        }
+        let key = &line[ks..i];
+        let mut j = i + 1;
+        let val = if j < b.len() && b[j] == b'"' {
+            j += 1;
+            let st = j;
+            while j < b.len() && b[j] != b'"' {
+                j += 1;
+            }
+            let v = &line[st..j];
+            j += 1;
+            v.to_string()
+        } else {
+            let st = j;
+            while j < b.len() && b[j] != b' ' {
+                j += 1;
+            }
+            line[st..j].to_string()
+        };
+        out.insert(key.to_string(), Value::String(val));
+        i = j;
+    }
+    out
+}
+
+async fn api_logs(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(q): Json<LogQuery>,
+) -> Response {
+    if let Err(r) = require_auth(&st, &headers).await {
+        return r;
+    }
+    // 多取一些再过滤：journald 没法按字段筛 tracing 的行内字段。
+    let fetch = q.limit.unwrap_or(100).clamp(1, 500) * 6;
+    let out = tokio::process::Command::new("journalctl")
+        .args([
+            "-u",
+            "aisix",
+            "--no-pager",
+            "-o",
+            "cat",
+            "-n",
+            &fetch.to_string(),
+        ])
+        .output()
+        .await;
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("读取 journal 失败：{err}。控制台用户需要在 systemd-journal 组里。")})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("无法执行 journalctl: {e}")})),
+            )
+                .into_response()
+        }
+    };
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut rows: Vec<Value> = Vec::new();
+    for line in text.lines().rev() {
+        // 只要带 api_key_id 的行——那是逐请求记录，其余是启动/重载噪声。
+        if !line.contains("api_key_id=") {
+            continue;
+        }
+        let kv = parse_kv(line);
+        if !q.api_key_id.is_empty()
+            && kv.get("api_key_id").and_then(Value::as_str) != Some(q.api_key_id.as_str())
+        {
+            continue;
+        }
+        // 行首的 RFC3339 时间戳是 tracing 打的，不在 kv 里。
+        let ts = line.split_whitespace().next().unwrap_or("").to_string();
+        let mut row = Value::Object(kv);
+        row["_ts"] = Value::String(ts);
+        rows.push(row);
+        if rows.len() as u32 >= q.limit.unwrap_or(100) {
+            break;
+        }
+    }
+    Json(json!({"rows": rows})).into_response()
+}
+
+// ── 上游模型清单 ──────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct UpstreamModelsReq {
+    /// resources.yaml 里的供应商 display_name。
+    provider_key: String,
+}
+
+/// 拉取某个供应商上游的模型清单。
+///
+/// 网关不知道上游有什么模型——它只按配置转发——所以这一步必须直接问上游。
+/// 凭据从 resources.yaml 读，只在服务端用，不下发给浏览器。
+async fn api_upstream_models(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<UpstreamModelsReq>,
+) -> Response {
+    if let Err(r) = require_auth(&st, &headers).await {
+        return r;
+    }
+    let doc: Value = match tokio::fs::read_to_string(&st.resources_path)
+        .await
+        .ok()
+        .and_then(|s| serde_yaml_ng::from_str(&s).ok())
+    {
+        Some(v) => v,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "读不到 resources.yaml"})),
+            )
+                .into_response()
+        }
+    };
+    let Some(pk) = doc
+        .get("provider_keys")
+        .and_then(Value::as_array)
+        .and_then(|a| {
+            a.iter().find(|p| {
+                p.get("display_name").and_then(Value::as_str) == Some(req.provider_key.as_str())
+            })
+        })
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("没有名为 {} 的供应商", req.provider_key)})),
+        )
+            .into_response();
+    };
+
+    let provider = pk.get("provider").and_then(Value::as_str).unwrap_or("openai");
+    let raw_key = pk.get("api_key").and_then(Value::as_str).unwrap_or_default();
+    // resources.yaml 支持 ${VAR}，这里要解出真实值才能调上游。
+    let api_key = if let Some(var) = raw_key.strip_prefix("${").and_then(|v| v.strip_suffix("}")) {
+        std::env::var(var).unwrap_or_default()
+    } else {
+        raw_key.to_string()
+    };
+    let base = pk
+        .get("api_base")
+        .and_then(Value::as_str)
+        .map(|b| b.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| match provider {
+            "anthropic" => "https://api.anthropic.com/v1".into(),
+            "deepseek" => "https://api.deepseek.com/v1".into(),
+            _ => "https://api.openai.com/v1".into(),
+        });
+
+    let url = format!("{base}/models");
+    let mut rb = st.http.get(&url);
+    // 两家的鉴权头不同，用错了会拿到 401 而不是清单。
+    rb = if provider == "anthropic" {
+        rb.header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+    } else {
+        rb.header("Authorization", format!("Bearer {api_key}"))
+    };
+
+    match rb.send().await {
+        Ok(r) => {
+            let status = r.status();
+            match r.json::<Value>().await {
+                Ok(v) if status.is_success() => {
+                    // 两家都用 {data:[{id,...}]}，取 id 就够。
+                    let ids: Vec<String> = v
+                        .get("data")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|m| m.get("id").and_then(Value::as_str))
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Json(json!({"models": ids, "provider": provider})).into_response()
+                }
+                Ok(v) => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": format!("上游 {status}: {v}")})),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": format!("上游返回的不是 JSON: {e}")})),
+                )
+                    .into_response(),
+            }
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("连不上上游: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
 // ── 静态页面 ──────────────────────────────────────────────────────────
 
 async fn index() -> Html<&'static str> {
@@ -469,6 +711,8 @@ async fn main() {
         .route("/api/file", get(api_file_get).put(api_file_put))
         .route("/api/mint-key", post(api_mint_key))
         .route("/api/metrics", post(api_metrics))
+        .route("/api/logs", post(api_logs))
+        .route("/api/upstream-models", post(api_upstream_models))
         .with_state(state);
 
     let addr = env("CONSOLE_ADDR", "127.0.0.1:8090");
