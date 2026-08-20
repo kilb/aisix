@@ -322,6 +322,36 @@ fn warn_inert_dimension_once(policy_name: &str, window: &str, dimension: &str) {
     }
 }
 
+/// 就 `(policy, model)` 警告一次：该模型没有配价，所以这条策略的花费
+/// 上限对它不生效。按模型去重而不是按策略——一条策略可能命中很多模型，
+/// 只报第一个会让其余的隐身。
+fn warn_unpriced_model_once(policy_name: &str, model: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    // 按 (策略, 模型) 组合数为界，正常情况下很小；这个上限只是防病态配置的兜底，不是工作限制。
+    const MAX_REMEMBERED: usize = 4096;
+    static SEEN: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+
+    let entry = (policy_name.to_string(), model.to_string());
+    let mut seen = SEEN
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if seen.contains(&entry) {
+        return;
+    }
+    tracing::warn!(
+        policy = %policy_name,
+        model = %model,
+        "spend ceiling not enforced: this model has no configured price, \
+         so requests to it contribute nothing to the ceiling",
+    );
+    if seen.len() < MAX_REMEMBERED {
+        seen.insert(entry);
+    }
+}
+
 /// Convert a classic row's `window` + `max_*` into the 7-field
 /// [`RateLimit`]. `None` when the row carries no window (formless rows
 /// are rejected at load; this is the total fallback).
@@ -528,6 +558,25 @@ async fn reserve_policy_layers(
                 .await
                 .map_err(|e| reject(state, e, "policy", Some((&entry.id, &policy.name))))?;
             reservations.push(r);
+
+            // 未定价模型对花费计数器贡献 0，所以这个上限对它无效。
+            // 放行，但不静默——拒绝会把一个配置疏漏变成流量中断。
+            // 取已解析的模型行判断是否定价——不是请求里的模型名：
+            // 通配符路径下两者不同，取错会让告警漏报或误报。
+            if let (Some(model_id), Some(model_name)) = (input.model, input.model_name) {
+                let unpriced = snap
+                    .models
+                    .get_by_id(model_id)
+                    .map(|e| e.value.cost.is_none())
+                    .unwrap_or(true);
+                if unpriced {
+                    // 标签必须用已解析的行名：通配符路径下调用方能自造模型名，
+                    // 直接打标签会让这个 series 基数无上限。
+                    let label = crate::usage_attr::metric_model_label(snap, model_name);
+                    state.metrics.record_budget_unpriced(&policy.name, &label);
+                    warn_unpriced_model_once(&policy.name, &label);
+                }
+            }
         }
     }
     Ok(())
@@ -1418,5 +1467,88 @@ mod tests {
         assert_eq!(spend_a, "spend:team_member:team-1:pol-1:user-a");
         assert_ne!(tok_a, tok_b);
         assert_ne!(spend_a, spend_b);
+    }
+
+    // ---- unpriced-model visibility (Task 5) ----
+
+    /// 未定价模型：策略配了花费上限，调度到没有 `cost` 的模型，请求照常
+    /// 放行（拒绝会把配置疏漏变成流量中断），但必须留下指标痕迹——不留痕
+    /// 的话，"预算配了但从不触发"和"预算没被超过"完全无法区分。
+    #[tokio::test]
+    async fn unpriced_model_under_a_spend_policy_is_counted() {
+        let snap = snapshot_with_policy(make_spend_policy(
+            "api_key",
+            "k1",
+            "day",
+            None,
+            Some(5_000_000),
+        ));
+        let unpriced: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "gpt-4o-mini",
+            "provider": "openai",
+            "model_name": "gpt-4o-mini",
+            "provider_key_id": "pk-1",
+        }))
+        .unwrap();
+        snap.models.insert(aisix_core::resource::ResourceEntry::new(
+            "model-1", unpriced, 1,
+        ));
+        let state = test_state(&snap);
+        let auth = test_auth_key("k1");
+        let mrl = make_model_rl("gpt-4o-mini", "model-1", Some("openai"));
+
+        reserve_layers(&state, &snap, &auth, Some(&mrl), None)
+            .await
+            .expect("未定价模型不该被拒绝，只是不对这条花费上限做贡献");
+
+        let rendered = state.metrics.render();
+        assert!(
+            rendered.contains(aisix_obs::metrics::M_BUDGET_UNPRICED_REQUESTS_TOTAL),
+            "未定价指标缺失: {rendered}"
+        );
+        assert!(
+            rendered.contains("policy=\"both\""),
+            "policy 标签缺失: {rendered}"
+        );
+        assert!(
+            rendered.contains("model=\"gpt-4o-mini\""),
+            "model 标签缺失: {rendered}"
+        );
+    }
+
+    /// 对照组：定价模型不应产生未定价告警指标。
+    #[tokio::test]
+    async fn priced_model_under_a_spend_policy_is_not_counted() {
+        let snap = snapshot_with_policy(make_spend_policy(
+            "api_key",
+            "k1",
+            "day",
+            None,
+            Some(5_000_000),
+        ));
+        let priced: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "gpt-4o",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "pk-1",
+            "cost": { "input_per_1k": 2.5, "output_per_1k": 10.0 },
+        }))
+        .unwrap();
+        snap.models.insert(aisix_core::resource::ResourceEntry::new(
+            "model-1", priced, 1,
+        ));
+        let state = test_state(&snap);
+        let auth = test_auth_key("k1");
+        let mrl = make_model_rl("gpt-4o", "model-1", Some("openai"));
+
+        reserve_layers(&state, &snap, &auth, Some(&mrl), None)
+            .await
+            .expect("应放行");
+
+        let rendered = state.metrics.render();
+        assert!(
+            !rendered.contains(aisix_obs::metrics::M_BUDGET_UNPRICED_REQUESTS_TOTAL),
+            "定价模型不该产生未定价告警: {rendered}"
+        );
     }
 }
