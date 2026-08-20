@@ -62,11 +62,11 @@ struct ResponseDispatchSuccess {
     model_id: String,
     /// UUID of the resolved ProviderKey for the winning target — feeds the
     /// per-PK telemetry attribution tags (provider_kind / branded_provider /
-    /// pk_label / …) on the emitted UsageEvent (AISIX-Cloud#867). Empty when
+    /// pk_label / …) on the emitted UsageEvent (#867). Empty when
     /// the target carried no provider_key_id.
     provider_key_id: String,
     /// The provider-side model name the winning attempt actually called,
-    /// for the `upstream_model` metric label (AISIX-Cloud#1234). Same value
+    /// for the `upstream_model` metric label (#1234). Same value
     /// chat + messages report, so a query can group all three endpoints by
     /// the model the provider was billed for rather than the alias.
     upstream_model: String,
@@ -85,7 +85,7 @@ struct ResponseDispatchSuccess {
     /// so the top-level handler must NOT emit the winner event again (#808).
     usage_handled_by_stream: bool,
     /// Captured request/response content for content-capturing exporters
-    /// (AISIX-Cloud#947). `Some` only when an enabled exporter opted into
+    /// (#947). `Some` only when an enabled exporter opted into
     /// `content_mode = full`; threaded to `fan_out` via the handler's emit,
     /// never to the CP sink. `None` on the streaming paths, whose
     /// end-of-stream emit owns the capture.
@@ -96,7 +96,7 @@ struct ResponseDispatchSuccess {
     /// paths — their end-of-stream closures own the output-side counts.
     output_redactions: crate::redact::RedactionCounts,
     /// Monitor-mode guardrail observations on the response side
-    /// (AISIX-Cloud#562), same lifecycle as `output_redactions`.
+    /// (#562), same lifecycle as `output_redactions`.
     output_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// Provider/body failure discovered after an HTTP-200 streaming response
     /// began. The wire response may remain 200, but health, metrics, and the
@@ -283,7 +283,7 @@ impl From<ProxyError> for ResponsesDispatchError {
 /// surfaces for telemetry (plus the two Anthropic cache counters carried
 /// only on the #825 cross-provider bridge path). Other fields (`total_tokens`,
 /// `output_tokens_details.audio_tokens`, etc.) are intentionally
-/// dropped here — cp-api's `dpmgr_usage_events` table records only
+/// dropped here — the control plane's `control plane_usage_events` table records only
 /// the ones below.
 #[derive(Default, Clone)]
 struct ResponseUsage {
@@ -300,7 +300,7 @@ struct ResponseUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
     /// True when any token counter was filled by the local estimator
-    /// because the upstream reported no usage (AISIX-Cloud#1074).
+    /// because the upstream reported no usage (#1074).
     usage_estimated: bool,
     /// o1/o3/GPT-5 class models surface reasoning tokens as a
     /// subset of `completion_tokens` via
@@ -331,7 +331,7 @@ struct ResponseUsage {
     downstream_latency_ms: u32,
     /// Responses-API response object `id` (`resp_…`), or the bridged
     /// upstream's own id on the #825 cross-provider path. Empty when the
-    /// upstream returned no id (AISIX-Cloud#1289).
+    /// upstream returned no id (#1289).
     provider_request_id: String,
 }
 
@@ -386,7 +386,7 @@ pub async fn responses(
     // terminal event identifies the policy that governed the request.
     let mut applied_guardrails: Vec<AppliedGuardrail> = Vec::new();
     // Filled by `dispatch` with monitor-mode guardrail observations
-    // (AISIX-Cloud#562), same lifecycle as `redaction_counts`.
+    // (#562), same lifecycle as `redaction_counts`.
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut failure_content_safe = true;
     // One snapshot for the whole request (#941) — see `embeddings`.
@@ -426,7 +426,7 @@ pub async fn responses(
                 // `None` on the streaming path — `usage` is filled by the
                 // stream's completion callback, long after this line. That
                 // case is covered by the per-attempt `provider call
-                // completed` line the usage sink emits (AISIX-Cloud#1289).
+                // completed` line the usage sink emits (#1289).
                 success
                     .usage
                     .as_ref()
@@ -467,7 +467,7 @@ pub async fn responses(
                 /* content_for_last */
                 None,
             );
-            // Issue #404: emit UsageEvent so cp-api's budget ledger
+            // Issue #404: emit UsageEvent so the control plane's budget ledger
             // and customer-facing /logs analytics see /v1/responses
             // spend. Pre-#404 the responses handler dropped the event
             // entirely — every o1/o3/GPT-5 traffic via Responses API
@@ -481,7 +481,7 @@ pub async fn responses(
             // `response.completed` event. `usage_handled_by_stream` guards
             // against a double-emit; `usage` is `None` on that path.
             if !success.usage_handled_by_stream {
-                // SLO e2e histogram (AISIX-Cloud#1011): recorded even when
+                // SLO e2e histogram (#1011): recorded even when
                 // the upstream response carried no parseable usage block —
                 // latency observation must not depend on token accounting.
                 let bounded_model =
@@ -600,7 +600,7 @@ pub async fn responses(
                 },
                 elapsed,
             );
-            // AISIX-Cloud#1013: failed requests carry the (post-mask)
+            // #1013: failed requests carry the (post-mask)
             // request body so a 4xx/5xx can be triaged from the log alone.
             // Same opt-in gate and cap as the success path; 401/403 stay
             // body-less (a 401 here is upstream-auth passthrough — caller
@@ -702,7 +702,7 @@ async fn dispatch(
     // arrives via `ResponseDispatchSuccess::output_redactions`; streaming
     // output counts travel via the stream completion instead.
     redactions_out: &mut crate::redact::RedactionCounts,
-    // Out-param: monitor-mode guardrail observations (AISIX-Cloud#562),
+    // Out-param: monitor-mode guardrail observations (#562),
     // same lifecycle as `redactions_out`.
     monitor_hits_out: &mut Vec<aisix_core::GuardrailMonitorHit>,
     // False when remote segment moderation could not prove a complete rewrite;
@@ -788,7 +788,7 @@ async fn dispatch(
             // wire envelope names only the guardrail that fired (#519 B.4b)
             // so callers can't enumerate the blocklist by probing error
             // responses.
-            // AISIX-Cloud#1013: mask before returning so the failure
+            // #1013: mask before returning so the failure
             // content capture exports post-mask text (see chat.rs).
             let redaction =
                 crate::redact::redact_responses_request_structured(resolved_chain.as_ref(), body);
@@ -1003,7 +1003,7 @@ async fn dispatch(
     'targets: for (target_idx, target) in attempt_models.iter().enumerate() {
         // Resolved ProviderKey UUID for this target — feeds the per-PK
         // telemetry attribution tags on the emitted UsageEvent
-        // (AISIX-Cloud#867). Recorded on the AttemptRecord (success + failure)
+        // (#867). Recorded on the AttemptRecord (success + failure)
         // so both the winner and each failed-attempt event can attribute it.
         let pk_id = target.model.provider_key_id.clone().unwrap_or_default();
         // Same-target retries before failing over, honoured exactly like
@@ -1052,7 +1052,7 @@ async fn dispatch(
                 ..Default::default()
             };
             // Reserve THIS target's own model rate-limit layers before
-            // dispatching to it (AISIX-Cloud#1087). Over-limit → record a
+            // dispatching to it (#1087). Over-limit → record a
             // 429 attempt and move on to the remaining targets in strategy
             // order (same-target retries can't help — the window won't
             // reset mid-loop).
@@ -1185,7 +1185,7 @@ async fn dispatch(
                     if !success.usage_handled_by_stream {
                         if let Some(mut r) = reservation.take() {
                             // Fold this target's model-layer reservation in
-                            // (AISIX-Cloud#1087) so one commit bills the
+                            // (#1087) so one commit bills the
                             // member's TPM/TPD too. Already `None` when the
                             // streaming path folded it into the guard.
                             if let Some(member) = member_reservation.take() {
@@ -1378,7 +1378,7 @@ async fn responses_to_target(
     timeouts: crate::routing::TimeoutBudget,
     request_id: &str,
     // Arc so the live-forward streaming path can carry the chain into its
-    // end-of-stream observation (AISIX-Cloud#1010).
+    // end-of-stream observation (#1010).
     chain: Arc<aisix_guardrails::GuardrailChain>,
     // #808: end-of-stream UsageEvent context for the verbatim streaming
     // path's Drop guard. Unused by the non-streaming / buffered paths,
@@ -1394,7 +1394,7 @@ async fn responses_to_target(
     attempt: AttemptInfo,
     reservation: &mut Option<aisix_ratelimit::MultiReservation>,
     // This target's own model-layer reservation (routing dispatch only,
-    // AISIX-Cloud#1087). The streaming path folds it into `reservation`
+    // #1087). The streaming path folds it into `reservation`
     // before the take below; the non-streaming path leaves it for the
     // handler to commit alongside `reservation`.
     member_reservation: &mut Option<aisix_ratelimit::MultiReservation>,
@@ -1402,7 +1402,7 @@ async fn responses_to_target(
     // end-of-stream emit; the non-streaming/buffered emits happen in the
     // handler, which already holds them.
     input_redactions: crate::redact::RedactionCounts,
-    // Input-side monitor hits (AISIX-Cloud#562), same lifecycle as
+    // Input-side monitor hits (#562), same lifecycle as
     // `input_redactions`.
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     input_capture_safe: bool,
@@ -1411,7 +1411,7 @@ async fn responses_to_target(
     let applied_guardrails = chain_arc.applied().to_vec();
     let chain = chain_arc.as_ref();
     // Largest content cap any enabled content-capturing exporter wants, or
-    // `None` when none do (AISIX-Cloud#947). The captured prompt is the
+    // `None` when none do (#947). The captured prompt is the
     // client-facing request body (post-#932-redaction), taken BEFORE the
     // upstream model rewrite below so the log shows what the caller sent.
     let content_cap = content_capture_cap(
@@ -1425,7 +1425,7 @@ async fn responses_to_target(
     let mut body = body.clone();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     // Resolved PK id for per-PK telemetry attribution on the emitted
-    // UsageEvent (AISIX-Cloud#867).
+    // UsageEvent (#867).
     let provider_key_id = pk_entry.id.clone();
     let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
@@ -1439,7 +1439,7 @@ async fn responses_to_target(
     // OpenAI bridge's chat() path and the /v1/messages passthrough. The
     // verbatim /v1/responses path builds the request directly (bypassing the
     // Hub), so without this the override pipeline silently no-ops for Codex
-    // traffic (AISIX-Cloud#867 follow-up). Apply order: renames → constraints
+    // traffic (#867 follow-up). Apply order: renames → constraints
     // → defaults; each is a no-op when its configured map is empty.
     if let Some(r) = pk_entry.value.request.as_ref() {
         aisix_provider_openai::overrides::validate_content_safe_request_overrides(r).map_err(
@@ -1594,7 +1594,7 @@ async fn responses_to_target(
         // response, scan the assistant output text, then release the bytes
         // verbatim or block with 422. A monitor-only chain resolves to
         // EndOfStreamCheck — it can never block, so it must never hold the
-        // stream back nor fail closed on the buffer cap (AISIX-Cloud#1010);
+        // stream back nor fail closed on the buffer cap (#1010);
         // it takes the live-forward path below, which scans at end-of-stream
         // for observation. Requests with no output-hook guardrail keep the
         // zero-copy verbatim passthrough.
@@ -1908,14 +1908,14 @@ async fn responses_to_target(
                 // terminal event for usage and let the handler emit (the body is
                 // a single complete chunk now, not a live stream).
                 //
-                // Token-estimation fallback (AISIX-Cloud#1074): a buffered
+                // Token-estimation fallback (#1074): a buffered
                 // stream with zero/missing usage fills the counters locally —
                 // telemetry only, the buffered bytes forward untouched.
                 let usage = {
                     let mut u = responses_sse_usage(&buf).unwrap_or_default();
                     // The usage gate is independent of the id: a stream whose
                     // terminal frame reported no usage still names the upstream
-                    // call it was (AISIX-Cloud#1289).
+                    // call it was (#1289).
                     if u.provider_request_id.is_empty() {
                         u.provider_request_id = responses_sse_provider_request_id(&buf);
                     }
@@ -1938,7 +1938,7 @@ async fn responses_to_target(
                     }
                     Some(u)
                 };
-                // Content capture (AISIX-Cloud#947): the assembled output text,
+                // Content capture (#947): the assembled output text,
                 // read from the POST-redaction buffer so masked PII stays masked
                 // in the exported content.
                 let captured_content = match (&captured_prompt, content_cap) {
@@ -2066,7 +2066,7 @@ async fn responses_to_target(
         // post-stream TPM/TPD accounting, the hold keeps the concurrency slot(s)
         // until the stream ends. `take()` leaves the handler's `reservation` as
         // `None` so it won't also `commit_tokens`.
-        // Fold this target's model-layer reservation in first (AISIX-Cloud#1087)
+        // Fold this target's model-layer reservation in first (#1087)
         // so the guard covers the member's limits too; `take()` leaves it `None`
         // so the handler won't also commit it.
         if let Some(member) = member_reservation.take() {
@@ -2079,7 +2079,7 @@ async fn responses_to_target(
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_c = std::sync::Arc::clone(&state.limiter);
         let captured_prompt_c = captured_prompt.clone();
-        // AISIX-Cloud#1010: a monitor-only output chain (EndOfStreamCheck —
+        // #1010: a monitor-only output chain (EndOfStreamCheck —
         // the only way an output-hook chain reaches this live-forward branch)
         // still gets its end-of-stream scan, so would-block / would-mask
         // observations reach telemetry. `None` without an output hook.
@@ -2090,7 +2090,7 @@ async fn responses_to_target(
             upstream_model: upstream_model.clone(),
         });
         let initial_capture_safe = !overflow_capture_unsafe && eos_scan.is_none();
-        // Token-estimation fallback context (AISIX-Cloud#1074): the request
+        // Token-estimation fallback context (#1074): the request
         // body is cloned because the closure runs at end-of-stream Drop.
         // Tokenized only if the upstream never reports usage.
         let estimator_c = crate::token_estimate::Estimator::new(
@@ -2108,7 +2108,7 @@ async fn responses_to_target(
                 // Streams that reach here are committed 200s — the
                 // `!status.is_success()` guard above returned early on errors.
                 //
-                // Token-estimation fallback (AISIX-Cloud#1074): a stream that
+                // Token-estimation fallback (#1074): a stream that
                 // ends without a terminal usage event (client abort, relay
                 // that omits usage) fills the missing counters from the
                 // request + the assembled output text, BEFORE the TPM
@@ -2159,7 +2159,7 @@ async fn responses_to_target(
                 }
                 let mut terminal_attempt = attempt_c;
                 terminal_attempt.error_class = terminal.error_class;
-                // Content capture (AISIX-Cloud#947): prompt captured up front,
+                // Content capture (#947): prompt captured up front,
                 // output text assembled by the stream wrapper (empty when no
                 // exporter wants content).
                 let captured_content = match (&captured_prompt_c, content_cap) {
@@ -2183,7 +2183,7 @@ async fn responses_to_target(
                 // guardrail holds back → buffered branch; a monitor-mode one
                 // suppresses its masks), so only the input-side counts apply.
                 // The end-of-stream scan's monitor observations ride along
-                // with the input-side hits (AISIX-Cloud#1010).
+                // with the input-side hits (#1010).
                 let mut monitor_hits = input_monitor_hits.clone();
                 monitor_hits.extend(output_hits);
                 // A stream can outlive several config generations, so the
@@ -2270,7 +2270,7 @@ async fn responses_to_target(
         // emission. Pulled here (before the response is moved into
         // `Json::into_response`) so the success struct can carry
         // typed counters rather than re-parsing JSON downstream.
-        // Token-estimation fallback (AISIX-Cloud#1074): a body with zero or
+        // Token-estimation fallback (#1074): a body with zero or
         // missing usage fills the counters locally — telemetry only, the
         // response body is forwarded untouched. A body with no `usage`
         // object at all becomes a wholly-estimated record instead of None.
@@ -2279,7 +2279,7 @@ async fn responses_to_target(
             // `extract_response_usage` returns None on a body with no usable
             // `usage` block, and the estimation fallback below then works off
             // a default — which would drop a perfectly good top-level `id`
-            // (AISIX-Cloud#1289).
+            // (#1289).
             if u.provider_request_id.is_empty() {
                 u.provider_request_id = crate::usage_attr::provider_response_id(&json_body);
             }
@@ -2368,7 +2368,7 @@ async fn responses_to_target(
                     output_redactions: crate::redact::RedactionCounts::new(),
                     // Hits observed by the blocking check still count.
                     output_monitor_hits,
-                    // AISIX-Cloud#1013: the billed-then-blocked event carries
+                    // #1013: the billed-then-blocked event carries
                     // the (post-mask) prompt; the blocked output itself stays
                     // out of the log — blocking it and then archiving it would
                     // defeat the block.
@@ -2386,7 +2386,7 @@ async fn responses_to_target(
 
         let output_redactions = output_seg_counts;
 
-        // Content capture (AISIX-Cloud#947): the assistant's assembled output
+        // Content capture (#947): the assistant's assembled output
         // text, read from the POST-redaction body so masked PII stays masked
         // in the exported content.
         let captured_content = match (&captured_prompt, content_cap) {
@@ -2446,14 +2446,14 @@ async fn responses_cross_provider_to_target(
     attempt: AttemptInfo,
     reservation: &mut Option<aisix_ratelimit::MultiReservation>,
     // This target's own model-layer reservation (routing dispatch only,
-    // AISIX-Cloud#1087). The streaming path folds it into `reservation`
+    // #1087). The streaming path folds it into `reservation`
     // before the take below; the non-streaming path leaves it for the
     // handler to commit alongside `reservation`.
     member_reservation: &mut Option<aisix_ratelimit::MultiReservation>,
     // Input-side PII mask counts (#932), merged into the streamed judge
     // path's end-of-stream emit; non-streaming emits happen in the handler.
     input_redactions: crate::redact::RedactionCounts,
-    // Input-side monitor hits (AISIX-Cloud#562), same lifecycle as
+    // Input-side monitor hits (#562), same lifecycle as
     // `input_redactions`.
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     input_capture_safe: bool,
@@ -2462,7 +2462,7 @@ async fn responses_cross_provider_to_target(
 
     let applied_guardrails = chain.applied().to_vec();
 
-    // Content capture (AISIX-Cloud#947), same contract as the verbatim
+    // Content capture (#947), same contract as the verbatim
     // target: prompt = the client-facing Responses request body
     // (post-#932-redaction), gated on an exporter actually wanting content.
     let content_cap = content_capture_cap(
@@ -2483,7 +2483,7 @@ async fn responses_cross_provider_to_target(
         .to_string();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     // Resolved PK id for per-PK telemetry attribution on the emitted
-    // UsageEvent (AISIX-Cloud#867).
+    // UsageEvent (#867).
     let provider_key_id = pk_entry.id.clone();
     let bridge: Arc<dyn Bridge> = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
         .ok_or(ProxyError::ProviderUnavailable)?;
@@ -2585,7 +2585,7 @@ async fn responses_cross_provider_to_target(
         // verbatim path does so a huge response can't OOM the gateway. A
         // monitor-only chain resolves to EndOfStreamCheck — it can never
         // block, so the bridge forwards live and scans at end-of-stream for
-        // observation only (AISIX-Cloud#1010).
+        // observation only (#1010).
         let output_guardrail = (!chain.is_empty()
             && aisix_guardrails::Guardrail::runs_on_output(chain.as_ref()))
         .then(|| chain.clone());
@@ -2618,7 +2618,7 @@ async fn responses_cross_provider_to_target(
         // post-stream TPM/TPD accounting, the hold keeps the concurrency slot(s)
         // until the stream ends. `take()` leaves the handler's `reservation` as
         // `None` so it won't also `commit_tokens`.
-        // Fold this target's model-layer reservation in first (AISIX-Cloud#1087)
+        // Fold this target's model-layer reservation in first (#1087)
         // so the guard covers the member's limits too; `take()` leaves it `None`
         // so the handler won't also commit it.
         if let Some(member) = member_reservation.take() {
@@ -2631,7 +2631,7 @@ async fn responses_cross_provider_to_target(
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_c = std::sync::Arc::clone(&state.limiter);
         let captured_prompt_c = captured_prompt.clone();
-        // Token-estimation fallback context (AISIX-Cloud#1074): the request
+        // Token-estimation fallback context (#1074): the request
         // body is cloned because the stream owns it until an end-of-stream
         // Drop. Tokenized only if the bridged upstream never reports usage.
         let estimator = crate::token_estimate::Estimator::new(
@@ -2707,7 +2707,7 @@ async fn responses_cross_provider_to_target(
                 let mut terminal_attempt = attempt_c;
                 terminal_attempt.error_class = terminal.error_class;
                 let status = terminal.status;
-                // Content capture (AISIX-Cloud#947): prompt captured up front,
+                // Content capture (#947): prompt captured up front,
                 // response assembled across the bridged stream into
                 // `comp.response_text` (empty when no exporter wants content
                 // or when the response was blocked before release).
@@ -2837,10 +2837,10 @@ async fn responses_cross_provider_to_target(
             downstream_latency_ms: 0,
             // The bridged upstream's own id, not the `resp_…` re-encoded
             // below — that one is minted here and means nothing to the
-            // provider (AISIX-Cloud#1289).
+            // provider (#1289).
             provider_request_id: crate::usage_attr::sanitize_provider_response_id(&resp.id),
         };
-        // Token-estimation fallback (AISIX-Cloud#1074): fill counters the
+        // Token-estimation fallback (#1074): fill counters the
         // bridged upstream never reported. Telemetry only — the re-encoded
         // Responses JSON below carries the upstream's own usage.
         if u.prompt_tokens == 0 || u.completion_tokens == 0 {
@@ -2923,7 +2923,7 @@ async fn responses_cross_provider_to_target(
                 output_redactions: crate::redact::RedactionCounts::new(),
                 // Hits observed by the blocking check still count.
                 output_monitor_hits,
-                // AISIX-Cloud#1013: the billed-then-blocked event carries
+                // #1013: the billed-then-blocked event carries
                 // the (post-mask) prompt; the blocked output itself stays
                 // out of the log — blocking it and then archiving it would
                 // defeat the block.
@@ -2947,7 +2947,7 @@ async fn responses_cross_provider_to_target(
         requested_model,
         created_at,
     );
-    // Content capture (AISIX-Cloud#947): the client-visible Responses JSON
+    // Content capture (#947): the client-visible Responses JSON
     // (post-redaction) is the source, so the exported text matches what the
     // caller received.
     let captured_content = match (&captured_prompt, content_cap) {
@@ -3038,7 +3038,7 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         upstream_ttft_ms: 0,
         downstream_latency_ms: 0,
         // `resp_…` straight off the upstream's own response object
-        // (AISIX-Cloud#1289). On the streaming path the caller carries the
+        // (#1289). On the streaming path the caller carries the
         // id it saw on an earlier frame across this replacement, so an
         // upstream that only stamps it on `response.created` still records.
         provider_request_id: crate::usage_attr::provider_response_id(body),
@@ -3169,7 +3169,7 @@ fn push_capped_lossy_bytes(output: &mut String, bytes: &[u8]) {
 /// The `resp_…` carried by any frame of a fully-buffered Responses-API SSE
 /// body — `response.created` is the first, so this survives a stream whose
 /// terminal frame reported no usage and therefore produced no
-/// [`ResponseUsage`] (AISIX-Cloud#1289).
+/// [`ResponseUsage`] (#1289).
 fn responses_sse_provider_request_id(bytes: &[u8]) -> String {
     for json in crate::redact::parse_sse_json_stream(bytes).0 {
         if let Some(r) = json.get("response") {
@@ -3184,7 +3184,7 @@ fn responses_sse_provider_request_id(bytes: &[u8]) -> String {
 
 /// Drain every complete SSE event from `buf`, updating `acc` with the latest
 /// terminal-event usage (#808) and feeding each parsed event to the optional
-/// content capture (AISIX-Cloud#947). Incomplete trailing bytes remain for the
+/// content capture (#947). Incomplete trailing bytes remain for the
 /// next chunk. The function stops at a semantic terminal so callers can discard
 /// coalesced later frames. Framing and multi-`data` interpretation use the
 /// shared WHATWG parser.
@@ -3211,7 +3211,7 @@ fn drain_responses_sse_frames(
             // (LiteLLM, caller-side gateways) stamps the same event, so
             // the figure matches external observers. A generated-output
             // whitelist here reported the END of a silent thinking
-            // phase on hidden-reasoning upstreams — AISIX-Cloud#1225.
+            // phase on hidden-reasoning upstreams — #1225.
             if !*first_frame_seen {
                 *first_frame_seen = true;
                 acc.get_or_insert_with(Default::default).upstream_ttft_ms =
@@ -3220,7 +3220,7 @@ fn drain_responses_sse_frames(
             // `resp_…` off any frame that carries the response object —
             // `response.created` is the first, so a stream that dies
             // before its terminal frame still records which upstream call
-            // it was (AISIX-Cloud#1289).
+            // it was (#1289).
             if let Some(id) = json
                 .get("response")
                 .and_then(|r| r.get("id"))
@@ -3283,7 +3283,7 @@ fn drain_responses_sse_frames(
 }
 
 /// Streamed output-text accumulator for content-capturing exporters
-/// (AISIX-Cloud#947). Mirrors `responses_sse_output_text`'s precedence: a
+/// (#947). Mirrors `responses_sse_output_text`'s precedence: a
 /// terminal `response.*` event's full output (incl. tool-call items) wins;
 /// concatenated `*.delta` text is the fallback for streams that abort before
 /// a terminal object. Delta accumulation is bounded to the capture cap so a
@@ -3376,8 +3376,8 @@ impl SseTextCapture {
 /// `None` means no terminal usage was seen (e.g. an abort before completion);
 /// the emit then records a zero-token 200 so the request still appears in the
 /// dashboard Logs. The second callback argument is the captured output text
-/// (AISIX-Cloud#947) — empty when no exporter wants content. The third is the
-/// end-of-stream scan's monitor observations (AISIX-Cloud#1010) — the Drop
+/// (#947) — empty when no exporter wants content. The third is the
+/// end-of-stream scan's monitor observations (#1010) — the Drop
 /// (disconnect) path passes none: the response never completed, so there is
 /// nothing final to observe, matching the chat surface's disconnect behavior.
 struct ResponsesStreamState {
@@ -3454,7 +3454,7 @@ impl<
 }
 
 /// End-of-stream output observation for the live-forward verbatim path
-/// (AISIX-Cloud#1010). Reachable only when the output-hook chain's resolved
+/// (#1010). Reachable only when the output-hook chain's resolved
 /// streaming policy is `EndOfStreamCheck` — today that is exactly the
 /// monitor-only chains, which can never block. Runs the same two-phase scan
 /// as the buffered branch (blob check + segment pass) so would-block /
@@ -3527,8 +3527,8 @@ struct EosOutputObservation {
 /// Wrap a Responses-API upstream byte stream so the terminal event's usage is
 /// parsed in-flight and `on_complete` fires once at end-of-stream (or
 /// client-disconnect) with the accumulated counts (#808) plus the captured
-/// output text (AISIX-Cloud#947, empty when `content_cap` is `None`) and the
-/// end-of-stream scan's monitor hits (AISIX-Cloud#1010, empty without
+/// output text (#947, empty when `content_cap` is `None`) and the
+/// end-of-stream scan's monitor hits (#1010, empty without
 /// `eos_scan`). Bytes forward verbatim — the client sees the exact upstream
 /// SSE wire shape.
 fn build_responses_passthrough_stream<S, F>(
@@ -3557,7 +3557,7 @@ where
 {
     // The scan and the token-estimation fallback read the same assembled
     // output text the capture produces, so the accumulator is now ALWAYS
-    // on (AISIX-Cloud#1074) — whether estimation is needed is only known
+    // on (#1074) — whether estimation is needed is only known
     // at end-of-stream — with the estimation cap as the floor. The cap
     // bounds delta accumulation; a terminal event's full output text is
     // instead bounded by MAX_SSE_FRAME_BUF_BYTES (an oversized frame
@@ -3579,7 +3579,7 @@ where
     // Re-attach the request span: the body is polled after the request-id
     // middleware returns, so the end-of-stream output-guardrail scan
     // (`EosOutputScan::observe`) would otherwise log without a
-    // `request_id` (AISIX-Cloud#1060).
+    // `request_id` (#1060).
     crate::request_id::in_request_span(async_stream::stream! {
         let mut guard = ResponsesUsageGuard {
             slot: Some((
@@ -3905,7 +3905,7 @@ fn apply_passthrough_headers(
     }
 }
 
-/// Issue #404: push one `UsageEvent` onto cp-api's telemetry sink
+/// Issue #404: push one `UsageEvent` onto the control plane's telemetry sink
 /// and fan it out to per-env OTLP exporters. Mirrors the shape of
 /// `embeddings::emit_usage_event` (#402) for the fields that matter
 /// to /v1/responses, with one extension: `reasoning_tokens` is
@@ -3918,14 +3918,14 @@ fn apply_passthrough_headers(
 ///     #825 cross-provider bridge path (Anthropic backends); 0 otherwise
 ///   - provider_model_version / finish_reason — not yet plumbed for
 ///     non-chat handlers (follow-up)
-///   - cost_usd — cp-api computes server-side from pricing catalog
+///   - cost_usd — the control plane computes server-side from pricing catalog
 ///   - cache_status / cache_hit_* / ttft_ms — no caching/streaming
 ///     surface on Responses API non-streaming
 ///   - served_by_model / routing_* — Responses doesn't run routing
 ///
 /// `provider_kind` / `provider_featured` / `branded_provider` / `pk_label` /
 /// `byo_label` are populated from the resolved target's ProviderKey
-/// `telemetry_tags` (AISIX-Cloud#867) — same lookup as `/v1/messages` and
+/// `telemetry_tags` (#867) — same lookup as `/v1/messages` and
 /// `/v1/chat/completions`, so Codex (`/v1/responses`) logs carry the upstream
 /// vendor + PK label the dashboard's Logs detail shows. Empty `provider_key_id`
 /// (pre-dispatch error) bypasses the lookup → wire NULL.
@@ -3945,7 +3945,7 @@ fn emit_usage_event(
     model_id: &str,
     requested_model: &str,
     api_key_id: &str,
-    // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
+    // Metric labels the UsageEvent has no field for (#1234
     // follow-up): the wire struct is the CP contract, so they ride
     // alongside rather than in it.
     provider: &str,
@@ -3962,11 +3962,11 @@ fn emit_usage_event(
     // Per-detector PII mask counts (#932), input + output merged. Detector
     // names only, never matched values. Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
-    // Monitor-mode guardrail observations (AISIX-Cloud#562), input +
+    // Monitor-mode guardrail observations (#562), input +
     // output merged.
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     // Captured request/response content for content-capturing exporters
-    // (AISIX-Cloud#947). Forwarded only to `fan_out`, never to the CP sink.
+    // (#947). Forwarded only to `fan_out`, never to the CP sink.
     content: Option<&CapturedContent>,
 ) {
     let tags = pk.telemetry_tags();
@@ -4038,7 +4038,7 @@ fn emit_usage_event(
         exporters.generation(),
         exporters.iter().map(|e| &*e.value),
     );
-    // AISIX-Cloud#1044: token volume by inbound client type × model. Codex
+    // #1044: token volume by inbound client type × model. Codex
     // traffic arrives on /v1/responses, so leaving this endpoint out of the
     // by-client series made an allowlisted client invisible in it. All three
     // usage-bearing paths (non-streaming, verbatim streaming, bridge
@@ -4096,10 +4096,10 @@ fn emit_zero_token_event(
     // Per-detector PII mask counts (#932): input masking may have fired
     // before the failure. Empty for most failure classes.
     redacted_entity_counts: crate::redact::RedactionCounts,
-    // Monitor-mode guardrail observations (AISIX-Cloud#562) that fired
+    // Monitor-mode guardrail observations (#562) that fired
     // before the failure.
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
-    // AISIX-Cloud#1013: captured (post-mask) request body for failed
+    // #1013: captured (post-mask) request body for failed
     // requests. Forwarded only to `fan_out`, never to the CP sink.
     content: Option<CapturedContent>,
 ) {
@@ -4154,7 +4154,7 @@ fn emit_failed_attempts(
     client: &ClientContext,
     applied_guardrails: &[AppliedGuardrail],
     routing: &RoutingTelemetry,
-    // AISIX-Cloud#1013: when every target failed there is no terminal
+    // #1013: when every target failed there is no terminal
     // event, so the captured request body rides the LAST failed attempt —
     // the one whose status the caller saw. Other attempts (and the
     // success-path caller) stay content-less.
@@ -4177,7 +4177,7 @@ fn emit_failed_attempts(
             snap,
             request_id,
             // Each failed attempt records the TARGET it actually hit
-            // (AISIX-Cloud#790), not the group it was resolved from.
+            // (#790), not the group it was resolved from.
             &rec.target_model_id,
             requested_model,
             api_key_id,
@@ -4308,7 +4308,7 @@ mod tests {
         ResourceEntry::new(OPENAI_PK_ID, pk, 1)
     }
 
-    /// An OpenAI PK carrying per-PK `request.*` overrides (AISIX-Cloud#867):
+    /// An OpenAI PK carrying per-PK `request.*` overrides (#867):
     /// a `default_body_fields` injection and a `default_headers` injection,
     /// so the verbatim Responses path can be asserted to apply both to the
     /// outbound upstream call.
@@ -4321,7 +4321,7 @@ mod tests {
     }
 
     /// An OpenAI PK carrying per-PK telemetry attribution tags
-    /// (AISIX-Cloud#867) so emitted UsageEvents can be asserted to surface the
+    /// (#867) so emitted UsageEvents can be asserted to surface the
     /// upstream vendor + PK label the dashboard's Logs detail shows.
     fn openai_pk_tagged(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
@@ -5227,7 +5227,7 @@ mod tests {
         ResourceEntry::new("g-out-mon-1", g, 1)
     }
 
-    /// AISIX-Cloud#1010: a MONITOR-mode output guardrail must never make a
+    /// #1010: a MONITOR-mode output guardrail must never make a
     /// streaming /v1/responses request fail closed. Same oversized stream as
     /// the fail-closed test above, but the chain resolves to EndOfStreamCheck
     /// — the bytes forward live and the client gets the full 200 SSE, not a
@@ -5278,7 +5278,7 @@ mod tests {
         );
     }
 
-    /// AISIX-Cloud#1010 companion: on the live-forward monitor path the
+    /// #1010 companion: on the live-forward monitor path the
     /// end-of-stream scan still runs — a violating stream is delivered
     /// verbatim (200, content included) and the emitted usage event carries
     /// the `would_block` observation instead of `guardrail_blocked`.
@@ -5346,7 +5346,7 @@ mod tests {
         );
     }
 
-    /// AISIX-Cloud#1010 audit H1: the end-of-stream observation awaits a
+    /// #1010 audit H1: the end-of-stream observation awaits a
     /// remote guardrail provider, and SDK clients close the connection right
     /// after the terminal frame — the generator is dropped at that await.
     /// The completion guard must stay armed across the scan so the Drop
@@ -5450,7 +5450,7 @@ mod tests {
         assert_eq!(event.completion_tokens, 3);
     }
 
-    /// AISIX-Cloud#1010, cross-provider bridge path: a monitor-mode output
+    /// #1010, cross-provider bridge path: a monitor-mode output
     /// guardrail must not hold back or fail the bridged stream on the buffer
     /// cap either. An oversized bridged response is released in full with no
     /// `content_filter` error frame, and the usage event stays an unblocked
@@ -5989,7 +5989,7 @@ mod tests {
     /// emit a `UsageEvent` onto the `usage_sink`. Pre-#404 the
     /// responses handler dropped the event entirely, so every
     /// o1/o3/GPT-5 traffic through Responses API was invisible to
-    /// cp-api's budget ledger and customer-facing /logs analytics.
+    /// the control plane's budget ledger and customer-facing /logs analytics.
     /// This test pins the contract: after a 200 with a real
     /// upstream usage block, exactly one event arrives with the
     /// input_tokens / output_tokens / reasoning_tokens / cached
@@ -6079,7 +6079,7 @@ mod tests {
         assert!(!event.occurred_at.is_empty());
     }
 
-    /// AISIX-Cloud#1289: `/v1/responses` must record the upstream's own
+    /// #1289: `/v1/responses` must record the upstream's own
     /// response object id. Before this it was one of the fields the handler
     /// left at `UsageEvent::default()` ("not yet plumbed for non-chat
     /// handlers"), so a Codex-class call had no id an operator could take to
@@ -6131,9 +6131,9 @@ mod tests {
         assert_ne!(ev.request_id, ev.provider_request_id);
     }
 
-    /// AISIX-Cloud#1289 follow-up: `extract_response_usage` gates on a usable
+    /// #1289 follow-up: `extract_response_usage` gates on a usable
     /// `usage.input_tokens` and returns `None` without one, so the estimation
-    /// fallback (AISIX-Cloud#1074) works off a defaulted `ResponseUsage` — and
+    /// fallback (#1074) works off a defaulted `ResponseUsage` — and
     /// used to drop a perfectly good top-level `id` with it. The estimated
     /// record must still name the upstream call it came from. Fails before the
     /// follow-up (empty), passes after.
@@ -6318,7 +6318,7 @@ event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\
         assert!(failure.is_none());
     }
 
-    /// AISIX-Cloud#1289, streaming: the id arrives on `response.created` and
+    /// #1289, streaming: the id arrives on `response.created` and
     /// the terminal `response.completed` need not repeat it — this upstream
     /// deliberately omits it there. A reader that only looked at the terminal
     /// frame, or one that let the terminal frame overwrite what earlier
@@ -6377,7 +6377,7 @@ data: [DONE]\n\n";
         );
     }
 
-    /// AISIX-Cloud#867: the verbatim-OpenAI /v1/responses path must apply the
+    /// #867: the verbatim-OpenAI /v1/responses path must apply the
     /// resolved ProviderKey's `request.*` overrides to the outbound call —
     /// both the `default_body_fields` injection (body) and the
     /// `default_headers` injection (header) must reach the upstream. The mock
@@ -6485,7 +6485,7 @@ data: [DONE]\n\n";
 
     /// Companion: an upstream 200 missing the `usage` block entirely
     /// (some relay / compat backends) now emits an ESTIMATED usage
-    /// event (AISIX-Cloud#1074) — the call must not stay invisible to
+    /// event (#1074) — the call must not stay invisible to
     /// billing. (Pre-#1074 this edge kept the pre-#404 no-emit
     /// behaviour.)
     #[tokio::test]
@@ -6623,7 +6623,7 @@ data: [DONE]\n\n";
         );
     }
 
-    /// AISIX-Cloud#867: a streaming `/v1/responses` 200 (every Codex request,
+    /// #867: a streaming `/v1/responses` 200 (every Codex request,
     /// which always streams) MUST carry the resolved ProviderKey's telemetry
     /// attribution tags — provider_kind / provider_featured / branded_provider
     /// / pk_label — exactly like `/v1/messages` and `/v1/chat/completions`.
@@ -6697,7 +6697,7 @@ data: [DONE]\n\n";
         );
     }
 
-    /// AISIX-Cloud#867 (non-streaming sibling): the same per-PK telemetry
+    /// #867 (non-streaming sibling): the same per-PK telemetry
     /// attribution must land on a non-streaming `/v1/responses` 200, which
     /// emits from the handler via `ResponseDispatchSuccess.provider_key_id`
     /// (a different threading path than the streaming Drop guard above).
@@ -6834,7 +6834,7 @@ data: [DONE]\n\n";
 
     /// A 200 with `usage: {}` (malformed — `input_tokens` is required
     /// by the Responses-API spec) now emits an ESTIMATED usage event
-    /// (AISIX-Cloud#1074) instead of dropping the record. Same edge as
+    /// (#1074) instead of dropping the record. Same edge as
     /// the omitted-usage test but the gate is one layer deeper —
     /// `usage` exists but is empty. (Pre-#1074, per issue #404 audit
     /// MEDIUM-1, this dropped the event entirely.)
@@ -6946,7 +6946,7 @@ data: [DONE]\n\n";
         );
     }
 
-    /// AISIX-Cloud#947: the streamed content capture prefers the terminal
+    /// #947: the streamed content capture prefers the terminal
     /// `response.completed` event's full output over accumulated deltas —
     /// the terminal object is authoritative (includes tool-call items the
     /// deltas may have missed).
@@ -6968,7 +6968,7 @@ data: [DONE]\n\n";
         assert_eq!(cap.into_text(), "the full text");
     }
 
-    /// AISIX-Cloud#947: a stream that aborts before any terminal event falls
+    /// #947: a stream that aborts before any terminal event falls
     /// back to the concatenated deltas — including tool-call argument deltas,
     /// which stream via their own event type.
     #[test]
@@ -6985,7 +6985,7 @@ data: [DONE]\n\n";
         assert_eq!(cap.into_text(), "hello {\"city\":\"SF\"}");
     }
 
-    /// AISIX-Cloud#947: delta accumulation is bounded to the capture cap so
+    /// #947: delta accumulation is bounded to the capture cap so
     /// a long stream can't grow the buffer without limit.
     #[test]
     fn sse_text_capture_bounds_delta_accumulation() {

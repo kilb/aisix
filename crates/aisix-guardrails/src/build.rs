@@ -38,7 +38,7 @@ use crate::{
 /// order is arbitrary and varies run-to-run; building the chain straight
 /// off it made "which Block fires first" random when multiple guardrails
 /// match (#519 B.4a). The dashboard lists guardrails oldest-first, so the
-/// chain evaluates oldest-first too. cp-api doesn't project `created_at`
+/// chain evaluates oldest-first too. The control plane doesn't project `created_at`
 /// yet — until it does, every row falls back to the id tiebreak, which is
 /// still deterministic.
 fn sorted_guardrail_entries(
@@ -268,7 +268,7 @@ fn build_one_inner(
         }
         #[cfg(feature = "bedrock")]
         GuardrailKind::Bedrock(cfg) => {
-            // Phase 2: build the AWS-SDK-backed dispatcher. cp-api
+            // Phase 2: build the AWS-SDK-backed dispatcher. The control plane
             // already decrypted the secret at projection time, so
             // the BedrockConfig in the snapshot carries plaintext
             // credentials. The endpoint URL is forwarded from
@@ -291,7 +291,7 @@ fn build_one_inner(
         }
         #[cfg(feature = "azure-content-safety")]
         GuardrailKind::AzureContentSafety(cfg) => {
-            // P1: HTTP-based Prompt Shield dispatcher. cp-api already
+            // P1: HTTP-based Prompt Shield dispatcher. The control plane already
             // decrypted the api_key at projection time; the config carries
             // plaintext. No deployment-wide endpoint override needed —
             // the endpoint is per-row (each customer has their own Azure CS
@@ -311,7 +311,7 @@ fn build_one_inner(
         }
         #[cfg(feature = "azure-content-safety")]
         GuardrailKind::AzureContentSafetyTextModeration(cfg) => {
-            // P2: HTTP-based text:analyze dispatcher. cp-api already
+            // P2: HTTP-based text:analyze dispatcher. The control plane already
             // decrypted the api_key at projection time; the config carries
             // plaintext. Endpoint is per-row (each customer's own resource).
             let g = crate::text_moderation::TextModerationGuardrail::new(
@@ -328,7 +328,7 @@ fn build_one_inner(
         }
         #[cfg(feature = "aliyun-text-moderation")]
         GuardrailKind::AliyunTextModeration(cfg) => {
-            // #603: HTTP-based TextModerationPlus dispatcher. cp-api already
+            // #603: HTTP-based TextModerationPlus dispatcher. The control plane already
             // decrypted the access_key_secret at projection time; the config
             // carries plaintext. Endpoint is per-row (derived from the row's
             // region, or an explicit override for tests/dev).
@@ -348,7 +348,7 @@ fn build_one_inner(
         GuardrailKind::AliyunAiGuardrail(cfg) => {
             // #1070: MultiModalGuard dispatcher (Aliyun AI Guardrails — a
             // different product from TextModerationPlus above, same signing
-            // scheme). cp-api already decrypted the access_key_secret at
+            // scheme). The control plane already decrypted the access_key_secret at
             // projection time; the config carries plaintext.
             let g = crate::aliyun_ai_guardrail::AliyunAiGuardrail::new(
                 row.name.clone(),
@@ -364,7 +364,7 @@ fn build_one_inner(
         }
         #[cfg(feature = "lakera")]
         GuardrailKind::Lakera(cfg) => {
-            // #52: HTTP-based /v2/guard dispatcher. cp-api already decrypted
+            // #52: HTTP-based /v2/guard dispatcher. The control plane already decrypted
             // the api_key at projection time; the config carries plaintext.
             // Endpoint is per-row (default api.lakera.ai, overridable for
             // regional/self-hosted deployments and tests).
@@ -380,7 +380,7 @@ fn build_one_inner(
         GuardrailKind::Lakera(_) => Err(BuildError::FeatureDisabled("lakera")),
         #[cfg(feature = "openai-moderation")]
         GuardrailKind::OpenaiModeration(cfg) => {
-            // #52: HTTP-based /moderations dispatcher. cp-api already
+            // #52: HTTP-based /moderations dispatcher. The control plane already
             // decrypted the api_key at projection time; the config carries
             // plaintext. Endpoint is per-row (default api.openai.com/v1).
             // Moderation scores are 0..=1; a threshold outside that range
@@ -532,7 +532,7 @@ impl MonitorGuardrail {
         }
     }
 
-    /// `would_block` telemetry hit for a downgraded Block (AISIX-Cloud#562).
+    /// `would_block` telemetry hit for a downgraded Block (#562).
     fn would_block_hit(&self, hook: &'static str, reason: &str) -> GuardrailMonitorHit {
         GuardrailMonitorHit {
             guardrail_name: self.row_name.clone(),
@@ -572,7 +572,7 @@ impl MonitorGuardrail {
         self.observe(hook, verdict)
     }
 
-    /// Observe a segment outcome (AISIX-Cloud#562): a Block downgrades to
+    /// Observe a segment outcome (#562): a Block downgrades to
     /// Allow with a `would_block` hit; an inner mask is suppressed (never
     /// written back) with a `would_mask` hit carrying the provider's
     /// entity counts. Bypass passes through — monitor mode doesn't change
@@ -1104,7 +1104,7 @@ pub struct LiveGuardrailIndex {
     snapshot: SnapshotHandle<AisixSnapshot>,
     bedrock_endpoint_url: Option<String>,
     /// Per-execution telemetry receiver, attached to every resolved chain
-    /// (AISIX-Cloud#1076). `None` (tests, standalone construction) records
+    /// (#1076). `None` (tests, standalone construction) records
     /// nothing; the server bootstrap wires the metrics layer's sink.
     metrics_sink: Option<Arc<dyn aisix_core::GuardrailMetricsSink>>,
     /// `ArcSwap`, not a `Mutex`: `current()` runs on every request just to
@@ -1287,7 +1287,7 @@ mod tests {
         assert!(!chain.check_output(&resp).await.is_block());
     }
 
-    /// AISIX-Cloud#562: the observed check surfaces what monitor mode
+    /// #562: the observed check surfaces what monitor mode
     /// suppressed — a downgraded Block becomes a `would_block` hit and a
     /// suppressed pii mask becomes a `would_mask` hit with the detector
     /// counts. Verdicts stay downgraded; names only, never values.
@@ -1619,7 +1619,7 @@ mod tests {
         ))
     }
 
-    /// AISIX-Cloud#1010: `enforcement_mode: "monitor"` must never block —
+    /// #1010: `enforcement_mode: "monitor"` must never block —
     /// including when the remote provider call itself FAILS, not just when
     /// content is flagged. With `fail_open: false` a provider 5xx surfaces
     /// as a `Block` from the inner guardrail; the monitor wrapper must
@@ -1900,7 +1900,7 @@ mod tests {
         assert_eq!(chain.member_names(), EXPECTED_ORDER);
     }
 
-    /// cp-api doesn't project `created_at` yet — a table where every row
+    /// The control plane doesn't project `created_at` yet — a table where every row
     /// lacks it must still build in a deterministic (id-ascending) order.
     #[test]
     fn chain_order_falls_back_to_id_when_created_at_absent() {
@@ -2252,7 +2252,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // per-execution metrics sink (AISIX-Cloud#1076)
+    // per-execution metrics sink (#1076)
     // -----------------------------------------------------------------------
 
     #[derive(Default)]

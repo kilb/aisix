@@ -1,6 +1,6 @@
 //! Regression tests for the two rmcp 3.x client-side defaults that would
 //! silently change the gateway's cost and isolation posture if left at their
-//! SDK values (AISIX-Cloud#1144):
+//! SDK values (#1144):
 //!
 //! 1. **MRTR auto-retry.** `RunningService::call_tool` drives SEP-2322
 //!    multi-round-trip requests automatically — up to 10 upstream round

@@ -1,4 +1,4 @@
-//! Local token estimation for usage telemetry (AISIX-Cloud#1074).
+//! Local token estimation for usage telemetry (#1074).
 //!
 //! When an upstream response — streaming or not — carries no `usage`
 //! block, the emit paths fall back to counting tokens locally so usage

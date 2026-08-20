@@ -18,19 +18,19 @@ pub(crate) fn new_request_id() -> String {
     Uuid::new_v4().to_string()
 }
 
-/// Longest caller-supplied request id accepted. Matches cp-api's
+/// Longest caller-supplied request id accepted. Matches the control plane's
 /// `maxRequestIDLen`.
 const MAX_REQUEST_ID_LEN: usize = 256;
 
 /// Whether a caller-supplied request id may be used as-is.
 ///
-/// MUST stay byte-identical to cp-api's `validRequestID`
-/// (AISIX-Cloud internal/dpmgr/api/telemetry.go). This side decides what
+/// MUST stay byte-identical to the control plane's `validRequestID`
+/// (the control plane's telemetry ingest). This side decides what
 /// to hand back to the caller and stamp on every usage event; that side
-/// decides what to persist. If cp-api were stricter, a request the caller
+/// decides what to persist. If the control plane were stricter, a request the caller
 /// was told succeeded — with this id in its `x-aisix-request-id` — would be
 /// dropped at telemetry ingest and vanish from billing and /logs, which is
-/// the failure AISIX-Cloud#1288 exists to remove.
+/// the failure #1288 exists to remove.
 ///
 /// Visible ASCII only (0x21..=0x7E): no control characters, no spaces, no
 /// non-ASCII. Covers every id shape in the wild (UUID, ULID, `req_abc123`,
@@ -83,7 +83,7 @@ pub(crate) struct RequestId(pub String);
 /// proxied response an `x-aisix-request-id` header derived from the same id
 /// the handler attributes its usage event to.
 ///
-/// Reusing the caller's id (AISIX-Cloud#1288) happens HERE, at the single
+/// Reusing the caller's id (#1288) happens HERE, at the single
 /// mint point, which is what makes it hold everywhere at once: the response
 /// header, every retry/failover attempt's usage event, the access log, the
 /// tracing span, and the `x-aisix-request-id` each bridge sends upstream all
@@ -106,7 +106,7 @@ pub(crate) struct RequestId(pub String);
 ///
 /// It also opens the request-scoped tracing span, so every log line a
 /// request emits carries its `request_id` without each call site having
-/// to thread one down (AISIX-Cloud#1060). That is what makes a deep
+/// to thread one down (#1060). That is what makes a deep
 /// diagnostic — e.g. the Aliyun guardrail's `aliyun_request_id` — join
 /// back to the `x-aisix-request-id` the caller was handed. The span is
 /// attached to the future rather than entered with a guard: a guard held
@@ -168,7 +168,7 @@ impl<T> futures::Stream for InSpan<T> {
 /// returned, so its span is no longer active by then: without this, every
 /// log event a generator emits — notably the output-guardrail checks that
 /// run at end-of-stream — lands outside the request span and loses its
-/// `request_id` (AISIX-Cloud#1060).
+/// `request_id` (#1060).
 ///
 /// MUST be called while still inside the handler, since it captures
 /// [`tracing::Span::current`] at construction time — calling it from
@@ -290,7 +290,7 @@ mod tests {
         );
     }
 
-    // AISIX-Cloud#1288. The caller's id must become THE id — what the
+    // #1288. The caller's id must become THE id — what the
     // handler attributes its usage event to AND what comes back on the
     // response — not merely be echoed back while telemetry uses another.
     #[tokio::test]

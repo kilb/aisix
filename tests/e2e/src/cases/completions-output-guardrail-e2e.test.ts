@@ -214,7 +214,7 @@ describe("completions output guardrail (#911 [23])", () => {
     // UsageEvent) rather than the zeroed error path. The observable signature
     // is the `provider` label on the 422 request metric: the charged Ok path
     // records the real provider ("openai"); the pre-fix bare-error path
-    // recorded "unknown" and dropped the billed usage from cp-api's ledger.
+    // recorded "unknown" and dropped the billed usage from the control plane's ledger.
     const scrape = await fetch(`${app.metricsUrl}/metrics`).then((r) => r.text());
     const blocked422 = scrape
       .split("\n")

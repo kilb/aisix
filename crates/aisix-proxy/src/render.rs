@@ -6,7 +6,7 @@
 //! describe what we *emit*. Keeping them separate means a client-facing
 //! schema change doesn't ripple into every provider adapter.
 //!
-//! ## `model` field contract (AISIX-Cloud#410)
+//! ## `model` field contract (#410)
 //!
 //! `response.model` is always the **customer-facing model name** the
 //! caller put on the request — for a direct model that's the model's
@@ -498,7 +498,7 @@ mod tests {
         assert_eq!(json["usage"]["prompt_cache_miss_tokens"], 18);
     }
 
-    /// Pins the AISIX-Cloud#410 contract: when the upstream returns one
+    /// Pins the #410 contract: when the upstream returns one
     /// model id but the customer requested a different name (alias /
     /// routing-group name), `response.model` must echo the customer's
     /// requested name, not the upstream's raw id.

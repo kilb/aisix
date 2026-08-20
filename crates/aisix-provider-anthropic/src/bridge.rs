@@ -136,7 +136,7 @@ fn resolve_base(ctx: &BridgeContext) -> Result<String, BridgeError> {
                 // Operator-facing detail (route, provider topology,
                 // remediation steps) goes to logs only — keep the
                 // customer-visible 500 body short and free of
-                // internal-product taxonomy (cp-api / adapter_map /
+                // internal-product taxonomy (the control plane / adapter_map /
                 // provider_metadata field names are not part of any
                 // wire contract a customer should depend on).
                 tracing::error!(
@@ -883,7 +883,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(stream.next().await.is_none());
     }
 
-    /// AISIX-Cloud#952: some relay backends omit usage from
+    /// #952: some relay backends omit usage from
     /// `message_start` and report input/cache counts only on the
     /// terminal `message_delta`. The bridge must harvest them there
     /// (pre-fix the final usage carried prompt_tokens=0).
@@ -948,7 +948,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         }
     }
 
-    /// AISIX-Cloud#1222 scenario 3: Anthropic reports mid-stream
+    /// #1222 scenario 3: Anthropic reports mid-stream
     /// failures as an in-band `event: error` frame inside the 200
     /// stream. Pre-fix the frame deserialized into the `Other`
     /// catch-all and was silently swallowed — the truncated stream
@@ -1100,7 +1100,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
                     // Sensitive-info-leakage guard: internal product
                     // taxonomy must not leak into the customer-visible
                     // 500 body. Those identifiers go to tracing only.
-                    for forbidden in ["cp-api", "adapter_map", "provider_metadata"] {
+                    for forbidden in ["control plane", "adapter_map", "provider_metadata"] {
                         assert!(
                             !msg.contains(forbidden),
                             "vendor {vendor:?}: error body must not leak \

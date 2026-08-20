@@ -206,8 +206,8 @@ pub struct ProxyStateInner {
     /// when the snapshot version changes. Default is an empty index
     /// (no-op); the server bootstrap wires a live handle at startup.
     pub guardrail_index: Arc<LiveGuardrailIndex>,
-    /// Per-request budget gate. Asks cp-api whether the api_key may
-    /// proceed; cached for 5s with sticky fallback on cp-api outage.
+    /// Per-request budget gate. Asks the control plane whether the api_key may
+    /// proceed; cached for 5s with sticky fallback on the control plane outage.
     pub budgets: Arc<BudgetClient>,
     /// Per-model health tracker. Updated on every upstream call outcome;
     /// read by `GET /admin/v1/health`.
@@ -237,7 +237,7 @@ pub struct ProxyStateInner {
     pub real_ip: Arc<ResolvedRealIp>,
     /// Pre-parsed `proxy.request_id.accept_headers`: the inbound headers a
     /// caller may supply its own request id in, in priority order
-    /// (AISIX-Cloud#1288). Default = `[x-aisix-request-id]`.
+    /// (#1288). Default = `[x-aisix-request-id]`.
     pub request_id_accept: Arc<[axum::http::HeaderName]>,
     /// Boot-compiled `proxy.url_rewrites` rules, applied in order to every
     /// request before routing (first match wins). Empty = layer no-ops.
@@ -250,11 +250,11 @@ pub struct ProxyStateInner {
     /// Batch ids whose completed output has already been attributed to
     /// UsageEvents by THIS process (#720). Process-local dedup only — the
     /// deterministic `request_id = "batch-<id>"` on the emitted events is
-    /// what keeps cross-restart re-emission idempotent on the cp-api side.
+    /// what keeps cross-restart re-emission idempotent on the control plane side.
     pub billed_batches: Arc<dashmap::DashMap<String, std::time::Instant>>,
     /// Boot-compiled User-Agent → `client_type` classifier: operator
     /// rules from `observability.metrics.client_type_rules` first, then
-    /// the built-in allowlist (AISIX-Cloud#1045). Default = built-ins
+    /// the built-in allowlist (#1045). Default = built-ins
     /// only; the server bootstrap swaps in the compiled config rules.
     pub client_classifier: Arc<ClientTypeClassifier>,
     /// Deployment-wide retry budget (`upstream.retries`) — the floor every
@@ -518,7 +518,7 @@ impl ProxyState {
     }
 
     /// Swap in the classifier compiled from
-    /// `observability.metrics.client_type_rules` (AISIX-Cloud#1045).
+    /// `observability.metrics.client_type_rules` (#1045).
     /// Default is built-ins only.
     pub fn with_client_classifier(mut self, classifier: Arc<ClientTypeClassifier>) -> Self {
         Arc::make_mut(&mut self.inner).client_classifier = classifier;
@@ -552,7 +552,7 @@ impl ProxyState {
         self
     }
 
-    /// Swap in a live `BudgetClient` that talks to cp-api. Default is
+    /// Swap in a live `BudgetClient` that talks to the control plane. Default is
     /// the disabled (allow-all) client used in self-hosted dev.
     pub fn with_budget_client(mut self, client: Arc<BudgetClient>) -> Self {
         Arc::make_mut(&mut self.inner).budgets = client;

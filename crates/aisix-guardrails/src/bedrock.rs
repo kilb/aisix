@@ -2,8 +2,8 @@
 //! `ApplyGuardrail` API on every chat request and translates the
 //! response into a [`GuardrailVerdict`].
 //!
-//! PRD-09c §6 Phase 2. The cp-api side ships the
-//! envelope-encrypted secret; cp-api decrypts at projection time
+//! PRD-09c §6 Phase 2. The the control plane side ships the
+//! envelope-encrypted secret; the control plane decrypts at projection time
 //! so this module only handles plaintext credentials. We never log
 //! the secret.
 //!
@@ -821,7 +821,7 @@ mod tests {
                 secret_access_key: "TEST".into(),
             },
             latency_mode: BedrockLatencyMode::Serial,
-            // Default fail-closed output (cp-api omits the field when unset).
+            // Default fail-closed output (the control plane omits the field when unset).
             output_fail_open: false,
         }
     }

@@ -751,7 +751,7 @@ mod tests {
     // Customers who saved an invalid resource in the dashboard saw
     // "Saved" but the DP dropped the row — no signal back. The fix
     // attaches a `RejectedEntry` per skip path so the heartbeat can
-    // surface the failure to cp-api.
+    // surface the failure to the control plane.
 
     #[test]
     fn rejection_records_bad_key_with_kind_and_error_message() {
@@ -798,7 +798,7 @@ mod tests {
         assert!(stats.rejections.is_empty());
     }
 
-    // ---- provider_key schema coverage (issue api7/AISIX-Cloud#398
+    // ---- provider_key schema coverage (issue api7/#398
     //      Tier 3 "DP loader schema check") ----------------------
     //
     // Pins the ProviderKey loader path. The existing tests above
@@ -825,7 +825,7 @@ mod tests {
 
     #[test]
     fn provider_key_aws_region_payload_loads_partially_compatible() {
-        // Flip of the pre-#871 `*_currently_rejected` pin. cp-api's
+        // Flip of the pre-#871 `*_currently_rejected` pin. The control plane's
         // adapter_map admits Bedrock provider_key payloads carrying a
         // top-level `aws_region`; the DP adapter never reads that field
         // — the Bedrock bridge takes its region from the credential JSON

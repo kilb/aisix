@@ -28,14 +28,14 @@ import {
 // are NON-ZERO. With the pre-#245 bug these counters stay at 0, so
 // this test fails red on a regression.
 //
-// Why metrics rather than cp-api: the DP e2e harness runs the gateway
-// standalone (no cp-api in the loop). `aisix_llm_input_tokens_total` /
+// Why metrics rather than the control plane: the DP e2e harness runs the gateway
+// standalone (no the control plane in the loop). `aisix_llm_input_tokens_total` /
 // `aisix_llm_output_tokens_total` are recorded by the same
 // emit_anthropic_usage_event call that ships the UsageEvent, so a
 // non-zero token counter proves the streaming usage parser ran.
 //
 // References:
-// - Issue: api7/AISIX-Cloud#245
+// - Issue: api7/#245
 // - Anthropic streaming wire shape:
 //   https://docs.anthropic.com/en/api/messages-streaming
 

@@ -1,6 +1,6 @@
 //! `ClaimMapping` entity — a rule mapping verified JWT claims to an
 //! existing API key, stored in etcd under `claim_mappings/<uuid>`
-//! (AISIX-Cloud#564).
+//! (#564).
 //!
 //! The direct `(jwt_provider, jwt_subject)` binding on an API key admits
 //! exactly one pre-registered identity per key. Claim mappings admit a

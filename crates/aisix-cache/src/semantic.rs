@@ -234,7 +234,7 @@ impl SemanticCacheStore for MemorySemanticCache {
         // A store from a request that read the policy BEFORE a purge
         // must not roll the bucket back and wipe post-purge entries:
         // drop the stale write instead. (Generations only ever move
-        // forward — cp-api increments on purge.)
+        // forward — the control plane increments on purge.)
         if generation < policy.generation {
             return Ok(());
         }

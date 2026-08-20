@@ -533,7 +533,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // provision path. Without this the placeholder
             // "https://placeholder-overridden-at-register:2379"
             // from config.managed.yaml survives into the etcd dial,
-            // causing the stale-endpoint bug (AISIX-Cloud#289).
+            // causing the stale-endpoint bug (#289).
             let etcd_url = derive_cp_etcd_url(&cfg.managed)?;
             tracing::info!(etcd = %etcd_url, "managed mode: etcd endpoint for subsequent boot");
             cfg.etcd.endpoints = vec![etcd_url];
@@ -698,19 +698,19 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         )
     });
     // Budget gate. Same on-disk mTLS bundle as heartbeat; URL is the
-    // dpmgr origin (heartbeat URL minus the /dp/heartbeat suffix), the
+    // control plane origin (heartbeat URL minus the /dp/heartbeat suffix), the
     // BudgetClient appends /dp/budget_check itself. See prd-09b rev 2
-    // §5.5 and AISIX-Cloud PR #95. When the bundle build fails the DP
+    // §5.5. When the bundle build fails the DP
     // logs and falls back to the default disabled() (allow-all) — a
     // mid-boot config glitch shouldn't take the proxy down.
     let budget_client = heartbeat_cfg.as_ref().and_then(|h| {
-        let dpmgr_base = h
+        let control_plane_base = h
             .url
             .strip_suffix("/dp/heartbeat")
             .unwrap_or(h.url.as_str())
             .to_string();
         match heartbeat::build_mtls_client(&h.mtls) {
-            Ok(http) => Some(Arc::new(BudgetClient::new(dpmgr_base, http))),
+            Ok(http) => Some(Arc::new(BudgetClient::new(control_plane_base, http))),
             Err(e) => {
                 tracing::warn!(error = %e, "budget_check disabled: mTLS client build failed");
                 None
@@ -730,7 +730,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // env_id is resolved by now (managed provisioning / sidecar restore
     // above); it becomes the constant `env_id` label on the SLO latency
     // histograms. Standalone DPs leave it empty → "unknown".
-    // AISIX-Cloud#1226: operator bucket overrides. Validation errors are
+    // #1226: operator bucket overrides. Validation errors are
     // boot-fatal — a silently ignored override would leave the deployment
     // reading quantiles off bucket edges it did not choose.
     let histogram_buckets =
@@ -911,9 +911,9 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     );
     // Wire the prometheus emit/drop counters into the sink (#408)
     // so a real DP scrape surfaces UsageEvent throughput without
-    // needing cp-api or an OTLP receiver in the loop.
+    // needing the control plane or an OTLP receiver in the loop.
     proxy_state = proxy_state.with_usage_sink(usage_sink.with_metrics((*metrics).clone()));
-    // AISIX-Cloud#1045: operator UA→client_type rules. Compile errors are
+    // #1045: operator UA→client_type rules. Compile errors are
     // boot-fatal — a dropped rule would silently misattribute traffic.
     let client_classifier =
         aisix_obs::ClientTypeClassifier::compile(&cfg.observability.metrics.client_type_rules)
@@ -949,10 +949,10 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // the exporter fan-out's delivery counters. Each tick reports:
     //   - rejected_resources: the supervisor's loader rejections (#115)
     //   - applied_revision: the highest etcd revision the supervisor has
-    //     applied, so cp-api can show "propagating…" until the DP catches
+    //     applied, so the control plane can show "propagating…" until the DP catches
     //     up with a kine write (#519 B.3)
     //   - config_hash: the hash of the applied (served) config set, so
-    //     cp-api can diff the hash a node reports against the hash it
+    //     the control plane can diff the hash a node reports against the hash it
     //     expects that node to be serving (#774)
     //   - supported_guardrail_kinds + exporter_health (#519 B.6 / D.2)
     let heartbeat_task = heartbeat_cfg.map(|mut h| {
@@ -1448,7 +1448,7 @@ fn load_heartbeat_config_from_disk(
 /// (`aisix-proxy::rerank`) and bypasses the Bridge trait entirely.
 ///
 /// Cohere chat is served by the `Adapter::Openai` family bridge —
-/// cp-api stores Cohere's PK with `adapter: "openai"` and `api_base`
+/// the control plane stores Cohere's PK with `adapter: "openai"` and `api_base`
 /// pointing at `https://api.cohere.com/compatibility/v1` (per
 /// <https://docs.cohere.com/reference/chat>). Cohere's `/v1/rerank`
 /// native surface is keyed off `Model.provider == "cohere"` in
@@ -1496,11 +1496,11 @@ fn build_hub() -> Hub {
     // ─── Family bridges (closed 5-value Adapter enum) ────────────────
     //
     // Catches every catalog vendor whose `ProviderKey.adapter` matches
-    // one of these. Any new long-tail OpenAI-compat vendor cp-api
+    // one of these. Any new long-tail OpenAI-compat vendor the control plane
     // admits (xai, openrouter, cerebras, moonshotai, …) routes here
     // through `Hub::dispatch_two_tier` without a DP code change.
     //
-    // CUTOVER CAUTION (non-openai families): cp-api admits
+    // CUTOVER CAUTION (non-openai families): the control plane admits
     // `google-vertex`, `azure`, `amazon-bedrock` Provider Keys via
     // its adapter_map (#302 Phase B). The Vertex / Azure / Bedrock
     // bridges below are functional implementations (Phases E/F/G).
@@ -1570,7 +1570,7 @@ const DOWNSTREAM_NODELAY: axum_server::accept::NoDelayAcceptor =
 ///
 /// Both variants run on `axum_server` rather than `axum::serve` because
 /// only the former exposes the hyper connection builder, which is where
-/// `downstream.idle_timeout_secs` has to be applied (AISIX-Cloud#1126).
+/// `downstream.idle_timeout_secs` has to be applied (#1126).
 async fn serve_http(
     addr: std::net::SocketAddr,
     router: axum::Router,
@@ -2143,8 +2143,8 @@ models:
 
     #[test]
     fn parse_host_port_strips_scheme_and_keeps_port() {
-        let (h, p) = parse_host_port("https://dp-manager:7943").unwrap();
-        assert_eq!(h, "dp-manager");
+        let (h, p) = parse_host_port("https://control-plane.internal:7943").unwrap();
+        assert_eq!(h, "control-plane.internal");
         assert_eq!(p, 7943);
     }
 
@@ -2252,7 +2252,7 @@ models:
 
     /// `build_hub()` must NOT register `cohere` as a specialized chat
     /// bridge. Post-#302 Phase A, Cohere's chat surface is served by
-    /// the `Adapter::Openai` family bridge: cp-api stores Cohere's PK
+    /// the `Adapter::Openai` family bridge: the control plane stores Cohere's PK
     /// with `adapter: "openai"` and `api_base: "https://api.cohere.com/compatibility/v1"`
     /// (per <https://docs.cohere.com/reference/chat>). A specialized
     /// chat bridge here would re-introduce the vendor-enumeration
@@ -2271,7 +2271,7 @@ models:
     /// bridge. Jina is rerank-only (#213 Phase 2) — its
     /// `/v1/chat/completions` traffic falls through to the family
     /// bridge `Adapter::Openai`, which is fine because the chat
-    /// envelope is OpenAI-shaped if cp-api populates `adapter`.
+    /// envelope is OpenAI-shaped if the control plane populates `adapter`.
     /// Registering a specialized Jina chat bridge here would
     /// silently change the metric label / behavior on a future
     /// `provider: "jina"` chat request.
@@ -2286,12 +2286,12 @@ models:
     }
 
     /// `build_hub()` MUST register `Adapter::Openai` as a family
-    /// bridge so any catalog vendor admitted by cp-api with
+    /// bridge so any catalog vendor admitted by the control plane with
     /// `adapter: "openai"` (xai, openrouter, groq, mistral, etc. —
     /// every models.dev long-tail) resolves through the family
     /// fallthrough. Without it, dispatch returns None and the
     /// customer sees a 503. Closes the dispatch half of
-    /// api7/AISIX-Cloud#417.
+    /// api7/#417.
     #[test]
     fn build_hub_registers_openai_family_bridge_for_long_tail_catalog_vendors() {
         let hub = build_hub();
@@ -2305,9 +2305,9 @@ models:
         let bridge = hub.dispatch_two_tier(&pk).unwrap_or_else(|| {
             panic!(
                 "Adapter::Openai family bridge must be registered so any catalog \
-                 vendor admitted by cp-api with `adapter: \"openai\"` resolves \
+                 vendor admitted by the control plane with `adapter: \"openai\"` resolves \
                  through the family fallthrough — a missing family bridge \
-                 re-introduces api7/AISIX-Cloud#417"
+                 re-introduces api7/#417"
             )
         });
         assert_eq!(
@@ -2320,7 +2320,7 @@ models:
 
     /// `build_hub()` MUST register `Adapter::Anthropic` as a family
     /// bridge for symmetry with `Adapter::Openai`. The Anthropic
-    /// family bridge serves any Anthropic-compat vendor cp-api admits.
+    /// family bridge serves any Anthropic-compat vendor the control plane admits.
     #[test]
     fn build_hub_registers_anthropic_family_bridge() {
         let hub = build_hub();

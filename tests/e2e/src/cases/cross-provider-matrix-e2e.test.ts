@@ -131,7 +131,7 @@ describe("cross-provider matrix: OpenAI-compat upstreams", () => {
         display_name: `${tc.displayPrefix}-pk-non-stream`,
         secret: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
-        // Post-#302 Phase A: cp-api writes `provider` + `adapter` on
+        // Post-#302 Phase A: the control plane writes `provider` + `adapter` on
         // every PK row. Without these the snapshot's
         // `Hub::dispatch_two_tier` misses both tiers (empty `provider`
         // string + None `adapter`) and the dispatch falls into the

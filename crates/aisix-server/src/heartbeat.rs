@@ -1,7 +1,7 @@
-//! Periodic `POST /dp/heartbeat` so cp-api knows the DP is alive.
+//! Periodic `POST /dp/heartbeat` so the control plane knows the DP is alive.
 //!
 //! Protocol (prd-09a §9A.7.2 + §9A.10A.3): the DP authenticates via
-//! its mTLS client certificate. cp-api reads the peer cert SAN URI
+//! its mTLS client certificate. The control plane reads the peer cert SAN URI
 //! (`x-aisix://env/<env_id>/dp/<dp_id>`) to derive the *credential*
 //! identity — there is no `Authorization` header on the v3 wire. The
 //! body still carries `{ dp_id, uptime_seconds, version }` for
@@ -11,7 +11,7 @@
 //! replica deployed from the same bundle (k8s Deployment mounting one
 //! Secret) presents the same `dp_id`. So each process additionally
 //! reports a per-boot `instance_id` (UUID v4) plus its `hostname`,
-//! letting cp-api track replicas individually instead of collapsing
+//! letting the control plane track replicas individually instead of collapsing
 //! them into one last-writer-wins row (#592).
 //!
 //! Shape:
@@ -37,14 +37,14 @@ use anyhow::{anyhow, Context};
 use serde::Serialize;
 use tokio::sync::watch;
 
-/// Build identity reported to cp-api (heartbeat `version` field + HTTP
+/// Build identity reported to the control plane (heartbeat `version` field + HTTP
 /// User-Agent). The base version is [`aisix_core::BUILD_VERSION`] —
 /// release builds are stamped from the git tag, local builds fall back
 /// to the crate version. CI additionally stamps `AISIX_BUILD_SHA` — the
 /// same short git sha that tags the container image — so the wire
 /// carries `0.4.0+sha-103d3ec` and an operator can match a DP node
-/// directly to its image. cp-api persists this into
-/// `dpmgr_nodes.dp_version`, replacing the `"pending"` placeholder it
+/// directly to its image. The control plane persists this into
+/// `control plane_nodes.dp_version`, replacing the `"pending"` placeholder it
 /// wrote at install-command time.
 pub static BUILD_VERSION: LazyLock<String> = LazyLock::new(|| {
     format_build_version(aisix_core::BUILD_VERSION, option_env!("AISIX_BUILD_SHA"))
@@ -69,7 +69,7 @@ pub type RejectionFetcher = Arc<dyn Fn() -> Vec<RejectedEntry> + Send + Sync>;
 
 /// Per-tick source of the highest etcd/kine revision the watch
 /// supervisor has applied to its snapshot (`WatchStatus.revision`).
-/// Reported as `applied_revision` so cp-api can compare it against the
+/// Reported as `applied_revision` so the control plane can compare it against the
 /// revision returned when IT wrote a resource through kine and show
 /// "propagating…" until the DP catches up (#519 B.3). `0` = the
 /// supervisor has not completed its first load yet.
@@ -77,7 +77,7 @@ pub type AppliedRevisionFetcher = Arc<dyn Fn() -> i64 + Send + Sync>;
 
 /// Per-tick source of the observability exporters' delivery counters,
 /// keyed by exporter name (`OtlpHttpFanOut::exporter_stats`). Reported
-/// as `exporter_health` so cp-api can surface silently-failing
+/// as `exporter_health` so the control plane can surface silently-failing
 /// exporters in the dashboard (#519 D.2). Counters reset when an
 /// exporter's pipeline is rebuilt on config change — the CP must treat
 /// them as resettable, not lifetime totals.
@@ -86,29 +86,29 @@ pub type ExporterHealthFetcher = Arc<dyn Fn() -> HashMap<String, SinkStatsSnapsh
 /// Per-tick source of the applied configuration hash — the sha256 the
 /// supervisor computed over the accepted (served) resource set
 /// (`ConfigStatus::applied_config_hash`, added in #774). Reported as
-/// `config_hash` so cp-api can diff the hash a DP node actually applied
+/// `config_hash` so the control plane can diff the hash a DP node actually applied
 /// against the hash it expects that node to be serving (per-node config
 /// verification). Returning `None` (config not applied yet) or leaving
 /// the fetcher unwired (tests / managed configs) omits the field, so the
-/// legacy body shape is preserved and cp-api's tolerance of its absence
+/// legacy body shape is preserved and the control plane's tolerance of its absence
 /// is honoured.
 pub type ConfigHashFetcher = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
 /// Per-tick source of the supervisor's partially-compatible aggregate:
 /// resources served with unknown fields ignored, per (kind, field) with
 /// row counts (#871, `Supervisor::recent_partial_compat`). Reported as
-/// `partially_compatible_resources` so cp-api can tell an operator
+/// `partially_compatible_resources` so the control plane can tell an operator
 /// "these DPs load your documents but do not enforce field X" — the
 /// signal that a fleet is mid-rollout behind a newer control plane.
 pub type PartialCompatFetcher = Arc<dyn Fn() -> Vec<PartialCompatEntry> + Send + Sync>;
 
 /// File paths to the on-disk mTLS bundle the heartbeat client presents
-/// to cp-api. Same three files written by cert-bundle provisioning and
+/// to the control plane. Same three files written by cert-bundle provisioning and
 /// re-used on every subsequent boot when the bundle is already on disk.
 ///
 /// `extra_ca_pem` is an optional second CA bundle the operator points
 /// at via `managed.cp_ca_cert_file` — needed in e2e / on-prem
-/// deployments where dp-manager's *server* cert is signed by a CA
+/// deployments where the control plane's *server* cert is signed by a CA
 /// distinct from the cert-manager-issued one (which only signs DP
 /// *client* certs). When set, every outbound mTLS client built from
 /// this bundle (heartbeat, telemetry, BudgetClient) appends it to
@@ -141,7 +141,7 @@ pub struct HeartbeatConfig {
     pub mtls: MtlsBundle,
     /// Optional source of supervisor-reported loader rejections. When
     /// set, every heartbeat includes a `rejected_resources` array so
-    /// cp-api can surface "your DP rejected these resources" in the
+    /// the control plane can surface "your DP rejected these resources" in the
     /// dashboard. None means the legacy schema (no rejection field) —
     /// kept for tests / managed-mode configs that don't have a
     /// supervisor wired in. See issue #115.
@@ -155,7 +155,7 @@ pub struct HeartbeatConfig {
     pub exporter_health_fetcher: Option<ExporterHealthFetcher>,
     /// Optional source of the supervisor's applied config hash. `None`
     /// (tests / managed-mode configs without a supervisor wired in) omits
-    /// `config_hash` from the body — cp-api tolerates its absence. See
+    /// `config_hash` from the body — the control plane tolerates its absence. See
     /// #774.
     pub config_hash_fetcher: Option<ConfigHashFetcher>,
     /// Optional source of the supervisor's partially-compatible
@@ -315,7 +315,7 @@ async fn run(cfg: HeartbeatConfig, cancel: &mut watch::Receiver<bool>) {
 #[derive(Debug, Serialize)]
 struct HeartbeatBody<'a> {
     dp_id: &'a str,
-    /// Per-boot runtime identity (#592). cp-api keys instance rows on
+    /// Per-boot runtime identity (#592). The control plane keys instance rows on
     /// `(dp_id, instance_id)` so N replicas sharing one cert show up
     /// as N instances instead of one last-writer-wins row.
     instance_id: &'a str,
@@ -324,20 +324,20 @@ struct HeartbeatBody<'a> {
     uptime_seconds: i64,
     version: &'a str,
     /// Guardrail `kind` discriminators compiled into this binary
-    /// (#519 B.6). Always present so cp-api can hide / flag kinds the
+    /// (#519 B.6). Always present so the control plane can hide / flag kinds the
     /// DP can't serve (e.g. a build without the `bedrock` feature).
     supported_guardrail_kinds: &'static [&'static str],
     /// Highest etcd/kine revision the watch supervisor has applied
-    /// (#519 B.3). `0` = snapshot not loaded yet. cp-api compares this
+    /// (#519 B.3). `0` = snapshot not loaded yet. The control plane compares this
     /// against the revision returned by its own kine writes: a DP with
     /// `applied_revision >= write_revision` has seen that write.
     applied_revision: i64,
     /// The sha256 the DP computed over its applied (served) config set
     /// (#774). Omitted from the wire when the supervisor has not applied a
     /// snapshot yet, or the fetcher isn't wired (tests / managed-mode
-    /// configs), so cp-api still sees the historical body shape — cp-api
+    /// configs), so the control plane still sees the historical body shape — the control plane
     /// records it on telemetry-bearing beats and tolerates its absence.
-    /// Present, it lets cp-api diff the hash a node applied against the
+    /// Present, it lets the control plane diff the hash a node applied against the
     /// hash it expects that node to serve.
     #[serde(skip_serializing_if = "Option::is_none")]
     config_hash: Option<String>,
@@ -354,9 +354,9 @@ struct HeartbeatBody<'a> {
     rejected_resources: Vec<RejectedResourceWire>,
     /// Resources served with unknown fields ignored, aggregated per
     /// (kind, field) with row counts (#871). Omitted when empty for the
-    /// same historical-shape tolerance as `rejected_resources`; cp-api's
+    /// same historical-shape tolerance as `rejected_resources`; the control plane's
     /// heartbeat handler accepts unknown fields, so an older CP simply
-    /// ignores this until AISIX-Cloud#1227 surfaces it.
+    /// ignores this until #1227 surfaces it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     partially_compatible_resources: Vec<PartialCompatWire>,
 }
@@ -368,7 +368,7 @@ const EXPORTER_LAST_ERROR_MAX_CHARS: usize = 256;
 
 /// Defensive cap on the reported `config_hash` length. The applied hash
 /// is a 64-char sha256 hex string, so this never triggers in practice —
-/// it matches the cp-api ingestion contract (`config_hash` ≤ 128 chars)
+/// it matches the control plane ingestion contract (`config_hash` ≤ 128 chars)
 /// so a future hash-scheme change can't overflow the CP's column.
 const CONFIG_HASH_MAX_CHARS: usize = 128;
 
@@ -406,7 +406,7 @@ impl ExporterHealthWire {
 /// representation can evolve without forcing a wire bump. The two
 /// converge today; `kind` is serialised as a string ("bad_key",
 /// "non_json", "schema_failed", "parse_failed", "unknown_kind") so
-/// cp-api can match without depending on Rust enum repr.
+/// the control plane can match without depending on Rust enum repr.
 #[derive(Debug, Serialize)]
 struct RejectedResourceWire {
     key: String,
@@ -415,7 +415,7 @@ struct RejectedResourceWire {
     timestamp_unix_secs: u64,
     /// Unix seconds since when this key has been serving its last known
     /// good value instead of the rejected bytes (#871) — present on
-    /// every beat while stale serving lasts, so cp-api can derive the
+    /// every beat while stale serving lasts, so the control plane can derive the
     /// staleness age each cycle. Omitted when nothing serves for the
     /// key, preserving the historical body shape for older CPs (whose
     /// heartbeat handler tolerates unknown fields either way).
@@ -497,7 +497,7 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
 
     let resp = client
         .post(&cfg.url)
-        // No bearer header — cp-api authenticates via the peer
+        // No bearer header — the control plane authenticates via the peer
         // certificate SAN URI (§9A.7.2).
         .json(&HeartbeatBody {
             dp_id: &cfg.dp_id,
@@ -530,7 +530,7 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
 }
 
 /// Build a reqwest client wired up with the on-disk mTLS bundle: the
-/// CA from cp-api as a trust root, plus the DP's client cert + key as
+/// CA from the control plane as a trust root, plus the DP's client cert + key as
 /// the presenting identity. Files are read here (not at config-load
 /// time) so an unreadable/rotated bundle surfaces an actionable error
 /// at the same place every other heartbeat error does.
@@ -572,7 +572,7 @@ fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
         .user_agent(format!("aisix-dp/{}", &*BUILD_VERSION))
         .identity(identity)
         .add_root_certificate(ca)
-        // Pin HTTP/1.1 for the dp-manager REST calls. dp-manager
+        // Pin HTTP/1.1 for the control plane REST calls. The control plane
         // multiplexes gRPC (kine/etcd, HTTP/2) and the REST surface
         // (/dp/*) on one TLS port via cmux, which routes by the
         // negotiated ALPN protocol. When the observability cloud-sink
@@ -927,9 +927,9 @@ mod tests {
     }
 
     /// #774: a telemetry-bearing beat carries the supervisor's applied
-    /// config hash so cp-api can diff expected-vs-reported config per
+    /// config hash so the control plane can diff expected-vs-reported config per
     /// node. A normal 64-hex-char hash rides verbatim; an over-long value
-    /// is clamped to 128 chars (the cp-api ingestion contract).
+    /// is clamped to 128 chars (the control plane ingestion contract).
     #[tokio::test]
     async fn send_includes_and_clamps_config_hash() {
         let server = MockServer::start().await;

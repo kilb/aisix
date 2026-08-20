@@ -184,7 +184,7 @@ pub async fn count_tokens(
 /// What the winning attempt resolved. `/v1/messages/count_tokens` emits no
 /// UsageEvent, so the only consumer is the request-metric label set — which
 /// still has to match what chat / messages / responses report
-/// (AISIX-Cloud#1234).
+/// (#1234).
 struct CountTokensSuccess {
     response: Response,
     provider: String,
@@ -342,7 +342,7 @@ async fn dispatch(
             .map(|entry| entry.id.clone())
             .unwrap_or_default();
         // Reserve THIS target's own model rate-limit layers before
-        // dispatching to it (AISIX-Cloud#1087); over-limit → skip it and
+        // dispatching to it (#1087); over-limit → skip it and
         // try the remaining targets. Like the handler-level `_reservation` it is
         // never token-committed — count_tokens burns no generation tokens;
         // the drop at scope end releases the concurrency slot.
@@ -731,7 +731,7 @@ fn emit_access_log(
         total_tokens: None,
         request_id,
         // No provider response id: count_tokens returns only the token
-        // estimate, and no upstream response object (AISIX-Cloud#1289).
+        // estimate, and no upstream response object (#1289).
         provider_request_id: None,
         served_by_model: None,
         routing_attempt_count: None,

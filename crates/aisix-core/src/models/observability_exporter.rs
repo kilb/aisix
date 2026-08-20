@@ -1,12 +1,12 @@
 //! `ObservabilityExporter` — env-scoped fan-out target the DP ships
 //! per-request telemetry to.
 //!
-//! cp-api writes one row per configured exporter to
+//! The control plane writes one row per configured exporter to
 //! `/aisix/<env>/observability_exporters/<uuid>`; the DP loads them on
 //! the watch and composes a fan-out sink that runs alongside the
-//! existing `usage::UsageSink` (which still feeds the cp-api telemetry
+//! existing `usage::UsageSink` (which still feeds the control plane telemetry
 //! pipeline). The DP is the authoritative consumer of these configs —
-//! cp-api never opens an HTTP connection to the user's exporter
+//! The control plane never opens an HTTP connection to the user's exporter
 //! endpoint, which is the whole reason for DP-direct egress (sensitive
 //! prompt / response content stays on the data plane).
 //!
@@ -292,7 +292,7 @@ impl Resource for ObservabilityExporter {
         &self.name
     }
 
-    /// Path segment under `/aisix/<env>/`. Matches the cp-api kine
+    /// Path segment under `/aisix/<env>/`. Matches the control plane kine
     /// kind written by the Go-side `mustMarshalObservabilityExporterKV`.
     fn kind() -> &'static str {
         "observability_exporters"
@@ -413,8 +413,8 @@ mod tests {
     }
 
     #[test]
-    fn resource_trait_kind_matches_cp_api() {
-        // The kine kind segment is the contract between cp-api's
+    fn resource_trait_kind_matches_control_plane() {
+        // The kine kind segment is the contract between the control plane's
         // `mustMarshalObservabilityExporterKV` and this loader. Pin it.
         assert_eq!(
             <ObservabilityExporter as Resource>::kind(),

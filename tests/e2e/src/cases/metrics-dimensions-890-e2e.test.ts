@@ -94,11 +94,11 @@ describe("metrics dimensions #890 e2e", () => {
     });
 
     // The api-key payload carries user_id + user_name — the DP stamps the
-    // readable name onto metric labels (req-3), proving cp-api's pushed name
+    // readable name onto metric labels (req-3), proving the control plane's pushed name
     // flows end-to-end. The DP standalone admin API intentionally only
     // accepts key_hash/allowed_models/rate_limit (member/team identity is a
-    // cp-api concern), so we write the full ApiKey straight to etcd — the
-    // real production path (cp-api → etcd → DP loader).
+    // the control plane concern), so we write the full ApiKey straight to etcd — the
+    // real production path (the control plane → etcd → DP loader).
     await new EtcdClient().put(
       `${app.etcdPrefix}/api_keys/${randomUUID()}`,
       JSON.stringify({

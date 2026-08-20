@@ -136,7 +136,7 @@ pub async fn chat_completions(
     // dual-path lifecycle as `applied_guardrails`.
     let mut redaction_counts = crate::redact::RedactionCounts::new();
     // Filled by `dispatch` with monitor-mode guardrail observations
-    // (AISIX-Cloud#562), same dual-path lifecycle as `applied_guardrails`.
+    // (#562), same dual-path lifecycle as `applied_guardrails`.
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     // One snapshot for the whole request (#941). Dispatch, the quota gate,
     // the terminal metric emits and the usage events all read this handle
@@ -196,7 +196,7 @@ pub async fn chat_completions(
                 // Empty on the streaming path — the id rides the first
                 // upstream frame, which has not arrived yet. That case is
                 // covered by the per-attempt `provider call completed` line
-                // the usage sink emits (AISIX-Cloud#1289).
+                // the usage sink emits (#1289).
                 Some(success.provider_request_id.as_str()),
                 &success.routing,
                 None,
@@ -234,7 +234,7 @@ pub async fn chat_completions(
                 let winner_latency = winner
                     .map(|w| Duration::from_millis(u64::from(w.latency_ms)))
                     .unwrap_or(elapsed);
-                // AISIX-Cloud#790: the event's model_id is the winning
+                // #790: the event's model_id is the winning
                 // TARGET's id so pricing resolves against it; cache hits
                 // record no attempt and keep the requested entry's id.
                 let event_model_id = winner
@@ -318,7 +318,7 @@ pub async fn chat_completions(
                 success.response.headers_mut().insert("x-aisix-call-id", v);
             }
             // `x-aisix-served-by` exposes which routing target served
-            // the request — see AISIX-Cloud#410. Only emitted when a
+            // the request — see #410. Only emitted when a
             // routing group was the entry point (direct models would
             // just echo `req.model`, which the body already carries).
             //
@@ -460,7 +460,7 @@ pub async fn chat_completions(
             // (guardrail) sets `guardrail_blocked` for the Blocked tab.
             let guardrail_blocked = matches!(err, ProxyError::ContentFiltered(_));
             let model_id_str = resolved_model_id.as_deref().unwrap_or("");
-            // AISIX-Cloud#1013: failed requests carry the (post-mask)
+            // #1013: failed requests carry the (post-mask)
             // request body so a 4xx/5xx can be triaged from the log alone.
             // Same opt-in gate and cap as the success path; 401/403 stay
             // body-less (a 401 here is upstream-auth passthrough — caller
@@ -519,7 +519,7 @@ pub async fn chat_completions(
             match charge {
                 Some(c) => {
                     let winner = routing.winner();
-                    // AISIX-Cloud#790: the billed-then-blocked event is the
+                    // #790: the billed-then-blocked event is the
                     // winning attempt's — carry its TARGET id.
                     let event_model_id = winner
                         .map(|w| w.target_model_id.as_str())
@@ -643,10 +643,10 @@ struct Success {
     total_tokens: Option<u64>,
     /// True when the token counters were filled by the local estimator
     /// because the upstream response carried no usage block
-    /// (AISIX-Cloud#1074). Lands on `UsageEvent::usage_estimated`.
+    /// (#1074). Lands on `UsageEvent::usage_estimated`.
     usage_estimated: bool,
     /// Provider-specific cache + reasoning token counters. Default 0
-    /// for providers that don't expose them; cp-api falls back to the
+    /// for providers that don't expose them; the control plane falls back to the
     /// standard prompt / completion rate when these are 0.
     cached_prompt_tokens: u32,
     reasoning_tokens: u32,
@@ -697,14 +697,14 @@ struct Success {
     telemetry_handled_by_stream: bool,
     /// On a cache HIT, the prompt + completion tokens of the cached
     /// response — the work the upstream would have repeated had the
-    /// cache not served the request. Both 0 on miss / disabled. cp-api
+    /// cache not served the request. Both 0 on miss / disabled. The control plane
     /// multiplies these by its pricing catalog to derive
     /// `cost_saved_usd` on ingestion (matches the existing `cost_usd`
-    /// pattern: DP records tokens, cp-api owns pricing). See #88.
+    /// pattern: DP records tokens, the control plane owns pricing). See #88.
     cache_hit_saved_input_tokens: u32,
     cache_hit_saved_output_tokens: u32,
     /// Display name of the routing target that actually served this
-    /// request (AISIX-Cloud#410). Surfaces in the `x-aisix-served-by`
+    /// request (#410). Surfaces in the `x-aisix-served-by`
     /// response header so callers can tell which target inside a
     /// routing group won the failover loop.
     ///
@@ -734,8 +734,8 @@ struct Success {
 }
 
 /// Cache decision attached to every successful request. Wire shape
-/// (lowercase string) is what cp-api persists in
-/// `dpmgr_usage_events.cache_status`.
+/// (lowercase string) is what the control plane persists in
+/// `control plane_usage_events.cache_status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum CacheStatus {
     /// No enabled cache policy in snapshot — gate skipped the lookup.
@@ -756,7 +756,7 @@ pub(crate) enum CacheStatus {
 }
 
 impl CacheStatus {
-    /// Lowercase wire string the DP ships to cp-api in `cache_status`.
+    /// Lowercase wire string the DP ships to the control plane in `cache_status`.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             CacheStatus::Disabled => "disabled",
@@ -770,7 +770,7 @@ impl CacheStatus {
     /// value set is `hit_exact` / `hit_semantic` / `miss` / `bypass`.
     ///
     /// Deliberately NOT [`Self::as_str`]. That is the `cache_status` value
-    /// shipped to cp-api, where a hit is plain `hit`; feeding it to the
+    /// shipped to the control plane, where a hit is plain `hit`; feeding it to the
     /// metric instead emitted an `outcome="hit"` that is not in the series'
     /// value set, so every dashboard written against the documented labels
     /// (`outcome=~"hit_.*"`) reported zero hits for the byte-bodied
@@ -1018,7 +1018,7 @@ async fn resolve_cache_hit(
 /// concatenated text of multimodal content blocks, so this also covers
 /// vision/array-shaped messages (non-text blocks are skipped upstream).
 /// Generated output text for the token-estimation fallback
-/// (AISIX-Cloud#1074) — the non-streaming analog of the stream loop's
+/// (#1074) — the non-streaming analog of the stream loop's
 /// `est_output_text` accumulation: message content + reasoning +
 /// tool-call name/argument text. Only built when estimation runs.
 pub(crate) fn estimation_output_text(resp: &aisix_gateway::ChatResponse) -> String {
@@ -1187,7 +1187,7 @@ struct UpstreamCharge {
     prompt_tokens: u32,
     completion_tokens: u32,
     /// True when the counters above were filled by the local estimator
-    /// (AISIX-Cloud#1074) — the billed-then-blocked upstream response
+    /// (#1074) — the billed-then-blocked upstream response
     /// carried no usage block.
     usage_estimated: bool,
     cached_prompt_tokens: u32,
@@ -1241,7 +1241,7 @@ async fn dispatch(
     // output counts travel via `StreamCompletion` instead (the event is
     // emitted at end-of-stream).
     redactions_out: &mut crate::redact::RedactionCounts,
-    // Out-param: monitor-mode guardrail observations (AISIX-Cloud#562),
+    // Out-param: monitor-mode guardrail observations (#562),
     // same lifecycle as `redactions_out`.
     monitor_hits_out: &mut Vec<aisix_core::GuardrailMonitorHit>,
     // False when remote segment moderation could not prove a complete rewrite;
@@ -1367,7 +1367,7 @@ async fn dispatch(
             // carries only the firing guardrail's name (#519 B.4b) so
             // callers can't enumerate the blocklist by inspecting
             // error responses.
-            // AISIX-Cloud#1013: the blocked request's body is captured
+            // #1013: the blocked request's body is captured
             // into full-content exporters, so run the mask-action rewrite
             // BEFORE returning — otherwise the capture would export the
             // pre-mask text the success path would have masked. (Remote
@@ -1398,8 +1398,8 @@ async fn dispatch(
     // The structured local rewrite above runs before any downstream use, so
     // semantic routing, cache keys, and upstream dispatch see only masked text.
 
-    // Budget pre-check via cp-api. The DP no longer owns budget state;
-    // cp-api returns a cached/live decision per api_key.
+    // Budget pre-check via control plane. The DP no longer owns budget state;
+    // the control plane returns a cached/live decision per api_key.
     let decision = state.budgets.check(&auth.entry.id).await;
     if let Some(budget) = decision.budget.as_ref() {
         record_budget_gauges(&state.metrics, auth, Some(budget));
@@ -1482,7 +1482,7 @@ async fn dispatch(
 
     // Multi-layer rate-limit reservation (api_key inline + model inline + policies).
     // `mut` so a routing dispatch can fold the winning target's model-layer
-    // reservation into it once the winner is known (AISIX-Cloud#1087).
+    // reservation into it once the winner is known (#1087).
     let model_rl = crate::quota::ModelRateLimit::from_model(
         &req.model,
         &virtual_entry.id,
@@ -1553,13 +1553,13 @@ async fn dispatch(
         // The un-flattened per-target quota rejection, kept only while it
         // is the loop's LATEST failure: on exhaustion it is surfaced
         // instead of its flattened BridgeError twin so the 429 keeps the
-        // structured `error.policy` attribution (AISIX-Cloud#892).
+        // structured `error.policy` attribution (#892).
         let mut last_reserve_reject: Option<ProxyError> = None;
 
         struct StreamWin {
             model: std::sync::Arc<aisix_core::Model>,
             /// Snapshot id of the winning target — the emitted event's
-            /// `model_id` (AISIX-Cloud#790). Equals the requested
+            /// `model_id` (#790). Equals the requested
             /// entry's id for direct (non-routing) requests.
             target_id: String,
             provider_lc: String,
@@ -1577,7 +1577,7 @@ async fn dispatch(
         // The winning target's own model-layer reservation (routing dispatch
         // only) — folded into `reservation` after the loop so the stream hold
         // and post-stream token accounting cover the member's limits too
-        // (AISIX-Cloud#1087).
+        // (#1087).
         let mut won_member_reservation: Option<aisix_ratelimit::MultiReservation> = None;
 
         'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
@@ -1633,7 +1633,7 @@ async fn dispatch(
             // Resolved per target, not once per request: the budget belongs
             // to the upstream being hit, so a group may mix a target that
             // tolerates three retries with one that tolerates none.
-            // Streaming used to skip `retries` entirely (AISIX-Cloud#1119);
+            // Streaming used to skip `retries` entirely (#1119);
             // a direct model used to be pinned at zero because the knob only
             // existed on the group.
             let budget = crate::routing::effective_retries(
@@ -1651,7 +1651,7 @@ async fn dispatch(
                     String::new()
                 };
                 // Reserve THIS target's own model rate-limit layers before
-                // dispatching to it (AISIX-Cloud#1087). Over-limit → record a
+                // dispatching to it (#1087). Over-limit → record a
                 // 429 attempt and move on to the remaining targets in strategy
                 // order (same-target retries can't help — the window won't
                 // reset mid-loop).
@@ -1847,7 +1847,7 @@ async fn dispatch(
             // When the loop's LAST failure was a per-target quota
             // rejection, surface the un-flattened ProxyError: same 429 +
             // Retry-After as the BridgeError twin, plus the structured
-            // `error.policy` attribution (AISIX-Cloud#892).
+            // `error.policy` attribution (#892).
             if let Some(e) = last_reserve_reject {
                 return Err(with_model(e).with_routing(stream_routing));
             }
@@ -1880,7 +1880,7 @@ async fn dispatch(
         //
         // Fold the winning target's model-layer reservation in first, so the
         // stream hold keeps its concurrency slot(s) and `post_stream_keys`
-        // bills its TPM/TPD at stream end too (AISIX-Cloud#1087).
+        // bills its TPM/TPD at stream end too (#1087).
         if let Some(member) = won_member_reservation.take() {
             reservation.merge(member);
         }
@@ -1902,7 +1902,7 @@ async fn dispatch(
         let state_for_telem = state.clone();
         let metrics_for_stream = state.metrics.clone();
         let request_id_for_telem = request_id.to_string();
-        // AISIX-Cloud#790: the per-attempt event carries the winning
+        // #790: the per-attempt event carries the winning
         // TARGET's id, not the group's — pricing resolves against the
         // target. (Equal for direct models.)
         let model_id_for_telem = winner_target_id;
@@ -1933,7 +1933,7 @@ async fn dispatch(
             .to_string();
         // Captured for the stream-end telemetry closure so
         // emit_usage_event can look up `telemetry_tags` for per-PK
-        // attribution (#302 M17 / AISIX-Cloud#436). The metrics
+        // attribution (#302 M17 / #436). The metrics
         // variant above is `&str`-scoped to inner scopes that consume
         // it as a borrow; the telem variant is owned for the move
         // into the on_complete closure.
@@ -1947,7 +1947,7 @@ async fn dispatch(
         // the end-of-stream event merges them with the output-side counts
         // accumulated in `comp.redacted_entity_counts`.
         let input_redactions_for_telem = redactions_out.clone();
-        // Input-side monitor hits (AISIX-Cloud#562), merged with the
+        // Input-side monitor hits (#562), merged with the
         // output-side hits accumulated in `comp.monitor_hits`.
         let input_monitor_hits_for_telem = monitor_hits_out.clone();
         let input_capture_safe_for_telem = *failure_content_safe_out;
@@ -1996,7 +1996,7 @@ async fn dispatch(
             .and_then(|so| so.get("include_usage"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        // Token-estimation fallback context (AISIX-Cloud#1074): the
+        // Token-estimation fallback context (#1074): the
         // request is cloned here because the stream owns it until an
         // end-of-stream Drop — where the borrow is long gone. Tokenized
         // only if the upstream never reports usage.
@@ -2289,7 +2289,7 @@ async fn dispatch(
 
     // Policy gate (Stage 3): the cache is only consulted when at
     // least one enabled `CachePolicy` in the snapshot has an
-    // `applies_to` clause that matches THIS request. cp-api owns
+    // `applies_to` clause that matches THIS request. The control plane owns
     // the policy CRUD surface (`/api/environments/:env/cache_policies`,
     // see Stage 1); kine fans out the rows; the loader populates
     // `snapshot.cache_policies` (see aisix-etcd). Stage 4 will add
@@ -2569,7 +2569,7 @@ async fn dispatch(
                     .upstream_model()
                     .unwrap_or("unknown")
                     .to_string();
-                // Token-estimation fallback (AISIX-Cloud#1074): a stored
+                // Token-estimation fallback (#1074): a stored
                 // response whose original upstream never reported usage
                 // replays zeros — fill them like the fresh-response path
                 // so hit rows (and their saved-token stats) don't record
@@ -2666,7 +2666,7 @@ async fn dispatch(
                     // upstream's prompt + completion tokens. Surfacing
                     // them as a dedicated counter (rather than relying
                     // on the existing prompt_tokens column + cache_status
-                    // filter) lets cp-api compute `cost_saved_usd`
+                    // filter) lets the control plane compute `cost_saved_usd`
                     // without joining on the status enum.
                     cache_hit_saved_input_tokens: prompt.try_into().unwrap_or(u32::MAX),
                     cache_hit_saved_output_tokens: completion.try_into().unwrap_or(u32::MAX),
@@ -2710,7 +2710,7 @@ async fn dispatch(
     let mut chosen_upstream_model: Option<String> = None;
     // Display name of the target whose attempt finally succeeded. Used
     // to populate the `x-aisix-served-by` response header for routing
-    // requests (AISIX-Cloud#410). Stays `None` until an attempt wins.
+    // requests (#410). Stays `None` until an attempt wins.
     let mut chosen_target_display_name: Option<String> = None;
     let mut upstream: Option<aisix_gateway::ChatResponse> = None;
     let retry_on_429 = virtual_entry
@@ -2731,7 +2731,7 @@ async fn dispatch(
     // The winning target's own model-layer reservation (routing dispatch
     // only) — folded into `reservation` at the commit point below so the
     // member's TPM/TPD bills with the request-level layers
-    // (AISIX-Cloud#1087).
+    // (#1087).
     let mut won_member_reservation: Option<aisix_ratelimit::MultiReservation> = None;
 
     'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
@@ -2807,7 +2807,7 @@ async fn dispatch(
             };
 
             // Reserve THIS target's own model rate-limit layers before
-            // dispatching to it (AISIX-Cloud#1087). Over-limit → record a
+            // dispatching to it (#1087). Over-limit → record a
             // 429 attempt and move on to the remaining targets in strategy
             // order (same-target retries can't help — the window won't
             // reset mid-loop).
@@ -2990,7 +2990,7 @@ async fn dispatch(
 
     let Some(mut upstream) = upstream else {
         // Prefer the un-flattened quota rejection when it was the last
-        // failure — keeps `error.policy` attribution (AISIX-Cloud#892).
+        // failure — keeps `error.policy` attribution (#892).
         if let Some(e) = last_reserve_reject {
             return Err(with_model(e).with_routing(routing));
         }
@@ -3008,7 +3008,7 @@ async fn dispatch(
     // already burned them — so commit before the check, and refuse the
     // refusal-write to the cache so a re-request gets a fresh chance.
     //
-    // Token-estimation fallback (AISIX-Cloud#1074): when the upstream
+    // Token-estimation fallback (#1074): when the upstream
     // response carries no usage block, fill the missing counters locally
     // BEFORE the quota commit and telemetry below so neither records
     // silent zeros. Local variables only — `render_response` serialises
@@ -3065,7 +3065,7 @@ async fn dispatch(
     let finish_reason = finish_reason_label(&upstream.finish_reason);
     // Fold the winning target's model-layer reservation in so one commit
     // bills the member's TPM/TPD alongside the request-level layers
-    // (AISIX-Cloud#1087).
+    // (#1087).
     if let Some(member) = won_member_reservation.take() {
         reservation.merge(member);
     }
@@ -3357,7 +3357,7 @@ async fn dispatch_ensemble(
     // function (the handler's main emit is skipped), so the counts ride
     // the judge event — the ensemble's terminal event.
     input_redactions: crate::redact::RedactionCounts,
-    // Input-side monitor hits (AISIX-Cloud#562), same lifecycle as
+    // Input-side monitor hits (#562), same lifecycle as
     // `input_redactions`.
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Result<Success, DispatchFailure> {
@@ -3400,7 +3400,7 @@ async fn dispatch_ensemble(
     // off the real upstream model, not the operator alias, exactly as the
     // direct and streaming-judge paths do (a `gpt-4o` alias must select
     // o200k_base, not the cl100k default an unrecognised alias falls back to).
-    // Empty ids if the target was deleted between dispatch and emit (cp-api
+    // Empty ids if the target was deleted between dispatch and emit (the control plane
     // stores NULL); the tokenizer then degrades to the display name.
     let resolve_sub = |display_name: &str| -> (String, String, String) {
         match snapshot.models.get_by_name(display_name) {
@@ -3749,7 +3749,7 @@ async fn dispatch_ensemble(
         // Input-side PII mask counts (#932); merged with the streamed judge's
         // output-side counts on the terminal (judge) event.
         let input_redactions_for_telem = input_redactions.clone();
-        // Input-side monitor hits (AISIX-Cloud#562), merged the same way.
+        // Input-side monitor hits (#562), merged the same way.
         let input_monitor_hits_for_telem = input_monitor_hits.clone();
 
         // Hold concurrency for the stream's full lifetime (#450). Snapshot the
@@ -3763,7 +3763,7 @@ async fn dispatch_ensemble(
         let judge_concurrency_hold = judge_reservation.into_stream_hold();
         let limiter = Arc::clone(&state.limiter);
 
-        // Token-estimation fallback (AISIX-Cloud#1074) for the streamed
+        // Token-estimation fallback (#1074) for the streamed
         // judge: `comp` carries the JUDGE's stream-only counts, so the
         // estimator gets the judge's own request (panel members buffered
         // their usage separately).
@@ -3922,7 +3922,7 @@ async fn dispatch_ensemble(
                     &client_for_telem,
                     /* content */ None,
                 );
-                // SLO histograms (AISIX-Cloud#1011): the handler's
+                // SLO histograms (#1011): the handler's
                 // record_success is stream-gated, so the ensemble stream
                 // records its e2e/TTFT here like the plain streaming path.
                 state_for_telem.metrics.record_request_e2e_latency(
@@ -4063,7 +4063,7 @@ async fn dispatch_ensemble(
     // This MUST run before the output-guardrail check on BOTH paths
     // (allow and block): the panel + judge tokens are already committed
     // above, so skipping these events on a block would under-report panel
-    // usage to cp-api. The `emit_subcalls` closure is therefore defined
+    // usage to the control plane. The `emit_subcalls` closure is therefore defined
     // here and invoked from each branch of the guardrail match below —
     // never from the post-match continuation alone.
     // Takes `outcome` as a parameter (not a capture) so the Allow branch
@@ -4215,7 +4215,7 @@ async fn dispatch_ensemble(
     // flag — `chat_completions` skips its own `emit_usage_event` when it
     // is set, exactly as it does for the streaming path.
     // #614: the client-facing response reports the AGGREGATE usage — every
-    // panel member plus the judge (api7/AISIX-Cloud#804) — so the caller sees
+    // panel member plus the judge (api7/#804) — so the caller sees
     // the full fan-out cost, not just the judge sub-call's. The per-sub-call
     // breakdown stays in the usage events emitted above (`judge_usage` carried
     // the judge-only count for its event; starting the fold from it adds the
@@ -4266,8 +4266,8 @@ async fn dispatch_ensemble(
     })
 }
 
-/// Wire-shape label for `FinishReason`. cp-api stores this verbatim
-/// in `dpmgr_usage_events.finish_reason`; the dashboard reads it back
+/// Wire-shape label for `FinishReason`. The control plane stores this verbatim
+/// in `control plane_usage_events.finish_reason`; the dashboard reads it back
 /// to distinguish normal stops from truncation / content_filter.
 fn finish_reason_label(reason: &aisix_gateway::FinishReason) -> String {
     use aisix_gateway::FinishReason;
@@ -4314,7 +4314,7 @@ fn record_success(
         status,
         elapsed,
     );
-    // SLO e2e histogram (AISIX-Cloud#1011): non-streaming only here —
+    // SLO e2e histogram (#1011): non-streaming only here —
     // `elapsed` for a stream is time-to-response-start; the stream's
     // on_complete records the full duration instead.
     if !stream {
@@ -4412,12 +4412,12 @@ fn emit_usage_event(
 ) {
     // Per-PK telemetry attribution tags. An unresolved key (the
     // pre-dispatch error paths) yields default (all empty / false) tags →
-    // wire fields skip-serialize → cp-api stores NULL. See
-    // AISIX-Cloud#436.
+    // wire fields skip-serialize → the control plane stores NULL. See
+    // #436.
     let tags = pk.telemetry_tags();
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
-        // RFC 3339 UTC. cp-api parses with time.Parse(time.RFC3339, ...);
+        // RFC 3339 UTC. The control plane parses with time.Parse(time.RFC3339, ...);
         // chrono's `to_rfc3339_opts(Secs, true)` emits the trailing Z.
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         model_id: model_id.to_string(),
@@ -4463,7 +4463,7 @@ fn emit_usage_event(
         attempt_model: extras.attempt_model,
         error_class: extras.error_class,
         error_message: extras.error_message,
-        // Per-PK telemetry attribution (#302 M17 / AISIX-Cloud#436).
+        // Per-PK telemetry attribution (#302 M17 / #436).
         // Source struct is `aisix_core::TelemetryTags`; the wire
         // shape is flat strings + a bool, with skip_serializing_if
         // covering legacy PKs that pre-date attribution.
@@ -4514,8 +4514,8 @@ fn emit_usage_event(
 /// provider-key form, persisted in etcd). A malicious operator with
 /// PK-write privileges could craft a label like
 /// `"production\u{0a}injected-internal-key: secret"` that, while
-/// safely JSON-escaped on this gateway↔cp-api hop, may forge log
-/// lines or muddle downstream consumers (cp-api logs, dashboards,
+/// safely JSON-escaped on this gateway↔the control plane hop, may forge log
+/// lines or muddle downstream consumers (the control plane logs, dashboards,
 /// log-aggregation pipelines) if any of them ever uses
 /// non-strict line-oriented parsing.
 ///
@@ -4524,7 +4524,7 @@ fn emit_usage_event(
 ///   2. Cap length at 256 chars
 ///
 /// The right place to enforce this in depth is at PK admission
-/// (cp-api / dashboard validation on `display_name` / tag fields).
+/// (the control plane / dashboard validation on `display_name` / tag fields).
 /// This sanitiser is a belt-and-suspenders guard on the emit side
 /// — it cannot prevent a malicious tag from being *stored*, but it
 /// can prevent the stored value from corrupting downstream logs.
@@ -4562,7 +4562,7 @@ struct UsageExtras {
     web_search_requests: u32,
     web_fetch_requests: u32,
     /// True when any token counter was filled by the local estimator
-    /// because the upstream reported no usage (AISIX-Cloud#1074). Lands
+    /// because the upstream reported no usage (#1074). Lands
     /// on `UsageEvent::usage_estimated`.
     usage_estimated: bool,
     provider_request_id: String,
@@ -4571,12 +4571,12 @@ struct UsageExtras {
     /// Set when at least one guardrail returned `Bypass` for this
     /// request (remote-API guardrail upstream unreachable +
     /// `fail_open=true`). Goes onto
-    /// `dpmgr_usage_events.guardrail_bypassed_reason`. Default empty
-    /// string = no bypass; cp-api stores NULL in that case.
+    /// `control plane_usage_events.guardrail_bypassed_reason`. Default empty
+    /// string = no bypass; the control plane stores NULL in that case.
     bypass_reason: String,
     /// Lowercased `CacheStatus` (`"hit"` / `"miss"` / `"disabled"` /
     /// `"bypass"`). Empty default for the error path where the cache
-    /// lookup never fired. Goes onto `dpmgr_usage_events.cache_status`.
+    /// lookup never fired. Goes onto `control plane_usage_events.cache_status`.
     cache_status: String,
     /// On a cache hit, the matching layer (`"exact"` / `"semantic"`).
     /// Empty otherwise. Goes onto `usage_events.cache_hit_layer`.
@@ -4585,7 +4585,7 @@ struct UsageExtras {
     /// `None` otherwise. Goes onto `usage_events.cache_similarity`.
     cache_similarity: Option<f32>,
     /// On a cache HIT, the cached response's prompt + completion
-    /// tokens. Zero otherwise. cp-api derives `cost_saved_usd` on
+    /// tokens. Zero otherwise. The control plane derives `cost_saved_usd` on
     /// ingest from these + its pricing catalog (see #88).
     cache_hit_saved_input_tokens: u32,
     cache_hit_saved_output_tokens: u32,
@@ -4609,7 +4609,7 @@ struct UsageExtras {
     error_message: String,
     /// The `{kind, hook}` set of guardrails that governed this request,
     /// captured at chain-resolve time. Lands on
-    /// `dpmgr_usage_events.applied_guardrails` so the dashboard can show
+    /// `control plane_usage_events.applied_guardrails` so the dashboard can show
     /// which guardrails ran (#379). Empty for the guardrail-free path and
     /// for requests rejected before resolution.
     applied_guardrails: Vec<AppliedGuardrail>,
@@ -4618,7 +4618,7 @@ struct UsageExtras {
     /// Detector names only, never matched values. Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
     /// Monitor-mode guardrail observations for this request, input +
-    /// output merged (AISIX-Cloud#562). Lands on
+    /// output merged (#562). Lands on
     /// `usage_events.guardrail_monitor_hits`. Empty = no monitor hit.
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 }
@@ -4639,7 +4639,7 @@ fn emit_failed_attempts(
     client: &ClientContext,
     applied_guardrails: &[AppliedGuardrail],
     routing: &RoutingTelemetry,
-    // AISIX-Cloud#1013: when every target failed there is no terminal
+    // #1013: when every target failed there is no terminal
     // event, so the captured request body rides the LAST failed attempt —
     // the one whose status the caller saw. Other attempts (and the
     // success-path caller) stay content-less to avoid duplicating a large
@@ -4666,7 +4666,7 @@ fn emit_failed_attempts(
             &pk,
             request_id,
             // Each failed attempt records the TARGET it actually hit
-            // (AISIX-Cloud#790), not the group it was resolved from.
+            // (#790), not the group it was resolved from.
             &rec.target_model_id,
             requested_model,
             api_key_id,
@@ -4790,7 +4790,7 @@ struct StreamCompletion {
     prompt_tokens: u32,
     completion_tokens: u32,
     /// `u64` because the rate-limit accounting consumer (TPM cap)
-    /// uses u64; cp-api's wire-shape `prompt_tokens` is u32 but
+    /// uses u64; the control plane's wire-shape `prompt_tokens` is u32 but
     /// cumulative-tokens accounting can overflow u32 over a long key.
     total_tokens: u64,
     cached_prompt_tokens: u32,
@@ -4847,7 +4847,7 @@ struct StreamCompletion {
     /// safe because the caller already received the same bytes.
     response_capture_safe: bool,
     /// Generated output (content + reasoning + tool-call text) accumulated
-    /// for the token-estimation fallback (AISIX-Cloud#1074). Always on —
+    /// for the token-estimation fallback (#1074). Always on —
     /// the terminal usage chunk that would make it unnecessary arrives
     /// only at end-of-stream — but bounded to
     /// `token_estimate::OUTPUT_ACCUMULATION_CAP`. Unlike `response_text`
@@ -4864,7 +4864,7 @@ struct StreamCompletion {
     /// telemetry closure. Detector names only, never matched values.
     redacted_entity_counts: crate::redact::RedactionCounts,
     /// Monitor-mode guardrail observations made by the end-of-stream
-    /// output checks (AISIX-Cloud#562). Merged with the input-side hits
+    /// output checks (#562). Merged with the input-side hits
     /// by the on_complete telemetry closure.
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// `true` once the upstream reached EOF. It stays `false` for a typed
@@ -4995,7 +4995,7 @@ struct CompleteOnDrop<F: FnOnce(StreamCompletion)> {
     /// returning `Ready(Some(_))` is exact — that's the moment the
     /// item handed to the consumer.
     delivered: Arc<AtomicU32>,
-    /// Token-estimation fallback (AISIX-Cloud#1074): when the stream
+    /// Token-estimation fallback (#1074): when the stream
     /// ends with no upstream-reported usage, Drop fills the missing
     /// counters from this estimator (prompt from the captured request,
     /// completion from `est_output_text`) and sets `usage_estimated`.
@@ -5035,7 +5035,7 @@ impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
                 c.cache_read_tokens = 0;
                 c.total_tokens = c.prompt_tokens as u64;
             }
-            // Token-estimation fallback (AISIX-Cloud#1074), after the #419
+            // Token-estimation fallback (#1074), after the #419
             // gate so a zero-delivered disconnect never bills estimated
             // completion tokens (the prompt still fills — upstream processed
             // it regardless, same "prompts always billed" contract). Runs
@@ -5083,7 +5083,7 @@ fn build_sse_stream<F>(
     // work don't inflate it.
     attempt_started: Instant,
     // Customer-facing model name (alias / routing group), re-stamped
-    // onto every SSE chunk's `model` field per AISIX-Cloud#410. Owned
+    // onto every SSE chunk's `model` field per #410. Owned
     // so it can move into the `async_stream::stream!` closure.
     client_facing_model: String,
     // Largest content cap any content-capturing exporter wants, or `None` to
@@ -5099,7 +5099,7 @@ fn build_sse_stream<F>(
     // `on_complete` (`comp`) counts stay stream-only. Zero for single-upstream
     // callers, where the fold is a no-op.
     base_usage: aisix_gateway::chat::UsageStats,
-    // Token-estimation fallback context (AISIX-Cloud#1074); see
+    // Token-estimation fallback context (#1074); see
     // `CompleteOnDrop::estimator`.
     estimator: Option<crate::token_estimate::Estimator>,
     on_complete: F,
@@ -5239,7 +5239,7 @@ where
                     // Record TTFT on the first upstream chunk of ANY type,
                     // role-only preambles included — the industry convention
                     // (LiteLLM, caller-side gateways), so the figure matches
-                    // what external observers report (AISIX-Cloud#1225).
+                    // what external observers report (#1225).
                     if !first_chunk_seen {
                         first_chunk_seen = true;
                         guard.comp().upstream_ttft_ms =
@@ -5759,7 +5759,7 @@ where
                             // content-capture accumulator from the masked
                             // content channel (the sync redactor below can't
                             // reproduce a provider-side mask), keeping the
-                            // original soft cap (#932 × AISIX-Cloud#947).
+                            // original soft cap (#932 × #947).
                             if let Some(cap) = content_cap {
                                 let mut rebuilt = String::new();
                                 for c in pending.iter() {
@@ -5849,7 +5849,7 @@ where
                                 // The wire chunks were masked — mask the
                                 // content-capture accumulator too, or the
                                 // exported content would carry PII the client
-                                // never saw (#932 × AISIX-Cloud#947).
+                                // never saw (#932 × #947).
                                 crate::redact::redact_captured_output(
                                     ctx.chain.as_ref(),
                                     &mut guard.comp().response_text,
@@ -5968,7 +5968,7 @@ where
         // the prior "on_complete then [DONE]" intent feels right.)
         // For providers that don't emit `usage` in the stream the
         // accumulator's numeric fields stay 0; on_complete callers
-        // must treat 0 as "no signal" (cp-api does — its pricing
+        // must treat 0 as "no signal" (the control plane does — its pricing
         // catalog falls back to the standard rate when absent).
         //
         // Per docs §5: skip `[DONE]` on abnormal termination so SDK
@@ -5988,7 +5988,7 @@ where
     // on the handler's stack and it is current. Without it the
     // end-of-stream output-guardrail checks below log without a
     // `request_id` and can't be traced back to the caller's
-    // `x-aisix-request-id` (AISIX-Cloud#1060).
+    // `x-aisix-request-id` (#1060).
     crate::request_id::in_request_span(DeliveryCounter {
         inner: Box::pin(inner),
         delivered,
@@ -6211,7 +6211,7 @@ mod sanitize_tag_tests {
     #[test]
     fn sanitize_tag_strips_newlines_carriage_returns_and_nul() {
         // Injection attempt: a label that, if echoed verbatim into a
-        // line-oriented log on the cp-api side, would forge an
+        // line-oriented log on the control plane side, would forge an
         // "injected-internal-key: secret" line. Sanitiser must strip
         // all control chars including \r and \0.
         let evil = "production\ninjected-internal-key: secret\r\0".to_string();
@@ -6290,7 +6290,7 @@ mod complete_on_drop_tests {
     }
 
     /// Same as [`drop_and_capture`] but with a token estimator armed
-    /// (AISIX-Cloud#1074) — the request is one user message "Hello".
+    /// (#1074) — the request is one user message "Hello".
     fn drop_and_capture_with_estimator(
         comp: StreamCompletion,
         delivered_count: u32,
@@ -6329,7 +6329,7 @@ mod complete_on_drop_tests {
         out
     }
 
-    /// AISIX-Cloud#1074: a stream that ended with no upstream usage
+    /// #1074: a stream that ended with no upstream usage
     /// fills prompt + completion from the estimator and flags the
     /// completion. Expected prompt: 3 per-message + "user" (1) +
     /// "Hello" (1) + 3 reply priming = 8 (cl100k fallback encoding);
@@ -6348,7 +6348,7 @@ mod complete_on_drop_tests {
         assert!(out.usage_estimated);
     }
 
-    /// AISIX-Cloud#1074 × #419: a zero-delivered disconnect still
+    /// #1074 × #419: a zero-delivered disconnect still
     /// estimates the prompt (prompts are always billed) but must NOT
     /// bill estimated completion tokens for content that never
     /// crossed the wire.
@@ -6368,7 +6368,7 @@ mod complete_on_drop_tests {
         assert!(out.usage_estimated);
     }
 
-    /// AISIX-Cloud#1074: upstream-reported usage wins — the armed
+    /// #1074: upstream-reported usage wins — the armed
     /// estimator must not touch a stream that carried a real usage
     /// block, and the event stays unflagged.
     #[test]

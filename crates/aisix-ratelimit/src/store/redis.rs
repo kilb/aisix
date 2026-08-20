@@ -1,4 +1,4 @@
-//! Redis-backed shared counter store — the fix for api7/AISIX-Cloud#798.
+//! Redis-backed shared counter store — the fix for api7/#798.
 //!
 //! Every DP replica points at the same Redis, so one global window is
 //! enforced across the cluster instead of one-per-replica. The counter

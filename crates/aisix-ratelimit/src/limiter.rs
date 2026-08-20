@@ -19,7 +19,7 @@
 //! [`crate::store::local::LocalStore`] is per-process (historical
 //! behaviour), while [`crate::store::redis::RedisStore`] shares them
 //! across every DP replica so a cluster enforces one global window
-//! (api7/AISIX-Cloud#798).
+//! (api7/#798).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

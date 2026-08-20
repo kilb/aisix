@@ -3,7 +3,7 @@
 //!
 //! ## Design
 //!
-//! cp-api projects every configured exporter onto kine at
+//! The control plane projects every configured exporter onto kine at
 //! `/aisix/<env>/observability_exporters/<uuid>`. The DP loads them via the
 //! existing etcd watch into `AisixSnapshot::observability_exporters`. After
 //! every chat completion the proxy hot path hands the resulting `UsageEvent`
@@ -323,7 +323,7 @@ impl OtlpHttpFanOut {
     }
 
     /// Per-exporter delivery counters, keyed by exporter name. Read by the
-    /// managed-mode heartbeat to report `exporter_health` to cp-api
+    /// managed-mode heartbeat to report `exporter_health` to the control plane
     /// (#519 D.2). Counters are per-pipeline: a reconfigured exporter gets
     /// a rebuilt pipeline, so its counters reset — consumers must treat
     /// them as resettable.
@@ -377,7 +377,7 @@ const SAMPLE_PRECISION: u64 = 10_000;
 /// Salt mixed into the sampling hash, drawn once per process.
 ///
 /// Without it the bucket is a pure function of `request_id` — and since
-/// AISIX-Cloud#1288 the caller may choose that id. A caller could then grind
+/// #1288 the caller may choose that id. A caller could then grind
 /// FNV-1a (which is trivially cheap) for ids that land outside the configured
 /// bucket and make its own traffic invisible to a sampled exporter, or inside
 /// it to force itself into every trace. The salt is not caller-observable, so
@@ -717,7 +717,7 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
         attr_string("gen_ai.operation.name", operation_name(event)),
     ];
     // The model alias the client sent (`model` field) — a Model-Group
-    // name for routed requests (AISIX-Cloud#790). Semconv key for the
+    // name for routed requests (#790). Semconv key for the
     // requested (vs response) model.
     if !event.requested_model.is_empty() {
         attributes.push(attr_string("gen_ai.request.model", &event.requested_model));
@@ -817,7 +817,7 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
             &event.client_user_agent,
         ));
     }
-    // JWT identity attribution (AISIX-Cloud#564): who the request ran as
+    // JWT identity attribution (#564): who the request ran as
     // when it authenticated with a JWT — the identity behind the (possibly
     // shared) api_key_id.
     if !event.jwt_subject.is_empty() {
@@ -836,7 +836,7 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
     // inference, and encoding one as a bare `chat` span left every agent and
     // tool call in a trace backend indistinguishable from an LLM request —
     // with the agent, the method and the task it touched recorded nowhere at
-    // all (AISIX-Cloud#1215).
+    // all (#1215).
     match event.inbound_protocol.as_str() {
         "a2a" => {
             if !event.a2a_agent_name.is_empty() {
@@ -1415,7 +1415,7 @@ mod tests {
         );
     }
 
-    // AISIX-Cloud#1288: the request id is caller-supplied, so the sampling
+    // #1288: the request id is caller-supplied, so the sampling
     // bucket must not be a pure function of it. Without the salt a caller can
     // grind ids offline until one falls outside a sampled exporter's bucket
     // and never appear in a trace again.
@@ -1613,7 +1613,7 @@ mod tests {
         // Every gateway-protocol event used to be encoded as `chat` /
         // `chat.completions`, so an agent call was indistinguishable from a
         // model inference in a trace backend and the agent, method and task it
-        // touched appeared nowhere (AISIX-Cloud#1215).
+        // touched appeared nowhere (#1215).
         let mut ev = sample_event();
         ev.inbound_protocol = "a2a".into();
         ev.a2a_agent_name = "invoice-processor".into();

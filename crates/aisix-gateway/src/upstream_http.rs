@@ -306,10 +306,10 @@ mod tests {
     /// catches that: such a client works fine until a load balancer
     /// starts reaping connections it still considers usable.
     ///
-    /// The first pass of this (AISIX-Cloud#1122) converted the provider
+    /// The first pass of this (#1122) converted the provider
     /// bridges only, leaving the guardrail, MCP, A2A, telemetry, and
     /// exporter clients on the defaults — which is what this test exists
-    /// to stop repeating (AISIX-Cloud#1126).
+    /// to stop repeating (#1126).
     #[test]
     fn no_production_code_builds_a_bare_reqwest_client() {
         let crates_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
@@ -630,7 +630,7 @@ mod tests {
     /// `Display` is "error sending request for url (…)" for a refused
     /// connection, a DNS failure, a TLS error, and a stale pooled
     /// connection alike. Operators can't tell those apart, which is what
-    /// made AISIX-Cloud#1122 undiagnosable from the logs.
+    /// made #1122 undiagnosable from the logs.
     #[tokio::test]
     async fn real_transport_error_names_the_root_cause() {
         // Bind an ephemeral loopback port and immediately release it, so the

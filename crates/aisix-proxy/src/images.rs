@@ -35,10 +35,10 @@ struct ImageDispatchSuccess {
     /// `model_id`. Always present on success.
     model_id: String,
     /// Resolved ProviderKey UUID — feeds per-PK telemetry attribution
-    /// (AISIX-Cloud#867 parity).
+    /// (#867 parity).
     provider_key_id: String,
     /// Provider-side model name, for the `upstream_model` metric label
-    /// (AISIX-Cloud#1234 parity with chat / messages / responses).
+    /// (#1234 parity with chat / messages / responses).
     upstream_model: String,
     /// The `{kind, hook}` set of guardrails that governed this request (#379
     /// parity) — surfaced on the emitted UsageEvent.
@@ -56,7 +56,7 @@ struct ImageDispatchSuccess {
     /// Per-detector PII mask counts (#932/#696) applied to the prompt.
     /// Attached to the emitted UsageEvent. Empty = no redaction.
     redactions: crate::redact::RedactionCounts,
-    /// Monitor-mode guardrail observations (AISIX-Cloud#562).
+    /// Monitor-mode guardrail observations (#562).
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// True when an output guardrail replaced the upstream success with 422.
     guardrail_blocked: bool,
@@ -144,7 +144,7 @@ pub async fn image_generations(
                 status,
                 elapsed,
             );
-            // Issue #407: emit UsageEvent so cp-api's budget ledger +
+            // Issue #407: emit UsageEvent so the control plane's budget ledger +
             // /logs see image-generation traffic. Pre-#407 the handler
             // dropped the event entirely. Emit on a real upstream call
             // (even zero tokens — request visible/attributed); skip the
@@ -152,7 +152,7 @@ pub async fn image_generations(
             // `usage` block when present (gpt-image-1); dall-e-3 has no
             // usage block → zero tokens (precise per-image cost is a
             // documented cross-repo follow-up — needs image-count /
-            // size / quality on the wire + cp-api pricing).
+            // size / quality on the wire + the control plane pricing).
             if success.upstream_called {
                 let (prompt_tokens, completion_tokens) = success.usage.unwrap_or((0, 0));
                 emit_usage_event(
@@ -631,18 +631,18 @@ fn extract_token_usage(body: &Value) -> Option<(u32, u32)> {
     Some((input, output))
 }
 
-/// Issue #407: push one `UsageEvent` onto cp-api's telemetry sink and
+/// Issue #407: push one `UsageEvent` onto the control plane's telemetry sink and
 /// fan it out to per-env OTLP exporters. Mirrors
 /// `embeddings::emit_usage_event` (#402). `inbound_protocol = "openai"`
 /// (images are an OpenAI-shape endpoint). Tokens are populated when the
 /// upstream returned a `usage` block (gpt-image-1); zero otherwise —
 /// the per-image cost basis (n × size × quality) is a cross-repo
-/// follow-up needing a UsageEvent wire extension + cp-api pricing.
+/// follow-up needing a UsageEvent wire extension + the control plane pricing.
 ///
 /// The per-PK attribution tags (provider_kind / provider_featured /
 /// branded_provider / pk_label / byo_label) are populated from the
 /// resolved ProviderKey — same lookup as chat / messages / responses /
-/// embeddings (AISIX-Cloud#867 parity) via `usage_attr::apply_pk_telemetry`.
+/// embeddings (#867 parity) via `usage_attr::apply_pk_telemetry`.
 #[allow(clippy::too_many_arguments)]
 fn emit_usage_event(
     state: &ProxyState,
@@ -654,7 +654,7 @@ fn emit_usage_event(
     model_id: &str,
     requested_model: &str,
     api_key_id: &str,
-    // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
+    // Metric labels the UsageEvent has no field for (#1234
     // follow-up): the wire struct is the CP contract, so they ride
     // alongside rather than in it.
     provider: &str,
@@ -669,7 +669,7 @@ fn emit_usage_event(
     client: &ClientContext,
     // Per-detector PII mask counts (#932/#696). Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
-    // Monitor-mode guardrail observations (AISIX-Cloud#562).
+    // Monitor-mode guardrail observations (#562).
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     guardrail_blocked: bool,
     // Captured request/response content (#700). Forwarded only to `fan_out`,
@@ -775,7 +775,7 @@ fn emit_access_log(
         total_tokens: None,
         request_id,
         // No provider response id: the images response is
-        // `{created, data, usage}` — no id on the wire (AISIX-Cloud#1289).
+        // `{created, data, usage}` — no id on the wire (#1289).
         provider_request_id: None,
         served_by_model: routing
             .map(|r| r.served_by_model.as_str())
@@ -852,7 +852,7 @@ mod tests {
         ResourceEntry::new(PK_ID, pk, 1)
     }
 
-    /// AISIX-Cloud#867: same openai PK as `provider_key_entry` but carrying
+    /// #867: same openai PK as `provider_key_entry` but carrying
     /// `telemetry_tags`, so the emitted UsageEvent gets the per-PK
     /// attribution fields stamped via `usage_attr::apply_pk_telemetry`.
     fn provider_key_entry_tagged(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
@@ -1289,13 +1289,13 @@ mod tests {
         }
     }
 
-    /// AISIX-Cloud#867 parity: a successful /v1/images/generations 200 must
+    /// #867 parity: a successful /v1/images/generations 200 must
     /// stamp the per-PK telemetry attribution fields (provider_kind /
     /// provider_featured / branded_provider / pk_label) on the emitted
     /// UsageEvent, sourced from the resolved ProviderKey's `telemetry_tags`
     /// — exactly like /v1/chat/completions, /v1/messages, /v1/responses, and
     /// /v1/embeddings. Pre-fix these five fields were left at Default, so
-    /// image-generation spend showed up unattributed in cp-api analytics.
+    /// image-generation spend showed up unattributed in the control plane analytics.
     #[tokio::test]
     async fn emits_provider_telemetry_tags_issue_867() {
         let upstream = MockServer::start().await;

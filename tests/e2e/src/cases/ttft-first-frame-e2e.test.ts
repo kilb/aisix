@@ -13,7 +13,7 @@ import {
 } from "../harness/index.js";
 
 // E2E: `upstream_ttft_ms` stops on the FIRST streamed frame of any type
-// (AISIX-Cloud#1225, both rounds).
+// (#1225, both rounds).
 //
 // The clock deliberately uses the industry convention — LiteLLM's
 // `completion_start_time` and caller-side gateways (istio/Higress-class

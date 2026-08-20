@@ -11,7 +11,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E for AISIX-Cloud#1044: aisix_llm_tokens_by_client_total gains a `model`
+// E2E for #1044: aisix_llm_tokens_by_client_total gains a `model`
 // label (the requested logical model, same value as the aisix_llm_* families'
 // `model`), so "which models is each client spending tokens on" is answerable.
 //
@@ -81,7 +81,7 @@ async function pollSeries(
   return text;
 }
 
-describe("aisix_llm_tokens_by_client_total model label (AISIX-Cloud#1044)", () => {
+describe("aisix_llm_tokens_by_client_total model label (#1044)", () => {
   let app: SpawnedApp | undefined;
   let nonStreamUpstream: OpenAiUpstream | undefined;
   let streamUpstream: OpenAiUpstream | undefined;

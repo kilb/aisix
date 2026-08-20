@@ -25,7 +25,7 @@
 #
 # For a multi-replica deployment, enable cluster-level rate limiting so
 # the cluster enforces one global window instead of N× per replica
-# (api7/AISIX-Cloud#798):
+# (api7/#798):
 #   AISIX_RATELIMIT__BACKEND=redis
 #   AISIX_RATELIMIT__REDIS__URL=redis://<host>:6379
 #
@@ -125,7 +125,7 @@ managed:
   snapshot_cache_path: "/var/lib/aisix/config_cache.json"
 
   # Heartbeat interval, in seconds. The DP POSTs a heartbeat to
-  # dp-manager every interval; the CP marks the DP "connected" on its
+  # the control plane every interval; the CP marks the DP "connected" on its
   # first heartbeat. Clamped to [5, 300]. Default 15s; lower it (e.g. 5s)
   # in dev/e2e so connect detection isn't bound by the interval.
   heartbeat_interval_secs: 15

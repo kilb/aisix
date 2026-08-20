@@ -115,7 +115,7 @@ impl Default for BedrockBridge {
 }
 
 /// The set of Bedrock publishers the bridge will dispatch to.
-/// Public so cp-api / dashboard can surface "which Bedrock
+/// Public so the control plane / dashboard can surface "which Bedrock
 /// publishers are supported" without re-deriving the list from the
 /// model id parser.
 ///
@@ -285,11 +285,11 @@ fn strip_region_prefix(model_id: &str) -> &str {
 /// Schema for `ProviderKey.api_key` on a Bedrock provider key.
 ///
 /// Convention: AWS credentials are JSON-encoded into the `secret`
-/// field. The cp-api side delivers them already-decrypted (mTLS-only
+/// field. The the control plane side delivers them already-decrypted (mTLS-only
 /// etcd channel; see ProviderKey doc).
 ///
 /// `endpoint_url` is intentionally NOT in here — that goes in
-/// `ProviderKey.api_base` so the cp-api validator can apply normal
+/// `ProviderKey.api_base` so the control plane validator can apply normal
 /// URL-shape rules. Region is in here because Bedrock keys dispatch
 /// off region (`bedrock-runtime.<region>.amazonaws.com`).
 #[derive(Debug, Deserialize)]
@@ -416,7 +416,7 @@ fn build_client(
 /// Resolve the ProviderKey's extra headers (rendered `default_headers` plus
 /// allowlisted client headers) and drop the SigV4-owned names
 /// ([`wire::reserved_sigv4_headers`]) before they reach the signing
-/// interceptor. cp-api SHOULD reject those at write time (#302 §5), but the DP
+/// interceptor. The control plane SHOULD reject those at write time (#302 §5), but the DP
 /// enforces it again here as defense-in-depth — an override naming e.g.
 /// `x-amz-date` or `authorization` must never perturb the signature. Matching
 /// is case-insensitive (HTTP header names are).
@@ -477,7 +477,7 @@ fn apply_body_overrides(
 /// [`filtered_default_headers`] (SigV4-owned names removed) at construction.
 /// A header already present on the request is left untouched (the SDK / caller
 /// wins); names or values that fail header parsing are skipped silently — the
-/// block came from cp-api validation and an unparseable entry is a config
+/// block came from the control plane validation and an unparseable entry is a config
 /// error one layer up, not a runtime failure the dispatch should hard-fail on.
 #[derive(Debug)]
 struct DefaultHeadersInterceptor {
@@ -669,7 +669,7 @@ impl Bridge for BedrockBridge {
         // Amazon Titan / Amazon Nova / AI21). Anthropic stays on the
         // legacy /invoke path (chat_anthropic, wired via #320) for
         // backward compat with existing operator deployments — the
-        // Anthropic Messages JSON envelope is what cp-api / dashboard
+        // Anthropic Messages JSON envelope is what the control plane / dashboard
         // tests already pin. Moving Anthropic to Converse is a clean
         // follow-up since the SDK-decoded Converse response shape is
         // equivalent for the customer-visible ChatResponse.
@@ -827,7 +827,7 @@ impl BedrockBridge {
     /// "bedrock-2023-05-31"`. Kept alongside `chat_converse` because
     /// the existing customer deployments + e2e tests pin the
     /// Anthropic-shape outbound body; future PR can fold this into
-    /// the Converse path once cp-api / dashboard tests have been
+    /// the Converse path once the control plane / dashboard tests have been
     /// updated to assert the Converse envelope instead.
     async fn chat_anthropic(
         &self,
@@ -1594,7 +1594,7 @@ fn map_converse_stream_sdk_error(
 /// response — throttling, internal failures, and model stream errors
 /// arrive as event-stream messages, not HTTP statuses — so surface
 /// them as [`BridgeError::UpstreamInBand`] with the AWS exception code
-/// in the view for `error_translate` (AISIX-Cloud#1222 scenario 3).
+/// in the view for `error_translate` (#1222 scenario 3).
 /// Same redaction rule as [`map_service_error`]: canned message keyed
 /// on the derived status, code-only view, no raw AWS text (which
 /// embeds ARNs / account ids). Non-service failures (transport,
@@ -2000,7 +2000,7 @@ mod tests {
     }
     use super::*;
 
-    // ─── Mid-stream event errors (AISIX-Cloud#1222) ──────────────────
+    // ─── Mid-stream event errors (#1222) ──────────────────
 
     /// The Converse event stream carries modeled exceptions inside the
     /// committed 200 response. They must surface as typed in-band

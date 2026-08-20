@@ -2,7 +2,7 @@
 //!
 //! This is the only bootstrap path — it replaces the removed legacy
 //! `/dp/register` round-trip. When the operator mints a cert via
-//! the dashboard's `CertIssueCard` (see AISIX-Cloud cp-api's
+//! the dashboard's certificate-issue view (see the control plane's
 //! `POST /api/environments/:env_id/gateway_certificates`), the
 //! resulting cert + key + CA PEM trio is inlined into the DP's
 //! environment vars (or written to disk for systemd / k8s Secret
@@ -16,7 +16,7 @@
 //!   AISIX_MANAGED__CP_KEY_PEM    — SEC1 EC private key paired with
 //!                                  the leaf
 //!   AISIX_MANAGED__CP_CA_PEM     — CA cert the DP installs as the
-//!                                  trust anchor for dp-manager mTLS
+//!                                  trust anchor for the control plane mTLS
 //!
 //! `_FILE` variants take the same content but load from disk; useful
 //! for systemd hosts where pasting multi-line PEMs into env vars is
@@ -24,8 +24,8 @@
 //! triplet; mixing gets a hard error at boot rather than a silent
 //! pick-one.
 //!
-//! The cert's URI SAN encodes `x-aisix://env/<env_id>` per cp-api's
-//! `internal/dpmgr/certmgr/issue.go`. We parse it out and plant it
+//! The cert's URI SAN encodes `x-aisix://env/<env_id>` per the control plane's
+//! `the control plane/certmgr/issue.go`. We parse it out and plant it
 //! into `cfg.etcd.env_id` so `effective_prefix()` returns
 //! `/aisix/<env_id>/` — the same scoping the legacy register-derived
 //! `r.env_id` used to populate.
@@ -141,7 +141,7 @@ async fn load_pem(
 }
 
 /// Parse a leaf cert's URI SANs and return `(env_id, dp_id)`. The
-/// cert manager (`internal/dpmgr/certmgr/issue.go`) encodes them
+/// cert manager (`the control plane/certmgr/issue.go`) encodes them
 /// as:
 ///
 ///   x-aisix://env/<env_id>
@@ -224,7 +224,7 @@ mod tests {
 
     /// Generate a self-signed cert with the same SAN URI shape cp-
     /// api's certmgr signs, so we can test the SAN parsing path
-    /// without touching cp-api at all.
+    /// without touching the control plane at all.
     fn synth_leaf(env_id: &str, dp_id: &str) -> (String, String) {
         let mut params = CertificateParams::default();
         params.distinguished_name = DistinguishedName::new();

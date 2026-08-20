@@ -14,7 +14,7 @@ import {
 } from "../harness/index.js";
 
 // E2E: the per-execution guardrail latency histogram
-// `aisix_guardrail_latency_seconds` (AISIX-Cloud#1076). Every guardrail
+// `aisix_guardrail_latency_seconds` (#1076). Every guardrail
 // consulted on a request must record one observation labelled with the
 // row name, kind, phase (input/output), enforced result, and — for
 // fail-open bypasses — the bounded error tag. Covered results: allowed,

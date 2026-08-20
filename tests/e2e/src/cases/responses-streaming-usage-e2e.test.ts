@@ -12,7 +12,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E regression for AISIX-Cloud#808: a STREAMING /v1/responses 200 must
+// E2E regression for #808: a STREAMING /v1/responses 200 must
 // emit a UsageEvent. Codex (the OpenAI CLI) talks to /v1/responses and
 // always streams, so pre-#808 every successful Codex call was invisible to
 // the dashboard Logs and the budget ledger — while a 4xx/5xx on the same
@@ -25,7 +25,7 @@ import {
 // end-of-stream — the same end-of-stream emission the Anthropic
 // /v1/messages streaming path already does (#245/#790).
 //
-// Usage telemetry has no cp-api receiver in DP e2e, so — like the
+// Usage telemetry has no the control plane receiver in DP e2e, so — like the
 // per-attempt telemetry test (#655) — we observe the emitted field values
 // through the per-env OTLP/HTTP fan-out: register a mock OTLP receiver as
 // an observability_exporter, drive one streamed request, and assert a span

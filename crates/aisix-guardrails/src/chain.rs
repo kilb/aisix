@@ -40,7 +40,7 @@ pub struct GuardrailChain {
     /// (the in-memory test path); populated by the snapshot build points
     /// (`build_chain_from_snapshot` and `GuardrailIndex::resolve`).
     applied: Vec<AppliedGuardrail>,
-    /// Per-execution telemetry receiver (AISIX-Cloud#1076). `None` (the
+    /// Per-execution telemetry receiver (#1076). `None` (the
     /// default) records nothing; `LiveGuardrailIndex::resolve` attaches
     /// the metrics layer's sink so every fold below reports each member's
     /// phase/result/duration.
@@ -100,7 +100,7 @@ impl GuardrailChain {
         }
     }
 
-    /// Attach a per-execution telemetry sink (AISIX-Cloud#1076). Called by
+    /// Attach a per-execution telemetry sink (#1076). Called by
     /// `LiveGuardrailIndex::resolve` on every resolved chain; `None`
     /// disables recording (the default for test-built chains).
     pub fn with_metrics_sink(mut self, sink: Option<Arc<dyn GuardrailMetricsSink>>) -> Self {
@@ -161,7 +161,7 @@ impl GuardrailChain {
     }
 }
 
-/// Classify one member execution for the metrics sink (AISIX-Cloud#1076).
+/// Classify one member execution for the metrics sink (#1076).
 ///
 /// The result is the ENFORCED outcome: a monitor-mode member's downgraded
 /// Block surfaces as `would_block` (via its hits), not `blocked`. `masked`
@@ -335,7 +335,7 @@ impl Guardrail for GuardrailChain {
         }
     }
 
-    // Observed folds (AISIX-Cloud#562): same short-circuit semantics as the
+    // Observed folds (#562): same short-circuit semantics as the
     // plain folds, but every member's monitor-mode observations are
     // collected — including the ones made before an enforcing member
     // blocks, so a monitored rule's hit isn't erased by a peer's Block.
@@ -1182,7 +1182,7 @@ mod tests {
         assert_eq!(chain.applied(), applied.as_slice());
     }
 
-    // --- per-execution metrics sink (AISIX-Cloud#1076) --------------------
+    // --- per-execution metrics sink (#1076) --------------------
 
     /// Owned copy of one recorded execution, captured by [`RecordingSink`].
     #[derive(Debug, Clone, PartialEq, Eq)]

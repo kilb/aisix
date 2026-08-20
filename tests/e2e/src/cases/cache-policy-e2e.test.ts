@@ -19,7 +19,7 @@ import {
 // `docs/api-proxy.md` §3 — `hit` if served from cache, `miss`
 // otherwise; absent for streaming responses and absent when no
 // enabled cache_policy applies to the request). The header is
-// observed by cp-api and the dashboard's /logs view via the
+// observed by the control plane and the dashboard's /logs view via the
 // telemetry path; both the header and the persisted
 // `usage_events.cache_status` field expose the cache outcome.
 //

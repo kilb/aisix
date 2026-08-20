@@ -12,7 +12,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E regression for AISIX-Cloud#1138: a `stream=true` transcription must
+// E2E regression for #1138: a `stream=true` transcription must
 // be billed for the tokens the upstream reports.
 //
 // The transcribe models answer a streaming transcription with
@@ -23,7 +23,7 @@ import {
 // zero tokens — unbilled spend that also never moved TPM/TPD, while the
 // identical non-streaming request billed normally.
 //
-// Usage telemetry has no cp-api receiver in DP e2e, so — like the
+// Usage telemetry has no the control plane receiver in DP e2e, so — like the
 // /v1/responses streaming test (#808) — the emitted values are observed
 // through the per-env OTLP/HTTP fan-out.
 

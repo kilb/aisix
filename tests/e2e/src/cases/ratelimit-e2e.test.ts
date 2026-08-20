@@ -141,7 +141,7 @@ describe("rate limit e2e: RPM=1 second call gets 429", () => {
 });
 
 // E2E: RateLimitPolicy.schedules — recurring suspension windows
-// (AISIX-Cloud#1104), driven through etcd exactly as cp-api writes
+// (#1104), driven through etcd exactly as the control plane writes
 // them. Windows are picked relative to "now" so the test is
 // deterministic without waiting for wall-clock boundaries:
 // - an all-week 00:00–24:00 window is always active → suspended
@@ -153,7 +153,7 @@ const SCHED_CALLER = "sk-rlp-sched-e2e-caller";
 const SCHED_KEY_ID = "c0000000-0000-0000-0000-000000000011";
 const SCHED_POLICY_ID = "d0000000-0000-0000-0000-000000000011";
 
-describe("rate limit policy schedules e2e (AISIX-Cloud#1104)", () => {
+describe("rate limit policy schedules e2e (#1104)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let seed: SeedClient | undefined;
@@ -167,7 +167,7 @@ describe("rate limit policy schedules e2e (AISIX-Cloud#1104)", () => {
     scope_ref: SCHED_KEY_ID,
     window: "minute",
     max_requests: 1,
-    // cp-api omits `schedules` when empty so schedule-less rows stay
+    // The control plane omits `schedules` when empty so schedule-less rows stay
     // parseable by pre-`schedules` strict data planes.
     ...(schedules ? { schedules } : {}),
   });

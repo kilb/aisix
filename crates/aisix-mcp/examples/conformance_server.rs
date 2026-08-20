@@ -1,6 +1,6 @@
 //! Serve the MCP gateway on a local port so the OFFICIAL MCP conformance
 //! suite can be run against the exact `/mcp/{server}` protocol surface the
-//! data plane ships (AISIX-Cloud#1144 acceptance):
+//! data plane ships (#1144 acceptance):
 //!
 //! ```text
 //! cargo run -p aisix-mcp --example conformance_server

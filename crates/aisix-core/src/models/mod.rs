@@ -11,9 +11,9 @@
 //! - [`Routing`] — virtual-router strategy + targets (§3.5, PR #17)
 //! - [`ProviderKey`] — managed upstream secret (§3.6)
 //!
-//! Team is intentionally absent: it's a SaaS-tier concept owned by
-//! the AISIX-Cloud control plane, not by the standalone gateway.
-//! Standalone deployments do per-key rate-limiting via
+//! Team is intentionally absent: it is a control-plane concept — the
+//! gateway never resolves a team, only the `team_id` label a key
+//! carries. Standalone deployments do per-key rate-limiting via
 //! `ApiKey::rate_limit`.
 
 pub mod a2a_agent;

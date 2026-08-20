@@ -56,7 +56,7 @@ pub const M_LLM_TTFT: &str = "aisix_llm_time_to_first_token_seconds";
 /// the per-key `aisix_llm_*_tokens_total` families. `client_type` is
 /// normalised to a bounded allowlist by [`client_type_from_user_agent`]; the
 /// raw user-agent + client version stay in logs / `UsageEvent`, never here.
-/// AISIX-Cloud#1044 adds a `model` label (the requested logical model, same
+/// #1044 adds a `model` label (the requested logical model, same
 /// value as the `aisix_llm_*` families' `model`) so the series answers
 /// "which models is each client spending tokens on". The label set stays
 /// client_type × model × token_type — per-key/team/user dimensions belong to
@@ -99,7 +99,7 @@ pub const M_PROXY_BODY_LIMIT_REJECTIONS_TOTAL: &str =
 /// That difference is the whole point of the family, and the reason a
 /// gateway-wide 5xx count read off `aisix_proxy_requests_total` can sit
 /// orders of magnitude below the number of failed attempts an operator
-/// sees in the usage log (AISIX-Cloud#1299): most failed attempts belong
+/// sees in the usage log (#1299): most failed attempts belong
 /// to requests a fallback went on to serve, and those requests are a
 /// `status="200"` sample in the request families.
 ///
@@ -151,7 +151,7 @@ pub const M_USAGE_EVENT_DROPS_TOTAL: &str = "aisix_usage_event_drops_total";
 pub const M_GUARDRAIL_BLOCKS_TOTAL: &str = "aisix_guardrail_blocks_total";
 pub const M_GUARDRAIL_BYPASSES_TOTAL: &str = "aisix_guardrail_bypasses_total";
 /// Per-request inbound authentication decisions
-/// (AISIX-Cloud#1080/#1081). Before this series, a rejected credential
+/// (#1080/#1081). Before this series, a rejected credential
 /// was invisible: the auth extractor short-circuits ahead of every
 /// handler, so no request counter and no access-log line ever fired
 /// for a 401. Labels, all bounded:
@@ -161,7 +161,7 @@ pub const M_GUARDRAIL_BYPASSES_TOTAL: &str = "aisix_guardrail_bypasses_total";
 ///   `key_expired`, `jwt_bad_signature`, `jwt_untrusted_issuer`,
 ///   `jwt_identity_unmapped`); `none` when allowed.
 pub const M_AUTH_DECISIONS_TOTAL: &str = "aisix_auth_decisions_total";
-/// Per-execution guardrail latency histogram (AISIX-Cloud#1076), recorded
+/// Per-execution guardrail latency histogram (#1076), recorded
 /// by the chain fold for every member consulted on any handler — chat,
 /// messages, responses, embeddings, streaming end-of-stream/window scans,
 /// cache-hit output checks, and the segment (Bedrock-style) pass alike.
@@ -184,7 +184,7 @@ pub const M_AUTH_DECISIONS_TOTAL: &str = "aisix_auth_decisions_total";
 pub const M_GUARDRAIL_LATENCY_SECONDS: &str = "aisix_guardrail_latency_seconds";
 /// Issue #408: counter for UsageEvents successfully enqueued onto the
 /// `UsageSink` (i.e. handed off to the telemetry worker for delivery
-/// to cp-api + per-env OTLP exporters). Operators slice this by:
+/// to the control plane + per-env OTLP exporters). Operators slice this by:
 /// - `handler`: which OpenAI-shape handler emitted (chat /
 ///   embeddings / responses / completions / rerank / audio /
 ///   images / messages). Fixed enumeration, low cardinality.
@@ -229,7 +229,7 @@ pub const M_CACHE_SEMANTIC_EMBED_FAILURES_TOTAL: &str =
 pub const M_CACHE_SEMANTIC_STORE_FAILURES_TOTAL: &str = "aisix_cache_semantic_store_failures_total";
 pub const M_OTLP_FANOUT_DROPS_TOTAL: &str = "aisix_otlp_fanout_drops_total";
 pub const M_OTLP_FANOUT_FAILURES_TOTAL: &str = "aisix_otlp_fanout_failures_total";
-/// AISIX-Cloud#1011: SLO-grade latency distributions as REAL bucketed
+/// #1011: SLO-grade latency distributions as REAL bucketed
 /// histograms (`_bucket{le=…}`), aggregatable across DP instances with
 /// `histogram_quantile()`. Every other `histogram!` series in this file
 /// renders as a summary (no buckets configured) whose quantiles cannot
@@ -250,7 +250,7 @@ pub const M_REQUEST_E2E_LATENCY_SECONDS: &str = "aisix_request_e2e_latency_secon
 /// [`M_REQUEST_E2E_LATENCY_SECONDS`] (with `streaming="true"` always).
 pub const M_REQUEST_TTFT_SECONDS: &str = "aisix_request_ttft_seconds";
 
-// ── A2A gateway series (AISIX-Cloud#1215) ──────────────────────────────────
+// ── A2A gateway series (#1215) ──────────────────────────────────
 //
 // The `aisix_proxy_*` families already count `/a2a` traffic and time it, but
 // only by route: which agent was reached and which operation was invoked are
@@ -334,7 +334,7 @@ pub const DEFAULT_E2E_LATENCY_BUCKETS: &[f64] = &[
     600.0,
 ];
 
-/// Default bucket edges for [`M_REQUEST_TTFT_SECONDS`] (AISIX-Cloud#1226).
+/// Default bucket edges for [`M_REQUEST_TTFT_SECONDS`] (#1226).
 /// Deliberately NOT the same set as [`DEFAULT_E2E_LATENCY_BUCKETS`]: this
 /// histogram observes the *upstream* time-to-first-token, so a request the
 /// gateway answers itself (cache hit, pre-dispatch rejection) never lands
@@ -353,7 +353,7 @@ pub const DEFAULT_TTFT_BUCKETS: &[f64] = &[
 /// Default bucket edges for [`M_GUARDRAIL_LATENCY_SECONDS`] — shifted an
 /// order of magnitude below the request-latency sets: local (keyword/pii)
 /// checks run in microseconds, the added-latency budget under scrutiny is
-/// ~50 ms (AISIX-Cloud#1076), and remote guardrail timeouts default to 5 s.
+/// ~50 ms (#1076), and remote guardrail timeouts default to 5 s.
 /// The 30 s top edge outlives any configurable guardrail timeout.
 pub const DEFAULT_GUARDRAIL_LATENCY_BUCKETS: &[f64] = &[
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
@@ -361,7 +361,7 @@ pub const DEFAULT_GUARDRAIL_LATENCY_BUCKETS: &[f64] = &[
 
 /// Resolved bucket edges for the three real (non-summary) histograms,
 /// each either the default above or an operator override from
-/// `observability.metrics.buckets` (AISIX-Cloud#1226).
+/// `observability.metrics.buckets` (#1226).
 ///
 /// Every edge here costs one `_bucket` time series **per label
 /// combination** on a metric labelled by endpoint × model × provider ×
@@ -544,7 +544,7 @@ struct UsageSeriesHandles {
 // current-thread runtime per pinned core (thread-per-core), and a shared
 // map — like the two `RwLock` caches this replaced — puts one contended
 // cache line (the lock word) in front of every emit on every worker. The
-// spike for AISIX-Cloud#1259 item 3b measured that shared-lock variant
+// spike for #1259 item 3b measured that shared-lock variant
 // recovering almost nothing (+0.5% throughput) while the thread-local
 // variant recovered +4.4%; per-worker duplication of a bounded handle set
 // is the whole trick.
@@ -713,7 +713,7 @@ impl Metrics {
     }
 
     /// Like [`Metrics::new_with_env_id`], with operator-supplied histogram
-    /// bucket edges (`observability.metrics.buckets`, AISIX-Cloud#1226).
+    /// bucket edges (`observability.metrics.buckets`, #1226).
     pub fn new_with_buckets(env_id: &str, buckets: &HistogramBuckets) -> Self {
         // Buckets ONLY for the SLO histograms and the guardrail latency
         // histogram: with `metrics-exporter-prometheus`, a distribution
@@ -935,7 +935,7 @@ impl Metrics {
     }
 
     /// Record one inbound authentication decision on
-    /// [`M_AUTH_DECISIONS_TOTAL`] (AISIX-Cloud#1081). Called from the
+    /// [`M_AUTH_DECISIONS_TOTAL`] (#1081). Called from the
     /// proxy auth choke point for every credential judgment — allowed
     /// or denied, API-key and JWT paths alike.
     pub fn record_auth_decision(&self, method: &str, allowed: bool, reason: &str) {
@@ -989,7 +989,7 @@ impl Metrics {
     }
 
     /// Record one guardrail member execution on
-    /// [`M_GUARDRAIL_LATENCY_SECONDS`] (AISIX-Cloud#1076). Called by the
+    /// [`M_GUARDRAIL_LATENCY_SECONDS`] (#1076). Called by the
     /// chain fold through the `GuardrailMetricsSink` impl below — once per
     /// member per hook pass, on every handler.
     pub fn record_guardrail_execution(&self, exec: &aisix_core::GuardrailExecution<'_>) {
@@ -1025,7 +1025,7 @@ impl Metrics {
     /// identifies the offending policy on the `policy` layer (bounded
     /// by the configured policy count) and is empty elsewhere.
     /// Recorded at the quota gate, the one point every endpoint funnels
-    /// through (AISIX-Cloud#892).
+    /// through (#892).
     pub fn record_ratelimit_rejection(&self, scope: &str, layer: &str, policy_id: Option<&str>) {
         let policy_id = policy_id.unwrap_or_default();
         self.cached_counter(
@@ -1651,9 +1651,9 @@ impl Metrics {
     /// come from [`ClientTypeClassifier::classify`] (or the built-in
     /// [`client_type_from_user_agent`]) — never raw client input — so the
     /// value set stays bounded by built-ins ∪ boot-validated operator rules
-    /// (AISIX-Cloud#1045); zero dims are skipped to keep the series sparse.
+    /// (#1045); zero dims are skipped to keep the series sparse.
     ///
-    /// `model` (AISIX-Cloud#1044) is the requested logical model — callers
+    /// `model` (#1044) is the requested logical model — callers
     /// MUST pass the same value they put in [`UsageLabels::model`] (or its
     /// endpoint's equivalent), never the raw client string of an unresolved
     /// request nor the routed `upstream_model`, so the label stays bounded by
@@ -1662,7 +1662,7 @@ impl Metrics {
     ///
     /// `total_tokens` is the caller's canonical cache-inclusive total
     /// (`input + output + Anthropic cache_creation/cache_read`), emitted under
-    /// `token_type="total"` (AISIX-Cloud#1002). It is passed in — not derived
+    /// `token_type="total"` (#1002). It is passed in — not derived
     /// from `input + output` — because Anthropic reports cache tokens as
     /// counters SEPARATE from `input_tokens`, so a prompt+completion sum
     /// undercounts cached traffic (same reason as [`total_tokens_with_cache`]
@@ -2024,7 +2024,7 @@ impl Metrics {
 }
 
 /// The injection point the guardrail chain records through
-/// (AISIX-Cloud#1076): `aisix-guardrails` sees only this core trait, so it
+/// (#1076): `aisix-guardrails` sees only this core trait, so it
 /// stays free of a metrics dependency.
 impl aisix_core::RateLimitMetricsSink for Metrics {
     fn record_redis_failure(&self, op: &str) {
@@ -2127,7 +2127,7 @@ pub fn client_type_from_user_agent(user_agent: &str) -> &'static str {
         ("claude-code", "claude-code"),
         ("codex", "codex"),
         ("cline", "cline"),
-        // Cline-family forks (AISIX-Cloud#1045). Each sends `<Product>/<ver>`
+        // Cline-family forks (#1045). Each sends `<Product>/<ver>`
         // on its OpenAI-compatible provider path (Roo since PR #5492,
         // Kilo ≤5.16.2, Zoo ≥3.54.0); the second spelling covers the
         // `roo-code/<ver> (<os>; <arch>)`-style native-path variants.
@@ -2144,7 +2144,7 @@ pub fn client_type_from_user_agent(user_agent: &str) -> &'static str {
         // Cursor routes BYO-endpoint traffic through its own backend,
         // which presents `Cursor/1.0` (version segment is fixed).
         ("cursor", "cursor"),
-        // Terminal agents / editors (AISIX-Cloud#1045). opencode PREFIXES
+        // Terminal agents / editors (#1045). opencode PREFIXES
         // the Vercel AI SDK UA (`opencode/<ver> ai-sdk/…`), so it must
         // stay ahead of the `ai-sdk/provider-utils` bucket below. Qwen
         // Code sends `QwenCode/<ver> (<os>; <arch>)` on OpenAI paths but
@@ -2198,7 +2198,7 @@ pub fn client_type_from_user_agent(user_agent: &str) -> &'static str {
 }
 
 /// Boot-compiled `client_type` classifier: operator rules from
-/// `observability.metrics.client_type_rules` (AISIX-Cloud#1045) tried in
+/// `observability.metrics.client_type_rules` (#1045) tried in
 /// config order first, then the built-in
 /// [`client_type_from_user_agent`] allowlist. Custom rules deliberately
 /// outrank built-ins so a deployment can re-bucket anything — e.g. an
@@ -2302,7 +2302,7 @@ pub struct RequestLabels<'a> {
     pub team_id: &'a str,
     pub user_id: &'a str,
     /// Readable user display name (#890 req-3). 1:1 with `user_id`;
-    /// `"unknown"` until cp-api syncs it onto the api-key config.
+    /// `"unknown"` until the control plane syncs it onto the api-key config.
     pub user_name: &'a str,
     /// Whether the client requested a streaming (SSE) response (#890 req-1).
     /// Emitted on the request counter AND duration histogram so a
@@ -2586,7 +2586,7 @@ mod tests {
         assert!(rendered.contains(M_REQUEST_DURATION));
     }
 
-    /// AISIX-Cloud#1076: the per-execution guardrail histogram renders with
+    /// #1076: the per-execution guardrail histogram renders with
     /// real `_bucket{le=…}` series (quantile-aggregatable, not a summary)
     /// and the full bounded label set; `error_type` defaults to `none`.
     #[test]
@@ -3960,7 +3960,7 @@ mod tests {
 
     #[test]
     fn tokens_by_client_splits_series_per_model() {
-        // AISIX-Cloud#1044: one client type spending on two models must
+        // #1044: one client type spending on two models must
         // produce two independent series per token_type, and every series
         // must carry the model label.
         let m = Metrics::new(false);
@@ -4026,7 +4026,7 @@ mod tests {
         );
     }
 
-    /// AISIX-Cloud#1045: coding clients added from source-verified UA
+    /// #1045: coding clients added from source-verified UA
     /// samples (real formats quoted from each product's provider code —
     /// see the issue's evidence table).
     #[test]
@@ -4112,7 +4112,7 @@ mod tests {
         );
     }
 
-    /// AISIX-Cloud#1045: operator rules outrank built-ins, first match
+    /// #1045: operator rules outrank built-ins, first match
     /// wins, non-matches fall back to the built-in table, and empty UA
     /// stays `unknown` even under a match-anything rule.
     #[test]
@@ -4158,7 +4158,7 @@ mod tests {
         assert_eq!(c.classify(""), "unknown");
     }
 
-    /// AISIX-Cloud#1045: invalid rule sets are rejected at compile (boot)
+    /// #1045: invalid rule sets are rejected at compile (boot)
     /// time — count cap, pattern syntax/length, label charset/length.
     #[test]
     fn classifier_rejects_invalid_rule_sets() {
@@ -4216,7 +4216,7 @@ mod tests {
         );
     }
 
-    /// AISIX-Cloud#1011: the two SLO series must render as REAL bucketed
+    /// #1011: the two SLO series must render as REAL bucketed
     /// histograms (`_bucket{le=…}` + `_sum`/`_count`) — the property that
     /// makes `histogram_quantile()` and cross-instance aggregation work.
     /// Every other `histogram!` series stays a summary (no buckets), so a
@@ -4346,7 +4346,7 @@ mod tests {
             .collect()
     }
 
-    /// AISIX-Cloud#1226: TTFT no longer borrows the end-to-end latency
+    /// #1226: TTFT no longer borrows the end-to-end latency
     /// edges. The two sets are pinned here because they are a public
     /// metric contract — a dashboard that hardcodes an `le` breaks when
     /// they move, so moving them must be a deliberate edit to this list.

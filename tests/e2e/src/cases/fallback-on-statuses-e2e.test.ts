@@ -10,7 +10,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// AISIX-Cloud#1012: some providers use non-429 4xx codes for transient
+// #1012: some providers use non-429 4xx codes for transient
 // conditions (model overload, queue full, quota). By default the gateway
 // treats a non-429 4xx as the caller's error and returns it as-is; a
 // routing model can now opt SPECIFIC codes into retry/failover via

@@ -55,7 +55,7 @@ pub struct AccessLog<'a> {
     /// — OpenAI's `chat.completion.id`, Anthropic's message `id`,
     /// `/v1/responses`' `resp_…`. Distinct from `request_id` (this
     /// gateway's own id) and from the provider's HTTP transport header id;
-    /// none of the three may overwrite another (AISIX-Cloud#1289).
+    /// none of the three may overwrite another (#1289).
     ///
     /// `None` whenever no id exists by the time this line is written:
     /// the request never reached an upstream (guardrail block,
@@ -83,7 +83,7 @@ pub struct AccessLog<'a> {
     /// Why the request failed — `None` on success. Without it a 5xx line
     /// carries only `status` + `latency_ms`, which is the same shape for a
     /// kernel-level connect timeout, an upstream 500, and a blocked
-    /// guardrail (AISIX-Cloud#1093).
+    /// guardrail (#1093).
     pub error: Option<&'a str>,
 }
 
@@ -190,7 +190,7 @@ mod tests {
         assert!(out.contains("provider=\"openai\"") || out.contains("provider=openai"));
         assert!(out.contains("total_tokens=3"));
         assert!(out.contains("request_id=\"req-abc\"") || out.contains("request_id=req-abc"));
-        // AISIX-Cloud#1289: the provider's own response id, next to — never
+        // #1289: the provider's own response id, next to — never
         // instead of — the gateway's `request_id`.
         assert!(
             out.contains("provider_request_id=\"chatcmpl-abc\"")

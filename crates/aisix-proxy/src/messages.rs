@@ -135,7 +135,7 @@ pub async fn messages(
     // travel via the stream builders' end-of-stream emit instead.
     let mut redaction_counts = crate::redact::RedactionCounts::new();
     // Filled by `dispatch` with monitor-mode guardrail observations
-    // (AISIX-Cloud#562), same lifecycle as `redaction_counts`.
+    // (#562), same lifecycle as `redaction_counts`.
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     // A sensitive JSON object key cannot be renamed without changing the tool
     // contract. Such a fail-closed rejection must also suppress full-content
@@ -191,7 +191,7 @@ pub async fn messages(
                 // Empty on the streaming path — the id rides the
                 // `message_start` frame, which has not arrived yet. That case
                 // is covered by the per-attempt `provider call completed`
-                // line the usage sink emits (AISIX-Cloud#1289).
+                // line the usage sink emits (#1289).
                 Some(metrics.provider_request_id.as_str()),
                 &routing,
                 None,
@@ -214,7 +214,7 @@ pub async fn messages(
                 status,
                 elapsed,
             );
-            // SLO e2e histogram (AISIX-Cloud#1011): non-streaming only —
+            // SLO e2e histogram (#1011): non-streaming only —
             // a stream records its full duration at completion instead.
             if !stream_requested {
                 let bounded_model =
@@ -257,7 +257,7 @@ pub async fn messages(
                 // "initial", empty target). The streaming path emits the
                 // winner from its Drop guard, so it is skipped here.
                 let winner = routing.winner();
-                // AISIX-Cloud#790: the event's model_id is the winning
+                // #790: the event's model_id is the winning
                 // TARGET's id so pricing resolves against it.
                 let event_model_id = winner
                     .map(|w| w.target_model_id.as_str())
@@ -361,7 +361,7 @@ pub async fn messages(
                 },
                 elapsed,
             );
-            // AISIX-Cloud#1013: failed requests carry the (post-mask)
+            // #1013: failed requests carry the (post-mask)
             // request body so a 4xx/5xx can be triaged from the log alone.
             // Same opt-in gate and cap as the success path; 401/403 stay
             // body-less (a 401 here is upstream-auth passthrough — caller
@@ -476,7 +476,7 @@ fn emit_failed_attempts_anthropic(
     client: &ClientContext,
     applied_guardrails: &[AppliedGuardrail],
     routing: &RoutingTelemetry,
-    // AISIX-Cloud#1013: when every target failed there is no terminal
+    // #1013: when every target failed there is no terminal
     // event, so the captured request body rides the LAST failed attempt —
     // the one whose status the caller saw. Other attempts (and the
     // success-path caller) stay content-less.
@@ -501,7 +501,7 @@ fn emit_failed_attempts_anthropic(
             &pk,
             request_id,
             // Each failed attempt records the TARGET it actually hit
-            // (AISIX-Cloud#790), not the group it was resolved from.
+            // (#790), not the group it was resolved from.
             &rec.target_model_id,
             api_key_id,
             provider,
@@ -548,7 +548,7 @@ async fn dispatch(
     // `applied_out`. Streaming output counts travel via the stream
     // builders' own end-of-stream emit instead.
     redactions_out: &mut crate::redact::RedactionCounts,
-    // Out-param: monitor-mode guardrail observations (AISIX-Cloud#562),
+    // Out-param: monitor-mode guardrail observations (#562),
     // same lifecycle as `redactions_out`.
     monitor_hits_out: &mut Vec<aisix_core::GuardrailMonitorHit>,
     suppress_failure_content_out: &mut bool,
@@ -626,7 +626,7 @@ async fn dispatch(
             guardrail_name,
         } = verdict
         {
-            // AISIX-Cloud#1013: mask before returning so the failure
+            // #1013: mask before returning so the failure
             // content capture exports post-mask text (see chat.rs).
             let redaction = crate::redact::redact_anthropic_request(resolved_chain.as_ref(), body);
             *suppress_failure_content_out |= redaction.unrewritable_tool_key;
@@ -671,7 +671,7 @@ async fn dispatch(
     // `Option` so the winning streaming attempt can `take()` the reservation
     // and carry it into the end-of-stream guard (#688); non-streaming / failed
     // attempts leave it in place for the post-dispatch commit or a retry.
-    // `quota::enforce` runs the cp-api budget gate itself (`check_budget`),
+    // `quota::enforce` runs the control plane budget gate itself (`check_budget`),
     // producing this same `BudgetExceeded` and additionally refreshing the
     // budget gauges — so an inline second check here would be unreachable
     // for the exceeded case and silently skip the gauge sync.
@@ -896,7 +896,7 @@ async fn dispatch(
                 String::new()
             };
             // Reserve THIS target's own model rate-limit layers before
-            // dispatching to it (AISIX-Cloud#1087). Over-limit → record a
+            // dispatching to it (#1087). Over-limit → record a
             // 429 attempt and move on to the remaining targets in strategy
             // order (same-target retries can't help — the window won't
             // reset mid-loop).
@@ -1003,7 +1003,7 @@ async fn dispatch(
                     if !outcome.usage_handled_by_stream {
                         if let Some(mut r) = reservation.take() {
                             // Fold this target's model-layer reservation in
-                            // (AISIX-Cloud#1087) so one commit bills the
+                            // (#1087) so one commit bills the
                             // member's TPM/TPD too. Already `None` when the
                             // streaming path folded it into the guard.
                             if let Some(member) = member_reservation.take() {
@@ -1111,7 +1111,7 @@ async fn dispatch_to_target(
     // on the non-streaming / error paths for the handler to commit or retry.
     reservation: &mut Option<aisix_ratelimit::MultiReservation>,
     // This target's own model-layer reservation (routing dispatch only,
-    // AISIX-Cloud#1087). The streaming path folds it into `reservation`
+    // #1087). The streaming path folds it into `reservation`
     // before the take above so the end-of-stream guard covers the member's
     // limits; the non-streaming path leaves it for the handler to commit
     // alongside `reservation`.
@@ -1120,7 +1120,7 @@ async fn dispatch_to_target(
     // into their end-of-stream telemetry emit (the non-streaming emit
     // happens in `messages()`, which already holds them).
     input_redactions: crate::redact::RedactionCounts,
-    // Input-side monitor hits (AISIX-Cloud#562), same lifecycle as
+    // Input-side monitor hits (#562), same lifecycle as
     // `input_redactions`.
     input_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     input_capture_safe: bool,
@@ -1214,7 +1214,7 @@ async fn anthropic_passthrough_dispatch(
     client_ctx: &ClientContext,
     attempt: AttemptInfo,
     reservation: &mut Option<aisix_ratelimit::MultiReservation>,
-    // This target's own model-layer reservation (AISIX-Cloud#1087); folded
+    // This target's own model-layer reservation (#1087); folded
     // into `reservation` before the streaming take so the end-of-stream
     // guard covers the member's limits.
     member_reservation: &mut Option<aisix_ratelimit::MultiReservation>,
@@ -1509,7 +1509,7 @@ async fn anthropic_passthrough_dispatch(
         // until the stream ends (mirrors chat.rs). `take()` leaves the handler's
         // `reservation` as `None`, so it won't also `commit_tokens`.
         //
-        // Fold this target's model-layer reservation in first (AISIX-Cloud#1087)
+        // Fold this target's model-layer reservation in first (#1087)
         // so the guard covers the member's limits too; `take()` leaves it `None`
         // for the same reason.
         if let Some(member) = member_reservation.take() {
@@ -1521,7 +1521,7 @@ async fn anthropic_passthrough_dispatch(
         let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_c = std::sync::Arc::clone(&state.limiter);
-        // Token-estimation fallback context (AISIX-Cloud#1074): the inbound
+        // Token-estimation fallback context (#1074): the inbound
         // Anthropic request body is cloned because the stream owns it until
         // an end-of-stream Drop. Tokenized only if the upstream never
         // reports usage.
@@ -1737,7 +1737,7 @@ async fn anthropic_passthrough_dispatch(
         state.runtime_status.mark_healthy(model_id);
 
         let mut metrics = anthropic_metrics_from_response_json(&json_body);
-        // Token-estimation fallback (AISIX-Cloud#1074): an
+        // Token-estimation fallback (#1074): an
         // Anthropic-compatible relay may omit `usage` entirely — fill
         // the missing counters locally before the emit below. The
         // response body is forwarded verbatim, untouched.
@@ -1864,7 +1864,7 @@ async fn anthropic_passthrough_dispatch(
 }
 
 /// Token-estimation fallback for a non-streaming `/v1/messages` response
-/// (AISIX-Cloud#1074): fill token counters the upstream never reported
+/// (#1074): fill token counters the upstream never reported
 /// and mark the metrics estimated. `output_text` is built lazily — only
 /// when estimation actually runs.
 fn fill_missing_anthropic_metrics(
@@ -2175,7 +2175,7 @@ async fn cross_provider_dispatch(
     client: &ClientContext,
     attempt: AttemptInfo,
     reservation: &mut Option<aisix_ratelimit::MultiReservation>,
-    // This target's own model-layer reservation (AISIX-Cloud#1087); folded
+    // This target's own model-layer reservation (#1087); folded
     // into `reservation` before the streaming take so the end-of-stream
     // guard covers the member's limits.
     member_reservation: &mut Option<aisix_ratelimit::MultiReservation>,
@@ -2215,7 +2215,7 @@ async fn cross_provider_dispatch(
     // stop_sequences/metadata/thinking are translated; Anthropic-only
     // fields (context_management, top_k, mcp_servers, …) are dropped —
     // flattened onto an OpenAI-compatible upstream they 400 as unknown
-    // parameters (AISIX-Cloud#953).
+    // parameters (#953).
     translate_extras_to_openai_shape(&mut chat.extra);
 
     let is_stream = chat.is_streaming();
@@ -2356,7 +2356,7 @@ async fn cross_provider_dispatch(
         // concurrency slot(s) until the stream ends. `take()` leaves the
         // handler's `reservation` as `None` so it won't also `commit_tokens`.
         //
-        // Fold this target's model-layer reservation in first (AISIX-Cloud#1087)
+        // Fold this target's model-layer reservation in first (#1087)
         // so the guard covers the member's limits too; `take()` leaves it `None`
         // so the handler won't also commit it.
         if let Some(member) = member_reservation.take() {
@@ -2368,7 +2368,7 @@ async fn cross_provider_dispatch(
         let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_for_stream = std::sync::Arc::clone(&state.limiter);
-        // Token-estimation fallback context (AISIX-Cloud#1074): the inbound
+        // Token-estimation fallback context (#1074): the inbound
         // Anthropic request body is cloned because the stream owns it until
         // an end-of-stream Drop.
         let estimator = crate::token_estimate::Estimator::new(
@@ -2623,7 +2623,7 @@ async fn cross_provider_dispatch(
         // Non-streaming: stamped by the handler, which holds the request clock.
         downstream_latency_ms: 0,
     };
-    // Token-estimation fallback (AISIX-Cloud#1074): fill counters the
+    // Token-estimation fallback (#1074): fill counters the
     // bridged upstream never reported. Telemetry only — the rendered
     // Anthropic JSON below carries the upstream's own usage.
     fill_missing_anthropic_metrics(&mut metrics, &upstream_model, body, || {
@@ -2683,7 +2683,7 @@ fn build_anthropic_sse_stream(
     // Largest content cap any content-capturing exporter wants, or `None` to
     // skip response accumulation (the common, content-free path).
     content_cap: Option<u32>,
-    // Token-estimation fallback context (AISIX-Cloud#1074); see
+    // Token-estimation fallback context (#1074); see
     // `CompleteAnthropicStreamOnDrop::estimator`.
     estimator: Option<crate::token_estimate::Estimator>,
     on_complete: impl FnOnce(AnthropicStreamCompletion) + Send + 'static,
@@ -2761,7 +2761,7 @@ fn build_anthropic_sse_stream(
                     // First upstream chunk of ANY type stops the TTFT clock —
                     // the industry convention (LiteLLM, caller-side gateways),
                     // so the figure matches external observers
-                    // (AISIX-Cloud#1225).
+                    // (#1225).
                     if !first_chunk_seen {
                         first_chunk_seen = true;
                         guard.comp().upstream_ttft_ms =
@@ -2782,7 +2782,7 @@ fn build_anthropic_sse_stream(
                             comp.web_fetch_requests =
                                 comp.web_fetch_requests.max(u.web_fetch_requests);
                         }
-                        // Token-estimation accumulator (AISIX-Cloud#1074): all
+                        // Token-estimation accumulator (#1074): all
                         // generated output, always on (whether the fallback is
                         // needed is only known at end-of-stream), bounded. This
                         // precedes the hold-back check so the chunk that trips the
@@ -3042,7 +3042,7 @@ fn build_anthropic_sse_stream(
                     // capture accumulator from the masked content channel
                     // (the sync redactor below can't reproduce a provider-
                     // side mask), keeping the original soft cap
-                    // (#932 × AISIX-Cloud#947).
+                    // (#932 × #947).
                     if let Some(cap) = content_cap {
                         let mut rebuilt = String::new();
                         for c in held_chunks.iter() {
@@ -3119,7 +3119,7 @@ fn build_anthropic_sse_stream(
                 if !redaction.counts.is_empty() {
                     // The wire chunks were masked — mask the content-capture
                     // accumulator too, or the exported content would carry
-                    // PII the client never saw (#932 × AISIX-Cloud#947).
+                    // PII the client never saw (#932 × #947).
                     crate::redact::redact_captured_output(
                         chain.as_ref(),
                         &mut guard.comp().response_text,
@@ -3147,7 +3147,7 @@ fn build_anthropic_sse_stream(
     };
     // Re-attach the request span: the body is polled after the request-id
     // middleware returns, so the end-of-stream output-guardrail check
-    // would otherwise log without a `request_id` (AISIX-Cloud#1060).
+    // would otherwise log without a `request_id` (#1060).
     axum::body::Body::from_stream(crate::sse_keepalive::with_heartbeat(
         crate::request_id::in_request_span(stream),
         crate::sse_keepalive::interval(),
@@ -3261,7 +3261,7 @@ struct AnthropicStreamCompletion {
     web_search_requests: u32,
     web_fetch_requests: u32,
     /// True when the Drop guard filled any token counter from the local
-    /// estimator (AISIX-Cloud#1074).
+    /// estimator (#1074).
     usage_estimated: bool,
     provider_request_id: String,
     provider_model_version: String,
@@ -3273,7 +3273,7 @@ struct AnthropicStreamCompletion {
     /// in between — most visibly a hold-back output guardrail.
     downstream_latency_ms: u32,
     /// Generated output (content + reasoning + tool-call text) accumulated
-    /// for the token-estimation fallback (AISIX-Cloud#1074). Always on,
+    /// for the token-estimation fallback (#1074). Always on,
     /// bounded to `token_estimate::OUTPUT_ACCUMULATION_CAP`; never leaves
     /// the process.
     est_output_text: String,
@@ -3286,14 +3286,14 @@ struct AnthropicStreamCompletion {
     /// (#932). Merged with the input-side counts by the on_complete emit.
     redacted_entity_counts: crate::redact::RedactionCounts,
     /// Monitor-mode guardrail observations made by the end-of-stream output
-    /// check (AISIX-Cloud#562). Merged with the input-side hits by the
+    /// check (#562). Merged with the input-side hits by the
     /// on_complete emit.
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 }
 
 struct CompleteAnthropicStreamOnDrop<F: FnOnce(AnthropicStreamCompletion)> {
     slot: Option<(F, AnthropicStreamCompletion)>,
-    /// Token-estimation fallback (AISIX-Cloud#1074); fills counters the
+    /// Token-estimation fallback (#1074); fills counters the
     /// upstream never reported before `on_complete` runs.
     estimator: Option<crate::token_estimate::Estimator>,
 }
@@ -3311,7 +3311,7 @@ impl<F: FnOnce(AnthropicStreamCompletion)> CompleteAnthropicStreamOnDrop<F> {
 impl<F: FnOnce(AnthropicStreamCompletion)> Drop for CompleteAnthropicStreamOnDrop<F> {
     fn drop(&mut self) {
         if let Some((f, mut c)) = self.slot.take() {
-            // Token-estimation fallback (AISIX-Cloud#1074): fill the
+            // Token-estimation fallback (#1074): fill the
             // counters the upstream never reported. This surface has no
             // delivered-count gate (unlike chat.rs / the passthrough
             // guard), so the estimate covers whatever the bridge produced
@@ -3420,7 +3420,7 @@ struct DispatchOutcome {
     /// end-of-stream closures own the output-side counts.
     output_redactions: crate::redact::RedactionCounts,
     /// Monitor-mode guardrail observations on the response side
-    /// (AISIX-Cloud#562), same lifecycle as `output_redactions`.
+    /// (#562), same lifecycle as `output_redactions`.
     output_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// Whether a cache policy answered this request, and what a hit saved.
     cache: crate::response_cache::CacheTelemetry,
@@ -3466,7 +3466,7 @@ struct AnthropicUsageMetrics {
     web_search_requests: u32,
     web_fetch_requests: u32,
     /// True when any token counter was filled by the local estimator
-    /// because the upstream reported no usage (AISIX-Cloud#1074).
+    /// because the upstream reported no usage (#1074).
     usage_estimated: bool,
     provider_request_id: String,
     provider_model_version: String,
@@ -3519,13 +3519,13 @@ fn emit_anthropic_usage_event(
     // Per-detector PII mask counts (#932), input + output merged. Detector
     // names only, never matched values. Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
-    // Monitor-mode guardrail observations (AISIX-Cloud#562), input +
+    // Monitor-mode guardrail observations (#562), input +
     // output merged.
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     guardrail_blocked: bool,
     content: Option<CapturedContent>,
 ) {
-    // Per-PK telemetry attribution (#302 M17 / AISIX-Cloud#436).
+    // Per-PK telemetry attribution (#302 M17 / #436).
     // Same shape as chat.rs's emit_usage_event — look up the
     // resolved ProviderKey from the live snapshot and copy its
     // `telemetry_tags` into wire fields. Empty `provider_key_id`
@@ -3537,7 +3537,7 @@ fn emit_anthropic_usage_event(
         model_id: model_id.to_string(),
         api_key_id: api_key_id.to_string(),
         // `model` is the client-sent alias on every call path
-        // (AISIX-Cloud#790) — the group name for routed requests.
+        // (#790) — the group name for routed requests.
         requested_model: model.to_string(),
         prompt_tokens: metrics.prompt_tokens,
         completion_tokens: metrics.completion_tokens,
@@ -3732,7 +3732,7 @@ struct AnthropicStreamUsage {
     /// from the delivered text instead of recording the placeholder.
     output_tokens_from_delta: bool,
     /// True when `AnthropicStreamGuard::drop` filled any token counter
-    /// from the local estimator (AISIX-Cloud#1074).
+    /// from the local estimator (#1074).
     usage_estimated: bool,
     provider_request_id: String,
     provider_model_version: String,
@@ -3755,7 +3755,7 @@ struct AnthropicStreamUsage {
     /// omit the incomplete capture.
     response_text_truncated: bool,
     /// Generated output (text + thinking + tool name/arguments)
-    /// accumulated for the token-estimation fallback (AISIX-Cloud#1074).
+    /// accumulated for the token-estimation fallback (#1074).
     /// Separate from `response_text`, which belongs to the guardrail
     /// scan: the scan `take`s that buffer (so estimation would read "")
     /// and pads it with newline separators (which inflate per-frame
@@ -3766,7 +3766,7 @@ struct AnthropicStreamUsage {
     /// (#932). Merged with the input-side counts by the on_complete emit.
     redacted_entity_counts: crate::redact::RedactionCounts,
     /// Monitor-mode guardrail observations made by the end-of-stream output
-    /// check (AISIX-Cloud#562). Merged with the input-side hits by the
+    /// check (#562). Merged with the input-side hits by the
     /// on_complete emit.
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// A non-empty SSE data event that was neither `[DONE]` nor valid JSON.
@@ -3787,7 +3787,7 @@ fn update_anthropic_usage(
 ) {
     // First parsed frame of ANY type (`message_start` included) stops the
     // TTFT clock — the industry convention (LiteLLM, caller-side gateways),
-    // so the figure matches external observers (AISIX-Cloud#1225).
+    // so the figure matches external observers (#1225).
     if !*first_token_seen {
         *first_token_seen = true;
         acc.upstream_ttft_ms = attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
@@ -3871,7 +3871,7 @@ fn update_anthropic_usage(
                     );
                 }
             }
-            // Token-estimation accumulator (AISIX-Cloud#1074): raw
+            // Token-estimation accumulator (#1074): raw
             // concatenation (no separators — a separator per frame would
             // inflate the count), plus `thinking` deltas, which are
             // billed output but out of guardrail scope.
@@ -3905,7 +3905,7 @@ fn update_anthropic_usage(
                         );
                     }
                 }
-                // AISIX-Cloud#952: newer Anthropic wire (and some relays)
+                // #952: newer Anthropic wire (and some relays)
                 // report cumulative input/cache counts on message_delta —
                 // for some backends that is the ONLY place they appear
                 // (message_start ships no usable usage), which recorded
@@ -4017,7 +4017,7 @@ fn drain_anthropic_sse_frames(
 struct AnthropicStreamGuard<F: FnOnce(AnthropicStreamUsage)> {
     slot: Option<(F, AnthropicStreamUsage)>,
     delivered: Arc<AtomicU32>,
-    /// Token-estimation fallback (AISIX-Cloud#1074): fills counters the
+    /// Token-estimation fallback (#1074): fills counters the
     /// upstream never reported. Prompt from the captured request body,
     /// completion from the accumulated `response_text`.
     estimator: Option<crate::token_estimate::Estimator>,
@@ -4047,7 +4047,7 @@ impl<F: FnOnce(AnthropicStreamUsage)> Drop for AnthropicStreamGuard<F> {
                 usage.cache_creation_tokens = 0;
                 usage.cache_read_tokens = 0;
             }
-            // Token-estimation fallback (AISIX-Cloud#1074), after the #419
+            // Token-estimation fallback (#1074), after the #419
             // gate. A floor-only completion count (message_start placeholder,
             // no message_delta) is treated as missing so an aborted stream
             // estimates from the delivered text; max() keeps the floor when
@@ -4119,7 +4119,7 @@ fn build_anthropic_passthrough_stream<S, F>(
     // When `Some`, the assembled `response_text` is preserved (not taken by the
     // guardrail scan) so the on_complete content capture can read it.
     content_cap: Option<u32>,
-    // Token-estimation fallback context (AISIX-Cloud#1074); see
+    // Token-estimation fallback context (#1074); see
     // `AnthropicStreamGuard::estimator`.
     estimator: Option<crate::token_estimate::Estimator>,
     on_complete: F,
@@ -4410,7 +4410,7 @@ where
                     // Bedrock masked the held bytes — rebuild the content-
                     // capture accumulator from the masked text channels
                     // (the sync redactor can't reproduce a provider-side
-                    // mask) (#932 × AISIX-Cloud#947).
+                    // mask) (#932 × #947).
                     if let Some(cap) = content_cap {
                         let rebuilt = crate::redact::anthropic_sse_text(&held);
                         let mut bounded = String::new();
@@ -4479,7 +4479,7 @@ where
                 if let Some(rewritten) = redaction.rewritten {
                     // The wire bytes were masked — mask the content-capture
                     // accumulator too, or the exported content would carry
-                    // PII the client never saw (#932 × AISIX-Cloud#947).
+                    // PII the client never saw (#932 × #947).
                     crate::redact::redact_captured_output(
                         chain.as_ref(),
                         &mut guard.usage().response_text,
@@ -4510,7 +4510,7 @@ where
         // Re-attach the request span: the body is polled after the
         // request-id middleware returns, so the end-of-stream
         // output-guardrail check would otherwise log without a
-        // `request_id` (AISIX-Cloud#1060).
+        // `request_id` (#1060).
         inner: Box::pin(crate::request_id::in_request_span(inner)),
         delivered,
     }
@@ -5177,7 +5177,7 @@ mod tests {
     async fn anthropic_passthrough_default_headers_cannot_overwrite_x_api_key() {
         // Defense-in-depth: `x-api-key` is in
         // `aisix_gateway::upstream_headers::RESERVED_UPSTREAM_HEADERS`
-        // — even if cp-api validation slips and lets the operator
+        // — even if the control plane validation slips and lets the operator
         // register a default_headers entry with `x-api-key`, the apply
         // function MUST drop it so the PK's secret remains the auth
         // value upstream sees.
@@ -5969,11 +5969,11 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         assert!(rx.try_recv().is_err(), "usage event should be emitted once");
     }
 
-    /// AISIX-Cloud#952: relay backends that ship NO usage on
+    /// #952: relay backends that ship NO usage on
     /// `message_start` (id/model present) and report cumulative
     /// input/cache counts only on the terminal `message_delta`. Pre-fix
     /// the emitted UsageEvent carried prompt_tokens=0 (stored as NULL by
-    /// cp-api, shown as 0 in the dashboard).
+    /// the control plane, shown as 0 in the dashboard).
     #[tokio::test]
     async fn anthropic_passthrough_streaming_harvests_input_tokens_from_message_delta() {
         use aisix_obs::UsageSink;
@@ -6837,7 +6837,7 @@ event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\
         assert_eq!(out.chunks_delivered, 5);
     }
 
-    /// AISIX-Cloud#1074: the passthrough guard's estimation fallback and
+    /// #1074: the passthrough guard's estimation fallback and
     /// its `message_start` floor normalization. The floor (a placeholder
     /// `output_tokens`, often 1, with no `message_delta` ever arriving)
     /// must count as "missing" so an aborted stream estimates from the
@@ -6927,7 +6927,7 @@ event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\
         assert!(!out.usage_estimated);
     }
 
-    /// AISIX-Cloud#1074: the non-streaming fill helper and its output
+    /// #1074: the non-streaming fill helper and its output
     /// extraction — zero counters fill from the estimator and flag the
     /// metrics; upstream-reported counters stay untouched. The output
     /// extractor covers text + thinking + tool_use name/input.

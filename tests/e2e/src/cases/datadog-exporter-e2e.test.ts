@@ -13,7 +13,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// L2 mock e2e (api7/ai-gateway#57, AISIX-Cloud#688): a dashboard-configured
+// L2 mock e2e (api7/ai-gateway#57, #688): a dashboard-configured
 // `datadog` exporter makes the real DP deliver request events to Datadog's
 // native Logs HTTP intake over a gzip JSON-array POST. We stand up a mock
 // Datadog intake (the SLS suite's in-test-receiver pattern), register the
@@ -28,7 +28,7 @@ import {
 // carries the Datadog reserved attributes + the OTel GenAI semconv token
 // fields. The full field-mapping matrix is covered by the Rust round-trip unit
 // tests (`sink::datadog::tests`); that a real Datadog site accepts the request
-// is validated by the control-plane full-chain e2e (api7/AISIX-Cloud), not here.
+// is validated by the control plane's own full-chain e2e, not here.
 //
 // The harness binds the in-test mock to a free loopback port and points `site`
 // at `127.0.0.1:<port>`, exactly as the SLS / OTLP mock-edge tests point their

@@ -14,7 +14,7 @@ import {
 } from "../harness/index.js";
 import { pickFreePort } from "../harness/ports.js";
 
-// E2E: semantic cache on the SHARED redis backend (AISIX-Cloud#558,
+// E2E: semantic cache on the SHARED redis backend (#558,
 // follow-up to the in-process store). Two DP replicas of one
 // environment (same etcd prefix) share one vector-capable Redis: an
 // entry stored by replica A must serve replica B both exactly AND

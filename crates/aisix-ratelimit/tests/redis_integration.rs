@@ -3,7 +3,7 @@
 //! Runs only when `RATELIMIT_TEST_REDIS_URL` is set (CI spins
 //! `redis:7-alpine` as a service; absence is a no-op so local unit runs
 //! stay hermetic). Two `RedisStore` instances stand in for two DP
-//! replicas pointed at one Redis — the exact api7/AISIX-Cloud#798 shape:
+//! replicas pointed at one Redis — the exact api7/#798 shape:
 //! a limit hit on one replica must already be hit on the other.
 
 use std::sync::Arc;

@@ -23,7 +23,7 @@ pub struct AuthenticatedKey {
     /// with a JWT instead of the key's plaintext; `None` on the API-key
     /// path. Carried for usage attribution — the resolved key alone
     /// cannot name the subject once claim mappings let many identities
-    /// share one key (AISIX-Cloud#564).
+    /// share one key (#564).
     pub jwt: Option<Arc<JwtIdentity>>,
 }
 
@@ -42,7 +42,7 @@ pub struct JwtIdentity {
 /// Per-request context carried onto an authentication denial.
 ///
 /// A 401 short-circuits ahead of every handler, so the request never
-/// reaches an access-log emit; AISIX-Cloud#1081 deliberately kept these out
+/// reaches an access-log emit; #1081 deliberately kept these out
 /// of the access log because an internet-facing DP would drown in scanner
 /// probes, leaving `aisix_auth_decisions_total` as the only record. That
 /// metric answers "how many" but not "who, when, against what" — so the
@@ -116,7 +116,7 @@ where
             Err(e) => {
                 // No credential at all: metric + a debug line, never the
                 // access log — logging every scanner probe at the default
-                // level would be noise (AISIX-Cloud#1081).
+                // level would be noise (#1081).
                 proxy_state
                     .metrics
                     .record_auth_decision("none", false, "missing_credentials");
@@ -137,7 +137,7 @@ where
         // Publish the resolved key so extractors that run after this one can
         // see who is calling without re-authenticating. `ClientContext` reads
         // it for the `${request.api_key.*}` header templates
-        // (AISIX-Cloud#1112) — which is why every handler declares
+        // (#1112) — which is why every handler declares
         // `auth: AuthenticatedKey` before `client: ClientContext`.
         parts.extensions.insert(authed.entry.clone());
         // Same for the JWT identity: `ClientContext` carries it to each
@@ -176,7 +176,7 @@ pub(crate) async fn authenticate_token(
     // Self-hosted CP (prd-09a §9A.7B.4): the snapshot stores
     // SHA-256 hashes of the plaintext bearer, never the plaintext
     // itself. Hash the incoming token via the canonical helper
-    // and look up by the hex digest. cp-api hashes with the same
+    // and look up by the hex digest. The control plane hashes with the same
     // function before persistence, so the two sides agree byte
     // for byte.
     let Some(entry) = snapshot.apikeys.get_by_name(&ApiKey::hash_bearer(token)) else {
@@ -218,7 +218,7 @@ pub(crate) async fn authenticate_token(
 }
 
 /// Record an API-key denial on the decision metric + log
-/// (AISIX-Cloud#1081 — before this, a 401 was invisible: the extractor
+/// (#1081 — before this, a 401 was invisible: the extractor
 /// short-circuits ahead of every handler, so neither the request
 /// counter nor the access log ever fired). The token itself is never
 /// logged.

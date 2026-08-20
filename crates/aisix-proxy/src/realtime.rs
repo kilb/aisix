@@ -1,5 +1,5 @@
 //! `/v1/realtime` — OpenAI Realtime WebSocket relay (#721,
-//! AISIX-Cloud#873 §⑤).
+//! #873 §⑤).
 //!
 //! Authenticates on connect, resolves the target Model from `?model=`,
 //! opens the provider WebSocket and relays frames bidirectionally.
@@ -155,7 +155,7 @@ pub(crate) async fn realtime(
             // `on_upgrade` runs the session on a detached task, so the
             // request span has to be attached to the future rather than
             // inherited — without it the session's guardrail checks log
-            // without a `request_id` (AISIX-Cloud#1060).
+            // without a `request_id` (#1060).
             let span = tracing::Span::current();
             ws.protocols(["realtime"])
                 // State the frame bounds rather than inheriting them. These
@@ -571,7 +571,7 @@ async fn run_session(
     let mut close_status: u16 = 200;
     // Paired with `close_status`: every branch that sets a FAILING status
     // also names the failure, so the access log can say why a session
-    // ended (AISIX-Cloud#1093).
+    // ended (#1093).
     //
     // A client-side transport error (`Some(Err(_))` on the receive half)
     // is deliberately not one of them: it keeps `close_status` 200 and

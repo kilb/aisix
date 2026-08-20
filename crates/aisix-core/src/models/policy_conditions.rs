@@ -1,6 +1,6 @@
 //! Conditional-form vocabulary for [`RateLimitPolicy`]: the condition
 //! node tree a policy matches requests with, and the dimensions its
-//! counters bucket on (AISIX-Cloud#892).
+//! counters bucket on (#892).
 //!
 //! The tree is the Rust equivalent of
 //! [lua-resty-expr](https://github.com/api7/lua-resty-expr): a node is
@@ -31,7 +31,7 @@
 //!   first true child);
 //! - the model dimensions (`model` / `model_name`) evaluate against a
 //!   PAIR on a routing/ensemble/semantic dispatch: the dispatched
-//!   target and the caller-addressed parent entry (AISIX-Cloud#1267).
+//!   target and the caller-addressed parent entry (#1267).
 //!   Positive operators are raw-true when EITHER identity satisfies
 //!   them (∃); `~=` is raw-true only when BOTH differ (∀ — the two
 //!   identities are distinct strings, so an ∃ reading would be
@@ -53,7 +53,7 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 
 /// Maximum group-nesting depth of a condition tree (top-level nodes are
-/// depth 1). Mirrored by cp-api validation and the dashboard builder.
+/// depth 1). Mirrored by the control plane validation and the dashboard builder.
 pub const MAX_CONDITION_DEPTH: usize = 3;
 /// Maximum total leaf count of a condition tree.
 pub const MAX_CONDITION_LEAVES: usize = 16;
@@ -403,7 +403,7 @@ pub struct ConditionInput<'a> {
     /// Entry id of the caller-addressed virtual parent (routing group /
     /// ensemble / semantic router) when `model` below is a dispatch
     /// target that parent selected. A `model` leaf matches when EITHER
-    /// id satisfies it (AISIX-Cloud#1267) — the group a caller
+    /// id satisfies it (#1267) — the group a caller
     /// addressed is as much "the model" as the member it dispatched to.
     /// `None` on direct dispatch and at the request gate (where `model`
     /// already IS the requested entry).
@@ -637,7 +637,7 @@ mod tests {
 
     #[test]
     fn wire_shape_matches_the_rfc() {
-        // The exact JSON the RFC and cp-api produce: a leaf row plus an
+        // The exact JSON the RFC and the control plane produce: a leaf row plus an
         // OR group, snake_case dimensions, lua-resty-expr operator
         // tokens, `negate` omitted when false.
         let nodes: Vec<ConditionNode> = serde_json::from_value(serde_json::json!([
@@ -728,7 +728,7 @@ mod tests {
 
     #[test]
     fn model_leaf_matches_routing_parent_id() {
-        // AISIX-Cloud#1267: `model in [group uuid]` must select requests
+        // #1267: `model in [group uuid]` must select requests
         // dispatched THROUGH the group even though the per-target gate's
         // primary value is the member id.
         let nodes = vec![leaf(

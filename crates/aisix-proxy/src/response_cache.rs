@@ -204,7 +204,7 @@ impl BodyCache {
     /// endpoint.
     ///
     /// The label comes from [`CacheStatus::metric_outcome`], never from
-    /// `as_str()`: that is the cp-api wire value, and feeding it here
+    /// `as_str()`: that is the control plane wire value, and feeding it here
     /// emitted `outcome="hit"` where chat emits `hit_exact` — one series,
     /// two vocabularies, so a dashboard covered chat and silently showed
     /// nothing for these endpoints.

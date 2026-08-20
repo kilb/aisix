@@ -13,7 +13,7 @@ import {
 } from "../harness/index.js";
 
 // E2E: a caller may hand the gateway its own request id and the gateway
-// uses THAT id everywhere (AISIX-Cloud#1288).
+// uses THAT id everywhere (#1288).
 //
 // The point of the feature is that one id spans systems: the caller's
 // business logs already carry it, so the response header, the telemetry
@@ -127,7 +127,7 @@ const OK_BODY = {
   usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 },
 };
 
-describe("client-supplied request id (AISIX-Cloud#1288)", () => {
+describe("client-supplied request id (#1288)", () => {
   let etcdReachable = false;
   let app: SpawnedApp | undefined;
   let seed: SeedClient | undefined;
@@ -225,7 +225,7 @@ describe("client-supplied request id (AISIX-Cloud#1288)", () => {
       await awaitPropagation("basic");
 
       // Deliberately NOT a UUID: the whole point is that a caller keeps
-      // its own id shape. This one used to be rejected by cp-api's
+      // its own id shape. This one used to be rejected by the control plane's
       // telemetry ingest and the request vanished from billing and /logs.
       const callerId = "req_abc123-orders-svc";
       const res = await chat("reqid-basic", {
@@ -398,7 +398,7 @@ describe("client-supplied request id (AISIX-Cloud#1288)", () => {
       // A space is legal in an HTTP header value but outside the id
       // charset; 300 bytes is past the 256-byte ceiling. Neither may cost
       // the caller their request — nor be persisted, which is why the
-      // charset and the ceiling match cp-api's ingest rule exactly.
+      // charset and the ceiling match the control plane's ingest rule exactly.
       for (const bad of ["req abc 123", "x".repeat(300)]) {
         const res = await chat("reqid-degrade", {
           "x-aisix-request-id": bad,

@@ -10,13 +10,13 @@
 //!   `/dp/telemetry` URL, and logs the outcome.
 //! - On HTTP error the batch is dropped (NOT retried). Phase 1
 //!   accepts a small loss window in exchange for not building a
-//!   persistent disk queue. The `received_at` column on the cp-api
+//!   persistent disk queue. The `received_at` column on the control plane
 //!   side records when CP saw the row, so dashboards distinguish
 //!   "DP never sent" from "DP sent but CP rejected" via log
 //!   correlation.
 //!
 //! mTLS: the sender presents the same on-disk bundle the heartbeat
-//! worker uses. cp-api derives `env_id` and `dp_id` from the peer
+//! worker uses. The control plane derives `env_id` and `dp_id` from the peer
 //! cert SAN URI, so the request body doesn't carry them — same wire
 //! shape as `/dp/heartbeat`.
 
@@ -50,7 +50,7 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 const QUEUE_CAPACITY: usize = 1024;
 
 /// Configuration for the sender. Mirrors `HeartbeatConfig` — the URL
-/// is the absolute `/dp/telemetry` endpoint on cp-api, the bundle is
+/// is the absolute `/dp/telemetry` endpoint on the control plane, the bundle is
 /// the externally provisioned on-disk mTLS material, and `interval`
 /// is the flush cadence (kept overridable so tests can speed up).
 #[derive(Debug, Clone)]
@@ -120,7 +120,7 @@ async fn run(
         tokio::select! {
             // New event from the proxy. Buffer it; flush if we hit
             // the batch ceiling so a steady high-throughput stream
-            // doesn't starve cp-api on a 5s cadence.
+            // doesn't starve the control plane on a 5s cadence.
             maybe_event = rx.recv() => {
                 match maybe_event {
                     Some(event) => {
@@ -194,7 +194,7 @@ async fn send(
 ) -> anyhow::Result<()> {
     let resp = client
         .post(&cfg.url)
-        // Same as /dp/heartbeat — no Authorization header; cp-api
+        // Same as /dp/heartbeat — no Authorization header; the control plane
         // derives identity from the peer cert SAN URI.
         .json(&TelemetryBody { events })
         .send()
@@ -244,7 +244,7 @@ fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
         .user_agent(format!("aisix-dp/{}", &*crate::heartbeat::BUILD_VERSION))
         .identity(identity)
         .add_root_certificate(ca)
-        // Pin HTTP/1.1 — see heartbeat::build_client. dp-manager cmux
+        // Pin HTTP/1.1 — see heartbeat::build_client. The control plane cmux
         // routes one TLS port to gRPC (h2) vs REST (http1) by ALPN; once
         // the cloud-sink crates pulled reqwest's `http2` feature into the
         // workspace, this telemetry client advertised `h2` and cmux

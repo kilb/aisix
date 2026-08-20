@@ -81,7 +81,7 @@ pub struct ErrorBody {
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub budget: Option<BudgetErrorFields>,
     /// Identity of the rate-limit policy that rejected the request —
-    /// present on policy-layer 429s only (AISIX-Cloud#892: with several
+    /// present on policy-layer 429s only (#892: with several
     /// policies live, an unattributed 429 is undebuggable). Same
     /// additive convention as `budget`: absent everywhere else.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -96,8 +96,8 @@ pub struct PolicyErrorRef {
 }
 
 /// The structured budget fields that `budget_exceeded` 429s lift from
-/// cp-api's reason. Flattened into `ErrorBody`. Each field is omitted
-/// when absent so a fallback-mode denial (cp-api unreachable, no
+/// the control plane's reason. Flattened into `ErrorBody`. Each field is omitted
+/// when absent so a fallback-mode denial (the control plane unreachable, no
 /// structured detail) still serializes cleanly with just a message.
 #[derive(Debug, Serialize, Clone)]
 pub struct BudgetErrorFields {
@@ -277,7 +277,7 @@ pub enum ProxyError {
     /// detail to `tracing` for operators.
     #[error("{0}")]
     ContentFiltered(String),
-    // Carries cp-api's structured reason. Display forwards the cp-api
+    // Carries the control plane's structured reason. Display forwards the control plane
     // message verbatim (it's already a complete customer sentence —
     // "<scope> budget '<name>' exceeded ($X/period). Resets …"); the
     // structured fields ride along in the 429 error block via
@@ -299,7 +299,7 @@ pub enum ProxyError {
     #[error(transparent)]
     RateLimit(#[from] RateLimitError),
     /// A policy-layer rate-limit rejection carrying the offending
-    /// policy's identity (AISIX-Cloud#892). Same status/type/headers as
+    /// policy's identity (#892). Same status/type/headers as
     /// [`Self::RateLimit`]; the envelope adds `error.policy` so a
     /// caller hitting one of several live policies can tell which. The
     /// Display form names the policy too, so every path that flattens
@@ -482,7 +482,7 @@ impl ProxyError {
         let env = ErrorEnvelope::new(self.to_string(), self.kind());
         match self {
             ProxyError::BudgetExceeded(r) => env.with_code("budget_exceeded").with_budget(r),
-            // Attribution for policy-layer 429s (AISIX-Cloud#892): the
+            // Attribution for policy-layer 429s (#892): the
             // OpenAI envelope names the offending policy. The Anthropic
             // envelope keeps its strict {type,message} shape.
             ProxyError::PolicyRateLimit {
@@ -504,7 +504,7 @@ impl ProxyError {
             ProxyError::ApiKeyExpired => env.with_code("api_key_expired"),
             ProxyError::ApiKeyDisabled => env.with_code("api_key_disabled"),
             // Same stable-code convention for the JWT auth path
-            // (AISIX-Cloud#1080/#1081): SDKs and agent frameworks branch
+            // (#1080/#1081): SDKs and agent frameworks branch
             // on `error.code` to decide between refreshing the token
             // (`jwt_expired`), fixing the token request
             // (`jwt_invalid` / `jwt_claims_rejected`), and asking the
@@ -803,7 +803,7 @@ pub(crate) fn is_length_limit_error(err: &axum::Error) -> bool {
 mod tests {
     use super::*;
 
-    /// AISIX-Cloud#1093 carries the transport cause on a timeout so an
+    /// #1093 carries the transport cause on a timeout so an
     /// operator can tell a `connect_timeout` from an expired request
     /// budget. That cause names the upstream host, so it must reach the
     /// logs and telemetry (`Display`) but NOT the caller's envelope —
@@ -1058,7 +1058,7 @@ mod tests {
 
     #[test]
     fn openai_envelope_budget_exceeded_carries_structured_fields() {
-        // prd-09b §5.8: the budget_exceeded 429 lifts cp-api's structured
+        // prd-09b §5.8: the budget_exceeded 429 lifts the control plane's structured
         // reason into the error block. Pin scope / scope_ref / limit_usd /
         // spent_usd / period so a regression that drops them (the old
         // String-only variant) fails here.

@@ -434,7 +434,7 @@
       "type": "string"
     },
     "schedules": {
-      "description": "Recurring windows during which this policy is suspended — the quota gate skips it while `now` falls in any listed window and enforcement resumes automatically afterwards (AISIX-Cloud#1104). The counters' bucket key never changes, so suspension does not reset the surrounding window's counts. Empty/absent = always enforced. cp-api omits the field when empty, keeping schedule-less rows parseable by pre-`schedules` strict data planes.",
+      "description": "Recurring windows during which this policy is suspended — the quota gate skips it while `now` falls in any listed window and enforcement resumes automatically afterwards (#1104). The counters' bucket key never changes, so suspension does not reset the surrounding window's counts. Empty/absent = always enforced. The control plane omits the field when empty, keeping schedule-less rows parseable by pre-`schedules` strict data planes.",
       "items": {
         "$ref": "#/definitions/PolicySchedule"
       },

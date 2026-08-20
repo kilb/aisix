@@ -21,9 +21,10 @@
 //! - `crates/aisix-admin/src/openapi.rs` — refactor target: replace
 //!   inline schema objects in the hand-written OpenAPI doc with
 //!   `$ref` into these files (follow-up PR).
-//! - `api7/AISIX-Cloud` — pulls these files (via submodule or pinned
-//!   tag) to drive cp-api request validation and dashboard form
-//!   generation. Refs api7/ai-gateway#304 (#1).
+//! - the control plane — consumes these files to drive its request
+//!   validation and dashboard form generation. They are the resource
+//!   model's source of truth: a field exists here first, and the
+//!   control plane converges to it.
 
 use std::fs;
 use std::path::{Path, PathBuf};

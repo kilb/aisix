@@ -21,7 +21,7 @@ import {
 // failed `initial` attempt on the primary and a successful `fallback`
 // attempt on the secondary.
 //
-// Usage telemetry has no cp-api receiver in DP e2e, so we observe the
+// Usage telemetry has no the control plane receiver in DP e2e, so we observe the
 // emitted field VALUES through the per-env OTLP/HTTP fan-out: register a
 // mock OTLP receiver as an `observability_exporter`, drive one failover
 // request, and assert two spans carrying the per-attempt attributes
@@ -396,7 +396,7 @@ describe("per-attempt telemetry e2e (#655): one UsageEvent per upstream attempt"
     expect(spans[1].latencyMs).toBeLessThan(spans[0].latencyMs);
 
     // The same failover, seen through the per-attempt COUNTERS
-    // (AISIX-Cloud#1299). Driven here rather than in a fixture of its own
+    // (#1299). Driven here rather than in a fixture of its own
     // because the emit chokepoint is shared with chat and messages, while
     // the requested-model reference each handler hands it is not — so the
     // fallback label is only pinned on this endpoint by driving it.
@@ -516,7 +516,7 @@ describe("per-attempt telemetry e2e (#655): one UsageEvent per upstream attempt"
 
     // non-streaming one and was rewired separately too, so the counters
 
-    // need their own real-traffic assertion here (AISIX-Cloud#1299).
+    // need their own real-traffic assertion here (#1299).
 
     const metricsAfter = await scrapeMetrics(app.metricsUrl);
 

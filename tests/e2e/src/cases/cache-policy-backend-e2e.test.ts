@@ -12,7 +12,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: per-policy cache backend dispatch (api7/AISIX-Cloud#519 B.8).
+// E2E: per-policy cache backend dispatch (api7/#519 B.8).
 //
 // `CachePolicy.backend` selects which cache instance serves a request:
 // - `memory` → the in-process cache, always available;

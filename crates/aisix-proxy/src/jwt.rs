@@ -1,4 +1,4 @@
-//! Inbound OIDC/JWT authentication (AISIX-Cloud#1080, #1081).
+//! Inbound OIDC/JWT authentication (#1080, #1081).
 //!
 //! When the environment has at least one enabled [`OidcProvider`], a bearer
 //! token that is a JWT is authenticated here instead of the API-key hash

@@ -12,17 +12,17 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E for AISIX-Cloud#1138 / api7/aisix#457: a transcription billed by
+// E2E for #1138 / api7/aisix#457: a transcription billed by
 // audio length must carry that length off the gateway.
 //
 // whisper-class models report `usage: {type: "duration", seconds: N}` and
-// no token counts at all, so a token-only usage event leaves cp-api with
+// no token counts at all, so a token-only usage event leaves the control plane with
 // nothing to price the request with. And because `response_format=text`
 // answers with a body that carries no usage whatsoever, the cost basis
 // cannot come from the response alone — otherwise the caller decides
 // whether the request is metered by choosing a response format.
 //
-// Usage telemetry has no cp-api receiver in DP e2e, so the emitted value
+// Usage telemetry has no the control plane receiver in DP e2e, so the emitted value
 // is observed through the per-env OTLP/HTTP fan-out.
 
 const CALLER_PLAINTEXT = "sk-issue-1138-duration";

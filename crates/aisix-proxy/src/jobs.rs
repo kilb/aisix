@@ -1,5 +1,5 @@
 //! First-class OpenAI-compatible **Files / Batches / Fine-tuning** surface
-//! (#720, AISIX-Cloud#873 §⑤).
+//! (#720, #873 §⑤).
 //!
 //! Before this module the only way to reach these provider APIs was the
 //! opaque `/passthrough/:provider/*` tunnel — no unified id routing, no
@@ -147,7 +147,7 @@ pub(crate) struct JobTarget {
     /// The ProviderKey's rendered `default_headers` plus the client headers
     /// its `forward_client_headers` allowlist admits, resolved once when the
     /// target is resolved so every round-trip on this surface (upload, poll,
-    /// download) sends the same set (AISIX-Cloud#1112 / #1167).
+    /// download) sends the same set (#1112 / #1167).
     pub extra_headers: Vec<(axum::http::HeaderName, axum::http::HeaderValue)>,
 }
 
@@ -645,7 +645,7 @@ fn emit_access_log(
         request_id,
         // Files / batches / fine-tuning return resource ids the caller keeps
         // using, not a per-call response-object id — same reasoning as the
-        // video-job id (AISIX-Cloud#1289).
+        // video-job id (#1289).
         provider_request_id: None,
         served_by_model: None,
         routing_attempt_count: None,
@@ -1650,7 +1650,7 @@ async fn forward_simple(
 /// Deterministic UUIDv5 request_id for a batch attribution event.
 ///
 /// The `/dp/telemetry` contract requires `request_id` to be a UUID
-/// (cp-api rejects the event otherwise — and with it the whole flush),
+/// (the control plane rejects the event otherwise — and with it the whole flush),
 /// while attribution needs a *stable* id per (batch, model-slice) so
 /// re-emission after a DP restart + re-retrieve doesn't mint a new
 /// identity. UUIDv5 over the batch identity gives both.
@@ -1667,7 +1667,7 @@ fn batch_attribution_request_id(raw_batch_id: &str, idx: usize, multi: bool) -> 
 /// set, then attribute usage in a detached task. The deterministic
 /// UUIDv5 `request_id` (see [`batch_attribution_request_id`]) keeps
 /// repeated emission (DP restart + re-retrieve) stable per
-/// (batch, model-slice) on the cp-api side.
+/// (batch, model-slice) on the control plane side.
 fn maybe_attribute_batch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
@@ -2302,8 +2302,8 @@ mod tests {
         }
         assert_eq!(mgmt, 1);
         let agg = agg.expect("aggregated batch event must be emitted");
-        // cp-api accepts any visible-ASCII request_id since
-        // AISIX-Cloud#1288, so this is no longer a wire constraint — but a
+        // The control plane accepts any visible-ASCII request_id since
+        // #1288, so this is no longer a wire constraint — but a
         // synthesised batch id has no caller behind it to correlate with,
         // and minting a UUID keeps it distinguishable from a caller's own
         // id in /logs. It must also stay deterministic for re-emission.

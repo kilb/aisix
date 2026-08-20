@@ -1,5 +1,5 @@
 //! Aliyun SLS (Simple Log Service) sink — the `http_batch` family's first
-//! concrete vendor (AISIX-Cloud#687, the pre-sales deliverable on
+//! concrete vendor (#687, the pre-sales deliverable on
 //! ai-gateway#432).
 //!
 //! A batch becomes one SLS **PutLogs** request: every [`SinkRecord`] maps to
@@ -226,7 +226,7 @@ impl ObservabilitySink for AliyunSlsSink {
 ///
 /// Metadata is produced by *serializing* [`crate::usage::UsageEvent`] rather
 /// than hand-listing its 30-plus fields: that single-sources the schema and
-/// inherits the exact `skip_serializing_if` emptiness rules the cp-api wire
+/// inherits the exact `skip_serializing_if` emptiness rules the control plane wire
 /// already uses (empty strings / zero counters are omitted). The SLS log time
 /// is ingest time (now); the event's own `occurred_at` is preserved as a
 /// content field.

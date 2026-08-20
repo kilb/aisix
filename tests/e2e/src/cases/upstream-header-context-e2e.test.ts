@@ -12,7 +12,7 @@ import {
 
 // E2E: the two operator-facing outbound-header features on
 // `ProviderKey.request`, exercised through a real gateway against a real
-// upstream (AISIX-Cloud#1112 + #1167).
+// upstream (#1112 + #1167).
 //
 //   1. `default_headers` values carrying `${...}` request-context
 //      variables — rendered per request, and DROPPED (not blanked) when a

@@ -54,7 +54,7 @@ use crate::snapshot_cache::SnapshotCache;
 /// a frozen snapshot (etcd partition or watch supervisor wedged) vs
 /// from a live config stream. See issue #114. Also read by the managed-
 /// mode heartbeat, which reports the revision as `applied_revision` so
-/// cp-api can compare it against the kine revision of its own writes
+/// the control plane can compare it against the kine revision of its own writes
 /// (#519 B.3).
 ///
 /// The previous health endpoint only reported per-model upstream
@@ -418,7 +418,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// Snapshot of the most recent loader rejections (capped), with the
     /// stale-serving instant joined in per key (#871). Used by the
     /// heartbeat path to forward "DP rejected these resources" to
-    /// cp-api. Returns a clone so the caller doesn't hold the lock
+    /// the control plane. Returns a clone so the caller doesn't hold the lock
     /// across the heartbeat HTTP call.
     pub fn recent_rejections(&self) -> Vec<RejectedEntry> {
         let stale: HashMap<String, u64> = {
@@ -753,7 +753,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             // The loader already attached a RejectedEntry for whatever
             // path failed (bad key / non-JSON / schema / parse). Move
             // them into the supervisor's retained buffer so the next
-            // heartbeat surfaces the failure to cp-api. See issue #115.
+            // heartbeat surfaces the failure to the control plane. See issue #115.
             for r in stats.rejections.drain(..) {
                 self.push_rejection(r);
             }
@@ -1852,7 +1852,7 @@ mod tests {
             "scope_id": "m-1",
             "priority": 100
         }"#;
-        // An OIDC trust provider created mid-run (AISIX-Cloud#1080).
+        // An OIDC trust provider created mid-run (#1080).
         // Same trap as #826: the kind existed in the loader but was
         // initially missing from apply_put's merge loop, so enabling
         // JWT auth via watch silently never took effect until resync.
@@ -1861,7 +1861,7 @@ mod tests {
             "issuer": "https://idp.example.com/realms/agents",
             "audiences": ["aisix-gateway"]
         }"#;
-        // A claim mapping created mid-run (AISIX-Cloud#564) — same
+        // A claim mapping created mid-run (#564) — same
         // guard: a rule added via watch must be live without a resync.
         const VALID_CLAIM_MAPPING: &[u8] = br#"{
             "name": "watch-rule",
@@ -1944,14 +1944,14 @@ mod tests {
                     br#"{"guardrail_id":"g-1","scope_type":"model","scope_id":"m-1","priority":100}"#,
                     1,
                 ),
-                // AISIX-Cloud#1080: deleting a trust provider must reach
+                // #1080: deleting a trust provider must reach
                 // the snapshot, or revoking JWT auth never takes effect.
                 entry(
                     "/aisix/oidc_providers/op-1",
                     br#"{"name":"idp","issuer":"https://idp.example.com","audiences":["aisix"]}"#,
                     1,
                 ),
-                // AISIX-Cloud#564: deleting a claim mapping must reach
+                // #564: deleting a claim mapping must reach
                 // the snapshot, or revoking a rule never takes effect.
                 entry(
                     "/aisix/claim_mappings/cm-1",
@@ -1993,7 +1993,7 @@ mod tests {
         // like a schema failure on the watch path: apply_put returns
         // false, the previously-served row keeps serving, and the
         // rejection lands in the retained buffer for the heartbeat
-        // (AISIX-Cloud#892 + #115).
+        // (#892 + #115).
         let good = br#"{
             "name": "premium",
             "conditions": [
@@ -2479,7 +2479,7 @@ mod tests {
     // ---- regression coverage for issue #115 -------------------------
     // The supervisor now retains the loader's rejected-entry list so
     // the heartbeat path can forward "DP rejected these resources" to
-    // cp-api. Tests pin (1) apply_resync replaces the buffer wholesale,
+    // the control plane. Tests pin (1) apply_resync replaces the buffer wholesale,
     // (2) apply_put with a bad row appends to the buffer, (3) a
     // different successful apply_put does not hide an unrelated
     // rejection, and (4) fixing/deleting the rejected key clears it.

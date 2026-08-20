@@ -152,19 +152,19 @@ pub struct ClientContext {
     pub request_id: String,
     /// The request's inbound headers, kept so dispatch can honour a
     /// ProviderKey's `request.forward_client_headers` allowlist
-    /// (AISIX-Cloud#1167). Held behind an `Arc` because every dispatch
+    /// (#1167). Held behind an `Arc` because every dispatch
     /// path clones the context; nothing here is forwarded unless an
     /// operator names the header.
     pub headers: Arc<HeaderMap>,
     /// The authenticated caller, for `${request.api_key.*}` header
-    /// templates (AISIX-Cloud#1112). Read from the request extension the
+    /// templates (#1112). Read from the request extension the
     /// [`crate::auth::AuthenticatedKey`] extractor publishes, so it is
     /// filled only when that extractor ran first — which every handler
     /// arranges by declaring `auth` before `client`. Default (empty) on
     /// the unauthenticated paths; those resolve no `api_key` variable.
     pub caller: aisix_gateway::CallerIdentity,
     /// The verified JWT identity behind the request, for usage
-    /// attribution (AISIX-Cloud#564). Published by the same auth
+    /// attribution (#564). Published by the same auth
     /// extractor; `None` when the request authenticated with the key's
     /// plaintext.
     pub jwt: Option<Arc<crate::auth::JwtIdentity>>,

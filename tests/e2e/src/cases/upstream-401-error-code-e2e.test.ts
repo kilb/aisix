@@ -29,7 +29,7 @@ import {
 //
 // References:
 // - OpenAI error envelope: https://platform.openai.com/docs/guides/error-codes/api-errors
-// - Issue: api7/AISIX-Cloud#543
+// - Issue: api7/#543
 
 const CALLER_PLAINTEXT = "sk-401-code-caller";
 const CALLER_KEY_HASH = createHash("sha256")

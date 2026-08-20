@@ -13,7 +13,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// AISIX-Cloud#1010: a guardrail set to `enforcement_mode: "monitor"`
+// #1010: a guardrail set to `enforcement_mode: "monitor"`
 // ("monitor only, never intercept") must not block traffic under ANY
 // circumstance a dashboard user can configure — including when the
 // remote moderation provider itself fails (HTTP 5xx / timeout), not
@@ -204,7 +204,7 @@ describe("guardrail e2e: monitor mode never blocks, even on provider failure (#1
     }
     // Gate: poll until the guardrail is live and failing closed. This is
     // the one guardrail-path mechanism that can produce the symptom in
-    // AISIX-Cloud#1010 (0 tokens, 422, latency = moderation call time).
+    // #1010 (0 tokens, 422, latency = moderation call time).
     await waitConfigPropagation(async () => {
       const r = await probe();
       return "status" in r && r.status === 422;

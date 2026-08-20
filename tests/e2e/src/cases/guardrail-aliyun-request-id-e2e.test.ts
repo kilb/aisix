@@ -14,7 +14,7 @@ import {
 
 // E2E: the Aliyun guardrail must preserve the upstream call's own
 // diagnostics and make them joinable to the gateway request the caller
-// holds (AISIX-Cloud#1060).
+// holds (#1060).
 //
 // The contract under test is a triage journey, not a field: a caller gets a
 // 422 plus an `x-aisix-request-id`, hands that id to an operator, and the

@@ -11,7 +11,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E for AISIX-Cloud#995: the native Anthropic paths committed only
+// E2E for #995: the native Anthropic paths committed only
 // prompt + completion tokens against TPM/TPD, silently excluding the
 // separate cache_creation_input_tokens / cache_read_input_tokens counters.
 // The OpenAI bridge already folds cache tokens into total_tokens (#679) and
@@ -104,7 +104,7 @@ async function nextCallEventually429(make: () => Promise<Response>): Promise<num
   return last;
 }
 
-describe("anthropic cache tokens count toward TPM (AISIX-Cloud#995)", () => {
+describe("anthropic cache tokens count toward TPM (#995)", () => {
   let app: SpawnedApp | undefined;
   let upstreamMsg: OpenAiUpstream | undefined;
   let upstreamMsgStream: OpenAiUpstream | undefined;

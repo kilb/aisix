@@ -233,7 +233,7 @@ fn full_valid_file_loads_every_kind() {
 
     // The conditional form loads with the same name sugar one level
     // down: a `model` leaf's values resolve to derived ids; `team` and
-    // string-dimension values pass through verbatim (AISIX-Cloud#892).
+    // string-dimension values pass through verbatim (#892).
     let premium = by_policy_name("premium-family");
     assert!(premium.value.is_conditional());
     let conditions = serde_json::to_value(premium.value.conditions.as_ref().unwrap()).unwrap();

@@ -31,7 +31,7 @@
 //! upload and a 413 are all proxy requests, but counting them as LLM
 //! requests would corrupt every per-request token/cost average and the LLM
 //! success rate. What is NOT a judgement call is that both tiers must cover
-//! every endpoint — before AISIX-Cloud#1234 only chat + messages emitted the
+//! every endpoint — before #1234 only chat + messages emitted the
 //! detailed families at all, so ten endpoints were absent from the
 //! success-rate and request-count queries built on them while still showing
 //! up in the legacy series.
@@ -307,7 +307,7 @@ pub(crate) struct Tokens<'a> {
 /// [`record`].
 ///
 /// Three families ride along, and each had a DIFFERENT endpoint coverage
-/// before AISIX-Cloud#1234's follow-up: the `aisix_llm_*_tokens_total` and
+/// before #1234's follow-up: the `aisix_llm_*_tokens_total` and
 /// `aisix_llm_spend_micro_usd_total` families were chat and messages only,
 /// `aisix_llm_tokens_by_client_total` was chat, messages and responses, and
 /// the legacy `aisix_tokens_consumed_total` was chat ALONE. A gateway that
@@ -530,7 +530,7 @@ mod tests {
 
     /// No proxy route may fall through to the `"other"` bucket. A route that
     /// does is invisible per-endpoint in every request series — which is how
-    /// `/v1/videos` shipped (AISIX-Cloud#1234): it was registered in
+    /// `/v1/videos` shipped (#1234): it was registered in
     /// `build_router` but missing from the normalizer's allowlist, so all
     /// video traffic reported `endpoint="other"`.
     #[test]

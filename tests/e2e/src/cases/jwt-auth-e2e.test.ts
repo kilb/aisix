@@ -14,7 +14,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: inbound OIDC/JWT authentication (AISIX-Cloud#1080, #1081).
+// E2E: inbound OIDC/JWT authentication (#1080, #1081).
 //
 // The environment trusts a mock identity provider (`oidc_providers`
 // row); API keys carry `jwt_subject` bindings. Pinned journeys:

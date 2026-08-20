@@ -11,7 +11,7 @@ import {
 } from "../harness/index.js";
 
 // E2E: /v1/embeddings native provider translation (#723,
-// AISIX-Cloud#873 §⑤ "跨厂商 embeddings"). Pre-#723 only OpenAI-shaped
+// #873 §⑤ "跨厂商 embeddings"). Pre-#723 only OpenAI-shaped
 // upstreams worked — a Vertex/Gemini or Bedrock Model on /v1/embeddings
 // returned 501. These cases drive the real `aisix` binary through the
 // OpenAI SDK and pin the provider-native upstream wire:

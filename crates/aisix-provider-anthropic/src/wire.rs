@@ -41,7 +41,7 @@ pub const DEFAULT_MAX_TOKENS: u32 = 4096;
 /// switches to the block-array form only when a caller's system message
 /// itself carried typed blocks — whose block-level fields (notably
 /// `cache_control` prompt-cache markers) must survive translation
-/// (AISIX-Cloud#1110 Gap A).
+/// (#1110 Gap A).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum AnthropicSystem {
@@ -160,7 +160,7 @@ impl<'a> AnthropicMessage<'a> {
     /// and Anthropic share the `{type:"text", text}` shape, and the
     /// block-level fields Anthropic accepts (notably `cache_control`
     /// prompt-cache markers) ride along in place. Flattening through the
-    /// concatenated-text path would silently strip them (AISIX-Cloud#1110
+    /// concatenated-text path would silently strip them (#1110
     /// Gap A). Image parts map to Anthropic `image` / `document` blocks in
     /// their original position; see [`anthropic_content_blocks`].
     /// Degrades to a single empty text block when nothing survives, so the
@@ -841,7 +841,7 @@ pub fn translate_openai_tools_to_anthropic(
             // inside `function`; forward either spelling — tool
             // definitions sit first in the prompt-cache prefix
             // hierarchy, so a stripped marker silently disables the
-            // caller's whole caching strategy (AISIX-Cloud#1110 Gap A).
+            // caller's whole caching strategy (#1110 Gap A).
             if let Some(cc) = t
                 .get("cache_control")
                 .or_else(|| function.get("cache_control"))
@@ -964,7 +964,7 @@ pub fn translate_anthropic_tool_choice_to_openai(
 /// cleanly; drop everything else — Anthropic-only fields flattened onto
 /// an OpenAI-compatible upstream request are rejected as unknown
 /// parameters, e.g. 400 "Unknown parameter: 'context_management'"
-/// (AISIX-Cloud#953). Mirrors the `/v1/responses` bridge's
+/// (#953). Mirrors the `/v1/responses` bridge's
 /// whitelist-and-drop policy (#825) in the opposite direction.
 ///
 /// Translations (matching LiteLLM's Anthropic→OpenAI adapter):
@@ -1257,7 +1257,7 @@ pub enum AnthropicStreamEvent {
     /// inside the committed 200 stream instead of an HTTP status.
     /// Without this variant the frame fell into [`Self::Other`] and was
     /// silently swallowed: the connection then closed and the truncated
-    /// stream looked like a clean completion (AISIX-Cloud#1222).
+    /// stream looked like a clean completion (#1222).
     #[serde(rename = "error")]
     Error { error: AnthropicStreamErrorBody },
     /// Catch-all for content_block_start / content_block_stop / ping /
@@ -1377,7 +1377,7 @@ pub struct AnthropicStreamUsage {
     pub server_tool_use: Option<AnthropicServerToolUse>,
     /// Cumulative input/cache counts on the terminal `message_delta` —
     /// newer Anthropic wire sends them there too, and for some relay
-    /// backends it is the ONLY frame that carries them (AISIX-Cloud#952:
+    /// backends it is the ONLY frame that carries them (#952:
     /// `message_start` shipped no usable usage, so prompt tokens
     /// recorded as 0).
     #[serde(default)]
@@ -1429,7 +1429,7 @@ impl StreamState {
                     .and_then(|u| u.cache_read_input_tokens)
                     .unwrap_or(0);
             }
-            // AISIX-Cloud#952: harvest cumulative input/cache counts from
+            // #952: harvest cumulative input/cache counts from
             // the terminal message_delta too (max-wins) — some backends
             // report them only there. Runs before to_chunk() for the same
             // event, so the emitted UsageStats picks these up.
@@ -2029,7 +2029,7 @@ pub struct AnthropicSseEncoder {
     tool_calls: std::collections::BTreeMap<u64, ToolCallState>,
     /// Stop reason captured at the `finish_reason` chunk while the
     /// closing `message_delta`/`message_stop` pair is withheld. With
-    /// `stream_options.include_usage` (AISIX-Cloud#790) an OpenAI
+    /// `stream_options.include_usage` (#790) an OpenAI
     /// upstream sends its only `usage` frame AFTER the stop chunk;
     /// emitting the pair at the stop chunk would hand the client
     /// `output_tokens: 0` and drop the usage frame unread.
@@ -2604,7 +2604,7 @@ mod tests {
         // caching sends array-form content with a `cache_control`
         // marker. The marker must reach the upstream — flattening to
         // the concatenated string silently strips it and the caller
-        // pays full input price every turn (AISIX-Cloud#1110 Gap A).
+        // pays full input price every turn (#1110 Gap A).
         let req = ChatFormat::new(
             "claude",
             vec![
@@ -3847,7 +3847,7 @@ mod tests {
         assert_eq!(usage.total_tokens, 10 + 4 + 200 + 800);
         // Option A: cache is neither folded into prompt_tokens nor
         // mapped onto cached_prompt_tokens — the latter would
-        // double-count cost in cp-api's pricing formula, which bills
+        // double-count cost in the control plane's pricing formula, which bills
         // cache_read as its own term.
         assert_eq!(usage.cached_prompt_tokens, 0);
     }
@@ -3976,7 +3976,7 @@ mod tests {
         ));
     }
 
-    // ─── translate_extras_to_openai_shape (AISIX-Cloud#953) ───────
+    // ─── translate_extras_to_openai_shape (#953) ───────
 
     #[test]
     fn extras_shape_drops_anthropic_only_fields() {

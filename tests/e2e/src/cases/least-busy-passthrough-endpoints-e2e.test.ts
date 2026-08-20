@@ -15,7 +15,7 @@ import {
 // /v1/responses dispatched without ever raising it, so a least_busy
 // group serving Anthropic-SDK or Codex traffic saw all-zero counts and
 // silently degraded to declaration order (failover) — same
-// silent-degradation class as AISIX-Cloud#954. These tests mirror
+// silent-degradation class as #954. These tests mirror
 // least-busy-routing-e2e.test.ts (chat) for both endpoints: occupy the
 // declared-first slow target with an un-awaited request, then assert
 // the next request diverts to the idle one.

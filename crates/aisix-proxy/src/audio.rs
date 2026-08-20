@@ -44,10 +44,10 @@ struct AudioDispatchSuccess {
     provider: String,
     model_id: String,
     /// Resolved ProviderKey UUID — feeds the per-PK telemetry attribution
-    /// tags on the emitted UsageEvent (AISIX-Cloud#867 parity).
+    /// tags on the emitted UsageEvent (#867 parity).
     provider_key_id: String,
     /// Provider-side model name, for the `upstream_model` metric label
-    /// (AISIX-Cloud#1234 parity with chat / messages / responses).
+    /// (#1234 parity with chat / messages / responses).
     upstream_model: String,
     /// `(prompt_tokens, completion_tokens)` from the upstream `usage`
     /// block when the model returns one (gpt-4o-transcribe). `None` for
@@ -64,7 +64,7 @@ struct AudioDispatchSuccess {
     /// field (input side) + the transcript (output side), merged. Attached
     /// to the emitted UsageEvent. Empty = no redaction.
     redactions: crate::redact::RedactionCounts,
-    /// Monitor-mode guardrail observations (AISIX-Cloud#562), input +
+    /// Monitor-mode guardrail observations (#562), input +
     /// output merged.
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// #696: set when an OUTPUT guardrail blocked the transcript AFTER the
@@ -830,7 +830,7 @@ async fn multipart_dispatch(
 
                 // Build headers explicitly so the PK's `request.default_headers` and
                 // `request.forward_client_headers` can inject operator/client headers
-                // (AISIX-Cloud#867 follow-up). The body is a multipart form, so the JSON
+                // (#867 follow-up). The body is a multipart form, so the JSON
                 // body-field overrides don't apply here — only headers do. Content-Type
                 // is left to `.multipart()` (it sets the boundary). Reserved auth
                 // headers are protected by `apply_request_headers`.
@@ -930,7 +930,7 @@ async fn multipart_dispatch(
     let routing = outcome.attribution();
     let target_id = outcome.target_id.clone();
     if let Some(member) = outcome.member_reservation {
-        // Fold the winning target's own model layers in (AISIX-Cloud#1087).
+        // Fold the winning target's own model layers in (#1087).
         reservation.merge(member);
     }
     let AudioAttempt {
@@ -1137,7 +1137,7 @@ struct SpeechDispatchSuccess {
     model_id: String,
     provider_key_id: String,
     /// Provider-side model name, for the `upstream_model` metric label
-    /// (AISIX-Cloud#1234).
+    /// (#1234).
     upstream_model: String,
     applied_guardrails: Vec<AppliedGuardrail>,
     redactions: crate::redact::RedactionCounts,
@@ -1288,7 +1288,7 @@ async fn speech_dispatch(
 
                 // Apply the PK's `request.*` overrides (body + headers) like the OpenAI
                 // bridge's chat() path — /v1/audio/speech is a JSON passthrough that builds
-                // the request directly (AISIX-Cloud#867 follow-up). No-op when none set.
+                // the request directly (#867 follow-up). No-op when none set.
                 if let Some(r) = pk_entry.value.request.as_ref() {
                     aisix_provider_openai::overrides::validate_content_safe_request_overrides(r)
                         .map_err(|message| {
@@ -1623,13 +1623,13 @@ fn emit_audio_usage(
     );
 }
 
-/// Issue #406: push one `UsageEvent` onto cp-api's telemetry sink and
+/// Issue #406: push one `UsageEvent` onto the control plane's telemetry sink and
 /// fan it out to per-env OTLP exporters. Mirrors
 /// `embeddings::emit_usage_event` (#402). `inbound_protocol = "openai"`.
 /// Tokens are populated when the upstream returned a `usage` block
 /// (gpt-4o-transcribe); zero otherwise — duration-based cost (whisper-1)
 /// is a documented cross-repo follow-up (needs duration on the wire +
-/// cp-api pricing).
+/// the control plane pricing).
 #[allow(clippy::too_many_arguments)]
 fn emit_usage_event(
     state: &ProxyState,
@@ -1641,7 +1641,7 @@ fn emit_usage_event(
     model_id: &str,
     requested_model: &str,
     api_key_id: &str,
-    // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
+    // Metric labels the UsageEvent has no field for (#1234
     // follow-up). `endpoint` too: the three audio routes share this emitter
     // but are three distinct series.
     endpoint: &'static str,
@@ -1660,7 +1660,7 @@ fn emit_usage_event(
     client: &ClientContext,
     // Per-detector PII mask counts (#932/#696). Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
-    // Monitor-mode guardrail observations (AISIX-Cloud#562).
+    // Monitor-mode guardrail observations (#562).
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     // #696: transcript blocked by an output guardrail after upstream billing.
     guardrail_blocked: bool,
@@ -1704,7 +1704,7 @@ fn emit_usage_event(
         ..Default::default()
     };
     // Per-PK telemetry attribution, same lookup as chat / messages /
-    // responses (AISIX-Cloud#867 parity).
+    // responses (#867 parity).
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);
     // Handler label "audio" — bucketed prometheus counter (#408).
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
@@ -1782,7 +1782,7 @@ fn emit_access_log(
         request_id,
         // No provider response id: transcription/translation return
         // `{text, usage}` and speech returns audio bytes — neither carries
-        // one (AISIX-Cloud#1289).
+        // one (#1289).
         provider_request_id: None,
         served_by_model: routing
             .map(|r| r.served_by_model.as_str())
@@ -1866,7 +1866,7 @@ mod tests {
         snap
     }
 
-    /// A PK carrying per-PK telemetry attribution tags (AISIX-Cloud#867
+    /// A PK carrying per-PK telemetry attribution tags (#867
     /// parity) for asserting they land on the emitted UsageEvent.
     fn provider_key_entry_tagged(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
@@ -1883,7 +1883,7 @@ mod tests {
         snap
     }
 
-    /// A PK carrying `request.*` operator overrides (AISIX-Cloud#867):
+    /// A PK carrying `request.*` operator overrides (#867):
     /// a default body field + a default header that the audio handlers
     /// must apply to the upstream request.
     fn provider_key_entry_overrides(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
@@ -2265,8 +2265,8 @@ mod tests {
         )
     }
 
-    /// AISIX-Cloud#1138: whisper-1 bills by audio length and reports no
-    /// tokens, so the emitted event must carry the duration or cp-api has
+    /// #1138: whisper-1 bills by audio length and reports no
+    /// tokens, so the emitted event must carry the duration or the control plane has
     /// nothing to price the request with.
     #[tokio::test]
     async fn whisper_response_emits_the_duration_cost_basis() {
@@ -2310,7 +2310,7 @@ mod tests {
         );
     }
 
-    /// AISIX-Cloud#1138: `response_format=text` answers with a body that
+    /// #1138: `response_format=text` answers with a body that
     /// carries no usage at all. The cost basis must not depend on which
     /// response format the caller asked for, so the handler falls back to
     /// the uploaded file's own length.
@@ -2351,7 +2351,7 @@ mod tests {
         );
     }
 
-    /// AISIX-Cloud#1138: `MediaRecorder` uploads `audio/webm`, which
+    /// #1138: `MediaRecorder` uploads `audio/webm`, which
     /// `lofty` cannot read — so a WebM transcription asked for as `text`
     /// would have reported no length and billed nothing, which is the
     /// exact bypass the file probe exists to close. Uses the header of a
@@ -2394,7 +2394,7 @@ mod tests {
         assert_eq!(super::upstream_duration_seconds(body), None);
     }
 
-    /// AISIX-Cloud#1138: `response_format=text` (and `srt`/`vtt`) answers
+    /// #1138: `response_format=text` (and `srt`/`vtt`) answers
     /// with a body that is not JSON at all, so the cost basis has to come
     /// off the uploaded audio — otherwise the caller picks whether the
     /// request is metered by picking a response format.
@@ -2434,7 +2434,7 @@ mod tests {
         assert_eq!(super::probe_audio_duration_seconds(&[]), None);
     }
 
-    /// AISIX-Cloud#1138: a `stream=true` transcription answers
+    /// #1138: a `stream=true` transcription answers
     /// `text/event-stream`, so the usage block rides the terminal
     /// `transcript.text.done` event instead of a JSON body. Pre-fix the
     /// JSON parse found nothing and the whole streaming surface emitted
@@ -2507,7 +2507,7 @@ mod tests {
         );
     }
 
-    /// AISIX-Cloud#867 parity: a successful audio request must carry the
+    /// #867 parity: a successful audio request must carry the
     /// resolved ProviderKey's telemetry attribution tags (provider_kind /
     /// provider_featured / branded_provider / pk_label) — same lookup as
     /// chat / messages / responses. Fails before the fix (empty tags).
@@ -2695,7 +2695,7 @@ mod tests {
         );
     }
 
-    /// AISIX-Cloud#867: `/v1/audio/speech` (JSON body) must apply the PK's
+    /// #867: `/v1/audio/speech` (JSON body) must apply the PK's
     /// `request.*` overrides to BOTH the request body
     /// (`default_body_fields`) and the request headers (`default_headers`).
     /// The Mock matches only when the upstream request carries the injected
@@ -2729,7 +2729,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    /// AISIX-Cloud#867: `/v1/audio/transcriptions` (multipart body) must
+    /// #867: `/v1/audio/transcriptions` (multipart body) must
     /// apply the PK's `request.default_headers` to the upstream request.
     /// Body `request.*` overrides do NOT apply (the body is a multipart
     /// form, not JSON). The Mock matches only on the injected header, so a

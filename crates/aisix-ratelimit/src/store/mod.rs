@@ -8,7 +8,7 @@
 //!   and is behaviour-identical to the pre-#798 limiter.
 //! - [`redis::RedisStore`] keeps the counters in a shared Redis so every
 //!   DP replica in a cluster enforces ONE global window — the fix for
-//!   api7/AISIX-Cloud#798, where N replicas multiplied every limit by N.
+//!   api7/#798, where N replicas multiplied every limit by N.
 //!
 //! Two phases mirror the limiter's contract:
 //! - **acquire** (request path, async): concurrency gate + token

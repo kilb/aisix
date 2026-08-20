@@ -8,7 +8,7 @@
 //! per-sink delivery state; a sink only encodes a batch and reports the
 //! outcome.
 //!
-//! This module is the framework foundation (AISIX-Cloud#692, phase F1): the
+//! This module is the framework foundation (#692, phase F1): the
 //! trait + capability matrix + idempotency types. The shared pipeline (F2)
 //! and the concrete sinks (SLS, …) build on it.
 

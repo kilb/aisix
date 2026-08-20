@@ -10,7 +10,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E regression for AISIX-Cloud#1010: a MONITOR-mode output guardrail must
+// E2E regression for #1010: a MONITOR-mode output guardrail must
 // never make a streaming /v1/responses request fail closed on the hold-back
 // buffer cap.
 //
@@ -72,7 +72,7 @@ function guardrailBody(enforcementMode: "block" | "monitor") {
   };
 }
 
-describe("responses streaming with monitor-mode output guardrail (AISIX-Cloud#1010)", () => {
+describe("responses streaming with monitor-mode output guardrail (#1010)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let seed: SeedClient | undefined;

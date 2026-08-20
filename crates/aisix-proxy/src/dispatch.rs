@@ -36,7 +36,7 @@ use aisix_gateway::{Bridge, BridgeError, Hub};
 /// expiring, and the kernel returning `ETIMEDOUT` for an unanswered SYN —
 /// so the reqwest cause chain is carried onto the error. Without it all
 /// three render as one sentence and an operator cannot tell a slow
-/// upstream from one that was never reached (AISIX-Cloud#1093).
+/// upstream from one that was never reached (#1093).
 pub(crate) fn reqwest_error_to_bridge(e: &reqwest::Error, started: Instant) -> BridgeError {
     if e.is_timeout() {
         BridgeError::Timeout {
@@ -55,13 +55,13 @@ use crate::error::ProxyError;
 /// `Hub::dispatch_two_tier` — specialized vendor first (keyed on
 /// `ProviderKey.provider`), then adapter family (keyed on
 /// `ProviderKey.adapter`). Vendor identity is an open string; adapter
-/// is the closed 5-value enum. Any catalog vendor cp-api admits (xai,
+/// is the closed 5-value enum. Any catalog vendor the control plane admits (xai,
 /// openrouter, future long-tail) resolves through the family
 /// fallthrough without a DP code change.
 ///
 /// Returns `None` when both tiers miss (the PK carries neither a
 /// registered `provider` nor a registered `adapter`) — caller surfaces
-/// this as 503 "no dispatch path". cp-api writes `provider` + `adapter`
+/// this as 503 "no dispatch path". The control plane writes `provider` + `adapter`
 /// on every PK, so a miss means a genuine misconfiguration, not a
 /// migration gap.
 pub(crate) fn resolve_bridge(hub: &Hub, provider_key: &ProviderKey) -> Option<Arc<dyn Bridge>> {
@@ -171,7 +171,7 @@ pub(crate) fn check_ip_access(model: &Model, source_ip: &str) -> Result<(), Prox
 /// `/v1/messages/count_tokens` reject the model outright.
 ///
 /// `model.provider` is still honoured so a ProviderKey written without an
-/// adapter — cp-api's AdapterMap-absent degenerate boot — keeps dispatching
+/// adapter — the control plane's AdapterMap-absent degenerate boot — keeps dispatching
 /// as before. A dangling `provider_key_id` likewise falls back to the vendor
 /// id, leaving the dispatch path (not this gate) to report it.
 pub(crate) fn speaks_anthropic(snapshot: &AisixSnapshot, model: &Model) -> bool {
@@ -237,7 +237,7 @@ pub(crate) fn resolve_base_url(provider_key: &ProviderKey) -> Result<String, Pro
     match provider_key.api_base.as_deref() {
         Some(b) if !b.trim().is_empty() => Ok(strip_endpoint_suffix(b.trim()).to_string()),
         _ => Err(ProxyError::InvalidRequest(format!(
-            "provider_key {:?} has no api_base — cp-api must populate api_base \
+            "provider_key {:?} has no api_base — the control plane must populate api_base \
              for every catalog vendor (the DP does not enumerate per-vendor \
              default URLs)",
             provider_key.display_name
@@ -397,7 +397,7 @@ mod tests {
     use super::*;
     use aisix_core::resource::ResourceEntry;
 
-    /// AISIX-Cloud#1093: `reqwest::Error::is_timeout()` is satisfied by an
+    /// #1093: `reqwest::Error::is_timeout()` is satisfied by an
     /// expired request budget, an expired `connect_timeout`, and the
     /// kernel's `ETIMEDOUT`. The mapped error must carry the cause chain so
     /// those are distinguishable — otherwise every one of them renders as
@@ -552,9 +552,9 @@ mod tests {
     }
 
     /// Empty `api_base` on the PK is now an error — the DP no longer
-    /// fabricates per-vendor defaults. cp-api populates api_base for
+    /// fabricates per-vendor defaults. The control plane populates api_base for
     /// every catalog vendor (handlers.go createProviderKey gate +
-    /// featured `default_base_url`); refusing here turns any cp-api
+    /// featured `default_base_url`); refusing here turns any the control plane
     /// admission gap into a loud 400 instead of a silent mis-route.
     #[test]
     fn resolve_base_url_errors_when_api_base_missing() {
@@ -738,7 +738,7 @@ mod tests {
         );
     }
 
-    /// AISIX-Cloud#1244: an `api_base` whose root is not `/v1` must be
+    /// #1244: an `api_base` whose root is not `/v1` must be
     /// preserved verbatim. Synthesizing `/v1` built `…/v2/v1/responses`,
     /// which the upstream 404s. Every value here is a real upstream root
     /// — three of them ship as CP catalog defaults.
@@ -978,7 +978,7 @@ mod tests {
 
         /// A PK whose `provider` matches no specialized entry and whose
         /// `adapter` matches no family entry has nothing to dispatch on
-        /// — caller surfaces 503. cp-api always writes both fields, so
+        /// — caller surfaces 503. The control plane always writes both fields, so
         /// this is a genuine misconfiguration, not a migration gap.
         #[test]
         fn none_when_neither_tier_matches() {

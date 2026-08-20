@@ -12,7 +12,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E for AISIX-Cloud#892: the CONDITIONAL form of rate_limit_policies —
+// E2E for #892: the CONDITIONAL form of rate_limit_policies —
 // a lua-resty-expr-style `conditions` tree (leaves + explicit AND/OR
 // groups, negate), `group_by` bucket splitting, and the full 7-field
 // `limits`. Covers:
@@ -94,7 +94,7 @@ type ChatResult = {
   };
 };
 
-describe("conditional rate limit policies e2e (AISIX-Cloud#892)", () => {
+describe("conditional rate limit policies e2e (#892)", () => {
   let app: SpawnedApp | undefined;
   let etcd: EtcdClient | undefined;
   let seed: SeedClient | undefined;

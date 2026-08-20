@@ -11,7 +11,7 @@ import {
 } from "../harness/index.js";
 
 // E2E: first-class /v1/files + /v1/batches + /v1/fine_tuning/jobs (#720,
-// AISIX-Cloud#873 §⑤). Pins the LiteLLM-baseline routing mechanism end to
+// #873 §⑤). Pins the LiteLLM-baseline routing mechanism end to
 // end against a real `aisix` binary:
 //
 //   1. A file uploaded with a routing hint (x-aisix-model header — the

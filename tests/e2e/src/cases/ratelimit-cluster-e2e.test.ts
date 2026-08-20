@@ -13,7 +13,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: cluster-level rate limiting (api7/AISIX-Cloud#798).
+// E2E: cluster-level rate limiting (api7/#798).
 //
 // Two DP replicas behind one shared etcd (same config → same ApiKey
 // entry id → same rate-limit bucket) and one shared Redis. With an

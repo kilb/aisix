@@ -94,7 +94,7 @@ async fn watch_stream_delivers_events_after_put() {
 
 /// #519 B.3: the supervisor's applied revision (read by the heartbeat as
 /// `applied_revision`) must catch up to the header revision returned to a
-/// writer — for puts AND deletes. This is the exact comparison cp-api
+/// writer — for puts AND deletes. This is the exact comparison the control plane
 /// performs: it writes through kine, records the response revision W, and
 /// treats a DP with `applied_revision >= W` as caught up.
 #[tokio::test]
@@ -139,7 +139,7 @@ async fn supervisor_applied_revision_catches_up_to_writer_revision() {
         }
     }
 
-    // Put: the writer's response header revision is what cp-api records
+    // Put: the writer's response header revision is what the control plane records
     // as W; the supervisor must report >= W once the event is applied.
     let test_key = format!("{prefix}/models/rev-test");
     let test_value = br#"{"display_name":"t","provider":"openai","model_name":"gpt-4o","provider_key_id":"11111111-1111-1111-1111-111111111111"}"#;

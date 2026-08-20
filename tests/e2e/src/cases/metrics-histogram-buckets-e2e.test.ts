@@ -7,7 +7,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// AISIX-Cloud#1226: the two request-latency histograms no longer share one
+// #1226: the two request-latency histograms no longer share one
 // bucket set, and every set is operator-overridable.
 //
 // Both halves are observable contracts, so both are pinned here against a

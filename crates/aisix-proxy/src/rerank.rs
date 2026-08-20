@@ -33,13 +33,13 @@ struct RerankDispatchSuccess {
     /// `model_id`. Always present on success.
     model_id: String,
     /// Resolved ProviderKey UUID — feeds per-PK telemetry attribution
-    /// (AISIX-Cloud#867 parity).
+    /// (#867 parity).
     provider_key_id: String,
     /// Provider-side model name, for the `upstream_model` metric label
-    /// (AISIX-Cloud#1234 parity with chat / messages / responses).
+    /// (#1234 parity with chat / messages / responses).
     upstream_model: String,
     /// Rerank response object `id` (Cohere sends one; Jina-style upstreams
-    /// do not). Empty when the upstream omitted it (AISIX-Cloud#1289).
+    /// do not). Empty when the upstream omitted it (#1289).
     provider_request_id: String,
     /// The `{kind, hook}` set of guardrails that governed this request (#379
     /// parity) — surfaced on the emitted UsageEvent.
@@ -52,7 +52,7 @@ struct RerankDispatchSuccess {
     /// Per-detector PII mask counts (#932/#696) applied to the request.
     /// Attached to the emitted UsageEvent. Empty = no redaction.
     redactions: crate::redact::RedactionCounts,
-    /// Monitor-mode guardrail observations (AISIX-Cloud#562).
+    /// Monitor-mode guardrail observations (#562).
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// Captured request/response content for content-capturing exporters
     /// (#700, LiteLLM parity: the full rerank response JSON). `Some` only
@@ -69,7 +69,7 @@ struct RerankDispatchSuccess {
 /// - OpenAI-compat: `usage.prompt_tokens` / `usage.input_tokens`
 ///
 /// All three end up here as a single `prompt_tokens` counter
-/// because cp-api's `dpmgr_usage_events` table has no rerank-
+/// because the control plane's `control plane_usage_events` table has no rerank-
 /// specific columns; the value is what gets multiplied by the
 /// model's per-token price for billing.
 struct RerankUsage {
@@ -148,7 +148,7 @@ pub async fn rerank(
                 status,
                 elapsed,
             );
-            // Issue #405: emit UsageEvent so cp-api's budget ledger
+            // Issue #405: emit UsageEvent so the control plane's budget ledger
             // and customer-facing /logs see /v1/rerank spend.
             // Pre-#405 the rerank handler dropped the event entirely.
             // Skip on 200 without a recognisable usage field — avoids
@@ -452,7 +452,7 @@ async fn dispatch(
                 }
 
                 // Apply the PK's `request.*` body overrides, matching the OpenAI bridge's
-                // chat() path and /v1/messages passthrough (AISIX-Cloud#867 follow-up). The
+                // chat() path and /v1/messages passthrough (#867 follow-up). The
                 // /v1/rerank path builds the request directly, so without this the override
                 // pipeline silently no-ops here. No-op when the PK carries none.
                 if let Some(r) = pk_entry.value.request.as_ref() {
@@ -594,7 +594,7 @@ async fn dispatch(
     let routing = outcome.attribution();
     let target_id = outcome.target_id.clone();
     if let Some(member) = outcome.member_reservation {
-        // Fold the winning target's own model layers in (AISIX-Cloud#1087)
+        // Fold the winning target's own model layers in (#1087)
         // so one commit bills the member's TPM/TPD too.
         reservation.merge(member);
     }
@@ -708,7 +708,7 @@ struct RerankAttempt {
 ///
 /// Rerank has no completion side — all three providers tokenise
 /// only the input (query + documents). The single counter is what
-/// cp-api multiplies by the model's per-token price for billing.
+/// the control plane multiplies by the model's per-token price for billing.
 fn extract_rerank_usage(body: &Value) -> Option<RerankUsage> {
     // OpenAI-compat / Jina shape: `usage` object at the top level.
     if let Some(usage) = body.get("usage") {
@@ -734,7 +734,7 @@ fn extract_rerank_usage(body: &Value) -> Option<RerankUsage> {
     None
 }
 
-/// Issue #405: push one `UsageEvent` onto cp-api's telemetry sink
+/// Issue #405: push one `UsageEvent` onto the control plane's telemetry sink
 /// and fan it out to per-env OTLP exporters. Mirrors the shape of
 /// `embeddings::emit_usage_event` (#402) — rerank, like embeddings,
 /// has no completion side, no streaming, no reasoning tokens.
@@ -751,7 +751,7 @@ fn emit_usage_event(
     model_id: &str,
     requested_model: &str,
     api_key_id: &str,
-    // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
+    // Metric labels the UsageEvent has no field for (#1234
     // follow-up): the wire struct is the CP contract, so they ride
     // alongside rather than in it.
     provider: &str,
@@ -766,7 +766,7 @@ fn emit_usage_event(
     client: &ClientContext,
     // Per-detector PII mask counts (#932/#696). Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
-    // Monitor-mode guardrail observations (AISIX-Cloud#562).
+    // Monitor-mode guardrail observations (#562).
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     // Captured request/response content (#700). Forwarded only to `fan_out`,
     // never to the CP sink.
@@ -807,7 +807,7 @@ fn emit_usage_event(
     };
     // Per-PK attribution tags (provider_kind / provider_featured /
     // branded_provider / pk_label / byo_label) ARE populated — same lookup as
-    // chat / messages / responses / embeddings (AISIX-Cloud#867 parity).
+    // chat / messages / responses / embeddings (#867 parity).
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);
     crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
     state.usage_sink.try_emit("rerank", event.clone());
@@ -989,7 +989,7 @@ mod tests {
     }
 
     /// An OpenAI PK carrying per-PK telemetry attribution tags
-    /// (AISIX-Cloud#867) so an emitted /v1/rerank UsageEvent can be asserted
+    /// (#867) so an emitted /v1/rerank UsageEvent can be asserted
     /// to surface the upstream vendor + PK label the dashboard's Logs detail
     /// shows. Reuses `PK_ID` so the rerank model fixtures still reference it.
     fn provider_key_entry_tagged(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
@@ -1007,7 +1007,7 @@ mod tests {
         snap
     }
 
-    /// AISIX-Cloud#867: an OpenAI PK that carries `request.*` overrides
+    /// #867: an OpenAI PK that carries `request.*` overrides
     /// (`default_body_fields` + `default_headers`). Clones the plain openai PK
     /// JSON and appends a `request` block; reuses `PK_ID` so the rerank model
     /// fixtures still reference it. Used to prove the resolved PK's request
@@ -1467,7 +1467,7 @@ mod tests {
         upstream.verify().await;
     }
 
-    /// AISIX-Cloud#1289: a rerank response object carries an `id` (Cohere
+    /// #1289: a rerank response object carries an `id` (Cohere
     /// sends one) and it must reach the UsageEvent — the handler recorded
     /// none before. Fails before the fix (empty), passes after.
     #[tokio::test]
@@ -1711,7 +1711,7 @@ mod tests {
     /// Issue #405: Cohere's wire shape puts the token counter at
     /// `meta.billed_units.input_tokens` instead of `usage.prompt_tokens`.
     /// The extractor must handle this — without coverage, customers
-    /// running Cohere-backed rerank would see zero spend in cp-api
+    /// running Cohere-backed rerank would see zero spend in the control plane
     /// even though billing is happening.
     #[tokio::test]
     async fn emits_usage_event_on_cohere_wire_shape_issue_405() {
@@ -1876,7 +1876,7 @@ mod tests {
         );
     }
 
-    /// AISIX-Cloud#867 parity: a successful /v1/rerank 200 must stamp the
+    /// #867 parity: a successful /v1/rerank 200 must stamp the
     /// five per-PK telemetry attribution fields (provider_kind /
     /// provider_featured / branded_provider / pk_label) from the resolved
     /// ProviderKey's `telemetry_tags` — exactly like /v1/chat/completions,
@@ -1947,7 +1947,7 @@ mod tests {
         );
     }
 
-    /// AISIX-Cloud#867: the resolved ProviderKey's `request.*` overrides
+    /// #867: the resolved ProviderKey's `request.*` overrides
     /// (`default_body_fields` + `default_headers`) must be applied to the
     /// outbound /v1/rerank request — exactly like the other proxy passthrough
     /// endpoints. The mock matcher ONLY accepts the request when BOTH the

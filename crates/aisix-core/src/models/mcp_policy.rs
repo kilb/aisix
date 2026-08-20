@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn tolerates_unknown_fields_for_forward_compat() {
-        // cp-api may ship new fields ahead of the DP rolling out; serde must
+        // The control plane may ship new fields ahead of the DP rolling out; serde must
         // accept them. The write path still rejects them via the strict
         // schema validators (validate_mcp_policy in models/schema.rs).
         let p: McpPolicy =
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn mcp_access_tolerates_unknown_fields_for_forward_compat_but_rejects_unknown_modes() {
-        // cp-api may ship new fields ahead of the DP rolling out; serde must
+        // The control plane may ship new fields ahead of the DP rolling out; serde must
         // accept them (the write path still rejects them via the strict
         // schema validators in models/schema.rs). Unknown enum values stay
         // hard errors.

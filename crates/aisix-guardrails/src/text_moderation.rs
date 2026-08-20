@@ -470,7 +470,7 @@ mod tests {
     }
 
     fn cfg(endpoint: &str) -> AzureContentSafetyTextModerationConfig {
-        // Mirrors what cp-api projects after applying its defaults.
+        // Mirrors what the control plane projects after applying its defaults.
         serde_json::from_value(json!({
             "endpoint": endpoint,
             "api_key": "test-key-abc",
@@ -631,7 +631,7 @@ mod tests {
 
     #[test]
     fn output_defaults_fail_closed() {
-        // cp-api omits output_fail_open when unset → serde default false.
+        // The control plane omits output_fail_open when unset → serde default false.
         let g = build("http://unused", true);
         assert!(!g.output_fail_open, "output must default to fail-closed");
         // An output-side failure with fail_open=false must Block.

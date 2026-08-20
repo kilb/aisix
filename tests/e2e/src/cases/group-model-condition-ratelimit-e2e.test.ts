@@ -12,7 +12,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E for AISIX-Cloud#1267: conditional rate-limit policies whose
+// E2E for #1267: conditional rate-limit policies whose
 // `model` / `model_name` conditions reference a ROUTING GROUP. The
 // per-target gate evaluates the {dispatched target, requested parent}
 // pair, so a group's own id/alias selects every request addressed to
@@ -28,7 +28,7 @@ import {
 //      via the group (previously the member id missed the set, so the
 //      negated leaf absurdly matched them) while direct dispatch to
 //      the member stays matched.
-//   4. The AISIX-Cloud#1087 principle survives: a MEMBER-id condition
+//   4. The #1087 principle survives: a MEMBER-id condition
 //      keeps matching when the member is reached via the group, an
 //      over-limit member fails over, and the same bucket throttles the
 //      member's direct alias.
@@ -92,7 +92,7 @@ type ChatResult = {
   };
 };
 
-describe("group-referencing model conditions e2e (AISIX-Cloud#1267)", () => {
+describe("group-referencing model conditions e2e (#1267)", () => {
   let app: SpawnedApp | undefined;
   let etcd: EtcdClient | undefined;
   let seed: SeedClient | undefined;

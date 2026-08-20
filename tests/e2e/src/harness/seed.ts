@@ -41,7 +41,7 @@ export class SeedClient {
   async createProviderKey(
     pk: Record<string, unknown>,
   ): Promise<{ id: string; value: Record<string, unknown> }> {
-    // Same defaulting as AdminClient.createProviderKey: cp-api always
+    // Same defaulting as AdminClient.createProviderKey: the control plane always
     // writes `provider` + `adapter`, so the seeded document carries the
     // OpenAI-compatible pair unless a test overrides them.
     return this.put("provider_keys", { provider: "openai", adapter: "openai", ...pk });

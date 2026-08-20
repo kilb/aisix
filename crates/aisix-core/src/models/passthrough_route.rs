@@ -4,8 +4,8 @@
 //! Replaces the removed implicit `/passthrough/:provider/*rest` tunnel: the
 //! route names its own upstream and credential handling instead of borrowing
 //! them from "the first accessible Model of the provider", so there is no
-//! implicit-selection ambiguity (AISIX-Cloud#1127) and no forced credential
-//! replacement (AISIX-Cloud#1312).
+//! implicit-selection ambiguity (#1127) and no forced credential
+//! replacement (#1312).
 //!
 //! etcd path: `{prefix}/passthrough_routes/{uuid}`. Secondary index on `name`.
 

@@ -18,7 +18,7 @@ import {
 } from "../harness/index.js";
 import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 
-// E2E: /v1/realtime WebSocket relay (#721, AISIX-Cloud#873 §⑤) against a
+// E2E: /v1/realtime WebSocket relay (#721, #873 §⑤) against a
 // real `aisix` binary. Verifies with a live WS handshake what unit tests
 // can't fully pin:
 //

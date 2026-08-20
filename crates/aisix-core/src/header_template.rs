@@ -1,5 +1,5 @@
 //! `${...}` variable substitution for `ProviderKey.request.default_headers`
-//! values (AISIX-Cloud#1112).
+//! values (#1112).
 //!
 //! An operator writes `"x-tenant-id": "${request.api_key.team_id}"` on the
 //! ProviderKey and the data plane renders it per request, just before the
@@ -10,7 +10,7 @@
 //! Three rules make this safe to expose to operator-supplied config:
 //!
 //! 1. **Closed vocabulary.** Only the names in [`HEADER_TEMPLATE_VARS`]
-//!    resolve. Anything else makes the whole template unresolvable — cp-api
+//!    resolve. Anything else makes the whole template unresolvable — the control plane
 //!    rejects unknown names at write time and the renderer refuses them
 //!    again at runtime, so a typo can never fall through as a literal
 //!    `${...}` on the wire.
@@ -29,7 +29,7 @@ use std::fmt::Write as _;
 /// The closed set of variable names a `default_headers` value may
 /// reference. Kept in the same order the docs list them.
 ///
-/// cp-api mirrors this list in
+/// The control plane mirrors this list in
 /// `internal/cpapi/resources/provider_key_overrides.go` so a bad template
 /// is a 400 at write time rather than a silently-dropped header at
 /// dispatch time. **The two lists must stay in sync**; this one is
@@ -68,7 +68,7 @@ pub struct HeaderVars<'a> {
 impl<'a> HeaderVars<'a> {
     /// Resolve one variable name. `None` for both an unknown name and a
     /// known-but-absent value — the caller treats them identically
-    /// (the header is dropped), and cp-api has already rejected the
+    /// (the header is dropped), and the control plane has already rejected the
     /// unknown-name case at write time.
     fn resolve(&self, name: &str) -> Option<&'a str> {
         let v = match name {
@@ -109,7 +109,7 @@ pub fn is_template(value: &str) -> bool {
 /// A resolved value that would inject CR/LF/NUL is rejected the same way
 /// (`None`): the substituted-in data is a display name an operator typed
 /// into the dashboard, so it is not trusted to be header-safe even though
-/// cp-api validates the template's own literal text.
+/// the control plane validates the template's own literal text.
 pub fn render_header_template(value: &str, vars: &HeaderVars<'_>) -> Option<String> {
     if !is_template(value) {
         return Some(value.to_string());
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn unknown_variable_is_unresolvable() {
         assert_eq!(render_header_template("${request.secret}", &vars()), None);
-        // cp-api rejects these at write time; belt-and-braces at runtime.
+        // The control plane rejects these at write time; belt-and-braces at runtime.
         assert_eq!(render_header_template("${api_key.secret}", &vars()), None);
     }
 

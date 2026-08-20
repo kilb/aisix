@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn tolerates_unknown_semantic_field_for_forward_compat() {
-        // cp-api may ship new fields ahead of the DP rolling out; serde must
+        // The control plane may ship new fields ahead of the DP rolling out; serde must
         // accept them. The write path still rejects them via the strict
         // schema validators (validate_* in models/schema.rs).
         let s: Semantic = serde_json::from_str(

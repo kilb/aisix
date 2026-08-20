@@ -24,7 +24,7 @@ import {
 //
 // The same router is exercised twice — non-streaming and `stream: true` —
 // because the two dispatch loops are written separately in chat.rs and the
-// streaming one used to ignore `retries` outright (AISIX-Cloud#1119).
+// streaming one used to ignore `retries` outright (#1119).
 
 const CALLER_PLAINTEXT = "sk-retry-backoff-caller";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -135,7 +135,7 @@ describe("retry backoff e2e: same-target retries wait before re-hitting upstream
     expect(elapsed).toBeGreaterThanOrEqual(MIN_EXPECTED_MS);
   });
 
-  // AISIX-Cloud#1119: the streaming dispatch loop walked the target list
+  // #1119: the streaming dispatch loop walked the target list
   // once and never read `routing.retries`, so a retryable failure went
   // straight to fail-over — and with a single target (this router) the
   // request just failed. Same router, same upstream, `stream: true`: the

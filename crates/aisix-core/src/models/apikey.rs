@@ -3,7 +3,7 @@
 //!
 //! Self-hosted CP (prd-09a §9A.7B.4): the KV payload stores
 //! **`key_hash`** (SHA-256 hex of the plaintext bearer) instead of
-//! the plaintext. cp-api stores only the hash and shows the
+//! the plaintext. The control plane stores only the hash and shows the
 //! plaintext to the user exactly once at create time. The DP proxy
 //! hashes incoming bearer tokens (`aisix-proxy/src/auth.rs`) and
 //! looks up by the hash. Net security win: no plaintext API key
@@ -27,7 +27,7 @@ pub struct ApiKey {
 
     /// Operator-facing label for this key, as shown in the dashboard.
     /// Read only by the `${request.api_key.name}` header template
-    /// (AISIX-Cloud#1112); never used for authentication or routing.
+    /// (#1112); never used for authentication or routing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
 
@@ -143,7 +143,7 @@ pub struct ApiKey {
 impl ApiKey {
     /// Canonical hash function for converting an `Authorization:
     /// Bearer <plaintext>` value to the form persisted in the
-    /// snapshot (and on the cp-api side as `api_keys.key_hash`).
+    /// snapshot (and on the control plane side as `api_keys.key_hash`).
     /// SHA-256, lowercase hex. Both sides MUST use this exact
     /// function — test fixtures and the `aisix-proxy::auth`
     /// extractor both call through here.
@@ -263,9 +263,9 @@ impl Resource for ApiKey {
     }
 
     /// Path segment under `/aisix/<env>/`. v3 (prd-09a §9A.7B.2) uses
-    /// the underscored form `api_keys` to align with cp-api migration
+    /// the underscored form `api_keys` to align with the control plane migration
     /// 008's table name. v2 used `apikeys` with no underscore. The v3
-    /// dp-manager only writes the underscored form.
+    /// the control plane only writes the underscored form.
     fn kind() -> &'static str {
         "api_keys"
     }
@@ -420,7 +420,7 @@ mod tests {
 
     #[test]
     fn mcp_access_tolerates_unknown_inner_fields_for_forward_compat() {
-        // cp-api may ship new `mcp_access` fields ahead of the DP rolling
+        // The control plane may ship new `mcp_access` fields ahead of the DP rolling
         // out; serde must accept them (the write path still rejects them
         // via `validate_apikey` in models/schema.rs).
         let k: ApiKey = serde_json::from_str(
@@ -522,7 +522,7 @@ mod tests {
 
     #[test]
     fn tolerates_unknown_fields_for_forward_compat() {
-        // cp-api may ship new fields ahead of the DP rolling out; serde
+        // The control plane may ship new fields ahead of the DP rolling out; serde
         // must accept them (the write path still rejects them via
         // `validate_apikey` in models/schema.rs).
         let k: ApiKey =

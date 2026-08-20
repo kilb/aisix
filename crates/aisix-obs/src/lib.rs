@@ -11,7 +11,7 @@
 //!   (concrete pipeline wired in a follow-up PR).
 //! - [`sink`] — pluggable observability-sink framework: the
 //!   capability-typed [`sink::ObservabilitySink`] adapter contract
-//!   (AISIX-Cloud#692).
+//!   (#692).
 
 #![deny(rust_2018_idioms)]
 
@@ -69,7 +69,7 @@ pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
     // on to a log store — the escapes land BETWEEN a field's name and its
     // value, so `grep 'aliyun_request_id=<id>'` matches nothing and the
     // structured fields are only searchable by bare value
-    // (AISIX-Cloud#1060). tracing-subscriber's `ansi` default feature is on
+    // (#1060). tracing-subscriber's `ansi` default feature is on
     // and it does not probe the writer itself.
     let fmt_layer = fmt::layer()
         .with_target(true)

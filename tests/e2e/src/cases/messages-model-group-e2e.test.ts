@@ -350,7 +350,7 @@ describe("model group via passthrough endpoints e2e (#471)", () => {
     // The per-attempt counters are emitted from one chokepoint shared by
     // chat, messages and responses, but each handler passes it its own
     // requested-model reference — so the fallback label is only correct on
-    // this endpoint if THIS endpoint is driven (AISIX-Cloud#1299).
+    // this endpoint if THIS endpoint is driven (#1299).
     const metricsAfter = await scrapeMetrics(app.metricsUrl);
     const delta = (name: string, want: Record<string, string>) =>
       metricDelta(metricsBefore, metricsAfter, name, want);

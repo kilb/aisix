@@ -1,4 +1,4 @@
-//! `/v1/videos` — unified video-generation surface (AISIX-Cloud#1118 Phase 1).
+//! `/v1/videos` — unified video-generation surface (#1118 Phase 1).
 //!
 //! Three typed routes following the submit → poll → fetch contract
 //! established by the upstream videos API
@@ -62,7 +62,7 @@
 //! **Rate limiting**: submit enforces the model-level layers exactly like
 //! chat / embeddings. The two GET routes deliberately pass `None` for the
 //! model layer — normal client polling must not burn the model's RPM
-//! (AISIX-Cloud#1118 decision 3). Key-level layers still apply.
+//! (#1118 decision 3). Key-level layers still apply.
 //!
 //! **Usage**: one zero-token UsageEvent per submit (mirrors the
 //! passthrough / jobs convention). Per-second cost accounting is a
@@ -1036,7 +1036,7 @@ struct VideoTarget {
     /// The ProviderKey's rendered `default_headers` plus the client headers
     /// its `forward_client_headers` allowlist admits, resolved once when the
     /// target is resolved so every round-trip on this surface (submit, poll,
-    /// content fetch) sends the same set (AISIX-Cloud#1112 / #1167).
+    /// content fetch) sends the same set (#1112 / #1167).
     extra_headers: Vec<(axum::http::HeaderName, axum::http::HeaderValue)>,
 }
 
@@ -1463,7 +1463,7 @@ impl Telemetry<'_> {
             // The provider's video-job id is a handle to a resource the
             // caller keeps polling, not this call's response-object id;
             // recording it here would repeat one id across every poll of the
-            // same job (AISIX-Cloud#1289). It already reaches the caller as
+            // same job (#1289). It already reaches the caller as
             // the job's own `id`.
             provider_request_id: None,
             served_by_model: None,
@@ -1548,7 +1548,7 @@ pub async fn create_video(
             // One zero-token UsageEvent per accepted submit — visible in
             // /logs and the budget ledger like every other endpoint.
             // Per-second cost is computed control-plane-side once the
-            // per-second cost schema lands (AISIX-Cloud#1118 decision 2);
+            // per-second cost schema lands (#1118 decision 2);
             // token fields stay zero. Skipped when no upstream call
             // happened (the 501 unsupported-provider branch).
             if success.upstream_called {
@@ -1699,7 +1699,7 @@ async fn dispatch_create(
     }
 
     // Model-level rate limiting — the submit is a full typed endpoint
-    // (AISIX-Cloud#1118 decision 3; the #1116 shape).
+    // (#1118 decision 3; the #1116 shape).
     let model_rl = crate::quota::ModelRateLimit::from_model(
         &body.model,
         &target.model_entry.id,
@@ -1827,7 +1827,7 @@ pub async fn get_video(
     let result: Result<(Response, String, String), ProxyError> = async {
         let (target, task_id) = resolve_get_target(&snapshot, &auth, &video_id, &client)?;
         // Poll traffic is exempt from model-level limits BY DESIGN
-        // (AISIX-Cloud#1118 decision 3): a client polling a task it
+        // (#1118 decision 3): a client polling a task it
         // already paid an RPM slot to submit must not starve itself.
         // Key-level layers still apply.
         let reservation = crate::quota::enforce(&state, &snapshot, &auth, None).await?;
@@ -1890,7 +1890,7 @@ pub async fn video_content(
 
         let response = match poll.status {
             // A completed task is delivered per the provider's content mode
-            // (AISIX-Cloud#1118, content-proxy design):
+            // (#1118, content-proxy design):
             //   Redirect — 302 to a signed, credential-free provider URL
             //              (Alibaba / Zhipu / Volcengine / Runway), zero
             //              relay bandwidth.
@@ -1984,7 +1984,7 @@ pub async fn video_content(
 /// jobs shape (#699) with the resolved Model attributed and the
 /// guardrail observability fields the chat family carries. Token fields
 /// stay zero: video billing is duration-based and priced control-plane-
-/// side once the per-second cost schema lands (AISIX-Cloud#1118
+/// side once the per-second cost schema lands (#1118
 /// decision 2).
 #[allow(clippy::too_many_arguments)]
 fn emit_submit_usage_event(
@@ -2052,7 +2052,7 @@ mod tests {
 
     #[test]
     fn task_status_mapping_table() {
-        // The full mapping pinned by AISIX-Cloud#1118: PENDING→queued,
+        // The full mapping pinned by #1118: PENDING→queued,
         // RUNNING→in_progress, SUCCEEDED→completed, FAILED/CANCELED/
         // UNKNOWN→failed. Unrecognised provider strings also collapse
         // to failed instead of leaking provider taxonomy.
@@ -2848,7 +2848,7 @@ mod tests {
         assert_eq!(v["error"]["type"], "rate_limit_exceeded");
 
         // Polling the submitted task is NOT gated by the exhausted
-        // model bucket (AISIX-Cloud#1118 decision 3).
+        // model bucket (#1118 decision 3).
         for _ in 0..3 {
             let poll =
                 tower::ServiceExt::oneshot(app.clone(), get_uri(&format!("/v1/videos/{id}")))

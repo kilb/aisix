@@ -11,7 +11,7 @@ import {
 } from "../harness/index.js";
 
 // E2E: Anthropic Messages client → OpenAI-compatible upstream —
-// Anthropic-only extras must not leak upstream (AISIX-Cloud#953).
+// Anthropic-only extras must not leak upstream (#953).
 //
 // The cross-provider path preserves unknown Anthropic top-level fields
 // in ChatFormat.extra, and the OpenAI bridge flattens extras into the

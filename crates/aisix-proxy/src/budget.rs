@@ -1,14 +1,14 @@
-//! Budget client — asks cp-api per request whether an api_key may proceed.
+//! Budget client — asks the control plane per request whether an api_key may proceed.
 //!
-//! Wire: `GET {dpmgr_base}/dp/budget_check?api_key_id=<uuid>`. Auth is
+//! Wire: `GET {control_plane_base}/dp/budget_check?api_key_id=<uuid>`. Auth is
 //! mTLS — the caller supplies a `reqwest::Client` already loaded with
-//! the same client cert + CA bundle the heartbeat worker uses. cp-api
+//! the same client cert + CA bundle the heartbeat worker uses. The control plane
 //! authenticates the DP by peer cert SAN (env_id, dp_id) and rejects
 //! requests for api_keys outside that env (403). See prd-09b rev 2 §5.5
-//! and AISIX-Cloud PR #95 for the CP-side route.
+//! for the control-plane side of this route.
 //!
 //! Decisions are cached in an LRU (capacity 10000, TTL 5s) keyed by
-//! api_key_id. When cp-api is unreachable we honor the last cached
+//! api_key_id. When the control plane is unreachable we honor the last cached
 //! decision (sticky) up to AISIX_DP_BUDGET_STALE_MAX_SECONDS (default
 //! 600s); past that we apply the fail_mode that came back on the last
 //! good response.
@@ -55,12 +55,12 @@ pub struct BudgetDetails {
     pub reset_seconds: Option<u64>,
 }
 
-/// Customer-facing detail for a budget denial, forwarded from cp-api's
+/// Customer-facing detail for a budget denial, forwarded from the control plane's
 /// `BudgetCheckReason` (prd-09b §5.8). The DP lifts these into the 429
 /// `error` block so a programmatic client can see *which* budget tripped
 /// (`scope` / `scope_ref`) and by how much (`limit_usd` / `spent_usd`),
 /// not just the human `message`. Every field beyond `message` is
-/// optional: the cp-api-unreachable fallback decisions carry only a
+/// optional: the control plane-unreachable fallback decisions carry only a
 /// message, with no structured detail.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BudgetReason {
@@ -76,7 +76,7 @@ pub struct BudgetReason {
 
 impl BudgetReason {
     /// A reason carrying only a human message — used by the
-    /// cp-api-unreachable fallback paths (and the api_key fallback in
+    /// the control plane-unreachable fallback paths (and the api_key fallback in
     /// chat dispatch), which have no structured scope detail.
     pub(crate) fn message_only(message: impl Into<String>) -> Self {
         Self {
@@ -103,7 +103,7 @@ struct CacheEntry {
     fetched_at: Instant,
 }
 
-/// Mode for the client: live (talks to cp-api) or disabled (allow-all).
+/// Mode for the client: live (talks to the control plane) or disabled (allow-all).
 enum Mode {
     Live {
         http: reqwest::Client,
@@ -132,8 +132,8 @@ impl std::fmt::Debug for BudgetClient {
 }
 
 impl BudgetClient {
-    /// Live client that asks cp-api per request via mTLS. `base_url` is
-    /// the same dpmgr origin the heartbeat worker hits (e.g.
+    /// Live client that asks the control plane per request via mTLS. `base_url` is
+    /// the same control plane origin the heartbeat worker hits (e.g.
     /// `https://cp.aisix.cloud:9101`); `http` must be a reqwest client
     /// already loaded with the DP's client cert + CA bundle. Build it
     /// with `aisix_server::heartbeat::build_mtls_client` (or its
@@ -155,7 +155,7 @@ impl BudgetClient {
     }
 
     /// Allow-all client. Used in dev / tests / standalone mode where no
-    /// cp-api is reachable.
+    /// the control plane is reachable.
     pub fn disabled() -> Self {
         Self {
             mode: Mode::Disabled,
@@ -212,7 +212,7 @@ impl BudgetClient {
             allowed: false,
             fail_mode: FailMode::Sticky,
             reason: Some(BudgetReason::message_only(
-                "cp-api unreachable and no cached decision",
+                "control plane unreachable and no cached decision",
             )),
             budget: None,
         }
@@ -255,7 +255,7 @@ fn apply_fail_mode(prev: &Decision) -> Decision {
             allowed: false,
             fail_mode: FailMode::Closed,
             reason: Some(BudgetReason::message_only(
-                "cp-api unreachable; fail_mode=closed",
+                "control plane unreachable; fail_mode=closed",
             )),
             budget: prev.budget.clone(),
         },
@@ -263,14 +263,14 @@ fn apply_fail_mode(prev: &Decision) -> Decision {
             allowed: false,
             fail_mode: FailMode::Sticky,
             reason: Some(BudgetReason::message_only(
-                "cp-api unreachable; cached decision stale",
+                "control plane unreachable; cached decision stale",
             )),
             budget: prev.budget.clone(),
         },
     }
 }
 
-// Wire shape mirrors cp-api's `budgetCheckResponse` in
+// Wire shape mirrors the control plane's `budgetCheckResponse` in
 // internal/cpapi/resources/budget_check.go (prd-09b rev 2 §5.5/§5.8):
 //
 //   {
@@ -318,7 +318,7 @@ struct WireReason {
     period: Option<String>,
     #[serde(default)]
     period_resets_at: Option<String>,
-    // cp-api's reason carries `retry_after_seconds` (int). Aliased to
+    // The control plane's reason carries `retry_after_seconds` (int). Aliased to
     // `reset_seconds` so the existing BudgetDetails (gauge) path keeps
     // reading the same field, and the BudgetReason path reuses it for
     // retry_after_seconds.
@@ -363,9 +363,9 @@ async fn fetch_decision(
         remaining_usd: value_as_f64(b.remaining_usd.as_ref()),
         reset_seconds: value_as_u64(b.reset_seconds.as_ref()),
     });
-    // Lift cp-api's structured reason into the customer-facing detail
+    // Lift the control plane's structured reason into the customer-facing detail
     // (prd-09b §5.8). limit_usd / spent_usd are formatted to the 2dp
-    // dollar-string cp-api itself uses. A reason with neither a message
+    // dollar-string the control plane itself uses. A reason with neither a message
     // nor any structured field is treated as absent.
     let reason = wire.reason.map(|r| BudgetReason {
         message: r.message,
@@ -415,7 +415,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_client_returns_cp_api_decision() {
+    async fn live_client_returns_control_plane_decision() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/dp/budget_check"))
@@ -492,7 +492,7 @@ mod tests {
         assert_eq!(d.fail_mode, FailMode::Closed);
         let r = d.reason.expect("reason present");
         assert!(r.message.contains("org budget 'monthly' exceeded"));
-        // Structured fields must be lifted from cp-api's reason (#433),
+        // Structured fields must be lifted from the control plane's reason (#433),
         // not dropped at deserialization.
         assert_eq!(r.scope.as_deref(), Some("org"));
         assert_eq!(r.scope_ref.as_deref(), Some("org-uuid-1"));
@@ -550,7 +550,7 @@ mod tests {
             e.fetched_at = Instant::now() - Duration::from_secs(10);
         }
         let second = c.check("k-1").await;
-        // cp-api now 500s but stale_max default is 600s, so the cached
+        // The control plane now 500s but stale_max default is 600s, so the cached
         // decision is still served.
         assert!(second.allowed);
     }

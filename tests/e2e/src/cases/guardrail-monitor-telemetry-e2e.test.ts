@@ -13,7 +13,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// AISIX-Cloud#562: an `enforcement_mode: monitor` guardrail must surface
+// #562: an `enforcement_mode: monitor` guardrail must surface
 // what it WOULD have done on the request's usage event
 // (`guardrail_monitor_hits`), not just in gateway logs — that record is
 // what lets an operator stage a policy, audit its hit rate in the

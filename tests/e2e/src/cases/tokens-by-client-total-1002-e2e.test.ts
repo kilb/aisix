@@ -11,7 +11,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E for AISIX-Cloud#1002: the aisix_llm_tokens_by_client_total series gained
+// E2E for #1002: the aisix_llm_tokens_by_client_total series gained
 // a token_type="total" slice that is CACHE-INCLUSIVE. Anthropic reports
 // cache_creation_input_tokens / cache_read_input_tokens as counters SEPARATE
 // from input_tokens, so the pre-existing input+output slices undercount cached
@@ -65,7 +65,7 @@ function seriesValue(text: string, tokenType: string): number | undefined {
     if (
       line.startsWith("aisix_llm_tokens_by_client_total{") &&
       line.includes(`client_type="${CLIENT_TYPE}"`) &&
-      // AISIX-Cloud#1044: the series carries the requested logical model.
+      // #1044: the series carries the requested logical model.
       line.includes(`model="${MODEL}"`) &&
       line.includes(`token_type="${tokenType}"`)
     ) {
@@ -75,7 +75,7 @@ function seriesValue(text: string, tokenType: string): number | undefined {
   return undefined;
 }
 
-describe("aisix_llm_tokens_by_client_total token_type=total is cache-inclusive (AISIX-Cloud#1002)", () => {
+describe("aisix_llm_tokens_by_client_total token_type=total is cache-inclusive (#1002)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let seed: SeedClient | undefined;

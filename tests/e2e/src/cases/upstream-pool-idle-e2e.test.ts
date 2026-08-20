@@ -10,7 +10,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E for `upstream.pool_idle_timeout_secs` (AISIX-Cloud#1122, #1126).
+// E2E for `upstream.pool_idle_timeout_secs` (#1122, #1126).
 //
 // The setting exists because a hop between the gateway and the provider
 // (load balancer, NAT gateway, service mesh) closes idle connections on

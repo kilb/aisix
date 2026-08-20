@@ -18,7 +18,7 @@ import {
 //
 // 1. The `outcome` label had two vocabularies on one series. Chat emitted
 //    the documented `hit_exact` / `hit_semantic`; the byte-bodied endpoints
-//    fed the metric the cp-api wire value instead and emitted `hit`, which
+//    fed the metric the control plane wire value instead and emitted `hit`, which
 //    is not in the series' value set. Any dashboard written against the
 //    documentation (`outcome=~"hit_.*"`) covered chat and silently showed
 //    nothing for Anthropic-SDK and Codex traffic.

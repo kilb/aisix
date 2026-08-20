@@ -12,7 +12,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E for AISIX-Cloud#825: the OpenAI Responses API (`POST /v1/responses`)
+// E2E for #825: the OpenAI Responses API (`POST /v1/responses`)
 // must work against a non-OpenAI backend. The `codex` CLI speaks only the
 // Responses API; pointing it at an Anthropic model (e.g. `opus-4.7`) used to
 // return a hard 400 ("model ... is not an OpenAI provider; /v1/responses

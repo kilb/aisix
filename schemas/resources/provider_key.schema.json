@@ -86,7 +86,7 @@
           "type": "object"
         },
         "forward_client_headers": {
-          "description": "Inbound client headers forwarded to the upstream provider, as single-`*` glob patterns matched case-insensitively against the header name (`\"anthropic-beta\"`, `\"x-trace-*\"`). Empty — the default — forwards nothing, which is the behavior of every standard-protocol endpoint before AISIX-Cloud#1167. Auth, transport, and gateway-owned headers are never forwarded whatever the patterns say.",
+          "description": "Inbound client headers forwarded to the upstream provider, as single-`*` glob patterns matched case-insensitively against the header name (`\"anthropic-beta\"`, `\"x-trace-*\"`). Empty — the default — forwards nothing, which is the behavior of every standard-protocol endpoint before #1167. Auth, transport, and gateway-owned headers are never forwarded whatever the patterns say.",
           "items": {
             "type": "string"
           },

@@ -3,7 +3,7 @@
 //! input and/or output and translates the returned `Data.Suggestion`
 //! into a [`GuardrailVerdict`].
 //!
-//! AISIX-Cloud#1070.
+//! #1070.
 //!
 //! A DIFFERENT Aliyun product from `kind=aliyun_text_moderation`
 //! (TextModerationPlus / Content Moderation): AI Guardrails is activated
@@ -406,7 +406,7 @@ impl AliyunAiGuardrail {
     /// any desensitized replacement text, alongside whatever upstream
     /// diagnostics the call yielded.
     ///
-    /// Diagnostics come back on BOTH arms on purpose (AISIX-Cloud#1060):
+    /// Diagnostics come back on BOTH arms on purpose (#1060):
     /// the failure arms are exactly the ones an operator needs
     /// `aliyun_request_id` for. The desensitized text travels in
     /// [`CallReply`], NOT in the diagnostics — it is caller content, and
@@ -637,7 +637,7 @@ fn reattach_clipped_tail(original: &str, masked_prefix: String) -> String {
 }
 
 /// What one `MultiModalGuard` call reported about itself, for operator
-/// triage (AISIX-Cloud#1060 pattern).
+/// triage (#1060 pattern).
 ///
 /// Provider metadata ONLY. The detection detail can echo matched text
 /// back (`RiskWords`-style fields inside `Result[].Ext`); per #153 none

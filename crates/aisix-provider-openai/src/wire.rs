@@ -48,7 +48,7 @@ pub struct OpenAiRequest<'a> {
     /// caller didn't set `stream_options` itself — OpenAI-protocol
     /// upstreams omit the terminal `usage` frame without it, which
     /// zeroed token telemetry for every streaming request whose client
-    /// didn't ask (AISIX-Cloud#790). `None` whenever `extra` already
+    /// didn't ask (#790). `None` whenever `extra` already
     /// carries a client-supplied `stream_options` (the flattened map
     /// wins; a typed duplicate would emit the key twice).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -382,7 +382,7 @@ fn into_usage(u: OpenAiUsage) -> UsageStats {
             .map(|d| d.reasoning_tokens)
             .unwrap_or(0),
         // OpenAI doesn't currently expose Anthropic-style cache
-        // creation/read counters; leave at 0 (cp-api falls back to
+        // creation/read counters; leave at 0 (the control plane falls back to
         // prompt rate for unset cache counters).
         cache_creation_tokens: 0,
         cache_read_tokens: 0,
@@ -630,7 +630,7 @@ mod tests {
         assert_eq!(out.finish_reason, FinishReason::Stop);
         assert_eq!(out.usage.total_tokens, 6);
         // No cache / reasoning details on this minimal response →
-        // counters stay at 0 (cp-api falls back to standard rates).
+        // counters stay at 0 (the control plane falls back to standard rates).
         assert_eq!(out.usage.cached_prompt_tokens, 0);
         assert_eq!(out.usage.reasoning_tokens, 0);
     }

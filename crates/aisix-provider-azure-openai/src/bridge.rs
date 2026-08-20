@@ -1086,7 +1086,7 @@ fn parse_stream_chunk(
 mod tests {
     use super::*;
 
-    /// AISIX-Cloud#1222 scenario 3: an in-band `data: {"error":{...}}`
+    /// #1222 scenario 3: an in-band `data: {"error":{...}}`
     /// frame inside the committed 200 stream surfaces as the typed
     /// in-band error, not a serde decode failure.
     #[test]
@@ -2444,7 +2444,7 @@ mod tests {
         }
     }
 
-    /// AISIX-Cloud#1122: `stream_timeout` is defined as the maximum gap
+    /// #1122: `stream_timeout` is defined as the maximum gap
     /// *between* chunks (see `Model::stream_timeout`), but the budget was
     /// applied as `timeout_at(started + d)` — one absolute instant reused
     /// for every chunk, i.e. a ceiling on the whole response. A long but

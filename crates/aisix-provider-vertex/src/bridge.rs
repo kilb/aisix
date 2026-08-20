@@ -67,7 +67,7 @@ use aisix_provider_openai::wire::{
 
 // Per-`ProviderKey` request/response override pipeline (#302 §5 / #339).
 // The Vertex bridge mirrors `OpenAiBridge`'s apply order exactly and reuses
-// the same primitives, so cp-api captures a provider's quirks once and every
+// the same primitives, so the control plane captures a provider's quirks once and every
 // adapter honours the same wire shape. All primitives are no-ops when the
 // targeted keys are absent, so they are safe to call uniformly across the
 // five publisher rails (the Gemini `contents` shape simply does not match the
@@ -4738,7 +4738,7 @@ mod tests {
         );
     }
 
-    /// AISIX-Cloud#1222 scenario 3: Google reports a mid-stream failure
+    /// #1222 scenario 3: Google reports a mid-stream failure
     /// as a `{"error":{code,message,status}}` frame inside the
     /// committed 200 stream. Pre-fix it surfaced as UpstreamDecode and
     /// the numeric code / gRPC status were lost.
@@ -4790,7 +4790,7 @@ data: {\"error\":{\"code\":503,\"message\":\"The service is currently unavailabl
     /// Claude-on-Vertex speaks the Anthropic Messages wire — an
     /// in-band `event: error` frame must surface typed instead of
     /// being swallowed by the `Other` catch-all (same fix as the
-    /// native Anthropic bridge, AISIX-Cloud#1222).
+    /// native Anthropic bridge, #1222).
     #[tokio::test]
     async fn chat_anthropic_stream_in_band_error_event_surfaces_typed() {
         let body = "event: content_block_delta\n\
@@ -5007,7 +5007,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
 
     /// Build a Vertex `ProviderKey` carrying a `request` override block
     /// (issue #302 §5). The block is supplied as JSON so the test exercises
-    /// the same on-disk deserialization cp-api writes to etcd.
+    /// the same on-disk deserialization the control plane writes to etcd.
     fn sample_pk_with_request_overrides(request: serde_json::Value) -> Arc<ProviderKey> {
         Arc::new(
             serde_json::from_value(serde_json::json!({

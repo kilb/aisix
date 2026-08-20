@@ -283,10 +283,10 @@ pub enum FinishReason {
 
 /// Token usage stats from one upstream chat completion. The four
 /// fine-grained counters that follow `total_tokens` carry the
-/// provider-specific cache / reasoning detail used by cp-api's cost
-/// formula (see `aisix-cloud:internal/dpmgr/dpstore/pricing.go`).
+/// provider-specific cache / reasoning detail used by the control plane's cost
+/// formula (see `aisix-cloud:the control plane/dpstore/pricing.go`).
 ///
-/// Provider-protocol mapping (the canonical comment lives in cp-api's
+/// Provider-protocol mapping (the canonical comment lives in the control plane's
 /// schema; mirrored here for grep-ability):
 ///
 ///   OpenAI Chat Completions response.usage:
@@ -304,7 +304,7 @@ pub enum FinishReason {
 ///     cache_read_input_tokens       → cache_read_tokens
 ///
 /// Provider bridges that don't surface these (gemini, deepseek,
-/// mistral, …) leave the four new counters at 0; cp-api treats 0 as
+/// mistral, …) leave the four new counters at 0; the control plane treats 0 as
 /// "no distinct rate" and falls back to the standard prompt /
 /// completion price for that token class.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,7 +369,7 @@ impl UsageStats {
     /// a single `prompt_tokens` that already includes the cached part
     /// (the OpenAI shape). `total_tokens` therefore folds the cache
     /// counters in, so it stays the honest total instead of
-    /// `prompt + completion` alone (#906 / AISIX-Cloud#906). OpenAI
+    /// `prompt + completion` alone (#906 / #906). OpenAI
     /// upstreams keep using `new()` — their cache hit is a subset of
     /// `prompt_tokens`, so it must NOT be added again here.
     pub fn with_cache(prompt: u32, completion: u32, cache_creation: u32, cache_read: u32) -> Self {
@@ -388,7 +388,7 @@ impl UsageStats {
 
     /// Field-wise saturating sum of two usage records. Used to build an
     /// ensemble's client-facing aggregate usage — the sum of every panel
-    /// member plus the judge (api7/AISIX-Cloud#804) — so a fan-out request
+    /// member plus the judge (api7/#804) — so a fan-out request
     /// reports its full multiplicative cost to the caller rather than a
     /// single sub-call's. The optional provider-native passthrough counters
     /// (DeepSeek hit/miss, #542) add with `None` treated as 0, staying
@@ -527,7 +527,7 @@ pub struct ChatDelta {
     /// by the Bridge after applying the
     /// [`response.reasoning_field`](aisix_core::ResponseOverrides::reasoning_field)
     /// path — issue #302 §5. `None` for upstreams that don't carry a
-    /// reasoning field or where cp-api didn't configure a path. Matches
+    /// reasoning field or where the control plane didn't configure a path. Matches
     /// DeepSeek's canonical `delta.reasoning_content` shape so the
     /// emitter is a passthrough.
     #[serde(default, skip_serializing_if = "Option::is_none")]

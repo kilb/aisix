@@ -1,5 +1,5 @@
 //! `Guardrail` entity — content-policy hooks the DP runs on every
-//! chat request. The control plane (cp-api) writes these to etcd at
+//! chat request. The control plane (the control plane) writes these to etcd at
 //! `/aisix/<env>/guardrails/<uuid>`; the DP loads them on watch and
 //! the `aisix-proxy::ProxyState::guardrail_index` resolves the
 //! applicable chain per request.
@@ -118,7 +118,7 @@ pub enum BedrockLatencyMode {
 /// Content Safety Prompt Shield API to detect jailbreak and indirect
 /// injection attacks.
 ///
-/// The CP (cp-api) decrypts the envelope-encrypted `api_key` at kine-
+/// The CP (the control plane) decrypts the envelope-encrypted `api_key` at kine-
 /// projection time so the DP always holds plaintext in memory. The
 /// key is never logged.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
@@ -152,10 +152,10 @@ fn default_acs_timeout_ms() -> u32 {
 /// Azure AI Content Safety `text:analyze` for category-severity and blocklist
 /// moderation on input and/or output, including streaming output.
 ///
-/// Reuses the P1 connection block (endpoint + api_key + timeout_ms). cp-api
+/// Reuses the P1 connection block (endpoint + api_key + timeout_ms). The control plane
 /// projects only operator-set fields (omitempty), so every optional field
-/// carries a serde default matching the cp-api validator's documented
-/// default. Only `api_key` is a secret (decrypted by cp-api before kine
+/// carries a serde default matching the control plane validator's documented
+/// default. Only `api_key` is a secret (decrypted by the control plane before kine
 /// projection). Every other field travels in the clear.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -278,7 +278,7 @@ fn default_acs_on_buffer_exceeded() -> String {
 /// `RiskLevel` (`none`/`low`/`medium`/`high`). The DP blocks when the
 /// returned level reaches `risk_level_threshold`.
 ///
-/// Only `access_key_secret` is a secret (decrypted by cp-api before kine
+/// Only `access_key_secret` is a secret (decrypted by the control plane before kine
 /// projection. It is plaintext in DP memory only and never logged). Every other
 /// field travels in the clear.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
@@ -357,7 +357,7 @@ fn default_aliyun_risk_level_threshold() -> String {
 /// local risk threshold. `block` blocks; anything else passes (detection
 /// detail lands in logs/telemetry).
 ///
-/// Only `access_key_secret` is a secret (decrypted by cp-api before kine
+/// Only `access_key_secret` is a secret (decrypted by the control plane before kine
 /// projection. It is plaintext in DP memory only and never logged). Every
 /// other field travels in the clear.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
@@ -770,7 +770,7 @@ pub enum GuardrailKind {
 }
 
 impl GuardrailKind {
-    /// The wire `kind` discriminator string — matches the cp-api kind enum
+    /// The wire `kind` discriminator string — matches the control plane kind enum
     /// and the dashboard. Used for applied-guardrail telemetry.
     pub fn kind_str(&self) -> &'static str {
         match self {
@@ -814,7 +814,7 @@ pub struct AppliedGuardrail {
 
 /// One monitor-mode observation: what an `enforcement_mode: monitor`
 /// guardrail WOULD have done to this request had it been enforcing
-/// (AISIX-Cloud#562). Carried on the telemetry UsageEvent so operators can
+/// (#562). Carried on the telemetry UsageEvent so operators can
 /// stage a policy, watch its hit rate in the dashboard, and only then flip
 /// it to `block`.
 ///
@@ -840,7 +840,7 @@ pub struct GuardrailMonitorHit {
 }
 
 /// One guardrail member execution as observed by the chain fold
-/// (AISIX-Cloud#1076): identity, phase, enforced outcome, and wall-clock
+/// (#1076): identity, phase, enforced outcome, and wall-clock
 /// duration. All fields are bounded values safe for metric labels — never
 /// matched content (#153 no-leak criterion).
 #[derive(Debug, Clone, Copy)]
@@ -1261,7 +1261,7 @@ mod tests {
 
     #[test]
     fn azure_text_moderation_kind_parses_with_defaults() {
-        // cp-api omits unset fields (omitempty); the DP must apply the
+        // The control plane omits unset fields (omitempty); the DP must apply the
         // documented defaults so a minimal row still moderates correctly.
         let v = json!({
             "name": "moderate",
@@ -1322,7 +1322,7 @@ mod tests {
 
     #[test]
     fn aliyun_text_moderation_kind_parses_with_defaults() {
-        // cp-api omits unset fields (omitempty); the DP must apply the
+        // The control plane omits unset fields (omitempty); the DP must apply the
         // documented defaults so a minimal row still moderates correctly.
         let v = json!({
             "name": "aliyun-guard",
@@ -1384,7 +1384,7 @@ mod tests {
 
     #[test]
     fn aliyun_ai_guardrail_kind_parses_with_defaults() {
-        // cp-api omits unset fields (omitempty); the DP must apply the
+        // The control plane omits unset fields (omitempty); the DP must apply the
         // documented defaults so a minimal row still moderates correctly.
         let v = json!({
             "name": "aig-guard",
@@ -1446,7 +1446,7 @@ mod tests {
 
     #[test]
     fn pii_kind_parses_with_defaults() {
-        // cp-api omits unset fields (omitempty); the DP must apply the
+        // The control plane omits unset fields (omitempty); the DP must apply the
         // documented defaults so a minimal row still works.
         let v = json!({
             "name": "mask-pii",

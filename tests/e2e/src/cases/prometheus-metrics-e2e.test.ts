@@ -130,7 +130,7 @@ describe("prometheus metrics e2e", () => {
   // inbound_protocol="openai"}` on the DP's /metrics endpoint. Pre-#408
   // the gateway emitted UsageEvents to the sink + OTLP fan-out but
   // had no DP-side prometheus counter, so a regression that dropped
-  // emission was invisible to e2e (the harness has no cp-api / OTLP
+  // emission was invisible to e2e (the harness has no the control plane / OTLP
   // receiver in the loop).
   test("usage_events_emitted counter increments on successful chat (#408)", async (ctx) => {
     if (!etcdReachable || !app || !upstream) {

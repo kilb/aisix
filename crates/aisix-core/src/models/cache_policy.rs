@@ -1,5 +1,5 @@
 //! `CachePolicy` entity — per-env prompt-response cache rules. The
-//! control plane (cp-api) writes these to etcd at
+//! control plane (the control plane) writes these to etcd at
 //! `/aisix/<env>/cache_policies/<uuid>`; the DP loads them on watch
 //! and `aisix-proxy::cache_gate` consults them on every chat request.
 //!
@@ -202,7 +202,7 @@ impl CachePolicy {
     /// Anything else (including the empty string) parses as `All` —
     /// the conservative default keeps caching on for legacy / future
     /// policy values rather than silently disabling them on a typo.
-    /// cp-api validation prevents the empty-string case at write time
+    /// The control plane validation prevents the empty-string case at write time
     /// (see internal/cpapi/resources/cache_policies.go::validateCachePolicyShape),
     /// so the conservative branch is dead in practice.
     pub fn parsed_applies_to(&self) -> AppliesTo {
@@ -229,7 +229,7 @@ pub enum AppliesTo {
     /// stable identifier here.
     Model(String),
     /// Only requests authenticated by the api_key whose UUID equals
-    /// the inner string. The UUID is the cp-api row id, the same
+    /// the inner string. The UUID is the control plane row id, the same
     /// value the dashboard exposes on the api keys page.
     ApiKey(String),
 }
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn applies_to_unknown_prefix_falls_back_to_all() {
-        // cp-api validation rejects this on write, but a hand-edited
+        // The control plane validation rejects this on write, but a hand-edited
         // kine row could surface here — we deliberately fall back to
         // All rather than disabling caching on an unknown discriminator.
         let p: CachePolicy =
@@ -339,7 +339,7 @@ mod tests {
 
     #[test]
     fn unknown_fields_are_tolerated_for_forward_compat() {
-        // cp-api may ship new fields ahead of the DP rolling out;
+        // The control plane may ship new fields ahead of the DP rolling out;
         // serde must accept them (no `deny_unknown_fields`).
         let v = json!({
             "name": "future",

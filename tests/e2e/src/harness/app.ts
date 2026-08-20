@@ -42,7 +42,7 @@ export interface AppOverrides {
     header?: string;
   };
   /**
-   * `proxy.request_id` block (AISIX-Cloud#1288). Merged into the base
+   * `proxy.request_id` block (#1288). Merged into the base
    * proxy config like `realIp`. Names the inbound headers a caller may
    * supply its own request id in; omitted, the binary's default
    * (`["x-aisix-request-id"]`) applies.
@@ -96,7 +96,7 @@ export interface AppOverrides {
    */
   logLevel?: string;
   /**
-   * `observability.metrics.client_type_rules` (AISIX-Cloud#1045): operator
+   * `observability.metrics.client_type_rules` (#1045): operator
    * UA→client_type regex rules, tried before the built-in allowlist.
    * A dedicated override because `extra` replaces whole top-level blocks
    * and the observability block carries the harness-picked metrics port.

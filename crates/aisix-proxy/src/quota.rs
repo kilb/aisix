@@ -1,7 +1,7 @@
 //! Pre-dispatch quota gate shared by every LLM endpoint.
 //!
 //! Applies budget + multi-layer rate limiting:
-//! 1. Budget pre-check (cp-api cached decision)
+//! 1. Budget pre-check (the control plane cached decision)
 //! 2. API-key inline rate limit (`auth.entry.id`)
 //! 3. Model inline rate limit (`model:<name>`) — when the resolved Model has one
 //! 4. MCP-server rate limit (`mcp:<api_key_id>:<server>`) — on an MCP
@@ -13,7 +13,7 @@
 //!    per-member default for a team: it matches every key in the team
 //!    but buckets the counter per `user_id`, so each member gets an
 //!    independent identical quota (vs. `team`, one shared bucket).
-//!    Conditional rows (AISIX-Cloud#892) match by their `conditions`
+//!    Conditional rows (#892) match by their `conditions`
 //!    tree and bucket by `group_by` — see [`match_policy_layer`] for
 //!    the phase split that decides whether a row reserves at the
 //!    request gate or per routing target.
@@ -79,7 +79,7 @@ impl ModelRateLimit {
 /// Identity of the caller-addressed virtual parent (routing group /
 /// ensemble / semantic router), forwarded by the dispatch loops into the
 /// per-target condition input so `model` / `model_name` leaves match the
-/// parent as well as the concrete target (AISIX-Cloud#1267).
+/// parent as well as the concrete target (#1267).
 #[derive(Clone, Copy)]
 pub(crate) struct RoutingParent<'a> {
     /// The parent Model's `display_name` (the alias the caller sent).
@@ -292,7 +292,7 @@ fn classic_rate_limit(policy: &RateLimitPolicy) -> Option<RateLimit> {
     let mut rl = RateLimit::default();
     match policy.window? {
         PolicyWindow::Second => {
-            // Pre-fix (api7/AISIX-Cloud#426): `rl.rpm = max * 60` — a
+            // Pre-fix (api7/#426): `rl.rpm = max * 60` — a
             // 5/second policy was upscaled to 300/minute, allowing
             // 60× bursts past the operator-declared cap inside any
             // single 1-second window.
@@ -310,7 +310,7 @@ fn classic_rate_limit(policy: &RateLimitPolicy) -> Option<RateLimit> {
             rl.rps = policy.max_requests;
             // Audit M1 (#399): warn loudly when an operator set
             // `max_tokens` on a sub-minute window. Without the warn,
-            // the policy looks accepted at cp-api but the token cap
+            // the policy looks accepted at the control plane but the token cap
             // is silently inert until ai-gateway#396 lands.
             if policy.max_tokens.is_some() {
                 warn_inert_max_tokens_once(&policy.name, "second");
@@ -321,7 +321,7 @@ fn classic_rate_limit(policy: &RateLimitPolicy) -> Option<RateLimit> {
             rl.tpm = policy.max_tokens;
         }
         PolicyWindow::Hour => {
-            // Pre-fix (api7/AISIX-Cloud#426): `rl.rpd = max * 24` —
+            // Pre-fix (api7/#426): `rl.rpd = max * 24` —
             // a 1000/hour policy was upscaled to 24000/day, allowing
             // the entire hourly cap to be burned in any single hour
             // with no enforcement (24× exploit shape, slower-window
@@ -418,7 +418,7 @@ async fn reserve_layers(
 /// applicable layer. Shared by the request gate ([`reserve_layers`])
 /// and the per-target gate ([`reserve_model_only`]) so the two scans
 /// cannot drift (the schedules gate had to be patched into both loops
-/// once already — AISIX-Cloud#1104).
+/// once already — #1104).
 async fn reserve_policy_layers(
     state: &ProxyState,
     // The caller's request snapshot (#941). This gate used to load its
@@ -441,7 +441,7 @@ async fn reserve_policy_layers(
         let policy = &entry.value;
         // Inside a scheduled suspension window the policy reserves
         // nothing; enforcement resumes automatically when the window
-        // closes, on the unchanged bucket (AISIX-Cloud#1104).
+        // closes, on the unchanged bucket (#1104).
         if policy.suspended_at(now) {
             continue;
         }
@@ -462,7 +462,7 @@ async fn reserve_policy_layers(
 /// counting it under `aisix_ratelimit_rejections_total{scope,layer}` —
 /// the gate is the one point every endpoint funnels through, so the
 /// counter covers them all. Policy-layer rejections carry the policy
-/// identity for 429 attribution (`error.policy`, AISIX-Cloud#892).
+/// identity for 429 attribution (`error.policy`, #892).
 fn reject(
     state: &ProxyState,
     err: aisix_ratelimit::RateLimitError,
@@ -513,7 +513,7 @@ pub(crate) async fn enforce_mcp(
 }
 
 /// Budget pre-check shared by the enforce entry points: refreshes the
-/// budget gauges from the cached cp-api decision and rejects the request
+/// budget gauges from the cached the control plane decision and rejects the request
 /// when the key is over budget.
 async fn check_budget(state: &ProxyState, auth: &AuthenticatedKey) -> Result<(), ProxyError> {
     let decision = state.budgets.check(&auth.entry.id).await;
@@ -601,7 +601,7 @@ pub(crate) async fn reserve_model_only(
     // Policies that follow the model to this target. The condition
     // input carries the {target, caller-addressed parent} pair so a
     // policy pinning the parent's id or alias matches here too
-    // (AISIX-Cloud#1267).
+    // (#1267).
     let input = condition_input(auth, Some(&mrl), routing_parent);
     reserve_policy_layers(
         state,
@@ -620,7 +620,7 @@ pub(crate) async fn reserve_model_only(
 /// reservation (#620). Returns `Ok(None)` for a direct (non-routing)
 /// dispatch: there the target IS the requested entry, whose model layers
 /// were already reserved pre-dispatch by [`enforce`]/[`enforce_rate_limit`],
-/// so reserving again would double-count the request (AISIX-Cloud#1087).
+/// so reserving again would double-count the request (#1087).
 ///
 /// An `Err` means this target is over one of its own limits right now —
 /// the dispatch loops treat that as a failed 429 attempt and continue with
@@ -781,7 +781,7 @@ mod tests {
         assert!(rl.tpd.is_none());
     }
 
-    // Regression guard for api7/AISIX-Cloud#426. Pre-fix these tests
+    // Regression guard for api7/#426. Pre-fix these tests
     // asserted the BUG: `second` → `rpm = max * 60` and `hour` →
     // `rpd = max * 24`. The upscaling allowed 60× and 24× bursts past
     // the operator-declared cap. Post-fix asserts the new contract:
@@ -890,7 +890,7 @@ mod tests {
         assert!(rl.tpm.is_none());
     }
 
-    // ---- conditional form (AISIX-Cloud#892) ----
+    // ---- conditional form (#892) ----
 
     #[test]
     fn conditional_shared_bucket_and_limits() {
@@ -986,7 +986,7 @@ mod tests {
 
     #[test]
     fn group_referencing_policy_matches_at_target_phase_via_parent() {
-        // AISIX-Cloud#1267: `model in [group uuid]` reserves at the
+        // #1267: `model in [group uuid]` reserves at the
         // per-target gate because the condition input carries the
         // {target, parent} pair — previously the parent id was compared
         // nowhere and the policy never fired.

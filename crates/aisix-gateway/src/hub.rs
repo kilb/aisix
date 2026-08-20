@@ -18,12 +18,12 @@
 //!   wire shape and has no specialized override.
 //!
 //! [`Hub::dispatch_two_tier`] looks up specialized first, then falls
-//! back to the family bridge. A new catalog vendor admitted by cp-api
+//! back to the family bridge. A new catalog vendor admitted by the control plane
 //! works without a DP code change: the family bridge for its adapter
 //! handles the request using `ProviderKey.api_base` for the upstream.
 //!
-//! Closes the dispatch half of api7/AISIX-Cloud#302 Phase A and the
-//! routing half of api7/AISIX-Cloud#417.
+//! Closes the dispatch half of api7/#302 Phase A and the
+//! routing half of api7/#417.
 
 use aisix_core::models::{Adapter, ProviderKey};
 use dashmap::DashMap;

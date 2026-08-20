@@ -9,7 +9,7 @@ import {
 } from "../harness/index.js";
 
 // E2E: `api_base` is the upstream root — whatever path it carries is
-// preserved, and every endpoint is appended to it (AISIX-Cloud#1244).
+// preserved, and every endpoint is appended to it (#1244).
 //
 // Before the fix the gateway used two different conventions on one
 // provider key: the OpenAI-family bridge appended `/chat/completions` to

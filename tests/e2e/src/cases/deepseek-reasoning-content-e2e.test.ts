@@ -26,7 +26,7 @@ import {
 //
 // References:
 // - DeepSeek reasoning API: https://api-docs.deepseek.com/guides/reasoning_model
-// - Issue: api7/AISIX-Cloud#466
+// - Issue: api7/#466
 
 const CALLER_PLAINTEXT = "sk-ds-reasoning-caller";
 const CALLER_KEY_HASH = createHash("sha256")

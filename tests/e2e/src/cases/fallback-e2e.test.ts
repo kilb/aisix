@@ -196,7 +196,7 @@ describe("fallback e2e: virtual routing fails over from 5xx to next target", () 
     expect(goodUpstream.receivedRequests.length - goodBaseline).toBe(1);
   });
 
-  // AISIX-Cloud#1299: an operator compared a 5xx count from the usage log
+  // #1299: an operator compared a 5xx count from the usage log
   // against `sum(increase(aisix_proxy_requests_total{status=~"5.."}[24h]))`
   // and found the metric two orders of magnitude lower. The request family
   // is per-REQUEST and carries the status the caller saw, so a request its

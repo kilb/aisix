@@ -24,7 +24,7 @@
 //! threshold, and the API's own `flagged` is ignored (LiteLLM has no
 //! equivalent knob).
 //!
-//! The cp-api decrypts the envelope-encrypted `api_key` at kine-projection
+//! The the control plane decrypts the envelope-encrypted `api_key` at kine-projection
 //! time so this module only handles plaintext keys. The key is never
 //! logged; block reasons carry category NAMES only, never matched content
 //! (#153).
@@ -71,7 +71,7 @@ pub struct OpenaiModerationGuardrail {
     row_name: String,
     /// Endpoint with trailing slash stripped.
     endpoint: String,
-    /// Plaintext Bearer key (decrypted by cp-api before kine write).
+    /// Plaintext Bearer key (decrypted by the control plane before kine write).
     api_key: String,
     model: String,
     category_thresholds: BTreeMap<String, f64>,

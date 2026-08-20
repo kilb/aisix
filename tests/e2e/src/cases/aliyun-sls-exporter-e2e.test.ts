@@ -12,7 +12,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// L2 mock e2e (AISIX-Cloud#687): a dashboard-configured `aliyun_sls`
+// L2 mock e2e (#687): a dashboard-configured `aliyun_sls`
 // exporter makes the real DP deliver request events to SLS over a signed
 // PutLogs call. We stand up a mock SLS receiver, register the exporter, drive
 // one chat, and assert the DP POSTed a correctly-shaped, signed lz4-protobuf
@@ -25,7 +25,7 @@ import {
 // credential_ref → env path, not a key on the kine config). The body's field
 // mapping is covered by the Rust round-trip unit test (`sink::sls::tests`),
 // and that a real Aliyun endpoint actually accepts the signed request is
-// validated by the control-plane full-chain e2e (api7/AISIX-Cloud), not in
+// validated by the control plane's own full-chain e2e, not in
 // this repo.
 
 const CALLER_PLAINTEXT = "sk-sls-exporter-caller-PLAINTEXT";

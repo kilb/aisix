@@ -627,7 +627,7 @@ async fn dispatch_stream(
     // Re-attach the request span: the body is polled after the request-id
     // middleware has returned, so a mid-stream failure would otherwise be
     // logged without its `request_id` and could not be joined to the rest of
-    // the request (AISIX-Cloud#1060).
+    // the request (#1060).
     let sse = crate::request_id::in_request_span(async_stream::stream! {
         let mut events = events;
         while let Some(event) = events.next().await {
@@ -1452,7 +1452,7 @@ mod tests {
     async fn a_call_records_the_task_and_context_it_touched() {
         // Without these the log answers "someone called the invoice agent" and
         // nothing else — not which task it produced, nor how that task ended
-        // (AISIX-Cloud#1215).
+        // (#1215).
         let event = usage_event_for(
             &spawn_task_agent().await,
             serde_json::json!({

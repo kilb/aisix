@@ -223,7 +223,7 @@ async fn dispatch(
     let peek = serde_json::from_slice::<JsonRpcPeek>(&bytes).ok();
 
     // Converge the accepted `MCP-Protocol-Version` set before any quota,
-    // guardrail, or upstream work (AISIX-Cloud#1148). rmcp's own transport
+    // guardrail, or upstream work (#1148). rmcp's own transport
     // check admits its whole hardcoded KNOWN_VERSIONS list — including
     // `2024-11-05`, whose HTTP+SSE transport this endpoint has never served —
     // and renders violations as a bare text/plain 400 outside the JSON-RPC
@@ -266,7 +266,7 @@ async fn dispatch(
 
     // Reuse the LLM path's rate-limit + budget gate on the unit of work, plus
     // the key's own limit for the MCP server this tool belongs to
-    // (AISIX-Cloud#1079). The reservation is held for the duration of the call
+    // (#1079). The reservation is held for the duration of the call
     // and dropped after (no tokens to commit — a tool call carries no token
     // cost), which releases the concurrency slot. On 429 / budget-exceeded this
     // returns before any upstream is contacted — and the rejected call is still
@@ -2043,7 +2043,7 @@ mod tests {
     /// rmcp's own transport check would ADMIT (it is in KNOWN_VERSIONS) —
     /// is rejected by the proxy gate: HTTP 400, JSON-RPC envelope, the
     /// request id echoed, the supported list attached
-    /// (AISIX-Cloud#1148 / #1144).
+    /// (#1148 / #1144).
     #[tokio::test]
     async fn unsupported_protocol_version_header_is_rejected_in_the_envelope() {
         let router = router_with(snapshot_with_key());

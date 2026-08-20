@@ -224,7 +224,7 @@ cache:
   #   # (it is logged at startup). Use SSL_CERT_FILE or the system trust
   #   # store for that one case; `verify` does apply.
 
-# Rate-limit counter backend (api7/AISIX-Cloud#798).
+# Rate-limit counter backend (api7/#798).
 #
 # `memory` (default) keeps counters in this process, so a cluster of N
 # replicas enforces N× every configured limit. `redis` shares the

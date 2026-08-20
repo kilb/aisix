@@ -15,7 +15,7 @@ import {
 // UsageEvent tracker (6/6 endpoints).
 //
 // Pre-fix both handlers emitted only an AccessLog + metrics; no
-// UsageEvent → the requests were invisible to cp-api's budget ledger
+// UsageEvent → the requests were invisible to the control plane's budget ledger
 // and /logs analytics. This drives real requests through the DP binary
 // and asserts the DP's own `aisix_usage_events_emitted_total` counter
 // (added in #408) increments for handler="images" / handler="audio".
@@ -27,7 +27,7 @@ import {
 // References:
 // - OpenAI images object (usage): https://platform.openai.com/docs/api-reference/images/object
 // - OpenAI audio (usage): https://platform.openai.com/docs/api-reference/audio
-// - Issues: api7/AISIX-Cloud#406, #407
+// - Issues: api7/#406, #407
 
 const CALLER_PLAINTEXT = "sk-audio-images-caller";
 const CALLER_KEY_HASH = createHash("sha256")

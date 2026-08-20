@@ -172,7 +172,7 @@ pub async fn embeddings(
                 status,
                 elapsed,
             );
-            // Issue #226: emit UsageEvent so cp-api's budget ledger
+            // Issue #226: emit UsageEvent so the control plane's budget ledger
             // and customer-facing /logs analytics see embeddings
             // spend. Pre-#226 the embedding handler dropped the
             // event entirely, so any /v1/embeddings traffic was
@@ -286,17 +286,17 @@ struct EmbedDispatchSuccess {
     provider: String,
     model_id: String,
     /// Resolved ProviderKey UUID — feeds the per-PK telemetry attribution
-    /// tags on the emitted UsageEvent (AISIX-Cloud#867 parity).
+    /// tags on the emitted UsageEvent (#867 parity).
     provider_key_id: String,
     /// Provider-side model name, for the `upstream_model` metric label
-    /// (AISIX-Cloud#1234 parity with chat / messages / responses).
+    /// (#1234 parity with chat / messages / responses).
     upstream_model: String,
     /// The `{kind, hook}` set of guardrails that governed this request (#379
     /// parity) — surfaced on the emitted UsageEvent.
     applied_guardrails: Vec<AppliedGuardrail>,
     /// Per-detector PII mask counts (#932) applied to the input.
     redactions: crate::redact::RedactionCounts,
-    /// Monitor-mode guardrail observations (AISIX-Cloud#562).
+    /// Monitor-mode guardrail observations (#562).
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// Captured request/response content for content-capturing exporters
     /// (#700, LiteLLM parity: the full response JSON — vectors included —
@@ -305,7 +305,7 @@ struct EmbedDispatchSuccess {
     captured_content: Option<CapturedContent>,
     prompt_tokens: u32,
     /// True when `prompt_tokens` came from the local estimator because
-    /// the upstream reported no usage (AISIX-Cloud#1074).
+    /// the upstream reported no usage (#1074).
     usage_estimated: bool,
     /// `true` when the dispatch produced a real 200 from the upstream
     /// (we have authoritative usage data to attribute). `false` for the
@@ -599,7 +599,7 @@ async fn dispatch(
             } = outcome.value;
             // The recovery signal (health + cooldown clear) is recorded by
             // the walker against the target that answered.
-            // Token accounting (#226 / AISIX-Cloud#1074). Embeddings are
+            // Token accounting (#226 / #1074). Embeddings are
             // input-only, so `prompt_tokens == total_tokens` on the OpenAI
             // shape. Providers that report only `total_tokens` (e.g. some
             // rerank/embed backends) get prompt from total — upstream-
@@ -626,7 +626,7 @@ async fn dispatch(
             // fallback above keeps this accurate for upstreams that
             // report no usage.
             // Fold the winning target's own model layers in
-            // (AISIX-Cloud#1087) so one commit bills the member's TPM/TPD
+            // (#1087) so one commit bills the member's TPM/TPD
             // too; `None` for a direct dispatch, where the entry's layers
             // were reserved pre-dispatch.
             if let Some(member) = member_reservation {
@@ -805,7 +805,7 @@ fn emit_access_log(
         total_tokens: None,
         request_id,
         // No provider response id: the OpenAI embeddings response shape
-        // carries none (AISIX-Cloud#1289).
+        // carries none (#1289).
         provider_request_id: None,
         served_by_model: routing
             .map(|r| r.served_by_model.as_str())
@@ -818,7 +818,7 @@ fn emit_access_log(
     .emit();
 }
 
-/// Push one `UsageEvent` onto cp-api's telemetry sink **and** fan it
+/// Push one `UsageEvent` onto the control plane's telemetry sink **and** fan it
 /// out to every per-env OTLP/HTTP exporter in the live snapshot.
 /// Non-blocking on both legs: the CP sink drops on full queue, the
 /// OTLP fan-out detaches a tokio task per exporter. Mirrors the
@@ -829,11 +829,11 @@ fn emit_access_log(
 ///   - `inbound_protocol = "openai"` — match chat.rs convention.
 ///   - No cache / streaming / reasoning / finish_reason metadata —
 ///     none of these concepts apply to the embeddings endpoint;
-///     cp-api reads these UsageEvent fields with `omitempty`-equivalent
+///     the control plane reads these UsageEvent fields with `omitempty`-equivalent
 ///     defaults so leaving them zero is the same as omitting.
 ///   - `cost_usd` — priced locally from the dispatched row's
 ///     `Model.cost` when the operator set one, `0.0` otherwise, so
-///     cp-api's own pricing catalog stays authoritative when it is
+///     the control plane's own pricing catalog stays authoritative when it is
 ///     the one billing (same convention as every chat.rs emit site).
 ///
 /// Issue #226. /v1/embeddings is the first non-chat handler to gain
@@ -851,7 +851,7 @@ fn emit_usage_event(
     model_id: &str,
     requested_model: &str,
     api_key_id: &str,
-    // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
+    // Metric labels the UsageEvent has no field for (#1234
     // follow-up): the wire struct is the CP contract, so they ride
     // alongside rather than in it.
     provider: &str,
@@ -868,7 +868,7 @@ fn emit_usage_event(
     client: &ClientContext,
     // Per-detector PII mask counts (#932) applied to the input.
     redacted_entity_counts: crate::redact::RedactionCounts,
-    // Monitor-mode guardrail observations (AISIX-Cloud#562).
+    // Monitor-mode guardrail observations (#562).
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     // Captured request/response content (#700). Forwarded only to `fan_out`,
     // never to the CP sink.
@@ -876,7 +876,7 @@ fn emit_usage_event(
 ) {
     // Only populate fields meaningful to /v1/embeddings; rely on
     // UsageEvent's `#[derive(Default)]` for everything else. Wire-level
-    // empty / zero / false maps to NULL on cp-api via skip_serializing_if,
+    // empty / zero / false maps to NULL on the control plane via skip_serializing_if,
     // identical to the legacy "field absent" semantics older DP images
     // emitted. Specifically left at Default:
     //   - completion_tokens / cached_prompt_tokens / reasoning_tokens /
@@ -893,11 +893,11 @@ fn emit_usage_event(
     //
     // The per-PK attribution tags (provider_kind / provider_featured /
     // branded_provider / pk_label / byo_label) ARE populated — same lookup as
-    // chat / messages / responses (AISIX-Cloud#867 parity) via
+    // chat / messages / responses (#867 parity) via
     // `usage_attr::apply_pk_telemetry` below.
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
-        // RFC 3339 UTC. cp-api parses with time.Parse(time.RFC3339, ...);
+        // RFC 3339 UTC. The control plane parses with time.Parse(time.RFC3339, ...);
         // chrono's `to_rfc3339_opts(Secs, true)` emits the trailing Z.
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         model_id: model_id.to_string(),
@@ -1028,7 +1028,7 @@ mod tests {
         snap
     }
 
-    /// A PK carrying per-PK telemetry attribution tags (AISIX-Cloud#867
+    /// A PK carrying per-PK telemetry attribution tags (#867
     /// parity) so emitted UsageEvents can be asserted to surface the upstream
     /// vendor + PK label the dashboard's Logs detail shows.
     fn provider_key_entry_tagged(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
@@ -1161,7 +1161,7 @@ mod tests {
         assert_eq!(ev.applied_guardrails[0].hook, "input");
     }
 
-    /// AISIX-Cloud#1074: an embeddings upstream that reports only
+    /// #1074: an embeddings upstream that reports only
     /// `total_tokens` (no `prompt_tokens`) fills prompt from total —
     /// upstream-authoritative, NOT estimated, so the event stays
     /// unflagged. Pre-#1074 this recorded prompt_tokens=0.
@@ -1211,7 +1211,7 @@ mod tests {
         );
     }
 
-    /// AISIX-Cloud#1074: an embeddings upstream that reports NO usage at
+    /// #1074: an embeddings upstream that reports NO usage at
     /// all gets the prompt estimated from the request `input` and the
     /// event flagged. "hello world" = 2 tokens (cl100k, and the seeded
     /// model name text-embedding-3-small maps to cl100k too).
@@ -1575,7 +1575,7 @@ mod tests {
     #[tokio::test]
     async fn response_contains_usage_tokens_from_upstream() {
         // The existing `happy_path_*` tests assert response.data shape but
-        // never pin the usage envelope; cp-api depends on it for billing.
+        // never pin the usage envelope; the control plane depends on it for billing.
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
@@ -1678,7 +1678,7 @@ mod tests {
     /// Issue #226: a successful /v1/embeddings call must emit a
     /// `UsageEvent` onto the `usage_sink`. Pre-#226 the embeddings
     /// handler dropped the event entirely, so any /v1/embeddings
-    /// traffic was invisible to cp-api's budget ledger and the
+    /// traffic was invisible to the control plane's budget ledger and the
     /// customer-facing /logs analytics. This test pins the contract:
     /// after a 200 response, exactly one event arrives with the
     /// caller's prompt_tokens, model_id, status, and `inbound_protocol
@@ -1768,7 +1768,7 @@ mod tests {
         );
     }
 
-    /// AISIX-Cloud#867 parity: a successful /v1/embeddings 200 must carry the
+    /// #867 parity: a successful /v1/embeddings 200 must carry the
     /// resolved ProviderKey's telemetry attribution tags (provider_kind /
     /// provider_featured / branded_provider / pk_label) — same lookup as
     /// chat / messages / responses. Fails before the fix (empty tags), passes

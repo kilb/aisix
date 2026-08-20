@@ -11,7 +11,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E for AISIX-Cloud#1045: client_type coverage of common AI coding
+// E2E for #1045: client_type coverage of common AI coding
 // clients + operator-defined `observability.metrics.client_type_rules`.
 //
 // Pinned here:
@@ -105,7 +105,7 @@ async function chatWithUa(app: SpawnedApp, ua: string): Promise<void> {
   expect(res.status).toBe(200);
 }
 
-describe("client_type built-ins + operator rules (AISIX-Cloud#1045)", () => {
+describe("client_type built-ins + operator rules (#1045)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let etcdReachable = false;

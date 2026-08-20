@@ -13,7 +13,7 @@ import {
 } from "../harness/index.js";
 import { pickFreePort } from "../harness/ports.js";
 
-// E2E: semantic cache (AISIX-Cloud#558). A CachePolicy carrying a
+// E2E: semantic cache (#558). A CachePolicy carrying a
 // `semantic` block serves an exact-fingerprint (L1) hit first and, on an
 // L1 miss, embeds the request and serves the nearest stored entry at or
 // above the policy's cosine threshold (L2). Real `aisix` binary + etcd +

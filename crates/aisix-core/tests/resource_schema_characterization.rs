@@ -151,7 +151,7 @@ fn apikey_corpus() {
                 true,
                 json!({"key_hash": "h", "allowed_models": ["a"], "team_id": "t1", "user_id": "m1"}),
             ),
-            // The load-bearing nullable case: cp-api sends null to clear team/owner.
+            // The load-bearing nullable case: the control plane sends null to clear team/owner.
             (
                 "null team and user",
                 true,
@@ -357,7 +357,7 @@ fn provider_key_corpus() {
                 true,
                 json!({"display_name": "x", "secret": "k", "telemetry_tags": {"kind": "byo", "byo_label": "platform-team"}}),
             ),
-            // The load-bearing nullable case: cp-api sends branded_provider:null.
+            // The load-bearing nullable case: the control plane sends branded_provider:null.
             (
                 "telemetry branded_provider null",
                 true,
@@ -631,7 +631,7 @@ fn guardrail_corpus() {
                 json!({"name": "k", "kind": "keyword", "patterns": [], "hook_point": "input", "enforcement_mode": "monitor", "created_at": "2026-01-01T00:00:00Z"}),
             ),
             // created_at is a non-null string (the runtime validator always
-            // enforced this; cp-api omits it when absent, never sends null).
+            // enforced this; the control plane omits it when absent, never sends null).
             (
                 "created_at null",
                 false,

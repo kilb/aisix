@@ -14,7 +14,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// AISIX-Cloud#1014: when a captured prompt/response exceeds the exporter's
+// #1014: when a captured prompt/response exceeds the exporter's
 // `content_max_bytes`, the logged field must stay VALID JSON — structure
 // preserved, long arrays sampled head+tail around an explicit
 // `{"_aisix_truncated": true, "omitted_items": N}` placeholder — instead of

@@ -44,7 +44,7 @@ pub(crate) struct AttemptRecord {
     /// UUID of the concrete Model row this attempt dispatched to. For a
     /// direct (non-routing) request this equals the requested entry's
     /// id. Feeds the emitted event's `model_id` so pricing resolves
-    /// against the TARGET, not the group (AISIX-Cloud#790) — group ids
+    /// against the TARGET, not the group (#790) — group ids
     /// have no pricing rows.
     pub target_model_id: String,
     /// Resolved ProviderKey UUID for this attempt's target — feeds the
@@ -111,7 +111,7 @@ impl RoutingTelemetry {
     /// this instead of pushing onto `attempts` directly, so a new dispatch
     /// path cannot land recording usage events but no metrics — which is
     /// exactly how `aisix_deployment_*` and `aisix_routing_*_fallbacks_total`
-    /// shipped as never-emitted series (AISIX-Cloud#1299): the emit
+    /// shipped as never-emitted series (#1299): the emit
     /// functions existed on `Metrics` from the start and simply had no
     /// caller.
     pub fn record(&mut self, state: &crate::state::ProxyState, rec: AttemptRecord) {
@@ -278,7 +278,7 @@ pub(crate) fn routing_error_class(err: &BridgeError) -> &'static str {
 /// (1 KiB) by the bridge, so a cap above that byte budget leaves the
 /// bridge's bound as the only one that ever fires and the operator sees
 /// the whole message the bridge kept. A tighter cap silently clipped it
-/// a second time (AISIX-Cloud#1065).
+/// a second time (#1065).
 const MAX_ATTEMPT_ERROR_MESSAGE_CHARS: usize = 2048;
 
 /// Control-char-stripped, capped rendering of an error's `Display`.
@@ -441,7 +441,7 @@ mod tests {
         )));
     }
 
-    /// AISIX-Cloud#1093: the access log is the one line an operator gets
+    /// #1093: the access log is the one line an operator gets
     /// per request, so EVERY failure has to name itself there — including
     /// the variants `attempt_error_from_proxy` deliberately leaves
     /// message-less because a per-attempt record only needs the class.
@@ -504,7 +504,7 @@ mod tests {
         }
     }
 
-    /// AISIX-Cloud#1065: an upstream error long enough to matter must
+    /// #1065: an upstream error long enough to matter must
     /// survive into telemetry whole. A content-filter refusal — the
     /// shape that provoked the issue — runs past 256 chars, and the old
     /// cap clipped its tail, which is exactly where the actionable part

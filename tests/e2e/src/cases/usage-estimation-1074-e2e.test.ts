@@ -12,7 +12,7 @@ import {
 } from "../harness/index.js";
 import { decodedTextFor, startMockSls, type MockSls } from "../harness/sls-mock.js";
 
-// E2E for AISIX-Cloud#1074: token metering for SSE + missing-usage upstreams.
+// E2E for #1074: token metering for SSE + missing-usage upstreams.
 //
 // Contract pinned here: when an upstream (an OpenAI-compatible relay, an
 // aborted stream, ...) never reports a `usage` block, the gateway counts
@@ -106,7 +106,7 @@ const RESPONSES_STREAM_EVENTS_NO_USAGE = [
   "[DONE]",
 ];
 
-describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is locally counted and flagged", () => {
+describe("usage estimation e2e (#1074): missing upstream usage is locally counted and flagged", () => {
   let app: SpawnedApp | undefined;
   let sls: MockSls | undefined;
   let chatStreamUpstream: OpenAiUpstream | undefined;

@@ -4,7 +4,7 @@
 //! serialized request; image/embedding responses are serialized JSON too).
 //! A blunt byte cut at `content_max_bytes` breaks the JSON mid-value, so a
 //! log console can no longer render the field hierarchy of a large payload
-//! (AISIX-Cloud#1014). When oversized content parses as JSON it is instead
+//! (#1014). When oversized content parses as JSON it is instead
 //! reduced *structurally*, so the logged field stays valid JSON:
 //!
 //! - long string values keep a prefix plus an inline

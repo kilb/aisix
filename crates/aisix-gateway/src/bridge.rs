@@ -212,7 +212,7 @@ pub enum BridgeError {
     /// `connect_timeout`, hyper's request timeout, and the kernel's own
     /// `ETIMEDOUT` on an unanswered SYN — so without the cause they render
     /// as the same sentence and an operator cannot tell "the upstream is
-    /// slow" from "we never reached it" (AISIX-Cloud#1093).
+    /// slow" from "we never reached it" (#1093).
     #[error("upstream request timed out after {elapsed_ms}ms{}", timeout_cause_suffix(.cause))]
     Timeout { elapsed_ms: u64, cause: String },
     /// Upstream returned a non-2xx HTTP status. `retry_after` carries
@@ -251,7 +251,7 @@ pub enum BridgeError {
     /// envelope carries no numeric code. Distinguishing this from
     /// [`UpstreamDecode`](Self::UpstreamDecode) keeps the provider's
     /// own error type/message intact instead of surfacing a serde
-    /// parse failure (AISIX-Cloud#1222 scenario 3).
+    /// parse failure (#1222 scenario 3).
     #[error("upstream reported an in-band stream error: {message}")]
     UpstreamInBand {
         status: Option<u16>,
@@ -986,7 +986,7 @@ mod tests {
 
     /// With a transport cause the message names it, so an expired
     /// `connect_timeout` and an expired request budget stop looking
-    /// identical (AISIX-Cloud#1093).
+    /// identical (#1093).
     #[test]
     fn timeout_with_cause_appends_it() {
         let e = BridgeError::Timeout {

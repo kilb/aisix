@@ -121,7 +121,7 @@ pub fn build_router(state: ProxyState) -> Router {
         .route("/v1/audio/transcriptions", post(audio::transcriptions))
         .route("/v1/audio/translations", post(audio::translations))
         .route("/v1/audio/speech", post(audio::speech))
-        // Unified video-generation surface (AISIX-Cloud#1118 Phase 1):
+        // Unified video-generation surface (#1118 Phase 1):
         // submit → poll → fetch. Auth/ACL/quota enforced inside the
         // handlers; the GET routes are exempt from model-level rate
         // limits by design (see videos.rs).
@@ -3604,7 +3604,7 @@ data: [DONE]\n\n"
         assert_eq!(v["error"]["type"], "rate_limit_exceeded");
     }
 
-    // ---- regression coverage for api7/AISIX-Cloud#1116 --------------
+    // ---- regression coverage for api7/#1116 --------------
     // Pre-fix the passthrough tunnel passed `None` to quota::enforce, so
     // a Model's inline rate_limit (and model-scope policies) never
     // applied to passthrough traffic — for provider endpoints with no
@@ -3691,7 +3691,7 @@ data: [DONE]\n\n"
         assert_eq!(
             resp.status(),
             StatusCode::TOO_MANY_REQUESTS,
-            "passthrough must enforce the body model's rate limit (api7/AISIX-Cloud#1116)",
+            "passthrough must enforce the body model's rate limit (api7/#1116)",
         );
         let body_bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
@@ -3841,7 +3841,7 @@ data: [DONE]\n\n"
 
     /// While inside a scheduled suspension window the policy reserves
     /// nothing; once the schedule no longer matches, enforcement resumes
-    /// on the unchanged bucket (AISIX-Cloud#1104).
+    /// on the unchanged bucket (#1104).
     #[tokio::test]
     async fn scheduled_suspension_pauses_policy_until_window_closes() {
         let upstream = MockServer::start().await;
@@ -3920,7 +3920,7 @@ data: [DONE]\n\n"
 
     /// The routing/ensemble per-target path (`reserve_model_only`)
     /// iterates the policy table independently of `reserve_layers`, so
-    /// it must honor scheduled suspensions too (AISIX-Cloud#1104).
+    /// it must honor scheduled suspensions too (#1104).
     #[tokio::test]
     async fn reserve_model_only_honors_scheduled_suspension() {
         let hub = Arc::new(Hub::new());
@@ -4206,7 +4206,7 @@ data: [DONE]\n\n";
         assert_eq!(v["error"]["type"], "rate_limit_exceeded");
     }
 
-    /// #790 (AISIX-Cloud): every OpenAI-protocol streaming leg now asks
+    /// #790: every OpenAI-protocol streaming leg now asks
     /// the upstream for the terminal usage frame by injecting
     /// `stream_options: {"include_usage": true}` when the client didn't
     /// set stream_options itself. Token telemetry used to record 0 for
@@ -4645,7 +4645,7 @@ data: [DONE]\n\n";
 
     /// Regression for #88. On a cache hit the DP must surface the
     /// cached response's prompt + completion tokens on a dedicated
-    /// `cache_hit_saved_*` pair so cp-api can multiply by its pricing
+    /// `cache_hit_saved_*` pair so the control plane can multiply by its pricing
     /// catalog server-side and report `cost_saved_usd` on `/usage`.
     /// Miss rows must keep the saved counters at zero.
     #[tokio::test]
@@ -5553,7 +5553,7 @@ data: [DONE]\n\n";
             "all attempts share the request_id (trace key)"
         );
 
-        // AISIX-Cloud#790: every attempt carries the requested group
+        // #790: every attempt carries the requested group
         // alias — model_id points at the per-attempt TARGET, so without
         // this the group name would appear nowhere.
         assert!(
@@ -5586,8 +5586,8 @@ data: [DONE]\n\n";
         assert_eq!(events[2].attempt_index, 2);
         assert_eq!(events[2].attempt_kind, "fallback");
         assert_eq!(events[2].attempt_model, "secondary");
-        // AISIX-Cloud#790: the winner records the TARGET's id, not the
-        // group's — cp-api prices via model_id and group ids have no
+        // #790: the winner records the TARGET's id, not the
+        // group's — the control plane prices via model_id and group ids have no
         // pricing rows.
         assert_eq!(events[2].model_id, "m-good");
         assert_eq!(events[2].status_code, 200);
@@ -5656,7 +5656,7 @@ data: [DONE]\n\n";
         assert_eq!(event.attempt_index, 0);
         assert_eq!(event.attempt_kind, "initial");
         assert_eq!(event.attempt_model, "primary");
-        // AISIX-Cloud#790: failed streaming attempt carries the
+        // #790: failed streaming attempt carries the
         // TARGET's id + the requested group alias.
         assert_eq!(event.model_id, "m-primary");
         assert_eq!(event.requested_model, "smart");
@@ -5678,7 +5678,7 @@ data: [DONE]\n\n";
         }
     }
 
-    /// AISIX-Cloud#1119: the streaming path must honour `routing.retries`
+    /// #1119: the streaming path must honour `routing.retries`
     /// exactly like the non-streaming one. Before the fix the streaming
     /// loop walked targets once and never re-hit the same target, so a
     /// retryable failure fell straight over — the operator saw
@@ -5794,7 +5794,7 @@ data: [DONE]\n\n";
         assert_eq!(events[2].status_code, 200);
     }
 
-    /// AISIX-Cloud#1119 / #1122: with a SINGLE target there is nothing to
+    /// #1119 / #1122: with a SINGLE target there is nothing to
     /// fail over to, so `routing.retries` is the only thing standing
     /// between a transient upstream blip and a failed request. The
     /// streaming path used to attempt once and give up.
@@ -5966,7 +5966,7 @@ data: [DONE]\n\n";
             events.iter().all(|e| e.inbound_protocol == "anthropic"),
             "/v1/messages tags inbound_protocol=anthropic on every attempt"
         );
-        // AISIX-Cloud#790: every attempt carries the requested group alias.
+        // #790: every attempt carries the requested group alias.
         assert!(
             events.iter().all(|e| e.requested_model == "smart"),
             "every attempt records the requested group alias"
@@ -5989,7 +5989,7 @@ data: [DONE]\n\n";
         assert_eq!(events[1].attempt_index, 1);
         assert_eq!(events[1].attempt_kind, "fallback");
         assert_eq!(events[1].attempt_model, "secondary");
-        // AISIX-Cloud#790: the winner records the TARGET's id (pricing
+        // #790: the winner records the TARGET's id (pricing
         // resolves against it), not the group's.
         assert_eq!(events[1].model_id, "m-good");
         assert_eq!(events[1].status_code, 200);
@@ -6093,7 +6093,7 @@ data: [DONE]\n\n";
             events.iter().all(|e| e.inbound_protocol == "openai"),
             "/v1/responses tags inbound_protocol=openai on every attempt"
         );
-        // AISIX-Cloud#790: every attempt carries the requested group alias.
+        // #790: every attempt carries the requested group alias.
         assert!(
             events.iter().all(|e| e.requested_model == "smart"),
             "every attempt records the requested group alias"
@@ -6115,7 +6115,7 @@ data: [DONE]\n\n";
         assert_eq!(events[1].attempt_index, 1);
         assert_eq!(events[1].attempt_kind, "fallback");
         assert_eq!(events[1].attempt_model, "secondary");
-        // AISIX-Cloud#790: the winner records the TARGET's id (pricing
+        // #790: the winner records the TARGET's id (pricing
         // resolves against it), not the group's.
         assert_eq!(events[1].model_id, "m-good");
         assert_eq!(events[1].status_code, 200);
@@ -6269,7 +6269,7 @@ data: [DONE]\n\n";
         assert!(events.iter().all(|e| e.status_code == 502));
     }
 
-    /// AISIX-Cloud#790: a plain direct-model request (no routing group)
+    /// #790: a plain direct-model request (no routing group)
     /// records the client-sent name in `requested_model` and keeps the
     /// direct model's own id in `model_id` — on both the OpenAI and the
     /// Anthropic inbound protocols.
@@ -7567,8 +7567,8 @@ data: [DONE]\n\n";
     async fn budget_exceeded_returns_429() {
         use crate::budget::BudgetClient;
 
-        // cp-api stand-in: returns a deny decision for our key.
-        // Wire shape mirrors cp-api's budgetCheckResponse — see
+        // The control plane stand-in: returns a deny decision for our key.
+        // Wire shape mirrors the control plane's budgetCheckResponse — see
         // internal/cpapi/resources/budget_check.go (prd-09b rev 2 §5.5).
         let cp = MockServer::start().await;
         Mock::given(method("GET"))
@@ -7878,7 +7878,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     }
 
     /// (OpenAI inbound) × (Gemini upstream). Gemini is served by the
-    /// `Adapter::Openai` family bridge — cp-api stores the Gemini PK
+    /// `Adapter::Openai` family bridge — the control plane stores the Gemini PK
     /// with `adapter: "openai"` and `api_base` pointing at Google's
     /// `/v1beta/openai` compat endpoint. The integration test pins
     /// that an inbound OpenAI request resolves through the family
@@ -7933,7 +7933,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     }
 
     /// (OpenAI inbound) × (DeepSeek upstream). DeepSeek is served by
-    /// the `Adapter::Openai` family bridge — cp-api stores the
+    /// the `Adapter::Openai` family bridge — the control plane stores the
     /// DeepSeek PK with `adapter: "openai"` and `api_base` pointing
     /// at `https://api.deepseek.com`. The integration test pins
     /// that an inbound OpenAI request resolves through the family
@@ -7994,7 +7994,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
 
     /// (OpenAI inbound) × (Cohere chat-compat upstream). Cohere serves
     /// an OpenAI-shape envelope at `/compatibility/v1/chat/completions`
-    /// per <https://docs.cohere.com/reference/chat>; cp-api stores the
+    /// per <https://docs.cohere.com/reference/chat>; the control plane stores the
     /// Cohere PK with `adapter: "openai"` and `api_base` pointing at
     /// `https://api.cohere.com/compatibility/v1`. The integration test
     /// pins that an inbound OpenAI request resolves through the
@@ -8029,7 +8029,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             .await;
 
         let snap = AisixSnapshot::new();
-        // PK `api_base` points at the wiremock root the way cp-api's
+        // PK `api_base` points at the wiremock root the way the control plane's
         // adapter_map points real Cohere PKs at `…/compatibility/v1`.
         snap.provider_keys.insert(matrix_cohere_pk(&upstream.uri()));
         snap.models.insert(cohere_model_entry("my-cohere"));
@@ -9076,7 +9076,7 @@ data: [DONE]\n\n";
     /// client must get the content-filtered status, AND every per-sub-call
     /// usage event (panel members + judge) must still fire with
     /// `guardrail_blocked == true` — the panel tokens are already committed,
-    /// so dropping these events would under-report panel usage to cp-api.
+    /// so dropping these events would under-report panel usage to the control plane.
     #[tokio::test]
     async fn ensemble_output_block_still_emits_panel_and_judge_usage() {
         use aisix_obs::UsageSink;

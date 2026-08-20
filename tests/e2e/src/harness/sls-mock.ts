@@ -3,7 +3,7 @@ import { pickFreePort } from "./ports.js";
 
 /**
  * Mock Aliyun SLS PutLogs endpoint shared by the content-capture e2e suites
- * (#687 chat/messages, AISIX-Cloud#947 responses/completions). Captures each
+ * (#687 chat/messages, #947 responses/completions). Captures each
  * PutLogs body (lz4 block compressed) per logstore so tests can decompress
  * and search for planted tokens.
  */

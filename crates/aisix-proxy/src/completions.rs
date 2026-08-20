@@ -64,14 +64,14 @@ struct CompletionDispatchSuccess {
     /// field. Audit MEDIUM-1 on PR #426 clarified.
     model_id: String,
     /// Resolved ProviderKey UUID — feeds per-PK telemetry attribution
-    /// (AISIX-Cloud#867 parity).
+    /// (#867 parity).
     provider_key_id: String,
     /// Provider-side model name, for the `upstream_model` metric label
-    /// (AISIX-Cloud#1234 parity with chat / messages / responses).
+    /// (#1234 parity with chat / messages / responses).
     upstream_model: String,
     /// Legacy-completions response object `id` (`cmpl-…`). Empty on the 501
     /// NotImplemented path (no upstream call) and when the upstream omitted
-    /// it (AISIX-Cloud#1289).
+    /// it (#1289).
     provider_request_id: String,
     /// Upstream-reported token counts. `None` on the 501
     /// NotImplemented path (provider doesn't support completions)
@@ -81,7 +81,7 @@ struct CompletionDispatchSuccess {
     /// Per-detector PII mask counts (#932), input + output merged.
     /// Attached to the emitted UsageEvent. Empty = no redaction.
     redactions: crate::redact::RedactionCounts,
-    /// Monitor-mode guardrail observations (AISIX-Cloud#562), input +
+    /// Monitor-mode guardrail observations (#562), input +
     /// output merged. Attached to the emitted UsageEvent.
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// Typed failure class for a held stream that failed after generating
@@ -90,12 +90,12 @@ struct CompletionDispatchSuccess {
     /// True when the response leg was blocked by an OUTPUT guardrail
     /// AFTER the upstream billed for it (#911 [23]). The response body is
     /// the redacted 422, but `usage` still carries the billed counts so
-    /// the UsageEvent (marked `guardrail_blocked`) keeps cp-api's budget
+    /// the UsageEvent (marked `guardrail_blocked`) keeps the control plane's budget
     /// ledger + /logs from under-reporting spend the provider charged for
     /// — the output analog of chat.rs's UpstreamCharge / responses.rs #543.
     guardrail_blocked: bool,
     /// Captured request/response content for content-capturing exporters
-    /// (AISIX-Cloud#947). `Some` only when an enabled exporter opted into
+    /// (#947). `Some` only when an enabled exporter opted into
     /// `content_mode = full`; threaded to `fan_out` via the handler's emit,
     /// never to the CP sink.
     captured_content: Option<CapturedContent>,
@@ -122,7 +122,7 @@ struct CompletionUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
     /// True when any counter was filled by the local estimator because
-    /// the upstream reported no usage (AISIX-Cloud#1074).
+    /// the upstream reported no usage (#1074).
     usage_estimated: bool,
 }
 
@@ -233,7 +233,7 @@ pub async fn completions(
                     elapsed,
                 );
             }
-            // Issue #403: emit UsageEvent so cp-api's budget ledger
+            // Issue #403: emit UsageEvent so the control plane's budget ledger
             // and customer-facing /logs see /v1/completions spend.
             // Pre-#403 the legacy completions handler dropped the
             // event entirely. Skip emit on the 501 NotImplemented
@@ -482,7 +482,7 @@ async fn dispatch(
     let mut redactions = final_redaction.counts;
     crate::redact::merge_counts(&mut redactions, input_seg_counts);
 
-    // Content capture (AISIX-Cloud#947): the client-facing request body
+    // Content capture (#947): the client-facing request body
     // (post-redaction, so masked PII stays masked in the exported content),
     // gated on an exporter actually wanting content.
     let content_cap = content_capture_cap(
@@ -1183,13 +1183,13 @@ async fn dispatch(
             // so the success struct carries typed counters rather
             // than re-parsing JSON downstream.
             //
-            // Token-estimation fallback (AISIX-Cloud#1074): a missing or
+            // Token-estimation fallback (#1074): a missing or
             // zero usage block fills locally — legacy completions is plain
             // text on both sides, so the plain-text counting rule applies
             // to each. The 200-without-usage edge previously skipped the
             // event entirely; it now emits an estimated record instead.
             // Telemetry only — the response body forwards untouched.
-            // AISIX-Cloud#1289: read the response object id BEFORE the
+            // #1289: read the response object id BEFORE the
             // redaction pass below rewrites the body.
             let provider_request_id = crate::usage_attr::provider_response_id(&resp_json);
             let usage = {
@@ -1281,7 +1281,7 @@ async fn dispatch(
                     // The upstream already billed for this response (tokens
                     // committed above), so return the redacted 422 body BUT
                     // carry the billed `usage` marked `guardrail_blocked` —
-                    // recording zero tokens here would let cp-api's ledger
+                    // recording zero tokens here would let the control plane's ledger
                     // under-report spend the customer was charged for. Same
                     // output analog as responses.rs #543 / chat.rs UpstreamCharge.
                     return Ok(CompletionDispatchSuccess {
@@ -1318,7 +1318,7 @@ async fn dispatch(
                 crate::redact::redact_completions_response(resolved_chain.as_ref(), &mut resp_json),
             );
 
-            // Content capture (AISIX-Cloud#947): the completion text from the
+            // Content capture (#947): the completion text from the
             // POST-redaction body, so the exported content matches what the
             // caller received.
             let captured_content = match (&captured_prompt, content_cap) {
@@ -1390,7 +1390,7 @@ fn extract_completion_usage(body: &Value) -> Option<CompletionUsage> {
 }
 
 /// Count the legacy /v1/completions `prompt` for the token-estimation
-/// fallback (AISIX-Cloud#1074): a plain string, an array of strings, an
+/// fallback (#1074): a plain string, an array of strings, an
 /// array of token ids (exact count), or an array of token-id arrays.
 /// Plain-text counting — the legacy surface has no message overhead.
 fn count_completion_prompt(model: &str, prompt: Option<&Value>) -> u32 {
@@ -1425,7 +1425,7 @@ fn completion_output_text(body: &Value) -> String {
         .unwrap_or_default()
 }
 
-/// Issue #403: push one `UsageEvent` onto cp-api's telemetry sink
+/// Issue #403: push one `UsageEvent` onto the control plane's telemetry sink
 /// and fan it out to per-env OTLP exporters. Mirrors the shape of
 /// `embeddings::emit_usage_event` (#402) and `responses::emit_usage_event`
 /// (#404); the legacy /v1/completions endpoint has both prompt and
@@ -1434,7 +1434,7 @@ fn completion_output_text(body: &Value) -> String {
 /// `inbound_protocol = "openai"` per chat.rs convention. The per-PK
 /// attribution tags (`provider_kind` / `provider_featured` /
 /// `branded_provider` / `pk_label` / `byo_label`) ARE populated — same
-/// lookup as chat / messages / responses / embeddings (AISIX-Cloud#867
+/// lookup as chat / messages / responses / embeddings (#867
 /// parity) via `usage_attr::apply_pk_telemetry` below.
 #[allow(clippy::too_many_arguments)]
 fn emit_usage_event(
@@ -1447,7 +1447,7 @@ fn emit_usage_event(
     model_id: &str,
     requested_model: &str,
     api_key_id: &str,
-    // Metric labels the UsageEvent has no field for (AISIX-Cloud#1234
+    // Metric labels the UsageEvent has no field for (#1234
     // follow-up): the wire struct is the CP contract, so they ride
     // alongside rather than in it.
     provider: &str,
@@ -1465,10 +1465,10 @@ fn emit_usage_event(
     applied_guardrails: Vec<aisix_core::AppliedGuardrail>,
     // Per-detector PII mask counts (#932). Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
-    // Monitor-mode guardrail observations (AISIX-Cloud#562).
+    // Monitor-mode guardrail observations (#562).
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     // Captured request/response content for content-capturing exporters
-    // (AISIX-Cloud#947). Forwarded only to `fan_out`, never to the CP sink.
+    // (#947). Forwarded only to `fan_out`, never to the CP sink.
     content: Option<&CapturedContent>,
 ) {
     let mut event = UsageEvent {
@@ -1716,7 +1716,7 @@ mod tests {
 
     /// Same PK as `provider_key_entry` (reuses `PK_ID` so existing model
     /// fixtures resolve to it) but carries `telemetry_tags` so the emitted
-    /// UsageEvent picks up the per-PK attribution fields (AISIX-Cloud#867).
+    /// UsageEvent picks up the per-PK attribution fields (#867).
     fn provider_key_entry_tagged(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
             r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai","telemetry_tags":{{"kind":"catalog","featured":true,"branded_provider":"openai","pk_label":"prod-completions-key"}}}}"#
@@ -2573,7 +2573,7 @@ mod tests {
         assert!(!event.occurred_at.is_empty());
     }
 
-    /// AISIX-Cloud#1289: the legacy completions response object carries a
+    /// #1289: the legacy completions response object carries a
     /// `cmpl-…` id, and it must reach the UsageEvent — the handler recorded
     /// none before, so this endpoint's calls had nothing an operator could
     /// look up in the provider's console. Fails before the fix (empty),
@@ -2625,7 +2625,7 @@ mod tests {
     /// Companion: an upstream 200 with `usage: {}` (malformed —
     /// `prompt_tokens` is a required field on every legitimate
     /// completion response) now emits an ESTIMATED usage event
-    /// (AISIX-Cloud#1074) instead of dropping the record: the tokens
+    /// (#1074) instead of dropping the record: the tokens
     /// are counted locally and the event is marked `usage_estimated`.
     /// (Pre-#1074 this dropped the event entirely — per audit MEDIUM-1
     /// on PR #425 — which left the request invisible to billing.)
@@ -2851,7 +2851,7 @@ mod tests {
 
     /// A 200 response with NO `usage` block at all (vs `usage: {}`
     /// which is empty-but-present) emits an ESTIMATED usage event
-    /// (AISIX-Cloud#1074) — the request must not stay invisible to
+    /// (#1074) — the request must not stay invisible to
     /// billing. (Pre-#1074, per issue #403 audit LOW-1, this dropped
     /// the event entirely.)
     #[tokio::test]
@@ -2903,7 +2903,7 @@ mod tests {
         );
     }
 
-    /// AISIX-Cloud#867 parity: a successful /v1/completions 200 must stamp
+    /// #867 parity: a successful /v1/completions 200 must stamp
     /// the five per-PK telemetry attribution fields (provider_kind /
     /// provider_featured / branded_provider / pk_label / byo_label) onto the
     /// emitted UsageEvent, sourced from the resolved ProviderKey's

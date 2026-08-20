@@ -4,8 +4,8 @@
 //! route binds a gateway entry (path prefix and/or inbound `Host`) to ONE
 //! upstream target with its own gateway-auth mode, credential handling,
 //! protocol hint, and streaming behavior. There is no implicit
-//! provider→Model credential borrowing (AISIX-Cloud#1127) and no forced
-//! `Authorization` replacement (AISIX-Cloud#1312).
+//! provider→Model credential borrowing (#1127) and no forced
+//! `Authorization` replacement (#1312).
 //!
 //! ## Entry points
 //!

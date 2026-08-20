@@ -13,7 +13,7 @@
 //! address makes an *in-process* retry reuse the **same** key (the pipeline
 //! retries the same batch on a transient error), so a downstream Snowpipe /
 //! Auto Loader dedups that retry by filename and does not double-load — the
-//! load-bearing property in AISIX-Cloud#689 §8. Two identical bodies always
+//! load-bearing property in #689 §8. Two identical bodies always
 //! land on the same key, restart or not, so that dedup survives a restart for
 //! any batch that re-forms identically.
 //!
@@ -343,7 +343,7 @@ pub fn build_object_store(
 /// Application Default Credentials (GKE Workload Identity / GCE metadata) by
 /// constructing the builder with no service-account key. **Azure** is not
 /// supported here — its managed identity still needs a non-secret account name
-/// the keyless config does not carry; cp-api rejects that combination at create
+/// the keyless config does not carry; the control plane rejects that combination at create
 /// time, and this arm returns a clear permanent error as a backstop.
 pub fn build_object_store_ambient(
     provider: ObjectStoreProvider,
@@ -358,7 +358,7 @@ pub fn build_object_store_ambient(
             // endpoint exposes. A custom endpoint means an S3-compatible host
             // (MinIO / R2 / OSS) with no cloud IAM identity, so fail fast with a
             // clear permanent error instead of building a sink that fails soft
-            // on every delivery. (cp-api also rejects this at create time.)
+            // on every delivery. (the control plane also rejects this at create time.)
             if endpoint.is_some() {
                 return Err(SinkError::Permanent(
                     "object_store: cloud_identity for s3 does not support a custom \
@@ -690,7 +690,7 @@ mod tests {
     async fn retry_of_same_batch_reuses_the_same_key() {
         // The pipeline retries the SAME batch on a transient error. The
         // content-addressed key must be identical so a downstream loader
-        // dedups by filename (AISIX-Cloud#689 §8) — assert exactly one object.
+        // dedups by filename (#689 §8) — assert exactly one object.
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let s = sink(store.clone(), ObjectStoreCompression::Gzip);
         let b = batch_of(vec![SinkRecord::metadata_only(event("req-dup"))]);

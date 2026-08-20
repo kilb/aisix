@@ -10,7 +10,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// AISIX-Cloud#1011: TTFT and end-to-end request latency must be exposed
+// #1011: TTFT and end-to-end request latency must be exposed
 // as REAL Prometheus histograms — `_bucket{le=…}` series that
 // `histogram_quantile()` can aggregate across DP instances — with a
 // dedicated low-cardinality label set (env_id / endpoint / model /

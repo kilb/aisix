@@ -2,7 +2,7 @@
 //! under `rate_limit_policies/<uuid>`.
 //!
 //! A policy is exactly one of two forms, fixed at creation
-//! (AISIX-Cloud#892):
+//! (#892):
 //!
 //! **Classic form** — targets a single subject via `(scope, scope_ref)`:
 //! - `api_key`     — matches by API key entry ID
@@ -211,7 +211,7 @@ impl PolicySchedule {
                     .is_some_and(|yesterday| self.selects_day(yesterday))
                     && minute < end)
         } else {
-            // start == end: an empty window (cp-api rejects the shape;
+            // start == end: an empty window (the control plane rejects the shape;
             // the DP's own write surface admits it and it matches
             // nothing).
             false
@@ -253,7 +253,7 @@ pub struct RateLimitPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub max_tokens: Option<u64>,
-    // —— conditional form (AISIX-Cloud#892) ——
+    // —— conditional form (#892) ——
     /// Condition node tree the request must satisfy (implicit AND
     /// across the top level; `[]`/absent = every request in the env).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -275,10 +275,10 @@ pub struct RateLimitPolicy {
     pub action: Option<PolicyAction>,
     /// Recurring windows during which this policy is suspended — the
     /// quota gate skips it while `now` falls in any listed window and
-    /// enforcement resumes automatically afterwards (AISIX-Cloud#1104).
+    /// enforcement resumes automatically afterwards (#1104).
     /// The counters' bucket key never changes, so suspension does not
     /// reset the surrounding window's counts. Empty/absent = always
-    /// enforced. cp-api omits the field when empty, keeping
+    /// enforced. The control plane omits the field when empty, keeping
     /// schedule-less rows parseable by pre-`schedules` strict data
     /// planes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -481,7 +481,7 @@ mod tests {
 
     #[test]
     fn tolerates_unknown_fields_for_forward_compat() {
-        // cp-api may ship new fields ahead of the DP rolling out; serde must
+        // The control plane may ship new fields ahead of the DP rolling out; serde must
         // accept them. The write path still rejects them via the strict
         // schema validator (validate_rate_limit_policy in models/schema.rs).
         let p: RateLimitPolicy = serde_json::from_str(
@@ -502,7 +502,7 @@ mod tests {
         assert_eq!(RateLimitPolicy::kind(), "rate_limit_policies");
     }
 
-    // --- dual form (AISIX-Cloud#892) ----------------------------------
+    // --- dual form (#892) ----------------------------------
 
     #[test]
     fn classic_row_serializes_byte_identically_to_pre_892() {
@@ -635,7 +635,7 @@ mod tests {
     #[test]
     fn schedules_compose_with_conditional_form() {
         // `schedules` is form-neutral: a conditional row suspends the
-        // same way a classic one does (AISIX-Cloud#1104).
+        // same way a classic one does (#1104).
         let p: RateLimitPolicy = serde_json::from_value(json!({
             "name": "cond-sched",
             "limits": { "rpm": 5 },
@@ -651,7 +651,7 @@ mod tests {
         assert!(p.suspended_at(at("2026-08-04T10:00:00Z")));
     }
 
-    // --- schedules (AISIX-Cloud#1104) --------------------------------
+    // --- schedules (#1104) --------------------------------
 
     /// Parse an RFC3339 instant for schedule sweeps.
     fn at(s: &str) -> DateTime<Utc> {
@@ -843,7 +843,7 @@ mod tests {
 
     #[test]
     fn empty_schedules_are_omitted_from_serialization() {
-        // cp-api relies on this shape: schedule-less rows stay
+        // The control plane relies on this shape: schedule-less rows stay
         // byte-compatible with pre-`schedules` data planes.
         let p: RateLimitPolicy = serde_json::from_str(
             r#"{"name":"x","scope":"team","scope_ref":"t1","window":"minute","max_requests":1}"#,

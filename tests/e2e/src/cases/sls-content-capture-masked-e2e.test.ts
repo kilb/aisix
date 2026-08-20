@@ -14,7 +14,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// #932 × AISIX-Cloud#947: on a streaming response with a mask-action PII
+// #932 × #947: on a streaming response with a mask-action PII
 // guardrail, the wire chunks released to the client are masked — and the
 // content handed to a `content_mode = full` exporter must be the SAME masked
 // text. Pre-fix, the capture accumulator collected raw deltas and only the
@@ -91,7 +91,7 @@ async function postJson(
   });
 }
 
-describe("sls content capture e2e: streaming capture is post-mask (#932 × AISIX-Cloud#947)", () => {
+describe("sls content capture e2e: streaming capture is post-mask (#932 × #947)", () => {
   let etcdReachable = false;
   let chatUpstream: OpenAiUpstream | undefined;
   let bridgeUpstream: OpenAiUpstream | undefined;

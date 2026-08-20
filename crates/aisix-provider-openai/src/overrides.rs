@@ -1,11 +1,11 @@
 //! Per-`ProviderKey` request/response override primitives.
 //!
-//! Skeleton for [api7/AISIX-Cloud#302](https://github.com/api7/AISIX-Cloud/issues/302)
+//! Skeleton for [api7/#302
 //! Phase A. The issue's §5 RuntimeConfig adds a `request` block
 //! (`param_renames` / `param_constraints` / `default_headers` /
 //! `default_body_fields`) and a `response` block (`stream_done_marker` /
 //! `content_list_to_string` / `error_envelope` / `reasoning_field`) so
-//! cp-api can capture per-provider quirks without forking a Bridge.
+//! The control plane can capture per-provider quirks without forking a Bridge.
 //!
 //! This module ships the primitive transforms. **Nothing in
 //! [`OpenAiBridge`](crate::OpenAiBridge) wires them in yet** — Phase
@@ -16,9 +16,9 @@
 //! `serde_json::Value` / `http::HeaderMap` inputs.
 //!
 //! The closed schema types ([`ParamConstraints`], [`StreamDoneMarker`])
-//! live in `aisix-core` so cp-api can write them straight into etcd
+//! live in `aisix-core` so the control plane can write them straight into etcd
 //! payloads; this module re-uses those types for its apply-function
-//! signatures so cp-api and the DP agree on a single wire shape.
+//! signatures so the control plane and the DP agree on a single wire shape.
 //! [`StreamDoneOutcome`] is purely a runtime evaluation result and
 //! stays here — it never serializes.
 //!

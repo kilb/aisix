@@ -56,7 +56,7 @@ Emit the request metrics through `request_metrics::record` and nothing else. It
 writes the legacy `aisix_requests_total` **and** the detailed `aisix_proxy_*` /
 `aisix_llm_*` families from one call, so calling `Metrics::record_request`
 directly silently produces a request that exists in one family and not the
-others — the bug AISIX-Cloud#1234 fixed across ten endpoints.
+others — the bug #1234 fixed across ten endpoints.
 
 ## A new proxy route has to be declared in three places
 
@@ -92,7 +92,7 @@ scoped to a member never runs for group traffic (measured: direct 422, via group
 200). It is unfixed because the semantics are undecided, not because entry scope
 is correct — input guardrails run before a target is picked, and under failover
 there is no single "winning member" to resolve against. Tracked in
-AISIX-Cloud#1090; do not cite it as precedent for scoping a new gate to the entry.
+#1090; do not cite it as precedent for scoping a new gate to the entry.
 The 2026-08 model-kind audit re-confirmed the same gap for **ensemble panel/judge
 sub-calls and semantic-router targets**, and the ruling (project decision) is that
 all three kinds stay under #1090's one unified design pass: the operator can
@@ -129,7 +129,7 @@ never becomes a probe for which members exist.
 
 ## `request_id` is caller-controlled input, not a gateway-minted UUID
 
-Since AISIX-Cloud#1288 a caller can supply the request id via a configured inbound
+Since #1288 a caller can supply the request id via a configured inbound
 header and `request_id::ensure_request_id` adopts it verbatim, so every
 `ClientContext.request_id` / `RequestId` value downstream may be a string the
 caller chose. It is only guaranteed to be 1..=256 bytes of visible ASCII
@@ -143,8 +143,8 @@ cardinality straight from the caller. The existing sinks are already safe and sh
 the shape: an OTLP span attribute, an HTTP header value, a `tracing` field, a
 parameterised SQL bind.
 
-`is_acceptable` is half of a cross-repo contract with cp-api's `validRequestID`
-(AISIX-Cloud `internal/dpmgr/api/telemetry.go`): tightening this side alone
+`is_acceptable` is half of a cross-repo contract with the control plane's `validRequestID`
+(the control plane's telemetry ingest): tightening this side alone
 silently strands ids, and tightening THAT side alone silently drops the request
 from billing and /logs while the caller still gets a 200 carrying the id. Change
 both or neither.

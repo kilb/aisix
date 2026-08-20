@@ -5,10 +5,10 @@
 //!
 //! 1. `request.default_headers` — static headers the ProviderKey injects,
 //!    with `${...}` request-context variables rendered per request
-//!    (AISIX-Cloud#1112).
+//!    (#1112).
 //! 2. `request.forward_client_headers` — inbound client headers matching an
 //!    operator-configured allowlist, forwarded verbatim
-//!    (AISIX-Cloud#1167).
+//!    (#1167).
 //!
 //! **Precedence is gateway > operator > client, and it is structural.** Every
 //! caller inserts its own bridge-owned headers (auth, `content-type`,
@@ -169,7 +169,7 @@ fn allowlist_admits(patterns: &[String], name: &str) -> bool {
 /// `default_headers` entry shadows a client header of the same name).
 /// Entries whose name or value will not parse as HTTP are skipped rather
 /// than failing the request — an unparseable entry is a config error one
-/// layer up, which cp-api rejects at write time.
+/// layer up, which the control plane rejects at write time.
 ///
 /// Callers that build a [`HeaderMap`] should use [`apply_request_headers`];
 /// this lower-level form exists for the Bedrock path, whose headers have to

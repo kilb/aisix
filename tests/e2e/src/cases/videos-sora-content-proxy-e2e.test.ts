@@ -11,7 +11,7 @@ import {
 } from "../harness/index.js";
 
 // E2E: OpenAI Sora on /v1/videos — the FIRST Proxy-delivery consumer of the
-// content-streaming proxy (AISIX-Cloud#1118 content-proxy design).
+// content-streaming proxy (#1118 content-proxy design).
 //
 // Unlike the four signed-URL providers (Alibaba/Zhipu/Volcengine/Runway),
 // which 302-redirect the caller to a credential-free URL, Sora's finished

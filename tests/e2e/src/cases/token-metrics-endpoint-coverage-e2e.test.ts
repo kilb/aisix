@@ -10,7 +10,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// The follow-up half of AISIX-Cloud#1234. Where that fixed the request
+// The follow-up half of #1234. Where that fixed the request
 // counters, the token families had the same gap in three different shapes:
 //
 //   aisix_llm_{input,output,total}_tokens_total  chat + messages

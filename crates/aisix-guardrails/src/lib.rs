@@ -158,7 +158,7 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
 /// Every non-keyword kind sits behind a cargo feature (see `build.rs`'s
 /// `BuildError::FeatureDisabled` arms); a DP built without one silently
 /// rejects rows of that kind while the dashboard still offers it
-/// (#519 B.6). The heartbeat reports this list so cp-api can hide /
+/// (#519 B.6). The heartbeat reports this list so the control plane can hide /
 /// flag kinds the connected DP can't serve. Strings MUST stay equal to
 /// the serde `kind` tags in `aisix_core::models::GuardrailKind`
 /// (`GuardrailKind::kind_str`).
@@ -584,7 +584,7 @@ pub trait Guardrail: Send + Sync + 'static {
         }
     }
 
-    // --- monitor-hit observation (AISIX-Cloud#562) -------------------------
+    // --- monitor-hit observation (#562) -------------------------
     //
     // `enforcement_mode: monitor` downgrades Blocks and suppresses masks,
     // which erases the observation from the plain check return value. The

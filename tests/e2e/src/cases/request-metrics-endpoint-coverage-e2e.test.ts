@@ -10,7 +10,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// AISIX-Cloud#1234: `aisix_proxy_requests_total` / `aisix_llm_requests_total`
+// #1234: `aisix_proxy_requests_total` / `aisix_llm_requests_total`
 // and their duration histograms were emitted by the chat and messages
 // handlers ONLY. Every other endpoint recorded just the legacy
 // `aisix_requests_total`, so `/v1/responses` traffic (Codex and friends) was

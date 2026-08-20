@@ -23,7 +23,7 @@ import {
 // `delta.reasoning_content` slot with no operator configuration.
 //
 // References:
-// - Issue: api7/ai-gateway#502 (follow-up to #501 / api7/AISIX-Cloud#648)
+// - Issue: api7/ai-gateway#502 (follow-up to #501 / api7/#648)
 
 const CALLER_PLAINTEXT = "sk-or-stream-reasoning-caller";
 const CALLER_KEY_HASH = createHash("sha256")

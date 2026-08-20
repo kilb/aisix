@@ -161,7 +161,7 @@ impl OpenAiBridge {
     /// the bridge refuses to fall back to `OPENAI_DEFAULT_BASE` — that
     /// would silently route the vendor's API key to `api.openai.com`.
     /// Closes the openrouter / xai / future-long-tail half of
-    /// api7/AISIX-Cloud#417. cp-api must populate `api_base` for every
+    /// api7/#417. The control plane must populate `api_base` for every
     /// catalog vendor via adapter_map / provider_metadata.api_base_url.
     fn resolve_base(&self, ctx: &BridgeContext) -> Result<String, BridgeError> {
         let raw = match ctx.provider_key.api_base.as_deref() {
@@ -177,7 +177,7 @@ impl OpenAiBridge {
                     // Operator-facing detail (route, provider topology,
                     // remediation steps) goes to logs only — keep the
                     // customer-visible 500 body short and free of
-                    // internal-product taxonomy (cp-api / adapter_map /
+                    // internal-product taxonomy (the control plane / adapter_map /
                     // provider_metadata field names are not part of any
                     // wire contract a customer should depend on).
                     tracing::error!(
@@ -392,8 +392,8 @@ fn prepare_outbound_body<T: serde::Serialize>(
 /// client header) clobbering auth.
 ///
 /// The previous `bridge_name` parameter + `X-Aisix-Bridge` outbound
-/// header was removed in AISIX-Cloud#468: after the Phase A clean
-/// cut (#375, closing AISIX-Cloud#417) most openai-family providers
+/// header was removed in #468: after the Phase A clean
+/// cut (#375, closing #417) most openai-family providers
 /// no longer have a distinguishable per-vendor `with_name()`
 /// identity, and operator-side diagnostics of which bridge served
 /// a request are already covered by the DP's own `tracing::info!`
@@ -1335,7 +1335,7 @@ data: [DONE]\n\n";
         }
     }
 
-    /// AISIX-Cloud#1222 scenario 3: an OpenAI-compatible upstream that
+    /// #1222 scenario 3: an OpenAI-compatible upstream that
     /// commits a 200 stream and then reports failure as a
     /// `data: {"error":{...}}` frame. Pre-fix the frame surfaced as an
     /// `UpstreamDecode` serde failure and the provider's own error
@@ -1422,7 +1422,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     /// MUST refuse rather than fall back to `OPENAI_DEFAULT_BASE` —
     /// that fallback would silently route the vendor's API key to
     /// `api.openai.com`. Closes the openrouter / xai half of
-    /// api7/AISIX-Cloud#417.
+    /// api7/#417.
     #[test]
     fn family_bridge_refuses_non_openai_vendor_with_empty_api_base() {
         let bridge = OpenAiBridge::new();
@@ -1433,7 +1433,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
         // - The three vendors that #379's clean cut deleted dedicated
         //   `register_specialized` entries for, so they now route only
         //   through the family bridge (google, deepseek, cohere) — the
-        //   bridge must refuse if cp-api ever ships them with empty
+        //   bridge must refuse if the control plane ever ships them with empty
         //   `api_base`.
         // - Cased + whitespace variants to pin that the guard does
         //   trim + lowercase normalization before matching `"openai"`.
@@ -1464,7 +1464,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
                     // Sensitive-info-leakage guard: internal product
                     // taxonomy must not leak into the customer-visible
                     // 500 body. Those identifiers go to tracing only.
-                    for forbidden in ["cp-api", "adapter_map", "provider_metadata"] {
+                    for forbidden in ["control plane", "adapter_map", "provider_metadata"] {
                         assert!(
                             !msg.contains(forbidden),
                             "vendor {vendor:?}: error body must not leak \
@@ -1506,7 +1506,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
         assert_eq!(bridge.resolve_base(&ctx).unwrap(), OPENAI_DEFAULT_BASE);
     }
 
-    /// xai happy path: cp-api populates `api_base` from the catalog
+    /// xai happy path: the control plane populates `api_base` from the catalog
     /// row (`provider_metadata.api_base_url` or adapter_map
     /// `default_base_url`), so the family bridge sees a populated
     /// base and dispatches normally to the vendor's upstream.
@@ -1731,7 +1731,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
             .expect("auth was kept as-is");
     }
 
-    /// AISIX-Cloud#867 follow-up: per-PK request overrides must apply on
+    /// #867 follow-up: per-PK request overrides must apply on
     /// `embed()`, not just `chat()`. Configure both a `default_body_fields` and
     /// a `default_headers` override; the outbound /embeddings request must carry
     /// both. Fails before the fix (overrides dropped → mock unmatched → Err).
@@ -2043,7 +2043,7 @@ data: [DONE]\n";
 
     // The previous "issue #368: X-AISIX-Bridge outbound header" block
     // of tests was removed along with the header insertion itself:
-    // Phase A clean cut (#375 closing AISIX-Cloud#417) made per-vendor
+    // Phase A clean cut (#375 closing #417) made per-vendor
     // `Hub.register(Provider::X, OpenAiBridge::new().with_name("Y"))`
     // an empty contract for openai-family long-tail providers, and
     // the operator-side bridge identity is already emitted via the

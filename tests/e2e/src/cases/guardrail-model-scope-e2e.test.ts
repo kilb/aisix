@@ -11,7 +11,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E (regression for AISIX-Cloud#850): a guardrail attached to ONE model
+// E2E (regression for #850): a guardrail attached to ONE model
 // via a `scope_type: "model"` attachment must run ONLY for requests that
 // target that model. A request to a DIFFERENT (unscoped) model must NOT
 // trigger the guardrail.
@@ -25,7 +25,7 @@ import {
 // watch-applied attachments), the guardrail has zero loaded attachments and
 // falls back to env-scope at priority 0 — running GLOBALLY on every model.
 //
-// This test creates the attachment via the same etcd watch path cp-api
+// This test creates the attachment via the same etcd watch path the control plane
 // uses (`/<prefix>/guardrail_attachments/<uuid>`), so it exercises the
 // load + resolve pipeline end-to-end. No DP-side attachment admin endpoint
 // exists, so the harness writes the row directly to etcd.
@@ -88,9 +88,9 @@ describe("guardrail e2e: model-scope attachment runs only for the scoped model (
     });
 
     // Attach the guardrail to the SCOPED model only. Wire shape mirrors
-    // cp-api's `marshalGuardrailAttachmentKV` (P0c): snake_case fields,
+    // the control plane's `marshalGuardrailAttachmentKV` (P0c): snake_case fields,
     // `scope_id` = the virtual-model UUID returned by createModel, plus the
-    // `env_id` cp-api always includes (the DP ignores it). Having ANY
+    // `env_id` the control plane always includes (the DP ignores it). Having ANY
     // attachment row suppresses the implicit-env fallback, so the only way
     // the guardrail can apply is via a matching model scope.
     await etcd!.put(

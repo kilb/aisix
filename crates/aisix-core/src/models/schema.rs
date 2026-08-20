@@ -601,7 +601,7 @@ pub fn validate_passthrough_route_lenient(value: &Value) -> Result<(), SchemaErr
 ///
 /// `nullable_options` controls schemars' `Option<T>` representation: `false`
 /// keeps optional fields plain-but-absent (`type: string`), matching the wire
-/// shape of resources that never receive an explicit `null` (cp-api omits
+/// shape of resources that never receive an explicit `null` (the control plane omits
 /// unset fields); `true` keeps the default nullable form (`type: [string,
 /// null]`) for resources whose schema deliberately accepts `null` (e.g.
 /// ApiKey `team_id`/`user_id`).
@@ -667,7 +667,7 @@ pub fn model_root_schema(strict: bool) -> Value {
 /// Canonical JSON Schema for the `api_key` resource, derived from the
 /// [`ApiKey`](crate::models::ApiKey) struct. Uses the default nullable
 /// `Option` representation so `team_id`/`user_id` keep accepting an explicit
-/// `null` (cp-api sends `null` to clear team/owner), matching the resource's
+/// `null` (the control plane sends `null` to clear team/owner), matching the resource's
 /// wire contract.
 pub fn apikey_root_schema() -> Value {
     struct_root_schema::<crate::models::ApiKey>(true)
@@ -675,7 +675,7 @@ pub fn apikey_root_schema() -> Value {
 
 /// Canonical JSON Schema for the `provider_key` resource, derived from the
 /// [`ProviderKey`](crate::models::ProviderKey) struct. Uses the nullable
-/// `Option` representation (`true`): `TelemetryTags` carries fields cp-api
+/// `Option` representation (`true`): `TelemetryTags` carries fields the control plane
 /// sends as explicit `null` (`branded_provider`/`pk_label`/`byo_label`), and
 /// keeping all optionals nullable matches the resource's wire contract.
 /// The credential is accepted under both its canonical name `api_key` and
@@ -1386,7 +1386,7 @@ fn set_property_additional_properties_description(
 /// Canonical JSON Schema for the `cache_policy` resource, derived from the
 /// [`CachePolicy`](crate::models::CachePolicy) struct. The struct intentionally
 /// has no `deny_unknown_fields`, so the schema omits `additionalProperties`
-/// (i.e. `true`) — forward-compat fields from a newer cp-api are tolerated.
+/// (i.e. `true`) — forward-compat fields from a newer the control plane are tolerated.
 pub fn cache_policy_root_schema() -> Value {
     struct_root_schema::<crate::models::CachePolicy>(false)
 }
@@ -1527,7 +1527,7 @@ pub fn rate_limit_policy_root_schema() -> Value {
 /// Canonical JSON Schema for the `guardrail_attachment` resource, derived from
 /// the [`GuardrailAttachment`](crate::models::GuardrailAttachment) struct. Uses
 /// the nullable `Option` representation (`scope_id` is `null` for `env`-scoped
-/// attachments) and stays open (no `deny_unknown_fields`): cp-api includes an
+/// attachments) and stays open (no `deny_unknown_fields`): the control plane includes an
 /// `env_id` the DP ignores.
 pub fn guardrail_attachment_root_schema() -> Value {
     struct_root_schema::<crate::models::GuardrailAttachment>(true)
@@ -2013,7 +2013,7 @@ mod tests {
         assert!(err.message.to_lowercase().contains("display_name"));
     }
 
-    /// Closed-enum on `provider` was the cause of api7/AISIX-Cloud#417
+    /// Closed-enum on `provider` was the cause of api7/#417
     /// — any catalog vendor not in the DP enum (`xai`, `openrouter`,
     /// future long-tail) failed schema validation at snapshot load
     /// and silently disappeared from dispatch. Phase A opened the
@@ -2382,7 +2382,7 @@ mod tests {
 
     #[test]
     fn routing_fallback_on_statuses_range_is_enforced() {
-        // AISIX-Cloud#1012: entries outside 400-599 are rejected by the
+        // #1012: entries outside 400-599 are rejected by the
         // same committed-schema validation the admin API and etcd watch
         // paths share; an in-range list passes.
         let bad = json!({
@@ -3331,7 +3331,7 @@ mod tests {
         assert!(validate_rate_limit_policy(&v).is_err());
     }
 
-    // ---- rate_limit_policy conditional form (AISIX-Cloud#892) ----
+    // ---- rate_limit_policy conditional form (#892) ----
 
     #[test]
     fn rate_limit_policy_conditional_form_passes_both_validator_sets() {

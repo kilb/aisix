@@ -27,7 +27,7 @@ import {
 // (https://platform.openai.com/docs/api-reference/chat/create) for
 // the request/response shape; the gateway's `x-aisix-cache:
 // hit|miss|disabled` response header is its own published contract
-// (depended on by cp-api / dashboard `/logs`).
+// (depended on by the control plane / dashboard `/logs`).
 
 const CALLER_PLAINTEXT = "sk-cache-scen-caller";
 const CALLER_KEY_HASH = createHash("sha256")

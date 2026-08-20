@@ -15,7 +15,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// AISIX-Cloud#947: a `content_mode = full` exporter must capture the request
+// #947: a `content_mode = full` exporter must capture the request
 // prompt + response for /v1/responses and /v1/completions too — pre-fix those
 // handlers fanned out with `content: None`, so SLS received metadata only even
 // with "full (prompt + response)" selected in the console. This suite pins all
@@ -124,7 +124,7 @@ async function postJson(app: SpawnedApp, path: string, body: unknown): Promise<R
   });
 }
 
-describe("sls content capture e2e (AISIX-Cloud#947): /v1/responses + /v1/completions", () => {
+describe("sls content capture e2e (#947): /v1/responses + /v1/completions", () => {
   let etcdReachable = false;
   let responsesUpstream: OpenAiUpstream | undefined;
   let responsesStreamUpstream: OpenAiUpstream | undefined;

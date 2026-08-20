@@ -15,7 +15,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: JWT claim mappings — claims → existing API key (AISIX-Cloud#564).
+// E2E: JWT claim mappings — claims → existing API key (#564).
 //
 // The environment trusts a mock identity provider and defines
 // `claim_mappings` rules. Pinned journeys:

@@ -14,7 +14,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// ai-gateway#700 (follow-up to AISIX-Cloud#947): content capture for the
+// ai-gateway#700 (follow-up to #947): content capture for the
 // non-text-generation endpoints, LiteLLM-parity scope — embeddings / rerank /
 // images capture the post-redaction request JSON as the prompt and the full
 // response JSON (vectors / scores / image url|b64) as the response; audio

@@ -13,7 +13,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// AISIX-Cloud#1013: non-200 requests must also record the (post-mask)
+// #1013: non-200 requests must also record the (post-mask)
 // request body in full-content SLS logs — previously content was attached
 // only on the 200 success path, so a 4xx/5xx row showed status + error
 // class but never WHAT was sent, making triage guesswork. This drives a

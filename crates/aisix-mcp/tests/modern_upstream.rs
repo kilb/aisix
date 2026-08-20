@@ -1,4 +1,4 @@
-//! The per-server `protocol_version` bridge contract (AISIX-Cloud#1151):
+//! The per-server `protocol_version` bridge contract (#1151):
 //!
 //! - `protocol_version: "2026-07-28"` opens the upstream session with the
 //!   handshake-free `server/discover` lifecycle — the only way to reach a

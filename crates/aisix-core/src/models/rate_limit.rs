@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn tolerates_unknown_fields_for_forward_compat() {
-        // cp-api may ship new fields ahead of the DP rolling out; serde must
+        // The control plane may ship new fields ahead of the DP rolling out; serde must
         // accept them (the write path still rejects them via the strict
         // schema validators in models/schema.rs).
         let rl: RateLimit = serde_json::from_str(r#"{"rpm": 10, "extra": 1}"#).unwrap();

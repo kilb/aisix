@@ -10,7 +10,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E (api7/AISIX-Cloud#557): model-level client-IP CIDR allowlist.
+// E2E (api7/#557): model-level client-IP CIDR allowlist.
 //
 // A model with `allowed_cidrs` only serves requests whose resolved client
 // IP falls inside one of the ranges; everyone else gets 403 before the
@@ -25,7 +25,7 @@ import {
 //                 untouched (rejected pre-dispatch).
 //   AC-2 isolation — same external IP: restricted model 403, unrestricted 200.
 //
-// AISIX-Cloud#1087 follow-up: the same per-model allowlist must hold when
+// #1087 follow-up: the same per-model allowlist must hold when
 // the model is reached as a Model Group target. Pre-fix a group bypassed
 // its members' `allowed_cidrs` entirely — only the named alias was checked
 // — so adding a restricted model to a group silently published it to every

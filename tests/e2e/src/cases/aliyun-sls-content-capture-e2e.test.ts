@@ -14,7 +14,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// Content-capture e2e (AISIX-Cloud#687): a `content_mode = full` aliyun_sls
+// Content-capture e2e (#687): a `content_mode = full` aliyun_sls
 // exporter captures the request prompt + assembled response into its logstore,
 // while a `metadata_only` exporter on the same DP receives metadata only. This
 // pins the per-exporter content gating end-to-end through the real binary, and

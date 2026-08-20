@@ -1,14 +1,14 @@
 //! Per-request usage events the proxy emits at end-of-request.
 //!
-//! The wire shape mirrors cp-api's `dpmgr_usage_events` table 1:1 —
-//! see `aisix-cloud:internal/dpmgr/api/telemetry.go` and
-//! `migrations/009_dpmgr_usage_events.up.sql` for the receiving end.
+//! The wire shape mirrors the control plane's `control plane_usage_events` table 1:1 —
+//! see `aisix-cloud:the control plane/api/telemetry.go` and
+//! `migrations/009_control plane_usage_events.up.sql` for the receiving end.
 //!
 //! Lifecycle:
 //!
 //! ```text
 //! chat_completions handler --emit()--> [ mpsc::channel ] --drain--> sender worker --POST--> /dp/telemetry
-//!         (proxy crate)                                                 (server crate)              (cp-api)
+//!         (proxy crate)                                                 (server crate)              (the control plane)
 //! ```
 //!
 //! Why split sink + worker:
@@ -32,7 +32,7 @@ use serde::Serialize;
 
 /// One usage event. Emitted at end-of-request (success / upstream error /
 /// guardrail block) per chat completion. Field shape pinned to the
-/// cp-api wire (snake_case via serde).
+/// the control plane wire (snake_case via serde).
 ///
 /// All fields are Copy / String / `Option<String>` so the event is
 /// cheap to construct on the request hot path. `costed in USD` per
@@ -42,9 +42,9 @@ use serde::Serialize;
 ///
 /// `model_id` and `api_key_id` are optional: a guardrail-rejected
 /// request may have neither (rejection runs before model resolution).
-/// cp-api stores empty strings as SQL NULL; the field is `Option`
+/// The control plane stores empty strings as SQL NULL; the field is `Option`
 /// here so the JSON serialiser emits `""` (not `null`) — matches what
-/// the cp-api parser expects.
+/// the control plane parser expects.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct UsageEvent {
     /// DP-supplied request id (idempotency key). Use the same id the
@@ -68,7 +68,7 @@ pub struct UsageEvent {
     /// body (`model` field) — a Model-Group name for routed requests,
     /// a direct model's display name otherwise. `model_id` records the
     /// resolved TARGET model, so without this field the group a caller
-    /// asked for appears nowhere in telemetry (AISIX-Cloud#790). Empty
+    /// asked for appears nowhere in telemetry (#790). Empty
     /// when the request never carried a resolvable model name.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub requested_model: String,
@@ -78,7 +78,7 @@ pub struct UsageEvent {
 
     /// OpenAI prompt-cache hit count. Subset of `prompt_tokens`.
     /// Defaults to 0 for providers that don't expose prompt caching.
-    /// Serialised with `omitempty`-equivalent behaviour: cp-api accepts
+    /// Serialised with `omitempty`-equivalent behaviour: the control plane accepts
     /// the absent-or-zero case identically.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub cached_prompt_tokens: u32,
@@ -89,7 +89,7 @@ pub struct UsageEvent {
 
     /// Anthropic cache_creation_input_tokens. Separate counter on top
     /// of input_tokens; bills at ~1.25× prompt rate (per-model rate
-    /// resolved by cp-api from model_pricing).
+    /// resolved by the control plane from model_pricing).
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub cache_creation_tokens: u32,
 
@@ -100,26 +100,26 @@ pub struct UsageEvent {
 
     /// True when any token counter on this event was locally estimated
     /// with the gateway's tokenizer because the upstream response
-    /// carried no usage block (AISIX-Cloud#1074) — e.g. an
+    /// carried no usage block (#1074) — e.g. an
     /// OpenAI-compatible relay that ignores `stream_options.include_usage`,
     /// a client disconnect before the terminal usage chunk, or an
     /// upstream error mid-stream. False when every counter came from
     /// the upstream (or the event carries no tokens at all). Estimated
     /// counts approximate the model's real tokenizer; consumers that
-    /// need provider-billed exactness can filter on this flag. cp-api
-    /// persists it to `dpmgr_usage_events.usage_estimated`; on the wire
+    /// need provider-billed exactness can filter on this flag. The control plane
+    /// persists it to `control plane_usage_events.usage_estimated`; on the wire
     /// false is omitted via `skip_serializing_if`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub usage_estimated: bool,
 
     /// Audio length in seconds — the cost basis for models billed by
-    /// duration rather than tokens (AISIX-Cloud#1138, api7/aisix#457).
+    /// duration rather than tokens (#1138, api7/aisix#457).
     /// `whisper-1` reports `usage: {type: "duration", seconds: N}` and no
     /// token counts at all, so without this field its spend is
-    /// unpriceable; cp-api multiplies it by the model's per-second rate.
+    /// unpriceable; the control plane multiplies it by the model's per-second rate.
     /// Populated on `/v1/audio/transcriptions` + `/translations`; 0
     /// elsewhere and omitted from the wire, so token-only events are
-    /// unchanged and older cp-api builds ignore it.
+    /// unchanged and older the control plane builds ignore it.
     #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub audio_duration_seconds: f64,
 
@@ -129,13 +129,13 @@ pub struct UsageEvent {
     /// A cost basis of its own, not a token class: the provider bills per
     /// search on top of tokens, so a request carrying searches costs more
     /// than any token counter here accounts for. Same shape as
-    /// `audio_duration_seconds` — the DP reports the quantity and cp-api
+    /// `audio_duration_seconds` — the DP reports the quantity and the control plane
     /// multiplies it by the rate. Deliberately NOT folded into
     /// `total_tokens`, which would both inflate the token figure and hide
     /// the charge.
     ///
     /// 0 elsewhere and omitted from the wire, so token-only events are
-    /// unchanged; cp-api's `/dp/telemetry` binds JSON leniently, so older
+    /// unchanged; the control plane's `/dp/telemetry` binds JSON leniently, so older
     /// CP images ignore the unknown field.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub web_search_requests: u32,
@@ -169,7 +169,7 @@ pub struct UsageEvent {
     /// and front-side gateways stamp the same event — so the figure is
     /// directly comparable with what a caller-side proxy reports. A
     /// hidden-reasoning model that streams nothing while it thinks
-    /// (AISIX-Cloud#1225) shows the wait in `upstream_latency_ms`, not
+    /// (#1225) shows the wait in `upstream_latency_ms`, not
     /// here. Same attempt scope as `upstream_latency_ms`, so the two
     /// are directly comparable. 0 on non-streaming, error, and
     /// cache-hit paths (omitted from the wire via skip_serializing_if)
@@ -235,7 +235,7 @@ pub struct UsageEvent {
     ///   audio, images, `count_tokens` — or the id it returns is a resource
     ///   handle rather than a per-call response id (video jobs,
     ///   files/batches/fine-tuning, the passthrough tunnel), which is
-    ///   deliberately not recorded here (AISIX-Cloud#1289);
+    ///   deliberately not recorded here (#1289);
     /// - the upstream simply omitted it.
     ///
     /// So a consumer may not infer "reached an upstream" from a non-empty
@@ -245,7 +245,7 @@ pub struct UsageEvent {
 
     /// Resolved model the provider actually billed (e.g.
     /// `gpt-4o-2024-08-06` when the request said `gpt-4o`). Differs
-    /// from cp-api's `model_id` which points at the dashboard alias.
+    /// from the control plane's `model_id` which points at the dashboard alias.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub provider_model_version: String,
 
@@ -256,7 +256,7 @@ pub struct UsageEvent {
 
     /// Cost the DP computed for this request in US dollars. Zero when
     /// the request never reached cost calculation (e.g. blocked by a
-    /// guardrail before dispatch). cp-api recomputes this server-side
+    /// guardrail before dispatch). The control plane recomputes this server-side
     /// from its pricing catalog; the DP-supplied value is dropped.
     pub cost_usd: f64,
 
@@ -269,8 +269,8 @@ pub struct UsageEvent {
     /// reason ("bedrock_5xx" / "bedrock_timeout" / "bedrock_throttled")
     /// is what gets recorded so a compliance audit can identify
     /// requests that slipped past the policy. Empty string = no
-    /// bypass (the normal Allow / Block paths). cp-api persists this
-    /// to `dpmgr_usage_events.guardrail_bypassed_reason`; on the
+    /// bypass (the normal Allow / Block paths). The control plane persists this
+    /// to `control plane_usage_events.guardrail_bypassed_reason`; on the
     /// wire empty maps to NULL via `skip_serializing_if`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub guardrail_bypassed_reason: String,
@@ -284,7 +284,7 @@ pub struct UsageEvent {
     ///
     /// Empty (the dominant guardrail-free deployment, or a request rejected
     /// before guardrail resolution) is omitted from the wire via
-    /// `skip_serializing_if`; cp-api stores absent as an empty set. cp-api's
+    /// `skip_serializing_if`; the control plane stores absent as an empty set. The control plane's
     /// `/dp/telemetry` binds JSON leniently, so older CP images that don't
     /// know this field ignore it — the DP can ship it ahead of the CP.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -294,18 +294,18 @@ pub struct UsageEvent {
     /// request (input + output merged), e.g. `{"email": 2}`. Detector names
     /// only — masked values are never captured (#932), so a compliance audit
     /// sees THAT redaction happened without the event becoming a PII sink.
-    /// Empty (no redaction) is omitted from the wire; cp-api's `/dp/telemetry`
+    /// Empty (no redaction) is omitted from the wire; the control plane's `/dp/telemetry`
     /// binds JSON leniently, so older CP images ignore the unknown field.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub redacted_entity_counts: std::collections::BTreeMap<String, u32>,
 
     /// What each `enforcement_mode: monitor` guardrail WOULD have done to
-    /// this request (AISIX-Cloud#562): one entry per suppressed Block
+    /// this request (#562): one entry per suppressed Block
     /// (`would_block`, with the operator-facing reason) or suppressed mask
     /// (`would_mask`, with per-detector counts). Names only — never matched
     /// content (#153). Lets operators stage a policy and audit its hit rate
     /// in the dashboard before flipping it to `block`. Empty (no
-    /// monitor-mode guardrail fired) is omitted from the wire; cp-api's
+    /// monitor-mode guardrail fired) is omitted from the wire; the control plane's
     /// `/dp/telemetry` binds JSON leniently, so older CP images ignore the
     /// unknown field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -324,8 +324,8 @@ pub struct UsageEvent {
     ///   the upstream served the request (the entry was refreshed)
     ///
     /// Empty string = cache state unknown / not applicable (error
-    /// paths that fail before the cache lookup). cp-api persists
-    /// this to `dpmgr_usage_events.cache_status`; on the wire empty
+    /// paths that fail before the cache lookup). The control plane persists
+    /// this to `control plane_usage_events.cache_status`; on the wire empty
     /// maps to NULL via `skip_serializing_if`. Source of truth is
     /// `aisix_proxy::chat::CacheStatus::as_str`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -335,10 +335,10 @@ pub struct UsageEvent {
     /// the input tokens the request *would* have spent on the upstream
     /// if the cache hadn't served it. Zero on miss / disabled / error.
     ///
-    /// cp-api derives `cost_saved_usd` server-side by multiplying these
+    /// The control plane derives `cost_saved_usd` server-side by multiplying these
     /// counters by the model's pricing (same pattern as `cost_usd` on
     /// non-cache rows — the DP doesn't own the pricing catalog).
-    /// Surfacing tokens (not USD) here keeps pricing changes a cp-api-
+    /// Surfacing tokens (not USD) here keeps pricing changes a control plane-
     /// only deploy and lets the dashboard show "tokens saved" too.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub cache_hit_saved_input_tokens: u32,
@@ -373,7 +373,7 @@ pub struct UsageEvent {
     /// **upstream** provider only — an Anthropic-SDK call routed at a
     /// non-Anthropic Model used to log `provider=openai` with no
     /// indication the inbound protocol was Anthropic. Empty string on
-    /// the wire = legacy DP image; cp-api stores empty as NULL.
+    /// the wire = legacy DP image; the control plane stores empty as NULL.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub inbound_protocol: String,
 
@@ -428,17 +428,17 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error_message: String,
 
-    // ─── ProviderKey telemetry attribution (#302 M17 / AISIX-Cloud#436) ───
+    // ─── ProviderKey telemetry attribution (#302 M17 / #436) ───
     //
     // Mirrors `aisix_core::models::provider_key::TelemetryTags` 1:1 so
-    // cp-api can slice usage events by who-paid-what (catalog vs BYO),
+    // the control plane can slice usage events by who-paid-what (catalog vs BYO),
     // featured / community attribution, and operator-defined per-PK
     // labels. Sourced at request dispatch time from the resolved
     // `ProviderKey.telemetry_tags`; all five default to empty / false
     // for backward compat with legacy PK rows that pre-date Phase A.
     //
-    // Empty / false on the wire maps to NULL on the cp-api side via
-    // `skip_serializing_if` — `dpmgr_usage_events` columns are
+    // Empty / false on the wire maps to NULL on the control plane side via
+    // `skip_serializing_if` — `control plane_usage_events` columns are
     // nullable so legacy events written by older DP images don't
     // require a migration.
     /// `"catalog"` for first-party curated providers, `"byo"` for
@@ -448,7 +448,7 @@ pub struct UsageEvent {
     pub provider_kind: String,
 
     /// Whether this ProviderKey is in the dashboard's "Featured"
-    /// surface. Defaults to false; cp-api treats false as "not
+    /// surface. Defaults to false; the control plane treats false as "not
     /// featured OR unknown" — slicing should not rely on this single
     /// bit alone for catalog/community segmentation.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -467,7 +467,7 @@ pub struct UsageEvent {
 
     /// Operator-defined label for BYO entries (e.g. an internal team
     /// name). Empty for catalog rows. Mutually exclusive with
-    /// `pk_label` by convention; cp-api projection emits one or the
+    /// `pk_label` by convention; the control plane projection emits one or the
     /// other based on `provider_kind`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub byo_label: String,
@@ -478,39 +478,39 @@ pub struct UsageEvent {
     /// walking the configured forwarded header (default `x-forwarded-for`)
     /// right-to-left when the peer is a trusted proxy (nginx
     /// `set_real_ip_from` + `real_ip_recursive` parity). Empty when the
-    /// peer address was unavailable. cp-api stores empty as NULL.
+    /// peer address was unavailable. The control plane stores empty as NULL.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_source_ip: String,
 
     /// Client `User-Agent` header verbatim (control chars stripped,
     /// length-capped). Surfaces the client type (e.g. `codex-cli/1.2`).
-    /// Empty when the client sent none. cp-api stores empty as NULL.
+    /// Empty when the client sent none. The control plane stores empty as NULL.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_user_agent: String,
 
     // ─── MCP gateway attribution ───
     /// Registered name of the upstream MCP server a `tools/call` was routed
     /// to (the namespace prefix of the requested tool). Empty for non-MCP
-    /// events; cp-api stores empty as NULL. Older cp-api images that predate
+    /// events; the control plane stores empty as NULL. Older the control plane images that predate
     /// this field ignore it (DP-first rollout).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mcp_server_name: String,
 
     /// Name of the MCP tool invoked, without the server prefix. Empty for
-    /// non-MCP events; cp-api stores empty as NULL.
+    /// non-MCP events; the control plane stores empty as NULL.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mcp_tool_name: String,
 
     // ─── A2A gateway attribution ───
     /// Registered name of the upstream A2A agent a request was routed to.
-    /// Empty for non-A2A events; cp-api stores empty as NULL. Older cp-api
+    /// Empty for non-A2A events; the control plane stores empty as NULL. Older the control plane
     /// images that predate this field ignore it (DP-first rollout).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub a2a_agent_name: String,
 
     /// The JSON-RPC method invoked on the A2A agent, exactly as the caller
     /// wrote it (such as `message/send`, or its 1.0 spelling `SendMessage`).
-    /// Empty for non-A2A events; cp-api stores empty as NULL.
+    /// Empty for non-A2A events; the control plane stores empty as NULL.
     ///
     /// Unbounded by nature — a caller picks the string — so this is the
     /// forensic value only. Aggregate on `a2a_operation`.
@@ -572,10 +572,10 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub a2a_stream_event_count: u32,
 
-    // ─── Passthrough-route attribution (AISIX-Cloud#1312) ───
+    // ─── Passthrough-route attribution (#1312) ───
     /// Registered name of the passthrough route that served the request.
-    /// Empty for non-passthrough events; cp-api stores empty as NULL.
-    /// Older cp-api images that predate this field ignore it (DP-first
+    /// Empty for non-passthrough events; the control plane stores empty as NULL.
+    /// Older the control plane images that predate this field ignore it (DP-first
     /// rollout).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub passthrough_route_name: String,
@@ -584,30 +584,30 @@ pub struct UsageEvent {
     /// route's `identity_header` (forward-proxy deployments, where the
     /// caller carries no gateway credential of its own). Empty when the
     /// route configures no identity header or the client sent none;
-    /// cp-api stores empty as NULL.
+    /// the control plane stores empty as NULL.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_identity: String,
 
-    // ─── JWT identity attribution (AISIX-Cloud#564) ───
+    // ─── JWT identity attribution (#564) ───
     /// Value of the OIDC trust provider's identity claim (`sub` by
     /// default) when the request authenticated with a JWT. Claim
     /// mappings let many external identities share one API key, so
     /// `api_key_id` alone can no longer name the caller — this field
     /// restores per-identity attribution. Empty for requests
-    /// authenticated with the key's plaintext; cp-api stores empty as
-    /// NULL. Older cp-api images ignore it (DP-first rollout).
+    /// authenticated with the key's plaintext; the control plane stores empty as
+    /// NULL. Older the control plane images ignore it (DP-first rollout).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub jwt_subject: String,
 
     /// Name of the OIDC trust provider that verified the token.
     /// Subjects are only unique per provider, so attribution carries
-    /// both. Empty for non-JWT events; cp-api stores empty as NULL.
+    /// both. Empty for non-JWT events; the control plane stores empty as NULL.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub jwt_provider: String,
 
     /// Name of the claim mapping that selected the API key. Empty for
     /// non-JWT events and for identities bound to their key directly
-    /// via `jwt_subject`; cp-api stores empty as NULL.
+    /// via `jwt_subject`; the control plane stores empty as NULL.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub jwt_claim_mapping: String,
 }
@@ -640,7 +640,7 @@ fn is_zero_f64(n: &f64) -> bool {
 ///
 /// Issue #408: the sink also bumps `aisix_usage_events_emitted_total
 /// {handler, status_code, inbound_protocol}` on every call so e2e
-/// can externally assert emission without a cp-api receiver in the
+/// can externally assert emission without a control plane receiver in the
 /// loop. Counter is bumped on emission *intent* (i.e. every call to
 /// `try_emit`); drops counter is the subset that failed to enqueue.
 /// Invariant (audit HIGH-1): `emitted == delivered + dropped`. Every
@@ -656,7 +656,7 @@ pub struct UsageSink {
 }
 
 /// Log one line per provider call that came back with a response id
-/// (AISIX-Cloud#1289), so `provider_request_id` is greppable in the plain
+/// (#1289), so `provider_request_id` is greppable in the plain
 /// application log and not only in telemetry.
 ///
 /// This lives on the usage-sink path on purpose: per #655 **every** upstream
@@ -852,7 +852,7 @@ mod tests {
         String::from_utf8(bytes).unwrap()
     }
 
-    /// AISIX-Cloud#1289: a provider call that came back with a response id
+    /// #1289: a provider call that came back with a response id
     /// must be greppable in the plain application log, keyed by the gateway
     /// `request_id` + `attempt_index` so a retried/failed-over request can be
     /// walked call by call. Emitting from `try_emit` is what makes this hold
@@ -1189,7 +1189,7 @@ mod tests {
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains(r#""request_id":"req-1""#));
         assert!(json.contains(r#""api_key_id":"ak-uuid""#));
-        // AISIX-Cloud#790: the client-sent alias rides next to model_id
+        // #790: the client-sent alias rides next to model_id
         // so the dashboard can show the group a routed request used.
         assert!(json.contains(r#""requested_model":"smart-group""#));
         assert!(json.contains(r#""prompt_tokens":12"#));
@@ -1201,7 +1201,7 @@ mod tests {
     fn cache_and_reasoning_fields_are_omitted_when_zero() {
         // Older DP builds and providers without cache support emit
         // events with these counters at 0. They must NOT appear in
-        // the JSON — cp-api treats absent and 0 identically, but a
+        // the JSON — the control plane treats absent and 0 identically, but a
         // wire-compat regression here would inflate the request size
         // for every event.
         let ev = UsageEvent {
@@ -1218,7 +1218,7 @@ mod tests {
         assert!(!json.contains("finish_reason"));
         assert!(!json.contains("upstream_ttft_ms"));
         // ProviderKey telemetry tag wire-compat (#302 M17 /
-        // AISIX-Cloud#436). Pre-attribution DP images would emit
+        // #436). Pre-attribution DP images would emit
         // empty / false defaults, which must NOT appear on the wire.
         assert!(!json.contains("provider_kind"));
         assert!(!json.contains("provider_featured"));
@@ -1229,12 +1229,12 @@ mod tests {
         // resolve a peer / the client sent no User-Agent.
         assert!(!json.contains("client_source_ip"));
         assert!(!json.contains("client_user_agent"));
-        // Requested alias (AISIX-Cloud#790): absent when the request
+        // Requested alias (#790): absent when the request
         // never carried a resolvable model name.
         assert!(!json.contains("requested_model"));
         // Applied guardrails (#379): absent when no guardrail governed the
         // request (the dominant guardrail-free deployment). Empty must not
-        // appear on the wire — cp-api treats absent as the empty set.
+        // appear on the wire — the control plane treats absent as the empty set.
         assert!(!json.contains("applied_guardrails"));
     }
 
@@ -1285,7 +1285,7 @@ mod tests {
     #[test]
     fn telemetry_tag_fields_serialise_when_set() {
         // Catalog PK with operator-defined pk_label. Mirrors the
-        // shape cp-api projects via mustMarshalProviderKeyKV (kind +
+        // shape the control plane projects via mustMarshalProviderKeyKV (kind +
         // featured + branded_provider + pk_label, byo_label empty).
         let ev = UsageEvent {
             request_id: "req-tags-catalog".into(),
@@ -1306,7 +1306,7 @@ mod tests {
 
     #[test]
     fn telemetry_tag_fields_byo_variant_serialises() {
-        // BYO PK with operator-defined byo_label. Per cp-api's
+        // BYO PK with operator-defined byo_label. Per the control plane's
         // mustMarshalProviderKeyKV the catalog/BYO branches are
         // mutually exclusive — pk_label stays empty here.
         let ev = UsageEvent {

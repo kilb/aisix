@@ -9,11 +9,11 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: AISIX-Cloud#952 — streaming /v1/messages against a relay backend
+// E2E: #952 — streaming /v1/messages against a relay backend
 // that ships NO usage block on message_start (id/model present) and
 // reports cumulative input/cache counts only on the terminal
 // message_delta. Pre-fix the DP emitted prompt_tokens=0 for these
-// streams (cp-api stored NULL, the dashboard displayed 0 and the
+// streams (the control plane stored NULL, the dashboard displayed 0 and the
 // request billed as zero input).
 //
 // Mirrors the wire shape observed in the POC: message_start carries a

@@ -198,7 +198,7 @@ impl AliyunTextModerationGuardrail {
     /// Diagnostics come back on BOTH arms on purpose: the failure arms are
     /// exactly the ones an operator needs `aliyun_request_id` for, and
     /// returning them rather than logging in place lets the one call site
-    /// log once with the verdict attached (AISIX-Cloud#1060).
+    /// log once with the verdict attached (#1060).
     async fn call(
         &self,
         service: &str,
@@ -498,7 +498,7 @@ pub(crate) enum AliyunFailure {
     ServerError,
     /// HTTP 2xx whose body wasn't the documented JSON. Distinct from
     /// `ServerError` so triage isn't told "5xx" for a response that in
-    /// fact arrived intact and merely didn't parse (AISIX-Cloud#1060) —
+    /// fact arrived intact and merely didn't parse (#1060) —
     /// the two want different fixes.
     MalformedResponse,
     ConfigError,
@@ -525,7 +525,7 @@ impl AliyunFailure {
 pub(crate) const ACS_REQUEST_ID_HEADER: &str = "x-acs-request-id";
 
 /// What one `TextModerationPlus` call reported about itself, for operator
-/// triage (AISIX-Cloud#1060).
+/// triage (#1060).
 ///
 /// Provider metadata ONLY. The moderation result echoes the offending text
 /// back in `Data.Result[].RiskWords` / `RiskPositions`; per #153 none of
@@ -1035,7 +1035,7 @@ mod tests {
     async fn error_paths_log_provider_diagnostics() {
         // 1. A wrong access key: green-cip answers 4xx (the customer saw 404)
         //    with a body naming the cause. Without the code the operator only
-        //    sees a bare status (AISIX-Cloud#1030 follow-up).
+        //    sees a bare status (#1030 follow-up).
         {
             let server = MockServer::start().await;
             Mock::given(method("POST"))

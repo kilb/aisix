@@ -1,7 +1,7 @@
 //! The canonical event a sink delivers, plus the batch wrapper.
 //!
 //! A [`SinkRecord`] wraps the existing per-request [`UsageEvent`] (the
-//! canonical metadata, already mirrored to cp-api) and adds optional,
+//! canonical metadata, already mirrored to the control plane) and adds optional,
 //! opt-in [`SinkContent`]. Reusing `UsageEvent` keeps the metadata schema
 //! single-sourced; content lives in a separate field so the default
 //! metadata-only path can never carry a prompt.

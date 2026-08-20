@@ -199,7 +199,7 @@ impl DatadogSink {
     /// The metadata is produced by *serializing* [`crate::usage::UsageEvent`]
     /// rather than hand-listing its 30-plus fields: that single-sources the
     /// schema and inherits the exact `skip_serializing_if` emptiness rules the
-    /// cp-api wire uses (empty strings / zero counters are omitted). Field
+    /// the control plane wire uses (empty strings / zero counters are omitted). Field
     /// names are remapped to the OTel GenAI semconv where one exists
     /// (`gen_ai.system`, `gen_ai.request.model` / `gen_ai.response.model`,
     /// `gen_ai.usage.input_tokens` / `gen_ai.usage.output_tokens`, …) so a

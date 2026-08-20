@@ -10,7 +10,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E regression for AISIX-Cloud#790: Anthropic /v1/messages STREAMING
+// E2E regression for #790: Anthropic /v1/messages STREAMING
 // through an OpenAI-protocol provider recorded prompt_tokens=0 /
 // completion_tokens=0 — the translated upstream request carried
 // `stream: true` without `stream_options: {include_usage: true}`, so

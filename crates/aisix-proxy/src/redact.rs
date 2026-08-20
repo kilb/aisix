@@ -1,4 +1,4 @@
-//! Application helpers for PII redaction (#932 / AISIX-Cloud#932).
+//! Application helpers for PII redaction (#932 / #932).
 //!
 //! `aisix-guardrails` owns detection and the text→text rewrite
 //! ([`Guardrail::redact_input_text`] / [`Guardrail::redact_output_text`]);
@@ -355,7 +355,7 @@ pub fn redact_value_strings(
 
 /// Mask-rewrite an already-assembled OUTPUT text buffer in place — the
 /// content-capture accumulator a streaming hold-back path hands to
-/// content-capturing exporters (#932 × AISIX-Cloud#947). The wire-side
+/// content-capturing exporters (#932 × #947). The wire-side
 /// SSE/chunk redaction rewrites only the held bytes released to the client;
 /// the capture accumulator collects raw deltas, so without this the exported
 /// content would carry PII the client never saw. Counts are deliberately
@@ -3194,7 +3194,7 @@ pub async fn moderate_anthropic_sse(
 /// SSE stream (per content-block `index` order, `content_block_start`
 /// head text included). Used to rebuild the content-capture accumulator
 /// after a segment (provider-side) mask rewrote the held bytes — the
-/// sync redactor can't reproduce a provider mask (#932 × AISIX-Cloud#947).
+/// sync redactor can't reproduce a provider mask (#932 × #947).
 pub fn anthropic_sse_text(raw: &[u8]) -> String {
     let frames = split_sse_frames(raw);
     let mut channels: BTreeMap<u64, String> = BTreeMap::new();

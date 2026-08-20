@@ -854,7 +854,7 @@ mod tests {
 
     #[test]
     fn tolerates_unknown_top_level_fields_for_forward_compat() {
-        // cp-api may ship new fields ahead of the DP rolling out; serde must
+        // The control plane may ship new fields ahead of the DP rolling out; serde must
         // accept them. The write path still rejects them via `validate_model`
         // in models/schema.rs.
         let m: Model = serde_json::from_str(

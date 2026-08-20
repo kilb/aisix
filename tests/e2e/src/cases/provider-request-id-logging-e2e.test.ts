@@ -13,7 +13,7 @@ import {
 
 // E2E: the provider's own response id must be reachable from the plain
 // application log, joined to the gateway request id the caller holds
-// (AISIX-Cloud#1289).
+// (#1289).
 //
 // The contract is a triage journey, not a field: a caller reports a bad
 // answer and quotes their `x-aisix-request-id`; the operator must be able to

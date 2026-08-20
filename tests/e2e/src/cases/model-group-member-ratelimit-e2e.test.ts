@@ -14,7 +14,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E for AISIX-Cloud#1087: a Model Group dispatch must honor each
+// E2E for #1087: a Model Group dispatch must honor each
 // TARGET's own `rate_limit`, not just the group entry's. Pre-fix the
 // pre-dispatch reservation covered only the requested entry (the group,
 // which carries no limits), so a member's RPM/TPM was silently ignored
@@ -106,7 +106,7 @@ type ChatResult = {
   };
 };
 
-describe("model group member rate limit e2e (AISIX-Cloud#1087)", () => {
+describe("model group member rate limit e2e (#1087)", () => {
   let app: SpawnedApp | undefined;
   let seed: SeedClient | undefined;
   let proxy: ProxyClient | undefined;
@@ -228,7 +228,7 @@ describe("model group member rate limit e2e (AISIX-Cloud#1087)", () => {
     // sent, so it must not appear in the deployment counters at all —
     // that family is read as upstream health, and a member sitting out its
     // own rate-limit window is not an unhealthy upstream
-    // (AISIX-Cloud#1299). It is still a real attempt in the usage log, and
+    // (#1299). It is still a real attempt in the usage log, and
     // still the reason the next target counts as a fallback.
     const metricsAfter = await scrapeMetrics(app!.metricsUrl);
     const delta = (name: string, want: Record<string, string>) =>

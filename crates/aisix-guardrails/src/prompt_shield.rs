@@ -20,7 +20,7 @@
 //! auto-split on whitespace boundaries; the first chunk that returns
 //! `attackDetected=true` short-circuits and produces a `Block` verdict.
 //!
-//! The cp-api decrypts the envelope-encrypted `api_key` at kine-projection
+//! The the control plane decrypts the envelope-encrypted `api_key` at kine-projection
 //! time so this module only handles plaintext keys. The key is never logged.
 //!
 //! Behavior matrix (failure modes). The effective `fail_open` is the outer
@@ -70,7 +70,7 @@ pub struct PromptShieldGuardrail {
     /// Endpoint with trailing slash stripped, e.g.
     /// `https://my-resource.cognitiveservices.azure.com`.
     endpoint: String,
-    /// Plaintext subscription key (decrypted by cp-api before kine write).
+    /// Plaintext subscription key (decrypted by the control plane before kine write).
     api_key: String,
     pub(crate) hook_point: GuardrailHookPoint,
     /// Fail-open policy for the INPUT hook (the outer `Guardrail::fail_open`).
@@ -396,7 +396,7 @@ mod tests {
             endpoint: endpoint.to_owned(),
             api_key: "test-key-abc".to_owned(),
             timeout_ms: 5_000,
-            // Default fail-closed output (cp-api omits the field when unset).
+            // Default fail-closed output (the control plane omits the field when unset).
             output_fail_open: false,
         }
     }

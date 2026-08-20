@@ -134,7 +134,7 @@ fn mask_token(name: &str) -> String {
 /// Patterns lean conservative — `\b` boundaries and checksum validators —
 /// because a mask false-positive corrupts user content (worse than a
 /// keyword-blocklist false positive, which merely rejects). IDs are wire
-/// contract: cp-api's validator and the dashboard's detector list carry
+/// contract: the control plane's validator and the dashboard's detector list carry
 /// the same set.
 pub const BUILTIN_DETECTORS: &[(&str, &str, Option<MatchValidator>)] = &[
     (

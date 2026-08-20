@@ -48,7 +48,7 @@
 //! - `us.anthropic.claude-3-5-sonnet-20241022-v2:0`
 //!
 //! Single-entry routing: every Bedrock-hosted model goes through one
-//! provider name (`amazon-bedrock`) in cp-api's catalog, and the
+//! provider name (`amazon-bedrock`) in the control plane's catalog, and the
 //! publisher + region are resolved inside the bridge from the model
 //! id. Diverging from this would force every customer to register a
 //! separate provider_key per publisher even though the IAM role + AWS

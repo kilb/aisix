@@ -85,7 +85,7 @@ pub trait ModelCaller: Send + Sync {
 pub(crate) struct ProxyModelCaller<'a> {
     pub state: &'a ProxyState,
     /// Caller identity — the per-member quota gate needs the identity
-    /// dimensions for conditional policy rows (AISIX-Cloud#892).
+    /// dimensions for conditional policy rows (#892).
     pub auth: &'a crate::auth::AuthenticatedKey,
     pub snapshot: &'a AisixSnapshot,
     pub request_id: &'a str,
@@ -94,7 +94,7 @@ pub(crate) struct ProxyModelCaller<'a> {
     /// forwardable client headers as a single-upstream dispatch would.
     pub client: &'a crate::client_ip::ClientContext,
     /// The ensemble entry the caller addressed, so per-member policy
-    /// matching sees the {member, parent} pair (AISIX-Cloud#1267).
+    /// matching sees the {member, parent} pair (#1267).
     pub routing_parent: crate::quota::RoutingParent<'a>,
 }
 
@@ -205,7 +205,7 @@ pub struct PanelOutcome {
     /// The member's answer text (content + reasoning + tool-call text),
     /// captured so the dispatch layer can estimate this sub-call's
     /// completion tokens when the member backend reports no usage
-    /// (AISIX-Cloud#1074). Never billed directly — only a fallback.
+    /// (#1074). Never billed directly — only a fallback.
     pub est_output_text: String,
 }
 
@@ -220,7 +220,7 @@ pub struct EnsembleOutcome {
     pub judge_model: String,
     /// The judge's synthesis request, kept so the dispatch layer can
     /// estimate the judge sub-call's prompt tokens when the judge backend
-    /// reports no usage (AISIX-Cloud#1074). The streaming path builds its
+    /// reports no usage (#1074). The streaming path builds its
     /// own judge estimator from `run_ensemble_panel`'s `judge_req`; this
     /// field carries the same request out of the buffered path.
     pub judge_req: ChatFormat,
@@ -235,7 +235,7 @@ pub enum EnsembleError {
         /// The panel members that DID succeed before the run was abandoned.
         /// Each one already hit an upstream and was billed, so the dispatch
         /// layer must still commit + emit their usage even though the request
-        /// fails — dropping them would under-report panel usage to cp-api.
+        /// fails — dropping them would under-report panel usage to the control plane.
         panel: Vec<PanelOutcome>,
     },
     #[error("ensemble judge call failed")]

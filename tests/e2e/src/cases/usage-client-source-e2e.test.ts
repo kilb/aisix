@@ -15,7 +15,7 @@ import {
 // E2E (#492): the proxy logs the downstream client's source IP + client
 // type (User-Agent) on every usage event.
 //
-// Usage telemetry has no cp-api receiver in DP e2e, so we observe the
+// Usage telemetry has no the control plane receiver in DP e2e, so we observe the
 // emitted field VALUES through the per-env OTLP/HTTP fan-out: register a
 // mock OTLP receiver as an `observability_exporter`, drive one chat
 // request, and assert the recorded span carries the two new custom

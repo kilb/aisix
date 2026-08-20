@@ -32,7 +32,7 @@ import {
 // References:
 // - OpenAI usage object: https://platform.openai.com/docs/api-reference/chat/object
 // - DeepSeek usage extension: https://api-docs.deepseek.com
-// - Issue: api7/AISIX-Cloud#542 (+ #465)
+// - Issue: api7/#542 (+ #465)
 
 const CALLER_PLAINTEXT = "sk-cache-counters-caller";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -113,7 +113,7 @@ describe("usage cache-counter passthrough on /v1/chat/completions (#542)", () =>
     app = await spawnApp();
     seed = new SeedClient(etcd, app.etcdPrefix);
 
-    // Post-#302 Phase A: cp-api writes `provider` + `adapter` on every
+    // Post-#302 Phase A: the control plane writes `provider` + `adapter` on every
     // PK row; the snapshot's two-tier dispatch needs both. DeepSeek
     // dispatches through the OpenAI-compat family bridge (`adapter:
     // "openai"`) — the same bridge whose usage parser this PR fixes.

@@ -54,11 +54,11 @@ const CALLER_KEY_HASH = createHash("sha256")
 
 interface ProviderCase {
   readonly provider: "anthropic" | "google" | "deepseek";
-  // Post-#302 Phase A wire-shape adapter cp-api stamps on the PK
+  // Post-#302 Phase A wire-shape adapter the control plane stamps on the PK
   // alongside `provider`. `Hub::dispatch_two_tier` routes to the
   // `Adapter::Anthropic` family bridge for `"anthropic"` and to
   // `Adapter::Openai` for every OpenAI-compat vendor (google +
-  // deepseek here, plus any long-tail vendor cp-api admits later).
+  // deepseek here, plus any long-tail vendor the control plane admits later).
   readonly adapter: "openai" | "anthropic";
   readonly upstreamModelId: string;
   readonly displayName: string;
@@ -190,7 +190,7 @@ describe("error envelope normalization e2e: provider-native 4xx → OpenAI-shape
         // Post-#302 Phase A: `Hub::dispatch_two_tier` needs the PK
         // to carry both `provider` (vendor identity, open string)
         // and `adapter` (closed 5-value enum) so the dispatch hits
-        // the right family bridge. cp-api writes these for every
+        // the right family bridge. The control plane writes these for every
         // PK row in production; the test mirrors that contract.
         provider: tc.provider,
         adapter: tc.adapter,

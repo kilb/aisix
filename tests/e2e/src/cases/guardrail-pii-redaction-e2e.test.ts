@@ -11,7 +11,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: `kind: "pii"` guardrail (#932 / AISIX-Cloud#932) — in-process
+// E2E: `kind: "pii"` guardrail (#932 / #932) — in-process
 // sensitive-data detection with per-detector `mask` / `block` actions.
 //
 // - mask on the REQUEST: the caller's prompt PII is rewritten to

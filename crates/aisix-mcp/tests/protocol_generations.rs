@@ -1,7 +1,7 @@
 //! Two-generation contract tests for the downstream `/mcp` surface after the
 //! rmcp 3.x upgrade: the stateless MCP `2026-07-28` revision and the legacy
 //! Streamable HTTP generations must BOTH work against the same endpoint, and
-//! the version-negotiation behavior pinned by AISIX-Cloud#1144/#1148 must not
+//! the version-negotiation behavior pinned by #1144/#1148 must not
 //! drift:
 //!
 //! - `initialize` echoes a supported requested version exactly, and falls

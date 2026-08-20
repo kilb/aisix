@@ -48,7 +48,7 @@ const FALLBACK_ALL_UNHEALTHY_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// help and may amplify damage. Everything else (5xx, timeout,
 /// transport, decode, config, stream abort) gets the retry/failover path.
 ///
-/// `fallback_on_statuses` (AISIX-Cloud#1012) is the routing model's
+/// `fallback_on_statuses` (#1012) is the routing model's
 /// explicit opt-in list for providers that use 4xx codes for transient
 /// conditions (overload, queue full, quota): a status in the list is
 /// retryable regardless of the default classification. Empty by default,
@@ -274,7 +274,7 @@ pub struct TimeoutBudget {
     /// the 200 until the first chunk arrives. The deployment default must
     /// NOT do that — it is a backstop, and withholding headers for its
     /// (long) duration would also silence the SSE heartbeats that exist
-    /// precisely to cover a slow first token (AISIX-Cloud#1126). With the
+    /// precisely to cover a slow first token (#1126). With the
     /// default budget, a first-chunk stall surfaces as an in-band timeout
     /// after the 200 instead of failing over. Same shape as
     /// [`RetryBudget::covers`]: explicit config opts into the sharper
@@ -1272,7 +1272,7 @@ pub(crate) fn resolve_attempt_models(
             req.tags
         )));
     }
-    // Client-IP pre-filter (AISIX-Cloud#1087 follow-up): a target whose own
+    // Client-IP pre-filter (#1087 follow-up): a target whose own
     // `allowed_cidrs` excludes this caller is not a candidate. Applied BEFORE
     // the strategy picks, so `max_fallbacks` budgets attempts across the
     // targets this caller may actually reach, and a metric-based strategy
@@ -1910,7 +1910,7 @@ mod tests {
         ));
     }
 
-    /// AISIX-Cloud#1222: in-band stream errors follow the same status
+    /// #1222: in-band stream errors follow the same status
     /// rules as HTTP status errors; a status-less one is treated as a
     /// transient fault (retryable).
     #[test]
@@ -1932,7 +1932,7 @@ mod tests {
         assert!(is_retryable(&in_band(None), false, &[]));
     }
 
-    /// AISIX-Cloud#1012: `fallback_on_statuses` opts specific upstream
+    /// #1012: `fallback_on_statuses` opts specific upstream
     /// status codes into retry/failover. The list is additive — codes not
     /// listed keep the default classification — and it never resurrects
     /// non-status failures (customer-fixable config stays terminal).
@@ -2289,7 +2289,7 @@ mod tests {
     fn effective_timeouts_only_resource_config_arms_the_first_chunk_peek() {
         // Deployment-default budgets must not withhold the 200 waiting for
         // the first chunk — that would silence the SSE heartbeats that
-        // cover a slow first token (AISIX-Cloud#1126).
+        // cover a slow first token (#1126).
         let t = effective_timeouts(
             &model_with_timeouts(None, None),
             None,

@@ -6,9 +6,8 @@
 //! becomes a single PUT against the ProviderKey rather than rewriting
 //! every Model that uses it.
 //!
-//! Naming intentionally aligns with the AISIX-Cloud control plane's
-//! `ProviderKey` table — same concept, same name. The self-hosted
-//! Admin API and the SaaS-tier dashboard exposition stay in lockstep.
+//! The control plane models the same concept under the same name, so
+//! the Admin API and any dashboard exposition stay in lockstep.
 //!
 //! etcd path: `{prefix}/provider_keys/{uuid}`. Secondary index on
 //! `display_name`.
@@ -263,7 +262,7 @@ pub struct RequestOverrides {
     /// single-`*` glob patterns matched case-insensitively against the
     /// header name (`"anthropic-beta"`, `"x-trace-*"`). Empty — the
     /// default — forwards nothing, which is the behavior of every
-    /// standard-protocol endpoint before AISIX-Cloud#1167. Auth,
+    /// standard-protocol endpoint before #1167. Auth,
     /// transport, and gateway-owned headers are never forwarded whatever
     /// the patterns say.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -368,7 +367,7 @@ mod tests {
 
     #[test]
     fn tolerates_unknown_fields_for_forward_compat() {
-        // cp-api may ship new fields ahead of the DP rolling out; serde
+        // The control plane may ship new fields ahead of the DP rolling out; serde
         // must accept them. The write path still rejects them via the
         // strict schema validator (validate_provider_key in
         // models/schema.rs).
@@ -505,7 +504,7 @@ mod tests {
 
     #[test]
     fn telemetry_tags_tolerates_unknown_field_for_forward_compat() {
-        // cp-api may ship a new tag ahead of the DP rolling out; serde
+        // The control plane may ship a new tag ahead of the DP rolling out; serde
         // must accept it. The write path still rejects it via the
         // strict schema validator (validate_provider_key in
         // models/schema.rs).
@@ -652,7 +651,7 @@ mod tests {
 
     #[test]
     fn request_overrides_tolerates_unknown_field_for_forward_compat() {
-        // cp-api may ship new override fields ahead of the DP rolling
+        // The control plane may ship new override fields ahead of the DP rolling
         // out; serde must accept them. Typos on the write path are
         // still rejected by the strict schema validator
         // (validate_provider_key in models/schema.rs).
@@ -707,7 +706,7 @@ mod tests {
 
     #[test]
     fn response_overrides_tolerates_unknown_field_for_forward_compat() {
-        // cp-api may ship new override fields ahead of the DP rolling
+        // The control plane may ship new override fields ahead of the DP rolling
         // out; serde must accept them (the strict write-path schema
         // still rejects them — validate_provider_key in models/schema.rs).
         let p: ProviderKey = serde_json::from_str(
@@ -725,7 +724,7 @@ mod tests {
     #[test]
     fn stream_done_marker_deserialises_all_three_variants() {
         // The on-disk wire form is the lowercased variant — verify
-        // every literal the cp-api spec promises.
+        // every literal the control plane spec promises.
         for (raw, expected) in [
             ("required", StreamDoneMarker::Required),
             ("optional", StreamDoneMarker::Optional),
@@ -765,7 +764,7 @@ mod tests {
 
     #[test]
     fn param_constraints_tolerates_unknown_field_for_forward_compat() {
-        // cp-api may ship a new clamp ahead of the DP rolling out;
+        // The control plane may ship a new clamp ahead of the DP rolling out;
         // serde must accept it (the strict write-path schema still
         // rejects it — validate_provider_key in models/schema.rs).
         let c: ParamConstraints =

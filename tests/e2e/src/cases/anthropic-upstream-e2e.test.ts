@@ -411,7 +411,7 @@ describe("anthropic upstream e2e: cache tokens fold into total_tokens (#906)", (
   });
 });
 
-// E2E (AISIX-Cloud#1110 Gap A): a caller managing its own provider-side
+// E2E (#1110 Gap A): a caller managing its own provider-side
 // prompt caching attaches `cache_control` markers to content blocks (and
 // tool definitions) in the OpenAI shape. Those markers MUST reach the
 // Anthropic upstream — a translation that flattens blocks to
@@ -621,7 +621,7 @@ describe("anthropic upstream e2e: client cache_control markers survive translati
   });
 });
 
-// E2E (AISIX-Cloud#1110 Phase 1): a model with `auto_prompt_caching`
+// E2E (#1110 Phase 1): a model with `auto_prompt_caching`
 // enabled makes the gateway INJECT cache_control breakpoints into
 // requests that carry none of their own — one on the last system block,
 // one on the last content block of the final message — so callers get
@@ -632,7 +632,7 @@ const INJ_CALLER_KEY_HASH = createHash("sha256")
   .update(INJ_CALLER_PLAINTEXT)
   .digest("hex");
 
-describe("anthropic upstream e2e: auto_prompt_caching injects breakpoints (AISIX-Cloud#1110)", () => {
+describe("anthropic upstream e2e: auto_prompt_caching injects breakpoints (#1110)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let seed: SeedClient | undefined;

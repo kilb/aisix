@@ -13,7 +13,7 @@ import {
 } from "../harness/index.js";
 
 // E2E: the response cache is isolated per environment on a shared Redis
-// (api7/AISIX-Cloud#788, P1-1).
+// (api7/#788, P1-1).
 //
 // The cache key is a content-only fingerprint (model + messages + params,
 // no env/caller). Redis is user-provided infrastructure our chart does

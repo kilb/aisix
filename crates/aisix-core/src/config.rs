@@ -58,7 +58,7 @@ pub struct Config {
     /// Rate-limit counter backend. Defaults to per-process memory
     /// (historical behaviour). Set `backend: redis` with a `redis` block
     /// to share counters across every DP replica so a cluster enforces
-    /// one global window instead of one-per-replica (api7/AISIX-Cloud#798).
+    /// one global window instead of one-per-replica (api7/#798).
     #[serde(default)]
     pub ratelimit: RateLimitConfig,
     /// Connection-layer tuning for outbound calls to LLM providers.
@@ -201,7 +201,7 @@ pub struct ManagedConfig {
     pub cp_ca_cert_file: Option<String>,
 
     /// Inline PEM-encoded leaf certificate for the api7ee-parity
-    /// cert-via-env-var bootstrap path (cp-api's
+    /// cert-via-env-var bootstrap path (the control plane's
     /// /api/environments/:id/gateway_certificates endpoint, dashboard
     /// CertIssueCard). When all three of `cp_cert_pem` / `cp_key_pem`
     /// / `cp_ca_pem` are set, the DP materialises the operator-minted
@@ -223,7 +223,7 @@ pub struct ManagedConfig {
 
     /// Inline PEM-encoded CA certificate paired with `cp_cert_pem`.
     /// The DP installs this as the trust anchor for outbound mTLS
-    /// to dp-manager. Mutually exclusive with `cp_ca_file`.
+    /// to the control plane. Mutually exclusive with `cp_ca_file`.
     #[serde(default)]
     pub cp_ca_pem: Option<String>,
 
@@ -270,7 +270,7 @@ pub struct ManagedConfig {
     pub snapshot_cache_path: Option<String>,
 
     /// Heartbeat interval, in seconds. The DP POSTs a heartbeat to
-    /// dp-manager every `heartbeat_interval_secs`; CP surfaces a DP as
+    /// the control plane every `heartbeat_interval_secs`; CP surfaces a DP as
     /// "connected" on its first heartbeat. Clamped to [5, 300] by
     /// [`crate`]-external `HeartbeatConfig::sanitised`. Default 15s in
     /// production; e2e/dev can lower it (min 5s) so connect-detection
@@ -373,7 +373,7 @@ impl EtcdConfig {
     /// self-managed deployments that haven't migrated yet.
     ///
     /// The trailing slash matters for the kine etcd-auth interceptor
-    /// (internal/dpmgr/etcdauth on the dp-manager side): it requires
+    /// (the control plane's etcd-auth side): it requires
     /// the DP's Range key to start with `<prefix>/<env_id>/`, NOT
     /// `<prefix>/<env_id>`. Without the slash a bare `<prefix>/<env_id>`
     /// Range request gets `PermissionDenied: outside env <env_id> prefix`
@@ -410,7 +410,7 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub real_ip: RealIpConfig,
     /// Which inbound headers a caller may hand the gateway its own
-    /// request id in (AISIX-Cloud#1288).
+    /// request id in (#1288).
     #[serde(default)]
     pub request_id: RequestIdConfig,
     /// Serve the proxy from independent worker threads — each with its
@@ -675,7 +675,7 @@ impl RealIpConfig {
 /// proxy-auth headers that no provider auth scheme uses but that are still
 /// dangerous to hand to config.
 ///
-/// cp-api rejects these at write time
+/// The control plane rejects these at write time
 /// (`internal/cpapi/resources/provider_key_overrides.go`); this list is the
 /// runtime half of that pair, and the two must stay in sync.
 ///
@@ -700,7 +700,7 @@ pub const RESERVED_UPSTREAM_HEADERS: &[&str] = &[
 ];
 
 /// Where the gateway will accept a caller-supplied request id
-/// (AISIX-Cloud#1288).
+/// (#1288).
 ///
 /// The id a caller sends becomes THE id for the request: the
 /// `x-aisix-request-id` response header, every attempt's usage event, the
@@ -843,7 +843,7 @@ pub struct MetricsConfig {
     pub prometheus: PrometheusConfig,
     pub otlp: OtlpConfig,
     /// Operator-defined User-Agent → `client_type` mapping rules
-    /// (AISIX-Cloud#1045), consulted BEFORE the built-in allowlist so a
+    /// (#1045), consulted BEFORE the built-in allowlist so a
     /// deployment can classify in-house tools (or re-bucket a built-in
     /// match). Deployment-scoped on purpose: the labels these rules mint
     /// go to this DP's own Prometheus scrape surface, so the operator who
@@ -855,7 +855,7 @@ pub struct MetricsConfig {
     #[serde(default, deserialize_with = "deserialize_client_type_rules")]
     pub client_type_rules: Vec<ClientTypeRule>,
     /// Operator overrides for the histogram bucket edges
-    /// (AISIX-Cloud#1226). Deployment-scoped for the same reason as
+    /// (#1226). Deployment-scoped for the same reason as
     /// `client_type_rules`: the series these edges mint go to this DP's
     /// own Prometheus scrape surface. Validated at boot (fail-fast),
     /// never hot-reloaded.
@@ -1103,7 +1103,7 @@ impl RedisConnConfig {
     }
 }
 
-/// Rate-limit counter backend (api7/AISIX-Cloud#798).
+/// Rate-limit counter backend (api7/#798).
 ///
 /// `Memory` is the default: per-process fixed-window counters, so an
 /// N-replica cluster enforces N× the configured limit. `Redis` shares
@@ -1672,7 +1672,7 @@ admin:
 
     #[test]
     fn request_id_accept_headers_default_to_the_gateway_header_only() {
-        // The default is the contract from AISIX-Cloud#1288: a caller can
+        // The default is the contract from #1288: a caller can
         // reuse an id through OUR header, and `x-request-id` — which every
         // ingress in front of the gateway stamps — stays opt-in.
         let f = write_yaml(
@@ -2326,7 +2326,7 @@ admin:
 
     /// An `upstream:` block is optional; the defaults must still bound the
     /// connect phase, keep TCP keepalive on, and expire pooled connections
-    /// sooner than reqwest's own 90s (AISIX-Cloud#1122).
+    /// sooner than reqwest's own 90s (#1122).
     #[test]
     fn upstream_defaults_apply_when_the_block_is_absent() {
         let f = write_yaml(
@@ -2388,7 +2388,7 @@ upstream:
     /// The inbound side defaults to today's behaviour: idle connections are
     /// held until the peer closes them (closing first is what hands the
     /// node in front a stale connection), and SSE responses heartbeat every
-    /// 15s (AISIX-Cloud#1126).
+    /// 15s (#1126).
     #[test]
     fn downstream_defaults_hold_idle_connections_and_keep_the_sse_heartbeat() {
         let f = write_yaml(

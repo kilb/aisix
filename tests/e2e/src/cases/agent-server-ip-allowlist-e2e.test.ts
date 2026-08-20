@@ -13,7 +13,7 @@ import {
 } from "../harness/index.js";
 
 // Model rows have carried a source-IP allowlist since #557, and a routing
-// group's members since AISIX-Cloud#1087. MCP servers and A2A agents carried
+// group's members since #1087. MCP servers and A2A agents carried
 // none — so an operator who restricted a model to a source network found the
 // same restriction unavailable for the MCP server and the A2A agent sitting
 // beside it in the same environment, with no error to say why.

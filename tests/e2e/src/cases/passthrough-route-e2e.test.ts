@@ -15,8 +15,8 @@ import {
 // implicit `/passthrough/{provider}/*rest` tunnel. A route binds a gateway
 // entry (path prefix and/or inbound Host) to ONE upstream target with its
 // own auth mode and credential handling, so there is no implicit
-// provider→Model credential borrowing (AISIX-Cloud#1127) and the caller's
-// own upstream credential can be forwarded verbatim (AISIX-Cloud#1312).
+// provider→Model credential borrowing (#1127) and the caller's
+// own upstream credential can be forwarded verbatim (#1312).
 //
 // Journeys pinned here:
 //

@@ -12,7 +12,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E for AISIX-Cloud#1126: the inbound half of the connection layer.
+// E2E for #1126: the inbound half of the connection layer.
 //
 //   - `downstream.idle_timeout_secs` closes a client connection that sits
 //     idle *between* requests. The whole point of putting it on hyper's
@@ -142,7 +142,7 @@ function heartbeatCount(sse: string): number {
   return sse.split("\n").filter((line) => line === ":").length;
 }
 
-describe("downstream idle timeout (AISIX-Cloud#1126)", () => {
+describe("downstream idle timeout (#1126)", () => {
   let app: SpawnedApp | undefined;
   let slow: OpenAiUpstream | undefined;
   let etcdReachable = false;
@@ -245,7 +245,7 @@ describe("downstream idle timeout (AISIX-Cloud#1126)", () => {
   }, 30_000);
 });
 
-describe("downstream SSE heartbeat (AISIX-Cloud#1126)", () => {
+describe("downstream SSE heartbeat (#1126)", () => {
   let app: SpawnedApp | undefined;
   let chatUpstream: OpenAiUpstream | undefined;
   let responsesUpstream: OpenAiUpstream | undefined;

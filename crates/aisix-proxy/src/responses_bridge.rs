@@ -952,7 +952,7 @@ pub struct ResponsesStreamCompletion {
     /// Response object `id` reported by the **bridged upstream** — i.e. the
     /// chat-completion id the provider sent, not the `resp_…` this encoder
     /// mints for the client. The minted one is a gateway value and would be
-    /// useless in the provider's console (AISIX-Cloud#1289).
+    /// useless in the provider's console (#1289).
     pub provider_request_id: String,
     /// Attempt-scoped time to the upstream's first generated chunk.
     pub upstream_ttft_ms: u32,
@@ -969,11 +969,11 @@ pub struct ResponsesStreamCompletion {
     /// (#932). Merged with the input-side counts by the on_complete emit.
     pub redacted_entity_counts: crate::redact::RedactionCounts,
     /// Monitor-mode guardrail observations made by the end-of-stream output
-    /// check (AISIX-Cloud#562). Merged with the input-side hits by the
+    /// check (#562). Merged with the input-side hits by the
     /// on_complete emit.
     pub monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// Assembled assistant text for content-capturing exporters
-    /// (AISIX-Cloud#947), accumulated across chunks ONLY when an exporter
+    /// (#947), accumulated across chunks ONLY when an exporter
     /// wants full content (bounded to the capture cap). Empty otherwise.
     /// Read by the on_complete telemetry closure; never reaches the CP sink.
     pub response_text: String,
@@ -982,10 +982,10 @@ pub struct ResponsesStreamCompletion {
     /// and structural redaction, before the first released byte is yielded.
     pub response_capture_safe: bool,
     /// True when the Drop guard filled any token counter from the local
-    /// estimator (AISIX-Cloud#1074).
+    /// estimator (#1074).
     pub usage_estimated: bool,
     /// Generated output (content + reasoning + tool-call text) accumulated
-    /// for the token-estimation fallback (AISIX-Cloud#1074). Always on,
+    /// for the token-estimation fallback (#1074). Always on,
     /// bounded to `token_estimate::OUTPUT_ACCUMULATION_CAP`; never leaves
     /// the process.
     est_output_text: String,
@@ -993,7 +993,7 @@ pub struct ResponsesStreamCompletion {
 
 struct CompleteOnDrop<F: FnOnce(ResponsesStreamCompletion)> {
     slot: Option<(F, ResponsesStreamCompletion)>,
-    /// Token-estimation fallback (AISIX-Cloud#1074); fills counters the
+    /// Token-estimation fallback (#1074); fills counters the
     /// upstream never reported before `on_complete` runs.
     estimator: Option<crate::token_estimate::Estimator>,
 }
@@ -1011,7 +1011,7 @@ impl<F: FnOnce(ResponsesStreamCompletion)> CompleteOnDrop<F> {
 impl<F: FnOnce(ResponsesStreamCompletion)> Drop for CompleteOnDrop<F> {
     fn drop(&mut self) {
         if let Some((f, mut comp)) = self.slot.take() {
-            // Token-estimation fallback (AISIX-Cloud#1074): fill the
+            // Token-estimation fallback (#1074): fill the
             // counters the upstream never reported from the request +
             // the accumulated output text.
             if let Some(est) = self.estimator.take() {
@@ -1048,7 +1048,7 @@ impl<F: FnOnce(ResponsesStreamCompletion)> Drop for CompleteOnDrop<F> {
 /// buffer to scan, so an overflow fails closed. When `hold_back` is false
 /// (EndOfStreamCheck — a monitor-only chain, which can never block), the
 /// bytes forward live and the same end-of-stream scan runs for observation
-/// only (AISIX-Cloud#1010). With no output guardrail the bytes forward live
+/// only (#1010). With no output guardrail the bytes forward live
 /// unscanned.
 #[allow(clippy::too_many_arguments)]
 pub fn build_responses_bridge_stream(
@@ -1064,9 +1064,9 @@ pub fn build_responses_bridge_stream(
     on_exceeded_fail_open: bool,
     model_label: String,
     // Largest content cap any content-capturing exporter wants
-    // (AISIX-Cloud#947); `None` skips response-text accumulation entirely.
+    // (#947); `None` skips response-text accumulation entirely.
     content_cap: Option<u32>,
-    // Token-estimation fallback context (AISIX-Cloud#1074); see
+    // Token-estimation fallback context (#1074); see
     // `CompleteOnDrop::estimator`.
     estimator: Option<crate::token_estimate::Estimator>,
     on_complete: impl FnOnce(ResponsesStreamCompletion) + Send + 'static,
@@ -1107,7 +1107,7 @@ pub fn build_responses_bridge_stream(
                     // First upstream chunk of ANY type stops the TTFT clock —
                     // the industry convention (LiteLLM, caller-side gateways),
                     // so the figure matches external observers
-                    // (AISIX-Cloud#1225).
+                    // (#1225).
                     if !first_chunk_seen {
                         first_chunk_seen = true;
                         guard.comp().upstream_ttft_ms =
@@ -1122,7 +1122,7 @@ pub fn build_responses_bridge_stream(
                         if let Some(fr) = chunk.finish_reason.as_ref() {
                             comp.finish_reason = finish_reason_label(fr);
                         }
-                        // Content capture (AISIX-Cloud#947): assemble the
+                        // Content capture (#947): assemble the
                         // assistant text for the observability fan-out,
                         // bounded to the cap so a long stream can't grow the
                         // buffer without limit. Only when an exporter wants
@@ -1136,7 +1136,7 @@ pub fn build_responses_bridge_stream(
                                 cap as usize,
                             );
                         }
-                        // Token-estimation accumulator (AISIX-Cloud#1074):
+                        // Token-estimation accumulator (#1074):
                         // all generated output, always on (whether the
                         // fallback is needed is only known at end-of-stream),
                         // bounded.
@@ -1306,7 +1306,7 @@ pub fn build_responses_bridge_stream(
         // assistant output (canonical tool calls, so a literal split across
         // argument deltas can't slip through), then release or block. On the
         // live-forward path (EndOfStreamCheck — monitor-only chain,
-        // AISIX-Cloud#1010) the same scan runs for observation: the bytes are
+        // #1010) the same scan runs for observation: the bytes are
         // already on the wire, so a Block (unreachable for monitor members;
         // `mandatory` unavailability is the one composition that can still
         // produce it) is signalled with a trailing error frame, mirroring the
@@ -1315,7 +1315,7 @@ pub fn build_responses_bridge_stream(
         let (text, tool_calls) = encoder.assembled_assistant_message();
         if !text.is_empty() || !tool_calls.is_empty() {
             // Live mode releases oversized streams (that's the point of
-            // AISIX-Cloud#1010), so the assembled text is unbounded here —
+            // #1010), so the assembled text is unbounded here —
             // cap the scan input like the verbatim path's EosOutputScan
             // does, keeping the observation provider calls bounded. Held
             // (buffering) text is already capped by the hold-back budget.
@@ -1405,7 +1405,7 @@ pub fn build_responses_bridge_stream(
             if buffering && !seg_counts.is_empty() {
                 // Bedrock masked the held bytes — rebuild the content-
                 // capture accumulator from the masked text channels,
-                // keeping the original soft cap (#932 × AISIX-Cloud#947).
+                // keeping the original soft cap (#932 × #947).
                 if let Some(cap) = content_cap {
                     let mut rebuilt = crate::redact::responses_sse_text(&joined);
                     let mut cut = (cap as usize).min(rebuilt.len());
@@ -1474,7 +1474,7 @@ pub fn build_responses_bridge_stream(
     };
     // Re-attach the request span: the body is polled after the request-id
     // middleware returns, so the end-of-stream output-guardrail check
-    // would otherwise log without a `request_id` (AISIX-Cloud#1060).
+    // would otherwise log without a `request_id` (#1060).
     axum::body::Body::from_stream(crate::sse_keepalive::with_heartbeat(
         crate::request_id::in_request_span(stream),
         crate::sse_keepalive::interval(),

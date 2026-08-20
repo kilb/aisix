@@ -13,7 +13,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: the `aliyun_ai_guardrail` guardrail (AISIX-Cloud#1070) moderates
+// E2E: the `aliyun_ai_guardrail` guardrail (#1070) moderates
 // chat input and output against Aliyun's AI Guardrails product
 // (`MultiModalGuard`) — a different product from TextModerationPlus,
 // with a Suggestion-driven verdict computed by the Aliyun-side policy.

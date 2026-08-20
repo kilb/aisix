@@ -1,4 +1,4 @@
-//! Downstream SSE heartbeat for streaming responses (AISIX-Cloud#1126).
+//! Downstream SSE heartbeat for streaming responses (#1126).
 //!
 //! A model that takes a long time to produce its first token leaves the
 //! response connection silent, and a proxy between the client and the

@@ -1,5 +1,5 @@
 //! Per-ProviderKey telemetry attribution shared by every request handler's
-//! usage-event emitter (AISIX-Cloud#867 + non-chat parity follow-up).
+//! usage-event emitter (#867 + non-chat parity follow-up).
 //!
 //! The five attribution fields — `provider_kind` / `provider_featured` /
 //! `branded_provider` / `pk_label` / `byo_label` — are sourced from the
@@ -29,7 +29,7 @@ use crate::state::ProxyState;
 /// OpenAI's `chat.completion.id`, a Responses-API `resp_…`, a legacy
 /// completions `cmpl-…`, a Cohere rerank `id`.
 ///
-/// AISIX-Cloud#1289 keeps three ids strictly separate: this one, the
+/// #1289 keeps three ids strictly separate: this one, the
 /// gateway's own `request_id`, and the provider's HTTP transport header id.
 /// None of them may stand in for another, and an absent id stays absent — a
 /// synthesised value would send an operator hunting in the provider's console
@@ -38,8 +38,8 @@ use crate::state::ProxyState;
 /// errored call has no response object, and a cache hit never reached a
 /// provider.
 ///
-/// The value is upstream-controlled and reaches both a log line and cp-api's
-/// `dpmgr_usage_events`, so it goes through [`sanitize_tag`] (control chars
+/// The value is upstream-controlled and reaches both a log line and the control plane's
+/// `control plane_usage_events`, so it goes through [`sanitize_tag`] (control chars
 /// stripped, 256-char cap) — an unescaped newline in an id would otherwise
 /// let an upstream forge whole log records.
 pub(crate) fn provider_response_id(body: &serde_json::Value) -> String {
@@ -66,7 +66,7 @@ pub(crate) const UNKNOWN_PK: &str = "unknown";
 ///
 /// Three terminal emitters want something off the same row: `record` and
 /// `record_usage` want the readable `provider_key_name` label (#890 req-3),
-/// and the usage-event emitters want `telemetry_tags` (AISIX-Cloud#867).
+/// and the usage-event emitters want `telemetry_tags` (#867).
 /// Each used to look the row up itself — three `DashMap` reads and two
 /// `display_name` clones for one request (#941). Resolving here and passing
 /// the result down replaces them with one read, and makes the two emits
@@ -225,7 +225,7 @@ pub(crate) fn live_exporters(
 /// undercounts cached traffic — the OpenAI bridge already folds them into
 /// `total_tokens` (#679) and the CP display total includes them (#906); this
 /// keeps the native `/v1/messages` and `/v1/responses` commits consistent
-/// (AISIX-Cloud#995). OpenAI's `cached_tokens` is a subset of
+/// (#995). OpenAI's `cached_tokens` is a subset of
 /// `prompt_tokens` and is deliberately NOT an input here.
 pub(crate) fn total_tokens_with_cache(
     prompt_tokens: u32,
@@ -394,7 +394,7 @@ pub(crate) fn apply_pk_telemetry(event: &mut UsageEvent, pk: &ResolvedPk<'_>) {
 }
 
 /// Stamp the JWT identity attribution fields onto an in-progress
-/// UsageEvent (AISIX-Cloud#564). A `None` identity (the API-key path)
+/// UsageEvent (#564). A `None` identity (the API-key path)
 /// leaves the fields empty, which skip-serialize to wire NULL. One
 /// source of truth for the mapping so the handler family can't drift —
 /// same rationale as [`apply_pk_telemetry`]. The values are sanitised
@@ -685,8 +685,8 @@ mod tests {
         assert_eq!((m.as_ref(), u.as_ref()), ("no-such/model", "raw-upstream"));
     }
 
-    /// AISIX-Cloud#1289: the id is upstream-controlled and reaches a log line
-    /// and cp-api's `dpmgr_usage_events`. A newline in it would break the
+    /// #1289: the id is upstream-controlled and reaches a log line
+    /// and the control plane's `control plane_usage_events`. A newline in it would break the
     /// one-record-per-line shape every log consumer relies on, and an
     /// unbounded id would ride every line for the request. Both entry points
     /// must normalise, because producers use whichever fits their decode:

@@ -36,7 +36,7 @@
 //! - `llama-3-70b-instruct-maas` → publisher `meta`
 //!
 //! Single-prefix routing: every Vertex-hosted model goes through one
-//! provider name in cp-api's catalog (`google-vertex`), and the
+//! provider name in the control plane's catalog (`google-vertex`), and the
 //! publisher is resolved inside the bridge from the upstream model
 //! id. Diverging from this would force every customer to register a
 //! separate provider_key per publisher even though the GCP credential

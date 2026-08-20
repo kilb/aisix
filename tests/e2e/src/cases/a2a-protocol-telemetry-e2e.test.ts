@@ -12,7 +12,7 @@ import {
 import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 import { STREAM_ANSWER } from "../harness/upstream-a2a.js";
 
-// E2E for AISIX-Cloud#1215: protocol-level observability for the A2A gateway.
+// E2E for #1215: protocol-level observability for the A2A gateway.
 //
 // The contract pinned here is what an operator can answer AFTER a call is
 // over. Before this, an A2A call left "someone reached agent X with method Y"
@@ -30,7 +30,7 @@ const sha256 = (value: string) => createHash("sha256").update(value).digest("hex
 /** How long to allow for the exporter's batch to reach the receiver. */
 const EXPORT_TIMEOUT_MS = 20_000;
 
-describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
+describe("a2a protocol telemetry e2e (#1215)", () => {
   let app: SpawnedApp | undefined;
   // Two stubs, each answering in the shape its version actually defines: 1.0
   // wraps the Task in the response's payload oneof, 0.3 puts it flat under

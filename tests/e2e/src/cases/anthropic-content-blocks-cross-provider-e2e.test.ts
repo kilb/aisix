@@ -11,7 +11,7 @@ import {
 } from "../harness/index.js";
 
 // E2E: /v1/messages cross-provider content-block translation (#722,
-// AISIX-Cloud#873 §⑤ "Anthropic Messages 跨厂商 仅文本块").
+// #873 §⑤ "Anthropic Messages 跨厂商 仅文本块").
 //
 // Pre-#722 the inbound parse dropped every non-text block silently, so a
 // Claude-Code-style multi-turn tool loop pointed at a non-Anthropic
