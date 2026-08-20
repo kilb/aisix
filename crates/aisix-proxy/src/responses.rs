@@ -6612,6 +6612,92 @@ data: [DONE]\n\n";
         );
     }
 
+    /// 流式 `/v1/responses`（verbatim 透传）必须在流结束后把花费记进花费桶。
+    /// 这条路径不走 `MultiReservation::commit`，而是在流结束回调里拿
+    /// `spend_keys()` 单独记一笔——删掉那一次调用，token 侧一切照常，
+    /// 只有预算悄悄不再增长，没有任何报错。
+    ///
+    /// 这是 Codex 的流量入口：只测 chat 的话，这条路径会永远绿着而
+    /// 预算静默失效。
+    #[tokio::test]
+    async fn streaming_responses_commits_spend_and_the_next_request_is_refused() {
+        let upstream = MockServer::start().await;
+        let sse_body = "\
+data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":500,\"output_tokens\":1000}}}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_body),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        // 1 USD / 1k token，进出同价 → (500 + 1000) / 1000 = 1.5 USD。
+        let model_json = format!(
+            r#"{{"display_name":"gpt-4o-resp","provider":"openai","model_name":"gpt-4o",
+                 "provider_key_id":"{OPENAI_PK_ID}",
+                 "cost":{{"input_per_1k":1.0,"output_per_1k":1.0}}}}"#
+        );
+        let m: Model = serde_json::from_str(&model_json).unwrap();
+        snap.models.insert(ResourceEntry::new("m-1", m, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        // 只设花费上限：第二次被拒只可能是花费层干的。窗口取 minute，
+        // 好让 `peek` 能回读 tpm_used。
+        let policy: aisix_core::models::RateLimitPolicy =
+            serde_json::from_value(serde_json::json!({
+                "name": "budget",
+                "scope": "api_key",
+                "scope_ref": "k-1",
+                "window": "minute",
+                "max_spend_micro_usd": 1_000_000u64,
+            }))
+            .unwrap();
+        snap.rate_limit_policies
+            .insert(ResourceEntry::new("pol-spend", policy, 1));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
+        let app = crate::build_router(state.clone());
+        let body = serde_json::json!({
+            "model": "gpt-4o-resp",
+            "input": "hi",
+            "stream": true,
+        });
+
+        let resp = app.clone().oneshot(make_req(body.clone())).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // 读完 body，让流结束回调触发。
+        to_bytes(resp.into_body(), 65536).await.unwrap();
+
+        let spend_limits = aisix_core::RateLimit {
+            tpm: Some(1_000_000),
+            ..Default::default()
+        };
+        let status = state
+            .limiter
+            .peek("spend:api_key:k-1:pol-spend", &spend_limits)
+            .await
+            .expect("花费桶应已存在");
+        assert_eq!(
+            status.tpm_used, 1_500_000,
+            "花费桶里应是 micro-USD；记成 1500 就是把 token 数当成了钱",
+        );
+
+        let resp = app.oneshot(make_req(body)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "流式 /v1/responses 的花费没有提交，预算完全不生效",
+        );
+    }
+
     /// #808: a streaming `/v1/responses` 200 (e.g. all Codex traffic, which
     /// always streams) MUST emit a UsageEvent with the tokens carried on the
     /// terminal `response.completed` event — pre-#808 the streaming path

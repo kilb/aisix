@@ -1478,7 +1478,9 @@ fn branch_kind(branch: &serde_json::Map<String, Value>) -> Option<&str> {
 ///
 /// - the classic/conditional form XOR
 ///   ([`super::rate_limit_policy::rate_limit_policy_form_one_of`]), which also
-///   carries the classic form's "at least one of `max_requests`/`max_tokens`";
+///   carries the classic form's "at least one of
+///   `max_requests`/`max_tokens`/`max_spend_micro_usd`" and keeps every classic
+///   field off the conditional form;
 /// - the `PolicySchedule` day-selector XOR;
 /// - closing the `ConditionNode` object variants in **both** validator sets:
 ///   the node is `#[serde(untagged)]`, so serde buffers its content and

@@ -352,7 +352,7 @@ fn classic_rate_limit(policy: &RateLimitPolicy) -> Option<RateLimit> {
             if policy.max_tokens.is_some() {
                 warn_inert_dimension_once(&policy.name, "second", "max_tokens");
             }
-            // 花费上限同理:second 窗口下同样无法生效,要报出来而不是静默丢弃。
+            // 花费上限同理：second 窗口下同样无法生效，要报出来而不是静默丢弃。
             if policy.max_spend_micro_usd.is_some() {
                 warn_inert_dimension_once(&policy.name, "second", "max_spend_micro_usd");
             }

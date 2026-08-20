@@ -4206,6 +4206,111 @@ data: [DONE]\n\n";
         assert_eq!(v["error"]["type"], "rate_limit_exceeded");
     }
 
+    /// 流式 `/v1/chat/completions` 必须在流结束后把花费记进花费桶。
+    ///
+    /// 这条路径**不走** `MultiReservation::commit`：它在流结束的回调里拿
+    /// `spend_keys()` 单独调一次 `add_tokens_post_stream_all`。删掉那一次
+    /// 调用，token 侧一切照常，只有预算悄悄不再增长——没有报错，只有一个
+    /// 错的数字。把 `keys()` 拆成 `token_keys()`/`spend_keys()` 时编译器
+    /// 强制复查过一遍，但那是一次性的，之后再也不会。
+    ///
+    /// 断言两件事：桶里记的是**钱**（micro-USD，不是 token 数），
+    /// 以及下一次请求真的会因为超预算被拒。
+    #[tokio::test]
+    async fn streaming_chat_commits_spend_and_the_next_request_is_refused() {
+        let upstream = MockServer::start().await;
+        // 终帧 usage：prompt 500 + completion 1000。
+        let sse = "\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":500,\"completion_tokens\":1000,\"total_tokens\":1500}}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        // 1 USD / 1k token，进出同价 → (500 + 1000) / 1000 = 1.5 USD
+        // = 1_500_000 micro-USD。
+        let model_json = format!(
+            r#"{{"display_name":"my-gpt4","provider":"openai","model_name":"gpt-4o",
+                 "provider_key_id":"{PK_ID}",
+                 "cost":{{"input_per_1k":1.0,"output_per_1k":1.0}}}}"#
+        );
+        let model: Model = serde_json::from_str(&model_json).unwrap();
+        snap.models
+            .insert(ResourceEntry::new("model-id-1", model, 1));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["my-gpt4"]));
+        // 只设花费上限，不设任何 token/请求上限：这样第二次被拒
+        // 只可能是花费层干的。窗口取 minute，好让 `peek` 能回读 tpm_used。
+        let policy: aisix_core::models::RateLimitPolicy =
+            serde_json::from_value(serde_json::json!({
+                "name": "budget",
+                "scope": "api_key",
+                "scope_ref": "key-id-1",
+                "window": "minute",
+                "max_spend_micro_usd": 1_000_000u64,
+            }))
+            .unwrap();
+        snap.rate_limit_policies
+            .insert(ResourceEntry::new("pol-spend", policy, 1));
+
+        let state = build_state(snap, hub);
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        // 第一次放行；把 body 读完，让流结束回调触发。
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body_stream = resp.into_body().into_data_stream();
+        while let Some(chunk) = body_stream.next().await {
+            let _ = chunk.unwrap();
+        }
+
+        // 桶里记的必须是钱：1.5 USD = 1_500_000 micro-USD。
+        // 若这里等于 1500，说明记进去的是 token 数——量纲错了。
+        let spend_limits = aisix_core::RateLimit {
+            tpm: Some(1_000_000),
+            ..Default::default()
+        };
+        let status = state
+            .limiter
+            .peek("spend:api_key:key-id-1:pol-spend", &spend_limits)
+            .await
+            .expect("花费桶应已存在");
+        assert_eq!(
+            status.tpm_used, 1_500_000,
+            "花费桶里应是 micro-USD；记成 1500 就是把 token 数当成了钱",
+        );
+
+        // 第二次必须 429：预算已超。
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "流式 chat 的花费没有提交，预算完全不生效",
+        );
+    }
+
     /// #790: every OpenAI-protocol streaming leg now asks
     /// the upstream for the terminal usage frame by injecting
     /// `stream_options: {"include_usage": true}` when the client didn't

@@ -6033,6 +6033,96 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         assert!(rx.try_recv().is_err(), "usage event should be emitted once");
     }
 
+    /// 流式 `/v1/messages`（原生 Anthropic 透传）必须在流结束后把花费记进
+    /// 花费桶。这条路径不走 `MultiReservation::commit`，而是在流结束回调里
+    /// 拿 `spend_keys()` 单独记一笔——删掉那一次调用，token 侧一切照常，
+    /// 只有预算悄悄不再增长，没有任何报错。
+    ///
+    /// 这是 Claude Code / Anthropic SDK 的流量入口：只测 chat 的话，这条
+    /// 路径会永远绿着而预算静默失效。
+    #[tokio::test]
+    async fn streaming_messages_commits_spend_and_the_next_request_is_refused() {
+        let upstream = MockServer::start().await;
+        let sse = "\
+event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-haiku-20241022\",\"stop_reason\":null}}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":500,\"output_tokens\":1000}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic(&upstream.uri());
+        // 1 USD / 1k token，进出同价 → (500 + 1000) / 1000 = 1.5 USD。
+        let model_json = format!(
+            r#"{{"display_name":"my-claude","provider":"anthropic",
+                 "model_name":"claude-3-5-haiku-20241022",
+                 "provider_key_id":"{ANTHROPIC_PK_ID}",
+                 "cost":{{"input_per_1k":1.0,"output_per_1k":1.0}}}}"#
+        );
+        let m: Model = serde_json::from_str(&model_json).unwrap();
+        snap.models.insert(ResourceEntry::new("m-1", m, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        // 只设花费上限：第二次被拒只可能是花费层干的。窗口取 minute，
+        // 好让 `peek` 能回读 tpm_used。
+        let policy: aisix_core::models::RateLimitPolicy =
+            serde_json::from_value(serde_json::json!({
+                "name": "budget",
+                "scope": "api_key",
+                "scope_ref": "k-1",
+                "window": "minute",
+                "max_spend_micro_usd": 1_000_000u64,
+            }))
+            .unwrap();
+        snap.rate_limit_policies
+            .insert(ResourceEntry::new("pol-spend", policy, 1));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
+        let app = crate::build_router(state.clone());
+        let body = serde_json::json!({
+            "model": "my-claude",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 200,
+            "stream": true,
+        });
+
+        let resp = app.clone().oneshot(make_req(body.clone())).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // 读完 body，让流结束回调触发。
+        to_bytes(resp.into_body(), 65536).await.unwrap();
+
+        let spend_limits = aisix_core::RateLimit {
+            tpm: Some(1_000_000),
+            ..Default::default()
+        };
+        let status = state
+            .limiter
+            .peek("spend:api_key:k-1:pol-spend", &spend_limits)
+            .await
+            .expect("花费桶应已存在");
+        assert_eq!(
+            status.tpm_used, 1_500_000,
+            "花费桶里应是 micro-USD；记成 1500 就是把 token 数当成了钱",
+        );
+
+        let resp = app.oneshot(make_req(body)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "流式 /v1/messages 的花费没有提交，预算完全不生效",
+        );
+    }
+
     /// #952: relay backends that ship NO usage on
     /// `message_start` (id/model present) and report cumulative
     /// input/cache counts only on the terminal `message_delta`. Pre-fix
