@@ -1018,8 +1018,20 @@ async fn main() {
         sessions: Arc::new(RwLock::new(HashMap::new())),
         save_lock: Arc::new(tokio::sync::Mutex::new(())),
         login_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+        // 出站客户端显式钉住与网关 `client_builder()` 相同的一组值。
+        // 不直接复用那个函数：它读的是网关配置里的全局 `UpstreamHttpConfig`，
+        // 而控制台是独立进程、从不加载网关配置，调过去只会拿到默认值还多
+        // 背一整个 crate 的依赖。
+        //
+        // 光有总超时不够：reqwest 默认没有连接超时、关掉 TCP keepalive、
+        // 连接池里的空闲连接留 90 秒。负载均衡器回收连接之后，池里那条
+        // 已经死掉的连接还会被拿去发下一个请求——表现是「同步上游模型」
+        // 偶发失败一次，重试又好了，最难查的那种。
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .tcp_keepalive(std::time::Duration::from_secs(60))
+            .pool_idle_timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("http client"),
     };

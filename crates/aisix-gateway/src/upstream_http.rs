@@ -326,8 +326,18 @@ mod tests {
             // scoped to that one file so a bare rmcp client anywhere else
             // still gets flagged.
             let sanctioned_rmcp_site = file.ends_with("aisix-mcp/src/bridge.rs");
+            // The console is a separate binary that never loads gateway
+            // config, so `client_builder()` — which reads the global
+            // `UpstreamHttpConfig` — has nothing to read there. It pins the
+            // same connect timeout / keepalive / pool-idle values literally
+            // instead; `console_client_is_not_left_on_reqwest_defaults`
+            // below is what holds it to them.
+            let sanctioned_console_site = file.ends_with("aisix-console/src/main.rs");
             for (n, line) in production.lines().enumerate() {
                 if sanctioned_rmcp_site && line.contains("rmcp_reqwest::Client::") {
+                    continue;
+                }
+                if sanctioned_console_site {
                     continue;
                 }
                 if line.contains("reqwest::Client::builder()")
@@ -345,6 +355,35 @@ mod tests {
              `aisix_gateway::client_builder()`:\n{}",
             offenders.join("\n"),
         );
+    }
+
+    /// The console is exempted from the scan above because it cannot call
+    /// `client_builder()` — but an exemption with nothing behind it just
+    /// removes it from the guard. This is what keeps it honest: its client
+    /// must still set every default reqwest gets wrong, or the exemption is
+    /// hiding exactly the bug the scan exists to catch.
+    ///
+    /// Asserted against the source rather than the built client because
+    /// `reqwest::Client` exposes none of these settings for readback.
+    #[test]
+    fn console_client_is_not_left_on_reqwest_defaults() {
+        let path = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../aisix-console/src/main.rs"
+        ));
+        let Ok(src) = std::fs::read_to_string(path) else {
+            // The console is an optional member; absent is not a failure.
+            return;
+        };
+        let production = production_half(&src);
+        for setting in ["connect_timeout(", "tcp_keepalive(", "pool_idle_timeout("] {
+            assert!(
+                production.contains(setting),
+                "the console's outbound client does not set `{setting}` — \
+                 reqwest's default there is what the workspace scan exists \
+                 to prevent, and the console is exempt from that scan",
+            );
+        }
     }
 
     /// The outbound stacks that are *not* reqwest each have exactly one

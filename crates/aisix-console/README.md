@@ -1,8 +1,14 @@
 # aisix-console
 
-`aigw.to` 上 AISIX 网关的管理界面。**刻意不在 aisix 仓库里** —— 那个仓库的
-`CLAUDE.md` 规定 Dashboard 属于控制平面，数据面不带用户界面。这里是单机独立
-部署场景下的管理面，只依赖网关已经对外暴露的契约，不碰网关内部。
+开源 AISIX 网关的单机管理界面。**不是 AISIX Cloud 的 Dashboard** —— 那是控制
+平面的界面，服务多租户与集中管理；这里只管一台网关，靠重写它的声明式配置文件
+工作。
+
+它和网关同仓，因为两者之间的契约有四类且每一类都会静默漂移：调用 `aisix
+validate` 二进制、resources schema 的字段名、`aisix_*` 指标名、Admin API 的形状。
+分仓时踩过一次——控制台先上线了 `max_spend_micro_usd` 表单，而网关二进制还在
+拒绝这个字段。同仓之后，「新配置项要连界面一起交付」这条规矩才可能在一个改动
+里满足。
 
 ## 它能做什么，为什么只能做这些
 
@@ -69,7 +75,7 @@ nginx:   location / -> 127.0.0.1:8090
 ## 本地开发
 
 ```sh
-cargo run --release -- hash '你的口令'      # 生成 argon2 散列
+cargo run -p aisix-console --release -- hash '你的口令'   # 生成 argon2 散列
 CONSOLE_PASSWORD_HASH='$argon2id$...' \
 AISIX_ADMIN_KEY_FOR_CONSOLE=... \
 AISIX_ADMIN_URL=http://127.0.0.1:8081 \
