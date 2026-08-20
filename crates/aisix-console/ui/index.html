@@ -1,0 +1,1233 @@
+<title>Gateway Meter Room</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%230E5563'/%3E%3Cpath d='M3 11.5 L6 6 L8.5 9.5 L11 4.5 L13 11.5' stroke='white' stroke-width='1.4' fill='none' stroke-linejoin='round' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --ground:#E8EAE6; --surface:#F4F5F2; --raise:#FBFCFA;
+  --ink:#161B19; --ink-2:#3D4642; --muted:#69736D; --line:#CFD5CE;
+  --accent:#0E5563; --accent-ink:#FFFFFF; --accent-soft:#D6E5E7;
+  --ok:#3F7D4E; --warn:#A8760F; --crit:#A81B4A;
+  --ok-soft:#DCE9DD; --warn-soft:#F2E6CB; --crit-soft:#F3D8E0;
+  --track:#D8DDD7;
+  --r:4px; --pad:20px;
+  --display:"Fraunces",Georgia,serif;
+  --body:"IBM Plex Sans",system-ui,-apple-system,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,monospace;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#131816; --surface:#1C2320; --raise:#232B27;
+    --ink:#E6E9E4; --ink-2:#BAC3BD; --muted:#8A948E; --line:#333D38;
+    --accent:#4FB3C4; --accent-ink:#0B1618; --accent-soft:#1D3A3F;
+    --ok:#69B478; --warn:#D9A63F; --crit:#E4708F;
+    --ok-soft:#1D2E22; --warn-soft:#332A16; --crit-soft:#331C25;
+    --track:#2A332E;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#131816; --surface:#1C2320; --raise:#232B27;
+  --ink:#E6E9E4; --ink-2:#BAC3BD; --muted:#8A948E; --line:#333D38;
+  --accent:#4FB3C4; --accent-ink:#0B1618; --accent-soft:#1D3A3F;
+  --ok:#69B478; --warn:#D9A63F; --crit:#E4708F;
+  --ok-soft:#1D2E22; --warn-soft:#332A16; --crit-soft:#331C25;
+  --track:#2A332E;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--body);
+  font-size:14px;line-height:1.55;-webkit-font-smoothing:antialiased}
+h1,h2,h3{font-family:var(--display);font-weight:600;margin:0;text-wrap:balance}
+button,input,select,textarea{font:inherit;color:inherit}
+a{color:var(--accent)}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+/* ── 外壳：仪表间的“铭牌 + 面板”骨架 ───────────────────────── */
+.shell{max-width:1180px;margin:0 auto;padding:0 24px 72px}
+header.plate{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
+  padding:26px 0 18px;border-bottom:2px solid var(--ink)}
+header.plate h1{font-size:22px;letter-spacing:-.01em}
+.plate .sub{font-family:var(--mono);font-size:11px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--muted)}
+.plate .spacer{flex:1}
+.pill{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);
+  font-size:11px;letter-spacing:.08em;text-transform:uppercase;
+  padding:3px 9px;border-radius:99px;border:1px solid var(--line);background:var(--surface)}
+.pill.ok{background:var(--ok-soft);border-color:transparent;color:var(--ok)}
+.pill.crit{background:var(--crit-soft);border-color:transparent;color:var(--crit)}
+.pill .dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+
+nav.tabs{display:flex;gap:2px;margin:0 0 22px;border-bottom:1px solid var(--line);
+  overflow-x:auto}
+nav.tabs button{background:none;border:0;border-bottom:2px solid transparent;
+  padding:11px 14px;cursor:pointer;color:var(--muted);white-space:nowrap;
+  font-size:13px;font-weight:500}
+nav.tabs button[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--accent)}
+nav.tabs button:hover{color:var(--ink)}
+nav.tabs button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);
+  padding:var(--pad);margin-bottom:16px}
+.panel > h2{font-size:15px;margin-bottom:4px}
+.panel > .hint{color:var(--muted);font-size:12.5px;margin-bottom:16px}
+.grid{display:grid;gap:14px}
+.g3{grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}
+.g2{grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+
+/* ── 读数：仪表盘上的大数字 ────────────────────────────────── */
+.read{background:var(--raise);border:1px solid var(--line);border-radius:var(--r);padding:16px}
+.read .lab{font-family:var(--mono);font-size:10.5px;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--muted)}
+.read .val{font-family:var(--mono);font-variant-numeric:tabular-nums;
+  font-size:27px;font-weight:500;letter-spacing:-.02em;margin-top:5px;line-height:1.1}
+.read .foot{font-size:11.5px;color:var(--muted);margin-top:5px}
+
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--muted);font-weight:500;
+  padding:0 10px 8px;border-bottom:1px solid var(--line)}
+td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:0}
+td.r,th.r{text-align:right}
+.scroll{overflow-x:auto}
+
+.bar{height:5px;background:var(--track);border-radius:2px;overflow:hidden;margin-top:5px}
+.bar > i{display:block;height:100%;background:var(--accent)}
+
+button.act{background:var(--accent);color:var(--accent-ink);border:0;
+  border-radius:var(--r);padding:8px 15px;cursor:pointer;font-weight:500;font-size:13px}
+button.act:hover{filter:brightness(1.1)}
+button.act:disabled{opacity:.5;cursor:default}
+button.ghost{background:none;border:1px solid var(--line);color:var(--ink-2);
+  border-radius:var(--r);padding:6px 12px;cursor:pointer;font-size:12.5px}
+button.ghost:hover{border-color:var(--accent);color:var(--accent)}
+button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+label.f{display:block;margin-bottom:12px}
+label.f > span{display:block;font-family:var(--mono);font-size:10.5px;
+  letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:5px}
+input[type=text],input[type=password],input[type=number],select{
+  width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:var(--r);
+  background:var(--raise)}
+input:focus,select:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:transparent}
+
+.note{border-left:3px solid var(--accent);background:var(--accent-soft);
+  padding:11px 14px;border-radius:0 var(--r) var(--r) 0;font-size:12.5px;margin:14px 0}
+.note.crit{border-color:var(--crit);background:var(--crit-soft)}
+.note.warn{border-color:var(--warn);background:var(--warn-soft)}
+.note code,code{font-family:var(--mono);font-size:12px}
+pre{font-family:var(--mono);font-size:11.5px;background:var(--raise);border:1px solid var(--line);
+  border-radius:var(--r);padding:12px;overflow-x:auto;margin:0}
+
+/* ── 登录闸 ───────────────────────────────────────────────── */
+#gate{min-height:100vh;display:grid;place-items:center;padding:24px}
+#gate .box{width:100%;max-width:355px}
+#gate .box h1{font-size:20px;margin-bottom:3px}
+#gate .box p{color:var(--muted);font-size:12.5px;margin:0 0 20px}
+[hidden]{display:none !important}
+
+@media (max-width:640px){
+  .shell{padding:0 16px 56px}
+  .read .val{font-size:23px}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none !important;animation:none !important}}
+</style>
+
+<!-- 登录闸：控制台能改网关配置、能看到明文上游密钥，所以未登录不渲染任何数据。 -->
+<div id="gate">
+  <div class="box panel">
+    <h1>Gateway Meter Room</h1>
+    <p>aigw.to · AISIX 网关控制台</p>
+    <form id="loginForm">
+      <!-- 单口令登录：给密码管理器一个可锚定的用户名字段，
+           否则浏览器会警告，且凭据存不进去。 -->
+      <input type="text" name="username" value="aigw.to" autocomplete="username"
+             readonly hidden aria-hidden="true" tabindex="-1">
+      <label class="f"><span>口令</span>
+        <input type="password" id="pw" autocomplete="current-password" required autofocus>
+      </label>
+      <button class="act" style="width:100%" type="submit">进入</button>
+    </form>
+    <div id="loginErr" class="note crit" hidden></div>
+  </div>
+</div>
+
+<div id="app" class="shell" hidden>
+  <header class="plate">
+    <h1>Gateway Meter Room</h1>
+    <span class="sub">aigw.to</span>
+    <span class="spacer"></span>
+    <span class="pill" id="healthPill"><span class="dot"></span><span id="healthTxt">检查中</span></span>
+    <button class="ghost" id="themeBtn" title="切换主题">主题</button>
+    <button class="ghost" id="logoutBtn">登出</button>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-tab="overview" aria-selected="true">概览</button>
+    <button role="tab" data-tab="usage" aria-selected="false">用量</button>
+    <button role="tab" data-tab="providers" aria-selected="false">供应商</button>
+    <button role="tab" data-tab="models" aria-selected="false">模型与定价</button>
+    <button role="tab" data-tab="keys" aria-selected="false">调用方密钥</button>
+    <button role="tab" data-tab="limits" aria-selected="false">限流与预算</button>
+    <button role="tab" data-tab="resources" aria-selected="false">全部资源</button>
+    <button role="tab" data-tab="logs" aria-selected="false">调用日志</button>
+    <button role="tab" data-tab="raw" aria-selected="false">配置原文</button>
+  </nav>
+
+  <section id="tab-overview"></section>
+  <section id="tab-usage" hidden></section>
+  <section id="tab-providers" hidden></section>
+  <section id="tab-models" hidden></section>
+  <section id="tab-keys" hidden></section>
+  <section id="tab-limits" hidden></section>
+  <section id="tab-resources" hidden></section>
+  <section id="tab-logs" hidden></section>
+  <section id="tab-raw" hidden></section>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+// ── 数字格式：仪表读数要一眼可读，不要 12345678 ──────────────
+const fmtInt = n => (n ?? 0).toLocaleString("en-US", {maximumFractionDigits:0});
+function fmtCompact(n){
+  n = Number(n) || 0;
+  if (n >= 1e9) return (n/1e9).toFixed(2) + "B";
+  if (n >= 1e6) return (n/1e6).toFixed(2) + "M";
+  if (n >= 1e3) return (n/1e3).toFixed(1) + "k";
+  return fmtInt(n);
+}
+// 花费以 micro-USD 计数，除回美元。
+// 精度随量级走：LLM 单次调用常在千分之一美元量级，固定 2 位小数会把
+// 真实花费显示成 $0.00 —— 那和「没有花费」在界面上无法区分。
+function fmtUsd(micro){
+  const usd = (Number(micro)||0)/1e6;
+  if (usd === 0) return "$0";
+  if (usd < 0.01) return "$" + usd.toFixed(6).replace(/0+$/,"").replace(/\.$/,"");
+  if (usd < 1)    return "$" + usd.toFixed(4);
+  return "$" + usd.toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});
+}
+
+async function api(path, opts={}){
+  const r = await fetch(path, {credentials:"same-origin", ...opts});
+  if (r.status === 401){ showGate(); throw new Error("未登录"); }
+  return r;
+}
+async function prom(query, range_hours){
+  const r = await api("/api/metrics", {method:"POST",
+    headers:{"content-type":"application/json"},
+    body: JSON.stringify({query, range_hours})});
+  const j = await r.json();
+  if (j.status !== "success") throw new Error(j.error || "查询失败");
+  return j.data.result;
+}
+/** 瞬时查询 -> [{labels, value}]，按值降序。 */
+async function promTop(query){
+  const rows = (await prom(query)).map(r => ({l:r.metric, v:Number(r.value[1])||0}));
+  rows.sort((a,b) => b.v - a.v);
+  return rows;
+}
+
+// ── 登录 ────────────────────────────────────────────────────
+function showGate(){ $("#gate").hidden = false; $("#app").hidden = true; }
+function showApp(){ $("#gate").hidden = true; $("#app").hidden = false; }
+
+$("#loginForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const err = $("#loginErr"); err.hidden = true;
+  const r = await fetch("/api/login", {method:"POST",
+    headers:{"content-type":"application/json"},
+    body: JSON.stringify({password: $("#pw").value})});
+  if (r.ok){ $("#pw").value = ""; showApp(); boot(); }
+  else { err.textContent = (await r.json()).error || "登录失败"; err.hidden = false; }
+});
+$("#logoutBtn").addEventListener("click", async () => {
+  await fetch("/api/logout", {method:"POST"}); location.reload();
+});
+$("#themeBtn").addEventListener("click", () => {
+  const cur = document.documentElement.getAttribute("data-theme");
+  const next = cur === "dark" ? "light" : cur === "light" ? "dark"
+    : (matchMedia("(prefers-color-scheme: dark)").matches ? "light" : "dark");
+  document.documentElement.setAttribute("data-theme", next);
+  try { localStorage.setItem("aisix-theme", next); } catch(_){}
+});
+try { const t = localStorage.getItem("aisix-theme");
+  if (t) document.documentElement.setAttribute("data-theme", t); } catch(_){}
+
+// ── 标签页 ──────────────────────────────────────────────────
+const TABS = ["overview","usage","providers","models","keys","limits","resources","logs","raw"];
+document.querySelectorAll("nav.tabs button").forEach(b => {
+  b.addEventListener("click", () => {
+    document.querySelectorAll("nav.tabs button")
+      .forEach(x => x.setAttribute("aria-selected", String(x === b)));
+    TABS.forEach(t => $("#tab-"+t).hidden = (t !== b.dataset.tab));
+    render(b.dataset.tab);
+  });
+});
+
+let RES = null;   // 管理 API 的资源快照
+let DOC = null;   // resources.yaml 的可编辑文档
+
+async function boot(){
+  await loadResources();
+  render("overview");
+}
+
+let DOC_VERSION = null;
+async function loadResources(){
+  const [r1, r2] = await Promise.all([
+    api("/api/resources").then(r => r.json()),
+    api("/api/file"),
+  ]);
+  // 这里绝不能退化成一份空文档。之前写的是 `DOC = r2.doc || {…}`：
+  // /api/file 返回 500 时 DOC 静默变空，界面显示「还没有配置任何东西」，
+  // 运维加一条再保存，这份只含一条的文档就通过校验并覆盖了真实配置——
+  // 所有模型、密钥、策略、护栏一次消失，而且不需要任何攻击者。
+  if (!r2.ok) {
+    const err = await r2.json().catch(() => ({}));
+    DOC = null;
+    // 版本也要作废。留着旧值的话，读失败之后的一次保存会带着过期版本，
+    // 而磁盘恰好没变时它就会被接受 —— 写回去的是上一次成功读取的内容，
+    // 中间的改动无声消失。
+    DOC_VERSION = null;
+    document.body.insertAdjacentHTML("afterbegin",
+      `<div class="note crit" style="margin:0;border-radius:0;position:sticky;top:0;z-index:9">
+         <strong>读取配置失败，已停止一切编辑操作。</strong>
+         在配置能被正常读取之前保存任何改动，都会用一份不完整的文档覆盖线上配置。<br>
+         ${esc(err.error || `HTTP ${r2.status}`)}
+       </div>`);
+    throw new Error(err.error || "读取配置失败");
+  }
+  const j = await r2.json();
+  RES = r1; DOC = j.doc || {_format_version:"1"};
+  // 这次编辑基于的磁盘版本。保存时带回去，服务端在写锁内比对——两个标签页
+  // 各改一处时，后保存的那份会被拒（409），而不是静默盖掉先保存的改动。
+  DOC_VERSION = j.version || null;
+  const st = RES.model_status;
+  const healthy = st && !st.error;
+  $("#healthPill").className = "pill " + (healthy ? "ok" : "crit");
+  $("#healthTxt").textContent = healthy ? "网关在线" : "网关不可达";
+}
+
+/** 管理 API 每条是 {id, revision, value:{...}} 信封，拆平成 {id, ...字段}。
+ *  不拆的话 k.display_name 恒为 undefined，界面会安静地退化成显示裸 id。 */
+function listOf(v){
+  const arr = Array.isArray(v) ? v : (v && Array.isArray(v.items) ? v.items : []);
+  return arr.map(e => (e && typeof e === "object" && e.value && typeof e.value === "object")
+    ? {id: e.id, revision: e.revision, ...e.value} : e);
+}
+
+function render(tab){
+  if (tab === "overview")  return renderOverview();
+  if (tab === "usage")     return renderUsage();
+  if (tab === "providers") return renderProviders();
+  if (tab === "models")    return renderModels();
+  if (tab === "keys")      return renderKeys();
+  if (tab === "limits")    return renderLimits();
+  if (tab === "resources") return renderResources();
+  if (tab === "logs")      return renderLogs();
+  if (tab === "raw")       return renderRaw();
+}
+
+// ── 概览 ────────────────────────────────────────────────────
+async function renderOverview(){
+  const el = $("#tab-overview");
+  const models = listOf(RES.models), keys = listOf(RES.api_keys), pks = listOf(RES.provider_keys);
+  el.innerHTML = `
+    <div class="panel">
+      <h2>网关读数</h2>
+      <p class="hint">累计值来自 Prometheus，自开始抓取起算。</p>
+      <div class="grid g3">
+        <div class="read"><div class="lab">请求总数</div><div class="val num" id="oReq">…</div>
+          <div class="foot">经 LLM 端点</div></div>
+        <div class="read"><div class="lab">Token 总量</div><div class="val num" id="oTok">…</div>
+          <div class="foot">输入 + 输出（含缓存）</div></div>
+        <div class="read"><div class="lab">累计花费</div><div class="val num" id="oSpend">…</div>
+          <div class="foot">按模型定价折算</div></div>
+        <div class="read"><div class="lab">已配置</div>
+          <div class="val num">${models.length} / ${pks.length} / ${keys.length}</div>
+          <div class="foot">模型 / 供应商 / 调用方密钥</div></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>近 24 小时请求</h2>
+      <p class="hint">按端点分。没有曲线说明该时段没有流量。</p>
+      <div id="oChart">读取中…</div>
+    </div>`;
+
+  try {
+    const [req, tok, spend] = await Promise.all([
+      promTop("sum(aisix_llm_requests_total)"),
+      promTop("sum(aisix_llm_total_tokens_total)"),
+      promTop("sum(aisix_llm_spend_micro_usd_total)"),
+    ]);
+    $("#oReq").textContent   = req.length   ? fmtCompact(req[0].v)   : "0";
+    $("#oTok").textContent   = tok.length   ? fmtCompact(tok[0].v)   : "0";
+    $("#oSpend").textContent = spend.length ? fmtUsd(spend[0].v)     : "$0.00";
+  } catch(e){
+    ["#oReq","#oTok","#oSpend"].forEach(s => $(s).textContent = "—");
+  }
+  try {
+    const series = await prom('sum by (endpoint) (rate(aisix_llm_requests_total[10m]))', 24);
+    $("#oChart").innerHTML = series.length
+      ? multiLine(series, v => v.toFixed(3) + " req/s")
+      : `<p class="hint">该时段没有 LLM 请求。</p>`;
+  } catch(e){ $("#oChart").innerHTML = `<div class="note crit">曲线读取失败：${esc(e.message)}</div>`; }
+}
+
+// ── 用量 ────────────────────────────────────────────────────
+async function renderUsage(){
+  const el = $("#tab-usage");
+  el.innerHTML = `
+    <div class="panel">
+      <h2>按调用方密钥</h2>
+      <p class="hint">指标只带 <code>api_key_id</code>，名称由控制台对照配置补上。</p>
+      <div class="scroll"><table id="uKeys"><thead><tr>
+        <th>密钥</th><th class="r">请求</th><th class="r">Token</th><th class="r">花费</th>
+      </tr></thead><tbody><tr><td colspan="4">读取中…</td></tr></tbody></table></div>
+    </div>
+    <div class="panel">
+      <h2>按模型</h2>
+      <div class="scroll"><table id="uModels"><thead><tr>
+        <th>模型</th><th>供应商</th><th class="r">请求</th><th class="r">Token</th><th class="r">花费</th>
+      </tr></thead><tbody><tr><td colspan="5">读取中…</td></tr></tbody></table></div>
+    </div>
+    <div class="panel">
+      <h2>近 24 小时 Token 速率（按模型）</h2>
+      <div id="uChart">读取中…</div>
+    </div>
+    <div class="panel">
+      <h2>近 24 小时 Token 速率（按调用方密钥）</h2>
+      <p class="hint">图例是 <code>api_key_id</code>：指标里只有 id，曲线上无法替换成名称。</p>
+      <div id="uKeyChart">读取中…</div>
+    </div>`;
+
+  // api_key_id -> 显示名。两跳：指标只有 id；管理 API 有 id 和 key_hash，
+  // 但没有名字——文件模式下 display_name 是「文件侧身份」，校验前就被剥离
+  // （见上游 filesource/desugar.rs 的说明），所以名字只存在于 resources.yaml。
+  // key_hash 是两边都有的字段，用它把两侧接起来。
+  const hashToName = {};
+  (DOC.api_keys || []).forEach(k => { if (k.key_hash) hashToName[k.key_hash] = k.display_name; });
+  const keyName = {};
+  listOf(RES.api_keys).forEach(k => {
+    if (k.id && k.key_hash && hashToName[k.key_hash]) keyName[k.id] = hashToName[k.key_hash];
+  });
+
+  try {
+    const [req, tok, spend] = await Promise.all([
+      promTop("sum by (api_key_id) (aisix_llm_requests_total)"),
+      promTop("sum by (api_key_id) (aisix_llm_total_tokens_total)"),
+      promTop("sum by (api_key_id) (aisix_llm_spend_micro_usd_total)"),
+    ]);
+    const by = {};
+    const put = (rows, f) => rows.forEach(r => {
+      const id = r.l.api_key_id || "(未知)";
+      (by[id] = by[id] || {req:0,tok:0,spend:0})[f] = r.v;
+    });
+    put(req,"req"); put(tok,"tok"); put(spend,"spend");
+    const rows = Object.entries(by).sort((a,b) => b[1].tok - a[1].tok);
+    const max = Math.max(1, ...rows.map(r => r[1].tok));
+    $("#uKeys tbody").innerHTML = rows.length ? rows.map(([id,v]) => `
+      <tr><td><strong>${esc(keyName[id] || "（未命名）")}</strong>
+        <div class="bar"><i style="width:${(v.tok/max*100).toFixed(1)}%"></i></div>
+        <div class="foot num" style="font-size:11px;color:var(--muted)">${esc(id)}</div></td>
+      <td class="r num">${fmtInt(v.req)}</td>
+      <td class="r num">${fmtCompact(v.tok)}</td>
+      <td class="r num">${fmtUsd(v.spend)}</td></tr>`).join("")
+      : `<tr><td colspan="4" style="color:var(--muted)">尚无用量数据。</td></tr>`;
+  } catch(e){
+    $("#uKeys tbody").innerHTML = `<tr><td colspan="4">读取失败：${esc(e.message)}</td></tr>`;
+  }
+
+  try {
+    const [req, tok, spend] = await Promise.all([
+      promTop("sum by (model, provider) (aisix_llm_requests_total)"),
+      promTop("sum by (model, provider) (aisix_llm_total_tokens_total)"),
+      promTop("sum by (model, provider) (aisix_llm_spend_micro_usd_total)"),
+    ]);
+    const by = {};
+    const put = (rows, f) => rows.forEach(r => {
+      const k = (r.l.model||"?") + "\u0000" + (r.l.provider||"?");
+      (by[k] = by[k] || {req:0,tok:0,spend:0})[f] = r.v;
+    });
+    put(req,"req"); put(tok,"tok"); put(spend,"spend");
+    const rows = Object.entries(by).sort((a,b) => b[1].tok - a[1].tok);
+    $("#uModels tbody").innerHTML = rows.length ? rows.map(([k,v]) => {
+      const [m,p] = k.split("\u0000");
+      return `<tr><td><strong>${esc(m)}</strong></td><td>${esc(p)}</td>
+        <td class="r num">${fmtInt(v.req)}</td><td class="r num">${fmtCompact(v.tok)}</td>
+        <td class="r num">${fmtUsd(v.spend)}</td></tr>`;
+    }).join("") : `<tr><td colspan="5" style="color:var(--muted)">尚无用量数据。</td></tr>`;
+  } catch(e){
+    $("#uModels tbody").innerHTML = `<tr><td colspan="5">读取失败：${esc(e.message)}</td></tr>`;
+  }
+
+  try {
+    const s = await prom('sum by (model) (rate(aisix_llm_total_tokens_total[10m]))', 24);
+    $("#uChart").innerHTML = s.length ? multiLine(s, v => v.toFixed(1) + " tok/s")
+      : `<p class="hint">该时段没有 token 流量。</p>`;
+  } catch(e){ $("#uChart").innerHTML = `<div class="note crit">${esc(e.message)}</div>`; }
+
+  try {
+    const s2 = await prom('sum by (api_key_id) (rate(aisix_llm_total_tokens_total[10m]))', 24);
+    $("#uKeyChart").innerHTML = s2.length ? multiLine(s2, v => v.toFixed(1) + " tok/s")
+      : `<p class="hint">该时段没有 token 流量。</p>`;
+  } catch(e){ $("#uKeyChart").innerHTML = `<div class="note crit">${esc(e.message)}</div>`; }
+}
+
+// ── 调用日志 ────────────────────────────────────────────────
+async function renderLogs(){
+  const el = $("#tab-logs");
+  const keys = (DOC.api_keys || []);
+  el.innerHTML = `
+    <div class="panel">
+      <h2>逐请求日志</h2>
+      <p class="hint">来自网关写进 journald 的结构化访问日志，每个请求一行。</p>
+      <div class="grid g2">
+        <label class="f"><span>筛选密钥</span>
+          <select id="lgKey"><option value="">全部</option>${
+            keys.map(k => `<option value="${esc(hashToId(k.key_hash) || "")}">${esc(k.display_name||"（未命名）")}</option>`).join("")
+          }</select></label>
+        <label class="f"><span>条数</span>
+          <select id="lgN"><option>50</option><option selected>100</option><option>200</option></select></label>
+      </div>
+      <button class="act" onclick="loadLogs()">读取</button>
+      <div class="note warn">两个限制照实说：<strong>流式请求</strong>的这一行是在
+        SSE 开始推送之前写的，所以 token 数为空；<strong>journald 有留存上限</strong>，
+        不是无限历史。要长期留存需要配 observability exporter。</div>
+      <div id="lgOut" style="margin-top:14px"></div>
+    </div>`;
+  loadLogs();
+}
+/** key_hash -> 网关侧的 api_key_id（指标和日志用的都是它）。 */
+function hashToId(hash){
+  const m = listOf(RES.api_keys).find(k => k.key_hash === hash);
+  return m && m.id;
+}
+async function loadLogs(){
+  const out = $("#lgOut"); out.innerHTML = "读取中…";
+  try {
+    const r = await api("/api/logs", {method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({api_key_id: $("#lgKey").value, limit: Number($("#lgN").value)})});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "读取失败");
+    const rows = j.rows || [];
+    out.innerHTML = rows.length ? `<div class="scroll"><table><thead><tr>
+      <th>时间</th><th>路径</th><th class="r">状态</th><th class="r">耗时</th>
+      <th>模型</th><th class="r">Token</th><th>request id</th>
+    </tr></thead><tbody>${rows.map(x => `
+      <tr><td class="num" style="font-size:11px">${esc((x._ts||"").replace("T"," ").slice(0,19))}</td>
+        <td class="num" style="font-size:12px">${esc(x.path||"")}</td>
+        <td class="r num">${statusPill(x.status)}</td>
+        <td class="r num">${esc(x.latency_ms||"")}ms</td>
+        <td>${esc(x.model||"")}</td>
+        <td class="r num">${x.total_tokens && x.total_tokens !== "0" ? esc(x.total_tokens) : "—"}</td>
+        <td class="num" style="font-size:11px;color:var(--muted)">${esc((x.request_id||"").slice(0,8))}</td>
+      </tr>`).join("")}</tbody></table></div>`
+      : `<p class="hint">没有匹配的记录。</p>`;
+  } catch(e){ out.innerHTML = `<div class="note crit">${esc(e.message)}</div>`; }
+}
+const statusPill = s => {
+  const n = Number(s);
+  const c = n >= 500 ? "crit" : n >= 400 ? "warn" : "ok";
+  return `<span style="color:var(--${c})">${esc(s||"")}</span>`;
+};
+
+/** 多序列折线图。手绘 SVG——外部图表库既加载不进来也不值得。 */
+function multiLine(series, fmt){
+  const W = 880, H = 190, PL = 54, PB = 22, PT = 10, PR = 8;
+  let tMin = Infinity, tMax = -Infinity, vMax = 0;
+  series.forEach(s => s.values.forEach(([t,v]) => {
+    t = Number(t); v = Number(v) || 0;
+    if (t < tMin) tMin = t; if (t > tMax) tMax = t; if (v > vMax) vMax = v;
+  }));
+  if (!isFinite(tMin) || vMax <= 0) return `<p class="hint">该时段全部为零。</p>`;
+  const x = t => PL + (Number(t)-tMin)/Math.max(1,(tMax-tMin)) * (W-PL-PR);
+  const y = v => PT + (1 - (Number(v)||0)/vMax) * (H-PT-PB);
+  const hues = ["var(--accent)","var(--ok)","var(--warn)","var(--crit)","var(--ink-2)"];
+  const paths = series.slice(0,5).map((s,i) => {
+    const d = s.values.map(([t,v],j) => (j?"L":"M") + x(t).toFixed(1) + " " + y(v).toFixed(1)).join(" ");
+    return `<path d="${d}" fill="none" stroke="${hues[i%5]}" stroke-width="1.6"
+      stroke-linejoin="round" stroke-linecap="round"/>`;
+  }).join("");
+  const grid = [0,.5,1].map(f => {
+    const yy = PT + f*(H-PT-PB);
+    return `<line x1="${PL}" x2="${W-PR}" y1="${yy}" y2="${yy}" stroke="var(--line)" stroke-width="1"/>
+      <text x="${PL-7}" y="${yy+4}" text-anchor="end" font-size="10"
+        font-family="var(--mono)" fill="var(--muted)">${esc(fmt(vMax*(1-f)))}</text>`;
+  }).join("");
+  const legend = series.slice(0,5).map((s,i) => {
+    const name = Object.values(s.metric)[0] || "(全部)";
+    return `<span class="pill" style="border-color:transparent">
+      <span class="dot" style="background:${hues[i%5]}"></span>${esc(name)}</span>`;
+  }).join(" ");
+  return `<div class="scroll"><svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}"
+    role="img" aria-label="时间序列">${grid}${paths}</svg></div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">${legend}</div>`;
+}
+
+// ── 供应商 ──────────────────────────────────────────────────
+function renderProviders(){
+  const el = $("#tab-providers");
+  const pks = DOC.provider_keys || [];
+  el.innerHTML = `
+    <div class="panel">
+      <h2>上游供应商</h2>
+      <p class="hint">保存会重写 <code>/etc/aisix/resources.yaml</code> 并向网关发 SIGHUP。
+        写盘前先跑网关自带的 <code>aisix validate</code>，校验不过则不改动任何东西。</p>
+      <div class="scroll"><table><thead><tr>
+        <th>名称</th><th>供应商</th><th>密钥</th><th>API 基址</th><th></th>
+      </tr></thead><tbody>${pks.length ? pks.map((p,i) => `
+        <tr><td><strong>${esc(p.display_name)}</strong></td>
+          <td>${esc(p.provider||"openai")}</td>
+          <td class="num" style="font-size:12px">${esc(maskKey(p.api_key))}</td>
+          <td class="num" style="font-size:12px">${esc(p.api_base||"（默认）")}</td>
+          <td class="r"><button class="ghost" onclick="delItem('provider_keys',${i})">删除</button></td>
+        </tr>`).join("") : `<tr><td colspan="5" style="color:var(--muted)">还没有配置供应商。</td></tr>`}
+      </tbody></table></div>
+    </div>
+    <div class="panel">
+      <h2>新增供应商</h2>
+      <div class="grid g2">
+        <label class="f"><span>名称</span><input type="text" id="pName" placeholder="openai-main"></label>
+        <label class="f"><span>供应商</span>
+          <select id="pProv">
+            <option value="openai">openai</option><option value="anthropic">anthropic</option>
+            <option value="gemini">gemini</option><option value="deepseek">deepseek</option>
+            <option value="bedrock">bedrock</option>
+          </select></label>
+        <label class="f"><span>API 密钥</span><input type="text" id="pKey" placeholder="sk-..."></label>
+        <label class="f"><span>API 基址（留空用官方）</span><input type="text" id="pBase" placeholder="https://api.openai.com/v1"></label>
+      </div>
+      <button class="act" onclick="addProvider()">保存并重载网关</button>
+      <div id="pMsg"></div>
+    </div>`;
+}
+const maskKey = k => !k ? "—" : (k.startsWith("${") ? k
+  : k.length <= 10 ? "••••" : k.slice(0,5) + "…" + k.slice(-4));
+
+async function addProvider(){
+  const name = $("#pName").value.trim(), key = $("#pKey").value.trim();
+  if (!name || !key) return msg("#pMsg","名称和密钥都不能为空","crit");
+  const item = {display_name:name, api_key:key, provider:$("#pProv").value};
+  const base = $("#pBase").value.trim(); if (base) item.api_base = base;
+  DOC.provider_keys = DOC.provider_keys || []; DOC.provider_keys.push(item);
+  await saveDoc("#pMsg", "providers");
+}
+
+// ── 模型与定价 ──────────────────────────────────────────────
+
+/// 参考折扣：上游对缓存 token 的计价相对于输入价的倍率。
+/// 这些是各家公开文档写明的倍率，填价时用来一键换算，不是网关行为。
+const CACHE_FACTORS = {
+  anthropic: {read: 0.1,  write: 1.25, note: "读 0.1×、5 分钟写 1.25×（1 小时写为 2×）"},
+  openai:    {read: 0.5,  write: 1.0,  note: "缓存输入约为输入价的一半"},
+  deepseek:  {read: 0.1,  write: 1.0,  note: "命中缓存约为未命中的十分之一"},
+  gemini:    {read: 0.25, write: 1.0,  note: "缓存读取按折扣计，另有存储费"},
+};
+
+/// 输入价一填，按所选供应商的公开倍率把缓存两项算出来，再统一乘系数。
+/// 只在缓存两格为空或由本函数填过时才覆盖，避免抹掉手工输入。
+let factorsOwned = true;
+function renderModels(){
+  // 重绘会把表单重建成空的，但 factorsOwned 是模块级变量，会跨重绘存活。
+  // 不复位的话：手改过一次缓存价之后，本次会话里后续新增的每个模型都
+  // 静默失去自动换算——用户填了输入价，缓存两栏一直是空的，于是缓存
+  // token 全按输入价计费，而界面上看不出任何异常。
+  factorsOwned = true;
+  const el = $("#tab-models");
+  const ms = DOC.models || [], pks = DOC.provider_keys || [];
+  el.innerHTML = `
+    <div class="panel">
+      <h2>模型与定价</h2>
+      <p class="hint">这里的价就是网关折算花费用的数字（USD / 千 token）。
+        没填价的模型，花费统计恒为 0 —— 不是没花钱，是没有价可算。</p>
+      <div class="scroll"><table><thead><tr>
+        <th>模型</th><th>供应商</th><th>上游名</th>
+        <th class="r">输入</th><th class="r">输出</th>
+        <th class="r">缓存读</th><th class="r">缓存写</th><th></th>
+      </tr></thead><tbody>${ms.length ? ms.map((m,i) => {
+        const c = m.cost, unset = '<span style="color:var(--muted)">未设</span>';
+        const p = v => v == null ? unset : "$" + Number(v).toFixed(5);
+        return `<tr><td><strong>${esc(m.display_name)}</strong></td>
+          <td>${esc(m.provider||"")}</td>
+          <td class="num" style="font-size:12px">${esc(m.model_name||"")}</td>
+          <td class="r num">${c ? p(c.input_per_1k) : unset}</td>
+          <td class="r num">${c ? p(c.output_per_1k) : unset}</td>
+          <td class="r num">${c ? p(c.cached_input_per_1k) : unset}</td>
+          <td class="r num">${c ? p(c.cache_write_per_1k) : unset}</td>
+          <td class="r"><button class="ghost" onclick="delItem('models',${i})">删除</button></td>
+        </tr>`;
+      }).join("") : `<tr><td colspan="8" style="color:var(--muted)">还没有配置模型。</td></tr>`}
+      </tbody></table></div>
+      <div class="note">缓存读/写未设时，网关按<strong>输入价</strong>计缓存 token。
+        上游对缓存的计价是打折（读）和加价（写）的，所以不填这两项，缓存流量的花费统计会偏。</div>
+    </div>
+
+    <div class="panel">
+      <h2>从上游同步模型</h2>
+      <p class="hint">网关不知道上游有哪些模型 —— 它只按配置转发。这里直接问上游要清单。</p>
+      ${pks.length ? `<div class="grid g2">
+        <label class="f"><span>供应商</span>
+          <select id="syncPk">${pks.map(p => `<option>${esc(p.display_name)}</option>`).join("")}</select></label>
+      </div>
+      <button class="act" onclick="syncModels()">拉取清单</button>` :
+      `<div class="note warn">先添加一个供应商。</div>`}
+      <div id="syncOut" style="margin-top:14px"></div>
+    </div>
+
+    <div class="panel">
+      <h2>新增模型</h2>
+      ${pks.length ? "" : `<div class="note warn">先添加一个供应商，模型需要绑定到它。</div>`}
+      <div class="grid g2">
+        <label class="f"><span>对外模型名</span><input type="text" id="mName" placeholder="gpt-4o-mini"></label>
+        <label class="f"><span>绑定供应商</span>
+          <select id="mPk">${pks.map(p => `<option value="${esc(p.display_name)}">${esc(p.display_name)}</option>`).join("")}</select></label>
+        <label class="f"><span>供应商类型</span>
+          <select id="mProv" onchange="applyFactors()">
+            ${Object.keys(CACHE_FACTORS).map(k => `<option value="${k}">${k}</option>`).join("")}
+          </select></label>
+        <label class="f"><span>上游模型名</span><input type="text" id="mUp" placeholder="gpt-4o-mini"></label>
+      </div>
+      <h3 style="font-size:13px;margin:18px 0 10px">定价</h3>
+      <div class="grid g2">
+        <label class="f"><span>输入 USD / 1k</span>
+          <input type="number" id="mIn" step="0.00001" min="0" placeholder="0.00015" oninput="applyFactors()"></label>
+        <label class="f"><span>输出 USD / 1k</span>
+          <input type="number" id="mOut" step="0.00001" min="0" placeholder="0.0006"></label>
+        <label class="f"><span>缓存读 USD / 1k</span><input type="number" id="mCacheR" step="0.000001" min="0"></label>
+        <label class="f"><span>缓存写 USD / 1k</span><input type="number" id="mCacheW" step="0.000001" min="0"></label>
+      </div>
+      <div class="note" id="factorNote"></div>
+      <label class="f" style="max-width:320px"><span>加价 / 折扣系数（对全部四个价生效）</span>
+        <input type="number" id="mMul" step="0.01" min="0" value="1" oninput="applyFactors()"></label>
+      <button class="act" onclick="addModel()" ${pks.length?"":"disabled"}>保存并重载网关</button>
+      <div id="mMsg"></div>
+    </div>`;
+  applyFactors();
+}
+
+function applyFactors(){
+  const prov = $("#mProv")?.value; if (!prov) return;
+  const f = CACHE_FACTORS[prov] || {read:1, write:1, note:""};
+  const mul = parseFloat($("#mMul")?.value);
+  const m = isNaN(mul) || mul < 0 ? 1 : mul;
+  const base = parseFloat($("#mIn")?.value);
+  $("#factorNote").innerHTML = `<strong>${esc(prov)}</strong> 的公开缓存倍率：${esc(f.note)}。` +
+    `填好输入价后自动换算；系数 ${m} 会同时乘到四个价上。这些倍率是上游的计价规则，不是网关行为。`;
+  if (!isNaN(base) && base >= 0 && factorsOwned){
+    const r = $("#mCacheR"), w = $("#mCacheW");
+    if (r) r.value = (base * f.read * m).toFixed(8).replace(/0+$/,"").replace(/\.$/,"");
+    if (w) w.value = (base * f.write * m).toFixed(8).replace(/0+$/,"").replace(/\.$/,"");
+  }
+}
+document.addEventListener("input", e => {
+  if (e.target && (e.target.id === "mCacheR" || e.target.id === "mCacheW")) factorsOwned = false;
+});
+
+async function syncModels(){
+  const out = $("#syncOut"); out.innerHTML = "拉取中…";
+  try {
+    const r = await api("/api/upstream-models", {method:"POST",
+      headers:{"content-type":"application/json"},
+      body: JSON.stringify({provider_key: $("#syncPk").value})});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "拉取失败");
+    const have = new Set((DOC.models||[]).map(m => m.model_name));
+    out.innerHTML = `<p class="hint">上游报告 ${j.models.length} 个模型。勾选要接入的，
+      或用下方的通配符一次性全接。</p>
+      <div class="scroll" style="max-height:320px"><table><thead><tr>
+        <th style="width:36px"></th><th>上游模型 id</th><th>状态</th>
+      </tr></thead><tbody>${j.models.map(id => `
+        <tr><td><input type="checkbox" class="syncPick" value="${esc(id)}" ${have.has(id)?"disabled":""}></td>
+          <td class="num" style="font-size:12px">${esc(id)}</td>
+          <td>${have.has(id) ? '<span style="color:var(--ok)">已接入</span>' : '<span style="color:var(--muted)">未接入</span>'}</td>
+        </tr>`).join("")}</tbody></table></div>
+      <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+        <!-- 用 data 属性 + addEventListener，不用内联 onclick：
+             HTML 解析器会先把 &#39; 解码回 '，之后 JS 才解析，所以 esc()
+             在「属性里的 JS 字符串」这个位置提供的保护是零。provider 的值
+             来自配置文件，原文编辑器能把它设成任意内容。 -->
+        <button class="act" data-provider="${esc(j.provider)}" data-act="picked">接入勾选的</button>
+        <button class="ghost" data-provider="${esc(j.provider)}" data-act="wildcard">改用通配符一次接全部</button>
+      </div>
+      <div class="note">通配符行 <code>${esc(j.provider)}/*</code> 一行服务上游<strong>所有</strong>模型，
+        <code>cost</code>、限流、护栏都从这一行继承。代价：通配符行<strong>不会出现在
+        <code>/v1/models</code> 列表里</strong>，客户端发现不到具体型号。</div>
+      <div id="syncMsg"></div>`;
+    out.querySelectorAll("button[data-act]").forEach(b => b.addEventListener("click", () =>
+      b.dataset.act === "picked" ? addPicked(b.dataset.provider) : addWildcard(b.dataset.provider)));
+  } catch(e){ out.innerHTML = `<div class="note crit">${esc(e.message)}</div>`; }
+}
+async function addPicked(provider){
+  const picked = [...document.querySelectorAll(".syncPick:checked")].map(x => x.value);
+  if (!picked.length) return msg("#syncMsg","没有勾选任何模型","warn");
+  const pk = $("#syncPk").value;
+  DOC.models = DOC.models || [];
+  picked.forEach(id => DOC.models.push({
+    display_name: id, provider, model_name: id, provider_key: pk}));
+  msg("#syncMsg", `正在接入 ${picked.length} 个模型…`, "");
+  await saveDoc("#syncMsg", "models");
+}
+async function addWildcard(provider){
+  const pk = $("#syncPk").value;
+  DOC.models = DOC.models || [];
+  if (DOC.models.some(m => m.display_name === provider + "/*"))
+    return msg("#syncMsg", "该通配符行已存在", "warn");
+  DOC.models.push({display_name: provider + "/*", provider,
+    model_name: "*", provider_key: pk});
+  await saveDoc("#syncMsg", "models");
+}
+
+async function addModel(){
+  const name = $("#mName").value.trim(), up = $("#mUp").value.trim();
+  if (!name || !up) return msg("#mMsg","模型名和上游模型名都不能为空","crit");
+  const item = {display_name:name, provider:$("#mProv").value,
+    model_name:up, provider_key:$("#mPk").value};
+  const num = id => { const v = parseFloat($(id).value); return isNaN(v) ? null : v; };
+  const i = num("#mIn"), o = num("#mOut"), cr = num("#mCacheR"), cw = num("#mCacheW");
+  // 只填了一半的定价此前被整块丢掉：模型于是变成未定价，而未定价的模型
+  // 不计入任何花费上限——用户填了价、看到表单接受了，得到的却是一个静默
+  // 豁免于自己预算的模型。宁可拦下来让他填全。
+  const anyPrice = [i, o, cr, cw].some(v => v != null);
+  if (anyPrice && (i == null || o == null)){
+    msg("#mMsg", "填了定价就必须同时给出输入价和输出价——只给一半的话网关会把这个模型当作未定价，" +
+                 "它的花费不计入任何预算上限。", "crit");
+    return;
+  }
+  if (i != null && o != null){
+    item.cost = {input_per_1k:i, output_per_1k:o};
+    if (cr != null) item.cost.cached_input_per_1k = cr;
+    if (cw != null) item.cost.cache_write_per_1k = cw;
+  }
+  DOC.models = DOC.models || []; DOC.models.push(item);
+  await saveDoc("#mMsg", "models");
+}
+
+// ── 调用方密钥 ──────────────────────────────────────────────
+function renderKeys(){
+  const el = $("#tab-keys");
+  const ks = DOC.api_keys || [];
+  el.innerHTML = `
+    <div class="panel">
+      <h2>调用方密钥</h2>
+      <p class="hint">配置里只存 sha256。明文在生成时显示一次，之后无法找回。</p>
+      <div class="scroll"><table><thead><tr>
+        <th>名称</th><th>可用模型</th><th>限速</th><th>花费上限</th><th>散列</th><th></th>
+      </tr></thead><tbody>${ks.length ? ks.map((k,i) => {
+        const sp = spendPolicyFor(k.display_name);
+        return `<tr><td><strong>${esc(k.display_name||"（未命名）")}</strong></td>
+          <td>${esc((k.allowed_models||["*"]).join(", "))}</td>
+          <td class="num" style="font-size:12px">${esc(fmtRl(k.rate_limit))}</td>
+          <td class="num" style="font-size:12px">${sp
+            ? fmtUsd(sp.max_spend_micro_usd) + " / " + esc(sp.window||"day")
+            : '<span style="color:var(--muted)">不限</span>'}</td>
+          <td class="num" style="font-size:11px;color:var(--muted)">${esc((k.key_hash||"").slice(0,16))}…</td>
+          <td class="r"><button class="ghost" onclick="delKey(${i})">删除</button></td>
+        </tr>`;
+      }).join("") : `<tr><td colspan="6" style="color:var(--muted)">还没有调用方密钥。</td></tr>`}
+      </tbody></table></div>
+    </div>
+
+    <div class="panel">
+      <h2>生成新密钥</h2>
+      <div class="grid g2">
+        <label class="f"><span>名称</span><input type="text" id="kName" placeholder="my-app"></label>
+        <label class="f"><span>可用模型（逗号分隔，* 为全部）</span>
+          <input type="text" id="kModels" value="*"></label>
+      </div>
+
+      <h3 style="font-size:13px;margin:18px 0 10px">限速</h3>
+      <p class="hint">按请求数与 token 数限速，超限返回 429 <code>rate_limit_exceeded</code>。</p>
+      <div class="grid g2">
+        <label class="f"><span>每分钟请求上限（留空不限）</span>
+          <input type="number" id="kRpm" min="1" placeholder="60"></label>
+        <label class="f"><span>每分钟 token 上限（留空不限）</span>
+          <input type="number" id="kTpm" min="1" placeholder="100000"></label>
+      </div>
+
+      <h3 style="font-size:13px;margin:18px 0 10px">花费上限</h3>
+      <p class="hint">按金额的硬上限，网关本地执行。超限返回 429
+        <code>billing_error</code>——和限速的 429 是<strong>不同的分类</strong>，
+        客户端据此区分「钱用完了」和「发得太快了」。</p>
+      <div class="grid g2">
+        <label class="f"><span>花费上限 USD（留空不限）</span>
+          <input type="number" id="kSpend" step="0.01" min="0" placeholder="5.00"></label>
+        <label class="f"><span>结算窗口</span>
+          <select id="kSpendWindow">
+            <option value="day">每日（UTC 零点归零）</option>
+            <option value="hour">每小时</option>
+            <option value="minute">每分钟</option>
+          </select></label>
+      </div>
+      <div class="note">花费按模型定价算出，所以<strong>未定价的模型对上限没有贡献</strong>——
+        它的请求会被放行并计入未定价指标。给模型填上价格，这个上限才对它生效。</div>
+
+      <button class="act" onclick="mintKey()">生成并重载网关</button>
+      <div id="kMsg"></div>
+    </div>
+
+    <div class="panel">
+      <h2>花费上限策略</h2>
+      <p class="hint">上面每设一个花费上限就会生成一条策略资源。这里按原样列出全部策略，
+        包括不是从本页创建的（例如按 team 作用域的）。</p>
+      <div class="scroll"><table><thead><tr>
+        <th>名称</th><th>作用域</th><th>对象</th><th>窗口</th><th class="r">上限</th><th></th>
+      </tr></thead><tbody>${(DOC.rate_limit_policies||[]).length
+        ? (DOC.rate_limit_policies||[]).map((p,i) => `
+        <tr><td><strong>${esc(p.name)}</strong></td>
+          <td>${esc(p.scope||"—")}</td>
+          <td class="num" style="font-size:12px">${esc(p.scope_ref||"—")}</td>
+          <td>${esc(p.window||"—")}</td>
+          <td class="r num">${p.max_spend_micro_usd != null
+            ? "$" + (p.max_spend_micro_usd/1e6).toFixed(2)
+            : '<span style="color:var(--muted)">非花费策略</span>'}</td>
+          <td class="r"><button class="ghost" onclick="delItem('rate_limit_policies',${i})">删除</button></td>
+        </tr>`).join("")
+        : `<tr><td colspan="6" style="color:var(--muted)">还没有策略。</td></tr>`}
+      </tbody></table></div>
+    </div>`;
+}
+
+/// 找出挂在某个 key 上的花费策略。文件模式下 scope_ref 存的是 key 的
+/// display_name 而不是 UUID——上游 desugar 会把名字解析成派生 id。
+function spendPolicyFor(keyName){
+  return (DOC.rate_limit_policies||[]).find(p =>
+    p.scope === "api_key" && p.scope_ref === keyName && p.max_spend_micro_usd != null);
+}
+
+/// 只接受纯整数字面量。Number() 而非 parseInt()：后者对 "1e3" 返回 1、
+/// 对 "60.9" 返回 60，两者都会静默给出一个不是运维想要的限制。
+function intOrNull(v){
+  const s = String(v ?? "").trim();
+  if (!s) return null;
+  const n = Number(s);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+/// 空的可用模型列表等于「拒绝所有模型」，而运维清空这个框想表达的
+/// 几乎肯定是「不限制」。空则回到 ["*"]。
+function modelsOrAll(v){
+  const list = String(v ?? "").split(",").map(x => x.trim()).filter(Boolean);
+  return list.length ? list : ["*"];
+}
+
+const fmtRl = rl => !rl ? "不限" :
+  Object.entries(rl).filter(([,v]) => v != null).map(([k,v]) => `${k}=${v}`).join(" ") || "不限";
+
+/// 删 key 必须连同引用它的策略一起删：scope_ref 指向不存在的 key 会让整份
+/// 配置校验失败，网关从此再也重载不了——留下孤儿策略比留下密钥更危险。
+async function delKey(i){
+  const k = (DOC.api_keys||[])[i]; if (!k) return;
+  const orphans = (DOC.rate_limit_policies||[])
+    .filter(p => p.scope === "api_key" && p.scope_ref === k.display_name);
+  const extra = orphans.length
+    ? `\n\n同时会删除引用它的 ${orphans.length} 条策略——留着会让配置校验失败。` : "";
+  if (!confirm(`确认删除密钥「${k.display_name}」？会立即重写配置并重载网关。${extra}`)) return;
+  DOC.api_keys.splice(i,1);
+  if (orphans.length) DOC.rate_limit_policies = (DOC.rate_limit_policies||[])
+    .filter(p => !(p.scope === "api_key" && p.scope_ref === k.display_name));
+  await saveDoc(null, "keys");
+}
+
+async function mintKey(){
+  const name = $("#kName").value.trim();
+  if (!name) return msg("#kMsg","名称不能为空","crit");
+  if ((DOC.api_keys||[]).some(k => k.display_name === name))
+    return msg("#kMsg",`已存在同名密钥「${name}」`,"crit");
+
+  const r = await api("/api/mint-key", {method:"POST"});
+  const {plaintext, key_hash} = await r.json();
+  const item = {display_name:name, key_hash,
+    allowed_models: modelsOrAll($("#kModels").value)};
+  // parseInt("1e3") 是 1，不是 1000——运维填科学计数法会得到一个紧 1000 倍
+  // 的限制且毫无提示。Number() 才按字面量解析。
+  const rpm = intOrNull($("#kRpm").value), tpm = intOrNull($("#kTpm").value);
+  const rl = {}; if (rpm>0) rl.rpm = rpm; if (tpm>0) rl.tpm = tpm;
+  if (Object.keys(rl).length) item.rate_limit = rl;
+  DOC.api_keys = DOC.api_keys || []; DOC.api_keys.push(item);
+
+  // 花费上限是独立的策略资源，不是 key 上的内联字段——
+  // 网关按 scope/scope_ref 把它绑到这个 key 上。
+  const usd = parseFloat($("#kSpend").value);
+  if (!isNaN(usd) && usd > 0 && Math.round(usd * 1e6) < 1) {
+    return msg("#kMsg", `花费上限 $${usd} 小于最小可表示单位（0.000001 美元），\
+      四舍五入后会变成 0——那等于禁止这把密钥花任何钱。请填更大的值或留空。`, "crit");
+  }
+  if (!isNaN(usd) && usd > 0) {
+    DOC.rate_limit_policies = DOC.rate_limit_policies || [];
+    DOC.rate_limit_policies.push({
+      name: `${name}-spend`, scope: "api_key", scope_ref: name,
+      window: $("#kSpendWindow").value,
+      // 界面用美元，落盘用 micro-USD 整数：计数器上不能出现浮点。
+      max_spend_micro_usd: Math.round(usd * 1e6),
+    });
+  }
+
+  // 明文先展示再保存。反过来的话，只要保存返回非 2xx（哪怕配置其实已经
+  // 写进去了，例如只是 SIGHUP 没送达），这把密钥的明文就永久丢失——
+  // 而它已经在网关配置里生效了，等于一把没人持有的活密钥。
+  $("#kMsg").innerHTML = `<div class="note"><strong>密钥明文——只显示这一次，请立即保存：</strong>
+    <pre style="margin-top:8px">${esc(plaintext)}</pre></div>`;
+  const prior = $("#kMsg").innerHTML;
+  const ok = await saveDoc("#kMsg", null);
+  $("#kMsg").innerHTML = prior + $("#kMsg").innerHTML;
+  if (!ok) $("#kMsg").innerHTML += `<div class="note crit">保存未成功。
+    如果这把密钥其实已经写进配置，请用上面的明文；否则请重新生成。</div>`;
+}
+
+// ── 限流与预算（完整的策略资源，花费只是其中一个维度）──────────
+function renderLimits(){
+  const el = $("#tab-limits");
+  const ps = DOC.rate_limit_policies || [];
+  const keys = (DOC.api_keys||[]).map(k => k.display_name).filter(Boolean);
+  const models = (DOC.models||[]).map(m => m.display_name).filter(Boolean);
+  el.innerHTML = `
+    <div class="panel">
+      <h2>限流与预算策略</h2>
+      <p class="hint">一条策略把若干上限绑到一个作用域上。三个维度互相独立、同时生效：
+        请求数、token 数、花费金额——任一超限即拒。</p>
+      <div class="scroll"><table><thead><tr>
+        <th>名称</th><th>作用域</th><th>对象</th><th>窗口</th>
+        <th class="r">请求上限</th><th class="r">Token 上限</th><th class="r">花费上限</th><th></th>
+      </tr></thead><tbody>${ps.length ? ps.map((p,i) => `
+        <tr><td><strong>${esc(p.name)}</strong></td>
+          <td>${esc(p.scope||"—")}</td>
+          <td class="num" style="font-size:12px">${esc(p.scope_ref||"—")}</td>
+          <td>${esc(p.window||"—")}</td>
+          <td class="r num">${p.max_requests != null ? esc(p.max_requests) : unset()}</td>
+          <td class="r num">${p.max_tokens != null ? esc(p.max_tokens) : unset()}</td>
+          <td class="r num">${p.max_spend_micro_usd != null
+            ? fmtUsd(p.max_spend_micro_usd) : unset()}</td>
+          <td class="r"><button class="ghost" onclick="delItem('rate_limit_policies',${i})">删除</button></td>
+        </tr>`).join("") : `<tr><td colspan="8" style="color:var(--muted)">还没有策略。</td></tr>`}
+      </tbody></table></div>
+      <div class="note">窗口是 epoch 对齐的固定窗口：<code>day</code> 在 UTC 零点归零，
+        <code>hour</code> 在整点，<code>minute</code> 在整分。
+        <code>second</code> 窗口下 token 与花费上限<strong>不生效</strong>——
+        它们都要等上游答复才知道数值，一秒窗口内几乎必然滞后，网关会在日志里报出来而不是假装生效。</div>
+    </div>
+
+    <div class="panel">
+      <h2>新增策略</h2>
+      <div class="grid g2">
+        <label class="f"><span>名称</span><input type="text" id="pmName" placeholder="team-daily"></label>
+        <label class="f"><span>作用域</span>
+          <select id="pmScope" onchange="limitScopeChanged()">
+            <option value="api_key">api_key —— 绑到某个调用方密钥</option>
+            <option value="model">model —— 绑到某个模型</option>
+            <option value="team">team —— 绑到某个团队</option>
+            <option value="member">member —— 绑到某个用户</option>
+            <option value="team_member">team_member —— 团队内的每个成员各自一份</option>
+          </select></label>
+        <label class="f"><span>对象</span>
+          <span id="pmRefWrap"><select id="pmRef">${
+            keys.map(k => `<option value="${esc(k)}">${esc(k)}</option>`).join("")
+          }</select></span></label>
+        <label class="f"><span>窗口</span>
+          <select id="pmWindow">
+            <option value="day">day（UTC 零点归零）</option>
+            <option value="hour">hour</option>
+            <option value="minute">minute</option>
+            <option value="second">second（token/花费上限在此窗口下不生效）</option>
+          </select></label>
+      </div>
+      <h3 style="font-size:13px;margin:18px 0 10px">上限（至少填一项）</h3>
+      <div class="grid g3">
+        <label class="f"><span>请求数上限</span><input type="number" id="pmReq" min="1" placeholder="留空不限"></label>
+        <label class="f"><span>Token 上限</span><input type="number" id="pmTok" min="1" placeholder="留空不限"></label>
+        <label class="f"><span>花费上限 USD</span><input type="number" id="pmSpend" step="0.01" min="0" placeholder="留空不限"></label>
+      </div>
+      <button class="act" onclick="addLimitPolicy()">保存并重载网关</button>
+      <div id="pmMsg"></div>
+    </div>`;
+  window.__limitRefs = {keys, models};
+}
+const unset = () => '<span style="color:var(--muted)">—</span>';
+
+/// api_key / model 作用域能从配置里给出候选；team / member 是外部身份
+/// （来自密钥上的 team_id / user_id），配置里没有清单，只能手填。
+function limitScopeChanged(){
+  const scope = $("#pmScope").value;
+  const {keys, models} = window.__limitRefs || {keys:[], models:[]};
+  const list = scope === "api_key" ? keys : scope === "model" ? models : null;
+  $("#pmRefWrap").innerHTML = list
+    ? `<select id="pmRef">${list.map(x => `<option value="${esc(x)}">${esc(x)}</option>`).join("")}</select>`
+    : `<input type="text" id="pmRef" placeholder="${scope === "team" ? "团队 id" : "用户 id"}">`;
+}
+
+async function addLimitPolicy(){
+  const name = $("#pmName").value.trim();
+  if (!name) return msg("#pmMsg","名称不能为空","crit");
+  const req = intOrNull($("#pmReq").value), tok = intOrNull($("#pmTok").value);
+  const usd = parseFloat($("#pmSpend").value);
+  if (!(req>0) && !(tok>0) && !(usd>0))
+    return msg("#pmMsg","三个上限至少要填一个——不填任何上限的策略网关会拒绝加载","crit");
+  const item = {name, scope: $("#pmScope").value,
+    scope_ref: ($("#pmRef")||{}).value, window: $("#pmWindow").value};
+  if (req>0) item.max_requests = req;
+  if (tok>0) item.max_tokens = tok;
+  // 界面用美元，落盘用 micro-USD 整数：计数器上不能出现浮点。
+  if (usd>0) item.max_spend_micro_usd = Math.round(usd * 1e6);
+  DOC.rate_limit_policies = DOC.rate_limit_policies || [];
+  DOC.rate_limit_policies.push(item);
+  await saveDoc("#pmMsg", "limits");
+}
+
+// ── 全部资源（九种集合都可见，没有界面的也不隐身）────────────
+const RESOURCE_KINDS = [
+  ["provider_keys",           "供应商密钥",   "providers"],
+  ["models",                  "模型",         "models"],
+  ["api_keys",                "调用方密钥",   "keys"],
+  ["rate_limit_policies",     "限流与预算",   "limits"],
+  ["guardrails",              "护栏",         null],
+  ["cache_policies",          "缓存策略",     null],
+  ["mcp_servers",             "MCP 服务",     null],
+  ["a2a_agents",              "A2A 智能体",   null],
+  ["observability_exporters", "可观测导出器", null],
+  ["oidc_providers",          "OIDC 提供方",  null],
+  ["claim_mappings",          "声明映射",     null],
+  ["passthrough_routes",      "透传路由",     null],
+];
+
+function renderResources(){
+  const el = $("#tab-resources");
+  el.innerHTML = `
+    <div class="panel">
+      <h2>全部资源</h2>
+      <p class="hint">配置文件支持的全部集合。没有专用界面的那几种可以在
+        「配置原文」页直接编辑——保存前会用网关自己的校验器过一遍，不通过就不落盘。</p>
+      <div class="scroll"><table><thead><tr>
+        <th>资源</th><th class="r">数量</th><th>条目</th><th>编辑方式</th>
+      </tr></thead><tbody>${RESOURCE_KINDS.map(([key,label,tab]) => {
+        const items = DOC[key] || [];
+        const names = items.map(x => x.display_name || x.name || "（未命名）");
+        return `<tr>
+          <td><strong>${esc(label)}</strong>
+            <div class="num" style="font-size:11px;color:var(--muted)">${esc(key)}</div></td>
+          <td class="r num">${items.length}</td>
+          <td style="font-size:12px">${names.length
+            ? esc(names.slice(0,6).join("、")) + (names.length>6 ? ` 等 ${names.length} 项` : "")
+            : '<span style="color:var(--muted)">无</span>'}</td>
+          <td>${tab
+            ? `<button class="ghost" onclick="gotoTab('${tab}')">专用界面</button>`
+            : `<button class="ghost" onclick="gotoTab('raw')">配置原文</button>`}</td>
+        </tr>`;
+      }).join("")}</tbody></table></div>
+    </div>`;
+}
+function gotoTab(t){
+  const b = document.querySelector(`nav.tabs button[data-tab="${t}"]`);
+  if (b) b.click();
+}
+
+// ── 配置原文（可编辑，保存前经网关校验）──────────────────────
+async function renderRaw(){
+  const el = $("#tab-raw");
+  const r = await api("/api/file"); const j = await r.json();
+  el.innerHTML = `
+    <div class="panel">
+      <h2>resources.yaml</h2>
+      <p class="hint">网关当前加载的声明式配置，可直接编辑。保存时先用网关自带的
+        校验器过一遍——<strong>校验不通过就不落盘</strong>，线上配置不受影响。
+        这是没有专用界面的那几种资源的编辑入口。</p>
+      <textarea id="rawEdit" spellcheck="false" style="width:100%;min-height:440px;
+        font-family:var(--mono);font-size:12px;line-height:1.5;padding:12px;
+        border:1px solid var(--line);border-radius:var(--r);background:var(--raise);
+        color:var(--ink);resize:vertical">${esc(j.raw || "")}</textarea>
+      <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+        <button class="act" onclick="saveRaw()">校验并保存</button>
+        <button class="ghost" onclick="renderRaw()">放弃修改，重新载入</button>
+      </div>
+      <div class="note">控制台保存时整体重写这个文件，所以手写的注释会消失。
+        原始带注释的版本留在主机的 <code>/etc/aisix/resources.yaml.orig</code>。</div>
+      <div id="rawMsg"></div>
+    </div>`;
+}
+
+/// 直接提交 YAML 文本。后端会解析成文档再走同一条
+/// 「校验 → 原子替换 → SIGHUP」路径，和表单保存完全一致。
+async function saveRaw(){
+  // 与表单页同一道守卫。原文页此前没有：读取失败后编辑框里留着上一次
+  // 成功载入的文本，直接保存等于把中间的改动全部回退，而界面上看不出来。
+  if (!DOC || !DOC_VERSION) {
+    return msg("#rawMsg",
+      "配置未能读取，拒绝保存：编辑框里是上一次成功载入的内容，保存会把此后的改动全部覆盖掉。",
+      "crit");
+  }
+  const text = $("#rawEdit").value;
+  msg("#rawMsg", "校验中…", "");
+  // 原文页同样要带版本。它比表单页更需要：这里提交的是整份文件，一次
+  // 过期覆盖抹掉的是别人所有的改动，不是某一条。
+  const r = await api("/api/file", {method:"PUT",
+    headers:{"content-type":"application/json"},
+    body: JSON.stringify({raw: text, base_version: DOC_VERSION})});
+  let j = {};
+  try { j = await r.json(); } catch (_) { j = {error:`服务端返回了非 JSON 响应（HTTP ${r.status}）`}; }
+  if (!r.ok) return msg("#rawMsg", j.error || "保存失败", "crit");
+  await loadResources();
+  msg("#rawMsg", "已保存，网关已重载。", "");
+}
+
+// ── 写入 ────────────────────────────────────────────────────
+function msg(sel, text, kind){
+  $(sel).innerHTML = `<div class="note ${kind||""}">${esc(text)}</div>`;
+  return false;
+}
+async function delItem(kind, i){
+  if (!confirm("确认删除？会立即重写配置并重载网关。")) return;
+  DOC[kind].splice(i,1);
+  // 重渲染「当前所在的页」而不是猜一个：之前 rate_limit_policies 被映射到
+  // models 页，于是策略表删除后从不重画，表里烘焙的索引全部过期——
+  // 下一次点删除，删掉的是另一条策略。
+  const cur = document.querySelector('nav.tabs button[aria-selected="true"]');
+  await saveDoc(null, cur ? cur.dataset.tab : null);
+}
+async function saveDoc(msgSel, rerenderTab){
+  // 读失败时 DOC 是 null——此时保存等于用残缺文档覆盖线上配置。
+  if (!DOC || !DOC_VERSION) {
+    const m = "配置未能读取，拒绝保存：保存会用一份不完整的文档覆盖线上配置。";
+    if (msgSel) msg(msgSel, m, "crit"); else alert(m);
+    return false;
+  }
+  DOC._format_version = DOC._format_version || "1";
+  const r = await api("/api/file", {method:"PUT",
+    headers:{"content-type":"application/json"},
+    body: JSON.stringify({doc: DOC, base_version: DOC_VERSION})});
+  // 传输层失败或 nginx 502 时 r.json() 会抛——之前没有 catch，被拒的编辑
+  // 就留在内存里，下一次保存会把它连同新改动一起再提交一遍（重复条目）。
+  let j = {};
+  try { j = await r.json(); } catch (_) { j = {error:`服务端返回了非 JSON 响应（HTTP ${r.status}）`}; }
+  const okResp = r.ok;
+
+  // 顺序不能反：先以磁盘为准重载（失败时这是回滚，成功时这是确认），
+  // 再写提示。反过来写的话，`render()` 重建 tab 的 innerHTML 会把提示
+  // 元素一并抹掉 —— 于是被拒的保存和成功的保存在界面上完全一样：什么
+  // 都不显示，而改动已经被回滚。校验失败、版本冲突全部无声无息。
+  try {
+    await loadResources();
+    if (rerenderTab) render(rerenderTab);
+  } catch (_) {
+    // loadResources 自己会在页面顶部挂阻塞横幅。这里吞掉异常是为了让
+    // 下面那条「保存为什么失败」照常显示 —— 两条信息都有用。
+  }
+
+  if (!okResp) {
+    const m = j.error || "保存失败";
+    if (msgSel) msg(msgSel, m, "crit"); else alert(m);
+    return false;
+  }
+  // msg() 内部已经 esc 过一次，这里再 esc 就是双重转义，detail 里的
+  // `<` 会显示成 `&lt;`。
+  if (msgSel) msg(msgSel, j.detail && j.detail.includes("SIGHUP")
+    ? "已保存，但网关未热加载——" + j.detail : "已保存，网关已重载。", "");
+  return true;
+}
+
+// 启动：先问会话状态，避免刷新后闪一下登录页。
+fetch("/api/session").then(r=>r.json()).then(j => {
+  if (j.authed){ showApp(); boot(); } else showGate();
+}).catch(showGate);
+</script>
