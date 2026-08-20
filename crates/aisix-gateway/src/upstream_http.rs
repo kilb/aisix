@@ -376,7 +376,17 @@ mod tests {
             return;
         };
         let production = production_half(&src);
-        for setting in ["connect_timeout(", "tcp_keepalive(", "pool_idle_timeout("] {
+        for setting in [
+            "connect_timeout(",
+            "tcp_keepalive(",
+            "pool_idle_timeout(",
+            // Redirects off: the console validates only the first hop
+            // before dialling an operator-supplied address, so following a
+            // 302 walks straight past that check — and reqwest strips only
+            // the standard auth headers cross-host, not the `x-api-key` that
+            // path sends.
+            "redirect(",
+        ] {
             assert!(
                 production.contains(setting),
                 "the console's outbound client does not set `{setting}` — \

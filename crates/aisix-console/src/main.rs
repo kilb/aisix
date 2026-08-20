@@ -925,35 +925,93 @@ async fn api_upstream_models(
     }
 }
 
+/// 本进程唯一的出站 HTTP 客户端。提成函数是为了让测试打到的就是生产用的
+/// 那一个——测试自己 new 一个客户端，证明不了生产客户端的任何事。
+fn outbound_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        // 不跟重定向。`guard_outbound_base` 只能校验第一跳，而 reqwest 默认
+        // 跟 10 跳：上游返回 `302 Location: http://169.254.169.254/...` 就整个
+        // 绕开了防护。更要命的是凭据——reqwest 跨主机时只剥 Authorization /
+        // Cookie / Proxy-Authorization / WWW-Authenticate（redirect.rs:239），
+        // `x-api-key` 是自定义头，不在名单里，会被原样转发给重定向目标。
+        //
+        // 不改成「每跳重跑一次防护」的策略：那个回调是同步的、跑在连接任务
+        // 上，而防护里有 DNS 解析。这个入口是去问已知供应商要模型清单，真实
+        // 供应商不会对 /v1/models 做重定向，直接不跟即可，3xx 变成运维看得见
+        // 的错误。
+        .redirect(reqwest::redirect::Policy::none())
+        // 显式钉住与网关 `client_builder()` 相同的一组值。不直接复用那个
+        // 函数：它读的是网关配置里的全局 `UpstreamHttpConfig`，而控制台是
+        // 独立进程、从不加载网关配置。
+        //
+        // 光有总超时不够：reqwest 默认没有连接超时、关掉 TCP keepalive、
+        // 连接池里的空闲连接留 90 秒。负载均衡器回收连接之后，池里那条已经
+        // 死掉的连接还会被拿去发下一个请求——表现是偶发失败一次、重试又好。
+        .timeout(std::time::Duration::from_secs(20))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .pool_idle_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("http client")
+}
+
 /// 出站地址防护：只允许 https，且解析后的地址不得落在回环 / 链路本地 /
 /// 私网段。DNS 在这里解析一次用于判断——这不能完全消除 DNS rebinding，
 /// 但挡住了直接写内网地址这一类，而那才是这个入口的现实风险。
 fn guard_outbound_base(base: &str) -> Result<(), String> {
-    let rest = base
-        .strip_prefix("https://")
-        .ok_or_else(|| format!("上游地址必须是 https://，收到 {base:?}"))?;
-    let hostport = rest.split('/').next().unwrap_or("");
-    let host = hostport
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(hostport);
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-
+    // 用真正的 URL 解析器，不手写切分。手写版本在 bracketed IPv6 上是坏的：
+    // 对 `[::ffff:127.0.0.1]` 从最后一个冒号切会得到 `::ffff`，于是守卫
+    // 校验的地址和 reqwest 实际会连的地址根本不是一个——放行还是拒绝纯
+    // 属巧合。userinfo（`https://good.example@127.0.0.1/`）是同一类问题。
+    let url = reqwest::Url::parse(base).map_err(|e| format!("上游地址无法解析：{e}"))?;
+    if url.scheme() != "https" {
+        return Err(format!("上游地址必须是 https://，收到 {base:?}"));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| format!("上游地址里没有主机名：{base:?}"))?
+        .to_string();
+    // 直接从解析结果拿 IP 字面量，绕开一次没必要的名字解析；只有真正的
+    // 主机名才走 DNS。
     use std::net::ToSocketAddrs;
-    let addrs: Vec<_> = (host, 443_u16)
-        .to_socket_addrs()
-        .map_err(|e| format!("无法解析上游主机 {host:?}: {e}"))?
-        .collect();
+    let addrs: Vec<std::net::SocketAddr> = match url.host() {
+        Some(url::Host::Ipv4(v4)) => vec![(std::net::IpAddr::V4(v4), 443).into()],
+        Some(url::Host::Ipv6(v6)) => vec![(std::net::IpAddr::V6(v6), 443).into()],
+        _ => (host.as_str(), 443_u16)
+            .to_socket_addrs()
+            .map_err(|e| format!("无法解析上游主机 {host:?}: {e}"))?
+            .collect(),
+    };
     if addrs.is_empty() {
         return Err(format!("上游主机 {host:?} 没有解析到任何地址"));
     }
     for a in addrs {
-        let ip = a.ip();
+        // 先规范化。`::ffff:127.0.0.1` 是回环的另一种写法，但
+        // `Ipv6Addr::is_loopback()` 对它返回 false —— 不规范化就等于给
+        // 每个 IPv4 内网地址开了一扇 IPv6 写法的后门。网关侧的 CIDR 判定
+        // （`models/model.rs`）早就踩过并修过同一个坑，用的就是这个函数。
+        let ip = a.ip().to_canonical();
         let bad = match ip {
             std::net::IpAddr::V4(v4) => {
-                v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+                    || v4.is_broadcast()
+                    || v4.is_multicast()
+                    // 运营商级 NAT（100.64.0.0/10）。不在 `is_private()` 里，
+                    // 但在云环境里同样是别人的内网。
+                    || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]))
             }
-            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_multicast()
+                    // 唯一本地地址 fc00::/7
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00
+                    // 链路本地 fe80::/10
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+            }
         };
         if bad {
             return Err(format!(
@@ -1018,22 +1076,7 @@ async fn main() {
         sessions: Arc::new(RwLock::new(HashMap::new())),
         save_lock: Arc::new(tokio::sync::Mutex::new(())),
         login_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        // 出站客户端显式钉住与网关 `client_builder()` 相同的一组值。
-        // 不直接复用那个函数：它读的是网关配置里的全局 `UpstreamHttpConfig`，
-        // 而控制台是独立进程、从不加载网关配置，调过去只会拿到默认值还多
-        // 背一整个 crate 的依赖。
-        //
-        // 光有总超时不够：reqwest 默认没有连接超时、关掉 TCP keepalive、
-        // 连接池里的空闲连接留 90 秒。负载均衡器回收连接之后，池里那条
-        // 已经死掉的连接还会被拿去发下一个请求——表现是「同步上游模型」
-        // 偶发失败一次，重试又好了，最难查的那种。
-        http: reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .tcp_keepalive(std::time::Duration::from_secs(60))
-            .pool_idle_timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("http client"),
+        http: outbound_client(),
     };
 
     let app = Router::new()
@@ -1191,6 +1234,129 @@ mod tests {
         ] {
             assert!(guard_outbound_base(base).is_err(), "必须拒绝: {base}",);
         }
+    }
+
+    /// IPv4-mapped IPv6（`::ffff:127.0.0.1`）是同一个回环地址的另一种写法，
+    /// 但 `Ipv6Addr::is_loopback()` 对它是 false。不先规范化的话，这个入口
+    /// 就能被指回本机——网关那边在别处已经栽过一次同样的坑，修法是
+    /// `to_canonical()`（见 `models/model.rs` 的 CIDR 判定）。
+    ///
+    /// 另外 IPv6 的唯一本地地址（`fc00::/7`）和链路本地（`fe80::/10`）
+    /// 此前完全没查，而它们正是内网。
+    #[tokio::test]
+    async fn outbound_guard_is_not_fooled_by_ipv6_spellings_of_internal_addresses() {
+        for base in [
+            "https://[::ffff:127.0.0.1]/v1",           // 回环，写成 IPv4-mapped
+            "https://[::ffff:10.0.0.5]/v1",            // 私网，写成 IPv4-mapped
+            "https://[::ffff:169.254.169.254]/latest", // 云元数据，同上
+            "https://[fd00::1]/v1",                    // IPv6 唯一本地
+            "https://[fe80::1]/v1",                    // IPv6 链路本地
+        ] {
+            assert!(
+                guard_outbound_base(base).is_err(),
+                "必须拒绝（内网地址的另一种写法）: {base}",
+            );
+        }
+    }
+
+    /// 守卫校验的必须是客户端实际会连的那个主机。手写切分做不到这点：
+    /// userinfo 里塞一个看起来正常的域名，真正的主机在 `@` 之后，而按
+    /// 冒号切分会把两者混成一个既不是前者也不是后者的字符串——它是否
+    /// 恰好解析失败纯属运气，而运气不是防护。
+    #[tokio::test]
+    async fn outbound_guard_reads_the_host_the_client_will_actually_dial() {
+        for base in [
+            "https://api.openai.com@127.0.0.1/v1",
+            "https://api.openai.com@127.0.0.1:443/v1",
+            "https://api.openai.com@[::1]/v1",
+        ] {
+            assert!(
+                guard_outbound_base(base).is_err(),
+                "userinfo 掩护下的内网地址必须被拒: {base}",
+            );
+        }
+    }
+
+    /// 运营商级 NAT 段（`100.64.0.0/10`）不在 `is_private()` 里，但在云上
+    /// 它同样是别人的内网。
+    #[tokio::test]
+    async fn outbound_guard_refuses_carrier_grade_nat_space() {
+        assert!(guard_outbound_base("https://100.64.0.1/v1").is_err());
+    }
+
+    /// `guard_outbound_base` 只能校验第一跳。跟随重定向会让上游用一个
+    /// `302 Location:` 把这次请求引到任何地方——防护形同虚设。
+    ///
+    /// 凭据这一面更糟：reqwest 跨主机只剥 Authorization / Cookie /
+    /// Proxy-Authorization / WWW-Authenticate（0.13.4 redirect.rs:239-252），
+    /// 而 Anthropic 那条路径用的是 `x-api-key`，属于自定义头，会被原样
+    /// 转发给重定向目标。
+    ///
+    /// 用两个真实监听端口，不是 mock：要证明的正是这个客户端在真实 HTTP
+    /// 上的行为。
+    #[tokio::test]
+    async fn the_outbound_client_does_not_follow_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 第二跳：如果被连上，就说明重定向被跟了。
+        let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sink_addr = sink.local_addr().unwrap();
+        let leaked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let leaked_key = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        {
+            let leaked = leaked.clone();
+            let leaked_key = leaked_key.clone();
+            tokio::spawn(async move {
+                if let Ok((mut c, _)) = sink.accept().await {
+                    leaked.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let mut buf = vec![0u8; 2048];
+                    if let Ok(n) = c.read(&mut buf).await {
+                        *leaked_key.lock().unwrap() =
+                            String::from_utf8_lossy(&buf[..n]).to_string();
+                    }
+                }
+            });
+        }
+
+        // 第一跳：无条件 302 到第二跳。
+        let hop = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hop_addr = hop.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut c, _)) = hop.accept().await {
+                let mut buf = vec![0u8; 2048];
+                let _ = c.read(&mut buf).await;
+                let body = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{sink_addr}/pwned\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = c.write_all(body.as_bytes()).await;
+            }
+        });
+
+        let res = outbound_client()
+            .get(format!("http://{hop_addr}/v1/models"))
+            .header("x-api-key", "sk-secret-provider-key")
+            .send()
+            .await
+            .expect("first hop answers");
+
+        assert_eq!(
+            res.status(),
+            302,
+            "重定向必须原样返回给调用方，而不是被悄悄跟掉",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !leaked.load(std::sync::atomic::Ordering::SeqCst),
+            "重定向目标被连上了 —— 防护只校验了第一跳，这是一把 SSRF",
+        );
+        assert!(
+            !leaked_key
+                .lock()
+                .unwrap()
+                .contains("sk-secret-provider-key"),
+            "供应商密钥被转发给了重定向目标",
+        );
     }
 
     // ── 日志行解析 ──────────────────────────────────────────
