@@ -560,7 +560,7 @@ async fn reserve_policy_layers(
                 .limiter
                 .pre_commit_with_unit(&spend.bucket_key, &spend.limits, CounterUnit::MicroUsd)
                 .await
-                .map_err(|e| reject_spend(state, e, &entry.id, policy))?;
+                .map_err(|e| reject_spend(state, e, &entry.id, policy, input.member))?;
             reservations.push(r);
 
             // 未定价模型对花费计数器贡献 0，所以这个上限对它无效。
@@ -634,11 +634,21 @@ fn reject(
 /// 花费层只在经典形态的策略行上构造（见 [`match_conditional_layer`] 里
 /// `spend: None` 的注释），走到这里时 `policy.scope`/`policy.scope_ref`
 /// 一定是 `Some`（[`match_policy_layer`] 已经检查过一次）。
+///
+/// `member` 是请求的 `ConditionInput::member`（即 `user_id`）——
+/// `team_member` 作用域的花费桶按成员拆分（`spend_bucket_key` 的
+/// `:{member}` 后缀，见 `match_policy_layer`），真正被记满的是*那一个
+/// 成员*的桶，不是整个团队。`scope_ref` 若只报团队 id，调用方会以为
+/// 全队预算耗尽，实际是某一个人——错误信封的职责就是指认是哪个桶超了，
+/// 报错桶会让这份信息失去意义。所以 `team_member` 下把 `scope_ref` 拼成
+/// `"{team}:{member}"`，与花费桶的身份一致；其余 scope 没有这个拆分，
+/// 原样使用 `policy.scope_ref`。
 fn reject_spend(
     state: &ProxyState,
     err: aisix_ratelimit::RateLimitError,
     policy_id: &str,
     policy: &RateLimitPolicy,
+    member: Option<&str>,
 ) -> ProxyError {
     state.metrics.record_ratelimit_rejection(
         &err.scope().to_string(),
@@ -647,10 +657,17 @@ fn reject_spend(
     );
     let retry_after_seconds = err.retry_after_secs();
     let usd = |micro: u64| format!("{:.6}", micro as f64 / 1_000_000.0);
+    let scope_ref = match (policy.scope, member) {
+        (Some(PolicyScope::TeamMember), Some(member)) => policy
+            .scope_ref
+            .as_deref()
+            .map(|team| format!("{team}:{member}")),
+        _ => policy.scope_ref.clone(),
+    };
     ProxyError::BudgetExceeded(Box::new(crate::budget_reason::BudgetReason {
         message: format!("spend ceiling reached for policy {}", policy.name),
         scope: policy.scope.map(|s| s.as_str().to_string()),
-        scope_ref: policy.scope_ref.clone(),
+        scope_ref,
         limit_usd: Some(usd(policy.max_spend_micro_usd.unwrap_or_default())),
         // 窗口计数器（`FixedWindowCounter`）只按桶存当前累加值，不区分
         // "花费"与"token"这两种量纲的读回接口——`Limiter::peek`
@@ -1451,17 +1468,22 @@ mod tests {
         );
     }
 
-    /// 对照组：token 层（同一策略资源，只是没设花费上限）超限时必须
-    /// 仍然是 `PolicyRateLimit`，不能被这次改动误伤——只有花费层的
-    /// 预留失败才改口成 `BudgetExceeded`。
+    /// 共存对照组之一：同一条策略行**同时**设了 token 与花费上限，只有
+    /// token 侧超限、花费侧远低于上限——分类仍必须是 `PolicyRateLimit`，
+    /// 不能因为这条策略行"带花费层"就被误判成 `BudgetExceeded`。
+    ///
+    /// 花费上限设为 `None` 的版本测不出这一点：那样 `layer.spend` 直接是
+    /// `None`，`reject_spend` 根本不会被调用，分类代码对不对都不影响
+    /// 断言结果——真正要钉住的是两层都存在时，只有触发的那一层决定错误
+    /// 形状。
     #[tokio::test]
-    async fn a_token_layer_breach_still_reports_policy_rate_limit_not_budget() {
+    async fn a_token_breach_on_a_dual_ceiling_policy_still_reports_policy_rate_limit() {
         let snap = snapshot_with_policy(make_spend_policy(
             "api_key",
             "k1",
             "day",
-            Some(1), // token 上限，第二次必超
-            None,    // 不设花费上限——这条策略的花费层不存在
+            Some(100),        // token 上限很小，第二次必超
+            Some(10_000_000), // 花费上限很大，远不会碰到
         ));
         let state = test_state(&snap);
         let auth = test_auth_key("k1");
@@ -1469,7 +1491,7 @@ mod tests {
         reserve_layers(&state, &snap, &auth, None, None)
             .await
             .expect("首次应放行")
-            .commit(10_000, 0)
+            .commit(200, 1) // token 超过上限；花费远低于上限
             .await;
 
         let err = reserve_layers(&state, &snap, &auth, None, None)
@@ -1477,10 +1499,79 @@ mod tests {
             .expect_err("token 已超上限，应被拒");
         assert!(
             matches!(err, ProxyError::PolicyRateLimit { .. }),
-            "token/请求层超限应仍为 PolicyRateLimit，实际 {err:?}"
+            "带花费层的策略行，token 侧超限时仍应是 PolicyRateLimit，实际 {err:?}"
         );
         assert_eq!(err.status().as_u16(), 429);
         assert_eq!(err.kind(), "rate_limit_exceeded");
+    }
+
+    /// 共存对照组之二（上一条的镜像）：同一条策略行同时设了两个上限，
+    /// 这次花费侧超限、token 侧远低于上限——分类必须是 `BudgetExceeded`，
+    /// 不能因为这条策略行"带 token 层"就被误判成 `PolicyRateLimit`。
+    /// 两条测试合起来才真正钉住"同一策略行两层独立判定"这件事。
+    #[tokio::test]
+    async fn a_spend_breach_on_a_dual_ceiling_policy_still_reports_budget_exceeded() {
+        let snap = snapshot_with_policy(make_spend_policy(
+            "api_key",
+            "k1",
+            "day",
+            Some(10_000_000), // token 上限很大，远不会碰到
+            Some(100),        // 花费上限很小，第二次必超
+        ));
+        let state = test_state(&snap);
+        let auth = test_auth_key("k1");
+
+        reserve_layers(&state, &snap, &auth, None, None)
+            .await
+            .expect("首次应放行")
+            .commit(1, 200) // 花费超过上限；token 远低于上限
+            .await;
+
+        let err = reserve_layers(&state, &snap, &auth, None, None)
+            .await
+            .expect_err("花费已超上限，应被拒");
+        assert!(
+            matches!(err, ProxyError::BudgetExceeded(_)),
+            "带 token 层的策略行，花费侧超限时仍应是 BudgetExceeded，实际 {err:?}"
+        );
+        assert_eq!(err.status().as_u16(), 429);
+        assert_eq!(err.kind(), "billing_error");
+    }
+
+    /// R17：`team_member` 作用域下真正记满的是*那一个成员*的花费桶
+    /// （`spend_bucket_key` 的 `:{member}` 后缀），不是整个团队。
+    /// `scope_ref` 若只报团队 id，调用方会把"某个成员超支"误读成
+    /// "全队预算耗尽"——错误信封的职责就是指认哪个桶超了，报错桶等于
+    /// 没报。
+    #[tokio::test]
+    async fn team_member_spend_breach_names_the_member_not_just_the_team() {
+        let snap = snapshot_with_policy(make_spend_policy(
+            "team_member",
+            "team-1",
+            "day",
+            None,
+            Some(1), // 1 micro-USD，第二次必超
+        ));
+        let state = test_state(&snap);
+        let auth = make_auth(Some("team-1"), Some("user-a"));
+
+        reserve_layers(&state, &snap, &auth, None, None)
+            .await
+            .expect("首次应放行")
+            .commit(0, 10_000)
+            .await;
+
+        let err = reserve_layers(&state, &snap, &auth, None, None)
+            .await
+            .expect_err("花费已超上限，应被拒");
+        let ProxyError::BudgetExceeded(reason) = err else {
+            panic!("应为 BudgetExceeded，实际 {err:?}");
+        };
+        assert_eq!(
+            reason.scope_ref.as_deref(),
+            Some("team-1:user-a"),
+            "team_member 的 scope_ref 必须带上真正超支的成员，不能只报团队"
+        );
     }
 
     /// 花费超限要报成预算错误，不是通用限流错误——两者状态码相同（429），
