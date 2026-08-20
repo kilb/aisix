@@ -247,47 +247,48 @@ fn escape_bucket_segment(value: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Convert a classic row's `window` + `max_*` into the 7-field
-/// [`RateLimit`]. `None` when the row carries no window (formless rows
-/// are rejected at load; this is the total fallback).
-/// Warn once per `(policy, window)` that its `max_tokens` is inert.
+/// 就 `(policy, window, dimension)` 警告一次：某个维度在该窗口下无法执行。
+/// 策略在控制平面看起来是被接受的，所以静默会让它读起来像生效了。
 ///
-/// `classic_rate_limit` runs per request through `match_policy_layer`, so an
-/// unconditional warn here is one line per request for the life of the
-/// deployment — at warn level, where it drowns the events an operator needs
-/// to see. The gap itself is real and tracked (api7/ai-gateway#396); what has
-/// to be bounded is the telling. Mirrors `warn_partial_compat_deduped` in the
-/// etcd loader, including its poison tolerance: this set only dedupes log
-/// lines, so a panic under the lock must not wedge the request path.
-fn warn_inert_max_tokens_once(policy_name: &str, window: &str) {
+/// `classic_rate_limit` 每个请求都会走一遍，所以这里必须去重，否则每个请求
+/// 都会在 warn 级别刷一行日志，把运维真正需要看到的事件淹没。Mirrors
+/// `warn_partial_compat_deduped`（etcd loader），包括它的锁污染容忍：这个
+/// 集合只用来给日志去重，锁下发生 panic 不能把请求路径卡死。
+fn warn_inert_dimension_once(policy_name: &str, window: &str, dimension: &str) {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
 
-    // Bounded by policy count, which is operator-configured and small; the
-    // cap is a backstop against a pathological config, not a working limit.
+    // 按策略数量为界，正常情况下很小；这个上限只是防病态配置的兜底，不是工作限制。
     const MAX_REMEMBERED: usize = 1024;
-    static WARNED: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+    static SEEN: OnceLock<Mutex<HashSet<(String, String, String)>>> = OnceLock::new();
 
-    let entry = (policy_name.to_string(), window.to_string());
-    let mut warned = WARNED
+    let entry = (
+        policy_name.to_string(),
+        window.to_string(),
+        dimension.to_string(),
+    );
+    let mut seen = SEEN
         .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if warned.contains(&entry) {
+    if seen.contains(&entry) {
         return;
     }
     tracing::warn!(
-        policy_name = %entry.0,
-        window = %entry.1,
-        "max_tokens ignored: per-{} token-rate counter not yet implemented; \
-         see api7/ai-gateway#396",
-        entry.1,
+        policy = %policy_name,
+        window = %window,
+        dimension = %dimension,
+        "{dimension} ignored: per-{window} counter not implemented; \
+         the policy is accepted but this ceiling is not enforced",
     );
-    if warned.len() < MAX_REMEMBERED {
-        warned.insert(entry);
+    if seen.len() < MAX_REMEMBERED {
+        seen.insert(entry);
     }
 }
 
+/// Convert a classic row's `window` + `max_*` into the 7-field
+/// [`RateLimit`]. `None` when the row carries no window (formless rows
+/// are rejected at load; this is the total fallback).
 fn classic_rate_limit(policy: &RateLimitPolicy) -> Option<RateLimit> {
     let mut rl = RateLimit::default();
     match policy.window? {
@@ -313,7 +314,11 @@ fn classic_rate_limit(policy: &RateLimitPolicy) -> Option<RateLimit> {
             // the policy looks accepted at the control plane but the token cap
             // is silently inert until ai-gateway#396 lands.
             if policy.max_tokens.is_some() {
-                warn_inert_max_tokens_once(&policy.name, "second");
+                warn_inert_dimension_once(&policy.name, "second", "max_tokens");
+            }
+            // 花费上限同理:second 窗口下同样无法生效,要报出来而不是静默丢弃。
+            if policy.max_spend_micro_usd.is_some() {
+                warn_inert_dimension_once(&policy.name, "second", "max_spend_micro_usd");
             }
         }
         PolicyWindow::Minute => {
@@ -346,6 +351,32 @@ fn classic_rate_limit(policy: &RateLimitPolicy) -> Option<RateLimit> {
         }
     }
     Some(rl)
+}
+
+/// 花费层的桶键。与 token 层的 `policy:` 前缀分开：同一策略的两个维度
+/// 共用一个桶，token 数会把花费额度吃掉，且不会有任何报错。
+///
+/// 尚未接入 `reserve_layers`——由后续任务完成接线，这里先落地纯函数并
+/// 用单元测试钉住其行为。
+#[allow(dead_code)]
+fn spend_bucket_key(scope: &str, scope_ref: &str, policy_entry_id: &str) -> String {
+    format!("spend:{scope}:{scope_ref}:{policy_entry_id}")
+}
+
+/// 把花费上限投影到与 token 相同的窗口字段。
+/// `second` 返回全空——见 [`warn_inert_dimension_once`] 的调用点。
+///
+/// 尚未接入 `classic_rate_limit`——由后续任务完成接线。
+#[allow(dead_code)]
+fn spend_limits_for(window: PolicyWindow, max_spend_micro_usd: u64) -> RateLimit {
+    let mut rl = RateLimit::default();
+    match window {
+        PolicyWindow::Second => {}
+        PolicyWindow::Minute => rl.tpm = Some(max_spend_micro_usd),
+        PolicyWindow::Hour => rl.tph = Some(max_spend_micro_usd),
+        PolicyWindow::Day => rl.tpd = Some(max_spend_micro_usd),
+    }
+    rl
 }
 
 /// Reserve across all applicable rate-limit layers (api_key, model,
@@ -888,6 +919,49 @@ mod tests {
         let rl = classic_rate_limit(&make_policy("minute", Some(60), None)).unwrap();
         assert_eq!(rl.rpm, Some(60));
         assert!(rl.tpm.is_none());
+    }
+
+    // ---- spend ceiling projection (#spend-budget) ----
+
+    /// 花费桶与 token 桶必须分开：同一策略的两个维度共用一个桶，
+    /// token 数会把花费额度吃掉（或反过来），两种都静默。
+    #[test]
+    fn spend_bucket_is_namespaced_apart_from_the_token_bucket() {
+        let tok = format!("policy:{}:{}:{}", "api_key", "k1", "p1");
+        let spend = spend_bucket_key("api_key", "k1", "p1");
+        assert_ne!(tok, spend);
+        assert!(spend.starts_with("spend:"), "得到 {spend}");
+    }
+
+    /// 花费投影到与 token 相同的窗口字段。
+    #[test]
+    fn spend_projects_onto_the_matching_window_field() {
+        for (window, pick) in [
+            (
+                PolicyWindow::Minute,
+                (|r: &RateLimit| r.tpm) as fn(&RateLimit) -> Option<u64>,
+            ),
+            (
+                PolicyWindow::Hour,
+                (|r: &RateLimit| r.tph) as fn(&RateLimit) -> Option<u64>,
+            ),
+            (
+                PolicyWindow::Day,
+                (|r: &RateLimit| r.tpd) as fn(&RateLimit) -> Option<u64>,
+            ),
+        ] {
+            let rl = spend_limits_for(window, 5_000_000);
+            assert_eq!(pick(&rl), Some(5_000_000), "{window:?} 未投影");
+        }
+    }
+
+    /// second 窗口下花费不生效——和 max_tokens 同样的理由，同样要报出来。
+    #[test]
+    fn spend_on_a_second_window_is_reported_not_silently_dropped() {
+        let rl = spend_limits_for(PolicyWindow::Second, 5_000_000);
+        assert_eq!(rl.tpm, None);
+        assert_eq!(rl.tph, None);
+        assert_eq!(rl.tpd, None);
     }
 
     // ---- conditional form (#892) ----
