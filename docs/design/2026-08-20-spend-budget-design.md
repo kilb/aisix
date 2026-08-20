@@ -227,6 +227,41 @@ etcd 中的 `RateLimitPolicy` 决定。**未配置带 `max_spend_micro_usd` 的�
   不是 bug。一个假的"未生效"信号比沉默更糟：会教会运维忽略这条 series，
   代价比留白更高。
 
+## 跟进项
+
+- `set_budget_gauges`、`clear_budget_gauges`（`crates/aisix-obs/src/metrics.rs`）
+  自本任务（Task 6，删除控制平面预算 HTTP 客户端）起没有生产调用方：它们
+  唯一的数据来源是控制平面预算判定返回的 `Decision.budget: Option<BudgetDetails>`
+  （`limit_usd`/`spent_usd`/`remaining_usd` 是 dollar f64，`reset_seconds`
+  是 u64 秒数），这个来源已随 HTTP 客户端一起删除。两者已记入
+  `crates/aisix-obs/tests/every_emit_has_a_caller.rs` 的 `ALLOWED_UNCALLED`，
+  附带下面这条阻塞说明。
+- 因此 `aisix_budget_details_present`、`aisix_budget_limit_usd`、
+  `aisix_budget_spent_usd`、`aisix_budget_remaining_usd`、
+  `aisix_budget_reset_seconds` 这五条 gauge 系列目前完全不再产生任何数据点——
+  `/metrics` 上看不到它们（与仍然存活的计数器
+  `aisix_budget_unpriced_requests_total` 无关，那条走的是未定价模型的另一条
+  路径，不受本任务影响）。
+
+  **为什么不顺手把它们接回本地花费层，而是留作独立跟进：**
+
+  1.（主要阻塞）标签集不匹配。gauge 的标签是
+     `BudgetLabels{api_key_id, team_id, user_id}`，而花费桶的键是
+     `spend:{scope}:{scope_ref}:{policy_id}`（`quota.rs:426` 的
+     `spend_bucket_key`）。一条 `scope: team` 的策略压根没有 `api_key_id`——
+     它的花费桶从来不按 api_key 切分，所以不存在一种"保留原标签集"的方式
+     把它读回 `BudgetLabels`。要接上，得先回答 gauge 该用什么标签集（桶的
+     `scope`/`scope_ref`？还是仍按调用方的 api_key/team/user，即使策略本身
+     按别的维度分桶？），这是一次独立的语义设计，不是接线活。
+  2.（次要阻塞）就算标签集有了答案，读取现值意味着要在请求路径上对
+     `Limiter::peek` 做一次额外查询——在 `RedisStore` 后端下，这正是本任务
+     刚刚删掉的那种"每请求一次网络往返"，只是换了个目标而已。
+
+  跟进任务需要：先定下 gauge 的标签集语义，再决定是从 `Limiter::peek` 同步
+  读、还是异步/采样读；同时决定是否保留 dollar-f64 的对外形状，还是改成
+  micro-USD u64（与本设计其余部分保持一致）。本仓库 issue 已关闭，所以这里
+  的记录就是唯一的记录。
+
 ## 备注：本文件位置
 
 本仓库的 `CLAUDE.md` 规定不在 `docs/` 下放散文档，理由是用户文档已外迁、

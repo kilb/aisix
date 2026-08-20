@@ -30,13 +30,27 @@ const ALLOWED_UNCALLED: &[(&str, &str)] = &[
     (
         "set_budget_gauges",
         "Its only data source was the control-plane budget HTTP decision \
-         (`Decision.budget: Option<BudgetDetails>`, dollar f64 amounts), which \
-         the spend-budget-plan Task 6 removed in favor of local \
-         `RateLimitPolicy.max_spend_micro_usd` enforcement (micro-USD u64 \
-         counters). Re-wiring this gauge from the local spend layer is a \
-         distinct, not-yet-scheduled unit conversion + semantics job (what do \
-         limit/spent/remaining mean for a rate-limit-shaped spend bucket), \
-         left for a follow-up rather than invented here.",
+         (`Decision.budget: Option<BudgetDetails>`: `limit_usd`/`spent_usd`/ \
+         `remaining_usd` as f64 dollars, `reset_seconds` as a u64 second \
+         count), which the spend-budget-plan Task 6 removed in favor of \
+         local `RateLimitPolicy.max_spend_micro_usd` enforcement (micro-USD \
+         u64 counters). Re-wiring it is blocked, primarily, by a label-set \
+         mismatch: the gauge's `BudgetLabels{api_key_id, team_id, user_id}` \
+         has no counterpart in the spend bucket key \
+         `spend:{scope}:{scope_ref}:{policy_id}` (`quota.rs:426`) — a \
+         team-scoped policy carries no `api_key_id` at all, so there is no \
+         label-preserving way to repopulate it. Secondarily, even with a \
+         label scheme, reading the live value means an extra per-request \
+         `Limiter::peek`, which on `RedisStore` reinstates the exact \
+         per-request network hop this task deleted. See the Follow-ups \
+         section of docs/design/2026-08-20-spend-budget-design.md.",
+    ),
+    (
+        "clear_budget_gauges",
+        "Same dead family as `set_budget_gauges` — its only two call sites \
+         were the same two control-plane budget-gate blocks Task 6 \
+         removed. See that entry's reason and the Follow-ups section of \
+         docs/design/2026-08-20-spend-budget-design.md.",
     ),
 ];
 
@@ -69,7 +83,7 @@ fn every_metrics_emit_has_a_caller_outside_the_module() {
     let metrics_rs = root.join("crates/aisix-obs/src/metrics.rs");
     let metrics_src = std::fs::read_to_string(&metrics_rs).expect("metrics.rs is readable");
 
-    // Emit surface: the `pub fn record_* / set_*` methods on `Metrics`.
+    // Emit surface: the `pub fn record_* / set_* / clear_*` methods on `Metrics`.
     let mut emits: BTreeSet<String> = BTreeSet::new();
     for line in metrics_src.lines() {
         let line = line.trim_start();
@@ -80,7 +94,7 @@ fn every_metrics_emit_has_a_caller_outside_the_module() {
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
             .collect();
-        if name.starts_with("record_") || name.starts_with("set_") {
+        if name.starts_with("record_") || name.starts_with("set_") || name.starts_with("clear_") {
             emits.insert(name);
         }
     }
