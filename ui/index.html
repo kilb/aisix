@@ -275,6 +275,7 @@ async function boot(){
   render("overview");
 }
 
+let DOC_VERSION = null;
 async function loadResources(){
   const [r1, r2] = await Promise.all([
     api("/api/resources").then(r => r.json()),
@@ -287,6 +288,10 @@ async function loadResources(){
   if (!r2.ok) {
     const err = await r2.json().catch(() => ({}));
     DOC = null;
+    // 版本也要作废。留着旧值的话，读失败之后的一次保存会带着过期版本，
+    // 而磁盘恰好没变时它就会被接受 —— 写回去的是上一次成功读取的内容，
+    // 中间的改动无声消失。
+    DOC_VERSION = null;
     document.body.insertAdjacentHTML("afterbegin",
       `<div class="note crit" style="margin:0;border-radius:0;position:sticky;top:0;z-index:9">
          <strong>读取配置失败，已停止一切编辑操作。</strong>
@@ -297,6 +302,9 @@ async function loadResources(){
   }
   const j = await r2.json();
   RES = r1; DOC = j.doc || {_format_version:"1"};
+  // 这次编辑基于的磁盘版本。保存时带回去，服务端在写锁内比对——两个标签页
+  // 各改一处时，后保存的那份会被拒（409），而不是静默盖掉先保存的改动。
+  DOC_VERSION = j.version || null;
   const st = RES.model_status;
   const healthy = st && !st.error;
   $("#healthPill").className = "pill " + (healthy ? "ok" : "crit");
@@ -441,13 +449,13 @@ async function renderUsage(){
     ]);
     const by = {};
     const put = (rows, f) => rows.forEach(r => {
-      const k = (r.l.model||"?") + " " + (r.l.provider||"?");
+      const k = (r.l.model||"?") + "\u0000" + (r.l.provider||"?");
       (by[k] = by[k] || {req:0,tok:0,spend:0})[f] = r.v;
     });
     put(req,"req"); put(tok,"tok"); put(spend,"spend");
     const rows = Object.entries(by).sort((a,b) => b[1].tok - a[1].tok);
     $("#uModels tbody").innerHTML = rows.length ? rows.map(([k,v]) => {
-      const [m,p] = k.split(" ");
+      const [m,p] = k.split("\u0000");
       return `<tr><td><strong>${esc(m)}</strong></td><td>${esc(p)}</td>
         <td class="r num">${fmtInt(v.req)}</td><td class="r num">${fmtCompact(v.tok)}</td>
         <td class="r num">${fmtUsd(v.spend)}</td></tr>`;
@@ -620,7 +628,15 @@ const CACHE_FACTORS = {
   gemini:    {read: 0.25, write: 1.0,  note: "缓存读取按折扣计，另有存储费"},
 };
 
+/// 输入价一填，按所选供应商的公开倍率把缓存两项算出来，再统一乘系数。
+/// 只在缓存两格为空或由本函数填过时才覆盖，避免抹掉手工输入。
+let factorsOwned = true;
 function renderModels(){
+  // 重绘会把表单重建成空的，但 factorsOwned 是模块级变量，会跨重绘存活。
+  // 不复位的话：手改过一次缓存价之后，本次会话里后续新增的每个模型都
+  // 静默失去自动换算——用户填了输入价，缓存两栏一直是空的，于是缓存
+  // token 全按输入价计费，而界面上看不出任何异常。
+  factorsOwned = true;
   const el = $("#tab-models");
   const ms = DOC.models || [], pks = DOC.provider_keys || [];
   el.innerHTML = `
@@ -693,9 +709,6 @@ function renderModels(){
   applyFactors();
 }
 
-/// 输入价一填，按所选供应商的公开倍率把缓存两项算出来，再统一乘系数。
-/// 只在缓存两格为空或由本函数填过时才覆盖，避免抹掉手工输入。
-let factorsOwned = true;
 function applyFactors(){
   const prov = $("#mProv")?.value; if (!prov) return;
   const f = CACHE_FACTORS[prov] || {read:1, write:1, note:""};
@@ -775,6 +788,15 @@ async function addModel(){
     model_name:up, provider_key:$("#mPk").value};
   const num = id => { const v = parseFloat($(id).value); return isNaN(v) ? null : v; };
   const i = num("#mIn"), o = num("#mOut"), cr = num("#mCacheR"), cw = num("#mCacheW");
+  // 只填了一半的定价此前被整块丢掉：模型于是变成未定价，而未定价的模型
+  // 不计入任何花费上限——用户填了价、看到表单接受了，得到的却是一个静默
+  // 豁免于自己预算的模型。宁可拦下来让他填全。
+  const anyPrice = [i, o, cr, cw].some(v => v != null);
+  if (anyPrice && (i == null || o == null)){
+    msg("#mMsg", "填了定价就必须同时给出输入价和输出价——只给一半的话网关会把这个模型当作未定价，" +
+                 "它的花费不计入任何预算上限。", "crit");
+    return;
+  }
   if (i != null && o != null){
     item.cost = {input_per_1k:i, output_per_1k:o};
     if (cr != null) item.cost.cached_input_per_1k = cr;
@@ -1065,6 +1087,9 @@ const RESOURCE_KINDS = [
   ["mcp_servers",             "MCP 服务",     null],
   ["a2a_agents",              "A2A 智能体",   null],
   ["observability_exporters", "可观测导出器", null],
+  ["oidc_providers",          "OIDC 提供方",  null],
+  ["claim_mappings",          "声明映射",     null],
+  ["passthrough_routes",      "透传路由",     null],
 ];
 
 function renderResources(){
@@ -1125,12 +1150,22 @@ async function renderRaw(){
 /// 直接提交 YAML 文本。后端会解析成文档再走同一条
 /// 「校验 → 原子替换 → SIGHUP」路径，和表单保存完全一致。
 async function saveRaw(){
+  // 与表单页同一道守卫。原文页此前没有：读取失败后编辑框里留着上一次
+  // 成功载入的文本，直接保存等于把中间的改动全部回退，而界面上看不出来。
+  if (!DOC || !DOC_VERSION) {
+    return msg("#rawMsg",
+      "配置未能读取，拒绝保存：编辑框里是上一次成功载入的内容，保存会把此后的改动全部覆盖掉。",
+      "crit");
+  }
   const text = $("#rawEdit").value;
   msg("#rawMsg", "校验中…", "");
+  // 原文页同样要带版本。它比表单页更需要：这里提交的是整份文件，一次
+  // 过期覆盖抹掉的是别人所有的改动，不是某一条。
   const r = await api("/api/file", {method:"PUT",
     headers:{"content-type":"application/json"},
-    body: JSON.stringify({raw: text})});
-  const j = await r.json();
+    body: JSON.stringify({raw: text, base_version: DOC_VERSION})});
+  let j = {};
+  try { j = await r.json(); } catch (_) { j = {error:`服务端返回了非 JSON 响应（HTTP ${r.status}）`}; }
   if (!r.ok) return msg("#rawMsg", j.error || "保存失败", "crit");
   await loadResources();
   msg("#rawMsg", "已保存，网关已重载。", "");
@@ -1152,30 +1187,42 @@ async function delItem(kind, i){
 }
 async function saveDoc(msgSel, rerenderTab){
   // 读失败时 DOC 是 null——此时保存等于用残缺文档覆盖线上配置。
-  if (!DOC) {
+  if (!DOC || !DOC_VERSION) {
     const m = "配置未能读取，拒绝保存：保存会用一份不完整的文档覆盖线上配置。";
     if (msgSel) msg(msgSel, m, "crit"); else alert(m);
     return false;
   }
   DOC._format_version = DOC._format_version || "1";
   const r = await api("/api/file", {method:"PUT",
-    headers:{"content-type":"application/json"}, body: JSON.stringify({doc: DOC})});
+    headers:{"content-type":"application/json"},
+    body: JSON.stringify({doc: DOC, base_version: DOC_VERSION})});
   // 传输层失败或 nginx 502 时 r.json() 会抛——之前没有 catch，被拒的编辑
   // 就留在内存里，下一次保存会把它连同新改动一起再提交一遍（重复条目）。
   let j = {};
   try { j = await r.json(); } catch (_) { j = {error:`服务端返回了非 JSON 响应（HTTP ${r.status}）`}; }
   const okResp = r.ok;
+
+  // 顺序不能反：先以磁盘为准重载（失败时这是回滚，成功时这是确认），
+  // 再写提示。反过来写的话，`render()` 重建 tab 的 innerHTML 会把提示
+  // 元素一并抹掉 —— 于是被拒的保存和成功的保存在界面上完全一样：什么
+  // 都不显示，而改动已经被回滚。校验失败、版本冲突全部无声无息。
   try {
-    if (!okResp && msgSel) msg(msgSel, j.error || "保存失败", "crit");
-    else if (!okResp) alert(j.error || "保存失败");
-  } finally {
-    // 成功或失败都以磁盘为准重新载入：失败时这是回滚，成功时这是确认。
     await loadResources();
     if (rerenderTab) render(rerenderTab);
+  } catch (_) {
+    // loadResources 自己会在页面顶部挂阻塞横幅。这里吞掉异常是为了让
+    // 下面那条「保存为什么失败」照常显示 —— 两条信息都有用。
   }
-  if (!okResp) return false;
+
+  if (!okResp) {
+    const m = j.error || "保存失败";
+    if (msgSel) msg(msgSel, m, "crit"); else alert(m);
+    return false;
+  }
+  // msg() 内部已经 esc 过一次，这里再 esc 就是双重转义，detail 里的
+  // `<` 会显示成 `&lt;`。
   if (msgSel) msg(msgSel, j.detail && j.detail.includes("SIGHUP")
-    ? "已保存，但网关未热加载——" + esc(j.detail) : "已保存，网关已重载。", "");
+    ? "已保存，但网关未热加载——" + j.detail : "已保存，网关已重载。", "");
   return true;
 }
 

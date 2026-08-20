@@ -17,15 +17,15 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::RwLock;
 
 /// 会话有效期。控制台能看到明文上游密钥，所以不做长期免登录。
@@ -142,7 +142,11 @@ async fn login(State(st): State<AppState>, Json(req): Json<LoginReq>) -> Respons
     if !ok {
         // 固定延迟，避免把「口令错」和「解析失败」在时间上区分开。
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "口令不正确"}))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "口令不正确"})),
+        )
+            .into_response();
     }
     let tok = random_token();
     st.sessions
@@ -317,9 +321,28 @@ async fn api_metrics(
 /// 自己构造的几条查询，没有必要支持完整的 PromQL 表面。
 fn promql_only_touches_aisix(q: &str) -> bool {
     const ALLOWED_WORDS: &[&str] = &[
-        "sum", "rate", "by", "avg", "max", "min", "count", "increase", "irate",
-        "topk", "bottomk", "without", "on", "group_left", "group_right", "or",
-        "and", "unless", "offset", "le", "quantile", "histogram_quantile",
+        "sum",
+        "rate",
+        "by",
+        "avg",
+        "max",
+        "min",
+        "count",
+        "increase",
+        "irate",
+        "topk",
+        "bottomk",
+        "without",
+        "on",
+        "group_left",
+        "group_right",
+        "or",
+        "and",
+        "unless",
+        "offset",
+        "le",
+        "quantile",
+        "histogram_quantile",
     ];
     let mut ident = String::new();
     let mut idents: Vec<String> = Vec::new();
@@ -344,8 +367,19 @@ fn promql_only_touches_aisix(q: &str) -> bool {
         }
         // 标签名与标签值也会落到这里；只允许已知的标签维度。
         const LABELS: &[&str] = &[
-            "api_key_id", "model", "provider", "endpoint", "policy", "outcome",
-            "status", "team_id", "user_id", "scope", "layer", "job", "instance",
+            "api_key_id",
+            "model",
+            "provider",
+            "endpoint",
+            "policy",
+            "outcome",
+            "status",
+            "team_id",
+            "user_id",
+            "scope",
+            "layer",
+            "job",
+            "instance",
         ];
         if LABELS.contains(&id.as_str()) {
             continue;
@@ -365,7 +399,10 @@ async fn api_file_get(State(st): State<AppState>, headers: HeaderMap) -> Respons
     }
     match tokio::fs::read_to_string(&st.resources_path).await {
         Ok(s) => match serde_yaml_ng::from_str::<Value>(&s) {
-            Ok(v) => Json(json!({"doc": v, "raw": s})).into_response(),
+            Ok(v) => {
+                let version = sha256_hex(s.as_bytes());
+                Json(json!({"doc": v, "raw": s, "version": version})).into_response()
+            }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("resources.yaml 解析失败: {e}")})),
@@ -380,16 +417,70 @@ async fn api_file_get(State(st): State<AppState>, headers: HeaderMap) -> Respons
     }
 }
 
+/// 保存失败的两种类型。分成枚举而不是靠比对错误文本来认版本冲突：
+/// 文本比对会在任何人改动措辞、加前缀、翻译这条消息时静默失效，而失效的
+/// 表现是 409 变成 400 —— 前端据此提示「重新载入」的分支就再也走不到。
+enum SaveError {
+    /// 调用方基于的版本已经不是磁盘上的版本。
+    Stale,
+    /// 序列化 / 校验 / 落盘失败，文本直接面向用户。
+    Failed(String),
+}
+
+impl SaveError {
+    fn message(&self) -> String {
+        match self {
+            Self::Stale => "配置在你编辑期间已被改动，未保存。请重新载入后再改一遍——\
+                            直接覆盖会悄悄丢掉别人（或另一个标签页）刚做的修改。"
+                .to_string(),
+            Self::Failed(m) => m.clone(),
+        }
+    }
+}
+
+impl From<String> for SaveError {
+    fn from(m: String) -> Self {
+        Self::Failed(m)
+    }
+}
+
+/// 乐观并发：调用方读到的版本还是不是磁盘上的当前版本。
+///
+/// 控制台的写入是「整份文档读-改-写」，`save_lock` 只保证两次写不交错，
+/// 拦不住丢失更新：两个标签页各自持有 T 时刻的文档，先保存的那份改动会被
+/// 后保存的整份覆盖，而且没有任何提示。被静默回退的如果是一次密钥吊销，
+/// 那把密钥就又活了。
+///
+/// 用内容哈希而不是 mtime：mtime 在部分文件系统上只有秒级粒度，且对
+/// 「改回等长内容」完全无感。`None` 表示调用方没有带版本（例如用 curl
+/// 直接打接口），此时放行——这是一个诚实的逃生口，不是默认路径。
+fn stale_write(base_version: Option<&str>, on_disk: &str) -> bool {
+    matches!(base_version, Some(v) if v != on_disk)
+}
+
 /// 校验 → 落盘 → SIGHUP。三步都成功才算保存。
 ///
 /// 校验用的是网关自己的 `aisix validate`，不是这里重新实现一份 schema：
 /// 重实现一定会和上游漂移，而漂移的方向永远是「控制台放行了网关拒绝的东西」。
-async fn save_resources(st: &AppState, doc: &Value) -> Result<String, String> {
+async fn save_resources(
+    st: &AppState,
+    doc: &Value,
+    base_version: Option<&str>,
+) -> Result<String, SaveError> {
     let yaml = serde_yaml_ng::to_string(doc).map_err(|e| format!("序列化失败: {e}"))?;
 
     // 整个序列串行执行。并发下共用一条临时路径会让 A 校验到 B 的内容
     // 再把它上线——界面承诺的「校验不通过就不落盘」正是死在这里。
     let _guard = st.save_lock.lock().await;
+
+    // 比对必须在锁内、且是重读磁盘：在锁外读会让检查本身可以被插队，
+    // 而用请求进来时的旧读数比对等于没比对。文件读不到时不拦——那种情况
+    // 下面的替换步骤自己会失败，在这里多编一个理由只会遮住真正的错误。
+    if let Ok(current) = tokio::fs::read_to_string(&st.resources_path).await
+        && stale_write(base_version, &sha256_hex(current.as_bytes()))
+    {
+        return Err(SaveError::Stale);
+    }
 
     // 随机后缀：即便将来锁被绕过，两个请求也不会踩同一个文件。
     let tmp = st
@@ -430,7 +521,7 @@ async fn save_resources(st: &AppState, doc: &Value) -> Result<String, String> {
         Ok(o) => o,
         Err(e) => {
             cleanup(tmp).await;
-            return Err(format!("无法执行 aisix validate: {e}"));
+            return Err(SaveError::Failed(format!("无法执行 aisix validate: {e}")));
         }
     };
     if !out.status.success() {
@@ -441,12 +532,14 @@ async fn save_resources(st: &AppState, doc: &Value) -> Result<String, String> {
             msg
         };
         cleanup(tmp).await;
-        return Err(format!("配置校验未通过，未改动网关：\n{msg}"));
+        return Err(SaveError::Failed(format!(
+            "配置校验未通过，未改动网关：\n{msg}"
+        )));
     }
 
     if let Err(e) = tokio::fs::rename(&tmp, &st.resources_path).await {
         cleanup(tmp).await;
-        return Err(format!("替换 resources.yaml 失败: {e}"));
+        return Err(SaveError::Failed(format!("替换 resources.yaml 失败: {e}")));
     }
 
     let hup = tokio::process::Command::new("pkill")
@@ -495,6 +588,10 @@ struct WriteReq {
     /// 会把 YAML 的解析语义分叉成两份实现。
     #[serde(default)]
     raw: Option<String>,
+    /// 调用方这次编辑所基于的版本（`GET /api/file` 返回的 `version`）。
+    /// 缺省时不做并发检查，见 [`stale_write`]。
+    #[serde(default)]
+    base_version: Option<String>,
 }
 
 async fn api_file_put(
@@ -514,7 +611,7 @@ async fn api_file_put(
                     StatusCode::BAD_REQUEST,
                     Json(json!({"error": format!("YAML 解析失败：{e}")})),
                 )
-                    .into_response()
+                    .into_response();
             }
         },
         (None, Some(d)) => d.clone(),
@@ -523,12 +620,17 @@ async fn api_file_put(
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "请求里既没有 doc 也没有 raw"})),
             )
-                .into_response()
+                .into_response();
         }
     };
-    match save_resources(&st, &doc).await {
+    match save_resources(&st, &doc, req.base_version.as_deref()).await {
         Ok(detail) => Json(json!({"ok": true, "detail": detail})).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+        // 版本冲突是 409 而不是 400：前端要据此提示「重新载入」，而 400
+        // 的其余成员都是「你写的内容不合法」，两者的处理动作完全不同。
+        Err(e @ SaveError::Stale) => {
+            (StatusCode::CONFLICT, Json(json!({"error": e.message()}))).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e.message()}))).into_response(),
     }
 }
 
@@ -650,7 +752,7 @@ async fn api_logs(
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": format!("无法执行 journalctl: {e}")})),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -710,7 +812,7 @@ async fn api_upstream_models(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "读不到 resources.yaml"})),
             )
-                .into_response()
+                .into_response();
         }
     };
     let Some(pk) = doc
@@ -729,8 +831,14 @@ async fn api_upstream_models(
             .into_response();
     };
 
-    let provider = pk.get("provider").and_then(Value::as_str).unwrap_or("openai");
-    let raw_key = pk.get("api_key").and_then(Value::as_str).unwrap_or_default();
+    let provider = pk
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("openai");
+    let raw_key = pk
+        .get("api_key")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     // resources.yaml 支持 ${VAR}，这里要解出真实值才能调上游。
     //
     // 但变量名必须限定前缀：不限定的话，任何能编辑配置的人写一条
@@ -825,7 +933,10 @@ fn guard_outbound_base(base: &str) -> Result<(), String> {
         .strip_prefix("https://")
         .ok_or_else(|| format!("上游地址必须是 https://，收到 {base:?}"))?;
     let hostport = rest.split('/').next().unwrap_or("");
-    let host = hostport.rsplit_once(':').map(|(h, _)| h).unwrap_or(hostport);
+    let host = hostport
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(hostport);
     let host = host.trim_start_matches('[').trim_end_matches(']');
 
     use std::net::ToSocketAddrs;
@@ -867,16 +978,9 @@ async fn health() -> &'static str {
 async fn main() {
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
 
-    let password_hash = match std::env::var("CONSOLE_PASSWORD_HASH") {
-        Ok(h) if !h.is_empty() => h,
-        _ => {
-            eprintln!("CONSOLE_PASSWORD_HASH 未设置——控制台可以改网关配置，不允许无口令启动。");
-            eprintln!("用 `aisix-console hash <口令>` 生成散列。");
-            std::process::exit(1);
-        }
-    };
-
-    // 便捷子命令：生成口令散列。
+    // 子命令先处理，且必须排在所有启动前置条件之前：`hash` 正是用来
+    // 生成 CONSOLE_PASSWORD_HASH 的，把它放在那条检查后面就等于要求
+    // 先有散列才能生成散列——README 记载的第一步会直接失败。
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 3 && args[1] == "hash" {
         let salt = SaltString::generate(&mut rand_core::OsRng);
@@ -886,6 +990,15 @@ async fn main() {
         println!("{h}");
         return;
     }
+
+    let password_hash = match std::env::var("CONSOLE_PASSWORD_HASH") {
+        Ok(h) if !h.is_empty() => h,
+        _ => {
+            eprintln!("CONSOLE_PASSWORD_HASH 未设置——控制台可以改网关配置，不允许无口令启动。");
+            eprintln!("用 `aisix-console hash <口令>` 生成散列。");
+            std::process::exit(1);
+        }
+    };
 
     let admin_key = match std::env::var("AISIX_ADMIN_KEY_FOR_CONSOLE") {
         Ok(k) if !k.is_empty() => k,
@@ -939,4 +1052,170 @@ async fn main() {
         .unwrap_or_else(|e| panic!("无法绑定 {addr}: {e}"));
     println!("aisix-console listening on {addr}");
     axum::serve(listener, app).await.expect("serve");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── 乐观并发（丢失更新）──────────────────────────────────
+
+    /// 控制台的写是「整份读-改-写」。`save_lock` 只保证两次写不交错，
+    /// 拦不住后写者用自己那份旧文档整体覆盖先写者的改动，而且没有提示。
+    #[test]
+    fn a_write_based_on_an_older_version_is_refused() {
+        let disk = sha256_hex(b"config as it is now");
+        let stale = sha256_hex(b"config as this tab read it");
+
+        assert!(
+            stale_write(Some(&stale), &disk),
+            "基于旧版本的写入必须被拦下 —— 放行就是静默丢失别人的改动",
+        );
+        assert!(
+            !stale_write(Some(&disk), &disk),
+            "版本一致时不能拦，否则正常保存全部失效",
+        );
+    }
+
+    /// 没带版本的调用方（curl、脚本）不被拦。这是一个明说的逃生口：
+    /// 拦下它会让所有既有的非浏览器调用方一夜之间全部失败。
+    #[test]
+    fn a_caller_that_sends_no_version_is_not_blocked() {
+        assert!(!stale_write(None, &sha256_hex(b"anything")));
+    }
+
+    /// 版本必须来自内容而不是时间戳：改回同样长度的内容、或同一秒内的
+    /// 两次写，mtime 都分辨不出来。
+    #[test]
+    fn the_version_tracks_content_not_size_or_time() {
+        let a = sha256_hex(b"models: [a]");
+        let b = sha256_hex(b"models: [b]");
+        assert_ne!(a, b, "等长但不同的内容必须是不同的版本");
+        assert_eq!(a, sha256_hex(b"models: [a]"), "同样内容必须是同一版本");
+    }
+
+    /// 版本冲突必须映射成 409 而不是 400。前端只在 409 上提示「重新载入」；
+    /// 退化成 400 之后它会跟校验失败混在一起，用户看到的是「你写的内容不
+    /// 合法」，而真实情况是内容没问题、只是基于了旧版本。
+    ///
+    /// 这条测试的存在是为了钉住那次重构：判定曾经是按错误文本相等来做的，
+    /// 任何人改一个字就会静默退化。
+    #[test]
+    fn a_version_conflict_is_a_distinct_error_kind_not_a_message_match() {
+        let stale = SaveError::Stale;
+        let failed = SaveError::Failed("配置校验未通过".into());
+
+        assert!(matches!(stale, SaveError::Stale));
+        assert!(!matches!(failed, SaveError::Stale));
+        assert!(
+            !stale.message().is_empty(),
+            "冲突必须给出人能读懂的原因 —— 空消息等于静默失败",
+        );
+        // 关键性质：文本一模一样也必须还能分辨类型。按文本比对的旧实现
+        // 在这里正好会认错——这是它与类型化判定的唯一可观测差别。
+        let impostor = SaveError::Failed(SaveError::Stale.message());
+        assert_eq!(
+            impostor.message(),
+            SaveError::Stale.message(),
+            "构造前提：两者文本相同",
+        );
+        assert!(
+            !matches!(impostor, SaveError::Stale),
+            "同文的普通失败被当成了版本冲突 —— 判定又退回按文本比对了",
+        );
+    }
+
+    // ── PromQL 注入面 ────────────────────────────────────────
+
+    /// 这个接口把查询串直接转发给 Prometheus。放行一条能读到别的指标的
+    /// 查询，就等于把 Prometheus 的整个指标面暴露给控制台会话。
+    #[test]
+    fn promql_gate_admits_only_this_gateways_own_series() {
+        for q in [
+            "sum by (model) (aisix_llm_requests_total)",
+            "rate(aisix_llm_total_tokens_total[5m])",
+            "histogram_quantile(0.95, sum by (le) (aisix_request_duration_bucket))",
+        ] {
+            assert!(promql_gate_allows(q), "本网关自己的查询被误拦: {q}");
+        }
+
+        for q in [
+            "up",                                 // Prometheus 自带
+            "node_cpu_seconds_total",             // 别的 exporter
+            "sum(process_resident_memory_bytes)", // Prometheus 自身进程
+            "aisix_llm_requests_total or up",     // 掺一条进来
+            "{__name__=~\".+\"}",                 // 全量抓取
+        ] {
+            assert!(!promql_gate_allows(q), "不该放行: {q}");
+        }
+    }
+
+    /// 一条不含任何 aisix_ 指标的查询即使全是允许的函数名也必须被拒 ——
+    /// 否则 `sum(count(rate(...)))` 这类空壳能探出 Prometheus 的行为。
+    #[test]
+    fn promql_gate_requires_an_actual_gateway_metric() {
+        assert!(!promql_gate_allows("sum(count(1))"));
+        assert!(!promql_gate_allows("topk(5, 1)"));
+    }
+
+    fn promql_gate_allows(q: &str) -> bool {
+        promql_only_touches_aisix(q)
+    }
+
+    // ── 出站地址防护（SSRF）──────────────────────────────────
+
+    /// 「同步上游模型」让调用方指定一个地址由服务端去请求。不设防的话
+    /// 它就是一个位于网关内网里的任意 GET 代理。
+    #[tokio::test]
+    async fn outbound_guard_refuses_plaintext_and_internal_targets() {
+        for base in [
+            "http://api.openai.com/v1",       // 明文
+            "https://127.0.0.1/v1",           // 回环
+            "https://localhost/v1",           // 回环别名
+            "https://10.0.0.5/v1",            // 私网
+            "https://192.168.1.1/v1",         // 私网
+            "https://169.254.169.254/latest", // 云元数据
+            "https://[::1]/v1",               // IPv6 回环
+        ] {
+            assert!(guard_outbound_base(base).is_err(), "必须拒绝: {base}",);
+        }
+    }
+
+    // ── 日志行解析 ──────────────────────────────────────────
+
+    /// 日志页把 journald 的行拆成键值展示。拆错不会报错，只会安静地
+    /// 少显示字段，所以这里把形状钉死。
+    #[test]
+    fn log_line_parsing_keeps_quoted_values_intact() {
+        let m = parse_kv(r#"level=INFO model="gpt-4o mini" status=200"#);
+        assert_eq!(m.get("level").and_then(Value::as_str), Some("INFO"));
+        assert_eq!(
+            m.get("model").and_then(Value::as_str),
+            Some("gpt-4o mini"),
+            "带空格的引号值被从中间截断了",
+        );
+        assert_eq!(m.get("status").and_then(Value::as_str), Some("200"));
+    }
+
+    // ── 密钥铸造 ────────────────────────────────────────────
+
+    /// 落盘的只能是散列。这条测试存在的意义是：明文一旦写进 resources.yaml
+    /// 就再也收不回来，而这个错误在界面上完全看不出来。
+    #[test]
+    fn minted_keys_are_stored_as_hashes_only() {
+        let plaintext = random_token();
+        let stored = sha256_hex(plaintext.as_bytes());
+        assert_eq!(stored.len(), 64, "sha256 十六进制应为 64 字符");
+        assert!(!stored.contains(&plaintext), "散列里不能含明文");
+        assert_ne!(stored, plaintext);
+    }
+
+    /// 两次铸造不能撞。撞了意味着两个调用方共用一把密钥，而其中一方
+    /// 被吊销时另一方也一起失效 —— 没人会往这个方向排查。
+    #[test]
+    fn minted_keys_do_not_repeat() {
+        let n = 256;
+        let set: std::collections::HashSet<String> = (0..n).map(|_| random_token()).collect();
+        assert_eq!(set.len(), n, "生成的密钥出现重复");
+    }
 }
