@@ -261,6 +261,23 @@ pub struct RateLimitPolicy {
     /// counts those requests on `aisix_budget_unpriced_requests_total` and
     /// logs them rather than failing them.
     ///
+    /// Enforced as a ceiling on *recorded* spend, not on in-flight spend. A
+    /// request is admitted when the spend already recorded for the window is
+    /// below the ceiling, and its own cost is added only after the upstream
+    /// answers — so every request already in flight when the ceiling is
+    /// crossed still completes and still counts. Recorded spend for a window
+    /// can therefore finish above `max_spend_micro_usd` by up to the combined
+    /// cost of the requests that were concurrently in flight at that moment.
+    ///
+    /// Two other ceilings bound that overshoot, and both stack with this one
+    /// because every policy matching a request applies: `max_requests` on the
+    /// same scope and window caps how many requests the window admits at all,
+    /// and a separate policy that sets a `concurrency` limit and groups by
+    /// `api_key` caps how many may be in flight at once. Both are checked
+    /// and counted at admission rather than at completion, so both hold
+    /// exactly. Set this ceiling below the amount you are actually willing
+    /// to spend.
+    ///
     /// Not honoured on a `second` window: spend, like tokens, is only known
     /// after the upstream answers, so a one-second ceiling would lag by about
     /// its own width. Configuring one is reported rather than silently

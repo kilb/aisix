@@ -118,6 +118,43 @@ spend:{scope}:{scope_ref}:{policy_entry_id}     ← 新增，计 micro-USD
 - 多网关：`RedisStore`，原子自增，**强一致**——且 Redis 是数据面自身的依赖，
   不是控制面往返
 
+### 这是软上限：并发超调是设计的一部分
+
+"准入只检查、完成才提交"直接推出一个必须写在明面上的后果：**上限约束的是已记录的
+花费，不是在途的花费。** 上限被越过的那一刻，所有已经在途的请求都会跑完、也都会
+记账。所以一个窗口的最终花费可以超出 `max_spend_micro_usd`，超出量最多是那一刻
+并发在途请求的花费总和。
+
+这跟后端无关。`RedisStore` 的自增是原子的、跨网关强一致——强一致的是**计数器**，
+不是上限。check-then-commit 之间的缺口来自"价格只有在上游答完之后才知道"这个事实
+本身，换任何 store 都还在。
+
+不做预扣（准入时先按估算扣一笔、完成后找补）的理由：估算依赖 prompt token 的准确
+预计数和对输出长度的猜测，两者都不可靠；猜高了会在远未到上限时就开始拒绝合法请求，
+猜低了并不比现在更安全。用一个不准的数字换一个仍然不精确的上限，不划算。
+
+约束超调靠的是准入时就递增的那些维度。`quota.rs` 对
+`snap.rate_limit_policies.entries()` 是**全表遍历、逐条叠加**的（不是取第一条匹配），
+所以两条都能和花费上限并存：
+
+- 同 scope 同窗口的 `max_requests`——`LocalStore::acquire` 里注释明写
+  "Request limits — checked AND incremented"，准入时就计数，是硬的。它给出的界是
+  *窗口花费 ≤ max_requests × 单请求最高价*。约束的是速率，不是在途量。
+- 另一条 conditional 形式策略的 `limits.concurrency`，配 `group_by: [api_key]`
+  ——这条才直接压在途量，界是 *超调 ≤ concurrency × 单请求最高价*。注意
+  conditional 形式没有 `scope`，它靠 `group_by` 分桶，所以不是"同 scope"，
+  而是"每个 key 各自一个并发桶"。
+
+`max_spend_micro_usd` 是 classic 形式的维度，`limits` 是 conditional 形式的，
+同一行策略上写不了；要两者都要就写两条策略。
+
+**明确不做**的是新增一个 `max_concurrency` 字段：conditional 形式的
+`limits.concurrency` 已经是这件事，而新增一个用户可配字段又会连带要求控制平面那半边
+（schema、Go 模型、表单、i18n），在这里是纯粹的重复建设。
+
+以上必须出现在 `max_spend_micro_usd` 的字段文档里（面向用户的 API 参考由它渲染），
+不能只留在设计文档里。
+
 ### `window: second` 下不生效
 
 没有秒级 token 窗口，所以 `max_spend_micro_usd` 在 `window: second` 下无法执行。

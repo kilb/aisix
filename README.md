@@ -140,8 +140,10 @@ For a multi-replica cluster, point the gateway at etcd instead — `resources_fi
   control plane and dashboard.
 - **Production controls built in.** Routing & failover, rate limits, guardrails, caching,
   and observability ship in the box. Per-key and per-team spend caps
-  (`RateLimitPolicy.max_spend_micro_usd`) are enforced locally by the gateway, alongside
-  its other rate limits — no control-plane round trip.
+  (`RateLimitPolicy.max_spend_micro_usd`) are enforced by the gateway itself, alongside
+  its other rate limits — never by calling out to a control plane. The default in-memory
+  backend adds no network call at all; the Redis backend trades one round trip to your
+  own Redis for counters shared across every replica.
 
 ## 🧩 Features — available today
 
@@ -265,7 +267,7 @@ Same gateway binary, same proxy API — in every form the gateway runs in your e
 | Tenancy | Single instance / namespace | Org → Team → Member → Environment |
 | Provider keys | In the resources file as `${VAR}` env references, or in etcd | Envelope-encrypted at rest, write-only, in-place rotation |
 | Inbound auth | Caller keys (SHA-256 hashed, model allowlists, expiry), or OIDC/JWT bearers | Same, plus masked reveal, key ownership, and PATs |
-| Budgets | Per key / team spend caps, hard-stop (`RateLimitPolicy.max_spend_micro_usd`, enforced locally) | Per key / provider / env / org / team, hard-stop & alerts, centralized dashboard |
+| Budgets | Per key / team spend caps (`RateLimitPolicy.max_spend_micro_usd`, enforced by the gateway; requests already in flight when the cap is crossed still complete) | Per key / provider / env / org / team, hard-stop & alerts, centralized dashboard |
 | RBAC | Admin key = read-only resource surface | Org roles (owner / admin / member), invites |
 | Audit log | — | Full org-scoped audit with diff viewer |
 | Usage & cost | Export logs, metrics, and usage events yourself | Managed usage views, model pricing catalog, spend reporting |
