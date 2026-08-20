@@ -1051,9 +1051,10 @@ mod tests {
 
     #[tokio::test]
     async fn anthropic_envelope_429_budget_exceeded_maps_to_rate_limit_error() {
-        let err = ProxyError::BudgetExceeded(Box::new(
-            crate::budget_reason::BudgetReason::message_only("ak-1"),
-        ));
+        let err = ProxyError::BudgetExceeded(Box::new(crate::budget_reason::BudgetReason {
+            message: "ak-1".to_string(),
+            ..Default::default()
+        }));
         let resp = err.into_anthropic_response();
         assert_anthropic_envelope(resp, StatusCode::TOO_MANY_REQUESTS, "rate_limit_error").await;
     }

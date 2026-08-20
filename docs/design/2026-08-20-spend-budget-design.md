@@ -88,8 +88,11 @@ impl MultiReservation {
 
     /// 保留，等价于 `commit(tokens, 0)`。仍有大量调用点只关心 token，
     /// 一次性全部改签名会把这个改动摊到十几个文件上，且那些调用点
-    /// 本来就拿不到花费数字。
-    pub async fn commit_tokens(self, tokens: u64);
+    /// 本来就拿不到花费数字。改名为 `commit_tokens_no_spend`（而不是
+    /// 保留 `commit_tokens` 这个名字）：审查发现原名字在一个带花费层的
+    /// 预留上悄悄记 0 元、没有任何信号，改名让每个调用点读起来都是一句
+    /// 明确的断言——"这里没有花费数字要记"。
+    pub async fn commit_tokens_no_spend(self, tokens: u64);
 }
 ```
 
@@ -159,8 +162,14 @@ spend:{scope}:{scope_ref}:{policy_entry_id}     ← 新增，计 micro-USD
 与现有 `ProxyError::BudgetExceeded` 完全一致（`error.rs:360`、`error.rs:396`），
 不引入新状态码。
 
-**对调用方的 JSON 形状不变。** 这是整个改动里唯一保持兼容的对外契约，有意为之：
-客户端解析预算错误的代码不应该因为服务端换了执行位置而失效。
+**兼容性是部分的，不是"JSON 形状不变"。** 状态码（429）、错误分类
+（`billing_error`）、`limit_usd` / `period` / `retry_after_seconds` 这几个
+字段的语义与旧的控制平面判定一致，客户端只依赖这几个字段的解析代码不受影响。
+但 `spent_usd` 与 `period_resets_at` 不是"不变"——它们从"控制平面填的真实值"
+变成了"本设计刻意留空"（原因见上表），且 `BudgetReason` 上两者都是
+`skip_serializing_if`，留空意味着响应体里这两个键**直接消失**，不是变成
+`null`。字段形状层面这是一个可观察的破坏性变化，已挪到下面"破坏性变更"一并
+记录，不再声称"唯一保持兼容"。
 
 ## 破坏性变更
 
@@ -176,7 +185,56 @@ etcd 中的 `RateLimitPolicy` 决定。**未配置带 `max_spend_micro_usd` 的�
 这是真正的行为变更，不是重构。必须在 commit message 与发版说明中写明，
 并给出迁移指引：把控制平面里的预算配置改写成对应 scope 的策略资源。
 
-保留 `BudgetReason`——它是对外错误契约的一部分，只是换了填充者。
+保留 `BudgetReason`——它是对外错误契约的一部分，只是换了填充者，但填充者
+换了不代表形状和数据完全不变，下面两条都是可观察的破坏性变化：
+
+- **`spent_usd` 与 `period_resets_at` 从"有值"变成"永远缺席"。** 旧的控制平面
+  判定会填这两个字段；本地策略判定选择留空（原因见"错误信封"一节），而
+  `BudgetErrorBody` 上两者都是 `skip_serializing_if`——留空不是变成 `json
+  null`，是响应体里这两个键直接消失。解析这两个字段的客户端代码升级后会
+  拿到"键不存在"而不是"键为 null"，两者在多数 JSON 客户端里处理路径不同。
+- **五条 `aisix_budget_*` gauge 系列从 `/metrics` 消失。** `aisix_budget_details_
+  present` / `aisix_budget_limit_usd` / `aisix_budget_spent_usd` /
+  `aisix_budget_remaining_usd` / `aisix_budget_reset_seconds` 的唯一数据来源
+  是旧控制平面判定的 `Decision.budget`，随 HTTP 客户端一起删除后没有任何
+  调用方还在喂它们。抓取这些 series 的看板/告警升级后会看到它们停止更新，
+  而不是报错——静默降级。完整的"为什么不顺手接回本地花费层"分析见下面
+  "跟进项"一节。
+
+## 控制平面
+
+**本任务只做了数据面的一半。** 控制平面那一半还没有任何进展，这一节把欠的账
+和后果都写清楚——本仓库 issue 已关闭，这一节就是唯一的记录，不会有 #编号
+可以链接。
+
+**(a) 还欠的控制平面工作，按 CLAUDE.md 的四层顺序：**
+
+1. `cp-admin.yaml` 里 `RateLimitPolicy` 资源的 schema 加一个字段（当前的闭合
+   校验器会拒绝任何 schema 没列出的字段——`max_spend_micro_usd` 现在写进
+   etcd 的唯一途径是绕过控制平面直接写 etcd），以及重新生成的 Go 绑定。
+2. 控制平面 `internal/cpapi/resources/` 下这个资源的 Go 类型模型、请求校验、
+   etcd 投影。
+3. dashboard 里对应的表单字段，加上 `messages/en.json` 与 `messages/
+   zh.json` 的 i18n 词条。
+4. 配套的跨平面测试：`e2e/cases/` 下的 CP↔DP Go 集成测试，以及 dashboard
+   表单的 Playwright 测试。
+
+**(b) 在这四层落地之前，托管部署没有任何花费预算执行手段。** 旧的
+`/dp/budget_check` 路径已被 Task 6 删除；新的 `max_spend_micro_usd` 只能
+通过 `resources.yaml` 或直接写 etcd 配置——托管部署的用户既没有 dashboard
+入口，也没有能通过控制平面校验器的写入路径。也就是说：**一个托管部署从
+旧版本升级到这个分支之后，预算执行会静默消失，且没有任何替代手段能重新
+打开它**，直到上面四层都落地。这不是"功能暂时受限"，是"这条能力在托管
+场景下完全不可达"，和 `AISIX-Cloud#873` 记录的模式同一类。
+
+**(c) `max_spend_micro_usd`（`u64`，单位 micro-USD）这个字段是临时的，不是
+定案。** 它是数据面先起的名字，本仓库的资源模型不是这个字段形状的权威来源——
+按 CLAUDE.md「资源模型以 cp-admin.yaml 为准」的规则，一旦控制平面团队定下
+这个能力在 `cp-admin.yaml` 里的最终名字与形状（可能是别的整数单位，也可能是
+一个十进制的 `max_spend_usd`，或别的完全不同的表达），本仓库都要收敛过去。
+收敛方式是给新字段名加 `#[serde(alias = "max_spend_micro_usd")]`，让这一版
+写入的存量文档在别名窗口内继续能读，而不是不打招呼的硬改名——`model.rs` 的
+renames 规则同样适用于这里。
 
 ## 测试
 
@@ -217,6 +275,23 @@ etcd 中的 `RateLimitPolicy` 决定。**未配置带 `max_spend_micro_usd` 的�
 
   本仓库的 issue 已关闭，所以这里的记录就是唯一的记录：补这一面时，token 与
   花费必须一起接，并且要覆盖 batch 与 fine-tuning 两条。
+
+- **ensemble 全程不计入预算——不是未定价盲区，是完全不提交花费**。
+  `crates/aisix-proxy/src/chat.rs:4036`、`chat.rs:4060` 与
+  `crates/aisix-proxy/src/ensemble.rs:193` 三处都只调用
+  `MultiReservation::commit_tokens_no_spend`（提交 token，花费恒记 0）；
+  流式 ensemble 更进一步，`reservation.token_keys()` / `judge_reservation.
+  token_keys()` 只取 token 层的键（`chat.rs:3760`、`3765`），花费层的键
+  从未被取用，花费桶终身停在 0。结果是：一条 `scope: api_key` 的花费
+  策略对 panel + judge 的真实花费——无论面板成员和裁判模型是否配了
+  price——**完全无感**，且不会有任何报错或告警。这与下一条"虚拟父级未
+  定价信号缺失"是两回事：那一条是"配了价也测不出未定价"的可观测性盲区，
+  这一条是"配了价、真花了钱、但一分钱都不会计入预算"的执行盲区——是货币
+  管控上的一个旁路，不是可观测性的空白。按 CLAUDE.md 的既定方向，ensemble
+  是一个整体未来设计要处理的实验性面，这里不做零敲碎打的修补；这条记录
+  只是把这个已知旁路和它的具体位置钉在案，供将来那次设计一次性接上——
+  接的时候要把 token 与花费一起接，覆盖非流式（`chat.rs:4036/4060`、
+  `ensemble.rs:193`）与流式（`chat.rs:3760/3765`）两条路径。
 
 - **虚拟父级（routing / ensemble / semantic）调度到的真正未定价目标不产生信号**。
   `aisix_budget_unpriced_requests_total` 只在直接模型（含 embedding）上断言：

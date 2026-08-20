@@ -139,8 +139,9 @@ For a multi-replica cluster, point the gateway at etcd instead — `resources_fi
   infrastructure. Choose AISIX Cloud when you want centralized management through a
   control plane and dashboard.
 - **Production controls built in.** Routing & failover, rate limits, guardrails, caching,
-  and observability ship in the box. (Budgets and spend caps are an AISIX Cloud feature —
-  the gateway enforces the control plane's decisions.)
+  and observability ship in the box. Per-key and per-team spend caps
+  (`RateLimitPolicy.max_spend_micro_usd`) are enforced locally by the gateway, alongside
+  its other rate limits — no control-plane round trip.
 
 ## 🧩 Features — available today
 
@@ -264,7 +265,7 @@ Same gateway binary, same proxy API — in every form the gateway runs in your e
 | Tenancy | Single instance / namespace | Org → Team → Member → Environment |
 | Provider keys | In the resources file as `${VAR}` env references, or in etcd | Envelope-encrypted at rest, write-only, in-place rotation |
 | Inbound auth | Caller keys (SHA-256 hashed, model allowlists, expiry), or OIDC/JWT bearers | Same, plus masked reveal, key ownership, and PATs |
-| Budgets | — (rate and token limits only) | Per key / provider / env / org / team, hard-stop & alerts |
+| Budgets | Per key / team spend caps, hard-stop (`RateLimitPolicy.max_spend_micro_usd`, enforced locally) | Per key / provider / env / org / team, hard-stop & alerts, centralized dashboard |
 | RBAC | Admin key = read-only resource surface | Org roles (owner / admin / member), invites |
 | Audit log | — | Full org-scoped audit with diff viewer |
 | Usage & cost | Export logs, metrics, and usage events yourself | Managed usage views, model pricing catalog, spend reporting |

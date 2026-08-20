@@ -19,16 +19,3 @@ pub struct BudgetReason {
     pub period_resets_at: Option<String>,
     pub retry_after_seconds: Option<u64>,
 }
-
-impl BudgetReason {
-    /// 只带人类可读消息的原因——用于没有结构化 scope 细节的兜底路径。
-    /// 本次改动删除了唯一的生产调用方（旧的控制平面 HTTP 预算网关）；
-    /// 保留是因为下一个任务会让本地花费层的拒绝走这条构造路径。
-    #[allow(dead_code)]
-    pub(crate) fn message_only(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            ..Default::default()
-        }
-    }
-}

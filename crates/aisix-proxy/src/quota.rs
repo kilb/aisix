@@ -290,6 +290,11 @@ fn escape_bucket_segment(value: &str) -> std::borrow::Cow<'_, str> {
 /// 都会在 warn 级别刷一行日志，把运维真正需要看到的事件淹没。Mirrors
 /// `warn_partial_compat_deduped`（etcd loader），包括它的锁污染容忍：这个
 /// 集合只用来给日志去重，锁下发生 panic 不能把请求路径卡死。
+///
+/// 由 `warn_inert_max_tokens_once` 泛化而来（当时只管 `max_tokens` 一个
+/// 维度），泛化时把这条参考丢了：sub-minute 窗口下为什么拒绝而不是接受
+/// token 上限，原始决策记在 api7/ai-gateway#396；本仓库 issue 已关闭，
+/// 这行注释是它唯一的存留记录。
 fn warn_inert_dimension_once(policy_name: &str, window: &str, dimension: &str) {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
@@ -622,6 +627,23 @@ fn reject(
     }
 }
 
+/// 花费拒绝的 `scope` 标签。不能用 `err.scope()`——底层花费桶复用的是
+/// token 桶同一条 `RateLimitError::Tokens` 路径，`err.scope()` 只会返回
+/// `"tokens"`，把花费拒绝混进真正的 token 限流拒绝那个 series；`layer`
+/// 虽然已经固定成 `policy_spend`，但只聚合 `scope` 的仪表盘看到的还是
+/// `"tokens"`，一样会把"钱超了"读成"token 超了"。这里改按策略窗口给固定
+/// 字符串，不掺调用方数据（基数规则）。花费层只在 minute/hour/day 上预留
+/// （`second` 下从不建层，见 [`warn_inert_dimension_once`] 的调用点），
+/// `Second`/`None` 分支理论上不可达，给一个不会被误读成具体窗口的兜底值。
+fn spend_scope_label(window: Option<PolicyWindow>) -> &'static str {
+    match window {
+        Some(PolicyWindow::Minute) => "spend_minute",
+        Some(PolicyWindow::Hour) => "spend_hour",
+        Some(PolicyWindow::Day) => "spend_day",
+        Some(PolicyWindow::Second) | None => "spend_unknown",
+    }
+}
+
 /// 花费层专属的拒绝路径，和 [`reject`] 分开：花费桶超限要报成
 /// `ProxyError::BudgetExceeded`（`billing_error`），不是通用的
 /// `ProxyError::PolicyRateLimit`（`rate_limit_exceeded`）——两者同为
@@ -643,6 +665,11 @@ fn reject(
 /// 报错桶会让这份信息失去意义。所以 `team_member` 下把 `scope_ref` 拼成
 /// `"{team}:{member}"`，与花费桶的身份一致；其余 scope 没有这个拆分，
 /// 原样使用 `policy.scope_ref`。
+///
+/// 同一条策略行上 token 上限与花费上限同时超限时，谁赢是确定性的但没有
+/// 明文写过：调用方（见上方 `reserve_layers`）总是先 `pre_commit` token 层，
+/// 只有它成功才会走到这个花费层，所以 token 层的 `rate_limit_exceeded`
+/// 总是先于这个函数产生的 `billing_error` 返回。
 fn reject_spend(
     state: &ProxyState,
     err: aisix_ratelimit::RateLimitError,
@@ -651,7 +678,7 @@ fn reject_spend(
     member: Option<&str>,
 ) -> ProxyError {
     state.metrics.record_ratelimit_rejection(
-        &err.scope().to_string(),
+        spend_scope_label(policy.window),
         "policy_spend",
         Some(policy_id),
     );
@@ -1613,6 +1640,13 @@ mod tests {
         assert!(
             rendered.contains("layer=\"policy_spend\""),
             "花费层拒绝应打独立的 layer 标签: {rendered}"
+        );
+        // scope 标签同理不能是 `err.scope()` 的 "tokens"：这条策略是
+        // day 窗口，花费拒绝应打 "spend_day"，不能和真正的 token 限流
+        // 拒绝共用 "tokens" 这个 series。
+        assert!(
+            rendered.contains("scope=\"spend_day\""),
+            "花费层拒绝的 scope 标签应为 spend_day，不是 tokens: {rendered}"
         );
     }
 

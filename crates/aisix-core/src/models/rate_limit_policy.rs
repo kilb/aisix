@@ -265,6 +265,11 @@ pub struct RateLimitPolicy {
     /// after the upstream answers, so a one-second ceiling would lag by about
     /// its own width. Configuring one is reported rather than silently
     /// ignored.
+    ///
+    /// Not enforced against ensemble model requests: panel and judge
+    /// sub-call spend is never counted against this ceiling, so an
+    /// api_key or team policy that also receives ensemble traffic sees
+    /// only its non-ensemble spend capped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub max_spend_micro_usd: Option<u64>,
