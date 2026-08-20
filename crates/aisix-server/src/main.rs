@@ -83,7 +83,6 @@ use aisix_provider_bedrock::BedrockBridge;
 use aisix_provider_openai::OpenAiBridge;
 use aisix_provider_vertex::VertexBridge;
 use aisix_proxy::background::run_background_model_check_once;
-use aisix_proxy::budget::BudgetClient;
 use aisix_proxy::{CacheBackends, ProxyState};
 use aisix_ratelimit::{Limiter, RedisStore};
 use clap::Parser;
@@ -424,7 +423,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     );
 
     // Operator-supplied extra trust root, threaded into every
-    // outbound mTLS client (etcd, heartbeat, telemetry, BudgetClient).
+    // outbound mTLS client (etcd, heartbeat, telemetry).
     // Needed for e2e / on-prem deployments where the
     // CP serves a cert distinct from the cert-manager-issued client-
     // cert CA. Production with public-CA certs leaves this `None`.
@@ -697,26 +696,6 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             h.mtls.clone(),
         )
     });
-    // Budget gate. Same on-disk mTLS bundle as heartbeat; URL is the
-    // control plane origin (heartbeat URL minus the /dp/heartbeat suffix), the
-    // BudgetClient appends /dp/budget_check itself. See prd-09b rev 2
-    // §5.5. When the bundle build fails the DP
-    // logs and falls back to the default disabled() (allow-all) — a
-    // mid-boot config glitch shouldn't take the proxy down.
-    let budget_client = heartbeat_cfg.as_ref().and_then(|h| {
-        let control_plane_base = h
-            .url
-            .strip_suffix("/dp/heartbeat")
-            .unwrap_or(h.url.as_str())
-            .to_string();
-        match heartbeat::build_mtls_client(&h.mtls) {
-            Ok(http) => Some(Arc::new(BudgetClient::new(control_plane_base, http))),
-            Err(e) => {
-                tracing::warn!(error = %e, "budget_check disabled: mTLS client build failed");
-                None
-            }
-        }
-    });
     let (usage_sink, telemetry_task) = match telemetry_cfg {
         Some(cfg) => {
             let (sink, handle) = telemetry::spawn(cfg, cancel_rx.clone());
@@ -922,9 +901,6 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     proxy_state = proxy_state.with_default_retries(cfg.upstream.retries);
     proxy_state =
         proxy_state.with_default_timeouts(cfg.upstream.timeout_ms, cfg.upstream.stream_timeout_ms);
-    if let Some(client) = budget_client {
-        proxy_state = proxy_state.with_budget_client(client);
-    }
     // Live guardrail index: resolves per-request chains from
     // attachment scope + priority, rebuilding lazily whenever the
     // etcd watch supervisor stores a fresh snapshot. Dashboard

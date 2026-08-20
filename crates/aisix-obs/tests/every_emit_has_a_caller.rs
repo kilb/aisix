@@ -19,13 +19,26 @@ use std::path::{Path, PathBuf};
 
 /// Emits that are deliberately uncalled. Each entry must say why, and each is
 /// a debt to clear rather than a permanent exemption.
-const ALLOWED_UNCALLED: &[(&str, &str)] = &[(
-    "record_llm_request",
-    "Superseded by `record_proxy_and_llm_request`, which emits the same \
-     family alongside the proxy tier. Pre-existing dead code, kept only \
-     because a unit test still exercises it — that test asserts behaviour \
-     no production path takes. Delete both together.",
-)];
+const ALLOWED_UNCALLED: &[(&str, &str)] = &[
+    (
+        "record_llm_request",
+        "Superseded by `record_proxy_and_llm_request`, which emits the same \
+         family alongside the proxy tier. Pre-existing dead code, kept only \
+         because a unit test still exercises it — that test asserts behaviour \
+         no production path takes. Delete both together.",
+    ),
+    (
+        "set_budget_gauges",
+        "Its only data source was the control-plane budget HTTP decision \
+         (`Decision.budget: Option<BudgetDetails>`, dollar f64 amounts), which \
+         the spend-budget-plan Task 6 removed in favor of local \
+         `RateLimitPolicy.max_spend_micro_usd` enforcement (micro-USD u64 \
+         counters). Re-wiring this gauge from the local spend layer is a \
+         distinct, not-yet-scheduled unit conversion + semantics job (what do \
+         limit/spent/remaining mean for a rate-limit-shaped spend bucket), \
+         left for a follow-up rather than invented here.",
+    ),
+];
 
 fn workspace_root() -> PathBuf {
     // CARGO_MANIFEST_DIR is crates/aisix-obs.

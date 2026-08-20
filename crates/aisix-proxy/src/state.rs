@@ -25,7 +25,6 @@ use aisix_ratelimit::Limiter;
 use dashmap::DashSet;
 use std::sync::Arc;
 
-use crate::budget::BudgetClient;
 use crate::client_ip::ResolvedRealIp;
 use crate::health::{HealthTracker, LivezState, ModelRuntimeStatusTracker};
 use crate::routing::RoutingRegistry;
@@ -206,9 +205,6 @@ pub struct ProxyStateInner {
     /// when the snapshot version changes. Default is an empty index
     /// (no-op); the server bootstrap wires a live handle at startup.
     pub guardrail_index: Arc<LiveGuardrailIndex>,
-    /// Per-request budget gate. Asks the control plane whether the api_key may
-    /// proceed; cached for 5s with sticky fallback on the control plane outage.
-    pub budgets: Arc<BudgetClient>,
     /// Per-model health tracker. Updated on every upstream call outcome;
     /// read by `GET /admin/v1/health`.
     pub health: Arc<HealthTracker>,
@@ -364,7 +360,6 @@ impl ProxyState {
             routing: Arc::new(RoutingRegistry::new()),
             semantic_cache: Arc::new(crate::semantic::SemanticVectorCache::default()),
             guardrail_index,
-            budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
             config_apply_age: Some(Arc::new(|| None)),
@@ -407,7 +402,6 @@ impl ProxyState {
             routing: Arc::new(RoutingRegistry::new()),
             semantic_cache: Arc::new(crate::semantic::SemanticVectorCache::default()),
             guardrail_index,
-            budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
             config_apply_age: Some(Arc::new(|| None)),
@@ -474,7 +468,6 @@ impl ProxyState {
             routing,
             semantic_cache: Arc::new(crate::semantic::SemanticVectorCache::default()),
             guardrail_index,
-            budgets: Arc::new(BudgetClient::disabled()),
             health,
             livez: Arc::new(LivezState::new()),
             config_apply_age: Some(Arc::new(|| None)),
@@ -549,13 +542,6 @@ impl ProxyState {
     /// the sender worker.
     pub fn with_usage_sink(mut self, sink: UsageSink) -> Self {
         Arc::make_mut(&mut self.inner).usage_sink = sink;
-        self
-    }
-
-    /// Swap in a live `BudgetClient` that talks to the control plane. Default is
-    /// the disabled (allow-all) client used in self-hosted dev.
-    pub fn with_budget_client(mut self, client: Arc<BudgetClient>) -> Self {
-        Arc::make_mut(&mut self.inner).budgets = client;
         self
     }
 

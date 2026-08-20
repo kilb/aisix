@@ -29,7 +29,7 @@ mod attempt;
 mod audio;
 mod auth;
 pub mod background;
-pub mod budget;
+pub mod budget_reason;
 mod chat;
 mod client_ip;
 mod completions;
@@ -7666,75 +7666,6 @@ data: [DONE]\n\n";
         assert_eq!(event.provider_request_id, "cmpl-stream-1");
         assert_eq!(event.provider_model_version, "gpt-4o-2024-08-06");
         assert_eq!(event.finish_reason, "stop");
-    }
-
-    #[tokio::test]
-    async fn budget_exceeded_returns_429() {
-        use crate::budget::BudgetClient;
-
-        // The control plane stand-in: returns a deny decision for our key.
-        // Wire shape mirrors the control plane's budgetCheckResponse — see
-        // internal/cpapi/resources/budget_check.go (prd-09b rev 2 §5.5).
-        let cp = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/dp/budget_check"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "allow": false,
-                "fail_mode": "closed",
-                "reason": {
-                    "type": "billing_error",
-                    "code": "budget_exceeded",
-                    "message": "monthly cap exceeded",
-                    "scope": "api_key",
-                    "scope_ref": "ak-uuid",
-                    "limit_usd": "10.00",
-                    "spent_usd": "10.50",
-                    "period": "month",
-                    "period_resets_at": "2026-05-01T00:00:00Z",
-                    "retry_after_seconds": 86400
-                }
-            })))
-            .mount(&cp)
-            .await;
-
-        // Upstream chat endpoint must NOT be hit — the budget check
-        // fires before dispatch.
-        let upstream = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0)
-            .mount(&upstream)
-            .await;
-
-        let hub = Arc::new(Hub::new());
-        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
-
-        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
-        let state = build_state(snap, hub).with_budget_client(Arc::new(BudgetClient::new(
-            cp.uri(),
-            reqwest::Client::new(),
-        )));
-
-        let app = build_router(state);
-        let body = serde_json::json!({
-            "model": "my-gpt4",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"]["type"], "billing_error");
-        assert_eq!(v["error"]["code"], "budget_exceeded");
     }
 
     // ─── Cross-protocol × upstream matrix ─────────────────────────

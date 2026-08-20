@@ -95,10 +95,10 @@ pub struct PolicyErrorRef {
     pub name: String,
 }
 
-/// The structured budget fields that `budget_exceeded` 429s lift from
-/// the control plane's reason. Flattened into `ErrorBody`. Each field is omitted
-/// when absent so a fallback-mode denial (the control plane unreachable, no
-/// structured detail) still serializes cleanly with just a message.
+/// The structured budget fields that a `budget_exceeded` 429 lifts from
+/// its [`crate::budget_reason::BudgetReason`]. Flattened into `ErrorBody`.
+/// Each field is omitted when absent so a reason carrying only a human
+/// message still serializes cleanly with just that message.
 #[derive(Debug, Serialize, Clone)]
 pub struct BudgetErrorFields {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,7 +148,7 @@ impl ErrorEnvelope {
 
     /// Attach the structured budget detail to the error block. Only
     /// the budget_exceeded path calls this.
-    pub fn with_budget(mut self, r: &crate::budget::BudgetReason) -> Self {
+    pub fn with_budget(mut self, r: &crate::budget_reason::BudgetReason) -> Self {
         self.error.budget = Some(BudgetErrorFields {
             scope: r.scope.clone(),
             scope_ref: r.scope_ref.clone(),
@@ -277,17 +277,18 @@ pub enum ProxyError {
     /// detail to `tracing` for operators.
     #[error("{0}")]
     ContentFiltered(String),
-    // Carries the control plane's structured reason. Display forwards the control plane
-    // message verbatim (it's already a complete customer sentence —
-    // "<scope> budget '<name>' exceeded ($X/period). Resets …"); the
-    // structured fields ride along in the 429 error block via
-    // `with_budget` (prd-09b §5.8).
+    // 携带结构化的预算拒绝原因（`BudgetReason`）。预算判定不再来自控制平面的
+    // HTTP 调用，而是由本地策略（etcd 中 `RateLimitPolicy.max_spend_micro_usd`）
+    // 判定并填充这个类型——契约（`error.budget.*` 的形状）不变，只是换了填充者。
+    // Display 原样转发 message（应当已经是完整的客户句子，例如
+    // "<scope> budget '<name>' exceeded ($X/period). Resets …"）；结构化字段
+    // 通过 `with_budget` 附加到 429 的 error block 里。
     // Boxed: BudgetReason is ~184 bytes; inlining it would make this the
     // largest ProxyError variant and trip clippy::result_large_err across
     // every `Result<_, ProxyError>` in the hot path. The box keeps the
     // enum small (budget denial is rare, so the extra alloc is fine).
     #[error("{}", .0.message)]
-    BudgetExceeded(Box<crate::budget::BudgetReason>),
+    BudgetExceeded(Box<crate::budget_reason::BudgetReason>),
     /// Per RFC 9110 §15.5.14, a request body that exceeds a server-
     /// imposed limit gets a `413 Content Too Large`. The caller-visible
     /// `message` is intentionally bare of the actual incoming size
@@ -1050,8 +1051,9 @@ mod tests {
 
     #[tokio::test]
     async fn anthropic_envelope_429_budget_exceeded_maps_to_rate_limit_error() {
-        let err =
-            ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason::message_only("ak-1")));
+        let err = ProxyError::BudgetExceeded(Box::new(
+            crate::budget_reason::BudgetReason::message_only("ak-1"),
+        ));
         let resp = err.into_anthropic_response();
         assert_anthropic_envelope(resp, StatusCode::TOO_MANY_REQUESTS, "rate_limit_error").await;
     }
@@ -1062,7 +1064,7 @@ mod tests {
         // reason into the error block. Pin scope / scope_ref / limit_usd /
         // spent_usd / period so a regression that drops them (the old
         // String-only variant) fails here.
-        let err = ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
+        let err = ProxyError::BudgetExceeded(Box::new(crate::budget_reason::BudgetReason {
             message: "team budget 'frontend' exceeded ($1.00/month). Resets soon.".into(),
             scope: Some("team".into()),
             scope_ref: Some("team-uuid-1".into()),
@@ -1105,7 +1107,7 @@ mod tests {
         // only. The Anthropic /v1/messages error block is the strict
         // {type, message} shape — a fully-populated reason must NOT leak
         // scope / limit_usd etc. into it.
-        let err = ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
+        let err = ProxyError::BudgetExceeded(Box::new(crate::budget_reason::BudgetReason {
             message: "team budget 'frontend' exceeded ($1.00/month). Resets soon.".into(),
             scope: Some("team".into()),
             scope_ref: Some("team-uuid-1".into()),

@@ -22,8 +22,7 @@ use aisix_core::{AisixSnapshot, AppliedGuardrail};
 use aisix_gateway::{BridgeError, ChatFormat, ChatResponse};
 use aisix_guardrails::GuardrailVerdict;
 use aisix_obs::{
-    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, Metrics, UsageEvent,
-    UsageLabels,
+    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent, UsageLabels,
 };
 use axum::extract::State;
 use axum::http::HeaderValue;
@@ -1398,21 +1397,9 @@ async fn dispatch(
     // The structured local rewrite above runs before any downstream use, so
     // semantic routing, cache keys, and upstream dispatch see only masked text.
 
-    // Budget pre-check via control plane. The DP no longer owns budget state;
-    // the control plane returns a cached/live decision per api_key.
-    let decision = state.budgets.check(&auth.entry.id).await;
-    if let Some(budget) = decision.budget.as_ref() {
-        record_budget_gauges(&state.metrics, auth, Some(budget));
-    } else {
-        record_budget_gauges(&state.metrics, auth, None);
-    }
-    if !decision.allowed {
-        return Err(with_model(ProxyError::BudgetExceeded(Box::new(
-            decision.reason.unwrap_or_else(|| {
-                crate::budget::BudgetReason::message_only(auth.entry.id.clone())
-            }),
-        ))));
-    }
+    // 预算不再由这里的控制平面 HTTP 调用单独判定：`quota::enforce_rate_limit`
+    // （下面 dispatch 前调用）已经预留了策略的花费层，超限时按限流层的形状
+    // 拒绝。花费层专属的 `BudgetExceeded` 由后续任务从本地策略状态回填。
 
     // Resolve the attempt-list of underlying Model entries. A semantic
     // router embeds the request and scores it against route examples to
@@ -4369,31 +4356,6 @@ fn record_success(
             client_type,
         },
     );
-}
-
-fn record_budget_gauges(
-    metrics: &Metrics,
-    auth: &AuthenticatedKey,
-    budget: Option<&crate::budget::BudgetDetails>,
-) {
-    let labels = aisix_obs::BudgetLabels {
-        api_key_id: &auth.entry.id,
-        team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
-        user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
-    };
-    if let Some(budget) = budget {
-        metrics.set_budget_gauges(
-            labels,
-            aisix_obs::BudgetGauges {
-                limit_usd: budget.limit_usd,
-                spent_usd: budget.spent_usd,
-                remaining_usd: budget.remaining_usd,
-                reset_seconds: budget.reset_seconds,
-            },
-        );
-    } else {
-        metrics.clear_budget_gauges(labels);
-    }
 }
 
 /// Push one telemetry event onto the CP-side sink **and** fan it out

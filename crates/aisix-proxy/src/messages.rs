@@ -671,12 +671,12 @@ async fn dispatch(
     // `Option` so the winning streaming attempt can `take()` the reservation
     // and carry it into the end-of-stream guard (#688); non-streaming / failed
     // attempts leave it in place for the post-dispatch commit or a retry.
-    // `quota::enforce` runs the control plane budget gate itself (`check_budget`),
-    // producing this same `BudgetExceeded` and additionally refreshing the
-    // budget gauges — so an inline second check here would be unreachable
-    // for the exceeded case and silently skip the gauge sync.
+    // `quota::enforce` reserves the budget/spend layer itself (a policy's
+    // `max_spend_micro_usd` projects onto a spend bucket alongside the
+    // token buckets), so an inline second check here is unnecessary.
     // `/v1/chat/completions` is the deliberate exception: it uses
-    // `enforce_rate_limit` and owns its budget check.
+    // `enforce_rate_limit`, which is equivalent to `enforce` for a request
+    // that resolves a model (see `quota::enforce_rate_limit` doc comment).
     let mut reservation =
         Some(crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?);
 

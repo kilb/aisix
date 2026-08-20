@@ -618,69 +618,44 @@ fn reject(
     }
 }
 
-/// Apply budget + multi-layer rate-limit checks for one request.
-/// `model_rl` carries the resolved model identity for policy matching
-/// and optional inline limits. Pass `None` only for endpoints that
-/// don't resolve a model (e.g. passthrough).
+/// Apply multi-layer rate-limit checks for one request (this includes the
+/// spend/budget layer projected from a policy's `max_spend_micro_usd`, see
+/// `PolicyLayer::spend` above). `model_rl` carries the resolved model
+/// identity for policy matching and optional inline limits. Pass `None`
+/// only for endpoints that don't resolve a model (e.g. passthrough).
+///
+/// 预算不再由这里单独判定：过去这里会先问一次控制平面（HTTP `check_budget`）
+/// 再走限流，现在预算就是策略里的一层花费桶，和其余限流层一起在
+/// `reserve_layers` 里预留/提交。花费桶超限时的错误形状（`ProxyError::
+/// BudgetExceeded`）由后续任务从本地策略状态回填。
 pub(crate) async fn enforce(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     model_rl: Option<&ModelRateLimit>,
 ) -> Result<MultiReservation, ProxyError> {
-    check_budget(state, auth).await?;
     reserve_layers(state, snapshot, auth, model_rl, None).await
 }
 
-/// Apply budget + multi-layer rate-limit checks for one MCP `tools/call`
-/// against `mcp_server`, the server the called tool belongs to. Same gate
-/// as [`enforce`] plus the key's per-server layer; MCP resolves no model,
-/// so the model layers are never engaged.
+/// Apply multi-layer rate-limit checks for one MCP `tools/call` against
+/// `mcp_server`, the server the called tool belongs to. Same gate as
+/// [`enforce`] plus the key's per-server layer; MCP resolves no model, so
+/// the model layers are never engaged.
 pub(crate) async fn enforce_mcp(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     mcp_server: &str,
 ) -> Result<MultiReservation, ProxyError> {
-    check_budget(state, auth).await?;
     reserve_layers(state, snapshot, auth, None, Some(mcp_server)).await
 }
 
-/// Budget pre-check shared by the enforce entry points: refreshes the
-/// budget gauges from the cached the control plane decision and rejects the request
-/// when the key is over budget.
-async fn check_budget(state: &ProxyState, auth: &AuthenticatedKey) -> Result<(), ProxyError> {
-    let decision = state.budgets.check(&auth.entry.id).await;
-    let budget_labels = aisix_obs::BudgetLabels {
-        api_key_id: &auth.entry.id,
-        team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
-        user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
-    };
-    if let Some(budget) = decision.budget.as_ref() {
-        state.metrics.set_budget_gauges(
-            budget_labels,
-            aisix_obs::BudgetGauges {
-                limit_usd: budget.limit_usd,
-                spent_usd: budget.spent_usd,
-                remaining_usd: budget.remaining_usd,
-                reset_seconds: budget.reset_seconds,
-            },
-        );
-    } else {
-        state.metrics.clear_budget_gauges(budget_labels);
-    }
-    if !decision.allowed {
-        return Err(ProxyError::BudgetExceeded(Box::new(
-            decision.reason.unwrap_or_else(|| {
-                crate::budget::BudgetReason::message_only(auth.entry.id.clone())
-            }),
-        )));
-    }
-    Ok(())
-}
-
-/// Rate-limit-only enforcement (no budget check). Used by `chat.rs`
-/// which handles budget separately.
+/// Rate-limit-only enforcement. Historically distinct from [`enforce`]
+/// because chat dispatch ran its own inline control-plane budget check
+/// before calling this; that inline check is gone (budgets are no longer
+/// decided by an HTTP call), so this is now equivalent to [`enforce`] for
+/// a request that resolves a model. Kept separate to avoid touching every
+/// call site in `chat.rs` for a rename with no behavior change.
 pub(crate) async fn enforce_rate_limit(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
