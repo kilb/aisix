@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { writeFile } from "node:fs/promises";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -659,5 +660,258 @@ describe("spend budget e2e (task 8: three endpoint families + bridge/legacy stre
     expect(body.error?.type).toBe("billing_error");
     expect(body.error?.scope).toBe("api_key");
     expect(body.error?.scope_ref).toBe(CMPL_STREAM_KEY_ID);
+  }, 30_000);
+});
+
+// `scope: team` and `scope: team_member` were only ever exercised by unit
+// tests. They are the two scopes where the bucket key is NOT one-per-key, so
+// they are also the two where a wrong bucket is invisible: collapse
+// `team_member` into one shared bucket and nothing errors — the first member
+// to arrive simply eats the whole team's budget, and every other member gets
+// a 429 that looks exactly like a legitimate one.
+//
+// The contract these two cases pin, stated without reference to the
+// implementation: a team ceiling is one budget the whole team draws from; a
+// team-member ceiling is that same number handed to each member separately.
+describe("spend budget e2e: team and team_member ceilings divide the budget differently", () => {
+  let app: SpawnedApp | undefined;
+  let etcd: EtcdClient | undefined;
+  let seed: SeedClient | undefined;
+  let etcdReachable = false;
+  let upstream: OpenAiUpstream | undefined;
+
+  const SHARED_TEAM = "sb-team-shared";
+  const PER_MEMBER_TEAM = "sb-team-per-member";
+
+  // Two keys per team, belonging to two different members.
+  const TEAM_A = "sk-sb-team-a";
+  const TEAM_A_ID = randomUUID();
+  const TEAM_B = "sk-sb-team-b";
+  const TEAM_B_ID = randomUUID();
+  const MEMBER_C = "sk-sb-member-c";
+  const MEMBER_C_ID = randomUUID();
+  const MEMBER_D = "sk-sb-member-d";
+  const MEMBER_D_ID = randomUUID();
+
+  beforeAll(async () => {
+    etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+
+    app = await spawnApp();
+    seed = new SeedClient(etcd, app.etcdPrefix);
+
+    upstream = await startOpenAiUpstream({ nonStreamBody: chatBody("sb-team-model") });
+    const pk = await seed.createProviderKey({
+      display_name: "sb-team-pk",
+      secret: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "sb-team-model",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: pk.id,
+      cost: COST,
+    });
+
+    // Only `max_spend_micro_usd` on both, so any 429 here is the spend layer
+    // and nothing else.
+    await seed.createRateLimitPolicy({
+      name: "sb-team-shared-budget",
+      scope: "team",
+      scope_ref: SHARED_TEAM,
+      window: "minute",
+      max_spend_micro_usd: CAP_MULTI,
+    });
+    await seed.createRateLimitPolicy({
+      name: "sb-team-per-member-budget",
+      scope: "team_member",
+      scope_ref: PER_MEMBER_TEAM,
+      window: "minute",
+      max_spend_micro_usd: CAP_MULTI,
+    });
+
+    const putKey = (id: string, plaintext: string, team: string, user: string) =>
+      etcd!.put(
+        `${app!.etcdPrefix}/api_keys/${id}`,
+        JSON.stringify({
+          key_hash: hash(plaintext),
+          allowed_models: ["sb-team-model"],
+          team_id: team,
+          user_id: user,
+        }),
+      );
+    await putKey(TEAM_A_ID, TEAM_A, SHARED_TEAM, "u1");
+    await putKey(TEAM_B_ID, TEAM_B, SHARED_TEAM, "u2");
+    await putKey(MEMBER_C_ID, MEMBER_C, PER_MEMBER_TEAM, "u1");
+    await putKey(MEMBER_D_ID, MEMBER_D, PER_MEMBER_TEAM, "u2");
+
+    const probe = new ProxyClient(app.proxyUrl, MEMBER_D);
+    await waitConfigPropagation(async () => {
+      const res = await probe.listModels();
+      if (res.status !== 200) return false;
+      const data = (res.body as { data?: Array<{ id?: string }> }).data ?? [];
+      return data.some((m) => m.id === "sb-team-model");
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+    if (etcd && app) await etcd.deletePrefix(app.etcdPrefix);
+  });
+
+  function call(key: string): Promise<Response> {
+    return fetch(`${app!.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "sb-team-model",
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+  }
+
+  async function admit(key: string, times: number): Promise<void> {
+    for (let i = 0; i < times; i++) {
+      const res = await call(key);
+      expect(res.status, `${key} call ${i + 1} should be admitted`).toBe(200);
+      await res.text();
+    }
+  }
+
+  test("a team ceiling is one budget the whole team draws from", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    await awaitWindowHeadroom(5);
+
+    // One member spends the whole ceiling...
+    await admit(TEAM_A, 2);
+
+    // ...and the OTHER member's very first call is already refused. This is
+    // the assertion that fails if each key got its own bucket.
+    const blocked = await call(TEAM_B);
+    expect(blocked.status, "a teammate must inherit the team's exhausted budget").toBe(429);
+    const body = (await blocked.json()) as ErrorEnvelope;
+    expect(body.error?.type).toBe("billing_error");
+    expect(body.error?.code).toBe("budget_exceeded");
+    expect(body.error?.scope).toBe("team");
+    expect(body.error?.scope_ref).toBe(SHARED_TEAM);
+  }, 30_000);
+
+  test("a team_member ceiling hands that same budget to each member separately", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    await awaitWindowHeadroom(5);
+
+    // One member exhausts their own ceiling.
+    await admit(MEMBER_C, 2);
+    const cBlocked = await call(MEMBER_C);
+    expect(cBlocked.status, "a member must be capped at their own ceiling").toBe(429);
+    const body = (await cBlocked.json()) as ErrorEnvelope;
+    expect(body.error?.scope).toBe("team_member");
+    // The team id alone would be ambiguous here: every member shares it,
+    // but each has a separate budget, so it cannot say WHICH budget ran
+    // out. The envelope names the exhausted budget, member included.
+    expect(body.error?.scope_ref).toBe(`${PER_MEMBER_TEAM}:u1`);
+    await cBlocked.text().catch(() => undefined);
+
+    // Their teammate is untouched — same policy, independent budget. If the
+    // member suffix ever stops reaching the spend bucket, this is the line
+    // that catches it: the ceiling silently becomes team-wide.
+    await admit(MEMBER_D, 2);
+  }, 30_000);
+});
+
+// A deployment with no spend ceiling anywhere and one comfortably under
+// its ceilings look identical on the rejection counters: both report zero
+// budget 429s. So how many ceilings are configured has to be its own
+// series, or "nobody ever set a budget" is unmonitorable.
+//
+// File mode rather than etcd: this block needs a config it can rewrite and
+// reload on demand, and it must run wherever the suite runs — an
+// etcd-gated block that silently skips is exactly how a metric ships
+// without ever being scraped.
+describe("spend budget e2e: configured-ceiling count is scrapeable and follows reloads", () => {
+  let app: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+
+  const CALLER = "sk-sb-gauge-caller";
+  const CALLER_HASH = createHash("sha256").update(CALLER).digest("hex");
+
+  // `spendPolicies` spend-capped policies plus one policy that caps only
+  // requests — the request-capped one must NOT be counted, or the series
+  // degenerates into "how many rate-limit policies exist".
+  function resources(upstreamBase: string, spendPolicies: number): string {
+    const budgets = Array.from({ length: spendPolicies }, (_, i) => `
+  - name: sb-gauge-budget-${i}
+    scope: api_key
+    scope_ref: sb-gauge-caller
+    window: day
+    max_spend_micro_usd: ${1_000_000 * (i + 1)}`).join("");
+    return `
+_format_version: "1"
+provider_keys:
+  - display_name: sb-gauge-pk
+    provider: openai
+    api_key: sk-mock
+    api_base: ${upstreamBase}/v1
+models:
+  - display_name: sb-gauge-model
+    provider: openai
+    model_name: gpt-4o-mini
+    provider_key: sb-gauge-pk
+api_keys:
+  - display_name: sb-gauge-caller
+    key_hash: ${CALLER_HASH}
+    allowed_models: ["*"]
+rate_limit_policies:
+  - name: sb-gauge-requests-only
+    scope: api_key
+    scope_ref: sb-gauge-caller
+    window: day
+    max_requests: 100000${budgets}
+`;
+  }
+
+  async function configuredCeilings(): Promise<number | undefined> {
+    const samples = await scrapeMetrics(app!.metricsUrl);
+    return samples.find((s) => s.name === "aisix_budget_policies_configured")?.value;
+  }
+
+  beforeAll(async () => {
+    upstream = await startOpenAiUpstream();
+    app = await spawnApp({ resourcesFile: resources(upstream.baseUrl, 2) });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+  });
+
+  test("the count is exposed, excludes request-only policies, and drops to zero when the last ceiling is removed", async () => {
+    if (!app || !upstream || !app.resourcesPath) throw new Error("setup failed");
+
+    expect(await configuredCeilings()).toBe(2);
+
+    // Removing the last spend ceiling must be visible. Zero has to be
+    // reported as zero — an absent series reads as "no traffic yet", which
+    // is the state this metric exists to distinguish from.
+    await writeFile(app.resourcesPath, resources(upstream.baseUrl, 0), "utf8");
+    app.signal("SIGHUP");
+    await waitConfigPropagation(async () => (await configuredCeilings()) === 0);
+    expect(await configuredCeilings()).toBe(0);
+
+    // And it comes back up on the next reload — a one-way gauge would
+    // still pass the assertion above.
+    await writeFile(app.resourcesPath, resources(upstream.baseUrl, 3), "utf8");
+    app.signal("SIGHUP");
+    await waitConfigPropagation(async () => (await configuredCeilings()) === 3);
+    expect(await configuredCeilings()).toBe(3);
   }, 30_000);
 });
