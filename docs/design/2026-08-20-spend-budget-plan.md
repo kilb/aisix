@@ -437,7 +437,8 @@ git commit -m "feat(proxy): 花费的窗口投影与独立桶命名空间
 
 **Files:**
 - Modify: `crates/aisix-proxy/src/quota.rs`（`reserve_layers` 约 360 行、`match_policy_layer` 约 136 行）
-- Modify: `crates/aisix-proxy/src/chat.rs`（`commit_tokens` 调用点）
+- Modify: `crates/aisix-proxy/src/chat.rs`、`messages.rs`、`responses.rs`、
+  `completions.rs`（全部 `commit_tokens` 调用点——见下方"覆盖四个文件"）
 - Test: `crates/aisix-proxy/src/quota.rs` 的 `mod tests`
 
 **Interfaces:**
@@ -497,14 +498,25 @@ Expected: FAIL，断言 "缺花费层"
                         .limiter
                         .pre_commit_with_unit(&key, &spend_limits, CounterUnit::MicroUsd)
                         .await
-                        .map_err(|e| policy_rate_limit_error(policy, e))?,
+                        // 用 reserve_layers 里既有的错误构造形状（quota.rs:478 的
+                        // `ProxyError::PolicyRateLimit { .. }`），不要另造 helper。
+                        // Task 7 会把花费层的这个错误换成 BudgetExceeded。
+                        .map_err(|e| policy_layer_error(policy, e))?,
                 );
             }
         }
 ```
 
-在 `chat.rs` 的非流式提交点，把 `commit_tokens(total)` 换成带花费的形式。
-花费用请求已算出的 `cost_usd`（`usage_attr::request_cost_usd` 的返回值）换算：
+**接线必须覆盖全部四个 handler 文件**，不是只有 chat。实测提交点分布：
+`chat.rs` 13 处、`messages.rs` 2 处、`responses.rs` 2 处、`completions.rs` 6 处
+（`grep -c "commit_tokens(" crates/aisix-proxy/src/<f>.rs`）。
+
+只接 chat 会让 `/v1/messages` 与 `/v1/responses` 的花费完全不计，
+且不产生任何报错——正是仓库反复点名的 handler 家族静默漂移。Task 8 的
+e2e 会驱动这三条，漏接必然失败。
+
+每个提交点的改法相同：把 `commit_tokens(total)` 换成带花费的形式，
+花费取该请求已算出的 `cost_usd`（`usage_attr::request_cost_usd` 的返回值）：
 
 ```rust
     // USD → micro-USD。四舍五入而非截断：单次调用常在 1e-4 美元量级，
@@ -512,6 +524,10 @@ Expected: FAIL，断言 "缺花费层"
     let spend_micro_usd = (cost_usd * 1_000_000.0).round().max(0.0) as u64;
     reservation.commit(total_tokens, spend_micro_usd).await;
 ```
+
+拿不到 `cost_usd` 的提交点（例如缓存命中、错误路径）保持调用
+`commit_tokens(n)` 不变——它等价于 `commit(n, 0)`，语义正确：
+没有上游调用就没有花费。
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -635,7 +651,14 @@ fn warn_unpriced_model_once(policy_name: &str, model: &str) {
 ```rust
             // 未定价模型对花费计数器贡献 0，所以这个上限对它无效。
             // 放行，但不静默——拒绝会把一个配置疏漏变成流量中断。
-            if dispatched_model_has_no_cost {
+            // 取已解析的模型行判断是否定价——不是请求里的模型名：
+            // 通配符路径下两者不同，取错会让告警漏报或误报。
+            let unpriced = snapshot
+                .models
+                .get_by_id(model_id)
+                .map(|e| e.value.cost.is_none())
+                .unwrap_or(true);
+            if unpriced {
                 // 标签必须用已解析的行名：通配符路径下调用方能自造模型名，
                 // 直接打标签会让这个 series 基数无上限。
                 let label = crate::usage_attr::metric_model_label(snapshot, model_name);
