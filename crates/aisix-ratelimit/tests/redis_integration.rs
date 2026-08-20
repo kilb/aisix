@@ -554,3 +554,67 @@ async fn env_namespace_isolates_model_alias_bucket() {
         .await
         .expect_err("same env shares the counter");
 }
+
+/// Counts what the store reports, so a test can assert on the shed signal
+/// without a Prometheus registry.
+#[derive(Default)]
+struct CountingSink {
+    shed: std::sync::atomic::AtomicU64,
+    calls: std::sync::atomic::AtomicU64,
+}
+
+impl aisix_core::RateLimitMetricsSink for CountingSink {
+    fn record_redis_failure(&self, _op: &str) {}
+
+    fn record_post_stream_shed(&self, dropped: u64) {
+        self.shed
+            .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Shedding a post-stream update means a caller's tokens — and, since spend
+/// ceilings became a local mechanism, their money — never reach the shared
+/// counters, so they can spend past a `max_spend_micro_usd` ceiling by the
+/// dropped amount.
+///
+/// The store logs that once per process. A sustained shed therefore looks
+/// identical to one that recovered a second later, which is the state an
+/// operator most needs to tell apart. Every occurrence must be counted.
+#[tokio::test]
+async fn every_shed_post_stream_update_is_counted_not_just_the_first() {
+    let Some(url) = redis_url() else {
+        eprintln!("RATELIMIT_TEST_REDIS_URL unset — skipping");
+        return;
+    };
+    let sink = Arc::new(CountingSink::default());
+    let store = store(&url).await.with_metrics(sink.clone());
+
+    // Fill the hand-off queue past its depth. Each key is one offer, so a
+    // batch far larger than the queue guarantees the tail is shed whatever
+    // the worker manages to drain concurrently.
+    let keys: Vec<String> = (0..20_000)
+        .map(|i| unique_key(&format!("shed:{i}")))
+        .collect();
+    store.add_tokens_all(&keys, 7);
+
+    let shed = sink.shed.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        shed > 0,
+        "queue depth was never exceeded — test drove too little work"
+    );
+
+    // Drive a second batch: the log latch has already fired, so this is the
+    // window where a warn-once-only signal goes silent.
+    let before = shed;
+    let more: Vec<String> = (0..20_000)
+        .map(|i| unique_key(&format!("shed2:{i}")))
+        .collect();
+    store.add_tokens_all(&more, 7);
+    assert!(
+        sink.shed.load(std::sync::atomic::Ordering::Relaxed) > before,
+        "shedding stopped being reported after the first batch — a sustained \
+         shed must stay visible, that is the whole point of the counter",
+    );
+}

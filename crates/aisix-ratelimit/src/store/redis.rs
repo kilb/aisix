@@ -341,19 +341,29 @@ impl RedisStore {
         format!("{}:{{{}}}", self.prefix, key)
     }
 
-    /// Log the fail-open transition once per outage.
     /// Report shed post-stream updates. Deliberately not an error on the
     /// request path: billing is decoupled, so a wedged Redis costs accuracy
-    /// on this replica's shared counters, never request latency. Logged once
-    /// per outage so it cannot be mistaken for silence.
+    /// on this replica's shared counters, never request latency.
+    ///
+    /// The log fires once per PROCESS, not once per outage — `shed_logged` is
+    /// never reset — so it marks that shedding started and says nothing about
+    /// whether it is still going. The counter is the signal to alert on.
     fn note_shed_post_stream(&self, dropped: usize) {
+        // 计数每次都记，日志只打第一次。持续丢弃恰恰是「outage 开始时那一
+        // 条日志」最没用的场景：它说不出现在还在丢。而且这个队列自花费上限
+        // 本地化之后同时载着 token 和钱——丢一笔就是有人花的钱没记进预算。
+        if let Some(metrics) = &self.metrics {
+            metrics.record_post_stream_shed(dropped as u64);
+        }
         if !self.shed_logged.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 target: "aisix::ratelimit",
                 dropped,
                 queue_depth = POST_STREAM_QUEUE_DEPTH,
-                "post-stream token accounting queue full; shedding updates rather than \
-                 delaying requests (shared token counters undercount until it drains)"
+                "post-stream accounting queue full; shedding updates rather than delaying \
+                 requests. Shared token AND spend counters undercount until it drains, so \
+                 a spend ceiling can be overrun by the shed amount. This logs once — watch \
+                 aisix_ratelimit_post_stream_shed_total for whether it is still happening."
             );
         }
     }

@@ -883,6 +883,11 @@ pub trait RateLimitMetricsSink: Send + Sync + 'static {
     /// One failed Redis operation. `op` is the store call that degraded
     /// (`acquire`, `commit`, `peek`, …) — never the key or its contents.
     fn record_redis_failure(&self, op: &str);
+
+    /// `dropped` post-stream counter updates were shed because the store's
+    /// hand-off queue was full. These updates carry token counts and spend,
+    /// so shedding makes the shared counters undercount both.
+    fn record_post_stream_shed(&self, dropped: u64);
 }
 
 /// Content policy evaluated before or after upstream calls.

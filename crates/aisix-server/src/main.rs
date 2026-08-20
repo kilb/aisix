@@ -720,6 +720,42 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         &histogram_buckets,
     ));
 
+    // 花费预算的可见性。控制平面下发的 `/dp/budget_check` 已在本次发布
+    // 中删除，改由 RateLimitPolicy 上的 `max_spend_micro_usd` 本地执行。
+    // 托管模式下升级上来的部署，如果没人写过这个字段，花费就是完全不设
+    // 上限的 —— 而且这种状态在指标上和「还没有流量」一模一样，只看拒绝
+    // 计数分辨不出来。
+    //
+    // 两者都挂在 `subscribe` 上，而不是在这里对快照采样一次：托管模式
+    // 强制走 etcd（`resources_file` 与之互斥），而 etcd 分支是先
+    // `restore_from_cache()` 再把 watch 任务 spawn 出去的，所以执行到这一
+    // 行时快照可能还是空的。在这里采样会让每个冷启动的托管部署都收到一条
+    // 必然误报的「没配预算」告警，而误报是训练运维忽略告警最快的办法。
+    //
+    // 闩锁只在**载入到内容之后**的第一个快照上判定：空快照代表"还什么都
+    // 不知道"，不是"确认没有预算"。gauge 则每次发布都跟着走，删掉最后一条
+    // 预算策略后会归零。
+    {
+        let metrics = metrics.clone();
+        let managed = heartbeat_cfg.is_some();
+        let warned = std::sync::atomic::AtomicBool::new(false);
+        snapshot_handle.subscribe(move |view| {
+            let configured = count_spend_policies(&view.snapshot);
+            metrics.set_budget_policies_configured(configured);
+            if spend_is_uncapped(managed, configured, view.snapshot.total_entries())
+                && !warned.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                tracing::warn!(
+                    "managed mode is enabled but no RateLimitPolicy carries \
+                     `max_spend_micro_usd`: control-plane budget enforcement \
+                     was removed in this release and no local spend ceiling is \
+                     configured — spend is UNCAPPED. Set `max_spend_micro_usd` \
+                     on a RateLimitPolicy to restore a ceiling.",
+                );
+            }
+        });
+    }
+
     // Rate-limit backend (#798). Default `memory` keeps per-process
     // counters; `redis` shares them across every replica so a cluster
     // enforces one global window instead of one-per-replica. The
@@ -1919,8 +1955,49 @@ async fn wait_for_signal(
     let _ = cancel_tx.send(true);
 }
 
+/// 快照里配了花费上限的 RateLimitPolicy 条数。
+fn count_spend_policies(snapshot: &AisixSnapshot) -> usize {
+    snapshot
+        .rate_limit_policies
+        .entries()
+        .iter()
+        .filter(|entry| entry.value.max_spend_micro_usd.is_some())
+        .count()
+}
+
+/// 该不该就「花费完全不设上限」发告警。
+///
+/// `total_entries` 是空快照的判据，不是凑数的条件：托管模式强制走 etcd，
+/// 而 etcd 分支先 `restore_from_cache()` 再把 watch 任务 spawn 出去，
+/// 所以第一个快照可能什么都还没载入。空快照代表「还不知道」，不是
+/// 「确认没配」—— 拿它发告警会让每个冷启动的托管部署都收到一条必然误报，
+/// 而误报是训练运维忽略告警最快的办法。
+const fn spend_is_uncapped(managed: bool, configured: usize, total_entries: usize) -> bool {
+    managed && configured == 0 && total_entries > 0
+}
+
 #[cfg(test)]
 mod tests {
+    /// 托管模式冷启动时快照还是空的（etcd 分支先 restore_from_cache 再
+    /// spawn watch）。拿空快照判定会让每个新托管部署都收到一条必然误报的
+    /// 「没配预算」告警 —— 实机启动时抓到过这个 bug，这里是它的回归保护。
+    #[test]
+    fn empty_snapshot_never_warns_about_uncapped_spend() {
+        assert!(
+            !super::spend_is_uncapped(true, 0, 0),
+            "空快照是「还不知道」，不是「确认没配」",
+        );
+        assert!(
+            super::spend_is_uncapped(true, 0, 7),
+            "载入到内容、且一条花费上限都没有 —— 这时才该告警",
+        );
+        assert!(!super::spend_is_uncapped(true, 1, 7), "配了上限就不该告警",);
+        assert!(
+            !super::spend_is_uncapped(false, 0, 7),
+            "非托管模式本来就没有控制平面预算可丢，不该告警",
+        );
+    }
+
     use super::*;
     use clap::Parser;
 
