@@ -3550,12 +3550,12 @@ data: [DONE]\n\n"
     // since the gate is centralised in `crate::quota::enforce`. If
     // any individual handler ever stops calling it, that handler's
     // own tests would still catch the breakage on the rate-limit path
-    // (a missing gate surfaces as a 200 where a 429 was expected). As
-    // of the spend-budget-plan's Task 6, that 429 is
-    // `ProxyError::PolicyRateLimit`/`RateLimit` — no production path
-    // constructs `BudgetExceeded` today, since the control-plane budget
-    // gate that used to produce it was removed; Task 7 restores that
-    // classification for a spend-layer rejection.
+    // (a missing gate surfaces as a 200 where a 429 was expected). That
+    // 429 is `ProxyError::PolicyRateLimit`/`RateLimit` for a
+    // token/request-layer breach, or `ProxyError::BudgetExceeded` for a
+    // spend-layer breach (`quota::reject_spend`) — see
+    // `quota::tests::a_spend_ceiling_breach_reports_as_budget_not_rate_limit`
+    // for that distinction.
 
     #[tokio::test]
     async fn rate_limit_rpm_applies_to_embeddings_endpoint_issue_107() {

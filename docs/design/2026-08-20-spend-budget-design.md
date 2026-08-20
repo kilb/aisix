@@ -149,10 +149,11 @@ spend:{scope}:{scope_ref}:{policy_entry_id}     ← 新增，计 micro-USD
 
 | 字段 | 来源 |
 | --- | --- |
-| `scope` / `scope_ref` | 策略桶键，已有 |
-| `limit_usd` / `spent_usd` | 窗口检查结果，micro-USD 换算回 USD 字符串 |
-| `period` / `period_resets_at` | `PolicyWindow` 与窗口滚动时刻 |
-| `retry_after_seconds` | `WindowCheck::Full` 已返回的 retry 秒数 |
+| `scope` / `scope_ref` | 策略的 `scope` / `scope_ref`，已有 |
+| `limit_usd` | `max_spend_micro_usd`，micro-USD 换算回 USD 字符串 |
+| `spent_usd` / `period_resets_at` | 留空——`Limiter::peek` 只读 rpm/tpm 这两个分钟窗口计数器，从不读 tph/tpd；对 hour/day 窗口的花费策略调它，回读到的会是"当前这一分钟"的花费，冒充整个周期的花费，一个权威外观、算错窗口的数字比留白更糟。要修 `peek` 本身去认窗口是 store 层改动，本设计的核心约束（store 层不改）不允许 |
+| `period` | `PolicyWindow` |
+| `retry_after_seconds` | `RateLimitError::retry_after_secs()` 已返回的秒数 |
 
 超限返回 **429 Too Many Requests**，错误分类 `billing_error`——
 与现有 `ProxyError::BudgetExceeded` 完全一致（`error.rs:360`、`error.rs:396`），

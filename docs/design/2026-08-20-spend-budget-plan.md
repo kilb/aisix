@@ -927,8 +927,12 @@ git commit -m "test(e2e): 花费预算在三个 endpoint 家族上的端到端�
 
 **已知偏差（有意为之，记录在此）**：
 
-- `spent_usd` 在错误信封里留空。窗口计数器不提供"当前已用"的回读接口，
-  为它加一个回读 API 会侵入 store 层——而本计划的核心约束是 store 不改。
+- `spent_usd` 在错误信封里留空。不是因为没有回读接口——`Limiter::peek`
+  （`store/local.rs:263-287`，`RateLimitStatus`见 `limiter.rs:40-47`）确实
+  存在，但它只读 rpm/tpm 这两个分钟窗口计数器，从不读 tph/tpd。对一条
+  hour/day 窗口的花费策略调它，回读到的会是"当前这一分钟"的花费，冒充
+  整个周期的花费——一个看起来权威、实际算错窗口的数字比留白更糟。要修
+  `peek` 本身去认窗口，是 store 层的改动，本计划的核心约束是 store 不改。
   上限 + 重试时间对客户端处置已足够。若将来需要，那是独立的一次改动。
 - 计划文件放在 `docs/design/` 而非技能默认的 `docs/superpowers/plans/`，
   与本项目的 spec 位置保持一致。

@@ -1398,8 +1398,9 @@ async fn dispatch(
     // semantic routing, cache keys, and upstream dispatch see only masked text.
 
     // 预算不再由这里的控制平面 HTTP 调用单独判定：`quota::enforce_rate_limit`
-    // （下面 dispatch 前调用）已经预留了策略的花费层，超限时按限流层的形状
-    // 拒绝。花费层专属的 `BudgetExceeded` 由后续任务从本地策略状态回填。
+    // （下面 dispatch 前调用）已经预留了策略的花费层，超限时报
+    // `ProxyError::BudgetExceeded`（`quota::reject_spend`），与 token/请求层
+    // 的 `PolicyRateLimit` 区分开。
 
     // Resolve the attempt-list of underlying Model entries. A semantic
     // router embeds the request and scores it against route examples to

@@ -551,12 +551,16 @@ async fn reserve_policy_layers(
         }
         if let Some(spend) = layer.spend {
             // 与 token 层同策略同窗口，独立桶与单位；任一超限即拒。
-            // 错误暂时沿用策略限流的形状——Task 7 会换成预算错误。
+            // 花费层超限要报成 `BudgetExceeded`（billing_error），不是
+            // token/请求层那种 `PolicyRateLimit`（rate_limit_exceeded）——
+            // 两者同为 429，但客户端据此区分"钱用完了"和"请求太快了"，
+            // 处置完全不同。只有这里（花费层）走这条路径；token 层的
+            // `reject` 调用点不变。
             let r = state
                 .limiter
                 .pre_commit_with_unit(&spend.bucket_key, &spend.limits, CounterUnit::MicroUsd)
                 .await
-                .map_err(|e| reject(state, e, "policy", Some((&entry.id, &policy.name))))?;
+                .map_err(|e| reject_spend(state, e, &entry.id, policy))?;
             reservations.push(r);
 
             // 未定价模型对花费计数器贡献 0，所以这个上限对它无效。
@@ -618,6 +622,51 @@ fn reject(
     }
 }
 
+/// 花费层专属的拒绝路径，和 [`reject`] 分开：花费桶超限要报成
+/// `ProxyError::BudgetExceeded`（`billing_error`），不是通用的
+/// `ProxyError::PolicyRateLimit`（`rate_limit_exceeded`）——两者同为
+/// 429，但客户端据此区分"钱用完了"和"请求太快了"，这是两种不同的处置。
+///
+/// 指标的 `layer` 标签同样要和 token 层分开（`policy_spend`，固定字符串，
+/// 不掺调用方数据），否则花费拒绝会计入 token 限流的层位，两者在
+/// `aisix_ratelimit_rejections_total` 上无法区分。
+///
+/// 花费层只在经典形态的策略行上构造（见 [`match_conditional_layer`] 里
+/// `spend: None` 的注释），走到这里时 `policy.scope`/`policy.scope_ref`
+/// 一定是 `Some`（[`match_policy_layer`] 已经检查过一次）。
+fn reject_spend(
+    state: &ProxyState,
+    err: aisix_ratelimit::RateLimitError,
+    policy_id: &str,
+    policy: &RateLimitPolicy,
+) -> ProxyError {
+    state.metrics.record_ratelimit_rejection(
+        &err.scope().to_string(),
+        "policy_spend",
+        Some(policy_id),
+    );
+    let retry_after_seconds = err.retry_after_secs();
+    let usd = |micro: u64| format!("{:.6}", micro as f64 / 1_000_000.0);
+    ProxyError::BudgetExceeded(Box::new(crate::budget_reason::BudgetReason {
+        message: format!("spend ceiling reached for policy {}", policy.name),
+        scope: policy.scope.map(|s| s.as_str().to_string()),
+        scope_ref: policy.scope_ref.clone(),
+        limit_usd: Some(usd(policy.max_spend_micro_usd.unwrap_or_default())),
+        // 窗口计数器（`FixedWindowCounter`）只按桶存当前累加值，不区分
+        // "花费"与"token"这两种量纲的读回接口——`Limiter::peek`
+        // （store/local.rs:263-287）确实存在，但它只读 rpm/tpm 这两个
+        // 分钟窗口计数器，从不读 tph/tpd。对一条 hour/day 窗口的花费策略
+        // 调它，回读到的会是"当前这一分钟"的花费，冒充整个周期的花费
+        // ——一个看起来权威、实际算错窗口的数字比留白更糟。要修 `peek`
+        // 本身去认窗口，是 store 层的改动，本任务的约束不允许。
+        // 上限 + 重试时间已足够客户端处置。
+        spent_usd: None,
+        period: policy.window.map(|w| w.as_str().to_string()),
+        period_resets_at: None,
+        retry_after_seconds,
+    }))
+}
+
 /// Apply multi-layer rate-limit checks for one request (this includes the
 /// spend/budget layer projected from a policy's `max_spend_micro_usd`, see
 /// `PolicyLayer::spend` above). `model_rl` carries the resolved model
@@ -626,8 +675,9 @@ fn reject(
 ///
 /// 预算不再由这里单独判定：过去这里会先问一次控制平面（HTTP `check_budget`）
 /// 再走限流，现在预算就是策略里的一层花费桶，和其余限流层一起在
-/// `reserve_layers` 里预留/提交。花费桶超限时的错误形状（`ProxyError::
-/// BudgetExceeded`）由后续任务从本地策略状态回填。
+/// `reserve_layers` 里预留/提交。花费桶超限时报 `ProxyError::
+/// BudgetExceeded`（见 [`reject_spend`]），与 token/请求层的
+/// `PolicyRateLimit` 区分开。
 pub(crate) async fn enforce(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
@@ -650,19 +700,19 @@ pub(crate) async fn enforce_mcp(
     reserve_layers(state, snapshot, auth, None, Some(mcp_server)).await
 }
 
-/// Rate-limit-only enforcement. Historically distinct from [`enforce`]
-/// because chat dispatch ran its own inline control-plane budget check
-/// before calling this; that inline check is gone (budgets are no longer
-/// decided by an HTTP call), so this is now equivalent to [`enforce`] for
-/// a request that resolves a model. Kept separate to avoid touching every
-/// call site in `chat.rs` for a rename with no behavior change.
+/// Alias for [`enforce`], kept so `chat.rs`'s call site doesn't need a
+/// rename. Historically distinct because chat dispatch ran its own inline
+/// control-plane budget check before calling this; that inline check is
+/// gone (budgets are no longer decided by an HTTP call), so the bodies were
+/// byte-identical duplicates — consolidated here into one delegation
+/// instead of two copies that could drift.
 pub(crate) async fn enforce_rate_limit(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     model_rl: Option<&ModelRateLimit>,
 ) -> Result<MultiReservation, ProxyError> {
-    reserve_layers(state, snapshot, auth, model_rl, None).await
+    enforce(state, snapshot, auth, model_rl).await
 }
 
 /// Reserve ONLY the model-scoped layers for one model, identified by its
@@ -1395,10 +1445,83 @@ mod tests {
         let err = reserve_layers(&state, &snap, &auth, None, None)
             .await
             .expect_err("花费已超上限，应被拒");
-        // Task 7 会把这里换成 BudgetExceeded；当下沿用策略限流的形状。
+        assert!(
+            matches!(err, ProxyError::BudgetExceeded(_)),
+            "应为 BudgetExceeded，实际 {err:?}"
+        );
+    }
+
+    /// 对照组：token 层（同一策略资源，只是没设花费上限）超限时必须
+    /// 仍然是 `PolicyRateLimit`，不能被这次改动误伤——只有花费层的
+    /// 预留失败才改口成 `BudgetExceeded`。
+    #[tokio::test]
+    async fn a_token_layer_breach_still_reports_policy_rate_limit_not_budget() {
+        let snap = snapshot_with_policy(make_spend_policy(
+            "api_key",
+            "k1",
+            "day",
+            Some(1), // token 上限，第二次必超
+            None,    // 不设花费上限——这条策略的花费层不存在
+        ));
+        let state = test_state(&snap);
+        let auth = test_auth_key("k1");
+
+        reserve_layers(&state, &snap, &auth, None, None)
+            .await
+            .expect("首次应放行")
+            .commit(10_000, 0)
+            .await;
+
+        let err = reserve_layers(&state, &snap, &auth, None, None)
+            .await
+            .expect_err("token 已超上限，应被拒");
         assert!(
             matches!(err, ProxyError::PolicyRateLimit { .. }),
-            "应带策略归属，实际 {err:?}"
+            "token/请求层超限应仍为 PolicyRateLimit，实际 {err:?}"
+        );
+        assert_eq!(err.status().as_u16(), 429);
+        assert_eq!(err.kind(), "rate_limit_exceeded");
+    }
+
+    /// 花费超限要报成预算错误，不是通用限流错误——两者状态码相同（429），
+    /// 但错误分类与 `error.budget.*` 字段不同，客户端据此区分"钱用完了"
+    /// 和"请求太快了"，这是两种完全不同的处置。
+    #[tokio::test]
+    async fn a_spend_ceiling_breach_reports_as_budget_not_rate_limit() {
+        let snap = snapshot_with_policy(make_spend_policy(
+            "api_key",
+            "k1",
+            "day",
+            None,    // token 侧不设限，只验花费维度
+            Some(1), // 1 micro-USD，第二次必超
+        ));
+        let state = test_state(&snap);
+        let auth = test_auth_key("k1");
+
+        reserve_layers(&state, &snap, &auth, None, None)
+            .await
+            .expect("首次应放行")
+            .commit(0, 10_000)
+            .await;
+
+        let err = reserve_layers(&state, &snap, &auth, None, None)
+            .await
+            .expect_err("超限应被拒");
+        assert!(
+            matches!(err, ProxyError::BudgetExceeded(_)),
+            "应为 BudgetExceeded，实际 {err:?}"
+        );
+        assert_eq!(err.status().as_u16(), 429);
+        assert_eq!(err.kind(), "billing_error");
+
+        // 指标的 layer 标签也要能把花费拒绝和 token/请求层拒绝分开，
+        // 否则 `aisix_ratelimit_rejections_total` 上两种拒绝会混成一个
+        // series，运维没法单独观察预算命中率。标签是固定字符串
+        // （"policy_spend"），不掺调用方数据。
+        let rendered = state.metrics.render();
+        assert!(
+            rendered.contains("layer=\"policy_spend\""),
+            "花费层拒绝应打独立的 layer 标签: {rendered}"
         );
     }
 
