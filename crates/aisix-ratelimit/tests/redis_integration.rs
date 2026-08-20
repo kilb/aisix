@@ -3,8 +3,22 @@
 //! Runs only when `RATELIMIT_TEST_REDIS_URL` is set (CI spins
 //! `redis:7-alpine` as a service; absence is a no-op so local unit runs
 //! stay hermetic). Two `RedisStore` instances stand in for two DP
-//! replicas pointed at one Redis — the exact api7/#798 shape:
-//! a limit hit on one replica must already be hit on the other.
+//! replicas pointed at one Redis: a limit hit on one replica must be hit
+//! on the other.
+//!
+//! Admission-time counters (requests, concurrency) are shared
+//! synchronously — the acquire round-trips to Redis, so the second replica
+//! sees the first one's increment before it answers. Post-hoc counters
+//! (tokens, spend) are not: their totals are only known once the upstream
+//! has replied, and the update is handed to a worker rather than awaited,
+//! so a wedged Redis cannot add latency to the stream that just finished.
+//! For those, the shared counter is reached promptly, not instantly, and
+//! the tests wait for it with an asserted bound.
+//!
+//! Getting that distinction wrong is not hypothetical: the post-stream
+//! hand-off became a queue while a test still asserted the synchronous
+//! shape, and because these tests are gated behind an environment variable
+//! that a local run leaves unset, the failure went unseen.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -203,12 +217,31 @@ async fn token_usage_at_exact_limit_blocks_the_next_replica() {
     ));
 }
 
+/// A limit reached on one replica must be reached on every other — that is
+/// the whole point of pointing them at one Redis.
+///
+/// It arrives asynchronously. `add_tokens_post_stream` hands the update to
+/// a worker and returns without waiting, so that a wedged Redis cannot add
+/// latency to the stream that just finished; the guarantee is that the
+/// other replica sees it, not that it sees it on the next instruction. This
+/// test asserted the synchronous shape, and went on asserting it after the
+/// hand-off became a queue — it was gated behind an unset environment
+/// variable, so nobody saw it fail.
+///
+/// Waiting for it here is not a weakened assertion: the original claim (the
+/// second replica refuses) still has to hold, and the bound is asserted
+/// too, so the delay cannot quietly grow into something that matters.
+/// Measured on a local Redis: 179µs min, 495µs median, 2.4ms max over 20
+/// runs — the bound below is orders of magnitude above that, because a
+/// flaky test is worse than a loose one.
 #[tokio::test]
-async fn post_stream_token_usage_is_ordered_before_the_next_replica_acquire() {
+async fn post_stream_token_usage_reaches_the_next_replica_promptly() {
     let Some(url) = redis_url() else {
         eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
         return;
     };
+    const BOUND: Duration = Duration::from_millis(250);
+
     let a = Limiter::with_store(Arc::new(store(&url).await));
     let b = Limiter::with_store(Arc::new(store(&url).await));
     let key = unique_key("tpm-stream-exact");
@@ -217,12 +250,25 @@ async fn post_stream_token_usage_is_ordered_before_the_next_replica_acquire() {
         ..rl()
     };
 
+    let started = std::time::Instant::now();
     a.add_tokens_post_stream(&key, 1_000);
 
-    assert!(matches!(
-        b.pre_commit(&key, &limits).await,
-        Err(aisix_ratelimit::RateLimitError::Tokens { .. }),
-    ));
+    loop {
+        if matches!(
+            b.pre_commit(&key, &limits).await,
+            Err(aisix_ratelimit::RateLimitError::Tokens { .. }),
+        ) {
+            break;
+        }
+        assert!(
+            started.elapsed() < BOUND,
+            "the second replica still admits requests {:?} after the first \
+             recorded a full window's tokens — the shared counter is not \
+             being shared",
+            started.elapsed(),
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 }
 
 #[tokio::test]
