@@ -424,6 +424,12 @@
       "minimum": 1.0,
       "type": "integer"
     },
+    "max_spend_micro_usd": {
+      "description": "Spend ceiling for this window, in micro-USD (1 USD = 1,000,000).\n\nSpend is computed from the dispatched model's configured price, so a model with no price contributes nothing to this counter — the policy then admits every request regardless of the ceiling. The gateway counts those requests on `aisix_budget_unpriced_requests_total` and logs them rather than failing them.\n\nNot honoured on a `second` window: spend, like tokens, is only known after the upstream answers, so a one-second ceiling would lag by about its own width. Configuring one is reported rather than silently ignored.",
+      "format": "uint64",
+      "minimum": 1.0,
+      "type": "integer"
+    },
     "max_tokens": {
       "format": "uint64",
       "minimum": 1.0,

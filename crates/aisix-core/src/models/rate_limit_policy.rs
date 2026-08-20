@@ -253,6 +253,21 @@ pub struct RateLimitPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub max_tokens: Option<u64>,
+    /// Spend ceiling for this window, in micro-USD (1 USD = 1,000,000).
+    ///
+    /// Spend is computed from the dispatched model's configured price, so a
+    /// model with no price contributes nothing to this counter — the policy
+    /// then admits every request regardless of the ceiling. The gateway
+    /// counts those requests on `aisix_budget_unpriced_requests_total` and
+    /// logs them rather than failing them.
+    ///
+    /// Not honoured on a `second` window: spend, like tokens, is only known
+    /// after the upstream answers, so a one-second ceiling would lag by about
+    /// its own width. Configuring one is reported rather than silently
+    /// ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub max_spend_micro_usd: Option<u64>,
     // —— conditional form (#892) ——
     /// Condition node tree the request must satisfy (implicit AND
     /// across the top level; `[]`/absent = every request in the env).
@@ -500,6 +515,28 @@ mod tests {
     #[test]
     fn resource_trait_returns_correct_kind() {
         assert_eq!(RateLimitPolicy::kind(), "rate_limit_policies");
+    }
+
+    /// 新字段可省略：既有策略文档必须原样加载，升级不改变任何人的配置含义。
+    #[test]
+    fn max_spend_is_optional_and_absent_by_default() {
+        let json = r#"{"name":"p","scope":"api_key","window":"day","max_requests":10}"#;
+        let p: RateLimitPolicy = serde_json::from_str(json).expect("既有文档仍可加载");
+        assert_eq!(p.max_spend_micro_usd, None);
+        // 未设置时不出现在序列化结果里，避免给存量文档凭空加字段。
+        let back = serde_json::to_string(&p).unwrap();
+        assert!(
+            !back.contains("max_spend_micro_usd"),
+            "未设置不应序列化: {back}"
+        );
+    }
+
+    /// 单位是 micro-USD 的整数：5 美元 = 5_000_000。
+    #[test]
+    fn max_spend_round_trips_as_micro_usd_integer() {
+        let json = r#"{"name":"p","scope":"api_key","window":"day","max_spend_micro_usd":5000000}"#;
+        let p: RateLimitPolicy = serde_json::from_str(json).expect("解析");
+        assert_eq!(p.max_spend_micro_usd, Some(5_000_000));
     }
 
     // --- dual form (#892) ----------------------------------
