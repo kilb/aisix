@@ -287,6 +287,18 @@ impl<C: Clock> RateStore for LocalStore<C> {
 }
 
 #[cfg(test)]
+impl<C: Clock> LocalStore<C> {
+    /// 读回某个桶已提交的 tpd 计数，仅供测试断言。
+    pub fn committed_tokens(&self, key: &str) -> u64 {
+        let now = self.clock.unix_secs();
+        self.states
+            .get(key)
+            .map(|s| s.lock().tpd.current(now))
+            .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::clock::TestClock;
