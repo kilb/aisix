@@ -191,6 +191,8 @@ async fn api_resources(State(st): State<AppState>, headers: HeaderMap) -> Respon
         ("provider_keys", "/admin/v1/provider_keys"),
         ("guardrails", "/admin/v1/guardrails"),
         ("cache_policies", "/admin/v1/cache_policies"),
+        // 注意：限流策略没有对应的管理 API 读端点，所以这里读不到它。
+        // 策略走 /api/file 从 resources.yaml 直接读——那才是文件模式下的真相来源。
     ] {
         match admin_get(&st, path).await {
             Ok(v) => {
@@ -353,8 +355,17 @@ async fn save_resources(st: &AppState, doc: &Value) -> Result<String, String> {
 
 #[derive(Deserialize)]
 struct WriteReq {
-    /// 完整的资源文档（前端改完整体提交）。
-    doc: Value,
+    /// 完整的资源文档（表单页整体提交）。
+    #[serde(default)]
+    doc: Option<Value>,
+    /// 原始 YAML 文本（配置原文页直接提交）。
+    ///
+    /// 两条入口最终走同一条「校验 → 原子替换 → SIGHUP」路径：没有专用界面的
+    /// 资源类型靠这条编辑，而它得到的安全保证与表单完全相同——校验不通过
+    /// 就不落盘。给原文一条独立入口而不是让前端先解析成 JSON，是因为那样
+    /// 会把 YAML 的解析语义分叉成两份实现。
+    #[serde(default)]
+    raw: Option<String>,
 }
 
 async fn api_file_put(
@@ -365,7 +376,28 @@ async fn api_file_put(
     if let Err(r) = require_auth(&st, &headers).await {
         return r;
     }
-    match save_resources(&st, &req.doc).await {
+    // 原文优先：两个字段都给时以原文为准，因为那是用户实际看到并编辑的东西。
+    let doc = match (&req.raw, &req.doc) {
+        (Some(text), _) => match serde_yaml_ng::from_str::<Value>(text) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("YAML 解析失败：{e}")})),
+                )
+                    .into_response()
+            }
+        },
+        (None, Some(d)) => d.clone(),
+        (None, None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "请求里既没有 doc 也没有 raw"})),
+            )
+                .into_response()
+        }
+    };
+    match save_resources(&st, &doc).await {
         Ok(detail) => Json(json!({"ok": true, "detail": detail})).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
     }

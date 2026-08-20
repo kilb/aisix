@@ -168,6 +168,8 @@ pre{font-family:var(--mono);font-size:11.5px;background:var(--raise);border:1px 
     <button role="tab" data-tab="providers" aria-selected="false">供应商</button>
     <button role="tab" data-tab="models" aria-selected="false">模型与定价</button>
     <button role="tab" data-tab="keys" aria-selected="false">调用方密钥</button>
+    <button role="tab" data-tab="limits" aria-selected="false">限流与预算</button>
+    <button role="tab" data-tab="resources" aria-selected="false">全部资源</button>
     <button role="tab" data-tab="logs" aria-selected="false">调用日志</button>
     <button role="tab" data-tab="raw" aria-selected="false">配置原文</button>
   </nav>
@@ -177,6 +179,8 @@ pre{font-family:var(--mono);font-size:11.5px;background:var(--raise);border:1px 
   <section id="tab-providers" hidden></section>
   <section id="tab-models" hidden></section>
   <section id="tab-keys" hidden></section>
+  <section id="tab-limits" hidden></section>
+  <section id="tab-resources" hidden></section>
   <section id="tab-logs" hidden></section>
   <section id="tab-raw" hidden></section>
 </div>
@@ -253,7 +257,7 @@ try { const t = localStorage.getItem("aisix-theme");
   if (t) document.documentElement.setAttribute("data-theme", t); } catch(_){}
 
 // ── 标签页 ──────────────────────────────────────────────────
-const TABS = ["overview","usage","providers","models","keys","logs","raw"];
+const TABS = ["overview","usage","providers","models","keys","limits","resources","logs","raw"];
 document.querySelectorAll("nav.tabs button").forEach(b => {
   b.addEventListener("click", () => {
     document.querySelectorAll("nav.tabs button")
@@ -297,6 +301,8 @@ function render(tab){
   if (tab === "providers") return renderProviders();
   if (tab === "models")    return renderModels();
   if (tab === "keys")      return renderKeys();
+  if (tab === "limits")    return renderLimits();
+  if (tab === "resources") return renderResources();
   if (tab === "logs")      return renderLogs();
   if (tab === "raw")       return renderRaw();
 }
@@ -765,102 +771,319 @@ function renderKeys(){
       <h2>调用方密钥</h2>
       <p class="hint">配置里只存 sha256。明文在生成时显示一次，之后无法找回。</p>
       <div class="scroll"><table><thead><tr>
-        <th>名称</th><th>可用模型</th><th>限流</th><th>散列</th><th></th>
-      </tr></thead><tbody>${ks.length ? ks.map((k,i) => `
-        <tr><td><strong>${esc(k.display_name||"（未命名）")}</strong></td>
+        <th>名称</th><th>可用模型</th><th>限速</th><th>花费上限</th><th>散列</th><th></th>
+      </tr></thead><tbody>${ks.length ? ks.map((k,i) => {
+        const sp = spendPolicyFor(k.display_name);
+        return `<tr><td><strong>${esc(k.display_name||"（未命名）")}</strong></td>
           <td>${esc((k.allowed_models||["*"]).join(", "))}</td>
           <td class="num" style="font-size:12px">${esc(fmtRl(k.rate_limit))}</td>
+          <td class="num" style="font-size:12px">${sp
+            ? "$" + (sp.max_spend_micro_usd/1e6).toFixed(2) + " / " + esc(sp.window||"day")
+            : '<span style="color:var(--muted)">不限</span>'}</td>
           <td class="num" style="font-size:11px;color:var(--muted)">${esc((k.key_hash||"").slice(0,16))}…</td>
-          <td class="r"><button class="ghost" onclick="delItem('api_keys',${i})">删除</button></td>
-        </tr>`).join("") : `<tr><td colspan="5" style="color:var(--muted)">还没有调用方密钥。</td></tr>`}
+          <td class="r"><button class="ghost" onclick="delKey(${i})">删除</button></td>
+        </tr>`;
+      }).join("") : `<tr><td colspan="6" style="color:var(--muted)">还没有调用方密钥。</td></tr>`}
       </tbody></table></div>
     </div>
+
     <div class="panel">
       <h2>生成新密钥</h2>
       <div class="grid g2">
         <label class="f"><span>名称</span><input type="text" id="kName" placeholder="my-app"></label>
         <label class="f"><span>可用模型（逗号分隔，* 为全部）</span>
           <input type="text" id="kModels" value="*"></label>
+      </div>
+
+      <h3 style="font-size:13px;margin:18px 0 10px">限速</h3>
+      <p class="hint">按请求数与 token 数限速，超限返回 429 <code>rate_limit_exceeded</code>。</p>
+      <div class="grid g2">
         <label class="f"><span>每分钟请求上限（留空不限）</span>
           <input type="number" id="kRpm" min="1" placeholder="60"></label>
         <label class="f"><span>每分钟 token 上限（留空不限）</span>
           <input type="number" id="kTpm" min="1" placeholder="100000"></label>
       </div>
 
-      <h3 style="font-size:13px;margin:18px 0 10px">日额度</h3>
+      <h3 style="font-size:13px;margin:18px 0 10px">花费上限</h3>
+      <p class="hint">按金额的硬上限，网关本地执行。超限返回 429
+        <code>billing_error</code>——和限速的 429 是<strong>不同的分类</strong>，
+        客户端据此区分「钱用完了」和「发得太快了」。</p>
       <div class="grid g2">
-        <label class="f"><span>每日 token 上限（留空不限）</span>
-          <input type="number" id="kTpd" min="1" placeholder="2000000"></label>
-        <label class="f"><span>或按金额估算：每日上限 USD</span>
-          <input type="number" id="kBudget" step="0.01" min="0" placeholder="5.00" oninput="budgetToTpd()"></label>
-        <label class="f"><span>按哪个模型的价换算</span>
-          <select id="kBudgetModel" onchange="budgetToTpd()">
-            ${(DOC.models||[]).filter(m => m.cost).map(m =>
-              `<option value="${esc(m.display_name)}">${esc(m.display_name)}</option>`).join("")
-              || '<option value="">（没有已定价的模型）</option>'}
+        <label class="f"><span>花费上限 USD（留空不限）</span>
+          <input type="number" id="kSpend" step="0.01" min="0" placeholder="5.00"></label>
+        <label class="f"><span>结算窗口</span>
+          <select id="kSpendWindow">
+            <option value="day">每日（UTC 零点归零）</option>
+            <option value="hour">每小时</option>
+            <option value="minute">每分钟</option>
           </select></label>
       </div>
-      <div class="note warn" id="budgetNote">
-        <strong>这是按 token 的近似额度，不是金额闸。</strong>
-        网关能强制执行的是 token 数，不是金额 —— 按金额的硬预算由控制平面下发，
-        独立部署下没有这个数据源。换算取所选模型的输入/输出均价；一个 key 若能用
-        多个不同价位的模型，实际花费会偏离这个估算。真正的花费以「用量」页为准。
-      </div>
+      <div class="note">花费按模型定价算出，所以<strong>未定价的模型对上限没有贡献</strong>——
+        它的请求会被放行并计入未定价指标。给模型填上价格，这个上限才对它生效。</div>
 
       <button class="act" onclick="mintKey()">生成并重载网关</button>
       <div id="kMsg"></div>
+    </div>
+
+    <div class="panel">
+      <h2>花费上限策略</h2>
+      <p class="hint">上面每设一个花费上限就会生成一条策略资源。这里按原样列出全部策略，
+        包括不是从本页创建的（例如按 team 作用域的）。</p>
+      <div class="scroll"><table><thead><tr>
+        <th>名称</th><th>作用域</th><th>对象</th><th>窗口</th><th class="r">上限</th><th></th>
+      </tr></thead><tbody>${(DOC.rate_limit_policies||[]).length
+        ? (DOC.rate_limit_policies||[]).map((p,i) => `
+        <tr><td><strong>${esc(p.name)}</strong></td>
+          <td>${esc(p.scope||"—")}</td>
+          <td class="num" style="font-size:12px">${esc(p.scope_ref||"—")}</td>
+          <td>${esc(p.window||"—")}</td>
+          <td class="r num">${p.max_spend_micro_usd != null
+            ? "$" + (p.max_spend_micro_usd/1e6).toFixed(2)
+            : '<span style="color:var(--muted)">非花费策略</span>'}</td>
+          <td class="r"><button class="ghost" onclick="delItem('rate_limit_policies',${i})">删除</button></td>
+        </tr>`).join("")
+        : `<tr><td colspan="6" style="color:var(--muted)">还没有策略。</td></tr>`}
+      </tbody></table></div>
     </div>`;
 }
-/// 金额 → tpd。网关的闸是 token 数，所以这里必须换算，且只能是估算：
-/// 取该模型输入价与输出价的均值，因为请求的输入/输出配比事先不知道。
-function budgetToTpd(){
-  const usd = parseFloat($("#kBudget")?.value);
-  const name = $("#kBudgetModel")?.value;
-  const m = (DOC.models||[]).find(x => x.display_name === name);
-  if (isNaN(usd) || usd <= 0 || !m || !m.cost) return;
-  const avgPer1k = (Number(m.cost.input_per_1k) + Number(m.cost.output_per_1k)) / 2;
-  if (!(avgPer1k > 0)) return;
-  const tpd = Math.floor(usd / avgPer1k * 1000);
-  const f = $("#kTpd"); if (f) f.value = tpd;
-  $("#budgetNote").innerHTML = `按 <strong>${esc(name)}</strong> 的输入/输出均价
-    $${avgPer1k.toFixed(6)}/1k 换算，$${usd} ≈ <strong>${tpd.toLocaleString()}</strong> token/天，
-    已填入上方。<br><strong>这是按 token 的近似额度，不是金额闸。</strong>
-    网关能强制执行的是 token 数；按金额的硬预算由控制平面下发，独立部署下没有该数据源。
-    一个 key 若能用多个不同价位的模型，实际花费会偏离这个估算。`;
+
+/// 找出挂在某个 key 上的花费策略。文件模式下 scope_ref 存的是 key 的
+/// display_name 而不是 UUID——上游 desugar 会把名字解析成派生 id。
+function spendPolicyFor(keyName){
+  return (DOC.rate_limit_policies||[]).find(p =>
+    p.scope === "api_key" && p.scope_ref === keyName && p.max_spend_micro_usd != null);
 }
 
 const fmtRl = rl => !rl ? "不限" :
   Object.entries(rl).filter(([,v]) => v != null).map(([k,v]) => `${k}=${v}`).join(" ") || "不限";
 
+/// 删 key 必须连同引用它的策略一起删：scope_ref 指向不存在的 key 会让整份
+/// 配置校验失败，网关从此再也重载不了——留下孤儿策略比留下密钥更危险。
+async function delKey(i){
+  const k = (DOC.api_keys||[])[i]; if (!k) return;
+  const orphans = (DOC.rate_limit_policies||[])
+    .filter(p => p.scope === "api_key" && p.scope_ref === k.display_name);
+  const extra = orphans.length
+    ? `\n\n同时会删除引用它的 ${orphans.length} 条策略——留着会让配置校验失败。` : "";
+  if (!confirm(`确认删除密钥「${k.display_name}」？会立即重写配置并重载网关。${extra}`)) return;
+  DOC.api_keys.splice(i,1);
+  if (orphans.length) DOC.rate_limit_policies = (DOC.rate_limit_policies||[])
+    .filter(p => !(p.scope === "api_key" && p.scope_ref === k.display_name));
+  await saveDoc(null, "keys");
+}
+
 async function mintKey(){
   const name = $("#kName").value.trim();
   if (!name) return msg("#kMsg","名称不能为空","crit");
+  if ((DOC.api_keys||[]).some(k => k.display_name === name))
+    return msg("#kMsg",`已存在同名密钥「${name}」`,"crit");
+
   const r = await api("/api/mint-key", {method:"POST"});
   const {plaintext, key_hash} = await r.json();
   const item = {display_name:name, key_hash,
     allowed_models: $("#kModels").value.split(",").map(s=>s.trim()).filter(Boolean)};
   const rpm = parseInt($("#kRpm").value), tpm = parseInt($("#kTpm").value);
-  const tpd = parseInt($("#kTpd").value);
-  const rl = {}; if (rpm>0) rl.rpm = rpm; if (tpm>0) rl.tpm = tpm; if (tpd>0) rl.tpd = tpd;
+  const rl = {}; if (rpm>0) rl.rpm = rpm; if (tpm>0) rl.tpm = tpm;
   if (Object.keys(rl).length) item.rate_limit = rl;
   DOC.api_keys = DOC.api_keys || []; DOC.api_keys.push(item);
+
+  // 花费上限是独立的策略资源，不是 key 上的内联字段——
+  // 网关按 scope/scope_ref 把它绑到这个 key 上。
+  const usd = parseFloat($("#kSpend").value);
+  if (!isNaN(usd) && usd > 0) {
+    DOC.rate_limit_policies = DOC.rate_limit_policies || [];
+    DOC.rate_limit_policies.push({
+      name: `${name}-spend`, scope: "api_key", scope_ref: name,
+      window: $("#kSpendWindow").value,
+      // 界面用美元，落盘用 micro-USD 整数：计数器上不能出现浮点。
+      max_spend_micro_usd: Math.round(usd * 1e6),
+    });
+  }
+
   const ok = await saveDoc("#kMsg", null);
   if (ok) $("#kMsg").innerHTML = `<div class="note"><strong>密钥已生成——明文只显示这一次：</strong>
     <pre style="margin-top:8px">${esc(plaintext)}</pre></div>` + $("#kMsg").innerHTML;
   else renderKeys();
 }
 
-// ── 配置原文 ────────────────────────────────────────────────
+// ── 限流与预算（完整的策略资源，花费只是其中一个维度）──────────
+function renderLimits(){
+  const el = $("#tab-limits");
+  const ps = DOC.rate_limit_policies || [];
+  const keys = (DOC.api_keys||[]).map(k => k.display_name).filter(Boolean);
+  const models = (DOC.models||[]).map(m => m.display_name).filter(Boolean);
+  el.innerHTML = `
+    <div class="panel">
+      <h2>限流与预算策略</h2>
+      <p class="hint">一条策略把若干上限绑到一个作用域上。三个维度互相独立、同时生效：
+        请求数、token 数、花费金额——任一超限即拒。</p>
+      <div class="scroll"><table><thead><tr>
+        <th>名称</th><th>作用域</th><th>对象</th><th>窗口</th>
+        <th class="r">请求上限</th><th class="r">Token 上限</th><th class="r">花费上限</th><th></th>
+      </tr></thead><tbody>${ps.length ? ps.map((p,i) => `
+        <tr><td><strong>${esc(p.name)}</strong></td>
+          <td>${esc(p.scope||"—")}</td>
+          <td class="num" style="font-size:12px">${esc(p.scope_ref||"—")}</td>
+          <td>${esc(p.window||"—")}</td>
+          <td class="r num">${p.max_requests ?? unset()}</td>
+          <td class="r num">${p.max_tokens ?? unset()}</td>
+          <td class="r num">${p.max_spend_micro_usd != null
+            ? "$" + (p.max_spend_micro_usd/1e6).toFixed(2) : unset()}</td>
+          <td class="r"><button class="ghost" onclick="delItem('rate_limit_policies',${i})">删除</button></td>
+        </tr>`).join("") : `<tr><td colspan="8" style="color:var(--muted)">还没有策略。</td></tr>`}
+      </tbody></table></div>
+      <div class="note">窗口是 epoch 对齐的固定窗口：<code>day</code> 在 UTC 零点归零，
+        <code>hour</code> 在整点，<code>minute</code> 在整分。
+        <code>second</code> 窗口下 token 与花费上限<strong>不生效</strong>——
+        它们都要等上游答复才知道数值，一秒窗口内几乎必然滞后，网关会在日志里报出来而不是假装生效。</div>
+    </div>
+
+    <div class="panel">
+      <h2>新增策略</h2>
+      <div class="grid g2">
+        <label class="f"><span>名称</span><input type="text" id="pmName" placeholder="team-daily"></label>
+        <label class="f"><span>作用域</span>
+          <select id="pmScope" onchange="limitScopeChanged()">
+            <option value="api_key">api_key —— 绑到某个调用方密钥</option>
+            <option value="model">model —— 绑到某个模型</option>
+            <option value="team">team —— 绑到某个团队</option>
+            <option value="member">member —— 绑到某个用户</option>
+            <option value="team_member">team_member —— 团队内的每个成员各自一份</option>
+          </select></label>
+        <label class="f"><span>对象</span>
+          <span id="pmRefWrap"><select id="pmRef">${
+            keys.map(k => `<option value="${esc(k)}">${esc(k)}</option>`).join("")
+          }</select></span></label>
+        <label class="f"><span>窗口</span>
+          <select id="pmWindow">
+            <option value="day">day（UTC 零点归零）</option>
+            <option value="hour">hour</option>
+            <option value="minute">minute</option>
+            <option value="second">second（token/花费上限在此窗口下不生效）</option>
+          </select></label>
+      </div>
+      <h3 style="font-size:13px;margin:18px 0 10px">上限（至少填一项）</h3>
+      <div class="grid g3">
+        <label class="f"><span>请求数上限</span><input type="number" id="pmReq" min="1" placeholder="留空不限"></label>
+        <label class="f"><span>Token 上限</span><input type="number" id="pmTok" min="1" placeholder="留空不限"></label>
+        <label class="f"><span>花费上限 USD</span><input type="number" id="pmSpend" step="0.01" min="0" placeholder="留空不限"></label>
+      </div>
+      <button class="act" onclick="addLimitPolicy()">保存并重载网关</button>
+      <div id="pmMsg"></div>
+    </div>`;
+  window.__limitRefs = {keys, models};
+}
+const unset = () => '<span style="color:var(--muted)">—</span>';
+
+/// api_key / model 作用域能从配置里给出候选；team / member 是外部身份
+/// （来自密钥上的 team_id / user_id），配置里没有清单，只能手填。
+function limitScopeChanged(){
+  const scope = $("#pmScope").value;
+  const {keys, models} = window.__limitRefs || {keys:[], models:[]};
+  const list = scope === "api_key" ? keys : scope === "model" ? models : null;
+  $("#pmRefWrap").innerHTML = list
+    ? `<select id="pmRef">${list.map(x => `<option value="${esc(x)}">${esc(x)}</option>`).join("")}</select>`
+    : `<input type="text" id="pmRef" placeholder="${scope === "team" ? "团队 id" : "用户 id"}">`;
+}
+
+async function addLimitPolicy(){
+  const name = $("#pmName").value.trim();
+  if (!name) return msg("#pmMsg","名称不能为空","crit");
+  const req = parseInt($("#pmReq").value), tok = parseInt($("#pmTok").value);
+  const usd = parseFloat($("#pmSpend").value);
+  if (!(req>0) && !(tok>0) && !(usd>0))
+    return msg("#pmMsg","三个上限至少要填一个——不填任何上限的策略网关会拒绝加载","crit");
+  const item = {name, scope: $("#pmScope").value,
+    scope_ref: ($("#pmRef")||{}).value, window: $("#pmWindow").value};
+  if (req>0) item.max_requests = req;
+  if (tok>0) item.max_tokens = tok;
+  // 界面用美元，落盘用 micro-USD 整数：计数器上不能出现浮点。
+  if (usd>0) item.max_spend_micro_usd = Math.round(usd * 1e6);
+  DOC.rate_limit_policies = DOC.rate_limit_policies || [];
+  DOC.rate_limit_policies.push(item);
+  await saveDoc("#pmMsg", "limits");
+}
+
+// ── 全部资源（九种集合都可见，没有界面的也不隐身）────────────
+const RESOURCE_KINDS = [
+  ["provider_keys",           "供应商密钥",   "providers"],
+  ["models",                  "模型",         "models"],
+  ["api_keys",                "调用方密钥",   "keys"],
+  ["rate_limit_policies",     "限流与预算",   "limits"],
+  ["guardrails",              "护栏",         null],
+  ["cache_policies",          "缓存策略",     null],
+  ["mcp_servers",             "MCP 服务",     null],
+  ["a2a_agents",              "A2A 智能体",   null],
+  ["observability_exporters", "可观测导出器", null],
+];
+
+function renderResources(){
+  const el = $("#tab-resources");
+  el.innerHTML = `
+    <div class="panel">
+      <h2>全部资源</h2>
+      <p class="hint">配置文件支持的全部集合。没有专用界面的那几种可以在
+        「配置原文」页直接编辑——保存前会用网关自己的校验器过一遍，不通过就不落盘。</p>
+      <div class="scroll"><table><thead><tr>
+        <th>资源</th><th class="r">数量</th><th>条目</th><th>编辑方式</th>
+      </tr></thead><tbody>${RESOURCE_KINDS.map(([key,label,tab]) => {
+        const items = DOC[key] || [];
+        const names = items.map(x => x.display_name || x.name || "（未命名）");
+        return `<tr>
+          <td><strong>${esc(label)}</strong>
+            <div class="num" style="font-size:11px;color:var(--muted)">${esc(key)}</div></td>
+          <td class="r num">${items.length}</td>
+          <td style="font-size:12px">${names.length
+            ? esc(names.slice(0,6).join("、")) + (names.length>6 ? ` 等 ${names.length} 项` : "")
+            : '<span style="color:var(--muted)">无</span>'}</td>
+          <td>${tab
+            ? `<button class="ghost" onclick="gotoTab('${tab}')">专用界面</button>`
+            : `<button class="ghost" onclick="gotoTab('raw')">配置原文</button>`}</td>
+        </tr>`;
+      }).join("")}</tbody></table></div>
+    </div>`;
+}
+function gotoTab(t){
+  const b = document.querySelector(`nav.tabs button[data-tab="${t}"]`);
+  if (b) b.click();
+}
+
+// ── 配置原文（可编辑，保存前经网关校验）──────────────────────
 async function renderRaw(){
   const el = $("#tab-raw");
   const r = await api("/api/file"); const j = await r.json();
   el.innerHTML = `
     <div class="panel">
       <h2>resources.yaml</h2>
-      <p class="hint">网关当前加载的声明式配置。控制台保存时会整体重写这个文件，
-        因此手写的注释会在第一次保存后消失。</p>
-      <pre>${esc(j.raw || "")}</pre>
+      <p class="hint">网关当前加载的声明式配置，可直接编辑。保存时先用网关自带的
+        校验器过一遍——<strong>校验不通过就不落盘</strong>，线上配置不受影响。
+        这是没有专用界面的那几种资源的编辑入口。</p>
+      <textarea id="rawEdit" spellcheck="false" style="width:100%;min-height:440px;
+        font-family:var(--mono);font-size:12px;line-height:1.5;padding:12px;
+        border:1px solid var(--line);border-radius:var(--r);background:var(--raise);
+        color:var(--ink);resize:vertical">${esc(j.raw || "")}</textarea>
+      <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+        <button class="act" onclick="saveRaw()">校验并保存</button>
+        <button class="ghost" onclick="renderRaw()">放弃修改，重新载入</button>
+      </div>
+      <div class="note">控制台保存时整体重写这个文件，所以手写的注释会消失。
+        原始带注释的版本留在主机的 <code>/etc/aisix/resources.yaml.orig</code>。</div>
+      <div id="rawMsg"></div>
     </div>`;
+}
+
+/// 直接提交 YAML 文本。后端会解析成文档再走同一条
+/// 「校验 → 原子替换 → SIGHUP」路径，和表单保存完全一致。
+async function saveRaw(){
+  const text = $("#rawEdit").value;
+  msg("#rawMsg", "校验中…", "");
+  const r = await api("/api/file", {method:"PUT",
+    headers:{"content-type":"application/json"},
+    body: JSON.stringify({raw: text})});
+  const j = await r.json();
+  if (!r.ok) return msg("#rawMsg", j.error || "保存失败", "crit");
+  await loadResources();
+  msg("#rawMsg", "已保存，网关已重载。", "");
 }
 
 // ── 写入 ────────────────────────────────────────────────────
