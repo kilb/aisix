@@ -76,62 +76,119 @@
 /* 浅色是「白天开了灯的机房」，同一套结构、反过来的明度。 */
 @media (prefers-color-scheme:light){
   :root:not([data-theme="dark"]){
-    --ground:oklch(95.5% .006 195);
-    --panel:oklch(99% .003 195);
+    /* ── 白天的仪表盘 ─────────────────────────────────────────
+       浅色不是暗色的翻转：隐喻从「背光玻璃」变成「日光下的搪瓷面板」，
+       那是另一种物理对象。印刷仪表是**高对比**的 —— 深墨压在近白的珐琅
+       面上，配可见的细线；不是灰压灰。
+
+       三个具体差别：
+       - 底面要有实在的色调，面板才能从上面浮起来。近白压近白等于没有面板。
+       - 文字是油墨，不是灰。标签压到 46%、次要文字 58%，而不是 70% 那种
+         「存在但读不出」的灰。
+       - 强调色是搪瓷和印刷油墨：饱和、深，而不是发光。花费用印刷红棕。 */
+    --ground:oklch(89.5% .011 188);
+    --panel:oklch(99.4% .003 188);
     --panel-hi:oklch(100% 0 0);
-    --inset:oklch(93% .008 195);
-    --raise:oklch(99.5% .002 195);
-    --ink:oklch(23% .015 195);
-    --ink-2:oklch(40% .015 195);
-    --dim:oklch(53% .014 195);
-    --faint:oklch(70% .012 195);
-    --line:oklch(87% .008 195);
-    --hair:oklch(91% .006 195);
-    --accent:oklch(48% .11 200);
+    --inset:oklch(93.5% .011 188);
+    --raise:oklch(100% 0 0);
+
+    --ink:oklch(21% .022 205);
+    --ink-2:oklch(35% .02 200);
+    --dim:oklch(46% .017 198);
+    --faint:oklch(58% .015 195);
+    --line:oklch(78% .014 190);
+    --hair:oklch(85% .011 190);
+
+    --accent:oklch(44% .155 208);
     --accent-ink:oklch(100% 0 0);
-    --accent-dim:oklch(72% .07 200);
-    --glow:oklch(48% .11 200 / .1);
-    --live:oklch(52% .15 45);
-    --live-dim:oklch(75% .08 45);
-    --ok:oklch(48% .13 155);
-    --warn:oklch(55% .13 80);
-    --crit:oklch(50% .18 15);
-    --ok-soft:oklch(94% .03 155);
-    --warn-soft:oklch(95% .04 88);
-    --crit-soft:oklch(95% .035 15);
-    --track:oklch(89% .008 195);
-    --lift:0 1px 0 oklch(100% 0 0) inset, 0 1px 2px oklch(20% .02 195 / .07),
-           0 10px 28px -16px oklch(20% .02 195 / .16);
-    --sink:inset 0 1px 3px oklch(20% .02 195 / .09);
-    --s1:oklch(52% .13 198); --s2:oklch(52% .14 268); --s3:oklch(52% .15 328);
-    --s4:oklch(52% .14 38); --s5:oklch(50% .13 148);
+    --accent-dim:oklch(66% .1 208);
+    --glow:oklch(44% .155 208 / .13);
+
+    --live:oklch(46% .18 32);
+    --live-dim:oklch(70% .11 32);
+
+    --ok:oklch(44% .15 152);
+    --warn:oklch(50% .14 76);
+    --crit:oklch(46% .2 18);
+    --ok-soft:oklch(93% .04 152);
+    --warn-soft:oklch(94% .05 84);
+    --crit-soft:oklch(94% .04 18);
+    --track:oklch(86% .01 190);
+
+    /* 日光下的实物是清晰的边界 + 一道紧贴的投影，不是网页卡片那种弥散
+       柔影。 */
+    --lift:0 0 0 1px oklch(80% .012 190 / .6), 0 1px 1px oklch(30% .02 200 / .06),
+           0 6px 14px -8px oklch(30% .02 200 / .14);
+    /* 只靠 3% 的色差看不出内凹。给一道贴着上沿的内阴影和一圈细边 ——
+       日光下嵌进面板的表头就是这样：上缘暗、四周有加工痕。 */
+    --sink:inset 0 2px 4px -1px oklch(30% .025 200 / .16),
+           inset 0 0 0 1px oklch(78% .014 190 / .5);
+
+    --s1:oklch(44% .15 208); --s2:oklch(44% .16 275); --s3:oklch(46% .17 335);
+    --s4:oklch(48% .16 42); --s5:oklch(44% .14 152);
   }
+}:root[data-theme="light"]{
+  /* ── 白天的仪表盘 ─────────────────────────────────────────
+     浅色不是暗色的翻转：隐喻从「背光玻璃」变成「日光下的搪瓷面板」，
+     那是另一种物理对象。印刷仪表是**高对比**的 —— 深墨压在近白的珐琅
+     面上，配可见的细线；不是灰压灰。
+
+     三个具体差别：
+     - 底面要有实在的色调，面板才能从上面浮起来。近白压近白等于没有面板。
+     - 文字是油墨，不是灰。标签压到 46%、次要文字 58%，而不是 70% 那种
+       「存在但读不出」的灰。
+     - 强调色是搪瓷和印刷油墨：饱和、深，而不是发光。花费用印刷红棕。 */
+  --ground:oklch(89.5% .011 188);
+  --panel:oklch(99.4% .003 188);
+  --panel-hi:oklch(100% 0 0);
+  --inset:oklch(93.5% .011 188);
+  --raise:oklch(100% 0 0);
+
+  --ink:oklch(21% .022 205);
+  --ink-2:oklch(35% .02 200);
+  --dim:oklch(46% .017 198);
+  --faint:oklch(58% .015 195);
+  --line:oklch(78% .014 190);
+  --hair:oklch(85% .011 190);
+
+  --accent:oklch(44% .155 208);
+  --accent-ink:oklch(100% 0 0);
+  --accent-dim:oklch(66% .1 208);
+  --glow:oklch(44% .155 208 / .13);
+
+  --live:oklch(46% .18 32);
+  --live-dim:oklch(70% .11 32);
+
+  --ok:oklch(44% .15 152);
+  --warn:oklch(50% .14 76);
+  --crit:oklch(46% .2 18);
+  --ok-soft:oklch(93% .04 152);
+  --warn-soft:oklch(94% .05 84);
+  --crit-soft:oklch(94% .04 18);
+  --track:oklch(86% .01 190);
+
+  /* 日光下的实物是清晰的边界 + 一道紧贴的投影，不是网页卡片那种弥散
+     柔影。 */
+  --lift:0 0 0 1px oklch(80% .012 190 / .6), 0 1px 1px oklch(30% .02 200 / .06),
+         0 6px 14px -8px oklch(30% .02 200 / .14);
+  --sink:inset 0 2px 4px -1px oklch(30% .025 200 / .16),
+         inset 0 0 0 1px oklch(78% .014 190 / .5);
+
+  --s1:oklch(44% .15 208); --s2:oklch(44% .16 275); --s3:oklch(46% .17 335);
+  --s4:oklch(48% .16 42); --s5:oklch(44% .14 152);
 }
-:root[data-theme="light"]{
-  --ground:oklch(95.5% .006 195); --panel:oklch(99% .003 195); --panel-hi:oklch(100% 0 0);
-  --inset:oklch(93% .008 195); --raise:oklch(99.5% .002 195);
-  --ink:oklch(23% .015 195); --ink-2:oklch(40% .015 195);
-  --dim:oklch(53% .014 195); --faint:oklch(70% .012 195);
-  --line:oklch(87% .008 195); --hair:oklch(91% .006 195);
-  --accent:oklch(48% .11 200); --accent-ink:oklch(100% 0 0); --accent-dim:oklch(72% .07 200);
-  --glow:oklch(48% .11 200 / .1);
-  --live:oklch(52% .15 45); --live-dim:oklch(75% .08 45);
-  --ok:oklch(48% .13 155); --warn:oklch(55% .13 80); --crit:oklch(50% .18 15);
-  --ok-soft:oklch(94% .03 155); --warn-soft:oklch(95% .04 88); --crit-soft:oklch(95% .035 15);
-  --track:oklch(89% .008 195);
-  --lift:0 1px 0 oklch(100% 0 0) inset, 0 1px 2px oklch(20% .02 195 / .07),
-         0 10px 28px -16px oklch(20% .02 195 / .16);
-  --sink:inset 0 1px 3px oklch(20% .02 195 / .09);
-  --s1:oklch(52% .13 198); --s2:oklch(52% .14 268); --s3:oklch(52% .15 328);
-  --s4:oklch(52% .14 38); --s5:oklch(50% .13 148);
+@media (prefers-color-scheme:light){
+  :root:not([data-theme="dark"]) body{background-image:none}
 }
+:root[data-theme="light"] body{background-image:none}
 
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
 body{
   margin:0;
+  /* 暗色下顶上一道极弱的光，像天花板的灯 —— 让暗底不是一块死板。
+     白天没有这回事，所以浅色主题把它关掉，底面就是干净的漆面。 */
   background:
-    /* 顶上一道极弱的光，像天花板的灯。让暗底不是一块死板。 */
     radial-gradient(120% 62% at 50% -12%, var(--glow), transparent 62%),
     var(--ground);
   background-attachment:fixed;
@@ -262,6 +319,16 @@ nav.tabs button:focus-visible{outline:2px solid var(--accent);outline-offset:1px
 .read .val .sep{color:var(--faint);font-weight:300;padding:0 .1em}
 .read .val.absent{color:var(--faint);font-weight:300}
 .read.money .val{color:var(--live);text-shadow:0 0 24px color-mix(in oklch,var(--live) 22%,transparent)}
+/* 白天的读数是印上去的墨，要有重量；暗色里它是发光的细笔画，两者的字重
+   本来就不该一样。辉光在纸面上也没有物理依据，关掉。 */
+@media (prefers-color-scheme:light){
+  :root:not([data-theme="dark"]) .read .val{font-weight:500}
+  :root:not([data-theme="dark"]) .read .val .lead{font-weight:400}
+  :root:not([data-theme="dark"]) .read.money .val{text-shadow:none}
+}
+:root[data-theme="light"] .read .val{font-weight:500}
+:root[data-theme="light"] .read .val .lead{font-weight:400}
+:root[data-theme="light"] .read.money .val{text-shadow:none}
 .read.money .val .lead{color:var(--live-dim);text-shadow:none}
 .read .foot{font-size:11px;color:var(--faint);margin-top:auto;padding-top:12px}
 
