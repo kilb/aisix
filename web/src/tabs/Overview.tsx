@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import * as api from "../lib/api";
 import { fmtCompact, fmtUsd, listOf } from "../lib/fmt";
 import { Chart, type Series } from "../components/Chart";
+import { Reading } from "../components/Reading";
 import type { DocState } from "../lib/useDoc";
 import type { TabId } from "../App";
 
@@ -57,28 +58,14 @@ export function Overview({ doc }: { doc: DocState; onGoto: (t: TabId) => void })
         <h2>网关读数</h2>
         <p className="hint">累计值来自 Prometheus，自开始抓取起算。</p>
         <div className="grid g3">
-          <div className="read">
-            <div className="lab">请求总数</div>
-            <div className="val num">{totals.req}</div>
-            <div className="foot">经 LLM 端点</div>
-          </div>
-          <div className="read">
-            <div className="lab">Token 总量</div>
-            <div className="val num">{totals.tok}</div>
-            <div className="foot">输入 + 输出（含缓存）</div>
-          </div>
-          <div className="read">
-            <div className="lab">累计花费</div>
-            <div className="val num">{totals.spend}</div>
-            <div className="foot">按模型定价折算</div>
-          </div>
-          <div className="read">
-            <div className="lab">已配置</div>
-            <div className="val num">
-              {models.length} / {pks.length} / {keys.length}
-            </div>
-            <div className="foot">模型 / 供应商 / 调用方密钥</div>
-          </div>
+          <Reading label="请求总数" value={totals.req} foot="经 LLM 端点" />
+          <Reading label="Token 总量" value={totals.tok} foot="输入 + 输出（含缓存）" />
+          <Reading label="累计花费" value={totals.spend} foot="按模型定价折算" money />
+          <Reading
+            label="已配置"
+            value={`${models.length} / ${pks.length} / ${keys.length}`}
+            foot="模型 / 供应商 / 调用方密钥"
+          />
         </div>
       </div>
 

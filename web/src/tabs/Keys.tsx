@@ -236,7 +236,7 @@ export function Keys({ doc }: { doc: DocState }) {
           </label>
         </div>
 
-        <h3 style={{ fontSize: 13, margin: "18px 0 10px" }}>限速</h3>
+        <h3>限速</h3>
         <p className="hint">
           按请求数与 token 数限速，超限返回 429 <code>rate_limit_exceeded</code>。
         </p>
@@ -263,7 +263,7 @@ export function Keys({ doc }: { doc: DocState }) {
           </label>
         </div>
 
-        <h3 style={{ fontSize: 13, margin: "18px 0 10px" }}>花费上限</h3>
+        <h3>花费上限</h3>
         <p className="hint">
           按金额的上限，网关本地执行。超限返回 429 <code>billing_error</code>——和限速的
           429 是<strong>不同的分类</strong>，客户端据此区分「钱用完了」和「发得太快了」。

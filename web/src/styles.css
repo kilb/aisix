@@ -1,127 +1,347 @@
+/* ════════════════════════════════════════════════════════════════
+   仪表间。
+
+   两条贯穿全局的规则，都在编码真实信息而不是装饰：
+
+   1. 读数「内凹」，控件「凸起」。真实的仪表间里表头嵌进面板、开关立在
+      表面上。这里同理 —— 运维扫一眼就知道哪块只是在读、哪块会改动生产
+      配置，不用先读标题。
+   2. 数字按有效位分层。这个产品的花费以千分之一美分计，两位小数会把真实
+      花费显示成 $0.00 —— 那和「没花钱」在屏幕上无法区分。所以前导零退成
+      弱色，有效位保持墨色：精度是这里的主角，不是被四舍五入掉的累赘。
+   ════════════════════════════════════════════════════════════════ */
+
 :root{
-  --ground:#E8EAE6; --surface:#F4F5F2; --raise:#FBFCFA;
-  --ink:#161B19; --ink-2:#3D4642; --muted:#69736D; --line:#CFD5CE;
-  --accent:#0E5563; --accent-ink:#FFFFFF; --accent-soft:#D6E5E7;
-  --ok:#3F7D4E; --warn:#A8760F; --crit:#A81B4A;
-  --ok-soft:#DCE9DD; --warn-soft:#F2E6CB; --crit-soft:#F3D8E0;
-  --track:#D8DDD7;
-  --r:4px; --pad:20px;
-  --display:"Fraunces",Georgia,serif;
+  /* 涂装钢板的冷灰绿，仪表盘的深青，以及「正在花钱」的锈红。 */
+  --ground:#E4E7E4;      /* 面板底色 */
+  --panel:#F2F4F1;       /* 凸起的控件面 */
+  --raise:#FAFBF9;       /* 输入框、代码块 */
+  --inset:#D9DED9;       /* 内凹的仪表床 */
+  --ink:#101614;
+  --ink-2:#39433E;
+  --muted:#6B756F;
+  --faint:#9AA39D;       /* 前导零、次要刻度 */
+  --line:#C8CFC8;
+  --hair:#D5DBD4;        /* 刻度线，比 line 更轻 */
+  --accent:#0C4F5C;      /* 仪表指针 */
+  --accent-ink:#FFFFFF;
+  --accent-soft:#DCE8EA;
+  --live:#A3441B;        /* 花费 —— 唯一真的在扣钱的量 */
+  --ok:#2F6B41; --warn:#8F6410; --crit:#96173F;
+  --ok-soft:#DDE8DE; --warn-soft:#F1E7CE; --crit-soft:#F1D9E0;
+  --track:#CBD2CB;
+
+  --r:3px;               /* 仪器倒角很小，几乎是直角 */
+  --pad:22px;
+  --display:"Archivo",system-ui,sans-serif;
   --body:"IBM Plex Sans",system-ui,-apple-system,sans-serif;
   --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,monospace;
+  --wide:.14em;          /* 铭牌字距 */
 }
+
 @media (prefers-color-scheme:dark){
   :root:not([data-theme="light"]){
-    --ground:#131816; --surface:#1C2320; --raise:#232B27;
-    --ink:#E6E9E4; --ink-2:#BAC3BD; --muted:#8A948E; --line:#333D38;
-    --accent:#4FB3C4; --accent-ink:#0B1618; --accent-soft:#1D3A3F;
-    --ok:#69B478; --warn:#D9A63F; --crit:#E4708F;
-    --ok-soft:#1D2E22; --warn-soft:#332A16; --crit-soft:#331C25;
-    --track:#2A332E;
+    --ground:#0E1312; --panel:#171D1B; --raise:#1E2523; --inset:#0A0F0E;
+    --ink:#E8EBE6; --ink-2:#B7C0BA; --muted:#87918B; --faint:#5C665F;
+    --line:#2C3632; --hair:#232C29;
+    --accent:#54B8C8; --accent-ink:#07171A; --accent-soft:#16343A;
+    --live:#E08356;
+    --ok:#63B073; --warn:#D2A03E; --crit:#E06C8B;
+    --ok-soft:#152B1D; --warn-soft:#2E2714; --crit-soft:#2E1A22;
+    --track:#252E2A;
   }
 }
 :root[data-theme="dark"]{
-  --ground:#131816; --surface:#1C2320; --raise:#232B27;
-  --ink:#E6E9E4; --ink-2:#BAC3BD; --muted:#8A948E; --line:#333D38;
-  --accent:#4FB3C4; --accent-ink:#0B1618; --accent-soft:#1D3A3F;
-  --ok:#69B478; --warn:#D9A63F; --crit:#E4708F;
-  --ok-soft:#1D2E22; --warn-soft:#332A16; --crit-soft:#331C25;
-  --track:#2A332E;
+  --ground:#0E1312; --panel:#171D1B; --raise:#1E2523; --inset:#0A0F0E;
+  --ink:#E8EBE6; --ink-2:#B7C0BA; --muted:#87918B; --faint:#5C665F;
+  --line:#2C3632; --hair:#232C29;
+  --accent:#54B8C8; --accent-ink:#07171A; --accent-soft:#16343A;
+  --live:#E08356;
+  --ok:#63B073; --warn:#D2A03E; --crit:#E06C8B;
+  --ok-soft:#152B1D; --warn-soft:#2E2714; --crit-soft:#2E1A22;
+  --track:#252E2A;
 }
+
 *{box-sizing:border-box}
-body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--body);
-  font-size:14px;line-height:1.55;-webkit-font-smoothing:antialiased}
-h1,h2,h3{font-family:var(--display);font-weight:600;margin:0;text-wrap:balance}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0;background:var(--ground);color:var(--ink);
+  font-family:var(--body);font-size:14px;line-height:1.55;
+  font-feature-settings:"ss01";
+  /* 中文允许字间断行，但把「客户端」这类紧密结合的词从中间断开读起来是错的。
+     strict 收紧允许断行的位置，这是中文排版该有的默认。 */
+  line-break:strict;
+  -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+}
+h1,h2,h3{margin:0;font-family:var(--display);text-wrap:balance}
 button,input,select,textarea{font:inherit;color:inherit}
-a{color:var(--accent)}
-.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
-
-/* ── 外壳：仪表间的“铭牌 + 面板”骨架 ───────────────────────── */
-.shell{max-width:1180px;margin:0 auto;padding:0 24px 72px}
-header.plate{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
-  padding:26px 0 18px;border-bottom:2px solid var(--ink)}
-header.plate h1{font-size:22px;letter-spacing:-.01em}
-.plate .sub{font-family:var(--mono);font-size:11px;letter-spacing:.14em;
-  text-transform:uppercase;color:var(--muted)}
-.plate .spacer{flex:1}
-.pill{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);
-  font-size:11px;letter-spacing:.08em;text-transform:uppercase;
-  padding:3px 9px;border-radius:99px;border:1px solid var(--line);background:var(--surface)}
-.pill.ok{background:var(--ok-soft);border-color:transparent;color:var(--ok)}
-.pill.crit{background:var(--crit-soft);border-color:transparent;color:var(--crit)}
-.pill .dot{width:6px;height:6px;border-radius:50%;background:currentColor}
-
-nav.tabs{display:flex;gap:2px;margin:0 0 22px;border-bottom:1px solid var(--line);
-  overflow-x:auto}
-nav.tabs button{background:none;border:0;border-bottom:2px solid transparent;
-  padding:11px 14px;cursor:pointer;color:var(--muted);white-space:nowrap;
-  font-size:13px;font-weight:500}
-nav.tabs button[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--accent)}
-nav.tabs button:hover{color:var(--ink)}
-nav.tabs button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
-
-.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);
-  padding:var(--pad);margin-bottom:16px}
-.panel > h2{font-size:15px;margin-bottom:4px}
-.panel > .hint{color:var(--muted);font-size:12.5px;margin-bottom:16px}
-.grid{display:grid;gap:14px}
-.g3{grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}
-.g2{grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
-
-/* ── 读数：仪表盘上的大数字 ────────────────────────────────── */
-.read{background:var(--raise);border:1px solid var(--line);border-radius:var(--r);padding:16px}
-.read .lab{font-family:var(--mono);font-size:10.5px;letter-spacing:.13em;
-  text-transform:uppercase;color:var(--muted)}
-.read .val{font-family:var(--mono);font-variant-numeric:tabular-nums;
-  font-size:27px;font-weight:500;letter-spacing:-.02em;margin-top:5px;line-height:1.1}
-.read .foot{font-size:11.5px;color:var(--muted);margin-top:5px}
-
-table{width:100%;border-collapse:collapse;font-size:13px}
-th{text-align:left;font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;
-  text-transform:uppercase;color:var(--muted);font-weight:500;
-  padding:0 10px 8px;border-bottom:1px solid var(--line)}
-td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top}
-tr:last-child td{border-bottom:0}
-td.r,th.r{text-align:right}
-.scroll{overflow-x:auto}
-
-.bar{height:5px;background:var(--track);border-radius:2px;overflow:hidden;margin-top:5px}
-.bar > i{display:block;height:100%;background:var(--accent)}
-
-button.act{background:var(--accent);color:var(--accent-ink);border:0;
-  border-radius:var(--r);padding:8px 15px;cursor:pointer;font-weight:500;font-size:13px}
-button.act:hover{filter:brightness(1.1)}
-button.act:disabled{opacity:.5;cursor:default}
-button.ghost{background:none;border:1px solid var(--line);color:var(--ink-2);
-  border-radius:var(--r);padding:6px 12px;cursor:pointer;font-size:12.5px}
-button.ghost:hover{border-color:var(--accent);color:var(--accent)}
-button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-
-label.f{display:block;margin-bottom:12px}
-label.f > span{display:block;font-family:var(--mono);font-size:10.5px;
-  letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:5px}
-input[type=text],input[type=password],input[type=number],select{
-  width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:var(--r);
-  background:var(--raise)}
-input:focus,select:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:transparent}
-
-.note{border-left:3px solid var(--accent);background:var(--accent-soft);
-  padding:11px 14px;border-radius:0 var(--r) var(--r) 0;font-size:12.5px;margin:14px 0}
-.note.crit{border-color:var(--crit);background:var(--crit-soft)}
-.note.warn{border-color:var(--warn);background:var(--warn-soft)}
-.note code,code{font-family:var(--mono);font-size:12px}
-pre{font-family:var(--mono);font-size:11.5px;background:var(--raise);border:1px solid var(--line);
-  border-radius:var(--r);padding:12px;overflow-x:auto;margin:0}
-
-/* ── 登录闸 ───────────────────────────────────────────────── */
-#gate{min-height:100vh;display:grid;place-items:center;padding:24px}
-#gate .box{width:100%;max-width:355px}
-#gate .box h1{font-size:20px;margin-bottom:3px}
-#gate .box p{color:var(--muted);font-size:12.5px;margin:0 0 20px}
+a{color:var(--accent);text-underline-offset:2px}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums;font-feature-settings:"zero"}
 [hidden]{display:none !important}
 
-@media (max-width:640px){
-  .shell{padding:0 16px 56px}
-  .read .val{font-size:23px}
+/* ── 铭牌 ─────────────────────────────────────────────────────
+   顶部是设备铭牌，不是网页头部：宽体大写、重字距、一条实线收边。 */
+.shell{max-width:1200px;margin:0 auto;padding:0 28px 88px}
+
+header.plate{
+  display:flex;align-items:center;gap:18px;flex-wrap:wrap;
+  padding:30px 0 16px;border-bottom:1.5px solid var(--ink);
 }
-@media (prefers-reduced-motion:reduce){*{transition:none !important;animation:none !important}}
+header.plate h1{
+  font-size:15px;font-weight:700;font-stretch:118%;
+  letter-spacing:var(--wide);text-transform:uppercase;
+}
+.plate .sub{
+  font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--faint);
+  padding-left:18px;border-left:1px solid var(--line);
+}
+.plate .spacer{flex:1}
+
+/* 大写 + 字距是「标签」的语法，只用在人写的短标签上。
+   任何「值」都不许套 —— 路由、模型名、api_key_id 都是大小写敏感的标识符，
+   把 /v1/chat/completions 显示成 /V1/CHAT/COMPLETIONS 是在指向一条不存在
+   的路径。 */
+.pill{
+  display:inline-flex;align-items:center;gap:7px;
+  font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;
+  padding:4px 10px;border:1px solid var(--line);background:var(--panel);color:var(--muted);
+}
+.pill.value{text-transform:none;letter-spacing:0;font-size:11px;color:var(--ink-2)}
+.pill.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 35%,transparent)}
+.pill.crit{color:var(--crit);border-color:color-mix(in srgb,var(--crit) 40%,transparent)}
+.pill .dot{width:5px;height:5px;border-radius:50%;background:currentColor}
+.pill.ok .dot{box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 18%,transparent)}
+
+/* ── 导航轨 ───────────────────────────────────────────────────
+   当前项由一条厚指针标出，像刻度盘上的指示。 */
+nav.tabs{
+  display:flex;gap:0;margin:0 0 26px;overflow-x:auto;
+  border-bottom:1px solid var(--line);scrollbar-width:thin;
+}
+nav.tabs button{
+  position:relative;background:none;border:0;
+  padding:13px 15px 12px;cursor:pointer;white-space:nowrap;
+  font-size:12.5px;font-weight:500;color:var(--muted);
+  transition:color .12s ease;
+}
+nav.tabs button::after{
+  content:"";position:absolute;left:15px;right:15px;bottom:-1px;height:2px;
+  background:var(--accent);transform:scaleX(0);transform-origin:left;
+  transition:transform .16s cubic-bezier(.2,.7,.3,1);
+}
+nav.tabs button:hover{color:var(--ink-2)}
+nav.tabs button[aria-selected="true"]{color:var(--ink);font-weight:600}
+nav.tabs button[aria-selected="true"]::after{transform:scaleX(1)}
+nav.tabs button:focus-visible{outline:2px solid var(--accent);outline-offset:-3px}
+
+/* ── 控件面：凸起 ─────────────────────────────────────────────
+   会改动生产配置的区域。有细微的抬起阴影。 */
+.panel{
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--r);
+  padding:var(--pad);margin-bottom:18px;
+  box-shadow:0 1px 0 color-mix(in srgb,var(--ink) 5%,transparent);
+}
+/* 中文标题不套拉丁惯用法。
+   `text-transform:uppercase` 对中文无效，而 `letter-spacing` 加在中文上只会
+   显得松散 —— 那是拉丁小型大写的语法，不是中文的。这里改用字重与一条收边
+   规则立标题，重字距只留给真正是拉丁文的地方（铭牌、mono 标签、id）。 */
+.panel > h2{
+  font-size:13.5px;font-weight:700;font-stretch:105%;letter-spacing:0;
+  color:var(--ink);
+  padding-bottom:11px;margin-bottom:14px;border-bottom:1px solid var(--hair);
+}
+.panel > h2 code,.panel > h2 .lat{letter-spacing:.06em}
+/* 行宽约束不能只给直接子元素：嵌在小节里的 hint 一样是给人读的散文，
+   失去约束就会被折在短语中间。 */
+.hint{color:var(--muted);font-size:12.5px;max-width:74ch;text-wrap:pretty}
+.panel > .hint{margin:0 0 15px}
+.panel > h3 + .hint{margin:5px 0 13px}
+.panel > h3{
+  font-family:var(--body);font-size:12px;font-weight:600;letter-spacing:0;
+  color:var(--ink-2);margin:22px 0 0;
+  padding-top:16px;border-top:1px solid var(--hair);
+}
+.panel > h3:first-of-type{margin-top:4px}
+.grid{display:grid;gap:16px}
+/* 整排，不留孤儿。auto-fit 会在 1180px 宽下把四块排成 3+1，
+   而仪表盘上一块落单比格子窄一点难看得多。 */
+.g3{grid-template-columns:repeat(4,minmax(0,1fr))}
+@media (max-width:900px){.g3{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:480px){.g3{grid-template-columns:1fr}}
+.g2{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+
+/* ── 读数：内凹 ───────────────────────────────────────────────
+   只读的仪表，嵌进面板里。底部一排刻度 —— 它标的是这块表的量程性质
+   （计数器自开始抓取起累加，没有上限），不是进度。 */
+.read{
+  background:var(--inset);border:1px solid var(--line);border-radius:var(--r);
+  padding:15px 16px 13px;
+  box-shadow:inset 0 1px 2px color-mix(in srgb,var(--ink) 7%,transparent);
+}
+/* 中英混排的小标签（"TOKEN 总量"）。字距压到 .07em：拉丁部分仍读得出
+   铭牌感，而中文不至于松散。 */
+.read .lab{
+  font-family:var(--mono);font-size:10px;letter-spacing:.07em;
+  text-transform:uppercase;color:var(--muted);
+}
+.read .val{
+  font-family:var(--mono);font-variant-numeric:tabular-nums;
+  font-size:30px;font-weight:450;letter-spacing:-.035em;
+  margin-top:8px;line-height:1;color:var(--ink);
+}
+/* 精度数字：前导零退到弱色，有效位留在墨色。 */
+.read .val .lead{color:var(--faint);font-weight:400}
+.read .val .unit{font-size:.55em;color:var(--muted);margin-left:2px;letter-spacing:0}
+/* 复合读数（模型/供应商/密钥）的斜杠退成弱色，否则 `3 / 1 / 2` 会被读成
+   一个数。 */
+.read .val .sep{color:var(--faint);font-weight:400;padding:0 .12em}
+/* 读不到时的占位。它要和数字占同一个光学位置，否则那一格看着像空的。 */
+.read .val.absent{color:var(--faint);font-weight:400}
+.read.money .val{color:var(--live)}
+.read.money .val .lead{color:color-mix(in srgb,var(--live) 38%,var(--faint))}
+.read .foot{font-size:11px;color:var(--muted);margin-top:9px}
+/* 刻度尺曾经在这里。摘掉了：它长在进度条该在的位置，读者会先把它当成
+   一个走到头的进度条，然后才发现不是 —— 产生的是歧义不是信息。读数的
+   「内凹」本身已经把只读区域讲清楚了，不需要再加一层器械装饰。 */
+
+/* ── 表格：数据密排 ───────────────────────────────────────────── */
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{
+  text-align:left;font-family:var(--mono);font-size:9.5px;
+  letter-spacing:.11em;text-transform:uppercase;color:var(--faint);font-weight:500;
+  padding:0 11px 9px;border-bottom:1px solid var(--line);white-space:nowrap;
+}
+td{padding:11px;border-bottom:1px solid var(--hair);vertical-align:top}
+tbody tr:last-child td{border-bottom:0}
+tbody tr:hover td{background:color-mix(in srgb,var(--accent) 4%,transparent)}
+td.r,th.r{text-align:right}
+/* 空表头是「动作列」。不给它宽度约束的话它会分到等份，于是删除按钮被推到
+   表格最右，和它作用的那一行隔着一大片空白。 */
+th:empty{width:1%}
+td:last-child:has(button){width:1%;white-space:nowrap}
+td strong{font-weight:600}
+.scroll{overflow-x:auto;scrollbar-width:thin}
+
+.bar{height:3px;background:var(--track);overflow:hidden;margin-top:7px;max-width:180px}
+.bar > i{display:block;height:100%;background:var(--accent)}
+
+/* ── 曲线 ─────────────────────────────────────────────────────
+   面积填充让「多少」有体量感，端点圆点标出「现在」—— 一条时间序列上
+   最右端才是运维真正在问的那个数。 */
+.chart{margin-top:2px}
+.chart svg{display:block;width:100%;height:auto}
+.chart .axis{font-family:var(--mono);font-size:9px;fill:var(--faint);letter-spacing:.04em}
+.chart .grid-line{stroke:var(--hair);stroke-width:1}
+.chart .zero-line{stroke:var(--line);stroke-width:1}
+.chart .now{stroke:var(--panel);stroke-width:1.5}
+.legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:14px;
+  padding-top:12px;border-top:1px solid var(--hair)}
+.legend .item{display:inline-flex;align-items:center;gap:7px;
+  font-family:var(--mono);font-size:11px;color:var(--ink-2)}
+.legend .swatch{width:9px;height:2px;border-radius:1px}
+
+/* ── 控件 ─────────────────────────────────────────────────────── */
+button.act{
+  background:var(--accent);color:var(--accent-ink);border:0;border-radius:var(--r);
+  padding:9px 17px;cursor:pointer;font-weight:600;font-size:12.5px;
+  letter-spacing:.02em;transition:filter .12s ease,transform .06s ease;
+}
+button.act:hover:not(:disabled){filter:brightness(1.12)}
+button.act:active:not(:disabled){transform:translateY(1px)}
+button.act:disabled{opacity:.42;cursor:not-allowed}
+button.ghost{
+  background:var(--raise);border:1px solid var(--line);color:var(--ink-2);
+  border-radius:var(--r);padding:6px 13px;cursor:pointer;font-size:12px;
+  transition:border-color .12s ease,color .12s ease,background .12s ease;
+}
+button.ghost:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+
+/* 表格里的动作安静下来。每行一个描边方框，两行就是两个在抢注意力的框，
+   而删除不该比它删的那一行更显眼。悬停时才显形，并转成警示色 —— 那时
+   用户已经指着它了，此刻才需要说明后果。 */
+td button.ghost{
+  background:none;border-color:transparent;color:var(--muted);
+  padding:4px 8px;
+}
+tr:hover td button.ghost{border-color:var(--line);color:var(--ink-2)}
+td button.ghost:hover:not(:disabled){
+  border-color:color-mix(in srgb,var(--crit) 45%,transparent);
+  color:var(--crit);background:var(--raise);
+}
+button.ghost:disabled{opacity:.45;cursor:not-allowed}
+button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+label.f{display:block;margin-bottom:14px}
+label.f > span{
+  display:block;font-family:var(--mono);font-size:9.5px;
+  letter-spacing:.11em;text-transform:uppercase;color:var(--muted);margin-bottom:6px;
+}
+input[type=text],input[type=password],input[type=number],select,textarea{
+  width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:var(--r);
+  background:var(--raise);transition:border-color .12s ease;
+}
+/* 输入框也有「行宽」。撑满两栏栅格意味着一个装 `my-app` 的框有 540px 宽，
+   而人会先怀疑自己是不是该填一长串东西。44ch 对逗号分隔的模型清单也够，
+   真的更长时它自己会滚。 */
+input[type=text],input[type=password],select{max-width:44ch}
+textarea{max-width:none}
+/* 按内容的量级定宽，而不是一律撑满栅格。一个装 `60` 的框宽到 540px 时，
+   人会先怀疑自己是不是该填一长串东西。 */
+input[type=number]{
+  font-family:var(--mono);font-variant-numeric:tabular-nums;
+  max-width:190px;
+}
+/* 密钥、URL、模型清单这类长值仍然撑满 —— 它们真的会长。 */
+input:hover,select:hover{border-color:var(--muted)}
+input:focus,select:focus,textarea:focus{
+  outline:2px solid var(--accent);outline-offset:-1px;border-color:transparent;
+}
+input[type=checkbox]{accent-color:var(--accent);width:14px;height:14px}
+
+/* ── 提示：左侧色条 + 弱底色 ─────────────────────────────────── */
+.note{
+  border-left:2px solid var(--accent);background:var(--accent-soft);
+  padding:12px 15px;border-radius:0 var(--r) var(--r) 0;
+  font-size:12.5px;margin:16px 0;max-width:82ch;text-wrap:pretty;
+  /* 上游错误里常带一整条查询 URL，不断行会把面板撑破。 */
+  overflow-wrap:anywhere;
+}
+.note.crit{border-color:var(--crit);background:var(--crit-soft)}
+.note.warn{border-color:var(--warn);background:var(--warn-soft)}
+.note strong{font-weight:600}
+.note p{margin:8px 0 0}
+.note p:first-child{margin-top:0}
+.note .hint{color:var(--muted);font-size:11.5px}
+code,.note code{font-family:var(--mono);font-size:11.5px;
+  background:color-mix(in srgb,var(--ink) 6%,transparent);padding:1px 4px;border-radius:2px}
+pre{
+  font-family:var(--mono);font-size:11.5px;background:var(--raise);
+  border:1px solid var(--line);border-radius:var(--r);
+  padding:13px;overflow-x:auto;margin:0;
+  user-select:all;  /* 密钥明文：一次点选全中，减少漏抄 */
+}
+
+/* ── 登录闸 ───────────────────────────────────────────────────
+   未登录只看得到铭牌本身。 */
+#gate{min-height:100vh;display:grid;place-items:center;padding:24px}
+#gate .box{width:100%;max-width:352px;padding:28px}
+#gate .box h1{
+  font-size:14px;font-weight:700;font-stretch:118%;
+  letter-spacing:var(--wide);text-transform:uppercase;margin-bottom:6px;
+}
+#gate .box p{
+  font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--faint);margin:0 0 22px;padding-bottom:16px;border-bottom:1px solid var(--hair);
+}
+
+@media (max-width:640px){
+  .shell{padding:0 16px 60px}
+  header.plate{padding-top:22px}
+  .plate .sub{padding-left:0;border-left:0}
+  .read .val{font-size:25px}
+  .panel{padding:17px}
+}
+@media (prefers-reduced-motion:reduce){
+  *,*::after,*::before{transition:none !important;animation:none !important}
+}

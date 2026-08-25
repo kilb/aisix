@@ -220,7 +220,7 @@ export function Limits({ doc }: { doc: DocState }) {
             </select>
           </label>
         </div>
-        <h3 style={{ fontSize: 13, margin: "18px 0 10px" }}>上限（至少填一项）</h3>
+        <h3>上限（至少填一项）</h3>
         <div className="grid g3">
           <label className="f">
             <span>请求数上限</span>

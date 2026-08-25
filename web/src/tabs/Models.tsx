@@ -258,7 +258,7 @@ export function Models({ doc }: { doc: DocState }) {
           </label>
         </div>
 
-        <h3 style={{ fontSize: 13, margin: "18px 0 10px" }}>定价</h3>
+        <h3>定价</h3>
         <div className="grid g2">
           <label className="f">
             <span>输入 USD / 1k</span>
