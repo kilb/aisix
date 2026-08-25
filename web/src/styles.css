@@ -587,44 +587,49 @@ pre{
 /* ── 登录闸 ───────────────────────────────────────────────────
    未登录者看到的全部，所以它承担整个第一印象。三段：铭牌、一排停在零位的
    示意刻度、口令。刻度不假装是数据 —— 标注写着「未连接」。 */
+/* 这是没登录的人看到的全部，所以它得有台机器的体量。520px 宽的一小块
+   飘在满屏暗色里，读起来是个对话框，不是一块面板。 */
 #gate{
   min-height:100vh;display:grid;place-content:center;justify-items:stretch;
-  gap:0;padding:clamp(24px,6vw,48px);
-  width:min(520px,100%);margin:0 auto;
+  gap:0;padding:clamp(24px,6vw,56px);
+  width:min(660px,100%);margin:0 auto;
 }
 .gate-plate{
-  display:flex;align-items:flex-end;gap:16px;
-  padding-bottom:18px;border-bottom:1.5px solid var(--ink);
+  display:flex;align-items:flex-end;gap:20px;
+  padding-bottom:22px;border-bottom:1.5px solid var(--ink);
   animation:rise .42s cubic-bezier(.16,.8,.3,1) backwards;
 }
 .gate-mark{flex:1;min-width:0}
 .gate-plate h1{
-  font-size:clamp(15px,2.4vw,19px);font-weight:700;font-stretch:120%;
-  letter-spacing:var(--wide);text-transform:uppercase;line-height:1.15;
+  font-size:clamp(21px,3.4vw,31px);font-weight:700;font-stretch:120%;
+  letter-spacing:.11em;text-transform:uppercase;line-height:1.08;
 }
 .gate-sub{
-  display:block;margin-top:7px;
-  font-family:var(--mono);font-size:10px;letter-spacing:.12em;
+  display:block;margin-top:10px;
+  font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;
   text-transform:uppercase;color:var(--faint);
 }
+/* 切换键是工具，不是铭牌的一部分：对齐标题首行的顶边，别浮在标题换行
+   之后留下的空当里。 */
+.gate-plate > button.ghost{flex:none;align-self:flex-start}
 
-/* 示意刻度：三个停在零位的读数，说明这台机器是计量装置。 */
+/* 三块停在静止位的表头。空着的静止位说明这是一台计量装置，同时不报数。 */
 .gate-dials{
-  display:flex;align-items:baseline;gap:clamp(16px,4vw,34px);flex-wrap:wrap;
-  padding:22px 2px 26px;
+  display:flex;align-items:baseline;gap:clamp(20px,5vw,46px);flex-wrap:wrap;
+  padding:26px 2px 34px;
   animation:rise .42s cubic-bezier(.16,.8,.3,1) .06s backwards;
 }
-.gate-dial{display:flex;flex-direction:column;gap:6px}
+.gate-dial{display:flex;flex-direction:column;gap:10px}
 .gate-dial-lab{
   font-family:var(--mono);font-size:9px;letter-spacing:.14em;
   text-transform:uppercase;color:var(--faint);
 }
+/* 静止位画成一道短横规。破折号在等宽字里落得偏低偏短，读起来像被涂掉的
+   字，不像一支停住的指针；一道有厚度的横规才是「量程在此，尚无读数」。 */
 .gate-dial-val{
-  font-family:var(--mono);font-variant-numeric:tabular-nums;
-  font-size:clamp(22px,3.4vw,30px);font-weight:300;letter-spacing:-.04em;
-  line-height:1;color:var(--faint);
+  display:block;width:clamp(30px,4vw,42px);height:3px;border-radius:2px;
+  background:var(--track);
 }
-.gate-dial-val .lead{color:color-mix(in oklch,var(--faint) 55%,transparent)}
 .gate-dial-note{
   margin-left:auto;align-self:flex-end;
   font-family:var(--mono);font-size:9px;letter-spacing:.14em;

@@ -9,8 +9,8 @@ import type { Theme } from "./lib/useTheme";
  * 界面骨架也不渲染。
  *
  * 但这也是没登录的人看到的**全部**，所以它承担整个第一印象：铭牌、一排
- * 停在零位的示意刻度、以及这台网关的身份。示意刻度不假装是数据（它标着
- * 「未连接」），它是在说明这台机器是干什么的 —— 一个计量装置。
+ * 三块停在静止位的表头、以及这台网关的身份。表头空着而不是停在零 ——
+ * 它们说明这台机器量的是什么，不报任何读数。
  */
 export function Gate({
   onIn,
@@ -57,15 +57,14 @@ export function Gate({
         </button>
       </div>
 
-      {/* 停在零位的示意刻度。它不假装是数据 —— 标注写着未连接。 */}
+      {/* 三块停在静止位的表头，说明这台机器量的是什么。
+          静止位是空的，不是零：印一个 0 出来就是在报一个没测到的数，旁边
+          写「未连接」也抵不掉 —— 概览页刚为同一件事改过一遍。 */}
       <div className="gate-dials" aria-hidden="true">
         {["请求", "TOKEN", "花费"].map((l) => (
           <div key={l} className="gate-dial">
             <span className="gate-dial-lab">{l}</span>
-            <span className="gate-dial-val">
-              <span className="lead">{l === "花费" ? "$0." : "0"}</span>
-              {l === "花费" ? "000000" : ""}
-            </span>
+            <span className="gate-dial-val" />
           </div>
         ))}
         <span className="gate-dial-note">未连接</span>
