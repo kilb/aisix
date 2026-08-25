@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import * as api from "./lib/api";
 import { EXPECTED_API_CONTRACT } from "./lib/contract";
 import { useDoc } from "./lib/useDoc";
+import { useTheme } from "./lib/useTheme";
 import { Gate } from "./Gate";
 import { Overview } from "./tabs/Overview";
 import { Usage } from "./tabs/Usage";
@@ -33,6 +34,7 @@ export function App() {
   const [authed, setAuthed] = useState<boolean | null>(null);
   const [apiContract, setApiContract] = useState<number | null>(null);
   const [tab, setTab] = useState<TabId>("overview");
+  const [theme, toggleTheme] = useTheme();
   const skewed = apiContract !== null && apiContract !== EXPECTED_API_CONTRACT;
   // 偏移时连读都不发：界面对响应形状的假设已经不成立，读回来的东西怎么
   // 渲染都是猜。
@@ -81,7 +83,7 @@ export function App() {
     );
   }
 
-  if (!authed) return <Gate onIn={() => setAuthed(true)} />;
+  if (!authed) return <Gate onIn={() => setAuthed(true)} theme={theme} onToggleTheme={toggleTheme} />;
 
   const status = doc.res?.model_status as { error?: string } | undefined;
   const healthy = !!status && !status.error;
@@ -96,6 +98,14 @@ export function App() {
           <span className="dot" />
           <span>{doc.res ? (healthy ? "网关在线" : "网关不可达") : "检查中"}</span>
         </span>
+        <button
+          className="ghost"
+          onClick={toggleTheme}
+          aria-label={theme === "dark" ? "切换到浅色" : "切换到深色"}
+          title={theme === "dark" ? "切换到浅色" : "切换到深色"}
+        >
+          {theme === "dark" ? "浅色" : "深色"}
+        </button>
         <button className="ghost" onClick={signOut}>
           登出
         </button>

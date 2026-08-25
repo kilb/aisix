@@ -64,6 +64,30 @@ test("未登录时不渲染任何数据", async ({ page }) => {
   await expect(page.getByRole("tab", { name: "供应商" })).toHaveCount(0);
 });
 
+/**
+ * 主题按钮曾经存在于旧界面，移植时被漏掉了 —— 一个功能就这样静默消失。
+ * 这条测试是它的回归保护。
+ *
+ * 默认暗色是产品判断（这个界面是仪表间，仪表间是暗的），但显式选择必须
+ * 一直生效，包括刷新之后 —— 否则它不是「选择」而是「本次会话的临时效果」。
+ */
+test("主题可切换，且选择在刷新后仍然生效", async ({ page }) => {
+  await page.goto(fx.previewUrl);
+  const root = page.locator("html");
+  await expect(root).toHaveAttribute("data-theme", "dark");
+
+  await page.getByRole("button", { name: "切换到浅色" }).click();
+  await expect(root).toHaveAttribute("data-theme", "light");
+
+  await page.reload();
+  await expect(root).toHaveAttribute(
+    "data-theme",
+    "light",
+  );
+  // 按钮的文案要跟着状态走，否则它在说自己是当前主题而不是可切换到的。
+  await expect(page.getByRole("button", { name: "切换到深色" })).toBeVisible();
+});
+
 test("口令错误时报错且不进入", async ({ page }) => {
   await page.goto(fx.previewUrl);
   await page.getByLabel("口令").fill("wrong");

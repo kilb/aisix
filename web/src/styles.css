@@ -373,22 +373,60 @@ pre{
   user-select:all;  /* 密钥明文：一次点选全中，减少漏抄 */
 }
 
-/* ── 登录闸 ───────────────────────────────────────────────── */
-#gate{min-height:100vh;display:grid;place-items:center;padding:24px}
-#gate .box{
-  width:100%;max-width:372px;padding:clamp(24px,3vw,32px);
-  animation:rise .4s cubic-bezier(.16,.8,.3,1) backwards;
+/* ── 登录闸 ───────────────────────────────────────────────────
+   未登录者看到的全部，所以它承担整个第一印象。三段：铭牌、一排停在零位的
+   示意刻度、口令。刻度不假装是数据 —— 标注写着「未连接」。 */
+#gate{
+  min-height:100vh;display:grid;place-content:center;justify-items:stretch;
+  gap:0;padding:clamp(24px,6vw,48px);
+  width:min(520px,100%);margin:0 auto;
 }
-#gate .box h1{
-  font-size:14px;font-weight:700;font-stretch:120%;letter-spacing:var(--wide);
-  text-transform:uppercase;margin-bottom:7px;
+.gate-plate{
+  display:flex;align-items:flex-end;gap:16px;
+  padding-bottom:18px;border-bottom:1.5px solid var(--ink);
+  animation:rise .42s cubic-bezier(.16,.8,.3,1) backwards;
 }
-#gate .box p{
-  font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;
-  color:var(--faint);margin:0 0 24px;padding-bottom:18px;
-  border-bottom:1px solid var(--hair);
+.gate-mark{flex:1;min-width:0}
+.gate-plate h1{
+  font-size:clamp(15px,2.4vw,19px);font-weight:700;font-stretch:120%;
+  letter-spacing:var(--wide);text-transform:uppercase;line-height:1.15;
 }
-#gate .box .act{width:100%;margin-top:4px}
+.gate-sub{
+  display:block;margin-top:7px;
+  font-family:var(--mono);font-size:10px;letter-spacing:.12em;
+  text-transform:uppercase;color:var(--faint);
+}
+
+/* 示意刻度：三个停在零位的读数，说明这台机器是计量装置。 */
+.gate-dials{
+  display:flex;align-items:baseline;gap:clamp(16px,4vw,34px);flex-wrap:wrap;
+  padding:22px 2px 26px;
+  animation:rise .42s cubic-bezier(.16,.8,.3,1) .06s backwards;
+}
+.gate-dial{display:flex;flex-direction:column;gap:6px}
+.gate-dial-lab{
+  font-family:var(--mono);font-size:9px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--faint);
+}
+.gate-dial-val{
+  font-family:var(--mono);font-variant-numeric:tabular-nums;
+  font-size:clamp(22px,3.4vw,30px);font-weight:300;letter-spacing:-.04em;
+  line-height:1;color:var(--faint);
+}
+.gate-dial-val .lead{color:color-mix(in oklch,var(--faint) 55%,transparent)}
+.gate-dial-note{
+  margin-left:auto;align-self:flex-end;
+  font-family:var(--mono);font-size:9px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--faint);
+  padding:3px 9px;border:1px solid var(--hair);border-radius:99px;
+}
+
+.gate-form{
+  margin:0;animation:rise .42s cubic-bezier(.16,.8,.3,1) .12s backwards;
+}
+.gate-form .f{margin-bottom:16px}
+.gate-form input[type=password]{max-width:none}
+.gate-form .act{width:100%}
 
 @media (prefers-reduced-motion:reduce){
   *,*::after,*::before{animation:none !important;transition:none !important}
