@@ -17,10 +17,18 @@ export default defineConfig({
     emptyOutDir: true,
     rollupOptions: {
       output: {
+        // 不拆包：这份界面由 nginx 直接托管，没有 HTTP/2 push、没有 CDN，
+        // 拆包只会变成串行的额外往返。
         manualChunks: undefined,
-        entryFileNames: "assets/app.js",
-        chunkFileNames: "assets/app.js",
-        assetFileNames: "assets/app.[ext]",
+        // 文件名带内容哈希 —— 不是美化，是缓存失效的唯一机制。产物带一周
+        // 缓存，固定文件名意味着缓存永不失效：`index.html` 不缓存也救不了，
+        // 因为它引用的路径没变，老访客会连着一周看到旧界面。
+        //
+        // 实测过：固定名 + max-age=604800 部署之后，同一个浏览器拿到的仍是
+        // 上一版 CSS，而服务器上明明是新的。
+        entryFileNames: "assets/[name].[hash].js",
+        chunkFileNames: "assets/[name].[hash].js",
+        assetFileNames: "assets/[name].[hash].[ext]",
       },
     },
   },
