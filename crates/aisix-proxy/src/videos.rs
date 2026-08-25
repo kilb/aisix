@@ -1562,6 +1562,7 @@ pub async fn create_video(
                     &success.provider_key_id,
                     &success.applied_guardrails,
                     success.monitor_hits.clone(),
+                    success.redactions.clone(),
                     status,
                     started.elapsed(),
                 );
@@ -1616,6 +1617,9 @@ struct CreateSuccess {
     provider_key_id: String,
     applied_guardrails: Vec<AppliedGuardrail>,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    /// Per-entity counts of what a mask rule rewrote. Names only, never
+    /// the matched values (#932).
+    redactions: crate::redact::RedactionCounts,
     /// `false` on the 501 unsupported-provider branch — no upstream call
     /// happened, so no UsageEvent is attributed (embeddings convention).
     upstream_called: bool,
@@ -1625,7 +1629,7 @@ async fn dispatch_create(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
-    body: VideoCreateBody,
+    mut body: VideoCreateBody,
     client: &ClientContext,
 ) -> Result<CreateSuccess, ProxyError> {
     let model_entry = crate::model_resolve::resolve_model(snapshot, &body.model)
@@ -1654,6 +1658,7 @@ async fn dispatch_create(
                 provider_key_id: String::new(),
                 applied_guardrails: Vec::new(),
                 monitor_hits: Vec::new(),
+                redactions: crate::redact::RedactionCounts::new(),
                 upstream_called: false,
             })
         }
@@ -1695,6 +1700,21 @@ async fn dispatch_create(
             return Err(ProxyError::ContentFiltered(
                 crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
             ));
+        }
+    }
+
+    // #932: mask-action rules rewrite the prompt in place AFTER the block
+    // check passes, so the masked text is what the provider receives — the
+    // same order embeddings uses. Without this a `mask` rule was accepted,
+    // listed in `applied_guardrails`, and changed nothing: the request
+    // succeeded and the caller's PII reached the provider verbatim.
+    let mut redactions = crate::redact::RedactionCounts::new();
+    if aisix_guardrails::Guardrail::redacts_input(&resolved_chain) {
+        if let Some(r) =
+            aisix_guardrails::Guardrail::redact_input_text(&resolved_chain, &body.prompt)
+        {
+            body.prompt = r.text;
+            crate::redact::merge_counts(&mut redactions, r.counts);
         }
     }
 
@@ -1763,6 +1783,7 @@ async fn dispatch_create(
         provider_key_id: target.pk_id.clone(),
         applied_guardrails,
         monitor_hits,
+        redactions,
         upstream_called: true,
     })
 }
@@ -1998,6 +2019,7 @@ fn emit_submit_usage_event(
     provider_key_id: &str,
     applied_guardrails: &[AppliedGuardrail],
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    redacted_entity_counts: crate::redact::RedactionCounts,
     status_code: u16,
     elapsed: Duration,
 ) {
@@ -2015,6 +2037,7 @@ fn emit_submit_usage_event(
         inbound_protocol: "openai".to_string(),
         applied_guardrails: applied_guardrails.to_vec(),
         guardrail_monitor_hits,
+        redacted_entity_counts,
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         ..Default::default()
@@ -2433,6 +2456,22 @@ mod tests {
         snap
     }
 
+    /// Same app, with the usage sink piped to a channel so a test can read
+    /// the emitted event. Mirrors the images / audio helpers.
+    fn build_app_with_sink(
+        snap: AisixSnapshot,
+        tx: tokio::sync::mpsc::Sender<aisix_obs::UsageEvent>,
+    ) -> axum::Router {
+        use aisix_obs::UsageSink;
+        let hub = Arc::new(Hub::new());
+        let handle = SnapshotHandle::new(snap);
+        crate::build_router(
+            crate::ProxyState::new(handle, hub, &cfg())
+                .without_cache()
+                .with_usage_sink(UsageSink::new(tx)),
+        )
+    }
+
     fn build_app(snap: AisixSnapshot) -> axum::Router {
         let hub = Arc::new(Hub::new());
         let handle = SnapshotHandle::new(snap);
@@ -2773,6 +2812,67 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let v = body_json(resp).await;
         assert_eq!(v["error"]["type"], "model_not_found");
+    }
+
+    /// A mask-action rule must rewrite the prompt before it leaves the
+    /// gateway. Every other prompt-bearing endpoint does this — embeddings
+    /// names it explicitly ("the masked text is what gets embedded, so the
+    /// matched values never reach the provider") — and this one only ran the
+    /// block check, so a `mask` rule was accepted, reported as applied, and
+    /// changed nothing.
+    ///
+    /// Silent in the worst way: the request succeeds, the guardrail shows up
+    /// in `applied_guardrails`, and the caller's PII is in the provider's logs.
+    #[tokio::test]
+    async fn a_mask_rule_rewrites_the_prompt_before_it_reaches_the_provider() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(DASHSCOPE_SUBMIT_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pending_submit_response()))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri(), "alibaba", "");
+        let g: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"mask-email","enabled":true,"hook_point":"input","kind":"pii","detectors":[{"type":"email","action":"mask"}]}"#,
+        )
+        .unwrap();
+        snap.guardrails.insert(ResourceEntry::new("g-mask", g, 1));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            post_videos(serde_json::json!({
+                "model": "my-video",
+                "prompt": "a cat holding a sign that says alice@example.com"
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "a mask rule must not block");
+
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let wire: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        let sent = serde_json::to_string(&wire).unwrap();
+        assert!(
+            !sent.contains("alice@example.com"),
+            "the prompt reached the provider unmasked:\n{sent}",
+        );
+
+        // A mask that leaves no trace in the usage event is a mask nobody can
+        // audit — the same reason images and audio assert this.
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(
+            event.redacted_entity_counts.get("email"),
+            Some(&1),
+            "the rewrite happened but was not reported",
+        );
     }
 
     #[tokio::test]

@@ -77,6 +77,64 @@ fn every_model_dispatch_handler_carries_the_shared_mechanisms() {
     );
 }
 
+/// A handler that inspects caller text for a BLOCK must also apply the MASK
+/// rules from the same chain. Conditional, like the cache rule below, and for
+/// the same reason: the bug is not "an endpoint forgot something universal",
+/// it is "an endpoint wired half of one mechanism".
+///
+/// The two halves come from one config object. A `pii` guardrail with
+/// `action: mask` is accepted, resolved, and reported in
+/// `applied_guardrails` whether or not the handler ever calls the rewrite —
+/// so a handler that only checks silently sends the caller's PII upstream on
+/// a request that succeeds. `/v1/videos` shipped that way: it ran
+/// `check_input_observed` on the prompt and never masked it.
+///
+/// Deliberately not in REQUIRED_MECHANISMS: a handler that inspects no caller
+/// text (a poll or fetch route) has nothing to mask, and demanding the call
+/// there would be noise.
+#[test]
+fn a_handler_that_checks_caller_text_also_masks_it() {
+    let dir = handlers_dir();
+    // Running an input/output chain over caller text.
+    const CHECKS_TEXT: &[&str] = &[
+        "check_input_observed",
+        "check_input_non_segment",
+        "moderate_body",
+        "moderate_structured_body",
+    ];
+    // Applying that same chain's mask action.
+    const APPLIES_MASKS: &[&str] = &[
+        "redacts_input",
+        "redact_input_text",
+        "redact::redact_",
+        "moderate_body",
+        "moderate_structured_body",
+    ];
+
+    let mut missing: Vec<String> = Vec::new();
+    for handler in MODEL_DISPATCH_HANDLERS {
+        let path = dir.join(handler);
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} is readable: {e}", path.display()));
+        let checks = CHECKS_TEXT.iter().any(|m| src.contains(m));
+        let masks = APPLIES_MASKS.iter().any(|m| src.contains(m));
+        if checks && !masks {
+            missing.push(format!(
+                "  {handler} runs a guardrail check over caller text but never \
+                 applies the chain's mask action"
+            ));
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "half-wired guardrail — a `mask` rule on these endpoints is accepted, \
+         listed as applied, and changes nothing, so the caller's PII reaches \
+         the provider on a request that succeeds:\n{}",
+        missing.join("\n"),
+    );
+}
+
 /// A cache HIT is client-visible output, so it must run the output chain
 /// before being returned — the contract #448 established for
 /// `/v1/chat/completions`.
