@@ -4265,6 +4265,197 @@ mod tests {
         assert!(!redaction.unrewritable_tool_key);
     }
 
+    /// 收集一份载荷里所有仍然原样含 `mark` 的位置。
+    fn unmasked_positions(v: &serde_json::Value, mark: &str) -> Vec<String> {
+        fn walk(v: &serde_json::Value, path: String, mark: &str, out: &mut Vec<String>) {
+            match v {
+                serde_json::Value::String(s) if s.contains(mark) => out.push(path),
+                serde_json::Value::Object(m) => {
+                    for (k, vv) in m {
+                        walk(vv, format!("{path}.{k}"), mark, out);
+                    }
+                }
+                serde_json::Value::Array(a) => {
+                    for (i, vv) in a.iter().enumerate() {
+                        walk(vv, format!("{path}[{i}]"), mark, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = vec![];
+        walk(v, String::from("$"), mark, &mut out);
+        out.sort();
+        out
+    }
+
+    /// walker 是「默认遮蔽 + 显式豁免」：任何字符串都会被遮，除非命中
+    /// `opaque` 那几条判定。这个方向是对的——新加的字段自动受保护——
+    /// 代价是**豁免表变成了唯一的泄露面**，而往里加一个名字是一行改动，
+    /// 看起来无害，效果是那个字段从此原样送到上游和全量内容导出器。
+    ///
+    /// 逐字段的测试证明的是「这个字段被遮了」，看不住豁免表。这条测试
+    /// 反过来钉住整个面：在每一种合法文本位置埋同一个值，跑完脱敏之后，
+    /// **仍然原样幸存的位置必须恰好等于下面这份清单**。豁免面一旦变宽，
+    /// 多出来的位置会直接出现在失败信息里；反过来，把某处刻意跳过改成
+    /// 遮蔽（会损坏签名或二进制载荷）也同样会被发现。
+    #[test]
+    fn anthropic_request_masks_every_text_position_but_the_listed_ones() {
+        let chain = both();
+        let mark = "probe@example.com";
+        let mut request = json!({
+            "system": mark,
+            "messages": [
+                {"role": "user", "content": mark},
+                {"role": "user", "content": [
+                    {"type": "text", "text": mark},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": mark}},
+                    {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": mark},
+                     "title": mark, "context": mark},
+                    {"type": "tool_use", "id": "t1", "name": "f", "input": {"q": mark}},
+                    {"type": "tool_result", "tool_use_id": "t1", "content": mark},
+                    {"type": "tool_result", "tool_use_id": "t2", "content": [{"type": "text", "text": mark}]},
+                    {"type": "thinking", "thinking": mark, "signature": "sig"},
+                    {"type": "redacted_thinking", "data": mark},
+                    {"type": "search_result", "title": mark, "content": [{"type": "text", "text": mark}]},
+                ]},
+                {"role": "assistant", "content": [{"type": "text", "text": mark}]}
+            ],
+            "tools": [
+                {"name": "f", "description": mark,
+                 "input_schema": {"type": "object", "properties": {"q": {"type": "string", "description": mark}}}}
+            ],
+        });
+
+        let out = redact_anthropic_request(chain.as_ref(), &mut request);
+        assert!(
+            !out.unrewritable_tool_key,
+            "这份载荷里没有改写不了的结构字段"
+        );
+
+        assert_eq!(
+            unmasked_positions(&request, mark),
+            vec![
+                // 二进制载荷：base64 图片。遮它会毁掉图片，而它也不是文本。
+                // 注意同一层的 document `source.data` 是 `type: text`，被遮了
+                // —— 区分的是来源类型，不是字段名。
+                "$.messages[1].content[1].source.data",
+                // 加密的思考载荷，本来就不可读。
+                "$.messages[1].content[7].data",
+                // 扩展思考块带签名，必须原样回传，改一个字符上游就会拒收。
+                "$.messages[1].content[6].thinking",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>(),
+            "幸存位置和预期不符 —— 要么新增的内容形状没走 walker（漏遮），\
+             要么刻意跳过的位置被改成了遮蔽（会损坏签名/二进制载荷）",
+        );
+    }
+
+    /// 同一条性质，打到 Responses API 的形状。它和 Anthropic 是两套独立的
+    /// walker，各有各的豁免表（`RESPONSES_OPAQUE_FIELDS` 对
+    /// `ANTHROPIC_METADATA_FIELDS` 那组判定），所以必须各自钉住 —— 这个
+    /// 仓库反复栽在「一个家族修了、另一个家族静默保持原状」上。
+    ///
+    /// 注意工具定义走的是另一条路径（`redact_tool_definitions`），不受
+    /// `RESPONSES_OPAQUE_FIELDS` 管辖；这里把它一并埋了值，是为了它哪天
+    /// 停止遮蔽时也能在这条测试里露出来。
+    #[test]
+    fn responses_request_masks_every_text_position_but_the_listed_ones() {
+        let chain = both();
+        let mark = "probe@example.com";
+        let mut request = json!({
+            "model": "gpt-4o",
+            "instructions": mark,
+            "input": [
+                {"role": "user", "content": mark},
+                {"role": "user", "content": [
+                    {"type": "input_text", "text": mark},
+                    {"type": "input_image", "image_url": mark},
+                    {"type": "input_file", "filename": mark, "file_data": mark},
+                ]},
+                {"type": "function_call", "call_id": "c1", "name": "f", "arguments": mark},
+                {"type": "function_call_output", "call_id": "c1", "output": mark},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": mark}]},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": mark}]},
+            ],
+            "tools": [
+                {"type": "function", "name": "f", "description": mark,
+                 "parameters": {"type": "object", "properties": {"q": {"type": "string", "description": mark}}}}
+            ],
+            "text": {"format": {"type": "json_schema", "name": "s", "description": mark,
+                                 "schema": {"type": "object"}}},
+        });
+
+        let out = redact_responses_request_structured(chain.as_ref(), &mut request);
+        assert!(!out.unrewritable_tool_key);
+
+        assert_eq!(
+            unmasked_positions(&request, mark),
+            vec![
+                // 内联文件内容是 base64，遮了就损坏；同一个块里的
+                // `filename` 是文本，被遮了。
+                "$.input[1].content[2].file_data",
+                // 图片地址：可能是 data: URI（二进制），也可能是外链 URL，
+                // 两种改了都会指向别处或损坏。
+                "$.input[1].content[1].image_url",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>(),
+            "幸存位置和预期不符",
+        );
+    }
+
+    /// 调用方自定义的标识字段（Anthropic 的 `metadata.user_id`、OpenAI 家族
+    /// 的 `metadata.*`）改写不了 —— 改了就换了一个人。所以规则命中时唯一
+    /// 安全的处置是拦下整个请求，而不是原样放行。
+    ///
+    /// 三个家族必须给出同一个结论：同一条规则在不同端点上得出不同的安全
+    /// 判断，是这个仓库最贵的一类 bug。
+    #[test]
+    fn a_matched_caller_identifier_blocks_on_every_family() {
+        let chain = both();
+        let mark = "probe@example.com";
+
+        let mut anthropic = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"user_id": mark},
+        });
+        assert!(
+            redact_anthropic_request(chain.as_ref(), &mut anthropic).unrewritable_tool_key,
+            "/v1/messages 放行了一个改写不了的标识字段",
+        );
+
+        let mut responses = json!({
+            "model": "gpt-4o",
+            "input": [{"role": "user", "content": "hi"}],
+            "metadata": {"trace": mark},
+        });
+        assert!(
+            redact_responses_request_structured(chain.as_ref(), &mut responses)
+                .unrewritable_tool_key,
+            "/v1/responses 放行了一个改写不了的标识字段",
+        );
+
+        let mut chat: aisix_gateway::ChatFormat = serde_json::from_value(json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"trace": mark},
+        }))
+        .expect("chat body");
+        assert!(
+            redact_chat_format_structured(chain.as_ref(), &mut chat).unrewritable_tool_key,
+            "/v1/chat/completions 放行了一个改写不了的标识字段",
+        );
+    }
+
     #[test]
     fn anthropic_walks_document_and_server_tool_result_text() {
         let chain = both();
