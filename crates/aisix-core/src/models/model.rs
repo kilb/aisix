@@ -103,28 +103,6 @@ pub struct InputTokens {
 }
 
 impl InputTokens {
-    /// Anthropic-shaped usage: the three counters are already disjoint, so
-    /// they are taken as given.
-    pub fn from_disjoint_counters(input: u64, cache_read: u64, cache_write: u64) -> Self {
-        Self {
-            uncached: input,
-            cache_read,
-            cache_write,
-        }
-    }
-
-    /// OpenAI-shaped usage: `cached` and `cache_write` are subsets of
-    /// `prompt`, so the fresh portion is what remains after both are removed.
-    /// Saturating, because a provider that reports a cached count exceeding
-    /// its own prompt total must not wrap into a huge charge.
-    pub fn from_prompt_superset(prompt: u64, cached: u64, cache_write: u64) -> Self {
-        Self {
-            uncached: prompt.saturating_sub(cached).saturating_sub(cache_write),
-            cache_read: cached,
-            cache_write,
-        }
-    }
-
     /// No cache involved: every prompt token is fresh.
     pub fn uncached_only(prompt: u64) -> Self {
         Self {
@@ -723,8 +701,14 @@ mod tests {
             cache_write_per_1k: None,
         };
         // 1000 fresh + 1000 read + 1000 write, all at the input rate.
-        let with_cache =
-            c.calculate_with_cache(InputTokens::from_disjoint_counters(1000, 1000, 1000), 0);
+        let with_cache = c.calculate_with_cache(
+            InputTokens {
+                uncached: 1000,
+                cache_read: 1000,
+                cache_write: 1000,
+            },
+            0,
+        );
         assert!((with_cache - 6.0).abs() < 1e-9, "got {with_cache}");
         // And the plain entry point is unchanged.
         assert!((c.calculate(1000, 500) - (2.0 + 2.0)).abs() < 1e-9);
@@ -735,19 +719,35 @@ mod tests {
     /// subset would subtract tokens the provider is charging for.
     #[test]
     fn anthropic_shaped_counters_are_additive() {
-        let got = cost()
-            .calculate_with_cache(InputTokens::from_disjoint_counters(1000, 2000, 4000), 1000);
+        let got = cost().calculate_with_cache(
+            InputTokens {
+                uncached: 1000,
+                cache_read: 2000,
+                cache_write: 4000,
+            },
+            1000,
+        );
         // 1000*1.0 + 2000*0.1 + 4000*1.25 + 1000*10.0, per 1k.
         let want = (1000.0 * 1.0 + 2000.0 * 0.1 + 4000.0 * 1.25 + 1000.0 * 10.0) / 1000.0;
         assert!((got - want).abs() < 1e-9, "got {got}, want {want}");
     }
 
-    /// OpenAI reports `cached_tokens` as a SUBSET of `prompt_tokens`. Failing
-    /// to subtract it charges the cached half twice — once at the fresh rate
-    /// and once at the cached rate.
+    /// Once the buckets are split, the cached half must be billed at the
+    /// cached rate and only there. Charging the whole prompt fresh is the
+    /// behaviour this replaced.
+    ///
+    /// Splitting a provider's usage into these buckets is a separate job and
+    /// lives in `aisix_proxy::usage_attr::input_tokens_for_pricing`, which is
+    /// where each upstream's vocabulary is interpreted; this type only prices
+    /// buckets that are already disjoint.
     #[test]
-    fn openai_shaped_cached_tokens_are_not_double_charged() {
-        let input = InputTokens::from_prompt_superset(1000, 800, 0);
+    fn a_cached_bucket_is_billed_at_the_cached_rate_not_the_fresh_one() {
+        // 1000 prompt tokens of which 800 came from cache.
+        let input = InputTokens {
+            uncached: 200,
+            cache_read: 800,
+            cache_write: 0,
+        };
         assert_eq!(input.uncached, 200);
         assert_eq!(input.cache_read, 800);
         // The buckets must still add up to the prompt the provider reported.
@@ -760,13 +760,27 @@ mod tests {
         assert!(got < cost().calculate(1000, 0));
     }
 
-    /// A provider reporting a cached count larger than its own prompt total
-    /// must not wrap the fresh bucket into an astronomically large charge.
+    /// An entirely-cached prompt costs the cache rate and nothing else. The
+    /// saturation that produces a zero fresh bucket from an impossible
+    /// upstream count is asserted where that subtraction happens
+    /// (`input_tokens_for_pricing`); here the point is that a zero fresh
+    /// bucket prices cleanly rather than reading as "no charge at all".
     #[test]
-    fn an_impossible_cached_count_cannot_wrap_into_a_huge_charge() {
-        let input = InputTokens::from_prompt_superset(100, 999, 0);
-        assert_eq!(input.uncached, 0);
-        assert!(cost().calculate_with_cache(input, 0) < 1.0);
+    fn an_entirely_cached_prompt_still_prices_the_cached_bucket() {
+        let input = InputTokens {
+            uncached: 0,
+            cache_read: 999,
+            cache_write: 0,
+        };
+        let got = cost().calculate_with_cache(input, 0);
+        // 999 tokens at the cached rate (0.1 / 1k) — not zero, and not the
+        // fresh rate.
+        let want = 999.0 * 0.1 / 1000.0;
+        assert!((got - want).abs() < 1e-9, "got {got}, want {want}");
+        assert!(
+            got < cost().calculate(999, 0),
+            "an all-cached prompt must cost less than the same prompt fresh",
+        );
     }
 
     /// Reading from the cache is cheaper than fresh input; writing to it is
@@ -774,12 +788,30 @@ mod tests {
     /// the operator's business, but the arithmetic must keep them distinct.
     #[test]
     fn read_and_write_rates_are_applied_to_their_own_buckets() {
-        let read_only =
-            cost().calculate_with_cache(InputTokens::from_disjoint_counters(0, 1000, 0), 0);
-        let write_only =
-            cost().calculate_with_cache(InputTokens::from_disjoint_counters(0, 0, 1000), 0);
-        let fresh_only =
-            cost().calculate_with_cache(InputTokens::from_disjoint_counters(1000, 0, 0), 0);
+        let read_only = cost().calculate_with_cache(
+            InputTokens {
+                uncached: 0,
+                cache_read: 1000,
+                cache_write: 0,
+            },
+            0,
+        );
+        let write_only = cost().calculate_with_cache(
+            InputTokens {
+                uncached: 0,
+                cache_read: 0,
+                cache_write: 1000,
+            },
+            0,
+        );
+        let fresh_only = cost().calculate_with_cache(
+            InputTokens {
+                uncached: 1000,
+                cache_read: 0,
+                cache_write: 0,
+            },
+            0,
+        );
         assert!(read_only < fresh_only, "cache read must be cheaper");
         assert!(write_only > fresh_only, "cache write must be dearer");
     }

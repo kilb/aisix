@@ -533,6 +533,65 @@ pub(crate) fn emit_guardrail_error_usage_event(
 
 #[cfg(test)]
 mod tests {
+    /// 每个请求收多少钱，最终都落在这个函数把 usage 拆成三个桶的方式上。
+    /// 此前它一条直接测试都没有——有测试的是 `InputTokens` 上那两个没有
+    /// 任何调用方的构造器，而它们的算术与这里并不一致。测试在给一个不
+    /// 运行的实现背书。
+    ///
+    /// 两种上游对 `prompt_tokens` 含义的分歧是这里唯一的难点，两边都靠
+    /// 上游文档定死：
+    /// - OpenAI：`prompt_tokens_details.cached_tokens` 是 `prompt_tokens`
+    ///   的子集，所以要减掉，否则缓存那一半按新鲜价和缓存价各收一次。
+    /// - Anthropic：`cache_read_input_tokens` / `cache_creation_input_tokens`
+    ///   与 `input_tokens` 不相交，所以不能减，减了就把已经计费的 token
+    ///   当成没有。
+    #[test]
+    fn pricing_buckets_follow_each_upstream_vocabulary() {
+        // OpenAI 形状：cached 是子集。
+        let openai = input_tokens_for_pricing(1_000, 800, 0, 0);
+        assert_eq!(openai.uncached, 200, "子集口径下必须减掉 cached");
+        assert_eq!(openai.cache_read, 800);
+        assert_eq!(openai.cache_write, 0);
+        assert_eq!(
+            openai.total(),
+            1_000,
+            "三个桶加起来必须还是上游报的 prompt 总数",
+        );
+
+        // Anthropic 形状：三个计数器互不相交（数值取自
+        // aisix-provider-anthropic 的流式夹具）。
+        let anthropic = input_tokens_for_pricing(37, 0, 9, 4);
+        assert_eq!(
+            anthropic.uncached, 37,
+            "不相交口径下减掉缓存 token 会让已计费的 token 免费",
+        );
+        assert_eq!(anthropic.cache_read, 9);
+        assert_eq!(anthropic.cache_write, 4);
+        assert_eq!(anthropic.total(), 50, "37 + 9 + 4");
+    }
+
+    /// `cache_creation_tokens` 只有一个来源：Anthropic 的
+    /// `cache_creation_input_tokens`（openai 侧的 wire 硬置 0），而它与
+    /// `input_tokens` 不相交。所以它绝不能从 prompt 里减掉——那正是一个
+    /// 早期的构造器做过的事。
+    #[test]
+    fn cache_writes_are_never_subtracted_from_the_prompt() {
+        let got = input_tokens_for_pricing(1_000, 0, 0, 300);
+        assert_eq!(
+            got.uncached, 1_000,
+            "cache_write 被从 prompt 里减掉了 —— 那是另一种上游口径，本仓库没有这种来源",
+        );
+        assert_eq!(got.cache_write, 300);
+    }
+
+    /// 上游报出比自己 prompt 总数还大的 cached 数（见过），减法必须饱和，
+    /// 不能回绕成一笔天文数字的账单。
+    #[test]
+    fn an_impossible_cached_count_cannot_wrap_the_fresh_bucket() {
+        let got = input_tokens_for_pricing(100, 999, 0, 0);
+        assert_eq!(got.uncached, 0);
+        assert_eq!(got.cache_read, 999);
+    }
 
     /// USD→micro-USD 必须四舍五入。单次调用常在 1e-4 美元量级（这里是
     /// 0.00012345 USD = 123.45 micro-USD），一律截断会让每一次调用都少记
