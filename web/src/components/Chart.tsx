@@ -66,7 +66,6 @@ export function Chart({ series, fmt }: { series: Series[]; fmt: (v: number) => s
   const x = (t: number) => PL + ((t - tMin) / Math.max(1, tMax - tMin)) * (W - PL - PR);
   const y = (v: number) => PT + (1 - v / top) * (H - PT - PB);
   const shown = series.slice(0, HUES.length);
-  const baseline = y(0);
 
   const pathOf = (s: Series) =>
     s.values.map(([t, v], i) => `${i ? "L" : "M"}${x(t).toFixed(1)} ${y(v).toFixed(1)}`).join(" ");
@@ -78,12 +77,6 @@ export function Chart({ series, fmt }: { series: Series[]; fmt: (v: number) => s
             preserveAspectRatio="…meet" 会取两者中较小的缩放并把内容居中，
             于是图在宽面板上两侧留出大片空白。让宽度驱动、高度按比例来。 */}
         <svg viewBox={`0 0 ${W} ${H}`} role="img" aria-label="时间序列">
-          <defs>
-            <linearGradient id="areaFade" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor={HUES[0]} stopOpacity="0.22" />
-              <stop offset="100%" stopColor={HUES[0]} stopOpacity="0.015" />
-            </linearGradient>
-          </defs>
 
           {[0, 0.25, 0.5, 0.75, 1].map((f) => {
             const yy = PT + f * (H - PT - PB);
@@ -106,14 +99,6 @@ export function Chart({ series, fmt }: { series: Series[]; fmt: (v: number) => s
             );
           })}
 
-          {/* 首条序列的面积。多条都填会互相盖住，所以只填一条。 */}
-          {shown[0] && (
-            <path
-              d={`${pathOf(shown[0])} L${x(tMax).toFixed(1)} ${baseline.toFixed(1)} L${x(tMin).toFixed(1)} ${baseline.toFixed(1)} Z`}
-              fill="url(#areaFade)"
-              stroke="none"
-            />
-          )}
 
           {shown.map((s, i) => (
             <path
@@ -153,7 +138,7 @@ export function Chart({ series, fmt }: { series: Series[]; fmt: (v: number) => s
               <span className="swatch" style={{ background: HUES[i % HUES.length] }} />
               {/* 原样显示：这些是大小写敏感的标识符。 */}
               {Object.values(s.metric)[0] ?? "(全部)"}
-              {last && <span style={{ color: "var(--faint)" }}>{fmt(last[1])}</span>}
+              {last && <span style={{ color: "var(--ink-3)" }}>{fmt(last[1])}</span>}
             </span>
           );
         })}

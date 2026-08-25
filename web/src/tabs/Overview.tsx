@@ -3,7 +3,7 @@ import * as api from "../lib/api";
 import { fmtCompact, fmtUsd, listOf, resError } from "../lib/fmt";
 import { Chart, type Series } from "../components/Chart";
 import { Reading } from "../components/Reading";
-import { Gauge } from "../components/Gauge";
+import { Balance } from "../components/Balance";
 import type { DocState } from "../lib/useDoc";
 import type { TabId } from "../App";
 
@@ -99,15 +99,9 @@ export function Overview({ doc }: { doc: DocState; onGoto: (t: TabId) => void })
       <div className="panel">
         <h2>网关读数</h2>
         <p className="hint">累计值来自 Prometheus，自开始抓取起算。</p>
-        <div className="dial-row">
-          <Gauge
-            spendMicro={windowSpend}
-            ceilingMicro={ceiling?.total ?? null}
-            window={ceiling?.window ?? "day"}
-          />
-          <div className="dial-side">
-            <Reading label="请求总数" value={totals.req} foot="经 LLM 端点" />
-            <Reading label="Token 总量" value={totals.tok} foot="输入 + 输出（含缓存）" />
+        <div className="entries">
+          <Reading label="请求总数" value={totals.req} foot="经 LLM 端点" />
+          <Reading label="Token 总量" value={totals.tok} foot="输入 + 输出（含缓存）" />
             {/* 花费归表盘所有，侧边不再重复。读不到就说读不到 ——把 0 印成大号数字，跟「真的配了
                 0 条」在屏幕上一模一样，而这两件事要采取的动作完全相反。 */}
             <Reading
@@ -123,8 +117,17 @@ export function Overview({ doc }: { doc: DocState; onGoto: (t: TabId) => void })
                   : "模型 / 供应商 / 调用方密钥"
               }
             />
-          </div>
         </div>
+      </div>
+
+      <div className="panel">
+        <h2>结账</h2>
+        <p className="hint">花费对着配置里的上限收口。上限来自限流策略，不是估算。</p>
+        <Balance
+          spendMicro={windowSpend}
+          ceilingMicro={ceiling?.total ?? null}
+          window={ceiling?.window ?? "day"}
+        />
       </div>
 
       <div className="panel">

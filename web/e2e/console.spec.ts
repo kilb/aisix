@@ -104,9 +104,14 @@ test("口令错误时报错且不进入", async ({ page }) => {
  * 看截图才发现。这条测试是它的回归保护：断言计算样式，而不是断言那段文字
  * 存在。
  */
-test("网关状态是一个带边框和状态点的胶囊", async ({ page }) => {
+/**
+ * 状态从发光胶囊改成账簿上盖的方戳（台账方向）。形状变了，要守的东西没变：
+ * 它必须仍是一个**有边框、带状态点、颜色跟状态走**的标记，而不是退成一行
+ * 纯文字 —— 之前有一次整段样式被连区段删掉，健康状态就是这样悄悄没的。
+ */
+test("网关状态是一个带边框和状态点的方戳", async ({ page }) => {
   await signIn(page);
-  const pill = page.locator(".rail-foot .pill").first();
+  const pill = page.locator(".book-foli .pill").first();
   await expect(pill).toBeVisible();
 
   const shape = await pill.evaluate((el) => {
@@ -117,48 +122,50 @@ test("网关状态是一个带边框和状态点的胶囊", async ({ page }) => 
       radius: parseFloat(cs.borderRadius),
       borderWidth: parseFloat(cs.borderTopWidth),
       borderTransparent: cs.borderTopColor === "rgba(0, 0, 0, 0)",
+      inkMatchesBorder: cs.color === cs.borderTopColor,
       dotSize: ds ? parseFloat(ds.width) : 0,
-      dotRound: ds ? parseFloat(ds.borderRadius) : 0,
     };
   });
 
-  expect(shape.radius).toBeGreaterThan(20);
+  // 账页上没有圆角。戳是方的 —— 这一条同时保证它没被退回成圆胶囊。
+  expect(shape.radius).toBe(0);
   expect(shape.borderWidth).toBeGreaterThan(0);
   expect(shape.borderTransparent).toBe(false);
+  // 墨色和框色同源：状态色确实上到了这个戳上，而不是只剩个灰框。
+  expect(shape.inkMatchesBorder).toBe(true);
   expect(shape.dotSize).toBeGreaterThan(2);
-  expect(shape.dotRound).toBeGreaterThan(0);
 });
 
-test("导航是一块浮起来的侧栏岛，且滚动时留在原处", async ({ page }) => {
+/**
+ * 侧栏按要求换成了页眉下的一排页签。要守的是**导航仍然是一整排、横向排布、
+ * 九个都在**，而不是塌成竖排或被折叠进某个菜单里。
+ */
+test("导航是页眉下横排的一行页签", async ({ page }) => {
   await signIn(page);
-  const rail = page.locator(".rail");
-  const pos = await rail.evaluate((el) => {
-    const cs = getComputedStyle(el);
-    const r = el.getBoundingClientRect();
-    return {
-      position: cs.position,
-      width: r.width,
-      // 「浮起」要能被验证，否则下次很容易被改回贴着窗口左沿的一整列。
-      // 三个条件：离左沿有距离、有圆角、有投影。
-      left: r.left,
-      top: r.top,
-      radius: parseFloat(cs.borderTopLeftRadius),
-      hasShadow: cs.boxShadow !== "none",
-    };
-  });
-  // 固定不随内容滚动：运维翻到长表格底部时，切页签和登出仍在原处。
-  expect(pos.position).toBe("sticky");
-  expect(pos.width).toBeGreaterThan(150);
-  expect(pos.left).toBeGreaterThan(4);
-  expect(pos.top).toBeGreaterThan(4);
-  expect(pos.radius).toBeGreaterThan(4);
-  expect(pos.hasShadow).toBe(true);
+  await expect(page.locator(".rail")).toHaveCount(0);
 
-  // 页签竖排在侧栏里，不是横排在顶部。
-  const box = await page.getByRole("tab", { name: "概览" }).boundingBox();
-  const box2 = await page.getByRole("tab", { name: "用量" }).boundingBox();
-  expect(box && box2).toBeTruthy();
-  if (box && box2) expect(box2.y).toBeGreaterThan(box.y + box.height - 2);
+  const nav = page.locator("nav.tabs");
+  await expect(nav).toBeVisible();
+
+  // 横排：第二个页签在第一个的右边，且两者在同一行。
+  const a = await page.getByRole("tab", { name: "概览" }).boundingBox();
+  const b = await page.getByRole("tab", { name: "用量" }).boundingBox();
+  expect(a && b).toBeTruthy();
+  if (a && b) {
+    expect(b.x).toBeGreaterThan(a.x + a.width - 2);
+    expect(Math.abs(b.y - a.y)).toBeLessThan(3);
+  }
+
+  // 页签压在页眉的重线下面，而不是飘在页面中段。
+  const head = await page.locator(".book-head").boundingBox();
+  expect(head && a).toBeTruthy();
+  if (head && a) expect(a.y).toBeGreaterThan(head.y + head.height - 2);
+
+  // 正文因此拿到整页宽度：不再有左边那条竖栏占位。
+  const frame = await page.locator(".frame").boundingBox();
+  const panel = await page.locator(".panel").first().boundingBox();
+  expect(frame && panel).toBeTruthy();
+  if (frame && panel) expect(panel.x - frame.x).toBeLessThan(60);
 });
 
 test("登录后九个页签都能打开", async ({ page }) => {
@@ -403,27 +410,28 @@ test("界面声明契约，于是服务端能强制它带并发版本", async ({
 
 test("管理 API 读不到时，「已配置」说读不到，而不是显示 0", async ({ page }) => {
   await signIn(page);
-  const card = page.locator(".read", { hasText: "已配置" });
-  await expect(card).toBeVisible();
+  const row = page.locator(".entry", { hasText: "已配置" });
+  await expect(row).toBeVisible();
 
-  await expect(card).toContainText(/读不到/);
+  await expect(row).toContainText(/读不到/);
   // 关键：不能把读不到渲染成一个数。
-  await expect(card.locator(".val")).not.toContainText(/\d/);
+  await expect(row.locator(".val")).not.toContainText(/\d/);
 });
 
-test("没配上限时表盘不画量程，也不假装花费为零", async ({ page }) => {
+test("没配上限时不结账，也不假装余额为零", async ({ page }) => {
   await signIn(page);
-  const gauge = page.locator(".gauge");
-  await expect(gauge).toBeVisible();
+  const bal = page.locator(".balance");
+  await expect(bal).toBeVisible();
 
-  await expect(gauge).toContainText(/未设上限/);
-  // 没有量程就不该有已用段：画一段长度为零的弧，读起来是「花了 0」。
-  await expect(gauge.locator(".gauge-fill")).toHaveCount(0);
-  // 空轨仍在，仪表本身要在场。
-  await expect(gauge.locator(".gauge-track")).toHaveCount(1);
+  await expect(bal).toContainText(/未设花费上限/);
+  // 没有上限就结不出余额：印一个 $0.00 出来读起来是「一分不剩」。
+  // 盯的是那道结账双线和余额行 —— 不能盯「余额」这两个字，空态的引导语
+  // 本身就该提到它（「要看余额，先配一条上限」）。
+  await expect(bal.locator(".balance-sum")).toHaveCount(0);
+  await expect(bal.locator(".balance-rule")).toHaveCount(0);
 });
 
-test("给密钥配上花费上限后，概览的表盘按这个上限标量程", async ({ page }) => {
+test("给密钥配上花费上限后，概览就把这笔账结出来", async ({ page }) => {
   await signIn(page);
   await page.getByRole("tab", { name: "调用方密钥" }).click();
   await page.getByLabel("名称").fill("gauge-scope");
@@ -432,7 +440,13 @@ test("给密钥配上花费上限后，概览的表盘按这个上限标量程",
   await expect(page.getByText(/已保存|明文/)).toBeVisible();
 
   await page.getByRole("tab", { name: "概览" }).click();
-  const gauge = page.locator(".gauge");
-  await expect(gauge).toContainText("$2.00");
-  await expect(gauge).not.toContainText(/未设上限/);
+  const bal = page.locator(".balance");
+  // 上限来自刚写进去的策略，跟指标后端无关，所以这一笔必须出现。
+  await expect(bal).toContainText("$2.00");
+  await expect(bal).not.toContainText(/未设花费上限/);
+
+  // 但这套夹具里 Prometheus 不可达，已花费读不到 —— 于是这笔账**结不出来**，
+  // 而这正是要守的：不知道花了多少就不能算余额，宁可说读不到。
+  await expect(bal).toContainText(/读不到窗口内花费/);
+  await expect(bal.locator(".balance-sum")).toHaveCount(0);
 });

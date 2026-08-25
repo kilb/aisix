@@ -177,7 +177,7 @@ export function Keys({ doc }: { doc: DocState }) {
             <tbody>
               {keys.length === 0 ? (
                 <tr>
-                  <td colSpan={6} style={{ color: "var(--muted)" }}>
+                  <td colSpan={6} style={{ color: "var(--ink-3)" }}>
                     还没有调用方密钥。
                   </td>
                 </tr>
@@ -198,13 +198,13 @@ export function Keys({ doc }: { doc: DocState }) {
                         {sp ? (
                           `${fmtUsd(sp.max_spend_micro_usd)} / ${String(sp.window ?? "day")}`
                         ) : (
-                          <span style={{ color: "var(--muted)" }}>不限</span>
+                          <span style={{ color: "var(--ink-3)" }}>不限</span>
                         )}
                       </td>
-                      <td className="num" style={{ fontSize: 11, color: "var(--muted)" }}>
+                      <td className="num" style={{ fontSize: 11, color: "var(--ink-3)" }}>
                         {String(k.key_hash ?? "").slice(0, 16)}…
                       </td>
-                      <td className="r">
+                      <td className="right">
                         <button className="ghost" disabled={busy} onClick={() => void delKey(i)}>
                           删除
                         </button>
@@ -327,14 +327,14 @@ export function Keys({ doc }: { doc: DocState }) {
                 <th>作用域</th>
                 <th>对象</th>
                 <th>窗口</th>
-                <th className="r">上限</th>
+                <th className="right">上限</th>
                 <th />
               </tr>
             </thead>
             <tbody>
               {policies.length === 0 ? (
                 <tr>
-                  <td colSpan={6} style={{ color: "var(--muted)" }}>
+                  <td colSpan={6} style={{ color: "var(--ink-3)" }}>
                     还没有策略。
                   </td>
                 </tr>
@@ -349,14 +349,14 @@ export function Keys({ doc }: { doc: DocState }) {
                       {String(p.scope_ref ?? "—")}
                     </td>
                     <td>{String(p.window ?? "—")}</td>
-                    <td className="r num">
+                    <td className="right num">
                       {p.max_spend_micro_usd != null ? (
                         `$${(Number(p.max_spend_micro_usd) / 1e6).toFixed(2)}`
                       ) : (
-                        <span style={{ color: "var(--muted)" }}>非花费策略</span>
+                        <span style={{ color: "var(--ink-3)" }}>非花费策略</span>
                       )}
                     </td>
-                    <td className="r">
+                    <td className="right">
                       <button className="ghost" disabled={busy} onClick={() => void delPolicy(i)}>
                         删除
                       </button>

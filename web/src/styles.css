@@ -1,648 +1,399 @@
 /* ════════════════════════════════════════════════════════════════
-   仪表间。暗的，被自己的仪表照亮。
+   台账。
+
+   这个产品本质上是在记账：按 token 计量、按定价折算、对着上限收口。
+   所以界面借的是这门生意自己的实物 —— 账簿的一页。
 
    四条贯穿全局的规则：
 
-   1. 尺度对比是主结构。标签 10px，读数 clamp 到 52px —— 这个比例本身就是
-      信息层级，不需要再靠框线区分主次。
-   2. 读数内凹、控件凸起。真实的仪表间里表头嵌进面板、开关立在表面。运维
-      扫一眼就知道哪块只是在读、哪块会改动生产配置。
-   3. 数字按有效位分层。这个产品的花费以千分之一美分计，两位小数会把真实
-      花费显示成 $0.00 —— 那和「没花钱」在屏幕上无法区分。
-   4. 拉丁惯用法只用在拉丁文上。大写加字距是小型大写的语法，套在中文上只
-      会松散。
+   1. 内容压在栏线上，不装在卡片里。账页没有卡片、没有阴影、没有圆角；
+      有的是横纹、栏线、和右对齐压在线上的数字。凡是想加一层立体感的
+      地方，改成加一道线。
+   2. 只有两种墨。台账历来黑墨记账、红墨记差额 —— 这里是蓝黑墨（标题、
+      可点、在线）和氧化红（超限、余额、负数）。没有第三种颜色表示状态。
+   3. 数字用衬线等宽数位，右对齐。这个产品的花费到千分之一美分，列对不
+      齐就读不出量级差别。
+   4. 拉丁惯用法只用在拉丁文上。字距和小型大写是拉丁字母的语法，套在中
+      文上只会把词拉散。
 
-   颜色用 oklch：同一个 L 值在不同色相上看起来才是同一个明度，调色阶不用
-   靠眼睛试。
+   深色不是把纸反过来，是另一种实物：复写纸。底子是吸了墨的暗面，栏线
+   退成暗棕，两种墨提亮到能在暗底上读。
    ════════════════════════════════════════════════════════════════ */
 
 :root{
-  color-scheme:dark light;
+  color-scheme:light dark;
 
-  /* 设备房：深青蓝，不是黑。黑会让面板边缘消失，而这里要的是「暗处仍有
-     结构」。 */
-  --ground:oklch(19% .014 195);
-  --panel:oklch(23.5% .015 195);
-  --panel-hi:oklch(27% .016 195);   /* 面板顶边受光 */
-  --inset:oklch(15.5% .013 195);    /* 内凹的仪表床 */
-  --raise:oklch(26% .015 195);      /* 输入框、代码块 */
+  /* 纸 —— 暖白，微微发黄。灰底显旧，纸底显用。 */
+  --paper:#faf7f0;
+  --paper-2:#f3efe4;   /* 表头带、隔行 */
+  --edge:#e9e2d2;
 
-  --ink:oklch(96% .006 190);
-  --ink-2:oklch(80% .012 190);
-  --dim:oklch(63% .014 190);
-  --faint:oklch(48% .016 195);      /* 前导零、次要刻度 */
-  --line:oklch(32% .016 195);
-  --hair:oklch(27.5% .014 195);
+  /* 墨 —— 两种，加三档灰墨。 */
+  --ink:#1e1b15;
+  --ink-2:#4d463b;
+  --ink-3:#7e7565;     /* 栏目名、单位、说明 */
+  --indigo:#26407c;    /* 蓝黑墨 */
+  --oxide:#9e3521;     /* 红墨 */
+  --indigo-wash:#e6ebf6;
+  --oxide-wash:#f7e7e1;
 
-  /* 背光玻璃的青。不是荧光绿 —— 那是屏幕在发光，这是玻璃后面有灯。 */
-  --accent:oklch(78% .13 198);
-  --accent-ink:oklch(17% .02 200);
-  --accent-dim:oklch(45% .08 198);
-  --glow:oklch(78% .13 198 / .16);
+  /* 栏线两个重量：细线分行，重线分节。 */
+  --rule:#dcd4c1;
+  --rule-2:#a79c81;
 
-  /* 花费用暖琥珀 —— 它是唯一真的在烧钱的量。 */
-  --live:oklch(80% .14 68);
-  --live-dim:oklch(52% .09 68);
-
-  --ok:oklch(76% .14 155);
-  --warn:oklch(81% .14 88);
-  --crit:oklch(70% .17 15);
-  --ok-soft:oklch(30% .05 155);
-  --warn-soft:oklch(32% .05 88);
-  --crit-soft:oklch(31% .07 15);
-  --track:oklch(28% .014 195);
-
-  --r:8px;
-  --r-sm:5px;
-  --display:"Archivo",system-ui,sans-serif;
-  --body:"IBM Plex Sans",system-ui,-apple-system,sans-serif;
+  --fig:"Source Serif 4",Georgia,"Times New Roman",serif;
+  --body:system-ui,-apple-system,"PingFang SC","Hiragino Sans GB",
+         "Microsoft YaHei",sans-serif;
   --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,monospace;
-  --wide:.16em;
 
-  /* 深度：两层。近处一圈极薄的边界光，远处一团弥散的环境阴影。 */
-  --lift:0 1px 0 oklch(100% 0 0 / .04) inset, 0 1px 2px oklch(0% 0 0 / .3),
-         0 8px 24px -12px oklch(0% 0 0 / .5);
-  --sink:inset 0 1px 3px oklch(0% 0 0 / .35), inset 0 -1px 0 oklch(100% 0 0 / .03);
-  /* 数据序列的分类色阶。同明度、同彩度、只走色相 —— 彼此可辨，且都不
-     表示状态。刻意不复用 --ok / --warn / --crit：那三个在这个界面里有固定
-     含义，拿来区分数据会让一条正常的曲线看起来在报警。 */
-  --s1:oklch(78% .13 198);
-  --s2:oklch(78% .13 268);
-  --s3:oklch(78% .13 328);
-  --s4:oklch(78% .13 38);
-  --s5:oklch(78% .13 128);
+  /* 数据序列：五支笔。台账多个账户就用多支不同颜色的笔 —— 都是文件用墨
+     的饱和度，不是界面强调色。刻意不复用状态色：红墨在这套里固定表示
+     超限，拿它画一条正常曲线会让人以为在报警。 */
+  --s1:#26407c; --s2:#9e3521; --s3:#6b5230; --s4:#3a5560; --s5:#4a5d2f;
+
+  /* 账页宽度。一页就是一页，不铺满显示器。 */
+  --leaf:1180px;
 }
 
-/* 浅色是「白天开了灯的机房」，同一套结构、反过来的明度。 */
-@media (prefers-color-scheme:light){
-  :root:not([data-theme="dark"]){
-    /* ── 白天的仪表盘 ─────────────────────────────────────────
-       浅色不是暗色的翻转：隐喻从「背光玻璃」变成「日光下的搪瓷面板」，
-       那是另一种物理对象。印刷仪表是**高对比**的 —— 深墨压在近白的珐琅
-       面上，配可见的细线；不是灰压灰。
-
-       三个具体差别：
-       - 底面要有实在的色调，面板才能从上面浮起来。近白压近白等于没有面板。
-       - 文字是油墨，不是灰。标签压到 46%、次要文字 58%，而不是 70% 那种
-         「存在但读不出」的灰。
-       - 强调色是搪瓷和印刷油墨：饱和、深，而不是发光。花费用印刷红棕。 */
-    --ground:oklch(97.2% .004 190);
-    --panel:oklch(100% 0 0);
-    --panel-hi:oklch(100% 0 0);
-    --inset:oklch(96.6% .006 190);
-    --raise:oklch(100% 0 0);
-
-    --ink:oklch(21% .022 205);
-    --ink-2:oklch(35% .02 200);
-    --dim:oklch(46% .017 198);
-    --faint:oklch(58% .015 195);
-    --line:oklch(89% .008 190);
-    --hair:oklch(93% .006 190);
-
-    --accent:oklch(44% .155 208);
-    --accent-ink:oklch(100% 0 0);
-    --accent-dim:oklch(66% .1 208);
-    --glow:oklch(44% .155 208 / .13);
-
-    --live:oklch(46% .18 32);
-    --live-dim:oklch(70% .11 32);
-
-    --ok:oklch(44% .15 152);
-    --warn:oklch(50% .14 76);
-    --crit:oklch(46% .2 18);
-    --ok-soft:oklch(93% .04 152);
-    --warn-soft:oklch(94% .05 84);
-    --crit-soft:oklch(94% .04 18);
-    --track:oklch(86% .01 190);
-
-    /* 日光下的实物是清晰的边界 + 一道紧贴的投影，不是网页卡片那种弥散
-       柔影。 */
-    /* 近白底上分层只能靠投影，不能靠把底色压灰 —— 灰底显旧。三层：一圈
-       极细的界线、一道贴近的接触影、一团远处的环境影。 */
-    --lift:0 0 0 1px oklch(88% .008 190 / .8),
-           0 1px 2px oklch(40% .02 200 / .05),
-           0 12px 28px -14px oklch(40% .03 205 / .16);
-    /* 只靠 3% 的色差看不出内凹。给一道贴着上沿的内阴影和一圈细边 ——
-       日光下嵌进面板的表头就是这样：上缘暗、四周有加工痕。 */
-    --sink:inset 0 2px 5px -1px oklch(35% .03 205 / .13),
-           inset 0 0 0 1px oklch(89% .008 190 / .9);
-
-    --s1:oklch(44% .15 208); --s2:oklch(44% .16 275); --s3:oklch(46% .17 335);
-    --s4:oklch(48% .16 42); --s5:oklch(44% .14 152);
+/* 复写纸。 */
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --paper:#16140f;
+    --paper-2:#1d1a13;
+    --edge:#231f17;
+    --ink:#ece6d7;
+    --ink-2:#b5ad9a;
+    --ink-3:#867e6c;
+    --indigo:#93aae6;
+    --oxide:#e07d60;
+    --indigo-wash:#1b2033;
+    --oxide-wash:#2c1d17;
+    --rule:#332e24;
+    --rule-2:#524936;
+    --s1:#93aae6; --s2:#e07d60; --s3:#cba873; --s4:#87a9b7; --s5:#a9bd7d;
   }
 }
-:root[data-theme="light"]{
-  /* ── 白天的仪表盘 ─────────────────────────────────────────
-     浅色不是暗色的翻转：隐喻从「背光玻璃」变成「日光下的搪瓷面板」，
-     那是另一种物理对象。印刷仪表是**高对比**的 —— 深墨压在近白的珐琅
-     面上，配可见的细线；不是灰压灰。
-
-     三个具体差别：
-     - 底面要有实在的色调，面板才能从上面浮起来。近白压近白等于没有面板。
-     - 文字是油墨，不是灰。标签压到 46%、次要文字 58%，而不是 70% 那种
-       「存在但读不出」的灰。
-     - 强调色是搪瓷和印刷油墨：饱和、深，而不是发光。花费用印刷红棕。 */
-  --ground:oklch(97.2% .004 190);
-  --panel:oklch(100% 0 0);
-  --panel-hi:oklch(100% 0 0);
-  --inset:oklch(96.6% .006 190);
-  --raise:oklch(100% 0 0);
-
-  --ink:oklch(21% .022 205);
-  --ink-2:oklch(35% .02 200);
-  --dim:oklch(46% .017 198);
-  --faint:oklch(58% .015 195);
-  --line:oklch(89% .008 190);
-  --hair:oklch(93% .006 190);
-
-  --accent:oklch(44% .155 208);
-  --accent-ink:oklch(100% 0 0);
-  --accent-dim:oklch(66% .1 208);
-  --glow:oklch(44% .155 208 / .13);
-
-  --live:oklch(46% .18 32);
-  --live-dim:oklch(70% .11 32);
-
-  --ok:oklch(44% .15 152);
-  --warn:oklch(50% .14 76);
-  --crit:oklch(46% .2 18);
-  --ok-soft:oklch(93% .04 152);
-  --warn-soft:oklch(94% .05 84);
-  --crit-soft:oklch(94% .04 18);
-  --track:oklch(86% .01 190);
-
-  /* 日光下的实物是清晰的边界 + 一道紧贴的投影，不是网页卡片那种弥散
-     柔影。 */
-  --lift:0 0 0 1px oklch(88% .008 190 / .8),
-         0 1px 2px oklch(40% .02 200 / .05),
-         0 12px 28px -14px oklch(40% .03 205 / .16);
-  --sink:inset 0 2px 5px -1px oklch(35% .03 205 / .13),
-         inset 0 0 0 1px oklch(89% .008 190 / .9);
-
-  --s1:oklch(44% .15 208); --s2:oklch(44% .16 275); --s3:oklch(46% .17 335);
-  --s4:oklch(48% .16 42); --s5:oklch(44% .14 152);
-}
-@media (prefers-color-scheme:light){
-    :root:not([data-theme="dark"]) body{
-    background-image:
-      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='.022'/%3E%3C/svg%3E");
-  }
-}
-:root[data-theme="light"] body{
-  background-image:
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='.022'/%3E%3C/svg%3E");
+:root[data-theme="dark"]{
+  --paper:#16140f;
+  --paper-2:#1d1a13;
+  --edge:#231f17;
+  --ink:#ece6d7;
+  --ink-2:#b5ad9a;
+  --ink-3:#867e6c;
+  --indigo:#93aae6;
+  --oxide:#e07d60;
+  --indigo-wash:#1b2033;
+  --oxide-wash:#2c1d17;
+  --rule:#332e24;
+  --rule-2:#524936;
+  --s1:#93aae6; --s2:#e07d60; --s3:#cba873; --s4:#87a9b7; --s5:#a9bd7d;
 }
 
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
 body{
   margin:0;
-  /* 暗色下顶上一道极弱的光，像天花板的灯 —— 让暗底不是一块死板。
-     白天没有这回事，所以浅色主题把它关掉，底面就是干净的漆面。 */
+  /* 纸纤维。大面积平涂读起来像没画完，实物的纸是有肌理的。 */
   background:
-    /* 一层几乎看不见的颗粒。近白或近黑的大面积平涂会读成「没画完」，
-       而实体的漆面是有肌理的 —— 这一层给它质感，不给它图案。 */
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='.032'/%3E%3C/svg%3E"),
-    radial-gradient(120% 62% at 50% -12%, var(--glow), transparent 62%),
-    var(--ground);
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='f'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='4'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23f)' opacity='.04'/%3E%3C/svg%3E"),
+    var(--paper);
   background-attachment:fixed;
-  color:var(--ink);font-family:var(--body);font-size:14px;line-height:1.55;
-  font-feature-settings:"ss01";
-  /* 中文允许字间断行，但把「客户端」这类词从中间断开读起来是错的。 */
+  color:var(--ink);font-family:var(--body);font-size:14.5px;line-height:1.6;
+  /* 中文允许字间断行，但把「客户端」从中间断开读起来是错的。 */
   line-break:strict;
   -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
 }
-h1,h2,h3{margin:0;font-family:var(--display);text-wrap:balance}
+h1,h2,h3{margin:0;font-family:var(--fig);font-weight:600;text-wrap:balance}
 button,input,select,textarea{font:inherit;color:inherit}
-a{color:var(--accent);text-underline-offset:2px}
-.num{font-family:var(--mono);font-variant-numeric:tabular-nums;font-feature-settings:"zero"}
-[hidden]{display:none !important}
-::selection{background:var(--accent);color:var(--accent-ink)}
+a{color:var(--indigo);text-underline-offset:2px}
+:focus-visible{outline:2px solid var(--indigo);outline-offset:1px}
 
-/* ── 入场：错峰浮现 ───────────────────────────────────────────
-   只在挂载时跑一次，从上到下错开 —— 眼睛会跟着顺序读下来，而不是一次
-   被整页糊住。reduced-motion 下整体关掉。 */
-@keyframes rise{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
-.panel,.read{animation:rise .34s cubic-bezier(.16,.8,.3,1) backwards}
-.read:nth-child(1){animation-delay:.02s}
-.read:nth-child(2){animation-delay:.06s}
-.read:nth-child(3){animation-delay:.1s}
-.read:nth-child(4){animation-delay:.14s}
-.panel:nth-of-type(2){animation-delay:.08s}
-.panel:nth-of-type(3){animation-delay:.12s}
+/* 衬线等宽数位。账页的数字必须能按位对齐 —— 这是这套排版的地基。 */
+.fig,.num,.val,.now{
+  font-family:var(--fig);font-variant-numeric:tabular-nums lining-nums;
+}
 
-/* ── 骨架：悬浮侧栏 + 宽舞台 ─────────────────────────────────
-   侧栏是一块**浮起来的岛**，不是贴着窗口左沿的一整列：四周留白、有圆角、
-   有投影，飘在背景之上。贴边通高的那种在视觉上属于「窗口的一部分」，而这
-   一块要读作「摆在台面上的控制盒」。
-
-   它同时是 sticky —— 运维翻到长表格底部时，切页签和登出仍在原处。 */
+/* ── 账簿 ─────────────────────────────────────────────────────
+   单栏。侧栏换成页眉下的一排页签，正文因此拿到整页宽度 —— 账页要的是
+   列宽，不是左边那条竖栏。 */
 .frame{
-  display:grid;
-  grid-template-columns:var(--rail-w) minmax(0,1fr);
-  gap:var(--gap);
-  padding:var(--gap);
+  width:min(var(--leaf),100%);margin:0 auto;
+  padding:clamp(20px,3.4vw,44px) clamp(16px,3vw,40px) 96px;
   min-height:100vh;
-  align-items:start;
-}
-:root{--rail-w:196px;--gap:clamp(10px,1.1vw,18px)}
-
-/* 还不知道是否登录时的空白。给它满高，避免 React 挂载瞬间页面抖一下。 */
-.boot{min-height:100vh}
-/* 契约偏移那类「停止一切操作」的整页消息。 */
-.centered{min-height:100vh;display:grid;place-items:center;padding:clamp(20px,5vw,48px)}
-.centered > .note{max-width:60ch;margin:0}
-
-.rail{
-  position:sticky;top:var(--gap);
-  height:calc(100vh - var(--gap) * 2);
-  display:flex;flex-direction:column;
-  padding:18px 14px;
-  border:1px solid var(--line);border-radius:calc(var(--r) + 4px);
-  background:color-mix(in oklch,var(--panel) 82%,transparent);
-  backdrop-filter:blur(16px) saturate(130%);
-  box-shadow:var(--lift);
-  animation:rail-in .4s cubic-bezier(.16,.8,.3,1) backwards;
-}
-@keyframes rail-in{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:none}}
-
-.rail-mark{padding:0 8px 16px;border-bottom:1.5px solid var(--ink);margin-bottom:14px}
-.rail-mark h1{
-  font-size:12px;font-weight:700;font-stretch:118%;
-  letter-spacing:.13em;text-transform:uppercase;line-height:1.35;
-}
-.rail-sub{
-  display:block;margin-top:7px;
-  font-family:var(--mono);font-size:9px;letter-spacing:.11em;
-  text-transform:uppercase;color:var(--faint);
 }
 
-/* 竖排导航：当前项用一条左侧指针 + 提亮的面，像刻度盘上的指示。 */
-nav.tabs{display:flex;flex-direction:column;gap:1px;overflow-y:auto;scrollbar-width:thin}
+.book-head{
+  display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
+  padding-bottom:12px;border-bottom:2px solid var(--ink);
+}
+.book-mark{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+.book-head h1{
+  font-size:clamp(19px,2.6vw,26px);font-weight:600;line-height:1.1;
+  font-variant:small-caps;letter-spacing:.03em;
+}
+.book-sub{
+  font-family:var(--mono);font-size:10.5px;color:var(--ink-3);
+}
+.book-foli{
+  margin-left:auto;display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+}
+
+/* 页签：一排压在栏线上的标题。选中的盖一道重线，不用底色块 —— 账页上
+   没有色块。 */
+nav.tabs{
+  display:flex;overflow-x:auto;
+  border-bottom:1px solid var(--rule-2);
+  margin-bottom:clamp(18px,2.4vw,30px);
+  scrollbar-width:thin;
+}
 nav.tabs button{
-  position:relative;text-align:left;background:none;border:0;
-  border-radius:var(--r-sm);padding:8px 10px 8px 13px;cursor:pointer;
-  font-size:12.5px;font-weight:500;color:var(--dim);
-  transition:color .14s ease,background .14s ease;
+  flex:none;background:none;border:0;cursor:pointer;
+  padding:11px clamp(11px,1.5vw,18px);
+  color:var(--ink-3);font-size:14px;white-space:nowrap;
+  border-bottom:2px solid transparent;margin-bottom:-1px;
+  transition:color .13s ease,border-color .13s ease;
 }
-nav.tabs button::before{
-  content:"";position:absolute;left:0;top:50%;translate:0 -50%;
-  width:2px;height:0;border-radius:1px;background:var(--accent);
-  transition:height .18s cubic-bezier(.2,.7,.3,1);
-}
-nav.tabs button:hover{color:var(--ink-2);background:color-mix(in oklch,var(--ink) 5%,transparent)}
+nav.tabs button:hover{color:var(--ink)}
 nav.tabs button[aria-selected="true"]{
-  color:var(--ink);font-weight:600;
-  background:color-mix(in oklch,var(--accent) 13%,transparent);
+  color:var(--ink);font-weight:600;border-bottom-color:var(--ink);
 }
-nav.tabs button[aria-selected="true"]::before{height:calc(100% - 12px)}
-nav.tabs button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
 
-/* 状态胶囊。改成侧栏骨架时这几条规则被我连区段一起删掉了，健康状态于是
-   退成一行纯文字 —— 边框和状态点都没了。 */
+/* 账簿上盖的小戳，不是发光的胶囊。 */
 .pill{
-  display:inline-flex;align-items:center;gap:8px;
-  font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;
-  padding:5px 11px;border-radius:99px;
-  border:1px solid var(--line);background:var(--panel);color:var(--dim);
+  display:inline-flex;align-items:center;gap:7px;
+  font-family:var(--mono);font-size:11px;padding:3px 9px;
+  border:1px solid var(--rule-2);color:var(--ink-3);
 }
-.pill.value{text-transform:none;letter-spacing:0;font-size:11px;color:var(--ink-2)}
-.pill.ok{color:var(--ok);border-color:color-mix(in oklch,var(--ok) 42%,transparent)}
-.pill.crit{color:var(--crit);border-color:color-mix(in oklch,var(--crit) 48%,transparent)}
-.pill .dot{width:5px;height:5px;border-radius:50%;background:currentColor;flex:none}
-/* 在线时脉动一次半径。运维要的是「它还活着」这个持续信号。 */
-@keyframes breathe{
-  0%,100%{box-shadow:0 0 0 0 color-mix(in oklch,var(--ok) 55%,transparent)}
-  50%{box-shadow:0 0 0 4px color-mix(in oklch,var(--ok) 0%,transparent)}
-}
-.pill.ok .dot{animation:breathe 2.6s ease-in-out infinite}
+.pill.value{font-size:11.5px;color:var(--ink-2)}
+.pill.ok{color:var(--indigo);border-color:var(--indigo)}
+.pill.crit{color:var(--oxide);border-color:var(--oxide)}
+.pill .dot{width:5px;height:5px;background:currentColor;flex:none}
 
-.rail-foot{
-  margin-top:auto;padding-top:18px;border-top:1px solid var(--hair);
-  display:flex;flex-direction:column;gap:12px;align-items:flex-start;
-}
-.rail-actions{display:flex;gap:8px;flex-wrap:wrap}
-
-.stage{
-  min-width:0;
-  padding:clamp(22px,2.6vw,40px) clamp(16px,2.6vw,40px) 96px;
-  max-width:1680px;
-}
-
-/* 窄屏：侧栏落回顶部横条，导航横向滚动。 */
-@media (max-width:900px){
-  .frame{grid-template-columns:minmax(0,1fr)}
-  .rail{
-    position:static;height:auto;flex-direction:row;align-items:center;
-    gap:16px;flex-wrap:wrap;padding:16px;
-    border-right:0;border-bottom:1px solid var(--line);
-  }
-  .rail-mark{
-    padding:0 12px 0 0;margin:0;border-bottom:0;border-right:1px solid var(--line);
-  }
-  .rail-sub{display:none}
-  nav.tabs{flex-direction:row;overflow-x:auto;flex:1;min-width:0}
-  nav.tabs button::before{
-    left:12px;right:12px;top:auto;bottom:0;translate:none;
-    width:auto;height:2px;transform:scaleX(0);transform-origin:left;
-    transition:transform .18s ease;
-  }
-  nav.tabs button[aria-selected="true"]::before{height:2px;transform:scaleX(1)}
-  .rail-foot{margin:0;padding:0;border-top:0;flex-direction:row;align-items:center}
-  .stage{padding:20px 16px 64px}
-}
-
-/* ── 控件面：凸起 ─────────────────────────────────────────── */
-.panel{
-  background:linear-gradient(180deg,var(--panel-hi),var(--panel) 42%);
-  border:1px solid var(--line);border-radius:var(--r);
-  padding:clamp(18px,2.2vw,26px);margin-bottom:clamp(14px,1.8vw,20px);
-  box-shadow:var(--lift);
-}
+/* ── 账页上的一节 ────────────────────────────────────────────
+   原来是一块有阴影的卡片。账页上没有卡片：一节就是小标题、一道线、和
+   线下面的内容。 */
+.panel{margin:0 0 clamp(22px,2.6vw,32px)}
 .panel > h2{
-  font-size:clamp(13px,1.5vw,15px);font-weight:700;font-stretch:105%;letter-spacing:0;
-  color:var(--ink);padding-bottom:13px;margin-bottom:16px;
-  border-bottom:1px solid var(--hair);
+  font-size:clamp(15px,1.7vw,18px);font-weight:600;
+  padding-bottom:7px;border-bottom:1px solid var(--rule-2);
+  display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;
 }
-.hint{color:var(--dim);font-size:12.5px;max-width:74ch;text-wrap:pretty}
-.panel > .hint{margin:0 0 16px}
-.panel > h3{
-  font-family:var(--body);font-size:12px;font-weight:600;letter-spacing:0;
-  color:var(--ink-2);margin:26px 0 0;padding-top:18px;border-top:1px solid var(--hair);
-}
-.panel > h3:first-of-type{margin-top:2px}
-.panel > h3 + .hint{margin:6px 0 14px}
-.grid{display:grid;gap:clamp(12px,1.4vw,16px)}
-.g3{grid-template-columns:repeat(4,minmax(0,1fr))}
-@media (max-width:1180px){.g3{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media (max-width:520px){.g3{grid-template-columns:1fr}}
-.g2{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+.panel > h2 .pill{margin-left:auto}
+.hint{margin:7px 0 12px;color:var(--ink-3);font-size:13px;max-width:74ch}
 
-/* ── 读数：内凹，尺度是主角 ───────────────────────────────── */
-.read{
-  background:var(--inset);border:1px solid var(--hair);border-radius:var(--r);
-  padding:clamp(15px,1.8vw,20px);box-shadow:var(--sink);
-  display:flex;flex-direction:column;gap:0;
+/* ── 记账行 ──────────────────────────────────────────────────
+   概览页的读数不再是四张卡片，而是账页的分录：项目在左，数字右对齐压在
+   栏线上，注释缩在项目下面一行。 */
+.entries{display:grid;grid-template-columns:1fr auto}
+.entry{
+  display:grid;grid-template-columns:subgrid;grid-column:1 / -1;
+  align-items:baseline;column-gap:clamp(18px,3vw,44px);
+  padding:9px 0 8px;border-bottom:1px solid var(--rule);
 }
-.read .lab{
-  font-family:var(--mono);font-size:10px;letter-spacing:.07em;text-transform:uppercase;
-  color:var(--dim);
+.entry .lab{
+  font-size:14.5px;color:var(--ink);font-family:var(--body);
+  /* 通用 .lab 带着 mono 的字距和大写；这里是中文项目名，必须全部复位，
+     否则「本 日 上 限」会被拉散 —— 开头第 4 条讲的就是这个。 */
+  letter-spacing:0;text-transform:none;font-weight:400;
 }
-/* 读数与标签之间的尺度落差就是层级本身。 */
-.read .val{
-  font-family:var(--mono);font-variant-numeric:tabular-nums;
-  font-size:clamp(30px,3.6vw,52px);font-weight:400;letter-spacing:-.045em;
-  margin-top:10px;line-height:.95;color:var(--ink);
+.entry .foot{grid-column:1;font-size:12px;color:var(--ink-3);margin-top:3px}
+.entry .val{
+  grid-column:2;grid-row:1;text-align:right;
+  font-size:clamp(19px,2.1vw,24px);font-weight:500;line-height:1.15;
+  white-space:nowrap;
 }
-/* 精度数字：前导零退到弱色，有效位留在亮处。 */
-.read .val .lead{color:var(--faint);font-weight:300}
-.read .val .sep{color:var(--faint);font-weight:300;padding:0 .1em}
-.read .val.absent{color:var(--faint);font-weight:300}
-.read.money .val{color:var(--live);text-shadow:0 0 24px color-mix(in oklch,var(--live) 22%,transparent)}
-/* 白天的读数是印上去的墨，要有重量；暗色里它是发光的细笔画，两者的字重
-   本来就不该一样。辉光在纸面上也没有物理依据，关掉。 */
-@media (prefers-color-scheme:light){
-  :root:not([data-theme="dark"]) .read .val{font-weight:500}
-  :root:not([data-theme="dark"]) .read .val .lead{font-weight:400}
-  :root:not([data-theme="dark"]) .read.money .val{text-shadow:none}
-}
-:root[data-theme="light"] .read .val{font-weight:500}
-:root[data-theme="light"] .read .val .lead{font-weight:400}
-:root[data-theme="light"] .read.money .val{text-shadow:none}
-.read.money .val .lead{color:var(--live-dim);text-shadow:none}
-.read .foot{font-size:11px;color:var(--faint);margin-top:auto;padding-top:12px}
-.read{transition:box-shadow .18s ease}
-.read:hover{box-shadow:var(--sink),0 0 0 1px color-mix(in oklch,var(--accent) 30%,transparent)}
+/* 前导零压低、有效位留在墨色。花费到千分之一美分，两位小数会把真实花费
+   显示成 $0.00 —— 那和「没花钱」在纸上没有区别。 */
+.val .lead{color:var(--ink-3);font-weight:400}
+.val .sep{color:var(--ink-3);padding:0 .26em;font-weight:400}
+.val.absent{color:var(--ink-3);font-weight:400}
 
-/* ── 花费表盘：这一版唯一放胆的地方 ───────────────────────────
-   一段弧回答「离上限还有多远」，而一个数字答不了。色调随占比走 —— 那是
-   运维要的信号，不是配色趣味。 */
-.dial-row{
-  display:grid;grid-template-columns:minmax(240px,290px) minmax(0,1fr);
-  gap:clamp(14px,1.8vw,24px);align-items:stretch;
-}
-.dial-side{
-  display:grid;grid-template-columns:repeat(3,minmax(0,1fr));
-  gap:clamp(12px,1.4vw,16px);
-}
-@media (max-width:1320px){.dial-side{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media (max-width:1080px){
-  .dial-row{grid-template-columns:minmax(0,1fr)}
-}
-@media (max-width:560px){
-  .dial-side{grid-template-columns:1fr}
-}
+/* ── 余额块：这一页的签名 ────────────────────────────────────
+   台账自己的装置。上限记一笔、已花记一笔，双线收口，余额用红墨 —— 这
+   正好就是运维要问的那句「离上限还有多远」，用记账的说法写出来。
 
-.gauge{
-  display:grid;place-items:center;
-  background:var(--inset);border:1px solid var(--hair);border-radius:var(--r);
-  box-shadow:var(--sink);padding:14px 10px 10px;
-  --gauge-a:var(--ok);--gauge-b:var(--ok);
+   没配上限就不结这笔账：写明未设上限，不去编一个余额。给一个不存在的
+   上限算差额，比不算更糟。 */
+.balance .entry:last-of-type{border-bottom:0}
+.balance-rule{
+  height:0;border-top:1px solid var(--ink);
+  box-shadow:0 3px 0 -1px var(--ink);   /* 双线：会计的结账线 */
+  margin:9px 0 0;
 }
-.gauge-warn{--gauge-a:var(--warn);--gauge-b:var(--warn)}
-.gauge-crit{--gauge-a:var(--crit);--gauge-b:var(--crit)}
-.gauge-idle{--gauge-a:var(--dim);--gauge-b:var(--dim)}
-/* 没配上限时轨道打虚。一整圈实心空轨说的是「有量程，现在为零」，跟
-   「没有量程」是两件事。 */
-.gauge-idle .gauge-track{stroke-dasharray:2 8;opacity:.8}
-.gauge svg{width:100%;max-width:248px;height:auto;overflow:visible}
-.gauge-track{
-  /* 量程两端切平。圆头会在满量程附近凸出 fill 的端点，那点残量看着像一颗
-     独立的深色药丸，而不是「还剩这么多」。 */
-  fill:none;stroke:var(--track);stroke-width:11;stroke-linecap:butt;
+.balance-sum{
+  display:grid;grid-template-columns:1fr auto;
+  column-gap:clamp(18px,3vw,44px);align-items:baseline;
+  padding:12px 0 0;
 }
-.gauge-fill{
-  fill:none;stroke:url(#gaugeFill);stroke-width:11;stroke-linecap:round;
-  filter:drop-shadow(0 0 7px color-mix(in oklch,var(--gauge-b) 45%,transparent));
-  /* 挂载时从零扫到位。这一下是有内容的：它演的正是这段时间累积出来的量。 */
-  animation:sweep .85s cubic-bezier(.22,.9,.28,1) backwards;
+.balance-sum .lab{
+  font-size:15.5px;font-weight:600;letter-spacing:0;
+  font-family:var(--body);color:var(--ink);text-transform:none;
 }
-@keyframes sweep{from{stroke-dasharray:0 999}to{stroke-dasharray:999 0}}
-.gauge-val{
-  font-family:var(--mono);font-variant-numeric:tabular-nums;
-  /* 这一行里的主角就得是最大的那个数。26px 时它比旁边的读数小了四成，
-     层级正好反过来了。 */
-  font-size:36px;font-weight:500;letter-spacing:-.045em;
-  /* 跟弧同色 —— 弧和数字说的是同一件事，两种颜色会读成两件事。 */
-  fill:var(--gauge-b);
+.balance-sum .val{
+  text-align:right;font-size:clamp(26px,3.6vw,42px);font-weight:600;
+  line-height:1.05;color:var(--oxide);white-space:nowrap;
 }
-/* 前导零用透明度压，不用 color-mix：oklch 里红跟青灰混要绕过黄，`$` 会
-   变成橄榄色。透明度不碰色相。 */
-.gauge-val .lead{opacity:.42;font-weight:300}
-/* 「上限」是中文，`$5.00 / DAY` 是拉丁数字 —— 字距和大写只加在后者身上。
-   整串一起加会把中文拉散，那是本文件开头第 4 条规则说的事。 */
-.gauge-cap{font-size:10.5px;fill:var(--faint)}
-.gauge-cap .q{
-  font-family:var(--mono);letter-spacing:.09em;text-transform:uppercase;
-}
+.balance-sum .val .lead{color:color-mix(in srgb,var(--oxide) 45%,var(--paper))}
+.balance-sum .foot{grid-column:1 / -1;margin-top:8px;font-size:12px;color:var(--ink-3)}
+.balance-note{padding:15px 0 0;font-size:13px;color:var(--ink-3)}
 
-/* ── 表格 ─────────────────────────────────────────────────── */
-table{width:100%;border-collapse:collapse;font-size:13px}
+/* ── 表格：账页本来的样子 ────────────────────────────────────*/
+table{width:100%;border-collapse:collapse;font-size:13.5px}
 th{
-  text-align:left;font-family:var(--mono);font-size:9.5px;letter-spacing:.11em;
-  text-transform:uppercase;color:var(--faint);font-weight:500;
-  padding:0 12px 10px;border-bottom:1px solid var(--line);white-space:nowrap;
+  text-align:left;font-family:var(--mono);font-size:11px;
+  color:var(--ink-3);font-weight:500;
+  padding:0 11px 8px;border-bottom:1px solid var(--rule-2);white-space:nowrap;
 }
-td{padding:12px;border-bottom:1px solid var(--hair);vertical-align:top}
-tbody tr:last-child td{border-bottom:0}
-tbody tr{transition:background .12s ease}
-tbody tr:hover td{background:color-mix(in oklch,var(--accent) 6%,transparent)}
-td.r,th.r{text-align:right}
-td strong{font-weight:600}
-/* 空表头是动作列。不约束宽度它会分到等份，于是按钮被推到离它作用的那行
-   很远的地方。 */
-th:empty{width:1%}
-td:last-child:has(button){width:1%;white-space:nowrap}
-.scroll{overflow-x:auto;scrollbar-width:thin}
+th:first-child,td:first-child{padding-left:0}
+th:last-child,td:last-child{padding-right:0}
+td{padding:11px;border-bottom:1px solid var(--rule);vertical-align:top}
+tbody tr:nth-child(even){background:color-mix(in srgb,var(--paper-2) 60%,transparent)}
+tbody tr:hover{background:var(--paper-2)}
+/* .num 只管数字排版，对齐交给 .right —— 这两件事以前挤在 .r 一个类里，
+   而 .r 是表单行的 flex 容器：套在 <td> 上会把单元格从表格布局里摘出去，
+   右侧那几列于是塌成竖排。 */
+.right{text-align:right}
+.scroll{overflow-x:auto;margin:0 -2px;padding:0 2px}
 
-.bar{height:3px;background:var(--track);border-radius:2px;overflow:hidden;
-  margin-top:8px;max-width:180px}
-.bar > i{display:block;height:100%;background:var(--accent);
-  box-shadow:0 0 8px var(--glow)}
-
-/* ── 曲线 ─────────────────────────────────────────────────── */
-.chart{margin-top:2px}
-.chart svg{display:block;width:100%;height:auto}
-.chart .axis{font-family:var(--mono);font-size:9px;fill:var(--faint);letter-spacing:.04em}
-.chart .grid-line{stroke:var(--hair);stroke-width:1}
-.chart .zero-line{stroke:var(--line);stroke-width:1}
-.chart .now{stroke:var(--inset);stroke-width:2}
-.legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:16px;
-  padding-top:14px;border-top:1px solid var(--hair)}
-.legend .item{display:inline-flex;align-items:center;gap:8px;
-  font-family:var(--mono);font-size:11px;color:var(--ink-2)}
-.legend .swatch{width:10px;height:2px;border-radius:1px}
-
-/* ── 控件 ─────────────────────────────────────────────────── */
-button.act{
-  background:var(--accent);color:var(--accent-ink);border:0;border-radius:var(--r-sm);
-  padding:10px 18px;cursor:pointer;font-weight:600;font-size:12.5px;letter-spacing:.01em;
-  box-shadow:0 1px 10px -2px var(--glow);
-  transition:filter .14s ease,transform .07s ease,box-shadow .14s ease;
+/* ── 控件：写在线上，不装在盒子里 ────────────────────────────
+   账簿的空白栏就是一条线，人在线上写字。所以输入框是下划线，不是圆角
+   方框 —— 这也让表单和账页用同一套栏线。 */
+.f{display:block;margin-bottom:15px}
+.f > span{
+  display:block;margin-bottom:5px;
+  font-family:var(--mono);font-size:11px;color:var(--ink-3);
 }
-button.act:hover:not(:disabled){filter:brightness(1.08);box-shadow:0 2px 16px -2px var(--glow)}
-button.act:active:not(:disabled){transform:translateY(1px)}
-button.act:disabled{opacity:.38;cursor:not-allowed;box-shadow:none}
-button.ghost{
-  background:var(--raise);border:1px solid var(--line);color:var(--ink-2);
-  border-radius:var(--r-sm);padding:7px 13px;cursor:pointer;font-size:12px;
-  transition:border-color .14s ease,color .14s ease,background .14s ease;
+input,select,textarea{
+  width:100%;background:transparent;color:var(--ink);
+  border:0;border-bottom:1px solid var(--rule-2);border-radius:0;
+  padding:7px 2px;
+  transition:border-color .13s ease,background .13s ease;
 }
-button.ghost:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
-button.ghost:disabled{opacity:.4;cursor:not-allowed}
-/* 表格里的动作安静下来：每行一个描边框会比它删的那行更显眼。悬停才显形，
-   并转成警示色 —— 那时用户已经指着它了。 */
-td button.ghost{background:none;border-color:transparent;color:var(--faint);padding:5px 9px}
-tr:hover td button.ghost{border-color:var(--line);color:var(--ink-2)}
-td button.ghost:hover:not(:disabled){
-  border-color:color-mix(in oklch,var(--crit) 45%,transparent);
-  color:var(--crit);background:color-mix(in oklch,var(--crit) 10%,transparent);
-}
-button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-
-label.f{display:block;margin-bottom:15px}
-label.f > span{
-  display:block;font-family:var(--mono);font-size:9.5px;letter-spacing:.11em;
-  text-transform:uppercase;color:var(--dim);margin-bottom:7px;
-}
-input[type=text],input[type=password],input[type=number],select,textarea{
-  width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:var(--r-sm);
-  background:var(--raise);transition:border-color .14s ease,box-shadow .14s ease;
-}
-/* 输入框也有行宽。撑满两栏意味着一个装 `my-app` 的框有 540px 宽，人会先
-   怀疑自己是不是该填一长串东西。 */
-input[type=text],input[type=password],select{max-width:44ch}
-input[type=number]{font-family:var(--mono);font-variant-numeric:tabular-nums;max-width:190px}
-textarea{max-width:none}
-input:hover,select:hover,textarea:hover{border-color:var(--dim)}
 input:focus,select:focus,textarea:focus{
-  outline:0;border-color:var(--accent);box-shadow:0 0 0 3px var(--glow);
+  outline:0;border-bottom-color:var(--indigo);
+  background:color-mix(in srgb,var(--indigo-wash) 55%,transparent);
 }
-input[type=checkbox]{accent-color:var(--accent);width:15px;height:15px}
-::placeholder{color:var(--faint)}
+input::placeholder{color:var(--ink-3)}
+textarea{
+  font-family:var(--mono);font-size:12.5px;line-height:1.65;
+  border:1px solid var(--rule-2);padding:12px;min-height:340px;resize:vertical;
+  background:var(--paper-2);
+}
+select{appearance:none;padding-right:20px}
+input[type=checkbox]{width:auto;border:0}
 
-/* ── 提示 ─────────────────────────────────────────────────── */
+button.act{
+  background:var(--ink);color:var(--paper);border:0;border-radius:0;
+  padding:9px 20px;cursor:pointer;font-size:13.5px;font-weight:600;
+  transition:background .13s ease;
+}
+button.act:hover:not(:disabled){background:var(--indigo)}
+button.act:disabled{opacity:.42;cursor:not-allowed}
+button.ghost{
+  background:transparent;border:1px solid var(--rule-2);color:var(--ink-2);
+  border-radius:0;padding:7px 14px;cursor:pointer;font-size:13px;
+  transition:border-color .13s ease,color .13s ease;
+}
+button.ghost:hover:not(:disabled){border-color:var(--ink);color:var(--ink)}
+button.ghost:disabled{opacity:.42;cursor:not-allowed}
+/* 表格里的动作安静下来：每行一个描边框会比它删的那行更显眼。悬停才显形。 */
+td button.ghost{border-color:transparent;color:var(--ink-3);padding:4px 8px}
+tr:hover td button.ghost{border-color:var(--rule-2);color:var(--oxide)}
+
+/* ── 批注 ────────────────────────────────────────────────────
+   账页上的批注是页边写的一段，靠一道粗墨线标出来，不是一个色块。 */
 .note{
-  border-left:2px solid var(--accent);
-  background:color-mix(in oklch,var(--accent) 10%,transparent);
-  padding:13px 16px;border-radius:0 var(--r-sm) var(--r-sm) 0;
-  font-size:12.5px;margin:16px 0;max-width:82ch;
-  text-wrap:pretty;overflow-wrap:anywhere;
+  margin:14px 0;padding:10px 0 10px 14px;font-size:13px;
+  border-left:3px solid var(--rule-2);color:var(--ink-2);
 }
-.note.crit{border-color:var(--crit);background:color-mix(in oklch,var(--crit) 12%,transparent)}
-.note.warn{border-color:var(--warn);background:color-mix(in oklch,var(--warn) 12%,transparent)}
-.note strong{font-weight:600}
-.note p{margin:9px 0 0}
-.note p:first-child{margin-top:0}
-.note .hint{color:var(--dim);font-size:11.5px}
-code,.note code{font-family:var(--mono);font-size:11.5px;
-  background:color-mix(in oklch,var(--ink) 9%,transparent);padding:2px 5px;border-radius:3px}
-pre{
-  font-family:var(--mono);font-size:11.5px;background:var(--inset);
-  border:1px solid var(--line);border-radius:var(--r-sm);
-  padding:14px;overflow-x:auto;margin:0;box-shadow:var(--sink);
-  user-select:all;  /* 密钥明文：一次点选全中，减少漏抄 */
-}
+.note.warn{border-left-color:var(--ink)}
+.note.crit{border-left-color:var(--oxide);color:var(--oxide)}
+.note strong{color:var(--ink)}
 
-/* ── 登录闸 ───────────────────────────────────────────────────
-   未登录者看到的全部，所以它承担整个第一印象。三段：铭牌、一排停在零位的
-   示意刻度、口令。刻度不假装是数据 —— 标注写着「未连接」。 */
-/* 这是没登录的人看到的全部，所以它得有台机器的体量。520px 宽的一小块
-   飘在满屏暗色里，读起来是个对话框，不是一块面板。 */
+/* ── 曲线 ────────────────────────────────────────────────────*/
+.chart{margin-top:4px}
+.chart svg{display:block;width:100%;height:auto}
+.grid-line{stroke:var(--rule);stroke-width:1}
+.zero-line{stroke:var(--rule-2);stroke-width:1}
+.axis{font-family:var(--mono);font-size:10px;fill:var(--ink-3)}
+.legend{
+  display:flex;flex-wrap:wrap;gap:6px 22px;margin-top:12px;
+  padding-top:11px;border-top:1px solid var(--rule);font-size:12px;
+}
+.legend .item{display:inline-flex;align-items:center;gap:7px}
+.legend .bar{width:15px;height:2px;flex:none}
+.legend .now{color:var(--ink-3)}
+
+/* ── 各处小件 ────────────────────────────────────────────────*/
+.grid{display:grid;gap:clamp(12px,1.6vw,20px)}
+.g2{grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
+.g3{grid-template-columns:repeat(auto-fit,minmax(190px,1fr))}
+.r{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end}
+.r > .f{flex:1 1 190px;margin-bottom:0}
+.swatch{
+  width:13px;height:13px;border:1px solid var(--rule-2);flex:none;
+  display:inline-block;vertical-align:-2px;
+}
+.q{font-family:var(--mono);letter-spacing:.08em}
+.lab{
+  font-family:var(--mono);font-size:11px;color:var(--ink-3);
+}
+.centered{min-height:100vh;display:grid;place-content:center;text-align:center;padding:40px}
+.boot{color:var(--ink-3);font-family:var(--mono);font-size:12px}
+
+/* ── 封皮（登录闸）─────────────────────────────────────────
+   没登录的人看到的全部，所以它是账簿的封皮：书名、这本册子记的三个栏
+   目、和一把锁。三个栏目停在空位 —— 印一个 0 出来就是在报一个没测到
+   的数。 */
 #gate{
-  min-height:100vh;display:grid;place-content:center;justify-items:stretch;
-  gap:0;padding:clamp(24px,6vw,56px);
-  width:min(660px,100%);margin:0 auto;
+  min-height:100vh;display:grid;place-content:center;
+  width:min(620px,100%);margin:0 auto;padding:clamp(24px,6vw,56px);
 }
 .gate-plate{
-  display:flex;align-items:flex-end;gap:20px;
-  padding-bottom:22px;border-bottom:1.5px solid var(--ink);
-  animation:rise .42s cubic-bezier(.16,.8,.3,1) backwards;
+  display:flex;align-items:flex-start;gap:20px;
+  padding-bottom:14px;border-bottom:2px solid var(--ink);
 }
 .gate-mark{flex:1;min-width:0}
 .gate-plate h1{
-  font-size:clamp(21px,3.4vw,31px);font-weight:700;font-stretch:120%;
-  letter-spacing:.11em;text-transform:uppercase;line-height:1.08;
+  font-size:clamp(24px,4vw,38px);font-weight:600;line-height:1.06;
+  font-variant:small-caps;letter-spacing:.03em;
 }
 .gate-sub{
-  display:block;margin-top:10px;
-  font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;
-  text-transform:uppercase;color:var(--faint);
+  display:block;margin-top:8px;
+  font-family:var(--mono);font-size:11px;color:var(--ink-3);
 }
-/* 切换键是工具，不是铭牌的一部分：对齐标题首行的顶边，别浮在标题换行
-   之后留下的空当里。 */
-.gate-plate > button.ghost{flex:none;align-self:flex-start}
+.gate-plate > button.ghost{flex:none}
 
-/* 三块停在静止位的表头。空着的静止位说明这是一台计量装置，同时不报数。 */
 .gate-dials{
-  display:flex;align-items:baseline;gap:clamp(20px,5vw,46px);flex-wrap:wrap;
-  padding:26px 2px 34px;
-  animation:rise .42s cubic-bezier(.16,.8,.3,1) .06s backwards;
+  display:flex;align-items:center;gap:clamp(22px,5vw,52px);flex-wrap:wrap;
+  padding:20px 0 22px;border-bottom:1px solid var(--rule);
 }
-.gate-dial{display:flex;flex-direction:column;gap:10px}
+.gate-dial{display:flex;flex-direction:column;gap:9px}
 .gate-dial-lab{
-  font-family:var(--mono);font-size:9px;letter-spacing:.14em;
-  text-transform:uppercase;color:var(--faint);
+  font-family:var(--mono);font-size:11px;color:var(--ink-3);
 }
-/* 静止位画成一道短横规。破折号在等宽字里落得偏低偏短，读起来像被涂掉的
-   字，不像一支停住的指针；一道有厚度的横规才是「量程在此，尚无读数」。 */
+/* 空位画成一道待填的栏线。破折号在等宽字里落得偏低偏短，读起来像被涂掉
+   的字；一道空栏线才是「这一栏还没记」。 */
 .gate-dial-val{
-  display:block;width:clamp(30px,4vw,42px);height:3px;border-radius:2px;
-  background:var(--track);
+  display:block;width:clamp(46px,6vw,64px);height:0;
+  border-bottom:1px solid var(--rule-2);
 }
+/* 「未连接」是页边的一句注记，不是标题：退成等宽灰墨加一道框，跟正文
+   里的方戳同一个语气。 */
 .gate-dial-note{
-  margin-left:auto;align-self:flex-end;
-  font-family:var(--mono);font-size:9px;letter-spacing:.14em;
-  text-transform:uppercase;color:var(--faint);
-  padding:3px 9px;border:1px solid var(--hair);border-radius:99px;
+  margin-left:auto;font-family:var(--mono);font-size:11px;
+  color:var(--ink-3);border:1px solid var(--rule-2);padding:3px 9px;
 }
 
-.gate-form{
-  margin:0;animation:rise .42s cubic-bezier(.16,.8,.3,1) .12s backwards;
+.gate-form{margin:22px 0 0}
+.gate-form .act{width:100%;margin-top:8px}
+
+@media (max-width:640px){
+  .frame{padding-left:14px;padding-right:14px}
+  .entry .val{font-size:21px}
+  .balance-sum .val{font-size:30px}
+  .book-foli{margin-left:0;width:100%}
 }
-.gate-form .f{margin-bottom:16px}
-.gate-form input[type=password]{max-width:none}
-.gate-form .act{width:100%}
 
 @media (prefers-reduced-motion:reduce){
   *,*::after,*::before{animation:none !important;transition:none !important}

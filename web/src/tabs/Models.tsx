@@ -27,7 +27,7 @@ function parseOrNull(s: string): number | null {
 }
 
 function Price({ v }: { v: unknown }) {
-  if (v == null) return <span style={{ color: "var(--muted)" }}>未设</span>;
+  if (v == null) return <span style={{ color: "var(--ink-3)" }}>未设</span>;
   return <>${Number(v).toFixed(5)}</>;
 }
 
@@ -154,17 +154,17 @@ export function Models({ doc }: { doc: DocState }) {
                 <th>模型</th>
                 <th>供应商</th>
                 <th>上游名</th>
-                <th className="r">输入</th>
-                <th className="r">输出</th>
-                <th className="r">缓存读</th>
-                <th className="r">缓存写</th>
+                <th className="right">输入</th>
+                <th className="right">输出</th>
+                <th className="right">缓存读</th>
+                <th className="right">缓存写</th>
                 <th />
               </tr>
             </thead>
             <tbody>
               {models.length === 0 ? (
                 <tr>
-                  <td colSpan={8} style={{ color: "var(--muted)" }}>
+                  <td colSpan={8} style={{ color: "var(--ink-3)" }}>
                     还没有配置模型。
                   </td>
                 </tr>
@@ -180,19 +180,19 @@ export function Models({ doc }: { doc: DocState }) {
                       <td className="num" style={{ fontSize: 12 }}>
                         {String(m.model_name ?? "")}
                       </td>
-                      <td className="r num">
+                      <td className="right num">
                         <Price v={c?.input_per_1k} />
                       </td>
-                      <td className="r num">
+                      <td className="right num">
                         <Price v={c?.output_per_1k} />
                       </td>
-                      <td className="r num">
+                      <td className="right num">
                         <Price v={c?.cached_input_per_1k} />
                       </td>
-                      <td className="r num">
+                      <td className="right num">
                         <Price v={c?.cache_write_per_1k} />
                       </td>
-                      <td className="r">
+                      <td className="right">
                         <button className="ghost" disabled={busy} onClick={() => void del(i)}>
                           删除
                         </button>
@@ -472,9 +472,9 @@ function SyncPanel({
                       </td>
                       <td>
                         {have.has(id) ? (
-                          <span style={{ color: "var(--ok)" }}>已接入</span>
+                          <span style={{ color: "var(--indigo)" }}>已接入</span>
                         ) : (
-                          <span style={{ color: "var(--muted)" }}>未接入</span>
+                          <span style={{ color: "var(--ink-3)" }}>未接入</span>
                         )}
                       </td>
                     </tr>

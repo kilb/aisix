@@ -102,10 +102,10 @@ export function Logs({ doc }: { doc: DocState }) {
                 <tr>
                   <th>时间</th>
                   <th>路径</th>
-                  <th className="r">状态</th>
-                  <th className="r">耗时</th>
+                  <th className="right">状态</th>
+                  <th className="right">耗时</th>
                   <th>模型</th>
-                  <th className="r">Token</th>
+                  <th className="right">Token</th>
                   <th>request id</th>
                 </tr>
               </thead>
@@ -120,15 +120,15 @@ export function Logs({ doc }: { doc: DocState }) {
                       <td className="num" style={{ fontSize: 12 }}>
                         {String(x.path ?? "")}
                       </td>
-                      <td className="r num">
+                      <td className="right num">
                         <StatusText s={x.status} />
                       </td>
-                      <td className="r num">{String(x.latency_ms ?? "")}ms</td>
+                      <td className="right num">{String(x.latency_ms ?? "")}ms</td>
                       <td>{String(x.model ?? "")}</td>
                       {/* 流式请求这一行没有 token 数，显示 "—" 而不是 0：
                           0 会被读成「这个请求没消耗 token」。 */}
-                      <td className="r num">{tokens && tokens !== "0" ? tokens : "—"}</td>
-                      <td className="num" style={{ fontSize: 11, color: "var(--muted)" }}>
+                      <td className="right num">{tokens && tokens !== "0" ? tokens : "—"}</td>
+                      <td className="num" style={{ fontSize: 11, color: "var(--ink-3)" }}>
                         {String(x.request_id ?? "").slice(0, 8)}
                       </td>
                     </tr>

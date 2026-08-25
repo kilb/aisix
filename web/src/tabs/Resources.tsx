@@ -42,7 +42,7 @@ export function Resources({
           <thead>
             <tr>
               <th>资源</th>
-              <th className="r">数量</th>
+              <th className="right">数量</th>
               <th>条目</th>
               <th>编辑方式</th>
             </tr>
@@ -57,11 +57,11 @@ export function Resources({
                 <tr key={key}>
                   <td>
                     <strong>{label}</strong>
-                    <div className="num" style={{ fontSize: 11, color: "var(--muted)" }}>
+                    <div className="num" style={{ fontSize: 11, color: "var(--ink-3)" }}>
                       {key}
                     </div>
                   </td>
-                  <td className="r num">{items.length}</td>
+                  <td className="right num">{items.length}</td>
                   <td style={{ fontSize: 12 }}>
                     {names.length ? (
                       <>
@@ -69,7 +69,7 @@ export function Resources({
                         {names.length > 6 ? ` 等 ${names.length} 项` : ""}
                       </>
                     ) : (
-                      <span style={{ color: "var(--muted)" }}>无</span>
+                      <span style={{ color: "var(--ink-3)" }}>无</span>
                     )}
                   </td>
                   <td>

@@ -131,9 +131,9 @@ export function Usage({ doc }: { doc: DocState }) {
             <thead>
               <tr>
                 <th>密钥</th>
-                <th className="r">请求</th>
-                <th className="r">Token</th>
-                <th className="r">花费</th>
+                <th className="right">请求</th>
+                <th className="right">Token</th>
+                <th className="right">花费</th>
               </tr>
             </thead>
             <tbody>
@@ -147,7 +147,7 @@ export function Usage({ doc }: { doc: DocState }) {
                 </tr>
               ) : keyRows.length === 0 ? (
                 <tr>
-                  <td colSpan={4} style={{ color: "var(--muted)" }}>
+                  <td colSpan={4} style={{ color: "var(--ink-3)" }}>
                     尚无用量数据。
                   </td>
                 </tr>
@@ -161,14 +161,14 @@ export function Usage({ doc }: { doc: DocState }) {
                       </div>
                       <div
                         className="foot num"
-                        style={{ fontSize: 11, color: "var(--muted)" }}
+                        style={{ fontSize: 11, color: "var(--ink-3)" }}
                       >
                         {id}
                       </div>
                     </td>
-                    <td className="r num">{fmtInt(v.req)}</td>
-                    <td className="r num">{fmtCompact(v.tok)}</td>
-                    <td className="r num">{fmtUsd(v.spend)}</td>
+                    <td className="right num">{fmtInt(v.req)}</td>
+                    <td className="right num">{fmtCompact(v.tok)}</td>
+                    <td className="right num">{fmtUsd(v.spend)}</td>
                   </tr>
                 ))
               )}
@@ -185,9 +185,9 @@ export function Usage({ doc }: { doc: DocState }) {
               <tr>
                 <th>模型</th>
                 <th>供应商</th>
-                <th className="r">请求</th>
-                <th className="r">Token</th>
-                <th className="r">花费</th>
+                <th className="right">请求</th>
+                <th className="right">Token</th>
+                <th className="right">花费</th>
               </tr>
             </thead>
             <tbody>
@@ -201,7 +201,7 @@ export function Usage({ doc }: { doc: DocState }) {
                 </tr>
               ) : modelRows.length === 0 ? (
                 <tr>
-                  <td colSpan={5} style={{ color: "var(--muted)" }}>
+                  <td colSpan={5} style={{ color: "var(--ink-3)" }}>
                     尚无用量数据。
                   </td>
                 </tr>
@@ -214,9 +214,9 @@ export function Usage({ doc }: { doc: DocState }) {
                         <strong>{m}</strong>
                       </td>
                       <td>{p}</td>
-                      <td className="r num">{fmtInt(v.req)}</td>
-                      <td className="r num">{fmtCompact(v.tok)}</td>
-                      <td className="r num">{fmtUsd(v.spend)}</td>
+                      <td className="right num">{fmtInt(v.req)}</td>
+                      <td className="right num">{fmtCompact(v.tok)}</td>
+                      <td className="right num">{fmtUsd(v.spend)}</td>
                     </tr>
                   );
                 })

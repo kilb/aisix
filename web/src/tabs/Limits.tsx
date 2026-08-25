@@ -15,7 +15,7 @@ const SCOPES = [
 ] as const;
 
 function Unset() {
-  return <span style={{ color: "var(--muted)" }}>—</span>;
+  return <span style={{ color: "var(--ink-3)" }}>—</span>;
 }
 
 export function Limits({ doc }: { doc: DocState }) {
@@ -107,16 +107,16 @@ export function Limits({ doc }: { doc: DocState }) {
                 <th>作用域</th>
                 <th>对象</th>
                 <th>窗口</th>
-                <th className="r">请求上限</th>
-                <th className="r">Token 上限</th>
-                <th className="r">花费上限</th>
+                <th className="right">请求上限</th>
+                <th className="right">Token 上限</th>
+                <th className="right">花费上限</th>
                 <th />
               </tr>
             </thead>
             <tbody>
               {policies.length === 0 ? (
                 <tr>
-                  <td colSpan={8} style={{ color: "var(--muted)" }}>
+                  <td colSpan={8} style={{ color: "var(--ink-3)" }}>
                     还没有策略。
                   </td>
                 </tr>
@@ -131,20 +131,20 @@ export function Limits({ doc }: { doc: DocState }) {
                       {String(p.scope_ref ?? "—")}
                     </td>
                     <td>{String(p.window ?? "—")}</td>
-                    <td className="r num">
+                    <td className="right num">
                       {p.max_requests != null ? String(p.max_requests) : <Unset />}
                     </td>
-                    <td className="r num">
+                    <td className="right num">
                       {p.max_tokens != null ? String(p.max_tokens) : <Unset />}
                     </td>
-                    <td className="r num">
+                    <td className="right num">
                       {p.max_spend_micro_usd != null ? (
                         fmtUsd(p.max_spend_micro_usd)
                       ) : (
                         <Unset />
                       )}
                     </td>
-                    <td className="r">
+                    <td className="right">
                       <button className="ghost" disabled={busy} onClick={() => void del(i)}>
                         删除
                       </button>

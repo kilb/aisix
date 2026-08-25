@@ -75,7 +75,7 @@ export function Providers({ doc }: { doc: DocState }) {
             <tbody>
               {pks.length === 0 ? (
                 <tr>
-                  <td colSpan={5} style={{ color: "var(--muted)" }}>
+                  <td colSpan={5} style={{ color: "var(--ink-3)" }}>
                     还没有配置供应商。
                   </td>
                 </tr>
@@ -92,7 +92,7 @@ export function Providers({ doc }: { doc: DocState }) {
                     <td className="num" style={{ fontSize: 12 }}>
                       {String(p.api_base ?? "（默认）")}
                     </td>
-                    <td className="r">
+                    <td className="right">
                       <button className="ghost" disabled={busy} onClick={() => void del(i)}>
                         删除
                       </button>

@@ -90,50 +90,48 @@ export function App() {
 
   return (
     <div className="frame">
-      {/* 悬浮侧栏：铭牌、导航、以及状态与出口。九个页签横排在顶部本来就挤，
-          竖排能给出完整标签，也给后续新增留了位置。 */}
-      <aside className="rail">
-        <div className="rail-mark">
+      {/* 账簿的页眉：册名在左，戳记和出口在右，底下一道重线。页签横排在
+          重线下面 —— 单栏账页要的是列宽，不是左边那条竖栏。 */}
+      <header className="book-head">
+        <div className="book-mark">
           <h1>Gateway Meter Room</h1>
-          <span className="rail-sub">AISIX 网关控制台</span>
+          <span className="book-sub">AISIX 网关控制台</span>
         </div>
 
-        <nav className="tabs" role="tablist" aria-label="控制台分区">
-          {TABS.map(([id, label]) => (
-            <button
-              key={id}
-              role="tab"
-              data-tab={id}
-              aria-selected={tab === id}
-              onClick={() => setTab(id)}
-            >
-              {label}
-            </button>
-          ))}
-        </nav>
-
-        <div className="rail-foot">
+        <div className="book-foli">
           <span className={`pill ${doc.res ? (healthy ? "ok" : "crit") : ""}`}>
             <span className="dot" />
             <span>{doc.res ? (healthy ? "网关在线" : "网关不可达") : "检查中"}</span>
           </span>
-          <div className="rail-actions">
-            <button
-              className="ghost"
-              onClick={toggleTheme}
-              aria-label={theme === "dark" ? "切换到浅色" : "切换到深色"}
-              title={theme === "dark" ? "切换到浅色" : "切换到深色"}
-            >
-              {theme === "dark" ? "浅色" : "深色"}
-            </button>
-            <button className="ghost" onClick={signOut}>
-              登出
-            </button>
-          </div>
+          <button
+            className="ghost"
+            onClick={toggleTheme}
+            aria-label={theme === "dark" ? "切换到浅色" : "切换到深色"}
+            title={theme === "dark" ? "切换到浅色" : "切换到深色"}
+          >
+            {theme === "dark" ? "浅色" : "深色"}
+          </button>
+          <button className="ghost" onClick={signOut}>
+            登出
+          </button>
         </div>
-      </aside>
+      </header>
 
-      <main className="stage">
+      <nav className="tabs" role="tablist" aria-label="控制台分区">
+        {TABS.map(([id, label]) => (
+          <button
+            key={id}
+            role="tab"
+            data-tab={id}
+            aria-selected={tab === id}
+            onClick={() => setTab(id)}
+          >
+            {label}
+          </button>
+        ))}
+      </nav>
+
+      <main>
         {/* 读取失败时这条横幅必须挡在所有编辑之前：在配置能被正常读取之前
             保存任何改动，都会用一份不完整的文档覆盖线上配置。 */}
         {doc.loadError && (

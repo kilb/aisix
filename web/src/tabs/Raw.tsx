@@ -48,9 +48,8 @@ export function Raw({ doc }: { doc: DocState }) {
           fontSize: 12,
           lineHeight: 1.5,
           padding: 12,
-          border: "1px solid var(--line)",
-          borderRadius: "var(--r)",
-          background: "var(--raise)",
+          border: "1px solid var(--rule-2)",
+          background: "var(--paper-2)",
           color: "var(--ink)",
           resize: "vertical",
         }}
