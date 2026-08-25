@@ -1214,6 +1214,46 @@ mod tests {
         })
     }
 
+    /// `content_record` 的门禁本身有测试，但那证明不了**调用点**用对了。
+    /// 扇出里它是逐 exporter 调的（`content_record(&exp.kind, …)`），未申请
+    /// 内容的那些拿到共享的 metadata-only 记录。把这一行提到循环外看起来
+    /// 像一个很自然的「循环不变量」优化——每次迭代传的 event 和 content
+    /// 都一样——但那样每个 sink 都会拿到带内容的记录，prompt 就流进了
+    /// 对象存储。而门禁函数自己的测试照样全绿。
+    ///
+    /// 这里用源码扫描而不是驱动扇出：pipeline 里跑的是真 sink，观察不到
+    /// 各自入队了什么，加观察缝隙要为测试改动生产结构。本仓库对这类
+    /// 「调用点形状」问题已有先例（`every_emit_has_a_caller`、
+    /// `no_production_code_builds_a_bare_reqwest_client`）。
+    #[test]
+    fn the_fan_out_builds_a_content_record_per_exporter() {
+        let src = include_str!("otlp_http_sink.rs");
+        let production = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(src);
+
+        let calls: Vec<&str> = production
+            .lines()
+            .filter(|l| l.contains("content_record(") && !l.trim_start().starts_with("//"))
+            .filter(|l| !l.contains("fn content_record"))
+            .collect();
+
+        assert_eq!(
+            calls.len(),
+            1,
+            "扇出之外多出了 content_record 调用点，每一个都得自己保证\
+             逐 exporter 判断:\n{calls:#?}",
+        );
+        assert!(
+            calls[0].contains("&exp.kind"),
+            "content_record 不再是按当前 exporter 的 kind 调用的 —— 如果只是\
+             重命名了循环变量，改这条断言；如果是把调用提出了循环，那么每个\
+             sink 都会收到带内容的记录，包括从未申请内容的对象存储:\n{}",
+            calls[0],
+        );
+    }
+
     #[test]
     fn content_record_targets_only_full_capture_sls() {
         let event = sample_event();
