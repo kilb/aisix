@@ -21,7 +21,7 @@ use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -184,8 +184,30 @@ async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Response {
         .into_response()
 }
 
+/// 前后端之间的接口契约版本。
+///
+/// 界面是独立部署的静态产物（`web/`，由 nginx 托管），所以两边可以各自
+/// 更新 —— 于是版本偏移成为可能。这个数字是唯一的判据。
+///
+/// **只在前后端接口真的变化时才 +1**：新增/删除/改名一个端点、改变请求或
+/// 响应的字段形状、改变一个字段的含义。不要用构建时间或 git SHA 代替它 ——
+/// 那会让任何一侧的无关重建都报一次偏移，而误报是训练运维忽略告警最快的
+/// 办法。
+///
+/// 偏移不是提示级别的问题。一个不带 `base_version` 的旧界面会落进
+/// [`stale_write`] 的逃生口（缺版本 = 不检查），于是丢失更新会静默回来：
+/// 两个标签页各改一处，后保存的整份覆盖先保存的，而被覆盖的可能是一次
+/// 密钥吊销。所以界面在偏移时必须停止写入，不只是显示一条横幅。
+const API_CONTRACT_VERSION: u32 = 1;
+
 async fn session_state(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
-    Json(json!({"authed": st.authed(&headers).await}))
+    // 契约版本挂在这个端点上，而不是新开一个：界面启动时本来就要问一次
+    // 登录状态，省一个往返。它在鉴权之前就返回，这是有意的 —— 偏移应该在
+    // 登录之前就能被发现。
+    Json(json!({
+        "authed": st.authed(&headers).await,
+        "api_contract": API_CONTRACT_VERSION,
+    }))
 }
 
 // ── 资源读（转发网关管理 API）──────────────────────────────────────────
@@ -458,6 +480,18 @@ fn stale_write(base_version: Option<&str>, on_disk: &str) -> bool {
     matches!(base_version, Some(v) if v != on_disk)
 }
 
+/// 声明了契约版本的调用方必须带 `base_version`。
+///
+/// `stale_write` 的逃生口（缺版本 = 不检查）是给脚本和 curl 留的，那些调用方
+/// 不声明契约。界面声明了，所以它不带版本只有一个解释：它是一个不知道这个
+/// 字段存在的旧界面 —— 而放它过去就是把丢失更新重新放回来。
+fn contract_client_must_send_version(
+    client_contract: Option<u32>,
+    base_version: Option<&str>,
+) -> bool {
+    client_contract.is_some() && base_version.is_none()
+}
+
 /// 校验 → 落盘 → SIGHUP。三步都成功才算保存。
 ///
 /// 校验用的是网关自己的 `aisix validate`，不是这里重新实现一份 schema：
@@ -466,7 +500,11 @@ async fn save_resources(
     st: &AppState,
     doc: &Value,
     base_version: Option<&str>,
+    client_contract: Option<u32>,
 ) -> Result<String, SaveError> {
+    if contract_client_must_send_version(client_contract, base_version) {
+        return Err(SaveError::Stale);
+    }
     let yaml = serde_yaml_ng::to_string(doc).map_err(|e| format!("序列化失败: {e}"))?;
 
     // 整个序列串行执行。并发下共用一条临时路径会让 A 校验到 B 的内容
@@ -592,6 +630,17 @@ struct WriteReq {
     /// 缺省时不做并发检查，见 [`stale_write`]。
     #[serde(default)]
     base_version: Option<String>,
+    /// 调用方自报的契约版本。
+    ///
+    /// 界面在启动时会比对契约并在偏移时自我拦截，但那只挡得住「新界面 +
+    /// 旧后端」。反方向挡不住：一个旧界面根本不读契约字段，于是照常运行，
+    /// 并且因为它不带 `base_version` 而落进「缺版本 = 不检查」的逃生口 ——
+    /// 丢失更新静默回来。
+    ///
+    /// 所以服务端也要有一条：声明了契约的调用方必须带版本。脚本和 curl
+    /// 不声明契约，继续走逃生口；界面一旦声明，就再也不能忘。
+    #[serde(default)]
+    client_contract: Option<u32>,
 }
 
 async fn api_file_put(
@@ -623,7 +672,7 @@ async fn api_file_put(
                 .into_response();
         }
     };
-    match save_resources(&st, &doc, req.base_version.as_deref()).await {
+    match save_resources(&st, &doc, req.base_version.as_deref(), req.client_contract).await {
         Ok(detail) => Json(json!({"ok": true, "detail": detail})).into_response(),
         // 版本冲突是 409 而不是 400：前端要据此提示「重新载入」，而 400
         // 的其余成员都是「你写的内容不合法」，两者的处理动作完全不同。
@@ -1024,10 +1073,6 @@ fn guard_outbound_base(base: &str) -> Result<(), String> {
 
 // ── 静态页面 ──────────────────────────────────────────────────────────
 
-async fn index() -> Html<&'static str> {
-    Html(include_str!("../ui/index.html"))
-}
-
 async fn health() -> &'static str {
     "ok"
 }
@@ -1080,7 +1125,6 @@ async fn main() {
     };
 
     let app = Router::new()
-        .route("/", get(index))
         .route("/healthz", get(health))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
@@ -1112,6 +1156,96 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 界面在启动时自查契约，但那只挡得住「新界面 + 旧后端」。反方向
+    /// 挡不住：旧界面不读契约字段，于是照常运行，并且因为它不带
+    /// `base_version` 而落进「缺版本 = 不检查」的逃生口 —— 丢失更新静默
+    /// 回来，被覆盖的可能是一次密钥吊销。
+    ///
+    /// 服务端这条补上那个方向：声明了契约的调用方必须带版本。
+    #[test]
+    fn a_contract_declaring_client_cannot_skip_the_version() {
+        // 旧界面：会声明契约（因为它是界面），但不知道 base_version 存在。
+        assert!(
+            contract_client_must_send_version(Some(1), None),
+            "声明了契约却不带版本 —— 只可能是一个不知道这个字段的旧界面",
+        );
+
+        // 正常界面。
+        assert!(!contract_client_must_send_version(Some(1), Some("abc")));
+
+        // 脚本 / curl：不声明契约，逃生口继续为它们保留。这是有意的，
+        // 拦下它们会让所有既有的非浏览器调用方一夜之间全部失败。
+        assert!(!contract_client_must_send_version(None, None));
+        assert!(!contract_client_must_send_version(None, Some("abc")));
+    }
+
+    /// 契约版本在两个地方各写了一份：这里（权威）和界面的
+    /// `web/src/lib/contract.ts`（镜像）。它们在同一个提交里必须相等。
+    ///
+    /// 这不是重复，而是这套机制成立的前提：只有当任一提交都自洽时，运行时
+    /// 的不一致才能被解读为「部署偏移」。两边可以各自漂移的话，界面报出的
+    /// 偏移就再也分不清是真偏移还是有人忘了改另一半。
+    #[test]
+    fn the_frontend_mirrors_this_contract_version() {
+        let ts = include_str!("../../../web/src/lib/contract.ts");
+        let declared = ts
+            .lines()
+            .find_map(|l| {
+                l.trim()
+                    .strip_prefix("export const EXPECTED_API_CONTRACT = ")
+            })
+            .and_then(|v| v.trim_end_matches(';').trim().parse::<u32>().ok())
+            .expect("web/src/lib/contract.ts 必须导出 EXPECTED_API_CONTRACT");
+
+        assert_eq!(
+            declared, API_CONTRACT_VERSION,
+            "界面期望契约 v{declared}，后端是 v{API_CONTRACT_VERSION} —— \
+             改了接口就要同时改两边，否则界面会对着一个自洽的部署报偏移",
+        );
+    }
+
+    /// 这个二进制只服务 API。界面是 `web/` 下的 React 应用，构建产物由
+    /// nginx 直接托管 —— 它本来就在做 TLS 终结和按路径分流，多一段 root
+    /// 比多一层进程转发便宜。
+    ///
+    /// 曾经不是这样：`/` 上挂过一个 `include_str!` 进来的 HTML。那个形状有
+    /// 两处代价，都真实付过：改一行文案要重新编译 Rust 并重启服务（光改文件
+    /// 重启没用，因为它已经进了二进制），以及构建产物被迫提交进 git 才能让
+    /// 没有 node 的 CI 编出带界面的二进制。
+    ///
+    /// 所以路由表里不该再出现任何返回 HTML 的项。
+    #[test]
+    fn the_console_serves_only_api_never_a_page() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(src);
+
+        assert!(
+            !production.contains("include_str!(\"../ui/"),
+            "界面又被编进二进制了 —— 前端归 web/，由 nginx 托管",
+        );
+        assert!(
+            !production.contains("Html<"),
+            "出现了返回 HTML 的 handler —— 这个二进制只服务 API",
+        );
+
+        // 路由白名单：新增一条非 /api 的路由要在这里写明理由。
+        let routes: Vec<&str> = production
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix(".route("))
+            .filter_map(|l| l.split('"').nth(1))
+            .collect();
+        assert!(!routes.is_empty(), "路由提取失效 —— 这条守卫成了空转");
+        for r in &routes {
+            assert!(
+                r.starts_with("/api/") || *r == "/healthz",
+                "非 API 路由 {r:?}：如果它是给前端用的，前端应该由 nginx 托管",
+            );
+        }
+    }
 
     // ── 乐观并发（丢失更新）──────────────────────────────────
 
