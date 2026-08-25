@@ -87,6 +87,20 @@ pub struct ModelCost {
 /// - OpenAI reports `prompt_tokens_details.cached_tokens` as tokens "present
 ///   in the prompt" — a SUBSET of `prompt_tokens`
 ///   (`openai-python: src/openai/types/completion_usage.py`).
+/// - Bedrock's Converse follows the first shape: `inputTokens` is the
+///   non-cached remainder, and the real input total is
+///   `inputTokens + cacheReadInputTokens + cacheWriteInputTokens`
+///   (<https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html>).
+/// - Gemini follows the second: `promptTokenCount` "is still the total
+///   effective prompt size" with `cachedContentTokenCount` inside it
+///   (<https://ai.google.dev/api/generate-content#UsageMetadata>).
+///
+/// The output side splits the same way and is easier to get wrong because
+/// nothing names it: OpenAI's reasoning tokens are a SUBSET of
+/// `completion_tokens`, while Gemini's `thoughtsTokenCount` sits OUTSIDE
+/// `candidatesTokenCount` (its own total is defined as prompt + thoughts +
+/// candidates). Adding the first double-counts; not adding the second bills
+/// a thinking model for none of its thinking.
 ///
 /// Subtracting on the first shape under-counts input; not subtracting on the
 /// second double-charges the cached half. Neither mistake fails a request or

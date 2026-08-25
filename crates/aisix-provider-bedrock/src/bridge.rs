@@ -1338,6 +1338,18 @@ fn converse_output_into_chat_response(
             prompt_tokens: u.input_tokens().max(0) as u32,
             completion_tokens: u.output_tokens().max(0) as u32,
             total_tokens: u.total_tokens().max(0) as u32,
+            // AWS bills cache reads and writes, and `inputTokens` counts
+            // NEITHER of them: it is the non-cached remainder, with the real
+            // input total being the sum of all three (prompt-caching guide,
+            // Converse API → Important). Dropping them hides billed tokens
+            // from pricing and from spend ceilings.
+            //
+            // Disjoint from the prompt, so these are the Anthropic-vocabulary
+            // fields. `cached_prompt_tokens` is OpenAI's subset field and is
+            // subtracted from the prompt — using it here would refund tokens
+            // the caller did spend.
+            cache_read_tokens: u.cache_read_input_tokens().unwrap_or(0).max(0) as u32,
+            cache_creation_tokens: u.cache_write_input_tokens().unwrap_or(0).max(0) as u32,
             ..Default::default()
         })
         .unwrap_or_default();
@@ -1511,6 +1523,12 @@ fn emit_converse_chunk(
                         prompt_tokens: u.input_tokens.max(0) as u32,
                         completion_tokens: u.output_tokens.max(0) as u32,
                         total_tokens: u.total_tokens.max(0) as u32,
+                        // Same as the non-streaming path — the metadata event
+                        // carries the identical `TokenUsage`, and a cache-heavy
+                        // streamed request is exactly as billable.
+                        cache_read_tokens: u.cache_read_input_tokens.unwrap_or(0).max(0) as u32,
+                        cache_creation_tokens: u.cache_write_input_tokens.unwrap_or(0).max(0)
+                            as u32,
                         ..Default::default()
                     }),
                 });
@@ -3677,6 +3695,108 @@ mod tests {
         assert!(
             body.get("toolConfig").is_none(),
             "tool_choice:none must send no toolConfig; body={body}"
+        );
+    }
+
+    /// The streaming metadata event carries the same `TokenUsage`, so it needs
+    /// the same treatment — a streamed cache-heavy request is exactly as
+    /// billable as a non-streamed one, and this repo's recurring bug is fixing
+    /// one branch and leaving its sibling as it was.
+    #[test]
+    fn converse_stream_metadata_carries_prompt_cache_token_counters() {
+        use aws_sdk_bedrockruntime::types::{ConverseStreamMetadataEvent, TokenUsage};
+
+        let usage = TokenUsage::builder()
+            .input_tokens(10)
+            .output_tokens(5)
+            .total_tokens(15)
+            .cache_read_input_tokens(900)
+            .cache_write_input_tokens(100)
+            .build()
+            .unwrap();
+        let event = ConverseStreamOutput::Metadata(
+            ConverseStreamMetadataEvent::builder().usage(usage).build(),
+        );
+
+        let mut emitted_role = true;
+        let mut tool_blocks: Vec<i32> = Vec::new();
+        let chunks = emit_converse_chunk(event, "m", &mut emitted_role, &mut tool_blocks);
+
+        let got = chunks
+            .iter()
+            .find_map(|c| c.usage.as_ref())
+            .expect("the metadata event must carry usage");
+        assert_eq!(got.prompt_tokens, 10);
+        assert_eq!(
+            got.cache_read_tokens, 900,
+            "streamed cacheReadInputTokens dropped while the non-streaming \
+             path carries it",
+        );
+        assert_eq!(got.cache_creation_tokens, 100);
+        assert_eq!(got.cached_prompt_tokens, 0);
+    }
+
+    /// Prompt caching on Bedrock. AWS is explicit that `inputTokens` counts
+    /// ONLY the non-cached tokens, and that the real input total is
+    /// `inputTokens + cacheReadInputTokens + cacheWriteInputTokens`
+    /// (<https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html>,
+    /// "Converse API" → Important). AWS bills all three.
+    ///
+    /// Dropping the two cache counters therefore does not merely lose a
+    /// statistic: those tokens become invisible to pricing and to spend
+    /// ceilings, so a cache-heavy Bedrock workload is billed by AWS and not
+    /// by the gateway. Nothing fails — the numbers are just quietly short.
+    ///
+    /// The counters are disjoint from `inputTokens`, which is the Anthropic
+    /// vocabulary, so they land on `cache_read_tokens` / `cache_creation_tokens`
+    /// and NOT on `cached_prompt_tokens` (that one is OpenAI's subset field and
+    /// gets subtracted from the prompt — using it here would refund tokens the
+    /// caller never spent).
+    #[tokio::test]
+    async fn chat_converse_carries_prompt_cache_token_counters() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/converse$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": {"message": {"role": "assistant", "content": [{"text": "hi"}]}},
+                "stopReason": "end_turn",
+                "usage": {
+                    "inputTokens": 10,
+                    "outputTokens": 5,
+                    "totalTokens": 15,
+                    "cacheReadInputTokens": 900,
+                    "cacheWriteInputTokens": 100
+                },
+            })))
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-cache",
+            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
+        let chat = bridge.chat(&req, &ctx).await.unwrap();
+
+        assert_eq!(
+            chat.usage.prompt_tokens, 10,
+            "inputTokens is the non-cached remainder and must be carried as-is",
+        );
+        assert_eq!(
+            chat.usage.cache_read_tokens, 900,
+            "cacheReadInputTokens dropped — AWS charges for these and the \
+             gateway would not",
+        );
+        assert_eq!(
+            chat.usage.cache_creation_tokens, 100,
+            "cacheWriteInputTokens dropped — AWS charges these at a premium",
+        );
+        assert_eq!(
+            chat.usage.cached_prompt_tokens, 0,
+            "must stay on the disjoint counters: `cached_prompt_tokens` is \
+             OpenAI's subset field and would be subtracted from the prompt",
         );
     }
 

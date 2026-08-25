@@ -1766,12 +1766,21 @@ fn gemini_chunk_into_chat_chunks(
 
     let usage = raw.usage_metadata.map(|u| UsageStats {
         prompt_tokens: u.prompt_token_count,
-        completion_tokens: u.candidates_token_count,
+        cached_prompt_tokens: u.cached_content_token_count,
+        completion_tokens: u
+            .candidates_token_count
+            .saturating_add(u.thoughts_token_count),
+        // Surfaced separately as well as counted: `reasoning_tokens` is
+        // defined as a subset of `completion_tokens`, which is exactly
+        // what thoughts became above, and an operator seeing a thinking
+        // model's bill wants "of which N were thinking".
+        reasoning_tokens: u.thoughts_token_count,
         total_tokens: if u.total_token_count > 0 {
             u.total_token_count
         } else {
             u.prompt_token_count
                 .saturating_add(u.candidates_token_count)
+                .saturating_add(u.thoughts_token_count)
         },
         ..Default::default()
     });
@@ -2114,8 +2123,21 @@ struct GeminiResponsePart {
 struct GeminiUsageMetadata {
     #[serde(default, rename = "promptTokenCount")]
     prompt_token_count: u32,
+    /// Cached portion of the prompt. INSIDE `promptTokenCount` — the API
+    /// reference states the prompt count is "still the total effective prompt
+    /// size" when cached content is set. Subset semantics, so it maps to
+    /// `cached_prompt_tokens`, which pricing subtracts before charging the
+    /// fresh rate.
+    #[serde(default, rename = "cachedContentTokenCount")]
+    cached_content_token_count: u32,
     #[serde(default, rename = "candidatesTokenCount")]
     candidates_token_count: u32,
+    /// Thinking tokens. OUTSIDE `candidatesTokenCount` — the reference defines
+    /// `totalTokenCount` as prompt + thoughts + candidates. They are generated
+    /// output and billed as output, so they are added to `completion_tokens`
+    /// rather than reported beside them.
+    #[serde(default, rename = "thoughtsTokenCount")]
+    thoughts_token_count: u32,
     #[serde(default, rename = "totalTokenCount")]
     total_token_count: u32,
 }
@@ -2149,12 +2171,21 @@ fn gemini_response_into_chat_response(
         .usage_metadata
         .map(|u| UsageStats {
             prompt_tokens: u.prompt_token_count,
-            completion_tokens: u.candidates_token_count,
+            cached_prompt_tokens: u.cached_content_token_count,
+            completion_tokens: u
+                .candidates_token_count
+                .saturating_add(u.thoughts_token_count),
+            // Surfaced separately as well as counted: `reasoning_tokens` is
+            // defined as a subset of `completion_tokens`, which is exactly
+            // what thoughts became above, and an operator seeing a thinking
+            // model's bill wants "of which N were thinking".
+            reasoning_tokens: u.thoughts_token_count,
             total_tokens: if u.total_token_count > 0 {
                 u.total_token_count
             } else {
                 u.prompt_token_count
                     .saturating_add(u.candidates_token_count)
+                    .saturating_add(u.thoughts_token_count)
             },
             ..Default::default()
         })
@@ -2879,6 +2910,122 @@ mod tests {
     }
 
     // ─── Gemini response translation ───────────────────────────────────
+
+    /// The streaming mapper reads the same `usageMetadata` and must reach the
+    /// same numbers. Fixing one branch and leaving the other is this repo's
+    /// most-repeated bug, and here it would mean a streamed request billing
+    /// differently from an identical non-streamed one.
+    #[test]
+    fn gemini_stream_usage_carries_cached_and_thinking_token_counts() {
+        let raw: GeminiGenerateContentResponse = serde_json::from_str(
+            r#"{
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "hi"}]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 1000,
+                    "cachedContentTokenCount": 800,
+                    "candidatesTokenCount": 50,
+                    "thoughtsTokenCount": 30,
+                    "totalTokenCount": 1080
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut emitted_role = false;
+        let chunks = gemini_chunk_into_chat_chunks(raw, "gemini-2.5-pro", &mut emitted_role);
+
+        let usage = chunks
+            .iter()
+            .find_map(|c| c.usage.as_ref())
+            .expect("the finish chunk must carry usage");
+        assert_eq!(usage.prompt_tokens, 1000);
+        assert_eq!(
+            usage.cached_prompt_tokens, 800,
+            "streamed cachedContentTokenCount dropped while the non-streaming \
+             path carries it — the same request would bill differently",
+        );
+        assert_eq!(usage.completion_tokens, 80, "50 candidates + 30 thoughts");
+        assert_eq!(usage.reasoning_tokens, 30);
+        assert_eq!(usage.total_tokens, 1080);
+    }
+
+    /// Gemini's `usageMetadata` carries two counters this bridge dropped, and
+    /// the two have OPPOSITE relationships to the fields beside them
+    /// (<https://ai.google.dev/api/generate-content#UsageMetadata>):
+    ///
+    /// - `cachedContentTokenCount` is INSIDE `promptTokenCount` — the docs say
+    ///   the prompt count "is still the total effective prompt size" when
+    ///   cached content is set. That is the OpenAI subset shape, so it belongs
+    ///   on `cached_prompt_tokens`, which pricing subtracts. Dropping it bills
+    ///   the cached portion at the full input rate — the caller is
+    ///   OVERCHARGED and their spend ceiling is consumed faster than the
+    ///   provider's own bill.
+    /// - `thoughtsTokenCount` is OUTSIDE `candidatesTokenCount` — the docs
+    ///   define the total as the sum of prompt, thoughts and candidates.
+    ///   Thinking tokens are generated output and billed as such, so dropping
+    ///   them UNDERCHARGES a thinking model, and leaves `total_tokens`
+    ///   disagreeing with prompt + completion.
+    ///
+    /// Getting either relationship backwards is silent in both directions,
+    /// which is why the fixture below sets all five counters at once.
+    #[test]
+    fn gemini_usage_carries_cached_and_thinking_token_counts() {
+        let raw: GeminiGenerateContentResponse = serde_json::from_str(
+            r#"{
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "hi"}]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 1000,
+                    "cachedContentTokenCount": 800,
+                    "candidatesTokenCount": 50,
+                    "thoughtsTokenCount": 30,
+                    "totalTokenCount": 1080
+                }
+            }"#,
+        )
+        .unwrap();
+        let chat = gemini_response_into_chat_response(raw, "gemini-2.5-pro");
+
+        assert_eq!(
+            chat.usage.prompt_tokens, 1000,
+            "promptTokenCount already includes the cached portion and is \
+             carried whole; pricing does the subtraction",
+        );
+        assert_eq!(
+            chat.usage.cached_prompt_tokens, 800,
+            "cachedContentTokenCount dropped — the cached portion would be \
+             billed at the full input rate",
+        );
+        assert_eq!(
+            chat.usage.cache_read_tokens, 0,
+            "must NOT use the disjoint counter: that one is added on top of \
+             the prompt, and this one is already inside it",
+        );
+        assert_eq!(
+            chat.usage.completion_tokens, 80,
+            "thinking tokens are generated output billed as output, and sit \
+             outside candidatesTokenCount — 50 + 30",
+        );
+        assert_eq!(
+            chat.usage.reasoning_tokens, 30,
+            "thoughts are inside completion_tokens now, so they belong in the \
+             field defined as its subset — that is what tells an operator how \
+             much of a thinking model's bill was thinking",
+        );
+        assert_eq!(
+            chat.usage.total_tokens, 1080,
+            "upstream's own total is authoritative",
+        );
+        assert_eq!(
+            chat.usage.prompt_tokens + chat.usage.completion_tokens,
+            chat.usage.total_tokens,
+            "the parts must reconcile with the total the provider reported",
+        );
+    }
 
     #[test]
     fn gemini_response_translates_text_into_chat_response() {
