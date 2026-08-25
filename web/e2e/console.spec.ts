@@ -96,6 +96,57 @@ test("口令错误时报错且不进入", async ({ page }) => {
   await expect(page.getByRole("tab", { name: "概览" })).toHaveCount(0);
 });
 
+/**
+ * 网关状态胶囊必须真的是个胶囊。
+ *
+ * 改成侧栏骨架时，整段 `.pill` 规则被我连着区段一起删掉了 —— 状态退成了
+ * 一行纯文字，边框和状态点全没。功能上没坏，所以别的测试全绿，只有肉眼
+ * 看截图才发现。这条测试是它的回归保护：断言计算样式，而不是断言那段文字
+ * 存在。
+ */
+test("网关状态是一个带边框和状态点的胶囊", async ({ page }) => {
+  await signIn(page);
+  const pill = page.locator(".rail-foot .pill").first();
+  await expect(pill).toBeVisible();
+
+  const shape = await pill.evaluate((el) => {
+    const cs = getComputedStyle(el);
+    const dot = el.querySelector(".dot");
+    const ds = dot ? getComputedStyle(dot) : null;
+    return {
+      radius: parseFloat(cs.borderRadius),
+      borderWidth: parseFloat(cs.borderTopWidth),
+      borderTransparent: cs.borderTopColor === "rgba(0, 0, 0, 0)",
+      dotSize: ds ? parseFloat(ds.width) : 0,
+      dotRound: ds ? parseFloat(ds.borderRadius) : 0,
+    };
+  });
+
+  expect(shape.radius).toBeGreaterThan(20);
+  expect(shape.borderWidth).toBeGreaterThan(0);
+  expect(shape.borderTransparent).toBe(false);
+  expect(shape.dotSize).toBeGreaterThan(2);
+  expect(shape.dotRound).toBeGreaterThan(0);
+});
+
+test("导航是一条侧栏，且滚动时留在原处", async ({ page }) => {
+  await signIn(page);
+  const rail = page.locator(".rail");
+  const pos = await rail.evaluate((el) => {
+    const cs = getComputedStyle(el);
+    return { position: cs.position, width: parseFloat(el.getBoundingClientRect().width) };
+  });
+  // 固定不随内容滚动：运维翻到长表格底部时，切页签和登出仍在原处。
+  expect(pos.position).toBe("sticky");
+  expect(pos.width).toBeGreaterThan(180);
+
+  // 页签竖排在侧栏里，不是横排在顶部。
+  const box = await page.getByRole("tab", { name: "概览" }).boundingBox();
+  const box2 = await page.getByRole("tab", { name: "用量" }).boundingBox();
+  expect(box && box2).toBeTruthy();
+  if (box && box2) expect(box2.y).toBeGreaterThan(box.y + box.height - 2);
+});
+
 test("登录后九个页签都能打开", async ({ page }) => {
   await signIn(page);
   for (const name of [

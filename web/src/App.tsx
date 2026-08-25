@@ -52,7 +52,7 @@ export function App() {
     setAuthed(false);
   }, []);
 
-  if (authed === null || apiContract === null) return <div className="shell" />;
+  if (authed === null || apiContract === null) return <div className="boot" />;
 
   // 偏移时停止一切操作，而不是显示一条横幅继续让人编辑。
   //
@@ -62,7 +62,7 @@ export function App() {
   if (skewed) {
     const stale = apiContract < EXPECTED_API_CONTRACT ? "后端" : "界面";
     return (
-      <div className="shell">
+      <div className="centered">
         <div className="note crit" style={{ margin: "24px" }}>
           <strong>界面与后端的接口版本不一致，已停止一切操作。</strong>
           <p>
@@ -89,64 +89,71 @@ export function App() {
   const healthy = !!status && !status.error;
 
   return (
-    <div className="shell">
-      <header className="plate">
-        <h1>Gateway Meter Room</h1>
-        <span className="sub">AISIX 网关控制台</span>
-        <span className="spacer" />
-        <span className={`pill ${doc.res ? (healthy ? "ok" : "crit") : ""}`}>
-          <span className="dot" />
-          <span>{doc.res ? (healthy ? "网关在线" : "网关不可达") : "检查中"}</span>
-        </span>
-        <button
-          className="ghost"
-          onClick={toggleTheme}
-          aria-label={theme === "dark" ? "切换到浅色" : "切换到深色"}
-          title={theme === "dark" ? "切换到浅色" : "切换到深色"}
-        >
-          {theme === "dark" ? "浅色" : "深色"}
-        </button>
-        <button className="ghost" onClick={signOut}>
-          登出
-        </button>
-      </header>
-
-      {/* 读取失败时这条横幅必须挡在所有编辑之前：在配置能被正常读取之前
-          保存任何改动，都会用一份不完整的文档覆盖线上配置。 */}
-      {doc.loadError && (
-        <div
-          className="note crit"
-          style={{ margin: 0, borderRadius: 0, position: "sticky", top: 0, zIndex: 9 }}
-        >
-          <strong>读取配置失败，已停止一切编辑操作。</strong> {doc.loadError}
+    <div className="frame">
+      {/* 悬浮侧栏：铭牌、导航、以及状态与出口。九个页签横排在顶部本来就挤，
+          竖排能给出完整标签，也给后续新增留了位置。 */}
+      <aside className="rail">
+        <div className="rail-mark">
+          <h1>Gateway Meter Room</h1>
+          <span className="rail-sub">AISIX 网关控制台</span>
         </div>
-      )}
 
-      <nav className="tabs" role="tablist">
-        {TABS.map(([id, label]) => (
-          <button
-            key={id}
-            role="tab"
-            data-tab={id}
-            aria-selected={tab === id}
-            onClick={() => setTab(id)}
-          >
-            {label}
-          </button>
-        ))}
-      </nav>
+        <nav className="tabs" role="tablist" aria-label="控制台分区">
+          {TABS.map(([id, label]) => (
+            <button
+              key={id}
+              role="tab"
+              data-tab={id}
+              aria-selected={tab === id}
+              onClick={() => setTab(id)}
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
 
-      <section id={`tab-${tab}`}>
-        {tab === "overview" && <Overview doc={doc} onGoto={setTab} />}
-        {tab === "usage" && <Usage doc={doc} />}
-        {tab === "providers" && <Providers doc={doc} />}
-        {tab === "models" && <Models doc={doc} />}
-        {tab === "keys" && <Keys doc={doc} />}
-        {tab === "limits" && <Limits doc={doc} />}
-        {tab === "resources" && <Resources doc={doc} onGoto={setTab} />}
-        {tab === "logs" && <Logs doc={doc} />}
-        {tab === "raw" && <Raw doc={doc} />}
-      </section>
+        <div className="rail-foot">
+          <span className={`pill ${doc.res ? (healthy ? "ok" : "crit") : ""}`}>
+            <span className="dot" />
+            <span>{doc.res ? (healthy ? "网关在线" : "网关不可达") : "检查中"}</span>
+          </span>
+          <div className="rail-actions">
+            <button
+              className="ghost"
+              onClick={toggleTheme}
+              aria-label={theme === "dark" ? "切换到浅色" : "切换到深色"}
+              title={theme === "dark" ? "切换到浅色" : "切换到深色"}
+            >
+              {theme === "dark" ? "浅色" : "深色"}
+            </button>
+            <button className="ghost" onClick={signOut}>
+              登出
+            </button>
+          </div>
+        </div>
+      </aside>
+
+      <main className="stage">
+        {/* 读取失败时这条横幅必须挡在所有编辑之前：在配置能被正常读取之前
+            保存任何改动，都会用一份不完整的文档覆盖线上配置。 */}
+        {doc.loadError && (
+          <div className="note crit" style={{ marginTop: 0 }}>
+            <strong>读取配置失败，已停止一切编辑操作。</strong> {doc.loadError}
+          </div>
+        )}
+
+        <section id={`tab-${tab}`}>
+          {tab === "overview" && <Overview doc={doc} onGoto={setTab} />}
+          {tab === "usage" && <Usage doc={doc} />}
+          {tab === "providers" && <Providers doc={doc} />}
+          {tab === "models" && <Models doc={doc} />}
+          {tab === "keys" && <Keys doc={doc} />}
+          {tab === "limits" && <Limits doc={doc} />}
+          {tab === "resources" && <Resources doc={doc} onGoto={setTab} />}
+          {tab === "logs" && <Logs doc={doc} />}
+          {tab === "raw" && <Raw doc={doc} />}
+        </section>
+      </main>
     </div>
   );
 }
