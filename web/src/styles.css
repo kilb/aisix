@@ -1,75 +1,143 @@
 /* ════════════════════════════════════════════════════════════════
-   仪表间。
+   仪表间。暗的，被自己的仪表照亮。
 
-   两条贯穿全局的规则，都在编码真实信息而不是装饰：
+   四条贯穿全局的规则：
 
-   1. 读数「内凹」，控件「凸起」。真实的仪表间里表头嵌进面板、开关立在
-      表面上。这里同理 —— 运维扫一眼就知道哪块只是在读、哪块会改动生产
-      配置，不用先读标题。
-   2. 数字按有效位分层。这个产品的花费以千分之一美分计，两位小数会把真实
-      花费显示成 $0.00 —— 那和「没花钱」在屏幕上无法区分。所以前导零退成
-      弱色，有效位保持墨色：精度是这里的主角，不是被四舍五入掉的累赘。
+   1. 尺度对比是主结构。标签 10px，读数 clamp 到 52px —— 这个比例本身就是
+      信息层级，不需要再靠框线区分主次。
+   2. 读数内凹、控件凸起。真实的仪表间里表头嵌进面板、开关立在表面。运维
+      扫一眼就知道哪块只是在读、哪块会改动生产配置。
+   3. 数字按有效位分层。这个产品的花费以千分之一美分计，两位小数会把真实
+      花费显示成 $0.00 —— 那和「没花钱」在屏幕上无法区分。
+   4. 拉丁惯用法只用在拉丁文上。大写加字距是小型大写的语法，套在中文上只
+      会松散。
+
+   颜色用 oklch：同一个 L 值在不同色相上看起来才是同一个明度，调色阶不用
+   靠眼睛试。
    ════════════════════════════════════════════════════════════════ */
 
 :root{
-  /* 涂装钢板的冷灰绿，仪表盘的深青，以及「正在花钱」的锈红。 */
-  --ground:#E4E7E4;      /* 面板底色 */
-  --panel:#F2F4F1;       /* 凸起的控件面 */
-  --raise:#FAFBF9;       /* 输入框、代码块 */
-  --inset:#D9DED9;       /* 内凹的仪表床 */
-  --ink:#101614;
-  --ink-2:#39433E;
-  --muted:#6B756F;
-  --faint:#9AA39D;       /* 前导零、次要刻度 */
-  --line:#C8CFC8;
-  --hair:#D5DBD4;        /* 刻度线，比 line 更轻 */
-  --accent:#0C4F5C;      /* 仪表指针 */
-  --accent-ink:#FFFFFF;
-  --accent-soft:#DCE8EA;
-  --live:#A3441B;        /* 花费 —— 唯一真的在扣钱的量 */
-  --ok:#2F6B41; --warn:#8F6410; --crit:#96173F;
-  --ok-soft:#DDE8DE; --warn-soft:#F1E7CE; --crit-soft:#F1D9E0;
-  --track:#CBD2CB;
+  color-scheme:dark light;
 
-  --r:3px;               /* 仪器倒角很小，几乎是直角 */
-  --pad:22px;
+  /* 设备房：深青蓝，不是黑。黑会让面板边缘消失，而这里要的是「暗处仍有
+     结构」。 */
+  --ground:oklch(19% .014 195);
+  --panel:oklch(23.5% .015 195);
+  --panel-hi:oklch(27% .016 195);   /* 面板顶边受光 */
+  --inset:oklch(15.5% .013 195);    /* 内凹的仪表床 */
+  --raise:oklch(26% .015 195);      /* 输入框、代码块 */
+
+  --ink:oklch(96% .006 190);
+  --ink-2:oklch(80% .012 190);
+  --dim:oklch(63% .014 190);
+  --faint:oklch(48% .016 195);      /* 前导零、次要刻度 */
+  --line:oklch(32% .016 195);
+  --hair:oklch(27.5% .014 195);
+
+  /* 背光玻璃的青。不是荧光绿 —— 那是屏幕在发光，这是玻璃后面有灯。 */
+  --accent:oklch(78% .13 198);
+  --accent-ink:oklch(17% .02 200);
+  --accent-dim:oklch(45% .08 198);
+  --glow:oklch(78% .13 198 / .16);
+
+  /* 花费用暖琥珀 —— 它是唯一真的在烧钱的量。 */
+  --live:oklch(80% .14 68);
+  --live-dim:oklch(52% .09 68);
+
+  --ok:oklch(76% .14 155);
+  --warn:oklch(81% .14 88);
+  --crit:oklch(70% .17 15);
+  --ok-soft:oklch(30% .05 155);
+  --warn-soft:oklch(32% .05 88);
+  --crit-soft:oklch(31% .07 15);
+  --track:oklch(28% .014 195);
+
+  --r:8px;
+  --r-sm:5px;
   --display:"Archivo",system-ui,sans-serif;
   --body:"IBM Plex Sans",system-ui,-apple-system,sans-serif;
   --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,monospace;
-  --wide:.14em;          /* 铭牌字距 */
+  --wide:.16em;
+
+  /* 深度：两层。近处一圈极薄的边界光，远处一团弥散的环境阴影。 */
+  --lift:0 1px 0 oklch(100% 0 0 / .04) inset, 0 1px 2px oklch(0% 0 0 / .3),
+         0 8px 24px -12px oklch(0% 0 0 / .5);
+  --sink:inset 0 1px 3px oklch(0% 0 0 / .35), inset 0 -1px 0 oklch(100% 0 0 / .03);
+  /* 数据序列的分类色阶。同明度、同彩度、只走色相 —— 彼此可辨，且都不
+     表示状态。刻意不复用 --ok / --warn / --crit：那三个在这个界面里有固定
+     含义，拿来区分数据会让一条正常的曲线看起来在报警。 */
+  --s1:oklch(78% .13 198);
+  --s2:oklch(78% .13 268);
+  --s3:oklch(78% .13 328);
+  --s4:oklch(78% .13 38);
+  --s5:oklch(78% .13 128);
 }
 
-@media (prefers-color-scheme:dark){
-  :root:not([data-theme="light"]){
-    --ground:#0E1312; --panel:#171D1B; --raise:#1E2523; --inset:#0A0F0E;
-    --ink:#E8EBE6; --ink-2:#B7C0BA; --muted:#87918B; --faint:#5C665F;
-    --line:#2C3632; --hair:#232C29;
-    --accent:#54B8C8; --accent-ink:#07171A; --accent-soft:#16343A;
-    --live:#E08356;
-    --ok:#63B073; --warn:#D2A03E; --crit:#E06C8B;
-    --ok-soft:#152B1D; --warn-soft:#2E2714; --crit-soft:#2E1A22;
-    --track:#252E2A;
+/* 浅色是「白天开了灯的机房」，同一套结构、反过来的明度。 */
+@media (prefers-color-scheme:light){
+  :root:not([data-theme="dark"]){
+    --ground:oklch(95.5% .006 195);
+    --panel:oklch(99% .003 195);
+    --panel-hi:oklch(100% 0 0);
+    --inset:oklch(93% .008 195);
+    --raise:oklch(99.5% .002 195);
+    --ink:oklch(23% .015 195);
+    --ink-2:oklch(40% .015 195);
+    --dim:oklch(53% .014 195);
+    --faint:oklch(70% .012 195);
+    --line:oklch(87% .008 195);
+    --hair:oklch(91% .006 195);
+    --accent:oklch(48% .11 200);
+    --accent-ink:oklch(100% 0 0);
+    --accent-dim:oklch(72% .07 200);
+    --glow:oklch(48% .11 200 / .1);
+    --live:oklch(52% .15 45);
+    --live-dim:oklch(75% .08 45);
+    --ok:oklch(48% .13 155);
+    --warn:oklch(55% .13 80);
+    --crit:oklch(50% .18 15);
+    --ok-soft:oklch(94% .03 155);
+    --warn-soft:oklch(95% .04 88);
+    --crit-soft:oklch(95% .035 15);
+    --track:oklch(89% .008 195);
+    --lift:0 1px 0 oklch(100% 0 0) inset, 0 1px 2px oklch(20% .02 195 / .07),
+           0 10px 28px -16px oklch(20% .02 195 / .16);
+    --sink:inset 0 1px 3px oklch(20% .02 195 / .09);
+    --s1:oklch(52% .13 198); --s2:oklch(52% .14 268); --s3:oklch(52% .15 328);
+    --s4:oklch(52% .14 38); --s5:oklch(50% .13 148);
   }
 }
-:root[data-theme="dark"]{
-  --ground:#0E1312; --panel:#171D1B; --raise:#1E2523; --inset:#0A0F0E;
-  --ink:#E8EBE6; --ink-2:#B7C0BA; --muted:#87918B; --faint:#5C665F;
-  --line:#2C3632; --hair:#232C29;
-  --accent:#54B8C8; --accent-ink:#07171A; --accent-soft:#16343A;
-  --live:#E08356;
-  --ok:#63B073; --warn:#D2A03E; --crit:#E06C8B;
-  --ok-soft:#152B1D; --warn-soft:#2E2714; --crit-soft:#2E1A22;
-  --track:#252E2A;
+:root[data-theme="light"]{
+  --ground:oklch(95.5% .006 195); --panel:oklch(99% .003 195); --panel-hi:oklch(100% 0 0);
+  --inset:oklch(93% .008 195); --raise:oklch(99.5% .002 195);
+  --ink:oklch(23% .015 195); --ink-2:oklch(40% .015 195);
+  --dim:oklch(53% .014 195); --faint:oklch(70% .012 195);
+  --line:oklch(87% .008 195); --hair:oklch(91% .006 195);
+  --accent:oklch(48% .11 200); --accent-ink:oklch(100% 0 0); --accent-dim:oklch(72% .07 200);
+  --glow:oklch(48% .11 200 / .1);
+  --live:oklch(52% .15 45); --live-dim:oklch(75% .08 45);
+  --ok:oklch(48% .13 155); --warn:oklch(55% .13 80); --crit:oklch(50% .18 15);
+  --ok-soft:oklch(94% .03 155); --warn-soft:oklch(95% .04 88); --crit-soft:oklch(95% .035 15);
+  --track:oklch(89% .008 195);
+  --lift:0 1px 0 oklch(100% 0 0) inset, 0 1px 2px oklch(20% .02 195 / .07),
+         0 10px 28px -16px oklch(20% .02 195 / .16);
+  --sink:inset 0 1px 3px oklch(20% .02 195 / .09);
+  --s1:oklch(52% .13 198); --s2:oklch(52% .14 268); --s3:oklch(52% .15 328);
+  --s4:oklch(52% .14 38); --s5:oklch(50% .13 148);
 }
 
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
 body{
-  margin:0;background:var(--ground);color:var(--ink);
-  font-family:var(--body);font-size:14px;line-height:1.55;
+  margin:0;
+  background:
+    /* 顶上一道极弱的光，像天花板的灯。让暗底不是一块死板。 */
+    radial-gradient(120% 62% at 50% -12%, var(--glow), transparent 62%),
+    var(--ground);
+  background-attachment:fixed;
+  color:var(--ink);font-family:var(--body);font-size:14px;line-height:1.55;
   font-feature-settings:"ss01";
-  /* 中文允许字间断行，但把「客户端」这类紧密结合的词从中间断开读起来是错的。
-     strict 收紧允许断行的位置，这是中文排版该有的默认。 */
+  /* 中文允许字间断行，但把「客户端」这类词从中间断开读起来是错的。 */
   line-break:strict;
   -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
 }
@@ -78,270 +146,250 @@ button,input,select,textarea{font:inherit;color:inherit}
 a{color:var(--accent);text-underline-offset:2px}
 .num{font-family:var(--mono);font-variant-numeric:tabular-nums;font-feature-settings:"zero"}
 [hidden]{display:none !important}
+::selection{background:var(--accent);color:var(--accent-ink)}
 
-/* ── 铭牌 ─────────────────────────────────────────────────────
-   顶部是设备铭牌，不是网页头部：宽体大写、重字距、一条实线收边。 */
-.shell{max-width:1200px;margin:0 auto;padding:0 28px 88px}
+/* ── 入场：错峰浮现 ───────────────────────────────────────────
+   只在挂载时跑一次，从上到下错开 —— 眼睛会跟着顺序读下来，而不是一次
+   被整页糊住。reduced-motion 下整体关掉。 */
+@keyframes rise{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
+.panel,.read{animation:rise .34s cubic-bezier(.16,.8,.3,1) backwards}
+.read:nth-child(1){animation-delay:.02s}
+.read:nth-child(2){animation-delay:.06s}
+.read:nth-child(3){animation-delay:.1s}
+.read:nth-child(4){animation-delay:.14s}
+.panel:nth-of-type(2){animation-delay:.08s}
+.panel:nth-of-type(3){animation-delay:.12s}
+
+/* ── 铭牌 ─────────────────────────────────────────────────── */
+.shell{max-width:1240px;margin:0 auto;padding:0 clamp(16px,3vw,32px) 96px}
 
 header.plate{
-  display:flex;align-items:center;gap:18px;flex-wrap:wrap;
-  padding:30px 0 16px;border-bottom:1.5px solid var(--ink);
+  display:flex;align-items:center;gap:clamp(12px,2vw,20px);flex-wrap:wrap;
+  padding:clamp(24px,4vw,38px) 0 18px;
 }
 header.plate h1{
-  font-size:15px;font-weight:700;font-stretch:118%;
+  font-size:clamp(13px,1.4vw,15px);font-weight:700;font-stretch:120%;
   letter-spacing:var(--wide);text-transform:uppercase;
 }
 .plate .sub{
-  font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;
-  text-transform:uppercase;color:var(--faint);
-  padding-left:18px;border-left:1px solid var(--line);
+  font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--faint);padding-left:16px;border-left:1px solid var(--line);
 }
 .plate .spacer{flex:1}
 
-/* 大写 + 字距是「标签」的语法，只用在人写的短标签上。
-   任何「值」都不许套 —— 路由、模型名、api_key_id 都是大小写敏感的标识符，
-   把 /v1/chat/completions 显示成 /V1/CHAT/COMPLETIONS 是在指向一条不存在
-   的路径。 */
 .pill{
-  display:inline-flex;align-items:center;gap:7px;
+  display:inline-flex;align-items:center;gap:8px;
   font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;
-  padding:4px 10px;border:1px solid var(--line);background:var(--panel);color:var(--muted);
+  padding:5px 11px;border-radius:99px;
+  border:1px solid var(--line);background:var(--panel);color:var(--dim);
 }
 .pill.value{text-transform:none;letter-spacing:0;font-size:11px;color:var(--ink-2)}
-.pill.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 35%,transparent)}
-.pill.crit{color:var(--crit);border-color:color-mix(in srgb,var(--crit) 40%,transparent)}
+.pill.ok{color:var(--ok);border-color:color-mix(in oklch,var(--ok) 32%,transparent)}
+.pill.crit{color:var(--crit);border-color:color-mix(in oklch,var(--crit) 38%,transparent)}
 .pill .dot{width:5px;height:5px;border-radius:50%;background:currentColor}
-.pill.ok .dot{box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 18%,transparent)}
+/* 在线时脉动一次半径。运维要的是「它还活着」这个持续信号。 */
+@keyframes breathe{
+  0%,100%{box-shadow:0 0 0 0 color-mix(in oklch,var(--ok) 55%,transparent)}
+  50%{box-shadow:0 0 0 4px color-mix(in oklch,var(--ok) 0%,transparent)}
+}
+.pill.ok .dot{animation:breathe 2.6s ease-in-out infinite}
 
-/* ── 导航轨 ───────────────────────────────────────────────────
-   当前项由一条厚指针标出，像刻度盘上的指示。 */
+/* ── 导航轨 ───────────────────────────────────────────────── */
 nav.tabs{
-  display:flex;gap:0;margin:0 0 26px;overflow-x:auto;
-  border-bottom:1px solid var(--line);scrollbar-width:thin;
+  display:flex;gap:2px;margin:0 0 clamp(18px,2.6vw,28px);overflow-x:auto;
+  padding:4px;border:1px solid var(--hair);border-radius:calc(var(--r) + 2px);
+  background:color-mix(in oklch,var(--panel) 60%,transparent);
+  backdrop-filter:blur(8px);scrollbar-width:thin;
 }
 nav.tabs button{
-  position:relative;background:none;border:0;
-  padding:13px 15px 12px;cursor:pointer;white-space:nowrap;
-  font-size:12.5px;font-weight:500;color:var(--muted);
-  transition:color .12s ease;
+  position:relative;background:none;border:0;border-radius:var(--r-sm);
+  padding:9px 14px;cursor:pointer;white-space:nowrap;
+  font-size:12.5px;font-weight:500;color:var(--dim);
+  transition:color .14s ease,background .14s ease;
 }
-nav.tabs button::after{
-  content:"";position:absolute;left:15px;right:15px;bottom:-1px;height:2px;
-  background:var(--accent);transform:scaleX(0);transform-origin:left;
-  transition:transform .16s cubic-bezier(.2,.7,.3,1);
+nav.tabs button:hover{color:var(--ink-2);background:color-mix(in oklch,var(--ink) 5%,transparent)}
+nav.tabs button[aria-selected="true"]{
+  color:var(--accent-ink);font-weight:600;
+  background:var(--accent);
+  box-shadow:0 1px 8px -2px var(--glow);
 }
-nav.tabs button:hover{color:var(--ink-2)}
-nav.tabs button[aria-selected="true"]{color:var(--ink);font-weight:600}
-nav.tabs button[aria-selected="true"]::after{transform:scaleX(1)}
-nav.tabs button:focus-visible{outline:2px solid var(--accent);outline-offset:-3px}
+nav.tabs button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
 
-/* ── 控件面：凸起 ─────────────────────────────────────────────
-   会改动生产配置的区域。有细微的抬起阴影。 */
+/* ── 控件面：凸起 ─────────────────────────────────────────── */
 .panel{
-  background:var(--panel);border:1px solid var(--line);border-radius:var(--r);
-  padding:var(--pad);margin-bottom:18px;
-  box-shadow:0 1px 0 color-mix(in srgb,var(--ink) 5%,transparent);
+  background:linear-gradient(180deg,var(--panel-hi),var(--panel) 42%);
+  border:1px solid var(--line);border-radius:var(--r);
+  padding:clamp(18px,2.2vw,26px);margin-bottom:clamp(14px,1.8vw,20px);
+  box-shadow:var(--lift);
 }
-/* 中文标题不套拉丁惯用法。
-   `text-transform:uppercase` 对中文无效，而 `letter-spacing` 加在中文上只会
-   显得松散 —— 那是拉丁小型大写的语法，不是中文的。这里改用字重与一条收边
-   规则立标题，重字距只留给真正是拉丁文的地方（铭牌、mono 标签、id）。 */
 .panel > h2{
-  font-size:13.5px;font-weight:700;font-stretch:105%;letter-spacing:0;
-  color:var(--ink);
-  padding-bottom:11px;margin-bottom:14px;border-bottom:1px solid var(--hair);
+  font-size:clamp(13px,1.5vw,15px);font-weight:700;font-stretch:105%;letter-spacing:0;
+  color:var(--ink);padding-bottom:13px;margin-bottom:16px;
+  border-bottom:1px solid var(--hair);
 }
-.panel > h2 code,.panel > h2 .lat{letter-spacing:.06em}
-/* 行宽约束不能只给直接子元素：嵌在小节里的 hint 一样是给人读的散文，
-   失去约束就会被折在短语中间。 */
-.hint{color:var(--muted);font-size:12.5px;max-width:74ch;text-wrap:pretty}
-.panel > .hint{margin:0 0 15px}
-.panel > h3 + .hint{margin:5px 0 13px}
+.hint{color:var(--dim);font-size:12.5px;max-width:74ch;text-wrap:pretty}
+.panel > .hint{margin:0 0 16px}
 .panel > h3{
   font-family:var(--body);font-size:12px;font-weight:600;letter-spacing:0;
-  color:var(--ink-2);margin:22px 0 0;
-  padding-top:16px;border-top:1px solid var(--hair);
+  color:var(--ink-2);margin:26px 0 0;padding-top:18px;border-top:1px solid var(--hair);
 }
-.panel > h3:first-of-type{margin-top:4px}
-.grid{display:grid;gap:16px}
-/* 整排，不留孤儿。auto-fit 会在 1180px 宽下把四块排成 3+1，
-   而仪表盘上一块落单比格子窄一点难看得多。 */
+.panel > h3:first-of-type{margin-top:2px}
+.panel > h3 + .hint{margin:6px 0 14px}
+.grid{display:grid;gap:clamp(12px,1.4vw,16px)}
 .g3{grid-template-columns:repeat(4,minmax(0,1fr))}
-@media (max-width:900px){.g3{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media (max-width:480px){.g3{grid-template-columns:1fr}}
+@media (max-width:980px){.g3{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:520px){.g3{grid-template-columns:1fr}}
 .g2{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
 
-/* ── 读数：内凹 ───────────────────────────────────────────────
-   只读的仪表，嵌进面板里。底部一排刻度 —— 它标的是这块表的量程性质
-   （计数器自开始抓取起累加，没有上限），不是进度。 */
+/* ── 读数：内凹，尺度是主角 ───────────────────────────────── */
 .read{
-  background:var(--inset);border:1px solid var(--line);border-radius:var(--r);
-  padding:15px 16px 13px;
-  box-shadow:inset 0 1px 2px color-mix(in srgb,var(--ink) 7%,transparent);
+  background:var(--inset);border:1px solid var(--hair);border-radius:var(--r);
+  padding:clamp(15px,1.8vw,20px);box-shadow:var(--sink);
+  display:flex;flex-direction:column;gap:0;
 }
-/* 中英混排的小标签（"TOKEN 总量"）。字距压到 .07em：拉丁部分仍读得出
-   铭牌感，而中文不至于松散。 */
 .read .lab{
-  font-family:var(--mono);font-size:10px;letter-spacing:.07em;
-  text-transform:uppercase;color:var(--muted);
+  font-family:var(--mono);font-size:10px;letter-spacing:.07em;text-transform:uppercase;
+  color:var(--dim);
 }
+/* 读数与标签之间的尺度落差就是层级本身。 */
 .read .val{
   font-family:var(--mono);font-variant-numeric:tabular-nums;
-  font-size:30px;font-weight:450;letter-spacing:-.035em;
-  margin-top:8px;line-height:1;color:var(--ink);
+  font-size:clamp(30px,3.6vw,52px);font-weight:400;letter-spacing:-.045em;
+  margin-top:10px;line-height:.95;color:var(--ink);
 }
-/* 精度数字：前导零退到弱色，有效位留在墨色。 */
-.read .val .lead{color:var(--faint);font-weight:400}
-.read .val .unit{font-size:.55em;color:var(--muted);margin-left:2px;letter-spacing:0}
-/* 复合读数（模型/供应商/密钥）的斜杠退成弱色，否则 `3 / 1 / 2` 会被读成
-   一个数。 */
-.read .val .sep{color:var(--faint);font-weight:400;padding:0 .12em}
-/* 读不到时的占位。它要和数字占同一个光学位置，否则那一格看着像空的。 */
-.read .val.absent{color:var(--faint);font-weight:400}
-.read.money .val{color:var(--live)}
-.read.money .val .lead{color:color-mix(in srgb,var(--live) 38%,var(--faint))}
-.read .foot{font-size:11px;color:var(--muted);margin-top:9px}
-/* 刻度尺曾经在这里。摘掉了：它长在进度条该在的位置，读者会先把它当成
-   一个走到头的进度条，然后才发现不是 —— 产生的是歧义不是信息。读数的
-   「内凹」本身已经把只读区域讲清楚了，不需要再加一层器械装饰。 */
+/* 精度数字：前导零退到弱色，有效位留在亮处。 */
+.read .val .lead{color:var(--faint);font-weight:300}
+.read .val .sep{color:var(--faint);font-weight:300;padding:0 .1em}
+.read .val.absent{color:var(--faint);font-weight:300}
+.read.money .val{color:var(--live);text-shadow:0 0 24px color-mix(in oklch,var(--live) 22%,transparent)}
+.read.money .val .lead{color:var(--live-dim);text-shadow:none}
+.read .foot{font-size:11px;color:var(--faint);margin-top:auto;padding-top:12px}
 
-/* ── 表格：数据密排 ───────────────────────────────────────────── */
+/* ── 表格 ─────────────────────────────────────────────────── */
 table{width:100%;border-collapse:collapse;font-size:13px}
 th{
-  text-align:left;font-family:var(--mono);font-size:9.5px;
-  letter-spacing:.11em;text-transform:uppercase;color:var(--faint);font-weight:500;
-  padding:0 11px 9px;border-bottom:1px solid var(--line);white-space:nowrap;
+  text-align:left;font-family:var(--mono);font-size:9.5px;letter-spacing:.11em;
+  text-transform:uppercase;color:var(--faint);font-weight:500;
+  padding:0 12px 10px;border-bottom:1px solid var(--line);white-space:nowrap;
 }
-td{padding:11px;border-bottom:1px solid var(--hair);vertical-align:top}
+td{padding:12px;border-bottom:1px solid var(--hair);vertical-align:top}
 tbody tr:last-child td{border-bottom:0}
-tbody tr:hover td{background:color-mix(in srgb,var(--accent) 4%,transparent)}
+tbody tr{transition:background .12s ease}
+tbody tr:hover td{background:color-mix(in oklch,var(--accent) 6%,transparent)}
 td.r,th.r{text-align:right}
-/* 空表头是「动作列」。不给它宽度约束的话它会分到等份，于是删除按钮被推到
-   表格最右，和它作用的那一行隔着一大片空白。 */
+td strong{font-weight:600}
+/* 空表头是动作列。不约束宽度它会分到等份，于是按钮被推到离它作用的那行
+   很远的地方。 */
 th:empty{width:1%}
 td:last-child:has(button){width:1%;white-space:nowrap}
-td strong{font-weight:600}
 .scroll{overflow-x:auto;scrollbar-width:thin}
 
-.bar{height:3px;background:var(--track);overflow:hidden;margin-top:7px;max-width:180px}
-.bar > i{display:block;height:100%;background:var(--accent)}
+.bar{height:3px;background:var(--track);border-radius:2px;overflow:hidden;
+  margin-top:8px;max-width:180px}
+.bar > i{display:block;height:100%;background:var(--accent);
+  box-shadow:0 0 8px var(--glow)}
 
-/* ── 曲线 ─────────────────────────────────────────────────────
-   面积填充让「多少」有体量感，端点圆点标出「现在」—— 一条时间序列上
-   最右端才是运维真正在问的那个数。 */
+/* ── 曲线 ─────────────────────────────────────────────────── */
 .chart{margin-top:2px}
 .chart svg{display:block;width:100%;height:auto}
 .chart .axis{font-family:var(--mono);font-size:9px;fill:var(--faint);letter-spacing:.04em}
 .chart .grid-line{stroke:var(--hair);stroke-width:1}
 .chart .zero-line{stroke:var(--line);stroke-width:1}
-.chart .now{stroke:var(--panel);stroke-width:1.5}
-.legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:14px;
-  padding-top:12px;border-top:1px solid var(--hair)}
-.legend .item{display:inline-flex;align-items:center;gap:7px;
+.chart .now{stroke:var(--inset);stroke-width:2}
+.legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:16px;
+  padding-top:14px;border-top:1px solid var(--hair)}
+.legend .item{display:inline-flex;align-items:center;gap:8px;
   font-family:var(--mono);font-size:11px;color:var(--ink-2)}
-.legend .swatch{width:9px;height:2px;border-radius:1px}
+.legend .swatch{width:10px;height:2px;border-radius:1px}
 
-/* ── 控件 ─────────────────────────────────────────────────────── */
+/* ── 控件 ─────────────────────────────────────────────────── */
 button.act{
-  background:var(--accent);color:var(--accent-ink);border:0;border-radius:var(--r);
-  padding:9px 17px;cursor:pointer;font-weight:600;font-size:12.5px;
-  letter-spacing:.02em;transition:filter .12s ease,transform .06s ease;
+  background:var(--accent);color:var(--accent-ink);border:0;border-radius:var(--r-sm);
+  padding:10px 18px;cursor:pointer;font-weight:600;font-size:12.5px;letter-spacing:.01em;
+  box-shadow:0 1px 10px -2px var(--glow);
+  transition:filter .14s ease,transform .07s ease,box-shadow .14s ease;
 }
-button.act:hover:not(:disabled){filter:brightness(1.12)}
+button.act:hover:not(:disabled){filter:brightness(1.08);box-shadow:0 2px 16px -2px var(--glow)}
 button.act:active:not(:disabled){transform:translateY(1px)}
-button.act:disabled{opacity:.42;cursor:not-allowed}
+button.act:disabled{opacity:.38;cursor:not-allowed;box-shadow:none}
 button.ghost{
   background:var(--raise);border:1px solid var(--line);color:var(--ink-2);
-  border-radius:var(--r);padding:6px 13px;cursor:pointer;font-size:12px;
-  transition:border-color .12s ease,color .12s ease,background .12s ease;
+  border-radius:var(--r-sm);padding:7px 13px;cursor:pointer;font-size:12px;
+  transition:border-color .14s ease,color .14s ease,background .14s ease;
 }
 button.ghost:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
-
-/* 表格里的动作安静下来。每行一个描边方框，两行就是两个在抢注意力的框，
-   而删除不该比它删的那一行更显眼。悬停时才显形，并转成警示色 —— 那时
-   用户已经指着它了，此刻才需要说明后果。 */
-td button.ghost{
-  background:none;border-color:transparent;color:var(--muted);
-  padding:4px 8px;
-}
+button.ghost:disabled{opacity:.4;cursor:not-allowed}
+/* 表格里的动作安静下来：每行一个描边框会比它删的那行更显眼。悬停才显形，
+   并转成警示色 —— 那时用户已经指着它了。 */
+td button.ghost{background:none;border-color:transparent;color:var(--faint);padding:5px 9px}
 tr:hover td button.ghost{border-color:var(--line);color:var(--ink-2)}
 td button.ghost:hover:not(:disabled){
-  border-color:color-mix(in srgb,var(--crit) 45%,transparent);
-  color:var(--crit);background:var(--raise);
+  border-color:color-mix(in oklch,var(--crit) 45%,transparent);
+  color:var(--crit);background:color-mix(in oklch,var(--crit) 10%,transparent);
 }
-button.ghost:disabled{opacity:.45;cursor:not-allowed}
 button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
-label.f{display:block;margin-bottom:14px}
+label.f{display:block;margin-bottom:15px}
 label.f > span{
-  display:block;font-family:var(--mono);font-size:9.5px;
-  letter-spacing:.11em;text-transform:uppercase;color:var(--muted);margin-bottom:6px;
+  display:block;font-family:var(--mono);font-size:9.5px;letter-spacing:.11em;
+  text-transform:uppercase;color:var(--dim);margin-bottom:7px;
 }
 input[type=text],input[type=password],input[type=number],select,textarea{
-  width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:var(--r);
-  background:var(--raise);transition:border-color .12s ease;
+  width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:var(--r-sm);
+  background:var(--raise);transition:border-color .14s ease,box-shadow .14s ease;
 }
-/* 输入框也有「行宽」。撑满两栏栅格意味着一个装 `my-app` 的框有 540px 宽，
-   而人会先怀疑自己是不是该填一长串东西。44ch 对逗号分隔的模型清单也够，
-   真的更长时它自己会滚。 */
+/* 输入框也有行宽。撑满两栏意味着一个装 `my-app` 的框有 540px 宽，人会先
+   怀疑自己是不是该填一长串东西。 */
 input[type=text],input[type=password],select{max-width:44ch}
+input[type=number]{font-family:var(--mono);font-variant-numeric:tabular-nums;max-width:190px}
 textarea{max-width:none}
-/* 按内容的量级定宽，而不是一律撑满栅格。一个装 `60` 的框宽到 540px 时，
-   人会先怀疑自己是不是该填一长串东西。 */
-input[type=number]{
-  font-family:var(--mono);font-variant-numeric:tabular-nums;
-  max-width:190px;
-}
-/* 密钥、URL、模型清单这类长值仍然撑满 —— 它们真的会长。 */
-input:hover,select:hover{border-color:var(--muted)}
+input:hover,select:hover,textarea:hover{border-color:var(--dim)}
 input:focus,select:focus,textarea:focus{
-  outline:2px solid var(--accent);outline-offset:-1px;border-color:transparent;
+  outline:0;border-color:var(--accent);box-shadow:0 0 0 3px var(--glow);
 }
-input[type=checkbox]{accent-color:var(--accent);width:14px;height:14px}
+input[type=checkbox]{accent-color:var(--accent);width:15px;height:15px}
+::placeholder{color:var(--faint)}
 
-/* ── 提示：左侧色条 + 弱底色 ─────────────────────────────────── */
+/* ── 提示 ─────────────────────────────────────────────────── */
 .note{
-  border-left:2px solid var(--accent);background:var(--accent-soft);
-  padding:12px 15px;border-radius:0 var(--r) var(--r) 0;
-  font-size:12.5px;margin:16px 0;max-width:82ch;text-wrap:pretty;
-  /* 上游错误里常带一整条查询 URL，不断行会把面板撑破。 */
-  overflow-wrap:anywhere;
+  border-left:2px solid var(--accent);
+  background:color-mix(in oklch,var(--accent) 10%,transparent);
+  padding:13px 16px;border-radius:0 var(--r-sm) var(--r-sm) 0;
+  font-size:12.5px;margin:16px 0;max-width:82ch;
+  text-wrap:pretty;overflow-wrap:anywhere;
 }
-.note.crit{border-color:var(--crit);background:var(--crit-soft)}
-.note.warn{border-color:var(--warn);background:var(--warn-soft)}
+.note.crit{border-color:var(--crit);background:color-mix(in oklch,var(--crit) 12%,transparent)}
+.note.warn{border-color:var(--warn);background:color-mix(in oklch,var(--warn) 12%,transparent)}
 .note strong{font-weight:600}
-.note p{margin:8px 0 0}
+.note p{margin:9px 0 0}
 .note p:first-child{margin-top:0}
-.note .hint{color:var(--muted);font-size:11.5px}
+.note .hint{color:var(--dim);font-size:11.5px}
 code,.note code{font-family:var(--mono);font-size:11.5px;
-  background:color-mix(in srgb,var(--ink) 6%,transparent);padding:1px 4px;border-radius:2px}
+  background:color-mix(in oklch,var(--ink) 9%,transparent);padding:2px 5px;border-radius:3px}
 pre{
-  font-family:var(--mono);font-size:11.5px;background:var(--raise);
-  border:1px solid var(--line);border-radius:var(--r);
-  padding:13px;overflow-x:auto;margin:0;
+  font-family:var(--mono);font-size:11.5px;background:var(--inset);
+  border:1px solid var(--line);border-radius:var(--r-sm);
+  padding:14px;overflow-x:auto;margin:0;box-shadow:var(--sink);
   user-select:all;  /* 密钥明文：一次点选全中，减少漏抄 */
 }
 
-/* ── 登录闸 ───────────────────────────────────────────────────
-   未登录只看得到铭牌本身。 */
+/* ── 登录闸 ───────────────────────────────────────────────── */
 #gate{min-height:100vh;display:grid;place-items:center;padding:24px}
-#gate .box{width:100%;max-width:352px;padding:28px}
+#gate .box{
+  width:100%;max-width:372px;padding:clamp(24px,3vw,32px);
+  animation:rise .4s cubic-bezier(.16,.8,.3,1) backwards;
+}
 #gate .box h1{
-  font-size:14px;font-weight:700;font-stretch:118%;
-  letter-spacing:var(--wide);text-transform:uppercase;margin-bottom:6px;
+  font-size:14px;font-weight:700;font-stretch:120%;letter-spacing:var(--wide);
+  text-transform:uppercase;margin-bottom:7px;
 }
 #gate .box p{
-  font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;
-  color:var(--faint);margin:0 0 22px;padding-bottom:16px;border-bottom:1px solid var(--hair);
+  font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--faint);margin:0 0 24px;padding-bottom:18px;
+  border-bottom:1px solid var(--hair);
 }
+#gate .box .act{width:100%;margin-top:4px}
 
-@media (max-width:640px){
-  .shell{padding:0 16px 60px}
-  header.plate{padding-top:22px}
-  .plate .sub{padding-left:0;border-left:0}
-  .read .val{font-size:25px}
-  .panel{padding:17px}
-}
 @media (prefers-reduced-motion:reduce){
-  *,*::after,*::before{transition:none !important;animation:none !important}
+  *,*::after,*::before{animation:none !important;transition:none !important}
 }

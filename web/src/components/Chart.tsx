@@ -5,12 +5,20 @@ export interface Series {
 
 const W = 880;
 const H = 200;
-const PL = 56;
+// 左边距要装得下最长的轴标签（`3.480 req/s` 在 9px 等宽下约 56 个 viewBox
+// 单位）。给 56 时它会溢出到 SVG 边界外被裁掉 —— 屏幕上看到的是 `80 req/s`，
+// 一个凭空少了一位的数。
+const PL = 84;
 const PB = 20;
 const PT = 12;
-const PR = 10;
-// 最多五条：再多线会互相压住、图例也读不完，不如让调用方先聚合。
-const HUES = ["var(--accent)", "var(--ok)", "var(--warn)", "var(--live)", "var(--ink-2)"];
+const PR = 12;
+/**
+ * 分类色阶，最多五条。取自 CSS 变量而不是写死值 —— 写死会锁在一种主题的
+ * 明度上：一组为暗底调的亮色落在白底上对比度不够，反之亦然。
+ *
+ * 这套刻意不复用 --ok / --warn / --crit（见 styles.css 的说明）。
+ */
+const HUES = ["var(--s1)", "var(--s2)", "var(--s3)", "var(--s4)", "var(--s5)"];
 
 /**
  * 多序列折线图。自绘 SVG —— 一个图表库的体积超过整个界面。
@@ -56,8 +64,8 @@ export function Chart({ series, fmt }: { series: Series[]; fmt: (v: number) => s
         <svg viewBox={`0 0 ${W} ${H}`} role="img" aria-label="时间序列">
           <defs>
             <linearGradient id="areaFade" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="var(--accent)" stopOpacity="0.16" />
-              <stop offset="100%" stopColor="var(--accent)" stopOpacity="0.01" />
+              <stop offset="0%" stopColor={HUES[0]} stopOpacity="0.22" />
+              <stop offset="100%" stopColor={HUES[0]} stopOpacity="0.015" />
             </linearGradient>
           </defs>
 
