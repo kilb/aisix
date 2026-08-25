@@ -31,6 +31,19 @@ const HUES = ["var(--s1)", "var(--s2)", "var(--s3)", "var(--s4)", "var(--s5)"];
  * - 图例里的名字原样显示。它们是路由、模型名、api_key_id —— 大小写敏感的
  *   标识符，改一个字母就指向了别的东西。
  */
+/**
+ * 抬到下一个整齐刻度，并且一定留出余量 —— 峰值恰好等于刻度时再上一档，
+ * 否则那个点仍然贴在框边。
+ */
+function niceMax(v: number): number {
+  const target = v * 1.02;
+  const mag = 10 ** Math.floor(Math.log10(target));
+  for (const step of [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8]) {
+    if (step * mag >= target) return step * mag;
+  }
+  return 10 * mag;
+}
+
 export function Chart({ series, fmt }: { series: Series[]; fmt: (v: number) => string }) {
   let tMin = Infinity;
   let tMax = -Infinity;
@@ -47,8 +60,11 @@ export function Chart({ series, fmt }: { series: Series[]; fmt: (v: number) => s
     return <p className="hint">该时段全部为零。</p>;
   }
 
+  // 量程抬到整齐的刻度上。直接用峰值当顶会把最高那个点顶在框边上，轴上
+  // 还会出现 `3.480 req/s` 这种没人读的刻度值。
+  const top = niceMax(vMax);
   const x = (t: number) => PL + ((t - tMin) / Math.max(1, tMax - tMin)) * (W - PL - PR);
-  const y = (v: number) => PT + (1 - v / vMax) * (H - PT - PB);
+  const y = (v: number) => PT + (1 - v / top) * (H - PT - PB);
   const shown = series.slice(0, HUES.length);
   const baseline = y(0);
 
@@ -83,7 +99,7 @@ export function Chart({ series, fmt }: { series: Series[]; fmt: (v: number) => s
                 />
                 {label && (
                   <text x={PL - 9} y={yy + 3.5} textAnchor="end" className="axis">
-                    {fmt(vMax * (1 - f))}
+                    {fmt(top * (1 - f))}
                   </text>
                 )}
               </g>

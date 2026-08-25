@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import * as api from "../lib/api";
-import { fmtCompact, fmtUsd, listOf } from "../lib/fmt";
+import { fmtCompact, fmtUsd, listOf, resError } from "../lib/fmt";
 import { Chart, type Series } from "../components/Chart";
 import { Reading } from "../components/Reading";
+import { Gauge } from "../components/Gauge";
 import type { DocState } from "../lib/useDoc";
 import type { TabId } from "../App";
 
@@ -13,7 +14,28 @@ export function Overview({ doc }: { doc: DocState; onGoto: (t: TabId) => void })
   // 以为网关没流量。
   const [totals, setTotals] = useState<Totals>({ req: "…", tok: "…", spend: "…" });
   const [series, setSeries] = useState<Series[] | null>(null);
+  /** 上限窗口内的花费。null = 还没读到。 */
+  const [windowSpend, setWindowSpend] = useState<number | null>(null);
   const [chartError, setChartError] = useState<string | null>(null);
+
+  /**
+   * 配置里的花费上限。取窗口相同的那些相加 —— 多条策略同时生效，任一超限
+   * 即拒，所以「离上限还有多远」看的是它们的总额在同一窗口下的位置。
+   *
+   * 只认 day/hour/minute：second 窗口下花费上限不生效（网关会报出来），
+   * 拿它画量程是在展示一个不存在的约束。
+   */
+  const ceiling = useMemo(() => {
+    const rows =
+      (doc.doc?.rate_limit_policies as Record<string, unknown>[] | undefined) ?? [];
+    for (const win of ["day", "hour", "minute"]) {
+      const total = rows
+        .filter((p) => p.window === win && p.max_spend_micro_usd != null)
+        .reduce((n, p) => n + Number(p.max_spend_micro_usd), 0);
+      if (total > 0) return { total, window: win };
+    }
+    return null;
+  }, [doc.doc]);
 
   useEffect(() => {
     let live = true;
@@ -33,6 +55,22 @@ export function Overview({ doc }: { doc: DocState; onGoto: (t: TabId) => void })
       } catch {
         if (live) setTotals({ req: "—", tok: "—", spend: "—" });
       }
+      // 窗口内的花费。**不能**拿累计总量跟日上限比 —— 那个数是自开始抓取
+      // 起累加的，跟「今天花了多少」没有关系。`increase` 才是这段时间的增量。
+      {
+        // 没配上限时按天读。给不出「离上限还有多远」，「今天花了多少」照样
+        // 是运维要的数 —— 读到了却不显示，是白扔一条真实读数。
+        const span =
+          ceiling?.window === "hour" ? "1h" : ceiling?.window === "minute" ? "1m" : "1d";
+        try {
+          const r = await api.promTop(
+            `sum(increase(aisix_llm_spend_micro_usd_total[${span}]))`,
+          );
+          if (live) setWindowSpend(r.length ? (r[0]?.v ?? 0) : 0);
+        } catch {
+          if (live) setWindowSpend(null);
+        }
+      }
       try {
         const rows = await api.promRange(
           "sum by (endpoint) (rate(aisix_llm_requests_total[10m]))",
@@ -46,26 +84,46 @@ export function Overview({ doc }: { doc: DocState; onGoto: (t: TabId) => void })
     return () => {
       live = false;
     };
-  }, []);
+  }, [ceiling]);
 
   const models = listOf(doc.res?.models);
   const keys = listOf(doc.res?.api_keys);
   const pks = listOf(doc.res?.provider_keys);
+  const inventoryDown =
+    resError(doc.res?.models) ??
+    resError(doc.res?.provider_keys) ??
+    resError(doc.res?.api_keys);
 
   return (
     <>
       <div className="panel">
         <h2>网关读数</h2>
         <p className="hint">累计值来自 Prometheus，自开始抓取起算。</p>
-        <div className="grid g3">
-          <Reading label="请求总数" value={totals.req} foot="经 LLM 端点" />
-          <Reading label="Token 总量" value={totals.tok} foot="输入 + 输出（含缓存）" />
-          <Reading label="累计花费" value={totals.spend} foot="按模型定价折算" money />
-          <Reading
-            label="已配置"
-            value={`${models.length} / ${pks.length} / ${keys.length}`}
-            foot="模型 / 供应商 / 调用方密钥"
+        <div className="dial-row">
+          <Gauge
+            spendMicro={windowSpend}
+            ceilingMicro={ceiling?.total ?? null}
+            window={ceiling?.window ?? "day"}
           />
+          <div className="dial-side">
+            <Reading label="请求总数" value={totals.req} foot="经 LLM 端点" />
+            <Reading label="Token 总量" value={totals.tok} foot="输入 + 输出（含缓存）" />
+            {/* 花费归表盘所有，侧边不再重复。读不到就说读不到 ——把 0 印成大号数字，跟「真的配了
+                0 条」在屏幕上一模一样，而这两件事要采取的动作完全相反。 */}
+            <Reading
+              label="已配置"
+              value={
+                doc.res === null || inventoryDown
+                  ? "—"
+                  : `${models.length} / ${pks.length} / ${keys.length}`
+              }
+              foot={
+                doc.res === null || inventoryDown
+                  ? "网关不可达，读不到清单"
+                  : "模型 / 供应商 / 调用方密钥"
+              }
+            />
+          </div>
         </div>
       </div>
 

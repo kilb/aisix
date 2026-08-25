@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "../lib/api";
-import { listOf } from "../lib/fmt";
+import { listOf, resError } from "../lib/fmt";
 import type { DocState } from "../lib/useDoc";
 
 function StatusText({ s }: { s: unknown }) {
@@ -16,6 +16,9 @@ export function Logs({ doc }: { doc: DocState }) {
   const [err, setErr] = useState<string | null>(null);
 
   /** `key_hash` → 网关侧的 `api_key_id`（指标和日志用的都是它）。 */
+  // 对照表读不到时下拉只剩「全部」。说清是读不到，否则会被当成「没有密钥」。
+  const keysDown = resError(doc.res?.api_keys) !== null;
+
   const options = useMemo(() => {
     const byHash = new Map<string, string>();
     for (const k of listOf(doc.res?.api_keys)) {
@@ -23,10 +26,14 @@ export function Logs({ doc }: { doc: DocState }) {
         byHash.set(k.key_hash, k.id);
       }
     }
-    return ((doc.doc?.api_keys as Record<string, unknown>[] | undefined) ?? []).map((k) => ({
-      id: byHash.get(String(k.key_hash ?? "")) ?? "",
-      name: String(k.display_name ?? "（未命名）"),
-    }));
+    // 拿不到 key_hash → api_key_id 的对照就不要放出选项：id 是空串的选项
+    // 看着能选，选了查出来永远是空的。
+    return ((doc.doc?.api_keys as Record<string, unknown>[] | undefined) ?? [])
+      .map((k) => ({
+        id: byHash.get(String(k.key_hash ?? "")) ?? "",
+        name: String(k.display_name ?? "（未命名）"),
+      }))
+      .filter((o) => o.id !== "");
   }, [doc.doc, doc.res]);
 
   const load = useCallback(async () => {
@@ -71,6 +78,11 @@ export function Logs({ doc }: { doc: DocState }) {
       <button className="act" onClick={() => void load()}>
         读取
       </button>
+      {keysDown && (
+        <div className="note warn">
+          网关不可达，读不到密钥对照表，所以只能按全部读取。
+        </div>
+      )}
       <div className="note warn">
         两个限制照实说：<strong>流式请求</strong>的这一行是在 SSE 开始推送之前写的，
         所以 token 数为空；<strong>journald 有留存上限</strong>，不是无限历史。

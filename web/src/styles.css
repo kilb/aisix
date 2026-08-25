@@ -130,7 +130,8 @@
     --s1:oklch(44% .15 208); --s2:oklch(44% .16 275); --s3:oklch(46% .17 335);
     --s4:oklch(48% .16 42); --s5:oklch(44% .14 152);
   }
-}:root[data-theme="light"]{
+}
+:root[data-theme="light"]{
   /* ── 白天的仪表盘 ─────────────────────────────────────────
      浅色不是暗色的翻转：隐喻从「背光玻璃」变成「日光下的搪瓷面板」，
      那是另一种物理对象。印刷仪表是**高对比**的 —— 深墨压在近白的珐琅
@@ -182,9 +183,15 @@
   --s4:oklch(48% .16 42); --s5:oklch(44% .14 152);
 }
 @media (prefers-color-scheme:light){
-  :root:not([data-theme="dark"]) body{background-image:none}
+    :root:not([data-theme="dark"]) body{
+    background-image:
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='.022'/%3E%3C/svg%3E");
+  }
 }
-:root[data-theme="light"] body{background-image:none}
+:root[data-theme="light"] body{
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='.022'/%3E%3C/svg%3E");
+}
 
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
@@ -193,6 +200,9 @@ body{
   /* 暗色下顶上一道极弱的光，像天花板的灯 —— 让暗底不是一块死板。
      白天没有这回事，所以浅色主题把它关掉，底面就是干净的漆面。 */
   background:
+    /* 一层几乎看不见的颗粒。近白或近黑的大面积平涂会读成「没画完」，
+       而实体的漆面是有肌理的 —— 这一层给它质感，不给它图案。 */
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='.032'/%3E%3C/svg%3E"),
     radial-gradient(120% 62% at 50% -12%, var(--glow), transparent 62%),
     var(--ground);
   background-attachment:fixed;
@@ -287,35 +297,6 @@ nav.tabs button[aria-selected="true"]{
 }
 nav.tabs button[aria-selected="true"]::before{height:calc(100% - 12px)}
 nav.tabs button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
-
-.rail-foot{
-  margin-top:auto;padding-top:14px;border-top:1px solid var(--hair);
-  display:flex;flex-direction:column;gap:10px;align-items:flex-start;
-}
-.rail-actions{display:flex;gap:6px;flex-wrap:wrap}
-
-.stage{min-width:0;max-width:1680px;padding-bottom:56px}
-
-/* 窄屏：岛躺平成顶部一条，导航横向滚动。 */
-@media (max-width:900px){
-  .frame{grid-template-columns:minmax(0,1fr)}
-  .rail{
-    position:static;height:auto;flex-direction:row;align-items:center;
-    gap:14px;flex-wrap:wrap;padding:12px 14px;
-  }
-  .rail-mark{
-    padding:0 12px 0 0;margin:0;border-bottom:0;border-right:1px solid var(--line);
-  }
-  .rail-sub{display:none}
-  nav.tabs{flex-direction:row;overflow-x:auto;flex:1;min-width:0}
-  nav.tabs button::before{
-    left:10px;right:10px;top:auto;bottom:0;translate:none;
-    width:auto;height:2px;transform:scaleX(0);transform-origin:left;
-    transition:transform .18s ease;
-  }
-  nav.tabs button[aria-selected="true"]::before{height:2px;transform:scaleX(1)}
-  .rail-foot{margin:0;padding:0;border-top:0;flex-direction:row;align-items:center}
-}
 
 /* 状态胶囊。改成侧栏骨架时这几条规则被我连区段一起删掉了，健康状态于是
    退成一行纯文字 —— 边框和状态点都没了。 */
@@ -430,6 +411,70 @@ nav.tabs button:focus-visible{outline:2px solid var(--accent);outline-offset:-2p
 :root[data-theme="light"] .read.money .val{text-shadow:none}
 .read.money .val .lead{color:var(--live-dim);text-shadow:none}
 .read .foot{font-size:11px;color:var(--faint);margin-top:auto;padding-top:12px}
+.read{transition:box-shadow .18s ease}
+.read:hover{box-shadow:var(--sink),0 0 0 1px color-mix(in oklch,var(--accent) 30%,transparent)}
+
+/* ── 花费表盘：这一版唯一放胆的地方 ───────────────────────────
+   一段弧回答「离上限还有多远」，而一个数字答不了。色调随占比走 —— 那是
+   运维要的信号，不是配色趣味。 */
+.dial-row{
+  display:grid;grid-template-columns:minmax(240px,290px) minmax(0,1fr);
+  gap:clamp(14px,1.8vw,24px);align-items:stretch;
+}
+.dial-side{
+  display:grid;grid-template-columns:repeat(3,minmax(0,1fr));
+  gap:clamp(12px,1.4vw,16px);
+}
+@media (max-width:1320px){.dial-side{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:1080px){
+  .dial-row{grid-template-columns:minmax(0,1fr)}
+}
+@media (max-width:560px){
+  .dial-side{grid-template-columns:1fr}
+}
+
+.gauge{
+  display:grid;place-items:center;
+  background:var(--inset);border:1px solid var(--hair);border-radius:var(--r);
+  box-shadow:var(--sink);padding:14px 10px 10px;
+  --gauge-a:var(--ok);--gauge-b:var(--ok);
+}
+.gauge-warn{--gauge-a:var(--warn);--gauge-b:var(--warn)}
+.gauge-crit{--gauge-a:var(--crit);--gauge-b:var(--crit)}
+.gauge-idle{--gauge-a:var(--dim);--gauge-b:var(--dim)}
+/* 没配上限时轨道打虚。一整圈实心空轨说的是「有量程，现在为零」，跟
+   「没有量程」是两件事。 */
+.gauge-idle .gauge-track{stroke-dasharray:2 8;opacity:.8}
+.gauge svg{width:100%;max-width:248px;height:auto;overflow:visible}
+.gauge-track{
+  /* 量程两端切平。圆头会在满量程附近凸出 fill 的端点，那点残量看着像一颗
+     独立的深色药丸，而不是「还剩这么多」。 */
+  fill:none;stroke:var(--track);stroke-width:11;stroke-linecap:butt;
+}
+.gauge-fill{
+  fill:none;stroke:url(#gaugeFill);stroke-width:11;stroke-linecap:round;
+  filter:drop-shadow(0 0 7px color-mix(in oklch,var(--gauge-b) 45%,transparent));
+  /* 挂载时从零扫到位。这一下是有内容的：它演的正是这段时间累积出来的量。 */
+  animation:sweep .85s cubic-bezier(.22,.9,.28,1) backwards;
+}
+@keyframes sweep{from{stroke-dasharray:0 999}to{stroke-dasharray:999 0}}
+.gauge-val{
+  font-family:var(--mono);font-variant-numeric:tabular-nums;
+  /* 这一行里的主角就得是最大的那个数。26px 时它比旁边的读数小了四成，
+     层级正好反过来了。 */
+  font-size:36px;font-weight:500;letter-spacing:-.045em;
+  /* 跟弧同色 —— 弧和数字说的是同一件事，两种颜色会读成两件事。 */
+  fill:var(--gauge-b);
+}
+/* 前导零用透明度压，不用 color-mix：oklch 里红跟青灰混要绕过黄，`$` 会
+   变成橄榄色。透明度不碰色相。 */
+.gauge-val .lead{opacity:.42;font-weight:300}
+/* 「上限」是中文，`$5.00 / DAY` 是拉丁数字 —— 字距和大写只加在后者身上。
+   整串一起加会把中文拉散，那是本文件开头第 4 条规则说的事。 */
+.gauge-cap{font-size:10.5px;fill:var(--faint)}
+.gauge-cap .q{
+  font-family:var(--mono);letter-spacing:.09em;text-transform:uppercase;
+}
 
 /* ── 表格 ─────────────────────────────────────────────────── */
 table{width:100%;border-collapse:collapse;font-size:13px}

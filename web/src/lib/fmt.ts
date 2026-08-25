@@ -54,6 +54,23 @@ export function modelsOrAll(v: unknown): string[] {
 }
 
 /**
+ * 管理 API 的每项资源各自成败：整体仍是 200，读不到的那一项是 `{error}`。
+ *
+ * 所以 `listOf` 对「读不到」和「真的是空的」给出同一个空数组，界面会把前者
+ * 显示成后者 —— 而这两件事要采取的动作完全相反。凡是按资源清单渲染的地方
+ * 都得先问这一句。
+ *
+ * 返回的字符串只作信号用，**不要显示**：它带着管理 API 的内网地址。
+ */
+export function resError(v: unknown): string | null {
+  if (v && typeof v === "object" && !Array.isArray(v)) {
+    const e = (v as { error?: unknown }).error;
+    if (typeof e === "string" && e) return e;
+  }
+  return null;
+}
+
+/**
  * 管理 API 每条是 `{id, revision, value:{...}}` 信封，拆平成
  * `{id, revision, ...字段}`。
  *

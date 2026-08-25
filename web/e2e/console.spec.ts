@@ -392,3 +392,47 @@ test("界面声明契约，于是服务端能强制它带并发版本", async ({
   const allowed = await api.put("/api/file", { doc: cur.doc });
   expect(allowed.status).toBe(200);
 });
+
+/**
+ * 以下三条盯的是表盘和「已配置」这一行的可观察约定。
+ *
+ * 夹具把管理 API 和 Prometheus 都指向 127.0.0.1:1（不可达），所以这里
+ * 恰好覆盖的是最容易悄悄退化的那个状态：读不到。这一类退化不报错，只是
+ * 把「读不到」显示成「是零」—— 而这两件事要采取的动作完全相反。
+ */
+
+test("管理 API 读不到时，「已配置」说读不到，而不是显示 0", async ({ page }) => {
+  await signIn(page);
+  const card = page.locator(".read", { hasText: "已配置" });
+  await expect(card).toBeVisible();
+
+  await expect(card).toContainText(/读不到/);
+  // 关键：不能把读不到渲染成一个数。
+  await expect(card.locator(".val")).not.toContainText(/\d/);
+});
+
+test("没配上限时表盘不画量程，也不假装花费为零", async ({ page }) => {
+  await signIn(page);
+  const gauge = page.locator(".gauge");
+  await expect(gauge).toBeVisible();
+
+  await expect(gauge).toContainText(/未设上限/);
+  // 没有量程就不该有已用段：画一段长度为零的弧，读起来是「花了 0」。
+  await expect(gauge.locator(".gauge-fill")).toHaveCount(0);
+  // 空轨仍在，仪表本身要在场。
+  await expect(gauge.locator(".gauge-track")).toHaveCount(1);
+});
+
+test("给密钥配上花费上限后，概览的表盘按这个上限标量程", async ({ page }) => {
+  await signIn(page);
+  await page.getByRole("tab", { name: "调用方密钥" }).click();
+  await page.getByLabel("名称").fill("gauge-scope");
+  await page.getByLabel("花费上限 USD（留空不限）").fill("2");
+  await page.getByRole("button", { name: /生成并重载网关/ }).click();
+  await expect(page.getByText(/已保存|明文/)).toBeVisible();
+
+  await page.getByRole("tab", { name: "概览" }).click();
+  const gauge = page.locator(".gauge");
+  await expect(gauge).toContainText("$2.00");
+  await expect(gauge).not.toContainText(/未设上限/);
+});
