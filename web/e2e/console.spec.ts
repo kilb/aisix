@@ -129,16 +129,30 @@ test("网关状态是一个带边框和状态点的胶囊", async ({ page }) => 
   expect(shape.dotRound).toBeGreaterThan(0);
 });
 
-test("导航是一条侧栏，且滚动时留在原处", async ({ page }) => {
+test("导航是一块浮起来的侧栏岛，且滚动时留在原处", async ({ page }) => {
   await signIn(page);
   const rail = page.locator(".rail");
   const pos = await rail.evaluate((el) => {
     const cs = getComputedStyle(el);
-    return { position: cs.position, width: parseFloat(el.getBoundingClientRect().width) };
+    const r = el.getBoundingClientRect();
+    return {
+      position: cs.position,
+      width: r.width,
+      // 「浮起」要能被验证，否则下次很容易被改回贴着窗口左沿的一整列。
+      // 三个条件：离左沿有距离、有圆角、有投影。
+      left: r.left,
+      top: r.top,
+      radius: parseFloat(cs.borderTopLeftRadius),
+      hasShadow: cs.boxShadow !== "none",
+    };
   });
   // 固定不随内容滚动：运维翻到长表格底部时，切页签和登出仍在原处。
   expect(pos.position).toBe("sticky");
-  expect(pos.width).toBeGreaterThan(180);
+  expect(pos.width).toBeGreaterThan(150);
+  expect(pos.left).toBeGreaterThan(4);
+  expect(pos.top).toBeGreaterThan(4);
+  expect(pos.radius).toBeGreaterThan(4);
+  expect(pos.hasShadow).toBe(true);
 
   // 页签竖排在侧栏里，不是横排在顶部。
   const box = await page.getByRole("tab", { name: "概览" }).boundingBox();
