@@ -7,6 +7,9 @@ edition = "2021"
 # 门户是独立进程，它的依赖不该压到网关那些 crate 头上。
 [dependencies]
 argon2 = "0.5.3"
+# rand_core 0.6 与 argon2 依赖的是同一个版本 —— 与 crates/aisix-console 一致，
+# 口令盐和（后续的）会话 token 共用一套随机源，省掉两套版本对齐。
+rand_core = { version = "0.6", features = ["getrandom"] }
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
@@ -17,3 +20,7 @@ serde_json = "1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-none", "sqlite", "macros", "migrate"] }
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+# 测试起真监听、发真 HTTP —— 与 crates/aisix-console 的做法一致，不用 mock。
+reqwest = { version = "0.12", default-features = false, features = ["json"] }

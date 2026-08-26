@@ -79,10 +79,7 @@ impl Store {
         Self::from_options(opts, 5).await
     }
 
-    async fn from_options(
-        opts: SqliteConnectOptions,
-        max_conns: u32,
-    ) -> Result<Self, StoreError> {
+    async fn from_options(opts: SqliteConnectOptions, max_conns: u32) -> Result<Self, StoreError> {
         let pool = SqlitePoolOptions::new()
             .max_connections(max_conns)
             .connect_with(opts)
@@ -128,13 +125,15 @@ impl Store {
         .bind(email)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(id, email, password_hash, display_name, disabled)| User {
-            id,
-            email,
-            password_hash,
-            display_name,
-            disabled: disabled != 0,
-        }))
+        Ok(
+            row.map(|(id, email, password_hash, display_name, disabled)| User {
+                id,
+                email,
+                password_hash,
+                display_name,
+                disabled: disabled != 0,
+            }),
+        )
     }
 
     pub async fn user_by_id(&self, id: &str) -> Result<Option<User>, StoreError> {
@@ -145,13 +144,15 @@ impl Store {
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(id, email, password_hash, display_name, disabled)| User {
-            id,
-            email,
-            password_hash,
-            display_name,
-            disabled: disabled != 0,
-        }))
+        Ok(
+            row.map(|(id, email, password_hash, display_name, disabled)| User {
+                id,
+                email,
+                password_hash,
+                display_name,
+                disabled: disabled != 0,
+            }),
+        )
     }
 }
 
@@ -162,7 +163,10 @@ mod tests {
     #[tokio::test]
     async fn 建表后可以插入并读回一个用户() {
         let store = Store::open_memory().await.unwrap();
-        store.insert_user("u1", "a@b.c", "hash", None).await.unwrap();
+        store
+            .insert_user("u1", "a@b.c", "hash", None)
+            .await
+            .unwrap();
         let u = store.user_by_email("a@b.c").await.unwrap().unwrap();
         assert_eq!(u.id, "u1");
     }
@@ -172,7 +176,10 @@ mod tests {
         let store = Store::open_memory().await.unwrap();
         store.insert_user("u1", "a@b.c", "h", None).await.unwrap();
         // 唯一约束必须由数据库拒绝，而不是靠调用方先查后插。
-        let e = store.insert_user("u2", "a@b.c", "h", None).await.unwrap_err();
+        let e = store
+            .insert_user("u2", "a@b.c", "h", None)
+            .await
+            .unwrap_err();
         // 而且必须被识别为「邮箱已占用」，否则注册接口会把它渲染成 500。
         assert!(matches!(e, StoreError::EmailTaken), "得到的是 {e:?}");
     }
@@ -191,11 +198,13 @@ mod tests {
         let mut a = store.pool().acquire().await.unwrap();
         let mut b = store.pool().acquire().await.unwrap();
 
-        sqlx::query("INSERT INTO users (id, email, password_hash, created_at)
-                     VALUES ('u1','shared@b.c','h','now')")
-            .execute(a.acquire().await.unwrap())
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, email, password_hash, created_at)
+                     VALUES ('u1','shared@b.c','h','now')",
+        )
+        .execute(a.acquire().await.unwrap())
+        .await
+        .unwrap();
 
         let found: Option<(String,)> =
             sqlx::query_as("SELECT id FROM users WHERE email = 'shared@b.c'")
@@ -205,4 +214,3 @@ mod tests {
         assert_eq!(found.map(|r| r.0).as_deref(), Some("u1"));
     }
 }
-
