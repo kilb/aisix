@@ -117,7 +117,9 @@ export function App() {
         </div>
       </header>
 
+      <div className="leafs">
       <nav className="tabs" role="tablist" aria-label="控制台分区">
+        <div className="tabs-in">
         {TABS.map(([id, label]) => (
           <button
             key={id}
@@ -129,6 +131,7 @@ export function App() {
             {label}
           </button>
         ))}
+        </div>
       </nav>
 
       <main>
@@ -152,6 +155,7 @@ export function App() {
           {tab === "raw" && <Raw doc={doc} />}
         </section>
       </main>
+      </div>
     </div>
   );
 }

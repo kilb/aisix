@@ -47,12 +47,12 @@
   --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,monospace;
 
   /* 数据序列：五支笔。台账多个账户就用多支不同颜色的笔 —— 都是文件用墨
-     的饱和度，不是界面强调色。刻意不复用状态色：红墨在这套里固定表示
-     超限，拿它画一条正常曲线会让人以为在报警。 */
-  --s1:#26407c; --s2:#9e3521; --s3:#6b5230; --s4:#3a5560; --s5:#4a5d2f;
+     的饱和度，不是界面强调色。**里面没有红**：红墨在这套里固定表示超限，
+     拿它画一条正常流量曲线，读起来就是在报警。 */
+  --s1:#26407c; --s2:#6b5230; --s3:#3a5560; --s4:#5c3550; --s5:#4a5d2f;
 
   /* 账页宽度。一页就是一页，不铺满显示器。 */
-  --leaf:1180px;
+  --leaf:1320px;
 }
 
 /* 复写纸。 */
@@ -70,7 +70,7 @@
     --oxide-wash:#2c1d17;
     --rule:#332e24;
     --rule-2:#524936;
-    --s1:#93aae6; --s2:#e07d60; --s3:#cba873; --s4:#87a9b7; --s5:#a9bd7d;
+    --s1:#93aae6; --s2:#cba873; --s3:#87a9b7; --s4:#c79bbe; --s5:#a9bd7d;
   }
 }
 :root[data-theme="dark"]{
@@ -86,7 +86,7 @@
   --oxide-wash:#2c1d17;
   --rule:#332e24;
   --rule-2:#524936;
-  --s1:#93aae6; --s2:#e07d60; --s3:#cba873; --s4:#87a9b7; --s5:#a9bd7d;
+  --s1:#93aae6; --s2:#cba873; --s3:#87a9b7; --s4:#c79bbe; --s5:#a9bd7d;
 }
 
 *{box-sizing:border-box}
@@ -138,24 +138,58 @@ a{color:var(--indigo);text-underline-offset:2px}
   margin-left:auto;display:flex;align-items:center;gap:10px;flex-wrap:wrap;
 }
 
-/* 页签：一排压在栏线上的标题。选中的盖一道重线，不用底色块 —— 账页上
-   没有色块。 */
-nav.tabs{
-  display:flex;overflow-x:auto;
-  border-bottom:1px solid var(--rule-2);
-  margin-bottom:clamp(18px,2.4vw,30px);
-  scrollbar-width:thin;
+/* ── 目录栏 ──────────────────────────────────────────────────
+   装订账本左边那条目录栏。它**不是浮岛**：整页零阴影零圆角，一块带投影
+   的板压在账页上会是全页唯一自相矛盾的东西。它靠一道竖栏线跟正文分开，
+   靠 sticky 停在原处 —— 翻到长表格底部时菜单还在，这是要的那个功能，
+   不需要浮起来才能拿到。 */
+.leafs{
+  display:grid;grid-template-columns:minmax(0,168px) minmax(0,1fr);
+  gap:clamp(20px,2.6vw,36px);
+  align-items:stretch;
 }
-nav.tabs button{
-  flex:none;background:none;border:0;cursor:pointer;
-  padding:11px clamp(11px,1.5vw,18px);
-  color:var(--ink-3);font-size:14px;white-space:nowrap;
-  border-bottom:2px solid transparent;margin-bottom:-1px;
+/* 栏线画在撑满整列的 nav 上，清单本身 sticky —— 线通到页脚，菜单停在
+   原处。把线画在清单上会让它在最后一项那里断掉。 */
+nav.tabs{
+  display:block;border-right:1px solid var(--rule-2);
+}
+nav.tabs > button{position:relative}
+.tabs-in{
+  position:sticky;top:0;
+  display:flex;flex-direction:column;
+  padding:6px 0 10px;
+  max-height:100vh;overflow-y:auto;scrollbar-width:thin;
+}
+.tabs-in button{
+  background:none;border:0;cursor:pointer;text-align:left;
+  padding:7px 14px 7px 0;
+  color:var(--ink-3);font-size:14px;
+  /* 选中项在栏线上盖一道墨签，像账本翻到的那一页。 */
+  border-right:2px solid transparent;margin-right:-1px;
   transition:color .13s ease,border-color .13s ease;
 }
-nav.tabs button:hover{color:var(--ink)}
-nav.tabs button[aria-selected="true"]{
-  color:var(--ink);font-weight:600;border-bottom-color:var(--ink);
+.tabs-in button:hover{color:var(--ink)}
+.tabs-in button[aria-selected="true"]{
+  color:var(--ink);font-weight:600;border-right-color:var(--ink);
+}
+
+/* 窄屏放不下两栏：目录栏躺回页眉下面，回到横排。 */
+@media (max-width:820px){
+  .leafs{grid-template-columns:minmax(0,1fr);gap:0}
+  nav.tabs{border-right:0;border-bottom:1px solid var(--rule-2);
+    margin-bottom:clamp(18px,2.4vw,30px);}
+  .tabs-in{
+    position:static;flex-direction:row;overflow-x:auto;
+    padding:0;max-height:none;
+  }
+  .tabs-in button{
+    flex:none;white-space:nowrap;padding:11px clamp(11px,1.5vw,18px);
+    border-right:0;margin-right:0;
+    border-bottom:2px solid transparent;margin-bottom:-1px;
+  }
+  .tabs-in button[aria-selected="true"]{
+    border-right-color:transparent;border-bottom-color:var(--ink);
+  }
 }
 
 /* 账簿上盖的小戳，不是发光的胶囊。 */

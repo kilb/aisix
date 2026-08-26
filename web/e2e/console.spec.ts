@@ -137,35 +137,44 @@ test("网关状态是一个带边框和状态点的方戳", async ({ page }) => 
 });
 
 /**
- * 侧栏按要求换成了页眉下的一排页签。要守的是**导航仍然是一整排、横向排布、
- * 九个都在**，而不是塌成竖排或被折叠进某个菜单里。
+ * 导航是账本左边的目录栏。
+ *
+ * 这条用例前后改过两次轴向（竖栏 → 顶部横排 → 目录栏），所以这里**不再钉
+ * 方向**，只钉三件跟布局怎么摆无关、但一旦丢了就是退化的事：九项都在、
+ * 靠栏线分隔而不是靠浮起、以及翻到页面底部时它还在原处。
+ *
+ * 「不是靠浮起」这条同时守着整套方向：这一版通篇零阴影零圆角，一块带投影
+ * 的浮岛会是全页唯一自相矛盾的东西。
  */
-test("导航是页眉下横排的一行页签", async ({ page }) => {
+test("导航是一条靠栏线分隔、且不随内容滚走的目录栏", async ({ page }) => {
   await signIn(page);
-  await expect(page.locator(".rail")).toHaveCount(0);
-
   const nav = page.locator("nav.tabs");
   await expect(nav).toBeVisible();
+  await expect(nav.getByRole("tab")).toHaveCount(9);
 
-  // 横排：第二个页签在第一个的右边，且两者在同一行。
-  const a = await page.getByRole("tab", { name: "概览" }).boundingBox();
-  const b = await page.getByRole("tab", { name: "用量" }).boundingBox();
-  expect(a && b).toBeTruthy();
-  if (a && b) {
-    expect(b.x).toBeGreaterThan(a.x + a.width - 2);
-    expect(Math.abs(b.y - a.y)).toBeLessThan(3);
+  const look = await nav.evaluate((el) => {
+    const cs = getComputedStyle(el);
+    return {
+      shadow: cs.boxShadow,
+      radius: parseFloat(cs.borderTopLeftRadius),
+      ruled:
+        parseFloat(cs.borderRightWidth) > 0 || parseFloat(cs.borderBottomWidth) > 0,
+    };
+  });
+  expect(look.ruled).toBe(true);
+  expect(look.shadow).toBe("none");
+  expect(look.radius).toBe(0);
+
+  // 翻到长页底部，菜单仍在视口里 —— 这是把它单独立成一栏换来的东西。
+  const before = await page.getByRole("tab", { name: "概览" }).boundingBox();
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  await page.waitForTimeout(250);
+  const after = await page.getByRole("tab", { name: "概览" }).boundingBox();
+  expect(before && after).toBeTruthy();
+  if (after) {
+    expect(after.y).toBeGreaterThan(-1);
+    expect(after.y).toBeLessThan(page.viewportSize()!.height);
   }
-
-  // 页签压在页眉的重线下面，而不是飘在页面中段。
-  const head = await page.locator(".book-head").boundingBox();
-  expect(head && a).toBeTruthy();
-  if (head && a) expect(a.y).toBeGreaterThan(head.y + head.height - 2);
-
-  // 正文因此拿到整页宽度：不再有左边那条竖栏占位。
-  const frame = await page.locator(".frame").boundingBox();
-  const panel = await page.locator(".panel").first().boundingBox();
-  expect(frame && panel).toBeTruthy();
-  if (frame && panel) expect(panel.x - frame.x).toBeLessThan(60);
 });
 
 test("登录后九个页签都能打开", async ({ page }) => {
