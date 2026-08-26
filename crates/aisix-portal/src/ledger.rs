@@ -1,0 +1,245 @@
+//! 余额与流水。
+//!
+//! 余额不是一个字段，而是流水的和。这样账永远能重算，也不存在「余额字段与
+//! 流水对不上」这种无法收拾的状态。
+//!
+//! **事务边界说明。** 计划里写的是「写入在 BEGIN IMMEDIATE 事务内」，实施时
+//! 判断不需要：一次记账就是一条 INSERT，单条语句本身原子，套事务只是仪式。
+//! 真正需要原子的是控制环那一步 —— 「扣款」与「推进水位线」必须一起成或一起
+//! 不成，中间崩了就会重复扣或漏扣；那个由 [`Ledger::debit_and_mark`] 承担。
+//!
+//! 金额一律 micro-USD 整数。浮点做钱会累积误差，而这个产品的花费到千分之一
+//! 美分。
+
+use crate::store::{Store, StoreError};
+
+/// 一条流水。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub id: i64,
+    pub delta_micro_usd: i64,
+    pub source: String,
+    pub note: Option<String>,
+}
+
+/// 记账来源。写成枚举而不是裸字符串，是因为四期接支付时要新增一种来源，
+/// 而账本的 credit 操作不该为此重写（spec §8 未决问题 1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    AdminGrant,
+    Consumption,
+    Payment,
+}
+
+impl Source {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AdminGrant => "admin_grant",
+            Self::Consumption => "consumption",
+            Self::Payment => "payment",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Ledger {
+    store: Store,
+}
+
+impl Ledger {
+    pub fn new(store: Store) -> Self {
+        Self { store }
+    }
+
+    /// 入账。金额取 `u64`，所以「发放负数」在类型上就不可能 —— 调用方从
+    /// JSON 拿到负数时必须自己先挡掉（见管理端 API）。
+    pub async fn credit(
+        &self,
+        user_id: &str,
+        micro_usd: u64,
+        source: Source,
+        note: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.insert(
+            user_id,
+            i64::try_from(micro_usd).unwrap_or(i64::MAX),
+            source,
+            note,
+        )
+        .await
+    }
+
+    /// 出账。
+    ///
+    /// **允许把余额压成负数，而且必须允许。** 钱已经花出去了，按直觉写成
+    /// 「余额不足则拒绝」的话这笔消费就永远不入账 —— 那是静默白送。超支是被
+    /// 接受的（设计文档 §3.2），账本如实记到负数，由控制环去停用密钥。
+    pub async fn debit(
+        &self,
+        user_id: &str,
+        micro_usd: u64,
+        source: Source,
+        note: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let d = i64::try_from(micro_usd).unwrap_or(i64::MAX);
+        self.insert(user_id, -d, source, note).await
+    }
+
+    async fn insert(
+        &self,
+        user_id: &str,
+        delta: i64,
+        source: Source,
+        note: Option<&str>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO ledger (user_id, delta_micro_usd, source, note, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(user_id)
+        .bind(delta)
+        .bind(source.as_str())
+        .bind(note)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(self.store.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// 余额 = 流水之和。
+    ///
+    /// 每次读都扫一遍该用户的流水（走 `ledger_user` 索引）。一期的量级下这没
+    /// 问题；真要长到扫不动了再物化，那时也仍然以流水为准、物化值只是缓存。
+    pub async fn balance(&self, user_id: &str) -> Result<i64, StoreError> {
+        let (sum,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(delta_micro_usd), 0) FROM ledger WHERE user_id = ?1",
+        )
+        .bind(user_id)
+        .fetch_one(self.store.pool())
+        .await?;
+        Ok(sum)
+    }
+
+    /// 按记账顺序返回流水。
+    pub async fn entries(&self, user_id: &str) -> Result<Vec<Entry>, StoreError> {
+        let rows: Vec<(i64, i64, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, delta_micro_usd, source, note FROM ledger
+             WHERE user_id = ?1 ORDER BY id",
+        )
+        .bind(user_id)
+        .fetch_all(self.store.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, delta_micro_usd, source, note)| Entry {
+                id,
+                delta_micro_usd,
+                source,
+                note,
+            })
+            .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn ledger() -> Ledger {
+        let store = Store::open_memory().await.unwrap();
+        // 流水有外键指向 users，先把用户建出来。
+        for id in ["u1", "u2"] {
+            store
+                .insert_user(id, &format!("{id}@b.c"), "h", None)
+                .await
+                .unwrap();
+        }
+        Ledger::new(store)
+    }
+
+    #[tokio::test]
+    async fn 余额是流水的和() {
+        let l = ledger().await;
+        l.credit("u1", 5_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        l.debit("u1", 1_500_000, Source::Consumption, None)
+            .await
+            .unwrap();
+        assert_eq!(l.balance("u1").await.unwrap(), 3_500_000);
+    }
+
+    #[tokio::test]
+    async fn 没有流水时余额为零_而不是报错() {
+        let l = ledger().await;
+        assert_eq!(l.balance("u1").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn 并发的充值与扣减不丢钱() {
+        let l = ledger().await;
+        l.credit("u1", 1_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+
+        // 50 笔入账与 50 笔出账同时打进去。任何一笔丢失或重复，最终余额都对
+        // 不上 —— 这是「记账必须原子」的实测，而不是对实现的信任。
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..50 {
+            let a = l.clone();
+            set.spawn(async move { a.credit("u1", 1_000, Source::AdminGrant, None).await });
+            let b = l.clone();
+            set.spawn(async move { b.debit("u1", 400, Source::Consumption, None).await });
+        }
+        while let Some(r) = set.join_next().await {
+            r.unwrap().unwrap();
+        }
+
+        assert_eq!(
+            l.balance("u1").await.unwrap(),
+            1_000_000 + 50 * 1_000 - 50 * 400
+        );
+        assert_eq!(l.entries("u1").await.unwrap().len(), 101);
+    }
+
+    #[tokio::test]
+    async fn 扣到负数仍然入账_不能因余额不足而丢弃这笔消费() {
+        let l = ledger().await;
+        l.credit("u1", 1_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        // 消费已经发生了，钱已经花出去了。按直觉写成「余额不足则拒绝」，这笔
+        // 就永远不入账 —— 又是一次静默白送。
+        l.debit("u1", 2_500, Source::Consumption, None)
+            .await
+            .unwrap();
+        assert_eq!(l.balance("u1").await.unwrap(), -1_500);
+    }
+
+    #[tokio::test]
+    async fn 流水只追加_扣减不改写既有行() {
+        let l = ledger().await;
+        l.credit("u1", 1_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        let before = l.entries("u1").await.unwrap();
+        l.debit("u1", 400, Source::Consumption, None).await.unwrap();
+        let after = l.entries("u1").await.unwrap();
+        // 账要能重算，历史行不得被动过。
+        assert_eq!(&after[..before.len()], &before[..]);
+        assert_eq!(after.len(), before.len() + 1);
+    }
+
+    #[tokio::test]
+    async fn 一个用户的流水不会算进另一个用户的余额() {
+        let l = ledger().await;
+        l.credit("u1", 5_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        l.debit("u2", 3_000_000, Source::Consumption, None)
+            .await
+            .unwrap();
+        assert_eq!(l.balance("u1").await.unwrap(), 5_000_000);
+        assert_eq!(l.balance("u2").await.unwrap(), -3_000_000);
+    }
+}

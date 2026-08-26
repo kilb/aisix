@@ -9,6 +9,7 @@
 //! 系统绑架。
 
 mod auth;
+mod ledger;
 mod store;
 
 use auth::AppState;
