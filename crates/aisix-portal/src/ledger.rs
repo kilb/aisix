@@ -70,22 +70,6 @@ impl Ledger {
         .await
     }
 
-    /// 出账。
-    ///
-    /// **允许把余额压成负数，而且必须允许。** 钱已经花出去了，按直觉写成
-    /// 「余额不足则拒绝」的话这笔消费就永远不入账 —— 那是静默白送。超支是被
-    /// 接受的（设计文档 §3.2），账本如实记到负数，由控制环去停用密钥。
-    pub async fn debit(
-        &self,
-        user_id: &str,
-        micro_usd: u64,
-        source: Source,
-        note: Option<&str>,
-    ) -> Result<(), StoreError> {
-        let d = i64::try_from(micro_usd).unwrap_or(i64::MAX);
-        self.insert(user_id, -d, source, note).await
-    }
-
     async fn insert(
         &self,
         user_id: &str,
@@ -132,111 +116,6 @@ impl Ledger {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    async fn ledger() -> Ledger {
-        let store = Store::open_memory().await.unwrap();
-        // 流水有外键指向 users，先把用户建出来。
-        for id in ["u1", "u2"] {
-            store
-                .insert_user(id, &format!("{id}@b.c"), "h", None)
-                .await
-                .unwrap();
-        }
-        Ledger::new(store)
-    }
-
-    #[tokio::test]
-    async fn 余额是流水的和() {
-        let l = ledger().await;
-        l.credit("u1", 5_000_000, Source::AdminGrant, None)
-            .await
-            .unwrap();
-        l.debit("u1", 1_500_000, Source::Consumption, None)
-            .await
-            .unwrap();
-        assert_eq!(l.balance("u1").await.unwrap(), 3_500_000);
-    }
-
-    #[tokio::test]
-    async fn 没有流水时余额为零_而不是报错() {
-        let l = ledger().await;
-        assert_eq!(l.balance("u1").await.unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn 并发的充值与扣减不丢钱() {
-        let l = ledger().await;
-        l.credit("u1", 1_000_000, Source::AdminGrant, None)
-            .await
-            .unwrap();
-
-        // 50 笔入账与 50 笔出账同时打进去。任何一笔丢失或重复，最终余额都对
-        // 不上 —— 这是「记账必须原子」的实测，而不是对实现的信任。
-        let mut set = tokio::task::JoinSet::new();
-        for _ in 0..50 {
-            let a = l.clone();
-            set.spawn(async move { a.credit("u1", 1_000, Source::AdminGrant, None).await });
-            let b = l.clone();
-            set.spawn(async move { b.debit("u1", 400, Source::Consumption, None).await });
-        }
-        while let Some(r) = set.join_next().await {
-            r.unwrap().unwrap();
-        }
-
-        assert_eq!(
-            l.balance("u1").await.unwrap(),
-            1_000_000 + 50 * 1_000 - 50 * 400
-        );
-        assert_eq!(l.entries("u1").await.unwrap().len(), 101);
-    }
-
-    #[tokio::test]
-    async fn 扣到负数仍然入账_不能因余额不足而丢弃这笔消费() {
-        let l = ledger().await;
-        l.credit("u1", 1_000, Source::AdminGrant, None)
-            .await
-            .unwrap();
-        // 消费已经发生了，钱已经花出去了。按直觉写成「余额不足则拒绝」，这笔
-        // 就永远不入账 —— 又是一次静默白送。
-        l.debit("u1", 2_500, Source::Consumption, None)
-            .await
-            .unwrap();
-        assert_eq!(l.balance("u1").await.unwrap(), -1_500);
-    }
-
-    #[tokio::test]
-    async fn 流水只追加_扣减不改写既有行() {
-        let l = ledger().await;
-        l.credit("u1", 1_000, Source::AdminGrant, None)
-            .await
-            .unwrap();
-        let before = l.entries("u1").await.unwrap();
-        l.debit("u1", 400, Source::Consumption, None).await.unwrap();
-        let after = l.entries("u1").await.unwrap();
-        // 账要能重算，历史行不得被动过。
-        assert_eq!(&after[..before.len()], &before[..]);
-        assert_eq!(after.len(), before.len() + 1);
-    }
-
-    #[tokio::test]
-    async fn 一个用户的流水不会算进另一个用户的余额() {
-        let l = ledger().await;
-        l.credit("u1", 5_000_000, Source::AdminGrant, None)
-            .await
-            .unwrap();
-        l.debit("u2", 3_000_000, Source::Consumption, None)
-            .await
-            .unwrap();
-        assert_eq!(l.balance("u1").await.unwrap(), 5_000_000);
-        assert_eq!(l.balance("u2").await.unwrap(), -3_000_000);
-    }
-}
-
-/// 写一条流水。接任意 executor，所以能落在调用方的事务里 —— 控制环要把
-/// 「扣款」和「推进水位线」放进同一个事务，若这里只接连接池，那段 SQL 就得
 /// 在 sweeper 里再抄一份，记账语句从此有两个真相。
 pub(crate) async fn insert_entry<'e, E>(
     exec: E,
@@ -260,4 +139,120 @@ where
     .execute(exec)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 出账。走的是生产路径 `insert_entry` —— 保留一个生产上没人调的
+    /// `Ledger::debit` 才是仓库规矩点名的那类隐形死码：pub 方法不会触发死码
+    /// 分析，单测调它照样通过，唯一的症状是它在真实流程里从未被执行。
+    async fn debit(l: &Ledger, user: &str, micro: u64) {
+        let mut c = l.store.pool().acquire().await.unwrap();
+        insert_entry(
+            &mut *c,
+            user,
+            -i64::try_from(micro).unwrap(),
+            Source::Consumption,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn ledger() -> Ledger {
+        let store = Store::open_memory().await.unwrap();
+        // 流水有外键指向 users，先把用户建出来。
+        for id in ["u1", "u2"] {
+            store
+                .insert_user(id, &format!("{id}@b.c"), "h", None)
+                .await
+                .unwrap();
+        }
+        Ledger::new(store)
+    }
+
+    #[tokio::test]
+    async fn 余额是流水的和() {
+        let l = ledger().await;
+        l.credit("u1", 5_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        debit(&l, "u1", 1_500_000).await;
+        assert_eq!(l.balance("u1").await.unwrap(), 3_500_000);
+    }
+
+    #[tokio::test]
+    async fn 没有流水时余额为零_而不是报错() {
+        let l = ledger().await;
+        assert_eq!(l.balance("u1").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn 并发的充值与扣减不丢钱() {
+        let l = ledger().await;
+        l.credit("u1", 1_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+
+        // 50 笔入账与 50 笔出账同时打进去。任何一笔丢失或重复，最终余额都对
+        // 不上 —— 这是「记账必须原子」的实测，而不是对实现的信任。
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..50 {
+            let a = l.clone();
+            set.spawn(async move { a.credit("u1", 1_000, Source::AdminGrant, None).await });
+            let b = l.clone();
+            set.spawn(async move {
+                debit(&b, "u1", 400).await;
+                Ok::<(), StoreError>(())
+            });
+        }
+        while let Some(r) = set.join_next().await {
+            r.unwrap().unwrap();
+        }
+
+        assert_eq!(
+            l.balance("u1").await.unwrap(),
+            1_000_000 + 50 * 1_000 - 50 * 400
+        );
+        assert_eq!(l.entries("u1").await.unwrap().len(), 101);
+    }
+
+    #[tokio::test]
+    async fn 扣到负数仍然入账_不能因余额不足而丢弃这笔消费() {
+        let l = ledger().await;
+        l.credit("u1", 1_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        // 消费已经发生了，钱已经花出去了。按直觉写成「余额不足则拒绝」，这笔
+        // 就永远不入账 —— 又是一次静默白送。
+        debit(&l, "u1", 2_500).await;
+        assert_eq!(l.balance("u1").await.unwrap(), -1_500);
+    }
+
+    #[tokio::test]
+    async fn 流水只追加_扣减不改写既有行() {
+        let l = ledger().await;
+        l.credit("u1", 1_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        let before = l.entries("u1").await.unwrap();
+        debit(&l, "u1", 400).await;
+        let after = l.entries("u1").await.unwrap();
+        // 账要能重算，历史行不得被动过。
+        assert_eq!(&after[..before.len()], &before[..]);
+        assert_eq!(after.len(), before.len() + 1);
+    }
+
+    #[tokio::test]
+    async fn 一个用户的流水不会算进另一个用户的余额() {
+        let l = ledger().await;
+        l.credit("u1", 5_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        debit(&l, "u2", 3_000_000).await;
+        assert_eq!(l.balance("u1").await.unwrap(), 5_000_000);
+        assert_eq!(l.balance("u2").await.unwrap(), -3_000_000);
+    }
 }

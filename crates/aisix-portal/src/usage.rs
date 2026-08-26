@@ -131,6 +131,32 @@ pub fn scalar_from_prom(body: &Value) -> Option<f64> {
         .ok()
 }
 
+/// 与用量查询同一条规矩：`user_id` 只从会话取。
+pub async fn balance(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(uid) = st.session_user(&headers).await else {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "未登录"}))).into_response();
+    };
+    let ledger = Ledger::new(st.store.clone());
+    let (Ok(balance), Ok(entries)) = (ledger.balance(&uid).await, ledger.entries(&uid).await)
+    else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "读取失败"})),
+        )
+            .into_response();
+    };
+    Json(json!({
+        "balance_micro_usd": balance,
+        "entries": entries.iter().map(|e| json!({
+            "id": e.id,
+            "delta_micro_usd": e.delta_micro_usd,
+            "source": e.source,
+            "note": e.note,
+        })).collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,32 +210,4 @@ mod tests {
         // 「没读到」和「是零」必须分得开：前者是读取问题，后者是真没流量。
         assert_eq!(scalar_from_prom(&body), None);
     }
-}
-
-/// `GET /api/balance` —— 本人的余额与流水。
-///
-/// 与用量查询同一条规矩：`user_id` 只从会话取。
-pub async fn balance(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(uid) = st.session_user(&headers).await else {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "未登录"}))).into_response();
-    };
-    let ledger = Ledger::new(st.store.clone());
-    let (Ok(balance), Ok(entries)) = (ledger.balance(&uid).await, ledger.entries(&uid).await)
-    else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "读取失败"})),
-        )
-            .into_response();
-    };
-    Json(json!({
-        "balance_micro_usd": balance,
-        "entries": entries.iter().map(|e| json!({
-            "id": e.id,
-            "delta_micro_usd": e.delta_micro_usd,
-            "source": e.source,
-            "note": e.note,
-        })).collect::<Vec<_>>(),
-    }))
-    .into_response()
 }
