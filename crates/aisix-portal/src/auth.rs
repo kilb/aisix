@@ -42,6 +42,11 @@ pub struct AppState {
     dummy_hash: Arc<String>,
     /// 管理凭据。`None` = 未配置，此时管理端整个关闭（默认拒绝）。
     admin_token: Option<Arc<String>>,
+    /// Prometheus 基址与网关配置文件路径。门户只**读**指标 —— 它绝不出现在
+    /// 网关的请求路径上。
+    prom_url: Arc<String>,
+    resources_path: Arc<String>,
+    http: reqwest::Client,
     /// 实际执行过的 argon2 校验次数。让「不存在的账号也走了校验」这件事
     /// 可以被确定性地断言，而不必去测时间（那种测试必然是 flaky 的）。
     verifications: Arc<AtomicU64>,
@@ -57,6 +62,22 @@ impl AppState {
         gate_permits: usize,
         admin_token: Option<String>,
     ) -> Self {
+        Self::build(
+            store,
+            gate_permits,
+            admin_token,
+            String::new(),
+            String::new(),
+        )
+    }
+
+    pub fn build(
+        store: Store,
+        gate_permits: usize,
+        admin_token: Option<String>,
+        prom_url: String,
+        resources_path: String,
+    ) -> Self {
         // 启动时算一次。内容无所谓，只要是一个合法的 argon2 PHC 串，
         // 校验它的开销与校验真散列同量级。
         let dummy =
@@ -67,8 +88,33 @@ impl AppState {
             gate: Arc::new(Semaphore::new(gate_permits)),
             dummy_hash: Arc::new(dummy),
             admin_token: admin_token.map(Arc::new),
+            prom_url: Arc::new(prom_url),
+            resources_path: Arc::new(resources_path),
+            http: reqwest::Client::new(),
             verifications: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// 读网关配置。一期用来数「有多少密钥绑到这个用户」。
+    pub async fn read_resources(&self) -> std::io::Result<String> {
+        tokio::fs::read_to_string(&*self.resources_path).await
+    }
+
+    /// 发一条**服务端构造**的 PromQL，取回一个标量。
+    ///
+    /// 这个方法故意只收已经拼好的查询串，且只有 `crate::usage` 里那几个模板会
+    /// 调它 —— 门户不存在把调用方给的查询转发出去的路径。
+    pub async fn prom_scalar(&self, promql: &str) -> Option<f64> {
+        let url = format!("{}/api/v1/query", self.prom_url);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("query", promql)])
+            .send()
+            .await
+            .ok()?;
+        let body: serde_json::Value = resp.json().await.ok()?;
+        crate::usage::scalar_from_prom(&body)
     }
 
     pub fn admin_token(&self) -> Option<&str> {

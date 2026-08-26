@@ -11,7 +11,9 @@
 mod admin;
 mod auth;
 mod ledger;
+mod resources;
 mod store;
+mod usage;
 
 use auth::AppState;
 use axum::routing::{get, post};
@@ -30,6 +32,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/login", post(auth::login))
         .route("/api/logout", post(auth::logout))
         .route("/api/session", get(auth::session))
+        .route("/api/usage", get(usage::usage))
         .route("/admin/users", get(admin::list_users))
         .route("/admin/users/{id}/grant", post(admin::grant))
         .with_state(state)
@@ -60,7 +63,13 @@ async fn main() {
     if admin_token.is_none() {
         eprintln!("PORTAL_ADMIN_TOKEN 未设置——管理端接口已关闭");
     }
-    let state = AppState::with_admin_token(store, ARGON2_GATE_PERMITS, admin_token);
+    let state = AppState::build(
+        store,
+        ARGON2_GATE_PERMITS,
+        admin_token,
+        std::env::var("PROMETHEUS_URL").unwrap_or_else(|_| "http://127.0.0.1:9090".into()),
+        std::env::var("AISIX_RESOURCES").unwrap_or_else(|_| "/etc/aisix/resources.yaml".into()),
+    );
     if let Err(e) = axum::serve(listener, router(state)).await {
         eprintln!("serve 失败: {e}");
         std::process::exit(1);
@@ -70,26 +79,79 @@ async fn main() {
 #[cfg(test)]
 mod testutil {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use uuid::Uuid;
 
     /// 起一个真监听、真 HTTP 的门户实例。
     ///
     /// 与 `crates/aisix-console` 的单测同一形状：不用 `oneshot`，因为那绕过了
     /// 真实的 HTTP 层（头部、状态码、序列化），而这些正是要断言的东西。
+    /// 一个真的 Prometheus：真监听、真 HTTP，把收到的 `query` 记下来。
+    ///
+    /// 不用 mock 库 —— 与 `crates/aisix-console` 的单测同一形状。要断言的
+    /// 正是「发出去的那条查询长什么样」，而这只有在真 HTTP 层才看得到。
+    pub struct FakeProm {
+        pub base: String,
+        queries: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeProm {
+        pub async fn start() -> Self {
+            let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let seen = queries.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = axum::Router::new().route(
+                "/api/v1/query",
+                axum::routing::get(move |q: axum::extract::RawQuery| {
+                    let seen = seen.clone();
+                    async move {
+                        if let Some(raw) = q.0 {
+                            seen.lock().unwrap().push(raw);
+                        }
+                        axum::Json(serde_json::json!({
+                            "status": "success",
+                            "data": {"resultType": "vector",
+                                     "result": [{"metric": {}, "value": [0, "7"]}]}
+                        }))
+                    }
+                }),
+            );
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            Self {
+                base: format!("http://{addr}"),
+                queries,
+            }
+        }
+
+        pub fn seen(&self) -> Vec<String> {
+            self.queries.lock().unwrap().clone()
+        }
+    }
+
+    /// 写一份临时的 resources.yaml，返回路径。
+    pub fn temp_resources(body: &str) -> String {
+        let p = std::env::temp_dir().join(format!("aisix-portal-{}.yaml", Uuid::new_v4()));
+        std::fs::write(&p, body).unwrap();
+        p.to_string_lossy().to_string()
+    }
+
     pub struct TestApp {
         pub base: String,
         pub store: Store,
         pub state: AppState,
         pub http: reqwest::Client,
+        /// 本实例的 resources.yaml 路径。注册之后才知道 user_id，所以配置
+        /// 必须能在注册后重写 —— 否则测试只能去拼凑 id，那是上一版失控的原因。
+        resources_path: String,
     }
 
     impl TestApp {
         pub async fn start() -> Self {
             Self::start_with_gate(ARGON2_GATE_PERMITS).await
         }
-
-        /// `permits = 0` 让闸门永远拿不到许可，用来确定性地测 429，
-        /// 而不必真去打并发（那种测试是 flaky 的）。
-        pub const ADMIN_TOKEN: &str = "test-admin-token";
 
         pub async fn start_with_gate(permits: usize) -> Self {
             Self::build(permits, Some(Self::ADMIN_TOKEN.to_string())).await
@@ -100,9 +162,40 @@ mod testutil {
             Self::build(ARGON2_GATE_PERMITS, None).await
         }
 
+        /// `permits = 0` 让闸门永远拿不到许可，用来确定性地测 429，
+        /// 而不必真去打并发（那种测试是 flaky 的）。
+        pub const ADMIN_TOKEN: &str = "test-admin-token";
+
+        /// 接上真 Prometheus 与一份配置文件的实例。
+        pub async fn start_with_usage(prom: &FakeProm, resources_path: &str) -> Self {
+            Self::build_full(
+                ARGON2_GATE_PERMITS,
+                Some(Self::ADMIN_TOKEN.to_string()),
+                prom.base.clone(),
+                resources_path.to_string(),
+            )
+            .await
+        }
+
         async fn build(permits: usize, admin_token: Option<String>) -> Self {
+            Self::build_full(permits, admin_token, String::new(), String::new()).await
+        }
+
+        async fn build_full(
+            permits: usize,
+            admin_token: Option<String>,
+            prom_url: String,
+            resources_path: String,
+        ) -> Self {
+            let resources_path_for_app = resources_path.clone();
             let store = Store::open_memory().await.unwrap();
-            let state = AppState::with_admin_token(store.clone(), permits, admin_token);
+            let state = AppState::build(
+                store.clone(),
+                permits,
+                admin_token,
+                prom_url,
+                resources_path,
+            );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let app = router(state.clone());
@@ -113,6 +206,7 @@ mod testutil {
                 base: format!("http://{addr}"),
                 store,
                 state,
+                resources_path: resources_path_for_app,
                 // cookie_store 让登录后的会话自动带上，测的是真实浏览器行为。
                 http: reqwest::Client::builder()
                     .cookie_store(true)
@@ -178,6 +272,11 @@ mod testutil {
                 .await
                 .unwrap();
             (r.status().as_u16(), r.text().await.unwrap())
+        }
+
+        /// 重写本实例的 resources.yaml。
+        pub fn set_resources(&self, body: &str) {
+            std::fs::write(&self.resources_path, body).unwrap();
         }
 
         pub async fn register(&self, email: &str, pw: &str) -> String {
@@ -515,5 +614,148 @@ mod admin_tests {
         assert_eq!(u["balance_micro_usd"], json!(2_500_000));
         // 散列绝不能出现在管理端响应里。
         assert!(!body.contains("$argon2"), "管理端漏出了口令散列");
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::testutil::{temp_resources, FakeProm, TestApp};
+    use serde_json::json;
+
+    const PW: &str = "correct horse battery";
+
+    /// 一份含两个用户各自密钥的配置。
+    fn doc(u1: &str, u2: &str) -> String {
+        format!(
+            "api_keys:\n\
+             - display_name: a\n  key_hash: aa\n  user_id: {u1}\n\
+             - display_name: b\n  key_hash: bb\n  user_id: {u2}\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn 未登录读不到任何用量() {
+        let prom = FakeProm::start().await;
+        let app = TestApp::start_with_usage(&prom, &temp_resources("api_keys: []")).await;
+        let (s, _) = app.get("/api/usage?range_hours=24").await;
+        assert_eq!(s, 401);
+        // 而且不该有任何查询被发出去 —— 未登录连查都不该查。
+        assert!(
+            prom.seen().is_empty(),
+            "未登录也发了查询: {:?}",
+            prom.seen()
+        );
+    }
+
+    #[tokio::test]
+    async fn 端点不接受调用方提供的查询() {
+        let prom = FakeProm::start().await;
+        let app = TestApp::start_with_usage(&prom, &temp_resources("api_keys: []")).await;
+        let me = app.register("a@b.c", PW).await;
+        app.post("/api/login", json!({"email":"a@b.c","password":PW}))
+            .await;
+
+        // 三种夹带都不该起作用。租户隔离是端点的形状 —— 它压根不读这些参数。
+        for probe in [
+            "/api/usage?query=sum(aisix_llm_spend_micro_usd_total)",
+            "/api/usage?user_id=someone-else",
+            "/api/usage?range_hours=24&user_id=someone-else",
+        ] {
+            let (s, body) = app.get(probe).await;
+            assert_eq!(s, 200, "{probe}");
+            assert!(!body.contains("someone-else"), "{probe} → {body}");
+        }
+
+        // 发出去的每一条查询都只带会话用户的 id。
+        for q in prom.seen() {
+            assert!(q.contains(&me), "查询里没有会话用户的 id: {q}");
+            assert!(!q.contains("someone-else"), "夹带的 id 进了查询: {q}");
+            assert!(
+                !q.contains("by+%28user_id%29") && !q.contains("by (user_id)"),
+                "出现了跨租户聚合: {q}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn 两个用户各自读到自己的_id() {
+        let prom = FakeProm::start().await;
+        let app = TestApp::start_with_usage(&prom, &temp_resources("api_keys: []")).await;
+        let a = app.register("a@b.c", PW).await;
+        let b = app.register("b@b.c", PW).await;
+
+        app.post("/api/login", json!({"email":"a@b.c","password":PW}))
+            .await;
+        app.get("/api/usage").await;
+        let after_a = prom.seen().len();
+        assert!(prom.seen().iter().all(|q| q.contains(&a)));
+
+        // 换人登录（同一个 client，cookie 被覆盖）。
+        app.post("/api/login", json!({"email":"b@b.c","password":PW}))
+            .await;
+        app.get("/api/usage").await;
+        let for_b = &prom.seen()[after_a..];
+        assert!(!for_b.is_empty());
+        for q in for_b {
+            assert!(q.contains(&b), "B 的查询里不是 B 的 id: {q}");
+            assert!(!q.contains(&a), "B 的查询里出现了 A 的 id: {q}");
+        }
+    }
+
+    #[tokio::test]
+    async fn 没有密钥携带本人_user_id_时明确报出未绑定() {
+        let prom = FakeProm::start().await;
+        // 配置里有两把密钥，但都不属于即将注册的这个人。
+        let path = temp_resources(&doc("someone-1", "someone-2"));
+        let app = TestApp::start_with_usage(&prom, &path).await;
+        app.register("a@b.c", PW).await;
+        app.post("/api/login", json!({"email":"a@b.c","password":PW}))
+            .await;
+
+        let (_, body) = app.get("/api/usage").await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // 这是 user_id 填错时唯一能被人看见的地方。没有这条，管理员打错一个
+        // 字符的后果就是「用量一直是 0」—— 跟「还没开始用」在屏幕上没有区别，
+        // 而它实际意味着这个人在免费用。
+        assert_eq!(v["linked_keys"], json!(0));
+        assert!(body.contains("未绑定"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn 有密钥绑定时不再报未绑定_且计出停用数() {
+        let prom = FakeProm::start().await;
+        let app = TestApp::start_with_usage(&prom, &temp_resources("api_keys: []")).await;
+        let me = app.register("a@b.c", PW).await;
+        // 注册之后才知道 user_id，所以配置在这里才写得出来。
+        app.set_resources(&format!(
+            "api_keys:\n\
+             - display_name: mine\n  key_hash: aa\n  user_id: {me}\n\
+             - display_name: mine-off\n  key_hash: bb\n  user_id: {me}\n  disabled: true\n\
+             - display_name: other\n  key_hash: cc\n  user_id: someone-else\n"
+        ));
+        app.post("/api/login", json!({"email":"a@b.c","password":PW}))
+            .await;
+
+        let (_, body) = app.get("/api/usage").await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["linked_keys"], json!(2));
+        assert_eq!(v["disabled_keys"], json!(1));
+        assert!(!body.contains("未绑定"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn 配置读不到时不假装有绑定() {
+        let prom = FakeProm::start().await;
+        // 指向一个不存在的路径。
+        let app = TestApp::start_with_usage(&prom, "/nonexistent/aisix/resources.yaml").await;
+        app.register("a@b.c", PW).await;
+        app.post("/api/login", json!({"email":"a@b.c","password":PW}))
+            .await;
+
+        let (_, body) = app.get("/api/usage").await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // 保守方向：读不到就报未绑定，促使人去看，而不是让人以为一切正常。
+        assert_eq!(v["linked_keys"], json!(0));
+        assert!(body.contains("未绑定"));
     }
 }
