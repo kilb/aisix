@@ -1,22 +1,79 @@
 //! 注册、登录、会话。
 //!
-//! 口令用 argon2（与 `crates/aisix-console` 一致），不用 sha256：口令是低熵的，
-//! 无盐无工作因子的散列被拖库后就是离线爆破。sha256 只用于 API 密钥那种高熵
-//! 随机串。
+//! 三件事在这里是耦合的，因为它们共用同一个稀缺资源：argon2 的内存。
+//!
+//! - 口令用 argon2（与 `crates/aisix-console` 一致），不用 sha256：口令低熵，
+//!   无盐无工作因子的散列被拖库后就是离线爆破。sha256 只配 API 密钥那种高熵
+//!   随机串。
+//! - argon2 默认单次占 **19 MiB**。注册与登录**都是未认证可达**的 argon2 操作，
+//!   而门户面向陌生人 —— 不闸并发就是一条内存耗尽 DoS。两个端点共用一个信号量。
+//! - 账号不存在时也要照样做一次校验。否则「口令错」慢、「无此账号」快，登录
+//!   接口就成了账号枚举器 —— 返回体一致也挡不住计时侧信道。
 
-use argon2::password_hash::{PasswordHasher, SaltString};
-use argon2::Argon2;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use argon2::password_hash::{PasswordHasher, PasswordVerifier, SaltString};
+use argon2::{Argon2, PasswordHash};
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use rand_core::RngCore;
 use serde::Deserialize;
 use serde_json::json;
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::store::{Store, StoreError};
 
 /// 口令下限。低于此长度的口令挡在注册处，而不是留给用户自己负责。
 const MIN_PASSWORD_LEN: usize = 12;
+const SESSION_TTL_SECS: u64 = 12 * 3600;
+const COOKIE: &str = "aisix_portal";
+
+#[derive(Clone)]
+pub struct AppState {
+    pub store: Store,
+    sessions: Arc<RwLock<HashMap<String, (String, u64)>>>,
+    /// 未认证可达的 argon2 操作的并发闸。见模块注释。
+    gate: Arc<Semaphore>,
+    /// 账号不存在时拿来「校验」的假散列，用于抹平计时差。
+    dummy_hash: Arc<String>,
+    /// 实际执行过的 argon2 校验次数。让「不存在的账号也走了校验」这件事
+    /// 可以被确定性地断言，而不必去测时间（那种测试必然是 flaky 的）。
+    verifications: Arc<AtomicU64>,
+}
+
+impl AppState {
+    pub fn new(store: Store, gate_permits: usize) -> Self {
+        // 启动时算一次。内容无所谓，只要是一个合法的 argon2 PHC 串，
+        // 校验它的开销与校验真散列同量级。
+        let dummy =
+            hash_password("aisix-portal-absent-account-placeholder").expect("生成占位散列失败");
+        Self {
+            store,
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            gate: Arc::new(Semaphore::new(gate_permits)),
+            dummy_hash: Arc::new(dummy),
+            verifications: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// 当前会话对应的 `user_id`，未登录则 `None`。顺手清掉过期项。
+    pub async fn session_user(&self, headers: &HeaderMap) -> Option<String> {
+        let tok = cookie_token(headers)?;
+        let now = now_secs();
+        let mut s = self.sessions.write().await;
+        s.retain(|_, (_, exp)| *exp > now);
+        s.get(&tok).map(|(uid, _)| uid.clone())
+    }
+
+    #[cfg(test)]
+    pub fn verification_count(&self) -> u64 {
+        self.verifications.load(Ordering::SeqCst)
+    }
+}
 
 #[derive(Deserialize)]
 pub struct RegisterReq {
@@ -27,7 +84,12 @@ pub struct RegisterReq {
 }
 
 /// `POST /api/register`
-pub async fn register(State(store): State<Store>, Json(req): Json<RegisterReq>) -> Response {
+pub async fn register(State(st): State<AppState>, Json(req): Json<RegisterReq>) -> Response {
+    // 注册跟登录一样是未认证可达的 argon2 操作，同样要闸。
+    let Ok(_permit) = st.gate.try_acquire() else {
+        return busy();
+    };
+
     let email = req.email.trim().to_ascii_lowercase();
     if !plausible_email(&email) {
         return bad_request("邮箱格式不正确");
@@ -36,8 +98,6 @@ pub async fn register(State(store): State<Store>, Json(req): Json<RegisterReq>) 
         return bad_request(&format!("口令至少 {MIN_PASSWORD_LEN} 个字符"));
     }
 
-    // argon2 是故意 CPU 昂贵的：直接在 async handler 里算会占住执行器线程，
-    // 并发注册时把整个进程拖慢。丢到阻塞线程池里去。
     let pw = req.password.clone();
     let hash = match tokio::task::spawn_blocking(move || hash_password(&pw)).await {
         Ok(Ok(h)) => h,
@@ -45,7 +105,8 @@ pub async fn register(State(store): State<Store>, Json(req): Json<RegisterReq>) 
     };
 
     let id = uuid::Uuid::new_v4().to_string();
-    match store
+    match st
+        .store
         .insert_user(&id, &email, &hash, req.display_name.as_deref())
         .await
     {
@@ -58,12 +119,126 @@ pub async fn register(State(store): State<Store>, Json(req): Json<RegisterReq>) 
     }
 }
 
-/// 用 argon2 算出 PHC 串。
+#[derive(Deserialize)]
+pub struct LoginReq {
+    pub email: String,
+    pub password: String,
+}
+
+/// `POST /api/login`
+pub async fn login(State(st): State<AppState>, Json(req): Json<LoginReq>) -> Response {
+    let Ok(_permit) = st.gate.try_acquire() else {
+        return busy();
+    };
+
+    let email = req.email.trim().to_ascii_lowercase();
+    let found = match st.store.user_by_email(&email).await {
+        Ok(u) => u,
+        Err(_) => return server_error("读取失败"),
+    };
+
+    // 关键：账号不存在时**也**跑一次 argon2，对着占位散列。
+    // 少了这一步，「无此账号」会明显更快返回，返回体再怎么一致都白搭。
+    let (hash, expect_id) = match &found {
+        Some(u) if !u.disabled => (u.password_hash.clone(), Some(u.id.clone())),
+        // 被停用的账号也走完整校验路径，不让它在时间上暴露出来。
+        Some(u) => (u.password_hash.clone(), None),
+        None => ((*st.dummy_hash).clone(), None),
+    };
+
+    let pw = req.password.clone();
+    st.verifications.fetch_add(1, Ordering::SeqCst);
+    let ok = tokio::task::spawn_blocking(move || {
+        PasswordHash::new(&hash)
+            .map(|parsed| {
+                Argon2::default()
+                    .verify_password(pw.as_bytes(), &parsed)
+                    .is_ok()
+            })
+            .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false);
+
+    let Some(uid) = expect_id.filter(|_| ok) else {
+        // 口令错、账号不存在、账号被停用 —— 三者返回完全一致。
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "邮箱或口令不正确"})),
+        )
+            .into_response();
+    };
+
+    let tok = random_token();
+    st.sessions
+        .write()
+        .await
+        .insert(tok.clone(), (uid, now_secs() + SESSION_TTL_SECS));
+    // HttpOnly + SameSite=Strict：会话不能被别的站点借用。
+    // Secure 是因为门户只经 HTTPS 暴露。
+    let cookie = format!(
+        "{COOKIE}={tok}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}"
+    );
+    ([(header::SET_COOKIE, cookie)], Json(json!({"ok": true}))).into_response()
+}
+
+/// `POST /api/logout`
+pub async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(tok) = cookie_token(&headers) {
+        st.sessions.write().await.remove(&tok);
+    }
+    let cleared = format!("{COOKIE}=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0");
+    ([(header::SET_COOKIE, cleared)], Json(json!({"ok": true}))).into_response()
+}
+
+/// `GET /api/session`
+pub async fn session(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    match st.session_user(&headers).await {
+        Some(uid) => match st.store.user_by_id(&uid).await {
+            Ok(Some(u)) => Json(json!({
+                "authed": true,
+                "user_id": u.id,
+                "email": u.email,
+                "display_name": u.display_name,
+            }))
+            .into_response(),
+            // 会话有效但用户没了：当作未登录，不要漏出那个 id。
+            _ => Json(json!({"authed": false})).into_response(),
+        },
+        None => Json(json!({"authed": false})).into_response(),
+    }
+}
+
 fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
     let salt = SaltString::generate(&mut rand_core::OsRng);
     Ok(Argon2::default()
         .hash_password(password.as_bytes(), &salt)?
         .to_string())
+}
+
+fn random_token() -> String {
+    let mut b = [0u8; 32];
+    rand_core::OsRng.fill_bytes(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn cookie_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| {
+            c.split(';')
+                .filter_map(|kv| kv.trim().split_once('='))
+                .find(|(k, _)| *k == COOKIE)
+                .map(|(_, v)| v.to_string())
+        })
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// 只做最低限度的形状检查。真正的可达性由邮箱验证流程负责（一期不做，
@@ -74,6 +249,14 @@ fn plausible_email(s: &str) -> bool {
         return false;
     };
     !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
+}
+
+fn busy() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({"error": "校验繁忙，请稍后重试"})),
+    )
+        .into_response()
 }
 
 fn bad_request(msg: &str) -> Response {

@@ -11,16 +11,24 @@
 mod auth;
 mod store;
 
-use axum::routing::post;
+use auth::AppState;
+use axum::routing::{get, post};
 use axum::Router;
 use store::Store;
 
+/// 未认证可达的 argon2 操作的并发上限。argon2 默认单次占 19 MiB，门户面向
+/// 陌生人，不闸就是一条内存耗尽 DoS。
+const ARGON2_GATE_PERMITS: usize = 4;
+
 /// 路由装配。抽成函数是为了测试能拿到同一个 app 而不必复制路由表 ——
 /// 复制出来的路由表迟早跟生产的那份漂开。
-pub fn router(store: Store) -> Router {
+pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/register", post(auth::register))
-        .with_state(store)
+        .route("/api/login", post(auth::login))
+        .route("/api/logout", post(auth::logout))
+        .route("/api/session", get(auth::session))
+        .with_state(state)
 }
 
 #[tokio::main]
@@ -43,7 +51,8 @@ async fn main() {
         }
     };
     eprintln!("aisix-portal listening on {addr}");
-    if let Err(e) = axum::serve(listener, router(store)).await {
+    let state = AppState::new(store, ARGON2_GATE_PERMITS);
+    if let Err(e) = axum::serve(listener, router(state)).await {
         eprintln!("serve 失败: {e}");
         std::process::exit(1);
     }
@@ -60,22 +69,35 @@ mod testutil {
     pub struct TestApp {
         pub base: String,
         pub store: Store,
+        pub state: AppState,
         pub http: reqwest::Client,
     }
 
     impl TestApp {
         pub async fn start() -> Self {
+            Self::start_with_gate(ARGON2_GATE_PERMITS).await
+        }
+
+        /// `permits = 0` 让闸门永远拿不到许可，用来确定性地测 429，
+        /// 而不必真去打并发（那种测试是 flaky 的）。
+        pub async fn start_with_gate(permits: usize) -> Self {
             let store = Store::open_memory().await.unwrap();
+            let state = AppState::new(store.clone(), permits);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
-            let app = router(store.clone());
+            let app = router(state.clone());
             tokio::spawn(async move {
                 let _ = axum::serve(listener, app).await;
             });
             Self {
                 base: format!("http://{addr}"),
                 store,
-                http: reqwest::Client::new(),
+                state,
+                // cookie_store 让登录后的会话自动带上，测的是真实浏览器行为。
+                http: reqwest::Client::builder()
+                    .cookie_store(true)
+                    .build()
+                    .unwrap(),
             }
         }
 
@@ -88,6 +110,45 @@ mod testutil {
                 .await
                 .unwrap();
             (r.status().as_u16(), r.text().await.unwrap())
+        }
+
+        pub async fn get(&self, path: &str) -> (u16, String) {
+            let r = self
+                .http
+                .get(format!("{}{path}", self.base))
+                .send()
+                .await
+                .unwrap();
+            (r.status().as_u16(), r.text().await.unwrap())
+        }
+
+        /// 直接看 Set-Cookie 头，用于断言 cookie 的属性。
+        pub async fn post_raw_headers(&self, path: &str, body: serde_json::Value) -> Vec<String> {
+            let r = reqwest::Client::new()
+                .post(format!("{}{path}", self.base))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            r.headers()
+                .get_all(reqwest::header::SET_COOKIE)
+                .iter()
+                .filter_map(|v| v.to_str().ok().map(str::to_string))
+                .collect()
+        }
+
+        pub async fn register(&self, email: &str, pw: &str) -> String {
+            let (s, body) = self
+                .post(
+                    "/api/register",
+                    serde_json::json!({"email": email, "password": pw}),
+                )
+                .await;
+            assert_eq!(s, 201, "注册失败: {body}");
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["user_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
         }
     }
 }
@@ -162,5 +223,146 @@ mod tests {
             )
             .await;
         assert_eq!(b, 409);
+    }
+}
+
+#[cfg(test)]
+mod login_tests {
+    use super::testutil::TestApp;
+    use serde_json::json;
+
+    const PW: &str = "correct horse battery";
+
+    #[tokio::test]
+    async fn 口令错误与账号不存在的返回完全一致() {
+        let app = TestApp::start().await;
+        app.register("a@b.c", PW).await;
+
+        let bad_pw = app
+            .post(
+                "/api/login",
+                json!({"email":"a@b.c","password":"wrong wrong wrong"}),
+            )
+            .await;
+        let no_user = app
+            .post(
+                "/api/login",
+                json!({"email":"nobody@b.c","password":"wrong wrong wrong"}),
+            )
+            .await;
+
+        // 两者必须无法区分，否则登录接口就是账号枚举器。
+        assert_eq!(bad_pw.0, no_user.0);
+        assert_eq!(bad_pw.1, no_user.1);
+        assert_eq!(bad_pw.0, 401);
+    }
+
+    #[tokio::test]
+    async fn 账号不存在时也跑一次_argon2_校验_抹平计时差() {
+        let app = TestApp::start().await;
+        let before = app.state.verification_count();
+        app.post(
+            "/api/login",
+            json!({"email":"nobody@b.c","password":"whatever12345"}),
+        )
+        .await;
+        // 返回体一致挡不住计时侧信道：不存在的账号如果直接短路返回，
+        // 它会明显更快，攻击者据此就能枚举账号。所以这一次校验必须发生。
+        //
+        // 断言次数而不是断言时间 —— 计时测试必然 flaky，而这个性质是确定的。
+        assert_eq!(app.state.verification_count(), before + 1);
+    }
+
+    #[tokio::test]
+    async fn 被停用的账号返回与普通口令错一致_不泄漏账号状态() {
+        let app = TestApp::start().await;
+        let blocked = app.register("blocked@b.c", PW).await;
+        app.register("live@b.c", PW).await;
+        sqlx::query("UPDATE users SET disabled = 1 WHERE id = ?1")
+            .bind(&blocked)
+            .execute(app.store.pool())
+            .await
+            .unwrap();
+
+        // 对照组必须是**另一个正常账号**配错口令。
+        //
+        // 第一版拿的是「同一个已停用账号 + 错口令」—— 两边都命中停用分支，
+        // 于是无论产品怎么改都恒等，是一条空测试。RED 校验才把它揪出来：
+        // 断言看着在比两件事，实际在比同一件事。
+        let disabled_right_pw = app
+            .post("/api/login", json!({"email":"blocked@b.c","password":PW}))
+            .await;
+        let live_wrong_pw = app
+            .post(
+                "/api/login",
+                json!({"email":"live@b.c","password":"wrong wrong wrong"}),
+            )
+            .await;
+
+        // 「这个账号被停用了」本身也是信息，不该从登录接口漏出去。
+        assert_eq!(disabled_right_pw, live_wrong_pw);
+        assert_eq!(disabled_right_pw.0, 401);
+    }
+
+    #[tokio::test]
+    async fn 未登录时会话接口不返回任何用户信息() {
+        let app = TestApp::start().await;
+        let (status, body) = app.get("/api/session").await;
+        assert_eq!(status, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["authed"], json!(false));
+        // 连邮箱的形状都不该出现。
+        assert!(!body.contains('@'), "未登录的会话响应里出现了 @：{body}");
+    }
+
+    #[tokio::test]
+    async fn 登录后会话认得本人_登出后失效() {
+        let app = TestApp::start().await;
+        let id = app.register("a@b.c", PW).await;
+
+        let (s, _) = app
+            .post("/api/login", json!({"email":"a@b.c","password":PW}))
+            .await;
+        assert_eq!(s, 200);
+
+        let (_, body) = app.get("/api/session").await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["authed"], json!(true));
+        assert_eq!(v["user_id"], json!(id));
+
+        app.post("/api/logout", json!({})).await;
+        let (_, after) = app.get("/api/session").await;
+        let v2: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(v2["authed"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn 会话_cookie_带上_httponly_secure_与_samesite() {
+        let app = TestApp::start().await;
+        app.register("a@b.c", PW).await;
+        let cookies = app
+            .post_raw_headers("/api/login", json!({"email":"a@b.c","password":PW}))
+            .await;
+        let c = cookies.join(" ");
+        // 三条缺一不可：HttpOnly 防脚本读取，SameSite=Strict 防别站借用，
+        // Secure 因为门户只经 HTTPS 暴露。
+        assert!(c.contains("HttpOnly"), "{c}");
+        assert!(c.contains("Secure"), "{c}");
+        assert!(c.contains("SameSite=Strict"), "{c}");
+    }
+
+    #[tokio::test]
+    async fn 注册与登录共用同一个_argon2_并发闸() {
+        let app = TestApp::start_with_gate(0).await;
+        // argon2 默认单次占 19 MiB，两个端点都是未认证可达的。门户面向陌生人，
+        // 任一端点没闸就是一条内存耗尽 DoS —— Task 2 的注册当时就漏了。
+        let (reg, _) = app
+            .post("/api/register", json!({"email":"a@b.c","password":PW}))
+            .await;
+        let (log, _) = app
+            .post("/api/login", json!({"email":"a@b.c","password":PW}))
+            .await;
+        assert_eq!(reg, 429, "注册没有过闸");
+        assert_eq!(log, 429, "登录没有过闸");
     }
 }
