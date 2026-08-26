@@ -16,6 +16,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::auth::AppState;
+use crate::ledger::Ledger;
 use crate::resources;
 
 /// 窗口长度。收成枚举式的白名单，而不是把数字直接拼进 PromQL。
@@ -112,7 +113,7 @@ fn query_for(metric: &str, user_id: &str, win: Window) -> String {
 /// 这里的 `user_id` 是我们自己铸的 uuid v4，理论上不含需要转义的字符。仍然转，
 /// 因为「这个值的来源永远安全」是一个会随着代码变化而失效的假设，而转义的成本
 /// 是零。
-fn escape_label(v: &str) -> String {
+pub(crate) fn escape_label(v: &str) -> String {
     v.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
@@ -183,4 +184,32 @@ mod tests {
         // 「没读到」和「是零」必须分得开：前者是读取问题，后者是真没流量。
         assert_eq!(scalar_from_prom(&body), None);
     }
+}
+
+/// `GET /api/balance` —— 本人的余额与流水。
+///
+/// 与用量查询同一条规矩：`user_id` 只从会话取。
+pub async fn balance(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(uid) = st.session_user(&headers).await else {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "未登录"}))).into_response();
+    };
+    let ledger = Ledger::new(st.store.clone());
+    let (Ok(balance), Ok(entries)) = (ledger.balance(&uid).await, ledger.entries(&uid).await)
+    else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "读取失败"})),
+        )
+            .into_response();
+    };
+    Json(json!({
+        "balance_micro_usd": balance,
+        "entries": entries.iter().map(|e| json!({
+            "id": e.id,
+            "delta_micro_usd": e.delta_micro_usd,
+            "source": e.source,
+            "note": e.note,
+        })).collect::<Vec<_>>(),
+    }))
+    .into_response()
 }

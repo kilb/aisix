@@ -34,7 +34,7 @@ pub enum Source {
 }
 
 impl Source {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::AdminGrant => "admin_grant",
             Self::Consumption => "consumption",
@@ -93,18 +93,8 @@ impl Ledger {
         source: Source,
         note: Option<&str>,
     ) -> Result<(), StoreError> {
-        sqlx::query(
-            "INSERT INTO ledger (user_id, delta_micro_usd, source, note, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )
-        .bind(user_id)
-        .bind(delta)
-        .bind(source.as_str())
-        .bind(note)
-        .bind(chrono::Utc::now().to_rfc3339())
-        .execute(self.store.pool())
-        .await?;
-        Ok(())
+        let mut c = self.store.pool().acquire().await?;
+        insert_entry(&mut *c, user_id, delta, source, note).await
     }
 
     /// 余额 = 流水之和。
@@ -243,4 +233,31 @@ mod tests {
         assert_eq!(l.balance("u1").await.unwrap(), 5_000_000);
         assert_eq!(l.balance("u2").await.unwrap(), -3_000_000);
     }
+}
+
+/// 写一条流水。接任意 executor，所以能落在调用方的事务里 —— 控制环要把
+/// 「扣款」和「推进水位线」放进同一个事务，若这里只接连接池，那段 SQL 就得
+/// 在 sweeper 里再抄一份，记账语句从此有两个真相。
+pub(crate) async fn insert_entry<'e, E>(
+    exec: E,
+    user_id: &str,
+    delta: i64,
+    source: Source,
+    note: Option<&str>,
+) -> Result<(), StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query(
+        "INSERT INTO ledger (user_id, delta_micro_usd, source, note, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(user_id)
+    .bind(delta)
+    .bind(source.as_str())
+    .bind(note)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(exec)
+    .await?;
+    Ok(())
 }

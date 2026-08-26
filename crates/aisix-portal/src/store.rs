@@ -156,6 +156,41 @@ impl Store {
             .collect())
     }
 
+    /// 已计入流水的截止时刻。`None` = 还没对过账。
+    pub async fn counted_through(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StoreError> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT counted_through FROM consumption_mark WHERE user_id = ?1")
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.and_then(|(t,)| {
+            chrono::DateTime::parse_from_rfc3339(&t)
+                .ok()
+                .map(|d| d.with_timezone(&chrono::Utc))
+        }))
+    }
+
+    pub async fn set_counted_through(
+        &self,
+        user_id: &str,
+        t: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO consumption_mark (user_id, counted_through, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(user_id) DO UPDATE SET counted_through = ?2, updated_at = ?3",
+        )
+        .bind(user_id)
+        .bind(t.to_rfc3339())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn user_by_id(&self, id: &str) -> Result<Option<User>, StoreError> {
         let row: Option<(String, String, String, Option<String>, i64)> = sqlx::query_as(
             "SELECT id, email, password_hash, display_name, disabled

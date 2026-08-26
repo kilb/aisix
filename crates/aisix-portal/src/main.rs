@@ -13,6 +13,7 @@ mod auth;
 mod ledger;
 mod resources;
 mod store;
+mod sweeper;
 mod usage;
 
 use auth::AppState;
@@ -33,6 +34,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/logout", post(auth::logout))
         .route("/api/session", get(auth::session))
         .route("/api/usage", get(usage::usage))
+        .route("/api/balance", get(usage::balance))
         .route("/admin/users", get(admin::list_users))
         .route("/admin/users/{id}/grant", post(admin::grant))
         .with_state(state)
@@ -63,12 +65,36 @@ async fn main() {
     if admin_token.is_none() {
         eprintln!("PORTAL_ADMIN_TOKEN 未设置——管理端接口已关闭");
     }
+    let prom_url =
+        std::env::var("PROMETHEUS_URL").unwrap_or_else(|_| "http://127.0.0.1:9090".into());
+    let resources_path =
+        std::env::var("AISIX_RESOURCES").unwrap_or_else(|_| "/etc/aisix/resources.yaml".into());
+    // 对账环。周期 15 秒 —— 超支上界 ≈ 本周期内的消费 + 在途，而真正压住
+    // 超支的是速率上限（设计文档 §3.2），不是这个数。
+    {
+        let sw = sweeper::Sweeper::new(
+            store.clone(),
+            sweeper::PromSource::new(prom_url.clone()),
+            resources_path.clone(),
+        );
+        tokio::spawn(async move {
+            let mut tick =
+                tokio::time::interval(std::time::Duration::from_secs(sweeper::DEFAULT_TICK_SECS));
+            loop {
+                tick.tick().await;
+                if let Err(e) = sw.tick(chrono::Utc::now()).await {
+                    eprintln!("对账失败（水位线未前进，下一轮窗口会更长）: {e}");
+                }
+            }
+        });
+    }
+
     let state = AppState::build(
-        store,
+        store.clone(),
         ARGON2_GATE_PERMITS,
         admin_token,
-        std::env::var("PROMETHEUS_URL").unwrap_or_else(|_| "http://127.0.0.1:9090".into()),
-        std::env::var("AISIX_RESOURCES").unwrap_or_else(|_| "/etc/aisix/resources.yaml".into()),
+        prom_url.clone(),
+        resources_path.clone(),
     );
     if let Err(e) = axum::serve(listener, router(state)).await {
         eprintln!("serve 失败: {e}");
@@ -757,5 +783,49 @@ mod usage_tests {
         // 保守方向：读不到就报未绑定，促使人去看，而不是让人以为一切正常。
         assert_eq!(v["linked_keys"], json!(0));
         assert!(body.contains("未绑定"));
+    }
+}
+
+#[cfg(test)]
+mod balance_tests {
+    use super::testutil::{temp_resources, FakeProm, TestApp};
+    use serde_json::json;
+
+    const PW: &str = "correct horse battery";
+
+    #[tokio::test]
+    async fn 未登录读不到余额() {
+        let prom = FakeProm::start().await;
+        let app = TestApp::start_with_usage(&prom, &temp_resources("api_keys: []")).await;
+        let (s, body) = app.get("/api/balance").await;
+        assert_eq!(s, 401);
+        assert!(!body.contains("balance_micro_usd"));
+    }
+
+    #[tokio::test]
+    async fn 只读到自己的余额与流水() {
+        let prom = FakeProm::start().await;
+        let app = TestApp::start_with_usage(&prom, &temp_resources("api_keys: []")).await;
+        let a = app.register("a@b.c", PW).await;
+        let b = app.register("b@b.c", PW).await;
+        app.post_admin(
+            &format!("/admin/users/{a}/grant"),
+            json!({"micro_usd": 5_000_000, "note": "给 A 的"}),
+        )
+        .await;
+        app.post_admin(
+            &format!("/admin/users/{b}/grant"),
+            json!({"micro_usd": 9_000_000, "note": "给 B 的"}),
+        )
+        .await;
+
+        app.post("/api/login", json!({"email":"a@b.c","password":PW}))
+            .await;
+        let (_, body) = app.get("/api/balance").await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["balance_micro_usd"], json!(5_000_000));
+        // B 的流水绝不能出现在 A 的响应里。
+        assert!(!body.contains("给 B 的"), "串账了: {body}");
+        assert_eq!(v["entries"].as_array().unwrap().len(), 1);
     }
 }
