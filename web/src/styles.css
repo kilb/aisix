@@ -4,15 +4,19 @@
    这个产品本质上是在记账：按 token 计量、按定价折算、对着上限收口。
    所以界面借的是这门生意自己的实物 —— 账簿的一页。
 
+   纸是底子，但这是一台**每天要用的操作台**，不是一份读物。上一版把两者
+   搞混了：全靠细线撑、零阴影零圆角、输入框只是一道下划线 —— 那是给「读」
+   的东西定的规矩，落到工具上就没有层次，也看不出哪里能点，读起来就是糙。
+
    四条贯穿全局的规则：
 
-   1. 内容压在栏线上，不装在卡片里。账页没有卡片、没有阴影、没有圆角；
-      有的是横纹、栏线、和右对齐压在线上的数字。凡是想加一层立体感的
-      地方，改成加一道线。
+   1. 可操作的东西要有面。分区是浮起来的纸片，控件是有边界的实体；层级
+      靠面和影，不只靠线。线留给**同一张面之内**的分行。
    2. 只有两种墨。台账历来黑墨记账、红墨记差额 —— 这里是蓝黑墨（标题、
       可点、在线）和氧化红（超限、余额、负数）。没有第三种颜色表示状态。
    3. 数字用衬线等宽数位，右对齐。这个产品的花费到千分之一美分，列对不
-      齐就读不出量级差别。
+      齐就读不出量级差别。衬线只给数字，正文和控件用无衬线 —— 大号衬线
+      铺满全页会把操作台读成一份周报。
    4. 拉丁惯用法只用在拉丁文上。字距和小型大写是拉丁字母的语法，套在中
       文上只会把词拉散。
 
@@ -24,22 +28,30 @@
   color-scheme:light dark;
 
   /* 纸 —— 暖白，微微发黄。灰底显旧，纸底显用。 */
-  --paper:#faf7f0;
-  --paper-2:#f3efe4;   /* 表头带、隔行 */
-  --edge:#e9e2d2;
+  --ground:#eeeae0;    /* 桌面：比纸片深一点，纸片才浮得起来 */
+  --paper:#fdfbf6;     /* 纸片 */
+  --paper-2:#f5f1e7;   /* 隔行、内嵌区 */
+  --edge:#e7e1d2;
 
   /* 墨 —— 两种，加三档灰墨。 */
   --ink:#1e1b15;
   --ink-2:#4d463b;
-  --ink-3:#7e7565;     /* 栏目名、单位、说明 */
+  --ink-3:#736a59;     /* 栏目名、单位、说明。压到 4.5:1 以上 */
   --indigo:#26407c;    /* 蓝黑墨 */
   --oxide:#9e3521;     /* 红墨 */
+  --on-indigo:#fff;   /* 压在 --indigo 上的字色，跟着主题翻 */
   --indigo-wash:#e6ebf6;
   --oxide-wash:#f7e7e1;
 
   /* 栏线两个重量：细线分行，重线分节。 */
-  --rule:#dcd4c1;
-  --rule-2:#a79c81;
+  --rule:#e4ddcb;
+  --rule-2:#bdb298;
+
+  --r:7px;
+  /* 两级：纸片贴着桌面，浮起的菜单离得远一点。暖色的影，不是灰的 —— 灰影
+     压在暖纸上会显脏。 */
+  --lift:0 1px 2px rgba(74,62,38,.07), 0 6px 16px -8px rgba(74,62,38,.16);
+  --float:0 2px 6px rgba(74,62,38,.09), 0 18px 40px -16px rgba(74,62,38,.30);
 
   --fig:"Source Serif 4",Georgia,"Times New Roman",serif;
   --body:system-ui,-apple-system,"PingFang SC","Hiragino Sans GB",
@@ -58,34 +70,42 @@
 /* 复写纸。 */
 @media (prefers-color-scheme:dark){
   :root:not([data-theme="light"]){
-    --paper:#16140f;
-    --paper-2:#1d1a13;
-    --edge:#231f17;
+    --ground:#100e0a;
+    --paper:#1a1712;
+    --paper-2:#221e17;
+    --edge:#2a251c;
     --ink:#ece6d7;
     --ink-2:#b5ad9a;
-    --ink-3:#867e6c;
+    --ink-3:#918876;
     --indigo:#93aae6;
     --oxide:#e07d60;
+    --on-indigo:#12100b;
     --indigo-wash:#1b2033;
     --oxide-wash:#2c1d17;
-    --rule:#332e24;
-    --rule-2:#524936;
+    --rule:#302b21;
+    --rule-2:#4c4434;
+    --lift:0 1px 2px rgba(0,0,0,.4), 0 6px 16px -8px rgba(0,0,0,.5);
+    --float:0 2px 6px rgba(0,0,0,.45), 0 18px 40px -16px rgba(0,0,0,.7);
     --s1:#93aae6; --s2:#cba873; --s3:#87a9b7; --s4:#c79bbe; --s5:#a9bd7d;
   }
 }
 :root[data-theme="dark"]{
-  --paper:#16140f;
-  --paper-2:#1d1a13;
-  --edge:#231f17;
+  --ground:#100e0a;
+  --paper:#1a1712;
+  --paper-2:#221e17;
+  --edge:#2a251c;
   --ink:#ece6d7;
   --ink-2:#b5ad9a;
-  --ink-3:#867e6c;
+  --ink-3:#918876;
   --indigo:#93aae6;
   --oxide:#e07d60;
+  --on-indigo:#12100b;
   --indigo-wash:#1b2033;
   --oxide-wash:#2c1d17;
-  --rule:#332e24;
-  --rule-2:#524936;
+  --rule:#302b21;
+  --rule-2:#4c4434;
+  --lift:0 1px 2px rgba(0,0,0,.4), 0 6px 16px -8px rgba(0,0,0,.5);
+  --float:0 2px 6px rgba(0,0,0,.45), 0 18px 40px -16px rgba(0,0,0,.7);
   --s1:#93aae6; --s2:#cba873; --s3:#87a9b7; --s4:#c79bbe; --s5:#a9bd7d;
 }
 
@@ -96,7 +116,7 @@ body{
   /* 纸纤维。大面积平涂读起来像没画完，实物的纸是有肌理的。 */
   background:
     url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='f'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='4'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23f)' opacity='.04'/%3E%3C/svg%3E"),
-    var(--paper);
+    var(--ground);
   background-attachment:fixed;
   color:var(--ink);font-family:var(--body);font-size:14.5px;line-height:1.6;
   /* 中文允许字间断行，但把「客户端」从中间断开读起来是错的。 */
@@ -124,7 +144,8 @@ a{color:var(--indigo);text-underline-offset:2px}
 
 .book-head{
   display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
-  padding-bottom:12px;border-bottom:2px solid var(--ink);
+  padding-bottom:14px;margin-bottom:clamp(14px,1.8vw,20px);
+  border-bottom:1px solid var(--rule-2);
 }
 .book-mark{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
 .book-head h1{
@@ -138,58 +159,41 @@ a{color:var(--indigo);text-underline-offset:2px}
   margin-left:auto;display:flex;align-items:center;gap:10px;flex-wrap:wrap;
 }
 
-/* ── 目录栏 ──────────────────────────────────────────────────
-   装订账本左边那条目录栏。它**不是浮岛**：整页零阴影零圆角，一块带投影
-   的板压在账页上会是全页唯一自相矛盾的东西。它靠一道竖栏线跟正文分开，
-   靠 sticky 停在原处 —— 翻到长表格底部时菜单还在，这是要的那个功能，
-   不需要浮起来才能拿到。 */
+/* ── 悬浮菜单 ────────────────────────────────────────────────
+   一块真正浮起来的纸片：离页边有距离、自己的面、自己的影，随页滚动而
+   停在原处。 */
 .leafs{
-  display:grid;grid-template-columns:minmax(0,168px) minmax(0,1fr);
-  gap:clamp(20px,2.6vw,36px);
-  align-items:stretch;
+  display:grid;grid-template-columns:minmax(0,196px) minmax(0,1fr);
+  gap:clamp(18px,2.2vw,30px);
+  align-items:start;
 }
-/* 栏线画在撑满整列的 nav 上，清单本身 sticky —— 线通到页脚，菜单停在
-   原处。把线画在清单上会让它在最后一项那里断掉。 */
 nav.tabs{
-  display:block;border-right:1px solid var(--rule-2);
+  position:sticky;top:clamp(14px,1.8vw,22px);
+  display:flex;flex-direction:column;gap:1px;
+  background:var(--paper);border:1px solid var(--rule);border-radius:var(--r);
+  box-shadow:var(--float);
+  padding:8px;
+  max-height:calc(100vh - 44px);overflow-y:auto;scrollbar-width:thin;
 }
-nav.tabs > button{position:relative}
-.tabs-in{
-  position:sticky;top:0;
-  display:flex;flex-direction:column;
-  padding:6px 0 10px;
-  max-height:100vh;overflow-y:auto;scrollbar-width:thin;
-}
-.tabs-in button{
+nav.tabs button{
   background:none;border:0;cursor:pointer;text-align:left;
-  padding:7px 14px 7px 0;
-  color:var(--ink-3);font-size:14px;
-  /* 选中项在栏线上盖一道墨签，像账本翻到的那一页。 */
-  border-right:2px solid transparent;margin-right:-1px;
-  transition:color .13s ease,border-color .13s ease;
+  padding:8px 11px;border-radius:calc(var(--r) - 3px);
+  color:var(--ink-2);font-size:13.5px;
+  transition:background .12s ease,color .12s ease;
 }
-.tabs-in button:hover{color:var(--ink)}
-.tabs-in button[aria-selected="true"]{
-  color:var(--ink);font-weight:600;border-right-color:var(--ink);
+nav.tabs button:hover{background:var(--paper-2);color:var(--ink)}
+/* 选中项：实底 + 墨色。工具里「我在这一页」要一眼看到，一道细线不够。 */
+nav.tabs button[aria-selected="true"]{
+  background:var(--indigo-wash);color:var(--indigo);font-weight:600;
 }
 
-/* 窄屏放不下两栏：目录栏躺回页眉下面，回到横排。 */
-@media (max-width:820px){
+@media (max-width:860px){
   .leafs{grid-template-columns:minmax(0,1fr);gap:0}
-  nav.tabs{border-right:0;border-bottom:1px solid var(--rule-2);
-    margin-bottom:clamp(18px,2.4vw,30px);}
-  .tabs-in{
-    position:static;flex-direction:row;overflow-x:auto;
-    padding:0;max-height:none;
+  nav.tabs{
+    position:static;flex-direction:row;overflow-x:auto;gap:2px;
+    margin-bottom:clamp(16px,2vw,24px);max-height:none;
   }
-  .tabs-in button{
-    flex:none;white-space:nowrap;padding:11px clamp(11px,1.5vw,18px);
-    border-right:0;margin-right:0;
-    border-bottom:2px solid transparent;margin-bottom:-1px;
-  }
-  .tabs-in button[aria-selected="true"]{
-    border-right-color:transparent;border-bottom-color:var(--ink);
-  }
+  nav.tabs button{flex:none;white-space:nowrap}
 }
 
 /* 账簿上盖的小戳，不是发光的胶囊。 */
@@ -206,10 +210,16 @@ nav.tabs > button{position:relative}
 /* ── 账页上的一节 ────────────────────────────────────────────
    原来是一块有阴影的卡片。账页上没有卡片：一节就是小标题、一道线、和
    线下面的内容。 */
-.panel{margin:0 0 clamp(22px,2.6vw,32px)}
+.panel{
+  background:var(--paper);border:1px solid var(--rule);border-radius:var(--r);
+  box-shadow:var(--lift);
+  padding:clamp(16px,1.8vw,22px) clamp(16px,2vw,26px) clamp(14px,1.6vw,20px);
+  margin:0 0 clamp(14px,1.6vw,20px);
+}
 .panel > h2{
-  font-size:clamp(15px,1.7vw,18px);font-weight:600;
-  padding-bottom:7px;border-bottom:1px solid var(--rule-2);
+  font-family:var(--body);
+  font-size:clamp(14px,1.5vw,16px);font-weight:600;letter-spacing:0;
+  padding-bottom:9px;border-bottom:1px solid var(--rule);
   display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;
 }
 .panel > h2 .pill{margin-left:auto}
@@ -231,9 +241,11 @@ nav.tabs > button{position:relative}
   letter-spacing:0;text-transform:none;font-weight:400;
 }
 .entry .foot{grid-column:1;font-size:12px;color:var(--ink-3);margin-top:3px}
+/* 最后一行不收线：一道横在面片下沿的线读起来像没写完。 */
+.entries > .entry:last-child{border-bottom:0;padding-bottom:0}
 .entry .val{
   grid-column:2;grid-row:1;text-align:right;
-  font-size:clamp(19px,2.1vw,24px);font-weight:500;line-height:1.15;
+  font-size:clamp(18px,1.9vw,21px);font-weight:600;line-height:1.15;
   white-space:nowrap;
 }
 /* 前导零压低、有效位留在墨色。花费到千分之一美分，两位小数会把真实花费
@@ -249,6 +261,14 @@ nav.tabs > button{position:relative}
    没配上限就不结这笔账：写明未设上限，不去编一个余额。给一个不存在的
    上限算差额，比不算更糟。 */
 .balance .entry:last-of-type{border-bottom:0}
+
+/* 概览的上半屏并排放：读数一栏、结账一栏。三块面片竖着堆，要滚两屏才
+   看得完，而这两件事本来就是一起看的。 */
+.deck{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));
+  gap:clamp(14px,1.6vw,20px);align-items:start;
+}
+.deck > .panel{margin:0}
 .balance-rule{
   height:0;border-top:1px solid var(--ink);
   box-shadow:0 3px 0 -1px var(--ink);   /* 双线：会计的结账线 */
@@ -264,7 +284,7 @@ nav.tabs > button{position:relative}
   font-family:var(--body);color:var(--ink);text-transform:none;
 }
 .balance-sum .val{
-  text-align:right;font-size:clamp(26px,3.6vw,42px);font-weight:600;
+  text-align:right;font-size:clamp(24px,2.8vw,32px);font-weight:600;
   line-height:1.05;color:var(--oxide);white-space:nowrap;
 }
 .balance-sum .val .lead{color:color-mix(in srgb,var(--oxide) 45%,var(--paper))}
@@ -297,38 +317,46 @@ tbody tr:hover{background:var(--paper-2)}
   display:block;margin-bottom:5px;
   font-family:var(--mono);font-size:11px;color:var(--ink-3);
 }
+/* 控件要看得出能操作。下划线好看，但在一台每天要用的工具上，它读起来是
+   「一段排好版的文字」，不是「一个可以填的框」。 */
 input,select,textarea{
-  width:100%;background:transparent;color:var(--ink);
-  border:0;border-bottom:1px solid var(--rule-2);border-radius:0;
-  padding:7px 2px;
-  transition:border-color .13s ease,background .13s ease;
+  width:100%;background:var(--paper-2);color:var(--ink);
+  border:1px solid var(--rule-2);border-radius:calc(var(--r) - 2px);
+  padding:8px 10px;
+  transition:border-color .13s ease,box-shadow .13s ease,background .13s ease;
 }
+input:hover:not(:focus),select:hover:not(:focus){border-color:var(--ink-3)}
 input:focus,select:focus,textarea:focus{
-  outline:0;border-bottom-color:var(--indigo);
-  background:color-mix(in srgb,var(--indigo-wash) 55%,transparent);
+  outline:0;border-color:var(--indigo);background:var(--paper);
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--indigo) 14%,transparent);
 }
 input::placeholder{color:var(--ink-3)}
 textarea{
   font-family:var(--mono);font-size:12.5px;line-height:1.65;
-  border:1px solid var(--rule-2);padding:12px;min-height:340px;resize:vertical;
-  background:var(--paper-2);
+  padding:12px;min-height:340px;resize:vertical;
 }
-select{appearance:none;padding-right:20px}
+select{appearance:none;padding-right:26px;cursor:pointer}
 input[type=checkbox]{width:auto;border:0}
 
 button.act{
-  background:var(--ink);color:var(--paper);border:0;border-radius:0;
-  padding:9px 20px;cursor:pointer;font-size:13.5px;font-weight:600;
-  transition:background .13s ease;
+  background:var(--indigo);color:var(--on-indigo);border:0;
+  border-radius:calc(var(--r) - 2px);
+  padding:9px 18px;cursor:pointer;font-size:13.5px;font-weight:600;
+  box-shadow:var(--lift);
+  transition:filter .13s ease,transform .09s ease;
 }
-button.act:hover:not(:disabled){background:var(--indigo)}
+button.act:hover:not(:disabled){filter:brightness(1.12)}
+button.act:active:not(:disabled){transform:translateY(1px)}
 button.act:disabled{opacity:.42;cursor:not-allowed}
 button.ghost{
-  background:transparent;border:1px solid var(--rule-2);color:var(--ink-2);
-  border-radius:0;padding:7px 14px;cursor:pointer;font-size:13px;
-  transition:border-color .13s ease,color .13s ease;
+  background:var(--paper);border:1px solid var(--rule-2);color:var(--ink-2);
+  border-radius:calc(var(--r) - 2px);padding:7px 13px;cursor:pointer;
+  font-size:13px;
+  transition:border-color .13s ease,color .13s ease,background .13s ease;
 }
-button.ghost:hover:not(:disabled){border-color:var(--ink);color:var(--ink)}
+button.ghost:hover:not(:disabled){
+  border-color:var(--ink-3);color:var(--ink);background:var(--paper-2);
+}
 button.ghost:disabled{opacity:.42;cursor:not-allowed}
 /* 表格里的动作安静下来：每行一个描边框会比它删的那行更显眼。悬停才显形。 */
 td button.ghost{border-color:transparent;color:var(--ink-3);padding:4px 8px}
@@ -337,11 +365,12 @@ tr:hover td button.ghost{border-color:var(--rule-2);color:var(--oxide)}
 /* ── 批注 ────────────────────────────────────────────────────
    账页上的批注是页边写的一段，靠一道粗墨线标出来，不是一个色块。 */
 .note{
-  margin:14px 0;padding:10px 0 10px 14px;font-size:13px;
+  margin:13px 0;padding:10px 13px;font-size:13px;
+  background:var(--paper-2);border-radius:calc(var(--r) - 2px);
   border-left:3px solid var(--rule-2);color:var(--ink-2);
 }
 .note.warn{border-left-color:var(--ink)}
-.note.crit{border-left-color:var(--oxide);color:var(--oxide)}
+.note.crit{border-left-color:var(--oxide);color:var(--oxide);background:var(--oxide-wash)}
 .note strong{color:var(--ink)}
 
 /* ── 曲线 ────────────────────────────────────────────────────*/

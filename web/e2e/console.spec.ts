@@ -137,16 +137,16 @@ test("网关状态是一个带边框和状态点的方戳", async ({ page }) => 
 });
 
 /**
- * 导航是账本左边的目录栏。
+ * 导航是一块浮起来的菜单。
  *
- * 这条用例前后改过两次轴向（竖栏 → 顶部横排 → 目录栏），所以这里**不再钉
- * 方向**，只钉三件跟布局怎么摆无关、但一旦丢了就是退化的事：九项都在、
- * 靠栏线分隔而不是靠浮起、以及翻到页面底部时它还在原处。
+ * 上一版这条用例断言的是反面（无阴影、无圆角），那是为了守住「整页零立体
+ * 感」的排版方向；使用者明确要求改成悬浮菜单，所以这条守卫按他的决定翻过来。
+ * 记在这里是因为断言反转过一次，不写清楚下一个人会以为是退化。
  *
- * 「不是靠浮起」这条同时守着整套方向：这一版通篇零阴影零圆角，一块带投影
- * 的浮岛会是全页唯一自相矛盾的东西。
+ * 轴向不再钉 —— 这条用例已经因为改布局重写过两次。钉的是丢了就是退化的四
+ * 件事：九项都在、离页边有距离、有自己的面和影、滚到页底仍在视口里。
  */
-test("导航是一条靠栏线分隔、且不随内容滚走的目录栏", async ({ page }) => {
+test("导航是一块离开页边、浮在自己面上的菜单", async ({ page }) => {
   await signIn(page);
   const nav = page.locator("nav.tabs");
   await expect(nav).toBeVisible();
@@ -154,26 +154,59 @@ test("导航是一条靠栏线分隔、且不随内容滚走的目录栏", async
 
   const look = await nav.evaluate((el) => {
     const cs = getComputedStyle(el);
+    const r = el.getBoundingClientRect();
     return {
-      shadow: cs.boxShadow,
+      left: r.left,
       radius: parseFloat(cs.borderTopLeftRadius),
-      ruled:
-        parseFloat(cs.borderRightWidth) > 0 || parseFloat(cs.borderBottomWidth) > 0,
+      elevated: cs.boxShadow !== "none",
+      // 有自己的面：背景不能是透明的，否则「浮起」只剩一圈影子。
+      opaque: cs.backgroundColor !== "rgba(0, 0, 0, 0)",
     };
   });
-  expect(look.ruled).toBe(true);
-  expect(look.shadow).toBe("none");
-  expect(look.radius).toBe(0);
+  expect(look.left).toBeGreaterThan(4);
+  expect(look.radius).toBeGreaterThan(2);
+  expect(look.elevated).toBe(true);
+  expect(look.opaque).toBe(true);
 
-  // 翻到长页底部，菜单仍在视口里 —— 这是把它单独立成一栏换来的东西。
-  const before = await page.getByRole("tab", { name: "概览" }).boundingBox();
+  // 翻到长页底部，菜单仍在视口里 —— 悬浮要换来的就是这个。
   await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
   await page.waitForTimeout(250);
   const after = await page.getByRole("tab", { name: "概览" }).boundingBox();
-  expect(before && after).toBeTruthy();
+  expect(after).toBeTruthy();
   if (after) {
     expect(after.y).toBeGreaterThan(-1);
     expect(after.y).toBeLessThan(page.viewportSize()!.height);
+  }
+});
+
+/**
+ * 主按钮的字色必须跟着底色翻。深色下 `--indigo` 是**浅**靛，字色写死成白的
+ * 只有 2.3:1 —— 这正是上一轮真出过的事，肉眼看截图看不出来。
+ */
+test("两套主题下主按钮的对比度都达标", async ({ page }) => {
+  // 登录一次就够：会话 cookie 会留着，第二轮再去找口令框会等到超时。
+  await signIn(page);
+
+  for (const theme of ["light", "dark"]) {
+    await page.evaluate((t) => localStorage.setItem("aisix-console-theme", t), theme);
+    await page.reload();
+    await expect(page.getByRole("tab", { name: "概览" })).toBeVisible();
+    await page.getByRole("tab", { name: "模型与定价" }).click();
+
+    const ratio = await page.locator("button.act").first().evaluate((el) => {
+      const lum = (c: string) => {
+        const [r, g, b] = c.match(/\d+/g)!.map(Number).map((v) => {
+          const n = v / 255;
+          return n <= 0.03928 ? n / 12.92 : ((n + 0.055) / 1.055) ** 2.4;
+        });
+        return 0.2126 * r! + 0.7152 * g! + 0.0722 * b!;
+      };
+      const cs = getComputedStyle(el);
+      const a = lum(cs.color);
+      const b = lum(cs.backgroundColor);
+      return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+    });
+    expect(ratio, `${theme} 主题下主按钮对比度`).toBeGreaterThanOrEqual(4.5);
   }
 });
 

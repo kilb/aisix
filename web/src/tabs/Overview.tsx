@@ -96,6 +96,7 @@ export function Overview({ doc }: { doc: DocState; onGoto: (t: TabId) => void })
 
   return (
     <>
+      <div className="deck">
       <div className="panel">
         <h2>网关读数</h2>
         <p className="hint">累计值来自 Prometheus，自开始抓取起算。</p>
@@ -128,6 +129,7 @@ export function Overview({ doc }: { doc: DocState; onGoto: (t: TabId) => void })
           ceilingMicro={ceiling?.total ?? null}
           window={ceiling?.window ?? "day"}
         />
+      </div>
       </div>
 
       <div className="panel">
