@@ -45,7 +45,8 @@ pub struct AppState {
     /// Prometheus 基址与网关配置文件路径。门户只**读**指标 —— 它绝不出现在
     /// 网关的请求路径上。
     prom_url: Arc<String>,
-    resources_path: Arc<String>,
+    resources: crate::resources::Writer,
+    default_allowed_models: Arc<Vec<String>>,
     http: reqwest::Client,
     /// 实际执行过的 argon2 校验次数。让「不存在的账号也走了校验」这件事
     /// 可以被确定性地断言，而不必去测时间（那种测试必然是 flaky 的）。
@@ -89,15 +90,31 @@ impl AppState {
             dummy_hash: Arc::new(dummy),
             admin_token: admin_token.map(Arc::new),
             prom_url: Arc::new(prom_url),
-            resources_path: Arc::new(resources_path),
+            resources: crate::resources::Writer::new(resources_path),
+            // 自助密钥默认能用哪些模型。按设计文档 §3.2，压住超支靠的是速率与
+            // 模型白名单而不是对账周期 —— 这个默认值是运维手里那个旋钮。
+            default_allowed_models: Arc::new(
+                std::env::var("PORTAL_DEFAULT_ALLOWED_MODELS")
+                    .map(|v| {
+                        v.split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_else(|_| vec!["*".to_string()]),
+            ),
             http: crate::client::outbound(),
             verifications: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// 读网关配置。一期用来数「有多少密钥绑到这个用户」。
-    pub async fn read_resources(&self) -> std::io::Result<String> {
-        tokio::fs::read_to_string(&*self.resources_path).await
+    /// 网关配置的读写闸口。两条写路径（铸密钥、对账停用）共用它。
+    pub fn resources(&self) -> &crate::resources::Writer {
+        &self.resources
+    }
+
+    pub fn default_allowed_models(&self) -> Vec<String> {
+        (*self.default_allowed_models).clone()
     }
 
     /// 发一条**服务端构造**的 PromQL，取回一个标量。

@@ -61,7 +61,7 @@ pub async fn usage(
     };
 
     let win = Window::from_hours(p.range_hours);
-    let keys = match st.read_resources().await {
+    let keys = match st.resources().read().await {
         Ok(yaml) => resources::tally_keys(&yaml, &uid),
         // 读不到配置时不假装「有绑定」。
         Err(_) => resources::KeyTally {

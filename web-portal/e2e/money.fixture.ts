@@ -56,8 +56,12 @@ export interface MoneyFixture {
   userId: string;
   readResources(): string;
   writeResources(body: string): void;
-  /** 打一次真实的 chat 请求，返回状态码。 */
+  /** 用夹具预置的密钥打一次真实 chat，返回状态码。 */
   chat(): Promise<number>;
+  /** 用任意明文密钥打一次真实 chat —— 用来验自助建的那把能不能调通。 */
+  chatWith(plaintext: string): Promise<number>;
+  /** 门户会话 cookie，用来调 /api/keys。 */
+  sessionCookie(): Promise<string>;
   stop(): void;
 }
 
@@ -158,6 +162,9 @@ export async function startMoney(): Promise<MoneyFixture> {
         PORTAL_ADDR: `127.0.0.1:${portalPort}`,
         PORTAL_ADMIN_TOKEN: ADMIN_TOKEN,
         PROMETHEUS_URL: `http://127.0.0.1:${promPort}`,
+        // 一条用例要跨四个状态、每个等一轮对账。15 秒一轮会把超时预算吃光，
+        // 而那种失败长得跟真 bug 一样。调快是让测试更确定，不是放宽断言。
+        PORTAL_TICK_SECS: "2",
         AISIX_RESOURCES: resourcesPath,
       },
       stdio: "inherit",
@@ -208,18 +215,21 @@ observability:
     readResources: () => readFileSync(resourcesPath, "utf8"),
     writeResources: (b: string) => writeFileSync(resourcesPath, b),
     async chat() {
-      const r = await fetch(`http://127.0.0.1:${proxyPort}/v1/chat/completions`, {
+      return chatWith(proxyPort, CALLER_KEY);
+    },
+    async chatWith(plaintext: string) {
+      return chatWith(proxyPort, plaintext);
+    },
+    async sessionCookie() {
+      const r = await fetch(`${portalUrl}/api/login`, {
         method: "POST",
-        headers: {
-          authorization: `Bearer ${CALLER_KEY}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "gpt-4o-mini",
-          messages: [{ role: "user", content: "hi" }],
-        }),
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email: "money@e2e.test", password: "correct horse battery" }),
       });
-      return r.status;
+      const raw = r.headers.getSetCookie?.() ?? [];
+      const c = raw.map((x) => x.split(";")[0]).join("; ");
+      if (!c.includes("aisix_portal=")) throw new Error("拿不到门户会话 cookie");
+      return c;
     },
     stop() {
       for (const p of procs) p.kill("SIGTERM");
@@ -227,6 +237,16 @@ observability:
       rmSync(dir, { recursive: true, force: true });
     },
   };
+}
+
+/** 打一次真实的 chat。 */
+async function chatWith(proxyPort: number, plaintext: string): Promise<number> {
+  const r = await fetch(`http://127.0.0.1:${proxyPort}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${plaintext}`, "content-type": "application/json" },
+    body: JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: "hi" }] }),
+  });
+  return r.status;
 }
 
 function writeResources(

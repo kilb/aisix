@@ -64,7 +64,26 @@ export const register = (email: string, password: string) =>
 export const login = (email: string, password: string) =>
   post<{ ok: true }>("/api/login", { email, password });
 export const logout = () => post<{ ok: true }>("/api/logout");
+export interface KeyRow {
+  name: string;
+  masked_hash: string;
+  disabled: boolean;
+}
+
+export interface MintedKey {
+  /** 明文只在这一次出现。此后任何接口都拿不到。 */
+  plaintext: string;
+  name: string;
+  label: string;
+  disabled: boolean;
+  note: string | null;
+}
+
 export const balance = () => req<Balance>("/api/balance");
+export const listKeys = () => req<{ keys: KeyRow[] }>("/api/keys");
+export const createKey = (label: string) => post<MintedKey>("/api/keys", { label });
+export const revokeKey = (name: string) =>
+  req<{ ok: true }>(`/api/keys/${encodeURIComponent(name)}`, { method: "DELETE" });
 /** 只有窗口长度是参数。没有、也不能有 user_id。 */
 export const usage = (rangeHours: number) =>
   req<Usage>(`/api/usage?range_hours=${rangeHours}`);

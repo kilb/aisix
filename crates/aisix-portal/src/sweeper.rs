@@ -28,6 +28,22 @@ use crate::store::{Store, StoreError};
 /// 真正压住超支的是速率上限，不是这个数。
 pub const DEFAULT_TICK_SECS: u64 = 15;
 
+/// 实际周期，允许用 `PORTAL_TICK_SECS` 覆盖。
+///
+/// e2e 需要这个：一条完整的用例要跨「启用 → 消费 → 停用 → 补额启用」四个状态，
+/// 每个都要等一轮对账。15 秒一轮的话整条链路就是一分钟起，几个等待叠起来把
+/// 超时预算吃光 —— 而那种失败长得跟真 bug 一样。调快周期是让测试**更**确定，
+/// 不是放宽断言。
+///
+/// 下限 1 秒：0 会让 `tokio::time::interval` 忙转。
+pub fn tick_secs() -> u64 {
+    std::env::var("PORTAL_TICK_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.max(1))
+        .unwrap_or(DEFAULT_TICK_SECS)
+}
+
 /// 一轮的结果，供调用方与测试观察。
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct TickReport {
@@ -57,16 +73,16 @@ pub struct Sweeper<S: ConsumptionSource> {
     store: Store,
     ledger: Ledger,
     source: S,
-    resources_path: String,
+    resources: crate::resources::Writer,
 }
 
 impl<S: ConsumptionSource> Sweeper<S> {
-    pub fn new(store: Store, source: S, resources_path: String) -> Self {
+    pub fn new(store: Store, source: S, resources: crate::resources::Writer) -> Self {
         Self {
             ledger: Ledger::new(store.clone()),
             store,
             source,
-            resources_path,
+            resources,
         }
     }
 
@@ -143,95 +159,61 @@ impl<S: ConsumptionSource> Sweeper<S> {
         Ok(())
     }
 
-    /// 写完配置后让网关重载。
-    ///
-    /// **不做这一步的话闸刀是空的。** 文件模式下网关只在 SIGHUP 时重新读
-    /// `resources_file`（`crates/aisix-server/src/main.rs` 的 SIGHUP 处理，
-    /// 没有文件监听）。少了信号，门户会尽职地写下 `disabled: true`、账面显示
-    /// 负余额，而客户被无限期继续服务 —— 又一个静默的免费推理洞，与本期开头
-    /// 那两个同类。计划的裁决 2 只说了「门户写 resources.yaml」，漏了谁通知
-    /// 网关，是 e2e 打真流量时才撞出来的。
-    ///
-    /// 做法与 `crates/aisix-console` 一致：`pkill -HUP -x aisix`。二期改走
-    /// Admin API 写 etcd 之后，watch 会自动传播，这一步随之消失。
-    async fn signal_reload(&self) {
-        let out = tokio::process::Command::new("pkill")
-            .args(["-HUP", "-x", "aisix"])
-            .output()
-            .await;
-        // 配置已经落盘了。信号没送到只是「还没热加载」，不该当成写入失败 ——
-        // 但必须报出来，否则闸刀失效这件事无处可查。
-        if !matches!(&out, Ok(o) if o.status.success()) {
-            eprintln!("已改写 resources.yaml，但 SIGHUP 未送达：网关仍在用旧配置");
-        }
-    }
-
     /// 把期望的启停状态落到 `resources.yaml`。返回 (新停用数, 新启用数)。
     ///
-    /// 用泛型 `Value` 做局部修改，**不经过窄结构体** —— 那会把网关配置里门户
-    /// 不认识的字段全部抹掉。一期两个进程写同一个文件（计划裁决 2 的代价），
-    /// 所以读改写之间比对内容散列，变了就重来。
+    /// 走共用的 [`crate::resources::Writer`]：铸密钥也写这个文件，两条路径不
+    /// 串行就会互相覆盖 —— 后写的那次带着自己读到的旧全文，把中间那次改动整段
+    /// 抹掉。改动用泛型 `Value`，不经过窄结构体（那会抹掉门户不认识的字段）。
     async fn apply_key_state(&self, wanted: &[(String, bool)]) -> (usize, usize) {
-        for _ in 0..5 {
-            let Ok(before) = tokio::fs::read_to_string(&self.resources_path).await else {
-                return (0, 0);
-            };
-            let Ok(mut doc) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&before) else {
-                return (0, 0);
-            };
-            let mut off = 0usize;
-            let mut on = 0usize;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
 
-            if let Some(keys) = doc
-                .get_mut("api_keys")
-                .and_then(serde_yaml_ng::Value::as_sequence_mut)
-            {
+        // 原子计数而不是捕获可变引用：闭包是 FnMut、可能被重试调用多次，
+        // 而这个 future 会被 tokio::spawn 送到别的线程上。
+        let off = Arc::new(AtomicUsize::new(0));
+        let on = Arc::new(AtomicUsize::new(0));
+        let (o1, o2) = (off.clone(), on.clone());
+        let wanted = wanted.to_vec();
+
+        let _ = self
+            .resources
+            .edit(move |doc| {
+                // 每次重试从零开始数。
+                o1.store(0, Ordering::SeqCst);
+                o2.store(0, Ordering::SeqCst);
+                let keys = crate::resources::api_keys_mut(doc);
                 for k in keys.iter_mut() {
-                    let Some(uid) = k.get("user_id").and_then(|v| v.as_str()) else {
+                    let Some(uid) = k.get("user_id").and_then(serde_yaml_ng::Value::as_str) else {
                         // 没有主人的密钥是运维自己用的，绝不能碰。
                         continue;
                     };
-                    let Some((_, want_disabled)) = wanted.iter().find(|(id, _)| id == uid) else {
+                    let Some((_, want)) = wanted.iter().find(|(id, _)| id == uid) else {
                         continue;
                     };
-                    let now_disabled = k.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false);
-                    if now_disabled == *want_disabled {
+                    let now = k
+                        .get("disabled")
+                        .and_then(serde_yaml_ng::Value::as_bool)
+                        .unwrap_or(false);
+                    if now == *want {
                         continue;
                     }
                     if let Some(m) = k.as_mapping_mut() {
                         m.insert(
                             serde_yaml_ng::Value::from("disabled"),
-                            serde_yaml_ng::Value::from(*want_disabled),
+                            serde_yaml_ng::Value::from(*want),
                         );
                     }
-                    if *want_disabled {
-                        off += 1;
+                    if *want {
+                        o1.fetch_add(1, Ordering::SeqCst);
                     } else {
-                        on += 1;
+                        o2.fetch_add(1, Ordering::SeqCst);
                     }
                 }
-            }
+                o1.load(Ordering::SeqCst) > 0 || o2.load(Ordering::SeqCst) > 0
+            })
+            .await;
 
-            if off == 0 && on == 0 {
-                return (0, 0);
-            }
-            // 读改写之间文件被别人动过就重来。
-            let Ok(current) = tokio::fs::read_to_string(&self.resources_path).await else {
-                return (0, 0);
-            };
-            if current != before {
-                continue;
-            }
-            let Ok(out) = serde_yaml_ng::to_string(&doc) else {
-                return (0, 0);
-            };
-            if tokio::fs::write(&self.resources_path, out).await.is_err() {
-                return (0, 0);
-            }
-            self.signal_reload().await;
-            return (off, on);
-        }
-        (0, 0)
+        (off.load(Ordering::SeqCst), on.load(Ordering::SeqCst))
     }
 }
 
@@ -382,7 +364,11 @@ mod tests {
         .unwrap();
         let src = Arc::new(FakeSource::default());
         Fx {
-            sw: Sweeper::new(store.clone(), src.clone(), path.clone()),
+            sw: Sweeper::new(
+                store.clone(),
+                src.clone(),
+                crate::resources::Writer::new(path.clone()),
+            ),
             src,
             ledger: Ledger::new(store.clone()),
             store,

@@ -159,3 +159,96 @@ test("用户会话拿不到管理端", async ({ page }) => {
   const r = await fetch(`${fx.portalUrl}/admin/users`, { headers: { cookie: jar } });
   expect(r.status).toBe(401);
 });
+
+test("自助创建密钥_明文只显示一次_列表里只有遮蔽的散列", async ({ page }) => {
+  const email = mail("mint");
+  await signUp(page, email);
+
+  await page.getByRole("button", { name: "创建密钥" }).click();
+  const code = page.locator(".minted code");
+  await expect(code).toBeVisible();
+  const plaintext = (await code.textContent())!.trim();
+  expect(plaintext).toMatch(/^sk-aisix-[0-9a-f]{64}$/);
+
+  // 明文只此一次。收起之后界面上任何地方都不该再有它。
+  await page.getByRole("button", { name: "我已保存" }).click();
+  await expect(code).toHaveCount(0);
+  await page.reload();
+  expect(await page.textContent("body")).not.toContain(plaintext);
+
+  // 列表里是遮蔽的散列。
+  const row = page.locator("tbody tr", { hasText: "portal-" }).first();
+  await expect(row).toContainText("…");
+});
+
+test("零余额时新密钥是停用态_发放额度后转为可用", async ({ page }) => {
+  const email = mail("bornoff");
+  await signUp(page, email);
+
+  await page.getByRole("button", { name: "创建密钥" }).click();
+  // 若建成可用的，它会在网关眼里活到对账环下一轮才被关掉 —— 那一段是白送的
+  // 推理，每建一把密钥送一次。
+  await expect(page.getByText(/当前余额为零/)).toBeVisible();
+  await page.getByRole("button", { name: "我已保存" }).click();
+  await expect(page.locator("tbody tr", { hasText: "portal-" }).first()).toContainText("已停用");
+
+  await grant(email, 5_000_000, "开通");
+  // 对账环会把它启用回来；这里等它跑一轮。
+  await expect(async () => {
+    await page.reload();
+    await expect(
+      page.locator("tbody tr", { hasText: "portal-" }).first(),
+    ).toContainText("可用");
+  }).toPass({ timeout: 60_000 });
+});
+
+test("可以创建多把_且吊销只影响自己那一把", async ({ page }) => {
+  const email = mail("many");
+  await signUp(page, email);
+
+  for (const label of ["一", "二", "三"]) {
+    await page.getByLabel("名称（可选）").fill(label);
+    await page.getByRole("button", { name: "创建密钥" }).click();
+    await page.getByRole("button", { name: "我已保存" }).click();
+  }
+  await expect(page.locator("tbody tr", { hasText: "portal-" })).toHaveCount(3);
+
+  await page.locator("tbody tr", { hasText: "portal-" }).first().getByRole("button", { name: "吊销" }).click();
+  await expect(page.locator("tbody tr", { hasText: "portal-" })).toHaveCount(2);
+});
+
+test("看不到也删不掉别人的密钥", async ({ page, browser }) => {
+  const a = mail("keys-a");
+  const b = mail("keys-b");
+  await signUp(page, a);
+  await page.getByLabel("名称（可选）").fill("A的密钥");
+  await page.getByRole("button", { name: "创建密钥" }).click();
+  await page.getByRole("button", { name: "我已保存" }).click();
+  const aName = (await page
+    .locator("tbody tr", { hasText: "portal-" })
+    .first()
+    .locator("td")
+    .first()
+    .textContent())!.split(" · ")[0]!;
+
+  const ctx = await browser.newContext();
+  const p2 = await ctx.newPage();
+  await signUp(p2, b);
+  // B 的列表里不该有 A 的任何东西。
+  await expect(p2.locator("tbody tr", { hasText: "portal-" })).toHaveCount(0);
+  expect(await p2.textContent("body")).not.toContain("A的密钥");
+
+  // B 直接调接口删 A 的密钥 —— 少了主人校验，任何登录用户都能凭名字删掉别人的。
+  const status = await p2.evaluate(async (n) => {
+    const r = await fetch(`/api/keys/${encodeURIComponent(n)}`, {
+      method: "DELETE",
+      credentials: "same-origin",
+    });
+    return r.status;
+  }, aName);
+  expect(status).toBe(404);
+
+  await page.reload();
+  await expect(page.locator("tbody tr", { hasText: "portal-" })).toHaveCount(1);
+  await ctx.close();
+});

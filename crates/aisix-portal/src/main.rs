@@ -11,6 +11,7 @@
 mod admin;
 mod auth;
 mod client;
+mod keys;
 mod ledger;
 mod resources;
 mod store;
@@ -36,6 +37,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/session", get(auth::session))
         .route("/api/usage", get(usage::usage))
         .route("/api/balance", get(usage::balance))
+        .route("/api/keys", get(keys::list).post(keys::create))
+        .route("/api/keys/{name}", axum::routing::delete(keys::revoke))
         .route("/admin/users", get(admin::list_users))
         .route("/admin/users/{id}/grant", post(admin::grant))
         .with_state(state)
@@ -52,15 +55,6 @@ async fn main() {
         }
     };
 
-    let addr = std::env::var("PORTAL_ADDR").unwrap_or_else(|_| "127.0.0.1:8091".to_string());
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("监听 {addr} 失败: {e}");
-            std::process::exit(1);
-        }
-    };
-    eprintln!("aisix-portal listening on {addr}");
     // 没配管理凭据时管理端整个关闭 —— 默认拒绝，而不是默认放行。
     let admin_token = std::env::var("PORTAL_ADMIN_TOKEN").ok();
     if admin_token.is_none() {
@@ -70,17 +64,29 @@ async fn main() {
         std::env::var("PROMETHEUS_URL").unwrap_or_else(|_| "http://127.0.0.1:9090".into());
     let resources_path =
         std::env::var("AISIX_RESOURCES").unwrap_or_else(|_| "/etc/aisix/resources.yaml".into());
-    // 对账环。周期 15 秒 —— 超支上界 ≈ 本周期内的消费 + 在途，而真正压住
-    // 超支的是速率上限（设计文档 §3.2），不是这个数。
+
+    let state = AppState::build(
+        store.clone(),
+        ARGON2_GATE_PERMITS,
+        admin_token,
+        prom_url.clone(),
+        resources_path,
+    );
+
+    // 对账环。周期 15 秒 —— 超支上界 ≈ 本周期内的消费 + 在途，而真正压住超支
+    // 的是速率上限（设计文档 §3.2），不是这个数。
+    //
+    // 用 `state` 手里那个 Writer，不另建一个：铸密钥与停用密钥都写同一个文件，
+    // 两条路径必须共用同一把串行锁，否则会互相覆盖。
     {
         let sw = sweeper::Sweeper::new(
             store.clone(),
-            sweeper::PromSource::new(prom_url.clone()),
-            resources_path.clone(),
+            sweeper::PromSource::new(prom_url),
+            state.resources().clone(),
         );
         tokio::spawn(async move {
             let mut tick =
-                tokio::time::interval(std::time::Duration::from_secs(sweeper::DEFAULT_TICK_SECS));
+                tokio::time::interval(std::time::Duration::from_secs(sweeper::tick_secs()));
             loop {
                 tick.tick().await;
                 if let Err(e) = sw.tick(chrono::Utc::now()).await {
@@ -90,13 +96,15 @@ async fn main() {
         });
     }
 
-    let state = AppState::build(
-        store.clone(),
-        ARGON2_GATE_PERMITS,
-        admin_token,
-        prom_url.clone(),
-        resources_path.clone(),
-    );
+    let addr = std::env::var("PORTAL_ADDR").unwrap_or_else(|_| "127.0.0.1:8091".to_string());
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("监听 {addr} 失败: {e}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!("aisix-portal listening on {addr}");
     if let Err(e) = axum::serve(listener, router(state)).await {
         eprintln!("serve 失败: {e}");
         std::process::exit(1);
@@ -304,6 +312,21 @@ mod testutil {
         /// 重写本实例的 resources.yaml。
         pub fn set_resources(&self, body: &str) {
             std::fs::write(&self.resources_path, body).unwrap();
+        }
+
+        pub async fn delete(&self, path: &str) -> (u16, String) {
+            let r = self
+                .http
+                .delete(format!("{}{path}", self.base))
+                .send()
+                .await
+                .unwrap();
+            (r.status().as_u16(), r.text().await.unwrap())
+        }
+
+        /// 读本实例的 resources.yaml。
+        pub fn read_resources(&self) -> String {
+            std::fs::read_to_string(&self.resources_path).unwrap_or_default()
         }
 
         pub async fn register(&self, email: &str, pw: &str) -> String {
@@ -828,5 +851,169 @@ mod balance_tests {
         // B 的流水绝不能出现在 A 的响应里。
         assert!(!body.contains("给 B 的"), "串账了: {body}");
         assert_eq!(v["entries"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod keys_tests {
+    use super::testutil::{temp_resources, FakeProm, TestApp};
+    use serde_json::json;
+
+    const PW: &str = "correct horse battery";
+    const SEED: &str = "models:\n- display_name: keep-me\napi_keys:\n- display_name: ops\n  key_hash: opsopsopsopsopsopsopsopsopsopsops\n";
+
+    async fn app() -> (FakeProm, TestApp) {
+        let prom = FakeProm::start().await;
+        let app = TestApp::start_with_usage(&prom, &temp_resources(SEED)).await;
+        (prom, app)
+    }
+
+    async fn signed_in(app: &TestApp, mail: &str) -> String {
+        let id = app.register(mail, PW).await;
+        app.post("/api/login", json!({"email": mail, "password": PW}))
+            .await;
+        id
+    }
+
+    #[tokio::test]
+    async fn 未登录不能铸密钥() {
+        let (_p, app) = app().await;
+        let (s, _) = app.post("/api/keys", json!({})).await;
+        assert_eq!(s, 401);
+    }
+
+    #[tokio::test]
+    async fn 明文只在铸出来那一次给出_落盘只有散列() {
+        let (_p, app) = app().await;
+        signed_in(&app, "a@b.c").await;
+        let (s, body) = app.post("/api/keys", json!({"label": "我的第一把"})).await;
+        assert_eq!(s, 201, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let plaintext = v["plaintext"].as_str().unwrap().to_string();
+        assert!(plaintext.starts_with("sk-aisix-"));
+
+        let yaml = app.read_resources();
+        // 明文绝不能落盘。
+        assert!(!yaml.contains(&plaintext), "明文进了配置文件");
+        assert!(
+            yaml.contains(&crate::keys::sha256_hex(&plaintext)),
+            "散列没落盘"
+        );
+
+        // 列表接口也拿不到明文，散列还得是遮蔽的。
+        let (_, list) = app.get("/api/keys").await;
+        assert!(!list.contains(&plaintext));
+        assert!(list.contains('…'), "散列没遮: {list}");
+    }
+
+    #[tokio::test]
+    async fn 零余额时新密钥生下来就是停用的() {
+        let (_p, app) = app().await;
+        signed_in(&app, "a@b.c").await;
+        let (_, body) = app.post("/api/keys", json!({})).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // 若建成可用的，它会在网关眼里活到对账环下一轮才被关掉 —— 那一段是
+        // 白送的推理，而且每建一把密钥就送一次。
+        assert_eq!(v["disabled"], json!(true));
+        assert!(v["note"].as_str().unwrap().contains("停用"));
+        assert!(app.read_resources().contains("disabled: true"));
+    }
+
+    #[tokio::test]
+    async fn 有余额时新密钥直接可用() {
+        let (_p, app) = app().await;
+        let id = signed_in(&app, "a@b.c").await;
+        app.post_admin(
+            &format!("/admin/users/{id}/grant"),
+            json!({"micro_usd": 5_000_000}),
+        )
+        .await;
+        let (_, body) = app.post("/api/keys", json!({})).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["disabled"], json!(false));
+        assert!(v["note"].is_null());
+    }
+
+    #[tokio::test]
+    async fn 可以铸任意多把_且都绑到本人() {
+        let (_p, app) = app().await;
+        let id = signed_in(&app, "a@b.c").await;
+        for i in 0..4 {
+            let (s, _) = app
+                .post("/api/keys", json!({"label": format!("k{i}")}))
+                .await;
+            assert_eq!(s, 201);
+        }
+        let (_, list) = app.get("/api/keys").await;
+        let v: serde_json::Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(v["keys"].as_array().unwrap().len(), 4);
+        // 每一把都带本人的 user_id —— 少了它，网关的指标打不上标签，
+        // 门户查不到用量，对账环也找不到这把密钥去停用。
+        assert_eq!(app.read_resources().matches(&id).count(), 4);
+    }
+
+    #[tokio::test]
+    async fn 铸密钥不会抹掉配置里门户不认识的东西() {
+        let (_p, app) = app().await;
+        signed_in(&app, "a@b.c").await;
+        app.post("/api/keys", json!({})).await;
+        let yaml = app.read_resources();
+        assert!(yaml.contains("keep-me"), "models 段被抹掉了:\n{yaml}");
+        assert!(yaml.contains("ops"), "运维自己的密钥被抹掉了:\n{yaml}");
+    }
+
+    #[tokio::test]
+    async fn 列表只给本人的密钥() {
+        let (_p, app) = app().await;
+        signed_in(&app, "a@b.c").await;
+        app.post("/api/keys", json!({"label": "A的"})).await;
+
+        signed_in(&app, "b@b.c").await; // 同一个 client，cookie 被覆盖
+        app.post("/api/keys", json!({"label": "B的"})).await;
+
+        let (_, list) = app.get("/api/keys").await;
+        let v: serde_json::Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(
+            v["keys"].as_array().unwrap().len(),
+            1,
+            "看到了别人的密钥: {list}"
+        );
+        assert!(list.contains("B的"));
+        assert!(!list.contains("A的"));
+    }
+
+    #[tokio::test]
+    async fn 只能吊销自己的密钥() {
+        let (_p, app) = app().await;
+        signed_in(&app, "a@b.c").await;
+        let (_, body) = app.post("/api/keys", json!({"label": "A的"})).await;
+        let a_name = serde_json::from_str::<serde_json::Value>(&body).unwrap()["name"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        signed_in(&app, "b@b.c").await;
+        // B 拿着 A 的密钥名去删。少了 user_id 那一半判断，任何登录用户都能
+        // 凭名字删掉别人的密钥 —— 包括运维那些没有 user_id 的。
+        let (s, _) = app.delete(&format!("/api/keys/{a_name}")).await;
+        assert_eq!(s, 404, "B 删掉了 A 的密钥");
+        assert!(app.read_resources().contains("A的"), "A 的密钥被删了");
+    }
+
+    #[tokio::test]
+    async fn 吊销自己的密钥会真的从配置里消失() {
+        let (_p, app) = app().await;
+        signed_in(&app, "a@b.c").await;
+        let (_, body) = app.post("/api/keys", json!({"label": "待删"})).await;
+        let name = serde_json::from_str::<serde_json::Value>(&body).unwrap()["name"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (s, _) = app.delete(&format!("/api/keys/{name}")).await;
+        assert_eq!(s, 200);
+        assert!(!app.read_resources().contains("待删"));
+        // 运维的密钥还在。
+        assert!(app.read_resources().contains("ops"));
     }
 }

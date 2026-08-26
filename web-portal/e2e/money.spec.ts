@@ -13,6 +13,8 @@ import { startMoney, ADMIN_TOKEN, type MoneyFixture } from "./money.fixture";
  */
 
 let fx: MoneyFixture;
+/** 第一条用例铸出来的明文，第二条要用它证明网关认得这把密钥。 */
+let mintedKey = "";
 
 test.describe.configure({ timeout: 180_000 });
 
@@ -45,6 +47,69 @@ async function waitFor(cond: () => Promise<boolean>, label: string, ms = 90_000)
   throw new Error(`超时等待：${label}`);
 }
 
+/** 当前余额。 */
+async function balance(cookie: string): Promise<number> {
+  const b = await fetch(`${fx.portalUrl}/api/balance`, { headers: { cookie } }).then((r) =>
+    r.json(),
+  );
+  return b.balance_micro_usd as number;
+}
+
+// 这一组用例**按声明顺序**跑在同一份夹具上，所以每条都自带前提、不依赖前一条
+// 的残留。第一版让最后一条靠「打请求把余额耗到零」来准备起点 —— 那是错的：
+// 每次调用花 $1，而对账每 15 秒才跑一轮，循环拿着过期的正余额疯狂发请求，把
+// 余额打到很深的负数，之后发放的额度根本填不平。
+
+test("自助建的密钥在零余额时生下来就是停用的_网关据此拒绝", async () => {
+  const cookie = await fx.sessionCookie();
+  // 刚注册，余额为零 —— 这条必须跑在任何发放之前。
+  expect(await balance(cookie)).toBe(0);
+
+  const minted = await fetch(`${fx.portalUrl}/api/keys`, {
+    method: "POST",
+    headers: { cookie, "content-type": "application/json" },
+    body: JSON.stringify({ label: "money-e2e" }),
+  }).then((r) => r.json());
+  expect(minted.plaintext).toMatch(/^sk-aisix-[0-9a-f]{64}$/);
+  expect(minted.disabled).toBe(true);
+
+  // 网关拒绝。此刻 401 还分不清「不认识」与「已停用」——「发放额度后同一把
+  // 密钥转为 200」那条用例才是证明它确实被认出来的地方。
+  expect(await fx.chatWith(minted.plaintext)).toBe(401);
+  mintedKey = minted.plaintext;
+});
+
+test("消费耗尽后密钥被停用_网关随即拒绝_补额后恢复", async () => {
+  // 从零起。给 $1.5：一次调用花 $1，第二次就把余额压成负的。
+  await grant(1_500_000);
+  await waitFor(async () => (await fx.chat()) === 200, "发放后预置密钥可用");
+  expect(await fx.chat()).toBe(200);
+
+  await waitFor(
+    async () => /disabled:\s*true/.test(fx.readResources()),
+    "余额耗尽后密钥被停用",
+  );
+  // 网关读到 disabled 之后必须拒绝 —— 这是整条链路真正闭合的那一步。
+  await waitFor(async () => (await fx.chat()) === 401, "网关拒绝已停用的密钥");
+
+  await grant(20_000_000);
+  await waitFor(async () => (await fx.chat()) === 200, "补额后网关重新放行");
+});
+
+test("同一把自助密钥在有余额后被网关放行_消费记在这个用户名下", async () => {
+  expect(mintedKey, "第一条用例没铸出密钥").toBeTruthy();
+  // 上一条用例结束时余额是正的，所以这把密钥应当已被对账环启用。
+  //
+  // 它能通同时证明三件事：散列算法与网关一致、`user_id` 写对了、SIGHUP 送到了。
+  await waitFor(
+    async () => (await fx.chatWith(mintedKey)) === 200,
+    "自助密钥被网关放行",
+  );
+
+  const metrics = await fetch(fx.metricsUrl).then((r) => r.text());
+  expect(metrics).toContain(`user_id="${fx.userId}"`);
+});
+
 test("真实消费被网关按定价折算并带上_user_id", async () => {
   expect(await fx.chat()).toBe(200);
   const metrics = await fetch(fx.metricsUrl).then((r) => r.text());
@@ -52,31 +117,6 @@ test("真实消费被网关按定价折算并带上_user_id", async () => {
     .split("\n")
     .find((l) => l.startsWith("aisix_llm_spend_micro_usd_total{") && l.includes(fx.userId));
   expect(line, "花费指标里没有这个用户的序列").toBeTruthy();
-  // 1000 输入 + 1000 输出，两边都是 $0.5/1k → 恰好 $1.00 = 1_000_000 micro。
+  // 1000 输入 + 1000 输出，两边都是 $0.5/1k → 每次调用恰好 $1.00。
   expect(Number(line!.slice(line!.lastIndexOf("}") + 1).trim())).toBeGreaterThanOrEqual(1_000_000);
-});
-
-test("消费耗尽后密钥被停用_网关随即拒绝_补额后恢复", async () => {
-  // 给 $1.5：一次调用花 $1，第二次就把余额压成负的。
-  await grant(1_500_000);
-
-  expect(await fx.chat()).toBe(200);
-  expect(await fx.chat()).toBe(200);
-
-  // 对账环把消费入账，余额转负，于是把这把密钥写成 disabled。
-  await waitFor(
-    async () => /disabled:\s*true/.test(fx.readResources()),
-    "余额耗尽后密钥被停用",
-  );
-
-  // 网关读到 disabled 之后必须拒绝 —— 这是整条链路真正闭合的那一步。
-  await waitFor(async () => (await fx.chat()) === 401, "网关拒绝已停用的密钥");
-
-  // 补额后恢复。
-  await grant(10_000_000);
-  await waitFor(
-    async () => !/disabled:\s*true/.test(fx.readResources()),
-    "补额后密钥被重新启用",
-  );
-  await waitFor(async () => (await fx.chat()) === 200, "网关重新放行");
 });
