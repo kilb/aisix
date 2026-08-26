@@ -90,7 +90,7 @@ impl AppState {
             admin_token: admin_token.map(Arc::new),
             prom_url: Arc::new(prom_url),
             resources_path: Arc::new(resources_path),
-            http: reqwest::Client::new(),
+            http: crate::client::outbound(),
             verifications: Arc::new(AtomicU64::new(0)),
         }
     }

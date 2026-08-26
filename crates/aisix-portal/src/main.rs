@@ -10,6 +10,7 @@
 
 mod admin;
 mod auth;
+mod client;
 mod ledger;
 mod resources;
 mod store;

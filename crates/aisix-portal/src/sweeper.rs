@@ -248,7 +248,7 @@ impl PromSource {
     pub fn new(base: String) -> Self {
         Self {
             base,
-            http: reqwest::Client::new(),
+            http: crate::client::outbound(),
         }
     }
 }

@@ -333,11 +333,19 @@ mod tests {
             // instead; `console_client_is_not_left_on_reqwest_defaults`
             // below is what holds it to them.
             let sanctioned_console_site = file.ends_with("aisix-console/src/main.rs");
+            // The portal is in the same position as the console: a separate
+            // binary that never loads gateway config, so `client_builder()`
+            // has no `UpstreamHttpConfig` to read. It pins the same values
+            // literally in one place, and
+            // `portal_client_is_not_left_on_reqwest_defaults` holds it to
+            // them. Scoped to that one file so a bare client anywhere else
+            // in the portal still gets flagged.
+            let sanctioned_portal_site = file.ends_with("aisix-portal/src/client.rs");
             for (n, line) in production.lines().enumerate() {
                 if sanctioned_rmcp_site && line.contains("rmcp_reqwest::Client::") {
                     continue;
                 }
-                if sanctioned_console_site {
+                if sanctioned_console_site || sanctioned_portal_site {
                     continue;
                 }
                 if line.contains("reqwest::Client::builder()")
@@ -392,6 +400,39 @@ mod tests {
                 "the console's outbound client does not set `{setting}` — \
                  reqwest's default there is what the workspace scan exists \
                  to prevent, and the console is exempt from that scan",
+            );
+        }
+    }
+
+    /// The portal's exemption from the scan above is conditional on it
+    /// pinning the same values `client_builder()` would have applied. Same
+    /// reasoning as the console: reqwest's defaults leave no connect
+    /// timeout, TCP keepalive off, and a 90s pooled-connection lifetime that
+    /// outlives a typical hop's idle timeout, which shows up as an
+    /// occasional failure that succeeds on retry.
+    #[test]
+    fn portal_client_is_not_left_on_reqwest_defaults() {
+        let path = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../aisix-portal/src/client.rs"
+        ));
+        let Ok(src) = std::fs::read_to_string(path) else {
+            // The portal is an optional member; absent is not a failure.
+            return;
+        };
+        let production = production_half(&src);
+        for setting in [
+            "connect_timeout(",
+            "tcp_keepalive(",
+            "pool_idle_timeout(",
+            // Redirects off: the portal dials operator-configured addresses,
+            // and following a 302 hands the choice of destination to whoever
+            // answered.
+            "redirect(",
+        ] {
+            assert!(
+                production.contains(setting),
+                "the portal's outbound client does not set `{setting}` —                  reqwest's default there is what the workspace scan exists                  to prevent, and the portal is exempt from that scan",
             );
         }
     }
