@@ -30,7 +30,10 @@
 - **明文凭据只出现一次。** 落库只存散列。
 - **注释用中文，函数必须有类型标注，禁止裸 except / unwrap 在错误路径。**
 - **一期已知限制，须在代码注释中写明，不得假装没有：** 对账读 Prometheus
-  会有漂移（spec §3.1）；超支上界 = 轮询周期内消费 + 在途（spec §3.2）。
+  会有漂移（spec §3.1）；超支上界 = 轮询周期内消费 + 在途（spec §3.2）；
+  会话存在进程内存里，门户重启即全体登出；门户要写 `resources.yaml`，
+  因此必须与控制台同机或共享卷（裁决 2 的部署代价）；`web-portal/` 会重复
+  `web/` 的一整套脚手架，这是 spec §5.1「分进程不分角色」换来的，接受。
 
 ## 一期裁决（spec 未定，此处定死）
 
@@ -59,7 +62,7 @@ Admin API 是只读的，写接口是二期的事（spec §2 缺口 4、§7 二�
 | 文件 | 职责 |
 |---|---|
 | `crates/aisix-portal/Cargo.toml` | 新 crate。不进 workspace deps，与 console 同样自带版本 |
-| `crates/aisix-portal/migrations/0001_init.sql` | users / ledger / sessions 表 |
+| `crates/aisix-portal/migrations/0001_init.sql` | `users` / `ledger` / `consumption_mark` 三张表 |
 | `crates/aisix-portal/src/main.rs` | 进程启动、路由装配、配置读取 |
 | `crates/aisix-portal/src/store.rs` | 数据库访问。**唯一**碰 SQL 的地方 |
 | `crates/aisix-portal/src/auth.rs` | 注册、登录、会话 |
@@ -112,12 +115,19 @@ CREATE TABLE ledger (
 );
 CREATE INDEX ledger_user ON ledger(user_id, id);
 
--- 消费对账的水位线。记录每个用户已计入流水的累计消费额，
--- 下一轮只把「新读到的累计值 − 水位线」入账，避免重复扣。
+-- 消费对账的水位线：记「已经计到哪个时刻」，不是「已经计了多少」。
+--
+-- 这里曾经想记累计额、每轮扣差值 —— 那是错的。花费指标是 counter，而且
+-- **每个网关副本各自暴露一份**；任一副本重启都会让 `sum` 下陷，看起来就像
+-- counter 重置。按累计额做差就会把水位线重新对齐到低点，那一刻起未入账的
+-- 消费永久丢失，且毫无信号：用户白得推理，账面看不出异常。
+--
+-- 改成记时刻后，每轮查 `increase(...[自上次至今])`。`increase()` 是逐时间
+-- 序列处理重置再求和的，跨副本天然安全，也没有缺口或重叠。
 CREATE TABLE consumption_mark (
-  user_id             TEXT PRIMARY KEY REFERENCES users(id),
-  counted_micro_usd   INTEGER NOT NULL,
-  updated_at          TEXT NOT NULL
+  user_id         TEXT PRIMARY KEY REFERENCES users(id),
+  counted_through TEXT NOT NULL,           -- RFC3339，已计入流水的截止时刻
+  updated_at      TEXT NOT NULL
 );
 ```
 
@@ -146,6 +156,15 @@ async fn 同一邮箱不能注册两次() {
 `cargo test -p aisix-portal` → 编译失败（`Store` 不存在）
 
 - [ ] **Step 4：实现 `Store`**，`open` / `open_memory` 应用 migrations
+
+两个 SQLite 的坑必须在这一步就踩平，否则 Task 4 的并发测试会给出莫名其妙
+的结果或间歇失败：
+
+- `open_memory` 必须用 `file::memory:?cache=shared`（或把连接池限成
+  `max_connections(1)`）。默认的 `sqlite::memory:` 下**每条池连接拿到各自
+  独立的库**，并发测试根本不在同一个数据库上跑。
+- 连接串须设 `busy_timeout`（建议 5s）。并发写入撞 `SQLITE_BUSY` 是常态，
+  不设就是一条 flaky 测试 —— 而 flaky 不许靠放宽断言收场。
 - [ ] **Step 5：跑测试确认通过**
 - [ ] **Step 6：提交** `feat(portal): user and ledger schema`
 
@@ -281,6 +300,17 @@ async fn 并发的充值与扣减不丢钱() {
 }
 
 #[tokio::test]
+async fn 扣到负数仍然入账_不能因余额不足而丢弃这笔消费() {
+    let l = test_ledger().await;
+    l.credit("u1", 1_000, "admin_grant", None).await.unwrap();
+    // 消费已经发生了，钱已经花出去了。按直觉写成「余额不足则拒绝」，
+    // 这笔就永远不入账 —— 又是一次静默白送。超支是被接受的（spec §3.2），
+    // 账本必须如实记到负数，由控制环去停用密钥。
+    l.debit("u1", 2_500, "consumption", None).await.unwrap();
+    assert_eq!(l.balance("u1").await.unwrap(), -1_500);
+}
+
+#[tokio::test]
 async fn 流水只追加_扣减不改写既有行() {
     let l = test_ledger().await;
     l.credit("u1", 1_000, "admin_grant", None).await.unwrap();
@@ -336,6 +366,17 @@ async fn 发放额度会落成一条可审计的流水() {
 }
 
 #[tokio::test]
+async fn 发放对象只能来自用户列表_不接受手输的任意标识() {
+    let app = test_app().await;
+    // 一期密钥由管理员手工创建并填 user_id。手输一个 uuid 填错一个字符，
+    // 网关照常放行、指标打的是错标签、门户查不到用量 —— 于是**永不扣款**，
+    // 用户免费用而没人会发现。发放端因此只接受已存在的用户 id。
+    let r = post_admin(&app, "/admin/users/not-a-real-user/grant",
+        json!({"micro_usd": 1_000_000})).await;
+    assert_eq!(r.status, 404);
+}
+
+#[tokio::test]
 async fn 发放负数被拒_而不是变成扣款() {
     let app = test_app().await;
     let id = register(&app, "a@b.c", "correct horse battery").await;
@@ -346,7 +387,8 @@ async fn 发放负数被拒_而不是变成扣款() {
 ```
 
 - [ ] **Step 2：跑测试确认失败**
-- [ ] **Step 3：实现**
+- [ ] **Step 3：实现**。`GET /admin/users` 返回列表供管理界面**选择**；
+      发放端校验 user 存在，否则 404
 - [ ] **Step 4：跑测试确认通过**
 - [ ] **Step 5：提交** `feat(portal): admin user listing and quota grants`
 
@@ -393,8 +435,24 @@ async fn 发往_prometheus_的查询里带的是会话用户的_id() {
 - [ ] **Step 2：跑测试确认失败**
 - [ ] **Step 3：实现**。查询模板写死在服务端，只有 `user_id` 与
       `range_hours` 是参数；`user_id` 须做 PromQL 标签值转义
-- [ ] **Step 4：跑测试确认通过**
-- [ ] **Step 5：提交** `feat(portal): tenant-scoped usage queries`
+
+- [ ] **Step 4：把「没有密钥绑到我」变成可见状态**
+
+```rust
+#[tokio::test]
+async fn 没有密钥携带本人_user_id_时明确报出未绑定() {
+    let app = test_app_with_config_without_my_key().await;
+    let s = register_and_login(&app, "a@b.c").await;
+    let r = get_with_session(&app, "/api/usage?range_hours=24", &s).await;
+    // 这是 user_id 填错时唯一能被人看见的地方。没有这条，管理员打错一个
+    // 字符的后果就是「用量一直是 0」—— 跟「还没开始用」在屏幕上没有区别，
+    // 而它实际意味着这个人在免费用。
+    assert_eq!(r.json["linked_keys"], json!(0));
+    assert!(r.body_text.contains("未绑定"));
+}
+```
+- [ ] **Step 5：跑测试确认通过**
+- [ ] **Step 6：提交** `feat(portal): tenant-scoped usage queries`
 
 ---
 
@@ -411,45 +469,80 @@ async fn 发往_prometheus_的查询里带的是会话用户的_id() {
 
 ```rust
 #[tokio::test]
-async fn 只把新增的消费入账_不重复扣() {
+async fn 按时间窗查增量_而不是在累计值上做差() {
     let s = test_sweeper().await;
     s.ledger.credit("u1", 5_000_000, "admin_grant", None).await.unwrap();
 
-    s.prom.set_cumulative("u1", 1_000_000);
+    // 夹具按「时间窗 → 增量」应答，正是 increase() 的语义。
+    s.prom.set_increase("u1", 1_000_000);
     s.tick().await.unwrap();
     assert_eq!(s.ledger.balance("u1").await.unwrap(), 4_000_000);
 
-    // 累计值没变，第二轮不该再扣一次——水位线的全部意义在此。
+    // 这一轮窗口内没有新增量，不该再扣。
+    s.prom.set_increase("u1", 0);
     s.tick().await.unwrap();
     assert_eq!(s.ledger.balance("u1").await.unwrap(), 4_000_000);
-
-    s.prom.set_cumulative("u1", 1_250_000);
-    s.tick().await.unwrap();
-    assert_eq!(s.ledger.balance("u1").await.unwrap(), 3_750_000);
 }
 
 #[tokio::test]
-async fn 累计值回退时不入账_并且报出来() {
+async fn 查询窗口从水位线接到当前_不留缺口也不重叠() {
     let s = test_sweeper().await;
     s.ledger.credit("u1", 5_000_000, "admin_grant", None).await.unwrap();
-    s.prom.set_cumulative("u1", 1_000_000);
+
+    s.clock.set("2026-08-26T10:00:00Z");
+    s.tick().await.unwrap();
+    // 停摆 10 分钟后再跑一轮：窗口必须覆盖整段空档，
+    // 否则停摆期间的消费就永远不入账了。
+    s.clock.set("2026-08-26T10:10:00Z");
     s.tick().await.unwrap();
 
-    // 网关重启会让 counter 归零。差值为负时**绝不能**倒贴钱给用户。
-    s.prom.set_cumulative("u1", 200_000);
+    let w = s.prom.last_window();
+    assert_eq!(w.from, "2026-08-26T10:00:00Z");
+    assert_eq!(w.to,   "2026-08-26T10:10:00Z");
+}
+
+#[tokio::test]
+async fn 副本重启不会让这轮少扣钱() {
+    // 花费指标是 counter，每个网关副本各自一份。以前的写法在累计值上做差，
+    // 任一副本重启导致 sum 下陷时会被当成「重置」而重新对齐水位线，
+    // 未入账的消费就永久丢了 —— 静默、且方向永远对用户有利。
+    //
+    // increase() 是逐序列处理重置后再求和的，所以副本重启对这一轮的
+    // 增量没有影响。这条测试钉的就是「不再有重新对齐这回事」。
+    let s = test_sweeper().await;
+    s.ledger.credit("u1", 5_000_000, "admin_grant", None).await.unwrap();
+    s.prom.set_increase("u1", 800_000);
+    s.prom.simulate_replica_restart();      // 其中一个副本的 counter 归零
     s.tick().await.unwrap();
-    assert_eq!(s.ledger.balance("u1").await.unwrap(), 4_000_000);
-    assert_eq!(s.counter_resets(), 1);
+    assert_eq!(s.ledger.balance("u1").await.unwrap(), 4_200_000);
+    // 水位线只会前进。
+    assert!(s.counted_through("u1") > s.clock.previous());
+}
+
+#[tokio::test]
+async fn 读取失败时水位线不前进() {
+    let s = test_sweeper().await;
+    s.ledger.credit("u1", 5_000_000, "admin_grant", None).await.unwrap();
+    s.clock.set("2026-08-26T10:00:00Z");
+    s.tick().await.unwrap();
+    let mark = s.counted_through("u1");
+
+    // Prometheus 读不到就必须原地不动。若此时把水位线推到当前时刻，
+    // 这段时间的消费就被跳过了 —— 又是一次静默白送。
+    s.prom.fail_next();
+    s.clock.set("2026-08-26T10:05:00Z");
+    assert!(s.tick().await.is_err());
+    assert_eq!(s.counted_through("u1"), mark);
 }
 
 #[tokio::test]
 async fn 余额归零会把该用户的密钥置_disabled() {
-    let s = test_sweeper_with_config().await;   // 配置里有一把 user_id=u1 的密钥
+    let s = test_sweeper_with_config().await;   // 配置里有 user_id=u1 与 u2 两把密钥
     s.ledger.credit("u1", 1_000_000, "admin_grant", None).await.unwrap();
-    s.prom.set_cumulative("u1", 1_200_000);
+    s.prom.set_increase("u1", 1_200_000);
     s.tick().await.unwrap();
 
-    assert!(s.ledger.balance("u1").await.unwrap() <= 0);
+    assert!(s.ledger.balance("u1").await.unwrap() < 0);
     let doc = s.read_resources();
     assert_eq!(doc.key_with_user("u1").disabled, true);
     // 别人的密钥不许被碰。
@@ -460,20 +553,23 @@ async fn 余额归零会把该用户的密钥置_disabled() {
 async fn 补上余额后密钥被重新启用() {
     let s = test_sweeper_with_config().await;
     s.ledger.credit("u1", 1_000_000, "admin_grant", None).await.unwrap();
-    s.prom.set_cumulative("u1", 1_200_000);
+    s.prom.set_increase("u1", 1_200_000);
     s.tick().await.unwrap();
     assert_eq!(s.read_resources().key_with_user("u1").disabled, true);
 
     s.ledger.credit("u1", 5_000_000, "admin_grant", None).await.unwrap();
+    s.prom.set_increase("u1", 0);
     s.tick().await.unwrap();
     assert_eq!(s.read_resources().key_with_user("u1").disabled, false);
 }
 ```
 
 - [ ] **Step 2：跑测试确认失败**
-- [ ] **Step 3：实现**。写 `resources.yaml` 用与控制台相同的内容散列乐观并发，
-      撞版本重读重试（裁决 2）；轮询周期默认 15 秒（spec §3.2）；
-      counter 回退只记 `counter_resets` 并把水位线降到新值，不入账
+- [ ] **Step 3：实现**。每轮按
+      `sum(increase(aisix_llm_spend_micro_usd_total{user_id="X"}[<counted_through→now>]))`
+      取增量；**水位线只在入账成功后前进，读取失败原地不动**；写
+      `resources.yaml` 用与控制台相同的内容散列乐观并发，撞版本重读重试
+      （裁决 2）；轮询周期默认 15 秒（spec §3.2）
 - [ ] **Step 4：跑测试确认通过**
 - [ ] **Step 5：提交** `feat(portal): reconciliation sweeper`
 
@@ -497,30 +593,45 @@ async fn 补上余额后密钥被重新启用() {
 
 ---
 
-### Task 9：E2E
+### Task 9：E2E（两层，都跑真后端）
 
 **Files:**
+- Create: `tests/e2e/src/cases/portal-quota.spec.ts`
 - Create: `web-portal/e2e/fixture.ts`、`web-portal/e2e/portal.spec.ts`
+
+计划初稿在这里留了个洞：要求覆盖「消费耗尽 → 密钥被停用」，却没说消费从哪来。
+按仓库既有惯例解决 —— `tests/e2e/src/harness` 已经提供 `startOpenAiUpstream`
+等桩上游，全部 e2e 都是**真网关 + 真 etcd + 本地桩上游**。只有 LLM 供应商是
+桩（对着付费接口打不出确定性的流量），网关、指标、花费全是真的。不自创第二套。
+
+**第一层 · 钱路（`tests/e2e/`，无浏览器）**
+
+用既有 harness 起真网关，打真请求产生真花费，断言控制环确实扣了钱、确实停了密钥。
+
+- [ ] **Step 1** 沿用 harness 起网关 + `startOpenAiUpstream`，seed 一把
+      `user_id=u1` 的密钥与带定价的模型；readiness gate 按 `AGENTS.md`
+      的规矩放在**最后 seed 的那把密钥**上
+- [ ] **Step 2** 起门户，发放少量额度
+- [ ] **Step 3** 打真请求直到超出额度
+- [ ] **Step 4** 断言：账本余额转负、`resources.yaml` 里 u1 的密钥
+      `disabled: true`、u2 的**没被碰**
+- [ ] **Step 5** 补额后断言恢复
+
+**第二层 · 人路（`web-portal/e2e/`，Playwright）**
 
 对照 `web/e2e/fixture.ts`：拉起**真实** `aisix-portal` 进程与 `vite preview`，
 随机空闲端口，`--host 127.0.0.1`。
 
-- [ ] **Step 1：夹具拉起真后端**
-- [ ] **Step 2：写用例**
+- [ ] **Step 6** 注册 → 登录 → 余额为 0 → 管理员发放 → 余额可见
+- [ ] **Step 7** 隔离用例：**两个用户各自登录，A 无论换什么参数都读不到 B
+      的任何数字**
+- [ ] **Step 8** 未绑定密钥时页面明确显示「未绑定」（H2 的可见性那一半）
 
-必须覆盖的真实路径：
-
-```
-注册 → 登录 → 余额为 0 → 管理员发放 → 余额可见 →
-用量页只显示自己的数 → 消费耗尽 → 密钥被停用 → 补额 → 恢复
-```
-
-以及一条隔离用例：**两个用户各自登录，A 无论如何都读不到 B 的任何数字。**
-
-- [ ] **Step 3：全绿**
-- [ ] **Step 4：对每条新用例做 RED 校验**（改坏产品代码，确认用例会红；
-      用**完整未过滤输出**核对，不要 grep 掉编译错误）
-- [ ] **Step 5：提交** `test(portal): end-to-end coverage`
+- [ ] **Step 9：全绿**
+- [ ] **Step 10：对每条新用例做 RED 校验**（改坏产品代码，确认用例会红；
+      用**完整未过滤输出**核对 —— 编译错误会被 grep 掉，读到的 "ok" 是上一次
+      的陈旧结果，这个坑本会话踩过两次）
+- [ ] **Step 11：提交** `test(portal): end-to-end coverage`
 
 ---
 
@@ -540,3 +651,15 @@ async fn 补上余额后密钥被重新启用() {
 **已知不足（有意留下，不是遗漏）：** 一期结束时用户**还不能自助生成密钥**，
 必须由管理员在控制台手工创建并填 `user_id`。因此一期交付的是"身份与钱的底座"
 而非终端可用的产品；二期补上密钥自助后才形成完整闭环。
+
+**审计后的修订（2026-08-26）：** 初稿有两处会**静默丢钱**的缺陷，已修：
+
+1. 对账原本在累计 counter 上做差。花费指标每个网关副本各自一份，任一副本
+   重启都会让 `sum` 下陷、被当成重置而重新对齐水位线，未入账的消费永久丢失
+   且毫无信号。改为按时间窗查 `increase()`（逐序列处理重置后再求和），水位线
+   改记时刻、且只在入账成功后前进。Task 1 的表与 Task 7 的全部测试随之重写。
+2. `user_id` 由管理员手输，错一个字符就是永不扣款的免费用户。发放端改为只接受
+   已存在的用户 id，门户增加「未绑定密钥」的显式状态，让静默失败变成可见状态。
+
+另修：扣减必须允许余额为负（否则超出的那笔消费会被丢弃，又是白送）；
+E2E 补上了「消费从哪来」的答案，沿用仓库既有 harness 的真网关 + 桩上游。
