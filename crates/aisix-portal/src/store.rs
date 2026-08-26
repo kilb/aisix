@@ -136,6 +136,26 @@ impl Store {
         )
     }
 
+    /// 全部用户，按注册时间。管理端据此提供**选择**而不是手输。
+    pub async fn all_users(&self) -> Result<Vec<User>, StoreError> {
+        let rows: Vec<(String, String, String, Option<String>, i64)> = sqlx::query_as(
+            "SELECT id, email, password_hash, display_name, disabled
+             FROM users ORDER BY created_at, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, email, password_hash, display_name, disabled)| User {
+                id,
+                email,
+                password_hash,
+                display_name,
+                disabled: disabled != 0,
+            })
+            .collect())
+    }
+
     pub async fn user_by_id(&self, id: &str) -> Result<Option<User>, StoreError> {
         let row: Option<(String, String, String, Option<String>, i64)> = sqlx::query_as(
             "SELECT id, email, password_hash, display_name, disabled

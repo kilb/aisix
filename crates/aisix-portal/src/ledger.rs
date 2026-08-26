@@ -22,13 +22,15 @@ pub struct Entry {
     pub note: Option<String>,
 }
 
-/// 记账来源。写成枚举而不是裸字符串，是因为四期接支付时要新增一种来源，
-/// 而账本的 credit 操作不该为此重写（spec §8 未决问题 1）。
+/// 记账来源。枚举而不是裸字符串，四期接支付时加一个变体即可，credit 路径
+/// 不用改（spec §8 未决问题 1）。
+///
+/// `Payment` 有意**现在不加**：四期不在本计划内，提前放一个永远构造不到的
+/// 变体只会挂着一条 dead_code 警告。要用的时候再加。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     AdminGrant,
     Consumption,
-    Payment,
 }
 
 impl Source {
@@ -36,7 +38,6 @@ impl Source {
         match self {
             Self::AdminGrant => "admin_grant",
             Self::Consumption => "consumption",
-            Self::Payment => "payment",
         }
     }
 }

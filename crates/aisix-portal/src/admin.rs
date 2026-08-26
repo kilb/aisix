@@ -1,0 +1,149 @@
+//! 管理端 API：列出用户、发放额度。
+//!
+//! 归门户所有，不归控制台（计划裁决 3）：用户库只能有一个写入者。控制台的
+//! 管理界面通过这里访问。
+//!
+//! 凭据与用户会话**完全分离**：一个合法的用户会话打不开这里。角色判断错一次
+//! 就是全量泄漏，所以这里认的是另一套东西（`PORTAL_ADMIN_TOKEN`），而不是在
+//! 同一套会话上挂一个 is_admin 标志。
+
+use axum::extract::{Path, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde::Deserialize;
+use serde_json::json;
+
+use crate::auth::AppState;
+use crate::ledger::{Ledger, Source};
+
+/// 校验管理凭据。用常量时间比较，避免把 token 的前缀猜出来。
+fn admin_ok(st: &AppState, headers: &HeaderMap) -> bool {
+    let Some(expected) = st.admin_token() else {
+        // 没配管理凭据就整个关掉，而不是放行。默认拒绝。
+        return false;
+    };
+    let Some(got) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    else {
+        return false;
+    };
+    constant_time_eq(got.as_bytes(), expected.as_bytes())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn forbidden() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": "需要管理凭据"})),
+    )
+        .into_response()
+}
+
+/// `GET /admin/users`
+///
+/// 管理界面据此**选择**发放对象，而不是让人手输 user_id。手输一个 uuid 错一个
+/// 字符，网关照常放行、指标打错标签、门户查不到用量 —— 于是永不扣款，用户免费
+/// 用而没人会发现。让界面从这份列表里选，那条路就不存在。
+pub async fn list_users(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if !admin_ok(&st, &headers) {
+        return forbidden();
+    }
+    let ledger = Ledger::new(st.store.clone());
+    match st.store.all_users().await {
+        Ok(users) => {
+            let mut out = Vec::with_capacity(users.len());
+            for u in users {
+                let balance = ledger.balance(&u.id).await.unwrap_or(0);
+                out.push(json!({
+                    "user_id": u.id,
+                    "email": u.email,
+                    "display_name": u.display_name,
+                    "disabled": u.disabled,
+                    "balance_micro_usd": balance,
+                }));
+            }
+            Json(json!({"users": out})).into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "读取失败"})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct GrantReq {
+    /// 有意用 `i64` 而不是 `u64`：负数要能进来，才能被明确拒绝并回 400。
+    /// 收成 u64 的话反序列化会先失败，错误信息对调用方毫无意义。
+    pub micro_usd: i64,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// `POST /admin/users/:id/grant`
+pub async fn grant(
+    State(st): State<AppState>,
+    Path(user_id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<GrantReq>,
+) -> Response {
+    if !admin_ok(&st, &headers) {
+        return forbidden();
+    }
+    if req.micro_usd <= 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "发放金额必须为正"})),
+        )
+            .into_response();
+    }
+    // 发放对象必须是已存在的用户。挡住手输错 id 的那条路。
+    match st.store.user_by_id(&user_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "没有这个用户"})),
+            )
+                .into_response()
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "读取失败"})),
+            )
+                .into_response()
+        }
+    }
+
+    let ledger = Ledger::new(st.store.clone());
+    match ledger
+        .credit(
+            &user_id,
+            req.micro_usd as u64,
+            Source::AdminGrant,
+            req.note.as_deref(),
+        )
+        .await
+    {
+        Ok(()) => {
+            let balance = ledger.balance(&user_id).await.unwrap_or(0);
+            Json(json!({"ok": true, "balance_micro_usd": balance})).into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "记账失败"})),
+        )
+            .into_response(),
+    }
+}

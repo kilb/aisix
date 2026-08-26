@@ -40,6 +40,8 @@ pub struct AppState {
     gate: Arc<Semaphore>,
     /// 账号不存在时拿来「校验」的假散列，用于抹平计时差。
     dummy_hash: Arc<String>,
+    /// 管理凭据。`None` = 未配置，此时管理端整个关闭（默认拒绝）。
+    admin_token: Option<Arc<String>>,
     /// 实际执行过的 argon2 校验次数。让「不存在的账号也走了校验」这件事
     /// 可以被确定性地断言，而不必去测时间（那种测试必然是 flaky 的）。
     verifications: Arc<AtomicU64>,
@@ -47,6 +49,14 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(store: Store, gate_permits: usize) -> Self {
+        Self::with_admin_token(store, gate_permits, None)
+    }
+
+    pub fn with_admin_token(
+        store: Store,
+        gate_permits: usize,
+        admin_token: Option<String>,
+    ) -> Self {
         // 启动时算一次。内容无所谓，只要是一个合法的 argon2 PHC 串，
         // 校验它的开销与校验真散列同量级。
         let dummy =
@@ -56,8 +66,13 @@ impl AppState {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             gate: Arc::new(Semaphore::new(gate_permits)),
             dummy_hash: Arc::new(dummy),
+            admin_token: admin_token.map(Arc::new),
             verifications: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub fn admin_token(&self) -> Option<&str> {
+        self.admin_token.as_deref().map(String::as_str)
     }
 
     /// 当前会话对应的 `user_id`，未登录则 `None`。顺手清掉过期项。
