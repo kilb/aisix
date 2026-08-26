@@ -1,0 +1,19 @@
+[package]
+name = "aisix-portal"
+version = "0.1.0"
+edition = "2021"
+
+# 与 crates/aisix-console 一样自带版本，不进 workspace deps：
+# 门户是独立进程，它的依赖不该压到网关那些 crate 头上。
+[dependencies]
+argon2 = "0.5.3"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 选 sqlx 而非 rusqlite：异步，与 axum/tokio 一致，不必 spawn_blocking；
+# 换 Postgres 只需改 feature 与连接串（spec §8 把多实例门户列为未定）。
+# 用运行时查询而不是编译期宏，避免构建时依赖 DATABASE_URL。
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-none", "sqlite", "macros", "migrate"] }
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }

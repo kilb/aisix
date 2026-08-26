@@ -157,14 +157,15 @@ async fn 同一邮箱不能注册两次() {
 
 - [ ] **Step 4：实现 `Store`**，`open` / `open_memory` 应用 migrations
 
-两个 SQLite 的坑必须在这一步就踩平，否则 Task 4 的并发测试会给出莫名其妙
-的结果或间歇失败：
-
-- `open_memory` 必须用 `file::memory:?cache=shared`（或把连接池限成
-  `max_connections(1)`）。默认的 `sqlite::memory:` 下**每条池连接拿到各自
-  独立的库**，并发测试根本不在同一个数据库上跑。
 - 连接串须设 `busy_timeout`（建议 5s）。并发写入撞 `SQLITE_BUSY` 是常态，
   不设就是一条 flaky 测试 —— 而 flaky 不许靠放宽断言收场。
+
+**订正（实施时实测推翻了审计的一条结论）：** 审计曾断言 `open_memory` 必须
+自己拼 `cache=shared`，否则每条池连接拿到各自独立的库。**在 sqlx 0.8 上这是
+错的**——探针实测 `sqlite::memory:` 下同一个池的多条连接共享同一个库
+（`池 size=2`、另一条连接能读到）、不同池之间隔离。那条结论来自一般经验而
+未对着本仓库的版本验证，绕路代码已删。留一条守卫测试盯住「同池共享」这个
+Task 4 依赖的性质。
 - [ ] **Step 5：跑测试确认通过**
 - [ ] **Step 6：提交** `feat(portal): user and ledger schema`
 
