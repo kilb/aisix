@@ -143,6 +143,29 @@ impl<S: ConsumptionSource> Sweeper<S> {
         Ok(())
     }
 
+    /// 写完配置后让网关重载。
+    ///
+    /// **不做这一步的话闸刀是空的。** 文件模式下网关只在 SIGHUP 时重新读
+    /// `resources_file`（`crates/aisix-server/src/main.rs` 的 SIGHUP 处理，
+    /// 没有文件监听）。少了信号，门户会尽职地写下 `disabled: true`、账面显示
+    /// 负余额，而客户被无限期继续服务 —— 又一个静默的免费推理洞，与本期开头
+    /// 那两个同类。计划的裁决 2 只说了「门户写 resources.yaml」，漏了谁通知
+    /// 网关，是 e2e 打真流量时才撞出来的。
+    ///
+    /// 做法与 `crates/aisix-console` 一致：`pkill -HUP -x aisix`。二期改走
+    /// Admin API 写 etcd 之后，watch 会自动传播，这一步随之消失。
+    async fn signal_reload(&self) {
+        let out = tokio::process::Command::new("pkill")
+            .args(["-HUP", "-x", "aisix"])
+            .output()
+            .await;
+        // 配置已经落盘了。信号没送到只是「还没热加载」，不该当成写入失败 ——
+        // 但必须报出来，否则闸刀失效这件事无处可查。
+        if !matches!(&out, Ok(o) if o.status.success()) {
+            eprintln!("已改写 resources.yaml，但 SIGHUP 未送达：网关仍在用旧配置");
+        }
+    }
+
     /// 把期望的启停状态落到 `resources.yaml`。返回 (新停用数, 新启用数)。
     ///
     /// 用泛型 `Value` 做局部修改，**不经过窄结构体** —— 那会把网关配置里门户
@@ -205,6 +228,7 @@ impl<S: ConsumptionSource> Sweeper<S> {
             if tokio::fs::write(&self.resources_path, out).await.is_err() {
                 return (0, 0);
             }
+            self.signal_reload().await;
             return (off, on);
         }
         (0, 0)

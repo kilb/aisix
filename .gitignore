@@ -45,3 +45,9 @@ coverage/
 
 # SDD 执行工作区（ledger / brief / review package），不入库
 .superpowers/
+
+# 门户前端的构建与测试产物
+web-portal/node_modules/
+web-portal/dist/
+web-portal/test-results/
+web-portal/playwright-report/
