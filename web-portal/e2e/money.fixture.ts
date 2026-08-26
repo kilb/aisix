@@ -22,6 +22,25 @@ const PORTAL_BIN = join(process.cwd(), "..", "target", "debug", "aisix-portal");
 export const ADMIN_TOKEN = "e2e-money-admin";
 export const CALLER_KEY = "e2e-caller-plaintext-key-0001";
 
+/**
+ * 停掉一个子进程连同它 fork 出来的。
+ *
+ * `detached: true` 让子进程自成进程组，`kill(-pid)` 才能把整组带走。只杀 pid
+ * 的话 `npx` 外壳下面那个真正的 server 会活下来变成孤儿。
+ */
+function killTree(p: ChildProcess): void {
+  if (p.pid === undefined) return;
+  try {
+    process.kill(-p.pid, "SIGTERM");
+  } catch {
+    try {
+      p.kill("SIGTERM");
+    } catch {
+      /* 已经退了 */
+    }
+  }
+}
+
 async function freePort(): Promise<number> {
   return new Promise((res, rej) => {
     const s = netServer();
@@ -232,7 +251,7 @@ observability:
       return c;
     },
     stop() {
-      for (const p of procs) p.kill("SIGTERM");
+      for (const p of procs) killTree(p);
       for (const s of servers) s.close();
       rmSync(dir, { recursive: true, force: true });
     },

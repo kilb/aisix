@@ -16,6 +16,25 @@ const PORTAL_BIN = join(process.cwd(), "..", "target", "debug", "aisix-portal");
 export const PASSWORD = "correct horse battery";
 export const ADMIN_TOKEN = "e2e-portal-admin-token";
 
+/**
+ * 停掉一个子进程连同它 fork 出来的。
+ *
+ * `detached: true` 让子进程自成进程组，`kill(-pid)` 才能把整组带走。只杀 pid
+ * 的话 `npx` 外壳下面那个真正的 server 会活下来变成孤儿。
+ */
+function killTree(p: ChildProcess): void {
+  if (p.pid === undefined) return;
+  try {
+    process.kill(-p.pid, "SIGTERM");
+  } catch {
+    try {
+      p.kill("SIGTERM");
+    } catch {
+      /* 已经退了 */
+    }
+  }
+}
+
 async function freePort(): Promise<number> {
   return new Promise((res, rej) => {
     const s = netServer();
@@ -54,7 +73,32 @@ export interface Fixture {
   stop(): void;
 }
 
+/**
+ * 确认 `dist/` 是按根路径构建的。
+ *
+ * 生产构建用 `PORTAL_BASE=/portal/`，产物里的资源路径变成 `/portal/assets/...`，
+ * 而 `vite preview` 会照着 base 提供服务 —— 用例访问根路径就什么都加载不出来，
+ * 于是每一条都等到超时。那种失败长得跟真 bug 一样，实测查了很久。
+ *
+ * 所以在这里当场失败并说清怎么修，而不是让它挂十分钟。
+ */
+function assertRootBuild(): void {
+  const html = join(process.cwd(), "dist", "index.html");
+  let body: string;
+  try {
+    body = readFileSync(html, "utf8");
+  } catch {
+    throw new Error("没有 dist/：先跑 `npm run build`");
+  }
+  if (/(src|href)="\/portal\//.test(body)) {
+    throw new Error(
+      "dist/ 是按 /portal/ 构建的（生产用），e2e 需要根路径构建：重跑 `npm run build`",
+    );
+  }
+}
+
 export async function start(): Promise<Fixture> {
+  assertRootBuild();
   const dir = mkdtempSync(join(tmpdir(), "aisix-portal-e2e-"));
   const resourcesPath = join(dir, "resources.yaml");
   writeFileSync(resourcesPath, "api_keys: []\n");
@@ -96,7 +140,14 @@ export async function start(): Promise<Fixture> {
     spawn(
       "npx",
       ["vite", "preview", "--port", String(webPort), "--strictPort", "--host", "127.0.0.1"],
-      { env: { ...process.env, PORTAL_ORIGIN: portalUrl }, stdio: "inherit" },
+      {
+        env: { ...process.env, PORTAL_ORIGIN: portalUrl },
+        stdio: "inherit",
+        // `npx vite preview` 只是外壳，真正的 server 是它 fork 出来的子进程。
+        // 杀外壳会留下孤儿，每跑一轮漏一批 —— 实测攒到 60 个之后整台机器变慢，
+        // 症状是 e2e 无端超时，长得跟真 bug 一样。放进独立进程组，按组杀。
+        detached: true,
+      },
     ),
   );
   const previewUrl = `http://127.0.0.1:${webPort}`;
@@ -109,7 +160,7 @@ export async function start(): Promise<Fixture> {
     readResources: () => readFileSync(resourcesPath, "utf8"),
     writeResources: (b: string) => writeFileSync(resourcesPath, b),
     stop: () => {
-      for (const p of procs) p.kill("SIGTERM");
+      for (const p of procs) killTree(p);
       prom.close();
       rmSync(dir, { recursive: true, force: true });
     },

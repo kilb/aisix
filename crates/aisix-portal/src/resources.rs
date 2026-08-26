@@ -14,6 +14,17 @@
 //!
 //! 绝不能把整份配置反序列化进门户认识的窄结构体再写回去 —— 那会把网关配置里
 //! 门户不认识的字段全部抹掉（模型、供应商、限流策略、守卫……）。
+//!
+//! # 注释保不住
+//!
+//! 泛型 `Value` 保住了所有**字段**，但 YAML 注释不是字段：反序列化再序列化
+//! 会把它们全部吃掉。这在生产上真的发生过一次 —— 那份 `resources.yaml` 顶上
+//! 有十几行注释掉的示例（怎么加 provider_keys、怎么用 `${VAR}` 从 env 读密钥），
+//! 门户第一次铸密钥就把它们清空了，而且不报错。
+//!
+//! 修不掉：要保注释得做定点文本编辑，对任意 YAML 正确实现的代价远超收益。
+//! 所以改成让这件事**在每次重写之后仍然可见** —— [`BANNER`] 会被重新写到文件
+//! 顶部，明确告诉下一个打开它的人：这里的注释留不住，说明写到别处去。
 
 use std::sync::Arc;
 
@@ -36,6 +47,17 @@ pub struct KeyRow {
     pub masked_hash: String,
     pub disabled: bool,
 }
+
+/// 每次重写后放回文件顶部的说明。
+///
+/// 序列化会吃掉文件里所有注释，包括上一次写的这段横幅，所以每次都要重新写。
+/// 它存在的意义是：让「这个文件由机器改写、注释留不住」这件事在文件自己身上
+/// 说出来，而不是指望运维记得。
+const BANNER: &str = "\
+# 这个文件由机器改写：控制台保存配置、门户铸密钥与停用密钥都会重写它。\n\
+# 重写走 YAML 反序列化再序列化，**注释不会保留**。要写给人看的说明，请放在\n\
+# 同目录的 resources.README 里，不要放在这个文件里。\n\
+\n";
 
 /// 独占写这个文件的闸口。
 #[derive(Clone)]
@@ -97,8 +119,10 @@ impl Writer {
             if self.read().await? != before {
                 continue;
             }
-            let out =
+            let body =
                 serde_yaml_ng::to_string(&doc).map_err(|e| WriteError::Parse(e.to_string()))?;
+            // 横幅重新写回顶部：序列化吃掉了所有注释，包括上一次的横幅。
+            let out = format!("{BANNER}{body}");
             tokio::fs::write(&*self.path, out)
                 .await
                 .map_err(|e| WriteError::Io(e.to_string()))?;
@@ -270,5 +294,61 @@ api_keys:
         assert!(api_keys_mut(&mut doc).is_empty());
         // 而且不能把 models 弄丢。
         assert!(doc.get("models").is_some());
+    }
+}
+
+#[cfg(test)]
+mod banner_tests {
+    use super::*;
+
+    async fn writer_with(body: &str) -> (Writer, String) {
+        let path = std::env::temp_dir()
+            .join(format!("aisix-banner-{}.yaml", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .to_string();
+        std::fs::write(&path, body).unwrap();
+        (Writer::new(path.clone()), path)
+    }
+
+    #[tokio::test]
+    async fn 每次重写都把横幅放回顶部() {
+        let (w, path) = writer_with("api_keys: []\n").await;
+        w.edit(|doc| {
+            api_keys_mut(doc).push(serde_yaml_ng::Value::from("x"));
+            true
+        })
+        .await
+        .unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.starts_with("# 这个文件由机器改写"), "{after}");
+        // 序列化会吃掉上一次的横幅，所以第二次写也必须放回去，且只有一份。
+        w.edit(|doc| {
+            api_keys_mut(doc).push(serde_yaml_ng::Value::from("y"));
+            true
+        })
+        .await
+        .unwrap();
+        let twice = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(twice.matches("这个文件由机器改写").count(), 1, "{twice}");
+    }
+
+    #[tokio::test]
+    async fn 带横幅的文件仍然能被解析回来() {
+        let (w, path) = writer_with("api_keys: []\n").await;
+        w.edit(|doc| {
+            api_keys_mut(doc).push(serde_yaml_ng::Value::from("x"));
+            true
+        })
+        .await
+        .unwrap();
+        // 横幅是注释，不能让下一轮读改写读不动这个文件。
+        let ok = w
+            .edit(|doc| {
+                assert_eq!(api_keys_mut(doc).len(), 1);
+                false
+            })
+            .await;
+        assert!(ok.is_ok(), "{ok:?}");
+        let _ = std::fs::remove_file(path);
     }
 }

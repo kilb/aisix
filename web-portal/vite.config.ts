@@ -7,6 +7,9 @@ const target = process.env.PORTAL_ORIGIN ?? "http://127.0.0.1:8091";
 
 export default defineConfig({
   plugins: [react()],
+  // 生产上门户挂在 /portal/（控制台在根路径占了 /api/，证书又没有通配，
+  // 起不了子域名）。开发与 e2e 保持根路径。
+  base: process.env.PORTAL_BASE ?? "/",
   // 内容散列是唯一的缓存失效手段：固定文件名配长缓存等于永不更新。
   build: {
     rollupOptions: {

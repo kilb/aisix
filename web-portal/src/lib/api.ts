@@ -5,8 +5,18 @@
  * 用量与余额只按会话返回本人的数，前端连一个可以夹带 user_id 的参数都拿不到。
  */
 
+/**
+ * API 前缀，从构建时的 `base` 推导。
+ *
+ * 生产上门户挂在 `aigw.to/portal/`（控制台在根路径占了 `/api/`，而证书只覆盖
+ * `aigw.to`，没有通配，所以起不了子域名）。把前缀写死成 `/api` 就只能在根路径
+ * 部署；从 `BASE_URL` 推导之后，开发与 e2e 仍在根路径，生产差异只活在一个构建
+ * 参数里。
+ */
+const API = `${import.meta.env.BASE_URL.replace(/\/$/, "")}/api`;
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const r = await fetch(path, { credentials: "same-origin", ...init });
+  const r = await fetch(`${API}${path}`, { credentials: "same-origin", ...init });
   const text = await r.text();
   let body: unknown = null;
   try {
@@ -58,12 +68,12 @@ export interface Usage {
   note: string | null;
 }
 
-export const session = () => req<Session>("/api/session");
+export const session = () => req<Session>("/session");
 export const register = (email: string, password: string) =>
-  post<{ user_id: string }>("/api/register", { email, password });
+  post<{ user_id: string }>("/register", { email, password });
 export const login = (email: string, password: string) =>
-  post<{ ok: true }>("/api/login", { email, password });
-export const logout = () => post<{ ok: true }>("/api/logout");
+  post<{ ok: true }>("/login", { email, password });
+export const logout = () => post<{ ok: true }>("/logout");
 export interface KeyRow {
   name: string;
   masked_hash: string;
@@ -79,11 +89,11 @@ export interface MintedKey {
   note: string | null;
 }
 
-export const balance = () => req<Balance>("/api/balance");
-export const listKeys = () => req<{ keys: KeyRow[] }>("/api/keys");
-export const createKey = (label: string) => post<MintedKey>("/api/keys", { label });
+export const balance = () => req<Balance>("/balance");
+export const listKeys = () => req<{ keys: KeyRow[] }>("/keys");
+export const createKey = (label: string) => post<MintedKey>("/keys", { label });
 export const revokeKey = (name: string) =>
-  req<{ ok: true }>(`/api/keys/${encodeURIComponent(name)}`, { method: "DELETE" });
+  req<{ ok: true }>(`/keys/${encodeURIComponent(name)}`, { method: "DELETE" });
 /** 只有窗口长度是参数。没有、也不能有 user_id。 */
 export const usage = (rangeHours: number) =>
-  req<Usage>(`/api/usage?range_hours=${rangeHours}`);
+  req<Usage>(`/usage?range_hours=${rangeHours}`);
