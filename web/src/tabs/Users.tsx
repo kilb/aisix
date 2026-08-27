@@ -30,13 +30,22 @@ export function Users() {
   const [rows, setRows] = useState<PortalUser[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [absent, setAbsent] = useState(false);
-  const [target, setTarget] = useState<PortalUser | null>(null);
+  /**
+   * 选中的是**用户 ID**，不是那一行的对象快照。
+   *
+   * 存对象的话：改完额度后 `load()` 换掉了整份列表，而这个快照还留在原地，
+   * 于是「当前总额度」那行显示的是改之前的数 —— 管理员看着没变，很可能再设
+   * 一次。所以选中的是 id，显示的数每次从最新列表里现算。
+   */
+  const [targetId, setTargetId] = useState("");
   const [usd, setUsd] = useState("");
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState<string | null>(null);
 
   const [topups, setTopups] = useState<Topup[]>([]);
+
+  const target: PortalUser | null = rows?.find((u) => u.user_id === targetId) ?? null;
 
   const load = useCallback(async () => {
     try {
@@ -68,6 +77,12 @@ export function Users() {
     if (!target) return;
     // 金额按 micro-USD 整数下发。浮点做钱会累积误差，而这个产品的花费到千分
     // 之一美分 —— 在这里就换算成整数，别把浮点带进账本。
+    // 空输入必须先挡住。`Number("")` 是 0，而「设为 0」是把这个人的额度整个
+    // 收回 —— 金额栏留空时点主按钮就会静默切断一个客户。
+    if (usd.trim() === "") {
+      setErr("请先填金额");
+      return;
+    }
     const micro = Math.round(Number(usd) * 1_000_000);
     // 设定允许 0（把额度收回），发放不允许 —— 发放 0 是个空操作，静默成功会让
     // 人以为发出去了。
@@ -189,12 +204,7 @@ export function Users() {
         <div className="r">
           <label className="f">
             <span>用户</span>
-            <select
-              value={target?.user_id ?? ""}
-              onChange={(e) =>
-                setTarget(rows?.find((u) => u.user_id === e.target.value) ?? null)
-              }
-            >
+            <select value={targetId} onChange={(e) => setTargetId(e.target.value)}>
               <option value="">选择一个用户</option>
               {(rows ?? []).map((u) => (
                 <option key={u.user_id} value={u.user_id}>
@@ -233,6 +243,15 @@ export function Users() {
             <strong>{fmtUsd(target.granted_micro_usd - target.balance_micro_usd)}</strong>，其中{" "}
             <strong>{fmtUsd(target.allocated_micro_usd)}</strong> 已由他自己分配到具体密钥上。
           </p>
+        )}
+        {/* 调低总额度可能让「已分配」反过来超过总额。花费仍受用户级那道闸约束，
+            所以不拦这次设定；但不说出来的话，管理员看不到分配已经对不上，而用户
+            那边只会看到一个负的「可再分配」而不知道原因。 */}
+        {target && target.allocated_micro_usd > target.granted_micro_usd && (
+          <div className="note warn">
+            他已分配到各把密钥上的额度（{fmtUsd(target.allocated_micro_usd)}）超过了总额度。
+            总花销仍以总额度为准；他需要自己调低某几把密钥的额度才能重新分配。
+          </div>
         )}
         {err && <div className="note crit">{err}</div>}
         {done && <div className="note">{done}</div>}

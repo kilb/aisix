@@ -23,6 +23,9 @@ pub enum StoreError {
     /// 邮箱已存在。注册处据此回 409，而不是 500 —— 唯一约束冲突是可预期的
     /// 用户错误，不是服务端故障。
     EmailTaken,
+    /// 金额算不下去了（相减会溢出 i64）。调用方据此回 400 —— 这是输入荒谬，
+    /// 不是服务端故障。
+    OutOfRange,
     Db(sqlx::Error),
 }
 
@@ -30,6 +33,7 @@ impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmailTaken => write!(f, "邮箱已被注册"),
+            Self::OutOfRange => write!(f, "金额超出可表示范围"),
             Self::Db(e) => write!(f, "数据库错误: {e}"),
         }
     }
@@ -191,13 +195,8 @@ impl Store {
 
     /// 某个用户名下各把密钥的额度。
     pub async fn key_quotas(&self, user_id: &str) -> Result<Vec<(String, i64)>, StoreError> {
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT key_name, micro_usd FROM key_quotas WHERE user_id = ?1 ORDER BY key_name",
-        )
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
+        let mut c = self.pool.acquire().await?;
+        key_quotas_on(&mut *c, user_id).await
     }
 
     /// 全部用户的密钥额度，供对账环一次性下推。
@@ -225,29 +224,16 @@ impl Store {
         key_name: &str,
         micro_usd: i64,
     ) -> Result<(), StoreError> {
-        sqlx::query(
-            "INSERT INTO key_quotas (user_id, key_name, micro_usd, updated_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(user_id, key_name) DO UPDATE SET micro_usd = ?3, updated_at = ?4",
-        )
-        .bind(user_id)
-        .bind(key_name)
-        .bind(micro_usd)
-        .bind(chrono::Utc::now().to_rfc3339())
-        .execute(&self.pool)
-        .await?;
+        let mut c = self.pool.acquire().await?;
+        set_key_quota_on(&mut *c, user_id, key_name, micro_usd).await?;
         Ok(())
     }
 
     /// 密钥被吊销时一并清掉它的额度 —— 留着的话下一轮对账还会为它下推策略，
     /// 而那把密钥已经不存在了。
     pub async fn drop_key_quota(&self, user_id: &str, key_name: &str) -> Result<(), StoreError> {
-        sqlx::query("DELETE FROM key_quotas WHERE user_id = ?1 AND key_name = ?2")
-            .bind(user_id)
-            .bind(key_name)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+        let mut c = self.pool.acquire().await?;
+        drop_key_quota_on(&mut *c, user_id, key_name).await
     }
 
     /// 已计入流水的截止时刻。`None` = 还没对过账。
@@ -303,6 +289,68 @@ impl Store {
             }),
         )
     }
+}
+
+// ── 可挂在任意 executor 上的语句 ─────────────────────────────────────────
+//
+// 抽出来是为了让「读额度 → 校验 → 写额度」能跑在**同一个** BEGIN IMMEDIATE
+// 事务里。各自在事务外单独跑的话，两个并发请求会各自读到同一份旧值、双双通过
+// 校验，于是各把密钥的额度之和越过用户总额 —— 用户要的那条不变量就破了。
+// 语句只此一份，事务内外共用，避免出现两个真相。
+
+pub(crate) async fn key_quotas_on<'e, E>(
+    exec: E,
+    user_id: &str,
+) -> Result<Vec<(String, i64)>, StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT key_name, micro_usd FROM key_quotas WHERE user_id = ?1 ORDER BY key_name",
+    )
+    .bind(user_id)
+    .fetch_all(exec)
+    .await?;
+    Ok(rows)
+}
+
+pub(crate) async fn set_key_quota_on<'e, E>(
+    exec: E,
+    user_id: &str,
+    key_name: &str,
+    micro_usd: i64,
+) -> Result<(), StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query(
+        "INSERT INTO key_quotas (user_id, key_name, micro_usd, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(user_id, key_name) DO UPDATE SET micro_usd = ?3, updated_at = ?4",
+    )
+    .bind(user_id)
+    .bind(key_name)
+    .bind(micro_usd)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(exec)
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn drop_key_quota_on<'e, E>(
+    exec: E,
+    user_id: &str,
+    key_name: &str,
+) -> Result<(), StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query("DELETE FROM key_quotas WHERE user_id = ?1 AND key_name = ?2")
+        .bind(user_id)
+        .bind(key_name)
+        .execute(exec)
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]

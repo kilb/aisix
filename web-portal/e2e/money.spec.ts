@@ -287,3 +287,48 @@ test("每把密钥的额度各自收口_且各把之和不得超过总额度", a
   // 配置仍是网关收得下的：乙照常可用，说明这次重载没有被整份拒收。
   await waitFor(async () => (await fx.chatWith(b.plaintext)) === 200, "吊销之后乙仍然可用");
 });
+
+test("流式请求也会消耗额度_不然这道闸对主流客户端形同不存在", async () => {
+  const cookie = await fx.sessionCookie();
+  await setQuota(1_000_000_000);
+  const k = await mint(cookie, "流式");
+  await waitFor(async () => (await fx.chatStream(k.plaintext)) === 200, "新密钥被启用");
+
+  // 只给这把密钥 $2。每次调用 $1，所以第三次流式请求就该被拒。
+  expect((await setKeyQuota(cookie, k.name, 2_000_000)).status).toBe(200);
+  await waitFor(async () => {
+    const doc = fx.readResources();
+    return doc.includes(`portal-key-${k.name}`) && doc.includes("scope: api_key");
+  }, "门户把这把密钥的额度推下去");
+
+  // 流式与非流式在网关里是两条记账路径。只有非流式记账的话，这里会一直 200。
+  await waitFor(
+    async () => (await fx.chatStream(k.plaintext)) === 429,
+    "流式请求把额度用尽后被拒",
+  );
+});
+
+test("三个端点的流式流量都算进同一份额度", async () => {
+  const cookie = await fx.sessionCookie();
+  await setQuota(1_000_000_000);
+
+  // 每个端点一把独立的密钥，各自 $2 —— 互不干扰，所以断言指向的是「这个端点
+  // 的流式记账有没有发生」，而不是三者共用一个计数器的混合结果。
+  for (const endpoint of ["messages", "responses"] as const) {
+    const k = await mint(cookie, endpoint);
+    await waitFor(
+      async () => (await fx.streamOn(endpoint, k.plaintext)) === 200,
+      `${endpoint} 上新密钥被启用`,
+    );
+    expect((await setKeyQuota(cookie, k.name, 2_000_000)).status).toBe(200);
+    await waitFor(async () => {
+      const doc = fx.readResources();
+      return doc.includes(`portal-key-${k.name}`);
+    }, `${endpoint} 的密钥额度被推下去`);
+
+    await waitFor(
+      async () => (await fx.streamOn(endpoint, k.plaintext)) === 429,
+      `${endpoint} 的流式流量把额度用尽后被拒`,
+    );
+  }
+});

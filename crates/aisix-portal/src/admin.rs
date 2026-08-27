@@ -143,14 +143,28 @@ pub async fn set_quota(
     {
         Ok(delta) => {
             let balance = ledger.balance(&user_id).await.unwrap_or(0);
+            // 已分配到各把密钥上的额度之和。调低总额时它可能反过来超过总额 ——
+            // 花费仍受用户级那道闸约束，所以不拒绝这次设定；但必须说出来，否则
+            // 管理员看不到这个人的分配已经对不上，而用户那边会看到一个负的
+            // 「可再分配」而不知道为什么。
+            let allocated = st.store.allocated_to_keys(&user_id).await.unwrap_or(0);
             Json(json!({
                 "ok": true,
                 "granted_micro_usd": req.micro_usd,
                 "delta_micro_usd": delta,
                 "balance_micro_usd": balance,
+                "allocated_micro_usd": allocated,
+                "over_allocated_micro_usd": (allocated - req.micro_usd).max(0),
             }))
             .into_response()
         }
+        // 荒谬的金额是输入错误，不是服务端故障 —— 回 400 才能让调用方知道该改
+        // 什么。都揉成 500 的话，管理员看到的是「服务挂了」。
+        Err(crate::store::StoreError::OutOfRange) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "金额超出可表示范围"})),
+        )
+            .into_response(),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "记账失败"})),

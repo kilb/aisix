@@ -163,10 +163,10 @@ fn breaks_gateway(before: &str, after: &str) -> Option<String> {
             Some("placeholder".to_string())
         })
     };
-    if load(after).is_ok() {
-        return None;
-    }
-    let err = load(after).err()?;
+    let err = match load(after) {
+        Ok(_) => return None,
+        Err(e) => e,
+    };
     if load(before).is_err() {
         // 本来就坏着 —— 不是这次改动的问题，照写。
         return None;
@@ -206,6 +206,25 @@ pub fn api_keys_mut(doc: &mut Value) -> &mut Vec<Value> {
     map.get_mut(&k)
         .and_then(Value::as_sequence_mut)
         .expect("api_keys 刚被建成序列")
+}
+
+/// 文件里现存的所有密钥名。**解析不了时返回 `None`，不是空表。**
+///
+/// 这个区别是关键：调用方拿它去剪除「已不存在的密钥」占着的额度，把一次读取
+/// 失败当成「一把密钥都没有」，会把所有人的额度分配一次清空。
+pub fn all_key_names(yaml: &str) -> Option<Vec<String>> {
+    let doc: Value = serde_yaml_ng::from_str(yaml).ok()?;
+    Some(
+        doc.get("api_keys")
+            .and_then(Value::as_sequence)
+            .map(|s| {
+                s.iter()
+                    .filter_map(|k| k.get("display_name").and_then(Value::as_str))
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    )
 }
 
 fn owner(k: &Value) -> Option<&str> {

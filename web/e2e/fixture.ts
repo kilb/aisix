@@ -7,6 +7,7 @@ import { join, resolve } from "node:path";
 const REPO = resolve(import.meta.dirname, "../..");
 const CONSOLE_BIN = join(REPO, "target/release/aisix-console");
 const GATEWAY_BIN = join(REPO, "target/release/aisix");
+const PORTAL_BIN = join(REPO, "target/release/aisix-portal");
 export const PORTAL_TOKEN_SENTINEL = "e2e-portal-token-must-never-leak";
 export const PASSWORD = "e2e-test-password";
 
@@ -15,8 +16,20 @@ export interface Fixture {
   resourcesPath: string;
   consoleUrl: string;
   previewUrl: string;
+  /** 真门户的地址；只有 `start({ withPortal: true })` 才有。 */
+  portalUrl?: string;
   read(): string;
   stop(): void;
+}
+
+export interface StartOptions {
+  /**
+   * 顺带起一个**真的**门户进程，让控制台的「门户用户」页有真后端可打。
+   *
+   * 默认不起：默认那套用例要的正是「门户不可达」时的表现。两种状态互斥，
+   * 所以分成两个夹具实例，而不是在一个里面切。
+   */
+  withPortal?: boolean;
 }
 
 const SEED = `_format_version: '1'
@@ -87,7 +100,7 @@ function killTree(p: ChildProcess): void {
   }
 }
 
-export async function start(): Promise<Fixture> {
+export async function start(opts: StartOptions = {}): Promise<Fixture> {
   const dir = mkdtempSync(join(tmpdir(), "aisix-console-e2e-"));
   const resourcesPath = join(dir, "resources.yaml");
   writeFileSync(resourcesPath, SEED);
@@ -98,6 +111,30 @@ export async function start(): Promise<Fixture> {
   const apiPort = await freePort();
   const webPort = await freePort();
   const procs: ChildProcess[] = [];
+
+  // 真门户（可选）。起在控制台之前 —— 控制台启动时就要拿到它的地址。
+  let portalUrl: string | undefined;
+  if (opts.withPortal) {
+    const portalPort = await freePort();
+    portalUrl = `http://127.0.0.1:${portalPort}`;
+    const portal = spawn(PORTAL_BIN, [], {
+      env: {
+        ...process.env,
+        PORTAL_ADDR: `127.0.0.1:${portalPort}`,
+        PORTAL_DB: `sqlite:${join(dir, "portal.db")}`,
+        PORTAL_ADMIN_TOKEN: PORTAL_TOKEN_SENTINEL,
+        PROMETHEUS_URL: "http://127.0.0.1:1",
+        AISIX_RESOURCES: resourcesPath,
+        // 对账环调到一小时一轮：本套用例测的是控制台界面，不需要它跑。让它
+        // 在中途改写这份 resources.yaml，会跟控制台自己的配置用例互相干扰。
+        PORTAL_TICK_SECS: "3600",
+      },
+      stdio: "ignore",
+      detached: true,
+    });
+    procs.push(portal);
+    await waitFor(`${portalUrl}/api/session`);
+  }
   const api = spawn(CONSOLE_BIN, [], {
     env: {
       ...process.env,
@@ -109,7 +146,7 @@ export async function start(): Promise<Fixture> {
       PORTAL_ADMIN_TOKEN: PORTAL_TOKEN_SENTINEL,
       // 指向一个不存在的门户：这一层测的是「凭据不泄漏」与「门户不可达时的
       // 表现」，有门户时的发放流程由 web-portal/e2e 覆盖（那里有真门户）。
-      PORTAL_URL: "http://127.0.0.1:1",
+      PORTAL_URL: portalUrl ?? "http://127.0.0.1:1",
       // 网关管理 API 不需要真的可达：本套用例只驱动配置读写这条路径，
       // 而那条路径只用到 resources.yaml 和 `aisix validate`。
       AISIX_ADMIN_URL: "http://127.0.0.1:1",
@@ -150,6 +187,7 @@ export async function start(): Promise<Fixture> {
     resourcesPath,
     consoleUrl: `http://127.0.0.1:${apiPort}`,
     previewUrl: `http://127.0.0.1:${webPort}`,
+    portalUrl,
     read: () => readFileSync(resourcesPath, "utf8"),
     stop() {
       for (const p of procs) killTree(p);

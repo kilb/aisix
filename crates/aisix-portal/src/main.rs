@@ -341,6 +341,16 @@ mod testutil {
             std::fs::write(&self.resources_path, body).unwrap();
         }
 
+        /// 把配置文件设成只读，用来测「读得到但写不进去」那条分支。
+        pub fn make_resources_read_only(&self) {
+            let mut perm = std::fs::metadata(&self.resources_path)
+                .unwrap()
+                .permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perm.set_readonly(true);
+            std::fs::set_permissions(&self.resources_path, perm).unwrap();
+        }
+
         /// 读回本实例的 resources.yaml。
         pub fn resources(&self) -> String {
             std::fs::read_to_string(&self.resources_path).unwrap()
@@ -1580,5 +1590,254 @@ api_keys:
         app.delete(&format!("/api/keys/{a}")).await;
         // 留着的话下一轮对账还会为一把不存在的密钥下推策略。
         assert_eq!(app.store.allocated_to_keys(&id).await.unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod review_probes {
+    use super::testutil::{temp_resources, FakeProm, TestApp};
+    use serde_json::json;
+
+    const PW: &str = "correct horse battery";
+    const SEED: &str = r#"_format_version: "1"
+provider_keys:
+  - display_name: stub
+    provider: openai
+    api_key: sk-stub
+models:
+  - display_name: keep-me
+    provider: openai
+    provider_key: stub
+    model_name: keep-me
+api_keys:
+  - display_name: ops
+    key_hash: opsopsopsopsopsopsopsopsopsopsops
+    allowed_models: ["*"]
+"#;
+
+    async fn app() -> (FakeProm, TestApp) {
+        let prom = FakeProm::start().await;
+        let app = TestApp::start_with_usage(&prom, &temp_resources(SEED)).await;
+        (prom, app)
+    }
+
+    async fn signed_in(app: &TestApp, mail: &str) -> String {
+        let id = app.register(mail, PW).await;
+        app.post("/api/login", json!({"email": mail, "password": PW}))
+            .await;
+        id
+    }
+
+    async fn mint(app: &TestApp, label: &str) -> String {
+        let (_, body) = app.post("/api/keys", json!({"label": label})).await;
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["name"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// 探针 1：超大额度不能绕过「之和 ≤ 总额」。
+    #[tokio::test]
+    async fn 巨大的额度值不能靠整数溢出绕过上限() {
+        let (_p, app) = app().await;
+        let id = signed_in(&app, "a@b.c").await;
+        app.post_admin(
+            &format!("/admin/users/{id}/quota"),
+            json!({"micro_usd": 10_000_000}),
+        )
+        .await;
+        let a = mint(&app, "一").await;
+        let b = mint(&app, "二").await;
+        app.put(
+            &format!("/api/keys/{a}/quota"),
+            json!({"micro_usd": 6_000_000}),
+        )
+        .await;
+
+        let (s, body) = app
+            .put(
+                &format!("/api/keys/{b}/quota"),
+                json!({"micro_usd": i64::MAX}),
+            )
+            .await;
+        assert_ne!(s, 200, "i64::MAX 被接受了: {body}");
+        assert_eq!(
+            app.store.allocated_to_keys(&id).await.unwrap(),
+            6_000_000,
+            "已分配额被写坏了"
+        );
+    }
+
+    /// 探针 2：密钥被别处删掉后，它占的额度要还回可分配池。
+    #[tokio::test]
+    async fn 密钥从配置里消失后它占的额度要还回来() {
+        let (_p, app) = app().await;
+        let id = signed_in(&app, "a@b.c").await;
+        app.post_admin(
+            &format!("/admin/users/{id}/quota"),
+            json!({"micro_usd": 10_000_000}),
+        )
+        .await;
+        let a = mint(&app, "一").await;
+        let b = mint(&app, "二").await;
+        app.put(
+            &format!("/api/keys/{a}/quota"),
+            json!({"micro_usd": 8_000_000}),
+        )
+        .await;
+
+        // 运维从控制台把「一」删了 —— 门户的库里那条额度记录还在。
+        let doc = app.resources();
+        let kept: String = doc.lines().collect::<Vec<_>>().join("\n");
+        let filtered = strip_key(&kept, &a);
+        app.set_resources(&filtered);
+        app.tick().await;
+
+        // 那 8 块必须回到池子里，否则用户看着自己有 10 块却一分也分不出去。
+        let (s, body) = app
+            .put(
+                &format!("/api/keys/{b}/quota"),
+                json!({"micro_usd": 9_000_000}),
+            )
+            .await;
+        assert_eq!(s, 200, "已删密钥占着的额度没还回来: {body}");
+    }
+
+    /// 并发给不同密钥设额度，之和仍不得越过总额。
+    #[tokio::test]
+    async fn 并发设置各把密钥的额度_之和不越过总额() {
+        let (_p, app) = app().await;
+        let id = signed_in(&app, "a@b.c").await;
+        app.post_admin(
+            &format!("/admin/users/{id}/quota"),
+            json!({"micro_usd": 10_000_000}),
+        )
+        .await;
+        // 五把密钥，每把都想要 4 块 —— 总额只有 10 块，最多只能有两把成功。
+        let mut names = Vec::new();
+        for i in 0..5 {
+            names.push(mint(&app, &format!("k{i}")).await);
+        }
+
+        let mut set = tokio::task::JoinSet::new();
+        for n in names {
+            let base = app.base.clone();
+            // 克隆出来的 reqwest::Client 共用同一个 cookie 存储，会话跟着走。
+            let http = app.http.clone();
+            set.spawn(async move {
+                http.put(format!("{base}/api/keys/{n}/quota"))
+                    .json(&json!({"micro_usd": 4_000_000}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            });
+        }
+        let mut ok = 0;
+        while let Some(r) = set.join_next().await {
+            if r.unwrap() == 200 {
+                ok += 1;
+            }
+        }
+
+        // 校验在事务外时，五个请求会各自读到「已分配 0」而全部通过。
+        let allocated = app.store.allocated_to_keys(&id).await.unwrap();
+        assert!(
+            allocated <= 10_000_000,
+            "各把额度之和 {allocated} 越过了总额 10000000（成功 {ok} 个）"
+        );
+    }
+
+    /// 并发把总额度设成不同的值，最终必须落在其中一个上。
+    #[tokio::test]
+    async fn 并发设定总额度_结果是其中一个目标而不是第三个数() {
+        let (_p, app) = app().await;
+        let id = signed_in(&app, "a@b.c").await;
+        app.post_admin(
+            &format!("/admin/users/{id}/quota"),
+            json!({"micro_usd": 5_000_000}),
+        )
+        .await;
+
+        // 只发两个请求时读写基本不交错，测试无论有没有事务都会绿 —— 那是虚假
+        // 信心。要把并发压到足以交错。
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..12 {
+            let target: i64 = if i % 2 == 0 { 8_000_000 } else { 2_000_000 };
+            let base = app.base.clone();
+            let http = app.http.clone();
+            let path = format!("/admin/users/{id}/quota");
+            set.spawn(async move {
+                http.post(format!("{base}{path}"))
+                    .header("authorization", format!("Bearer {}", TestApp::ADMIN_TOKEN))
+                    .json(&json!({"micro_usd": target}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            });
+        }
+        while let Some(r) = set.join_next().await {
+            r.unwrap();
+        }
+
+        // 读改写不在一个事务里时，多个请求读到同一份旧值、各写一条按旧值算出的
+        // 差额，最终总额落在一个谁也没要求过的数上，而每个请求都报了成功。
+        let g = crate::ledger::Ledger::new(app.store.clone())
+            .total_granted(&id)
+            .await
+            .unwrap();
+        assert!(
+            g == 8_000_000 || g == 2_000_000,
+            "总额停在了 {g}，既不是 8000000 也不是 2000000"
+        );
+    }
+
+    /// 探针 3：配置写入失败时，库里的额度不能已经被改掉。
+    #[tokio::test]
+    async fn 写盘失败时不能留下改了一半的状态() {
+        let (_p, app) = app().await;
+        let id = signed_in(&app, "a@b.c").await;
+        app.post_admin(
+            &format!("/admin/users/{id}/quota"),
+            json!({"micro_usd": 10_000_000}),
+        )
+        .await;
+        let a = mint(&app, "一").await;
+        app.put(
+            &format!("/api/keys/{a}/quota"),
+            json!({"micro_usd": 6_000_000}),
+        )
+        .await;
+
+        // 让写盘失败：文件只读。读还能读，所以改动会算出来，只有落盘那一步失败。
+        app.make_resources_read_only();
+        let (s, _) = app.delete(&format!("/api/keys/{a}")).await;
+        assert_ne!(s, 200, "写盘失败却报成功");
+
+        // 密钥还在配置里（写没成），所以它的额度也必须还在。否则下一轮对账会
+        // 把它的策略撤掉，这把密钥就静默变成「不单独设限」。
+        assert_eq!(
+            app.store.allocated_to_keys(&id).await.unwrap(),
+            6_000_000,
+            "写盘失败了，库里的额度却已经被删掉"
+        );
+    }
+
+    /// 从 YAML 文本里删掉某把密钥那一段（够用的粗暴做法，只在测试里）。
+    fn strip_key(doc: &str, short_name: &str) -> String {
+        let mut out = Vec::new();
+        let mut skipping = false;
+        for line in doc.lines() {
+            if line.starts_with("- display_name:") || line.starts_with("  - display_name:") {
+                skipping = line.contains(short_name);
+            }
+            if !skipping {
+                out.push(line);
+            }
+        }
+        out.join("\n") + "\n"
     }
 }

@@ -276,6 +276,15 @@ impl<C: Clock> RateStore for LocalStore<C> {
         s.tpm.add(now, tokens);
         s.tph.add(now, tokens);
         s.tpd.add(now, tokens);
+        // 与 `commit` 完全一致：花费层通过同一个参数传 micro-USD，累计计数器
+        // 必须跟着涨。
+        //
+        // 这条路是**流式**的记账入口（`add_tokens_post_stream_all`），非流式走
+        // `commit`。少了这一行，累计额度闸对流式流量就等于不存在 —— 而流式是
+        // LLM 客户端的主流模式，所以那道闸看起来配好了、实际上从不触发。
+        // Redis 那侧的 `ADD_TOKENS_LUA` 一直有 `INCRBY prefix:consumed`，是本地
+        // store 落了单。
+        s.consumed_micro_usd = s.consumed_micro_usd.saturating_add(tokens);
         s.last_touched = now;
     }
 
@@ -469,6 +478,47 @@ mod allowance_tests {
             s.acquire("k", &lim, "").await,
             Err(RateLimitError::AllowanceExhausted)
         ));
+    }
+
+    /// 流式响应走的是 `add_tokens`，不是 `commit` —— 它也必须记进累计额。
+    ///
+    /// 流式的记账时机跟非流式不同：非流式在拿到完整应答时 `commit`，流式在流
+    /// 结束的同步回调里 `add_tokens`。两条路径记的都是同一份账，漏掉任何一条，
+    /// 那道闸对该模式的流量就等于不存在 —— 而流式是 LLM 客户端的主流模式。
+    /// Redis 那侧的脚本一直是两条都记的，本地 store 曾经只记窗口桶。
+    #[tokio::test]
+    async fn 流式的记账也要计入累计额() {
+        let s = LocalStore::with_clock(TestClock::new(0));
+        let lim = granted(1_000);
+        s.acquire("k", &lim, "").await.unwrap();
+        s.add_tokens("k", 600);
+        s.acquire("k", &lim, "").await.unwrap();
+        s.add_tokens("k", 600);
+        // 已消费 1200 ≥ 1000。只记窗口桶的话这里照样放行 —— 用户可以一直流下去。
+        assert!(
+            matches!(
+                s.acquire("k", &lim, "").await,
+                Err(RateLimitError::AllowanceExhausted)
+            ),
+            "流式记的账没有计入累计额，这道闸对流式流量形同不存在"
+        );
+    }
+
+    /// 两条记账路径必须等价：同样的数字，同样的结果。
+    #[tokio::test]
+    async fn 流式与非流式记账对累计额等价() {
+        let a = LocalStore::with_clock(TestClock::new(0));
+        let b = LocalStore::with_clock(TestClock::new(0));
+        let lim = granted(1_000);
+        a.acquire("k", &lim, "").await.unwrap();
+        a.commit("k", 1_000, "").await;
+        b.acquire("k", &lim, "").await.unwrap();
+        b.add_tokens("k", 1_000);
+        assert_eq!(
+            a.acquire("k", &lim, "").await.is_err(),
+            b.acquire("k", &lim, "").await.is_err(),
+            "同样的花费，流式与非流式给出了不同的判定"
+        );
     }
 
     #[tokio::test]

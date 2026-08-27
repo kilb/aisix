@@ -220,7 +220,9 @@ pub async fn revoke(
         })
         .await;
 
-    if found {
+    // **只在写成功之后动库。** 写盘失败时密钥仍在配置里，这时把额度记录删掉，
+    // 下一轮对账就会撤掉它的策略 —— 那把密钥于此静默变成「不单独设限」。
+    if found && result.is_ok() {
         // 留着的话下一轮对账还会为一把已经不存在的密钥下推策略。
         //
         // 按**完整 display_name** 删：额度是按全名存的（`portal-xxx · 标签`），
@@ -298,37 +300,56 @@ pub async fn set_quota(
             .into_response();
     };
 
-    let ledger = Ledger::new(st.store.clone());
-    let (Ok(granted), Ok(quotas)) = (
-        ledger.total_granted(&uid).await,
-        st.store.key_quotas(&uid).await,
-    ) else {
-        return server_error("读取失败");
-    };
-    let others: i64 = quotas
-        .iter()
-        .filter(|(k, _)| k != &full_name)
-        .map(|(_, v)| *v)
-        .sum();
-    if others + req.micro_usd > granted {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "error": "各把密钥的额度之和不能超过你的总额度",
-                "granted_micro_usd": granted,
-                "other_keys_micro_usd": others,
-                "available_micro_usd": granted - others,
-            })),
-        )
-            .into_response();
-    }
+    // **读额度 → 校验 → 写额度，一个事务。**
+    //
+    // 分三步各自跑的话，同一个用户对两把不同密钥的两次并发请求会各自读到同一份
+    // 旧值、双双通过校验，于是各把额度之和越过用户总额 —— 正是这里要守的那条
+    // 不变量被破掉。`BEGIN IMMEDIATE` 从第一条语句就拿写锁，第二个事务排队。
+    let uid_tx = uid.clone();
+    let name_tx = full_name.clone();
+    let want = req.micro_usd;
+    let outcome = st
+        .store
+        .immediate_tx(move |conn| {
+            Box::pin(async move {
+                let granted = crate::ledger::total_granted_on(&mut *conn, &uid_tx).await?;
+                let quotas = crate::store::key_quotas_on(&mut *conn, &uid_tx).await?;
+                let others: i64 = quotas
+                    .iter()
+                    .filter(|(k, _)| k != &name_tx)
+                    .map(|(_, v)| *v)
+                    .sum();
+                // `checked_add`：`others + 新值` 会溢出。溢出在 release 下**回绕
+                // 成负数**，于是这道上限被静默绕过，一个 i64::MAX 的额度就落了
+                // 库；debug 下则是 panic。溢出本身就意味着「远超总额」，按超额处理。
+                if others.checked_add(want).is_none_or(|v| v > granted) {
+                    return Ok(Err((granted, others)));
+                }
+                if want == 0 {
+                    crate::store::drop_key_quota_on(&mut *conn, &uid_tx, &name_tx).await?;
+                } else {
+                    crate::store::set_key_quota_on(&mut *conn, &uid_tx, &name_tx, want).await?;
+                }
+                Ok(Ok(()))
+            })
+        })
+        .await;
 
-    let r = if req.micro_usd == 0 {
-        st.store.drop_key_quota(&uid, &full_name).await
-    } else {
-        st.store
-            .set_key_quota(&uid, &full_name, req.micro_usd)
-            .await
+    let r = match outcome {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err((granted, others))) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "各把密钥的额度之和不能超过你的总额度",
+                    "granted_micro_usd": granted,
+                    "other_keys_micro_usd": others,
+                    "available_micro_usd": granted - others,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => Err(e),
     };
     match r {
         Ok(()) => Json(json!({"ok": true})).into_response(),

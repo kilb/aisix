@@ -55,6 +55,12 @@ pub struct TickReport {
     pub reenabled: usize,
     /// 读取失败、水位线未前进的用户数。
     pub read_failures: usize,
+    /// 配置写入失败的次数。
+    ///
+    /// 单独记一格，因为这几步原本用 `let _ =` 把错误全丢了：写前校验一旦拒绝
+    /// 这次改动（比如库里有条记录指向已不存在的密钥），对账环会照常报成功，
+    /// 而额度从此再也推不下去 —— 没有任何东西会说出来。
+    pub write_failures: usize,
 }
 
 /// 消费读取器。抽成 trait 只为把 Prometheus 换成测试替身，生产实现只有一个。
@@ -131,12 +137,18 @@ impl<S: ConsumptionSource> Sweeper<S> {
         for u in &users {
             grants.push((u.id.clone(), self.ledger.total_granted(&u.id).await?));
         }
-        let _ = self.apply_allowances(&grants).await;
+        if let Err(e) = self.apply_allowances(&grants).await {
+            eprintln!("下推额度失败（网关仍在用旧值）: {e}");
+            r.write_failures += 1;
+        }
 
         // 密钥级额度。用户把自己的总额分配到各把密钥上，网关按 `scope: api_key`
         // 单独收口每一把 —— 用户级那条策略仍然在，所以「总花销不超过用户额度」
         // 由它保证，密钥级只是在此之下再切分。
-        let _ = self.apply_key_allowances().await;
+        if let Err(e) = self.apply_key_allowances().await {
+            eprintln!("下推密钥额度失败（网关仍在用旧值）: {e}");
+            r.write_failures += 1;
+        }
 
         // 余额决定密钥开关。放在入账之后，用的是这一轮之后的余额。
         let mut wanted: Vec<(String, bool)> = Vec::new();
@@ -144,9 +156,16 @@ impl<S: ConsumptionSource> Sweeper<S> {
             let balance = self.ledger.balance(&u.id).await?;
             wanted.push((u.id.clone(), balance <= 0));
         }
-        let changed = self.apply_key_state(&wanted).await;
-        r.disabled = changed.0;
-        r.reenabled = changed.1;
+        match self.apply_key_state(&wanted).await {
+            Ok((off, on)) => {
+                r.disabled = off;
+                r.reenabled = on;
+            }
+            Err(e) => {
+                eprintln!("停用/启用密钥写入失败（网关仍在放行）: {e}");
+                r.write_failures += 1;
+            }
+        }
         Ok(r)
     }
 
@@ -199,10 +218,35 @@ impl<S: ConsumptionSource> Sweeper<S> {
     ///
     /// 用户级那条策略不受影响：两条同时生效，所以密钥再怎么分配，总花销都过不了
     /// 用户级那道闸。
-    async fn apply_key_allowances(&self) -> Result<(), StoreError> {
-        let quotas = self.store.all_key_quotas().await?;
-        let _ = self
+    async fn apply_key_allowances(&self) -> Result<(), String> {
+        // 先把「密钥已经不在了、额度记录还留着」这种残留剪掉。
+        //
+        // 不剪的话那份额度永远占着用户的可分配额：`allocated_to_keys` 照样把它
+        // 算进去，于是用户看着自己有额度却一分也分不出去，而界面上没有任何东西
+        // 解释为什么。密钥可以从门户之外消失（运维在控制台删掉了它）。
+        //
+        // `all_key_names` 读不动时返回 `None`，此时**不剪** —— 把一次读取失败
+        // 当成「一把密钥都没有」会把所有人的分配一次清空。
+        if let Some(present) = self
             .resources
+            .read()
+            .await
+            .ok()
+            .as_deref()
+            .and_then(crate::resources::all_key_names)
+        {
+            for (uid, name, _) in self.quotas().await? {
+                if !present.contains(&name) {
+                    self.store
+                        .drop_key_quota(&uid, &name)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+
+        let quotas = self.quotas().await?;
+        self.resources
             .edit(move |doc| {
                 use serde_yaml_ng::Value;
                 let Some(map) = doc.as_mapping_mut() else {
@@ -292,8 +336,14 @@ impl<S: ConsumptionSource> Sweeper<S> {
                 }
                 changed
             })
-            .await;
-        Ok(())
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// 额度记录。折成文字错误：调用方只用它记日志与计数，不按类型分支。
+    async fn quotas(&self) -> Result<Vec<(String, String, i64)>, String> {
+        self.store.all_key_quotas().await.map_err(|e| e.to_string())
     }
 
     /// 把每个用户的累计发放总额写成一条 `scope: member` 的策略。
@@ -303,10 +353,9 @@ impl<S: ConsumptionSource> Sweeper<S> {
     ///
     /// 只写 `granted_micro_usd`，不写窗口 —— 这条策略表达的是「总共给了多少」，
     /// 给它一个窗口会让读配置的人以为额度按那个周期刷新。
-    async fn apply_allowances(&self, grants: &[(String, i64)]) -> Result<(), StoreError> {
+    async fn apply_allowances(&self, grants: &[(String, i64)]) -> Result<(), String> {
         let grants = grants.to_vec();
-        let _ = self
-            .resources
+        self.resources
             .edit(move |doc| {
                 use serde_yaml_ng::Value;
                 let map = match doc.as_mapping_mut() {
@@ -356,8 +405,9 @@ impl<S: ConsumptionSource> Sweeper<S> {
                 }
                 changed
             })
-            .await;
-        Ok(())
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     /// 把期望的启停状态落到 `resources.yaml`。返回 (新停用数, 新启用数)。
@@ -365,7 +415,7 @@ impl<S: ConsumptionSource> Sweeper<S> {
     /// 走共用的 [`crate::resources::Writer`]：铸密钥也写这个文件，两条路径不
     /// 串行就会互相覆盖 —— 后写的那次带着自己读到的旧全文，把中间那次改动整段
     /// 抹掉。改动用泛型 `Value`，不经过窄结构体（那会抹掉门户不认识的字段）。
-    async fn apply_key_state(&self, wanted: &[(String, bool)]) -> (usize, usize) {
+    async fn apply_key_state(&self, wanted: &[(String, bool)]) -> Result<(usize, usize), String> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
@@ -376,7 +426,7 @@ impl<S: ConsumptionSource> Sweeper<S> {
         let (o1, o2) = (off.clone(), on.clone());
         let wanted = wanted.to_vec();
 
-        let _ = self
+        let wrote = self
             .resources
             .edit(move |doc| {
                 // 每次重试从零开始数。
@@ -414,7 +464,10 @@ impl<S: ConsumptionSource> Sweeper<S> {
             })
             .await;
 
-        (off.load(Ordering::SeqCst), on.load(Ordering::SeqCst))
+        // 这一步落的是杀手闸。写失败还报「改了 N 把」的话，账面显示已停用、
+        // 实际仍然在放行 —— 最不该被吞掉的一次失败。
+        wrote.map_err(|e| e.to_string())?;
+        Ok((off.load(Ordering::SeqCst), on.load(Ordering::SeqCst)))
     }
 }
 
@@ -955,6 +1008,65 @@ mod key_allowance_tests {
             "用户域的额度策略被误删了"
         );
         assert!(policy(&f.path, "portal-key-a").is_some());
+    }
+
+    /// 把配置文件设成只读：读得到，写不进去。
+    fn make_read_only(path: &str) {
+        let mut perm = std::fs::metadata(path).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(path, perm).unwrap();
+    }
+
+    // 下面三条各自安排成「只有那一步需要写盘」，否则断言分不清是谁失败的 ——
+    // 第一版就是这么写的：三步共用一个计数器，删掉任何一步的错误传递都照样绿。
+
+    #[tokio::test]
+    async fn 额度下推写不进去时被记下来() {
+        let f = fx().await;
+        // 有额度要推（这一步要写）；余额为正、密钥本来就是启用态（那一步不写）；
+        // 没有密钥额度（那一步也不写）。
+        //
+        // **两个用户都要给额度。** 夹具里有 u2，漏掉它的话它余额为零、这一轮要
+        // 被停用，于是停用那一步也写了盘 —— 计数变成 2，隔离就没了。
+        for u in [&f.uid, &f.other] {
+            f.ledger
+                .credit(u, 5_000_000, crate::ledger::Source::AdminGrant, None)
+                .await
+                .unwrap();
+        }
+        make_read_only(&f.path);
+        let r = f.sw.tick(t("2026-08-27T10:00:00Z")).await.unwrap();
+        assert_eq!(r.write_failures, 1, "额度下推的写入失败没被记下来: {r:?}");
+    }
+
+    #[tokio::test]
+    async fn 密钥额度下推写不进去时被记下来() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 5_000_000, crate::ledger::Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.store.set_key_quota(&f.uid, "a", 1_000_000).await.unwrap();
+        // 先让用户级那条策略落地，这样本轮只剩密钥级那一步需要写。
+        f.sw.tick(t("2026-08-27T10:00:00Z")).await.unwrap();
+        f.store.set_key_quota(&f.uid, "a", 2_000_000).await.unwrap();
+        make_read_only(&f.path);
+        let r = f.sw.tick(t("2026-08-27T10:00:15Z")).await.unwrap();
+        assert_eq!(
+            r.write_failures, 1,
+            "密钥额度下推的写入失败没被记下来: {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn 停用密钥写不进去时被记下来() {
+        let f = fx().await;
+        // 余额为零 → 这一轮必须把密钥写成停用，只有这一步需要写盘。
+        make_read_only(&f.path);
+        let r = f.sw.tick(t("2026-08-27T10:00:00Z")).await.unwrap();
+        assert_eq!(r.write_failures, 1, "停用写入失败没被记下来: {r:?}");
+        // 而且不能报成「停用了 N 把」—— 那会让账面显示已停用、实际仍在放行。
+        assert_eq!(r.disabled, 0, "写盘失败却报了停用数: {r:?}");
     }
 
     #[tokio::test]

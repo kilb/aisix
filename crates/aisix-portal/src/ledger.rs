@@ -112,33 +112,48 @@ impl Ledger {
     /// 这是下推给网关的那个数。网关那边只累加消费、从不重置，所以「还剩多少」
     /// 是两个量的差，不需要任何对账去校正。
     pub async fn total_granted(&self, user_id: &str) -> Result<i64, StoreError> {
-        let (sum,): (i64,) = sqlx::query_as(
-            "SELECT COALESCE(SUM(delta_micro_usd), 0) FROM ledger
-             WHERE user_id = ?1 AND source != 'consumption'",
-        )
-        .bind(user_id)
-        .fetch_one(self.store.pool())
-        .await?;
-        Ok(sum)
+        let mut c = self.store.pool().acquire().await?;
+        total_granted_on(&mut *c, user_id).await
     }
 
     /// 把总额度设定成 `target`，记一条差额流水。返回实际写入的差额。
     ///
     /// 目标低于已消费是允许的：那就是「我把你的额度调到这个数」，网关会立刻
     /// 拒绝后续请求。不允许的是负的目标值 —— 那没有意义。
+    /// 读当前总额、算差额、记流水 —— **一个事务**。分开做的话两个并发的设定
+    /// 会各自读到同一份旧值，各写一条差额，最终总额既不是这个目标也不是那个
+    /// （设 8 与设 2 同时发生，结果停在原来的 5）。
     pub async fn set_total_granted(
         &self,
         user_id: &str,
         target: i64,
         note: Option<&str>,
     ) -> Result<i64, StoreError> {
-        let current = self.total_granted(user_id).await?;
-        let delta = target - current;
-        if delta != 0 {
-            let mut c = self.store.pool().acquire().await?;
-            insert_entry(&mut *c, user_id, delta, Source::AdminSet, note).await?;
-        }
-        Ok(delta)
+        let user_id = user_id.to_string();
+        let note = note.map(str::to_string);
+        self.store
+            .immediate_tx(move |conn| {
+                Box::pin(async move {
+                    let current = total_granted_on(&mut *conn, &user_id).await?;
+                    // `target - current` 会溢出（target 接近 i64::MAX 而 current
+                    // 为负时）。release 下回绕成一个符号相反的差额，账本从此对不上。
+                    let Some(delta) = target.checked_sub(current) else {
+                        return Err(StoreError::OutOfRange);
+                    };
+                    if delta != 0 {
+                        insert_entry(
+                            &mut *conn,
+                            &user_id,
+                            delta,
+                            Source::AdminSet,
+                            note.as_deref(),
+                        )
+                        .await?;
+                    }
+                    Ok(delta)
+                })
+            })
+            .await
     }
 
     /// 按记账顺序返回流水。
@@ -160,6 +175,21 @@ impl Ledger {
             })
             .collect())
     }
+}
+
+/// 总额度的那条查询，可挂在任意 executor 上 —— 事务内外共用同一份语句。
+pub(crate) async fn total_granted_on<'e, E>(exec: E, user_id: &str) -> Result<i64, StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let (sum,): (i64,) = sqlx::query_as(
+        "SELECT COALESCE(SUM(delta_micro_usd), 0) FROM ledger
+         WHERE user_id = ?1 AND source != 'consumption'",
+    )
+    .bind(user_id)
+    .fetch_one(exec)
+    .await?;
+    Ok(sum)
 }
 
 /// 在 sweeper 里再抄一份，记账语句从此有两个真相。
