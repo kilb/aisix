@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import * as api from "./lib/api";
 import { count, splitLead, usd } from "./lib/fmt";
 import { Keys } from "./Keys";
+import { Logs } from "./Logs";
 
 const RANGES: [number, string][] = [
   [1, "近 1 小时"],
@@ -86,6 +87,8 @@ export function Account({ sess, onOut }: { sess: api.Session; onOut: () => void 
       {use?.note && <div className="note warn">{use.note}</div>}
 
       <Keys onChanged={() => void load()} />
+
+      <Logs />
 
       <div className="deck">
         <section className="panel">

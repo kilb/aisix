@@ -211,3 +211,32 @@ export async function upstreamModels(providerKey: string): Promise<string[]> {
   if (!r.ok) throw new ApiError(await errorOf(r), r.status);
   return ((await r.json()) as { models?: string[] }).models ?? [];
 }
+
+// ── 自助门户的管理端（经控制台转发，凭据留在服务端）────────────────────
+
+export interface PortalUser {
+  user_id: string;
+  email: string;
+  display_name: string | null;
+  disabled: boolean;
+  balance_micro_usd: number;
+}
+
+export async function portalUsers(): Promise<{ users: PortalUser[] }> {
+  const r = await req("/api/portal/users");
+  if (!r.ok) throw new ApiError(await errorOf(r), r.status);
+  return (await r.json()) as { users: PortalUser[] };
+}
+
+export async function portalGrant(
+  userId: string,
+  microUsd: number,
+  note: string | null,
+): Promise<void> {
+  const r = await req(`/api/portal/users/${encodeURIComponent(userId)}/grant`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ micro_usd: microUsd, note }),
+  });
+  if (!r.ok) throw new ApiError(await errorOf(r), r.status);
+}

@@ -13,6 +13,7 @@ mod auth;
 mod client;
 mod keys;
 mod ledger;
+mod logs;
 mod resources;
 mod store;
 mod sweeper;
@@ -36,6 +37,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/logout", post(auth::logout))
         .route("/api/session", get(auth::session))
         .route("/api/usage", get(usage::usage))
+        .route("/api/logs", get(logs::logs))
         .route("/api/balance", get(usage::balance))
         .route("/api/keys", get(keys::list).post(keys::create))
         .route("/api/keys/{name}", axum::routing::delete(keys::revoke))

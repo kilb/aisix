@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { start, PASSWORD, type Fixture } from "./fixture";
+import { start, PASSWORD, PORTAL_TOKEN_SENTINEL, type Fixture } from "./fixture";
 
 let fx: Fixture;
 
@@ -144,13 +144,13 @@ test("网关状态是一个带边框和状态点的方戳", async ({ page }) => 
  * 记在这里是因为断言反转过一次，不写清楚下一个人会以为是退化。
  *
  * 轴向不再钉 —— 这条用例已经因为改布局重写过两次。钉的是丢了就是退化的四
- * 件事：九项都在、离页边有距离、有自己的面和影、滚到页底仍在视口里。
+ * 件事：每一项都在、离页边有距离、有自己的面和影、滚到页底仍在视口里。
  */
 test("导航是一块离开页边、浮在自己面上的菜单", async ({ page }) => {
   await signIn(page);
   const nav = page.locator("nav.tabs");
   await expect(nav).toBeVisible();
-  await expect(nav.getByRole("tab")).toHaveCount(9);
+  await expect(nav.getByRole("tab")).toHaveCount(10);
 
   const look = await nav.evaluate((el) => {
     const cs = getComputedStyle(el);
@@ -210,7 +210,7 @@ test("两套主题下主按钮的对比度都达标", async ({ page }) => {
   }
 });
 
-test("登录后九个页签都能打开", async ({ page }) => {
+test("登录后每个页签都能打开", async ({ page }) => {
   await signIn(page);
   for (const name of [
     "概览",
@@ -491,4 +491,40 @@ test("给密钥配上花费上限后，概览就把这笔账结出来", async ({
   // 而这正是要守的：不知道花了多少就不能算余额，宁可说读不到。
   await expect(bal).toContainText(/读不到窗口内花费/);
   await expect(bal.locator(".balance-sum")).toHaveCount(0);
+});
+
+/**
+ * 门户用户页。
+ *
+ * 夹具把 `PORTAL_URL` 指向一个不存在的地址，并给 `PORTAL_ADMIN_TOKEN` 设了一个
+ * 哨兵值。所以这一层钉两件事：门户不可达时说清原因、以及**那把凭据绝不泄漏**。
+ *
+ * 有门户时的发放流程由 `web-portal/e2e` 覆盖 —— 那里有真的门户进程。
+ */
+test("门户不可达时说明原因_而不是显示一张空表", async ({ page }) => {
+  await signIn(page);
+  await page.getByRole("tab", { name: "门户用户" }).click();
+  await expect(page.getByText(/门户不可达/)).toBeVisible();
+  // 空表会被读成「还没有人注册」，那跟「连不上门户」是两件事。
+  await expect(page.locator("table")).toHaveCount(0);
+});
+
+test("门户的管理凭据既不进前端产物_也不进任何接口响应", async ({ page }) => {
+  await signIn(page);
+  await page.getByRole("tab", { name: "门户用户" }).click();
+
+  const leaked = await page.evaluate(async (sentinel) => {
+    const hits: string[] = [];
+    for (const s of document.querySelectorAll("script[src]")) {
+      const js = await fetch((s as HTMLScriptElement).src).then((r) => r.text());
+      if (js.includes(sentinel)) hits.push("前端产物");
+    }
+    for (const path of ["/api/session", "/api/portal/users"]) {
+      const body = await fetch(path, { credentials: "same-origin" }).then((r) => r.text());
+      if (body.includes(sentinel)) hits.push(path);
+    }
+    return hits;
+  }, PORTAL_TOKEN_SENTINEL);
+
+  expect(leaked, "门户凭据泄漏到了浏览器").toEqual([]);
 });

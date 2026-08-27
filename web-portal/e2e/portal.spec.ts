@@ -252,3 +252,24 @@ test("看不到也删不掉别人的密钥", async ({ page, browser }) => {
   await expect(page.locator("tbody tr", { hasText: "portal-" })).toHaveCount(1);
   await ctx.close();
 });
+
+test("调用记录只按会话过滤_没有密钥时明说而不是空表", async ({ page }) => {
+  const email = mail("logs");
+  await signUp(page, email);
+
+  // 刚注册、没有密钥：应当明说没有绑定的密钥，而不是显示一张空表 ——
+  // 空表会被读成「有密钥但没流量」，那是两件不同的事。
+  await expect(page.getByRole("heading", { name: "调用记录" })).toBeVisible();
+  await expect(page.getByText(/还没有绑定的密钥/)).toBeVisible();
+
+  // 端点不接受任何能改变过滤对象的参数。
+  const probe = await page.evaluate(async () => {
+    const r = await fetch("/api/logs?limit=50&user_id=someone-else&api_key_id=whatever", {
+      credentials: "same-origin",
+    });
+    return { status: r.status, body: await r.text() };
+  });
+  expect(probe.status).toBe(200);
+  expect(probe.body).not.toContain("someone-else");
+  expect(probe.body).not.toContain("whatever");
+});

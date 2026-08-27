@@ -90,6 +90,22 @@ export interface MintedKey {
 }
 
 export const balance = () => req<Balance>("/balance");
+export interface LogRow {
+  ts: string;
+  method?: string;
+  path?: string;
+  status?: number;
+  latency_ms?: number;
+  model?: string;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+}
+
+/** 只返回本人密钥的记录 —— 过滤在服务端，前端给不出能改变结果的参数。 */
+export const logs = (limit: number) =>
+  req<{ rows: LogRow[]; note: string | null }>(`/logs?limit=${limit}`);
+
 export const listKeys = () => req<{ keys: KeyRow[] }>("/keys");
 export const createKey = (label: string) => post<MintedKey>("/keys", { label });
 export const revokeKey = (name: string) =>

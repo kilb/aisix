@@ -7,6 +7,7 @@ import { join, resolve } from "node:path";
 const REPO = resolve(import.meta.dirname, "../..");
 const CONSOLE_BIN = join(REPO, "target/release/aisix-console");
 const GATEWAY_BIN = join(REPO, "target/release/aisix");
+export const PORTAL_TOKEN_SENTINEL = "e2e-portal-token-must-never-leak";
 export const PASSWORD = "e2e-test-password";
 
 export interface Fixture {
@@ -82,6 +83,13 @@ export async function start(): Promise<Fixture> {
       ...process.env,
       CONSOLE_PASSWORD_HASH: hashed.stdout.trim(),
       AISIX_ADMIN_KEY_FOR_CONSOLE: "e2e-admin-key",
+      // 哨兵值：用例断言它绝不出现在任何前端产物或接口响应里。
+      // 控制台持有它去调门户的管理端；浏览器拿到它就等于拿到了给任何人发放
+      // 额度的权力，而门户的管理端**不认控制台的会话**，那把 token 是唯一的钥匙。
+      PORTAL_ADMIN_TOKEN: PORTAL_TOKEN_SENTINEL,
+      // 指向一个不存在的门户：这一层测的是「凭据不泄漏」与「门户不可达时的
+      // 表现」，有门户时的发放流程由 web-portal/e2e 覆盖（那里有真门户）。
+      PORTAL_URL: "http://127.0.0.1:1",
       // 网关管理 API 不需要真的可达：本套用例只驱动配置读写这条路径，
       // 而那条路径只用到 resources.yaml 和 `aisix validate`。
       AISIX_ADMIN_URL: "http://127.0.0.1:1",

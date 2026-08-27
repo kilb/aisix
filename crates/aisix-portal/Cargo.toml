@@ -6,6 +6,10 @@ edition = "2021"
 # 与 crates/aisix-console 一样自带版本，不进 workspace deps：
 # 门户是独立进程，它的依赖不该压到网关那些 crate 头上。
 [dependencies]
+# 用网关自己的 id 派生函数，不复制那段逻辑：api_key_id 是 uuid5(命名空间,
+# "api_keys/<display_name>")，自己抄一份必然跟上游漂开，而漂开的后果是门户
+# 按错的 id 过滤日志、用户看到空白且不知道为什么。
+aisix-core = { path = "../aisix-core" }
 argon2 = "0.5.3"
 # rand_core 0.6 与 argon2 依赖的是同一个版本 —— 与 crates/aisix-console 一致，
 # 口令盐和（后续的）会话 token 共用一套随机源，省掉两套版本对齐。

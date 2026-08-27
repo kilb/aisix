@@ -275,6 +275,7 @@ dependencies = [
 name = "aisix-portal"
 version = "0.1.0"
 dependencies = [
+ "aisix-core",
  "argon2",
  "axum 0.8.9",
  "chrono",

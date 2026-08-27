@@ -37,6 +37,12 @@ struct AppState {
     admin_url: String,
     /// 管理密钥。只存在服务端，绝不下发给浏览器。
     admin_key: String,
+    /// 自助门户的地址与管理凭据。
+    ///
+    /// 凭据留在服务端，跟 `admin_key` 同一个道理：浏览器拿到它就等于拿到了
+    /// 全部用户的账目和发放额度的权力。控制台只把结果转出去，不把凭据转出去。
+    portal_url: String,
+    portal_admin_token: Option<String>,
     /// Prometheus 基址（回环）。
     prom_url: String,
     /// 声明式资源文件，控制台写它。
@@ -208,6 +214,84 @@ async fn session_state(State(st): State<AppState>, headers: HeaderMap) -> Json<V
         "authed": st.authed(&headers).await,
         "api_contract": API_CONTRACT_VERSION,
     }))
+}
+
+// ── 自助门户的管理端（转发，凭据不出服务端）────────────────────────────
+
+/// 门户未配置时的统一回应。控制台可以独立部署，没有门户不是错误。
+fn portal_absent() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": "未配置自助门户（PORTAL_ADMIN_TOKEN 未设置）"})),
+    )
+        .into_response()
+}
+
+/// `GET /api/portal/users` —— 注册用户与各自余额。
+async fn portal_users(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = require_auth(&st, &headers).await {
+        return r;
+    }
+    let Some(token) = st.portal_admin_token.clone() else {
+        return portal_absent();
+    };
+    match st
+        .http
+        .get(format!("{}/admin/users", st.portal_url))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .send()
+        .await
+    {
+        Ok(r) => passthrough(r).await,
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("门户不可达: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /api/portal/users/{id}/grant` —— 给某个用户发放额度。
+async fn portal_grant(
+    State(st): State<AppState>,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(r) = require_auth(&st, &headers).await {
+        return r;
+    }
+    let Some(token) = st.portal_admin_token.clone() else {
+        return portal_absent();
+    };
+    match st
+        .http
+        .post(format!("{}/admin/users/{user_id}/grant", st.portal_url))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => passthrough(r).await,
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("门户不可达: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// 把门户的应答原样转出去（状态码 + JSON）。
+async fn passthrough(r: reqwest::Response) -> Response {
+    let status = StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    match r.json::<Value>().await {
+        Ok(v) => (status, Json(v)).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("门户返回的不是 JSON: {e}")})),
+        )
+            .into_response(),
+    }
 }
 
 // ── 资源读（转发网关管理 API）──────────────────────────────────────────
@@ -1114,6 +1198,9 @@ async fn main() {
     let state = AppState {
         admin_url: env("AISIX_ADMIN_URL", "http://127.0.0.1:8081"),
         admin_key,
+        portal_url: env("PORTAL_URL", "http://127.0.0.1:8091"),
+        // 没配就把门户管理页整个关掉 —— 控制台可以独立部署。
+        portal_admin_token: std::env::var("PORTAL_ADMIN_TOKEN").ok(),
         prom_url: env("PROMETHEUS_URL", "http://127.0.0.1:9090"),
         resources_path: PathBuf::from(env("AISIX_RESOURCES", "/etc/aisix/resources.yaml")),
         aisix_bin: PathBuf::from(env("AISIX_BIN", "/usr/local/bin/aisix")),
@@ -1139,6 +1226,8 @@ async fn main() {
                 .put(api_file_put)
                 .layer(axum::extract::DefaultBodyLimit::max(256 * 1024)),
         )
+        .route("/api/portal/users", get(portal_users))
+        .route("/api/portal/users/{id}/grant", post(portal_grant))
         .route("/api/mint-key", post(api_mint_key))
         .route("/api/metrics", post(api_metrics))
         .route("/api/logs", post(api_logs))
@@ -1215,6 +1304,72 @@ mod tests {
     /// 没有 node 的 CI 编出带界面的二进制。
     ///
     /// 所以路由表里不该再出现任何返回 HTML 的项。
+    /// 门户的管理凭据必须留在服务端。
+    ///
+    /// 浏览器拿到它就等于拿到了全部注册用户的账目、以及给任何人发放额度的
+    /// 权力 —— 而门户的管理端**不认控制台的会话**（两套凭据刻意互不通用），
+    /// 所以那把 token 是唯一的钥匙。
+    ///
+    /// 这里扫的是源码而不是行为：一旦有人把它塞进某个 JSON 响应里，行为测试
+    /// 只有在恰好断言那个字段时才会发现。
+    #[test]
+    fn the_portal_admin_token_never_reaches_a_response() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(src);
+
+        for line in production.lines() {
+            let l = line.trim();
+            // 只允许它出现在两个地方：读环境变量、以及拼成 Authorization 头。
+            if !l.contains("portal_admin_token") {
+                continue;
+            }
+            let sanctioned = l.contains("std::env::var")
+                || l.contains("portal_admin_token: ")
+                || l.contains("let Some(token) = st.portal_admin_token.clone()");
+            assert!(sanctioned, "门户凭据出现在了不该出现的地方: {l}");
+        }
+        // 它只能经 Authorization 头出去。
+        assert!(
+            production.contains("format!(\"Bearer {token}\")"),
+            "转发时没有把门户凭据放进 Authorization 头",
+        );
+    }
+
+    /// 没配门户时管理页整个关掉，而不是崩掉或假装成功。控制台可以独立部署。
+    #[test]
+    fn an_absent_portal_is_reported_not_crashed() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("SERVICE_UNAVAILABLE"),
+            "门户缺席时没有一个明确的状态码",
+        );
+        assert!(
+            src.contains("未配置自助门户"),
+            "门户缺席时没有给出可读的原因",
+        );
+    }
+
+    /// 门户的两个管理端点都必须先过控制台自己的会话检查。少了它，任何人都能
+    /// 匿名读到全部注册用户的邮箱与余额。
+    #[test]
+    fn portal_admin_routes_require_a_console_session() {
+        let src = include_str!("main.rs");
+        for f in ["async fn portal_users(", "async fn portal_grant("] {
+            let body = src
+                .split_once(f)
+                .and_then(|(_, rest)| rest.split_once("\n}\n"))
+                .map(|(b, _)| b)
+                .unwrap_or_else(|| panic!("找不到 {f}"));
+            assert!(
+                body.contains("require_auth(&st, &headers).await"),
+                "{f} 没有过会话检查",
+            );
+        }
+    }
+
     #[test]
     fn the_console_serves_only_api_never_a_page() {
         let src = include_str!("main.rs");

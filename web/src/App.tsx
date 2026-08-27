@@ -12,6 +12,7 @@ import { Keys } from "./tabs/Keys";
 import { Limits } from "./tabs/Limits";
 import { Resources } from "./tabs/Resources";
 import { Logs } from "./tabs/Logs";
+import { Users } from "./tabs/Users";
 import { Raw } from "./tabs/Raw";
 
 const TABS = [
@@ -22,6 +23,7 @@ const TABS = [
   ["keys", "调用方密钥"],
   ["limits", "限流与预算"],
   ["resources", "全部资源"],
+  ["users", "门户用户"],
   ["logs", "调用日志"],
   ["raw", "配置原文"],
 ] as const;
@@ -149,6 +151,7 @@ export function App() {
           {tab === "keys" && <Keys doc={doc} />}
           {tab === "limits" && <Limits doc={doc} />}
           {tab === "resources" && <Resources doc={doc} onGoto={setTab} />}
+          {tab === "users" && <Users />}
           {tab === "logs" && <Logs doc={doc} />}
           {tab === "raw" && <Raw doc={doc} />}
         </section>
