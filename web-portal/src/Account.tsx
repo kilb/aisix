@@ -3,6 +3,7 @@ import * as api from "./lib/api";
 import { count, splitLead, usd } from "./lib/fmt";
 import { Keys } from "./Keys";
 import { Logs } from "./Logs";
+import { Topup } from "./Topup";
 
 const RANGES: [number, string][] = [
   [1, "近 1 小时"],
@@ -85,6 +86,8 @@ export function Account({ sess, onOut }: { sess: api.Session; onOut: () => void 
           用量恒为 0 —— 跟「还没开始用」在屏幕上没有区别，而它实际意味着
           这个人在免费用。所以它显式占一整条横幅，而不是一个角落里的小字。 */}
       {use?.note && <div className="note warn">{use.note}</div>}
+
+      <Topup onChanged={() => void load()} />
 
       <Keys onChanged={() => void load()} />
 

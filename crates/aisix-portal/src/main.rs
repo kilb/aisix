@@ -17,6 +17,7 @@ mod logs;
 mod resources;
 mod store;
 mod sweeper;
+mod topup;
 mod usage;
 
 use auth::AppState;
@@ -38,6 +39,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/session", get(auth::session))
         .route("/api/usage", get(usage::usage))
         .route("/api/logs", get(logs::logs))
+        .route("/api/topups", get(topup::mine).post(topup::create))
+        .route("/admin/topups", get(topup::pending))
+        .route("/admin/topups/{id}/approve", post(topup::approve))
+        .route("/admin/topups/{id}/reject", post(topup::reject))
         .route("/api/balance", get(usage::balance))
         .route("/api/keys", get(keys::list).post(keys::create))
         .route("/api/keys/{name}", axum::routing::delete(keys::revoke))
@@ -1017,5 +1022,226 @@ mod keys_tests {
         assert!(!app.read_resources().contains("待删"));
         // 运维的密钥还在。
         assert!(app.read_resources().contains("ops"));
+    }
+}
+
+#[cfg(test)]
+mod topup_tests {
+    use super::testutil::{temp_resources, FakeProm, TestApp};
+    use serde_json::json;
+
+    const PW: &str = "correct horse battery";
+
+    async fn app() -> (FakeProm, TestApp) {
+        let prom = FakeProm::start().await;
+        let app = TestApp::start_with_usage(&prom, &temp_resources("api_keys: []")).await;
+        (prom, app)
+    }
+
+    async fn signed_in(app: &TestApp, mail: &str) -> String {
+        let id = app.register(mail, PW).await;
+        app.post("/api/login", json!({"email": mail, "password": PW}))
+            .await;
+        id
+    }
+
+    async fn balance(app: &TestApp, uid: &str) -> i64 {
+        crate::ledger::Ledger::new(app.store.clone())
+            .balance(uid)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn 发起充值单不会立刻入账() {
+        let (_p, app) = app().await;
+        let id = signed_in(&app, "a@b.c").await;
+        let (s, _) = app
+            .post("/api/topups", json!({"micro_usd": 5_000_000}))
+            .await;
+        assert_eq!(s, 201);
+        // 钱还没到，余额就不能动 —— 这一条是「线下」两个字的全部含义。
+        assert_eq!(balance(&app, &id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn 负数与超大金额被拒() {
+        let (_p, app) = app().await;
+        signed_in(&app, "a@b.c").await;
+        for bad in [-1_000_000i64, 0, 10_000_000_001] {
+            let (s, _) = app.post("/api/topups", json!({"micro_usd": bad})).await;
+            assert_eq!(s, 400, "金额 {bad} 没被拒");
+        }
+    }
+
+    #[tokio::test]
+    async fn 批准后入账_且流水来源是充值() {
+        let (_p, app) = app().await;
+        let uid = signed_in(&app, "a@b.c").await;
+        app.post(
+            "/api/topups",
+            json!({"micro_usd": 5_000_000, "note": "转账截图见邮件"}),
+        )
+        .await;
+
+        let (_, list) = app.get_admin("/admin/topups").await;
+        let v: serde_json::Value = serde_json::from_str(&list).unwrap();
+        let tid = v["topups"][0]["id"].as_i64().unwrap();
+        assert_eq!(v["topups"][0]["email"], json!("a@b.c"));
+
+        let (s, _) = app
+            .post_admin(
+                &format!("/admin/topups/{tid}/approve"),
+                json!({"note": "已核对"}),
+            )
+            .await;
+        assert_eq!(s, 200);
+        assert_eq!(balance(&app, &uid).await, 5_000_000);
+
+        let entries = crate::ledger::Ledger::new(app.store.clone())
+            .entries(&uid)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source, "topup");
+    }
+
+    #[tokio::test]
+    async fn 重复批准不会重复入账() {
+        let (_p, app) = app().await;
+        let uid = signed_in(&app, "a@b.c").await;
+        app.post("/api/topups", json!({"micro_usd": 5_000_000}))
+            .await;
+        let (_, list) = app.get_admin("/admin/topups").await;
+        let tid = serde_json::from_str::<serde_json::Value>(&list).unwrap()["topups"][0]["id"]
+            .as_i64()
+            .unwrap();
+
+        let (a, _) = app
+            .post_admin(&format!("/admin/topups/{tid}/approve"), json!({}))
+            .await;
+        let (b, _) = app
+            .post_admin(&format!("/admin/topups/{tid}/approve"), json!({}))
+            .await;
+        assert_eq!(a, 200);
+        // 第二次必须是冲突而不是「成功」—— 假装成功会让管理员以为自己刚入了账。
+        assert_eq!(b, 409);
+        assert_eq!(balance(&app, &uid).await, 5_000_000, "同一笔充值入账了两次");
+    }
+
+    #[tokio::test]
+    async fn 驳回不入账_且不能再被批准() {
+        let (_p, app) = app().await;
+        let uid = signed_in(&app, "a@b.c").await;
+        app.post("/api/topups", json!({"micro_usd": 5_000_000}))
+            .await;
+        let (_, list) = app.get_admin("/admin/topups").await;
+        let tid = serde_json::from_str::<serde_json::Value>(&list).unwrap()["topups"][0]["id"]
+            .as_i64()
+            .unwrap();
+
+        app.post_admin(
+            &format!("/admin/topups/{tid}/reject"),
+            json!({"note": "没收到款"}),
+        )
+        .await;
+        assert_eq!(balance(&app, &uid).await, 0);
+        let (s, _) = app
+            .post_admin(&format!("/admin/topups/{tid}/approve"), json!({}))
+            .await;
+        assert_eq!(s, 409);
+        assert_eq!(balance(&app, &uid).await, 0);
+    }
+
+    #[tokio::test]
+    async fn 用户只看得到自己的充值单() {
+        let (_p, app) = app().await;
+        signed_in(&app, "a@b.c").await;
+        app.post(
+            "/api/topups",
+            json!({"micro_usd": 1_000_000, "note": "A的单子"}),
+        )
+        .await;
+        signed_in(&app, "b@b.c").await;
+        app.post(
+            "/api/topups",
+            json!({"micro_usd": 2_000_000, "note": "B的单子"}),
+        )
+        .await;
+
+        let (_, mine) = app.get("/api/topups").await;
+        assert!(mine.contains("B的单子"));
+        assert!(!mine.contains("A的单子"), "看到了别人的充值单: {mine}");
+    }
+
+    #[tokio::test]
+    async fn 用户会话打不开充值单的管理端() {
+        let (_p, app) = app().await;
+        signed_in(&app, "a@b.c").await;
+        let (s, _) = app.get("/admin/topups").await;
+        assert_eq!(s, 401);
+    }
+}
+
+#[cfg(test)]
+mod topup_race_tests {
+    use super::testutil::{temp_resources, FakeProm, TestApp};
+    use serde_json::json;
+
+    /// 两个管理员同时点确认。
+    ///
+    /// 串行的重复批准由 SELECT 里的 `status = 'pending'` 就挡住了；影响行数那
+    /// 道防线**只在真并发下才起作用** —— 两个事务都查到 pending，然后靠 UPDATE
+    /// 的影响行数决出唯一的赢家。没有这条测试，那段代码等于没被验证过。
+    #[tokio::test]
+    async fn 并发批准同一笔只入账一次() {
+        let prom = FakeProm::start().await;
+        let app = TestApp::start_with_usage(&prom, &temp_resources("api_keys: []")).await;
+        let uid = app.register("a@b.c", "correct horse battery").await;
+        app.post(
+            "/api/login",
+            json!({"email":"a@b.c","password":"correct horse battery"}),
+        )
+        .await;
+        app.post("/api/topups", json!({"micro_usd": 5_000_000}))
+            .await;
+
+        let (_, list) = app.get_admin("/admin/topups").await;
+        let tid = serde_json::from_str::<serde_json::Value>(&list).unwrap()["topups"][0]["id"]
+            .as_i64()
+            .unwrap();
+
+        let base = app.base.clone();
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..6 {
+            let url = format!("{base}/admin/topups/{tid}/approve");
+            set.spawn(async move {
+                reqwest::Client::new()
+                    .post(url)
+                    .bearer_auth(TestApp::ADMIN_TOKEN)
+                    .json(&json!({}))
+                    .send()
+                    .await
+                    .map(|r| r.status().as_u16())
+                    .unwrap_or(0)
+            });
+        }
+        let mut ok = 0;
+        let mut conflict = 0;
+        while let Some(r) = set.join_next().await {
+            match r.unwrap() {
+                200 => ok += 1,
+                409 => conflict += 1,
+                other => panic!("意外状态码 {other}"),
+            }
+        }
+        assert_eq!(ok, 1, "有不止一个调用者认为自己入了账");
+        assert_eq!(conflict, 5);
+
+        let bal = crate::ledger::Ledger::new(app.store.clone())
+            .balance(&uid)
+            .await
+            .unwrap();
+        assert_eq!(bal, 5_000_000, "同一笔充值入账了多次");
     }
 }

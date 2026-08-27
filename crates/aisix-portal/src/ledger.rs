@@ -31,6 +31,8 @@ pub struct Entry {
 pub enum Source {
     AdminGrant,
     Consumption,
+    /// 线下充值单被管理员确认。真接支付后这条来源换成回调触发，账本不用改。
+    Topup,
 }
 
 impl Source {
@@ -38,6 +40,7 @@ impl Source {
         match self {
             Self::AdminGrant => "admin_grant",
             Self::Consumption => "consumption",
+            Self::Topup => "topup",
         }
     }
 }

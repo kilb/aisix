@@ -141,22 +141,36 @@ impl<S: ConsumptionSource> Sweeper<S> {
         micro: u64,
         through: DateTime<Utc>,
     ) -> Result<(), StoreError> {
-        let mut tx = self.store.pool().begin().await?;
+        let user_id = user_id.to_string();
         let delta = -i64::try_from(micro).unwrap_or(i64::MAX);
-        // 用账本自己的写入函数，不在这里抄一份 SQL —— 记账语句只能有一个真相。
-        crate::ledger::insert_entry(&mut *tx, user_id, delta, Source::Consumption, None).await?;
-        sqlx::query(
-            "INSERT INTO consumption_mark (user_id, counted_through, updated_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(user_id) DO UPDATE SET counted_through = ?2, updated_at = ?3",
-        )
-        .bind(user_id)
-        .bind(through.to_rfc3339())
-        .bind(Utc::now().to_rfc3339())
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
+        let through = through.to_rfc3339();
+        // 同样用 `BEGIN IMMEDIATE`：这个事务里有两条写，多个门户实例或多轮对账
+        // 重叠时，deferred 事务会在升级成写的那一刻当场失败而不是等待。
+        self.store
+            .immediate_tx(move |conn| {
+                Box::pin(async move {
+                    crate::ledger::insert_entry(
+                        &mut *conn,
+                        &user_id,
+                        delta,
+                        Source::Consumption,
+                        None,
+                    )
+                    .await?;
+                    sqlx::query(
+                        "INSERT INTO consumption_mark (user_id, counted_through, updated_at)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(user_id) DO UPDATE SET counted_through = ?2, updated_at = ?3",
+                    )
+                    .bind(&user_id)
+                    .bind(&through)
+                    .bind(Utc::now().to_rfc3339())
+                    .execute(&mut *conn)
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
     }
 
     /// 把期望的启停状态落到 `resources.yaml`。返回 (新停用数, 新启用数)。

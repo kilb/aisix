@@ -96,6 +96,39 @@ impl Store {
         &self.pool
     }
 
+    /// 跑一段**先读后写**的事务，用 `BEGIN IMMEDIATE`。
+    ///
+    /// 默认的 `BEGIN`（deferred）在并发下会死锁式失败：两个事务都先读、再都想
+    /// 升级成写，其中一个当场拿到 `SQLITE_BUSY` —— 而 `busy_timeout` 救不了升级
+    /// 冲突（它只在事务尚未持有读锁时才有机会等待）。表现是随机的 500，且只在
+    /// 真并发下出现，所以串行测试永远看不到，实测靠一条并发用例才炸出来。
+    ///
+    /// `IMMEDIATE` 一开始就拿写锁，于是第二个事务是**等待**而不是失败。
+    ///
+    /// 单条 INSERT 不需要这个（一条语句本身原子）；先读后写的才需要。
+    pub async fn immediate_tx<T, F>(&self, f: F) -> Result<T, StoreError>
+    where
+        F: for<'c> FnOnce(
+            &'c mut sqlx::SqliteConnection,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<T, StoreError>> + Send + 'c>,
+        >,
+    {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        match f(&mut conn).await {
+            Ok(v) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(v)
+            }
+            Err(e) => {
+                // 回滚失败也不掩盖原始错误 —— 那才是要报出去的东西。
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
+    }
+
     pub async fn insert_user(
         &self,
         id: &str,

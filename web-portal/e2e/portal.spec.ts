@@ -273,3 +273,38 @@ test("调用记录只按会话过滤_没有密钥时明说而不是空表", asyn
   expect(probe.body).not.toContain("someone-else");
   expect(probe.body).not.toContain("whatever");
 });
+
+test("提交充值单不改余额_确认后才入账_重复确认被拒", async ({ page }) => {
+  const email = mail("topup");
+  await signUp(page, email);
+
+  await page.getByLabel("金额 USD").fill("20");
+  await page.getByLabel("备注（转账单号等）").fill("单号 X1");
+  await page.getByRole("button", { name: "提交充值单" }).click();
+  await expect(page.getByText(/等待管理员确认/)).toBeVisible();
+  await expect(page.locator("tbody tr", { hasText: "单号 X1" })).toContainText("待确认");
+
+  // 提交 ≠ 到账。这一条是「线下」两个字的全部含义。
+  await expect(balanceReading(page)).toHaveText("$0.00");
+
+  // 管理员确认。
+  const list = await fetch(`${fx.portalUrl}/admin/topups`, {
+    headers: { authorization: `Bearer ${fx.adminToken}` },
+  }).then((r) => r.json());
+  const t = list.topups.find((x: { email: string }) => x.email === email);
+  expect(t, "管理端看不到这笔充值单").toBeTruthy();
+
+  const approve = () =>
+    fetch(`${fx.portalUrl}/admin/topups/${t.id}/approve`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${fx.adminToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ note: "已核对" }),
+    });
+  expect((await approve()).status).toBe(200);
+  // 第二次必须是冲突 —— 假装成功会让管理员以为自己刚又入了一笔。
+  expect((await approve()).status).toBe(409);
+
+  await page.reload();
+  await expect(balanceReading(page)).toHaveText("$20.00");
+  await expect(page.locator("tbody tr", { hasText: "单号 X1" })).toContainText("已入账");
+});

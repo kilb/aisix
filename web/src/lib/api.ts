@@ -240,3 +240,33 @@ export async function portalGrant(
   });
   if (!r.ok) throw new ApiError(await errorOf(r), r.status);
 }
+
+export interface PortalTopup {
+  id: number;
+  user_id: string;
+  email: string;
+  micro_usd: number;
+  note: string | null;
+  status: string;
+  created_at: string;
+}
+
+export async function portalTopups(): Promise<{ topups: PortalTopup[] }> {
+  const r = await req("/api/portal/topups");
+  if (!r.ok) throw new ApiError(await errorOf(r), r.status);
+  return (await r.json()) as { topups: PortalTopup[] };
+}
+
+/** `decision` 只能是 approve / reject —— 服务端也会再挡一次。 */
+export async function portalDecideTopup(
+  id: number,
+  decision: "approve" | "reject",
+  note: string | null,
+): Promise<void> {
+  const r = await req(`/api/portal/topups/${id}/${decision}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ note }),
+  });
+  if (!r.ok) throw new ApiError(await errorOf(r), r.status);
+}

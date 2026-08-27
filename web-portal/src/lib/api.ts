@@ -106,6 +106,18 @@ export interface LogRow {
 export const logs = (limit: number) =>
   req<{ rows: LogRow[]; note: string | null }>(`/logs?limit=${limit}`);
 
+export interface Topup {
+  id: number;
+  micro_usd: number;
+  note: string | null;
+  status: string;
+  created_at: string;
+}
+
+export const topups = () => req<{ topups: Topup[] }>("/topups");
+export const requestTopup = (microUsd: number, note: string | null) =>
+  post<{ ok: true }>("/topups", { micro_usd: microUsd, note });
+
 export const listKeys = () => req<{ keys: KeyRow[] }>("/keys");
 export const createKey = (label: string) => post<MintedKey>("/keys", { label });
 export const revokeKey = (name: string) =>

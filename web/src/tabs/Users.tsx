@@ -13,6 +13,14 @@ import { fmtUsd } from "../lib/fmt";
  * 用户免费用而没人会发现。
  */
 
+interface Topup {
+  id: number;
+  email: string;
+  micro_usd: number;
+  note: string | null;
+  created_at: string;
+}
+
 interface PortalUser {
   user_id: string;
   email: string;
@@ -31,10 +39,13 @@ export function Users() {
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState<string | null>(null);
 
+  const [topups, setTopups] = useState<Topup[]>([]);
+
   const load = useCallback(async () => {
     try {
-      const r = await api.portalUsers();
+      const [r, t] = await Promise.all([api.portalUsers(), api.portalTopups()]);
       setRows(r.users);
+      setTopups(t.topups);
       setErr(null);
       setAbsent(false);
     } catch (e) {
@@ -87,8 +98,77 @@ export function Users() {
     );
   }
 
+  async function decide(id: number, d: "approve" | "reject") {
+    setBusy(true);
+    setErr(null);
+    setDone(null);
+    try {
+      await api.portalDecideTopup(id, d, null);
+      setDone(d === "approve" ? "已确认，额度已入账" : "已驳回");
+      await load();
+    } catch (e) {
+      // 409 = 别人已经处理过。照实说，别让人以为自己刚入了账。
+      setErr(e instanceof Error ? e.message : "处理失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <>
+      {topups.length > 0 && (
+        <div className="panel">
+          <h2>待确认的充值单</h2>
+          <p className="hint">
+            核对到账后确认，<strong>确认那一刻才入账</strong>。同一笔被重复确认时
+            服务端会拒绝第二次，不会重复入账。
+          </p>
+          <div className="scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>用户</th>
+                  <th className="right">金额</th>
+                  <th>备注</th>
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                {topups.map((t) => (
+                  <tr key={t.id}>
+                    <td className="num" style={{ fontSize: 11 }}>
+                      {t.created_at.replace("T", " ").slice(0, 16)}
+                    </td>
+                    <td>{t.email}</td>
+                    <td className="right num">{fmtUsd(t.micro_usd)}</td>
+                    <td>{t.note ?? ""}</td>
+                    <td className="right">
+                      <button
+                        className="ghost"
+                        disabled={busy}
+                        onClick={() => void decide(t.id, "approve")}
+                      >
+                        确认
+                      </button>{" "}
+                      <button
+                        className="ghost"
+                        disabled={busy}
+                        onClick={() => void decide(t.id, "reject")}
+                      >
+                        驳回
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {err && <div className="note crit">{err}</div>}
+          {done && <div className="note">{done}</div>}
+        </div>
+      )}
+
       <div className="panel">
         <h2>发放额度</h2>
         <p className="hint">

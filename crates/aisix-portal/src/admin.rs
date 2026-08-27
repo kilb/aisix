@@ -18,7 +18,7 @@ use crate::auth::AppState;
 use crate::ledger::{Ledger, Source};
 
 /// 校验管理凭据。用常量时间比较，避免把 token 的前缀猜出来。
-fn admin_ok(st: &AppState, headers: &HeaderMap) -> bool {
+pub(crate) fn admin_ok(st: &AppState, headers: &HeaderMap) -> bool {
     let Some(expected) = st.admin_token() else {
         // 没配管理凭据就整个关掉，而不是放行。默认拒绝。
         return false;
@@ -40,7 +40,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn forbidden() -> Response {
+pub(crate) fn forbidden() -> Response {
     (
         StatusCode::UNAUTHORIZED,
         Json(json!({"error": "需要管理凭据"})),

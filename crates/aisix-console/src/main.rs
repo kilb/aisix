@@ -243,11 +243,7 @@ async fn portal_users(State(st): State<AppState>, headers: HeaderMap) -> Respons
         .await
     {
         Ok(r) => passthrough(r).await,
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": format!("门户不可达: {e}")})),
-        )
-            .into_response(),
+        Err(e) => portal_unreachable(e),
     }
 }
 
@@ -273,12 +269,70 @@ async fn portal_grant(
         .await
     {
         Ok(r) => passthrough(r).await,
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": format!("门户不可达: {e}")})),
-        )
-            .into_response(),
+        Err(e) => portal_unreachable(e),
     }
+}
+
+/// `GET /api/portal/topups` —— 待确认的充值单。
+async fn portal_topups(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = require_auth(&st, &headers).await {
+        return r;
+    }
+    let Some(token) = st.portal_admin_token.clone() else {
+        return portal_absent();
+    };
+    match st
+        .http
+        .get(format!("{}/admin/topups", st.portal_url))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .send()
+        .await
+    {
+        Ok(r) => passthrough(r).await,
+        Err(e) => portal_unreachable(e),
+    }
+}
+
+/// `POST /api/portal/topups/{id}/{decision}` —— 确认或驳回一笔充值单。
+async fn portal_decide_topup(
+    State(st): State<AppState>,
+    axum::extract::Path((id, decision)): axum::extract::Path<(i64, String)>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(r) = require_auth(&st, &headers).await {
+        return r;
+    }
+    // 白名单，不是把路径段直接拼进 URL：拼的话 `../` 之类能走到门户的别的端点上。
+    if decision != "approve" && decision != "reject" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "只能是 approve 或 reject"})),
+        )
+            .into_response();
+    }
+    let Some(token) = st.portal_admin_token.clone() else {
+        return portal_absent();
+    };
+    match st
+        .http
+        .post(format!("{}/admin/topups/{id}/{decision}", st.portal_url))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => passthrough(r).await,
+        Err(e) => portal_unreachable(e),
+    }
+}
+
+fn portal_unreachable(e: reqwest::Error) -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({"error": format!("门户不可达: {e}")})),
+    )
+        .into_response()
 }
 
 /// 把门户的应答原样转出去（状态码 + JSON）。
@@ -1228,6 +1282,8 @@ async fn main() {
         )
         .route("/api/portal/users", get(portal_users))
         .route("/api/portal/users/{id}/grant", post(portal_grant))
+        .route("/api/portal/topups", get(portal_topups))
+        .route("/api/portal/topups/{id}/{decision}", post(portal_decide_topup))
         .route("/api/mint-key", post(api_mint_key))
         .route("/api/metrics", post(api_metrics))
         .route("/api/logs", post(api_logs))
@@ -1338,6 +1394,28 @@ mod tests {
         );
     }
 
+    /// 转发时不把调用方给的路径段直接拼进 URL。
+    ///
+    /// 拼的话 `../` 之类能从「确认充值单」走到门户的别的管理端点上 —— 控制台
+    /// 持有的是门户的**全权**凭据，那等于把整个管理端交出去。
+    #[test]
+    fn the_forwarded_path_segment_comes_from_a_whitelist() {
+        let src = include_str!("main.rs");
+        let body = src
+            .split_once("async fn portal_decide_topup(")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(b, _)| b)
+            .expect("找不到 portal_decide_topup");
+        assert!(
+            body.contains(r#"decision != "approve" && decision != "reject""#),
+            "转发前没有把路径段限制成白名单",
+        );
+        // 而且校验必须发生在拼 URL 之前。
+        let check = body.find("decision != ").expect("没有校验");
+        let build = body.find("/admin/topups/").expect("没有拼 URL");
+        assert!(check < build, "先拼了 URL 才校验，等于没校验");
+    }
+
     /// 没配门户时管理页整个关掉，而不是崩掉或假装成功。控制台可以独立部署。
     #[test]
     fn an_absent_portal_is_reported_not_crashed() {
@@ -1357,7 +1435,12 @@ mod tests {
     #[test]
     fn portal_admin_routes_require_a_console_session() {
         let src = include_str!("main.rs");
-        for f in ["async fn portal_users(", "async fn portal_grant("] {
+        for f in [
+            "async fn portal_users(",
+            "async fn portal_grant(",
+            "async fn portal_topups(",
+            "async fn portal_decide_topup(",
+        ] {
             let body = src
                 .split_once(f)
                 .and_then(|(_, rest)| rest.split_once("\n}\n"))
