@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { startMoney, ADMIN_TOKEN, type MoneyFixture } from "./money.fixture";
+import { startMoney, ADMIN_TOKEN, CALLER_KEY, type MoneyFixture } from "./money.fixture";
 
 /**
  * 钱路：真网关 + 真流量 + 真指标 + 真账本 + 真停用。
@@ -119,4 +119,49 @@ test("真实消费被网关按定价折算并带上_user_id", async () => {
   expect(line, "花费指标里没有这个用户的序列").toBeTruthy();
   // 1000 输入 + 1000 输出，两边都是 $0.5/1k → 每次调用恰好 $1.00。
   expect(Number(line!.slice(line!.lastIndexOf("}") + 1).trim())).toBeGreaterThanOrEqual(1_000_000);
+});
+
+test("网关侧的累计发放额独立于门户余额_用尽即拒且不给重试时间", async () => {
+  // 先把门户侧余额垫高。两个闸是独立的：门户按余额停密钥（401），网关按累计
+  // 发放额拒请求（429）。不垫高的话下面的轮询会先把余额打穿，对账环停掉密钥，
+  // 于是永远等不到 429 —— 第一版就是这么挂的，看起来像网关的闸没生效。
+  await grant(200_000_000);
+  await waitFor(async () => (await fx.chat()) === 200, "垫高余额后可调用");
+
+  // 给这个用户挂一条**只有累计发放额、没有窗口**的策略。走配置而不是门户
+  // 接口：要测的是网关那一侧的闸。
+  const before = fx.readResources();
+  fx.writeResources(
+    `${before}\nrate_limit_policies:\n` +
+      `  - name: e2e-allowance\n` +
+      `    scope: member\n` +
+      `    scope_ref: "${fx.userId}"\n` +
+      `    granted_micro_usd: 2500000\n`,
+  );
+  // 直接改文件的用例要自己发 SIGHUP：平时那一下是对账环写完配置时发的。
+  fx.reloadGateway();
+  await new Promise((r) => setTimeout(r, 800));
+
+  // 每次调用 $1。累计到 $2.5 之上就拒 —— 准入时比的是**已记录**的消费，
+  // 所以越过那一刻的那次请求仍会放行，这是文档里写明的溢出。
+  let last = 0;
+  await waitFor(async () => {
+    last = await fx.chatWithStatus();
+    return last === 429;
+  }, "累计发放额用尽后被拒");
+
+  // 拒绝理由必须是「额度用尽」而不是「速率超了」：两者都是 429，但一个要
+  // 充值、一个等等就好。
+  const r = await fetch(`${fx.proxyUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${CALLER_KEY}`, "content-type": "application/json" },
+    body: JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: "hi" }] }),
+  });
+  expect(r.status).toBe(429);
+  const body = await r.text();
+  expect(body).toContain("allowance exhausted");
+  expect(body).toContain("top up");
+  expect(body).toContain("billing_error");
+  // 不给 retry-after —— 等是等不回来的，只有人去充值才行。
+  expect(r.headers.get("retry-after")).toBeNull();
 });

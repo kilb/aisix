@@ -180,7 +180,10 @@ fn match_policy_layer(
     if !applies {
         return None;
     }
-    let limits = classic_rate_limit(policy)?;
+    // `classic_rate_limit` 需要 window，而只配累计发放额的策略没有窗口 ——
+    // 用 `?` 会让整条策略在这里就被丢掉，字段配了也不生效（正是仓库反复吃过的
+    // 那种「接受但不读」的形态）。没有窗口时退成空限制，由下面的花费层承载。
+    let limits = classic_rate_limit(policy).unwrap_or_default();
     // Most scopes share one counter across every key the policy matches
     // (`policy:<scope>:<scope_ref>:<id>`). `team_member` appends the
     // request's `user_id` so each member of the team counts against an
@@ -193,9 +196,20 @@ fn match_policy_layer(
         _ => String::new(),
     };
     let bucket_key = format!("policy:{scope}:{scope_ref}:{policy_entry_id}{member_suffix}");
-    let spend = policy.max_spend_micro_usd.and_then(|max_spend| {
-        let limits = spend_limits_for(policy.window?, max_spend);
-        // second 窗口投影为空，此时不预留（已在 `classic_rate_limit` 报警）。
+    // 花费桶：窗口上限与累计发放额共用同一个桶。
+    //
+    // 共用是有意的 —— 那次 acquire 本来就要发生，累计额搭上去零新增往返
+    // （reserve_layers 的各层是顺序 await 的）。两者也不是替代关系：一个是
+    // 「总共给了多少」，一个是「每天最多花多快」，同时设时都生效。
+    //
+    // 累计额不看窗口：`second` 窗口下花费上限失效，但发放额照样成立，因为它
+    // 根本不按窗口结算。所以「只配了发放额、没配窗口」这条策略也必须建桶。
+    let spend = {
+        let mut limits = match (policy.max_spend_micro_usd, policy.window) {
+            (Some(max_spend), Some(window)) => spend_limits_for(window, max_spend),
+            _ => RateLimit::default(),
+        };
+        apply_granted(&mut limits, policy.granted_micro_usd);
         (!limits.is_unrestricted()).then(|| SpendLayer {
             bucket_key: format!(
                 "{}{member_suffix}",
@@ -203,7 +217,7 @@ fn match_policy_layer(
             ),
             limits,
         })
-    });
+    };
     // 只设了花费上限的策略也要生效：token 侧无限制不代表整条策略无限制。
     if limits.is_unrestricted() && spend.is_none() {
         return None;
@@ -445,6 +459,21 @@ fn spend_limits_for(window: PolicyWindow, max_spend_micro_usd: u64) -> RateLimit
     rl
 }
 
+/// 把累计发放额投影到同一个花费桶上。
+///
+/// 刻意跟窗口上限**共用一个桶**：那次 `acquire` 本来就要发生，累计额度搭上去
+/// 是零新增往返（`reserve_layers` 的各层是顺序 await 的，多一层就多一次串行
+/// 往返）。两者可以同时设，互不替代 —— 一个是「总共给了多少」，一个是「每天
+/// 最多花多快」。
+///
+/// 累计额不看窗口：`second` 窗口下花费上限是失效的，但发放额照样生效，因为它
+/// 根本不按窗口结算。
+fn apply_granted(rl: &mut RateLimit, granted_micro_usd: Option<u64>) {
+    if let Some(g) = granted_micro_usd {
+        rl.granted_micro_usd = Some(g);
+    }
+}
+
 /// Reserve across all applicable rate-limit layers (api_key, model,
 /// mcp_server, policies). `mcp_server` is the MCP server an in-flight
 /// `tools/call` targets; `None` for every non-MCP endpoint.
@@ -635,7 +664,16 @@ fn reject(
 /// 字符串，不掺调用方数据（基数规则）。花费层只在 minute/hour/day 上预留
 /// （`second` 下从不建层，见 [`warn_inert_dimension_once`] 的调用点），
 /// `Second`/`None` 分支理论上不可达，给一个不会被误读成具体窗口的兜底值。
-fn spend_scope_label(window: Option<PolicyWindow>) -> &'static str {
+fn spend_scope_label(
+    window: Option<PolicyWindow>,
+    err: &aisix_ratelimit::RateLimitError,
+) -> &'static str {
+    // 累计发放额没有窗口，所以不能按窗口打标签 —— 那会落进 `spend_unknown`，
+    // 把「额度用尽」跟一个说不清的状况混在一起。这两件事的处置完全不同：
+    // 当日上限打满等到明天就好了，额度用尽要有人去充值。
+    if matches!(err, aisix_ratelimit::RateLimitError::AllowanceExhausted) {
+        return "spend_allowance";
+    }
     match window {
         Some(PolicyWindow::Minute) => "spend_minute",
         Some(PolicyWindow::Hour) => "spend_hour",
@@ -678,7 +716,7 @@ fn reject_spend(
     member: Option<&str>,
 ) -> ProxyError {
     state.metrics.record_ratelimit_rejection(
-        spend_scope_label(policy.window),
+        spend_scope_label(policy.window, &err),
         "policy_spend",
         Some(policy_id),
     );
@@ -692,10 +730,25 @@ fn reject_spend(
         _ => policy.scope_ref.clone(),
     };
     ProxyError::BudgetExceeded(Box::new(crate::budget_reason::BudgetReason {
-        message: format!("spend ceiling reached for policy {}", policy.name),
+        message: if matches!(err, aisix_ratelimit::RateLimitError::AllowanceExhausted) {
+            // 措辞要说清「等不回来」。窗口上限的文案会让人以为再等等就好了，
+            // 而这个要有人去充值。
+            format!(
+                "spend allowance exhausted for policy {} — top up to continue",
+                policy.name
+            )
+        } else {
+            format!("spend ceiling reached for policy {}", policy.name)
+        },
         scope: policy.scope.map(|s| s.as_str().to_string()),
         scope_ref,
-        limit_usd: Some(usd(policy.max_spend_micro_usd.unwrap_or_default())),
+        limit_usd: Some(usd(
+            if matches!(err, aisix_ratelimit::RateLimitError::AllowanceExhausted) {
+                policy.granted_micro_usd.unwrap_or_default()
+            } else {
+                policy.max_spend_micro_usd.unwrap_or_default()
+            },
+        )),
         // 窗口计数器（`FixedWindowCounter`）只按桶存当前累加值，不区分
         // "花费"与"token"这两种量纲的读回接口——`Limiter::peek`
         // （store/local.rs:263-287）确实存在，但它只读 rpm/tpm 这两个

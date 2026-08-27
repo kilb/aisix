@@ -30,6 +30,12 @@ struct KeyState {
     tpm: FixedWindowCounter,
     tph: FixedWindowCounter,
     tpd: FixedWindowCounter,
+    /// Micro-USD spent on this bucket since the process started counting.
+    ///
+    /// No window. It is the one counter here that never rolls, which is what
+    /// makes a granted allowance behave like an allowance instead of a
+    /// per-window ceiling that refills on its own.
+    consumed_micro_usd: u64,
     in_flight: u32,
     /// Unix seconds of the last operation on this bucket, so [`LocalStore::reap`]
     /// can tell a live key from one whose config row was deleted hours ago.
@@ -46,6 +52,7 @@ impl KeyState {
             tpm: FixedWindowCounter::new(MINUTE_SECS),
             tph: FixedWindowCounter::new(HOUR_SECS),
             tpd: FixedWindowCounter::new(DAY_SECS),
+            consumed_micro_usd: 0,
             in_flight: 0,
             last_touched: now,
         }
@@ -123,6 +130,15 @@ impl<C: Clock> RateStore for LocalStore<C> {
         if let Some(max) = limits.concurrency {
             if s.in_flight >= max {
                 return Err(RateLimitError::Concurrency);
+            }
+        }
+
+        // Cumulative allowance — checked ahead of the windows, because it is
+        // the one that does not come back on its own, so when both would
+        // reject it is the more useful thing to report.
+        if let Some(granted) = limits.granted_micro_usd {
+            if s.consumed_micro_usd >= granted {
+                return Err(RateLimitError::AllowanceExhausted);
             }
         }
 
@@ -228,6 +244,9 @@ impl<C: Clock> RateStore for LocalStore<C> {
         s.tpm.add(now, tokens);
         s.tph.add(now, tokens);
         s.tpd.add(now, tokens);
+        // Spend buckets pass micro-USD through this same argument, so the
+        // cumulative counter accumulates next to the windowed ones.
+        s.consumed_micro_usd = s.consumed_micro_usd.saturating_add(tokens);
         s.in_flight = s.in_flight.saturating_sub(1);
         s.last_touched = now;
     }
@@ -421,5 +440,92 @@ mod tests {
         store.reap(Duration::from_secs(DAY_SECS));
 
         assert!(store.peek("recent", &l).await.is_some());
+    }
+}
+
+#[cfg(test)]
+mod allowance_tests {
+    use super::*;
+    use crate::clock::TestClock;
+
+    fn granted(n: u64) -> RateLimit {
+        RateLimit {
+            granted_micro_usd: Some(n),
+            ..RateLimit::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn 累计额度用尽后拒绝() {
+        let s = LocalStore::with_clock(TestClock::new(0));
+        let lim = granted(1_000);
+        s.acquire("k", &lim, "").await.unwrap();
+        s.commit("k", 600, "").await;
+        // 还没到，放行。
+        s.acquire("k", &lim, "").await.unwrap();
+        s.commit("k", 600, "").await;
+        // 已消费 1200 ≥ 1000，拒绝。
+        assert!(matches!(
+            s.acquire("k", &lim, "").await,
+            Err(RateLimitError::AllowanceExhausted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn 跨天不重置_这是它跟窗口上限的全部区别() {
+        let clock = TestClock::new(0);
+        let s = LocalStore::with_clock(clock.clone());
+        let lim = granted(1_000);
+        s.acquire("k", &lim, "").await.unwrap();
+        s.commit("k", 1_500, "").await;
+        assert!(s.acquire("k", &lim, "").await.is_err());
+
+        // 往后跳两天。窗口型上限到这里就「续杯」了 —— 累计额不能。
+        clock.set(2 * DAY_SECS + 10);
+        assert!(
+            matches!(
+                s.acquire("k", &lim, "").await,
+                Err(RateLimitError::AllowanceExhausted)
+            ),
+            "跨天之后额度自己回来了 —— 那就退化成了窗口上限",
+        );
+    }
+
+    #[tokio::test]
+    async fn 提高发放额即可继续_不需要重置任何东西() {
+        let s = LocalStore::with_clock(TestClock::new(0));
+        s.acquire("k", &granted(1_000), "").await.unwrap();
+        s.commit("k", 1_500, "").await;
+        assert!(s.acquire("k", &granted(1_000), "").await.is_err());
+        // 把总额提到 5000：已消费 1500 < 5000，放行。补额就是「换一个更大的数」。
+        s.acquire("k", &granted(5_000), "").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn 没配发放额时不参与判断() {
+        let s = LocalStore::with_clock(TestClock::new(0));
+        let none = RateLimit::default();
+        s.acquire("k", &none, "").await.unwrap();
+        s.commit("k", 10_000_000, "").await;
+        // 消费再多，没配额度就不该被这条拦住。
+        s.acquire("k", &none, "").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn 累计额与窗口上限同时生效_互不替代() {
+        let clock = TestClock::new(0);
+        let s = LocalStore::with_clock(clock.clone());
+        let both = RateLimit {
+            granted_micro_usd: Some(10_000),
+            tpd: Some(1_000),
+            ..RateLimit::default()
+        };
+        s.acquire("k", &both, "").await.unwrap();
+        s.commit("k", 1_200, "").await;
+        // 当天上限已破，拒绝。
+        assert!(s.acquire("k", &both, "").await.is_err());
+        // 跨天：窗口回来了，累计额还剩 8800，所以放行。
+        clock.set(DAY_SECS + 10);
+        s.acquire("k", &both, "").await.unwrap();
     }
 }

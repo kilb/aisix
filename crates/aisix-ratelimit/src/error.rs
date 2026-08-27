@@ -19,6 +19,13 @@ pub enum RateLimitError {
     },
     #[error("concurrency limit exceeded")]
     Concurrency,
+    /// Cumulative spend allowance used up.
+    ///
+    /// Carries no retry-after on purpose: unlike a window this does not come
+    /// back on its own, so telling the caller to wait would be telling them
+    /// something untrue. Someone has to raise the granted figure.
+    #[error("spend allowance exhausted")]
+    AllowanceExhausted,
 }
 
 impl RateLimitError {
@@ -27,6 +34,7 @@ impl RateLimitError {
             RateLimitError::Requests { scope, .. } => *scope,
             RateLimitError::Tokens { scope, .. } => *scope,
             RateLimitError::Concurrency => RateLimitScope::Requests,
+            RateLimitError::AllowanceExhausted => RateLimitScope::Tokens,
         }
     }
 
@@ -38,7 +46,9 @@ impl RateLimitError {
             | RateLimitError::Tokens {
                 retry_after_secs, ..
             } => Some(*retry_after_secs),
-            RateLimitError::Concurrency => None,
+            // 补额是人的动作，不是等待 —— 给一个 retry-after 等于告诉调用方
+            // 一件不实的事。
+            RateLimitError::Concurrency | RateLimitError::AllowanceExhausted => None,
         }
     }
 }

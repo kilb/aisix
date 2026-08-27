@@ -466,6 +466,7 @@ mod tests {
             tph: None,
             tpd: None,
             concurrency,
+            granted_micro_usd: None,
         }
     }
 
@@ -485,6 +486,7 @@ mod tests {
             tph: None,
             tpd: None,
             concurrency: None,
+            granted_micro_usd: None,
         }
     }
 
@@ -712,6 +714,7 @@ mod tests {
             tph: None,
             tpd: None,
             concurrency: None,
+            granted_micro_usd: None,
         };
         // Soak up 19 RPM = 19 RPD across two minutes so RPD is at 19.
         for i in 0..19 {
@@ -752,6 +755,7 @@ mod tests {
             tph: None,
             tpd: None,
             concurrency: None,
+            granted_micro_usd: None,
         };
         for _ in 0..5 {
             let _r = limiter.pre_commit("k1", &l).await.unwrap();

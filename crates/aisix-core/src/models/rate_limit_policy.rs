@@ -290,6 +290,33 @@ pub struct RateLimitPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub max_spend_micro_usd: Option<u64>,
+
+    /// Cumulative spend allowance in micro-USD — the total ever granted to
+    /// this subject, not what is left of it.
+    ///
+    /// This is the prepaid figure, and it differs from `max_spend_micro_usd`
+    /// in the one way that matters: it has no window. The counter behind it
+    /// only grows and is never reset, so an allowance that runs out stays
+    /// run out until this number is raised. A ceiling with a `day` window
+    /// refills every midnight, which makes it a spending rate and not a
+    /// balance.
+    ///
+    /// Both can be set on one policy and both are checked. A useful pairing
+    /// is a granted total for the prepaid amount and a daily ceiling as a
+    /// cap on how fast it can be drawn down.
+    ///
+    /// Enforced against *recorded* spend, with the same overshoot as
+    /// `max_spend_micro_usd`: requests already in flight when the allowance
+    /// runs out still complete and still count, so recorded spend can finish
+    /// above the granted figure by their combined cost. `concurrency` and
+    /// `max_requests` bound that, and both are counted at admission.
+    ///
+    /// Raising this is how more spending is allowed. Nothing has to be reset,
+    /// and because both the granted figure and the consumed counter only ever
+    /// increase, no reconciliation is needed between them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub granted_micro_usd: Option<u64>,
     // —— conditional form (#892) ——
     /// Condition node tree the request must satisfy (implicit AND
     /// across the top level; `[]`/absent = every request in the env).
@@ -407,16 +434,26 @@ impl RateLimitPolicy {
             }
             return Ok(());
         }
-        // Classic form: same required set the pre-#892 schema enforced.
-        if self.scope.is_none() || self.scope_ref.is_none() || self.window.is_none() {
-            return Err("classic policy requires `scope`, `scope_ref` and `window`".into());
+        // Classic form: same required set the pre-#892 schema enforced, plus
+        // the granted allowance — which is the one limit here with no window,
+        // so `window` is required only alongside the windowed three.
+        if self.scope.is_none() || self.scope_ref.is_none() {
+            return Err("classic policy requires `scope` and `scope_ref`".into());
         }
-        if self.max_requests.is_none()
-            && self.max_tokens.is_none()
-            && self.max_spend_micro_usd.is_none()
-        {
+        let windowed = self.max_requests.is_some()
+            || self.max_tokens.is_some()
+            || self.max_spend_micro_usd.is_some();
+        if windowed && self.window.is_none() {
             return Err(
-                "classic policy requires `max_requests`, `max_tokens` or `max_spend_micro_usd`"
+                "classic policy requires `window` alongside `max_requests`, `max_tokens` or \
+                 `max_spend_micro_usd`"
+                    .into(),
+            );
+        }
+        if !windowed && self.granted_micro_usd.is_none() {
+            return Err(
+                "classic policy requires `max_requests`, `max_tokens`, `max_spend_micro_usd` or \
+                 `granted_micro_usd`"
                     .into(),
             );
         }
@@ -426,18 +463,38 @@ impl RateLimitPolicy {
 
 /// The form XOR `schemars` can't derive, injected as a top-level `oneOf` by
 /// [`crate::models::schema::rate_limit_policy_root_schema`]: a row is either
-/// the classic form (scope/scope_ref/window required, at least one of
-/// `max_requests`/`max_tokens`/`max_spend_micro_usd`, none of the conditional
-/// fields) or the conditional form (`limits` required, none of the classic
-/// fields). Pre-#892 rows satisfy the classic branch byte-for-byte.
+/// the classic form (scope/scope_ref required, at least one of
+/// `max_requests`/`max_tokens`/`max_spend_micro_usd`/`granted_micro_usd`,
+/// `window` required alongside any of the three windowed ones, none of the
+/// conditional fields) or the conditional form (`limits` required, none of the
+/// classic fields). Pre-#892 rows satisfy the classic branch byte-for-byte.
+///
+/// `window` is conditional rather than flatly required because a granted
+/// allowance has none: it is a total, not a rate. Demanding one would tell
+/// the reader the allowance refreshes on that period, which is the opposite
+/// of what the field is for.
 pub fn rate_limit_policy_form_one_of() -> Value {
     json!([
         {
-            "required": ["scope", "scope_ref", "window"],
+            "required": ["scope", "scope_ref"],
             "anyOf": [
                 { "required": ["max_requests"] },
                 { "required": ["max_tokens"] },
-                { "required": ["max_spend_micro_usd"] }
+                { "required": ["max_spend_micro_usd"] },
+                { "required": ["granted_micro_usd"] }
+            ],
+            // `window` 只对窗口型的三个上限是必需的。累计发放额没有窗口 ——
+            // 逼它填一个会让人以为额度按那个周期刷新，而那正是这个字段存在的
+            // 理由的反面。
+            "allOf": [
+                {
+                    "if": { "anyOf": [
+                        { "required": ["max_requests"] },
+                        { "required": ["max_tokens"] },
+                        { "required": ["max_spend_micro_usd"] }
+                    ]},
+                    "then": { "required": ["window"] }
+                }
             ],
             "not": { "anyOf": [
                 { "required": ["conditions"] },
@@ -454,7 +511,8 @@ pub fn rate_limit_policy_form_one_of() -> Value {
                 { "required": ["window"] },
                 { "required": ["max_requests"] },
                 { "required": ["max_tokens"] },
-                { "required": ["max_spend_micro_usd"] }
+                { "required": ["max_spend_micro_usd"] },
+                { "required": ["granted_micro_usd"] }
             ]}
         }
     ])

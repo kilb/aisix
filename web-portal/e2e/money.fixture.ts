@@ -79,6 +79,16 @@ export interface MoneyFixture {
   chat(): Promise<number>;
   /** 用任意明文密钥打一次真实 chat —— 用来验自助建的那把能不能调通。 */
   chatWith(plaintext: string): Promise<number>;
+  /**
+   * 给网关发 SIGHUP，让它重读配置。
+   *
+   * 用例直接改 resources.yaml 时必须自己发这个信号 —— 平时是门户的对账环在
+   * 发（它写完配置就发），而直接写文件的用例没有那一步。少了它文件改了网关
+   * 不知道，症状是「闸没生效」，跟真 bug 一模一样。
+   */
+  reloadGateway(): void;
+  /** 与 chat 相同，但明确返回状态码供轮询用。 */
+  chatWithStatus(): Promise<number>;
   /** 门户会话 cookie，用来调 /api/keys。 */
   sessionCookie(): Promise<string>;
   stop(): void;
@@ -221,7 +231,11 @@ observability:
 `,
   );
 
-  procs.push(spawn(GATEWAY_BIN, ["--config", cfgPath], { stdio: "inherit" }));
+  // 按名字持有，不靠下标：门户是先起的（要先注册用户才知道 user_id），
+  // 下标取错的症状是「SIGHUP 发给了门户」，而门户不重读网关配置 —— 表现成
+  // 「闸没生效」，跟真 bug 一模一样。
+  const gateway = spawn(GATEWAY_BIN, ["--config", cfgPath], { stdio: "inherit" });
+  procs.push(gateway);
   const metricsUrl = `http://127.0.0.1:${metricsPort}/metrics`;
   await waitReady(metricsUrl, "aisix 网关指标口", (s) => s === 200);
 
@@ -238,6 +252,12 @@ observability:
     },
     async chatWith(plaintext: string) {
       return chatWith(proxyPort, plaintext);
+    },
+    reloadGateway() {
+      gateway.kill("SIGHUP");
+    },
+    async chatWithStatus() {
+      return chatWith(proxyPort, CALLER_KEY);
     },
     async sessionCookie() {
       const r = await fetch(`${portalUrl}/api/login`, {
