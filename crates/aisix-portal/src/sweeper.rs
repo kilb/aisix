@@ -122,6 +122,17 @@ impl<S: ConsumptionSource> Sweeper<S> {
             }
         }
 
+        // 把累计发放总额下推给网关。
+        //
+        // 这才是真正的闸：网关按 `granted_micro_usd` 比对自己那个只增不减的
+        // 消费计数器，精确、跨天不续杯、无需对账。下面停用密钥的那一段退居
+        // **兜底** —— 它有轮询周期的滞后，而这一条没有。
+        let mut grants: Vec<(String, i64)> = Vec::new();
+        for u in &users {
+            grants.push((u.id.clone(), self.ledger.total_granted(&u.id).await?));
+        }
+        let _ = self.apply_allowances(&grants).await;
+
         // 余额决定密钥开关。放在入账之后，用的是这一轮之后的余额。
         let mut wanted: Vec<(String, bool)> = Vec::new();
         for u in &users {
@@ -171,6 +182,70 @@ impl<S: ConsumptionSource> Sweeper<S> {
                 })
             })
             .await
+    }
+
+    /// 把每个用户的累计发放总额写成一条 `scope: member` 的策略。
+    ///
+    /// 策略名按用户派生，所以重复运行是幂等的：已经一致就不写盘、不发 SIGHUP。
+    /// 无条件重写会让文件 mtime 一直跳、网关白重载。
+    ///
+    /// 只写 `granted_micro_usd`，不写窗口 —— 这条策略表达的是「总共给了多少」，
+    /// 给它一个窗口会让读配置的人以为额度按那个周期刷新。
+    async fn apply_allowances(&self, grants: &[(String, i64)]) -> Result<(), StoreError> {
+        let grants = grants.to_vec();
+        let _ = self
+            .resources
+            .edit(move |doc| {
+                use serde_yaml_ng::Value;
+                let map = match doc.as_mapping_mut() {
+                    Some(m) => m,
+                    None => return false,
+                };
+                let key = Value::from("rate_limit_policies");
+                if !map.get(&key).map(Value::is_sequence).unwrap_or(false) {
+                    map.insert(key.clone(), Value::Sequence(Vec::new()));
+                }
+                let Some(list) = map.get_mut(&key).and_then(Value::as_sequence_mut) else {
+                    return false;
+                };
+                let mut changed = false;
+                for (uid, granted) in &grants {
+                    if *granted <= 0 {
+                        continue;
+                    }
+                    let name = format!("portal-allowance-{uid}");
+                    let existing = list
+                        .iter_mut()
+                        .find(|p| p.get("name").and_then(Value::as_str) == Some(name.as_str()));
+                    match existing {
+                        Some(p) => {
+                            let cur = p
+                                .get("granted_micro_usd")
+                                .and_then(Value::as_i64)
+                                .unwrap_or(0);
+                            if cur == *granted {
+                                continue;
+                            }
+                            if let Some(m) = p.as_mapping_mut() {
+                                m.insert(Value::from("granted_micro_usd"), Value::from(*granted));
+                                changed = true;
+                            }
+                        }
+                        None => {
+                            let mut m = serde_yaml_ng::Mapping::new();
+                            m.insert(Value::from("name"), Value::from(name));
+                            m.insert(Value::from("scope"), Value::from("member"));
+                            m.insert(Value::from("scope_ref"), Value::from(uid.clone()));
+                            m.insert(Value::from("granted_micro_usd"), Value::from(*granted));
+                            list.push(Value::Mapping(m));
+                            changed = true;
+                        }
+                    }
+                }
+                changed
+            })
+            .await;
+        Ok(())
     }
 
     /// 把期望的启停状态落到 `resources.yaml`。返回 (新停用数, 新启用数)。
@@ -289,7 +364,7 @@ mod tests {
 
     /// 记录被问过的窗口，并按「时间窗 → 增量」应答 —— 正是 `increase()` 的语义。
     #[derive(Default)]
-    struct FakeSource {
+    pub(super) struct FakeSource {
         increase: Mutex<u64>,
         /// 指定让哪个用户的读取失败。写成按用户而不是「下一次」，因为
         /// 「下一次」会让测试依赖清扫器先访问谁 —— 那种测试无论答案如何都是
@@ -301,7 +376,7 @@ mod tests {
     }
 
     impl FakeSource {
-        fn set_increase(&self, v: u64) {
+        pub(super) fn set_increase(&self, v: u64) {
             *self.increase.lock().unwrap() = v;
         }
         fn fail_for(&self, user_id: &str) {
@@ -337,21 +412,21 @@ mod tests {
         }
     }
 
-    struct Fx {
-        sw: Sweeper<Arc<FakeSource>>,
-        src: Arc<FakeSource>,
-        ledger: Ledger,
-        store: Store,
-        path: String,
-        uid: String,
-        other: String,
+    pub(super) struct Fx {
+        pub(super) sw: Sweeper<Arc<FakeSource>>,
+        pub(super) src: Arc<FakeSource>,
+        pub(super) ledger: Ledger,
+        pub(super) store: Store,
+        pub(super) path: String,
+        pub(super) uid: String,
+        pub(super) other: String,
     }
 
-    fn t(s: &str) -> DateTime<Utc> {
+    pub(super) fn t(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
     }
 
-    async fn fx() -> Fx {
+    pub(super) async fn fx() -> Fx {
         let store = Store::open_memory().await.unwrap();
         let uid = "u1".to_string();
         let other = "u2".to_string();
@@ -540,5 +615,108 @@ mod tests {
             .unwrap();
         // 运维自己的密钥没有 user_id，不属于任何用户，余额与它无关。
         assert!(ops.get("disabled").is_none(), "运维密钥被动过了");
+    }
+}
+
+#[cfg(test)]
+mod allowance_pushdown_tests {
+    use super::tests::{fx, t};
+    use crate::ledger::Source;
+
+    fn policy_granted(path: &str, uid: &str) -> Option<i64> {
+        let doc: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&std::fs::read_to_string(path).unwrap()).ok()?;
+        doc.get("rate_limit_policies")?
+            .as_sequence()?
+            .iter()
+            .find(|p| {
+                p.get("name").and_then(serde_yaml_ng::Value::as_str)
+                    == Some(&format!("portal-allowance-{uid}"))
+            })?
+            .get("granted_micro_usd")?
+            .as_i64()
+    }
+
+    #[tokio::test]
+    async fn 累计发放总额被写成一条策略() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 5_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        assert_eq!(policy_granted(&f.path, &f.uid), Some(5_000_000));
+    }
+
+    #[tokio::test]
+    async fn 补额之后策略跟着涨_而不是新增一条() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 5_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        f.ledger
+            .credit(&f.uid, 3_000_000, Source::Topup, None)
+            .await
+            .unwrap();
+        f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
+
+        assert_eq!(policy_granted(&f.path, &f.uid), Some(8_000_000));
+        let doc: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&std::fs::read_to_string(&f.path).unwrap()).unwrap();
+        // 策略名按用户派生，所以只该有一条 —— 每轮新增一条会让配置无限膨胀，
+        // 而且哪条生效变得无法预料。
+        assert_eq!(doc["rate_limit_policies"].as_sequence().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn 消费不影响下推的数字() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 5_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        f.src.set_increase(2_000_000);
+        f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
+
+        // 下推的是**累计发放**，不是余额。网关那边自己累计消费，两个单调量
+        // 相减才是剩余 —— 把余额推下去会在网关再减一次，等于扣两遍。
+        assert_eq!(policy_granted(&f.path, &f.uid), Some(5_000_000));
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 3_000_000);
+    }
+
+    #[tokio::test]
+    async fn 没发放过的用户不生成策略() {
+        let f = fx().await;
+        f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        assert_eq!(policy_granted(&f.path, &f.uid), None);
+    }
+
+    #[tokio::test]
+    async fn 无变化时不重写配置() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 5_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        let after_first = std::fs::read_to_string(&f.path).unwrap();
+
+        let mtime_first = std::fs::metadata(&f.path).unwrap().modified().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        f.src.set_increase(0);
+        f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&f.path).unwrap(), after_first);
+        // 比 mtime 而不是比内容：无条件重写写回去的字节是一样的，只有写这个
+        // 动作本身能被看见 —— 而它每次都会让网关白重载一遍。
+        assert_eq!(
+            std::fs::metadata(&f.path).unwrap().modified().unwrap(),
+            mtime_first,
+            "无变化也重写了配置 —— 网关会因此白重载",
+        );
     }
 }

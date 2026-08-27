@@ -98,6 +98,21 @@ impl Ledger {
         Ok(sum)
     }
 
+    /// 累计发放总额 —— 只把入账那些加起来，不减消费。
+    ///
+    /// 这是下推给网关的那个数。网关那边也只累加消费、从不重置，两边都单调
+    /// 递增，所以「还剩多少」是两个单调量的差，不需要任何对账去校正。
+    pub async fn total_granted(&self, user_id: &str) -> Result<i64, StoreError> {
+        let (sum,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(delta_micro_usd), 0) FROM ledger
+             WHERE user_id = ?1 AND delta_micro_usd > 0",
+        )
+        .bind(user_id)
+        .fetch_one(self.store.pool())
+        .await?;
+        Ok(sum)
+    }
+
     /// 按记账顺序返回流水。
     pub async fn entries(&self, user_id: &str) -> Result<Vec<Entry>, StoreError> {
         let rows: Vec<(i64, i64, String, Option<String>)> = sqlx::query_as(

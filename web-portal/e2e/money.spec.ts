@@ -121,37 +121,43 @@ test("真实消费被网关按定价折算并带上_user_id", async () => {
   expect(Number(line!.slice(line!.lastIndexOf("}") + 1).trim())).toBeGreaterThanOrEqual(1_000_000);
 });
 
-test("网关侧的累计发放额独立于门户余额_用尽即拒且不给重试时间", async () => {
-  // 先把门户侧余额垫高。两个闸是独立的：门户按余额停密钥（401），网关按累计
-  // 发放额拒请求（429）。不垫高的话下面的轮询会先把余额打穿，对账环停掉密钥，
-  // 于是永远等不到 429 —— 第一版就是这么挂的，看起来像网关的闸没生效。
-  await grant(200_000_000);
-  await waitFor(async () => (await fx.chat()) === 200, "垫高余额后可调用");
+test("门户把累计发放额推给网关_网关按它精确收口", async () => {
+  // 不手写策略：下推本来就是生产路径的一部分，手写一条测的是别的东西。
+  // 这一条从头到尾走真实链路 —— 发放 → 门户写策略 → SIGHUP → 网关据此拒绝。
+  //
+  // 自带前提，不依赖前面用例的残留：单独跑时那些发放不会发生，累计额是 0，
+  // 门户就不写策略 —— 症状是「等不到配置」，跟真 bug 一模一样。
+  await grant(3_000_000);
+  const cookie = await fx.sessionCookie();
+  const granted: number = await fetch(`${fx.portalUrl}/api/balance`, { headers: { cookie } })
+    .then((r) => r.json())
+    .then((b: { entries: { delta_micro_usd: number }[] }) =>
+      b.entries
+        .filter((e) => e.delta_micro_usd > 0)
+        .reduce((n, e) => n + e.delta_micro_usd, 0),
+    );
+  expect(granted).toBeGreaterThan(0);
 
-  // 给这个用户挂一条**只有累计发放额、没有窗口**的策略。走配置而不是门户
-  // 接口：要测的是网关那一侧的闸。
-  const before = fx.readResources();
-  fx.writeResources(
-    `${before}\nrate_limit_policies:\n` +
-      `  - name: e2e-allowance\n` +
-      `    scope: member\n` +
-      `    scope_ref: "${fx.userId}"\n` +
-      `    granted_micro_usd: 2500000\n`,
-  );
-  // 直接改文件的用例要自己发 SIGHUP：平时那一下是对账环写完配置时发的。
-  fx.reloadGateway();
-  await new Promise((r) => setTimeout(r, 800));
-
-  // 每次调用 $1。累计到 $2.5 之上就拒 —— 准入时比的是**已记录**的消费，
-  // 所以越过那一刻的那次请求仍会放行，这是文档里写明的溢出。
-  let last = 0;
   await waitFor(async () => {
-    last = await fx.chatWithStatus();
-    return last === 429;
-  }, "累计发放额用尽后被拒");
+    const doc = fx.readResources();
+    return (
+      doc.includes(`portal-allowance-${fx.userId}`) &&
+      doc.includes(`granted_micro_usd: ${granted}`)
+    );
+  }, `门户把累计发放额 ${granted} 写进配置`);
 
-  // 拒绝理由必须是「额度用尽」而不是「速率超了」：两者都是 429，但一个要
-  // 充值、一个等等就好。
+  // 打到网关按这条策略拒绝。每次 $1，累计消费越过发放总额即拒。
+  //
+  // 按需并发，不是每秒一次地慢慢烧：跑整套时前面的用例已经发放了几十美元，
+  // 串行烧的时长会随那个数增长，撞上超时 —— 而那种失败长得跟「闸没生效」
+  // 一模一样。需要多少次是算得出来的，就并发打多少次。
+  const needed = Math.ceil(granted / 1_000_000) + 2;
+  for (let fired = 0; fired < needed; fired += 20) {
+    const batch = Math.min(20, needed - fired);
+    await Promise.all(Array.from({ length: batch }, () => fx.chatWithStatus()));
+  }
+  await waitFor(async () => (await fx.chatWithStatus()) === 429, "累计发放额用尽后被拒");
+
   const r = await fetch(`${fx.proxyUrl}/v1/chat/completions`, {
     method: "POST",
     headers: { authorization: `Bearer ${CALLER_KEY}`, "content-type": "application/json" },
@@ -159,9 +165,14 @@ test("网关侧的累计发放额独立于门户余额_用尽即拒且不给重�
   });
   expect(r.status).toBe(429);
   const body = await r.text();
+  // 必须是「钱用完了」而不是「太快了」：两者同为 429，处置完全不同。
   expect(body).toContain("allowance exhausted");
   expect(body).toContain("top up");
   expect(body).toContain("billing_error");
-  // 不给 retry-after —— 等是等不回来的，只有人去充值才行。
+  // 不给 retry-after —— 等是等不回来的。
   expect(r.headers.get("retry-after")).toBeNull();
+
+  // 补额之后放行，且不需要重置任何东西：推下去的是更大的一个数。
+  await grant(50_000_000);
+  await waitFor(async () => (await fx.chatWithStatus()) === 200, "补额后网关重新放行");
 });
