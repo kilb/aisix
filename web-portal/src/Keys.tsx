@@ -1,25 +1,33 @@
 import { useCallback, useEffect, useState } from "react";
 import * as api from "./lib/api";
+import { usd } from "./lib/fmt";
 
 /**
- * 自助密钥。
+ * 自助密钥与每把密钥的额度。
  *
- * 一个用户可以铸任意多把，它们**共享同一份余额** —— 额度挂在用户身上，不在
- * 密钥上。所以这里没有「给这把密钥分多少钱」这种东西。
+ * 两层闸：总额度由管理员设定，你自己决定怎么把它分到各把密钥上。分出去的总和
+ * 不能超过总额度 —— 服务端会挡，这里也把剩余可分配额摆在明面上，免得让人填完
+ * 才被拒。
+ *
+ * 不分配额度的密钥不是「没得花」，是「不单独设限」：它只受总额度约束。这两种
+ * 状态在界面上必须分得开，否则用户会以为得给每把密钥都填个数才能用。
  *
  * 明文只在铸出来那一次出现。界面因此必须把它当成一次性的东西对待：显眼地给
  * 出来、说清不会再显示，而不是塞进列表里等用户以后回来复制。
  */
 export function Keys({ onChanged }: { onChanged: () => void }) {
-  const [rows, setRows] = useState<api.KeyRow[] | null>(null);
+  const [list, setList] = useState<api.KeyList | null>(null);
   const [minted, setMinted] = useState<api.MintedKey | null>(null);
   const [label, setLabel] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  /** 正在编辑额度的那把密钥的全名，以及输入框里的 USD 文本。 */
+  const [editing, setEditing] = useState<string | null>(null);
+  const [quotaUsd, setQuotaUsd] = useState("");
 
   const load = useCallback(async () => {
     try {
-      setRows((await api.listKeys()).keys);
+      setList(await api.listKeys());
       setErr(null);
     } catch (e) {
       setErr(e instanceof Error ? e.message : "读取密钥失败");
@@ -59,13 +67,58 @@ export function Keys({ onChanged }: { onChanged: () => void }) {
     }
   }
 
+  async function saveQuota(fullName: string) {
+    // 金额按 micro-USD 整数下发。浮点做钱会累积误差，而这个产品的花费到千分
+    // 之一美分 —— 在这里就换算成整数。
+    const micro = Math.round(Number(quotaUsd) * 1_000_000);
+    if (!Number.isFinite(micro) || micro < 0) {
+      setErr("额度必须是非负数");
+      return;
+    }
+    setBusy(true);
+    setErr(null);
+    try {
+      await api.setKeyQuota(fullName.split(" · ")[0] ?? fullName, micro);
+      setEditing(null);
+      setQuotaUsd("");
+      await load();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "设置失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const rows = list?.keys ?? null;
+  const granted = list?.granted_micro_usd ?? 0;
+  const allocated = list?.allocated_micro_usd ?? 0;
+  const free = granted - allocated;
+
   return (
     <section className="panel">
       <h2>API 密钥</h2>
       <p className="hint">
-        可以创建任意多把，它们共用同一份余额。余额为零时新密钥会处于停用态，
-        管理员发放额度后自动启用。
+        可以创建任意多把。每把可以单独设额度，各把额度之和不会超过你的总额度；
+        不设额度的密钥只受总额度约束。总额度为零时新密钥处于停用态，管理员设好
+        额度后自动启用。
       </p>
+
+      {list && (
+        <div className="row budget">
+          <span>
+            总额度 <strong className="num">{usd(granted)}</strong>
+          </span>
+          <span>
+            已分配 <strong className="num">{usd(allocated)}</strong>
+          </span>
+          <span>
+            可再分配{" "}
+            <strong className="num" data-low={free <= 0 ? "yes" : undefined}>
+              {usd(free)}
+            </strong>
+          </span>
+        </div>
+      )}
 
       <div className="row">
         <label className="f">
@@ -107,6 +160,7 @@ export function Keys({ onChanged }: { onChanged: () => void }) {
               <tr>
                 <th>名称</th>
                 <th>散列</th>
+                <th className="right">额度</th>
                 <th>状态</th>
                 <th />
               </tr>
@@ -116,6 +170,41 @@ export function Keys({ onChanged }: { onChanged: () => void }) {
                 <tr key={k.name}>
                   <td>{k.name}</td>
                   <td className="num">{k.masked_hash}</td>
+                  <td className="right">
+                    {editing === k.name ? (
+                      <span className="quota-edit">
+                        <input
+                          aria-label={`${k.name} 的额度 USD`}
+                          inputMode="decimal"
+                          value={quotaUsd}
+                          placeholder="0 = 不设限"
+                          onChange={(e) => setQuotaUsd(e.target.value)}
+                        />
+                        <button
+                          className="ghost"
+                          disabled={busy}
+                          onClick={() => void saveQuota(k.name)}
+                        >
+                          保存
+                        </button>
+                        <button className="ghost" onClick={() => setEditing(null)}>
+                          取消
+                        </button>
+                      </span>
+                    ) : (
+                      <button
+                        className="ghost num"
+                        onClick={() => {
+                          setEditing(k.name);
+                          setQuotaUsd(
+                            k.quota_micro_usd > 0 ? String(k.quota_micro_usd / 1_000_000) : "",
+                          );
+                        }}
+                      >
+                        {k.quota_micro_usd > 0 ? usd(k.quota_micro_usd) : "不设限"}
+                      </button>
+                    )}
+                  </td>
                   <td>{k.disabled ? "已停用" : "可用"}</td>
                   <td className="right">
                     <button

@@ -1,16 +1,21 @@
 import { useCallback, useEffect, useState } from "react";
 import * as api from "../lib/api";
+import type { PortalUser } from "../lib/api";
 import { fmtUsd } from "../lib/fmt";
 
 /**
- * 自助门户的注册用户与额度发放。
+ * 自助门户的注册用户与额度。
  *
- * 额度挂在**用户**身上，不在密钥上：一个用户的所有密钥共用同一份余额。所以
- * 这里发放的对象是人，不是某一把密钥。
+ * 额度由管理员设定在**用户**身上。用户自己再决定怎么把它分到各把密钥上 ——
+ * 那一步在门户里做，各把密钥的额度之和不会超过这里设的总额。
  *
- * 发放对象从这份列表里**选**，不给手输的口子。一期密钥的 `user_id` 曾经靠手
- * 填，填错一个字符网关照常放行、指标打错标签、用量查不到 —— 于是永不扣款，
- * 用户免费用而没人会发现。
+ * 两个动作分工不同：**设定**是绝对值（「他一共 20 块」），**发放**是增量
+ * （「再给他 5 块」）。日常调额用设定 —— 用增量调额得先算差值，算错就是白送
+ * 或误封。
+ *
+ * 对象从这份列表里**选**，不给手输的口子。一期密钥的 `user_id` 曾经靠手填，
+ * 填错一个字符网关照常放行、指标打错标签、用量查不到 —— 于是永不扣款，用户
+ * 免费用而没人会发现。
  */
 
 interface Topup {
@@ -19,14 +24,6 @@ interface Topup {
   micro_usd: number;
   note: string | null;
   created_at: string;
-}
-
-interface PortalUser {
-  user_id: string;
-  email: string;
-  display_name: string | null;
-  disabled: boolean;
-  balance_micro_usd: number;
 }
 
 export function Users() {
@@ -61,26 +58,39 @@ export function Users() {
     void load();
   }, [load]);
 
-  async function grant() {
+  /**
+   * 提交一次额度改动。
+   *
+   * `mode` 决定语义：`set` 是设定成这个数，`grant` 是再加这么多。两者共用同一
+   * 段换算与校验，因为差别只在语义 —— 分开写两份换算，迟早只有一份被改对。
+   */
+  async function submit(mode: "set" | "grant") {
     if (!target) return;
     // 金额按 micro-USD 整数下发。浮点做钱会累积误差，而这个产品的花费到千分
     // 之一美分 —— 在这里就换算成整数，别把浮点带进账本。
     const micro = Math.round(Number(usd) * 1_000_000);
-    if (!Number.isFinite(micro) || micro <= 0) {
-      setErr("发放金额必须是正数");
+    // 设定允许 0（把额度收回），发放不允许 —— 发放 0 是个空操作，静默成功会让
+    // 人以为发出去了。
+    if (!Number.isFinite(micro) || micro < 0 || (mode === "grant" && micro === 0)) {
+      setErr(mode === "set" ? "额度不能是负数" : "发放金额必须是正数");
       return;
     }
     setBusy(true);
     setErr(null);
     setDone(null);
     try {
-      await api.portalGrant(target.user_id, micro, note.trim() || null);
-      setDone(`已给 ${target.email} 发放 ${fmtUsd(micro)}`);
+      if (mode === "set") {
+        await api.portalSetQuota(target.user_id, micro, note.trim() || null);
+        setDone(`${target.email} 的总额度已设为 ${fmtUsd(micro)}`);
+      } else {
+        await api.portalGrant(target.user_id, micro, note.trim() || null);
+        setDone(`已给 ${target.email} 发放 ${fmtUsd(micro)}`);
+      }
       setUsd("");
       setNote("");
       await load();
     } catch (e) {
-      setErr(e instanceof Error ? e.message : "发放失败");
+      setErr(e instanceof Error ? e.message : "提交失败");
     } finally {
       setBusy(false);
     }
@@ -170,10 +180,11 @@ export function Users() {
       )}
 
       <div className="panel">
-        <h2>发放额度</h2>
+        <h2>用户额度</h2>
         <p className="hint">
-          额度挂在用户身上，他名下的所有密钥共用这一份余额。余额归零时那些密钥
-          会被自动停用，补上之后自动恢复。
+          额度挂在用户身上，他名下的密钥共用这一份。用户可以在门户里给每把密钥
+          单独设额度，各把之和不会超过这里设的总额。总额被消耗完时那些密钥会被
+          自动停用，调高之后自动恢复。
         </p>
         <div className="r">
           <label className="f">
@@ -187,7 +198,7 @@ export function Users() {
               <option value="">选择一个用户</option>
               {(rows ?? []).map((u) => (
                 <option key={u.user_id} value={u.user_id}>
-                  {u.email}（余额 {fmtUsd(u.balance_micro_usd)}）
+                  {u.email}（总额度 {fmtUsd(u.granted_micro_usd)}）
                 </option>
               ))}
             </select>
@@ -197,7 +208,7 @@ export function Users() {
             <input
               inputMode="decimal"
               value={usd}
-              placeholder="5.00"
+              placeholder="20.00"
               onChange={(e) => setUsd(e.target.value)}
             />
           </label>
@@ -205,14 +216,24 @@ export function Users() {
             <span>备注</span>
             <input
               value={note}
-              placeholder="首充赠送"
+              placeholder="季度额度"
               onChange={(e) => setNote(e.target.value)}
             />
           </label>
-          <button className="act" disabled={busy || !target} onClick={() => void grant()}>
-            {busy ? "处理中…" : "发放"}
+          <button className="act" disabled={busy || !target} onClick={() => void submit("set")}>
+            {busy ? "处理中…" : "设为该额度"}
+          </button>
+          <button className="ghost" disabled={busy || !target} onClick={() => void submit("grant")}>
+            改为追加
           </button>
         </div>
+        {target && (
+          <p className="hint">
+            {target.email} 当前总额度 <strong>{fmtUsd(target.granted_micro_usd)}</strong>，已用{" "}
+            <strong>{fmtUsd(target.granted_micro_usd - target.balance_micro_usd)}</strong>，其中{" "}
+            <strong>{fmtUsd(target.allocated_micro_usd)}</strong> 已由他自己分配到具体密钥上。
+          </p>
+        )}
         {err && <div className="note crit">{err}</div>}
         {done && <div className="note">{done}</div>}
       </div>
@@ -230,7 +251,9 @@ export function Users() {
                 <tr>
                   <th>邮箱</th>
                   <th>用户 ID</th>
+                  <th className="right">总额度</th>
                   <th className="right">余额</th>
+                  <th className="right">已分配到密钥</th>
                   <th>状态</th>
                 </tr>
               </thead>
@@ -241,12 +264,14 @@ export function Users() {
                     <td className="num" style={{ fontSize: 11 }}>
                       {u.user_id}
                     </td>
+                    <td className="right num">{fmtUsd(u.granted_micro_usd)}</td>
                     <td className="right num">{fmtUsd(u.balance_micro_usd)}</td>
+                    <td className="right num">{fmtUsd(u.allocated_micro_usd)}</td>
                     <td>
                       {u.disabled
                         ? "已停用"
                         : u.balance_micro_usd <= 0
-                          ? "无额度"
+                          ? "额度已用完"
                           : "正常"}
                     </td>
                   </tr>

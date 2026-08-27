@@ -73,6 +73,8 @@ pub enum WriteError {
     Contended,
     Io(String),
     Parse(String),
+    /// 这次改动生成的文档网关加载不了。**没有写盘。**
+    WouldBreakGateway(String),
 }
 
 impl std::fmt::Display for WriteError {
@@ -81,6 +83,9 @@ impl std::fmt::Display for WriteError {
             Self::Contended => write!(f, "配置文件正被其它进程改写，请重试"),
             Self::Io(e) => write!(f, "读写配置失败: {e}"),
             Self::Parse(e) => write!(f, "配置不是合法 YAML: {e}"),
+            Self::WouldBreakGateway(e) => {
+                write!(f, "这次改动会让网关拒收整份配置，已放弃写入: {e}")
+            }
         }
     }
 }
@@ -123,6 +128,9 @@ impl Writer {
                 serde_yaml_ng::to_string(&doc).map_err(|e| WriteError::Parse(e.to_string()))?;
             // 横幅重新写回顶部：序列化吃掉了所有注释，包括上一次的横幅。
             let out = format!("{BANNER}{body}");
+            if let Some(why) = breaks_gateway(&before, &out) {
+                return Err(WriteError::WouldBreakGateway(why));
+            }
             tokio::fs::write(&*self.path, out)
                 .await
                 .map_err(|e| WriteError::Io(e.to_string()))?;
@@ -131,6 +139,39 @@ impl Writer {
         }
         Err(WriteError::Contended)
     }
+}
+
+/// 这次改动会不会让网关拒收整份配置？会的话返回原因。
+///
+/// 用网关**自己**那个加载器来判，不是另写一份校验 —— 另写一份就一定会跟它漂移。
+///
+/// 为什么必须有这一道：文件模式下加载失败时网关只记一条 WARN、**保留旧快照**，
+/// 门户这边一无所知。于是一个字段写错的后果不是「这条策略不生效」，而是从那一刻
+/// 起整份配置都冻住 —— 包括「余额耗尽就停用」那个闸。这真的发生过一次：`scope_ref`
+/// 写成了派生 id 而不是密钥名字，网关把它当成引用了不存在的密钥，整份配置拒收。
+///
+/// 判据是「**是我这次改动弄坏的**」，而不是「文档能不能加载」：一份本来就坏掉的
+/// 文件（运维自己写错了）不该让门户从此拒绝写入 —— 那会把停用闸一起卡死，比原来
+/// 的问题更糟。
+///
+/// `${VAR}` 一律插成占位串，而不是查门户自己的环境变量：这里要验的是**结构与
+/// 引用**，而门户与网关的环境本来就可以不同，拿门户的 env 去判会把「网关那边有
+/// 这个变量」误判成致命错。
+fn breaks_gateway(before: &str, after: &str) -> Option<String> {
+    let load = |body: &str| {
+        aisix_core::filesource::load_from_str(body, "portal-candidate", 1, &|_| {
+            Some("placeholder".to_string())
+        })
+    };
+    if load(after).is_ok() {
+        return None;
+    }
+    let err = load(after).err()?;
+    if load(before).is_err() {
+        // 本来就坏着 —— 不是这次改动的问题，照写。
+        return None;
+    }
+    Some(err.to_string())
 }
 
 /// 写完配置后让网关重载。
@@ -349,6 +390,116 @@ mod banner_tests {
             })
             .await;
         assert!(ok.is_ok(), "{ok:?}");
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// 写前校验：这次改动会不会让网关拒收整份配置。
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    /// 一份网关真能加载的配置。残缺文档会让每个用例都走「本来就坏」那条降级
+    /// 路径，闸就等于没测。
+    const VALID: &str = r#"_format_version: "1"
+provider_keys:
+  - display_name: stub
+    provider: openai
+    api_key: sk-stub
+models:
+  - display_name: m
+    provider: openai
+    provider_key: stub
+    model_name: m
+api_keys:
+  - display_name: k
+    key_hash: aa
+    allowed_models: ["*"]
+"#;
+
+    async fn writer_with(body: &str) -> (Writer, String) {
+        let path = std::env::temp_dir()
+            .join(format!("aisix-guard-{}.yaml", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .to_string();
+        std::fs::write(&path, body).unwrap();
+        (Writer::new(path.clone()), path)
+    }
+
+    /// 往文档里塞一条引用了不存在密钥的 api_key 域策略 —— 正是踩过的那个坑。
+    fn add_bogus_policy(doc: &mut Value) -> bool {
+        let map = doc.as_mapping_mut().unwrap();
+        let mut m = serde_yaml_ng::Mapping::new();
+        m.insert(Value::from("name"), Value::from("bogus"));
+        m.insert(Value::from("scope"), Value::from("api_key"));
+        m.insert(
+            Value::from("scope_ref"),
+            Value::from("6efd592d-a73b-573d-8e2c-e9e103692f92"),
+        );
+        m.insert(Value::from("granted_micro_usd"), Value::from(1_000_000));
+        map.insert(
+            Value::from("rate_limit_policies"),
+            Value::Sequence(vec![Value::Mapping(m)]),
+        );
+        true
+    }
+
+    #[tokio::test]
+    async fn 会让网关拒收整份配置的改动不写盘() {
+        let (w, path) = writer_with(VALID).await;
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let r = w.edit(add_bogus_policy).await;
+        assert!(
+            matches!(r, Err(WriteError::WouldBreakGateway(_))),
+            "坏文档被放过去了: {r:?}"
+        );
+        // 关键是文件没动。写下去的后果不是「这条策略不生效」，而是网关从此
+        // 保留旧快照 —— 连停用闸也一起冻住，而且只有一条 WARN。
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn 本来就加载不了的文件不会因此拒绝写入() {
+        // 运维自己把文件写坏了。这时候门户若拒绝写入，「余额耗尽就停用」也跟着
+        // 停摆 —— 比原来的问题更糟。判据必须是「是我这次改动弄坏的」。
+        let (w, path) = writer_with("api_keys: []\n").await;
+        let r = w
+            .edit(|doc| {
+                api_keys_mut(doc).push(Value::from("x"));
+                true
+            })
+            .await;
+        assert!(r.is_ok(), "本来就坏的文件让门户彻底写不动了: {r:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn 门户环境里少个变量_不会把这道闸悄悄关掉() {
+        // 生产上 `${VAR}` 是从环境读上游密钥的正常写法，而门户与网关的环境本来
+        // 可以不同。
+        //
+        // 若拿门户自己的 env 去插值：这份配置在门户看来「本来就加载不了」，于是
+        // 上面那条「本来就坏就照写」的出口每次都命中 —— 闸被悄悄关掉，坏文档照
+        // 样写下去。这是比误拒更隐蔽的失效：什么都不报，只是不再拦。
+        //
+        // 用身份字段而不是普通字段：普通字段上未设的变量只展开成空串，分不出两
+        // 种插值方式；身份字段上未设值是明确的加载错误。
+        assert!(std::env::var("AISIX_PORTAL_GUARD_UNSET").is_err());
+        let doc = VALID.replace(
+            "  - display_name: k\n",
+            "  - display_name: \"${AISIX_PORTAL_GUARD_UNSET}\"\n",
+        );
+        let (w, path) = writer_with(&doc).await;
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let r = w.edit(add_bogus_policy).await;
+        assert!(
+            matches!(r, Err(WriteError::WouldBreakGateway(_))),
+            "配置里带 ${{VAR}} 就把闸关掉了: {r:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         let _ = std::fs::remove_file(path);
     }
 }

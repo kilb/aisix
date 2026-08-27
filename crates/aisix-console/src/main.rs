@@ -247,12 +247,39 @@ async fn portal_users(State(st): State<AppState>, headers: HeaderMap) -> Respons
     }
 }
 
-/// `POST /api/portal/users/{id}/grant` —— 给某个用户发放额度。
+/// `POST /api/portal/users/{id}/grant` —— 给某个用户追加一笔额度。
 async fn portal_grant(
     State(st): State<AppState>,
     axum::extract::Path(user_id): axum::extract::Path<String>,
     headers: HeaderMap,
     Json(body): Json<Value>,
+) -> Response {
+    portal_user_action(st, headers, &user_id, "grant", body).await
+}
+
+/// `POST /api/portal/users/{id}/quota` —— 把某个用户的总额度**设定**成某个数。
+///
+/// 跟发放的区别是绝对值与增量：发放是「再给他 5 块」，设定是「他一共 5 块」。
+/// 两条都留着 —— 日常调额用设定，一次性赠送用发放。
+async fn portal_set_quota(
+    State(st): State<AppState>,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    portal_user_action(st, headers, &user_id, "quota", body).await
+}
+
+/// 转发一次针对某个门户用户的写操作。
+///
+/// `action` 只来自上面两个调用点写死的字面量，绝不取自请求 —— 路径段一旦能被
+/// 调用方摆布，这个代理就成了打门户管理面任意端点的跳板。
+async fn portal_user_action(
+    st: AppState,
+    headers: HeaderMap,
+    user_id: &str,
+    action: &'static str,
+    body: Value,
 ) -> Response {
     if let Err(r) = require_auth(&st, &headers).await {
         return r;
@@ -262,7 +289,7 @@ async fn portal_grant(
     };
     match st
         .http
-        .post(format!("{}/admin/users/{user_id}/grant", st.portal_url))
+        .post(format!("{}/admin/users/{user_id}/{action}", st.portal_url))
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .json(&body)
         .send()
@@ -1282,6 +1309,7 @@ async fn main() {
         )
         .route("/api/portal/users", get(portal_users))
         .route("/api/portal/users/{id}/grant", post(portal_grant))
+        .route("/api/portal/users/{id}/quota", post(portal_set_quota))
         .route("/api/portal/topups", get(portal_topups))
         .route("/api/portal/topups/{id}/{decision}", post(portal_decide_topup))
         .route("/api/mint-key", post(api_mint_key))
@@ -1416,6 +1444,33 @@ mod tests {
         assert!(check < build, "先拼了 URL 才校验，等于没校验");
     }
 
+    /// 用户写操作那条转发，路径段必须是编译期字面量。
+    ///
+    /// 这跟上面充值单那条是同一件事的两种写法：那条从请求里拿路径段、再用白名单
+    /// 挡；这条压根不给请求碰路径段的机会。后者更稳，因为它不依赖有人记得加校验。
+    #[test]
+    fn the_portal_user_action_segment_is_a_compile_time_literal() {
+        let src = include_str!("main.rs");
+        // 只扫生产段。整文件扫的话，断言要找的字面量在断言自己这行里也有一份
+        // —— 那条测试就永远为真，把签名改坏了也照样绿。
+        let production = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(src);
+        assert!(
+            production.contains("action: &'static str"),
+            "转发的路径段不是编译期字面量 —— 调用方就能摆布它",
+        );
+        for lit in ["\"grant\"", "\"quota\""] {
+            assert!(
+                production.contains(&format!(
+                    "portal_user_action(st, headers, &user_id, {lit}, body)"
+                )),
+                "{lit} 那个调用点没有传字面量",
+            );
+        }
+    }
+
     /// 没配门户时管理页整个关掉，而不是崩掉或假装成功。控制台可以独立部署。
     #[test]
     fn an_absent_portal_is_reported_not_crashed() {
@@ -1435,20 +1490,29 @@ mod tests {
     #[test]
     fn portal_admin_routes_require_a_console_session() {
         let src = include_str!("main.rs");
+        let body_of = |f: &str| -> String {
+            src.split_once(f)
+                .and_then(|(_, rest)| rest.split_once("\n}\n"))
+                .map(|(b, _)| b.to_string())
+                .unwrap_or_else(|| panic!("找不到 {f}"))
+        };
+        // 共用的转发函数是唯一允许被委托到的落点，它自己必须查会话。
+        assert!(
+            body_of("async fn portal_user_action(").contains("require_auth(&st, &headers).await"),
+            "共用转发函数没有过会话检查 —— 委托给它的那几条路由就全裸了",
+        );
         for f in [
             "async fn portal_users(",
             "async fn portal_grant(",
+            "async fn portal_set_quota(",
             "async fn portal_topups(",
             "async fn portal_decide_topup(",
         ] {
-            let body = src
-                .split_once(f)
-                .and_then(|(_, rest)| rest.split_once("\n}\n"))
-                .map(|(b, _)| b)
-                .unwrap_or_else(|| panic!("找不到 {f}"));
+            let body = body_of(f);
             assert!(
-                body.contains("require_auth(&st, &headers).await"),
-                "{f} 没有过会话检查",
+                body.contains("require_auth(&st, &headers).await")
+                    || body.contains("portal_user_action("),
+                "{f} 既没有自己查会话，也没有委托给查会话的那个",
             );
         }
     }

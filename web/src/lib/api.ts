@@ -220,12 +220,36 @@ export interface PortalUser {
   display_name: string | null;
   disabled: boolean;
   balance_micro_usd: number;
+  /** 总额度 —— 迄今给过他的一切之和。下推给网关的就是这个数。 */
+  granted_micro_usd: number;
+  /** 他自己已经分到各把密钥上的额度之和。 */
+  allocated_micro_usd: number;
 }
 
 export async function portalUsers(): Promise<{ users: PortalUser[] }> {
   const r = await req("/api/portal/users");
   if (!r.ok) throw new ApiError(await errorOf(r), r.status);
   return (await r.json()) as { users: PortalUser[] };
+}
+
+/**
+ * 把某个用户的总额度**设定**成某个数（绝对值，不是增量）。
+ *
+ * 跟 {@link portalGrant} 的区别是语义而不是实现：设定回答「他一共有多少」，
+ * 发放回答「再给他多少」。日常调额用设定 —— 用增量调额时，管理员得先算出差值，
+ * 算错就是白送或误封。
+ */
+export async function portalSetQuota(
+  userId: string,
+  microUsd: number,
+  note: string | null,
+): Promise<void> {
+  const r = await req(`/api/portal/users/${encodeURIComponent(userId)}/quota`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ micro_usd: microUsd, note }),
+  });
+  if (!r.ok) throw new ApiError(await errorOf(r), r.status);
 }
 
 export async function portalGrant(

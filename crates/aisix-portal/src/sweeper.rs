@@ -133,6 +133,11 @@ impl<S: ConsumptionSource> Sweeper<S> {
         }
         let _ = self.apply_allowances(&grants).await;
 
+        // 密钥级额度。用户把自己的总额分配到各把密钥上，网关按 `scope: api_key`
+        // 单独收口每一把 —— 用户级那条策略仍然在，所以「总花销不超过用户额度」
+        // 由它保证，密钥级只是在此之下再切分。
+        let _ = self.apply_key_allowances().await;
+
         // 余额决定密钥开关。放在入账之后，用的是这一轮之后的余额。
         let mut wanted: Vec<(String, bool)> = Vec::new();
         for u in &users {
@@ -182,6 +187,95 @@ impl<S: ConsumptionSource> Sweeper<S> {
                 })
             })
             .await
+    }
+
+    /// 把每把密钥的额度写成一条 `scope: api_key` 的策略。
+    ///
+    /// `scope_ref` 必须是密钥的 **entry id**（`ConditionInput::api_key` 比的是
+    /// `auth.entry.id`），而文件模式下那个 id 是
+    /// `uuid5(命名空间, "api_keys/<display_name>")`。派生直接调网关自己的函数 ——
+    /// 自己抄一份跟上游漂开之后，策略会挂在一个不存在的身份上：配了、加载了、
+    /// 永不命中，而这种失败不报错。
+    ///
+    /// 用户级那条策略不受影响：两条同时生效，所以密钥再怎么分配，总花销都过不了
+    /// 用户级那道闸。
+    async fn apply_key_allowances(&self) -> Result<(), StoreError> {
+        let quotas = self.store.all_key_quotas().await?;
+        let _ = self
+            .resources
+            .edit(move |doc| {
+                use serde_yaml_ng::Value;
+                let Some(map) = doc.as_mapping_mut() else {
+                    return false;
+                };
+                let key = Value::from("rate_limit_policies");
+                if !map.get(&key).map(Value::is_sequence).unwrap_or(false) {
+                    map.insert(key.clone(), Value::Sequence(Vec::new()));
+                }
+                let Some(list) = map.get_mut(&key).and_then(Value::as_sequence_mut) else {
+                    return false;
+                };
+
+                // `scope_ref` 写密钥的**名字**，不是算好的 id。
+                //
+                // 文件模式里这一层是「糖」：网关自己把名字解析成派生 id。写成
+                // 派生 id 的话它成了一个「不存在的名字」，网关**整份配置**加载
+                // 失败、静默保留旧快照 —— 连「余额耗尽就停用」那个闸也一起失效，
+                // 而配置文件看起来完全正常。
+                //
+                // 这也正是仓库里记下的那条分歧轴：声明式文件里用名字，走线协议
+                // 上才用 UUID。
+                let wanted: Vec<(String, String, i64)> = quotas
+                    .iter()
+                    .filter(|(_, _, v)| *v > 0)
+                    .map(|(_, name, v)| (format!("portal-key-{name}"), name.clone(), *v))
+                    .collect();
+
+                let mut changed = false;
+                // 额度被清掉或密钥被吊销的，对应策略要一并移除 —— 留着会挂在
+                // 一个不存在的身份上，白占配置。
+                let before = list.len();
+                list.retain(|p| {
+                    let n = p.get("name").and_then(Value::as_str).unwrap_or("");
+                    !n.starts_with("portal-key-") || wanted.iter().any(|(w, _, _)| w == n)
+                });
+                if list.len() != before {
+                    changed = true;
+                }
+
+                for (pname, entry_id, granted) in &wanted {
+                    let existing = list
+                        .iter_mut()
+                        .find(|p| p.get("name").and_then(Value::as_str) == Some(pname.as_str()));
+                    match existing {
+                        Some(p) => {
+                            let cur = p
+                                .get("granted_micro_usd")
+                                .and_then(Value::as_i64)
+                                .unwrap_or(0);
+                            if cur == *granted {
+                                continue;
+                            }
+                            if let Some(m) = p.as_mapping_mut() {
+                                m.insert(Value::from("granted_micro_usd"), Value::from(*granted));
+                                changed = true;
+                            }
+                        }
+                        None => {
+                            let mut m = serde_yaml_ng::Mapping::new();
+                            m.insert(Value::from("name"), Value::from(pname.clone()));
+                            m.insert(Value::from("scope"), Value::from("api_key"));
+                            m.insert(Value::from("scope_ref"), Value::from(entry_id.clone()));
+                            m.insert(Value::from("granted_micro_usd"), Value::from(*granted));
+                            list.push(Value::Mapping(m));
+                            changed = true;
+                        }
+                    }
+                }
+                changed
+            })
+            .await;
+        Ok(())
     }
 
     /// 把每个用户的累计发放总额写成一条 `scope: member` 的策略。
@@ -440,14 +534,35 @@ mod tests {
             .join(format!("aisix-sweeper-{}.yaml", uuid::Uuid::new_v4()))
             .to_string_lossy()
             .to_string();
+        // 这份配置必须是网关**真能加载**的。第一版随手写了个残缺文档，结果
+        // 每个用例走的都是「文件本来就坏、照写」那条降级路径 —— 写前校验那道闸
+        // 在测试里完全没被执行过，而生产上它是开着的。
         std::fs::write(
             &path,
             format!(
-                "models:\n- display_name: keep-me\n  provider: openai\n\
-                 api_keys:\n\
-                 - display_name: a\n  key_hash: aa\n  user_id: {uid}\n\
-                 - display_name: b\n  key_hash: bb\n  user_id: {other}\n\
-                 - display_name: ops\n  key_hash: cc\n"
+                r#"_format_version: "1"
+provider_keys:
+  - display_name: stub
+    provider: openai
+    api_key: sk-stub
+models:
+  - display_name: keep-me
+    provider: openai
+    provider_key: stub
+    model_name: keep-me
+api_keys:
+  - display_name: a
+    key_hash: aa
+    user_id: {uid}
+    allowed_models: ["*"]
+  - display_name: b
+    key_hash: bb
+    user_id: {other}
+    allowed_models: ["*"]
+  - display_name: ops
+    key_hash: cc
+    allowed_models: ["*"]
+"#
             ),
         )
         .unwrap();
@@ -718,5 +833,122 @@ mod allowance_pushdown_tests {
             mtime_first,
             "无变化也重写了配置 —— 网关会因此白重载",
         );
+    }
+}
+
+/// 每把密钥自己的额度下推成 `api_key` 域的策略。
+///
+/// 用户域那条（`portal-allowance-<uid>`）管的是「这个人总共能花多少」，这里
+/// 管的是「这把密钥能花多少」。两条各自成闸，网关取更严的那个。
+#[cfg(test)]
+mod key_allowance_tests {
+    use super::tests::{fx, t};
+    use serde_yaml_ng::Value;
+
+    fn policies(path: &str) -> Vec<Value> {
+        let doc: Value = serde_yaml_ng::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        doc.get("rate_limit_policies")
+            .and_then(Value::as_sequence)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn policy(path: &str, name: &str) -> Option<Value> {
+        policies(path)
+            .into_iter()
+            .find(|p| p.get("name").and_then(Value::as_str) == Some(name))
+    }
+
+    #[tokio::test]
+    async fn 密钥额度下推成_api_key_域的策略() {
+        let f = fx().await;
+        f.store.set_key_quota(&f.uid, "a", 3_000_000).await.unwrap();
+        f.sw.tick(t("2026-08-27T10:00:00Z")).await.unwrap();
+
+        let p = policy(&f.path, "portal-key-a").expect("没有下推 portal-key-a");
+        assert_eq!(p.get("scope").and_then(Value::as_str), Some("api_key"));
+        assert_eq!(
+            p.get("granted_micro_usd").and_then(Value::as_i64),
+            Some(3_000_000)
+        );
+        // scope_ref 是密钥的**名字**，网关自己去解析成 id。
+        //
+        // 这条断言原本写的是「等于派生 id」—— 实现和测试一起错，单测全绿，直到
+        // 真网关拒收整份配置才暴露。所以这里额外钉一句：那串不能是 uuid 形状。
+        assert_eq!(p.get("scope_ref").and_then(Value::as_str), Some("a"));
+        assert!(
+            uuid::Uuid::parse_str(p.get("scope_ref").and_then(Value::as_str).unwrap()).is_err(),
+            "scope_ref 又写成了 uuid —— 网关会把整份配置当成引用了不存在的密钥而整体拒收",
+        );
+    }
+
+    #[tokio::test]
+    async fn 改了额度_策略里的数跟着改() {
+        let f = fx().await;
+        f.store.set_key_quota(&f.uid, "a", 3_000_000).await.unwrap();
+        f.sw.tick(t("2026-08-27T10:00:00Z")).await.unwrap();
+        f.store.set_key_quota(&f.uid, "a", 9_000_000).await.unwrap();
+        f.sw.tick(t("2026-08-27T10:00:15Z")).await.unwrap();
+
+        let p = policy(&f.path, "portal-key-a").unwrap();
+        assert_eq!(
+            p.get("granted_micro_usd").and_then(Value::as_i64),
+            Some(9_000_000)
+        );
+        // 改额度不该多出一条同名策略 —— 重名会让加载方按第一条生效，改的那条
+        // 永远不起作用。
+        assert_eq!(
+            policies(&f.path)
+                .iter()
+                .filter(|p| p.get("name").and_then(Value::as_str) == Some("portal-key-a"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn 额度清掉后_那条策略被撤掉() {
+        let f = fx().await;
+        f.store.set_key_quota(&f.uid, "a", 3_000_000).await.unwrap();
+        f.sw.tick(t("2026-08-27T10:00:00Z")).await.unwrap();
+        f.store.drop_key_quota(&f.uid, "a").await.unwrap();
+        f.sw.tick(t("2026-08-27T10:00:15Z")).await.unwrap();
+
+        assert!(
+            policy(&f.path, "portal-key-a").is_none(),
+            "额度已清掉，策略还挂在配置里"
+        );
+    }
+
+    #[tokio::test]
+    async fn 不碰用户域那条策略_也不碰运维手写的() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 5_000_000, crate::ledger::Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.store.set_key_quota(&f.uid, "a", 1_000_000).await.unwrap();
+        f.sw.tick(t("2026-08-27T10:00:00Z")).await.unwrap();
+
+        // 撤旧策略那一步按 `portal-key-` 前缀筛。筛错了就会把用户域的闸、
+        // 或者运维自己写的策略一起删掉 —— 静默地把限流全放开。
+        assert!(
+            policy(&f.path, &format!("portal-allowance-{}", f.uid)).is_some(),
+            "用户域的额度策略被误删了"
+        );
+        assert!(policy(&f.path, "portal-key-a").is_some());
+    }
+
+    #[tokio::test]
+    async fn 只给有额度的密钥下推() {
+        let f = fx().await;
+        f.store.set_key_quota(&f.uid, "a", 2_000_000).await.unwrap();
+        // 额度是 0 的那条也不该下推：0 额度的闸不是「不限」，是「一分钱都
+        // 不许花」—— 会把一把本该不受限的密钥直接锁死。
+        f.store.set_key_quota(&f.uid, "b", 0).await.unwrap();
+        f.sw.tick(t("2026-08-27T10:00:00Z")).await.unwrap();
+        assert!(policy(&f.path, "portal-key-b").is_none());
+        // 压根没有额度记录的密钥同样不该有策略。
+        assert!(policy(&f.path, "portal-key-ops").is_none());
     }
 }

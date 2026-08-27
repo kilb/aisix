@@ -78,6 +78,16 @@ export interface KeyRow {
   name: string;
   masked_hash: string;
   disabled: boolean;
+  /** 0 = 没单独设限，只受总额度约束。 */
+  quota_micro_usd: number;
+}
+
+export interface KeyList {
+  keys: KeyRow[];
+  /** 管理员给你设的总额度。 */
+  granted_micro_usd: number;
+  /** 已经分到各把密钥上的额度之和。 */
+  allocated_micro_usd: number;
 }
 
 export interface MintedKey {
@@ -118,7 +128,14 @@ export const topups = () => req<{ topups: Topup[] }>("/topups");
 export const requestTopup = (microUsd: number, note: string | null) =>
   post<{ ok: true }>("/topups", { micro_usd: microUsd, note });
 
-export const listKeys = () => req<{ keys: KeyRow[] }>("/keys");
+export const listKeys = () => req<KeyList>("/keys");
+/** `microUsd` 传 0 表示撤掉这把密钥的单独额度。 */
+export const setKeyQuota = (name: string, microUsd: number) =>
+  req<{ ok: true }>(`/keys/${encodeURIComponent(name)}/quota`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ micro_usd: microUsd }),
+  });
 export const createKey = (label: string) => post<MintedKey>("/keys", { label });
 export const revokeKey = (name: string) =>
   req<{ ok: true }>(`/keys/${encodeURIComponent(name)}`, { method: "DELETE" });

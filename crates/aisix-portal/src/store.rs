@@ -189,6 +189,67 @@ impl Store {
             .collect())
     }
 
+    /// 某个用户名下各把密钥的额度。
+    pub async fn key_quotas(&self, user_id: &str) -> Result<Vec<(String, i64)>, StoreError> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT key_name, micro_usd FROM key_quotas WHERE user_id = ?1 ORDER BY key_name",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// 全部用户的密钥额度，供对账环一次性下推。
+    pub async fn all_key_quotas(&self) -> Result<Vec<(String, String, i64)>, StoreError> {
+        let rows: Vec<(String, String, i64)> =
+            sqlx::query_as("SELECT user_id, key_name, micro_usd FROM key_quotas")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows)
+    }
+
+    /// 已分配到各把密钥上的额度之和。
+    pub async fn allocated_to_keys(&self, user_id: &str) -> Result<i64, StoreError> {
+        let (sum,): (i64,) =
+            sqlx::query_as("SELECT COALESCE(SUM(micro_usd), 0) FROM key_quotas WHERE user_id = ?1")
+                .bind(user_id)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(sum)
+    }
+
+    pub async fn set_key_quota(
+        &self,
+        user_id: &str,
+        key_name: &str,
+        micro_usd: i64,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO key_quotas (user_id, key_name, micro_usd, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(user_id, key_name) DO UPDATE SET micro_usd = ?3, updated_at = ?4",
+        )
+        .bind(user_id)
+        .bind(key_name)
+        .bind(micro_usd)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 密钥被吊销时一并清掉它的额度 —— 留着的话下一轮对账还会为它下推策略，
+    /// 而那把密钥已经不存在了。
+    pub async fn drop_key_quota(&self, user_id: &str, key_name: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM key_quotas WHERE user_id = ?1 AND key_name = ?2")
+            .bind(user_id)
+            .bind(key_name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// 已计入流水的截止时刻。`None` = 还没对过账。
     pub async fn counted_through(
         &self,

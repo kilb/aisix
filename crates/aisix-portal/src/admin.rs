@@ -63,12 +63,18 @@ pub async fn list_users(State(st): State<AppState>, headers: HeaderMap) -> Respo
             let mut out = Vec::with_capacity(users.len());
             for u in users {
                 let balance = ledger.balance(&u.id).await.unwrap_or(0);
+                let granted = ledger.total_granted(&u.id).await.unwrap_or(0);
+                let allocated = st.store.allocated_to_keys(&u.id).await.unwrap_or(0);
                 out.push(json!({
                     "user_id": u.id,
                     "email": u.email,
                     "display_name": u.display_name,
                     "disabled": u.disabled,
                     "balance_micro_usd": balance,
+                    "granted_micro_usd": granted,
+                    // 已分配到各把密钥上的额度之和。运维看得到「这个人把额度
+                    // 分出去多少」，也就看得出把总额调低到什么程度会撞上分配。
+                    "allocated_micro_usd": allocated,
                 }));
             }
             Json(json!({"users": out})).into_response()
@@ -76,6 +82,78 @@ pub async fn list_users(State(st): State<AppState>, headers: HeaderMap) -> Respo
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "读取失败"})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct QuotaReq {
+    /// 目标总额度。有意用 `i64`：负数要能进来才能被明确拒绝。
+    pub micro_usd: i64,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// `POST /admin/users/{id}/quota` —— 把这个用户的总额度**设定**成给定值。
+///
+/// 跟发放（追加）分开：运维想的是「这个人有多少额度」，而不是「再给他加多少」。
+/// 追加那条路留着，充值单确认走的就是它。
+///
+/// 账本仍然只追加：这里记的是与当前总额的差，可正可负。所以「谁在什么时候把
+/// 额度改成了多少」留得下痕，余额与总额也都还能从流水重算。
+pub async fn set_quota(
+    State(st): State<AppState>,
+    Path(user_id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<QuotaReq>,
+) -> Response {
+    if !admin_ok(&st, &headers) {
+        return forbidden();
+    }
+    if req.micro_usd < 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "额度不能是负数"})),
+        )
+            .into_response();
+    }
+    match st.store.user_by_id(&user_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "没有这个用户"})),
+            )
+                .into_response()
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "读取失败"})),
+            )
+                .into_response()
+        }
+    }
+
+    let ledger = Ledger::new(st.store.clone());
+    match ledger
+        .set_total_granted(&user_id, req.micro_usd, req.note.as_deref())
+        .await
+    {
+        Ok(delta) => {
+            let balance = ledger.balance(&user_id).await.unwrap_or(0);
+            Json(json!({
+                "ok": true,
+                "granted_micro_usd": req.micro_usd,
+                "delta_micro_usd": delta,
+                "balance_micro_usd": balance,
+            }))
+            .into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "记账失败"})),
         )
             .into_response(),
     }

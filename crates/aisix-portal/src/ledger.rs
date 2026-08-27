@@ -33,6 +33,11 @@ pub enum Source {
     Consumption,
     /// 线下充值单被管理员确认。真接支付后这条来源换成回调触发，账本不用改。
     Topup,
+    /// 管理员把总额度**设定**成某个值。
+    ///
+    /// 账本仍然只追加：设定记的是「与当前总额的差」，可正可负。这样「谁在
+    /// 什么时候把额度改成了多少」全部留痕，而余额与总额都还能从流水重算出来。
+    AdminSet,
 }
 
 impl Source {
@@ -41,6 +46,7 @@ impl Source {
             Self::AdminGrant => "admin_grant",
             Self::Consumption => "consumption",
             Self::Topup => "topup",
+            Self::AdminSet => "admin_set",
         }
     }
 }
@@ -98,19 +104,41 @@ impl Ledger {
         Ok(sum)
     }
 
-    /// 累计发放总额 —— 只把入账那些加起来，不减消费。
+    /// 总额度 —— 除消费之外的一切之和。
     ///
-    /// 这是下推给网关的那个数。网关那边也只累加消费、从不重置，两边都单调
-    /// 递增，所以「还剩多少」是两个单调量的差，不需要任何对账去校正。
+    /// 按**来源**而不是按正负判断，这一点是必须的：管理员调减额度会记一条负数
+    /// 流水，按正负筛的话它会被漏掉，总额只涨不落，网关那边的闸就跟着降不下来。
+    ///
+    /// 这是下推给网关的那个数。网关那边只累加消费、从不重置，所以「还剩多少」
+    /// 是两个量的差，不需要任何对账去校正。
     pub async fn total_granted(&self, user_id: &str) -> Result<i64, StoreError> {
         let (sum,): (i64,) = sqlx::query_as(
             "SELECT COALESCE(SUM(delta_micro_usd), 0) FROM ledger
-             WHERE user_id = ?1 AND delta_micro_usd > 0",
+             WHERE user_id = ?1 AND source != 'consumption'",
         )
         .bind(user_id)
         .fetch_one(self.store.pool())
         .await?;
         Ok(sum)
+    }
+
+    /// 把总额度设定成 `target`，记一条差额流水。返回实际写入的差额。
+    ///
+    /// 目标低于已消费是允许的：那就是「我把你的额度调到这个数」，网关会立刻
+    /// 拒绝后续请求。不允许的是负的目标值 —— 那没有意义。
+    pub async fn set_total_granted(
+        &self,
+        user_id: &str,
+        target: i64,
+        note: Option<&str>,
+    ) -> Result<i64, StoreError> {
+        let current = self.total_granted(user_id).await?;
+        let delta = target - current;
+        if delta != 0 {
+            let mut c = self.store.pool().acquire().await?;
+            insert_entry(&mut *c, user_id, delta, Source::AdminSet, note).await?;
+        }
+        Ok(delta)
     }
 
     /// 按记账顺序返回流水。

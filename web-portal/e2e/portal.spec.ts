@@ -308,3 +308,96 @@ test("提交充值单不改余额_确认后才入账_重复确认被拒", async 
   await expect(balanceReading(page)).toHaveText("$20.00");
   await expect(page.locator("tbody tr", { hasText: "单号 X1" })).toContainText("已入账");
 });
+
+/** 把某个用户的总额度**设定**成某个数（绝对值）。 */
+async function setQuota(email: string, micro: number): Promise<void> {
+  const list = await fetch(`${fx.portalUrl}/admin/users`, {
+    headers: { authorization: `Bearer ${fx.adminToken}` },
+  }).then((r) => r.json());
+  const u = list.users.find((x: { email: string }) => x.email === email);
+  expect(u, `管理端列表里找不到 ${email}`).toBeTruthy();
+  const r = await fetch(`${fx.portalUrl}/admin/users/${u.user_id}/quota`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${fx.adminToken}`, "content-type": "application/json" },
+    body: JSON.stringify({ micro_usd: micro, note: "e2e 设定" }),
+  });
+  expect(r.status).toBe(200);
+}
+
+/** 密钥表里第 `i` 行（0 起）。 */
+function keyRow(page: Page, i: number) {
+  return page.locator("tbody tr", { hasText: "portal-" }).nth(i);
+}
+
+test("给每把密钥设额度_界面上分不出去的那部分被明确挡住", async ({ page }) => {
+  const email = mail("key-quota");
+  await signUp(page, email);
+  await setQuota(email, 10_000_000);
+
+  for (const label of ["甲", "乙"]) {
+    await page.getByLabel("名称（可选）").fill(label);
+    await page.getByRole("button", { name: "创建密钥" }).click();
+    await page.getByRole("button", { name: "我已保存" }).click();
+  }
+  await page.reload();
+
+  const budget = page.locator(".budget");
+  await expect(budget).toContainText("$10.00");
+  // 还没分配，可再分配就该等于总额度。
+  await expect(budget).toContainText("已分配 $0.00");
+
+  // 给甲分 $6。
+  await keyRow(page, 0).getByRole("button", { name: "不设限" }).click();
+  await keyRow(page, 0).getByLabel(/的额度 USD$/).fill("6");
+  await keyRow(page, 0).getByRole("button", { name: "保存" }).click();
+  await expect(budget).toContainText("已分配 $6.00");
+  await expect(budget).toContainText("可再分配 $4.00");
+
+  // 再给乙分 $5 —— 6 + 5 > 10，必须被挡住，并说清还能分多少。
+  await keyRow(page, 1).getByRole("button", { name: "不设限" }).click();
+  await keyRow(page, 1).getByLabel(/的额度 USD$/).fill("5");
+  await keyRow(page, 1).getByRole("button", { name: "保存" }).click();
+  await expect(page.locator(".note.crit")).toContainText("不能超过你的总额度");
+  // 被挡住之后账面不能变 —— 「先写再报错」会让用户莫名多出一道闸。
+  await expect(budget).toContainText("已分配 $6.00");
+
+  // 改成 $4 刚好用完，放行。
+  await keyRow(page, 1).getByLabel(/的额度 USD$/).fill("4");
+  await keyRow(page, 1).getByRole("button", { name: "保存" }).click();
+  await expect(budget).toContainText("已分配 $10.00");
+  await expect(budget).toContainText("可再分配 $0.00");
+
+  // 调低甲到 $1：校验若拿「当前总和 + 新值」比会算成 11 > 10 而误拒。
+  await keyRow(page, 0).getByRole("button", { name: "$6.00" }).click();
+  await keyRow(page, 0).getByLabel(/的额度 USD$/).fill("1");
+  await keyRow(page, 0).getByRole("button", { name: "保存" }).click();
+  await expect(budget).toContainText("已分配 $5.00");
+  await expect(page.locator(".note.crit")).toHaveCount(0);
+
+  // 清成 0 就是「不设限」，那份额度回到可分配的池子。
+  await keyRow(page, 0).getByRole("button", { name: "$1.00" }).click();
+  await keyRow(page, 0).getByLabel(/的额度 USD$/).fill("0");
+  await keyRow(page, 0).getByRole("button", { name: "保存" }).click();
+  await expect(keyRow(page, 0).getByRole("button", { name: "不设限" })).toBeVisible();
+  await expect(budget).toContainText("已分配 $4.00");
+});
+
+test("吊销一把密钥会把它占的额度还回来", async ({ page }) => {
+  const email = mail("key-quota-revoke");
+  await signUp(page, email);
+  await setQuota(email, 8_000_000);
+  await page.getByLabel("名称（可选）").fill("要吊销的");
+  await page.getByRole("button", { name: "创建密钥" }).click();
+  await page.getByRole("button", { name: "我已保存" }).click();
+  await page.reload();
+
+  await keyRow(page, 0).getByRole("button", { name: "不设限" }).click();
+  await keyRow(page, 0).getByLabel(/的额度 USD$/).fill("8");
+  await keyRow(page, 0).getByRole("button", { name: "保存" }).click();
+  await expect(page.locator(".budget")).toContainText("可再分配 $0.00");
+
+  await keyRow(page, 0).getByRole("button", { name: "吊销" }).click();
+  // 不还回来的话，用户看着自己有额度却一分也分不出去。
+  await expect(page.locator(".budget")).toContainText("可再分配 $8.00");
+  await expect(page.locator(".budget")).toContainText("已分配 $0.00");
+});

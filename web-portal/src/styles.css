@@ -125,6 +125,24 @@ button.ghost:hover{border-color:var(--ink-3);color:var(--ink)}
 .row{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;margin-bottom:4px}
 .row > .f{flex:1 1 220px;margin-bottom:0}
 button.act.narrow{width:auto;flex:none}
+
+/* 额度预算条。把「还能分多少」摆在填之前，而不是让人填完再吃一个 409。 */
+.budget{
+  gap:24px;margin:0 0 15px;padding:10px 0;align-items:baseline;
+  border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);
+}
+.budget > span{font-family:var(--mono);font-size:11px;color:var(--ink-3)}
+.budget strong{
+  display:block;margin-top:2px;font-family:var(--fig);font-size:17px;
+  font-weight:600;color:var(--ink);
+}
+/* 可再分配为零时压成警示色 —— 这时候点「额度」只会吃拒绝，得先说清原因。 */
+.budget strong[data-low]{color:var(--oxide)}
+
+.quota-edit{display:inline-flex;gap:6px;align-items:center;justify-content:flex-end}
+/* 表格里的输入框不能撑满单元格，否则那一列会被顶宽、把后面几列挤没。 */
+.quota-edit input{width:9ch;padding:5px 7px;font-size:13px}
+button.ghost.num{padding:5px 9px;font-family:var(--fig);font-variant-numeric:tabular-nums lining-nums}
 .minted{display:flex;flex-direction:column;gap:8px;align-items:flex-start}
 .minted code{
   display:block;width:100%;font-family:var(--mono);font-size:12.5px;

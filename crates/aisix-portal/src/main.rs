@@ -46,8 +46,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/balance", get(usage::balance))
         .route("/api/keys", get(keys::list).post(keys::create))
         .route("/api/keys/{name}", axum::routing::delete(keys::revoke))
+        .route(
+            "/api/keys/{name}/quota",
+            axum::routing::put(keys::set_quota),
+        )
         .route("/admin/users", get(admin::list_users))
         .route("/admin/users/{id}/grant", post(admin::grant))
+        .route("/admin/users/{id}/quota", post(admin::set_quota))
         .with_state(state)
 }
 
@@ -319,6 +324,17 @@ mod testutil {
         /// 重写本实例的 resources.yaml。
         pub fn set_resources(&self, body: &str) {
             std::fs::write(&self.resources_path, body).unwrap();
+        }
+
+        pub async fn put(&self, path: &str, body: serde_json::Value) -> (u16, String) {
+            let r = self
+                .http
+                .put(format!("{}{path}", self.base))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            (r.status().as_u16(), r.text().await.unwrap())
         }
 
         pub async fn delete(&self, path: &str) -> (u16, String) {
@@ -867,7 +883,23 @@ mod keys_tests {
     use serde_json::json;
 
     const PW: &str = "correct horse battery";
-    const SEED: &str = "models:\n- display_name: keep-me\napi_keys:\n- display_name: ops\n  key_hash: opsopsopsopsopsopsopsopsopsopsops\n";
+    /// 网关**真能加载**的一份配置。残缺文档会让写前校验那道闸走「本来就坏、
+    /// 照写」的降级路径，于是它在这批用例里全程没被执行过。
+    const SEED: &str = r#"_format_version: "1"
+provider_keys:
+  - display_name: stub
+    provider: openai
+    api_key: sk-stub
+models:
+  - display_name: keep-me
+    provider: openai
+    provider_key: stub
+    model_name: keep-me
+api_keys:
+  - display_name: ops
+    key_hash: opsopsopsopsopsopsopsopsopsopsops
+    allowed_models: ["*"]
+"#;
 
     async fn app() -> (FakeProm, TestApp) {
         let prom = FakeProm::start().await;
@@ -1243,5 +1275,250 @@ mod topup_race_tests {
             .await
             .unwrap();
         assert_eq!(bal, 5_000_000, "同一笔充值入账了多次");
+    }
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::testutil::{temp_resources, FakeProm, TestApp};
+    use serde_json::json;
+
+    const PW: &str = "correct horse battery";
+    /// 网关**真能加载**的一份配置。残缺文档会让写前校验那道闸走「本来就坏、
+    /// 照写」的降级路径，于是它在这批用例里全程没被执行过。
+    const SEED: &str = r#"_format_version: "1"
+provider_keys:
+  - display_name: stub
+    provider: openai
+    api_key: sk-stub
+models:
+  - display_name: keep-me
+    provider: openai
+    provider_key: stub
+    model_name: keep-me
+api_keys:
+  - display_name: ops
+    key_hash: opsopsopsopsopsopsopsopsopsopsops
+    allowed_models: ["*"]
+"#;
+
+    async fn app() -> (FakeProm, TestApp) {
+        let prom = FakeProm::start().await;
+        let app = TestApp::start_with_usage(&prom, &temp_resources(SEED)).await;
+        (prom, app)
+    }
+
+    async fn signed_in(app: &TestApp, mail: &str) -> String {
+        let id = app.register(mail, PW).await;
+        app.post("/api/login", json!({"email": mail, "password": PW}))
+            .await;
+        id
+    }
+
+    async fn mint(app: &TestApp, label: &str) -> String {
+        let (_, body) = app.post("/api/keys", json!({"label": label})).await;
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["name"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn 管理员设定额度是绝对值_不是追加() {
+        let (_p, app) = app().await;
+        let id = signed_in(&app, "a@b.c").await;
+
+        app.post_admin(
+            &format!("/admin/users/{id}/quota"),
+            json!({"micro_usd": 5_000_000}),
+        )
+        .await;
+        app.post_admin(
+            &format!("/admin/users/{id}/quota"),
+            json!({"micro_usd": 8_000_000}),
+        )
+        .await;
+
+        let l = crate::ledger::Ledger::new(app.store.clone());
+        // 设两次 5 和 8，总额是 8 而不是 13 —— 这是「设定」跟「发放」的全部区别。
+        assert_eq!(l.total_granted(&id).await.unwrap(), 8_000_000);
+    }
+
+    #[tokio::test]
+    async fn 调低额度会记一条负数流水_总额跟着落() {
+        let (_p, app) = app().await;
+        let id = signed_in(&app, "a@b.c").await;
+        app.post_admin(
+            &format!("/admin/users/{id}/quota"),
+            json!({"micro_usd": 9_000_000}),
+        )
+        .await;
+        app.post_admin(
+            &format!("/admin/users/{id}/quota"),
+            json!({"micro_usd": 2_000_000}),
+        )
+        .await;
+
+        let l = crate::ledger::Ledger::new(app.store.clone());
+        // 按正负筛总额的写法在这里会漏掉负数那条，总额只涨不落 —— 网关那边的
+        // 闸也就降不下来。所以总额必须按**来源**算。
+        assert_eq!(l.total_granted(&id).await.unwrap(), 2_000_000);
+        let entries = l.entries(&id).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].delta_micro_usd, -7_000_000);
+        assert_eq!(entries[1].source, "admin_set");
+    }
+
+    #[tokio::test]
+    async fn 负数额度被拒() {
+        let (_p, app) = app().await;
+        let id = signed_in(&app, "a@b.c").await;
+        let (s, _) = app
+            .post_admin(
+                &format!("/admin/users/{id}/quota"),
+                json!({"micro_usd": -1}),
+            )
+            .await;
+        assert_eq!(s, 400);
+    }
+
+    #[tokio::test]
+    async fn 密钥额度之和不得超过用户总额() {
+        let (_p, app) = app().await;
+        let id = signed_in(&app, "a@b.c").await;
+        app.post_admin(
+            &format!("/admin/users/{id}/quota"),
+            json!({"micro_usd": 10_000_000}),
+        )
+        .await;
+        let a = mint(&app, "一").await;
+        let b = mint(&app, "二").await;
+
+        assert_eq!(
+            app.put(
+                &format!("/api/keys/{a}/quota"),
+                json!({"micro_usd": 6_000_000})
+            )
+            .await
+            .0,
+            200
+        );
+        // 6 + 5 > 10，必须被拒。
+        let (s, body) = app
+            .put(
+                &format!("/api/keys/{b}/quota"),
+                json!({"micro_usd": 5_000_000}),
+            )
+            .await;
+        assert_eq!(s, 409, "{body}");
+        assert!(body.contains("available_micro_usd"), "{body}");
+        // 6 + 4 = 10，刚好，放行。
+        assert_eq!(
+            app.put(
+                &format!("/api/keys/{b}/quota"),
+                json!({"micro_usd": 4_000_000})
+            )
+            .await
+            .0,
+            200
+        );
+    }
+
+    #[tokio::test]
+    async fn 调低某把密钥的额度不会被自己的旧值挡住() {
+        let (_p, app) = app().await;
+        let id = signed_in(&app, "a@b.c").await;
+        app.post_admin(
+            &format!("/admin/users/{id}/quota"),
+            json!({"micro_usd": 10_000_000}),
+        )
+        .await;
+        let a = mint(&app, "一").await;
+        app.put(
+            &format!("/api/keys/{a}/quota"),
+            json!({"micro_usd": 10_000_000}),
+        )
+        .await;
+
+        // 把它从 10 调到 3。校验若拿「当前总和 + 新值」比，会算成 13 > 10 而误拒。
+        let (s, body) = app
+            .put(
+                &format!("/api/keys/{a}/quota"),
+                json!({"micro_usd": 3_000_000}),
+            )
+            .await;
+        assert_eq!(s, 200, "调低自己的额度被自己的旧值挡住了: {body}");
+    }
+
+    #[tokio::test]
+    async fn 只能给自己的密钥设额度() {
+        let (_p, app) = app().await;
+        let a_id = signed_in(&app, "a@b.c").await;
+        app.post_admin(
+            &format!("/admin/users/{a_id}/quota"),
+            json!({"micro_usd": 10_000_000}),
+        )
+        .await;
+        let a_key = mint(&app, "A的").await;
+
+        let b_id = signed_in(&app, "b@b.c").await;
+        app.post_admin(
+            &format!("/admin/users/{b_id}/quota"),
+            json!({"micro_usd": 10_000_000}),
+        )
+        .await;
+        let (s, _) = app
+            .put(
+                &format!("/api/keys/{a_key}/quota"),
+                json!({"micro_usd": 1_000_000}),
+            )
+            .await;
+        assert_eq!(s, 404, "B 给 A 的密钥设了额度");
+    }
+
+    #[tokio::test]
+    async fn 额度设为零等于不单独设限() {
+        let (_p, app) = app().await;
+        let id = signed_in(&app, "a@b.c").await;
+        app.post_admin(
+            &format!("/admin/users/{id}/quota"),
+            json!({"micro_usd": 10_000_000}),
+        )
+        .await;
+        let a = mint(&app, "一").await;
+        app.put(
+            &format!("/api/keys/{a}/quota"),
+            json!({"micro_usd": 6_000_000}),
+        )
+        .await;
+        app.put(&format!("/api/keys/{a}/quota"), json!({"micro_usd": 0}))
+            .await;
+
+        // 清零之后那份额度回到可分配的池子里。
+        assert_eq!(app.store.allocated_to_keys(&id).await.unwrap(), 0);
+        let (_, list) = app.get("/api/keys").await;
+        let v: serde_json::Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(v["keys"][0]["quota_micro_usd"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn 吊销密钥会一并清掉它的额度() {
+        let (_p, app) = app().await;
+        let id = signed_in(&app, "a@b.c").await;
+        app.post_admin(
+            &format!("/admin/users/{id}/quota"),
+            json!({"micro_usd": 10_000_000}),
+        )
+        .await;
+        let a = mint(&app, "一").await;
+        app.put(
+            &format!("/api/keys/{a}/quota"),
+            json!({"micro_usd": 6_000_000}),
+        )
+        .await;
+
+        app.delete(&format!("/api/keys/{a}")).await;
+        // 留着的话下一轮对账还会为一把不存在的密钥下推策略。
+        assert_eq!(app.store.allocated_to_keys(&id).await.unwrap(), 0);
     }
 }

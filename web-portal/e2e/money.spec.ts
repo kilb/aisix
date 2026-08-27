@@ -176,3 +176,100 @@ test("门户把累计发放额推给网关_网关按它精确收口", async () =
   await grant(50_000_000);
   await waitFor(async () => (await fx.chatWithStatus()) === 200, "补额后网关重新放行");
 });
+
+/** 把某个用户的总额度**设定**成某个数（绝对值）。 */
+async function setQuota(micro: number): Promise<void> {
+  const r = await fetch(`${fx.portalUrl}/admin/users/${fx.userId}/quota`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${ADMIN_TOKEN}`, "content-type": "application/json" },
+    body: JSON.stringify({ micro_usd: micro, note: "e2e 设定" }),
+  });
+  expect(r.status).toBe(200);
+}
+
+/** 自助铸一把密钥。返回明文与短名（额度接口与策略名都按短名找得到）。 */
+async function mint(cookie: string, label: string): Promise<{ plaintext: string; name: string }> {
+  const m = await fetch(`${fx.portalUrl}/api/keys`, {
+    method: "POST",
+    headers: { cookie, "content-type": "application/json" },
+    body: JSON.stringify({ label }),
+  }).then((r) => r.json());
+  expect(m.plaintext, "没铸出明文").toBeTruthy();
+  return { plaintext: m.plaintext, name: m.name };
+}
+
+async function setKeyQuota(
+  cookie: string,
+  name: string,
+  micro: number,
+): Promise<{ status: number; body: string }> {
+  const r = await fetch(`${fx.portalUrl}/api/keys/${encodeURIComponent(name)}/quota`, {
+    method: "PUT",
+    headers: { cookie, "content-type": "application/json" },
+    body: JSON.stringify({ micro_usd: micro }),
+  });
+  return { status: r.status, body: await r.text() };
+}
+
+test("管理员设定的额度是绝对值_调低之后调用被拒_调高即恢复", async () => {
+  // 先抬高再调低。「设定」若被实现成「追加」，网关收到的会是两次之和
+  // （507000000），于是本该被收口的用户继续畅通 —— 静默白送，没有任何报错。
+  await setQuota(500_000_000);
+  await waitFor(
+    async () => /granted_micro_usd: 500000000\b/.test(fx.readResources()),
+    "门户把 500000000 推给网关",
+  );
+  await setQuota(7_000_000);
+  await waitFor(async () => {
+    const doc = fx.readResources();
+    return (
+      doc.includes(`portal-allowance-${fx.userId}`) && /granted_micro_usd: 7000000\b/.test(doc)
+    );
+  }, "门户把设定后的总额度 7000000 推给网关（不是两次之和）");
+
+  // 自带前提：不管前面用例花掉多少，这里再花掉 $10，保证花费越过 $7。
+  for (let i = 0; i < 10; i++) await fx.chatWithStatus();
+
+  // 拒绝可能来自两个闸，两者都是「钱不够了」的正确处置，取决于哪个先到：
+  //   * 网关侧的额度闸 → 429，带「top up to continue」；
+  //   * 门户侧的余额闸（额度被调到已花费之下，账面为负）→ 把密钥写成停用，401。
+  // 断言「被拒」而不是断言某一个码 —— 钉死其中一个等于断言两个闸的赛跑结果。
+  await waitFor(async () => {
+    const s = await fx.chatWithStatus();
+    return s === 401 || s === 429;
+  }, "调低总额度后调用被拒");
+
+  // 调高就恢复，不需要重置任何计数器 —— 推下去的只是一个更大的数。
+  await setQuota(1_000_000_000);
+  await waitFor(async () => (await fx.chatWithStatus()) === 200, "调高总额度后恢复放行");
+});
+
+test("每把密钥的额度各自收口_且各把之和不得超过总额度", async () => {
+  const cookie = await fx.sessionCookie();
+  // 把总额度抬到远高于已消费，让**用户**那一层的闸不成为约束 —— 这一条要证的
+  // 是密钥这一层，两层混在一起就分不清是谁拦下的。
+  await setQuota(1_000_000_000);
+  const a = await mint(cookie, "甲");
+  const b = await mint(cookie, "乙");
+  await waitFor(async () => (await fx.chatWith(a.plaintext)) === 200, "新铸的密钥被启用");
+  expect(await fx.chatWith(b.plaintext)).toBe(200);
+
+  // 给甲设 $2 —— 每次调用 $1，它很快就该自己撞墙；乙不设限。
+  expect((await setKeyQuota(cookie, a.name, 2_000_000)).status).toBe(200);
+  await waitFor(async () => {
+    const doc = fx.readResources();
+    return doc.includes(`portal-key-${a.name}`) && doc.includes("scope: api_key");
+  }, "门户把这把密钥的额度推成 api_key 域的策略");
+
+  await waitFor(async () => (await fx.chatWith(a.plaintext)) === 429, "甲自己的额度用尽后被拒");
+  // 乙仍然可用 —— 这是「每把密钥各自一份」的全部含义。闸若错挂在用户身上，
+  // 乙会跟着一起被拒；那在用户看来是「另一把密钥无缘无故不能用了」。
+  expect(await fx.chatWith(b.plaintext)).toBe(200);
+
+  // 和不得超过总额度：甲已占 $2，再给乙要满额就必须被拒。
+  const r = await setKeyQuota(cookie, b.name, 1_000_000_000);
+  expect(r.status).toBe(409);
+  expect(r.body).toContain("available_micro_usd");
+  // 被拒之后乙不该被改坏 —— 拒绝要是「先写再报错」，用户会莫名多出一道闸。
+  expect(await fx.chatWith(b.plaintext)).toBe(200);
+});

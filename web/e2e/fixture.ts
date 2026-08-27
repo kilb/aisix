@@ -67,6 +67,26 @@ async function waitFor(url: string, tries = 120): Promise<void> {
 }
 
 /** 起一个真的控制台 + 一个服务构建产物的静态服务器。 */
+/**
+ * 停掉一个子进程连同它 fork 出来的。
+ *
+ * `npx` 是外壳，真正的 server 在它底下。只 kill pid 的话那个 server 活下来变成
+ * 孤儿 —— 每跑一次漏一个。攒到几十个之后机器变慢，E2E 开始超时，而那种失败看
+ * 起来跟真 bug 一模一样（真的排查过一次）。
+ */
+function killTree(p: ChildProcess): void {
+  if (p.pid === undefined) return;
+  try {
+    process.kill(-p.pid, "SIGTERM");
+  } catch {
+    try {
+      p.kill("SIGTERM");
+    } catch {
+      /* 已经退了 */
+    }
+  }
+}
+
 export async function start(): Promise<Fixture> {
   const dir = mkdtempSync(join(tmpdir(), "aisix-console-e2e-"));
   const resourcesPath = join(dir, "resources.yaml");
@@ -117,6 +137,8 @@ export async function start(): Promise<Fixture> {
     // preview 的代理指向本套用例起的那个控制台，不是开发用的 8090。
     env: { ...process.env, CONSOLE_ORIGIN: `http://127.0.0.1:${apiPort}` },
     stdio: "ignore",
+    // 自成进程组，收尾时才能把 npx 底下那个真正的 server 一起带走。见 killTree。
+    detached: true,
   });
   procs.push(preview);
 
@@ -130,7 +152,7 @@ export async function start(): Promise<Fixture> {
     previewUrl: `http://127.0.0.1:${webPort}`,
     read: () => readFileSync(resourcesPath, "utf8"),
     stop() {
-      for (const p of procs) p.kill("SIGTERM");
+      for (const p of procs) killTree(p);
       rmSync(dir, { recursive: true, force: true });
     },
   };

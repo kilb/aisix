@@ -133,11 +133,25 @@ pub async fn list(State(st): State<AppState>, headers: HeaderMap) -> Response {
     };
     let yaml = st.resources().read().await.unwrap_or_default();
     let rows = resources::list_keys(&yaml, &uid);
+    let quotas = st.store.key_quotas(&uid).await.unwrap_or_default();
+    let granted = Ledger::new(st.store.clone())
+        .total_granted(&uid)
+        .await
+        .unwrap_or(0);
+    let allocated: i64 = quotas.iter().map(|(_, v)| *v).sum();
     Json(json!({
+        "granted_micro_usd": granted,
+        "allocated_micro_usd": allocated,
         "keys": rows.iter().map(|r| json!({
             "name": r.display_name,
             "masked_hash": r.masked_hash,
             "disabled": r.disabled,
+            // 0 = 没单独设限，只受用户总额度约束。
+            "quota_micro_usd": quotas
+                .iter()
+                .find(|(k, _)| k == &r.display_name)
+                .map(|(_, v)| *v)
+                .unwrap_or(0),
         })).collect::<Vec<_>>(),
     }))
     .into_response()
@@ -152,6 +166,14 @@ pub async fn revoke(
     let Some(uid) = st.session_user(&headers).await else {
         return unauthorized();
     };
+
+    // 先把全名解析出来 —— 删额度要用它，见下面的说明。
+    let yaml = st.resources().read().await.unwrap_or_default();
+    let full_name = resources::list_keys(&yaml, &uid)
+        .into_iter()
+        .map(|k| k.display_name)
+        .find(|d| d == &name || d.starts_with(&format!("{name} · ")))
+        .unwrap_or_else(|| name.clone());
 
     let uid2 = uid.clone();
     let name2 = name.clone();
@@ -178,6 +200,14 @@ pub async fn revoke(
         })
         .await;
 
+    if found {
+        // 留着的话下一轮对账还会为一把已经不存在的密钥下推策略。
+        //
+        // 按**完整 display_name** 删：额度是按全名存的（`portal-xxx · 标签`），
+        // 而路径上给的是短名。用短名删会删不掉，而且不报错 —— 症状是吊销之后
+        // 那份额度仍占着分配额，用户看着自己「还有额度却分不出去」。
+        let _ = st.store.drop_key_quota(&uid, &full_name).await;
+    }
     match result {
         Ok(_) if found => Json(json!({"ok": true})).into_response(),
         Ok(_) => (
@@ -204,8 +234,102 @@ pub fn sha256_hex(s: &str) -> String {
     h.finalize().iter().map(|x| format!("{x:02x}")).collect()
 }
 
+#[derive(Deserialize)]
+pub struct QuotaReq {
+    /// 这把密钥的额度。0 = 不单独设限，只受用户总额度约束。
+    /// 有意用 `i64`：负数要能进来才能被明确拒绝。
+    pub micro_usd: i64,
+}
+
+/// `PUT /api/keys/{name}/quota` —— 给自己的一把密钥设额度。
+///
+/// # 不变量：各把密钥的额度之和 ≤ 用户总额度
+///
+/// 在这里校验，而不是指望调用方自律。校验用的是「其余密钥之和 + 这次的新值」，
+/// 不是「当前总和 + 新值」—— 后者在**调低**某把密钥时会误判为超额。
+///
+/// 允许总和小于总额度：没分配出去的那部分仍然可用（用户级的闸还在），密钥级
+/// 的额度是给用户自己做隔离用的，不是必须把总额分光。
+pub async fn set_quota(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<QuotaReq>,
+) -> Response {
+    let Some(uid) = st.session_user(&headers).await else {
+        return unauthorized();
+    };
+    if req.micro_usd < 0 {
+        return bad("额度不能是负数");
+    }
+
+    // 只能给自己的密钥设额度。
+    let yaml = st.resources().read().await.unwrap_or_default();
+    let mine = resources::list_keys(&yaml, &uid);
+    let Some(full_name) = mine
+        .iter()
+        .map(|k| k.display_name.clone())
+        .find(|d| d == &name || d.starts_with(&format!("{name} · ")))
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "没有这把密钥"})),
+        )
+            .into_response();
+    };
+
+    let ledger = Ledger::new(st.store.clone());
+    let (Ok(granted), Ok(quotas)) = (
+        ledger.total_granted(&uid).await,
+        st.store.key_quotas(&uid).await,
+    ) else {
+        return server_error("读取失败");
+    };
+    let others: i64 = quotas
+        .iter()
+        .filter(|(k, _)| k != &full_name)
+        .map(|(_, v)| *v)
+        .sum();
+    if others + req.micro_usd > granted {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "各把密钥的额度之和不能超过你的总额度",
+                "granted_micro_usd": granted,
+                "other_keys_micro_usd": others,
+                "available_micro_usd": granted - others,
+            })),
+        )
+            .into_response();
+    }
+
+    let r = if req.micro_usd == 0 {
+        st.store.drop_key_quota(&uid, &full_name).await
+    } else {
+        st.store
+            .set_key_quota(&uid, &full_name, req.micro_usd)
+            .await
+    };
+    match r {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(_) => server_error("写入失败"),
+    }
+}
+
 fn unauthorized() -> Response {
     (StatusCode::UNAUTHORIZED, Json(json!({"error": "未登录"}))).into_response()
+}
+
+fn bad(msg: &str) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response()
+}
+
+fn server_error(msg: &str) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": msg})),
+    )
+        .into_response()
 }
 
 fn write_failed(e: WriteError) -> Response {
