@@ -208,6 +208,24 @@ impl<S: ConsumptionSource> Sweeper<S> {
                 let Some(map) = doc.as_mapping_mut() else {
                     return false;
                 };
+                // 文档里现存的密钥名。只为它们下推策略 —— 一条指着不存在的密钥
+                // 的策略会让网关**整份拒收**配置，而这里的额度记录来自门户自己的
+                // 库，两者可能不同步（比如运维从控制台删掉了一把带额度的密钥）。
+                // 不筛的话，那一条记录会让门户此后每次写入都被拒。
+                let present: Vec<String> = map
+                    .get(Value::from("api_keys"))
+                    .and_then(Value::as_sequence)
+                    .map(|s| {
+                        s.iter()
+                            .filter_map(|k| {
+                                k.get("display_name")
+                                    .and_then(Value::as_str)
+                                    .map(String::from)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
                 let key = Value::from("rate_limit_policies");
                 if !map.get(&key).map(Value::is_sequence).unwrap_or(false) {
                     map.insert(key.clone(), Value::Sequence(Vec::new()));
@@ -227,7 +245,7 @@ impl<S: ConsumptionSource> Sweeper<S> {
                 // 上才用 UUID。
                 let wanted: Vec<(String, String, i64)> = quotas
                     .iter()
-                    .filter(|(_, _, v)| *v > 0)
+                    .filter(|(_, name, v)| *v > 0 && present.iter().any(|p| p == name))
                     .map(|(_, name, v)| (format!("portal-key-{name}"), name.clone(), *v))
                     .collect();
 
@@ -936,6 +954,24 @@ mod key_allowance_tests {
             policy(&f.path, &format!("portal-allowance-{}", f.uid)).is_some(),
             "用户域的额度策略被误删了"
         );
+        assert!(policy(&f.path, "portal-key-a").is_some());
+    }
+
+    #[tokio::test]
+    async fn 密钥已不在配置里时不下推它的策略() {
+        let f = fx().await;
+        // 额度记录还在，密钥却已经从配置里消失了（比如运维从控制台删掉了它）。
+        f.store
+            .set_key_quota(&f.uid, "早就没了", 1_000_000)
+            .await
+            .unwrap();
+        f.store.set_key_quota(&f.uid, "a", 1_000_000).await.unwrap();
+        f.sw.tick(t("2026-08-27T10:00:00Z")).await.unwrap();
+
+        // 指着不存在的密钥的策略会让网关**整份拒收**配置 —— 于是门户此后每次
+        // 写入都被写前校验挡下，停用闸也跟着停摆。
+        assert!(policy(&f.path, "portal-key-早就没了").is_none());
+        // 同一轮里正常那把仍要照常下推，不能一竿子全停。
         assert!(policy(&f.path, "portal-key-a").is_some());
     }
 

@@ -272,4 +272,18 @@ test("每把密钥的额度各自收口_且各把之和不得超过总额度", a
   expect(r.body).toContain("available_micro_usd");
   // 被拒之后乙不该被改坏 —— 拒绝要是「先写再报错」，用户会莫名多出一道闸。
   expect(await fx.chatWith(b.plaintext)).toBe(200);
+
+  // 吊销一把**带额度**的密钥必须成。它的策略要跟密钥同批消失：晚一轮撤的话，
+  // 中间那份文档里策略指着已不存在的密钥，网关整份拒收 —— 生产上真发生过，
+  // 是写前校验把它拦下来的（否则会静默冻住整个配置，含停用闸）。
+  const del = await fetch(`${fx.portalUrl}/api/keys/${encodeURIComponent(a.name)}`, {
+    method: "DELETE",
+    headers: { cookie },
+  });
+  expect(del.status, await del.text()).toBe(200);
+  const doc = fx.readResources();
+  expect(doc).not.toContain(`portal-key-${a.name}`);
+  expect(doc).not.toContain(a.name);
+  // 配置仍是网关收得下的：乙照常可用，说明这次重载没有被整份拒收。
+  await waitFor(async () => (await fx.chatWith(b.plaintext)) === 200, "吊销之后乙仍然可用");
 });

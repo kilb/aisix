@@ -177,6 +177,7 @@ pub async fn revoke(
 
     let uid2 = uid.clone();
     let name2 = name.clone();
+    let full2 = full_name.clone();
     let mut found = false;
     let seen = &mut found;
     let result = st
@@ -196,6 +197,25 @@ pub async fn revoke(
                 !(mine && named)
             });
             *seen = keys.len() < before;
+            if *seen {
+                // **策略必须跟密钥同批走。**
+                //
+                // 撤策略原本交给下一轮对账，可那要等一个周期：中间这份文档里
+                // 密钥行已经没了、`portal-key-*` 还指着它，网关会判成「引用了
+                // 不存在的密钥」而**整份拒收**。也就是说吊销一把带额度的密钥会
+                // 把整个配置冻住 —— 包括停用闸。写前校验会挡下这次写入，于是
+                // 症状是吊销失败；不校验的话就是静默冻住。
+                let want = format!("portal-key-{full}", full = full2);
+                if let Some(list) = doc
+                    .as_mapping_mut()
+                    .and_then(|m| m.get_mut(Value::from("rate_limit_policies")))
+                    .and_then(Value::as_sequence_mut)
+                {
+                    list.retain(|pol| {
+                        pol.get("name").and_then(Value::as_str) != Some(want.as_str())
+                    });
+                }
+            }
             *seen
         })
         .await;

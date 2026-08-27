@@ -185,6 +185,21 @@ mod testutil {
         p.to_string_lossy().to_string()
     }
 
+    /// 对账环需要一个消费来源，而这些用例不关心消费。返回 0 而不是 None ——
+    /// None 是「读不到」，会让水位线停在原地，那是另一条分支。
+    pub struct NoConsumption;
+
+    impl crate::sweeper::ConsumptionSource for NoConsumption {
+        async fn spend_in_window(
+            &self,
+            _user_id: &str,
+            _from: chrono::DateTime<chrono::Utc>,
+            _to: chrono::DateTime<chrono::Utc>,
+        ) -> Option<u64> {
+            Some(0)
+        }
+    }
+
     pub struct TestApp {
         pub base: String,
         pub store: Store,
@@ -324,6 +339,22 @@ mod testutil {
         /// 重写本实例的 resources.yaml。
         pub fn set_resources(&self, body: &str) {
             std::fs::write(&self.resources_path, body).unwrap();
+        }
+
+        /// 读回本实例的 resources.yaml。
+        pub fn resources(&self) -> String {
+            std::fs::read_to_string(&self.resources_path).unwrap()
+        }
+
+        /// 跑一轮对账。用真 [`Sweeper`]，因为要测的正是「它写下的东西与接口
+        /// 这一侧的改动能不能同时成立」—— 自己手写一份策略测的是别的东西。
+        pub async fn tick(&self) {
+            let sw = crate::sweeper::Sweeper::new(
+                self.store.clone(),
+                NoConsumption,
+                crate::resources::Writer::new(self.resources_path.clone()),
+            );
+            sw.tick(chrono::Utc::now()).await.unwrap();
         }
 
         pub async fn put(&self, path: &str, body: serde_json::Value) -> (u16, String) {
@@ -1499,6 +1530,35 @@ api_keys:
         let (_, list) = app.get("/api/keys").await;
         let v: serde_json::Value = serde_json::from_str(&list).unwrap();
         assert_eq!(v["keys"][0]["quota_micro_usd"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn 吊销带额度的密钥能成_且策略与密钥同批消失() {
+        let (_p, app) = app().await;
+        let id = signed_in(&app, "a@b.c").await;
+        app.post_admin(
+            &format!("/admin/users/{id}/quota"),
+            json!({"micro_usd": 10_000_000}),
+        )
+        .await;
+        let a = mint(&app, "一").await;
+        app.put(
+            &format!("/api/keys/{a}/quota"),
+            json!({"micro_usd": 6_000_000}),
+        )
+        .await;
+        // 先让对账环把策略写进配置。
+        app.tick().await;
+        let doc = app.resources();
+        assert!(doc.contains("portal-key-"), "策略没被下推: {doc}");
+
+        // 吊销必须成功。策略若留到下一轮才撤，这份文档里就有一条指着已不存在
+        // 密钥的策略 —— 写前校验会拒掉整次写入，吊销直接失败。
+        let (s, body) = app.delete(&format!("/api/keys/{a}")).await;
+        assert_eq!(s, 200, "吊销带额度的密钥失败了: {body}");
+        let after = app.resources();
+        assert!(!after.contains("portal-key-"), "策略被留下了: {after}");
+        assert!(!after.contains(&a), "密钥还在: {after}");
     }
 
     #[tokio::test]
