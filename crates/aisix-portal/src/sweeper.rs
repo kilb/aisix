@@ -107,6 +107,8 @@ impl<S: ConsumptionSource> Sweeper<S> {
     pub async fn tick(&self, now: DateTime<Utc>) -> Result<TickReport, StoreError> {
         let mut r = TickReport::default();
         let users = self.store.all_users().await?;
+        // 花超自己额度的密钥。在用户循环里就地收集 —— 那里才拿得到真正的窗口。
+        let mut exhausted: Vec<String> = Vec::new();
 
         for u in &users {
             let from = match self.store.counted_through(&u.id).await? {
@@ -125,15 +127,20 @@ impl<S: ConsumptionSource> Sweeper<S> {
                 Some(0) => {
                     // 没有增量也要推进水位线，否则窗口会越来越长。
                     self.store.set_counted_through(&u.id, now).await?;
+                    exhausted.extend(self.mark_key_spend(&u.id, from, now).await?);
                 }
                 Some(micro) => {
                     // 扣款与推进水位线必须一起成或一起不成。
                     self.debit_and_mark(&u.id, micro, now).await?;
                     r.debited += 1;
+                    exhausted.extend(self.mark_key_spend(&u.id, from, now).await?);
                 }
                 None => {
                     // 读不到就原地不动。宁可下一轮窗口更长（increase 照样正确），
                     // 也不能把这段跳过去。
+                    //
+                    // 密钥级也一并跳过：水位线没动，下一轮会用更长的窗口重来。
+                    // 这里若照样记，那段花费会被这轮和下一轮各记一次。
                     r.read_failures += 1;
                 }
             }
@@ -160,18 +167,11 @@ impl<S: ConsumptionSource> Sweeper<S> {
         // 由它保证，密钥级只是在此之下再切分。
         //
         // 剪残留只动库，得在读配置之前做完。
-        if let Err(e) = self.prune_orphan_quotas().await {
-            eprintln!("剪除失效的密钥额度失败: {e}");
-            r.write_failures += 1;
-        }
-        let quotas = self.quotas().await.unwrap_or_default();
-
-        // 密钥级的持久兜底：按密钥累计花费，越过它自己的额度就停这一把。
-        //
-        // 网关那边的额度闸是**进程内**计数器，重启即归零 —— 每把密钥的子额度会
-        // 「续杯」。用户级不受影响，因为它有余额归零就停用这条持久路径；这一段
-        // 给密钥级同样的兜底。窗口沿用用户的水位线，两边的账才对得上。
-        let exhausted = self.mark_key_spend(&users, now).await?;
+        // 用 `?` 而不是记进 `write_failures`：那个计数的含义是「网关正在用旧
+        // 配置」，而剪残留失败不会造成那个后果。库出问题跟这一轮里其它数据库
+        // 调用一样，让整轮失败（计入 `reconcile_errors`）。
+        self.prune_orphan_quotas().await?;
+        let quotas = self.store.all_key_quotas().await?;
 
         // 余额与账号状态共同决定密钥开关。放在入账之后，用的是这一轮之后的余额。
         //
@@ -213,52 +213,49 @@ impl<S: ConsumptionSource> Sweeper<S> {
         Ok(r)
     }
 
-    /// 给每把设了额度的密钥累计花费，返回**已超额**的密钥名。
+    /// 给这个用户名下设了额度的密钥累计 `[from, now)` 的花费，返回已超额的那几把。
     ///
-    /// 窗口跟用户那一段完全一致（同一条水位线），所以密钥花费之和不会跟用户花费
-    /// 对不上。水位线由用户那一段推进：这里读失败只是这一轮少记一点，下一轮窗口
-    /// 更长会补回来 —— 与其为密钥再维护一条水位线，不如共用一条。
+    /// **窗口由调用方给，而且必须是用户那一段刚用过的那个。** 第一版在用户循环
+    /// 之后再去读 `counted_through`，可那时它已经被推到 `now` 了 —— 窗口长度为
+    /// 零，密钥花费在生产上永远累计不到。单测当时全绿，因为测试替身忽略了
+    /// `from`/`to`，把这个 bug 整个盖住了。
+    ///
+    /// 只在水位线确实推进的那两条分支上调用：读失败时若照样记，那段花费会被这轮
+    /// 和下一轮各记一次。
+    ///
+    /// 存在的理由：网关那边的额度闸是**进程内**计数器，重启即归零，每把密钥的
+    /// 子额度会「续杯」。用户级不受影响（余额归零就停用，那是持久的），这一段给
+    /// 密钥级同样的兜底。
     async fn mark_key_spend(
         &self,
-        users: &[crate::store::User],
+        user_id: &str,
+        from: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<Vec<String>, StoreError> {
         let mut exhausted = Vec::new();
-        for u in users {
-            let quotas = self.store.key_quotas(&u.id).await?;
-            if quotas.is_empty() {
+        for (name, quota) in self.store.key_quotas(user_id).await? {
+            if quota <= 0 {
                 continue;
             }
-            // 用户那一段已经把水位线推到 now 了，所以这里要的是**上一轮**的
-            // 水位线。拿不到就说明这轮没推进（读失败），跳过。
-            let from = match self.store.counted_through(&u.id).await? {
-                Some(t) => t,
-                None => continue,
+            let id = aisix_core::filesource::derive_id("api_keys", &name);
+            let Some(micro) = self.source.key_spend_in_window(&id, from, now).await else {
+                continue;
             };
-            for (name, quota) in quotas {
-                if quota <= 0 {
-                    continue;
-                }
-                let id = aisix_core::filesource::derive_id("api_keys", &name);
-                let Some(micro) = self.source.key_spend_in_window(&id, from, now).await else {
-                    continue;
-                };
-                let spent = if micro > 0 {
-                    self.store
-                        .add_key_spend(&u.id, &name, i64::try_from(micro).unwrap_or(i64::MAX))
-                        .await?
-                } else {
-                    self.store
-                        .key_spend(&u.id)
-                        .await?
-                        .into_iter()
-                        .find(|(k, _)| *k == name)
-                        .map(|(_, v)| v)
-                        .unwrap_or(0)
-                };
-                if spent >= quota {
-                    exhausted.push(name);
-                }
+            let spent = if micro > 0 {
+                self.store
+                    .add_key_spend(user_id, &name, i64::try_from(micro).unwrap_or(i64::MAX))
+                    .await?
+            } else {
+                self.store
+                    .key_spend(user_id)
+                    .await?
+                    .into_iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v)
+                    .unwrap_or(0)
+            };
+            if spent >= quota {
+                exhausted.push(name);
             }
         }
         Ok(exhausted)
@@ -314,7 +311,7 @@ impl<S: ConsumptionSource> Sweeper<S> {
     /// 用户级那条策略不受影响：两条同时生效，所以密钥再怎么分配，总花销都过不了
     /// 用户级那道闸。
     /// 剪掉「密钥已经不在了、额度记录还留着」的残留。**只动库，不写配置。**
-    async fn prune_orphan_quotas(&self) -> Result<(), String> {
+    async fn prune_orphan_quotas(&self) -> Result<(), StoreError> {
         // 先把「密钥已经不在了、额度记录还留着」这种残留剪掉。
         //
         // 不剪的话那份额度永远占着用户的可分配额：`allocated_to_keys` 照样把它
@@ -325,7 +322,7 @@ impl<S: ConsumptionSource> Sweeper<S> {
         // 设了额度的那把密钥会既不在旧的文件快照里、又已经在新的额度表里，于是
         // 被当成残留删掉 —— 用户刚设的额度悄无声息地没了。按这个顺序，晚于快照
         // 出现的记录压根不在候选集里。
-        let snapshot = self.quotas().await?;
+        let snapshot = self.store.all_key_quotas().await?;
         // `all_key_names` 读不动时返回 `None`，此时**不剪** —— 把一次读取失败
         // 当成「一把密钥都没有」会把所有人的分配一次清空。
         if let Some(present) = self
@@ -338,26 +335,15 @@ impl<S: ConsumptionSource> Sweeper<S> {
         {
             for (uid, name, _) in &snapshot {
                 if !present.contains(name) {
-                    self.store
-                        .drop_key_quota(uid, name)
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    self.store.drop_key_quota(uid, name).await?;
                     // 累计花费一起剪。留着的话这把密钥的名字将来若被重新用到
                     // （运维手建同名），它一上来就带着别人的花费。
-                    self.store
-                        .drop_key_spend(uid, name)
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    self.store.drop_key_spend(uid, name).await?;
                 }
             }
         }
 
         Ok(())
-    }
-
-    /// 额度记录。折成文字错误：调用方只用它记日志与计数，不按类型分支。
-    async fn quotas(&self) -> Result<Vec<(String, String, i64)>, String> {
-        self.store.all_key_quotas().await.map_err(|e| e.to_string())
     }
 }
 
@@ -718,6 +704,8 @@ mod tests {
         windows: Mutex<Vec<Window>>,
         /// 按 api_key_id 指定每轮的花费增量。没指定的按 0。
         key_increase: Mutex<std::collections::HashMap<String, u64>>,
+        /// 密钥级查询被问过的窗口，用来断言窗口不是空的。
+        key_windows: Mutex<Vec<Window>>,
     }
 
     impl FakeSource {
@@ -731,10 +719,25 @@ mod tests {
                 .unwrap()
                 .insert(aisix_core::filesource::derive_id("api_keys", key_name), v);
         }
-        fn fail_for(&self, user_id: &str) {
+        pub(super) fn fail_for(&self, user_id: &str) {
             *self.fail_for.lock().unwrap() = Some(user_id.to_string());
         }
-        fn last_window_for(&self, user_id: &str) -> (DateTime<Utc>, DateTime<Utc>) {
+        /// 某把密钥最后被问过的窗口。
+        pub(super) fn last_key_window(
+            &self,
+            key_name: &str,
+        ) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+            let id = aisix_core::filesource::derive_id("api_keys", key_name);
+            self.key_windows
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(k, _, _)| *k == id)
+                .map(|(_, f, t)| (*f, *t))
+        }
+
+        pub(super) fn last_window_for(&self, user_id: &str) -> (DateTime<Utc>, DateTime<Utc>) {
             self.windows
                 .lock()
                 .unwrap()
@@ -766,9 +769,19 @@ mod tests {
         async fn key_spend_in_window(
             &self,
             api_key_id: &str,
-            _from: DateTime<Utc>,
-            _to: DateTime<Utc>,
+            from: DateTime<Utc>,
+            to: DateTime<Utc>,
         ) -> Option<u64> {
+            // **窗口为空就回 0，跟真实现一致。** 第一版忽略了 from/to，于是
+            // 「窗口算错成零长度」这个 bug 被替身盖住了 —— 生产上密钥花费永远
+            // 累计不到，而所有单测都是绿的。
+            self.key_windows
+                .lock()
+                .unwrap()
+                .push((api_key_id.to_string(), from, to));
+            if to <= from {
+                return Some(0);
+            }
             self.key_increase
                 .lock()
                 .unwrap()
@@ -802,10 +815,11 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let path = std::env::temp_dir()
-            .join(format!("aisix-sweeper-{}.yaml", uuid::Uuid::new_v4()))
-            .to_string_lossy()
-            .to_string();
+        // 各自一个目录：失败注入要 chmod 目录（见 make_read_only），扔在 /tmp
+        // 根下就只能去动 /tmp 本身。
+        let dir = std::env::temp_dir().join(format!("aisix-sweeper-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("resources.yaml").to_string_lossy().to_string();
         // 这份配置必须是网关**真能加载**的。第一版随手写了个残缺文档，结果
         // 每个用例走的都是「文件本来就坏、照写」那条降级路径 —— 写前校验那道闸
         // 在测试里完全没被执行过，而生产上它是开着的。
@@ -1213,9 +1227,12 @@ mod key_allowance_tests {
 
     /// 把配置文件设成只读：读得到，写不进去。
     fn make_read_only(path: &str) {
-        let mut perm = std::fs::metadata(path).unwrap().permissions();
+        // 改**目录**的权限：写盘走「同目录临时文件 + rename」，只把文件设成
+        // 只读拦不住 —— 目录可写就照样能覆盖过去。
+        let dir = std::path::Path::new(path).parent().unwrap();
+        let mut perm = std::fs::metadata(dir).unwrap().permissions();
         perm.set_readonly(true);
-        std::fs::set_permissions(path, perm).unwrap();
+        std::fs::set_permissions(dir, perm).unwrap();
     }
 
     // 下面三条各自安排成「只有那一步需要写盘」，否则断言分不清是谁失败的 ——
@@ -1286,7 +1303,7 @@ mod key_allowance_tests {
             .map(|(b, _)| b)
             .expect("找不到 prune_orphan_quotas");
         let snapshot = body
-            .find("let snapshot = self.quotas()")
+            .find("let snapshot = self.store.all_key_quotas()")
             .expect("没有取额度表");
         let read = body
             .find(".resources\n            .read()")
@@ -1431,6 +1448,73 @@ mod key_allowance_tests {
             body.matches(".edit(").count(),
             1,
             "tick 里有不止一次写盘 —— 每一次都会让网关重载一遍",
+        );
+    }
+
+    /// 密钥级查询用的窗口，必须跟用户级那一段用的是同一个、且不是空的。
+    ///
+    /// 窗口算错成零长度时，`increase(...[0s])` 恒为 0 —— 花费永远累计不到，而
+    /// 一切看起来都在正常运转。这条直接看被问过的窗口，不看结果。
+    /// 数据库出问题要让**整轮失败**，不能报成「配置写入失败」。
+    ///
+    /// 两者的处置完全不同：`config_write_failures` 的含义是「网关正在用旧配置」，
+    /// 会据此报警去看网关；而库读不动是另一回事。混在一起，运维会照着错误的
+    /// 方向查。
+    #[tokio::test]
+    async fn 库出问题让整轮失败_而不是报成配置写入失败() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 5_000_000, crate::ledger::Source::AdminGrant, None)
+            .await
+            .unwrap();
+        // 确定性地制造一次库失败：把表删掉。
+        sqlx::query("DROP TABLE key_quotas")
+            .execute(f.store.pool())
+            .await
+            .unwrap();
+
+        let r = f.sw.tick(t("2026-08-28T10:00:00Z")).await;
+        assert!(r.is_err(), "库读不动了，这一轮却报成功: {r:?}");
+    }
+
+    #[tokio::test]
+    async fn 密钥级查询的窗口与用户级一致且非空() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 50_000_000, crate::ledger::Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.store.set_key_quota(&f.uid, "a", 2_000_000).await.unwrap();
+        // 第一轮只建水位线，第二轮才有真窗口。
+        f.sw.tick(t("2026-08-28T10:00:00Z")).await.unwrap();
+        f.sw.tick(t("2026-08-28T10:00:30Z")).await.unwrap();
+
+        let (kf, kt) = f.src.last_key_window("a").expect("密钥级查询根本没发生");
+        assert!(kt > kf, "密钥级的窗口是空的：[{kf}, {kt}]");
+        // 与用户级完全一致 —— 不一致的话两边的账对不上。
+        let (uf, ut) = f.src.last_window_for(&f.uid);
+        assert_eq!((kf, kt), (uf, ut), "密钥级与用户级用了不同的窗口");
+    }
+
+    #[tokio::test]
+    async fn 读花费失败的那一轮_密钥级也不记() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 50_000_000, crate::ledger::Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.store.set_key_quota(&f.uid, "a", 2_000_000).await.unwrap();
+        f.sw.tick(t("2026-08-28T10:00:00Z")).await.unwrap();
+
+        // 这一轮用户级读失败 → 水位线不动。密钥级若照样记，同一段花费会被这轮
+        // 和下一轮各记一次。
+        f.src.fail_for(&f.uid);
+        f.src.set_key_increase("a", 5_000_000);
+        f.sw.tick(t("2026-08-28T10:00:30Z")).await.unwrap();
+        assert_eq!(
+            f.store.key_spend(&f.uid).await.unwrap(),
+            Vec::new(),
+            "用户级读失败的那一轮，密钥级却记了账"
         );
     }
 

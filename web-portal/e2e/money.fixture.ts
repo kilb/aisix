@@ -4,6 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer as netServer } from "node:net";
+import { createHash } from "node:crypto";
 import { statSync, readdirSync } from "node:fs";
 
 /**
@@ -85,6 +86,14 @@ export interface MoneyFixture {
   /** 打一次**流式** chat。流式的记账走的是另一条路径。 */
   chatStream(plaintext: string): Promise<number>;
   /**
+   * 让门户对某把密钥的花费**失明**：PromQL 垫片对这把密钥的查询恒回 0。
+   *
+   * 用来把两道闸拆开测。门户的持久兜底（累计花费越过额度就把密钥写成停用）会在
+   * 一轮内接管，于是「网关自己有没有记账」这件事被盖住 —— 网关侧的记账完全坏掉，
+   * 用例照样绿。失明之后只剩网关那道闸，它坏了就立刻看得出来。
+   */
+  blindPortalTo(keyName: string): void;
+  /**
    * 打一次流式 `/v1/messages`（Anthropic 形状）或 `/v1/responses`（Codex 形状）。
    *
    * 这三个端点各有自己的流式记账调用点。只驱动 chat 的话，另两个端点上的同类
@@ -106,6 +115,24 @@ export interface MoneyFixture {
   stop(): void;
 }
 
+/**
+ * 与网关一致的 api_key 派生 id：`uuid5(命名空间, "api_keys/<display_name>")`。
+ *
+ * 命名空间与算法抄自 `aisix-core` 的 `derive_id`；这里只在测试里用来指认一把
+ * 密钥，不参与任何生产路径。
+ */
+function deriveKeyId(displayName: string): string {
+  const NS = Buffer.from("63e50ab2677a54d38d1ec0cb29ceae94", "hex");
+  const h = createHash("sha1");
+  h.update(NS);
+  h.update(Buffer.from(`api_keys/${displayName}`, "utf8"));
+  const b = h.digest();
+  b[6] = (b[6]! & 0x0f) | 0x50;
+  b[8] = (b[8]! & 0x3f) | 0x80;
+  const hex = b.subarray(0, 16).toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
 /** sha256 —— 与网关 `key_hash` 的算法一致。 */
 async function sha256Hex(s: string): Promise<string> {
   const b = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
@@ -121,7 +148,7 @@ async function sha256Hex(s: string): Promise<string> {
  *
  * 与其记得重建，不如让它自己说出来。
  */
-function assertFresh(bin: string, crateDir: string): void {
+function assertFresh(bin: string, crateDirs: string[]): void {
   let binTime: number;
   try {
     binTime = statSync(bin).mtimeMs;
@@ -143,7 +170,7 @@ function assertFresh(bin: string, crateDir: string): void {
       }
     }
   };
-  walk(crateDir);
+  for (const d of crateDirs) walk(d);
   if (newest > binTime) {
     throw new Error(
       `${bin} 比源码旧（${newestFile} 更新）——` +
@@ -154,9 +181,22 @@ function assertFresh(bin: string, crateDir: string): void {
 }
 
 export async function startMoney(): Promise<MoneyFixture> {
-  const repo = join(process.cwd(), "..");
-  assertFresh(PORTAL_BIN, join(repo, "crates", "aisix-portal"));
-  assertFresh(GATEWAY_BIN, join(repo, "crates", "aisix-proxy"));
+  // 按**实际依赖**分开比，不是笼统地比整个 `crates/`。
+  //
+  // 只盯自己那一个目录会漏：网关受 aisix-core、aisix-ratelimit 影响（那次流式
+  // 记账的修复就在 ratelimit 里）。笼统地比整个 crates/ 又会误报：改门户跟网关
+  // 二进制没关系，却逼你重建它。
+  const crates = join(process.cwd(), "..", "crates");
+  const all = readdirSync(crates, { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => join(crates, e.name));
+  const portalDeps = all.filter((d) =>
+    /aisix-(portal|core)$/.test(d),
+  );
+  // 网关不依赖门户与控制台，其余都算上。
+  const gatewayDeps = all.filter((d) => !/aisix-(portal|console)$/.test(d));
+  assertFresh(PORTAL_BIN, portalDeps);
+  assertFresh(GATEWAY_BIN, gatewayDeps);
 
   const dir = mkdtempSync(join(tmpdir(), "aisix-money-e2e-"));
   const resourcesPath = join(dir, "resources.yaml");
@@ -277,6 +317,8 @@ export async function startMoney(): Promise<MoneyFixture> {
   // increase() 在连续窗口上的语义就是「本次累计值 − 上次累计值」，垫片按这个
   // 记账（无重置场景下与真 Prometheus 等价）。
   const lastSeen = new Map<string, number>();
+  /** 门户对这些 api_key_id 的花费查询恒回 0。见 blindPortalTo。 */
+  const blind = new Set<string>();
   const prom = createServer((req, res) => {
     void (async () => {
       const u = new URL(req.url ?? "/", "http://x");
@@ -290,6 +332,16 @@ export async function startMoney(): Promise<MoneyFixture> {
       // 有没有匹配到任何序列。真 Prometheus 在一条都没匹配到时回**空** result，
       // 而不是一条值为 0 的序列 —— 那两种情况在门户侧的处置完全不同（「这个人
       // 从来没调过」vs「读不到」）。垫片必须照着真的来，否则那条分支永远测不到。
+      if (label === "api_key_id" && blind.has(id)) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            status: "success",
+            data: { resultType: "vector", result: [{ metric: {}, value: [0, "0"] }] },
+          }),
+        );
+        return;
+      }
       let matched = false;
       try {
         const text = await fetch(`http://127.0.0.1:${metricsPort}/metrics`).then((r) => r.text());
@@ -408,6 +460,9 @@ observability:
     },
     async chatStream(plaintext: string) {
       return chatWith(proxyPort, plaintext, true);
+    },
+    blindPortalTo(keyName: string) {
+      blind.add(deriveKeyId(keyName));
     },
     async streamOn(endpoint, plaintext) {
       const body =

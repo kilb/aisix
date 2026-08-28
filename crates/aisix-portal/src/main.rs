@@ -229,8 +229,16 @@ mod testutil {
     }
 
     /// 写一份临时的 resources.yaml，返回路径。
+    /// 配置文件放在**自己的目录**里。
+    ///
+    /// 直接扔进 /tmp 的话，「把写入路径变成不可写」这种失败注入就只能去 chmod
+    /// /tmp —— 那会波及整台机器。写盘改成「同目录临时文件 + rename」之后，只把
+    /// 文件设成只读也拦不住写入了（目录可写就能 rename 覆盖），所以必须能单独
+    /// 控制那个目录。
     pub fn temp_resources(body: &str) -> String {
-        let p = std::env::temp_dir().join(format!("aisix-portal-{}.yaml", Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("aisix-portal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("resources.yaml");
         std::fs::write(&p, body).unwrap();
         p.to_string_lossy().to_string()
     }
@@ -402,12 +410,13 @@ mod testutil {
 
         /// 把配置文件设成只读，用来测「读得到但写不进去」那条分支。
         pub fn make_resources_read_only(&self) {
-            let mut perm = std::fs::metadata(&self.resources_path)
-                .unwrap()
-                .permissions();
+            // 改**目录**的权限，不是文件的：写盘走「同目录临时文件 + rename」，
+            // 目录可写就照样能覆盖过去。
+            let dir = std::path::Path::new(&self.resources_path).parent().unwrap();
+            let mut perm = std::fs::metadata(dir).unwrap().permissions();
             #[allow(clippy::permissions_set_readonly_false)]
             perm.set_readonly(true);
-            std::fs::set_permissions(&self.resources_path, perm).unwrap();
+            std::fs::set_permissions(dir, perm).unwrap();
         }
 
         /// 读回本实例的 resources.yaml。

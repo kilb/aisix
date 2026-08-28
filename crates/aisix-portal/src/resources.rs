@@ -131,14 +131,48 @@ impl Writer {
             if let Some(why) = breaks_gateway(&before, &out) {
                 return Err(WriteError::WouldBreakGateway(why));
             }
-            tokio::fs::write(&*self.path, out)
-                .await
-                .map_err(|e| WriteError::Io(e.to_string()))?;
+            write_atomic(&self.path, &out).await?;
             signal_reload().await;
             return Ok(true);
         }
         Err(WriteError::Contended)
     }
+}
+
+/// 先写同目录的临时文件，再 rename 覆盖。
+///
+/// `tokio::fs::write` 是「截断 + 写」：进程在中间死掉就留下一个截断的配置。网关
+/// 下次启动会直接加载失败 —— 那是整站不可用，而不是某条策略不生效。同一个文件
+/// 系统上的 rename 是原子的，读者要么看到旧的完整内容、要么看到新的。
+///
+/// 临时文件放在**同目录**：跨文件系统 rename 会失败。写完先 fsync，否则崩溃后
+/// 可能 rename 已生效而内容还没落盘。
+async fn write_atomic(path: &str, body: &str) -> Result<(), WriteError> {
+    let tmp = format!("{path}.tmp-{}", uuid::Uuid::new_v4());
+    let io = |e: std::io::Error| WriteError::Io(e.to_string());
+    // 保留原文件的权限：新建的临时文件默认是 0644，直接 rename 过去会把
+    // 0600 的配置放宽 —— 那份文件里有密钥散列。
+    let perm = tokio::fs::metadata(path)
+        .await
+        .ok()
+        .map(|m| m.permissions());
+    let mut f = tokio::fs::File::create(&tmp).await.map_err(io)?;
+    use tokio::io::AsyncWriteExt;
+    let r = async {
+        f.write_all(body.as_bytes()).await.map_err(io)?;
+        f.sync_all().await.map_err(io)?;
+        drop(f);
+        if let Some(p) = perm {
+            tokio::fs::set_permissions(&tmp, p).await.map_err(io)?;
+        }
+        tokio::fs::rename(&tmp, path).await.map_err(io)
+    }
+    .await;
+    if r.is_err() {
+        // 失败了就别把临时文件留在配置目录里。
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    r
 }
 
 /// 这次改动会不会让网关拒收整份配置？会的话返回原因。
@@ -214,17 +248,23 @@ pub fn api_keys_mut(doc: &mut Value) -> &mut Vec<Value> {
 /// 失败当成「一把密钥都没有」，会把所有人的额度分配一次清空。
 pub fn all_key_names(yaml: &str) -> Option<Vec<String>> {
     let doc: Value = serde_yaml_ng::from_str(yaml).ok()?;
-    Some(
-        doc.get("api_keys")
-            .and_then(Value::as_sequence)
-            .map(|s| {
-                s.iter()
-                    .filter_map(|k| k.get("display_name").and_then(Value::as_str))
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default(),
-    )
+    // **看不懂的文档要回 `None`，不能回「一把密钥都没有」。**
+    //
+    // 调用方拿它去剪除「已不存在的密钥」占的额度，把「读到一份看不懂的东西」
+    // 当成空表，会把所有人的额度分配一次清空 —— 而这是可达的：写盘不是原子的，
+    // 写到一半崩溃就留下一个空文件，`from_str("")` 解析成 `Null` 而不是报错。
+    // 同理，`api_keys` 存在但不是序列，说明这份文档不是我们认识的形状。
+    let map = doc.as_mapping()?;
+    match map.get(Value::from("api_keys")) {
+        // 没有这一段：合法的「确实没有密钥」。
+        None => Some(Vec::new()),
+        Some(v) => v.as_sequence().map(|s| {
+            s.iter()
+                .filter_map(|k| k.get("display_name").and_then(Value::as_str))
+                .map(String::from)
+                .collect()
+        }),
+    }
 }
 
 fn owner(k: &Value) -> Option<&str> {
@@ -461,6 +501,95 @@ api_keys:
             Value::Sequence(vec![Value::Mapping(m)]),
         );
         true
+    }
+
+    /// 看不懂的文档必须回 `None`，不能回「一把密钥都没有」。
+    ///
+    /// 回空表的话，调用方会把所有人的密钥额度当成残留一次清空。空文件是可达的：
+    /// 写盘不是原子的，写到一半崩溃就留下它，而 `from_str("")` 不报错。
+    /// 写盘是原子的：读者要么看到旧的完整内容，要么看到新的。
+    ///
+    /// 「截断 + 写」在进程中途死掉时会留下一个截断的配置，网关下次启动直接加载
+    /// 失败 —— 那是整站不可用，不是某条策略不生效。这条一边狂写一边狂读，读到
+    /// 的每一份都必须是完整的两者之一。
+    #[tokio::test]
+    async fn 写盘是原子的_读不到写了一半的样子() {
+        let (w, path) = writer_with(VALID).await;
+        let orig = std::fs::read_to_string(&path).unwrap();
+        let p2 = path.clone();
+        let reader = tokio::task::spawn_blocking(move || {
+            let mut bad = 0;
+            for _ in 0..3_000 {
+                let text = std::fs::read_to_string(&p2).unwrap_or_default();
+                // 每一次读到的都得是一份能解析、且带 api_keys 的完整文档。
+                if super::all_key_names(&text).is_none() {
+                    bad += 1;
+                }
+            }
+            bad
+        });
+        for i in 0..40 {
+            w.edit(move |d| {
+                let keys = api_keys_mut(d);
+                keys[0]
+                    .as_mapping_mut()
+                    .unwrap()
+                    .insert(Value::from("display_name"), Value::from(format!("k{i}")));
+                true
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(reader.await.unwrap(), 0, "读到过写了一半的配置");
+        assert_ne!(std::fs::read_to_string(&path).unwrap(), orig);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// rename 覆盖不能把原文件的权限放宽。
+    ///
+    /// 新建的临时文件默认 0644，直接 rename 过去会让一份 0600 的配置变成人人可读
+    /// —— 那里面有密钥散列。
+    #[tokio::test]
+    async fn 覆盖写不会放宽文件权限() {
+        use std::os::unix::fs::PermissionsExt;
+        let (w, path) = writer_with(VALID).await;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        w.edit(|d| {
+            api_keys_mut(d)[0]
+                .as_mapping_mut()
+                .unwrap()
+                .insert(Value::from("disabled"), Value::from(true));
+            true
+        })
+        .await
+        .unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "权限被放宽成了 {mode:o}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn 看不懂的配置不能被当成没有密钥() {
+        assert_eq!(
+            all_key_names("api_keys:\n- display_name: a\n"),
+            Some(vec!["a".to_string()])
+        );
+        // 合法的「确实没有密钥」。
+        assert_eq!(all_key_names("models: []\n"), Some(Vec::new()));
+        assert_eq!(all_key_names("api_keys: []\n"), Some(Vec::new()));
+
+        // 看不懂的几种。
+        for junk in [
+            "",              // 空文件 —— 写到一半崩溃就是这个
+            "api_keys: 3\n", // 不是序列
+            "api_keys: [\n", // 不是合法 YAML
+            "- 1\n- 2\n",    // 根不是映射
+            "just a string\n",
+        ] {
+            assert_eq!(all_key_names(junk), None, "{junk:?} 被当成了「没有密钥」");
+        }
     }
 
     #[tokio::test]

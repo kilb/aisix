@@ -261,7 +261,16 @@ test("每把密钥的额度各自收口_且各把之和不得超过总额度", a
     return doc.includes(`portal-key-${a.name}`) && doc.includes("scope: api_key");
   }, "门户把这把密钥的额度推成 api_key 域的策略");
 
-  await waitFor(async () => (await fx.chatWith(a.plaintext)) === 429, "甲自己的额度用尽后被拒");
+  // 花超自己额度之后会被拒，但**由哪道闸拒**取决于两者的赛跑：
+  //   * 网关侧的额度闸 → 429，带「top up to continue」，立刻生效；
+  //   * 门户侧的持久兜底（按密钥累计花费，越过额度就写成停用）→ 401，滞后一轮。
+  // 后者是为网关重启后计数器归零准备的（否则每把密钥的子额度会「续杯」），代价
+  // 是正常路径上它也会在一轮内接管，把 429 变成 401。断言「被拒」而不是钉某一个
+  // 码 —— 钉死其中一个等于断言这场赛跑的结果。
+  await waitFor(
+    async () => [401, 429].includes(await fx.chatWith(a.plaintext)),
+    "甲自己的额度用尽后被拒",
+  );
   // 乙仍然可用 —— 这是「每把密钥各自一份」的全部含义。闸若错挂在用户身上，
   // 乙会跟着一起被拒；那在用户看来是「另一把密钥无缘无故不能用了」。
   expect(await fx.chatWith(b.plaintext)).toBe(200);
@@ -292,6 +301,10 @@ test("流式请求也会消耗额度_不然这道闸对主流客户端形同不�
   const cookie = await fx.sessionCookie();
   await setQuota(1_000_000_000);
   const k = await mint(cookie, "流式");
+  // **让门户对这把密钥失明。** 门户的持久兜底会在一轮内把超额的密钥写成停用，
+  // 于是「网关自己有没有记流式的账」被盖住 —— 实测过：把网关侧的流式记账整个
+  // 删掉，这条用例照样绿。失明之后只剩网关那道闸。
+  fx.blindPortalTo(`${k.name} · 流式`);
   await waitFor(async () => (await fx.chatStream(k.plaintext)) === 200, "新密钥被启用");
 
   // 只给这把密钥 $2。每次调用 $1，所以第三次流式请求就该被拒。
@@ -302,9 +315,10 @@ test("流式请求也会消耗额度_不然这道闸对主流客户端形同不�
   }, "门户把这把密钥的额度推下去");
 
   // 流式与非流式在网关里是两条记账路径。只有非流式记账的话，这里会一直 200。
+  // 门户已失明，所以只能是网关那道闸拦下的 —— 断言 429 而不是「被拒」。
   await waitFor(
     async () => (await fx.chatStream(k.plaintext)) === 429,
-    "流式请求把额度用尽后被拒",
+    "流式请求把额度用尽后被网关拒绝",
   );
 });
 
@@ -316,6 +330,8 @@ test("三个端点的流式流量都算进同一份额度", async () => {
   // 的流式记账有没有发生」，而不是三者共用一个计数器的混合结果。
   for (const endpoint of ["messages", "responses"] as const) {
     const k = await mint(cookie, endpoint);
+    // 同上：隔离出网关那道闸，否则门户的兜底会把这个端点的记账缺失盖住。
+    fx.blindPortalTo(`${k.name} · ${endpoint}`);
     await waitFor(
       async () => (await fx.streamOn(endpoint, k.plaintext)) === 200,
       `${endpoint} 上新密钥被启用`,
@@ -328,7 +344,7 @@ test("三个端点的流式流量都算进同一份额度", async () => {
 
     await waitFor(
       async () => (await fx.streamOn(endpoint, k.plaintext)) === 429,
-      `${endpoint} 的流式流量把额度用尽后被拒`,
+      `${endpoint} 的流式流量把额度用尽后被网关拒绝`,
     );
   }
 });
@@ -350,10 +366,13 @@ test("门户自己的指标能被抓到_而且是真流量驱动出来的", asyn
   const t0 = ticksOf(before);
   expect(t0).toBeGreaterThanOrEqual(0);
 
-  // 驱动真流量：发额度、打请求，让对账环有事可做。
-  await setQuota(1_000_000_000);
+  // 驱动真流量。**自带前提**：先把额度设成 0 再铸密钥 —— 那把密钥生下来是停用
+  // 的，随后发额度必然产生一次「启用」。靠前面用例留下的残局来凑，这条断言就
+  // 会随别的用例改动而时灵时不灵。
+  await setQuota(0);
   const cookie = await fx.sessionCookie();
   const k = await mint(cookie, "指标");
+  await setQuota(1_000_000_000);
   await waitFor(async () => (await fx.chatWith(k.plaintext)) === 200, "新密钥可用");
 
   // 轮数要涨（对账环在跑），而且写盘失败与读指标失败都该是 0。
@@ -372,7 +391,8 @@ test("门户自己的指标能被抓到_而且是真流量驱动出来的", asyn
     );
   expect(valueOf("aisix_portal_config_write_failures_total"), after).toBe(0);
   expect(valueOf("aisix_portal_reconcile_errors_total"), after).toBe(0);
-  // 有额度、有密钥，所以这一轮至少启用过一把 —— 说明记的是真事，不是常量 0。
+  // 上面那把密钥是在零额度下铸的（生下来停用），发额度之后必然被启用过一次 ——
+  // 说明这个计数记的是真事，不是常量 0。
   expect(valueOf("aisix_portal_keys_reenabled_total")).toBeGreaterThan(0);
 });
 
