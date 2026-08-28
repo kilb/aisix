@@ -375,3 +375,46 @@ test("门户自己的指标能被抓到_而且是真流量驱动出来的", asyn
   // 有额度、有密钥，所以这一轮至少启用过一把 —— 说明记的是真事，不是常量 0。
   expect(valueOf("aisix_portal_keys_reenabled_total")).toBeGreaterThan(0);
 });
+
+test("从未产生流量的用户_水位线照样推进_失败计数不涨", async () => {
+  // 这是生产上真发生过的那个形态：Prometheus 正常应答但没有任何序列（这个人
+  // 从来没调过），旧写法把它当成「读不到」—— 水位线永不推进，查询窗口一天天
+  // 变长，失败计数每轮都涨。
+  const email = `quiet-${Date.now()}@e2e.test`;
+  const r = await fetch(`${fx.portalUrl}/api/register`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email, password: "correct horse battery" }),
+  });
+  const uid = JSON.parse(await r.text()).user_id as string;
+
+  const failuresOf = async () => {
+    const text = await fetch(fx.portalMetricsUrl).then((x) => x.text());
+    return Number(
+      text
+        .split("\n")
+        .find((l) => l.startsWith("aisix_portal_metric_read_failures_total "))
+        ?.split(" ")[1] ?? -1,
+    );
+  };
+  const before = await failuresOf();
+  expect(before).toBeGreaterThanOrEqual(0);
+
+  // 等这个新用户被对账环见过两轮 —— 第一轮建水位线，第二轮之后它必须往前走。
+  const markOf = async () => {
+    const b = await fetch(`${fx.portalUrl}/admin/users`, {
+      headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+    }).then((x) => x.json());
+    return b.users.find((u: { user_id: string }) => u.user_id === uid) !== undefined;
+  };
+  await waitFor(markOf, "管理端看到这个用户");
+
+  // 水位线推进本身看不到，但它的直接后果看得到：失败计数不该因为这个用户而涨。
+  // 给足够多轮（tick 是 2 秒），旧写法下每轮都会 +1。
+  await new Promise((res) => setTimeout(res, 8_000));
+  const after = await failuresOf();
+  expect(
+    after,
+    `从未产生流量的用户让读取失败计数从 ${before} 涨到了 ${after}`,
+  ).toBe(before);
+});

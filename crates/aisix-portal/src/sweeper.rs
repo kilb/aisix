@@ -633,7 +633,13 @@ impl ConsumptionSource for PromSource {
             .ok()?;
         let body: serde_json::Value = resp.json().await.ok()?;
         // 读不到与读到零必须分开：前者不推进水位线，后者推进。
-        plausible_spend(crate::usage::scalar_from_prom(&body)?)
+        match crate::usage::scalar_of(&body) {
+            crate::usage::PromScalar::Value(v) => plausible_spend(v),
+            // 没有序列 = 这个身份从来没产生过流量 = 这段窗口花了 0。当成「读不到」
+            // 的话水位线永不推进，窗口一天天变长，失败计数每轮都涨。
+            crate::usage::PromScalar::NoSeries => Some(0),
+            crate::usage::PromScalar::Unreadable => None,
+        }
     }
 
     async fn key_spend_in_window(
@@ -658,7 +664,13 @@ impl ConsumptionSource for PromSource {
             .await
             .ok()?;
         let body: serde_json::Value = resp.json().await.ok()?;
-        plausible_spend(crate::usage::scalar_from_prom(&body)?)
+        match crate::usage::scalar_of(&body) {
+            crate::usage::PromScalar::Value(v) => plausible_spend(v),
+            // 没有序列 = 这个身份从来没产生过流量 = 这段窗口花了 0。当成「读不到」
+            // 的话水位线永不推进，窗口一天天变长，失败计数每轮都涨。
+            crate::usage::PromScalar::NoSeries => Some(0),
+            crate::usage::PromScalar::Unreadable => None,
+        }
     }
 }
 

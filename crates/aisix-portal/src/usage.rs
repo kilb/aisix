@@ -117,18 +117,50 @@ pub(crate) fn escape_label(v: &str) -> String {
     v.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// 把 Prometheus 的即时向量应答取成一个标量。
-pub fn scalar_from_prom(body: &Value) -> Option<f64> {
-    body.get("data")?
-        .get("result")?
-        .as_array()?
-        .first()?
-        .get("value")?
-        .as_array()?
-        .get(1)?
-        .as_str()?
-        .parse()
-        .ok()
+/// Prometheus 即时向量应答的三种结果。
+///
+/// **「没有序列」跟「读不到」必须分开。** Prometheus 对一个匹配不到任何序列的
+/// 查询会正常应答 `status: success` + 空结果 —— 那意味着这个用户从来没产生过
+/// 流量，对账口径下就是 0。混成「读不到」的后果是：水位线永不推进，查询窗口
+/// 一天天变长，而失败计数每轮都涨。生产上真发生过，是门户的指标口刚上线就
+/// 把它暴露出来的。
+#[derive(Debug, PartialEq)]
+pub enum PromScalar {
+    /// 读到了一个数。
+    Value(f64),
+    /// Prometheus 答了，但这个查询没有任何序列 —— 也就是 0。
+    NoSeries,
+    /// 没能问到：不是 JSON、`status` 不是 success、或者形状不对。
+    Unreadable,
+}
+
+/// 把 Prometheus 的即时向量应答分类。
+pub fn scalar_of(body: &Value) -> PromScalar {
+    // `status` 是 Prometheus 自己对这次查询成败的判断，先看它。
+    if body.get("status").and_then(Value::as_str) != Some("success") {
+        return PromScalar::Unreadable;
+    }
+    let Some(result) = body.get("data").and_then(|d| d.get("result")) else {
+        return PromScalar::Unreadable;
+    };
+    let Some(items) = result.as_array() else {
+        return PromScalar::Unreadable;
+    };
+    if items.is_empty() {
+        return PromScalar::NoSeries;
+    }
+    match items
+        .first()
+        .and_then(|i| i.get("value"))
+        .and_then(Value::as_array)
+        .and_then(|v| v.get(1))
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<f64>().ok())
+    {
+        Some(v) => PromScalar::Value(v),
+        // 有序列却取不出值 —— 形状跟预期不符，当成读不到。
+        None => PromScalar::Unreadable,
+    }
 }
 
 /// 余额页展示的流水条数上限。
@@ -211,14 +243,38 @@ mod tests {
                 "result":[{"metric":{},"value":[0,"1234.5"]}]}}"#,
         )
         .unwrap();
-        assert_eq!(scalar_from_prom(&body), Some(1234.5));
+        assert_eq!(scalar_of(&body), PromScalar::Value(1234.5));
     }
 
+    /// 「没有序列」「读不到」「读到了」三者必须分开。
+    ///
+    /// 空结果曾经被当成「读不到」：于是一个从未产生流量的用户会让水位线永远
+    /// 停在原地，查询窗口一天天变长，失败计数每轮都涨 —— 生产上真发生了，是
+    /// 门户的指标口刚上线就把它照出来的。
     #[tokio::test]
-    async fn 空应答解析成_none_而不是零() {
-        let body: Value =
-            serde_json::from_str(r#"{"status":"success","data":{"result":[]}}"#).unwrap();
-        // 「没读到」和「是零」必须分得开：前者是读取问题，后者是真没流量。
-        assert_eq!(scalar_from_prom(&body), None);
+    async fn 没有序列不等于读不到() {
+        let empty: Value = serde_json::from_str(
+            r#"{"status":"success","data":{"resultType":"vector","result":[]}}"#,
+        )
+        .unwrap();
+        assert_eq!(scalar_of(&empty), PromScalar::NoSeries);
+
+        // Prometheus 自己说查询失败 —— 这才是读不到。
+        let err: Value = serde_json::from_str(
+            r#"{"status":"error","errorType":"bad_data","error":"parse error"}"#,
+        )
+        .unwrap();
+        assert_eq!(scalar_of(&err), PromScalar::Unreadable);
+
+        // 形状不对也是读不到，而不是 0。
+        for junk in [
+            r#"{"status":"success"}"#,
+            r#"{"status":"success","data":{"result":{}}}"#,
+            r#"{"status":"success","data":{"result":[{"metric":{}}]}}"#,
+            r#"{}"#,
+        ] {
+            let v: Value = serde_json::from_str(junk).unwrap();
+            assert_eq!(scalar_of(&v), PromScalar::Unreadable, "{junk}");
+        }
     }
 }

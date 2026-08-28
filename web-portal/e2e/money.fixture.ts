@@ -4,6 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer as netServer } from "node:net";
+import { statSync, readdirSync } from "node:fs";
 
 /**
  * 钱路夹具：**真网关 + 真流量 + 真指标 + 真门户**。
@@ -111,7 +112,52 @@ async function sha256Hex(s: string): Promise<string> {
   return [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
 }
 
+/**
+ * 二进制比源码新，否则立刻报错。
+ *
+ * 这一条咬过三次：改完 Rust 只重建了 release 而夹具跑的是 debug、变异让 TS 编译
+ * 失败而测试跑的是上一次的产物……症状都一样 —— 测试结果看起来在讲代码，其实在讲
+ * 一个旧文件。而它长得跟真 bug 一模一样，每次都要花很久才想到。
+ *
+ * 与其记得重建，不如让它自己说出来。
+ */
+function assertFresh(bin: string, crateDir: string): void {
+  let binTime: number;
+  try {
+    binTime = statSync(bin).mtimeMs;
+  } catch {
+    throw new Error(`找不到 ${bin}\n先构建它，再跑 e2e。`);
+  }
+  let newest = 0;
+  let newestFile = "";
+  const walk = (dir: string) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (e.name.endsWith(".rs") || e.name.endsWith(".sql")) {
+        const t = statSync(full).mtimeMs;
+        if (t > newest) {
+          newest = t;
+          newestFile = full;
+        }
+      }
+    }
+  };
+  walk(crateDir);
+  if (newest > binTime) {
+    throw new Error(
+      `${bin} 比源码旧（${newestFile} 更新）——` +
+        `跑的是上一次构建的产物，结果讲的不是当前代码。\n` +
+        `先重建：cargo build${bin.includes("/release/") ? " --release" : ""} -p <crate>`,
+    );
+  }
+}
+
 export async function startMoney(): Promise<MoneyFixture> {
+  const repo = join(process.cwd(), "..");
+  assertFresh(PORTAL_BIN, join(repo, "crates", "aisix-portal"));
+  assertFresh(GATEWAY_BIN, join(repo, "crates", "aisix-proxy"));
+
   const dir = mkdtempSync(join(tmpdir(), "aisix-money-e2e-"));
   const resourcesPath = join(dir, "resources.yaml");
   const procs: ChildProcess[] = [];
@@ -235,21 +281,40 @@ export async function startMoney(): Promise<MoneyFixture> {
     void (async () => {
       const u = new URL(req.url ?? "/", "http://x");
       const q = u.searchParams.get("query") ?? "";
-      const uid = /user_id="([^"]+)"/.exec(q)?.[1] ?? "";
+      // 门户会按 user_id 查（用户级）也会按 api_key_id 查（密钥级持久兜底）。
+      const m =
+        /user_id="([^"]+)"/.exec(q) ?? /api_key_id="([^"]+)"/.exec(q);
+      const label = q.includes("api_key_id=") ? "api_key_id" : "user_id";
+      const id = m?.[1] ?? "";
       let cumulative = 0;
+      // 有没有匹配到任何序列。真 Prometheus 在一条都没匹配到时回**空** result，
+      // 而不是一条值为 0 的序列 —— 那两种情况在门户侧的处置完全不同（「这个人
+      // 从来没调过」vs「读不到」）。垫片必须照着真的来，否则那条分支永远测不到。
+      let matched = false;
       try {
         const text = await fetch(`http://127.0.0.1:${metricsPort}/metrics`).then((r) => r.text());
         for (const line of text.split("\n")) {
           if (!line.startsWith("aisix_llm_spend_micro_usd_total{")) continue;
-          if (!line.includes(`user_id="${uid}"`)) continue;
+          if (!line.includes(`${label}="${id}"`)) continue;
+          matched = true;
           cumulative += Number(line.slice(line.lastIndexOf("}") + 1).trim()) || 0;
         }
       } catch {
         /* 网关还没起来 */
       }
-      const prev = lastSeen.get(uid) ?? 0;
+      if (!matched) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            status: "success",
+            data: { resultType: "vector", result: [] },
+          }),
+        );
+        return;
+      }
+      const prev = lastSeen.get(`${label}:${id}`) ?? 0;
       const delta = Math.max(0, cumulative - prev);
-      lastSeen.set(uid, cumulative);
+      lastSeen.set(`${label}:${id}`, cumulative);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({

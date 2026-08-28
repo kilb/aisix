@@ -159,7 +159,13 @@ impl AppState {
             .await
             .ok()?;
         let body: serde_json::Value = resp.json().await.ok()?;
-        crate::usage::scalar_from_prom(&body)
+        match crate::usage::scalar_of(&body) {
+            crate::usage::PromScalar::Value(v) => Some(v),
+            // 没有序列就是 0。返回 `None` 的话界面显示「—」，读起来像「出错了」，
+            // 而实际是「这个人还没开始用」。
+            crate::usage::PromScalar::NoSeries => Some(0.0),
+            crate::usage::PromScalar::Unreadable => None,
+        }
     }
 
     pub fn admin_token(&self) -> Option<&str> {
