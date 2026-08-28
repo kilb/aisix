@@ -33,7 +33,9 @@ type TopupRow = (
 );
 
 /// 单笔充值的上限。不是风控，是防手滑 —— 多打两个零在这种表单里很常见。
-const MAX_TOPUP_MICRO_USD: i64 = 10_000_000_000; // $10,000
+/// 单笔金额上限（$10,000）。充值申请与管理员设额度共用同一个数 —— 两处各自
+/// 定一个的话，迟早只有一处被调。
+pub const MAX_TOPUP_MICRO_USD: i64 = 10_000_000_000;
 
 #[derive(Deserialize)]
 pub struct CreateReq {

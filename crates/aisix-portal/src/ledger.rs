@@ -156,15 +156,25 @@ impl Ledger {
             .await
     }
 
-    /// 按记账顺序返回流水。
-    pub async fn entries(&self, user_id: &str) -> Result<Vec<Entry>, StoreError> {
-        let rows: Vec<(i64, i64, String, Option<String>)> = sqlx::query_as(
+    /// 按记账顺序返回**最近** `limit` 条流水。
+    ///
+    /// 必须有上限。对账环给每个有消费的用户每轮写一条，15 秒一轮就是一天约
+    /// 5760 条；不限的话，几周之后一次余额请求要序列化十几万条、浏览器再把它们
+    /// 全渲染出来 —— 页面先卡死，接口本身也成了自己打自己的那种慢查询。
+    ///
+    /// 余额不受影响：那是 `SUM` 出来的，永远算全部流水。这里限的只是「给人看的
+    /// 那几条」。
+    pub async fn entries(&self, user_id: &str, limit: i64) -> Result<Vec<Entry>, StoreError> {
+        // 倒序取最近 N 条，再翻回正序 —— 正序 + LIMIT 会取到最老的那几条。
+        let mut rows: Vec<(i64, i64, String, Option<String>)> = sqlx::query_as(
             "SELECT id, delta_micro_usd, source, note FROM ledger
-             WHERE user_id = ?1 ORDER BY id",
+             WHERE user_id = ?1 ORDER BY id DESC LIMIT ?2",
         )
         .bind(user_id)
+        .bind(limit)
         .fetch_all(self.store.pool())
         .await?;
+        rows.reverse();
         Ok(rows
             .into_iter()
             .map(|(id, delta_micro_usd, source, note)| Entry {
@@ -292,7 +302,7 @@ mod tests {
             l.balance("u1").await.unwrap(),
             1_000_000 + 50 * 1_000 - 50 * 400
         );
-        assert_eq!(l.entries("u1").await.unwrap().len(), 101);
+        assert_eq!(l.entries("u1", 1_000).await.unwrap().len(), 101);
     }
 
     #[tokio::test]
@@ -313,9 +323,9 @@ mod tests {
         l.credit("u1", 1_000, Source::AdminGrant, None)
             .await
             .unwrap();
-        let before = l.entries("u1").await.unwrap();
+        let before = l.entries("u1", 1_000).await.unwrap();
         debit(&l, "u1", 400).await;
-        let after = l.entries("u1").await.unwrap();
+        let after = l.entries("u1", 1_000).await.unwrap();
         // 账要能重算，历史行不得被动过。
         assert_eq!(&after[..before.len()], &before[..]);
         assert_eq!(after.len(), before.len() + 1);

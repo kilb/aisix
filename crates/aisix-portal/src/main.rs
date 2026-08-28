@@ -665,7 +665,7 @@ mod admin_tests {
         assert_eq!(s, 200);
 
         let ledger = crate::ledger::Ledger::new(app.store.clone());
-        let entries = ledger.entries(&id).await.unwrap();
+        let entries = ledger.entries(&id, 1_000).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].delta_micro_usd, 5_000_000);
         assert_eq!(entries[0].source, "admin_grant");
@@ -1172,7 +1172,7 @@ mod topup_tests {
         assert_eq!(balance(&app, &uid).await, 5_000_000);
 
         let entries = crate::ledger::Ledger::new(app.store.clone())
-            .entries(&uid)
+            .entries(&uid, 1_000)
             .await
             .unwrap();
         assert_eq!(entries.len(), 1);
@@ -1404,10 +1404,27 @@ api_keys:
         // 按正负筛总额的写法在这里会漏掉负数那条，总额只涨不落 —— 网关那边的
         // 闸也就降不下来。所以总额必须按**来源**算。
         assert_eq!(l.total_granted(&id).await.unwrap(), 2_000_000);
-        let entries = l.entries(&id).await.unwrap();
+        let entries = l.entries(&id, 1_000).await.unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[1].delta_micro_usd, -7_000_000);
         assert_eq!(entries[1].source, "admin_set");
+    }
+
+    #[tokio::test]
+    async fn 荒谬的大额度被拒_而不是把闸开到无穷() {
+        let (_p, app) = app().await;
+        let id = signed_in(&app, "a@b.c").await;
+        for path in ["quota", "grant"] {
+            let (s, _) = app
+                .post_admin(
+                    &format!("/admin/users/{id}/{path}"),
+                    json!({"micro_usd": 900_000_000_000_000i64}),
+                )
+                .await;
+            assert_eq!(s, 400, "{path} 接受了一个多打了几个零的数");
+        }
+        let l = crate::ledger::Ledger::new(app.store.clone());
+        assert_eq!(l.total_granted(&id).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -1793,6 +1810,72 @@ api_keys:
             g == 8_000_000 || g == 2_000_000,
             "总额停在了 {g}，既不是 8000000 也不是 2000000"
         );
+    }
+
+    /// 流水多起来之后，余额接口不能把全部条目一次吐出来。
+    #[tokio::test]
+    async fn 余额接口的流水条数有上限_且余额本身仍算全部() {
+        let (_p, app) = app().await;
+        let id = signed_in(&app, "a@b.c").await;
+        let l = crate::ledger::Ledger::new(app.store.clone());
+        // 对账环给有消费的用户每轮写一条，15 秒一轮就是一天约 5760 条。这里造
+        // 300 条已经越过展示上限。
+        for _ in 0..300 {
+            l.credit(&id, 1_000, crate::ledger::Source::AdminGrant, None)
+                .await
+                .unwrap();
+        }
+
+        let (_, body) = app.get("/api/balance").await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let n = v["entries"].as_array().unwrap().len();
+        assert!(n <= 200, "一次吐了 {n} 条流水");
+        assert_eq!(
+            v["entries_truncated"],
+            serde_json::json!(true),
+            "截断了却没说"
+        );
+        // 余额是 SUM 出来的，不受展示上限影响 —— 截断的是给人看的那几条。
+        assert_eq!(v["balance_micro_usd"], serde_json::json!(300_000));
+    }
+
+    #[tokio::test]
+    async fn 账号被停用后_旧会话立刻失效() {
+        let (_p, app) = app().await;
+        let id = signed_in(&app, "a@b.c").await;
+        assert_eq!(app.get("/api/keys").await.0, 200);
+
+        sqlx::query("UPDATE users SET disabled = 1 WHERE id = ?1")
+            .bind(&id)
+            .execute(app.store.pool())
+            .await
+            .unwrap();
+
+        // 只在登录处看这个字段的话，刚被停用的人还能拿着旧会话继续铸密钥、设
+        // 额度、提充值单，最长一个会话周期。
+        assert_eq!(app.get("/api/keys").await.0, 401, "停用后旧会话仍然有效");
+        assert_eq!(
+            app.post("/api/keys", json!({"label": "还能建吗"})).await.0,
+            401
+        );
+    }
+
+    #[tokio::test]
+    async fn 过长的密钥名称被拒() {
+        let (_p, app) = app().await;
+        let id = signed_in(&app, "a@b.c").await;
+        app.post_admin(
+            &format!("/admin/users/{id}/quota"),
+            json!({"micro_usd": 1_000_000}),
+        )
+        .await;
+        // 名称原样进网关配置，也进下推的策略名。不限长的话一个请求就能把配置
+        // 撑起来，而网关每次重载都要整份读一遍。
+        let (s, _) = app
+            .post("/api/keys", json!({"label": "长".repeat(500)}))
+            .await;
+        assert_eq!(s, 400, "过长的名称被接受了");
+        assert!(!app.resources().contains(&"长".repeat(500)));
     }
 
     /// 探针 3：配置写入失败时，库里的额度不能已经被改掉。

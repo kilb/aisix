@@ -138,13 +138,25 @@ impl AppState {
         self.admin_token.as_deref().map(String::as_str)
     }
 
-    /// 当前会话对应的 `user_id`，未登录则 `None`。顺手清掉过期项。
+    /// 当前会话对应的 `user_id`，未登录或账号已停用则 `None`。顺手清掉过期项。
+    ///
+    /// **账号状态每次都查。** 登录处挡住了停用账号，但会话签发之后那个字段可能
+    /// 才被改；只在登录处看的话，一个刚被停用的人还能拿着旧会话继续铸密钥、设
+    /// 额度、提充值单，最长 12 小时。这里是每个需要登录的接口都要过的唯一路口，
+    /// 所以检查放在这里，而不是散到各个 handler 里（散着写迟早漏一个）。
     pub async fn session_user(&self, headers: &HeaderMap) -> Option<String> {
         let tok = cookie_token(headers)?;
         let now = now_secs();
-        let mut s = self.sessions.write().await;
-        s.retain(|_, (_, exp)| *exp > now);
-        s.get(&tok).map(|(uid, _)| uid.clone())
+        let uid = {
+            let mut s = self.sessions.write().await;
+            s.retain(|_, (_, exp)| *exp > now);
+            s.get(&tok).map(|(uid, _)| uid.clone())
+        }?;
+        match self.store.user_by_id(&uid).await {
+            Ok(Some(u)) if !u.disabled => Some(uid),
+            // 读不到就当没登录：这一步失败时放行等于把停用检查跳过去。
+            _ => None,
+        }
     }
 
     #[cfg(test)]

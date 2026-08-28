@@ -131,14 +131,23 @@ pub fn scalar_from_prom(body: &Value) -> Option<f64> {
         .ok()
 }
 
+/// 余额页展示的流水条数上限。
+///
+/// 对账环给有消费的用户每轮写一条，所以这张表只增不减；不限条数的话，几周之后
+/// 一次余额请求要吐十几万条，页面先卡死。总额与余额不受影响 —— 那是 `SUM` 出来
+/// 的，永远算全部流水。
+const ENTRY_PAGE: i64 = 200;
+
 /// 与用量查询同一条规矩：`user_id` 只从会话取。
 pub async fn balance(State(st): State<AppState>, headers: HeaderMap) -> Response {
     let Some(uid) = st.session_user(&headers).await else {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "未登录"}))).into_response();
     };
     let ledger = Ledger::new(st.store.clone());
-    let (Ok(balance), Ok(entries)) = (ledger.balance(&uid).await, ledger.entries(&uid).await)
-    else {
+    let (Ok(balance), Ok(entries)) = (
+        ledger.balance(&uid).await,
+        ledger.entries(&uid, ENTRY_PAGE).await,
+    ) else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "读取失败"})),
@@ -147,6 +156,8 @@ pub async fn balance(State(st): State<AppState>, headers: HeaderMap) -> Response
     };
     Json(json!({
         "balance_micro_usd": balance,
+        // 截断了就说出来。不说的话，用户翻不到更早的记录却以为那就是全部。
+        "entries_truncated": entries.len() as i64 >= ENTRY_PAGE,
         "entries": entries.iter().map(|e| json!({
             "id": e.id,
             "delta_micro_usd": e.delta_micro_usd,

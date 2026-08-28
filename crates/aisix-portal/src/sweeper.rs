@@ -150,11 +150,16 @@ impl<S: ConsumptionSource> Sweeper<S> {
             r.write_failures += 1;
         }
 
-        // 余额决定密钥开关。放在入账之后，用的是这一轮之后的余额。
+        // 余额与账号状态共同决定密钥开关。放在入账之后，用的是这一轮之后的余额。
+        //
+        // **账号被停用也要停密钥。** `users.disabled` 原本只在登录处检查：那个人
+        // 登不进门户了，可他名下的密钥在网关那边照常放行 —— 而「停用这个用户」
+        // 恰恰是要切断他的场景。控制台还把这种账号显示成「已停用」，等于告诉运维
+        // 人已经断了。
         let mut wanted: Vec<(String, bool)> = Vec::new();
         for u in &users {
             let balance = self.ledger.balance(&u.id).await?;
-            wanted.push((u.id.clone(), balance <= 0));
+            wanted.push((u.id.clone(), u.disabled || balance <= 0));
         }
         match self.apply_key_state(&wanted).await {
             Ok((off, on)) => {
@@ -225,6 +230,11 @@ impl<S: ConsumptionSource> Sweeper<S> {
         // 算进去，于是用户看着自己有额度却一分也分不出去，而界面上没有任何东西
         // 解释为什么。密钥可以从门户之外消失（运维在控制台删掉了它）。
         //
+        // **额度记录必须先于配置文件读取。** 反过来的话，在两次读取之间新铸并
+        // 设了额度的那把密钥会既不在旧的文件快照里、又已经在新的额度表里，于是
+        // 被当成残留删掉 —— 用户刚设的额度悄无声息地没了。按这个顺序，晚于快照
+        // 出现的记录压根不在候选集里。
+        let snapshot = self.quotas().await?;
         // `all_key_names` 读不动时返回 `None`，此时**不剪** —— 把一次读取失败
         // 当成「一把密钥都没有」会把所有人的分配一次清空。
         if let Some(present) = self
@@ -235,10 +245,10 @@ impl<S: ConsumptionSource> Sweeper<S> {
             .as_deref()
             .and_then(crate::resources::all_key_names)
         {
-            for (uid, name, _) in self.quotas().await? {
-                if !present.contains(&name) {
+            for (uid, name, _) in &snapshot {
+                if !present.contains(name) {
                     self.store
-                        .drop_key_quota(&uid, &name)
+                        .drop_key_quota(uid, name)
                         .await
                         .map_err(|e| e.to_string())?;
                 }
@@ -1067,6 +1077,74 @@ mod key_allowance_tests {
         assert_eq!(r.write_failures, 1, "停用写入失败没被记下来: {r:?}");
         // 而且不能报成「停用了 N 把」—— 那会让账面显示已停用、实际仍在放行。
         assert_eq!(r.disabled, 0, "写盘失败却报了停用数: {r:?}");
+    }
+
+    /// 剪除残留时，额度表必须先于配置文件被读到。
+    ///
+    /// 顺序反了就有一个窗口：两次读取之间新铸并设了额度的密钥，既不在旧的文件
+    /// 快照里、又已经在新的额度表里，于是被当成残留删掉。窗口只有一次数据库
+    /// 往返，症状是「刚设的额度自己没了」，无从复现。
+    ///
+    /// 钉源码序而不是去撞那个竞态：那种测试要么永远绿，要么偶尔红，两种都没用。
+    #[test]
+    fn 剪除残留时先取额度表再读配置() {
+        let src = include_str!("sweeper.rs");
+        let body = src
+            .split_once("async fn apply_key_allowances(")
+            .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+            .map(|(b, _)| b)
+            .expect("找不到 apply_key_allowances");
+        let snapshot = body
+            .find("let snapshot = self.quotas()")
+            .expect("没有取额度表");
+        let read = body
+            .find(".resources\n            .read()")
+            .expect("没有读配置");
+        assert!(
+            snapshot < read,
+            "先读了配置才取额度表 —— 中间新设的额度会被当成残留删掉",
+        );
+    }
+
+    #[tokio::test]
+    async fn 账号被停用后_他的密钥也在网关侧被停掉() {
+        let f = fx().await;
+        // 余额充足 —— 只有账号状态这一个理由要停他。
+        f.ledger
+            .credit(&f.uid, 50_000_000, crate::ledger::Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.sw.tick(t("2026-08-28T10:00:00Z")).await.unwrap();
+        assert!(!key_disabled(&f.path, "a"), "余额充足时不该停用");
+
+        sqlx::query("UPDATE users SET disabled = 1 WHERE id = ?1")
+            .bind(&f.uid)
+            .execute(f.store.pool())
+            .await
+            .unwrap();
+        let r = f.sw.tick(t("2026-08-28T10:00:15Z")).await.unwrap();
+
+        // 只在登录处看这个字段的话，人登不进门户、密钥却照常放行 —— 而「停用
+        // 这个用户」正是要切断他。控制台还把这种账号显示成「已停用」。
+        assert!(
+            key_disabled(&f.path, "a"),
+            "账号已停用，他的密钥在网关侧仍然是启用的"
+        );
+        assert_eq!(r.disabled, 1);
+    }
+
+    /// 配置里这把密钥是不是停用态。
+    fn key_disabled(path: &str, name: &str) -> bool {
+        let doc: Value = serde_yaml_ng::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        doc.get("api_keys")
+            .and_then(Value::as_sequence)
+            .and_then(|s| {
+                s.iter()
+                    .find(|k| k.get("display_name").and_then(Value::as_str) == Some(name))
+            })
+            .and_then(|k| k.get("disabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
     }
 
     #[tokio::test]

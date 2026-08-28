@@ -118,6 +118,15 @@ pub async fn set_quota(
         )
             .into_response();
     }
+    // 上限与充值申请那条一致。挡的不是恶意管理员（他本来就有权发钱），是多打了
+    // 几个零 —— 那会把一个人的闸实际上开到无穷，而账面上看不出异常。
+    if req.micro_usd > crate::topup::MAX_TOPUP_MICRO_USD {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "金额过大，请确认数字"})),
+        )
+            .into_response();
+    }
     match st.store.user_by_id(&user_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -196,6 +205,15 @@ pub async fn grant(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "发放金额必须为正"})),
+        )
+            .into_response();
+    }
+    // 上限与充值申请那条一致。挡的不是恶意管理员（他本来就有权发钱），是多打了
+    // 几个零 —— 那会把一个人的闸实际上开到无穷，而账面上看不出异常。
+    if req.micro_usd > crate::topup::MAX_TOPUP_MICRO_USD {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "金额过大，请确认数字"})),
         )
             .into_response();
     }

@@ -56,6 +56,8 @@ export interface Entry {
 export interface Balance {
   balance_micro_usd: number;
   entries: Entry[];
+  /** 流水只返回最近若干条；为真时说明更早的没在这里。 */
+  entries_truncated: boolean;
 }
 
 export interface Usage {

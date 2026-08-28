@@ -64,7 +64,13 @@ impl Store {
             .map_err(StoreError::Db)?
             .create_if_missing(true)
             // 并发写入撞 SQLITE_BUSY 是常态，不设就是间歇失败。
-            .busy_timeout(Duration::from_secs(5));
+            .busy_timeout(Duration::from_secs(5))
+            // **WAL，不是默认的 delete。** 实测 `from_str` 这条路给出的是
+            // `journal_mode=delete`：写事务持排他锁，期间**所有读都被挡住**。
+            // 对账环每轮都在写（扣款、推额度、开关密钥），而门户的每个请求都要
+            // 读（会话、余额、密钥列表），于是那几百毫秒里请求全排队，撞到
+            // `busy_timeout` 就是 500。WAL 下读不被写挡住。
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
         Self::from_options(opts, 5).await
     }
 
@@ -351,6 +357,39 @@ where
         .execute(exec)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod pragma_tests {
+    use super::*;
+
+    /// 文件库必须跑在 WAL 上。
+    ///
+    /// 默认的 `delete` 模式下写事务会挡住所有读，而这个进程里有一个每轮都在写
+    /// 的对账环和一堆每个请求都在读的接口 —— 症状是零星的 500，只在对账那一
+    /// 刻出现，最难查的那种。断言 pragma 而不是去测时序：后者必然是 flaky 的。
+    #[tokio::test]
+    async fn 文件库跑在_wal_上_否则写会挡住所有读() {
+        let path = std::env::temp_dir().join(format!("aisix-pragma-{}.db", uuid::Uuid::new_v4()));
+        let s = Store::open(&format!("sqlite:{}", path.display()))
+            .await
+            .unwrap();
+        let (mode,): (String,) = sqlx::query_as("PRAGMA journal_mode")
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal", "日志模式不是 WAL");
+        // 外键是真在生效的：删用户前必须先删他的流水与额度记录。
+        let (fk,): (i64,) = sqlx::query_as("PRAGMA foreign_keys")
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+        assert_eq!(fk, 1, "外键没开，那些 REFERENCES 就只是注释");
+        drop(s);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 }
 
 #[cfg(test)]

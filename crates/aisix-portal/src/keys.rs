@@ -73,6 +73,12 @@ pub async fn create(
         .filter(|s| !s.is_empty())
         .unwrap_or("我的密钥")
         .to_string();
+    // 标签会原样进 `display_name`，也就是进网关的配置文件、进下推的策略名。
+    // 不设上限的话，一个请求体大小的标签就能把配置撑起来，而网关每次重载都要
+    // 把它整份读一遍。按字符数而不是字节数算，免得中文标签被误伤。
+    if label.chars().count() > MAX_LABEL_CHARS {
+        return bad("名称过长");
+    }
 
     let uid2 = uid.clone();
     let hash2 = hash.clone();
@@ -240,6 +246,9 @@ pub async fn revoke(
         Err(e) => write_failed(e),
     }
 }
+
+/// 密钥名称的长度上限（字符）。
+const MAX_LABEL_CHARS: usize = 64;
 
 /// 32 字节随机，hex 编码。熵足够，所以散列用 sha256 而不是 argon2 —— 后者是
 /// 给低熵口令抗爆破用的，对随机串是白付代价。

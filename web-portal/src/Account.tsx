@@ -33,6 +33,28 @@ function Reading({ label, value, foot }: { label: string; value: string; foot?: 
   );
 }
 
+/**
+ * 记账来源的中文名。
+ *
+ * 「除了发放就是消费」的写法把 `topup`（充值入账）和 `admin_set`（管理员设定
+ * 额度）都显示成了「消费」—— 那是两笔**进账**被标成了花钱，而 `admin_set` 正是
+ * 管理员日常调额走的那条路。不认识的来源照原样显示，不猜。
+ */
+function sourceLabel(source: string): string {
+  switch (source) {
+    case "admin_grant":
+      return "管理员发放";
+    case "admin_set":
+      return "管理员设定额度";
+    case "topup":
+      return "充值入账";
+    case "consumption":
+      return "消费";
+    default:
+      return source;
+  }
+}
+
 export function Account({ sess, onOut }: { sess: api.Session; onOut: () => void }) {
   const [bal, setBal] = useState<api.Balance | null>(null);
   const [use, setUse] = useState<api.Usage | null>(null);
@@ -108,6 +130,9 @@ export function Account({ sess, onOut }: { sess: api.Session; onOut: () => void 
             />
           </div>
           <h3>流水</h3>
+          {bal?.entries_truncated && (
+            <p className="hint">只显示最近的若干条。上面的余额始终按全部流水计算。</p>
+          )}
           {bal?.entries.length ? (
             <div className="scroll">
               <table>
@@ -122,7 +147,7 @@ export function Account({ sess, onOut }: { sess: api.Session; onOut: () => void 
                   {[...bal.entries].reverse().map((e) => (
                     <tr key={e.id}>
                       <td className="right num">{usd(e.delta_micro_usd)}</td>
-                      <td>{e.source === "admin_grant" ? "管理员发放" : "消费"}</td>
+                      <td>{sourceLabel(e.source)}</td>
                       <td>{e.note ?? ""}</td>
                     </tr>
                   ))}

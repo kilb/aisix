@@ -307,6 +307,32 @@ test("提交充值单不改余额_确认后才入账_重复确认被拒", async 
   await page.reload();
   await expect(balanceReading(page)).toHaveText("$20.00");
   await expect(page.locator("tbody tr", { hasText: "单号 X1" })).toContainText("已入账");
+
+  // 流水里那一笔是**进账**。「除了发放就是消费」的写法会把它标成「消费」——
+  // 一笔加钱的记录写着花钱，用户会以为自己被扣了。
+  const row = page
+    .locator(".panel", { hasText: "流水" })
+    .locator("tbody tr")
+    .filter({ hasText: "$20.00" })
+    .first();
+  await expect(row).toContainText("充值");
+  await expect(row).not.toContainText("消费");
+});
+
+test("管理员设定的额度在流水里显示为进账_不是消费", async ({ page }) => {
+  const email = mail("setquota-label");
+  await signUp(page, email);
+  await setQuota(email, 12_000_000);
+  await page.reload();
+
+  // `admin_set` 是管理员日常调额走的那条路，落在流水里必须是能看懂的进账。
+  const row = page
+    .locator(".panel", { hasText: "流水" })
+    .locator("tbody tr")
+    .filter({ hasText: "$12.00" })
+    .first();
+  await expect(row).toContainText("额度");
+  await expect(row).not.toContainText("消费");
 });
 
 /** 把某个用户的总额度**设定**成某个数（绝对值）。 */
