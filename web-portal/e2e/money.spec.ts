@@ -332,3 +332,46 @@ test("三个端点的流式流量都算进同一份额度", async () => {
     );
   }
 });
+
+test("门户自己的指标能被抓到_而且是真流量驱动出来的", async () => {
+  // 仓库的规矩：没有 e2e 能在 `/metrics` 里断言到的指标等于不存在。对账环那几个
+  // 计数原本只写 stderr —— 一个只进日志的失败计数，在监控看来跟「一切正常」没有
+  // 区别，而「额度从此推不下去」正是要靠它才能发现的故障。
+  const before = await fetch(fx.portalMetricsUrl).then((r) => r.text());
+  expect(before).toContain("aisix_portal_config_write_failures_total");
+  expect(before).toContain("# TYPE aisix_portal_reconcile_ticks_total counter");
+  const ticksOf = (text: string) =>
+    Number(
+      text
+        .split("\n")
+        .find((l) => l.startsWith("aisix_portal_reconcile_ticks_total "))
+        ?.split(" ")[1] ?? -1,
+    );
+  const t0 = ticksOf(before);
+  expect(t0).toBeGreaterThanOrEqual(0);
+
+  // 驱动真流量：发额度、打请求，让对账环有事可做。
+  await setQuota(1_000_000_000);
+  const cookie = await fx.sessionCookie();
+  const k = await mint(cookie, "指标");
+  await waitFor(async () => (await fx.chatWith(k.plaintext)) === 200, "新密钥可用");
+
+  // 轮数要涨（对账环在跑），而且写盘失败与读指标失败都该是 0。
+  await waitFor(async () => {
+    const now = await fetch(fx.portalMetricsUrl).then((r) => r.text());
+    return ticksOf(now) > t0;
+  }, "对账轮数没有增长");
+
+  const after = await fetch(fx.portalMetricsUrl).then((r) => r.text());
+  const valueOf = (name: string) =>
+    Number(
+      after
+        .split("\n")
+        .find((l) => l.startsWith(`${name} `))
+        ?.split(" ")[1] ?? -1,
+    );
+  expect(valueOf("aisix_portal_config_write_failures_total"), after).toBe(0);
+  expect(valueOf("aisix_portal_reconcile_errors_total"), after).toBe(0);
+  // 有额度、有密钥，所以这一轮至少启用过一把 —— 说明记的是真事，不是常量 0。
+  expect(valueOf("aisix_portal_keys_reenabled_total")).toBeGreaterThan(0);
+});

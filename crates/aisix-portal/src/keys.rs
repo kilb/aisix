@@ -52,6 +52,15 @@ pub async fn create(
     // 余额不足时新密钥直接建成停用态。见模块注释：否则每建一把就白送一轮
     // 对账周期的推理。
     let ledger = Ledger::new(st.store.clone());
+    // 频率限制。放在写配置之前 —— 挡住的正是「循环铸密钥把网关按在重载上」。
+    if !st.mint_allowed(&uid).await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": "创建过于频繁，请稍后再试"})),
+        )
+            .into_response();
+    }
+
     let born_disabled = ledger.balance(&uid).await.unwrap_or(0) <= 0;
 
     let plaintext = mint_plaintext();
@@ -235,6 +244,8 @@ pub async fn revoke(
         // 而路径上给的是短名。用短名删会删不掉，而且不报错 —— 症状是吊销之后
         // 那份额度仍占着分配额，用户看着自己「还有额度却分不出去」。
         let _ = st.store.drop_key_quota(&uid, &full_name).await;
+        // 累计花费也一起清。名字里带 uuid，同名密钥不会复用，留着只是垃圾。
+        let _ = st.store.drop_key_spend(&uid, &full_name).await;
     }
     match result {
         Ok(_) if found => Json(json!({"ok": true})).into_response(),

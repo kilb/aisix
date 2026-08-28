@@ -63,14 +63,32 @@ pub async fn list_users(State(st): State<AppState>, headers: HeaderMap) -> Respo
     if !admin_ok(&st, &headers) {
         return forbidden();
     }
-    let ledger = Ledger::new(st.store.clone());
-    match st.store.all_users().await {
-        Ok(users) => {
+    // 三条聚合查询，不是「每个用户三次」。
+    let (Ok(users), Ok(sums), Ok(allocs)) = (
+        st.store.all_users().await,
+        st.store.all_balances().await,
+        st.store.all_allocated().await,
+    ) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "读取失败"})),
+        )
+            .into_response();
+    };
+    {
+        {
             let mut out = Vec::with_capacity(users.len());
             for u in users {
-                let balance = ledger.balance(&u.id).await.unwrap_or(0);
-                let granted = ledger.total_granted(&u.id).await.unwrap_or(0);
-                let allocated = st.store.allocated_to_keys(&u.id).await.unwrap_or(0);
+                let (balance, granted) = sums
+                    .iter()
+                    .find(|(id, _, _)| *id == u.id)
+                    .map(|(_, b, g)| (*b, *g))
+                    .unwrap_or((0, 0));
+                let allocated = allocs
+                    .iter()
+                    .find(|(id, _)| *id == u.id)
+                    .map(|(_, a)| *a)
+                    .unwrap_or(0);
                 out.push(json!({
                     "user_id": u.id,
                     "email": u.email,
@@ -85,11 +103,6 @@ pub async fn list_users(State(st): State<AppState>, headers: HeaderMap) -> Respo
             }
             Json(json!({"users": out})).into_response()
         }
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "读取失败"})),
-        )
-            .into_response(),
     }
 }
 

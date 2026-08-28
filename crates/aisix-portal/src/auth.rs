@@ -30,6 +30,21 @@ use crate::store::{Store, StoreError};
 /// 口令下限。低于此长度的口令挡在注册处，而不是留给用户自己负责。
 const MIN_PASSWORD_LEN: usize = 12;
 const SESSION_TTL_SECS: u64 = 12 * 3600;
+/// 同一个邮箱连续失败多少次之后进入冷却。
+const LOGIN_FAILURES_BEFORE_COOLDOWN: u32 = 5;
+/// 铸密钥的频率窗口与窗口内上限。
+///
+/// 一分钟十把：正常用户一次建几把就够了，而这个数把「循环铸密钥逼网关一直重载」
+/// 压到每分钟十次重载。
+const MINT_WINDOW_SECS: u64 = 60;
+const MINT_MAX_PER_WINDOW: u32 = 10;
+
+/// 冷却时长。
+///
+/// 这个数是在两种坏结果之间选的：太长，别人连着输错五次就能把你锁在门外一整
+/// 段时间（拿别人的邮箱刷失败即可）；太短，等于没拦。一分钟把爆破速度压到每
+/// 分钟五次，而被误锁的人等一分钟就好。
+const LOGIN_COOLDOWN_SECS: u64 = 60;
 const COOKIE: &str = "aisix_portal";
 
 #[derive(Clone)]
@@ -48,6 +63,17 @@ pub struct AppState {
     resources: crate::resources::Writer,
     default_allowed_models: Arc<Vec<String>>,
     http: reqwest::Client,
+    /// 按用户记的铸密钥时刻。见 [`AppState::mint_allowed`]。
+    mints: Arc<RwLock<HashMap<String, Vec<u64>>>>,
+    /// 按邮箱记的连续失败次数与冷却截止时刻。
+    ///
+    /// **按邮箱而不是按 IP**：门户在 nginx 后面，客户端 IP 要靠 `X-Forwarded-For`，
+    /// 而那个头是可以伪造的 —— 除非明确信任前置代理，按它限流等于不限。邮箱是
+    /// 攻击者绕不开的那一维：他要爆破某个账号，就必须一直用那个邮箱。
+    ///
+    /// 放内存里，跟会话一致：门户重启会清空，代价是重启那一刻的冷却被重置，
+    /// 而收益是不给这条路径加一次数据库写。
+    failures: Arc<RwLock<HashMap<String, (u32, u64)>>>,
     /// 实际执行过的 argon2 校验次数。让「不存在的账号也走了校验」这件事
     /// 可以被确定性地断言，而不必去测时间（那种测试必然是 flaky 的）。
     verifications: Arc<AtomicU64>,
@@ -104,6 +130,8 @@ impl AppState {
                     .unwrap_or_else(|_| vec!["*".to_string()]),
             ),
             http: crate::client::outbound(),
+            mints: Arc::new(RwLock::new(HashMap::new())),
+            failures: Arc::new(RwLock::new(HashMap::new())),
             verifications: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -138,6 +166,58 @@ impl AppState {
         self.admin_token.as_deref().map(String::as_str)
     }
 
+    /// 这个用户现在能不能再铸一把密钥。能，就把这次记下来。
+    ///
+    /// **限的是频率，不是总数。** 用户要的是「任意多把」，所以不设个数上限；但
+    /// 每铸一把都要重写整份网关配置并发一次 SIGHUP，网关据此重建整个快照 ——
+    /// 一个登录用户循环调这个接口，就能让网关一直在重载。
+    ///
+    /// 按用户记，所以谁也影响不到别人。
+    pub async fn mint_allowed(&self, user_id: &str) -> bool {
+        let now = now_secs();
+        let mut m = self.mints.write().await;
+        m.retain(|_, v| {
+            v.retain(|t| *t + MINT_WINDOW_SECS > now);
+            !v.is_empty()
+        });
+        let v = m.entry(user_id.to_string()).or_default();
+        if v.len() as u32 >= MINT_MAX_PER_WINDOW {
+            return false;
+        }
+        v.push(now);
+        true
+    }
+
+    /// 这个邮箱现在是不是在冷却里。顺手清掉早就过期的记录。
+    async fn in_cooldown(&self, email: &str) -> bool {
+        let now = now_secs();
+        let f = self.failures.read().await;
+        matches!(f.get(email), Some((n, until)) if *n >= LOGIN_FAILURES_BEFORE_COOLDOWN && *until > now)
+    }
+
+    /// 记一次失败。
+    ///
+    /// 第二个数既是冷却截止时刻、也是这条记录的保鲜期，所以每次失败都往后推。
+    /// 第一版只在到阈值时才设它，于是没到阈值的条目那个数是 0，下面的清理判据
+    /// `0 + 窗口 > now` 恒假 —— 每次失败都把刚记的那条删掉，计数永远停在 1，
+    /// 冷却根本不会触发。这条测试就是这么炸出来的。
+    ///
+    /// 副作用正好是想要的：失败之间隔得比窗口还长时，记录自然过期、计数归零 ——
+    /// 慢速爆破本来也被压到每窗口五次。
+    async fn note_failure(&self, email: &str) {
+        let now = now_secs();
+        let mut f = self.failures.write().await;
+        f.retain(|_, (_, until)| *until > now);
+        let e = f.entry(email.to_string()).or_insert((0, 0));
+        e.0 += 1;
+        e.1 = now + LOGIN_COOLDOWN_SECS;
+    }
+
+    /// 登录成功后清掉计数 —— 否则一个人偶尔输错几次，攒够五次就被锁。
+    async fn clear_failures(&self, email: &str) {
+        self.failures.write().await.remove(email);
+    }
+
     /// 当前会话对应的 `user_id`，未登录或账号已停用则 `None`。顺手清掉过期项。
     ///
     /// **账号状态每次都查。** 登录处挡住了停用账号，但会话签发之后那个字段可能
@@ -147,16 +227,48 @@ impl AppState {
     pub async fn session_user(&self, headers: &HeaderMap) -> Option<String> {
         let tok = cookie_token(headers)?;
         let now = now_secs();
+        // 读路径只取读锁，并只看这一条自己的过期时间。
+        //
+        // 原先每个请求都取**写**锁、再全表扫一遍清过期项 —— 一个读多写少的操作
+        // 走独占锁，所有登录请求在这里排成一队。清理改成按量触发（见下），日常
+        // 请求只读。
         let uid = {
-            let mut s = self.sessions.write().await;
-            s.retain(|_, (_, exp)| *exp > now);
-            s.get(&tok).map(|(uid, _)| uid.clone())
-        }?;
+            let s = self.sessions.read().await;
+            match s.get(&tok) {
+                Some((uid, exp)) if *exp > now => Some(uid.clone()),
+                _ => None,
+            }
+        };
+        // 没命中才需要考虑清理：要么这条过期了，要么根本不存在。顺手把攒下的
+        // 过期项清掉 —— 这时本来就要写锁，不额外增加争用。
+        let uid = match uid {
+            Some(uid) => uid,
+            None => {
+                let mut s = self.sessions.write().await;
+                s.retain(|_, (_, exp)| *exp > now);
+                return None;
+            }
+        };
         match self.store.user_by_id(&uid).await {
             Ok(Some(u)) if !u.disabled => Some(uid),
             // 读不到就当没登录：这一步失败时放行等于把停用检查跳过去。
             _ => None,
         }
+    }
+
+    /// 当前会话条目数。测试用来断言过期项确实被清掉了。
+    #[cfg(test)]
+    pub async fn session_count(&self) -> usize {
+        self.sessions.read().await.len()
+    }
+
+    /// 直接塞一条会话，指定过期时刻。测试用来造「已过期」的条目。
+    #[cfg(test)]
+    pub async fn put_session(&self, token: &str, user_id: &str, expires_at: u64) {
+        self.sessions
+            .write()
+            .await
+            .insert(token.to_string(), (user_id.to_string(), expires_at));
     }
 
     #[cfg(test)]
@@ -222,6 +334,17 @@ pub async fn login(State(st): State<AppState>, Json(req): Json<LoginReq>) -> Res
     };
 
     let email = req.email.trim().to_ascii_lowercase();
+
+    // 连续失败太多次就先冷却。**在跑 argon2 之前挡**，否则爆破照样能让每次尝试
+    // 都吃掉一次 19 MiB 的散列计算。
+    if st.in_cooldown(&email).await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": "尝试过于频繁，请稍后再试"})),
+        )
+            .into_response();
+    }
+
     let found = match st.store.user_by_email(&email).await {
         Ok(u) => u,
         Err(_) => return server_error("读取失败"),
@@ -251,6 +374,7 @@ pub async fn login(State(st): State<AppState>, Json(req): Json<LoginReq>) -> Res
     .unwrap_or(false);
 
     let Some(uid) = expect_id.filter(|_| ok) else {
+        st.note_failure(&email).await;
         // 口令错、账号不存在、账号被停用 —— 三者返回完全一致。
         return (
             StatusCode::UNAUTHORIZED,
@@ -258,6 +382,8 @@ pub async fn login(State(st): State<AppState>, Json(req): Json<LoginReq>) -> Res
         )
             .into_response();
     };
+    // 成功就清计数：一个人偶尔输错几次，攒够阈值就被锁在门外才是更常见的伤害。
+    st.clear_failures(&email).await;
 
     let tok = random_token();
     st.sessions

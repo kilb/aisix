@@ -72,12 +72,26 @@ pub async fn logs(
 
     Json(json!({
         "rows": rows,
+        // 只扫了最近若干行日志，所以「没有记录」有两种可能：真没调用过，或者
+        // 调用早于这个窗口。不说清楚的话用户会以为自己的请求没被记下来。
+        "window_note": format!("只在网关最近 {} 行日志里查找", limit * 8),
         "note": if rows_note(&rows) { Some("流式请求的这一行在推流开始前写下，所以 token 数为空") } else { None },
     }))
     .into_response()
 }
 
+/// 同时最多几个人在读 journal。
+///
+/// 每次调用起一个 `journalctl` 子进程读上千行。被轮询时那是实打实的主机负担，
+/// 而且没有上界 —— 一个登录用户循环调这个接口就能把 CPU 吃掉。闸设在这里而不是
+/// 按用户限速：读日志本身不改任何状态，几个人同时读没问题，怕的是并发无上限。
+static JOURNAL_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
 async fn read_journal(n: u32) -> Result<String, String> {
+    // 拿不到许可就直说「忙」，而不是排队等着 —— 排队只会让请求堆在这里。
+    let _permit = JOURNAL_GATE
+        .try_acquire()
+        .map_err(|_| "读取调用记录的请求过于集中，请稍后再试".to_string())?;
     let out = tokio::process::Command::new("journalctl")
         .args([
             "-u",

@@ -187,15 +187,28 @@ impl Ledger {
     }
 }
 
+/// 算进「总额度」的来源，SQL 的 `IN` 列表。
+///
+/// **只此一份。** 单用户那条查询与管理端的聚合查询都要用它 —— 各写一份的话两边
+/// 会各自漂移，而症状是「列表里的总额跟详情里的总额不一样」，谁也说不清哪个对。
+/// 里面全是编译期字面量，没有外部输入。
+pub(crate) const GRANT_SOURCES: &str = "('admin_grant', 'topup', 'admin_set')";
+
 /// 总额度的那条查询，可挂在任意 executor 上 —— 事务内外共用同一份语句。
 pub(crate) async fn total_granted_on<'e, E>(exec: E, user_id: &str) -> Result<i64, StoreError>
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    let (sum,): (i64,) = sqlx::query_as(
+    // **白名单，不是反筛。** 原先写的是 `source != 'consumption'`：将来加一个
+    // 「退款」「冲正」这类**扣减**性质的来源，它会被当成发放算进总额 —— 那是静默
+    // 白送。列举之后，未知来源落在总额之外：用户拿到的额度偏少，这是看得见、能
+    // 被投诉、能被修的方向。
+    //
+    // 加新来源时这里必须一起改，`来源分类必须逐个列举` 那条测试会替你记得。
+    let (sum,): (i64,) = sqlx::query_as(&format!(
         "SELECT COALESCE(SUM(delta_micro_usd), 0) FROM ledger
-         WHERE user_id = ?1 AND source != 'consumption'",
-    )
+         WHERE user_id = ?1 AND source IN {GRANT_SOURCES}"
+    ))
     .bind(user_id)
     .fetch_one(exec)
     .await?;
@@ -225,6 +238,66 @@ where
     .execute(exec)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    /// 每一个来源都必须被明确划到「算进总额」或「不算」。
+    ///
+    /// 漏掉一个的后果不对称：漏掉入账 → 用户额度偏少（看得见）；漏掉扣减 →
+    /// 静默白送（看不见）。所以这条测试要求逐个列举，而不是「除了消费都算」。
+    #[tokio::test]
+    async fn 来源分类必须逐个列举() {
+        let store = Store::open_memory().await.unwrap();
+        store.insert_user("u1", "u1@b.c", "h", None).await.unwrap();
+        let l = Ledger::new(store);
+
+        // (来源, 是否算进总额)
+        let all = [
+            (Source::AdminGrant, true),
+            (Source::Topup, true),
+            (Source::AdminSet, true),
+            (Source::Consumption, false),
+        ];
+        let mut expected = 0i64;
+        for (src, counts) in all {
+            let mut c = l.store.pool().acquire().await.unwrap();
+            insert_entry(&mut *c, "u1", 1_000, src, None).await.unwrap();
+            if counts {
+                expected += 1_000;
+            }
+            assert_eq!(
+                l.total_granted("u1").await.unwrap(),
+                expected,
+                "{} 的分类不对",
+                src.as_str()
+            );
+        }
+
+        // 一条**没被归类**的来源。将来加了新来源却忘了在这里列举，就是这个形态。
+        //
+        // 反筛（`!= 'consumption'`）会把它当成发放算进总额 —— 如果它其实是扣减
+        // 性质的，那就是静默白送。白名单让它落在总额之外：用户额度偏少，看得见。
+        sqlx::query(
+            "INSERT INTO ledger (user_id, delta_micro_usd, source, note, created_at)
+             VALUES ('u1', -5000, 'refund_reversal', NULL, '2026-08-28T00:00:00Z')",
+        )
+        .execute(l.store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            l.total_granted("u1").await.unwrap(),
+            expected,
+            "没归类的来源被算进了总额"
+        );
+        // 余额仍然把它算进去 —— 账要能重算，余额是全部流水的和。
+        assert_eq!(
+            l.balance("u1").await.unwrap(),
+            4_000 - 5_000 + 1_000 - 1_000
+        );
+    }
 }
 
 #[cfg(test)]

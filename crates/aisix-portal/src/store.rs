@@ -242,6 +242,87 @@ impl Store {
         drop_key_quota_on(&mut *c, user_id, key_name).await
     }
 
+    /// 一次查出所有用户的余额与总额度。
+    ///
+    /// 替掉「每个用户查三次」：那是 N+1，用户上千时一次列表请求要打几千次库，
+    /// 而这三个数各自一条 `GROUP BY` 就够了。
+    ///
+    /// 返回 (user_id, 余额, 总额度)。没有流水的用户不在结果里，调用方按 0 处理。
+    pub async fn all_balances(&self) -> Result<Vec<(String, i64, i64)>, StoreError> {
+        // 分类用 `ledger::GRANT_SOURCES` 那一份常量，不在这里再抄一遍。
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(&format!(
+            "SELECT user_id,
+                    COALESCE(SUM(delta_micro_usd), 0),
+                    COALESCE(SUM(CASE WHEN source IN {}
+                                      THEN delta_micro_usd ELSE 0 END), 0)
+             FROM ledger GROUP BY user_id",
+            crate::ledger::GRANT_SOURCES
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// 一次查出所有用户已分配到密钥上的额度之和。
+    pub async fn all_allocated(&self) -> Result<Vec<(String, i64)>, StoreError> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT user_id, COALESCE(SUM(micro_usd), 0) FROM key_quotas GROUP BY user_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// 某个用户名下各把密钥的累计花费。
+    pub async fn key_spend(&self, user_id: &str) -> Result<Vec<(String, i64)>, StoreError> {
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT key_name, spent_micro_usd FROM key_spend WHERE user_id = ?1")
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows)
+    }
+
+    /// 给某把密钥的累计花费加一笔。返回加完之后的值。
+    pub async fn add_key_spend(
+        &self,
+        user_id: &str,
+        key_name: &str,
+        micro: i64,
+    ) -> Result<i64, StoreError> {
+        sqlx::query(
+            "INSERT INTO key_spend (user_id, key_name, spent_micro_usd, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(user_id, key_name)
+             DO UPDATE SET spent_micro_usd = spent_micro_usd + ?3, updated_at = ?4",
+        )
+        .bind(user_id)
+        .bind(key_name)
+        .bind(micro)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        let (v,): (i64,) = sqlx::query_as(
+            "SELECT spent_micro_usd FROM key_spend WHERE user_id = ?1 AND key_name = ?2",
+        )
+        .bind(user_id)
+        .bind(key_name)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(v)
+    }
+
+    /// 清掉某把密钥的累计花费。吊销时连同额度一起清 —— 同名密钥不会复用
+    /// （名字里带 uuid），所以留着只是垃圾。
+    pub async fn drop_key_spend(&self, user_id: &str, key_name: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM key_spend WHERE user_id = ?1 AND key_name = ?2")
+            .bind(user_id)
+            .bind(key_name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// 停用或恢复一个账号。
     pub async fn set_user_disabled(&self, id: &str, disabled: bool) -> Result<(), StoreError> {
         sqlx::query("UPDATE users SET disabled = ?2 WHERE id = ?1")

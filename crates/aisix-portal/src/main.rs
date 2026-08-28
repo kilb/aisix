@@ -14,6 +14,7 @@ mod client;
 mod keys;
 mod ledger;
 mod logs;
+mod metrics;
 mod resources;
 mod store;
 mod sweeper;
@@ -95,6 +96,40 @@ async fn main() {
         resources_path,
     );
 
+    let met = metrics::Metrics::new();
+    // 指标口单独监听，不经 nginx —— 里面是运维数据，不该出现在租户能打到的
+    // 地方。默认只在环回上。
+    {
+        let m = met.clone();
+        let addr =
+            std::env::var("PORTAL_METRICS_ADDR").unwrap_or_else(|_| "127.0.0.1:8092".to_string());
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/metrics",
+                axum::routing::get(move || {
+                    let m = m.clone();
+                    async move {
+                        (
+                            [(
+                                axum::http::header::CONTENT_TYPE,
+                                "text/plain; version=0.0.4",
+                            )],
+                            m.render(),
+                        )
+                    }
+                }),
+            );
+            match tokio::net::TcpListener::bind(&addr).await {
+                Ok(l) => {
+                    println!("aisix-portal metrics on {addr}");
+                    let _ = axum::serve(l, app).await;
+                }
+                // 指标口起不来不该拖垮门户本身。
+                Err(e) => eprintln!("指标口 {addr} 监听失败: {e}"),
+            }
+        });
+    }
+
     // 对账环。周期 15 秒 —— 超支上界 ≈ 本周期内的消费 + 在途，而真正压住超支
     // 的是速率上限（设计文档 §3.2），不是这个数。
     //
@@ -106,13 +141,18 @@ async fn main() {
             sweeper::PromSource::new(prom_url),
             state.resources().clone(),
         );
+        let m = met.clone();
         tokio::spawn(async move {
             let mut tick =
                 tokio::time::interval(std::time::Duration::from_secs(sweeper::tick_secs()));
             loop {
                 tick.tick().await;
-                if let Err(e) = sw.tick(chrono::Utc::now()).await {
-                    eprintln!("对账失败（水位线未前进，下一轮窗口会更长）: {e}");
+                match sw.tick(chrono::Utc::now()).await {
+                    Ok(r) => m.record_tick(&r),
+                    Err(e) => {
+                        eprintln!("对账失败（水位线未前进，下一轮窗口会更长）: {e}");
+                        m.record_tick_error();
+                    }
                 }
             }
         });
@@ -203,6 +243,15 @@ mod testutil {
         async fn spend_in_window(
             &self,
             _user_id: &str,
+            _from: chrono::DateTime<chrono::Utc>,
+            _to: chrono::DateTime<chrono::Utc>,
+        ) -> Option<u64> {
+            Some(0)
+        }
+
+        async fn key_spend_in_window(
+            &self,
+            _api_key_id: &str,
             _from: chrono::DateTime<chrono::Utc>,
             _to: chrono::DateTime<chrono::Utc>,
         ) -> Option<u64> {
@@ -1907,6 +1956,231 @@ api_keys:
         // 只能一笔笔驳回。
         assert!(accepted <= 5, "接受了 {accepted} 笔未处理申请");
         assert!(accepted >= 1, "一笔都没接受，那是另一个 bug");
+    }
+
+    #[tokio::test]
+    async fn 过期会话既不生效_也不会一直堆着() {
+        let (_p, app) = app().await;
+        let id = signed_in(&app, "a@b.c").await;
+        // 塞一堆已经过期的条目。清理原本发生在每个请求的写锁里；改成只读之后
+        // 必须仍然有地方把它们收走，否则这个表只增不减。
+        for i in 0..50 {
+            app.state.put_session(&format!("stale-{i}"), &id, 1).await;
+        }
+        assert!(app.state.session_count().await >= 50);
+
+        // 拿一个不存在的令牌打一次 —— 未命中那条路径顺手清理。
+        let r = app
+            .http
+            .get(format!("{}/api/keys", app.base))
+            .header("cookie", "aisix_portal=nope")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 401);
+        // 只剩真正在用的那一条。
+        assert_eq!(app.state.session_count().await, 1, "过期条目没被清掉");
+
+        // 而且过期的令牌本身绝不能生效。
+        let r = app
+            .http
+            .get(format!("{}/api/keys", app.base))
+            .header("cookie", "aisix_portal=stale-0")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 401, "过期会话仍然放行");
+    }
+
+    #[tokio::test]
+    async fn 聚合查询与逐用户算出来的数一致() {
+        let (_p, app) = app().await;
+        let l = crate::ledger::Ledger::new(app.store.clone());
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let id = signed_in(&app, &format!("u{i}@b.c")).await;
+            ids.push(id.clone());
+            // 各种来源都来一笔，让「算总额」与「算余额」的差别真的体现出来。
+            app.post_admin(
+                &format!("/admin/users/{id}/quota"),
+                json!({"micro_usd": 10_000_000 + i * 1_000_000}),
+            )
+            .await;
+            app.post_admin(
+                &format!("/admin/users/{id}/grant"),
+                json!({"micro_usd": 500_000}),
+            )
+            .await;
+            let mut c = app.store.pool().acquire().await.unwrap();
+            crate::ledger::insert_entry(
+                &mut *c,
+                &id,
+                -(300_000 + i * 1_000),
+                crate::ledger::Source::Consumption,
+                None,
+            )
+            .await
+            .unwrap();
+            if i % 2 == 0 {
+                let k = mint(&app, "k").await;
+                app.put(
+                    &format!("/api/keys/{k}/quota"),
+                    json!({"micro_usd": 2_000_000}),
+                )
+                .await;
+            }
+        }
+        // 还有一个一笔流水都没有的用户 —— 聚合查询里压根没有他这一行，
+        // 调用方必须按 0 处理而不是漏掉他。
+        let quiet = signed_in(&app, "quiet@b.c").await;
+        ids.push(quiet);
+
+        // 再塞一条**没被归类**的来源。两份分类逻辑（单用户查询与聚合查询）若
+        // 各自漂移，这里就会露出来 —— 症状本来是「列表里的总额跟详情不一样」。
+        let mut c = app.store.pool().acquire().await.unwrap();
+        sqlx::query(
+            "INSERT INTO ledger (user_id, delta_micro_usd, source, note, created_at)
+             VALUES (?1, -7000, 'refund_reversal', NULL, '2026-08-28T00:00:00Z')",
+        )
+        .bind(&ids[0])
+        .execute(&mut *c)
+        .await
+        .unwrap();
+        drop(c);
+
+        let sums = app.store.all_balances().await.unwrap();
+        let allocs = app.store.all_allocated().await.unwrap();
+        for id in &ids {
+            let (b, g) = sums
+                .iter()
+                .find(|(u, _, _)| u == id)
+                .map(|(_, b, g)| (*b, *g))
+                .unwrap_or((0, 0));
+            let a = allocs
+                .iter()
+                .find(|(u, _)| u == id)
+                .map(|(_, a)| *a)
+                .unwrap_or(0);
+            assert_eq!(b, l.balance(id).await.unwrap(), "余额对不上: {id}");
+            assert_eq!(g, l.total_granted(id).await.unwrap(), "总额对不上: {id}");
+            assert_eq!(
+                a,
+                app.store.allocated_to_keys(id).await.unwrap(),
+                "已分配对不上: {id}"
+            );
+        }
+
+        // 接口输出也要能对上，包括那个没有流水的用户。
+        let (_, body) = app.get_admin("/admin/users").await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let users = v["users"].as_array().unwrap();
+        assert_eq!(users.len(), ids.len());
+        for u in users {
+            let id = u["user_id"].as_str().unwrap();
+            assert_eq!(
+                u["balance_micro_usd"].as_i64().unwrap(),
+                l.balance(id).await.unwrap()
+            );
+            assert_eq!(
+                u["granted_micro_usd"].as_i64().unwrap(),
+                l.total_granted(id).await.unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn 连续失败若干次后进入冷却_成功一次即清零() {
+        let (_p, app) = app().await;
+        signed_in(&app, "a@b.c").await;
+
+        // 前几次是普通的 401。
+        for i in 0..5 {
+            let (s, _) = app
+                .post(
+                    "/api/login",
+                    json!({"email": "a@b.c", "password": "错的口令啊啊"}),
+                )
+                .await;
+            assert_eq!(s, 401, "第 {i} 次应当是 401");
+        }
+        // 之后进冷却。**连正确口令也进不去** —— 冷却是按邮箱的，不看这次对不对，
+        // 否则爆破只要最后一次猜对就穿了。
+        let (s, _) = app
+            .post(
+                "/api/login",
+                json!({"email": "a@b.c", "password": "错的口令啊啊"}),
+            )
+            .await;
+        assert_eq!(s, 429, "连续失败之后没有进冷却");
+        let (s, _) = app
+            .post("/api/login", json!({"email": "a@b.c", "password": PW}))
+            .await;
+        assert_eq!(s, 429);
+
+        // 冷却只对这个邮箱，别人不受影响 —— 否则拿别人的邮箱刷失败就能把整个
+        // 门户的登录锁死。
+        signed_in(&app, "b@b.c").await;
+
+        // 换个没失败过的邮箱能正常登录，说明计数是按邮箱分开的。
+        let (s, _) = app
+            .post("/api/login", json!({"email": "b@b.c", "password": PW}))
+            .await;
+        assert_eq!(s, 200);
+    }
+
+    #[tokio::test]
+    async fn 失败没到阈值时_成功登录会把计数清零() {
+        let (_p, app) = app().await;
+        signed_in(&app, "a@b.c").await;
+        // 输错四次（没到阈值），成功一次，再输错四次 —— 若不清零，这里已经是
+        // 第八次失败，会被误锁。偶尔输错的正常用户就是这个形态。
+        for _ in 0..4 {
+            app.post(
+                "/api/login",
+                json!({"email": "a@b.c", "password": "错的口令啊啊"}),
+            )
+            .await;
+        }
+        assert_eq!(
+            app.post("/api/login", json!({"email": "a@b.c", "password": PW}))
+                .await
+                .0,
+            200
+        );
+        for i in 0..4 {
+            let (s, _) = app
+                .post(
+                    "/api/login",
+                    json!({"email": "a@b.c", "password": "错的口令啊啊"}),
+                )
+                .await;
+            assert_eq!(s, 401, "成功一次之后计数没清零（第 {i} 次就被锁了）");
+        }
+    }
+
+    #[tokio::test]
+    async fn 铸密钥有频率上限_但不限总数() {
+        let (_p, app) = app().await;
+        let id = signed_in(&app, "a@b.c").await;
+        app.post_admin(
+            &format!("/admin/users/{id}/quota"),
+            json!({"micro_usd": 10_000_000}),
+        )
+        .await;
+
+        let mut ok = 0;
+        let mut throttled = 0;
+        for _ in 0..15 {
+            match app.post("/api/keys", json!({"label": "k"})).await.0 {
+                201 => ok += 1,
+                429 => throttled += 1,
+                other => panic!("意外状态 {other}"),
+            }
+        }
+        // 每铸一把都要重写整份网关配置并发 SIGHUP，所以频率要有上限……
+        assert!(throttled > 0, "循环铸密钥没有被限速");
+        // ……但用户要的是「任意多把」，所以窗口内该放行的都要放行。
+        assert_eq!(ok, 10, "窗口内放行的把数不对: {ok}");
     }
 
     /// 探针 3：配置写入失败时，库里的额度不能已经被改掉。

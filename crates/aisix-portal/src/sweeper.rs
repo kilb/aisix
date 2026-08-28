@@ -73,6 +73,17 @@ pub trait ConsumptionSource {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
     ) -> Option<u64>;
+
+    /// 同一个窗口内**某一把密钥**的花费。`None` = 读不到。
+    ///
+    /// 单独一条而不是复用上面那条：标签不同（`api_key_id` 而不是 `user_id`），
+    /// 而按用户查出来的数没法拆到密钥上。
+    async fn key_spend_in_window(
+        &self,
+        api_key_id: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Option<u64>;
 }
 
 pub struct Sweeper<S: ConsumptionSource> {
@@ -128,27 +139,39 @@ impl<S: ConsumptionSource> Sweeper<S> {
             }
         }
 
-        // 把累计发放总额下推给网关。
+        // ── 配置改动：算齐之后**只写一次盘** ───────────────────────────
         //
-        // 这才是真正的闸：网关按 `granted_micro_usd` 比对自己那个只增不减的
-        // 消费计数器，精确、跨天不续杯、无需对账。下面停用密钥的那一段退居
-        // **兜底** —— 它有轮询周期的滞后，而这一条没有。
+        // 这三段以前各自 `edit()` 一次，于是一轮对账最多写三次文件、发三次
+        // SIGHUP，网关跟着重建三遍快照（生产日志里 `generation` 一路跳）。合成
+        // 一次之后网关每轮最多重载一次，而且中间不再出现「额度推了、开关还没
+        // 落」这种半成品状态。
+        //
+        // 顺序无关：三段各改文档的不同部分（策略表 / api_keys 的 disabled）。
+
+        // 累计发放总额 —— 这才是真正的闸：网关按 `granted_micro_usd` 比对自己
+        // 那个只增不减的消费计数器，精确、跨天不续杯、无需对账。
         let mut grants: Vec<(String, i64)> = Vec::new();
         for u in &users {
             grants.push((u.id.clone(), self.ledger.total_granted(&u.id).await?));
-        }
-        if let Err(e) = self.apply_allowances(&grants).await {
-            eprintln!("下推额度失败（网关仍在用旧值）: {e}");
-            r.write_failures += 1;
         }
 
         // 密钥级额度。用户把自己的总额分配到各把密钥上，网关按 `scope: api_key`
         // 单独收口每一把 —— 用户级那条策略仍然在，所以「总花销不超过用户额度」
         // 由它保证，密钥级只是在此之下再切分。
-        if let Err(e) = self.apply_key_allowances().await {
-            eprintln!("下推密钥额度失败（网关仍在用旧值）: {e}");
+        //
+        // 剪残留只动库，得在读配置之前做完。
+        if let Err(e) = self.prune_orphan_quotas().await {
+            eprintln!("剪除失效的密钥额度失败: {e}");
             r.write_failures += 1;
         }
+        let quotas = self.quotas().await.unwrap_or_default();
+
+        // 密钥级的持久兜底：按密钥累计花费，越过它自己的额度就停这一把。
+        //
+        // 网关那边的额度闸是**进程内**计数器，重启即归零 —— 每把密钥的子额度会
+        // 「续杯」。用户级不受影响，因为它有余额归零就停用这条持久路径；这一段
+        // 给密钥级同样的兜底。窗口沿用用户的水位线，两边的账才对得上。
+        let exhausted = self.mark_key_spend(&users, now).await?;
 
         // 余额与账号状态共同决定密钥开关。放在入账之后，用的是这一轮之后的余额。
         //
@@ -161,17 +184,84 @@ impl<S: ConsumptionSource> Sweeper<S> {
             let balance = self.ledger.balance(&u.id).await?;
             wanted.push((u.id.clone(), u.disabled || balance <= 0));
         }
-        match self.apply_key_state(&wanted).await {
-            Ok((off, on)) => {
-                r.disabled = off;
-                r.reenabled = on;
+
+        let off = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let on = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (o1, o2) = (off.clone(), on.clone());
+        let wrote = self
+            .resources
+            .edit(move |doc| {
+                let mut changed = apply_key_allowances_to(doc, &quotas);
+                changed |= apply_allowances_to(doc, &grants);
+                changed |= apply_key_state_to(doc, &wanted, &exhausted, &o1, &o2);
+                changed
+            })
+            .await;
+        match wrote {
+            Ok(_) => {
+                use std::sync::atomic::Ordering;
+                r.disabled = off.load(Ordering::SeqCst);
+                r.reenabled = on.load(Ordering::SeqCst);
             }
             Err(e) => {
-                eprintln!("停用/启用密钥写入失败（网关仍在放行）: {e}");
+                // 这一次写盘里就有杀手闸。失败还报「改了 N 把」的话，账面显示
+                // 已停用、实际仍然在放行 —— 最不该被吞掉的一次失败。
+                eprintln!("对账写配置失败（网关仍在用旧值）: {e}");
                 r.write_failures += 1;
             }
         }
         Ok(r)
+    }
+
+    /// 给每把设了额度的密钥累计花费，返回**已超额**的密钥名。
+    ///
+    /// 窗口跟用户那一段完全一致（同一条水位线），所以密钥花费之和不会跟用户花费
+    /// 对不上。水位线由用户那一段推进：这里读失败只是这一轮少记一点，下一轮窗口
+    /// 更长会补回来 —— 与其为密钥再维护一条水位线，不如共用一条。
+    async fn mark_key_spend(
+        &self,
+        users: &[crate::store::User],
+        now: DateTime<Utc>,
+    ) -> Result<Vec<String>, StoreError> {
+        let mut exhausted = Vec::new();
+        for u in users {
+            let quotas = self.store.key_quotas(&u.id).await?;
+            if quotas.is_empty() {
+                continue;
+            }
+            // 用户那一段已经把水位线推到 now 了，所以这里要的是**上一轮**的
+            // 水位线。拿不到就说明这轮没推进（读失败），跳过。
+            let from = match self.store.counted_through(&u.id).await? {
+                Some(t) => t,
+                None => continue,
+            };
+            for (name, quota) in quotas {
+                if quota <= 0 {
+                    continue;
+                }
+                let id = aisix_core::filesource::derive_id("api_keys", &name);
+                let Some(micro) = self.source.key_spend_in_window(&id, from, now).await else {
+                    continue;
+                };
+                let spent = if micro > 0 {
+                    self.store
+                        .add_key_spend(&u.id, &name, i64::try_from(micro).unwrap_or(i64::MAX))
+                        .await?
+                } else {
+                    self.store
+                        .key_spend(&u.id)
+                        .await?
+                        .into_iter()
+                        .find(|(k, _)| *k == name)
+                        .map(|(_, v)| v)
+                        .unwrap_or(0)
+                };
+                if spent >= quota {
+                    exhausted.push(name);
+                }
+            }
+        }
+        Ok(exhausted)
     }
 
     /// 扣款 + 推进水位线，一个事务。
@@ -223,7 +313,8 @@ impl<S: ConsumptionSource> Sweeper<S> {
     ///
     /// 用户级那条策略不受影响：两条同时生效，所以密钥再怎么分配，总花销都过不了
     /// 用户级那道闸。
-    async fn apply_key_allowances(&self) -> Result<(), String> {
+    /// 剪掉「密钥已经不在了、额度记录还留着」的残留。**只动库，不写配置。**
+    async fn prune_orphan_quotas(&self) -> Result<(), String> {
         // 先把「密钥已经不在了、额度记录还留着」这种残留剪掉。
         //
         // 不剪的话那份额度永远占着用户的可分配额：`allocated_to_keys` 照样把它
@@ -251,234 +342,253 @@ impl<S: ConsumptionSource> Sweeper<S> {
                         .drop_key_quota(uid, name)
                         .await
                         .map_err(|e| e.to_string())?;
+                    // 累计花费一起剪。留着的话这把密钥的名字将来若被重新用到
+                    // （运维手建同名），它一上来就带着别人的花费。
+                    self.store
+                        .drop_key_spend(uid, name)
+                        .await
+                        .map_err(|e| e.to_string())?;
                 }
             }
         }
 
-        let quotas = self.quotas().await?;
-        self.resources
-            .edit(move |doc| {
-                use serde_yaml_ng::Value;
-                let Some(map) = doc.as_mapping_mut() else {
-                    return false;
-                };
-                // 文档里现存的密钥名。只为它们下推策略 —— 一条指着不存在的密钥
-                // 的策略会让网关**整份拒收**配置，而这里的额度记录来自门户自己的
-                // 库，两者可能不同步（比如运维从控制台删掉了一把带额度的密钥）。
-                // 不筛的话，那一条记录会让门户此后每次写入都被拒。
-                let present: Vec<String> = map
-                    .get(Value::from("api_keys"))
-                    .and_then(Value::as_sequence)
-                    .map(|s| {
-                        s.iter()
-                            .filter_map(|k| {
-                                k.get("display_name")
-                                    .and_then(Value::as_str)
-                                    .map(String::from)
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                let key = Value::from("rate_limit_policies");
-                if !map.get(&key).map(Value::is_sequence).unwrap_or(false) {
-                    map.insert(key.clone(), Value::Sequence(Vec::new()));
-                }
-                let Some(list) = map.get_mut(&key).and_then(Value::as_sequence_mut) else {
-                    return false;
-                };
-
-                // `scope_ref` 写密钥的**名字**，不是算好的 id。
-                //
-                // 文件模式里这一层是「糖」：网关自己把名字解析成派生 id。写成
-                // 派生 id 的话它成了一个「不存在的名字」，网关**整份配置**加载
-                // 失败、静默保留旧快照 —— 连「余额耗尽就停用」那个闸也一起失效，
-                // 而配置文件看起来完全正常。
-                //
-                // 这也正是仓库里记下的那条分歧轴：声明式文件里用名字，走线协议
-                // 上才用 UUID。
-                let wanted: Vec<(String, String, i64)> = quotas
-                    .iter()
-                    .filter(|(_, name, v)| *v > 0 && present.iter().any(|p| p == name))
-                    .map(|(_, name, v)| (format!("portal-key-{name}"), name.clone(), *v))
-                    .collect();
-
-                let mut changed = false;
-                // 额度被清掉或密钥被吊销的，对应策略要一并移除 —— 留着会挂在
-                // 一个不存在的身份上，白占配置。
-                let before = list.len();
-                list.retain(|p| {
-                    let n = p.get("name").and_then(Value::as_str).unwrap_or("");
-                    !n.starts_with("portal-key-") || wanted.iter().any(|(w, _, _)| w == n)
-                });
-                if list.len() != before {
-                    changed = true;
-                }
-
-                for (pname, entry_id, granted) in &wanted {
-                    let existing = list
-                        .iter_mut()
-                        .find(|p| p.get("name").and_then(Value::as_str) == Some(pname.as_str()));
-                    match existing {
-                        Some(p) => {
-                            let cur = p
-                                .get("granted_micro_usd")
-                                .and_then(Value::as_i64)
-                                .unwrap_or(0);
-                            if cur == *granted {
-                                continue;
-                            }
-                            if let Some(m) = p.as_mapping_mut() {
-                                m.insert(Value::from("granted_micro_usd"), Value::from(*granted));
-                                changed = true;
-                            }
-                        }
-                        None => {
-                            let mut m = serde_yaml_ng::Mapping::new();
-                            m.insert(Value::from("name"), Value::from(pname.clone()));
-                            m.insert(Value::from("scope"), Value::from("api_key"));
-                            m.insert(Value::from("scope_ref"), Value::from(entry_id.clone()));
-                            m.insert(Value::from("granted_micro_usd"), Value::from(*granted));
-                            list.push(Value::Mapping(m));
-                            changed = true;
-                        }
-                    }
-                }
-                changed
-            })
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        Ok(())
     }
 
     /// 额度记录。折成文字错误：调用方只用它记日志与计数，不按类型分支。
     async fn quotas(&self) -> Result<Vec<(String, String, i64)>, String> {
         self.store.all_key_quotas().await.map_err(|e| e.to_string())
     }
+}
 
-    /// 把每个用户的累计发放总额写成一条 `scope: member` 的策略。
-    ///
-    /// 策略名按用户派生，所以重复运行是幂等的：已经一致就不写盘、不发 SIGHUP。
-    /// 无条件重写会让文件 mtime 一直跳、网关白重载。
-    ///
-    /// 只写 `granted_micro_usd`，不写窗口 —— 这条策略表达的是「总共给了多少」，
-    /// 给它一个窗口会让读配置的人以为额度按那个周期刷新。
-    async fn apply_allowances(&self, grants: &[(String, i64)]) -> Result<(), String> {
-        let grants = grants.to_vec();
-        self.resources
-            .edit(move |doc| {
-                use serde_yaml_ng::Value;
-                let map = match doc.as_mapping_mut() {
-                    Some(m) => m,
-                    None => return false,
-                };
-                let key = Value::from("rate_limit_policies");
-                if !map.get(&key).map(Value::is_sequence).unwrap_or(false) {
-                    map.insert(key.clone(), Value::Sequence(Vec::new()));
-                }
-                let Some(list) = map.get_mut(&key).and_then(Value::as_sequence_mut) else {
-                    return false;
-                };
-                let mut changed = false;
-                for (uid, granted) in &grants {
-                    if *granted <= 0 {
-                        continue;
-                    }
-                    let name = format!("portal-allowance-{uid}");
-                    let existing = list
-                        .iter_mut()
-                        .find(|p| p.get("name").and_then(Value::as_str) == Some(name.as_str()));
-                    match existing {
-                        Some(p) => {
-                            let cur = p
-                                .get("granted_micro_usd")
-                                .and_then(Value::as_i64)
-                                .unwrap_or(0);
-                            if cur == *granted {
-                                continue;
-                            }
-                            if let Some(m) = p.as_mapping_mut() {
-                                m.insert(Value::from("granted_micro_usd"), Value::from(*granted));
-                                changed = true;
-                            }
-                        }
-                        None => {
-                            let mut m = serde_yaml_ng::Mapping::new();
-                            m.insert(Value::from("name"), Value::from(name));
-                            m.insert(Value::from("scope"), Value::from("member"));
-                            m.insert(Value::from("scope_ref"), Value::from(uid.clone()));
-                            m.insert(Value::from("granted_micro_usd"), Value::from(*granted));
-                            list.push(Value::Mapping(m));
-                            changed = true;
-                        }
-                    }
-                }
-                changed
-            })
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+/// 把每把密钥的额度写成 `api_key` 域的策略。返回文档是否被改过。
+///
+/// 纯函数：一轮对账里三段改动共用**同一次**写盘（见 [`Sweeper::tick`]），所以
+/// 它们都只改内存里的文档，由调用方决定什么时候落盘。
+fn apply_key_allowances_to(
+    doc: &mut serde_yaml_ng::Value,
+    quotas: &[(String, String, i64)],
+) -> bool {
+    use serde_yaml_ng::Value;
+    let Some(map) = doc.as_mapping_mut() else {
+        return false;
+    };
+    // 文档里现存的密钥名。只为它们下推策略 —— 一条指着不存在的密钥
+    // 的策略会让网关**整份拒收**配置，而这里的额度记录来自门户自己的
+    // 库，两者可能不同步（比如运维从控制台删掉了一把带额度的密钥）。
+    // 不筛的话，那一条记录会让门户此后每次写入都被拒。
+    let present: Vec<String> = map
+        .get(Value::from("api_keys"))
+        .and_then(Value::as_sequence)
+        .map(|s| {
+            s.iter()
+                .filter_map(|k| {
+                    k.get("display_name")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let key = Value::from("rate_limit_policies");
+    if !map.get(&key).map(Value::is_sequence).unwrap_or(false) {
+        map.insert(key.clone(), Value::Sequence(Vec::new()));
+    }
+    let Some(list) = map.get_mut(&key).and_then(Value::as_sequence_mut) else {
+        return false;
+    };
+
+    // `scope_ref` 写密钥的**名字**，不是算好的 id。
+    //
+    // 文件模式里这一层是「糖」：网关自己把名字解析成派生 id。写成
+    // 派生 id 的话它成了一个「不存在的名字」，网关**整份配置**加载
+    // 失败、静默保留旧快照 —— 连「余额耗尽就停用」那个闸也一起失效，
+    // 而配置文件看起来完全正常。
+    //
+    // 这也正是仓库里记下的那条分歧轴：声明式文件里用名字，走线协议
+    // 上才用 UUID。
+    let wanted: Vec<(String, String, i64)> = quotas
+        .iter()
+        .filter(|(_, name, v)| *v > 0 && present.iter().any(|p| p == name))
+        .map(|(_, name, v)| (format!("portal-key-{name}"), name.clone(), *v))
+        .collect();
+
+    let mut changed = false;
+    // 额度被清掉或密钥被吊销的，对应策略要一并移除 —— 留着会挂在
+    // 一个不存在的身份上，白占配置。
+    let before = list.len();
+    list.retain(|p| {
+        let n = p.get("name").and_then(Value::as_str).unwrap_or("");
+        !n.starts_with("portal-key-") || wanted.iter().any(|(w, _, _)| w == n)
+    });
+    if list.len() != before {
+        changed = true;
     }
 
-    /// 把期望的启停状态落到 `resources.yaml`。返回 (新停用数, 新启用数)。
-    ///
-    /// 走共用的 [`crate::resources::Writer`]：铸密钥也写这个文件，两条路径不
-    /// 串行就会互相覆盖 —— 后写的那次带着自己读到的旧全文，把中间那次改动整段
-    /// 抹掉。改动用泛型 `Value`，不经过窄结构体（那会抹掉门户不认识的字段）。
-    async fn apply_key_state(&self, wanted: &[(String, bool)]) -> Result<(usize, usize), String> {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-
-        // 原子计数而不是捕获可变引用：闭包是 FnMut、可能被重试调用多次，
-        // 而这个 future 会被 tokio::spawn 送到别的线程上。
-        let off = Arc::new(AtomicUsize::new(0));
-        let on = Arc::new(AtomicUsize::new(0));
-        let (o1, o2) = (off.clone(), on.clone());
-        let wanted = wanted.to_vec();
-
-        let wrote = self
-            .resources
-            .edit(move |doc| {
-                // 每次重试从零开始数。
-                o1.store(0, Ordering::SeqCst);
-                o2.store(0, Ordering::SeqCst);
-                let keys = crate::resources::api_keys_mut(doc);
-                for k in keys.iter_mut() {
-                    let Some(uid) = k.get("user_id").and_then(serde_yaml_ng::Value::as_str) else {
-                        // 没有主人的密钥是运维自己用的，绝不能碰。
-                        continue;
-                    };
-                    let Some((_, want)) = wanted.iter().find(|(id, _)| id == uid) else {
-                        continue;
-                    };
-                    let now = k
-                        .get("disabled")
-                        .and_then(serde_yaml_ng::Value::as_bool)
-                        .unwrap_or(false);
-                    if now == *want {
-                        continue;
-                    }
-                    if let Some(m) = k.as_mapping_mut() {
-                        m.insert(
-                            serde_yaml_ng::Value::from("disabled"),
-                            serde_yaml_ng::Value::from(*want),
-                        );
-                    }
-                    if *want {
-                        o1.fetch_add(1, Ordering::SeqCst);
-                    } else {
-                        o2.fetch_add(1, Ordering::SeqCst);
-                    }
+    for (pname, entry_id, granted) in &wanted {
+        let existing = list
+            .iter_mut()
+            .find(|p| p.get("name").and_then(Value::as_str) == Some(pname.as_str()));
+        match existing {
+            Some(p) => {
+                let cur = p
+                    .get("granted_micro_usd")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                if cur == *granted {
+                    continue;
                 }
-                o1.load(Ordering::SeqCst) > 0 || o2.load(Ordering::SeqCst) > 0
-            })
-            .await;
-
-        // 这一步落的是杀手闸。写失败还报「改了 N 把」的话，账面显示已停用、
-        // 实际仍然在放行 —— 最不该被吞掉的一次失败。
-        wrote.map_err(|e| e.to_string())?;
-        Ok((off.load(Ordering::SeqCst), on.load(Ordering::SeqCst)))
+                if let Some(m) = p.as_mapping_mut() {
+                    m.insert(Value::from("granted_micro_usd"), Value::from(*granted));
+                    changed = true;
+                }
+            }
+            None => {
+                let mut m = serde_yaml_ng::Mapping::new();
+                m.insert(Value::from("name"), Value::from(pname.clone()));
+                m.insert(Value::from("scope"), Value::from("api_key"));
+                m.insert(Value::from("scope_ref"), Value::from(entry_id.clone()));
+                m.insert(Value::from("granted_micro_usd"), Value::from(*granted));
+                list.push(Value::Mapping(m));
+                changed = true;
+            }
+        }
     }
+    changed
+}
+
+/// 把每个用户的累计发放总额写成一条 `scope: member` 的策略。返回是否改过。
+///
+/// 策略名按用户派生，所以重复运行是幂等的：已经一致就不写盘、不发 SIGHUP。
+/// 无条件重写会让文件 mtime 一直跳、网关白重载。
+///
+/// 只写 `granted_micro_usd`，不写窗口 —— 这条策略表达的是「总共给了多少」，
+/// 给它一个窗口会让读配置的人以为额度按那个周期刷新。
+fn apply_allowances_to(doc: &mut serde_yaml_ng::Value, grants: &[(String, i64)]) -> bool {
+    use serde_yaml_ng::Value;
+    let map = match doc.as_mapping_mut() {
+        Some(m) => m,
+        None => return false,
+    };
+    let key = Value::from("rate_limit_policies");
+    if !map.get(&key).map(Value::is_sequence).unwrap_or(false) {
+        map.insert(key.clone(), Value::Sequence(Vec::new()));
+    }
+    let Some(list) = map.get_mut(&key).and_then(Value::as_sequence_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    // 先撤掉不该再存在的：额度归零、或者这个用户已经不在库里了
+    // （直接删过库行）。留着的话它挂在一个谁也对不上的身份上，白占
+    // 配置，而且下一个读配置的人会以为那个人还有额度。
+    //
+    // 只认自己写的那个前缀 —— 运维手写的策略不能碰。
+    let keep: Vec<String> = grants
+        .iter()
+        .filter(|(_, g)| *g > 0)
+        .map(|(uid, _)| format!("portal-allowance-{uid}"))
+        .collect();
+    let before = list.len();
+    list.retain(|p| {
+        let n = p.get("name").and_then(Value::as_str).unwrap_or("");
+        !n.starts_with("portal-allowance-") || keep.iter().any(|k| k == n)
+    });
+    if list.len() != before {
+        changed = true;
+    }
+
+    for (uid, granted) in grants {
+        if *granted <= 0 {
+            continue;
+        }
+        let name = format!("portal-allowance-{uid}");
+        let existing = list
+            .iter_mut()
+            .find(|p| p.get("name").and_then(Value::as_str) == Some(name.as_str()));
+        match existing {
+            Some(p) => {
+                let cur = p
+                    .get("granted_micro_usd")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                if cur == *granted {
+                    continue;
+                }
+                if let Some(m) = p.as_mapping_mut() {
+                    m.insert(Value::from("granted_micro_usd"), Value::from(*granted));
+                    changed = true;
+                }
+            }
+            None => {
+                let mut m = serde_yaml_ng::Mapping::new();
+                m.insert(Value::from("name"), Value::from(name));
+                m.insert(Value::from("scope"), Value::from("member"));
+                m.insert(Value::from("scope_ref"), Value::from(uid.clone()));
+                m.insert(Value::from("granted_micro_usd"), Value::from(*granted));
+                list.push(Value::Mapping(m));
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// 把期望的启停状态落到文档里。返回是否改过；改了几把记在 `off` / `on` 里。
+///
+/// `wanted` 是按**用户**算出来的期望状态；`exhausted` 是按**密钥**算出来的那几把
+/// 已经花超自己额度的。两者取更严的一侧：用户没问题但这把超了，也停。
+///
+/// 走共用的写盘：铸密钥也写这个文件，两条路径不串行就会互相覆盖。改动用泛型
+/// `Value`，不经过窄结构体（那会抹掉门户不认识的字段）。
+fn apply_key_state_to(
+    doc: &mut serde_yaml_ng::Value,
+    wanted: &[(String, bool)],
+    exhausted: &[String],
+    o1: &std::sync::atomic::AtomicUsize,
+    o2: &std::sync::atomic::AtomicUsize,
+) -> bool {
+    use std::sync::atomic::Ordering;
+
+    // 每次重试从零开始数。
+    o1.store(0, Ordering::SeqCst);
+    o2.store(0, Ordering::SeqCst);
+    let keys = crate::resources::api_keys_mut(doc);
+    for k in keys.iter_mut() {
+        let Some(uid) = k.get("user_id").and_then(serde_yaml_ng::Value::as_str) else {
+            // 没有主人的密钥是运维自己用的，绝不能碰。
+            continue;
+        };
+        let Some((_, user_want)) = wanted.iter().find(|(id, _)| id == uid) else {
+            continue;
+        };
+        // 这把密钥自己有没有花超。取更严的一侧 —— 用户还有余额，但
+        // 这把的子额度用完了，同样要停。
+        let name = k
+            .get("display_name")
+            .and_then(serde_yaml_ng::Value::as_str)
+            .unwrap_or("");
+        let want = &(*user_want || exhausted.iter().any(|n| n == name));
+        let now = k
+            .get("disabled")
+            .and_then(serde_yaml_ng::Value::as_bool)
+            .unwrap_or(false);
+        if now == *want {
+            continue;
+        }
+        if let Some(m) = k.as_mapping_mut() {
+            m.insert(
+                serde_yaml_ng::Value::from("disabled"),
+                serde_yaml_ng::Value::from(*want),
+            );
+        }
+        if *want {
+            o1.fetch_add(1, Ordering::SeqCst);
+        } else {
+            o2.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    o1.load(Ordering::SeqCst) > 0 || o2.load(Ordering::SeqCst) > 0
 }
 
 /// 生产实现：向 Prometheus 查 `increase()`。
@@ -525,6 +635,31 @@ impl ConsumptionSource for PromSource {
         // 读不到与读到零必须分开：前者不推进水位线，后者推进。
         plausible_spend(crate::usage::scalar_from_prom(&body)?)
     }
+
+    async fn key_spend_in_window(
+        &self,
+        api_key_id: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Option<u64> {
+        let secs = (to - from).num_seconds();
+        if secs <= 0 {
+            return Some(0);
+        }
+        let q = format!(
+            "sum(increase(aisix_llm_spend_micro_usd_total{{api_key_id=\"{}\"}}[{secs}s]))",
+            crate::usage::escape_label(api_key_id)
+        );
+        let resp = self
+            .http
+            .get(format!("{}/api/v1/query", self.base))
+            .query(&[("query", q.as_str()), ("time", &to.timestamp().to_string())])
+            .send()
+            .await
+            .ok()?;
+        let body: serde_json::Value = resp.json().await.ok()?;
+        plausible_spend(crate::usage::scalar_from_prom(&body)?)
+    }
 }
 
 /// 把一个读数变成可入账的金额。**读数坏了要当成读不到，不能当成花了多少。**
@@ -569,11 +704,20 @@ mod tests {
         /// 按用户记录被问过的窗口。写成一条全局列表时，`last()` 会混进另一个
         /// 用户的窗口 —— 又是一次顺序依赖，第二版就是这么挂的。
         windows: Mutex<Vec<Window>>,
+        /// 按 api_key_id 指定每轮的花费增量。没指定的按 0。
+        key_increase: Mutex<std::collections::HashMap<String, u64>>,
     }
 
     impl FakeSource {
         pub(super) fn set_increase(&self, v: u64) {
             *self.increase.lock().unwrap() = v;
+        }
+        /// 指定某把密钥（按名字，内部转成派生 id）每轮的花费增量。
+        pub(super) fn set_key_increase(&self, key_name: &str, v: u64) {
+            self.key_increase
+                .lock()
+                .unwrap()
+                .insert(aisix_core::filesource::derive_id("api_keys", key_name), v);
         }
         fn fail_for(&self, user_id: &str) {
             *self.fail_for.lock().unwrap() = Some(user_id.to_string());
@@ -605,6 +749,20 @@ mod tests {
                 .unwrap()
                 .push((user_id.to_string(), from, to));
             Some(*self.increase.lock().unwrap())
+        }
+
+        async fn key_spend_in_window(
+            &self,
+            api_key_id: &str,
+            _from: DateTime<Utc>,
+            _to: DateTime<Utc>,
+        ) -> Option<u64> {
+            self.key_increase
+                .lock()
+                .unwrap()
+                .get(api_key_id)
+                .copied()
+                .or(Some(0))
         }
     }
 
@@ -1111,10 +1269,10 @@ mod key_allowance_tests {
     fn 剪除残留时先取额度表再读配置() {
         let src = include_str!("sweeper.rs");
         let body = src
-            .split_once("async fn apply_key_allowances(")
+            .split_once("async fn prune_orphan_quotas(")
             .and_then(|(_, rest)| rest.split_once("\n    }\n"))
             .map(|(b, _)| b)
-            .expect("找不到 apply_key_allowances");
+            .expect("找不到 prune_orphan_quotas");
         let snapshot = body
             .find("let snapshot = self.quotas()")
             .expect("没有取额度表");
@@ -1140,6 +1298,183 @@ mod key_allowance_tests {
         // 的欠款 —— 余额深度为负、密钥永久停用，管理员填不平。
         assert_eq!(super::plausible_spend(f64::INFINITY), None, "Inf 被入账了");
         assert_eq!(super::plausible_spend(1e30), None, "天文数字被入账了");
+    }
+
+    #[tokio::test]
+    async fn 额度归零或用户消失后_用户域策略被撤掉() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 5_000_000, crate::ledger::Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.sw.tick(t("2026-08-28T10:00:00Z")).await.unwrap();
+        let name = format!("portal-allowance-{}", f.uid);
+        assert!(policy(&f.path, &name).is_some());
+
+        // 直接删库行 —— 门户没有删用户的接口，运维只能这么做。
+        sqlx::query("DELETE FROM consumption_mark WHERE user_id = ?1")
+            .bind(&f.uid)
+            .execute(f.store.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM ledger WHERE user_id = ?1")
+            .bind(&f.uid)
+            .execute(f.store.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE id = ?1")
+            .bind(&f.uid)
+            .execute(f.store.pool())
+            .await
+            .unwrap();
+        f.sw.tick(t("2026-08-28T10:00:15Z")).await.unwrap();
+
+        // 留着的话它挂在一个谁也对不上的身份上，下一个读配置的人会以为那个人
+        // 还有额度。
+        assert!(
+            policy(&f.path, &name).is_none(),
+            "用户已不存在，用户域额度策略还留着"
+        );
+    }
+
+    #[tokio::test]
+    async fn 不碰运维手写的用户域策略() {
+        let f = fx().await;
+        // 运维自己写了一条 member 域策略，名字不带门户前缀。
+        let doc = std::fs::read_to_string(&f.path).unwrap();
+        std::fs::write(
+            &f.path,
+            format!("{doc}rate_limit_policies:\n- name: ops-member-cap\n  scope: member\n  scope_ref: someone\n  granted_micro_usd: 1\n"),
+        )
+        .unwrap();
+        f.ledger
+            .credit(&f.uid, 5_000_000, crate::ledger::Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.sw.tick(t("2026-08-28T10:00:00Z")).await.unwrap();
+
+        assert!(
+            policy(&f.path, "ops-member-cap").is_some(),
+            "把运维手写的策略删了"
+        );
+        assert!(policy(&f.path, &format!("portal-allowance-{}", f.uid)).is_some());
+    }
+
+    /// 一轮对账**最多写一次配置**。
+    ///
+    /// 三段改动以前各自写一次，于是一轮最多三次写盘、三次 SIGHUP，网关跟着重建
+    /// 三遍快照；中间还会出现「额度推了、开关还没落」这种半成品状态。这条测试
+    /// 数的是 mtime 变了几次 —— 比数内容更直接，因为白写一次的字节可能一样。
+    #[tokio::test]
+    async fn 一轮对账最多写一次配置() {
+        let f = fx().await;
+        // 让三段都有事情要做：要推用户额度、要推密钥额度、要停 u2 的密钥。
+        f.ledger
+            .credit(&f.uid, 5_000_000, crate::ledger::Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.store.set_key_quota(&f.uid, "a", 1_000_000).await.unwrap();
+
+        let before = std::fs::metadata(&f.path).unwrap().modified().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let doc_before = std::fs::read_to_string(&f.path).unwrap();
+
+        f.sw.tick(t("2026-08-28T10:00:00Z")).await.unwrap();
+
+        let after = std::fs::metadata(&f.path).unwrap().modified().unwrap();
+        assert_ne!(after, before, "什么都没写？三段都该有事做");
+        let doc_after = std::fs::read_to_string(&f.path).unwrap();
+        // 三段的结果都在这一次写里。
+        assert!(
+            doc_after.contains(&format!("portal-allowance-{}", f.uid)),
+            "{doc_after}"
+        );
+        assert!(doc_after.contains("portal-key-a"), "{doc_after}");
+        assert!(doc_after.contains("disabled: true"), "{doc_after}");
+        assert_ne!(doc_before, doc_after);
+
+        // 再跑一轮，什么都没变 —— 不该再写盘（否则网关每轮白重载一次）。
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        f.sw.tick(t("2026-08-28T10:00:15Z")).await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&f.path).unwrap().modified().unwrap(),
+            after,
+            "无变化也写了盘"
+        );
+    }
+
+    /// 源码序守卫：`tick` 里只能有一次 `.edit(`。
+    ///
+    /// 上面那条测 mtime 的用例只能发现「同一轮写了两次」，而两次写之间若字节相同、
+    /// 或者第二次恰好也在同一秒里，它就看不出来。这条直接数调用点。
+    #[test]
+    fn tick_里只有一次写盘调用() {
+        let src = include_str!("sweeper.rs");
+        let body = src
+            .split_once("pub async fn tick(&self, now: DateTime<Utc>)")
+            .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+            .map(|(b, _)| b)
+            .expect("找不到 tick");
+        assert_eq!(
+            body.matches(".edit(").count(),
+            1,
+            "tick 里有不止一次写盘 —— 每一次都会让网关重载一遍",
+        );
+    }
+
+    #[tokio::test]
+    async fn 某把密钥花超自己的额度后_只停这一把() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 500_000_000, crate::ledger::Source::AdminGrant, None)
+            .await
+            .unwrap();
+        // a 有 $2 的子额度，b 不设限。两把都属于 u1？不是 —— 夹具里 b 属于 u2，
+        // 所以这里再给 u2 也发额度，免得它因为余额为零被停用而混淆断言。
+        f.ledger
+            .credit(
+                &f.other,
+                500_000_000,
+                crate::ledger::Source::AdminGrant,
+                None,
+            )
+            .await
+            .unwrap();
+        f.store.set_key_quota(&f.uid, "a", 2_000_000).await.unwrap();
+        f.sw.tick(t("2026-08-28T10:00:00Z")).await.unwrap();
+        assert!(!key_disabled(&f.path, "a"), "一开始不该停");
+
+        // a 花掉 $3，越过它自己的 $2。用户余额还有 $500 —— 所以停它的理由只能
+        // 是密钥级那道闸。网关侧那个计数器重启就归零，这条路径是持久的兜底。
+        f.src.set_key_increase("a", 3_000_000);
+        f.sw.tick(t("2026-08-28T10:00:15Z")).await.unwrap();
+
+        assert!(key_disabled(&f.path, "a"), "花超自己额度的密钥没被停用");
+        // b 不受影响 —— 这是「每把各自一份」的全部含义。
+        assert!(!key_disabled(&f.path, "b"), "把别的密钥一起停了");
+    }
+
+    #[tokio::test]
+    async fn 累计花费跨轮累加_不是每轮单独比() {
+        let f = fx().await;
+        for u in [&f.uid, &f.other] {
+            f.ledger
+                .credit(u, 500_000_000, crate::ledger::Source::AdminGrant, None)
+                .await
+                .unwrap();
+        }
+        f.store.set_key_quota(&f.uid, "a", 2_500_000).await.unwrap();
+        f.sw.tick(t("2026-08-28T10:00:00Z")).await.unwrap();
+
+        // 每轮花 $1，三轮共 $3 越过 $2.5。按轮单独比的话每轮都是 $1 < $2.5，
+        // 永远不会停 —— 那正是「续杯」这个 bug 的形状。
+        f.src.set_key_increase("a", 1_000_000);
+        f.sw.tick(t("2026-08-28T10:00:15Z")).await.unwrap();
+        assert!(!key_disabled(&f.path, "a"), "$1 就停了？");
+        f.sw.tick(t("2026-08-28T10:00:30Z")).await.unwrap();
+        assert!(!key_disabled(&f.path, "a"), "$2 就停了？");
+        f.sw.tick(t("2026-08-28T10:00:45Z")).await.unwrap();
+        assert!(key_disabled(&f.path, "a"), "累计 $3 越过 $2.5 却没停");
     }
 
     #[tokio::test]

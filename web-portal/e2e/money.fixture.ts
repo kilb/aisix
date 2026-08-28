@@ -71,6 +71,8 @@ export interface MoneyFixture {
   proxyUrl: string;
   metricsUrl: string;
   portalUrl: string;
+  /** 门户自己的指标口。与主端口分开，不经 nginx 暴露。 */
+  portalMetricsUrl: string;
   resourcesPath: string;
   userId: string;
   readResources(): string;
@@ -120,6 +122,7 @@ export async function startMoney(): Promise<MoneyFixture> {
   const metricsPort = await freePort();
   const promPort = await freePort();
   const portalPort = await freePort();
+  const portalMetricsPort = await freePort();
 
   // 桩上游：OpenAI 兼容的应答，带固定 usage 让花费可预期。
   //
@@ -277,6 +280,7 @@ export async function startMoney(): Promise<MoneyFixture> {
         // 一条用例要跨四个状态、每个等一轮对账。15 秒一轮会把超时预算吃光，
         // 而那种失败长得跟真 bug 一样。调快是让测试更确定，不是放宽断言。
         PORTAL_TICK_SECS: "2",
+        PORTAL_METRICS_ADDR: `127.0.0.1:${portalMetricsPort}`,
         AISIX_RESOURCES: resourcesPath,
       },
       stdio: "inherit",
@@ -326,6 +330,7 @@ observability:
     proxyUrl: `http://127.0.0.1:${proxyPort}`,
     metricsUrl,
     portalUrl,
+    portalMetricsUrl: `http://127.0.0.1:${portalMetricsPort}/metrics`,
     resourcesPath,
     userId,
     readResources: () => readFileSync(resourcesPath, "utf8"),
