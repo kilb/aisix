@@ -123,6 +123,31 @@ export function Users() {
     );
   }
 
+  /**
+   * 停用或恢复一个账号。
+   *
+   * 停用同时挡住两侧：他登不进门户，名下密钥也会在下一轮对账后被网关拒绝。
+   * 之前这个开关只能直接改库 —— 那是运维手术，而这张表已经在显示「已停用」了。
+   */
+  async function suspend(u: PortalUser) {
+    setBusy(true);
+    setErr(null);
+    setDone(null);
+    try {
+      await api.portalSuspend(u.user_id, !u.disabled);
+      setDone(
+        u.disabled
+          ? `已恢复 ${u.email}，名下密钥会在下一轮对账后重新可用`
+          : `已停用 ${u.email}，名下密钥会在下一轮对账后被拒绝`,
+      );
+      await load();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "操作失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function decide(id: number, d: "approve" | "reject") {
     setBusy(true);
     setErr(null);
@@ -274,6 +299,7 @@ export function Users() {
                   <th className="right">余额</th>
                   <th className="right">已分配到密钥</th>
                   <th>状态</th>
+                  <th />
                 </tr>
               </thead>
               <tbody>
@@ -292,6 +318,15 @@ export function Users() {
                         : u.balance_micro_usd <= 0
                           ? "额度已用完"
                           : "正常"}
+                    </td>
+                    <td className="right">
+                      <button
+                        className="ghost"
+                        disabled={busy}
+                        onClick={() => void suspend(u)}
+                      >
+                        {u.disabled ? "恢复" : "停用"}
+                      </button>
                     </td>
                   </tr>
                 ))}

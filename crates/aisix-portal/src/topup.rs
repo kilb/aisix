@@ -33,6 +33,9 @@ type TopupRow = (
 );
 
 /// 单笔充值的上限。不是风控，是防手滑 —— 多打两个零在这种表单里很常见。
+/// 单个用户同时未处理的充值申请数上限。
+const MAX_PENDING_TOPUPS: i64 = 5;
+
 /// 单笔金额上限（$10,000）。充值申请与管理员设额度共用同一个数 —— 两处各自
 /// 定一个的话，迟早只有一处被调。
 pub const MAX_TOPUP_MICRO_USD: i64 = 10_000_000_000;
@@ -60,6 +63,21 @@ pub async fn create(
     }
     if req.micro_usd > MAX_TOPUP_MICRO_USD {
         return bad("单笔充值金额过大，请联系管理员");
+    }
+    // 未处理的申请有个数上限。不设的话，一个登录用户可以一直提，把管理员的待办
+    // 列表和这张表一起刷爆 —— 而管理员没法批量清理（只能一笔笔驳回）。
+    match sqlx::query_as::<_, (i64,)>(
+        "SELECT COUNT(*) FROM topups WHERE user_id = ?1 AND status = 'pending'",
+    )
+    .bind(&uid)
+    .fetch_one(st.store.pool())
+    .await
+    {
+        Ok((n,)) if n >= MAX_PENDING_TOPUPS => {
+            return bad("你还有未处理的充值申请，请等管理员处理完再提交");
+        }
+        Ok(_) => {}
+        Err(_) => return server_error("读取失败"),
     }
     match sqlx::query(
         "INSERT INTO topups (user_id, micro_usd, note, created_at)

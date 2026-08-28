@@ -257,6 +257,16 @@ async fn portal_grant(
     portal_user_action(st, headers, &user_id, "grant", body).await
 }
 
+/// `POST /api/portal/users/{id}/suspend` —— 停用或恢复一个门户账号。
+async fn portal_suspend(
+    State(st): State<AppState>,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    portal_user_action(st, headers, &user_id, "suspend", body).await
+}
+
 /// `POST /api/portal/users/{id}/quota` —— 把某个用户的总额度**设定**成某个数。
 ///
 /// 跟发放的区别是绝对值与增量：发放是「再给他 5 块」，设定是「他一共 5 块」。
@@ -1310,6 +1320,7 @@ async fn main() {
         .route("/api/portal/users", get(portal_users))
         .route("/api/portal/users/{id}/grant", post(portal_grant))
         .route("/api/portal/users/{id}/quota", post(portal_set_quota))
+        .route("/api/portal/users/{id}/suspend", post(portal_suspend))
         .route("/api/portal/topups", get(portal_topups))
         .route("/api/portal/topups/{id}/{decision}", post(portal_decide_topup))
         .route("/api/mint-key", post(api_mint_key))
@@ -1461,7 +1472,7 @@ mod tests {
             production.contains("action: &'static str"),
             "转发的路径段不是编译期字面量 —— 调用方就能摆布它",
         );
-        for lit in ["\"grant\"", "\"quota\""] {
+        for lit in ["\"grant\"", "\"quota\"", "\"suspend\""] {
             assert!(
                 production.contains(&format!(
                     "portal_user_action(st, headers, &user_id, {lit}, body)"
@@ -1505,6 +1516,7 @@ mod tests {
             "async fn portal_users(",
             "async fn portal_grant(",
             "async fn portal_set_quota(",
+            "async fn portal_suspend(",
             "async fn portal_topups(",
             "async fn portal_decide_topup(",
         ] {

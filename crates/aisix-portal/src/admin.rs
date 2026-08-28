@@ -23,6 +23,12 @@ pub(crate) fn admin_ok(st: &AppState, headers: &HeaderMap) -> bool {
         // 没配管理凭据就整个关掉，而不是放行。默认拒绝。
         return false;
     };
+    // 空凭据也当没配。启动时已经把空串滤掉了，这里再挡一次：判定放在这个函数
+    // 里，才不依赖「构造 AppState 的每一条路径都记得过滤」。空串对空串的常量
+    // 时间比较是 true —— 那等于管理端对所有人敞开。
+    if expected.is_empty() {
+        return false;
+    }
     let Some(got) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -183,6 +189,66 @@ pub async fn set_quota(
 }
 
 #[derive(Deserialize)]
+pub struct SuspendReq {
+    /// true = 停用，false = 恢复。
+    pub disabled: bool,
+}
+
+/// `POST /admin/users/{id}/suspend` —— 停用或恢复一个账号。
+///
+/// 停用会同时切断两侧：他登不进门户（会话每次都查这个字段），名下的密钥也会在
+/// 下一轮对账里被写成停用，网关据此拒绝。恢复则反过来。
+///
+/// 这个开关必须有接口。字段本身早就在，对账环也认它，但此前只能直接改库 ——
+/// 那是运维手术，不是产品功能；而控制台已经把这种账号显示成「已停用」了。
+pub async fn suspend(
+    State(st): State<AppState>,
+    Path(user_id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<SuspendReq>,
+) -> Response {
+    if !admin_ok(&st, &headers) {
+        return forbidden();
+    }
+    match st.store.user_by_id(&user_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "没有这个用户"})),
+            )
+                .into_response()
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "读取失败"})),
+            )
+                .into_response()
+        }
+    }
+    match st.store.set_user_disabled(&user_id, req.disabled).await {
+        Ok(()) => Json(json!({
+            "ok": true,
+            "disabled": req.disabled,
+            // 密钥的启停由下一轮对账落到配置里，不是这一刻。说清楚，免得管理员
+            // 以为按下去就立刻断流。
+            "note": if req.disabled {
+                "已停用；名下密钥会在下一轮对账（最多一个周期）后被网关拒绝"
+            } else {
+                "已恢复；名下密钥会在下一轮对账后重新可用"
+            },
+        }))
+        .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "写入失败"})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
 pub struct GrantReq {
     /// 有意用 `i64` 而不是 `u64`：负数要能进来，才能被明确拒绝并回 400。
     /// 收成 u64 的话反序列化会先失败，错误信息对调用方毫无意义。
@@ -255,5 +321,56 @@ pub async fn grant(
             Json(json!({"error": "记账失败"})),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod admin_ok_tests {
+    use super::*;
+    use crate::auth::AppState;
+    use crate::store::Store;
+
+    async fn state(token: Option<&str>) -> AppState {
+        AppState::with_admin_token(
+            Store::open_memory().await.unwrap(),
+            1,
+            token.map(str::to_string),
+        )
+    }
+
+    fn bearer(v: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, v.parse().unwrap());
+        h
+    }
+
+    /// 空凭据必须等同于没配。
+    ///
+    /// **这不是一条能打到的攻击路径**：实测 hyper 会把头值尾部的空白裁掉，所以
+    /// `Authorization: Bearer ` 到达时是 `Bearer`，`strip_prefix("Bearer ")` 直接
+    /// 返回 `None`，走不到比较那一步。挡在这里是因为这个函数的契约本身就该是
+    /// 「空凭据 = 关闭」—— 它不该依赖上游某一层恰好帮忙做了归一化。启动时也
+    /// 已经把空串滤成 `None`，这是第二道。
+    #[tokio::test]
+    async fn 空凭据不等于人人可过() {
+        let st = state(Some("")).await;
+        assert!(!admin_ok(&st, &bearer("Bearer ")), "空凭据放行了");
+        assert!(!admin_ok(&st, &bearer("Bearer")), "空凭据放行了");
+        assert!(!admin_ok(&st, &HeaderMap::new()));
+    }
+
+    #[tokio::test]
+    async fn 正常凭据仍然可过_错的不行() {
+        let st = state(Some("s3cret-token")).await;
+        assert!(admin_ok(&st, &bearer("Bearer s3cret-token")));
+        assert!(!admin_ok(&st, &bearer("Bearer s3cret-toke")));
+        assert!(!admin_ok(&st, &bearer("Bearer s3cret-tokenX")));
+        // **等长但不同**。上面两条都被长度检查挡在比较之前，只有这一条真的走到
+        // 逐字节那一步 —— 少了它，把比较改成恒真也照样绿。
+        assert!(
+            !admin_ok(&st, &bearer("Bearer s3cret-tokeX")),
+            "等长的错误凭据被放行了"
+        );
+        assert!(!admin_ok(&st, &bearer("s3cret-token")));
     }
 }

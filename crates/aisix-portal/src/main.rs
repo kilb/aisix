@@ -53,6 +53,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/users", get(admin::list_users))
         .route("/admin/users/{id}/grant", post(admin::grant))
         .route("/admin/users/{id}/quota", post(admin::set_quota))
+        .route("/admin/users/{id}/suspend", post(admin::suspend))
         .with_state(state)
 }
 
@@ -68,9 +69,18 @@ async fn main() {
     };
 
     // 没配管理凭据时管理端整个关闭 —— 默认拒绝，而不是默认放行。
-    let admin_token = std::env::var("PORTAL_ADMIN_TOKEN").ok();
+    //
+    // **空串等于没配。** `env::var(..).ok()` 会把 `PORTAL_ADMIN_TOKEN=` 变成
+    // `Some("")`，而请求头 `Authorization: Bearer ` 去掉前缀后也是空串，两个空串
+    // 常量时间比较为真 —— 于是「凭据配错」变成了「管理端对所有人敞开」，任何人
+    // 都能给自己发额度。部署模板漏填就是这个形态。控制台那边对口令散列写的正是
+    // `Ok(h) if !h.is_empty()`，这里跟上。
+    let admin_token = std::env::var("PORTAL_ADMIN_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
     if admin_token.is_none() {
-        eprintln!("PORTAL_ADMIN_TOKEN 未设置——管理端接口已关闭");
+        eprintln!("PORTAL_ADMIN_TOKEN 未设置或为空——管理端接口已关闭");
     }
     let prom_url =
         std::env::var("PROMETHEUS_URL").unwrap_or_else(|_| "http://127.0.0.1:9090".into());
@@ -1876,6 +1886,27 @@ api_keys:
             .await;
         assert_eq!(s, 400, "过长的名称被接受了");
         assert!(!app.resources().contains(&"长".repeat(500)));
+    }
+
+    #[tokio::test]
+    async fn 未处理的充值申请有个数上限() {
+        let (_p, app) = app().await;
+        signed_in(&app, "a@b.c").await;
+        let mut accepted = 0;
+        for _ in 0..10 {
+            if app
+                .post("/api/topups", json!({"micro_usd": 1_000_000}))
+                .await
+                .0
+                == 201
+            {
+                accepted += 1;
+            }
+        }
+        // 不设上限的话，一个登录用户能一直提，把管理员的待办列表刷爆，而管理员
+        // 只能一笔笔驳回。
+        assert!(accepted <= 5, "接受了 {accepted} 笔未处理申请");
+        assert!(accepted >= 1, "一笔都没接受，那是另一个 bug");
     }
 
     /// 探针 3：配置写入失败时，库里的额度不能已经被改掉。

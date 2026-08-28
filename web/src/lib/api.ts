@@ -252,6 +252,16 @@ export async function portalSetQuota(
   if (!r.ok) throw new ApiError(await errorOf(r), r.status);
 }
 
+/** 停用或恢复一个门户账号。停用会同时挡住登录与他名下密钥的调用。 */
+export async function portalSuspend(userId: string, disabled: boolean): Promise<void> {
+  const r = await req(`/api/portal/users/${encodeURIComponent(userId)}/suspend`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ disabled }),
+  });
+  if (!r.ok) throw new ApiError(await errorOf(r), r.status);
+}
+
 export async function portalGrant(
   userId: string,
   microUsd: number,

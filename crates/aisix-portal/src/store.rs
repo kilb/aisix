@@ -242,6 +242,16 @@ impl Store {
         drop_key_quota_on(&mut *c, user_id, key_name).await
     }
 
+    /// 停用或恢复一个账号。
+    pub async fn set_user_disabled(&self, id: &str, disabled: bool) -> Result<(), StoreError> {
+        sqlx::query("UPDATE users SET disabled = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(i64::from(disabled))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// 已计入流水的截止时刻。`None` = 还没对过账。
     pub async fn counted_through(
         &self,

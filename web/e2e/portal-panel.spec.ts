@@ -148,3 +148,33 @@ test("已分配超过总额度时_面板明确说出来", async ({ page }) => {
   await expect(page.getByText(/超过了总额度/)).toBeVisible();
   expect(await granted(uid)).toBe(3_000_000);
 });
+
+test("停用与恢复一个账号_两侧同时生效", async ({ page }) => {
+  const email = mail("suspend");
+  const uid = await register(email);
+  await openPanel(page);
+
+  const row = page.locator("tbody tr", { hasText: email });
+  // 刚注册、还没发额度，所以状态是「额度已用完」而不是「正常」。
+  await expect(row).toContainText("额度已用完");
+  await row.getByRole("button", { name: "停用" }).click();
+  await expect(page.getByText(/已停用/).first()).toBeVisible();
+  await expect(row).toContainText("已停用");
+
+  // 门户侧：登不进去。这个开关此前只能直接改库。
+  const login = await fetch(`${fx.portalUrl}/api/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email, password: "correct horse battery staple" }),
+  });
+  expect(login.status, "停用后仍然能登录").toBe(401);
+
+  await row.getByRole("button", { name: "恢复" }).click();
+  await expect(row).toContainText("额度已用完");
+  const again = await fetch(`${fx.portalUrl}/api/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email, password: "correct horse battery staple" }),
+  });
+  expect(again.status, "恢复后仍然登不进去").toBe(200);
+});
