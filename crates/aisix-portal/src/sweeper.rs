@@ -523,9 +523,30 @@ impl ConsumptionSource for PromSource {
             .ok()?;
         let body: serde_json::Value = resp.json().await.ok()?;
         // 读不到与读到零必须分开：前者不推进水位线，后者推进。
-        let v = crate::usage::scalar_from_prom(&body)?;
-        Some(v.max(0.0) as u64)
+        plausible_spend(crate::usage::scalar_from_prom(&body)?)
     }
+}
+
+/// 把一个读数变成可入账的金额。**读数坏了要当成读不到，不能当成花了多少。**
+///
+/// 两个坏值都是真会出现的：
+///
+/// * `NaN` —— 旧写法 `v.max(0.0)` 会把它变成 0，于是水位线照常推进，而那段窗口
+///   里真实发生的消费被永久跳过，账面上什么异常都看不出来。
+/// * `+Inf` 或大得离谱的有限值 —— `as u64` 是饱和转换，会得到 `u64::MAX`，接着
+///   给这个用户记一笔 `i64::MAX` 的欠款：余额深度为负、密钥永久停用，而管理员
+///   没有任何数能把它填平。
+///
+/// 返回 `None` 就是走「读不到」那条既有分支：水位线原地不动，下一轮用更长的窗口
+/// 重来，`increase()` 在更长的窗口上照样正确。
+///
+/// 负数仍然按 0 处理：`increase()` 在计数器上不该为负，一点点负值是外推的舍入，
+/// 当成「这段没花钱」比卡住水位线更合适。
+fn plausible_spend(v: f64) -> Option<u64> {
+    if !v.is_finite() || v > i64::MAX as f64 {
+        return None;
+    }
+    Some(v.max(0.0) as u64)
 }
 
 #[cfg(test)]
@@ -1104,6 +1125,21 @@ mod key_allowance_tests {
             snapshot < read,
             "先读了配置才取额度表 —— 中间新设的额度会被当成残留删掉",
         );
+    }
+
+    #[test]
+    fn 坏读数当成读不到_而不是零也不是天文数字() {
+        assert_eq!(super::plausible_spend(1_500.0), Some(1_500));
+        assert_eq!(super::plausible_spend(0.0), Some(0));
+        // 负的按 0：increase() 不该为负，一点点负值是外推舍入。
+        assert_eq!(super::plausible_spend(-3.0), Some(0));
+
+        // NaN 当成 0 的话，水位线照推，那段窗口的真实消费永久丢失。
+        assert_eq!(super::plausible_spend(f64::NAN), None, "NaN 被当成了花了 0");
+        // +Inf / 超大值经 `as u64` 饱和成 u64::MAX，会给用户记一笔 i64::MAX
+        // 的欠款 —— 余额深度为负、密钥永久停用，管理员填不平。
+        assert_eq!(super::plausible_spend(f64::INFINITY), None, "Inf 被入账了");
+        assert_eq!(super::plausible_spend(1e30), None, "天文数字被入账了");
     }
 
     #[tokio::test]

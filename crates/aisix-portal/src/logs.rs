@@ -59,7 +59,15 @@ pub async fn logs(
     // 多取一些再过滤：journald 没法按 tracing 的行内字段筛。
     let rows = match read_journal(limit * 8).await {
         Ok(text) => filter(&text, &mine, limit),
-        Err(e) => return (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
+        // 同上：journalctl 的 stderr 里可能带着主机路径与单元名，只写日志。
+        Err(e) => {
+            eprintln!("读取调用记录失败: {e}");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "暂时读不到调用记录，请稍后再试"})),
+            )
+                .into_response();
+        }
     };
 
     Json(json!({

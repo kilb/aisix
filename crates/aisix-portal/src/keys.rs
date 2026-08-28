@@ -382,12 +382,60 @@ fn server_error(msg: &str) -> Response {
         .into_response()
 }
 
+/// 写配置失败时给调用方的应答。
+///
+/// **细节只进日志，不进响应体。** `WouldBreakGateway` 的原文来自网关的加载器，
+/// 它在报「引用了不存在的密钥」时会把**文件里所有已知密钥名**列出来做提示 ——
+/// 那里面有别的租户的密钥名；`Io` 的原文里带着服务端的文件路径。两者都不该出现
+/// 在一个租户能看到的地方。运维要的那份细节写到 stderr。
 fn write_failed(e: WriteError) -> Response {
-    let code = match e {
-        WriteError::Contended => StatusCode::CONFLICT,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    let (code, msg) = match &e {
+        WriteError::Contended => (StatusCode::CONFLICT, "配置正被改写，请重试"),
+        WriteError::WouldBreakGateway(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "这次改动没有生效，请联系管理员",
+        ),
+        WriteError::Io(_) | WriteError::Parse(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "配置读写失败")
+        }
     };
-    (code, Json(json!({"error": e.to_string()}))).into_response()
+    eprintln!("门户写配置失败: {e}");
+    (code, Json(json!({"error": msg}))).into_response()
+}
+
+#[cfg(test)]
+mod error_body_tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    async fn body_of(r: Response) -> String {
+        String::from_utf8_lossy(&to_bytes(r.into_body(), 64 * 1024).await.unwrap()).to_string()
+    }
+
+    /// 写配置失败的应答里不能带上加载器原文。
+    ///
+    /// 那段原文在报「引用了不存在的密钥」时会把文件里**所有**已知密钥名列出来
+    /// 当提示 —— 里面有别的租户的密钥名。这是一个租户能看到的响应体。
+    #[tokio::test]
+    async fn 写配置失败的应答不泄漏别人的密钥名与服务端路径() {
+        let leaky = "resources file /etc/aisix/resources.yaml: 1 error(s):\n               - rate_limit_policies[1]: `scope_ref` references unknown api key \"portal-aaa · 我的\"              (defined api_keys: default, portal-bbb · 别人的密钥, portal-ccc · 又一个人的)";
+        let r = write_failed(WriteError::WouldBreakGateway(leaky.to_string()));
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_of(r).await;
+        for secret in ["portal-bbb", "别人的密钥", "portal-ccc", "/etc/aisix"] {
+            assert!(!body.contains(secret), "应答里泄漏了 {secret}: {body}");
+        }
+
+        let r = write_failed(WriteError::Io(
+            "写入 /var/lib/aisix-console/resources.yaml 失败: 权限不足".into(),
+        ));
+        let body = body_of(r).await;
+        assert!(!body.contains("/var/lib"), "应答里泄漏了服务端路径: {body}");
+
+        // 冲突这一类本来就没有敏感内容，仍然要能被区分出来（409，可以重试）。
+        let r = write_failed(WriteError::Contended);
+        assert_eq!(r.status(), StatusCode::CONFLICT);
+    }
 }
 
 #[cfg(test)]
