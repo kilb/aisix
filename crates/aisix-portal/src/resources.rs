@@ -117,6 +117,20 @@ impl Writer {
             let before = self.read().await?;
             let mut doc: Value =
                 serde_yaml_ng::from_str(&before).map_err(|e| WriteError::Parse(e.to_string()))?;
+            // **根必须是映射，在调闭包之前挡住。**
+            //
+            // 空文件解析成 `Null` 而不是报错，而闭包里的 `api_keys_mut` 会对
+            // 非映射的根 panic。调用方有两类：用户请求（铸密钥、吊销）panic 是
+            // 一次 500；**对账环**里 panic 会把那个 spawn 出去的任务整个杀掉 ——
+            // 计费从此停摆，没有任何东西会说出来，直到有人重启门户。
+            //
+            // 挡在这里而不是让每个闭包各自小心：闭包有三个，写第四个的人不会
+            // 想到这件事。
+            if !doc.is_mapping() {
+                return Err(WriteError::Parse(
+                    "配置的根不是映射（空文件也算）——不敢在它上面改东西".into(),
+                ));
+            }
             if !edit(&mut doc) {
                 return Ok(false);
             }
@@ -148,23 +162,35 @@ impl Writer {
 /// 临时文件放在**同目录**：跨文件系统 rename 会失败。写完先 fsync，否则崩溃后
 /// 可能 rename 已生效而内容还没落盘。
 async fn write_atomic(path: &str, body: &str) -> Result<(), WriteError> {
+    // tokio 的 OpenOptions 自带 mode()，不需要 OpenOptionsExt。
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::AsyncWriteExt;
+
     let tmp = format!("{path}.tmp-{}", uuid::Uuid::new_v4());
     let io = |e: std::io::Error| WriteError::Io(e.to_string());
-    // 保留原文件的权限：新建的临时文件默认是 0644，直接 rename 过去会把
-    // 0600 的配置放宽 —— 那份文件里有密钥散列。
-    let perm = tokio::fs::metadata(path)
+    // **建的时候就带上正确权限**，不是建完再改。
+    //
+    // 沿用原文件的权限（rename 会把临时文件的权限一并带过去，所以运维设的 0600
+    // 不能被降级）；原文件还不存在时默认 0600 —— 这份内容里有密钥散列，按 umask
+    // 建成 0644 等于第一次写就把它摊开。控制台那条路径早就是这么做的。
+    //
+    // 先建后改也能得到最终权限，但中间有一小段窗口文件是 0644 的。
+    let mode = tokio::fs::metadata(path)
         .await
-        .ok()
-        .map(|m| m.permissions());
-    let mut f = tokio::fs::File::create(&tmp).await.map_err(io)?;
-    use tokio::io::AsyncWriteExt;
+        .map(|m| m.permissions().mode() & 0o777)
+        .unwrap_or(0o600);
+    let mut f = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&tmp)
+        .await
+        .map_err(io)?;
     let r = async {
         f.write_all(body.as_bytes()).await.map_err(io)?;
+        // rename 之前落盘：崩在写与 rename 之间会让网关读到半截文件。
         f.sync_all().await.map_err(io)?;
         drop(f);
-        if let Some(p) = perm {
-            tokio::fs::set_permissions(&tmp, p).await.map_err(io)?;
-        }
         tokio::fs::rename(&tmp, path).await.map_err(io)
     }
     .await;
@@ -231,8 +257,13 @@ async fn signal_reload() {
 }
 
 /// 取出 `api_keys` 序列（不存在则就地建一个空的）。
+///
+/// 只能在 [`Writer::edit`] 的闭包里调用 —— 那里已经确认过根是映射。别处调用
+/// 要自己先确认，否则这里会 panic。
 pub fn api_keys_mut(doc: &mut Value) -> &mut Vec<Value> {
-    let map = doc.as_mapping_mut().expect("配置根不是映射");
+    let map = doc
+        .as_mapping_mut()
+        .expect("根不是映射；Writer::edit 已在调用闭包前挡住这种文档");
     let k = Value::from("api_keys");
     if !map.get(&k).map(Value::is_sequence).unwrap_or(false) {
         map.insert(k.clone(), Value::Sequence(Vec::new()));
@@ -568,6 +599,47 @@ api_keys:
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "权限被放宽成了 {mode:o}");
         let _ = std::fs::remove_file(path);
+    }
+
+    /// 根不是映射的配置（空文件就是这种）不能让写入路径 panic。
+    ///
+    /// 这个闭包跑在 `edit` 里，而 `edit` 的调用方有两类：用户请求（铸密钥、
+    /// 吊销）和**对账环**。前者 panic 是一次 500，后者 panic 会把那个 spawn 出去
+    /// 的任务整个杀掉 —— 计费从此停摆，没有任何东西会说出来，直到有人重启门户。
+    #[tokio::test]
+    async fn 根不是映射时报错而不是崩掉() {
+        for body in ["", "- 1\n- 2\n", "just a string\n"] {
+            let (w, path) = writer_with(body).await;
+            let r = w
+                .edit(|d| {
+                    api_keys_mut(d).push(Value::from("x"));
+                    true
+                })
+                .await;
+            assert!(
+                matches!(r, Err(WriteError::Parse(_))),
+                "{body:?} 应当报错，实际: {r:?}"
+            );
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// 目标文件还不存在时，新写出的那份必须是 0600。
+    ///
+    /// 这份内容里有密钥散列。按 umask 建成 0644 等于第一次写就把它摊开，而且
+    /// 之后每次 rename 都会把这个权限延续下去 —— 一次疏忽会一直留着。
+    #[tokio::test]
+    async fn 文件不存在时新写出的配置是_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aisix-first-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("resources.yaml").to_string_lossy().to_string();
+        // 目标不存在。`edit` 会先读，读不到就直接报错，所以这里调底层的写。
+        super::write_atomic(&path, "api_keys: []\n").await.unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "新写出的配置权限是 {mode:o}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

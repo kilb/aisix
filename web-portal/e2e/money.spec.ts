@@ -438,3 +438,42 @@ test("从未产生流量的用户_水位线照样推进_失败计数不涨", asy
     `从未产生流量的用户让读取失败计数从 ${before} 涨到了 ${after}`,
   ).toBe(before);
 });
+
+test("对账环某一轮 panic_不会让它从此停摆", async () => {
+  // 这条测的是「任务还活着」，只能用真进程验：单测里 panic 会直接让用例失败，
+  // 看不到「循环是否继续」。
+  //
+  // 造一份根不是映射的配置（空文件就是），那是写入路径上唯一已知会 panic 的
+  // 形态。循环若不隔离每一轮，这个任务就没了 —— 计费从此停摆，而进程还活着、
+  // 接口照常应答，没有任何东西会说出来。
+  const ticksOf = async () => {
+    const text = await fetch(fx.portalMetricsUrl).then((r) => r.text());
+    return Number(
+      text
+        .split("\n")
+        .find((l) => l.startsWith("aisix_portal_reconcile_ticks_total "))
+        ?.split(" ")[1] ?? -1,
+    );
+  };
+  // 根不是映射时 `edit` 直接报错 —— 那是「写没落下去、网关还在用旧配置」，
+  // 算写入失败，不是整轮失败。计数器选错就会等一个永远不涨的数。
+  const writeFailsOf = async () => {
+    const text = await fetch(fx.portalMetricsUrl).then((r) => r.text());
+    return Number(
+      text
+        .split("\n")
+        .find((l) => l.startsWith("aisix_portal_config_write_failures_total "))
+        ?.split(" ")[1] ?? -1,
+    );
+  };
+
+  const good = fx.readResources();
+  const t0 = await ticksOf();
+  const e0 = await writeFailsOf();
+  fx.writeResources("");
+  // 几轮之后：要么算成功、要么算失败，但**必须还在跑**。
+  await waitFor(async () => (await writeFailsOf()) > e0, "坏配置被记成一次写入失败");
+  fx.writeResources(good);
+  fx.reloadGateway();
+  await waitFor(async () => (await ticksOf()) > t0 + 2, "对账环在坏配置之后仍然在跑");
+});

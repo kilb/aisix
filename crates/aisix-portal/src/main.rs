@@ -136,21 +136,36 @@ async fn main() {
     // 用 `state` 手里那个 Writer，不另建一个：铸密钥与停用密钥都写同一个文件，
     // 两条路径必须共用同一把串行锁，否则会互相覆盖。
     {
-        let sw = sweeper::Sweeper::new(
+        // Arc：每一轮把它交给一个子任务（见下面的 panic 兜底）。
+        let sw = std::sync::Arc::new(sweeper::Sweeper::new(
             store.clone(),
             sweeper::PromSource::new(prom_url),
             state.resources().clone(),
-        );
+        ));
         let m = met.clone();
         tokio::spawn(async move {
             let mut tick =
                 tokio::time::interval(std::time::Duration::from_secs(sweeper::tick_secs()));
             loop {
                 tick.tick().await;
-                match sw.tick(chrono::Utc::now()).await {
-                    Ok(r) => m.record_tick(&r),
-                    Err(e) => {
+                // **一轮里的 panic 不能杀掉整个循环。**
+                //
+                // 这个循环本身是 spawn 出去的：里面 panic，任务就没了，之后再也
+                // 没有对账 —— 计费、额度下推、密钥启停全部停摆，而进程还好好活
+                // 着、接口照常应答，没有任何东西会说出来。
+                //
+                // 每一轮再 spawn 一层：tokio 会把子任务的 panic 收成 `JoinError`
+                // 交回来，循环因此活得下去。这比一个依赖换来的 `catch_unwind`
+                // 更省事，行为也一样。
+                let once = sw.clone();
+                match tokio::spawn(async move { once.tick(chrono::Utc::now()).await }).await {
+                    Ok(Ok(r)) => m.record_tick(&r),
+                    Ok(Err(e)) => {
                         eprintln!("对账失败（水位线未前进，下一轮窗口会更长）: {e}");
+                        m.record_tick_error();
+                    }
+                    Err(e) => {
+                        eprintln!("对账这一轮没跑完（{e}），下一轮继续");
                         m.record_tick_error();
                     }
                 }
