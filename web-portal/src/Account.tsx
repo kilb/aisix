@@ -104,9 +104,8 @@ export function Account({ sess, onOut }: { sess: api.Session; onOut: () => void 
 
       {err && <div className="note crit">{err}</div>}
 
-      {/* 未绑定密钥是一期最容易被忽略的状态：管理员手输 user_id 填错时，
-          用量恒为 0 —— 跟「还没开始用」在屏幕上没有区别，而它实际意味着
-          这个人在免费用。所以它显式占一整条横幅，而不是一个角落里的小字。 */}
+      {/* 「一把密钥都没有」最容易被忽略：用量恒为 0，跟「还没开始用」在屏幕上
+          没有区别。所以它显式占一整条横幅，而不是一个角落里的小字。 */}
       {use?.note && <div className="note warn">{use.note}</div>}
 
       <Topup onChanged={() => void load()} />
@@ -125,7 +124,7 @@ export function Account({ sess, onOut }: { sess: api.Session; onOut: () => void 
               foot={
                 bal && bal.balance_micro_usd <= 0
                   ? "余额已耗尽，密钥已停用。补充额度后会自动恢复。"
-                  : "额度由管理员发放"
+                  : "额度由管理员分配"
               }
             />
           </div>

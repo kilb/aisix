@@ -146,6 +146,13 @@ async fn main() {
         tokio::spawn(async move {
             let mut tick =
                 tokio::time::interval(std::time::Duration::from_secs(sweeper::tick_secs()));
+            // **跳过错过的轮次，不要补齐。**
+            //
+            // `interval` 默认是 Burst：一轮跑超时之后，错过的几轮会背靠背立刻
+            // 补上。对账是幂等的，补齐没有意义 —— 而它恰好在系统刚吃力过的那
+            // 一刻，再压上一串满负荷的对账（每轮 N 个用户的 Prometheus 查询加
+            // 一次写盘）。跳过就是「下一班车照常发」。
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
                 // **一轮里的 panic 不能杀掉整个循环。**
@@ -900,7 +907,7 @@ mod usage_tests {
     }
 
     #[tokio::test]
-    async fn 没有密钥携带本人_user_id_时明确报出未绑定() {
+    async fn 一把密钥都没有时明确说出来并给出下一步() {
         let prom = FakeProm::start().await;
         // 配置里有两把密钥，但都不属于即将注册的这个人。
         let path = temp_resources(&doc("someone-1", "someone-2"));
@@ -911,15 +918,17 @@ mod usage_tests {
 
         let (_, body) = app.get("/api/usage").await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        // 这是 user_id 填错时唯一能被人看见的地方。没有这条，管理员打错一个
-        // 字符的后果就是「用量一直是 0」—— 跟「还没开始用」在屏幕上没有区别，
-        // 而它实际意味着这个人在免费用。
+        // 「一把密钥都没有」时用量恒为 0，跟「还没开始用」在屏幕上没有区别。
+        // 所以必须明确说出来，并且给出**当前**可执行的下一步。
         assert_eq!(v["linked_keys"], json!(0));
-        assert!(body.contains("未绑定"), "{body}");
+        assert!(body.contains("还没有密钥"), "{body}");
+        assert!(body.contains("创建一把"), "{body}");
+        // 这句话曾经是「请让管理员创建密钥」—— 用户能自助建之后，照做只会白等。
+        assert!(!body.contains("让管理员创建密钥"), "{body}");
     }
 
     #[tokio::test]
-    async fn 有密钥绑定时不再报未绑定_且计出停用数() {
+    async fn 有密钥时不再报没有密钥_且计出停用数() {
         let prom = FakeProm::start().await;
         let app = TestApp::start_with_usage(&prom, &temp_resources("api_keys: []")).await;
         let me = app.register("a@b.c", PW).await;
@@ -951,9 +960,9 @@ mod usage_tests {
 
         let (_, body) = app.get("/api/usage").await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        // 保守方向：读不到就报未绑定，促使人去看，而不是让人以为一切正常。
+        // 保守方向：读不到就当成「没有密钥」，促使人去看，而不是让人以为一切正常。
         assert_eq!(v["linked_keys"], json!(0));
-        assert!(body.contains("未绑定"));
+        assert!(body.contains("还没有密钥"));
     }
 }
 
@@ -2110,6 +2119,23 @@ api_keys:
                 l.total_granted(id).await.unwrap()
             );
         }
+    }
+
+    /// 对账环错过的轮次必须跳过，不能背靠背补齐。
+    ///
+    /// 钉源码而不是去测时序：要测出 Burst 与 Skip 的差别，得让一轮真的超时，
+    /// 那种测试要么很慢要么很脆。这里要守的是一个明确的选择。
+    #[test]
+    fn 对账环跳过错过的轮次而不是补齐() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(src);
+        assert!(
+            production.contains("MissedTickBehavior::Skip"),
+            "对账环用的是默认的 Burst —— 一轮超时之后会背靠背补齐，正好压在系统刚吃力过的时候",
+        );
     }
 
     #[tokio::test]

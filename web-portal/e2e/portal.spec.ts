@@ -89,7 +89,14 @@ test("没有密钥绑到本人时门户明确说未绑定", async ({ page }) => 
   // 这是管理员把 user_id 填错时唯一能被人看见的地方。没有它，
   // 「用量一直是 0」跟「还没开始用」在屏幕上没有区别 —— 而它实际意味着
   // 这个人在免费用。
-  await expect(page.getByText(/未绑定任何密钥/)).toBeVisible();
+  // 这条横幅要给出**当前**可执行的下一步。它曾经写的是「请让管理员创建密钥」，
+  // 而用户能自助建密钥之后，照着做只会白等。
+  //
+  // 指名那条横幅：密钥面板里也有一句「还没有密钥」，两处都匹配会撞上严格模式。
+  const banner = page.locator(".note.warn", { hasText: "还没有密钥" });
+  await expect(banner).toBeVisible();
+  await expect(banner).toContainText("创建一把");
+  await expect(page.getByText(/让管理员创建密钥/)).toHaveCount(0);
   await expect(page.getByText("已绑定密钥")).toBeVisible();
 });
 
