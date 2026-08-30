@@ -87,6 +87,10 @@ export interface MoneyFixture {
   chatStream(plaintext: string): Promise<number>;
   /** 打一次 `/v1/embeddings`。这个端点的记账路径与 chat 完全不同。 */
   embed(plaintext: string): Promise<number>;
+  /** 用指定模型打一次 chat（比如语义路由）。`stream` 为真时走 SSE。 */
+  chatModel(plaintext: string, model: string, stream?: boolean): Promise<number>;
+  /** 桩上游至今收到的嵌入调用次数。 */
+  embedCallCount(): number;
   /**
    * 让门户对某把密钥的花费**失明**：PromQL 垫片对这把密钥的查询恒回 0。
    *
@@ -101,7 +105,12 @@ export interface MoneyFixture {
    * 这三个端点各有自己的流式记账调用点。只驱动 chat 的话，另两个端点上的同类
    * 漏洞会一直绿着 —— 而它们分别是 Claude Code 与 Codex 的流量入口。
    */
-  streamOn(endpoint: "messages" | "responses", plaintext: string): Promise<number>;
+  streamOn(
+    endpoint: "messages" | "responses",
+    plaintext: string,
+    model?: string,
+    stream?: boolean,
+  ): Promise<number>;
   /**
    * 给网关发 SIGHUP，让它重读配置。
    *
@@ -212,6 +221,9 @@ export async function startMoney(): Promise<MoneyFixture> {
   const portalPort = await freePort();
   const portalMetricsPort = await freePort();
 
+  /** 桩上游收到的嵌入调用次数。语义路由每次分类都会打一发。 */
+  let embedCalls = 0;
+
   // 桩上游：OpenAI 兼容的应答，带固定 usage 让花费可预期。
   //
   // 请求带 `stream: true` 时回 SSE。流式与非流式在网关里走的是**两条**记账
@@ -229,12 +241,28 @@ export async function startMoney(): Promise<MoneyFixture> {
       }
       // 嵌入接口是另一种形状：没有 choices，usage 只有 prompt/total。
       if ((req.url ?? "").includes("/embeddings")) {
+        embedCalls += 1;
+        // **每个输入回一个向量**：语义路由会把 prompt 与所有未缓存的样例批在
+        // 一次调用里，回少了网关会正确地判成畸形应答并整条降级 —— 那样就测不到
+        // 分类路径了。
+        let n = 1;
+        try {
+          const inp = JSON.parse(body || "{}").input;
+          n = Array.isArray(inp) ? inp.length : 1;
+        } catch {
+          /* 按 1 个算 */
+        }
         res.writeHead(200, { "content-type": "application/json" });
         res.end(
           JSON.stringify({
             object: "list",
             model: "embed-1",
-            data: [{ object: "embedding", index: 0, embedding: [0.1, 0.2, 0.3] }],
+            data: Array.from({ length: n }, (_, i) => ({
+              object: "embedding",
+              index: i,
+              // 全部相同：余弦相似度恒为 1，于是必定命中那条路由。
+              embedding: [0.1, 0.2, 0.3],
+            })),
             // 1000 输入 token，配上 $0.5/1k 的定价 → 单次 $0.50。
             usage: { prompt_tokens: 1000, total_tokens: 1000 },
           }),
@@ -477,6 +505,23 @@ observability:
     async chatStream(plaintext: string) {
       return chatWith(proxyPort, plaintext, true);
     },
+    async chatModel(plaintext: string, model: string, stream = false) {
+      const r = await fetch(`http://127.0.0.1:${proxyPort}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${plaintext}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: "user", content: "hello" }],
+          ...(stream ? { stream: true } : {}),
+        }),
+      });
+      await r.text();
+      return r.status;
+    },
+    embedCallCount: () => embedCalls,
     async embed(plaintext: string) {
       const r = await fetch(`http://127.0.0.1:${proxyPort}/v1/embeddings`, {
         method: "POST",
@@ -492,16 +537,16 @@ observability:
     blindPortalTo(keyName: string) {
       blind.add(deriveKeyId(keyName));
     },
-    async streamOn(endpoint, plaintext) {
+    async streamOn(endpoint, plaintext, model = "gpt-4o-mini", stream = true) {
       const body =
         endpoint === "messages"
           ? {
-              model: "gpt-4o-mini",
+              model,
               max_tokens: 16,
-              stream: true,
+              ...(stream ? { stream: true } : {}),
               messages: [{ role: "user", content: "hi" }],
             }
-          : { model: "gpt-4o-mini", stream: true, input: "hi" };
+          : { model, ...(stream ? { stream: true } : {}), input: "hi" };
       const r = await fetch(`http://127.0.0.1:${proxyPort}/v1/${endpoint}`, {
         method: "POST",
         headers: {
@@ -592,6 +637,21 @@ models:
     cost:
       input_per_1k: 0.5
       output_per_1k: 0.5
+  - display_name: routed-1
+    routing:
+      strategy: round_robin
+      targets:
+        - model: gpt-4o-mini
+  - display_name: semantic-1
+    semantic:
+      embedding_model: embed-1
+      default: gpt-4o-mini
+      match:
+        threshold: 0.99
+      routes:
+        - name: only
+          target: gpt-4o-mini
+          examples: ["hello"]
 api_keys:
   - display_name: e2e-caller
     key_hash: "${keyHash}"

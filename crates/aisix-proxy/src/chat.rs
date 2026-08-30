@@ -2709,6 +2709,14 @@ async fn dispatch(
     // to populate the `x-aisix-served-by` response header for routing
     // requests (#410). Stays `None` until an attempt wins.
     let mut chosen_target_display_name: Option<String> = None;
+    // Entry id of the winning target. **Pricing resolves against the
+    // DISPATCHED row, not the caller-addressed one** — for a routing group
+    // or a semantic router the addressed entry is a virtual parent with no
+    // `cost`, so pricing against it silently yields 0: no spend series, no
+    // allowance consumed, no budget enforced. Equal to `model_id` for a
+    // direct model, which is why it went unnoticed. The streaming branch
+    // already carries the winner's id (`winner_target_id`, #790).
+    let mut chosen_target_id: Option<String> = None;
     let mut upstream: Option<aisix_gateway::ChatResponse> = None;
     let retry_on_429 = virtual_entry
         .value
@@ -2887,6 +2895,7 @@ async fn dispatch(
                     chosen_upstream_model =
                         Some(model.upstream_model().unwrap_or("unknown").to_string());
                     chosen_target_display_name = Some(model.display_name.clone());
+                    chosen_target_id = Some(attempt.id.clone());
                     routing.record(
                         state,
                         AttemptRecord {
@@ -3076,7 +3085,10 @@ async fn dispatch(
     // 算在提交之前：同一个数字既进用量事件，也进花费层的计数器。
     let cost_usd = crate::usage_attr::request_cost_usd(
         snapshot,
-        &model_id,
+        // 调度到的那一行，不是调用方点名的那一行：路由组与语义路由的父行没有
+        // `cost`，按它定价就是恒 0 —— 花费指标为空、额度不被消耗、预算形同虚设。
+        // 直连模型下两者相等，所以这个洞一直没被看见。
+        chosen_target_id.as_deref().unwrap_or(&model_id),
         crate::usage_attr::input_tokens_for_pricing(
             prompt,
             u64::from(cached_prompt_tokens),

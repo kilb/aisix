@@ -511,3 +511,40 @@ test("嵌入接口的花费同样计入额度_它的记账路径与_chat_完全�
   expect(body, body).toContain("billing_error");
   expect(body, body).toContain("allowance exhausted");
 });
+
+test("经路由组与语义路由的花费照样计入_不管流不流式", async () => {
+  // **两个模型身份**：调用方点名的那一行（可能是虚拟父行）与实际调度到的那一行。
+  // 定价必须按后者解析 —— 路由组与语义路由的父行没有 `cost`，按父行定价就是恒 0：
+  // 花费指标为空、额度不被消耗、门户永远不扣款。直连模型下两者相等，所以这个洞
+  // 在只驱动直连模型的测试里永远看不见。
+  //
+  // chat 的非流式路径曾经就是这样，而流式那条一直是对的 —— 所以六格都要量。
+  const cookie = await fx.sessionCookie();
+  await setQuota(1_000_000_000);
+  const k = await mint(cookie, "身份");
+
+  const sumSpend = async () => {
+    const m = await fetch(fx.metricsUrl).then((r) => r.text());
+    return m
+      .split("\n")
+      .filter((l) => l.startsWith("aisix_llm_spend_micro_usd_total{"))
+      .reduce((a, l) => a + (Number(l.slice(l.lastIndexOf("}") + 1).trim()) || 0), 0);
+  };
+  // 先热一次：语义路由第一次要把样例也嵌入一遍，且要让密钥被启用。
+  await waitFor(async () => (await fx.chatModel(k.plaintext, "gpt-4o-mini")) === 200, "密钥可用");
+
+  for (const [label, model, stream] of [
+    ["直连 非流式", "gpt-4o-mini", false],
+    ["直连 流式", "gpt-4o-mini", true],
+    ["路由组 非流式", "routed-1", false],
+    ["路由组 流式", "routed-1", true],
+    ["语义 非流式", "semantic-1", false],
+    ["语义 流式", "semantic-1", true],
+  ] as const) {
+    const before = await sumSpend();
+    expect(await fx.chatModel(k.plaintext, model, stream), label).toBe(200);
+    const delta = (await sumSpend()) - before;
+    // 每次调用 1000 输入 + 1000 输出，两边都是 $0.5/1k → 恰好 $1.00。
+    expect(delta, `${label} 记的花费是 ${delta}`).toBe(1_000_000);
+  }
+});
