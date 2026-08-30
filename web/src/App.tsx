@@ -73,7 +73,7 @@ export function App() {
           </p>
           <p className="hint">
             两者是分开部署的：界面是 <code>web/</code> 的构建产物（由 nginx
-            托管），后端是 <code>aisix-console</code> 二进制。只更新了一侧就会
+            托管），后端是 <code>aisix-console</code> 二进制。只更新了一侧就会{""}
             出现这个状态。
           </p>
           <p className="hint">

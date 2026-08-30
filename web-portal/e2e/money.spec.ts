@@ -477,3 +477,37 @@ test("对账环某一轮 panic_不会让它从此停摆", async () => {
   fx.reloadGateway();
   await waitFor(async () => (await ticksOf()) > t0 + 2, "对账环在坏配置之后仍然在跑");
 });
+
+test("嵌入接口的花费同样计入额度_它的记账路径与_chat_完全不同", async () => {
+  // 仓库反复吃过的亏：只驱动 /v1/chat/completions 的 e2e 会一直绿，而兄弟端点
+  // 静默不记账。嵌入这条路的用量形状都不一样（没有 choices、没有输出 token），
+  // 定价与提交都是另一段代码。
+  const cookie = await fx.sessionCookie();
+  await setQuota(1_000_000_000);
+  const k = await mint(cookie, "嵌入");
+  fx.blindPortalTo(`${k.name} · 嵌入`); // 隔离出网关那道闸
+  await waitFor(async () => (await fx.embed(k.plaintext)) === 200, "新密钥可用");
+
+  // 每次 1000 输入 token × $0.5/1k = $0.50。给 $1，第三次就该被拒。
+  expect((await setKeyQuota(cookie, k.name, 1_000_000)).status).toBe(200);
+  await waitFor(async () => {
+    const doc = fx.readResources();
+    return doc.includes(`portal-key-${k.name}`);
+  }, "密钥额度被推下去");
+
+  await waitFor(
+    async () => (await fx.embed(k.plaintext)) === 429,
+    "嵌入把额度用尽后被网关拒绝",
+  );
+
+  // 拒绝要是「钱用完了」而不是「太快了」—— 两者同为 429，处置完全不同。
+  const r = await fetch(`${fx.proxyUrl}/v1/embeddings`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${k.plaintext}`, "content-type": "application/json" },
+    body: JSON.stringify({ model: "embed-1", input: "hello" }),
+  });
+  const body = await r.text();
+  expect(r.status).toBe(429);
+  expect(body, body).toContain("billing_error");
+  expect(body, body).toContain("allowance exhausted");
+});

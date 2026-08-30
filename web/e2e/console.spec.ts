@@ -249,6 +249,43 @@ test("列表里的密钥被遮蔽，只显示两端", async ({ page }) => {
   await expect(row).toContainText("…");
 });
 
+test("没有定价的模型被明确点名_并说清它对计费意味着什么", async ({ page }) => {
+  await signIn(page);
+  await page.getByRole("tab", { name: "模型" }).click();
+  // 夹具里的 seed-model 就没有定价。表格里它只显示「未设」—— 读起来像「还没
+  // 填」，而实际含义是「门户用户用它不计费、额度不会被扣、密钥不会被停用」。
+  const warn = page.locator(".note.warn", { hasText: "没有定价" });
+  await expect(warn).toBeVisible();
+  await expect(warn).toContainText("seed-model");
+  await expect(warn).toContainText("不会被扣额度");
+  await expect(warn).toContainText("密钥也不会被停用");
+});
+
+/**
+ * 中文句子中间不能有多余空格。
+ *
+ * JSX 把源码里的换行折成一个空格。英文里那正好是词间距，中文里就是句子中间凭空
+ * 多出一个洞 —— 而它只在**渲染后**看得见，源码读起来完全正常。整个前端曾经有
+ * 六处这样的洞，写的时候一处都没察觉。
+ *
+ * 扫构建产物而不是源码：要判断的正是折叠之后的样子。
+ */
+test("构建产物里没有夹在汉字中间的空格", async () => {
+  const { readFileSync, readdirSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const dir = join(process.cwd(), "dist", "assets");
+  const js = readdirSync(dir).filter((f) => f.endsWith(".js"));
+  expect(js.length).toBeGreaterThan(0);
+  const offenders = new Set<string>();
+  for (const f of js) {
+    const text = readFileSync(join(dir, f), "utf8");
+    for (const m of text.match(/[\u4e00-\u9fff]{2,} [\u4e00-\u9fff]{2,}/g) ?? []) {
+      offenders.add(m);
+    }
+  }
+  expect([...offenders], "这些是 JSX 换行折出来的空格，把那一行结尾补上 {\"\"}").toEqual([]);
+});
+
 test("只填一半的定价被拦下，且不写入配置", async ({ page }) => {
   await signIn(page);
   await page.getByRole("tab", { name: "模型与定价" }).click();

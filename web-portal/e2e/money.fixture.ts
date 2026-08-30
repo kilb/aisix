@@ -85,6 +85,8 @@ export interface MoneyFixture {
   chatWith(plaintext: string): Promise<number>;
   /** 打一次**流式** chat。流式的记账走的是另一条路径。 */
   chatStream(plaintext: string): Promise<number>;
+  /** 打一次 `/v1/embeddings`。这个端点的记账路径与 chat 完全不同。 */
+  embed(plaintext: string): Promise<number>;
   /**
    * 让门户对某把密钥的花费**失明**：PromQL 垫片对这把密钥的查询恒回 0。
    *
@@ -224,6 +226,20 @@ export async function startMoney(): Promise<MoneyFixture> {
         wantsStream = JSON.parse(body || "{}").stream === true;
       } catch {
         /* 不是 JSON 就按非流式回 */
+      }
+      // 嵌入接口是另一种形状：没有 choices，usage 只有 prompt/total。
+      if ((req.url ?? "").includes("/embeddings")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            object: "list",
+            model: "embed-1",
+            data: [{ object: "embedding", index: 0, embedding: [0.1, 0.2, 0.3] }],
+            // 1000 输入 token，配上 $0.5/1k 的定价 → 单次 $0.50。
+            usage: { prompt_tokens: 1000, total_tokens: 1000 },
+          }),
+        );
+        return;
       }
       if (wantsStream) {
         res.writeHead(200, {
@@ -461,6 +477,18 @@ observability:
     async chatStream(plaintext: string) {
       return chatWith(proxyPort, plaintext, true);
     },
+    async embed(plaintext: string) {
+      const r = await fetch(`http://127.0.0.1:${proxyPort}/v1/embeddings`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${plaintext}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ model: "embed-1", input: "hello" }),
+      });
+      await r.text();
+      return r.status;
+    },
     blindPortalTo(keyName: string) {
       blind.add(deriveKeyId(keyName));
     },
@@ -552,6 +580,15 @@ models:
     provider: openai
     provider_key: stub
     model_name: gpt-4o-mini
+    cost:
+      input_per_1k: 0.5
+      output_per_1k: 0.5
+  - display_name: embed-1
+    provider: openai
+    provider_key: stub
+    model_name: text-embedding-3-small
+    embedding:
+      dimensions: 3
     cost:
       input_per_1k: 0.5
       output_per_1k: 0.5

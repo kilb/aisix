@@ -31,6 +31,25 @@ function Price({ v }: { v: unknown }) {
   return <>${Number(v).toFixed(5)}</>;
 }
 
+/**
+ * 没有完整定价的模型名。
+ *
+ * 「未设」在表格里只是两个字，读起来像「还没填」。它的实际含义要重得多：网关
+ * 对未定价的模型按花费 0 记账，于是**所有按花费设的闸都对它无效** —— 门户用户
+ * 的额度不会被扣、余额不会归零、密钥不会被停用。一个模型漏填定价，等于给所有
+ * 自助用户开了一条不计费的通道，而账面上什么异常都看不出来。
+ *
+ * 只填一半也算未定价：网关要求输入价与输出价同时存在。
+ */
+function unpricedModels(models: Record<string, unknown>[]): string[] {
+  return models
+    .filter((m) => {
+      const c = m.cost as Record<string, unknown> | undefined;
+      return c?.input_per_1k == null || c?.output_per_1k == null;
+    })
+    .map((m) => String(m.display_name ?? ""));
+}
+
 export function Models({ doc }: { doc: DocState }) {
   const { note, setNote, busy, run } = useSave(doc);
   const models = (doc.doc?.models as Record<string, unknown>[] | undefined) ?? [];
@@ -143,6 +162,13 @@ export function Models({ doc }: { doc: DocState }) {
     <>
       <div className="panel">
         <h2>模型与定价</h2>
+        {unpricedModels(models).length > 0 && (
+          <div className="note warn">
+            <strong>{unpricedModels(models).join("、")}</strong> 没有定价。网关对未定价的{""}
+            模型按花费 0 记账，所以按花费设的闸对它们无效 —— 门户用户用这些模型不会{""}
+            被扣额度、余额不会归零、密钥也不会被停用。
+          </div>
+        )}
         <p className="hint">
           这里的价就是网关折算花费用的数字（USD / 千 token）。没填价的模型，花费统计恒为
           0 —— 不是没花钱，是没有价可算。

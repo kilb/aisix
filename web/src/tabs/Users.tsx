@@ -170,7 +170,7 @@ export function Users() {
         <div className="panel">
           <h2>待确认的充值单</h2>
           <p className="hint">
-            核对到账后确认，<strong>确认那一刻才入账</strong>。同一笔被重复确认时
+            核对到账后确认，<strong>确认那一刻才入账</strong>。同一笔被重复确认时{""}
             服务端会拒绝第二次，不会重复入账。
           </p>
           <div className="scroll">
@@ -222,8 +222,8 @@ export function Users() {
       <div className="panel">
         <h2>用户额度</h2>
         <p className="hint">
-          额度挂在用户身上，他名下的密钥共用这一份。用户可以在门户里给每把密钥
-          单独设额度，各把之和不会超过这里设的总额。总额被消耗完时那些密钥会被
+          额度挂在用户身上，他名下的密钥共用这一份。用户可以在门户里给每把密钥{""}
+          单独设额度，各把之和不会超过这里设的总额。总额被消耗完时那些密钥会被{""}
           自动停用，调高之后自动恢复。
         </p>
         <div className="r">
