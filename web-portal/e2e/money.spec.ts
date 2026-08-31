@@ -606,6 +606,62 @@ test("语义路由的分类调用被计入花费_按嵌入模型自己的标签"
   expect(line, line).toContain('endpoint="/v1/embeddings"');
 });
 
+test("三个端点上_命中缓存都不该收钱", async () => {
+  // 命中缓存意味着这次请求没有打上游，网关没为它付过一分钱 —— 那这次请求就
+  // 不该记花费，与调用方用的是哪个 SDK 无关。上面那条用例已经把 chat 的这个
+  // 契约钉住了；同一个问题在 `/v1/messages`（Claude Code 的入口）和
+  // `/v1/responses`（Codex 的入口）上是各自一套记账代码，只驱动 chat 的话，
+  // 那两条即使收错钱也会一直绿着。
+  //
+  // 用一个普通直连模型 + 开缓存来量：语义那条同时带着分类调用的花费，量不出
+  // 「命中本身收了多少」。
+  const cookie = await fx.sessionCookie();
+  await setQuota(1_000_000_000);
+  const k = await mint(cookie, "命中不收钱");
+
+  const spendOf = async (model: string) => {
+    const m = await fetch(fx.metricsUrl).then((r) => r.text());
+    return m
+      .split("\n")
+      .filter(
+        (l) =>
+          l.startsWith("aisix_llm_spend_micro_usd_total{") && l.includes(`model="${model}"`),
+      )
+      .reduce((a, l) => a + (Number(l.slice(l.lastIndexOf("}") + 1).trim()) || 0), 0);
+  };
+
+  for (const endpoint of ["chat", "messages", "responses"] as const) {
+    // 第一次：未命中，走上游，该收钱。缓存按「端点 + 模型 + 请求体」分键，
+    // 所以每个端点的第一发都是各自的未命中。
+    await waitFor(
+      async () => (await fx.callOn(endpoint, k.plaintext, "cached-direct")) === 200,
+      `${endpoint} 上 cached-direct 可用`,
+    );
+    const miss = await spendOf("cached-direct");
+    expect(miss, `${endpoint}：未命中那一发没记花费`).toBeGreaterThan(0);
+
+    // 第二次：同样的请求体，应当命中缓存 —— 没打上游，就不该再收一次。
+    expect(await fx.callOn(endpoint, k.plaintext, "cached-direct")).toBe(200);
+    const hit = await spendOf("cached-direct");
+    expect(hit - miss, `${endpoint}：命中缓存却还是收了钱`).toBe(0);
+  }
+
+  // 流式的契约是**另一条**：实测下来三个端点的流式请求都不进缓存闸（缓存
+  // 事件一条都不记，连 miss 都没有），所以每一发都是真打上游、每一发都该
+  // 收钱。这里把它钉住，是为了哪天缓存开始服务流式时这条会红 —— 那时计费
+  // 侧必须跟着改，否则真实流量（Claude Code 与 Codex 都是流式）会被重复收费。
+  for (const endpoint of ["messages", "responses"] as const) {
+    await waitFor(
+      async () => (await fx.streamOn(endpoint, k.plaintext, "cached-direct", true)) === 200,
+      `${endpoint} 上 cached-direct 的流式可用`,
+    );
+    const one = await spendOf("cached-direct");
+    expect(await fx.streamOn(endpoint, k.plaintext, "cached-direct", true)).toBe(200);
+    const two = await spendOf("cached-direct");
+    expect(two - one, `${endpoint} 流式：第二发没记花费，说明它被缓存服务了`).toBe(1_000_000);
+  }
+});
+
 test("命中缓存时不收_chat_的钱_但分类那一发照收", async () => {
   // 语义路由为了决定路由，在查缓存**之前**就打了一发嵌入调用。命中缓存的那条
   // 分支原先走 `commit_tokens_no_spend(0)`，于是那笔分类花费从额度里掉了出去

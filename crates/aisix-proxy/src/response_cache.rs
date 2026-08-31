@@ -69,6 +69,19 @@ impl CacheTelemetry {
         }
     }
 
+    /// Whether this request's usage event should carry the upstream price.
+    ///
+    /// 命中缓存的请求没有打上游，网关没为它付过一分钱 —— 所以它的花费是 0，
+    /// 而不是「把重放的 token 按价目表再算一遍」。`/v1/chat/completions` 一直
+    /// 是这个契约（命中分支上直接写 `cost_usd: 0.0`，并把重放的 token 记进
+    /// `cache_hit_saved_*` 供控制面算省了多少）；按 `CacheTelemetry` 记账的
+    /// 另外两个端点走这个判据，免得三条路径各写各的、再各自漂一次。
+    ///
+    /// 命中时 token 计数照报：它们是「这次省下了多少」的依据，只有价钱是 0。
+    pub(crate) fn bills_upstream_cost(&self) -> bool {
+        !matches!(self.status, CacheStatus::Hit)
+    }
+
     /// `cache_hit_layer` for the usage event — this gate is exact-only.
     pub(crate) fn layer(&self) -> String {
         if matches!(self.status, CacheStatus::Hit) {

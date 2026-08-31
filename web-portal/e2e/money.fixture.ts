@@ -112,6 +112,15 @@ export interface MoneyFixture {
     stream?: boolean,
   ): Promise<number>;
   /**
+   * 打一次**非流式**请求，三个端点同形状 —— 用来把同一件事在三条家族路径上
+   * 各量一遍。计费问题往往只落在其中一条上，而另两条静默地不一样。
+   */
+  callOn(
+    endpoint: "chat" | "messages" | "responses",
+    plaintext: string,
+    model: string,
+  ): Promise<number>;
+  /**
    * 给网关发 SIGHUP，让它重读配置。
    *
    * 用例直接改 resources.yaml 时必须自己发这个信号 —— 平时是门户的对账环在
@@ -178,7 +187,11 @@ function assertFresh(bin: string, crateDirs: string[]): void {
     for (const e of entries) {
       const full = join(dir, e.name);
       if (e.isDirectory()) walk(full);
-      else if (e.name.endsWith(".rs") || e.name.endsWith(".sql")) {
+      else if (
+        e.name.endsWith(".rs") ||
+        e.name.endsWith(".sql") ||
+        e.name.endsWith(".json")
+      ) {
         const t = statSync(full).mtimeMs;
         if (t > newest) {
           newest = t;
@@ -194,6 +207,10 @@ function assertFresh(bin: string, crateDirs: string[]): void {
   // 真的挡掉过整套钱路的 16 条用例：闸响了，但讲的不是事实。
   //
   // `Cargo.toml` 要算：换依赖确实会改二进制。`migrations/` 也算：门户把它编进去。
+  //
+  // `schemas/resources/*.schema.json` 同样要算 —— 它们是被 `include_str!` 编进
+  // 二进制的，改了 schema 而不重建，配置校验的行为已经变了而闸不会响。
+  walk(join(process.cwd(), "..", "schemas"));
   for (const d of crateDirs) {
     walk(join(d, "src"));
     walk(join(d, "migrations"));
@@ -542,6 +559,34 @@ observability:
   const metricsUrl = `http://127.0.0.1:${metricsPort}/metrics`;
   await waitReady(metricsUrl, "aisix 网关指标口", (s) => s === 200);
 
+  const callNonChat = async (
+    endpoint: "messages" | "responses",
+    plaintext: string,
+    model: string,
+    stream: boolean,
+  ): Promise<number> => {
+    const body =
+      endpoint === "messages"
+        ? {
+            model,
+            max_tokens: 16,
+            ...(stream ? { stream: true } : {}),
+            messages: [{ role: "user", content: "hi" }],
+          }
+        : { model, ...(stream ? { stream: true } : {}), input: "hi" };
+    const r = await fetch(`http://127.0.0.1:${proxyPort}/v1/${endpoint}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${plaintext}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    // 记账在流结束的回调里，所以必须把 body 读完。
+    await r.text();
+    return r.status;
+  };
+
   return {
     proxyUrl: `http://127.0.0.1:${proxyPort}`,
     metricsUrl,
@@ -592,27 +637,21 @@ observability:
     blindPortalTo(keyName: string) {
       blind.add(deriveKeyId(keyName));
     },
-    async streamOn(endpoint, plaintext, model = "gpt-4o-mini", stream = true) {
-      const body =
-        endpoint === "messages"
-          ? {
-              model,
-              max_tokens: 16,
-              ...(stream ? { stream: true } : {}),
-              messages: [{ role: "user", content: "hi" }],
-            }
-          : { model, ...(stream ? { stream: true } : {}), input: "hi" };
-      const r = await fetch(`http://127.0.0.1:${proxyPort}/v1/${endpoint}`, {
+    async callOn(endpoint: "chat" | "messages" | "responses", plaintext: string, model: string) {
+      if (endpoint !== "chat") return await callNonChat(endpoint, plaintext, model, false);
+      const r = await fetch(`http://127.0.0.1:${proxyPort}/v1/chat/completions`, {
         method: "POST",
         headers: {
           authorization: `Bearer ${plaintext}`,
           "content-type": "application/json",
         },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ model, messages: [{ role: "user", content: "hello" }] }),
       });
-      // 记账在流结束的回调里，所以必须把 body 读完。
       await r.text();
       return r.status;
+    },
+    async streamOn(endpoint, plaintext, model = "gpt-4o-mini", stream = true) {
+      return await callNonChat(endpoint, plaintext, model, stream);
     },
     reloadGateway() {
       gateway.kill("SIGHUP");
@@ -707,6 +746,13 @@ models:
         - name: only
           target: gpt-4o-mini
           examples: ["hello"]
+  - display_name: cached-direct
+    provider: openai
+    provider_key: stub
+    model_name: gpt-4o-mini
+    cost:
+      input_per_1k: 0.5
+      output_per_1k: 0.5
   - display_name: semantic-1
     semantic:
       embedding_model: embed-1
@@ -724,6 +770,12 @@ cache_policies:
     enabled: true
     ttl_seconds: 300
     applies_to: "model:semantic-cached"
+  # 一个「普通直连模型 + 开缓存」的格子，专供三个端点对齐用例：语义那条同时
+  # 带着分类调用的花费，量不出「命中本身收了多少」。
+  - name: cache-direct-only
+    enabled: true
+    ttl_seconds: 300
+    applies_to: "model:cached-direct"
 api_keys:
   - display_name: e2e-caller
     key_hash: "${keyHash}"

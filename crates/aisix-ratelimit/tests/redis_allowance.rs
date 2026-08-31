@@ -134,23 +134,32 @@ async fn store(r: &Redis) -> aisix_ratelimit::store::redis::RedisStore {
 /// 「装着但起不来」不跳过，直接失败：那是环境出了问题，跳过它就成了静默通过 ——
 /// 一套永远绿的测试比没有测试更糟，因为它还让人放心。
 macro_rules! redis_or_skip {
-    () => {
-        match Redis::start() {
-            Some(r) => {
-                assert!(
-                    r.wait_ready().await,
-                    "redis-server 在这台机器上存在却起不来（端口 {}）—— 这是环境问题，\
-                     不是「没装 redis」，所以不跳过",
-                    r.port,
-                );
-                r
-            }
-            None => {
-                eprintln!("跳过：机器上没有 redis-server");
-                return;
+    () => {{
+        // 端口是「先 bind(0) 拿号、关掉、再让 redis 去 bind」拿到的，中间有一个
+        // 极小的窗口 —— 并行跑的另一条用例可能刚好抢到同一个号，于是 redis 起不
+        // 来。那不是环境问题，重来一次就好；而把它算成环境问题会让这套用例偶尔
+        // 无理由地红。
+        //
+        // 重试有上界：真的环境问题不该被无限重试掩盖成一次超时。
+        let mut got = None;
+        for attempt in 1..=3 {
+            match Redis::start() {
+                None => {
+                    eprintln!("跳过：机器上没有 redis-server");
+                    return;
+                }
+                Some(r) => {
+                    if r.wait_ready().await {
+                        got = Some(r);
+                        break;
+                    }
+                    eprintln!("第 {attempt} 次起 redis 没就绪（端口 {}），重来", r.port);
+                    // r 在这里析构，进程与目录都收掉。
+                }
             }
         }
-    };
+        got.expect("redis-server 存在却连着三次起不来 —— 这是环境问题，不跳过")
+    }};
 }
 
 #[tokio::test]
