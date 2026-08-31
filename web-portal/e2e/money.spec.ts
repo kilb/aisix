@@ -551,6 +551,21 @@ test("经路由组与语义路由的花费照样计入_不管流不流式", asyn
     const delta = (await sumSpend()) - before;
     expect(delta, `${label} 记的花费是 ${delta}，应当是 ${want}`).toBe(want);
   }
+
+  // 兄弟端点同样要量。「按调度到的目标定价」对它们一样成立，而只驱动 chat 的
+  // 对照会让它们的同类问题一直藏着 —— 这个仓库反复吃的就是这个亏。
+  for (const ep of ["messages", "responses"] as const) {
+    for (const [label, model, stream] of [
+      ["直连 非流式", "gpt-4o-mini", false],
+      ["路由组 非流式", "routed-1", false],
+      ["路由组 流式", "routed-1", true],
+    ] as const) {
+      const before = await sumSpend();
+      expect(await fx.streamOn(ep, k.plaintext, model, stream), `${ep} ${label}`).toBe(200);
+      const delta = (await sumSpend()) - before;
+      expect(delta, `${ep} ${label} 记的花费是 ${delta}`).toBe(CHAT);
+    }
+  }
 });
 
 test("语义路由的分类调用被计入花费_按嵌入模型自己的标签", async () => {

@@ -169,7 +169,13 @@ function assertFresh(bin: string, crateDirs: string[]): void {
   let newest = 0;
   let newestFile = "";
   const walk = (dir: string) => {
-    for (const e of readdirSync(dir, { withFileTypes: true })) {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return; // 这个 crate 没有这一层目录
+    }
+    for (const e of entries) {
       const full = join(dir, e.name);
       if (e.isDirectory()) walk(full);
       else if (e.name.endsWith(".rs") || e.name.endsWith(".sql")) {
@@ -181,7 +187,26 @@ function assertFresh(bin: string, crateDirs: string[]): void {
       }
     }
   };
-  for (const d of crateDirs) walk(d);
+  // **只看进二进制的那些文件。**
+  //
+  // 原先是把整个 crate 目录走一遍，于是 `tests/` 里的文件也算进来 —— 改一个
+  // 集成测试就会说网关二进制过期，逼着重建，而那个文件压根不进二进制。这条误报
+  // 真的挡掉过整套钱路的 16 条用例：闸响了，但讲的不是事实。
+  //
+  // `Cargo.toml` 要算：换依赖确实会改二进制。`migrations/` 也算：门户把它编进去。
+  for (const d of crateDirs) {
+    walk(join(d, "src"));
+    walk(join(d, "migrations"));
+    try {
+      const t = statSync(join(d, "Cargo.toml")).mtimeMs;
+      if (t > newest) {
+        newest = t;
+        newestFile = join(d, "Cargo.toml");
+      }
+    } catch {
+      /* 不是 crate 目录 */
+    }
+  }
   if (newest > binTime) {
     throw new Error(
       `${bin} 比源码旧（${newestFile} 更新）——` +
@@ -265,6 +290,33 @@ export async function startMoney(): Promise<MoneyFixture> {
             })),
             // 1000 输入 token，配上 $0.5/1k 的定价 → 单次 $0.50。
             usage: { prompt_tokens: 1000, total_tokens: 1000 },
+          }),
+        );
+        return;
+      }
+      // 非流式的 `/v1/responses` 也是自己一套形状：usage 在顶层、叫
+      // input_tokens/output_tokens。回 chat 形状的话网关解析不到，会退到 token
+      // 估算 —— 金额变成几千 micro，于是「按父行定价恒 0」这种问题在对照里
+      // 看不出来（两边都是估算值，还相等）。
+      if ((req.url ?? "").includes("/responses") && !wantsStream) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            id: "resp-e2e",
+            object: "response",
+            created_at: 0,
+            model: "gpt-4o-mini",
+            status: "completed",
+            output: [
+              {
+                type: "message",
+                id: "msg-e2e",
+                role: "assistant",
+                status: "completed",
+                content: [{ type: "output_text", text: "ok" }],
+              },
+            ],
+            usage: { input_tokens: 1000, output_tokens: 1000, total_tokens: 2000 },
           }),
         );
         return;
