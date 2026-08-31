@@ -344,6 +344,48 @@ fn warn_inert_dimension_once(policy_name: &str, window: &str, dimension: &str) {
 /// 就 `(policy, model)` 警告一次：该模型没有配价，所以这条策略的花费
 /// 上限对它不生效。按模型去重而不是按策略——一条策略可能命中很多模型，
 /// 只报第一个会让其余的隐身。
+/// 这个入口下，是否存在一条会让花费上限失效的调度目标。
+///
+/// 直接模型（含 embedding）就问它自己：`cost` 是它的定价。虚拟父级问它
+/// **声明的**目标——路由组的 `targets`、语义路由的 `routes[].target` 与
+/// `default`、ensemble 的 panel 成员与 judge。只要其中任一行没配价，路由
+/// 到它的那次请求对花费计数器贡献 0，上限就被绕过了；标签用父级名，因为
+/// 操作者配置的正是这个入口，也正是他要去补价格的地方。
+///
+/// 判据刻意是"任一"而不是"这次分派到的那个"：这是一条**配置**层面的结论
+/// （某个声明的出口没有价格），在预留阶段就能给出，比等到提交阶段再按实际
+/// 目标判断更早，也不必在每个端点的提交点各写一遍。代价是父级下只要有一条
+/// 目标没配价，该父级的每次请求都会记一次——对一个"去把价格补上"的信号来
+/// 说，这个方向是安全的。
+///
+/// 目标名解析不了（配置引用了不存在的行）时不作声：那是配置校验该报的错，
+/// 在这里报会把一个引用错误说成定价问题。
+fn unpriced_dispatch_exists(snap: &aisix_core::AisixSnapshot, model: &aisix_core::Model) -> bool {
+    let unpriced_by_name = |name: &str| {
+        snap.models
+            .get_by_name(name)
+            .is_some_and(|e| e.value.cost.is_none() && !is_virtual_parent(&e.value))
+    };
+    if let Some(routing) = model.routing.as_ref() {
+        return routing.targets.iter().any(|t| unpriced_by_name(&t.model));
+    }
+    if let Some(semantic) = model.semantic.as_ref() {
+        return unpriced_by_name(&semantic.default)
+            || semantic.routes.iter().any(|r| unpriced_by_name(&r.target));
+    }
+    if let Some(ensemble) = model.ensemble.as_ref() {
+        return unpriced_by_name(&ensemble.judge.model)
+            || ensemble.panel.iter().any(|m| unpriced_by_name(&m.model));
+    }
+    model.cost.is_none()
+}
+
+/// 父级不带 `cost` 是结构使然，不是"没配价"。目标本身又是父级时不下结论——
+/// 嵌套父级的目标由它自己那条入口的检查覆盖。
+fn is_virtual_parent(model: &aisix_core::Model) -> bool {
+    model.is_routing() || model.is_ensemble() || model.is_semantic()
+}
+
 fn warn_unpriced_model_once(policy_name: &str, model: &str) {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
@@ -602,21 +644,16 @@ async fn reserve_policy_layers(
             //
             // R10：只在能给出准确结论的地方断言"未定价"。
             // 直接模型（含 embedding）：`cost` 就是它自己的定价，直接判断。
-            // 虚拟父级（routing/ensemble/semantic）：此刻还不知道会调度到
-            // 哪个具体目标，而这类行结构上永远不带 `cost`——真实花费是按
-            // *调度到的目标* 定价的（`usage_attr::request_cost_usd` 吃的是
-            // 实际调度目标的 model_id，不是这里的父级 id），可能非零。对
-            // 父级断言"未定价"会把一条计费正常的请求错误地标成"预算失
-            // 效"，这是假信号，比留白更糟——见
-            // docs/design/2026-08-20-spend-budget-design.md 的 Non-goals：
-            // 通过虚拟父级调度到的、真正未定价的目标，这里不会产生任何
-            // 信号，是已知盲区。
+            // 虚拟父级（routing/ensemble/semantic）：这类行结构上永远不带
+            // `cost`，真实花费是按*调度到的目标*定价的（`request_cost_usd`
+            // 吃的是实际调度目标的 model_id，不是这里的父级 id），所以对
+            // 父级本身断言"未定价"是假信号。判据换成它**声明的目标**：
+            // 目标名在配置里是静态写着的，不必等运行时分派就能答，于是
+            // 结论仍然准确，而检查还留在这一个点上——提交点每个端点各有
+            // 一处，把判断挪过去就是漂移的温床。
             if let (Some(model_id), Some(model_name)) = (input.model, input.model_name) {
                 if let Some(resolved) = snap.models.get_by_id(model_id) {
-                    let model = &resolved.value;
-                    let is_virtual_parent =
-                        model.is_routing() || model.is_ensemble() || model.is_semantic();
-                    if !is_virtual_parent && model.cost.is_none() {
+                    if unpriced_dispatch_exists(snap, &resolved.value) {
                         // 标签必须用已解析的行名：通配符路径下调用方能自造模型名，
                         // 直接打标签会让这个 series 基数无上限。
                         let label = crate::usage_attr::metric_model_label(snap, model_name);
@@ -1843,7 +1880,9 @@ mod tests {
     /// *调度到的目标* 定价的（可能非零），对父级断言"未定价"是假信号，
     /// 比留白更糟——这里必须什么都不产生。
     #[tokio::test]
-    async fn virtual_parent_dispatch_emits_no_unpriced_signal() {
+    async fn parent_with_a_priced_target_emits_no_unpriced_signal() {
+        // 父级自己结构上就不带 `cost`，那不是"没配价"。目标定价齐全时不该
+        // 出声——否则这个信号会被噪声淹没，操作者就不看它了。
         let snap = snapshot_with_policy(make_spend_policy(
             "api_key",
             "k1",
@@ -1851,6 +1890,16 @@ mod tests {
             None,
             Some(5_000_000),
         ));
+        let priced: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "gpt-4o",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "pk-1",
+            "cost": { "input_per_1k": 0.5, "output_per_1k": 0.5 },
+        }))
+        .unwrap();
+        snap.models
+            .insert(aisix_core::resource::ResourceEntry::new("t-1", priced, 1));
         let parent: aisix_core::Model = serde_json::from_value(serde_json::json!({
             "display_name": "chat-group",
             "routing": { "targets": [{ "model": "gpt-4o" }] },
@@ -1870,7 +1919,137 @@ mod tests {
         let rendered = state.metrics.render();
         assert!(
             !rendered.contains(aisix_obs::metrics::M_BUDGET_UNPRICED_REQUESTS_TOTAL),
-            "虚拟父级不该产生未定价告警——此刻不知道会调度到哪个具体目标: {rendered}"
+            "目标定价齐全的父级被误报成预算失效: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_with_an_unpriced_target_is_counted() {
+        // 真花费是按*调度到的目标*定价的，所以只要父级声明的目标里有一条
+        // 没配价，路由到它的那次请求对花费计数器贡献 0，上限就被绕过了。
+        // 目标名在配置里是静态写着的，预留阶段就能答。
+        let snap = snapshot_with_policy(make_spend_policy(
+            "api_key",
+            "k1",
+            "day",
+            None,
+            Some(5_000_000),
+        ));
+        let unpriced: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "gpt-4o",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "pk-1",
+        }))
+        .unwrap();
+        snap.models
+            .insert(aisix_core::resource::ResourceEntry::new("t-1", unpriced, 1));
+        let parent: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "chat-group",
+            "routing": { "targets": [{ "model": "gpt-4o" }] },
+        }))
+        .unwrap();
+        snap.models.insert(aisix_core::resource::ResourceEntry::new(
+            "group-1", parent, 1,
+        ));
+        let state = test_state(&snap);
+        let auth = test_auth_key("k1");
+        let mrl = make_model_rl("chat-group", "group-1", None);
+
+        reserve_layers(&state, &snap, &auth, Some(&mrl), None)
+            .await
+            .expect("未定价目标不该被拒绝，只是不对这条花费上限做贡献");
+
+        let rendered = state.metrics.render();
+        assert!(
+            rendered.contains(aisix_obs::metrics::M_BUDGET_UNPRICED_REQUESTS_TOTAL),
+            "经路由组打到未定价目标，上限被静默绕过: {rendered}"
+        );
+        // 标签用父级名：操作者配置的是这个入口，也是他要去补价格的地方。
+        assert!(
+            rendered.contains("model=\"chat-group\""),
+            "标签不是父级名: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_target_that_is_itself_a_parent_emits_no_unpriced_signal() {
+        // 父级不带 `cost` 是结构使然，不是"没配价"——对它下结论就是原来那条
+        // 假信号。而且这种形状根本走不通：实测直接打嵌套组会被 400 拒掉
+        // （"routing models can't be dispatched directly"），所以这里不作声
+        // 也不留残余盲区。
+        let snap = snapshot_with_policy(make_spend_policy(
+            "api_key",
+            "k1",
+            "day",
+            None,
+            Some(5_000_000),
+        ));
+        let inner: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "inner-group",
+            "routing": { "targets": [{ "model": "gpt-4o" }] },
+        }))
+        .unwrap();
+        snap.models.insert(aisix_core::resource::ResourceEntry::new(
+            "g-inner", inner, 1,
+        ));
+        let parent: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "chat-group",
+            "routing": { "targets": [{ "model": "inner-group" }] },
+        }))
+        .unwrap();
+        snap.models.insert(aisix_core::resource::ResourceEntry::new(
+            "group-1", parent, 1,
+        ));
+        let state = test_state(&snap);
+        let auth = test_auth_key("k1");
+        let mrl = make_model_rl("chat-group", "group-1", None);
+
+        reserve_layers(&state, &snap, &auth, Some(&mrl), None)
+            .await
+            .expect("应放行");
+
+        let rendered = state.metrics.render();
+        assert!(
+            !rendered.contains(aisix_obs::metrics::M_BUDGET_UNPRICED_REQUESTS_TOTAL),
+            "把「父级结构上没有 cost」当成了没配价: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_with_an_unresolvable_target_emits_no_unpriced_signal() {
+        // 引用了不存在的行是配置校验该报的错。在这里报会把一个引用错误说成
+        // 定价问题，把人指向错误的地方。
+        //
+        // 这条同时是上面两条的护栏：目标行没插进快照时，"父级有未定价目标"
+        // 那条断言会因为这个分支而恒真地通过——本文件里就出过这个空测。
+        let snap = snapshot_with_policy(make_spend_policy(
+            "api_key",
+            "k1",
+            "day",
+            None,
+            Some(5_000_000),
+        ));
+        let parent: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "chat-group",
+            "routing": { "targets": [{ "model": "nowhere" }] },
+        }))
+        .unwrap();
+        snap.models.insert(aisix_core::resource::ResourceEntry::new(
+            "group-1", parent, 1,
+        ));
+        let state = test_state(&snap);
+        let auth = test_auth_key("k1");
+        let mrl = make_model_rl("chat-group", "group-1", None);
+
+        reserve_layers(&state, &snap, &auth, Some(&mrl), None)
+            .await
+            .expect("应放行");
+
+        let rendered = state.metrics.render();
+        assert!(
+            !rendered.contains(aisix_obs::metrics::M_BUDGET_UNPRICED_REQUESTS_TOTAL),
+            "引用错误被说成了定价问题: {rendered}"
         );
     }
 }

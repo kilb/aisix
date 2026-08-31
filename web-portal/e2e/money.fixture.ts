@@ -746,6 +746,17 @@ models:
         - name: only
           target: gpt-4o-mini
           examples: ["hello"]
+  # 没配价的直连模型 + 一个指到它的路由组：用来量「通过虚拟父级调度到未定价
+  # 目标」这个盲区。
+  - display_name: unpriced-1
+    provider: openai
+    provider_key: stub
+    model_name: gpt-4o-mini
+  - display_name: routed-unpriced
+    routing:
+      strategy: round_robin
+      targets:
+        - model: unpriced-1
   - display_name: cached-direct
     provider: openai
     provider_key: stub

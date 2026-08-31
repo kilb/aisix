@@ -662,6 +662,55 @@ test("三个端点上_命中缓存都不该收钱", async () => {
   }
 });
 
+test("经虚拟父级打到未定价目标_也要报警", async () => {
+  // 模型没配价 → 它对花费计数器贡献 0 → 这把密钥的花费上限对它无效。网关
+  // 选择放行（拒绝会把一个配置疏漏变成流量中断），但必须出声。
+  //
+  // 直连未定价模型一直是出声的；经路由组打到**同一个**未定价目标却一声不
+  // 响，而路由组正是推荐的暴露方式（要故障转移就得用它）。那种形状下上限
+  // 被静默绕过：钱照花，计数器不动，也没有任何信号。
+  const cookie = await fx.sessionCookie();
+  await setQuota(1_000_000_000);
+  const k = await mint(cookie, "未定价");
+  fx.blindPortalTo(`${k.name} · 未定价`);
+  // 计数器只在有花费上限压着的时候才有意义 —— 先给这把密钥一个上限。
+  expect((await setKeyQuota(cookie, k.name, 50_000_000)).status).toBe(200);
+  await waitFor(async () => fx.readResources().includes(`portal-key-${k.name}`), "额度推下去");
+
+  const unpricedFor = async (model: string) => {
+    const m = await fetch(fx.metricsUrl).then((r) => r.text());
+    return m
+      .split("\n")
+      .filter(
+        (l) =>
+          l.startsWith("aisix_budget_unpriced_requests_total{") &&
+          l.includes(`model="${model}"`),
+      )
+      .reduce((a, l) => a + (Number(l.slice(l.lastIndexOf("}") + 1).trim()) || 0), 0);
+  };
+
+  await waitFor(
+    async () => (await fx.callOn("chat", k.plaintext, "unpriced-1")) === 200,
+    "直连未定价模型可用",
+  );
+  expect(await unpricedFor("unpriced-1"), "直连未定价没报警").toBeGreaterThan(0);
+
+  const before = await unpricedFor("routed-unpriced");
+  expect(await fx.callOn("chat", k.plaintext, "routed-unpriced")).toBe(200);
+  expect(
+    (await unpricedFor("routed-unpriced")) - before,
+    "经路由组打到未定价目标，上限被静默绕过",
+  ).toBeGreaterThan(0);
+
+  // 反面：目标配了价的路由组不该报警，否则这个信号会被噪声淹没。
+  const q0 = await unpricedFor("routed-1");
+  expect(await fx.callOn("chat", k.plaintext, "routed-1")).toBe(200);
+  expect(
+    (await unpricedFor("routed-1")) - q0,
+    "目标定价齐全的路由组被误报成预算失效",
+  ).toBe(0);
+});
+
 test("命中缓存时不收_chat_的钱_但分类那一发照收", async () => {
   // 语义路由为了决定路由，在查缓存**之前**就打了一发嵌入调用。命中缓存的那条
   // 分支原先走 `commit_tokens_no_spend(0)`，于是那笔分类花费从额度里掉了出去
