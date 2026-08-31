@@ -441,6 +441,9 @@ export async function startMoney(): Promise<MoneyFixture> {
         // 一条用例要跨四个状态、每个等一轮对账。15 秒一轮会把超时预算吃光，
         // 而那种失败长得跟真 bug 一样。调快是让测试更确定，不是放宽断言。
         PORTAL_TICK_SECS: "2",
+        // 这一套给同一个用户连着铸十几把密钥，生产默认的每分钟十把会把它卡住。
+        // 限频本身由门户的单测覆盖，这里放开只是为了让钱路用例跑得完。
+        PORTAL_MINT_MAX_PER_MINUTE: "1000",
         PORTAL_METRICS_ADDR: `127.0.0.1:${portalMetricsPort}`,
         AISIX_RESOURCES: resourcesPath,
       },
@@ -642,6 +645,16 @@ models:
       strategy: round_robin
       targets:
         - model: gpt-4o-mini
+  - display_name: semantic-cached
+    semantic:
+      embedding_model: embed-1
+      default: gpt-4o-mini
+      match:
+        threshold: 0.99
+      routes:
+        - name: only
+          target: gpt-4o-mini
+          examples: ["hello"]
   - display_name: semantic-1
     semantic:
       embedding_model: embed-1
@@ -652,6 +665,13 @@ models:
         - name: only
           target: gpt-4o-mini
           examples: ["hello"]
+cache_policies:
+  # 只作用于 semantic-cached：全局开缓存会让其它用例的重复请求命中缓存，
+  # 它们量的是「每次调用记多少钱」，一命中就全变 0。
+  - name: cache-semantic-only
+    enabled: true
+    ttl_seconds: 300
+    applies_to: "model:semantic-cached"
 api_keys:
   - display_name: e2e-caller
     key_hash: "${keyHash}"

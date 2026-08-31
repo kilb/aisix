@@ -32,12 +32,22 @@ const MIN_PASSWORD_LEN: usize = 12;
 const SESSION_TTL_SECS: u64 = 12 * 3600;
 /// 同一个邮箱连续失败多少次之后进入冷却。
 const LOGIN_FAILURES_BEFORE_COOLDOWN: u32 = 5;
-/// 铸密钥的频率窗口与窗口内上限。
-///
-/// 一分钟十把：正常用户一次建几把就够了，而这个数把「循环铸密钥逼网关一直重载」
-/// 压到每分钟十次重载。
+/// 铸密钥的频率窗口。
 const MINT_WINDOW_SECS: u64 = 60;
-const MINT_MAX_PER_WINDOW: u32 = 10;
+
+/// 窗口内允许铸几把。默认一分钟十把：正常用户一次建几把就够了，而这个数把
+/// 「循环铸密钥逼网关一直重载」压到每分钟十次重载。
+///
+/// 做成可配是因为写死会挡住合理的批量场景 —— 一次给团队开二十把密钥不该被当成
+/// 攻击，而运维除了改代码没有别的办法。（这条限制卡住过我们自己的端到端套件：
+/// 它给同一个用户连着铸了十几把。）
+fn mint_max_per_window() -> u32 {
+    std::env::var("PORTAL_MINT_MAX_PER_MINUTE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(10)
+}
 
 /// 冷却时长。
 ///
@@ -65,6 +75,10 @@ pub struct AppState {
     http: reqwest::Client,
     /// 按用户记的铸密钥时刻。见 [`AppState::mint_allowed`]。
     mints: Arc<RwLock<HashMap<String, Vec<u64>>>>,
+    /// 窗口内允许铸几把。**构造时读一次**，不是每次调用读环境变量 —— 后者让
+    /// 并行跑的用例互相干扰（一条改了进程级环境变量，另一条读到），那是自找的
+    /// 抖动。
+    mint_max: u32,
     /// 按邮箱记的连续失败次数与冷却截止时刻。
     ///
     /// **按邮箱而不是按 IP**：门户在 nginx 后面，客户端 IP 要靠 `X-Forwarded-For`，
@@ -131,6 +145,7 @@ impl AppState {
             ),
             http: crate::client::outbound(),
             mints: Arc::new(RwLock::new(HashMap::new())),
+            mint_max: mint_max_per_window(),
             failures: Arc::new(RwLock::new(HashMap::new())),
             verifications: Arc::new(AtomicU64::new(0)),
         }
@@ -187,7 +202,7 @@ impl AppState {
             !v.is_empty()
         });
         let v = m.entry(user_id.to_string()).or_default();
-        if v.len() as u32 >= MINT_MAX_PER_WINDOW {
+        if v.len() as u32 >= self.mint_max {
             return false;
         }
         v.push(now);

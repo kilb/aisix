@@ -2208,6 +2208,33 @@ api_keys:
         }
     }
 
+    /// 上限可以由运维调，不必改代码。
+    ///
+    /// 写死会挡住合理的批量场景 —— 一次给团队开二十把密钥不该被当成攻击。
+    /// 值在构造 `AppState` 时读一次，所以这条用例可以安全地与别的并行跑。
+    #[test]
+    fn 铸密钥的频率上限来自环境变量_且构造时读一次() {
+        let src = include_str!("auth.rs");
+        let production = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(src);
+        assert!(
+            production.contains("PORTAL_MINT_MAX_PER_MINUTE"),
+            "上限写死了，运维只能改代码",
+        );
+        // 每次调用都去读环境变量的话，并行跑的用例会互相干扰 —— 一条改了进程级
+        // 变量，另一条读到，那是自找的抖动。
+        assert!(
+            production.contains("mint_max: mint_max_per_window()"),
+            "上限不是在构造时读一次的",
+        );
+        assert!(
+            production.contains("self.mint_max"),
+            "判断处没有用构造时读到的那个值",
+        );
+    }
+
     #[tokio::test]
     async fn 铸密钥有频率上限_但不限总数() {
         let (_p, app) = app().await;

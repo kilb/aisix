@@ -590,3 +590,56 @@ test("语义路由的分类调用被计入花费_按嵌入模型自己的标签"
   expect(line, line).toContain(`user_id="${fx.userId}"`);
   expect(line, line).toContain('endpoint="/v1/embeddings"');
 });
+
+test("命中缓存时不收_chat_的钱_但分类那一发照收", async () => {
+  // 语义路由为了决定路由，在查缓存**之前**就打了一发嵌入调用。命中缓存的那条
+  // 分支原先走 `commit_tokens_no_spend(0)`，于是那笔分类花费从额度里掉了出去
+  // ——指标里还在（门户照扣），但网关侧的闸不认它，两边对不上。
+  const cookie = await fx.sessionCookie();
+  await setQuota(1_000_000_000);
+  const k = await mint(cookie, "缓存");
+
+  const spendOf = async (model: string) => {
+    const m = await fetch(fx.metricsUrl).then((r) => r.text());
+    return m
+      .split("\n")
+      .filter(
+        (l) =>
+          l.startsWith("aisix_llm_spend_micro_usd_total{") && l.includes(`model="${model}"`),
+      )
+      .reduce((a, l) => a + (Number(l.slice(l.lastIndexOf("}") + 1).trim()) || 0), 0);
+  };
+
+  // 第一次：未命中，走上游，chat 与分类都记账。
+  await waitFor(
+    async () => (await fx.chatModel(k.plaintext, "semantic-cached")) === 200,
+    "带缓存的语义路由可用",
+  );
+  const chat0 = await spendOf("gpt-4o-mini");
+  const embed0 = await spendOf("embed-1");
+
+  // 第二次：同一个 prompt，应当命中缓存。
+  expect(await fx.chatModel(k.plaintext, "semantic-cached")).toBe(200);
+  const chat1 = await spendOf("gpt-4o-mini");
+  const embed1 = await spendOf("embed-1");
+
+  expect(chat1 - chat0, "命中缓存却还是收了 chat 的钱").toBe(0);
+  // 分类调用在查缓存之前就发生了，是真金白银 —— 必须收。
+  expect(embed1 - embed0, "命中缓存时分类那一发没被计费").toBe(500_000);
+
+  // **额度那一侧也要认它。** 上面量的是指标（门户据此扣款），网关侧的额度闸
+  // 是另一个计数器：命中缓存的分支若用「不记花费」的提交，分类花费就从额度里
+  // 掉出去了，两边对不上。给这把密钥 $2 的额度、反复打同一个会命中缓存的请求
+  // —— 每次只花分类的 $0.5，四次之后必须被拒。不认的话它永远打得通。
+  fx.blindPortalTo(`${k.name} · 缓存`); // 隔离出网关那道闸，别让门户的兜底接管
+  expect((await setKeyQuota(cookie, k.name, 2_000_000)).status).toBe(200);
+  await waitFor(async () => {
+    const doc = fx.readResources();
+    return doc.includes(`portal-key-${k.name}`);
+  }, "密钥额度被推下去");
+
+  await waitFor(
+    async () => (await fx.chatModel(k.plaintext, "semantic-cached")) === 429,
+    "反复命中缓存也要把额度烧完",
+  );
+});

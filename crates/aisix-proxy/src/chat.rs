@@ -2488,7 +2488,12 @@ async fn dispatch(
         };
         match resolved {
             Some((mut cached, hit_layer, hit_similarity)) => {
-                reservation.commit_tokens_no_spend(0).await;
+                // 命中缓存：没有上游 chat 调用，所以 token 记 0。但**分类调用
+                // 已经发生了** —— 语义路由为了决定路由，在缓存查询之前就打了一发
+                // 嵌入调用。用 `commit_tokens_no_spend` 会把它从额度里漏掉（指标
+                // 里还在，所以门户照扣，但网关侧的闸不认它）。非语义请求这个数
+                // 是 0，行为与原来完全一致。
+                reservation.commit(0, semantic_embed_spend).await;
                 // Counted HERE, at the gate's decision — the same rule the
                 // `None` arm below already states. Recorded after the output
                 // chain instead, a hit the chain BLOCKS increments nothing at
