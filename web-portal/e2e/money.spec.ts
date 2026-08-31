@@ -533,18 +533,60 @@ test("经路由组与语义路由的花费照样计入_不管流不流式", asyn
   // 先热一次：语义路由第一次要把样例也嵌入一遍，且要让密钥被启用。
   await waitFor(async () => (await fx.chatModel(k.plaintext, "gpt-4o-mini")) === 200, "密钥可用");
 
-  for (const [label, model, stream] of [
-    ["直连 非流式", "gpt-4o-mini", false],
-    ["直连 流式", "gpt-4o-mini", true],
-    ["路由组 非流式", "routed-1", false],
-    ["路由组 流式", "routed-1", true],
-    ["语义 非流式", "semantic-1", false],
-    ["语义 流式", "semantic-1", true],
+  // 每次 chat 调用 1000 输入 + 1000 输出、两边 $0.5/1k → $1.00。
+  // 语义路由还要多一发分类用的嵌入调用（1000 输入 × $0.5/1k → $0.50），所以它
+  // 的每次请求是 $1.50 —— 这一项本身也是被测的契约，不是宽容值。
+  const CHAT = 1_000_000;
+  const CLASSIFY = 500_000;
+  for (const [label, model, stream, want] of [
+    ["直连 非流式", "gpt-4o-mini", false, CHAT],
+    ["直连 流式", "gpt-4o-mini", true, CHAT],
+    ["路由组 非流式", "routed-1", false, CHAT],
+    ["路由组 流式", "routed-1", true, CHAT],
+    ["语义 非流式", "semantic-1", false, CHAT + CLASSIFY],
+    ["语义 流式", "semantic-1", true, CHAT + CLASSIFY],
   ] as const) {
     const before = await sumSpend();
     expect(await fx.chatModel(k.plaintext, model, stream), label).toBe(200);
     const delta = (await sumSpend()) - before;
-    // 每次调用 1000 输入 + 1000 输出，两边都是 $0.5/1k → 恰好 $1.00。
-    expect(delta, `${label} 记的花费是 ${delta}`).toBe(1_000_000);
+    expect(delta, `${label} 记的花费是 ${delta}，应当是 ${want}`).toBe(want);
   }
+});
+
+test("语义路由的分类调用被计入花费_按嵌入模型自己的标签", async () => {
+  // 语义路由每次请求都要调一次嵌入模型给 prompt 分类 —— 那是真金白银的上游调用。
+  // 它原先完全不计量：不进花费指标、不占额度、门户永远扣不到，于是用户可以靠
+  // 语义路由白嫖这一部分，而账面上什么都看不出来。
+  const cookie = await fx.sessionCookie();
+  await setQuota(1_000_000_000);
+  const k = await mint(cookie, "分类计费");
+
+  const seriesFor = async (model: string) => {
+    const m = await fetch(fx.metricsUrl).then((r) => r.text());
+    return m
+      .split("\n")
+      .filter(
+        (l) =>
+          l.startsWith("aisix_llm_spend_micro_usd_total{") && l.includes(`model="${model}"`),
+      )
+      .reduce((a, l) => a + (Number(l.slice(l.lastIndexOf("}") + 1).trim()) || 0), 0);
+  };
+
+  await waitFor(async () => (await fx.chatModel(k.plaintext, "semantic-1")) === 200, "语义路由可用");
+  const before = await seriesFor("embed-1");
+  expect(await fx.chatModel(k.plaintext, "semantic-1")).toBe(200);
+  const after = await seriesFor("embed-1");
+
+  // 分类调用记在**嵌入模型**名下，不是混进 chat 那条序列 —— 成本分析里才看得出
+  // 「路由本身花了多少」。稳态下每次请求一发（样例已缓存）。
+  expect(after - before, `embed-1 的花费 ${before} -> ${after}`).toBeGreaterThan(0);
+
+  // 而且它归到了这个调用方名下 —— 门户正是按 user_id 求和扣款的。
+  const m = await fetch(fx.metricsUrl).then((r) => r.text());
+  const line = m
+    .split("\n")
+    .find((l) => l.startsWith("aisix_llm_spend_micro_usd_total{") && l.includes('model="embed-1"'));
+  expect(line, "没有 embed-1 的花费序列").toBeTruthy();
+  expect(line, line).toContain(`user_id="${fx.userId}"`);
+  expect(line, line).toContain('endpoint="/v1/embeddings"');
 });

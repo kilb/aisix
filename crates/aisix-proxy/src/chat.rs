@@ -882,10 +882,18 @@ struct SemanticGateCtx {
 /// Embed the request text for the cache's semantic layer. `None` on any
 /// failure — the cache is an optimization layer, so a broken embedding
 /// path degrades to an ordinary miss instead of failing the request.
+/// 缓存语义层的嵌入子调用。
+///
+/// 跟语义路由那条是同一件事：一次真金白银的上游调用。两条都要记账，只修一条就是
+/// 「同族没有齐步走」—— 而那正是这个仓库反复吃亏的形状。
+///
+/// 与路由那条的一个差别：命中缓存时这次请求根本不会走到提交预留那一步，所以这里
+/// 只发指标（门户按 user_id 求和照样扣得到），网关侧的额度计数器不包含它。
 async fn cache_semantic_embed(
     state: &ProxyState,
     snapshot: &AisixSnapshot,
     sem: &SemanticGateCtx,
+    auth: &crate::auth::AuthenticatedKey,
     request_id: &str,
 ) -> Option<Vec<f32>> {
     let started = Instant::now();
@@ -908,11 +916,18 @@ async fn cache_semantic_embed(
     )
     .await
     {
-        Ok(vectors) => {
+        Ok(embedded) => {
             state
                 .metrics
                 .record_cache_semantic_embed(&sem.policy_name, started.elapsed());
-            vectors.into_iter().next()
+            crate::semantic::record_embed_usage(
+                state,
+                snapshot,
+                &sem.embed_entry,
+                auth,
+                embedded.prompt_tokens,
+            );
+            embedded.vectors.into_iter().next()
         }
         Err(err) => {
             tracing::warn!(
@@ -945,6 +960,7 @@ async fn resolve_cache_hit(
     key: &str,
     ttl: Option<Duration>,
     semantic_gate: Option<&SemanticGateCtx>,
+    auth: &crate::auth::AuthenticatedKey,
     request_id: &str,
     semantic_embedding: &mut Option<Vec<f32>>,
 ) -> Option<(ChatResponse, CacheHitLayer, Option<f32>)> {
@@ -956,7 +972,7 @@ async fn resolve_cache_hit(
         }
     }
     let sem = semantic_gate?;
-    let vector = cache_semantic_embed(state, snapshot, sem, request_id).await?;
+    let vector = cache_semantic_embed(state, snapshot, sem, auth, request_id).await?;
     match sem
         .store
         .lookup(
@@ -1411,41 +1427,49 @@ async fn dispatch(
     // the "which target + which route" decision. `semantic_route` carries
     // the matched route name (None on a fall-through to `default` or a
     // non-semantic request) for the `x-aisix-route` response header.
-    let (attempt_models, semantic_route): (Vec<AttemptModel>, Option<String>) =
-        if virtual_entry.value.is_semantic() {
-            let prompt = last_user_message_text(req).unwrap_or_default();
-            crate::semantic::resolve(
-                state,
-                snapshot,
-                &virtual_entry,
-                &prompt,
-                &client.source_ip,
-                request_id,
-            )
-            .await
-            .map_err(&with_model)?
-        } else {
-            let attempts = resolve_attempt_models(
-                &state.routing,
-                &state.runtime_status,
-                snapshot,
-                &req.model,
-                &virtual_entry.id,
-                &virtual_entry.value,
-                RoutingRequest {
-                    tags: &client.routing_tags,
-                    stability_key: Some(
-                        client
-                            .routing_key
-                            .as_deref()
-                            .unwrap_or(auth.entry.id.as_str()),
-                    ),
-                    source_ip: &client.source_ip,
-                },
-            )
-            .map_err(&with_model)?;
-            (attempts, None)
-        };
+    // 第三个值是这次分类调用的花费（micro-USD）：语义路由每次请求都会打一发
+    // 嵌入调用，那是真金白银。它在预留建立之前发生，所以拦不住，但要在下面提交
+    // 时并进去 —— 否则用户能靠语义路由白嫖这部分。
+    let (attempt_models, semantic_route, semantic_embed_spend): (
+        Vec<AttemptModel>,
+        Option<String>,
+        u64,
+    ) = if virtual_entry.value.is_semantic() {
+        let prompt = last_user_message_text(req).unwrap_or_default();
+        crate::semantic::resolve(
+            state,
+            snapshot,
+            &virtual_entry,
+            auth,
+            &prompt,
+            &client.source_ip,
+            request_id,
+        )
+        .await
+        .map_err(&with_model)?
+    } else {
+        let attempts = resolve_attempt_models(
+            &state.routing,
+            &state.runtime_status,
+            snapshot,
+            &req.model,
+            &virtual_entry.id,
+            &virtual_entry.value,
+            RoutingRequest {
+                tags: &client.routing_tags,
+                stability_key: Some(
+                    client
+                        .routing_key
+                        .as_deref()
+                        .unwrap_or(auth.entry.id.as_str()),
+                ),
+                source_ip: &client.source_ip,
+            },
+        )
+        .map_err(&with_model)?;
+        // 非语义路径没有分类调用，也就没有这笔额外花费。
+        (attempts, None, 0)
+    };
 
     // For non-routing requests, surface a misconfigured bridge as a
     // proper 503 rather than burying it inside a generic Bridge error.
@@ -2045,7 +2069,8 @@ async fn dispatch(
                 // 记账成对：两批键各记各的数字。
                 limiter.add_tokens_post_stream_all(
                     &spend_post_stream_keys,
-                    crate::usage_attr::spend_micro_usd(stream_cost_usd),
+                    // 同上：分类调用的花费也要进额度。
+                    crate::usage_attr::spend_micro_usd(stream_cost_usd) + semantic_embed_spend,
                 );
                 let deployment_success = terminal.error_class.is_empty() && terminal.status < 400;
                 routing_for_terminal.finish_staged(
@@ -2455,6 +2480,7 @@ async fn dispatch(
                 key,
                 matched_policy_ttl,
                 semantic_gate.as_ref(),
+                auth,
                 request_id,
                 &mut semantic_embedding,
             )
@@ -3098,7 +3124,12 @@ async fn dispatch(
         completion,
     );
     reservation
-        .commit(total, crate::usage_attr::spend_micro_usd(cost_usd))
+        // 加上语义路由那次分类调用的花费：它在预留建立之前发生，拦不住，但必须
+        // 记进额度 —— 不记的话用户能靠语义路由白嫖这一部分。非语义请求是 0。
+        .commit(
+            total,
+            crate::usage_attr::spend_micro_usd(cost_usd) + semantic_embed_spend,
+        )
         .await;
 
     let (output_verdict, hits) = resolved_chain
@@ -3225,7 +3256,9 @@ async fn dispatch(
         if let Some(sem) = semantic_gate.as_ref() {
             let vector = match semantic_embedding.take() {
                 Some(v) => Some(v),
-                None if cc.no_cache => cache_semantic_embed(state, snapshot, sem, request_id).await,
+                None if cc.no_cache => {
+                    cache_semantic_embed(state, snapshot, sem, auth, request_id).await
+                }
                 None => None,
             };
             if let Some(vector) = vector {

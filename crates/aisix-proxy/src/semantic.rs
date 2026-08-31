@@ -141,10 +141,11 @@ pub(crate) async fn resolve(
     state: &ProxyState,
     snapshot: &AisixSnapshot,
     router_entry: &ResourceEntry<Model>,
+    auth: &crate::auth::AuthenticatedKey,
     prompt: &str,
     source_ip: &str,
     request_id: &str,
-) -> Result<(Vec<AttemptModel>, Option<String>), ProxyError> {
+) -> Result<(Vec<AttemptModel>, Option<String>, u64), ProxyError> {
     let semantic = router_entry
         .value
         .semantic
@@ -158,7 +159,8 @@ pub(crate) async fn resolve(
     if prompt.trim().is_empty() {
         let (attempt, _) =
             select_eligible(state, snapshot, router, source_ip, &semantic.default, None)?;
-        return Ok((vec![attempt], None));
+        // 没有可分类的文本 → 不发嵌入调用 → 这次没有额外花费。
+        return Ok((vec![attempt], None, 0));
     }
 
     // Resolve the embedding model + its modality metadata. A dangling or
@@ -210,7 +212,7 @@ pub(crate) async fn resolve(
     let embed_deadline = semantic.embedding_timeout().or_else(|| {
         crate::routing::effective_timeouts(&embed_entry.value, None, state.default_timeouts).request
     });
-    let vectors = match embed_texts(
+    let embedded = match embed_texts(
         state,
         snapshot,
         &embed_entry,
@@ -231,7 +233,9 @@ pub(crate) async fn resolve(
         }
     };
 
-    let mut iter = vectors.into_iter();
+    let embed_spend =
+        record_embed_usage(state, snapshot, &embed_entry, auth, embedded.prompt_tokens);
+    let mut iter = embedded.vectors.into_iter();
     let prompt_vec = iter
         .next()
         .expect("embed_texts returns at least the prompt vector");
@@ -290,7 +294,7 @@ pub(crate) async fn resolve(
         target = %attempt.model.display_name,
         "semantic routing decision",
     );
-    Ok((vec![attempt], route_name))
+    Ok((vec![attempt], route_name, embed_spend))
 }
 
 /// Apply the `on_embedding_failure` policy: route to the fallback target,
@@ -301,11 +305,12 @@ fn fallback(
     router: &Model,
     source_ip: &str,
     semantic: &Semantic,
-) -> Result<(Vec<AttemptModel>, Option<String>), ProxyError> {
+) -> Result<(Vec<AttemptModel>, Option<String>, u64), ProxyError> {
     match embedding_failure_target(semantic) {
         Some(alias) => {
             let (attempt, _) = select_eligible(state, snapshot, router, source_ip, alias, None)?;
-            Ok((vec![attempt], None))
+            // 嵌入调用失败了，上游没有报回 usage —— 没有可计的花费。
+            Ok((vec![attempt], None, 0))
         }
         None => Err(ProxyError::ProviderUnavailable),
     }
@@ -409,6 +414,16 @@ fn select_eligible(
 /// semantic router (route matching) and the cache gate's semantic layer
 /// (`aisix-proxy::chat`), which is why the deadline arrives as a plain
 /// `Option<Duration>` rather than either feature's config type.
+/// 一次嵌入子调用的结果：向量，外加上游报回来的 token 数。
+///
+/// 带上 usage 是为了让调用方能给这次调用**定价**。原先只回向量，于是这笔真金
+/// 白银的上游调用在所有账上都不存在：不进花费指标、不占任何额度、门户也永远
+/// 扣不到它。
+pub(crate) struct Embedded {
+    pub vectors: Vec<Vec<f32>>,
+    pub prompt_tokens: u32,
+}
+
 pub(crate) async fn embed_texts(
     state: &ProxyState,
     snapshot: &AisixSnapshot,
@@ -416,7 +431,7 @@ pub(crate) async fn embed_texts(
     timeout: Option<std::time::Duration>,
     request_id: &str,
     texts: &[String],
-) -> Result<Vec<Vec<f32>>, ProxyError> {
+) -> Result<Embedded, ProxyError> {
     let model = &embed_entry.value;
     crate::dispatch::require_provider(model)?;
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
@@ -448,6 +463,7 @@ pub(crate) async fn embed_texts(
     };
 
     let resp = bridge.embed(&req, &ctx).await.map_err(ProxyError::Bridge)?;
+    let prompt_tokens = resp.usage.prompt_tokens;
     let mut data = resp.data;
     data.sort_by_key(|d| d.index);
     let expected_dims = dimensions.map(|d| d as usize);
@@ -484,7 +500,66 @@ pub(crate) async fn embed_texts(
             texts.len(),
         )));
     }
-    Ok(out)
+    Ok(Embedded {
+        vectors: out,
+        prompt_tokens,
+    })
+}
+
+/// 给一次嵌入子调用记账：发一条用量记录，并返回它的花费（micro-USD）。
+///
+/// **两个系统各计一次，互不重复。** 指标这边按**嵌入模型自己的**标签发，所以
+/// 序列标注是对的，门户按 `user_id` 求和时也就自动扣到了这个人头上；额度那边由
+/// 调用方把返回的数字并进本次请求的预留提交。
+///
+/// 记在 `/v1/embeddings` 名下而不是发起它的那个端点：上游确实是一次嵌入调用，
+/// 按它归类，成本分析里才看得出「路由本身花了多少」。
+pub(crate) fn record_embed_usage(
+    state: &ProxyState,
+    snapshot: &AisixSnapshot,
+    embed_entry: &ResourceEntry<Model>,
+    auth: &crate::auth::AuthenticatedKey,
+    prompt_tokens: u32,
+) -> u64 {
+    let model = &embed_entry.value;
+    let spend = crate::usage_attr::request_spend_micro_usd(
+        snapshot,
+        &embed_entry.id,
+        aisix_core::InputTokens::uncached_only(u64::from(prompt_tokens)),
+        0,
+    );
+    let provider = model
+        .provider
+        .as_deref()
+        .unwrap_or("unknown")
+        .to_ascii_lowercase();
+    let pk_id = crate::dispatch::resolve_provider_key(snapshot, model)
+        .map(|e| e.id.clone())
+        .unwrap_or_default();
+    let pk = crate::usage_attr::ResolvedPk::resolve(snapshot, &pk_id);
+    crate::request_metrics::record_usage(
+        state,
+        "/v1/embeddings",
+        crate::request_metrics::Caller::new(auth),
+        crate::request_metrics::Upstream {
+            provider: &provider,
+            model: &model.display_name,
+            upstream_model: model.upstream_model().unwrap_or("unknown"),
+            pk: pk.labels(),
+            // 这是一次内部子调用：不流式，也谈不上回退。
+            stream: false,
+            is_fallback: false,
+        },
+        crate::request_metrics::Tokens {
+            input: prompt_tokens,
+            output: 0,
+            total: prompt_tokens,
+            spend_usd: spend as f64 / 1_000_000.0,
+            // 发起者是网关自己（语义路由的分类调用），不是某个客户端。
+            client_type: "gateway",
+        },
+    );
+    spend
 }
 
 #[cfg(test)]
