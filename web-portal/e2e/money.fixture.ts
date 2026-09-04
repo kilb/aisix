@@ -125,6 +125,13 @@ export interface MoneyFixture {
     text: string,
     model?: string,
   ): Promise<number>;
+  /** 同 `saying`，但走流式 —— 流式记账是另一条代码路径。 */
+  sayingStream(
+    endpoint: "chat" | "messages" | "responses",
+    plaintext: string,
+    text: string,
+    model?: string,
+  ): Promise<number>;
   callOn(
     endpoint: "chat" | "messages" | "responses",
     plaintext: string,
@@ -304,6 +311,47 @@ export async function startMoney(): Promise<MoneyFixture> {
       } catch {
         /* 不是 JSON 就回 ok */
       }
+      // Anthropic 原生的流式：事件名和 OpenAI 那套完全不同，用量在
+      // message_start（输入）与 message_delta（输出）两处。回 OpenAI 形状的话
+      // 网关解析不出用量，会退到估算 —— 金额变成几千 micro，测不出真问题。
+      if ((req.url ?? "").includes("/v1/messages") && wantsStream) {
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+        });
+        const ev = (type: string, data: unknown) =>
+          res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+        ev("message_start", {
+          type: "message_start",
+          message: {
+            id: "msg-e2e",
+            type: "message",
+            role: "assistant",
+            model: "claude-sonnet-4",
+            content: [],
+            usage: { input_tokens: 1000, output_tokens: 0 },
+          },
+        });
+        ev("content_block_start", {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "text", text: "" },
+        });
+        ev("content_block_delta", {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: echoed },
+        });
+        ev("content_block_stop", { type: "content_block_stop", index: 0 });
+        ev("message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn" },
+          usage: { output_tokens: 1000 },
+        });
+        ev("message_stop", { type: "message_stop" });
+        res.end();
+        return;
+      }
       // Anthropic 原生形状：content 是块数组，usage 叫 input_tokens/output_tokens。
       // 回 OpenAI 形状的话网关解析不出用量，会退到估算，金额对不上。
       if ((req.url ?? "").includes("/v1/messages") && !wantsStream) {
@@ -405,7 +453,7 @@ export async function startMoney(): Promise<MoneyFixture> {
                   {
                     type: "message",
                     role: "assistant",
-                    content: [{ type: "output_text", text: "ok" }],
+                    content: [{ type: "output_text", text: echoed }],
                   },
                 ],
                 usage: {
@@ -427,7 +475,7 @@ export async function startMoney(): Promise<MoneyFixture> {
             choices: [{ index: 0, delta, finish_reason: null }],
             ...extra,
           })}\n\n`;
-        res.write(chunk({ role: "assistant", content: "ok" }));
+        res.write(chunk({ role: "assistant", content: echoed }));
         // 末块带 usage：与非流式同一组数字，所以单次花费同样是 $1.00。
         res.write(
           `data: ${JSON.stringify({
@@ -601,6 +649,40 @@ observability:
   const metricsUrl = `http://127.0.0.1:${metricsPort}/metrics`;
   await waitReady(metricsUrl, "aisix 网关指标口", (s) => s === 200);
 
+  const sayingOn = async (
+    endpoint: "chat" | "messages" | "responses",
+    plaintext: string,
+    text: string,
+    model: string,
+    stream: boolean,
+  ): Promise<number> => {
+    const [path, payload] =
+      endpoint === "chat"
+        ? [
+            "/v1/chat/completions",
+            { model, messages: [{ role: "user", content: text }], ...(stream ? { stream: true } : {}) },
+          ]
+        : endpoint === "messages"
+          ? [
+              "/v1/messages",
+              {
+                model,
+                max_tokens: 16,
+                messages: [{ role: "user", content: text }],
+                ...(stream ? { stream: true } : {}),
+              },
+            ]
+          : ["/v1/responses", { model, input: text, ...(stream ? { stream: true } : {}) }];
+    const r = await fetch(`http://127.0.0.1:${proxyPort}${path}`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${plaintext}`, "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    // 记账在流结束的回调里，所以必须把 body 读完。
+    await r.text();
+    return r.status;
+  };
+
   const callNonChat = async (
     endpoint: "messages" | "responses",
     plaintext: string,
@@ -647,31 +729,21 @@ observability:
     async chatStream(plaintext: string) {
       return chatWith(proxyPort, plaintext, true);
     },
+    async sayingStream(
+      endpoint: "chat" | "messages" | "responses",
+      plaintext: string,
+      text: string,
+      model = "gpt-4o-mini",
+    ) {
+      return await sayingOn(endpoint, plaintext, text, model, true);
+    },
     async saying(
       endpoint: "chat" | "messages" | "responses",
       plaintext: string,
       text: string,
       model = "gpt-4o-mini",
     ) {
-      const [path, payload] =
-        endpoint === "chat"
-          ? ["/v1/chat/completions", { model, messages: [{ role: "user", content: text }] }]
-          : endpoint === "messages"
-            ? [
-                "/v1/messages",
-                { model, max_tokens: 16, messages: [{ role: "user", content: text }] },
-              ]
-            : ["/v1/responses", { model, input: text }];
-      const r = await fetch(`http://127.0.0.1:${proxyPort}${path}`, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${plaintext}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      });
-      await r.text();
-      return r.status;
+      return await sayingOn(endpoint, plaintext, text, model, false);
     },
     async chatModel(plaintext: string, model: string, stream = false) {
       const r = await fetch(`http://127.0.0.1:${proxyPort}/v1/chat/completions`, {

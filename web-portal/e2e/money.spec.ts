@@ -606,6 +606,60 @@ test("语义路由的分类调用被计入花费_按嵌入模型自己的标签"
   expect(line, line).toContain('endpoint="/v1/embeddings"');
 });
 
+test("流式被输出护栏拦截时_也按成功那样收钱", async () => {
+  // 非流式那条的流式版本。两者在网关里是**两套**记账代码（流结束的回调 vs
+  // 拿到完整应答时提交），实测过：非流式对的端点流式可能错，反之亦然。而
+  // Claude Code 与 Codex 的真实流量都是流式的。
+  //
+  // 这里断言的状态码与非流式不同：SSE 一旦开始发就改不了 HTTP 状态，网关只能
+  // 把流截断，所以调用方看到的是 200 加一个残缺的流。钱的账则完全一样。
+  const cookie = await fx.sessionCookie();
+  await setQuota(1_000_000_000);
+  const cells = [
+    ["chat", "gpt-4o-mini"],
+    ["messages", "gpt-4o-mini"],
+    ["responses", "gpt-4o-mini"],
+    ["messages", "anthropic-direct"],
+  ] as const;
+  for (const [ep, model] of cells) {
+    const label = `流拦${ep}-${model}`;
+    const k = await mint(cookie, label);
+    fx.blindPortalTo(`${k.name} · ${label}`);
+    expect((await setKeyQuota(cookie, k.name, 2_000_000)).status).toBe(200);
+    await waitFor(async () => fx.readResources().includes(`portal-key-${k.name}`), "额度推下去");
+    await waitFor(
+      async () => (await fx.sayingStream(ep, k.plaintext, "hello", model)) === 200,
+      `${label} 流式可用`,
+    );
+
+    const spendOfModel = async () => {
+      const m = await fetch(fx.metricsUrl).then((r) => r.text());
+      return m
+        .split("\n")
+        .filter(
+          (l) =>
+            l.startsWith("aisix_llm_spend_micro_usd_total{") && l.includes(`model="${model}"`),
+        )
+        .reduce((a, l) => a + (Number(l.slice(l.lastIndexOf("}") + 1).trim()) || 0), 0);
+    };
+    const before = await spendOfModel();
+    await fx.sayingStream(ep, k.plaintext, "forbidden-output-phrase", model);
+    // 流式的记账落在流结束的回调里，调用方可能先看到 body 结束 —— 所以等它
+    // 落地，别假设它已经落了（这里一开始就是这么写的，间歇性地红一次）。
+    await waitFor(
+      async () => (await spendOfModel()) > before,
+      `${label}：被拦的一发上游已经收过钱，花费指标却没记`,
+    );
+    expect((await spendOfModel()) - before, `${label}：记的金额不对`).toBe(1_000_000);
+
+    // 额度也烧完了：再来一发必须被闸挡下。
+    await waitFor(
+      async () => (await fx.sayingStream(ep, k.plaintext, "forbidden-output-phrase", model)) === 429,
+      `${label}：被拦的请求没消耗额度，可以无上限地触发`,
+    );
+  }
+});
+
 test("输出护栏拦截时_三个端点都按成功那样收钱", async () => {
   // 输出护栏在上游调用**之后**才判，那些 token 供应商已经收过钱了。所以被拦
   // 的一发和成功的一发对网关来说成本完全相同，两侧都得照收：花费指标（门户

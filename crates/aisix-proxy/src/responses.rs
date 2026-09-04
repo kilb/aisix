@@ -1904,25 +1904,10 @@ async fn responses_to_target(
                         }
                     }
                 }
-                if let aisix_guardrails::GuardrailVerdict::Block {
-                    reason,
-                    guardrail_name,
-                } = verdict
-                {
-                    // Per #153 the matched-pattern detail stays in ops logs only.
-                    tracing::warn!(
-                        guardrail_hook = "output",
-                        model = %model.display_name,
-                        reason = %reason,
-                        "guardrail blocked streaming /v1/responses response",
-                    );
-                    return Err(ProxyError::ContentFiltered(
-                        crate::error::guardrail_block_message(
-                            "response",
-                            guardrail_name.as_deref(),
-                        ),
-                    ));
-                }
+                // 用量在护栏判决**之前**算好：被拦下的那一发上游同样调用过、
+                // 同样计过费，它要带着这笔账走成功那条收尾路径。缓冲区此刻已是
+                // 脱敏后的最终内容，与成功路径读到的完全一致。
+                //
                 // #808: the whole SSE response is buffered here, so parse its
                 // terminal event for usage and let the handler emit (the body is
                 // a single complete chunk now, not a live stream).
@@ -1957,6 +1942,45 @@ async fn responses_to_target(
                     }
                     Some(u)
                 };
+                if let aisix_guardrails::GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                } = verdict
+                {
+                    // Per #153 the matched-pattern detail stays in ops logs only.
+                    tracing::warn!(
+                        guardrail_hook = "output",
+                        model = %model.display_name,
+                        reason = %reason,
+                        "guardrail blocked streaming /v1/responses response",
+                    );
+                    // 非流式的输出拦截一直是这么收尾的（#543）；缓冲流式这条原先
+                    // 走的是裸 `Err`，于是花费指标不记、额度闸也不扣，反复触发就能
+                    // 无上限地花运营方在供应商那边的钱。
+                    return Ok(ResponseDispatchSuccess {
+                        response: ProxyError::ContentFiltered(
+                            crate::error::guardrail_block_message(
+                                "response",
+                                guardrail_name.as_deref(),
+                            ),
+                        )
+                        .into_response(),
+                        provider: provider_label,
+                        usage,
+                        model_id: model_id.to_string(),
+                        provider_key_id: provider_key_id.clone(),
+                        upstream_model: upstream_model.clone(),
+                        routing: RoutingTelemetry::default(),
+                        guardrail_blocked: true,
+                        usage_handled_by_stream: false,
+                        output_redactions,
+                        output_monitor_hits,
+                        // 被拦下的正文不进采集：拦了又归档等于没拦。
+                        captured_content: None,
+                        terminal_failure,
+                        cache: crate::response_cache::CacheTelemetry::default(),
+                    });
+                }
                 // Content capture (#947): the assembled output text,
                 // read from the POST-redaction buffer so masked PII stays masked
                 // in the exported content.
