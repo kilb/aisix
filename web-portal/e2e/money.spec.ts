@@ -660,6 +660,66 @@ test("流式被输出护栏拦截时_也按成功那样收钱", async () => {
   }
 });
 
+test("额度耗尽的账号_网关重启后依然进不来", async () => {
+  // 网关那道闸靠的是「只增不减」的消费计数器，而默认的存储在进程内存里 ——
+  // 真重启一次它就归零，额度整个长回来（用共享存储才不会，见
+  // `granted_micro_usd` 的字段说明）。
+  //
+  // 撑住这件事的是门户那道闸：余额耗尽时它把密钥在配置文件里标成停用，那是
+  // 落盘的，重启翻不回来。这条用例钉的就是这个 —— 它一旦红，意味着停用状态
+  // 变成了进程内状态，那时候「余额耗尽」就只能挡到下一次重启为止。
+  const cookie = await fx.sessionCookie();
+  await setQuota(1_000_000_000);
+  const k = await mint(cookie, "重启");
+  expect((await setKeyQuota(cookie, k.name, 2_000_000)).status).toBe(200);
+  await waitFor(async () => fx.readResources().includes(`portal-key-${k.name}`), "额度推下去");
+  await waitFor(async () => (await fx.saying("chat", k.plaintext, "hello")) !== 200, "烧完额度");
+
+  await fx.restartGateway();
+  expect(
+    await fx.saying("chat", k.plaintext, "hello"),
+    "网关重启把已经耗尽的额度放回来了",
+  ).not.toBe(200);
+});
+
+test("被护栏拦下时_不得转移到下一个目标", async () => {
+  // 拦截曾经是从分派函数里 `Err` 出去的，落在目标循环的错误臂上 —— 那条臂
+  // 会判断能不能转移。若判成可转移，一次被拦的请求就打了多次上游，钱是成倍
+  // 的，而调用方拿到的仍然只是一个 422。内容被策略拦下不是上游的故障，换个
+  // 目标只会被同一条规则再拦一次。
+  const cookie = await fx.sessionCookie();
+  await setQuota(1_000_000_000);
+  const k = await mint(cookie, "转移");
+  const upstreamCalls = async () => {
+    const m = await fetch(fx.metricsUrl).then((r) => r.text());
+    return m
+      .split("\n")
+      .filter((l) => l.startsWith("aisix_deployment_requests_total{"))
+      .reduce((a, l) => a + (Number(l.slice(l.lastIndexOf("}") + 1).trim()) || 0), 0);
+  };
+  for (const ep of ["chat", "messages", "responses"] as const) {
+    await waitFor(
+      async () => (await fx.saying(ep, k.plaintext, "hello", "routed-two")) === 200,
+      `${ep} 路由组可用`,
+    );
+    for (const [mode, send] of [
+      ["非流式", fx.saying],
+      ["流式", fx.sayingStream],
+    ] as const) {
+      const before = await upstreamCalls();
+      await send(ep, k.plaintext, "forbidden-output-phrase", "routed-two");
+      await waitFor(
+        async () => (await upstreamCalls()) > before,
+        `${ep} ${mode}：上游没被调用，这一格量不到东西`,
+      );
+      expect(
+        (await upstreamCalls()) - before,
+        `${ep} ${mode}：被拦下之后又打了一次上游`,
+      ).toBe(1);
+    }
+  }
+});
+
 test("输出护栏拦截时_三个端点都按成功那样收钱", async () => {
   // 输出护栏在上游调用**之后**才判，那些 token 供应商已经收过钱了。所以被拦
   // 的一发和成功的一发对网关来说成本完全相同，两侧都得照收：花费指标（门户

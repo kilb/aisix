@@ -287,6 +287,11 @@ pub struct RateLimitPolicy {
     /// sub-call spend is never counted against this ceiling, so an
     /// api_key or team policy that also receives ensemble traffic sees
     /// only its non-ensemble spend capped.
+    ///
+    /// Recorded spend is held in the configured rate-limit store. The default
+    /// in-process store keeps it in memory only, so a restart begins the
+    /// window's tally again and is not shared between gateway instances;
+    /// a shared Redis store keeps one tally across both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub max_spend_micro_usd: Option<u64>,
@@ -314,6 +319,14 @@ pub struct RateLimitPolicy {
     /// Raising this is how more spending is allowed. Nothing has to be reset,
     /// and because both the granted figure and the consumed counter only ever
     /// increase, no reconciliation is needed between them.
+    ///
+    /// The consumed counter lives in the configured rate-limit store, and its
+    /// lifetime is the store's. A shared Redis store keeps it across gateway
+    /// restarts and shares it between gateway instances, which is what a
+    /// prepaid balance needs. The default in-process store holds it in memory
+    /// only: it is not shared between instances, and a restart returns every
+    /// allowance to unspent. Configure a shared store for any allowance that
+    /// has to outlive the process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub granted_micro_usd: Option<u64>,

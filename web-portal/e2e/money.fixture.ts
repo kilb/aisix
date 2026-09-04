@@ -137,6 +137,8 @@ export interface MoneyFixture {
     plaintext: string,
     model: string,
   ): Promise<number>;
+  /** 真重启网关进程（不是 SIGHUP）。用来量进程内状态在重启后还剩什么。 */
+  restartGateway(): Promise<void>;
   /**
    * 给网关发 SIGHUP，让它重读配置。
    *
@@ -644,7 +646,7 @@ observability:
   // 按名字持有，不靠下标：门户是先起的（要先注册用户才知道 user_id），
   // 下标取错的症状是「SIGHUP 发给了门户」，而门户不重读网关配置 —— 表现成
   // 「闸没生效」，跟真 bug 一模一样。
-  const gateway = spawn(GATEWAY_BIN, ["--config", cfgPath], { stdio: "inherit" });
+  let gateway = spawn(GATEWAY_BIN, ["--config", cfgPath], { stdio: "inherit" });
   procs.push(gateway);
   const metricsUrl = `http://127.0.0.1:${metricsPort}/metrics`;
   await waitReady(metricsUrl, "aisix 网关指标口", (s) => s === 200);
@@ -796,6 +798,17 @@ observability:
     reloadGateway() {
       gateway.kill("SIGHUP");
     },
+    async restartGateway() {
+      // 真重启，不是 SIGHUP：SIGHUP 只让进程重读配置，进程内的计数器原样还在。
+      // 累计额度那个「只增不减」的计数器住在哪、活多久，只有真重启才量得出来。
+      const old = procs.indexOf(gateway);
+      gateway.kill("SIGTERM");
+      await new Promise<void>((r) => gateway.once("exit", () => r()));
+      gateway = spawn(GATEWAY_BIN, ["--config", cfgPath], { stdio: "inherit" });
+      if (old >= 0) procs[old] = gateway;
+      else procs.push(gateway);
+      await waitReady(metricsUrl, "aisix 网关指标口（重启后）", (st) => st === 200);
+    },
     async chatWithStatus() {
       return chatWith(proxyPort, CALLER_KEY);
     },
@@ -898,6 +911,14 @@ models:
     provider: openai
     provider_key: stub
     model_name: gpt-4o-mini
+  # 两个目标的路由组：用来量「被输出护栏拦下时会不会向下一个目标转移」——
+  # 会的话一次被拦的请求就打了多次上游，钱是双倍的。
+  - display_name: routed-two
+    routing:
+      strategy: round_robin
+      targets:
+        - model: gpt-4o-mini
+        - model: cached-direct
   - display_name: routed-unpriced
     routing:
       strategy: round_robin
