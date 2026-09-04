@@ -86,7 +86,7 @@ export interface MoneyFixture {
   /** 打一次**流式** chat。流式的记账走的是另一条路径。 */
   chatStream(plaintext: string): Promise<number>;
   /** 打一次 `/v1/embeddings`。这个端点的记账路径与 chat 完全不同。 */
-  embed(plaintext: string): Promise<number>;
+  embed(plaintext: string, model?: string): Promise<number>;
   /** 用指定模型打一次 chat（比如语义路由）。`stream` 为真时走 SSE。 */
   chatModel(plaintext: string, model: string, stream?: boolean): Promise<number>;
   /** 桩上游至今收到的嵌入调用次数。 */
@@ -622,14 +622,14 @@ observability:
       return r.status;
     },
     embedCallCount: () => embedCalls,
-    async embed(plaintext: string) {
+    async embed(plaintext: string, model = "embed-1") {
       const r = await fetch(`http://127.0.0.1:${proxyPort}/v1/embeddings`, {
         method: "POST",
         headers: {
           authorization: `Bearer ${plaintext}`,
           "content-type": "application/json",
         },
-        body: JSON.stringify({ model: "embed-1", input: "hello" }),
+        body: JSON.stringify({ model, input: "hello" }),
       });
       await r.text();
       return r.status;
@@ -757,6 +757,17 @@ models:
       strategy: round_robin
       targets:
         - model: unpriced-1
+  # 另起一个开缓存的嵌入模型：embed-1 兼着语义路由的分类调用，给它开缓存会让
+  # 「分类那一发照收」那条用例的第二发命中，量的就不是同一件事了。
+  - display_name: embed-cached
+    provider: openai
+    provider_key: stub
+    model_name: text-embedding-3-small
+    embedding:
+      dimensions: 3
+    cost:
+      input_per_1k: 0.5
+      output_per_1k: 0.5
   - display_name: cached-direct
     provider: openai
     provider_key: stub
@@ -787,6 +798,10 @@ cache_policies:
     enabled: true
     ttl_seconds: 300
     applies_to: "model:cached-direct"
+  - name: cache-embed-only
+    enabled: true
+    ttl_seconds: 300
+    applies_to: "model:embed-cached"
 api_keys:
   - display_name: e2e-caller
     key_hash: "${keyHash}"

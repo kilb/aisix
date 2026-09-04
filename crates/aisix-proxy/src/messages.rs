@@ -3616,23 +3616,19 @@ fn emit_anthropic_usage_event(
         cache_hit_saved_output_tokens: cache.saved_output_tokens,
         // Priced from the dispatched row's `Model.cost` when the operator set
         // one, `0.0` otherwise — see `usage_attr::request_cost_usd`.
-        cost_usd: if cache.bills_upstream_cost() {
-            crate::usage_attr::request_cost_usd(
-                snap,
-                model_id,
-                crate::usage_attr::input_tokens_for_pricing(
-                    u64::from(metrics.prompt_tokens),
-                    // `/v1/messages` is native Anthropic: there is no
-                    // OpenAI-shaped subset counter on this path.
-                    0,
-                    u64::from(metrics.cache_read_tokens),
-                    u64::from(metrics.cache_creation_tokens),
-                ),
-                u64::from(metrics.completion_tokens),
-            )
-        } else {
-            0.0
-        },
+        cost_usd: cache.cost_usd(
+            snap,
+            model_id,
+            crate::usage_attr::input_tokens_for_pricing(
+                u64::from(metrics.prompt_tokens),
+                // `/v1/messages` is native Anthropic: there is no
+                // OpenAI-shaped subset counter on this path.
+                0,
+                u64::from(metrics.cache_read_tokens),
+                u64::from(metrics.cache_creation_tokens),
+            ),
+            u64::from(metrics.completion_tokens),
+        ),
         cache_creation_tokens: metrics.cache_creation_tokens,
         cache_read_tokens: metrics.cache_read_tokens,
         usage_estimated: metrics.usage_estimated,

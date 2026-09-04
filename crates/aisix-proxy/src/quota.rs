@@ -370,7 +370,10 @@ fn unpriced_dispatch_exists(snap: &aisix_core::AisixSnapshot, model: &aisix_core
         return routing.targets.iter().any(|t| unpriced_by_name(&t.model));
     }
     if let Some(semantic) = model.semantic.as_ref() {
-        return unpriced_by_name(&semantic.default)
+        // 分类模型也算：语义路由为了决定路由会先打一发嵌入调用，那是这个入口
+        // 下真花掉的钱、也确实记进了这条花费上限。它没配价，同样是漏计。
+        return unpriced_by_name(&semantic.embedding_model)
+            || unpriced_by_name(&semantic.default)
             || semantic.routes.iter().any(|r| unpriced_by_name(&r.target));
     }
     if let Some(ensemble) = model.ensemble.as_ref() {
@@ -2013,6 +2016,65 @@ mod tests {
         assert!(
             !rendered.contains(aisix_obs::metrics::M_BUDGET_UNPRICED_REQUESTS_TOTAL),
             "把「父级结构上没有 cost」当成了没配价: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_parent_with_an_unpriced_classifier_is_counted() {
+        // 路由目标都配了价，只有分类模型没配 —— 那一发嵌入调用是真花掉的钱，
+        // 也确实记进了这条花费上限，所以它没配价同样是漏计。
+        let snap = snapshot_with_policy(make_spend_policy(
+            "api_key",
+            "k1",
+            "day",
+            None,
+            Some(5_000_000),
+        ));
+        let priced: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "gpt-4o",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "pk-1",
+            "cost": { "input_per_1k": 0.5, "output_per_1k": 0.5 },
+        }))
+        .unwrap();
+        snap.models
+            .insert(aisix_core::resource::ResourceEntry::new("t-1", priced, 1));
+        let classifier: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "embed-1",
+            "provider": "openai",
+            "model_name": "text-embedding-3-small",
+            "provider_key_id": "pk-1",
+            "embedding": { "dimensions": 3 },
+        }))
+        .unwrap();
+        snap.models.insert(aisix_core::resource::ResourceEntry::new(
+            "e-1", classifier, 1,
+        ));
+        let parent: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "smart",
+            "semantic": {
+                "embedding_model": "embed-1",
+                "default": "gpt-4o",
+                "match": { "threshold": 0.9 },
+                "routes": [{ "name": "only", "target": "gpt-4o", "examples": ["hi"] }],
+            },
+        }))
+        .unwrap();
+        snap.models
+            .insert(aisix_core::resource::ResourceEntry::new("sem-1", parent, 1));
+        let state = test_state(&snap);
+        let auth = test_auth_key("k1");
+        let mrl = make_model_rl("smart", "sem-1", None);
+
+        reserve_layers(&state, &snap, &auth, Some(&mrl), None)
+            .await
+            .expect("应放行");
+
+        let rendered = state.metrics.render();
+        assert!(
+            rendered.contains(aisix_obs::metrics::M_BUDGET_UNPRICED_REQUESTS_TOTAL),
+            "分类模型没配价，那部分花费漏计却没出声: {rendered}"
         );
     }
 

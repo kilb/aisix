@@ -4053,25 +4053,20 @@ fn emit_usage_event(
         cache_hit_saved_output_tokens: cache.saved_output_tokens,
         // Priced from the dispatched row's `Model.cost` when the operator set
         // one, `0.0` otherwise — see `usage_attr::request_cost_usd`.
-        cost_usd: if cache.bills_upstream_cost() {
-            crate::usage_attr::request_cost_usd(
-                snap,
-                model_id,
-                // `/v1/responses` carries BOTH vocabularies: the OpenAI subset
-                // counter on the verbatim path, the Anthropic separate counters
-                // on the cross-provider bridge (#825). The splitter handles
-                // either.
-                crate::usage_attr::input_tokens_for_pricing(
-                    u64::from(usage.prompt_tokens),
-                    u64::from(usage.cached_prompt_tokens),
-                    u64::from(usage.cache_read_tokens),
-                    u64::from(usage.cache_creation_tokens),
-                ),
-                u64::from(usage.completion_tokens),
-            )
-        } else {
-            0.0
-        },
+        cost_usd: cache.cost_usd(
+            snap,
+            model_id,
+            // `/v1/responses` carries BOTH vocabularies: the OpenAI subset
+            // counter on the verbatim path, the Anthropic separate counters on
+            // the cross-provider bridge (#825). The splitter handles either.
+            crate::usage_attr::input_tokens_for_pricing(
+                u64::from(usage.prompt_tokens),
+                u64::from(usage.cached_prompt_tokens),
+                u64::from(usage.cache_read_tokens),
+                u64::from(usage.cache_creation_tokens),
+            ),
+            u64::from(usage.completion_tokens),
+        ),
         cached_prompt_tokens: usage.cached_prompt_tokens,
         reasoning_tokens: usage.reasoning_tokens,
         // Anthropic cache counters (#825 cross-provider path); 0 on the

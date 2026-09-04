@@ -646,6 +646,21 @@ test("三个端点上_命中缓存都不该收钱", async () => {
     expect(hit - miss, `${endpoint}：命中缓存却还是收了钱`).toBe(0);
   }
 
+  // `/v1/embeddings` 也有缓存闸，也是同一个问题。它形状不同（没有 messages），
+  // 所以单独一格 —— 按 `reservation.commit` 去找会漏掉它，按「哪些端点有缓存
+  // 闸」去找才不会。
+  await waitFor(
+    async () => (await fx.embed(k.plaintext, "embed-cached")) === 200,
+    "embed-cached 可用",
+  );
+  const eMiss = await spendOf("embed-cached");
+  expect(eMiss, "embeddings：未命中那一发没记花费").toBeGreaterThan(0);
+  expect(await fx.embed(k.plaintext, "embed-cached")).toBe(200);
+  expect(
+    (await spendOf("embed-cached")) - eMiss,
+    "embeddings：命中缓存却还是收了钱",
+  ).toBe(0);
+
   // 流式的契约是**另一条**：实测下来三个端点的流式请求都不进缓存闸（缓存
   // 事件一条都不记，连 miss 都没有），所以每一发都是真打上游、每一发都该
   // 收钱。这里把它钉住，是为了哪天缓存开始服务流式时这条会红 —— 那时计费

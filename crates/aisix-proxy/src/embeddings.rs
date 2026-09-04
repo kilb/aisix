@@ -926,7 +926,7 @@ fn emit_usage_event(
         cache_hit_saved_input_tokens: cache.saved_input_tokens,
         // Priced from the dispatched row's `Model.cost` when the operator set
         // one, `0.0` otherwise — see `usage_attr::request_cost_usd`.
-        cost_usd: crate::usage_attr::request_cost_usd(
+        cost_usd: cache.cost_usd(
             snap,
             model_id,
             // 这个表面没有提示缓存，全部按新鲜输入计价。

@@ -69,17 +69,31 @@ impl CacheTelemetry {
         }
     }
 
-    /// Whether this request's usage event should carry the upstream price.
+    /// This request's upstream price, which a cache hit does not have.
     ///
     /// 命中缓存的请求没有打上游，网关没为它付过一分钱 —— 所以它的花费是 0，
     /// 而不是「把重放的 token 按价目表再算一遍」。`/v1/chat/completions` 一直
     /// 是这个契约（命中分支上直接写 `cost_usd: 0.0`，并把重放的 token 记进
-    /// `cache_hit_saved_*` 供控制面算省了多少）；按 `CacheTelemetry` 记账的
-    /// 另外两个端点走这个判据，免得三条路径各写各的、再各自漂一次。
+    /// `cache_hit_saved_*` 供控制面算省了多少）。
+    ///
+    /// 定价走这里而不是让每个端点自己判一次：带缓存闸的端点现在有三个
+    /// （`/v1/messages`、`/v1/responses`、`/v1/embeddings`），条件写三遍就是
+    /// 三份各自会漂的副本 —— 这个 bug 本来就是「chat 修了、另两个没修」漏出
+    /// 来的，补的时候又漏了第三个。拿得到 `CacheTelemetry` 的调用点用这个，
+    /// 拿不到的（没有缓存闸的那几个端点）继续直接用 `request_cost_usd`。
     ///
     /// 命中时 token 计数照报：它们是「这次省下了多少」的依据，只有价钱是 0。
-    pub(crate) fn bills_upstream_cost(&self) -> bool {
-        !matches!(self.status, CacheStatus::Hit)
+    pub(crate) fn cost_usd(
+        &self,
+        snap: &aisix_core::AisixSnapshot,
+        model_id: &str,
+        input: aisix_core::InputTokens,
+        output_tokens: u64,
+    ) -> f64 {
+        if matches!(self.status, CacheStatus::Hit) {
+            return 0.0;
+        }
+        crate::usage_attr::request_cost_usd(snap, model_id, input, output_tokens)
     }
 
     /// `cache_hit_layer` for the usage event — this gate is exact-only.
