@@ -116,6 +116,7 @@ pub fn build_router(state: ProxyState) -> Router {
             "/v1/messages/count_tokens",
             post(count_tokens::count_tokens),
         )
+
         .route("/v1/rerank", post(rerank::rerank))
         .route("/v1/responses", post(responses::responses))
         .route("/v1/audio/transcriptions", post(audio::transcriptions))

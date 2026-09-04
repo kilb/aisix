@@ -522,11 +522,95 @@ mod tests {
         "/v1/batches/batch_abc123/cancel",
         "/v1/fine_tuning/jobs",
         "/v1/fine_tuning/jobs/ft_abc123",
+        "/v1/fine_tuning/jobs/ft_abc123/cancel",
         "/mcp",
+        // 带尾斜杠的那条是单独注册的，归一化里也有专门的臂 —— 两者都要有样本，
+        // 否则那个臂没有任何断言看着。
+        "/mcp/",
         "/mcp/some-server",
         "/a2a/some-agent",
+        "/a2a/some-agent/.well-known/agent-card.json",
         "/passthrough/openai/v1/anything",
     ];
+
+    /// Routes deliberately outside the per-endpoint request families, with
+    /// the reason. Everything else must have a sample in [`ROUTES`].
+    ///
+    /// The liveness and readiness probes are scraped continuously by the
+    /// orchestrator, carry no caller identity, and answer from process state
+    /// without reaching an upstream — a per-endpoint series for them would
+    /// be pure scrape noise sharing labels with real traffic.
+    const NOT_METERED: &[&str] = &["/livez", "/readyz"];
+
+    /// Every route `build_router` registers must have a sample in [`ROUTES`]
+    /// or an entry in [`NOT_METERED`].
+    ///
+    /// [`ROUTES`] is what makes the two assertions below able to see a route
+    /// at all, and it was kept in step by eye: a route added to
+    /// `build_router` and not here produced no failure, it just stopped
+    /// being checked. That is the same invisibility that shipped `/v1/videos`
+    /// reporting `endpoint="other"` (#1234) — the label was never decided,
+    /// and nothing said so.
+    ///
+    /// The route table is read out of this crate's own source rather than
+    /// duplicated: a third list would be a third thing to align by hand. The
+    /// scan stops at the test module so routes declared by tests below do not
+    /// count as shipped ones.
+    #[test]
+    fn every_registered_route_is_covered_by_a_sample() {
+        const LIB_SRC: &str = include_str!("lib.rs");
+        let production = LIB_SRC
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(LIB_SRC);
+
+        // `.route("<pattern>"` — the literal may sit on the next line.
+        let mut patterns: Vec<&str> = Vec::new();
+        for chunk in production.split(".route(").skip(1) {
+            let Some(open) = chunk.find('"') else {
+                continue;
+            };
+            // 只接受紧跟其后的字面量：`.route(` 与它之间只能有空白，否则那是
+            // 别的东西（比如注释里提到的 `.route(`）。
+            if !chunk[..open].chars().all(char::is_whitespace) {
+                continue;
+            }
+            let rest = &chunk[open + 1..];
+            let Some(close) = rest.find('"') else {
+                continue;
+            };
+            patterns.push(&rest[..close]);
+        }
+        patterns.sort_unstable();
+        patterns.dedup();
+        assert!(
+            patterns.len() > 20,
+            "只从源码里认出 {} 条路由，抽取多半坏了（真实数量是三十几条）",
+            patterns.len()
+        );
+
+        /// 一个样本路径是否匹配一条路由模式。`:param` 段匹配任意一段。
+        fn matches(pattern: &str, sample: &str) -> bool {
+            let p: Vec<&str> = pattern.split('/').collect();
+            let s: Vec<&str> = sample.split('/').collect();
+            p.len() == s.len()
+                && p.iter()
+                    .zip(&s)
+                    .all(|(pseg, sseg)| pseg.starts_with(':') || pseg == sseg)
+        }
+
+        for pattern in &patterns {
+            if NOT_METERED.contains(pattern) {
+                continue;
+            }
+            assert!(
+                ROUTES.iter().any(|sample| matches(pattern, sample)),
+                "路由 {pattern} 在 ROUTES 里没有样本，于是下面两条断言看不见它 —— \
+                 它的 endpoint 标签和 LLM/proxy 分层都还没被决定过。加一个样本，\
+                 或者连同理由加进 NOT_METERED。"
+            );
+        }
+    }
 
     /// No proxy route may fall through to the `"other"` bucket. A route that
     /// does is invisible per-endpoint in every request series — which is how
