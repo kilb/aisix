@@ -1244,7 +1244,15 @@ pub(crate) async fn get_batch(
         // batch downloads the output JSONL and emits real token usage.
         if status == StatusCode::OK {
             if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-                maybe_attribute_batch(&state, &auth, &target, &raw, &v);
+                maybe_attribute_batch(
+                    &state,
+                    &auth,
+                    &target,
+                    &raw,
+                    &v,
+                    _reservation.spend_keys(),
+                    &client.user_agent,
+                );
             }
         }
 
@@ -1674,6 +1682,8 @@ fn maybe_attribute_batch(
     target: &JobTarget,
     raw_batch_id: &str,
     batch: &Value,
+    spend_keys: Vec<String>,
+    user_agent: &str,
 ) {
     if batch.get("status").and_then(Value::as_str) != Some("completed") {
         return;
@@ -1711,6 +1721,7 @@ fn maybe_attribute_batch(
     let api_base = target.pk_entry.value.api_base.clone();
     let pk_tls = target.pk_entry.value.tls.clone();
     let raw_batch_id = raw_batch_id.to_string();
+    let user_agent = user_agent.to_string();
 
     tokio::spawn(async move {
         if let Err(e) = attribute_batch_usage(
@@ -1727,6 +1738,8 @@ fn maybe_attribute_batch(
             pk_tls.as_ref(),
             &raw_batch_id,
             &output_file_id,
+            &spend_keys,
+            &user_agent,
         )
         .await
         {
@@ -1759,6 +1772,11 @@ async fn attribute_batch_usage(
     tls: Option<&aisix_core::models::provider_key::ProviderKeyTls>,
     raw_batch_id: &str,
     output_file_id: &str,
+    // 这次请求的花费桶键，取自 retrieve 时那次预留。批处理的钱是事后落账的，
+    // 落账时预留早就没了 —— 键先拿在手上，才能把这笔钱回扣到额度上。
+    spend_keys: &[String],
+    // 归入 `aisix_llm_tokens_by_client_total` 的客户端分类。
+    user_agent: &str,
 ) -> Result<(), String> {
     let url = match adapter {
         Adapter::AzureOpenai => {
@@ -1836,9 +1854,35 @@ async fn attribute_batch_usage(
 
     let snap = state.snapshot.load();
     let pk = crate::usage_attr::ResolvedPk::resolve(&snap, pk_id);
+    // 指标的 provider 标签取这个模型行自己的 provider —— 与请求路径同一个来源。
+    let provider_label = snap
+        .models
+        .get_by_id(model_id)
+        .and_then(|e| e.value.provider.clone())
+        .unwrap_or_else(|| "unknown".to_string());
     // Same exporter set for every model slice of one batch.
     let exporters = crate::usage_attr::live_exporters(state, &snap);
     let multi = per_model.len() > 1;
+    // 先回扣额度，再发事件与指标。顺序是有意的：观察者只能看见事件和指标，
+    // 把额度放在它们之后，就存在一个「指标已到、额度未到」的窗口，任何据此
+    // 判断的检查都会间歇性地看错。
+    //
+    // 用 retrieve 时那次预留的键：预留本身早已释放（它只在准入时挡人），但键
+    // 是纯字符串，事后照样能记。批次去重保证这笔钱只记一次。
+    let billed_micro_usd: u64 = per_model
+        .values()
+        .map(|agg| {
+            cost.map(|c| {
+                crate::usage_attr::spend_micro_usd(c.calculate(agg.prompt, agg.completion))
+            })
+            .unwrap_or(0)
+        })
+        .fold(0u64, |a, b| a.saturating_add(b));
+    if billed_micro_usd > 0 && !spend_keys.is_empty() {
+        state
+            .limiter
+            .add_tokens_post_stream_all(spend_keys, billed_micro_usd);
+    }
     for (idx, (provider_model, agg)) in per_model.iter().enumerate() {
         let request_id = batch_attribution_request_id(raw_batch_id, idx, multi);
         let mut event = UsageEvent {
@@ -1869,6 +1913,30 @@ async fn attribute_batch_usage(
             exporters.generation(),
             exporters.iter().map(|e| &*e.value),
         );
+        // 同一笔钱也要进 Prometheus 的 token/花费族。事件只进控制面的账本，
+        // 而按花费序列求和扣款的那一侧看不到它 —— 于是一个批次可以消耗巨量
+        // token 而用户余额分毫不动。
+        let owned_caller = crate::request_metrics::Caller::from_api_key_id(&snap, api_key_id);
+        crate::request_metrics::record_usage(
+            state,
+            "/v1/batches",
+            owned_caller.as_caller(),
+            crate::request_metrics::Upstream {
+                provider: &provider_label,
+                model: display_name,
+                upstream_model: provider_model,
+                pk: pk.labels(),
+                ..Default::default()
+            },
+            crate::request_metrics::Tokens {
+                input: event.prompt_tokens,
+                output: event.completion_tokens,
+                total: event.prompt_tokens.saturating_add(event.completion_tokens),
+                spend_usd: event.cost_usd,
+                client_type: state.client_classifier.classify(user_agent),
+            },
+        );
+
         tracing::info!(
             batch_id = %raw_batch_id,
             provider_model = %provider_model,

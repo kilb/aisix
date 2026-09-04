@@ -125,6 +125,11 @@ export interface MoneyFixture {
     text: string,
     model?: string,
   ): Promise<number>;
+  /**
+   * 取一个批处理任务。存根回的是「已完成」，于是网关会去下载输出并事后落账
+   * —— 那是与请求路径完全不同的一条计费代码。
+   */
+  retrieveBatch(plaintext: string, batchId: string, model?: string): Promise<number>;
   /** 同 `saying`，但走流式 —— 流式记账是另一条代码路径。 */
   sayingStream(
     endpoint: "chat" | "messages" | "responses",
@@ -312,6 +317,39 @@ export async function startMoney(): Promise<MoneyFixture> {
         else if (typeof j.input === "string") echoed = j.input;
       } catch {
         /* 不是 JSON 就回 ok */
+      }
+      // 批处理：retrieve 回一个已完成的批次，输出文件里每行带自己的 usage。
+      // 网关首次看到 completed 时会把输出下载下来聚合 —— 这条路径上的钱是
+      // 「事后落账」的，和请求路径完全不同。
+      if ((req.url ?? "").includes("/batches/")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            id: "batch_e2e",
+            object: "batch",
+            status: "completed",
+            output_file_id: "file-out-e2e",
+            endpoint: "/v1/chat/completions",
+          }),
+        );
+        return;
+      }
+      if ((req.url ?? "").includes("/files/file-out-e2e/content")) {
+        res.writeHead(200, { "content-type": "application/x-ndjson" });
+        // 两行，各 1000 输入 + 1000 输出 —— 配上 $0.5/1k 的定价，整批 $2.00。
+        const line = (i: number) =>
+          JSON.stringify({
+            id: `req-${i}`,
+            response: {
+              status_code: 200,
+              body: {
+                model: "gpt-4o-mini",
+                usage: { prompt_tokens: 1000, completion_tokens: 1000, total_tokens: 2000 },
+              },
+            },
+          });
+        res.end(`${line(1)}\n${line(2)}\n`);
+        return;
       }
       // Anthropic 原生的流式：事件名和 OpenAI 那套完全不同，用量在
       // message_start（输入）与 message_delta（输出）两处。回 OpenAI 形状的话
@@ -731,6 +769,14 @@ observability:
     async chatStream(plaintext: string) {
       return chatWith(proxyPort, plaintext, true);
     },
+    async retrieveBatch(plaintext: string, batchId: string, model = "gpt-4o-mini") {
+      const r = await fetch(
+        `http://127.0.0.1:${proxyPort}/v1/batches/${batchId}?model=${model}`,
+        { headers: { authorization: `Bearer ${plaintext}` } },
+      );
+      await r.text();
+      return r.status;
+    },
     async sayingStream(
       endpoint: "chat" | "messages" | "responses",
       plaintext: string,
@@ -865,6 +911,8 @@ function writeResources(
 provider_keys:
   - display_name: stub
     provider: openai
+    # jobs 表面（files/batches/fine-tuning）那道闸看的是 adapter，不是 provider。
+    adapter: openai
     api_key: sk-stub
     api_base: "${upstreamBase}"
   # Anthropic 原生上游：打到它的 /v1/messages 走的是穿透分派，与打到

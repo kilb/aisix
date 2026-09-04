@@ -660,6 +660,54 @@ test("流式被输出护栏拦截时_也按成功那样收钱", async () => {
   }
 });
 
+test("批处理跑完的钱_也要进指标和额度", async () => {
+  // 批处理的钱是**事后**落账的：网关首次看到批次 completed 时把输出下载下来，
+  // 按行聚合 usage。那条路径与请求路径完全分开，所以请求路径上的记账是否正确
+  // 说明不了它 —— 而一个批次可以消耗巨量 token。
+  //
+  // 三侧同样都要齐：客户账本、花费指标（门户据此扣款）、网关自己的额度闸。
+  const cookie = await fx.sessionCookie();
+  await setQuota(1_000_000_000);
+  const k = await mint(cookie, "批处理");
+  fx.blindPortalTo(`${k.name} · 批处理`);
+  expect((await setKeyQuota(cookie, k.name, 10_000_000)).status).toBe(200);
+  await waitFor(async () => fx.readResources().includes(`portal-key-${k.name}`), "额度推下去");
+
+  const spend = async () => {
+    const m = await fetch(fx.metricsUrl).then((r) => r.text());
+    return m
+      .split("\n")
+      .filter(
+        (l) =>
+          l.startsWith("aisix_llm_spend_micro_usd_total{") && l.includes('model="gpt-4o-mini"'),
+      )
+      .reduce((a, l) => a + (Number(l.slice(l.lastIndexOf("}") + 1).trim()) || 0), 0);
+  };
+
+  const before = await spend();
+  expect(await fx.retrieveBatch(k.plaintext, "batch_e2e")).toBe(200);
+  // 落账在脱离请求的任务里，所以等它落地。输出两行、各 1000+1000 token，
+  // 按 $0.5/1k 算整批 $2.00。
+  await waitFor(async () => (await spend()) > before, "批处理的花费没进指标，门户永远扣不到");
+  expect((await spend()) - before, "批处理记的金额不对").toBe(2_000_000);
+
+  // 额度那一侧也要扣。额度 $10，五个批次刚好 $10 —— 之后**一发**普通请求就
+  // 该被闸挡下。
+  //
+  // 这里刻意不用「反复打 chat 直到 429」来等：那种等法自己就在花钱（每轮
+  // $1），十轮之后必然 429，跟批处理扣没扣毫无关系 —— 第一版就是这么写的，
+  // 变异检查照过。改成先用免费的观察（指标）等五个批次都落账；网关是先扣额度
+  // 再发指标的，所以指标到了就意味着额度也到了。
+  for (let i = 0; i < 4; i++) {
+    expect(await fx.retrieveBatch(k.plaintext, `batch_e2e_${i}`)).toBe(200);
+  }
+  await waitFor(async () => (await spend()) - before === 10_000_000, "五个批次都落账");
+  expect(
+    await fx.saying("chat", k.plaintext, "hello"),
+    "批处理的花费没扣额度，可以无上限地跑",
+  ).toBe(429);
+});
+
 test("额度耗尽的账号_网关重启后依然进不来", async () => {
   // 网关那道闸靠的是「只增不减」的消费计数器，而默认的存储在进程内存里 ——
   // 真重启一次它就归零，额度整个长回来（用共享存储才不会，见
