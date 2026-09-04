@@ -734,11 +734,32 @@ async fn run_session(
     let elapsed = started.elapsed();
     let total_tokens = usage.input_tokens + usage.output_tokens;
     // 会话的花费：算在提交之前，同一个数字既进花费桶也进下面的用量事件。
+    //
+    // 走家族共用的那个口子，而不是直接 `ModelCost::calculate(input, output)`：
+    // 会话里从提示缓存读回来的 token 有自己的费率（`cached_input_per_1k`），
+    // 按全价输入算会多收 —— 而事件里 `cached_prompt_tokens` 是照报的，于是
+    // 按事件重算花费的控制面会得到另一个数字，两个平面对同一次会话给出不同
+    // 的钱。`input_tokens` 含缓存那部分（OpenAI 的约定），`cached_tokens`
+    // 是它的子集，所以按「子集」那个位置传。
+    // 用会话开始时捕获的那份定价，而不是重取快照：会话可以比它启动时那代
+    // 配置活得更久，而重取之后行可能已经不在了 —— 那会把一次会话的钱静默
+    // 归零。`calculate_with_cache` 与 `request_cost_usd` 用的是同一个函数。
     let cost_usd = model_entry
         .value
         .cost
         .as_ref()
-        .map(|c| c.calculate(usage.input_tokens, usage.output_tokens))
+        .map(|c| {
+            c.calculate_with_cache(
+                crate::usage_attr::input_tokens_for_pricing(
+                    usage.input_tokens,
+                    usage.cached_tokens,
+                    // 这个表面没有 Anthropic 那套分开的缓存读/写计数。
+                    0,
+                    0,
+                ),
+                usage.output_tokens,
+            )
+        })
         .unwrap_or(0.0);
     reservation
         .commit(total_tokens, crate::usage_attr::spend_micro_usd(cost_usd))
@@ -956,6 +977,17 @@ mod tests {
     const CALLER_HASH: &str = "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891";
 
     fn snapshot(api_base: &str, adapter: &str, provider: &str) -> AisixSnapshot {
+        snapshot_with_cost(api_base, adapter, provider, "")
+    }
+
+    /// `cost` 是要插进模型行的 `"cost": {...}` 片段（含前导逗号），空串表示
+    /// 不配价。
+    fn snapshot_with_cost(
+        api_base: &str,
+        adapter: &str,
+        provider: &str,
+        cost: &str,
+    ) -> AisixSnapshot {
         let snap = AisixSnapshot::new();
         let pk_json = format!(
             r#"{{"display_name":"rt-pk","secret":"sk-up","api_base":"{api_base}","provider":"{provider}","adapter":"{adapter}"}}"#
@@ -963,7 +995,7 @@ mod tests {
         let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
         snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
         let m_json = format!(
-            r#"{{"display_name":"rt-model","provider":"{provider}","model_name":"gpt-realtime","provider_key_id":"{PK_ID}"}}"#
+            r#"{{"display_name":"rt-model","provider":"{provider}","model_name":"gpt-realtime","provider_key_id":"{PK_ID}"{cost}}}"#
         );
         let m: Model = serde_json::from_str(&m_json).unwrap();
         snap.models.insert(ResourceEntry::new("m-rt", m, 1));
@@ -1055,6 +1087,61 @@ mod tests {
             }
         });
         (addr, seen_handshake, seen_frames)
+    }
+
+    /// 会话里从提示缓存读回来的 token 要按缓存费率计价，而不是全价输入。
+    ///
+    /// 这个表面自己算成本（`ModelCost::calculate(input, output)`），而家族其它
+    /// 端点一律走 `usage_attr::request_cost_usd` + `input_tokens_for_pricing`，
+    /// 那条路会把 `cached_input_per_1k` 应用上。事件里 `cached_prompt_tokens`
+    /// 是照报的，所以按事件重算花费的控制面会得到另一个数字 —— 两个平面对同
+    /// 一次会话给出不同的钱。
+    ///
+    /// 上游存根回 7 输入（其中 1 来自缓存）+ 3 输出。输入 $10/1k、缓存读
+    /// $1/1k、输出 $20/1k：应为 6*0.01 + 1*0.001 + 3*0.02 = $0.121。按全价
+    /// 输入算会得到 7*0.01 + 3*0.02 = $0.13。
+    #[tokio::test]
+    async fn cached_session_tokens_are_priced_at_the_cache_rate() {
+        let (up_addr, _handshake, _frames) = spawn_upstream().await;
+        let snap = snapshot_with_cost(
+            &format!("http://{up_addr}/v1"),
+            "openai",
+            "openai",
+            r#","cost":{"input_per_1k":10.0,"output_per_1k":20.0,"cached_input_per_1k":1.0}"#,
+        );
+        let (addr, _state, mut rx) = serve(snap).await;
+
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer sk-caller".parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("handshake");
+        let (mut tx, mut client_rx) = ws.split();
+        tx.send(TgMessage::Text(
+            serde_json::json!({"type": "session.update"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        // 存根回一帧带用量的 response.done 之后就关闭；会话的记账在关闭时做。
+        while let Some(Ok(msg)) = client_rx.next().await {
+            if matches!(msg, TgMessage::Close(_)) {
+                break;
+            }
+        }
+
+        let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("usage event expected")
+            .expect("sink closed");
+        assert_eq!(ev.cached_prompt_tokens, 1, "缓存 token 没被记下来");
+        assert!(
+            (ev.cost_usd - 0.121).abs() < 1e-9,
+            "缓存读按全价输入计了价（应为 0.121，得到 {}）",
+            ev.cost_usd
+        );
     }
 
     #[tokio::test]

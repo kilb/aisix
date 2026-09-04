@@ -169,8 +169,16 @@ pub(crate) const BILLED_BATCH_DEDUP_WINDOW: std::time::Duration =
 /// Entries older than `ttl` are reclaimed on the way through. The set is an
 /// optimization, not the correctness mechanism — the deterministic
 /// `request_id = "batch-<id>"` on the emitted events is what keeps
-/// re-emission idempotent across a restart (#720) — so expiring an entry can
-/// at worst cost one redundant, already-idempotent emit.
+/// re-emission idempotent across a restart (#720) — so expiring an entry
+/// costs at worst one redundant download and one redundant, already-idempotent
+/// emit.
+///
+/// That covers the event and nothing else. The spend counters the attribution
+/// also feeds are plain counters: re-crediting them charges the batch again.
+/// They are guarded separately by a `RateStore::claim_once` marker, which
+/// lives beside the counters it protects and so survives exactly as long as
+/// they do. Do not extend this set's job to them — an in-process map cannot
+/// guard state that outlives the process.
 pub(crate) fn remember_billed_batch(
     seen: &dashmap::DashMap<String, std::time::Instant>,
     batch_id: &str,

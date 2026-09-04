@@ -1917,14 +1917,24 @@ async fn attribute_batch_usage(
     //
     // 用 retrieve 时那次预留的键：预留本身早已释放（它只在准入时挡人），但键
     // 是纯字符串，事后照样能记。
+    // 一处算价，两处用（额度那笔、事件那笔）。上一版把公式抄了两遍 —— 那正是
+    // 两个数字会各自漂走的形状。
+    //
+    // 输出行里的 `prompt_tokens_details.cached_tokens` 有自己的费率
+    // （`cached_input_per_1k`）：按全价输入算会多收，而事件里这个计数是照报的，
+    // 于是按事件重算花费的控制面会得到另一个数字。
+    let slice_cost_usd = |agg: &Agg| {
+        cost.map(|c| {
+            c.calculate_with_cache(
+                crate::usage_attr::input_tokens_for_pricing(agg.prompt, agg.cached, 0, 0),
+                agg.completion,
+            )
+        })
+        .unwrap_or(0.0)
+    };
     let billed_micro_usd: u64 = per_model
         .values()
-        .map(|agg| {
-            cost.map(|c| {
-                crate::usage_attr::spend_micro_usd(c.calculate(agg.prompt, agg.completion))
-            })
-            .unwrap_or(0)
-        })
+        .map(|agg| crate::usage_attr::spend_micro_usd(slice_cost_usd(agg)))
         .fold(0u64, |a, b| a.saturating_add(b));
     if credit && billed_micro_usd > 0 && !spend_keys.is_empty() {
         state
@@ -1944,9 +1954,7 @@ async fn attribute_batch_usage(
             cached_prompt_tokens: agg.cached.min(u32::MAX as u64) as u32,
             status_code: 200,
             provider_model_version: provider_model.clone(),
-            cost_usd: cost
-                .map(|c| c.calculate(agg.prompt, agg.completion))
-                .unwrap_or(0.0),
+            cost_usd: slice_cost_usd(agg),
             inbound_protocol: "batch".to_string(),
             ..Default::default()
         };
@@ -2405,6 +2413,86 @@ mod tests {
         assert!(
             upstream_a.received_requests().await.unwrap().is_empty(),
             "upstream A must not be touched"
+        );
+    }
+
+    /// 批处理输出行里从提示缓存读回来的 token 要按缓存费率计价。
+    ///
+    /// 这些计数是聚合了、也报进事件的（`cached_prompt_tokens`），只有价钱那步
+    /// 用的是不含缓存的 `calculate`。按事件重算花费的控制面因此会得到另一个
+    /// 数字 —— 同一批账，两个平面两个价。
+    ///
+    /// 一行：10 输入（其中 4 来自缓存）+ 5 输出。输入 $10/1k、缓存读 $1/1k、
+    /// 输出 $20/1k：应为 6*0.01 + 4*0.001 + 5*0.02 = $0.164。按全价输入算会
+    /// 得到 10*0.01 + 5*0.02 = $0.20。
+    #[tokio::test]
+    async fn batch_cached_tokens_are_priced_at_the_cache_rate() {
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/batches/batch_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "batch_1",
+                "object": "batch",
+                "status": "completed",
+                "output_file_id": "file-out"
+            })))
+            .mount(&upstream)
+            .await;
+        let line = serde_json::json!({
+            "id": "r",
+            "response": {"status_code": 200, "body": {
+                "model": "gpt-4o",
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "prompt_tokens_details": {"cached_tokens": 4}
+                }
+            }}
+        });
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/files/file-out/content"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(format!("{line}\n"), "application/jsonl"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        let m: Model = serde_json::from_str(&format!(
+            r#"{{"display_name":"jobs-a","provider":"openai","model_name":"gpt-4o","provider_key_id":"{PK_A}","cost":{{"input_per_1k":10.0,"output_per_1k":20.0,"cached_input_per_1k":1.0}}}}"#
+        ))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-a", m, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let (app, mut rx, _state) = build_app_with_sink_and_state(snap);
+
+        let encoded = encode_routed_id("batch_1", "jobs-a");
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/batches/{encoded}"))
+            .header("authorization", "Bearer sk-caller")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+        let mut ev = None;
+        for _ in 0..40 {
+            match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await {
+                Ok(Some(e)) if e.inbound_protocol == "batch" => {
+                    ev = Some(e);
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        let ev = ev.expect("batch 用量事件");
+        assert_eq!(ev.cached_prompt_tokens, 4, "缓存 token 没被聚合");
+        assert!(
+            (ev.cost_usd - 0.164).abs() < 1e-9,
+            "缓存读按全价输入计了价（应为 0.164，得到 {}）",
+            ev.cost_usd
         );
     }
 
