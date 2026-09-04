@@ -914,6 +914,111 @@ mod tests {
         assert_eq!(m.display_name, "x");
     }
 
+    /// strict 模式**多**禁止的字段，必须恰好等于 lenient 加载时**剥离**的字段。
+    ///
+    /// 这条不变量是这个仓库里最要紧的几条之一：禁而不剥的字段会被半兑现（写
+    /// 路径拒了，可存量行加载后仍带着它，而运行时从不读），剥而不禁的字段会
+    /// 在加载时静默消失，而写路径照收。两侧现在是**两处手工维护**的清单，靠
+    /// 人眼对齐；这条测试把它变成机械等式。
+    ///
+    /// 两个变体的形状恰好可比：`strict` 只是在 `base` 上追加禁止项，所以
+    /// 「strict 禁止集 − lenient 禁止集」就是那份 DEAD 清单，不用另写一张表
+    /// ——另写一张表就又多了一处要人工对齐的地方。
+    #[test]
+    fn the_strict_forbidden_knobs_are_exactly_the_leniently_stripped_ones() {
+        use std::collections::BTreeSet;
+
+        /// 一个 oneOf 变体里 `not.anyOf[].required[0]` 的字段名集合。
+        fn forbidden(variant: &Value) -> BTreeSet<String> {
+            variant["not"]["anyOf"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|e| e["required"][0].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        let lenient = model_one_of();
+        let strict = model_one_of_strict();
+        let lenient = lenient.as_array().expect("oneOf array");
+        let strict = strict.as_array().expect("oneOf array");
+        assert_eq!(
+            lenient.len(),
+            strict.len(),
+            "两个变体的变体数不同，下面的按下标配对就不成立了"
+        );
+
+        // 每个变体一个「这种 kind 的最小行」，用来跑 strip。下标与 oneOf 的
+        // 顺序一致（0 routing / 1 direct / 2 ensemble / 3 semantic）。
+        let rows: [Value; 4] = [
+            json!({"display_name":"g","routing":{"targets":[{"model":"m"}]}}),
+            json!({"display_name":"d","provider":"openai","model_name":"m","provider_key_id":"pk"}),
+            json!({
+                "display_name":"e",
+                "ensemble":{"panel":[{"model":"m"}],"judge":{"model":"m"}}
+            }),
+            json!({
+                "display_name":"s",
+                "semantic":{
+                    "embedding_model":"e","default":"m",
+                    "match":{"threshold":0.9},
+                    "routes":[{"name":"r","target":"m","examples":["x"]}]
+                }
+            }),
+        ];
+
+        for (i, row) in rows.iter().enumerate() {
+            let dead_in_schema: BTreeSet<String> = forbidden(&strict[i])
+                .difference(&forbidden(&lenient[i]))
+                .cloned()
+                .collect();
+
+            // 把**所有**与 kind 有关的旋钮都写上，再看 strip 报出哪些。只写
+            // schema 说是 DEAD 的那些不够：那样「strip 剥了一个 schema 没禁的
+            // 字段」永远驱动不到 —— 那个字段不会被写上，strip 自然不报它，
+            // 断言两边都缺它、照过。第一版就是这么写的，变异检查照过。
+            //
+            // 这份清单来自 `model_one_of_variant` 注释里那条 kind 政策（通用
+            // 调用旋钮 + 模型专属旋钮）。schema 宣布为 DEAD 的字段一律会被写
+            // 上（它们来自 `dead_in_schema`），所以未覆盖的只剩「strip 剥了一
+            // 个既不在 schema 的 DEAD 集、也不在这份清单里的字段」这一种。
+            const KIND_DEPENDENT_KNOBS: &[&str] = &[
+                "timeout",
+                "stream_timeout",
+                "retries",
+                "auto_prompt_caching",
+                "cost",
+            ];
+            let mut doc = row.clone();
+            for f in KIND_DEPENDENT_KNOBS
+                .iter()
+                .map(|s| s.to_string())
+                .chain(dead_in_schema.iter().cloned())
+            {
+                doc[f.as_str()] = match f.as_str() {
+                    "cost" => json!({"input_per_1k": 1.0, "output_per_1k": 1.0}),
+                    "auto_prompt_caching" => json!({"enabled": true}),
+                    _ => json!(1),
+                };
+            }
+            let mut model: Model =
+                serde_json::from_value(doc).expect("每个 DEAD 字段都该能反序列化");
+            let stripped: BTreeSet<String> = model
+                .strip_kind_inapplicable()
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+
+            assert_eq!(
+                stripped, dead_in_schema,
+                "第 {i} 个变体：strict 多禁止的字段与 lenient 剥离的字段不一致。\
+                 只在 schema 里的会被半兑现，只在 strip 里的会静默消失。"
+            );
+        }
+    }
+
     #[test]
     fn strip_kind_inapplicable_per_kind() {
         let load = |v: serde_json::Value| -> Model { serde_json::from_value(v).unwrap() };

@@ -227,7 +227,13 @@ pub(crate) async fn resolve(
         &embed_entry.value.display_name,
         &embed_entry.id,
         &embed_entry.value,
-        None,
+        // 带上父级：调用方寻址的是这个语义路由，所以按路由名写的策略条件也该
+        // 覆盖它的分类子调用（#1267）—— 这条路的 chat 目标走
+        // `reserve_routing_target` 时同样带着父级，两者要一致。
+        Some(crate::quota::RoutingParent {
+            name: &router.display_name,
+            entry_id: &router_entry.id,
+        }),
     )
     .await
     {
