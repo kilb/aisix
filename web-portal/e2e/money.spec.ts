@@ -660,6 +660,48 @@ test("流式被输出护栏拦截时_也按成功那样收钱", async () => {
   }
 });
 
+test("语义路由的分类调用_要过分类模型自己的闸", async () => {
+  // 分类那一发是一次真实的分派：打的是嵌入模型自己的上游，花的是真钱。它不
+  // 经过 `resolve_attempt_models` 那个主干，所以只接在主干上的闸在这条路上是
+  // 静默缺席的 —— 运维给嵌入模型配的 TPM 保护对分类流量完全无效。
+  //
+  // 被闸拒之后走 `on_embedding_failure: default`，请求仍然成功（降级到
+  // default 目标），而不是变成 429 —— 一个保护性上限不该变成停服。观察点是
+  // 「路由到哪个目标」：命中路由时是 cached-direct，降级时是 gpt-4o-mini。
+  const cookie = await fx.sessionCookie();
+  await setQuota(1_000_000_000);
+  const k = await mint(cookie, "分类闸");
+
+  // 直接数存根收到的嵌入请求 —— 最贴近「上游有没有真被打」这个问题。
+  const embedCalls = () => fx.embedCallCount();
+
+  // 第一发：闸里还有额度，分类调用发生。
+  const before = embedCalls();
+  await waitFor(
+    async () => (await fx.chatModel(k.plaintext, "semantic-capped")) === 200,
+    "带上限的语义路由可用",
+  );
+  expect(embedCalls(), "第一发的分类调用没发生，这条用例量不到东西").toBeGreaterThan(before);
+  const embedAfterFirst = embedCalls();
+
+  // 再打五发。分类调用必须在某处饱和：token 窗口在准入时是「检查但不递增」，
+  // 提交发生在调用之后，所以第二发是合法通过的（此刻已记 1000 < 1500），第三
+  // 发起才会被拒 —— 总共 2 次分类调用，而不是 6 次。
+  //
+  // 请求全程 200：被闸拒走的是 `on_embedding_failure: default` 那条降级路，
+  // 而不是把整条请求拒掉。
+  for (let i = 0; i < 5; i++) {
+    expect(
+      await fx.chatModel(k.plaintext, "semantic-capped"),
+      "被分类模型的闸拒之后该降级，而不是把整条请求拒掉",
+    ).toBe(200);
+  }
+  expect(
+    embedCalls() - (embedAfterFirst - 1),
+    "分类调用没有被分类模型自己的上限拦住 —— 它绕过了那道闸",
+  ).toBe(2);
+});
+
 test("批处理跑完的钱_也要进指标和额度", async () => {
   // 批处理的钱是**事后**落账的：网关首次看到批次 completed 时把输出下载下来，
   // 按行聚合 usage。那条路径与请求路径完全分开，所以请求路径上的记账是否正确

@@ -995,6 +995,30 @@ models:
     cost:
       input_per_1k: 0.5
       output_per_1k: 0.5
+  # 带自身上限的分类模型 + 用它的语义路由：量「分类那一发过不过它自己的闸」。
+  # 每次分类调用 1000 提示 token，所以 tpm 1500 只够一发。
+  - display_name: embed-capped
+    provider: openai
+    provider_key: stub
+    model_name: text-embedding-3-small
+    embedding:
+      dimensions: 3
+    rate_limit:
+      tpm: 1500
+    cost:
+      input_per_1k: 0.5
+      output_per_1k: 0.5
+  - display_name: semantic-capped
+    semantic:
+      embedding_model: embed-capped
+      default: gpt-4o-mini
+      match:
+        threshold: 0.99
+      on_embedding_failure: default
+      routes:
+        - name: only
+          target: cached-direct
+          examples: ["hello"]
   - display_name: semantic-1
     semantic:
       embedding_model: embed-1

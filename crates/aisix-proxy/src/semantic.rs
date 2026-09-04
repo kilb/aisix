@@ -212,6 +212,37 @@ pub(crate) async fn resolve(
     let embed_deadline = semantic.embedding_timeout().or_else(|| {
         crate::routing::effective_timeouts(&embed_entry.value, None, state.default_timeouts).request
     });
+    // 分类那一发是一次真实的分派：它打的是嵌入模型自己的上游，花的是真钱。
+    // 所以它也要过那个模型自己的闸 —— 内联的 TPM/TPD、以及跟着模型走的
+    // `scope: model` 策略（含花费上限）。这条路不经 `resolve_attempt_models`
+    // 那个主干，所以只接在主干上的闸在这里是静默缺席的。
+    //
+    // 被闸拒不当成错误抛给调用方，而是并入既有的「嵌入不可用」那条路：走
+    // `on_embedding_failure`。语义路由本来就为这种情况准备了降级出口，而把
+    // 「分类模型限流了」变成整条请求 429 会让一个保护性上限变成停服。
+    let embed_reservation = match crate::quota::reserve_model_only(
+        state,
+        snapshot,
+        auth,
+        &embed_entry.value.display_name,
+        &embed_entry.id,
+        &embed_entry.value,
+        None,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                router = %router_entry.value.display_name,
+                embedding_model = %embed_entry.value.display_name,
+                error = %e,
+                "semantic classifier refused by its own limits; applying \
+                 on_embedding_failure",
+            );
+            return fallback(state, snapshot, router, source_ip, semantic);
+        }
+    };
     let embedded = match embed_texts(
         state,
         snapshot,
@@ -235,6 +266,11 @@ pub(crate) async fn resolve(
 
     let embed_spend =
         record_embed_usage(state, snapshot, &embed_entry, auth, embedded.prompt_tokens);
+    // 提交到嵌入模型自己的那些桶。父级那边的记账是另一笔：`embed_spend` 会被
+    // 调用方加进父级的提交里，两笔各记各的层，互不替代。
+    embed_reservation
+        .commit(u64::from(embedded.prompt_tokens), embed_spend)
+        .await;
     let mut iter = embedded.vectors.into_iter();
     let prompt_vec = iter
         .next()
