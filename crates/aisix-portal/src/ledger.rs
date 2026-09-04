@@ -41,12 +41,34 @@ pub enum Source {
 }
 
 impl Source {
+    /// 每一个来源。加了变体却忘了加进来的后果与忘了分类一样（见
+    /// [`Source::counts_toward_granted`]），而那个分类是编译期强制的：新变体
+    /// 会让它的 match 编不过，那一刻正是把它加进这里的时机。
+    pub(crate) const ALL: &'static [Source] = &[
+        Source::AdminGrant,
+        Source::Consumption,
+        Source::Topup,
+        Source::AdminSet,
+    ];
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::AdminGrant => "admin_grant",
             Self::Consumption => "consumption",
             Self::Topup => "topup",
             Self::AdminSet => "admin_set",
+        }
+    }
+
+    /// 这条来源算不算进「总额度」。
+    ///
+    /// **穷举 match，不是反筛。** 反筛（`!= Consumption`）会把将来某个**扣减**
+    /// 性质的来源（退款、冲正）当成发放算进总额 —— 那是静默白送。穷举则让新
+    /// 变体在这里编不过：分类必须被决定，而不是默认。
+    pub(crate) fn counts_toward_granted(self) -> bool {
+        match self {
+            Self::AdminGrant | Self::Topup | Self::AdminSet => true,
+            Self::Consumption => false,
         }
     }
 }
@@ -189,25 +211,32 @@ impl Ledger {
 
 /// 算进「总额度」的来源，SQL 的 `IN` 列表。
 ///
-/// **只此一份。** 单用户那条查询与管理端的聚合查询都要用它 —— 各写一份的话两边
-/// 会各自漂移，而症状是「列表里的总额跟详情里的总额不一样」，谁也说不清哪个对。
-/// 里面全是编译期字面量，没有外部输入。
-pub(crate) const GRANT_SOURCES: &str = "('admin_grant', 'topup', 'admin_set')";
+/// **只此一份，而且是从分类派生的。** 单用户那条查询与管理端的聚合查询都要用它
+/// —— 各写一份的话两边会各自漂移，症状是「列表里的总额跟详情里的总额不一样」，
+/// 谁也说不清哪个对。而列表本身也不再手写：它由
+/// [`Source::counts_toward_granted`] 生成，所以 SQL 不可能与分类不一致。
+///
+/// 拼进 SQL 的全是 `Source::as_str` 的编译期字面量，没有外部输入。
+pub(crate) fn grant_sources_sql() -> String {
+    let quoted: Vec<String> = Source::ALL
+        .iter()
+        .filter(|s| s.counts_toward_granted())
+        .map(|s| format!("'{}'", s.as_str()))
+        .collect();
+    format!("({})", quoted.join(", "))
+}
 
 /// 总额度的那条查询，可挂在任意 executor 上 —— 事务内外共用同一份语句。
 pub(crate) async fn total_granted_on<'e, E>(exec: E, user_id: &str) -> Result<i64, StoreError>
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    // **白名单，不是反筛。** 原先写的是 `source != 'consumption'`：将来加一个
-    // 「退款」「冲正」这类**扣减**性质的来源，它会被当成发放算进总额 —— 那是静默
-    // 白送。列举之后，未知来源落在总额之外：用户拿到的额度偏少，这是看得见、能
-    // 被投诉、能被修的方向。
-    //
-    // 加新来源时这里必须一起改，`来源分类必须逐个列举` 那条测试会替你记得。
+    // 白名单，不是反筛 —— 理由见 `Source::counts_toward_granted`，那里的穷举
+    // match 让新来源在编译期就必须被分类，这条查询跟着它走。
     let (sum,): (i64,) = sqlx::query_as(&format!(
         "SELECT COALESCE(SUM(delta_micro_usd), 0) FROM ledger
-         WHERE user_id = ?1 AND source IN {GRANT_SOURCES}"
+         WHERE user_id = ?1 AND source IN {}",
+        grant_sources_sql()
     ))
     .bind(user_id)
     .fetch_one(exec)
@@ -254,15 +283,38 @@ mod source_tests {
         store.insert_user("u1", "u1@b.c", "h", None).await.unwrap();
         let l = Ledger::new(store);
 
-        // (来源, 是否算进总额)
-        let all = [
-            (Source::AdminGrant, true),
-            (Source::Topup, true),
-            (Source::AdminSet, true),
-            (Source::Consumption, false),
+        // 期望值写死，不从 `counts_toward_granted` 反推：反推出来的断言是同义
+        // 反复，分类被改也照过（第一版就是这么写的，变异检查照过）。写死之后
+        // 这条测试断言的是**意图**，而代码是被检查的一侧。
+        //
+        // 而遍历的是 `Source::ALL`：加了变体却忘了在这里写下预期，查表会失败
+        // ——「替你记得」这句承诺由此成立。分类本身还有编译期那道闸
+        // （`counts_toward_granted` 的穷举 match）。
+        let intended: &[(&str, bool)] = &[
+            ("admin_grant", true),
+            ("topup", true),
+            ("admin_set", true),
+            ("consumption", false),
         ];
         let mut expected = 0i64;
-        for (src, counts) in all {
+        for &src in Source::ALL {
+            let counts = intended
+                .iter()
+                .find(|(name, _)| *name == src.as_str())
+                .map(|(_, c)| *c)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "新来源 {} 没在这里写下预期 —— 它算不算进总额，是个要\
+                         明写的决定",
+                        src.as_str()
+                    )
+                });
+            assert_eq!(
+                src.counts_toward_granted(),
+                counts,
+                "{} 的分类与这里写下的意图不一致",
+                src.as_str()
+            );
             let mut c = l.store.pool().acquire().await.unwrap();
             insert_entry(&mut *c, "u1", 1_000, src, None).await.unwrap();
             if counts {
@@ -271,7 +323,7 @@ mod source_tests {
             assert_eq!(
                 l.total_granted("u1").await.unwrap(),
                 expected,
-                "{} 的分类不对",
+                "{} 记进总额的方式与它的分类不一致 —— SQL 那份列表该由分类派生",
                 src.as_str()
             );
         }

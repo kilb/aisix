@@ -249,14 +249,14 @@ impl Store {
     ///
     /// 返回 (user_id, 余额, 总额度)。没有流水的用户不在结果里，调用方按 0 处理。
     pub async fn all_balances(&self) -> Result<Vec<(String, i64, i64)>, StoreError> {
-        // 分类用 `ledger::GRANT_SOURCES` 那一份常量，不在这里再抄一遍。
+        // 分类从 `ledger::grant_sources_sql` 派生，不在这里再抄一遍。
         let rows: Vec<(String, i64, i64)> = sqlx::query_as(&format!(
             "SELECT user_id,
                     COALESCE(SUM(delta_micro_usd), 0),
                     COALESCE(SUM(CASE WHEN source IN {}
                                       THEN delta_micro_usd ELSE 0 END), 0)
              FROM ledger GROUP BY user_id",
-            crate::ledger::GRANT_SOURCES
+            crate::ledger::grant_sources_sql()
         ))
         .fetch_all(&self.pool)
         .await?;
