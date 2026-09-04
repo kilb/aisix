@@ -1873,12 +1873,23 @@ async fn attribute_batch_usage(
 
     let snap = state.snapshot.load();
     let pk = crate::usage_attr::ResolvedPk::resolve(&snap, pk_id);
-    // 指标的 provider 标签取这个模型行自己的 provider —— 与请求路径同一个来源。
-    let provider_label = snap
-        .models
-        .get_by_id(model_id)
+    // 指标的 provider / upstream_model 都取这个模型行的配置 —— 与请求路径同一个
+    // 来源。**不能**用输出行里上游报的模型名：`metric_model_label_pair` 只收口
+    // model 那一侧，upstream 是原样透传的，而这里那个字符串来自应答内容，等于
+    // 让上游决定 series 基数，而这个 recorder 没有空闲回收（#451）。
+    //
+    // 每片的确切模型名仍然记在事件的 `provider_model_version` 上，那是它该去的
+    // 地方；多片批次在指标上合并成一条 series，总量不变。
+    let row = snap.models.get_by_id(model_id);
+    let provider_label = row
+        .as_ref()
         .and_then(|e| e.value.provider.clone())
         .unwrap_or_else(|| "unknown".to_string());
+    let configured_upstream = row
+        .as_ref()
+        .and_then(|e| e.value.upstream_model())
+        .unwrap_or("unknown")
+        .to_string();
     // Same exporter set for every model slice of one batch.
     let exporters = crate::usage_attr::live_exporters(state, &snap);
     let multi = per_model.len() > 1;
@@ -1964,7 +1975,7 @@ async fn attribute_batch_usage(
                 crate::request_metrics::Upstream {
                     provider: &provider_label,
                     model: display_name,
-                    upstream_model: provider_model,
+                    upstream_model: &configured_upstream,
                     pk: pk.labels(),
                     ..Default::default()
                 },
@@ -2394,6 +2405,96 @@ mod tests {
         assert!(
             upstream_a.received_requests().await.unwrap().is_empty(),
             "upstream A must not be touched"
+        );
+    }
+
+    /// 输出行里上游报的模型名不能进指标标签：那是应答内容，等于让上游决定
+    /// series 基数，而这个 recorder 没有空闲回收（#451）。标签取模型行配置里的
+    /// 上游名 —— 与其它端点同一个来源 —— 所以一个多模型批次在指标上是**一条**
+    /// series（总量不变），每片的确切模型名留在事件的 `provider_model_version`。
+    #[tokio::test]
+    async fn batch_metric_labels_come_from_config_not_from_the_output_lines() {
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/batches/batch_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "batch_1",
+                "object": "batch",
+                "status": "completed",
+                "output_file_id": "file-out"
+            })))
+            .mount(&upstream)
+            .await;
+        // 两行，上游报了两个不同的模型名 —— 其中一个还是明显不该出现在标签里的
+        // 长字符串。
+        let line = |m: &str| {
+            serde_json::json!({
+                "id": "r",
+                "response": {"status_code": 200, "body": {
+                    "model": m,
+                    "usage": {"prompt_tokens": 1000, "completion_tokens": 1000}
+                }}
+            })
+            .to_string()
+        };
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/files/file-out/content"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                format!(
+                    "{}\n{}\n",
+                    line("gpt-4o-2024-08-06"),
+                    line("whatever-the-upstream-says-x9271")
+                ),
+                "application/jsonl",
+            ))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(priced_model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let (app, _rx, state) = build_app_with_sink_and_state(snap);
+
+        let encoded = encode_routed_id("batch_1", "jobs-a");
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/batches/{encoded}"))
+            .header("authorization", "Bearer sk-caller")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+        let mut rendered = String::new();
+        for _ in 0..40 {
+            rendered = state.metrics.render();
+            if rendered.contains(aisix_obs::metrics::M_LLM_SPEND_MICRO_USD_TOTAL) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            rendered.contains(aisix_obs::metrics::M_LLM_SPEND_MICRO_USD_TOTAL),
+            "花费序列没出现，这条断言就量不到东西: {rendered}"
+        );
+        assert!(
+            !rendered.contains("whatever-the-upstream-says-x9271"),
+            "上游报的模型名进了指标标签 —— series 基数由上游决定了: {rendered}"
+        );
+        let series: Vec<&str> = rendered
+            .lines()
+            .filter(|l| l.starts_with(aisix_obs::metrics::M_LLM_SPEND_MICRO_USD_TOTAL))
+            .collect();
+        assert_eq!(
+            series.len(),
+            1,
+            "多模型批次该合并成一条 series（总量不变）: {series:?}"
+        );
+        // 两行各 1000+1000 token，$0.5/1k —— 整批 $2.00，序列单位是 micro-USD。
+        assert!(
+            series[0].ends_with(" 2000000"),
+            "合并后的总额不对（应为 2_000_000 micro-USD）: {}",
+            series[0]
         );
     }
 
