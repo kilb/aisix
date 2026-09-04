@@ -911,8 +911,6 @@ function writeResources(
 provider_keys:
   - display_name: stub
     provider: openai
-    # jobs 表面（files/batches/fine-tuning）那道闸看的是 adapter，不是 provider。
-    adapter: openai
     api_key: sk-stub
     api_base: "${upstreamBase}"
   # Anthropic 原生上游：打到它的 /v1/messages 走的是穿透分派，与打到

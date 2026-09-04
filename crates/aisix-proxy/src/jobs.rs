@@ -160,11 +160,29 @@ impl JobTarget {
     }
 }
 
+/// Which of this surface's two upstream protocols a ProviderKey speaks.
+///
+/// `adapter` names a protocol family and is only needed where no
+/// vendor-specific bridge exists — and both protocols here have one, matched
+/// on `provider`, so the two most common key shapes leave `adapter` unset.
+/// The request path never asks for it; reading only `adapter` here therefore
+/// refused keys that work fine on every other endpoint.
+///
+/// The two vocabularies share their wire strings by construction
+/// (`Adapter::Openai` serialises to `"openai"`), so a provider name that *is*
+/// a family name names that family. Anything else — a vendor name such as
+/// `"deepseek"` — is still refused: whether that upstream speaks OpenAI's
+/// files/batches protocol is genuinely unknown.
 fn supported_adapter(pk: &ProviderKey) -> Option<Adapter> {
     match pk.adapter {
         Some(Adapter::Openai) => Some(Adapter::Openai),
         Some(Adapter::AzureOpenai) => Some(Adapter::AzureOpenai),
-        _ => None,
+        Some(_) => None,
+        None => match pk.provider.trim() {
+            "openai" => Some(Adapter::Openai),
+            "azure-openai" => Some(Adapter::AzureOpenai),
+            _ => None,
+        },
     }
 }
 
@@ -242,9 +260,10 @@ pub(crate) fn resolve_target(
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     let adapter = supported_adapter(&pk_entry.value).ok_or_else(|| {
         ProxyError::InvalidRequest(format!(
-            "model {:?} uses provider {:?} which is not supported on the \
-             files/batches/fine-tuning surface yet (supported: OpenAI-compatible, \
-             Azure OpenAI)",
+            "model {:?} resolves to a provider key for {:?}, which the \
+             files/batches/fine-tuning surface does not support yet. It supports \
+             OpenAI and Azure OpenAI; set the key's `adapter` to `openai` or \
+             `azure-openai` if that upstream speaks one of them",
             model.display_name, pk_entry.value.provider
         ))
     })?;
@@ -1951,6 +1970,52 @@ async fn attribute_batch_usage(
 
 #[cfg(test)]
 mod tests {
+    /// `adapter` 是可选的，而 OpenAI / Azure OpenAI 这两种最常见的密钥形状
+    /// 都不需要写它（请求路径按 `provider` 找专用桥）。这里以前只读 `adapter`，
+    /// 于是这些密钥在 files/batches/fine-tuning 上被拒，而报错说的是 provider
+    /// 不受支持 —— 指向了错误的字段。
+    #[test]
+    fn provider_name_stands_in_for_an_unset_adapter() {
+        use super::supported_adapter;
+        use aisix_core::models::Adapter;
+
+        let pk = |json: serde_json::Value| -> aisix_core::ProviderKey {
+            serde_json::from_value(json).expect("fixture parses")
+        };
+        let base = |provider: &str| {
+            serde_json::json!({
+                "display_name": "k",
+                "secret": "sk-x",
+                "provider": provider,
+            })
+        };
+
+        assert_eq!(
+            supported_adapter(&pk(base("openai"))),
+            Some(Adapter::Openai),
+            "provider: openai 不带 adapter 是标准形状，不该被拒"
+        );
+        assert_eq!(
+            supported_adapter(&pk(base("azure-openai"))),
+            Some(Adapter::AzureOpenai)
+        );
+        // 厂商名不是族名：对面说不说这套协议，这里真的不知道。
+        assert_eq!(supported_adapter(&pk(base("deepseek"))), None);
+        // 写了 adapter 就以它为准 —— 一把 provider 叫 deepseek、adapter 是
+        // openai 的密钥（仓库里 provider_key 的测试用的正是这个形状）要放行。
+        let mut explicit = base("deepseek");
+        explicit["adapter"] = serde_json::Value::String("openai".into());
+        assert_eq!(supported_adapter(&pk(explicit)), Some(Adapter::Openai));
+        // 而 adapter 明确是别的族时，provider 不再兜底。
+        let mut other = base("openai");
+        other["adapter"] = serde_json::Value::String("anthropic".into());
+        assert_eq!(
+            supported_adapter(&pk(other)),
+            None,
+            "写明了 adapter 就该按它判，不该被 provider 名字翻回来"
+        );
+    }
+
     use super::*;
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;
@@ -2539,12 +2604,15 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let msg = v["error"]["message"].as_str().unwrap();
+        // 这条消息要说清三件事，操作者才知道下一步做什么：哪个模型、对面是
+        // 什么、以及可以动哪个字段。只断言「not supported」的话，一条不告诉
+        // 人该改什么的消息也照过。
+        assert!(msg.contains("claude"), "没说是哪个模型: {msg}");
+        assert!(msg.contains("anthropic"), "没说对面是什么: {msg}");
         assert!(
-            v["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("not supported"),
-            "clear unsupported-provider message expected, got {v}"
+            msg.contains("adapter"),
+            "没指出可以动的字段 —— 判据读的是 provider key 的 `adapter`: {msg}"
         );
     }
 
