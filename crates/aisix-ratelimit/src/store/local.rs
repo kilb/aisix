@@ -62,6 +62,11 @@ impl KeyState {
 /// Per-process fixed-window store.
 pub struct LocalStore<C: Clock = SystemClock> {
     states: DashMap<String, Arc<Mutex<KeyState>>>,
+    /// `claim_once` markers, expiring at the stored unix second. Separate
+    /// from `states`: those are rate-limit buckets that `reap` prunes by
+    /// idleness, these carry their own deadline and must not be reclaimed
+    /// early — an expired claim lets the side effect it guards happen twice.
+    claims: DashMap<String, u64>,
     clock: C,
 }
 
@@ -81,6 +86,7 @@ impl<C: Clock> LocalStore<C> {
     pub fn with_clock(clock: C) -> Self {
         Self {
             states: DashMap::new(),
+            claims: DashMap::new(),
             clock,
         }
     }
@@ -266,6 +272,22 @@ impl<C: Clock> RateStore for LocalStore<C> {
         LocalStore::reap(self, idle_for);
     }
 
+    async fn claim_once(&self, key: &str, ttl: std::time::Duration) -> bool {
+        let now = self.clock.unix_secs();
+        // 过期的顺手清掉：这些标记按自己的截止时间活，`reap` 的空闲判据不适用。
+        self.claims.retain(|_, expires_at| *expires_at > now);
+        // 只在缺失时写 —— 被拒的一次不能重写截止时间，否则反复来问就能把标记
+        // 无限续命，而 Redis 的 `SET NX` 在已存在时什么都不做。两个后端在这一点
+        // 上不一致，换存储就会改变收费次数。
+        match self.claims.entry(key.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => false,
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(now.saturating_add(ttl.as_secs()));
+                true
+            }
+        }
+    }
+
     fn add_tokens(&self, key: &str, tokens: u64) {
         if tokens == 0 {
             return;
@@ -346,6 +368,37 @@ mod tests {
     /// stored, and have it never refuse anything. The `tpd` counter beside it
     /// worked the whole time, which is what made the gap invisible — the
     /// feature looked present because its sibling was.
+    /// 一次性标记：第一个调用者拿到，之后的拿不到，直到 TTL 过去。
+    ///
+    /// 进程内这份的寿命就是进程的寿命 —— 它保护的计数器也是，两者同寿是刻意
+    /// 的（见 `RateStore::claim_once`）。共享存储那侧的跨实例语义由
+    /// `tests/redis_allowance.rs` 覆盖。
+    #[tokio::test]
+    async fn a_one_shot_claim_is_granted_once_until_it_expires() {
+        let clock = TestClock::new(1_000);
+        let store = LocalStore::with_clock(clock.clone());
+        let ttl = std::time::Duration::from_secs(60);
+
+        assert!(store.claim_once("b1", ttl).await, "第一次该拿到");
+        assert!(!store.claim_once("b1", ttl).await, "第二次不该拿到");
+        assert!(store.claim_once("b2", ttl).await, "别的键互不影响");
+
+        // 边界要和共享存储那侧一致：Redis 的 `EX 60` 在第 60 秒键就没了，
+        // 所以「有效期」是左闭右开的 [t, t+ttl)。两个后端在这一点上不一致的话，
+        // 换存储就会改变收费次数。
+        clock.advance(59);
+        assert!(!store.claim_once("b1", ttl).await, "还在有效期内就放行了");
+
+        // 上面那次被拒的调用不得把截止时间往后推：能推的话，反复来问就能让
+        // 标记永不过期。`SET NX` 在键已存在时什么都不做，这里要一样。
+        clock.advance(1);
+        assert!(
+            store.claim_once("b1", ttl).await,
+            "到 t+ttl 该已过期 —— 与 Redis `EX` 同一边界；这里若不过期，多半是\
+             被拒的那次调用重写了截止时间"
+        );
+    }
+
     #[tokio::test]
     async fn an_hour_token_cap_refuses_once_the_hour_is_spent_and_frees_on_roll() {
         let clock = TestClock::new(1_000);

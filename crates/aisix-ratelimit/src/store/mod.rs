@@ -173,4 +173,21 @@ pub trait RateStore: Send + Sync + 'static {
     /// Read-only snapshot for the `x-ratelimit-*` headers. Returns `None`
     /// when there is nothing meaningful to report for the bucket.
     async fn peek(&self, key: &str, limits: &RateLimit) -> Option<RateLimitStatus>;
+
+    /// Claim a one-shot marker, `true` for the caller that got it.
+    ///
+    /// Lives in this store, so it lasts exactly as long as the counters do:
+    /// a shared store holds the claim across restarts and across instances,
+    /// the in-process store only for one process's lifetime. That pairing is
+    /// the point — it guards side effects on the counters in this same
+    /// store, so a claim can never outlive or fall short of what it protects.
+    ///
+    /// For work that may legitimately be redone but whose accounting must
+    /// not repeat. The after-the-fact spend attribution of a completed batch
+    /// is the case: its usage event carries a deterministic id the consumer
+    /// dedups on, but crediting a monotonic spend counter and incrementing a
+    /// Prometheus counter are not idempotent, and the attribution replays
+    /// whenever a process that has forgotten the batch sees it completed
+    /// again.
+    async fn claim_once(&self, key: &str, ttl: Duration) -> bool;
 }

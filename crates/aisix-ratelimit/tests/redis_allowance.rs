@@ -266,3 +266,54 @@ async fn 额度调高之后立刻放行_不需要重置计数器() {
         .await
         .expect("额度调高之后仍被拒");
 }
+
+/// `claim_once` 是给「会重放、但记账不能重复」的副作用用的：批处理跑完之后的
+/// 花费归因就是这种 —— 它的用量事件带确定性 id，消费端能去重，而只增的花费
+/// 计数器和 Prometheus 计数器都没有那层保护，重放一次就是多收一遍。
+///
+/// 用两个各自 `connect` 出来的存储，模拟「重启后的同一个网关」与「另一个实例」
+/// —— 它们不共享任何进程内状态，只共享 Redis。标记要在这种情况下仍然只发一次。
+#[tokio::test]
+async fn 一次性标记跨实例只发一次() {
+    let r = redis_or_skip!();
+    let a = store(&r).await;
+    let b = store(&r).await;
+    let ttl = std::time::Duration::from_secs(600);
+
+    assert!(
+        a.claim_once("batch-spend:b1", ttl).await,
+        "第一次该拿到标记"
+    );
+    assert!(
+        !a.claim_once("batch-spend:b1", ttl).await,
+        "同一个存储重来一次不该再拿到"
+    );
+    assert!(
+        !b.claim_once("batch-spend:b1", ttl).await,
+        "另一个实例（也等价于重启后的自己）不该再拿到 —— 这正是本地内存那份\
+         做不到、必须放进共享存储的原因"
+    );
+    // 另一个批次互不影响。
+    assert!(
+        b.claim_once("batch-spend:b2", ttl).await,
+        "不同批次的标记被互相挡住了"
+    );
+
+    // TTL 真的落在键上：没有过期时间的标记会永久占着 Redis。
+    let mut conn = r.raw().await;
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg("*claim:batch-spend:b1*")
+        .query_async(&mut conn)
+        .await
+        .expect("KEYS 可用");
+    assert_eq!(keys.len(), 1, "标记键没建出来: {keys:?}");
+    let secs: i64 = redis::cmd("TTL")
+        .arg(&keys[0])
+        .query_async(&mut conn)
+        .await
+        .expect("TTL 可用");
+    assert!(
+        secs > 0 && secs <= 600,
+        "标记键的 TTL 不对（{secs}）—— -1 表示永不过期，那是泄漏"
+    );
+}

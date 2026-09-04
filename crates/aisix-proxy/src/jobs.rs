@@ -1882,12 +1882,30 @@ async fn attribute_batch_usage(
     // Same exporter set for every model slice of one batch.
     let exporters = crate::usage_attr::live_exporters(state, &snap);
     let multi = per_model.len() > 1;
+    // 这条归因会重放：进程内的去重集合是优化不是正确性机制，重启或换实例之后
+    // 再看到同一个已完成批次就会重来一遍。用量事件带确定性 id，消费端据此去重
+    // ——**它**是幂等的。而下面两条不是：Prometheus 计数器和只增的花费计数器
+    // 都没有那层保护，重放一次就是把这批多收一遍。
+    //
+    // 所以只给这两条加闸，且闸放在与计数器同一个存储里：共享存储下跨重启、跨
+    // 实例都只记一次，进程内存储下只在本进程有效 —— 而那种部署里计数器本身也
+    // 只在本进程里，两者同寿。TTL 取 30 天：供应商保留已完成批次的量级就是这
+    // 个，之后不可能再被重取。
+    //
+    // 事件仍然无条件发 —— 它本来就该在重放时也到达消费端。
+    let credit = state
+        .limiter
+        .claim_once(
+            &format!("batch-spend:{raw_batch_id}"),
+            std::time::Duration::from_secs(30 * 24 * 3600),
+        )
+        .await;
     // 先回扣额度，再发事件与指标。顺序是有意的：观察者只能看见事件和指标，
     // 把额度放在它们之后，就存在一个「指标已到、额度未到」的窗口，任何据此
     // 判断的检查都会间歇性地看错。
     //
     // 用 retrieve 时那次预留的键：预留本身早已释放（它只在准入时挡人），但键
-    // 是纯字符串，事后照样能记。批次去重保证这笔钱只记一次。
+    // 是纯字符串，事后照样能记。
     let billed_micro_usd: u64 = per_model
         .values()
         .map(|agg| {
@@ -1897,7 +1915,7 @@ async fn attribute_batch_usage(
             .unwrap_or(0)
         })
         .fold(0u64, |a, b| a.saturating_add(b));
-    if billed_micro_usd > 0 && !spend_keys.is_empty() {
+    if credit && billed_micro_usd > 0 && !spend_keys.is_empty() {
         state
             .limiter
             .add_tokens_post_stream_all(spend_keys, billed_micro_usd);
@@ -1935,26 +1953,30 @@ async fn attribute_batch_usage(
         // 同一笔钱也要进 Prometheus 的 token/花费族。事件只进控制面的账本，
         // 而按花费序列求和扣款的那一侧看不到它 —— 于是一个批次可以消耗巨量
         // token 而用户余额分毫不动。
-        let owned_caller = crate::request_metrics::Caller::from_api_key_id(&snap, api_key_id);
-        crate::request_metrics::record_usage(
-            state,
-            "/v1/batches",
-            owned_caller.as_caller(),
-            crate::request_metrics::Upstream {
-                provider: &provider_label,
-                model: display_name,
-                upstream_model: provider_model,
-                pk: pk.labels(),
-                ..Default::default()
-            },
-            crate::request_metrics::Tokens {
-                input: event.prompt_tokens,
-                output: event.completion_tokens,
-                total: event.prompt_tokens.saturating_add(event.completion_tokens),
-                spend_usd: event.cost_usd,
-                client_type: state.client_classifier.classify(user_agent),
-            },
-        );
+        //
+        // 与额度同受 `credit` 管：这是个计数器，重放一次就多收一次。
+        if credit {
+            let owned_caller = crate::request_metrics::Caller::from_api_key_id(&snap, api_key_id);
+            crate::request_metrics::record_usage(
+                state,
+                "/v1/batches",
+                owned_caller.as_caller(),
+                crate::request_metrics::Upstream {
+                    provider: &provider_label,
+                    model: display_name,
+                    upstream_model: provider_model,
+                    pk: pk.labels(),
+                    ..Default::default()
+                },
+                crate::request_metrics::Tokens {
+                    input: event.prompt_tokens,
+                    output: event.completion_tokens,
+                    total: event.prompt_tokens.saturating_add(event.completion_tokens),
+                    spend_usd: event.cost_usd,
+                    client_type: state.client_classifier.classify(user_agent),
+                },
+            );
+        }
 
         tracing::info!(
             batch_id = %raw_batch_id,
@@ -2077,6 +2099,16 @@ mod tests {
         ResourceEntry::new(entry_id, m, 1)
     }
 
+    /// 带定价的模型。不配价的话花费恒 0，任何「花费有没有被记」的断言都是
+    /// 空的 —— 计数器压根不会出现，无论代码怎么写都通过。
+    fn priced_model(entry_id: &str, name: &str, pk_id: &str) -> ResourceEntry<Model> {
+        let json = format!(
+            r#"{{"display_name":"{name}","provider":"openai","model_name":"gpt-4o","provider_key_id":"{pk_id}","cost":{{"input_per_1k":0.5,"output_per_1k":0.5}}}}"#
+        );
+        let m: Model = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(entry_id, m, 1)
+    }
+
     fn apikey_entry(allowed: &[&str]) -> ResourceEntry<ApiKey> {
         let json = format!(
             r#"{{"key_hash":"8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891","allowed_models":{}}}"#,
@@ -2095,13 +2127,26 @@ mod tests {
     fn build_app_with_sink(
         snap: AisixSnapshot,
     ) -> (axum::Router, tokio::sync::mpsc::Receiver<ObsUsageEvent>) {
+        let (app, rx, _state) = build_app_with_sink_and_state(snap);
+        (app, rx)
+    }
+
+    /// 同上，但把 state 也交出来 —— 有些断言要看它的指标，或者先在它的限流
+    /// 存储上占掉一个一次性标记。
+    fn build_app_with_sink_and_state(
+        snap: AisixSnapshot,
+    ) -> (
+        axum::Router,
+        tokio::sync::mpsc::Receiver<ObsUsageEvent>,
+        crate::ProxyState,
+    ) {
         let (tx, rx) = tokio::sync::mpsc::channel::<ObsUsageEvent>(32);
         let hub = Arc::new(Hub::new());
         let handle = SnapshotHandle::new(snap);
         let state = crate::ProxyState::new(handle, hub, &cfg())
             .without_cache()
             .with_usage_sink(UsageSink::new(tx));
-        (crate::build_router(state), rx)
+        (crate::build_router(state.clone()), rx, state)
     }
 
     // ---- id codec ----
@@ -2349,6 +2394,89 @@ mod tests {
         assert!(
             upstream_a.received_requests().await.unwrap().is_empty(),
             "upstream A must not be touched"
+        );
+    }
+
+    /// 批处理的花费归因会重放：进程内的去重集合是优化不是正确性机制，重启或
+    /// 换实例之后再看到同一个已完成批次就会重来一遍。两类通道在重放下的表现
+    /// 必须不同 —— 用量事件带确定性 id，消费端去重，所以它该照发；而只增的
+    /// 花费计数器与 Prometheus 计数器没有那层保护，重放一次就是多收一遍，所以
+    /// 它们必须被那个一次性标记挡住。
+    ///
+    /// 这里预先占掉标记来模拟「这批已经归因过了」。本地存储下标记随进程消失，
+    /// 所以真实部署里这条分支只在共享存储上起作用 —— 而共享存储正是预付余额
+    /// 本来就要求的形态（见 `granted_micro_usd` 的字段说明）。
+    #[tokio::test]
+    async fn a_replayed_batch_attribution_re_emits_the_event_but_not_the_counters() {
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/batches/batch_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "batch_1",
+                "object": "batch",
+                "status": "completed",
+                "output_file_id": "file-out"
+            })))
+            .mount(&upstream)
+            .await;
+        let line = serde_json::json!({
+            "id": "batch_req_1",
+            "response": {"status_code": 200, "body": {
+                "model": "gpt-4o-2024-08-06",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+            }}
+        });
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/files/file-out/content"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(format!("{line}\n"), "application/jsonl"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(priced_model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let (app, mut rx, state) = build_app_with_sink_and_state(snap);
+
+        // 「这批已经归因过了」：标记先被占掉。
+        assert!(
+            state
+                .limiter
+                .claim_once("batch-spend:batch_1", std::time::Duration::from_secs(600))
+                .await,
+            "标记该是空的"
+        );
+
+        let encoded = encode_routed_id("batch_1", "jobs-a");
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/batches/{encoded}"))
+            .header("authorization", "Bearer sk-caller")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+        // 事件照发 —— 消费端按确定性 id 去重，少发才是问题。
+        let mut saw_batch_event = false;
+        for _ in 0..40 {
+            match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await {
+                Ok(Some(ev)) if ev.inbound_protocol == "batch" => {
+                    saw_batch_event = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(saw_batch_event, "重放时用量事件也该发 —— 它本来就是幂等的");
+
+        // 而计数器一动不动。
+        let rendered = state.metrics.render();
+        assert!(
+            !rendered.contains(aisix_obs::metrics::M_LLM_SPEND_MICRO_USD_TOTAL),
+            "重放把这批的钱又收了一遍: {rendered}"
         );
     }
 

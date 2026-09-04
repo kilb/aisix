@@ -768,6 +768,40 @@ impl RateStore for RedisStore {
             }
         }
     }
+
+    async fn claim_once(&self, key: &str, ttl: std::time::Duration) -> bool {
+        // `SET … NX EX` 是原子的，所以并发的两个实例只有一个拿到标记。
+        //
+        // Redis 不可达时退回进程内的那份 —— 与这个存储其它方法同一个姿态
+        // （`local` 兜底、fail-open）。退化的后果正好与退化的对象一致：那时
+        // 计数器也只在本进程里，所以标记只在本进程里有效，两者仍然同寿。
+        let mut conn = match self.conn.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                self.warn_degraded("claim_once", &e);
+                return self.local.claim_once(key, ttl).await;
+            }
+        };
+        let marker = self.bucket_prefix(&format!("claim:{key}"));
+        let res: redis::RedisResult<Option<String>> = redis::cmd("SET")
+            .arg(&marker)
+            .arg(1)
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl.as_secs().max(1))
+            .query_async(&mut conn)
+            .await;
+        match res {
+            Ok(reply) => {
+                self.mark_ok();
+                reply.is_some()
+            }
+            Err(e) => {
+                self.warn_degraded("claim_once", &e);
+                self.local.claim_once(key, ttl).await
+            }
+        }
+    }
 }
 
 #[cfg(test)]

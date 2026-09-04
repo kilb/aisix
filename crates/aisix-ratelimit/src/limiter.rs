@@ -73,6 +73,11 @@ impl Limiter {
 
     /// Build over a specific store — the server bootstrap passes a
     /// `RedisStore` when a shared backend is configured.
+    /// 见 [`RateStore::claim_once`]。
+    pub async fn claim_once(&self, key: &str, ttl: Duration) -> bool {
+        self.store.claim_once(key, ttl).await
+    }
+
     pub fn with_store(store: Arc<dyn RateStore>) -> Self {
         Self {
             store,
@@ -453,6 +458,12 @@ mod tests {
 
         async fn peek(&self, _key: &str, _limits: &RateLimit) -> Option<RateLimitStatus> {
             None
+        }
+
+        // 这个替身只用来量并发租约的续租，不涉及一次性标记 —— 永远给出
+        // 标记，任何依赖它的分支在这里都不会被静默跳过。
+        async fn claim_once(&self, _key: &str, _ttl: Duration) -> bool {
+            true
         }
     }
 
