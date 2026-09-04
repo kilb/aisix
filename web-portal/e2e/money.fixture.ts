@@ -115,6 +115,16 @@ export interface MoneyFixture {
    * 打一次**非流式**请求，三个端点同形状 —— 用来把同一件事在三条家族路径上
    * 各量一遍。计费问题往往只落在其中一条上，而另两条静默地不一样。
    */
+  /**
+   * 发一发内容自定的请求。存根会把它回显进应答，所以这是驱动**输出**护栏的
+   * 手段：输入护栏在派发前就拦了，量不到「上游已经付过钱之后被拦」。
+   */
+  saying(
+    endpoint: "chat" | "messages" | "responses",
+    plaintext: string,
+    text: string,
+    model?: string,
+  ): Promise<number>;
   callOn(
     endpoint: "chat" | "messages" | "responses",
     plaintext: string,
@@ -281,6 +291,36 @@ export async function startMoney(): Promise<MoneyFixture> {
       } catch {
         /* 不是 JSON 就按非流式回 */
       }
+      // 应答回显请求里的用户内容：输出护栏检的是应答，不回显就没法只让某一发
+      // 触发它 —— 固定回 "ok" 的话，要么全部拦、要么一条都拦不到。三种入站形状
+      // 各有各的取法（chat/messages 是 messages[]，responses 是 input）。
+      let echoed = "ok";
+      try {
+        const j = JSON.parse(body || "{}");
+        const msgs = j.messages;
+        const last = Array.isArray(msgs) ? msgs[msgs.length - 1] : undefined;
+        if (typeof last?.content === "string") echoed = last.content;
+        else if (typeof j.input === "string") echoed = j.input;
+      } catch {
+        /* 不是 JSON 就回 ok */
+      }
+      // Anthropic 原生形状：content 是块数组，usage 叫 input_tokens/output_tokens。
+      // 回 OpenAI 形状的话网关解析不出用量，会退到估算，金额对不上。
+      if ((req.url ?? "").includes("/v1/messages") && !wantsStream) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            id: "msg-e2e",
+            type: "message",
+            role: "assistant",
+            model: "claude-sonnet-4",
+            content: [{ type: "text", text: echoed }],
+            stop_reason: "end_turn",
+            usage: { input_tokens: 1000, output_tokens: 1000 },
+          }),
+        );
+        return;
+      }
       // 嵌入接口是另一种形状：没有 choices，usage 只有 prompt/total。
       if ((req.url ?? "").includes("/embeddings")) {
         embedCalls += 1;
@@ -330,7 +370,7 @@ export async function startMoney(): Promise<MoneyFixture> {
                 id: "msg-e2e",
                 role: "assistant",
                 status: "completed",
-                content: [{ type: "output_text", text: "ok" }],
+                content: [{ type: "output_text", text: echoed }],
               },
             ],
             usage: { input_tokens: 1000, output_tokens: 1000, total_tokens: 2000 },
@@ -409,7 +449,9 @@ export async function startMoney(): Promise<MoneyFixture> {
           object: "chat.completion",
           created: 0,
           model: "gpt-4o-mini",
-          choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+          choices: [
+            { index: 0, message: { role: "assistant", content: echoed }, finish_reason: "stop" },
+          ],
           // 每次调用 1000 输入 + 1000 输出 token。配上下面的定价，
           // 单次花费 = 1000/1000*0.5 + 1000/1000*0.5 = $1.00 = 1_000_000 micro。
           usage: { prompt_tokens: 1000, completion_tokens: 1000, total_tokens: 2000 },
@@ -605,6 +647,32 @@ observability:
     async chatStream(plaintext: string) {
       return chatWith(proxyPort, plaintext, true);
     },
+    async saying(
+      endpoint: "chat" | "messages" | "responses",
+      plaintext: string,
+      text: string,
+      model = "gpt-4o-mini",
+    ) {
+      const [path, payload] =
+        endpoint === "chat"
+          ? ["/v1/chat/completions", { model, messages: [{ role: "user", content: text }] }]
+          : endpoint === "messages"
+            ? [
+                "/v1/messages",
+                { model, max_tokens: 16, messages: [{ role: "user", content: text }] },
+              ]
+            : ["/v1/responses", { model, input: text }];
+      const r = await fetch(`http://127.0.0.1:${proxyPort}${path}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${plaintext}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+      await r.text();
+      return r.status;
+    },
     async chatModel(plaintext: string, model: string, stream = false) {
       const r = await fetch(`http://127.0.0.1:${proxyPort}/v1/chat/completions`, {
         method: "POST",
@@ -714,6 +782,12 @@ provider_keys:
     provider: openai
     api_key: sk-stub
     api_base: "${upstreamBase}"
+  # Anthropic 原生上游：打到它的 /v1/messages 走的是穿透分派，与打到
+  # OpenAI 模型时的跨供应商桥接是两条代码路径。Claude Code 的真实形状是这条。
+  - display_name: stub-anthropic
+    provider: anthropic
+    api_key: sk-stub
+    api_base: "${upstreamBase}"
 models:
   - display_name: gpt-4o-mini
     provider: openai
@@ -759,6 +833,13 @@ models:
         - model: unpriced-1
   # 另起一个开缓存的嵌入模型：embed-1 兼着语义路由的分类调用，给它开缓存会让
   # 「分类那一发照收」那条用例的第二发命中，量的就不是同一件事了。
+  - display_name: anthropic-direct
+    provider: anthropic
+    provider_key: stub-anthropic
+    model_name: claude-sonnet-4
+    cost:
+      input_per_1k: 0.5
+      output_per_1k: 0.5
   - display_name: embed-cached
     provider: openai
     provider_key: stub
@@ -802,6 +883,15 @@ cache_policies:
     enabled: true
     ttl_seconds: 300
     applies_to: "model:embed-cached"
+guardrails:
+  # 文件模式没有附着集合，护栏是全环境生效的 —— 所以这条只能靠"应答里出现
+  # 这个短语"来触发，别的用例发的是 hello / hi，不会命中。
+  - name: block-that-phrase
+    kind: keyword
+    hook_point: output
+    patterns:
+      - kind: literal
+        value: forbidden-output-phrase
 api_keys:
   - display_name: e2e-caller
     key_hash: "${keyHash}"

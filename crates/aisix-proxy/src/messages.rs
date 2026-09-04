@@ -174,6 +174,7 @@ pub async fn messages(
             output_redactions,
             output_monitor_hits,
             cache,
+            guardrail_blocked,
         }) => {
             // #932: fold the non-streaming response-side mask counts into
             // the per-request total before the terminal emit below.
@@ -297,7 +298,7 @@ pub async fn messages(
                     applied_guardrails.clone(),
                     redaction_counts.clone(),
                     monitor_hits.clone(),
-                    false,
+                    guardrail_blocked,
                     captured_content,
                 );
             }
@@ -792,6 +793,7 @@ async fn dispatch(
                 output_redactions: crate::redact::RedactionCounts::new(),
                 output_monitor_hits: Vec::new(),
                 cache,
+                guardrail_blocked: false,
             });
         }
     }
@@ -1754,6 +1756,7 @@ async fn anthropic_passthrough_dispatch(
             output_redactions: crate::redact::RedactionCounts::new(),
             output_monitor_hits: Vec::new(),
             cache: crate::response_cache::CacheTelemetry::default(),
+            guardrail_blocked: false,
         })
     } else {
         // Non-streaming: deserialise and re-serialise as JSON. Decode
@@ -1834,9 +1837,31 @@ async fn anthropic_passthrough_dispatch(
                     reason = %reason,
                     "guardrail blocked /v1/messages passthrough response",
                 );
-                return Err(ProxyError::ContentFiltered(
-                    crate::error::guardrail_block_message("response", guardrail_name.as_deref()),
-                ));
+                // 上游已经调用并按这些 token 计过费了，所以这一发带着账走成功
+                // 那条收尾路径（应答体是 422），而不是当成错误丢掉。丢掉的话
+                // 花费指标不记、额度闸也不扣，反复触发护栏就能无上限地花运营
+                // 方在供应商那边的钱。
+                return Ok(DispatchOutcome {
+                    response: ProxyError::ContentFiltered(crate::error::guardrail_block_message(
+                        "response",
+                        guardrail_name.as_deref(),
+                    ))
+                    .into_response(),
+                    provider_label,
+                    provider_key_id: pk_id.to_string(),
+                    upstream_model,
+                    metrics,
+                    usage_handled_by_stream: false,
+                    routing: RoutingTelemetry::default(),
+                    // 被拦下的正文不进采集：拦了又归档等于没拦。
+                    captured_content: None,
+                    // 应答没有交付出去，也就没有输出侧的掩码计数 ——
+                    // /v1/responses 的同类分支也是这么记的。
+                    output_redactions: crate::redact::RedactionCounts::new(),
+                    output_monitor_hits,
+                    cache: crate::response_cache::CacheTelemetry::default(),
+                    guardrail_blocked: true,
+                });
             }
         }
 
@@ -1899,6 +1924,7 @@ async fn anthropic_passthrough_dispatch(
             output_redactions,
             output_monitor_hits,
             cache: crate::response_cache::CacheTelemetry::default(),
+            guardrail_blocked: false,
         })
     }
 }
@@ -2602,6 +2628,7 @@ async fn cross_provider_dispatch(
             output_redactions: crate::redact::RedactionCounts::new(),
             output_monitor_hits: Vec::new(),
             cache: crate::response_cache::CacheTelemetry::default(),
+            guardrail_blocked: false,
         });
     }
 
@@ -2622,6 +2649,24 @@ async fn cross_provider_dispatch(
     let mut output_seg_counts = crate::redact::RedactionCounts::new();
     let mut output_monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut output_capture_safe = true;
+    // 在护栏判决**之前**取账：被拦下的一发也要带着它走。这几个字段读的是
+    // `resp.usage` / `id` / `model` / `finish_reason`，下面的脱敏改的是正文，
+    // 所以挪上来不改成功路径的任何数字。
+    let mut metrics = AnthropicUsageMetrics {
+        prompt_tokens: resp.usage.prompt_tokens,
+        completion_tokens: resp.usage.completion_tokens,
+        cache_creation_tokens: resp.usage.cache_creation_tokens,
+        cache_read_tokens: resp.usage.cache_read_tokens,
+        web_search_requests: resp.usage.web_search_requests,
+        web_fetch_requests: resp.usage.web_fetch_requests,
+        usage_estimated: false,
+        provider_request_id: crate::usage_attr::sanitize_provider_response_id(&resp.id),
+        provider_model_version: resp.model.clone(),
+        finish_reason: finish_reason_label(&resp.finish_reason),
+        upstream_ttft_ms: 0,
+        // Non-streaming: stamped by the handler, which holds the request clock.
+        downstream_latency_ms: 0,
+    };
     if !resolved_chain.is_empty() {
         let (verdict, hits) = aisix_guardrails::Guardrail::check_output_non_segment_observed(
             resolved_chain.as_ref(),
@@ -2649,9 +2694,28 @@ async fn cross_provider_dispatch(
                 reason = %reason,
                 "guardrail blocked /v1/messages response",
             );
-            return Err(ProxyError::ContentFiltered(
-                crate::error::guardrail_block_message("response", guardrail_name.as_deref()),
-            ));
+            // 同 passthrough 那条：上游已经计过费，带着账走成功收尾路径。
+            fill_missing_anthropic_metrics(&mut metrics, &upstream_model, body, || {
+                crate::chat::estimation_output_text(&resp)
+            });
+            return Ok(DispatchOutcome {
+                response: ProxyError::ContentFiltered(crate::error::guardrail_block_message(
+                    "response",
+                    guardrail_name.as_deref(),
+                ))
+                .into_response(),
+                provider_label,
+                provider_key_id: provider_key_id.to_string(),
+                upstream_model,
+                metrics,
+                usage_handled_by_stream: false,
+                routing: RoutingTelemetry::default(),
+                captured_content: None,
+                output_redactions: crate::redact::RedactionCounts::new(),
+                output_monitor_hits,
+                cache: crate::response_cache::CacheTelemetry::default(),
+                guardrail_blocked: true,
+            });
         }
     }
 
@@ -2672,21 +2736,6 @@ async fn cross_provider_dispatch(
     let mut output_redactions = redaction.counts;
     crate::redact::merge_counts(&mut output_redactions, output_seg_counts);
 
-    let mut metrics = AnthropicUsageMetrics {
-        prompt_tokens: resp.usage.prompt_tokens,
-        completion_tokens: resp.usage.completion_tokens,
-        cache_creation_tokens: resp.usage.cache_creation_tokens,
-        cache_read_tokens: resp.usage.cache_read_tokens,
-        web_search_requests: resp.usage.web_search_requests,
-        web_fetch_requests: resp.usage.web_fetch_requests,
-        usage_estimated: false,
-        provider_request_id: crate::usage_attr::sanitize_provider_response_id(&resp.id),
-        provider_model_version: resp.model.clone(),
-        finish_reason: finish_reason_label(&resp.finish_reason),
-        upstream_ttft_ms: 0,
-        // Non-streaming: stamped by the handler, which holds the request clock.
-        downstream_latency_ms: 0,
-    };
     // Token-estimation fallback (#1074): fill counters the
     // bridged upstream never reported. Telemetry only — the rendered
     // Anthropic JSON below carries the upstream's own usage.
@@ -2724,6 +2773,7 @@ async fn cross_provider_dispatch(
         output_redactions,
         output_monitor_hits,
         cache: crate::response_cache::CacheTelemetry::default(),
+        guardrail_blocked: false,
     })
 }
 
@@ -3488,6 +3538,11 @@ struct DispatchOutcome {
     output_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// Whether a cache policy answered this request, and what a hit saved.
     cache: crate::response_cache::CacheTelemetry,
+    /// 输出护栏拦下了这个应答。上游已经调用并计费，所以它带着账走成功那条
+    /// 收尾路径（`response` 是 422），而不是当成错误丢掉 —— 记 0 会让客户
+    /// 账本少报他们已经向供应商付过的量，也会让花费指标漏掉这笔钱，于是
+    /// 门户永远扣不到它。`/v1/responses` 一直是这么做的。
+    guardrail_blocked: bool,
 }
 
 /// Dispatch error carrying the per-attempt telemetry accumulated before

@@ -530,6 +530,61 @@ pub async fn chat_completions(
                         .map(|w| Duration::from_millis(u64::from(w.latency_ms)))
                         .unwrap_or(elapsed);
                     let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &c.provider_key_id);
+                    // 上游已经为这些 token 收过钱了，所以这一发和成功的一发对
+                    // 网关来说成本相同 —— 网关自己的额度闸也正是这么算的。定价
+                    // 按调度到的目标（虚拟父级不带 `cost`），与成功路径同一条
+                    // 规则。写 0 会让客户账本上出现「有 token、没金额」，而门户
+                    // 按花费序列扣款，那笔钱就永远扣不到，两本账各说各话。
+                    let blocked_cost_usd = crate::usage_attr::request_cost_usd(
+                        &snapshot,
+                        event_model_id,
+                        crate::usage_attr::input_tokens_for_pricing(
+                            u64::from(c.prompt_tokens),
+                            u64::from(c.cached_prompt_tokens),
+                            u64::from(c.cache_read_tokens),
+                            u64::from(c.cache_creation_tokens),
+                        ),
+                        u64::from(c.completion_tokens),
+                    );
+                    // 同一笔钱也要进 Prometheus 的 token/花费族：`record` 记的是
+                    // 「这次请求发生了」，`record_usage` 记的是「花了多少」，
+                    // 失败路径原先只发前者。`/v1/responses` 把输出拦截当成功路径
+                    // 收尾，所以它一直是对的；这里补齐同一套。
+                    let blocked_target = snapshot.models.get_by_id(event_model_id);
+                    let blocked_provider = blocked_target
+                        .as_ref()
+                        .and_then(|e| e.value.provider.as_deref())
+                        .unwrap_or("unknown");
+                    let blocked_upstream = blocked_target
+                        .as_ref()
+                        .and_then(|e| e.value.upstream_model())
+                        .unwrap_or("unknown");
+                    let blocked_total = crate::usage_attr::total_tokens_with_cache(
+                        c.prompt_tokens,
+                        c.completion_tokens,
+                        c.cache_creation_tokens,
+                        c.cache_read_tokens,
+                    );
+                    crate::request_metrics::record_usage(
+                        &state,
+                        "/v1/chat/completions",
+                        crate::request_metrics::Caller::new(&auth),
+                        crate::request_metrics::Upstream {
+                            provider: blocked_provider,
+                            model: metric_model.as_ref(),
+                            upstream_model: blocked_upstream,
+                            pk: pk.labels(),
+                            stream: req.is_streaming(),
+                            is_fallback: routing.fallback_count() > 0,
+                        },
+                        crate::request_metrics::Tokens {
+                            input: c.prompt_tokens,
+                            output: c.completion_tokens,
+                            total: blocked_total.min(u64::from(u32::MAX)) as u32,
+                            spend_usd: blocked_cost_usd,
+                            client_type: state.client_classifier.classify(&client.user_agent),
+                        },
+                    );
                     emit_usage_event(
                         &state,
                         &snapshot,
@@ -578,7 +633,7 @@ pub async fn chat_completions(
                             redacted_entity_counts: redaction_counts.clone(),
                             guardrail_monitor_hits: monitor_hits.clone(),
                         },
-                        /* cost_usd */ 0.0,
+                        blocked_cost_usd,
                         guardrail_blocked,
                         &client,
                         failure_content.take(),

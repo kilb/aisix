@@ -606,6 +606,63 @@ test("语义路由的分类调用被计入花费_按嵌入模型自己的标签"
   expect(line, line).toContain('endpoint="/v1/embeddings"');
 });
 
+test("输出护栏拦截时_三个端点都按成功那样收钱", async () => {
+  // 输出护栏在上游调用**之后**才判，那些 token 供应商已经收过钱了。所以被拦
+  // 的一发和成功的一发对网关来说成本完全相同，两侧都得照收：花费指标（门户
+  // 据此扣款）和网关自己的额度闸。
+  //
+  // 少收哪一侧都有后果：指标不记 → 门户永远不扣这笔，用户余额和网关计数器
+  // 各说各话；额度闸不记 → 反复触发护栏就能无上限地花运营方在供应商那边的
+  // 钱，既没有闸也没有记录。
+  const cookie = await fx.sessionCookie();
+  await setQuota(1_000_000_000);
+
+  // 第四格是 Anthropic 原生上游：打到它的 /v1/messages 走**穿透**分派，与打到
+  // OpenAI 模型时的跨供应商桥接是两条各自记账的代码路径。Claude Code 的真实
+  // 形状是这条，只驱动桥接那条的话，它上面的同一个问题会一直绿着。
+  const cells = [
+    ["chat", "gpt-4o-mini"],
+    ["messages", "gpt-4o-mini"],
+    ["responses", "gpt-4o-mini"],
+    ["messages", "anthropic-direct"],
+  ] as const;
+  for (const [ep, model] of cells) {
+    const label = `拦${ep}-${model}`;
+    const k = await mint(cookie, label);
+    fx.blindPortalTo(`${k.name} · ${label}`); // 隔离出网关那道闸，别让门户兜底
+    // 额度只够两发：一发热身 + 一发被拦，第三发就该被闸挡下。
+    expect((await setKeyQuota(cookie, k.name, 2_000_000)).status).toBe(200);
+    await waitFor(async () => fx.readResources().includes(`portal-key-${k.name}`), "额度推下去");
+    await waitFor(
+      async () => (await fx.saying(ep, k.plaintext, "hello", model)) === 200,
+      `${label} 可用`,
+    );
+
+    const spendOfModel = async () => {
+      const m = await fetch(fx.metricsUrl).then((r) => r.text());
+      return m
+        .split("\n")
+        .filter(
+          (l) =>
+            l.startsWith("aisix_llm_spend_micro_usd_total{") && l.includes(`model="${model}"`),
+        )
+        .reduce((a, l) => a + (Number(l.slice(l.lastIndexOf("}") + 1).trim()) || 0), 0);
+    };
+    const before = await spendOfModel();
+    expect(await fx.saying(ep, k.plaintext, "forbidden-output-phrase", model)).toBe(422);
+    expect(
+      (await spendOfModel()) - before,
+      `${label}：被拦的一发上游已经收过钱，花费指标却没记`,
+    ).toBe(1_000_000);
+
+    // 额度也烧完了：再来一发必须被闸挡下，而不是继续白打。
+    expect(
+      await fx.saying(ep, k.plaintext, "forbidden-output-phrase", model),
+      `${label}：被拦的请求没消耗额度，可以无上限地触发`,
+    ).toBe(429);
+  }
+});
+
 test("三个端点上_命中缓存都不该收钱", async () => {
   // 命中缓存意味着这次请求没有打上游，网关没为它付过一分钱 —— 那这次请求就
   // 不该记花费，与调用方用的是哪个 SDK 无关。上面那条用例已经把 chat 的这个
