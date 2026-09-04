@@ -210,8 +210,13 @@ function assertFresh(bin: string, crateDirs: string[]): void {
     }
     for (const e of entries) {
       const full = join(dir, e.name);
-      if (e.isDirectory()) walk(full);
-      else if (
+      // `src/bin/` 是这个 crate 自己的附属可执行文件，没有别的 crate 链接它们
+      // —— 被测的二进制都从 `src/main.rs` 进。走进去的话，改一句
+      // `dump-schema` 的注释就会说门户二进制过期（它俩毫无关系），而重建也
+      // 消不掉：`cargo build -p aisix-portal` 不会碰那个文件。
+      if (e.isDirectory()) {
+        if (e.name !== "bin") walk(full);
+      } else if (
         e.name.endsWith(".rs") ||
         e.name.endsWith(".sql") ||
         e.name.endsWith(".json")
@@ -234,6 +239,9 @@ function assertFresh(bin: string, crateDirs: string[]): void {
   //
   // `schemas/resources/*.schema.json` 同样要算 —— 它们是被 `include_str!` 编进
   // 二进制的，改了 schema 而不重建，配置校验的行为已经变了而闸不会响。
+  //
+  // 反过来，`src/bin/` 不算（见 `walk` 里的判断）。这条闸的价值全在「它响的时候
+  // 讲的是事实」；误报一次就会被绕过一次，之后真的过期也不会有人信它。
   walk(join(process.cwd(), "..", "schemas"));
   for (const d of crateDirs) {
     walk(join(d, "src"));

@@ -409,6 +409,58 @@ jobs:
             exit 1
           fi
 
+  # The Playwright suites had no automated gate: nothing in this workflow
+  # touched `web/` or `web-portal/`, so the money contracts (what each
+  # endpoint charges, on which side of the ledger, and when a ceiling
+  # refuses) were only ever checked when someone ran them by hand. Those
+  # suites are where nearly every billing regression has been caught.
+  playwright-e2e:
+    name: e2e (playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-protoc
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      # The money fixture runs the RELEASE gateway and the DEBUG portal, and
+      # refuses to run against a binary older than its sources — so both
+      # profiles are built here rather than assumed. The console suite runs
+      # the release console + portal + gateway (`aisix validate`).
+      - name: build the binaries the suites drive
+        run: |
+          cargo build --release -p aisix-server -p aisix-portal -p aisix-console
+          cargo build -p aisix-portal
+      # Browser-free and the fastest of the three, so it runs first: it
+      # spawns real processes and asserts over `/metrics` with `fetch`.
+      - name: money e2e (no browser)
+        working-directory: web-portal
+        run: |
+          npm ci
+          npx playwright test money.spec.ts
+      # Chromium is installed from each project so each gets the build its
+      # own pinned `@playwright/test` expects.
+      #
+      # `dist/` must be the ROOT-path build: the deployed portal is served
+      # under `/portal/`, and its fixture rejects a `/portal/`-based bundle.
+      - name: portal UI e2e
+        working-directory: web-portal
+        run: |
+          npx playwright install --with-deps chromium
+          npm run build
+          npx playwright test portal.spec.ts
+      # The console fixture serves `dist/` through `vite preview`, so this
+      # exercises the artifact that ships rather than a dev server.
+      - name: console UI e2e
+        working-directory: web
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npm run build
+          npx playwright test
+
   mcp-conformance:
     # The OFFICIAL MCP conformance suite against the shipped /mcp chain
     # (scoped gateway + bridge + in-process upstream). Scenario list and

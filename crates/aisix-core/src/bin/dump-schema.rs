@@ -12,9 +12,11 @@
 //! `schemars` 0.8) — nested types live in the `definitions/` section
 //! of the same document, no cross-file `$ref` required.
 //!
-//! Re-run after modifying any resource struct in
-//! `crates/aisix-core/src/models/`. CI runs this binary and rejects PRs
-//! that leave `schemas/` out of date (drift check, follow-up PR).
+//! Re-run after modifying any resource struct — or any doc comment on one —
+//! in `crates/aisix-core/src/models/`. CI runs this binary and fails the
+//! build when `schemas/` differs afterwards, so a forgotten regeneration is
+//! caught rather than shipped (`.github/workflows/ci.yml`, the "assert no
+//! drift" step).
 //!
 //! Downstream consumers:
 //!
