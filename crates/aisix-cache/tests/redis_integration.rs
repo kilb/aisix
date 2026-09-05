@@ -13,8 +13,26 @@ use aisix_cache::{Cache, RedisCache};
 use aisix_core::{RedisConnConfig, RedisMode};
 use aisix_gateway::{ChatMessage, ChatResponse, FinishReason, UsageStats};
 
+/// 读一个**闸门**环境变量：没设就跳过这条用例，但在 CI 上直接失败。
+///
+/// 本地不设是常态，跳过是对的。CI 上不设意味着那份配置掉了 —— 而后果是这套
+/// 测试从此安静地停跑：一行 stderr，没人会看见。这个仓库刚在
+/// `aisix-ratelimit` 那套上吃过一次同样的亏。
+fn gate_var(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Ok(v) if !v.trim().is_empty() => Some(v),
+        _ => {
+            assert!(
+                std::env::var("CI").is_err(),
+                "CI 上没有设 {name}：跳过就是静默无覆盖"
+            );
+            None
+        }
+    }
+}
+
 fn redis_url() -> Option<String> {
-    std::env::var("CACHE_TEST_REDIS_URL").ok()
+    gate_var("CACHE_TEST_REDIS_URL")
 }
 
 fn single(url: &str) -> RedisConnConfig {
@@ -26,7 +44,7 @@ fn single(url: &str) -> RedisConnConfig {
 }
 
 fn cluster_cfg() -> Option<RedisConnConfig> {
-    let nodes = std::env::var("CACHE_TEST_REDIS_CLUSTER_NODES").ok()?;
+    let nodes = gate_var("CACHE_TEST_REDIS_CLUSTER_NODES")?;
     Some(RedisConnConfig {
         mode: RedisMode::Cluster,
         nodes: nodes.split(',').map(|s| s.trim().to_string()).collect(),
@@ -35,8 +53,8 @@ fn cluster_cfg() -> Option<RedisConnConfig> {
 }
 
 fn sentinel_cfg() -> Option<RedisConnConfig> {
-    let sentinels = std::env::var("CACHE_TEST_REDIS_SENTINELS").ok()?;
-    let master = std::env::var("CACHE_TEST_REDIS_MASTER").ok()?;
+    let sentinels = gate_var("CACHE_TEST_REDIS_SENTINELS")?;
+    let master = gate_var("CACHE_TEST_REDIS_MASTER")?;
     Some(RedisConnConfig {
         mode: RedisMode::Sentinel,
         sentinels: sentinels.split(',').map(|s| s.trim().to_string()).collect(),

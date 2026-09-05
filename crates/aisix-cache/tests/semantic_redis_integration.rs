@@ -14,8 +14,26 @@ use aisix_cache::{RedisSemanticCache, SemanticCacheStore};
 use aisix_core::{RedisConnConfig, RedisMode};
 use aisix_gateway::{ChatMessage, ChatResponse, FinishReason, UsageStats};
 
+/// 读一个**闸门**环境变量：没设就跳过这条用例，但在 CI 上直接失败。
+///
+/// 本地不设是常态，跳过是对的。CI 上不设意味着那份配置掉了 —— 而后果是这套
+/// 测试从此安静地停跑：一行 stderr，没人会看见。这个仓库刚在
+/// `aisix-ratelimit` 那套上吃过一次同样的亏。
+fn gate_var(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Ok(v) if !v.trim().is_empty() => Some(v),
+        _ => {
+            assert!(
+                std::env::var("CI").is_err(),
+                "CI 上没有设 {name}：跳过就是静默无覆盖"
+            );
+            None
+        }
+    }
+}
+
 fn vector_url() -> Option<String> {
-    std::env::var("CACHE_TEST_REDIS_VECTOR_URL").ok()
+    gate_var("CACHE_TEST_REDIS_VECTOR_URL")
 }
 
 fn single(url: &str) -> RedisConnConfig {
@@ -552,7 +570,7 @@ async fn probe_fails_on_plain_redis() {
     // search (CI: a redis:7 cluster node). Skip when absent — and skip
     // rather than fail when the target actually has vector support,
     // so local setups pointing it at a Redis 8 stay honest.
-    let Some(url) = std::env::var("CACHE_TEST_REDIS_PLAIN_URL").ok() else {
+    let Some(url) = gate_var("CACHE_TEST_REDIS_PLAIN_URL") else {
         return;
     };
     let store = RedisSemanticCache::connect(&single(&url))
