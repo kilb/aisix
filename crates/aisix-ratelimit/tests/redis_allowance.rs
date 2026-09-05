@@ -18,7 +18,7 @@ use aisix_ratelimit::{RateLimitError, RateStore};
 /// 每个用例一个键空间。共用一台 Redis 时靠它互不干扰（见 `Redis::start`）。
 static NS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// 一台可用的 Redis：要么是别人给的（`AISIX_TEST_REDIS_URL`），要么是这里
+/// 一台可用的 Redis：要么是别人给的（`RATELIMIT_TEST_REDIS_URL`），要么是这里
 /// 起的用完即弃的实例。
 struct Redis {
     /// 自己起的那种才有；用别人给的时候是 `None`。
@@ -31,10 +31,16 @@ struct Redis {
 impl Redis {
     /// `None` **只表示这台机器上既没有给定的 Redis、也没有 redis-server**。
     ///
-    /// 优先用 `AISIX_TEST_REDIS_URL`：CI 上的 Redis 是容器服务，runner 的 PATH
+    /// 优先用 `RATELIMIT_TEST_REDIS_URL`：CI 上的 Redis 是容器服务，runner 的 PATH
     /// 上没有 `redis-server` 二进制 —— 只会自己起的话，这些用例在 CI 里是**静默
     /// 跳过**的，而它们守的是累计额度与「批处理不重复收费」那道闸。共用一台时
     /// 每个用例用自己的键前缀，互不影响。
+    ///
+    /// 变量名沿用这个 crate 里 `redis_integration.rs` 已有的那一个（CI 早就设
+    /// 好了），而不是另起一个。另起的名字**绝不能以 `AISIX_` 开头**：
+    /// `Config::load_from_path` 会把所有 `AISIX_*` 合并进根配置，而 `Config` 带
+    /// `deny_unknown_fields` —— 那会让 `aisix-core::config` 的整组测试炸掉。
+    /// CI 里那段注释写的就是这件事，我第一版起的名正好踩中。
     ///
     /// 探测通过之后的任何失败都直接 panic：那是环境问题，混进 `None` 会让整套
     /// 测试静默跳过 —— 一套永远绿的测试比没有测试更糟，因为它还让人放心。
@@ -51,7 +57,7 @@ impl Redis {
             std::process::id(),
             NS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
-        if let Ok(url) = std::env::var("AISIX_TEST_REDIS_URL") {
+        if let Ok(url) = std::env::var("RATELIMIT_TEST_REDIS_URL") {
             if !url.trim().is_empty() {
                 return Some(Self {
                     owned: None,
@@ -202,13 +208,13 @@ macro_rules! redis_or_skip {
                     // CI 上跳过 = 静默无覆盖。这几条守的是累计额度与「批处理
                     // 不重复收费」那道闸，而 CI 的 Redis 是容器服务、PATH 上没
                     // 有 `redis-server` —— 只靠自起的话它们从来没跑过，而没人
-                    // 会注意到一行 stderr。给 `AISIX_TEST_REDIS_URL` 指一台就行。
+                    // 会注意到一行 stderr。给 `RATELIMIT_TEST_REDIS_URL` 指一台就行。
                     assert!(
                         std::env::var("CI").is_err(),
-                        "CI 上没有可用的 Redis：既没有 AISIX_TEST_REDIS_URL，\
+                        "CI 上没有可用的 Redis：既没有 RATELIMIT_TEST_REDIS_URL，\
                          PATH 上也没有 redis-server。跳过就是静默无覆盖。"
                     );
-                    eprintln!("跳过：本机既没有 AISIX_TEST_REDIS_URL 也没有 redis-server");
+                    eprintln!("跳过：本机既没有 RATELIMIT_TEST_REDIS_URL 也没有 redis-server");
                     return;
                 }
                 Some(r) => {
