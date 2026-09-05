@@ -420,6 +420,17 @@ export async function startMoney(): Promise<MoneyFixture> {
       // 嵌入接口是另一种形状：没有 choices，usage 只有 prompt/total。
       if ((req.url ?? "").includes("/embeddings")) {
         embedCalls += 1;
+        // 一个「坏掉的」嵌入模型：用来量分类失败之后的降级路径。上游报错时
+        // 网关拿不到任何用量，所以那一发不该记任何花费。
+        try {
+          if (JSON.parse(body || "{}").model === "text-embedding-broken") {
+            res.writeHead(500, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: { message: "embedding upstream is down" } }));
+            return;
+          }
+        } catch {
+          /* 不是 JSON 就按正常走 */
+        }
         // **每个输入回一个向量**：语义路由会把 prompt 与所有未缓存的样例批在
         // 一次调用里，回少了网关会正确地判成畸形应答并整条降级 —— 那样就测不到
         // 分类路径了。
@@ -1019,6 +1030,27 @@ models:
   - display_name: semantic-capped
     semantic:
       embedding_model: embed-capped
+      default: gpt-4o-mini
+      match:
+        threshold: 0.99
+      on_embedding_failure: default
+      routes:
+        - name: only
+          target: cached-direct
+          examples: ["hello"]
+  # 分类会失败的语义路由：嵌入模型的上游固定报 500。
+  - display_name: embed-broken
+    provider: openai
+    provider_key: stub
+    model_name: text-embedding-broken
+    embedding:
+      dimensions: 3
+    cost:
+      input_per_1k: 0.5
+      output_per_1k: 0.5
+  - display_name: semantic-broken
+    semantic:
+      embedding_model: embed-broken
       default: gpt-4o-mini
       match:
         threshold: 0.99

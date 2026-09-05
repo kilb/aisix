@@ -702,6 +702,50 @@ test("语义路由的分类调用_要过分类模型自己的闸", async () => {
   ).toBe(2);
 });
 
+test("分类调用失败时_降级仍然成功_且那一发不收钱", async () => {
+  // 分类失败走 `on_embedding_failure: default`，请求仍然成功。钱这一侧要分清
+  // 两笔：降级之后真打的那次 chat 照收；而失败的那次分类，网关没拿到任何用量，
+  // 不该凭空记一笔。
+  //
+  // 这条路径（`resolve` 里的失败降级）此前只在顺利情形下被驱动过 —— 覆盖率量
+  // 出来整个 `resolve` 没有任何 Rust 层测试，而它决定的既是请求成不成、也是
+  // 收不收钱。
+  const cookie = await fx.sessionCookie();
+  await setQuota(1_000_000_000);
+  const k = await mint(cookie, "分类失败");
+
+  const spendOf = async (model: string) => {
+    const m = await fetch(fx.metricsUrl).then((r) => r.text());
+    return m
+      .split("\n")
+      .filter(
+        (l) =>
+          l.startsWith("aisix_llm_spend_micro_usd_total{") && l.includes(`model="${model}"`),
+      )
+      .reduce((a, l) => a + (Number(l.slice(l.lastIndexOf("}") + 1).trim()) || 0), 0);
+  };
+
+  const chatBefore = await spendOf("gpt-4o-mini");
+  const routedBefore = await spendOf("cached-direct");
+  expect(
+    await fx.chatModel(k.plaintext, "semantic-broken"),
+    "分类挂了不该把整条请求带下去 —— 有降级出口就该用",
+  ).toBe(200);
+
+  await waitFor(async () => (await spendOf("gpt-4o-mini")) > chatBefore, "降级那次 chat 没记账");
+  expect(
+    (await spendOf("gpt-4o-mini")) - chatBefore,
+    "降级之后打的是 default（gpt-4o-mini），金额该是一次普通调用",
+  ).toBe(1_000_000);
+  // 分类失败就不该走到路由目标上去。
+  expect(
+    (await spendOf("cached-direct")) - routedBefore,
+    "分类失败却路由到了 route 目标 —— 那说明降级没生效",
+  ).toBe(0);
+  // 失败的那一发没有任何用量可记。
+  expect(await spendOf("embed-broken"), "为一次失败的分类调用记了花费").toBe(0);
+});
+
 test("批处理跑完的钱_也要进指标和额度", async () => {
   // 批处理的钱是**事后**落账的：网关首次看到批次 completed 时把输出下载下来，
   // 按行聚合 usage。那条路径与请求路径完全分开，所以请求路径上的记账是否正确
