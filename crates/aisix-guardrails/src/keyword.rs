@@ -18,25 +18,33 @@ use crate::{Guardrail, GuardrailVerdict};
 
 #[derive(Debug, Clone)]
 pub enum KeywordRule {
-    Literal(String),
+    /// 两份：`raw` 是操作者写下的原样（`description` 要把它原封不动放进日志和
+    /// 拦截理由里），`lower` 是匹配用的。小写在构造时算一次，而不是每次检查、
+    /// 每条规则各算一遍。
+    Literal {
+        raw: String,
+        lower: String,
+    },
     Regex(Regex),
 }
 
 impl KeywordRule {
     pub fn literal(s: impl Into<String>) -> Self {
-        Self::Literal(s.into())
+        let raw: String = s.into();
+        let lower = raw.to_lowercase();
+        Self::Literal { raw, lower }
     }
 
     pub fn regex(pattern: &str) -> Result<Self, regex::Error> {
         Regex::new(pattern).map(Self::Regex)
     }
 
-    fn matches(&self, haystack: &str) -> bool {
+    /// `haystack_lower` 是调用方小写过一次的同一段文本。字面量规则用它，正则
+    /// 用原文（大小写由正则自己的 `(?i)` 决定）。
+    fn matches(&self, haystack: &str, haystack_lower: &str) -> bool {
         match self {
-            KeywordRule::Literal(needle) => {
-                let h = haystack.to_lowercase();
-                let n = needle.to_lowercase();
-                !needle.is_empty() && h.contains(&n)
+            KeywordRule::Literal { raw, lower } => {
+                !raw.is_empty() && haystack_lower.contains(lower.as_str())
             }
             KeywordRule::Regex(re) => re.is_match(haystack),
         }
@@ -44,7 +52,7 @@ impl KeywordRule {
 
     fn description(&self) -> String {
         match self {
-            KeywordRule::Literal(s) => format!("literal {s:?}"),
+            KeywordRule::Literal { raw, .. } => format!("literal {raw:?}"),
             KeywordRule::Regex(r) => format!("regex /{}/", r.as_str()),
         }
     }
@@ -85,7 +93,18 @@ impl KeywordBlocklist {
     }
 
     fn first_match<'a>(&'a self, text: &str) -> Option<&'a KeywordRule> {
-        self.rules.iter().find(|r| r.matches(text))
+        // 整段文本只小写一次。原先是每条字面量规则各小写一遍整段 —— L 条规则
+        // 对 H 字节的提示词就是 O(L·H) 的分配与拷贝，而这是每个请求都要走的
+        // 路径（输入一次、输出再一次）。
+        //
+        // 全是正则的黑名单不付这个代价：没有字面量规则时根本不小写。
+        let lowered = self
+            .rules
+            .iter()
+            .any(|r| matches!(r, KeywordRule::Literal { .. }))
+            .then(|| text.to_lowercase());
+        let lower = lowered.as_deref().unwrap_or("");
+        self.rules.iter().find(|r| r.matches(text, lower))
     }
 }
 
@@ -163,6 +182,52 @@ mod tests {
             finish_reason: FinishReason::Stop,
             usage: UsageStats::new(0, 0),
         }
+    }
+
+    /// 拦截理由里必须出现操作者**原样**写下的那个词。
+    ///
+    /// 匹配用的是预先小写好的那一份；理由若也用它，运维配的 `AKIA` 会在日志里
+    /// 变成 `akia` —— 那是拿去和配置对照的那个字符串，不能被改。
+    #[tokio::test]
+    async fn the_reported_pattern_keeps_the_operator_casing() {
+        let g = KeywordBlocklist::new(vec![KeywordRule::literal("AKIA")]);
+        let v = g
+            .check_input(&req(&[("user", "my key is akia-secret")]))
+            .await;
+        match v {
+            GuardrailVerdict::Block { reason, .. } => {
+                assert!(reason.contains("AKIA"), "理由里没有原样的字面量: {reason}");
+                assert!(
+                    !reason.contains("akia\""),
+                    "理由里出现了被小写过的字面量: {reason}"
+                );
+            }
+            other => panic!("该拦下: {other:?}"),
+        }
+    }
+
+    /// 多条字面量规则时，整段文本只小写一次 —— 但从行为上看不出来，所以这里
+    /// 钉的是「提到多条也仍然逐条正确」：优化写坏最可能的表现是只有第一条生效。
+    #[tokio::test]
+    async fn every_literal_still_matches_when_several_are_configured() {
+        let g = KeywordBlocklist::new(vec![
+            KeywordRule::literal("alpha"),
+            KeywordRule::literal("BRAVO"),
+            KeywordRule::literal("charlie"),
+        ]);
+        for probe in ["say Alpha", "say bravo", "say CHARLIE"] {
+            assert!(
+                matches!(
+                    g.check_input(&req(&[("user", probe)])).await,
+                    GuardrailVerdict::Block { .. }
+                ),
+                "没拦下: {probe}"
+            );
+        }
+        assert!(matches!(
+            g.check_input(&req(&[("user", "say delta")])).await,
+            GuardrailVerdict::Allow
+        ));
     }
 
     #[tokio::test]
