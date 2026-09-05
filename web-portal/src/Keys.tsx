@@ -70,9 +70,21 @@ export function Keys({ onChanged }: { onChanged: () => void }) {
   async function saveQuota(fullName: string) {
     // 金额按 micro-USD 整数下发。浮点做钱会累积误差，而这个产品的花费到千分
     // 之一美分 —— 在这里就换算成整数。
-    const micro = Math.round(Number(quotaUsd) * 1_000_000);
+    const usd = Number(quotaUsd);
+    const micro = Math.round(usd * 1_000_000);
     if (!Number.isFinite(micro) || micro < 0) {
       setErr("额度必须是非负数");
+      return;
+    }
+    // micro-USD 是整数计数器，比一个单位还小的额度四舍五入后是 0 —— 而 0 在
+    // 这里的意思是「不单独设限」。不挡的话，「给它一个很小的上限」会静默变成
+    // 「这把密钥不设上限」，与意图正相反，而且是花钱那个方向。
+    if (usd > 0 && micro === 0) {
+      setErr(
+        `额度 $${quotaUsd} 小于最小可表示单位（0.000001 美元），` +
+          `四舍五入后是 0，而 0 的意思是「不单独设限」。` +
+          `请填更大的值，或者填 0 表示确实不设限。`,
+      );
       return;
     }
     setBusy(true);

@@ -32,9 +32,20 @@ export function Topup({ onChanged }: { onChanged: () => void }) {
   async function submit() {
     // 金额在这里就换算成 micro-USD 整数。浮点做钱会累积误差，而这个产品的
     // 花费到千分之一美分 —— 别把浮点带进账本。
-    const micro = Math.round(Number(amount) * 1_000_000);
-    if (!Number.isFinite(micro) || micro <= 0) {
+    const usd = Number(amount);
+    const micro = Math.round(usd * 1_000_000);
+    if (!Number.isFinite(micro) || micro < 0) {
       setErr("金额必须是正数");
+      return;
+    }
+    // 填了正数却被舍入成 0 时，「金额必须是正数」是句错话 —— 用户填的**就是**
+    // 正数。说清真正的原因。
+    if (micro === 0) {
+      setErr(
+        usd > 0
+          ? `金额 $${amount} 小于最小可表示单位（0.000001 美元），四舍五入后是 0。`
+          : "金额必须是正数",
+      );
       return;
     }
     setBusy(true);

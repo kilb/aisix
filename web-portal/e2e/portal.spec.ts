@@ -415,6 +415,35 @@ test("给每把密钥设额度_界面上分不出去的那部分被明确挡住"
   await expect(budget).toContainText("已分配 $4.00");
 });
 
+test("小到会被舍入成零的额度_必须挡下而不是悄悄变成不设限", async ({ page }) => {
+  // micro-USD 是整数计数器，比一个单位还小的额度四舍五入后是 0 —— 而这个界面
+  // 里 0 的意思是「不单独设限」。于是「我想给它一个很小的上限」会静默变成
+  // 「这把密钥不设上限」，与意图正相反，且方向是花钱那一边。
+  //
+  // 控制台那边同样的输入有明确的守卫（那里 0 的意思是「禁止花钱」，方向不同
+  // 但同一个坑）；这一侧没有。
+  const email = mail("tiny-quota");
+  await signUp(page, email);
+  await setQuota(email, 10_000_000);
+
+  await page.getByLabel("名称（可选）").fill("甲");
+  await page.getByRole("button", { name: "创建密钥" }).click();
+  await page.getByRole("button", { name: "我已保存" }).click();
+  await page.reload();
+
+  await keyRow(page, 0).getByRole("button", { name: "不设限" }).click();
+  await keyRow(page, 0).getByLabel(/的额度 USD$/).fill("0.0000004");
+  await keyRow(page, 0).getByRole("button", { name: "保存" }).click();
+
+  await expect(page.locator(".note.crit")).toContainText("0.000001");
+  // 挡住之后什么也没落下去 —— 重新加载后仍是「不设限」，而不是被这次操作
+  // 静默确认成了不设限。（这两种状态在界面上长得一样，所以看的是「有没有
+  // 提示挡下过」加上「重载后额度没变」。）
+  await page.reload();
+  await expect(keyRow(page, 0).getByRole("button", { name: "不设限" })).toBeVisible();
+  await expect(page.locator(".budget")).toContainText("已分配 $0.00");
+});
+
 test("吊销一把密钥会把它占的额度还回来", async ({ page }) => {
   const email = mail("key-quota-revoke");
   await signUp(page, email);
