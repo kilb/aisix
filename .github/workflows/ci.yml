@@ -213,6 +213,16 @@ jobs:
           docker exec redis-fo-sentinel redis-cli -p 26380 sentinel get-master-addr-by-name myfo | tr -d '\r' | tr '\n' ' ' | grep -qE '127\.0\.0\.1 +6381' \
             || { echo "::error::Failover sentinel 26380 did not resolve myfo to the master"; exit 1; }
       - name: unit tests with coverage
+        env:
+          # The Redis-backed integration tests spawn their own `redis-server`
+          # when they can, but this runner has Redis only as a container
+          # service — no binary on PATH — so without this they skipped in
+          # silence. They cover the cumulative spend allowance and the
+          # once-only marker that keeps a replayed batch attribution from
+          # charging twice. Each test namespaces its own keys, so sharing
+          # the single-node service is safe; the tests refuse to skip when
+          # `CI` is set, so this going missing fails loudly.
+          AISIX_TEST_REDIS_URL: redis://127.0.0.1:6379
         run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov-unit.info
       - uses: actions/upload-artifact@v7
         with:

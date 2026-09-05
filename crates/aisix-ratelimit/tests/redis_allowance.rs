@@ -15,19 +15,51 @@ use aisix_core::config::{RedisConnConfig, RedisMode};
 use aisix_core::RateLimit;
 use aisix_ratelimit::{RateLimitError, RateStore};
 
-/// 一个用完即弃的 redis-server。
+/// 每个用例一个键空间。共用一台 Redis 时靠它互不干扰（见 `Redis::start`）。
+static NS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 一台可用的 Redis：要么是别人给的（`AISIX_TEST_REDIS_URL`），要么是这里
+/// 起的用完即弃的实例。
 struct Redis {
-    child: Child,
-    port: u16,
-    dir: std::path::PathBuf,
+    /// 自己起的那种才有；用别人给的时候是 `None`。
+    owned: Option<(Child, std::path::PathBuf)>,
+    url: String,
+    /// 这个用例独占的键前缀命名空间。
+    ns: String,
 }
 
 impl Redis {
-    /// `None` **只表示机器上没有 redis-server**。
+    /// `None` **只表示这台机器上既没有给定的 Redis、也没有 redis-server**。
+    ///
+    /// 优先用 `AISIX_TEST_REDIS_URL`：CI 上的 Redis 是容器服务，runner 的 PATH
+    /// 上没有 `redis-server` 二进制 —— 只会自己起的话，这些用例在 CI 里是**静默
+    /// 跳过**的，而它们守的是累计额度与「批处理不重复收费」那道闸。共用一台时
+    /// 每个用例用自己的键前缀，互不影响。
     ///
     /// 探测通过之后的任何失败都直接 panic：那是环境问题，混进 `None` 会让整套
     /// 测试静默跳过 —— 一套永远绿的测试比没有测试更糟，因为它还让人放心。
     fn start() -> Option<Self> {
+        // 掺进 pid：计数器每个进程从 0 开始，而共用的那台 Redis 是跨进程存在的
+        // —— 只用计数器的话，连跑两遍时第二遍会读到第一遍留下的键，症状是「计
+        // 数器的键不是恰好一个」，看起来像被测代码坏了。（这条是被这套测试自己
+        // 抓出来的。）
+        //
+        // 共用实例上这些键会留下来。CI 的 Redis 是每个 job 一份的容器，随 job
+        // 消失；指向长期实例时它会慢慢攒 —— 那是这个 env 变量的已知代价。
+        let ns = format!(
+            "t{}-{}",
+            std::process::id(),
+            NS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        if let Ok(url) = std::env::var("AISIX_TEST_REDIS_URL") {
+            if !url.trim().is_empty() {
+                return Some(Self {
+                    owned: None,
+                    url: url.trim().to_string(),
+                    ns,
+                });
+            }
+        }
         if Command::new("redis-server")
             .arg("--version")
             .output()
@@ -68,11 +100,15 @@ impl Redis {
                 panic!("redis-server 探测通过却起不起来（{e}）—— 环境问题，不当作「没装」跳过");
             }
         };
-        Some(Self { child, port, dir })
+        Some(Self {
+            owned: Some((child, dir)),
+            url: format!("redis://127.0.0.1:{port}"),
+            ns,
+        })
     }
 
     fn url(&self) -> String {
-        format!("redis://127.0.0.1:{}", self.port)
+        self.url.clone()
     }
 
     async fn wait_ready(&self) -> bool {
@@ -93,6 +129,18 @@ impl Redis {
         false
     }
 
+    /// 按**本用例的命名空间**扫键。共用一台 Redis 时，裸 `KEYS *consumed*` 会
+    /// 扫到别的用例的键 —— 而那种污染的症状是「键不是恰好一个」，看起来像被测
+    /// 代码的问题。
+    async fn keys(&self, suffix_glob: &str) -> Vec<String> {
+        let mut c = self.raw().await;
+        redis::cmd("KEYS")
+            .arg(format!("*:{}:*{suffix_glob}", self.ns))
+            .query_async(&mut c)
+            .await
+            .expect("KEYS 可用")
+    }
+
     /// 直接读一个键，用来断言脚本真的写了它（以及没给它设过期）。
     async fn raw(&self) -> redis::aio::MultiplexedConnection {
         redis::Client::open(self.url())
@@ -105,9 +153,12 @@ impl Redis {
 
 impl Drop for Redis {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.dir);
+        // 别人给的那台不归这里收 —— 只清自己起的。
+        if let Some((child, dir)) = self.owned.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
 
@@ -127,6 +178,9 @@ async fn store(r: &Redis) -> aisix_ratelimit::store::redis::RedisStore {
     aisix_ratelimit::store::redis::RedisStore::connect(&cfg)
         .await
         .expect("connect")
+        // 共用一台 Redis 时，键前缀是用例之间唯一的隔离手段。自己起实例时它
+        // 无害，所以两种情形走同一条路 —— 分叉的话，只有一边会被跑到。
+        .with_env_namespace(&r.ns)
 }
 
 /// 只在**机器上没有 redis-server** 时跳过，并说明原因。
@@ -145,7 +199,16 @@ macro_rules! redis_or_skip {
         for attempt in 1..=3 {
             match Redis::start() {
                 None => {
-                    eprintln!("跳过：机器上没有 redis-server");
+                    // CI 上跳过 = 静默无覆盖。这几条守的是累计额度与「批处理
+                    // 不重复收费」那道闸，而 CI 的 Redis 是容器服务、PATH 上没
+                    // 有 `redis-server` —— 只靠自起的话它们从来没跑过，而没人
+                    // 会注意到一行 stderr。给 `AISIX_TEST_REDIS_URL` 指一台就行。
+                    assert!(
+                        std::env::var("CI").is_err(),
+                        "CI 上没有可用的 Redis：既没有 AISIX_TEST_REDIS_URL，\
+                         PATH 上也没有 redis-server。跳过就是静默无覆盖。"
+                    );
+                    eprintln!("跳过：本机既没有 AISIX_TEST_REDIS_URL 也没有 redis-server");
                     return;
                 }
                 Some(r) => {
@@ -153,7 +216,7 @@ macro_rules! redis_or_skip {
                         got = Some(r);
                         break;
                     }
-                    eprintln!("第 {attempt} 次起 redis 没就绪（端口 {}），重来", r.port);
+                    eprintln!("第 {attempt} 次连 redis 没就绪（{}），重来", r.url());
                     // r 在这里析构，进程与目录都收掉。
                 }
             }
@@ -188,11 +251,7 @@ async fn 累计额度用尽后拒绝_且跨窗口不重置() {
     // 键名扫出来而不是写死：布局带 Cluster 哈希标签（`aisix:rl:{k}:consumed`），
     // 写死一次猜错就会变成一条「键不存在、TTL=-2」的假通过。
     let mut c = r.raw().await;
-    let keys: Vec<String> = redis::cmd("KEYS")
-        .arg("*consumed*")
-        .query_async(&mut c)
-        .await
-        .expect("KEYS");
+    let keys = r.keys("consumed*").await;
     assert_eq!(keys.len(), 1, "累计计数器的键不是恰好一个: {keys:?}");
     let key = &keys[0];
     let ttl: i64 = redis::cmd("TTL")
@@ -223,11 +282,7 @@ async fn 流式那条记账路径也计入累计额() {
     // add_tokens 在 Redis 后端是异步落到后台 worker 的，等它写进去。
     let mut c = r.raw().await;
     for _ in 0..100 {
-        let keys: Vec<String> = redis::cmd("KEYS")
-            .arg("*consumed*")
-            .query_async(&mut c)
-            .await
-            .expect("KEYS");
+        let keys = r.keys("consumed*").await;
         let v: i64 = match keys.first() {
             Some(k) => redis::cmd("GET")
                 .arg(k)
@@ -301,11 +356,7 @@ async fn 一次性标记跨实例只发一次() {
 
     // TTL 真的落在键上：没有过期时间的标记会永久占着 Redis。
     let mut conn = r.raw().await;
-    let keys: Vec<String> = redis::cmd("KEYS")
-        .arg("*claim:batch-spend:b1*")
-        .query_async(&mut conn)
-        .await
-        .expect("KEYS 可用");
+    let keys = r.keys("claim:batch-spend:b1*").await;
     assert_eq!(keys.len(), 1, "标记键没建出来: {keys:?}");
     let secs: i64 = redis::cmd("TTL")
         .arg(&keys[0])
