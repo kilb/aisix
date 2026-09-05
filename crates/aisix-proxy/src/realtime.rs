@@ -1089,6 +1089,48 @@ mod tests {
         (addr, seen_handshake, seen_frames)
     }
 
+    /// 虚拟父级（routing / ensemble / semantic）不能走 `/v1/realtime`。
+    ///
+    /// 这不只是「不支持」：父级行结构上不带 `cost`，所以一旦让它进来，整场会话
+    /// 的花费恒为 0 —— 一条不计费的通道，而且没有任何信号。这道闸此前没有任何
+    /// 测试。
+    #[tokio::test]
+    async fn a_virtual_router_is_refused_for_being_virtual() {
+        let snap = snapshot("http://127.0.0.1:1/v1", "openai", "openai");
+        let group: Model = serde_json::from_str(
+            r#"{"display_name":"rt-group","routing":{"targets":[{"model":"rt-model"}]}}"#,
+        )
+        .unwrap();
+        snap.models
+            .insert(ResourceEntry::new("m-rt-group", group, 1));
+        let handle = SnapshotHandle::new(snap);
+        let live = handle.load();
+        let state = crate::ProxyState::new(handle.clone(), Arc::new(Hub::new()), &cfg());
+        let key: aisix_core::ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_models":["*"]}"#).unwrap();
+        let auth = crate::auth::AuthenticatedKey {
+            entry: Arc::new(ResourceEntry::new("k-1", key, 1)),
+            jwt: None,
+        };
+        let params = HashMap::from([("model".to_string(), "rt-group".to_string())]);
+        let client = crate::client_ip::ClientContext::default();
+
+        let err = match super::prepare(&state, &live, &params, &client, auth).await {
+            Err(e) => e,
+            Ok(_) => panic!("虚拟父级不该被放进来 —— 那是一条不计费的通道"),
+        };
+
+        // **断言拒绝的理由**，不只是「被拒了」。父级没有 provider / model_name，
+        // 所以把这道闸拆掉之后连接照样会失败 —— 只断言「失败」的话，这条用例
+        // 无论闸在不在都是绿的（第一版就是这样，变异检查照过）。
+        let msg = err.to_string();
+        assert!(
+            msg.contains("virtual router"),
+            "拒绝理由说的不是「这是个虚拟父级」，那说明闸没起作用、是后面某步偶然\
+             拦下的: {msg}"
+        );
+    }
+
     /// 会话里从提示缓存读回来的 token 要按缓存费率计价，而不是全价输入。
     ///
     /// 这个表面自己算成本（`ModelCost::calculate(input, output)`），而家族其它
