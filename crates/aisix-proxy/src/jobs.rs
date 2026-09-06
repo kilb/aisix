@@ -455,13 +455,35 @@ async fn send_upstream(
 
 /// Run the resolved input-guardrail chain over an opaque blob (whole-body
 /// lossy text scan — the `/passthrough` precedent from #911 [6]).
+/// One multipart field of a `/v1/files` upload, held verbatim until the file
+/// body has been through the guardrail chain. The form cannot be assembled
+/// during the read: a `mask` rule rewrites the file part, and `reqwest`'s
+/// `Form` has no way to replace a part once added.
+enum UploadField {
+    Text(String, String),
+    File {
+        file_name: String,
+        content_type: Option<String>,
+        bytes: Bytes,
+    },
+}
+
 async fn scan_input_blob(
     state: &ProxyState,
     auth: &AuthenticatedKey,
     target: &JobTarget,
     blob: &[u8],
     monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
-) -> Result<(), ProxyError> {
+    // `Some(..)` 表示这个 blob 是最终用户内容：`mask` 规则可以改写它，改写
+    // 的计数就记进来。传计数槽本身就是开启遮蔽的开关 —— 于是「遮蔽了却没
+    // 有审计痕迹」这种状态压根写不出来。
+    //
+    // `None` 是控制体（ids、endpoint、超参）：只查不改。在控制体上做遮蔽
+    // 会改坏它本该保护的上游引用 —— `input_file_id` 在 JSON 里也不过是个
+    // 字符串值 —— 而且这也和 chat 一致：遮蔽改的是消息内容，从不动请求的
+    // 控制字段。
+    redactions: Option<&mut crate::redact::RedactionCounts>,
+) -> Result<Option<Vec<u8>>, ProxyError> {
     let ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
         model_id: &target.model_entry.id,
@@ -471,7 +493,7 @@ async fn scan_input_blob(
     };
     let chain = state.guardrail_index.resolve(&ctx);
     if chain.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let chat = aisix_gateway::ChatFormat::new(
         target.display_name(),
@@ -496,7 +518,24 @@ async fn scan_input_blob(
             crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
         ));
     }
-    Ok(())
+
+    // #932 的顺序：先过阻断，再改写，改写后的字节才是上游收到的东西。
+    let Some(redactions) = redactions else {
+        return Ok(None);
+    };
+    if !aisix_guardrails::Guardrail::redacts_input(&chain) {
+        return Ok(None);
+    }
+    // 改写是在文本 span 上做替换，所以 blob 得能按 UTF-8 读回来。把 lossy
+    // 转换的结果写回去会毁掉一个非文本上传 —— 那种 blob 只查不改。
+    let Ok(text) = std::str::from_utf8(blob) else {
+        return Ok(None);
+    };
+    let Some(r) = aisix_guardrails::Guardrail::redact_input_text(&chain, text) else {
+        return Ok(None);
+    };
+    crate::redact::merge_counts(redactions, r.counts);
+    Ok(Some(r.text.into_bytes()))
 }
 
 /// Output-side twin of [`scan_input_blob`].
@@ -599,6 +638,8 @@ fn emit_job_usage_event(
     elapsed: Duration,
     client: &ClientContext,
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    // 遮蔽只记类型和条数，不记被遮蔽的内容 —— 事件本身不能变成 PII 汇集点。
+    redacted_entity_counts: crate::redact::RedactionCounts,
 ) {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
@@ -615,6 +656,7 @@ fn emit_job_usage_event(
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         guardrail_monitor_hits,
+        redacted_entity_counts,
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(
@@ -678,7 +720,7 @@ fn emit_access_log(
 /// Shared success/error tail for every handler: access log, metrics,
 /// usage event, response header.
 #[allow(clippy::too_many_arguments)]
-fn finish(
+async fn finish(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     label: &'static str,
@@ -690,6 +732,7 @@ fn finish(
     request_id: String,
     result: Result<(Response, JobTarget), ProxyError>,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    redactions: crate::redact::RedactionCounts,
 ) -> Response {
     let elapsed = started.elapsed();
     // `path` carries the real job/file id — bounded route template only.
@@ -730,7 +773,29 @@ fn finish(
                 elapsed,
                 client,
                 monitor_hits,
+                redactions,
             );
+            // 这条路和 /v1/chat/completions 花的是同一个 key 级配额桶
+            // （`quota::enforce` 预留的就是请求级那几层），所以也得照实
+            // 汇报：不发头，SDK 只能盲目重试撞 429；不发 gauge，
+            // `aisix_rate_limit_remaining` 会一直停在上一次 chat 请求的读数，
+            // 而这个 key 其实已经逼近上限了。
+            let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
+            crate::request_metrics::publish_rate_limit_window(
+                &state.metrics,
+                &state.limiter,
+                snapshot,
+                &auth.entry.id,
+                &rl_limits,
+                target.display_name(),
+                target
+                    .model_entry
+                    .value
+                    .upstream_model()
+                    .unwrap_or_default(),
+                &mut resp,
+            )
+            .await;
             if let Ok(hv) = HeaderValue::from_str(&request_id) {
                 resp.headers_mut().insert("x-aisix-request-id", hv);
             }
@@ -849,6 +914,7 @@ pub(crate) async fn create_file(
         }
     };
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    let mut redactions = crate::redact::RedactionCounts::new();
     // Loaded below, after the upload is drained — see the note in
     // `audio::multipart_dispatch` (#941 audit M2).
     let mut snapshot = None;
@@ -857,9 +923,11 @@ pub(crate) async fn create_file(
         // Re-build the outbound multipart form, extracting the gateway-only
         // `model` routing field. Text fields (purpose, expires_after[...])
         // forward verbatim.
-        let mut form = reqwest::multipart::Form::new();
+        // 表单要等文件体过完护栏（可能被遮蔽）之后才能拼，所以先按收到的
+        // 顺序原样留存 —— multipart 的部件顺序对上游可见，不该因为这次改动
+        // 变了样。
+        let mut fields: Vec<UploadField> = Vec::new();
         let mut form_model: Option<String> = None;
-        let mut file_bytes: Option<Bytes> = None;
 
         while let Some(field) = multipart.next_field().await.map_err(|e| {
             crate::error::proxy_error_from_multipart(
@@ -892,14 +960,11 @@ pub(crate) async fn create_file(
                         "failed to read file field",
                     )
                 })?;
-                let mut part = reqwest::multipart::Part::bytes(bytes.to_vec()).file_name(file_name);
-                if let Some(ct) = content_type {
-                    part = part.mime_str(&ct).map_err(|e| {
-                        ProxyError::InvalidRequest(format!("invalid file content-type: {e}"))
-                    })?;
-                }
-                form = form.part("file", part);
-                file_bytes = Some(bytes);
+                fields.push(UploadField::File {
+                    file_name,
+                    content_type,
+                    bytes,
+                });
                 continue;
             }
             let v = field.text().await.map_err(|e| {
@@ -909,20 +974,56 @@ pub(crate) async fn create_file(
                     "malformed multipart field",
                 )
             })?;
-            form = form.text(name, v);
+            fields.push(UploadField::Text(name, v));
         }
 
-        let file_bytes = file_bytes.ok_or_else(|| {
-            ProxyError::InvalidRequest("multipart body must include a `file` field".into())
-        })?;
+        let file_bytes = fields
+            .iter()
+            .find_map(|f| match f {
+                UploadField::File { bytes, .. } => Some(bytes.clone()),
+                UploadField::Text(..) => None,
+            })
+            .ok_or_else(|| {
+                ProxyError::InvalidRequest("multipart body must include a `file` field".into())
+            })?;
 
         let wanted = form_model.or_else(|| explicit_model(&params, &headers));
         let snapshot = &**snapshot.insert(state.snapshot.load());
         let target = resolve_target(snapshot, &auth, wanted.as_deref(), &client)?;
 
         // Batch/fine-tune input files carry end-user content — scan them
-        // like any other inbound payload.
-        scan_input_blob(&state, &auth, &target, &file_bytes, &mut monitor_hits).await?;
+        // like any other inbound payload. 这也是这条面上唯一承载最终用户
+        // 提示词的载荷，所以是唯一允许被 `mask` 规则改写的那一个。
+        let masked = scan_input_blob(
+            &state,
+            &auth,
+            &target,
+            &file_bytes,
+            &mut monitor_hits,
+            Some(&mut redactions),
+        )
+        .await?;
+
+        let mut form = reqwest::multipart::Form::new();
+        for field in fields {
+            match field {
+                UploadField::Text(name, v) => form = form.text(name, v),
+                UploadField::File {
+                    file_name,
+                    content_type,
+                    bytes,
+                } => {
+                    let body = masked.clone().unwrap_or_else(|| bytes.to_vec());
+                    let mut part = reqwest::multipart::Part::bytes(body).file_name(file_name);
+                    if let Some(ct) = content_type {
+                        part = part.mime_str(&ct).map_err(|e| {
+                            ProxyError::InvalidRequest(format!("invalid file content-type: {e}"))
+                        })?;
+                    }
+                    form = form.part("file", part);
+                }
+            }
+        }
         let _reservation = crate::quota::enforce(
             &state,
             snapshot,
@@ -968,7 +1069,9 @@ pub(crate) async fn create_file(
         request_id,
         result,
         monitor_hits,
+        redactions,
     )
+    .await
 }
 
 pub(crate) async fn list_files(
@@ -1125,6 +1228,8 @@ pub(crate) async fn create_batch(
     };
     let request_id = client.request_id.clone();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    // 控制体路线只查不改：计数表恒空，仍然交给 `finish`，这样签名只有一份。
+    let redactions = crate::redact::RedactionCounts::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
@@ -1168,7 +1273,7 @@ pub(crate) async fn create_batch(
         }
         let out_body = Bytes::from(serde_json::to_vec(&req_json).unwrap_or_default());
 
-        scan_input_blob(&state, &auth, &target, &out_body, &mut monitor_hits).await?;
+        scan_input_blob(&state, &auth, &target, &out_body, &mut monitor_hits, None).await?;
         let _reservation = crate::quota::enforce(
             &state,
             &snapshot,
@@ -1212,7 +1317,9 @@ pub(crate) async fn create_batch(
         request_id,
         result,
         monitor_hits,
+        redactions,
     )
+    .await
 }
 
 pub(crate) async fn get_batch(
@@ -1227,6 +1334,8 @@ pub(crate) async fn get_batch(
     let request_id = client.request_id.clone();
     let (raw, embedded) = routed_model_hint(&id, &params, &headers);
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    // 控制体路线只查不改：计数表恒空，仍然交给 `finish`，这样签名只有一份。
+    let redactions = crate::redact::RedactionCounts::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
@@ -1298,7 +1407,9 @@ pub(crate) async fn get_batch(
         request_id,
         result,
         monitor_hits,
+        redactions,
     )
+    .await
 }
 
 pub(crate) async fn cancel_batch(
@@ -1395,6 +1506,8 @@ pub(crate) async fn create_ft_job(
     };
     let request_id = client.request_id.clone();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    // 控制体路线只查不改：计数表恒空，仍然交给 `finish`，这样签名只有一份。
+    let redactions = crate::redact::RedactionCounts::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
@@ -1435,7 +1548,7 @@ pub(crate) async fn create_ft_job(
         }
         let out_body = Bytes::from(serde_json::to_vec(&req_json).unwrap_or_default());
 
-        scan_input_blob(&state, &auth, &target, &out_body, &mut monitor_hits).await?;
+        scan_input_blob(&state, &auth, &target, &out_body, &mut monitor_hits, None).await?;
         let _reservation = crate::quota::enforce(
             &state,
             &snapshot,
@@ -1479,7 +1592,9 @@ pub(crate) async fn create_ft_job(
         request_id,
         result,
         monitor_hits,
+        redactions,
     )
+    .await
 }
 
 pub(crate) async fn get_ft_job(
@@ -1603,6 +1718,8 @@ async fn forward_simple(
     let log_path = spec.log_path.clone();
     let label = spec.label;
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    // 控制体路线只查不改：计数表恒空，仍然交给 `finish`，这样签名只有一份。
+    let redactions = crate::redact::RedactionCounts::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
@@ -1619,7 +1736,7 @@ async fn forward_simple(
         let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
 
         if let Some(body) = &spec.body {
-            scan_input_blob(&state, &auth, &target, body, &mut monitor_hits).await?;
+            scan_input_blob(&state, &auth, &target, body, &mut monitor_hits, None).await?;
         }
         let _reservation = crate::quota::enforce(
             &state,
@@ -1672,7 +1789,9 @@ async fn forward_simple(
         request_id,
         result,
         monitor_hits,
+        redactions,
     )
+    .await
 }
 
 // ─────────────────── batch completion attribution ───────────────────
@@ -2985,6 +3104,246 @@ mod tests {
                 .unwrap()
                 .contains("no model specified"),
             "got {v}"
+        );
+    }
+    /// 这条路和 /v1/chat/completions 花的是同一个 key 级窗口，所以也得照实
+    /// 汇报——头给调用方，gauge 给运维。
+    ///
+    /// 源码扫描（`endpoint_family_parity`）只能证明「调用点在」，证明不了
+    /// 「头真的落到响应上、series 真的出现在 /metrics 里」，所以这里驱动一次
+    /// 真实请求来断言可观测到的那一面。
+    #[tokio::test]
+    async fn a_job_route_reports_the_window_it_spent() {
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(path("/v1/batches"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "batch_rl",
+                "object": "batch",
+                "status": "validating",
+                "input_file_id": "file-in"
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        // 不限速的 key 没有窗口可报（`peek` 返回 None），得给它一个 rpm。
+        let k: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891","allowed_models":["*"],"rate_limit":{"rpm":10}}"#,
+        )
+        .unwrap();
+        snap.apikeys.insert(ResourceEntry::new("k-1", k, 1));
+        let (app, _rx, state) = build_app_with_sink_and_state(snap);
+
+        let body = serde_json::json!({
+            "input_file_id": encode_routed_id("file-in", "jobs-a"),
+            "endpoint": "/v1/chat/completions",
+            "completion_window": "24h"
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/batches")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let hdr = |n: &str| {
+            resp.headers()
+                .get(n)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        assert_eq!(
+            hdr("x-ratelimit-limit-requests").as_deref(),
+            Some("10"),
+            "the caller must be told the ceiling this request counted against"
+        );
+        assert_eq!(
+            hdr("x-ratelimit-remaining-requests").as_deref(),
+            Some("9"),
+            "one batch request out of an rpm of 10 leaves 9; anything else \
+             means the number the caller schedules back-off from is wrong"
+        );
+
+        let rendered = state.metrics.render();
+        let line = rendered
+            .lines()
+            .find(|l| l.starts_with("aisix_ratelimit_remaining_requests{"))
+            .unwrap_or_else(|| {
+                panic!("remaining-requests gauge missing after a job request:\n{rendered}")
+            });
+        assert!(
+            line.contains(r#"api_key_id="k-1""#) && line.contains(r#"model="jobs-a""#),
+            "gauge must carry the caller and the resolved model row; got {line}"
+        );
+        assert!(
+            line.ends_with(" 9"),
+            "gauge must show what the job request left, not a stale reading; got {line}"
+        );
+    }
+    /// A `mask` rule must rewrite the uploaded batch file before it leaves
+    /// the gateway. The file IS the end-user content on this surface — the
+    /// prompts a batch will run — so a mask rule that is accepted, resolved
+    /// and reported as applied while the bytes go upstream verbatim is the
+    /// #932 half-wiring, one endpoint later.
+    #[tokio::test]
+    async fn a_mask_rule_rewrites_the_uploaded_file_before_it_leaves() {
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(path("/v1/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "file-abc",
+                "object": "file",
+                "purpose": "batch",
+                "filename": "input.jsonl"
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let g: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"mask-email","enabled":true,"hook_point":"input","kind":"pii","detectors":[{"type":"email","action":"mask"}]}"#,
+        )
+        .unwrap();
+        snap.guardrails.insert(ResourceEntry::new("g-mask", g, 1));
+        let (app, mut rx) = build_app_with_sink(snap);
+
+        let boundary = "XBOUNDARYX";
+        let mut b: Vec<u8> = Vec::new();
+        b.extend_from_slice(
+            format!(
+                "--{boundary}\r\ncontent-disposition: form-data; name=\"model\"\r\n\r\njobs-a\r\n"
+            )
+            .as_bytes(),
+        );
+        b.extend_from_slice(
+            format!(
+                "--{boundary}\r\ncontent-disposition: form-data; name=\"purpose\"\r\n\r\nbatch\r\n"
+            )
+            .as_bytes(),
+        );
+        b.extend_from_slice(
+            format!(
+                "--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; filename=\"input.jsonl\"\r\ncontent-type: application/jsonl\r\n\r\n{{\"custom_id\":\"r1\",\"body\":{{\"messages\":[{{\"role\":\"user\",\"content\":\"mail alice@example.com\"}}]}}}}\r\n"
+            )
+            .as_bytes(),
+        );
+        b.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/files")
+            .header("authorization", "Bearer sk-caller")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(b))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "a mask rule must not block");
+
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let sent = String::from_utf8_lossy(&received[0].body).into_owned();
+        assert!(
+            !sent.contains("alice@example.com"),
+            "the uploaded file reached the provider unmasked:\n{sent}"
+        );
+        // 其它字段照原样转发 —— 遮蔽不能顺手改坏这次上传的其它部分。
+        assert!(
+            sent.contains("name=\"purpose\""),
+            "purpose must still forward"
+        );
+        assert!(
+            sent.contains("filename=\"input.jsonl\""),
+            "the file part must keep its filename"
+        );
+        assert!(
+            sent.contains(r#""custom_id":"r1""#),
+            "masking must rewrite the matched span only, not the whole file:\n{sent}"
+        );
+
+        // 遮蔽了却不在用量事件里留痕，等于没人能审计。
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert!(
+            !event.redacted_entity_counts.is_empty(),
+            "a mask that leaves no trace in the usage event cannot be audited"
+        );
+    }
+    /// 遮蔽是在文本 span 上做替换。一个不是合法 UTF-8 的上传只查不改 ——
+    /// 把 lossy 转换的结果写回去会把文件毁掉，而"护栏开着就悄悄改坏用户
+    /// 上传的文件"比漏遮蔽更糟。
+    #[tokio::test]
+    async fn a_non_utf8_upload_is_checked_but_relayed_byte_for_byte() {
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(path("/v1/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "file-bin", "object": "file", "purpose": "batch", "filename": "b.bin"
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let g: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"mask-email","enabled":true,"hook_point":"input","kind":"pii","detectors":[{"type":"email","action":"mask"}]}"#,
+        )
+        .unwrap();
+        snap.guardrails.insert(ResourceEntry::new("g-mask", g, 1));
+        let app = build_app(snap);
+
+        // 0xff / 0xfe 在 UTF-8 里永远非法；邮箱地址放在后面，确保"没改"
+        // 不是因为没匹配上。
+        let payload: Vec<u8> = [b"\xff\xfe\x00bin alice@example.com".as_slice()].concat();
+        let boundary = "XBINX";
+        let mut b: Vec<u8> = Vec::new();
+        b.extend_from_slice(
+            format!(
+                "--{boundary}\r\ncontent-disposition: form-data; name=\"model\"\r\n\r\njobs-a\r\n"
+            )
+            .as_bytes(),
+        );
+        b.extend_from_slice(
+            format!("--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; filename=\"b.bin\"\r\n\r\n")
+                .as_bytes(),
+        );
+        b.extend_from_slice(&payload);
+        b.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/files")
+            .header("authorization", "Bearer sk-caller")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(b))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let sent = &received[0].body;
+        assert!(
+            sent.windows(payload.len()).any(|w| w == payload.as_slice()),
+            "a non-text upload must reach the provider byte-for-byte"
         );
     }
 }

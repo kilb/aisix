@@ -16,10 +16,21 @@
 use std::path::{Path, PathBuf};
 
 /// Handlers that resolve a Model, reserve quota against it, and return a
-/// response to an SDK client. `/mcp`, `/a2a`, `/passthrough_route` and the
-/// jobs surface are deliberately absent: they resolve no Model.
+/// response to an SDK client. `/mcp` and `/a2a` are deliberately absent:
+/// they resolve no Model. `passthrough_route.rs` resolves one only from a
+/// body that may not carry a `model` at all, and relays the upstream
+/// response verbatim, so the shared response-shaping mechanisms do not
+/// apply to it. `realtime.rs` answers with a WebSocket upgrade rather than
+/// a response an SDK reads.
+///
+/// The jobs surface IS one of these and was listed as "resolves no Model"
+/// for as long as `jobs.rs` had been resolving one (and IP-checking it).
+/// That wrong reason is exactly how it went a whole release without
+/// publishing the rate-limit window it spends — membership here is decided
+/// by what the file does, never by which URL family it feels like.
 const MODEL_DISPATCH_HANDLERS: &[&str] = &[
     "chat.rs",
+    "jobs.rs",
     "messages.rs",
     "responses.rs",
     "completions.rs",
@@ -271,6 +282,126 @@ fn the_handler_list_matches_what_is_on_disk() {
         assert!(
             dir.join(handler).exists(),
             "MODEL_DISPATCH_HANDLERS lists `{handler}`, which no longer exists"
+        );
+    }
+}
+
+/// A handler that SPENDS the caller's rate-limit window must also REPORT it.
+///
+/// `quota::enforce` reserves the request-level layers — the api_key's own
+/// `rate_limit` among them — so every surface that calls it draws down the
+/// same per-key bucket `/v1/chat/completions` draws down. Reporting that
+/// bucket is a separate call, and five surfaces spent it without ever making
+/// that call: the caller receives no `x-ratelimit-*` headers and backs off
+/// blindly into 429s, and `aisix_rate_limit_remaining` keeps publishing the
+/// value from the last chat request while the key is in fact near its
+/// ceiling. Nothing errors either way, which is why this stayed unnoticed.
+///
+/// Scoped by *behaviour*, not by a hand-drawn endpoint list, because that is
+/// exactly what the list above missed: `MODEL_DISPATCH_HANDLERS` excuses the
+/// jobs surface on the grounds that it "resolves no Model", and
+/// `jobs.rs` has resolved one — and IP-checked it — the whole time.
+#[test]
+fn a_handler_that_spends_the_rate_limit_window_also_reports_it() {
+    /// Calls that reserve the request-level layers (api_key / team / member).
+    const SPENDS_THE_WINDOW: &[&str] = &[
+        "quota::enforce(",
+        "quota::enforce_rate_limit(",
+        "quota::enforce_mcp(",
+    ];
+
+    /// Surfaces that spend the window and deliberately do not report it, each
+    /// for a reason that is about THAT surface — not "we didn't get to it".
+    /// A reason that stops being true is a bug: re-check them when the
+    /// surface changes shape.
+    const EXEMPT: &[(&str, &str)] = &[
+        (
+            "passthrough_route.rs",
+            "relays every non-hop-by-hop upstream response header verbatim \
+             (`copy_safe_headers`), so the caller may already be holding the \
+             UPSTREAM's own `x-ratelimit-*`. `inject_ratelimit_headers` uses \
+             `insert`, so publishing here would overwrite a truthful upstream \
+             number with the gateway's — worse than saying nothing.",
+        ),
+        (
+            "mcp.rs",
+            "resolves no Model, and the remaining-quota gauge is labelled by \
+             one. Reporting would mean either a synthetic model label (a \
+             permanent junk series) or splitting the call so the two halves \
+             can drift — the failure this file exists to prevent.",
+        ),
+        (
+            "a2a.rs",
+            "resolves no Model; same gauge-label problem as `mcp.rs`.",
+        ),
+        (
+            "realtime.rs",
+            "answers with a WebSocket upgrade. Headers on a 101 reach no \
+             client API, and the session's token spend lands after the \
+             handshake, so a window sampled at upgrade time would be stale \
+             before the caller could read it.",
+        ),
+    ];
+
+    let dir = handlers_dir();
+    let mut silent: Vec<String> = Vec::new();
+    let mut spends_the_window: Vec<String> = Vec::new();
+
+    let entries = std::fs::read_dir(&dir).expect("proxy src is readable");
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .collect();
+    files.sort();
+
+    for path in &files {
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("source file has a utf-8 name")
+            .to_string();
+        let src = std::fs::read_to_string(path).expect("handler is readable");
+        // A mention inside a comment is not a call: `lib.rs` discusses
+        // `quota::enforce` in three places and reserves nothing.
+        let spends = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .any(|l| SPENDS_THE_WINDOW.iter().any(|m| l.contains(m)));
+        if !spends {
+            continue;
+        }
+        spends_the_window.push(name.clone());
+        if src.contains("publish_rate_limit_window") {
+            continue;
+        }
+        if EXEMPT.iter().any(|(f, _)| *f == name) {
+            continue;
+        }
+        silent.push(format!("  {name}"));
+    }
+
+    assert!(
+        !spends_the_window.is_empty(),
+        "the scan found no caller of {SPENDS_THE_WINDOW:?} — the marker was \
+         renamed and this guard is now checking nothing"
+    );
+
+    assert!(
+        silent.is_empty(),
+        "these surfaces draw down the caller's rate-limit window and never \
+         report it:\n{}\n\nCall `request_metrics::publish_rate_limit_window` \
+         on the success path, as `/v1/chat/completions` does — or add the \
+         file to EXEMPT with the reason it cannot.",
+        silent.join("\n"),
+    );
+
+    // The exemptions rot the same way the handler list does: a surface that
+    // stopped reserving, or was renamed, leaves a reason nobody re-reads.
+    for (file, _) in EXEMPT {
+        assert!(
+            spends_the_window.iter().any(|f| f == file),
+            "EXEMPT lists `{file}`, which no longer reserves the caller's \
+             rate-limit window — drop the exemption"
         );
     }
 }
