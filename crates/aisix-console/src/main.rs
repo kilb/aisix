@@ -1496,6 +1496,88 @@ mod tests {
         );
     }
 
+    /// **每一条**路由的处理器都要过会话检查，公开的那几条除外且要写明理由。
+    ///
+    /// 会话检查在处理器体内，不是路由层 —— 新加一条路由忘了那一行照样编译、
+    /// 照样注册，而这个二进制能写网关的配置文件。下面那条更老的守卫只盯着门户
+    /// 那六个端点；这条把同一条规则铺到全部路由上，所以新端点默认是被管住的。
+    #[test]
+    fn every_console_route_checks_the_session() {
+        /// 公开路由，各带理由。
+        const PUBLIC: &[(&str, &str)] = &[
+            ("/healthz", "存活探针，不带任何身份，也不读任何东西"),
+            ("/api/login", "建立会话的那一条，按定义在会话之前"),
+            (
+                "/api/session",
+                "回答「我登录了吗」，未登录时的答案就是 false",
+            ),
+            ("/api/logout", "清掉会话；没有会话时它无事可做"),
+        ];
+
+        let src = include_str!("main.rs");
+        let production = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(src);
+
+        let mut pairs: Vec<(String, Vec<String>)> = Vec::new();
+        for line_idx in production.match_indices(".route(") {
+            let rest = &production[line_idx.0..];
+            let Some(end) = rest.find(");").or_else(|| rest.find(")\n")) else {
+                continue;
+            };
+            let chunk = &rest[..end];
+            let Some(path) = chunk.split('"').nth(1) else {
+                continue;
+            };
+            let mut handlers = Vec::new();
+            for verb in ["get(", "post(", "put(", "delete(", "patch("] {
+                for m in chunk.match_indices(verb) {
+                    let after = &chunk[m.0 + verb.len()..];
+                    let name: String = after
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if !name.is_empty() {
+                        handlers.push(name);
+                    }
+                }
+            }
+            pairs.push((path.to_string(), handlers));
+        }
+        assert!(
+            pairs.len() >= 10,
+            "只认出 {} 条路由，抽取多半坏了",
+            pairs.len()
+        );
+
+        let body_of = |name: &str| -> String {
+            let needle = format!("async fn {name}(");
+            production
+                .split_once(&needle)
+                .and_then(|(_, rest)| rest.split_once("\n}\n"))
+                .map(|(b, _)| b.to_string())
+                .unwrap_or_else(|| panic!("找不到处理器 {name}"))
+        };
+
+        for (path, handlers) in &pairs {
+            if PUBLIC.iter().any(|(p, _)| p == path) {
+                continue;
+            }
+            assert!(!handlers.is_empty(), "路由 {path} 没认出处理器");
+            for h in handlers {
+                let body = body_of(h);
+                assert!(
+                    body.contains("require_auth(&st, &headers)")
+                        || body.contains("portal_user_action("),
+                    "{path} 的处理器 {h} 没有查会话 —— 它对任何能连到这个端口的\
+                     人开放，而这个二进制写的是网关的配置文件。真要公开就加进\
+                     PUBLIC 并写明理由。",
+                );
+            }
+        }
+    }
+
     /// 门户的两个管理端点都必须先过控制台自己的会话检查。少了它，任何人都能
     /// 匿名读到全部注册用户的邮箱与余额。
     #[test]
