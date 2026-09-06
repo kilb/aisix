@@ -4,6 +4,8 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer as netServer } from "node:net";
+import { readdirSync } from "node:fs";
+import { assertFresh } from "./money.fixture.js";
 
 /**
  * 拉起**真实**的 aisix-portal 进程与 vite preview。
@@ -119,6 +121,16 @@ export async function start(): Promise<Fixture> {
     res.end(JSON.stringify({ status: "success", data: { resultType: "vector", result: [] } }));
   });
   await new Promise<void>((r) => prom.listen(promPort, "127.0.0.1", r));
+
+  // 同 money fixture：产物比源码旧就直接停，不要拿上一次构建的行为当本次
+  // 结论。这个 fixture 跑的是 DEBUG 的门户产物（`cargo build -p aisix-portal`）。
+  assertFresh(
+    PORTAL_BIN,
+    readdirSync(join(process.cwd(), "..", "crates"), { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => join(process.cwd(), "..", "crates", e.name))
+      .filter((d) => /aisix-(portal|core)$/.test(d)),
+  );
 
   procs.push(
     spawn(PORTAL_BIN, [], {

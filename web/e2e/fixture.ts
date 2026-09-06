@@ -1,6 +1,13 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import {
+  mkdtempSync,
+  writeFileSync,
+  readFileSync,
+  rmSync,
+  readdirSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -100,7 +107,77 @@ function killTree(p: ChildProcess): void {
   }
 }
 
+/// Refuse to run against a binary older than the sources it was built from.
+///
+/// A twin of `web-portal/e2e/money.fixture.ts`'s `assertFresh`, kept as a copy
+/// because that lives in a different npm package with its own tsconfig and
+/// reaching across the boundary in a Playwright fixture is more fragile than
+/// eight lines of `statSync`.
+///
+/// This suite is the one that most needs it: it spawns THREE binaries and all
+/// three are RELEASE builds, which nobody rebuilds casually. A stale one turns
+/// 30 green tests into a description of whatever was last compiled. That is
+/// not hypothetical — the sibling check found exactly that on its first run
+/// against the portal binary.
+function assertFresh(bin: string, crateDirs: string[]): void {
+  let binTime: number;
+  try {
+    binTime = statSync(bin).mtimeMs;
+  } catch {
+    throw new Error(
+      `${bin} not found. Build it first: cargo build --release -p aisix-console -p aisix-portal -p aisix-server`,
+    );
+  }
+  let newest = 0;
+  let newestFile = "";
+  const walk = (dir: string) => {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const full = join(dir, e.name);
+      if (e.isDirectory()) {
+        // `src/bin/` holds a crate's side executables; nothing under test
+        // links them, so touching one must not condemn this binary.
+        if (e.name !== "bin") walk(full);
+      } else if (e.name.endsWith(".rs")) {
+        const t = statSync(full).mtimeMs;
+        if (t > newest) {
+          newest = t;
+          newestFile = full;
+        }
+      }
+    }
+  };
+  for (const d of crateDirs) walk(join(d, "src"));
+  if (newest > binTime) {
+    throw new Error(
+      `${bin} is older than ${newestFile} — this run would describe the last ` +
+        `build, not the current tree.\nRebuild: cargo build --release -p ` +
+        `aisix-console -p aisix-portal -p aisix-server`,
+    );
+  }
+}
+
+/// Which crates each binary is actually built from. Comparing against all of
+/// `crates/` would condemn the console binary for a gateway-only edit and
+/// force a pointless release rebuild; comparing against only its own
+/// directory would miss `aisix-core`, which all three link.
+function crateDirsFor(re: RegExp): string[] {
+  const crates = resolve(REPO, "crates");
+  return readdirSync(crates, { withFileTypes: true })
+    .filter((e) => e.isDirectory() && re.test(e.name))
+    .map((e) => join(crates, e.name));
+}
+
 export async function start(opts: StartOptions = {}): Promise<Fixture> {
+  assertFresh(CONSOLE_BIN, crateDirsFor(/^aisix-(console|core)$/));
+  assertFresh(PORTAL_BIN, crateDirsFor(/^aisix-(portal|core)$/));
+  assertFresh(GATEWAY_BIN, crateDirsFor(/^aisix-(?!portal$|console$)/));
+
   const dir = mkdtempSync(join(tmpdir(), "aisix-console-e2e-"));
   const resourcesPath = join(dir, "resources.yaml");
   writeFileSync(resourcesPath, SEED);

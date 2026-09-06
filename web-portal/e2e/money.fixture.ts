@@ -202,7 +202,7 @@ async function sha256Hex(s: string): Promise<string> {
  *
  * 与其记得重建，不如让它自己说出来。
  */
-function assertFresh(bin: string, crateDirs: string[]): void {
+export function assertFresh(bin: string, crateDirs: string[]): void {
   let binTime: number;
   try {
     binTime = statSync(bin).mtimeMs;
