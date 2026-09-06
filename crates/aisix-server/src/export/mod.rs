@@ -44,6 +44,9 @@ pub struct ExportArgs {
 const CLI_CONNECT_POLICY: ConnectPolicy = ConnectPolicy {
     interval: Duration::from_secs(1),
     attempts: 3,
+    // Same reason as the attempt count: a person is waiting at a terminal, so
+    // a silent endpoint should say so rather than sit there.
+    request_timeout: Some(Duration::from_secs(10)),
 };
 
 /// Run the export end to end. Reads etcd, writes the resources file to

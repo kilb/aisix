@@ -50,6 +50,9 @@ pub const CONNECT_MAX_ATTEMPTS: u32 = 5;
 pub struct ConnectPolicy {
     pub interval: Duration,
     pub attempts: u32,
+    /// Deadline applied to each unary request the resulting provider makes.
+    /// See [`EtcdConfigProvider::request_timeout`].
+    pub request_timeout: Option<Duration>,
 }
 
 impl Default for ConnectPolicy {
@@ -57,6 +60,7 @@ impl Default for ConnectPolicy {
         Self {
             interval: CONNECT_RETRY_INTERVAL,
             attempts: CONNECT_MAX_ATTEMPTS,
+            request_timeout: None,
         }
     }
 }
@@ -67,6 +71,19 @@ pub struct EtcdConfigProvider {
     /// underlying channel is not Sync at construction time.
     client: Mutex<Client>,
     prefix: String,
+    /// Deadline for one unary request (`etcd.request_timeout_ms`).
+    ///
+    /// Applied HERE and not through `ConnectOptions::with_timeout`, because
+    /// etcd-client turns that into `Endpoint::timeout` — a tonic
+    /// channel-level deadline on every request INCLUDING the streaming
+    /// watch, which would tear the config watch down on a fixed schedule.
+    /// `request_timeout` describes a request; the watch is not one.
+    ///
+    /// `None` leaves the read unbounded, which is what every caller got
+    /// before the knob was wired: `dial_timeout_ms` and `request_timeout_ms`
+    /// have been accepted, defaulted and documented since the config struct
+    /// existed, with no reader anywhere.
+    request_timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for EtcdConfigProvider {
@@ -104,6 +121,7 @@ impl EtcdConfigProvider {
                     return Ok(Self {
                         client: Mutex::new(client),
                         prefix,
+                        request_timeout: policy.request_timeout,
                     });
                 }
                 Err(err) => {
@@ -137,13 +155,20 @@ impl EtcdConfigProvider {
 impl ConfigProvider for EtcdConfigProvider {
     async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
         let mut client = self.client.lock().await;
-        let resp = client
-            .get(
-                self.prefix.as_bytes(),
-                Some(GetOptions::new().with_prefix()),
-            )
-            .await
-            .map_err(|e| ProviderError::Range(format_error_chain(&e)))?;
+        let get = client.get(
+            self.prefix.as_bytes(),
+            Some(GetOptions::new().with_prefix()),
+        );
+        let resp = match self.request_timeout {
+            Some(d) => tokio::time::timeout(d, get).await.map_err(|_| {
+                ProviderError::Range(format!(
+                    "etcd range request exceeded etcd.request_timeout_ms ({} ms)",
+                    d.as_millis()
+                ))
+            })?,
+            None => get.await,
+        }
+        .map_err(|e| ProviderError::Range(format_error_chain(&e)))?;
 
         let revision = resp.header().map(|h| h.revision()).unwrap_or(0);
 
@@ -286,6 +311,7 @@ mod tests {
         let policy = ConnectPolicy {
             interval: Duration::from_millis(1),
             attempts: 1,
+            ..Default::default()
         };
         let endpoints: Vec<String> = vec![];
         let err = EtcdConfigProvider::connect_with_policy(&endpoints, "/aisix", None, policy)

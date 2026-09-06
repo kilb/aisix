@@ -627,10 +627,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // `<prefix>` in self-hosted dev where env_id is empty.
             let etcd_prefix = cfg.etcd.effective_prefix();
             let provider = Arc::new(
-                EtcdConfigProvider::connect(
+                EtcdConfigProvider::connect_with_policy(
                     &cfg.etcd.endpoints,
                     etcd_prefix.clone(),
                     connect_options.clone(),
+                    etcd_connect_policy(&cfg.etcd),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("etcd connect failed: {e}"))?,
@@ -1233,19 +1234,64 @@ fn build_etcd_connect_options(etcd: &EtcdConfig) -> anyhow::Result<Option<Connec
     build_etcd_connect_options_with_extra_ca(etcd, None)
 }
 
+/// HTTP/2 keepalive on the etcd channel: ping every interval, drop the
+/// connection if a ping goes unanswered for the timeout.
+///
+/// This is the one that mattered. `ConnectOptions::new()` sets
+/// `keep_alive: None` — no pings at all — while `keep_alive_while_idle` is
+/// already `true`, so the setting that was missing is the one that does the
+/// work. Against an endpoint that accepts the TCP connection and then never
+/// speaks gRPC, the first `load_all` on the boot path DID NOT RETURN AT ALL
+/// (measured: the 45s guard in the test fires; with these bounds it errors in
+/// ~15s). The watch is the same shape and worse, because it is idle between
+/// config changes by design: a peer that stops answering leaves the stream
+/// open and silent, config quietly goes stale, and nothing errors.
+///
+/// A dead peer is noticed in about 15s. 10s stays clear of etcd's default
+/// `--grpc-keepalive-min-time` of 5s, so the server will not answer these
+/// pings with GOAWAY.
+///
+/// Deliberately NOT `with_timeout`: etcd-client turns that into
+/// `Endpoint::timeout`, a tonic CHANNEL-level deadline applied to every
+/// request INCLUDING the streaming watch, which would tear the config watch
+/// down on a fixed schedule.
+const ETCD_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const ETCD_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The connect policy boot uses, in one place so a test can drive the same
+/// one. Without this the wiring is what rots: the provider can honour
+/// `etcd.request_timeout_ms` perfectly while the boot call quietly stops
+/// passing it, and nothing anywhere fails.
+fn etcd_connect_policy(etcd: &EtcdConfig) -> aisix_etcd::ConnectPolicy {
+    aisix_etcd::ConnectPolicy {
+        // `etcd.request_timeout_ms` — accepted, defaulted and documented
+        // since this config struct existed, and read by nothing until now.
+        request_timeout: Some(etcd.request_timeout()),
+        ..Default::default()
+    }
+}
+
 fn build_etcd_connect_options_with_extra_ca(
     etcd: &EtcdConfig,
     extra_ca_pem: Option<&[u8]>,
 ) -> anyhow::Result<Option<ConnectOptions>> {
-    let mut needs_options = false;
-    let mut options = ConnectOptions::new();
+    // Set unconditionally. These used to sit behind a `needs_options` flag
+    // that only turned true for auth or TLS, so a plain no-auth no-TLS etcd —
+    // the standalone default — got no options whatsoever.
+    //
+    // Note that `Client::connect` proves nothing on its own: etcd-client
+    // builds a `balance_channel` and, with no auth configured, sends no
+    // request, so it returns `Ok` against an endpoint that is not etcd at all.
+    // The bounds below are what the FIRST READ and the watch rely on.
+    let mut options = ConnectOptions::new()
+        .with_connect_timeout(etcd.dial_timeout())
+        .with_keep_alive(ETCD_KEEPALIVE_INTERVAL, ETCD_KEEPALIVE_TIMEOUT);
 
     if let (Some(user), Some(env_key)) = (etcd.user.as_ref(), etcd.password_env.as_ref()) {
         let pw = std::env::var(env_key).map_err(|_| {
             anyhow::anyhow!("etcd.password_env = {env_key:?} is set but the env var is missing")
         })?;
         options = options.with_user(user.clone(), pw);
-        needs_options = true;
     }
 
     if let Some(tls) = etcd.tls.as_ref() {
@@ -1281,10 +1327,9 @@ fn build_etcd_connect_options_with_extra_ca(
             .ca_certificate(Certificate::from_pem(ca_pem))
             .identity(Identity::from_pem(cert_pem, key_pem));
         options = options.with_tls(tls_opts);
-        needs_options = true;
     }
 
-    Ok(needs_options.then_some(options))
+    Ok(Some(options))
 }
 
 /// Extract the host portion of a URL-like endpoint (`http://host:2379`,
@@ -2149,8 +2194,17 @@ models:
         );
     }
 
+    /// Retired assertion: this used to require `None` for the plain-HTTP
+    /// case, on the grounds that no auth and no TLS means nothing to
+    /// configure. That was true of the AUTH/TLS extras and false of the
+    /// connection itself — with no options at all, a plain no-auth etcd (the
+    /// standalone default) got no connect timeout and no keepalive, and a
+    /// peer that accepted the socket and then went silent left the first read
+    /// hanging with nothing to end it. The old assertion pinned an
+    /// implementation detail with no user-visible behaviour behind it; this
+    /// one pins the behaviour that replaced it.
     #[test]
-    fn build_connect_options_none_when_plain_http() {
+    fn build_connect_options_bounds_even_a_plain_http_etcd() {
         let etcd = aisix_core::EtcdConfig {
             endpoints: vec!["http://127.0.0.1:2379".into()],
             prefix: "/aisix".into(),
@@ -2163,8 +2217,10 @@ models:
         };
         let opts = build_etcd_connect_options(&etcd).unwrap();
         assert!(
-            opts.is_none(),
-            "plain HTTP etcd must not synthesise options"
+            opts.is_some(),
+            "a plain HTTP etcd still needs a bounded connection: without \
+             options it gets no connect timeout and no keepalive, and a \
+             silent peer never ends the first read"
         );
     }
 
@@ -2522,6 +2578,86 @@ models:
             "these listeners accept connections with Nagle left on, which \
              delays streamed response frames; wire `DOWNSTREAM_NODELAY`:\n{}",
             offenders.join("\n"),
+        );
+    }
+
+    /// A first read against an etcd endpoint that accepts the TCP connection
+    /// and then says nothing must FAIL, not hang.
+    ///
+    /// `Client::connect` proves nothing here — etcd-client builds a
+    /// `balance_channel` and, with no auth configured, sends no request, so it
+    /// returns `Ok` against an endpoint that is not etcd at all. Connectivity
+    /// is first exercised by `load_all`, which is on the boot path; with no
+    /// connect timeout set that call had nothing bounding it.
+    ///
+    /// Drives the REAL options builder rather than a hand-made
+    /// `ConnectOptions`, because the wiring is what was wrong: the bounds used
+    /// to sit behind `needs_options`, so a plain no-auth no-TLS etcd — the
+    /// standalone default — got no options at all.
+    #[tokio::test]
+    async fn a_first_read_from_a_silent_etcd_fails_instead_of_hanging() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+        let port = listener.local_addr().expect("read back the port").port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept() {
+                held.push(sock);
+            }
+        });
+
+        let cfg = aisix_core::config::EtcdConfig {
+            endpoints: vec![format!("http://127.0.0.1:{port}")],
+            ..Default::default()
+        };
+        let options = super::build_etcd_connect_options_with_extra_ca(&cfg, None)
+            .expect("building options must not fail for a plain endpoint");
+        assert!(
+            options.is_some(),
+            "a no-auth no-TLS etcd must still get bounded connect options — \
+             that gap is half of what this guards"
+        );
+
+        let provider = aisix_etcd::EtcdConfigProvider::connect_with_policy(
+            &cfg.endpoints,
+            "/aisix-test",
+            options,
+            // Boot's own policy, with only the retry ladder shortened: the
+            // point is that whatever boot passes is what is being measured.
+            aisix_etcd::ConnectPolicy {
+                interval: std::time::Duration::from_millis(1),
+                attempts: 1,
+                ..super::etcd_connect_policy(&cfg)
+            },
+        )
+        .await
+        .expect("the lazy connect reports success without reaching the endpoint");
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            aisix_etcd::ConfigProvider::load_all(&provider),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let result = outcome.unwrap_or_else(|_| {
+            panic!(
+                "the first read from a silent etcd never returned — boot waits \
+                 forever instead of failing with a reason"
+            )
+        });
+        assert!(
+            result.is_err(),
+            "an endpoint that never speaks gRPC must not yield a snapshot"
+        );
+        // `etcd.request_timeout_ms` defaults to 5s and is what should end
+        // this. Ceiling set well above it but well below the ~15s the
+        // keepalive alone would take, so losing the request bound and falling
+        // back to the slower net still fails here.
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the read took {elapsed:?} — `etcd.request_timeout_ms` is not \
+             bounding it"
         );
     }
 }
