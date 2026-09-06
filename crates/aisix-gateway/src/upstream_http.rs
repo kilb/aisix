@@ -163,6 +163,31 @@ pub fn build_client_or_default(builder: reqwest::ClientBuilder, what: &str) -> r
 pub fn client_builder() -> reqwest::ClientBuilder {
     let cfg = config();
     let mut b = reqwest::Client::builder()
+        // Do not follow redirects. reqwest's default follows up to ten, and
+        // on a cross-host hop it strips only `Authorization`, `Cookie`,
+        // `cookie2`, `Proxy-Authorization` and `WWW-Authenticate`
+        // (reqwest 0.12 `redirect.rs::remove_sensitive_headers`). The two
+        // credential headers this gateway sends most are neither: Anthropic
+        // takes `x-api-key` and Azure takes `api-key`, both custom, both
+        // forwarded verbatim. So an upstream answering `302 Location:
+        // http://elsewhere/` had the operator's provider credential — and the
+        // caller's prompt — re-sent to whatever it named.
+        //
+        // This client is shared by every outbound purpose: provider dispatch,
+        // the video and file content routes, remote guardrails, A2A, OTLP. The
+        // content routes are the only ones where following could plausibly be
+        // wanted, and this repo's own notes say those endpoints return bytes
+        // rather than a redirect (`videos.rs`: the OpenAI job "carries no
+        // downloadable URL, so the gateway streams the bytes back"); the video
+        // provider that DOES hand back a URL 302s the caller instead of
+        // fetching it. A passthrough route relaying a 3xx to its caller is
+        // likewise more faithful than silently resolving it here.
+        //
+        // Same policy, and the same reasoning, as the console's and portal's
+        // outbound clients — which have asserted it for longer than this one
+        // has had it. If an upstream ever does need a redirect followed, the
+        // symptom is a visible 3xx rather than a leaked credential.
+        .redirect(reqwest::redirect::Policy::none())
         .pool_idle_timeout(cfg.pool_idle_timeout)
         .tcp_keepalive(cfg.tcp_keepalive);
     if let Some(d) = cfg.connect_timeout {
@@ -388,6 +413,43 @@ mod tests {
             "these build a reqwest client directly instead of \
              `aisix_gateway::client_builder()`:\n{}",
             offenders.join("\n"),
+        );
+    }
+
+    /// The gateway's OWN client is held to the rule its two siblings were
+    /// already held to.
+    ///
+    /// The console's and portal's clients each had a test requiring
+    /// `redirect(`, and the comments there name the exact hazard: reqwest
+    /// follows up to ten redirects and strips only `Authorization`, `Cookie`,
+    /// `cookie2`, `Proxy-Authorization` and `WWW-Authenticate` cross-host, so
+    /// a custom credential header rides along. This client — the one that
+    /// actually carries provider credentials on every request, `x-api-key`
+    /// for Anthropic and `api-key` for Azure — was the one with no such test
+    /// and no such setting.
+    #[test]
+    fn the_shared_upstream_client_does_not_follow_redirects() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/upstream_http.rs"))
+                .expect("this module is readable");
+        let builder = src
+            .split_once("pub fn client_builder() -> reqwest::ClientBuilder {")
+            .expect("client_builder is declared here")
+            .1
+            .split_once("\n}")
+            .expect("client_builder is closed")
+            .0;
+        // Comment lines do not count: the explanation survives deleting the
+        // call, and a guard satisfied by its own rationale guards nothing.
+        assert!(
+            builder
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .any(|l| l.contains(".redirect(")),
+            "`client_builder` sets no redirect policy, so reqwest's default \
+             follows up to ten hops and forwards `x-api-key` / `api-key` — \
+             the operator's provider credential — to whatever an upstream \
+             names in a cross-host `Location`."
         );
     }
 
