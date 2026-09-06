@@ -400,3 +400,69 @@ async fn releasing_an_unknown_member_frees_nothing() {
     })
     .await;
 }
+
+/// Post-stream token accounting lands in the same windows on both stores.
+///
+/// `add_tokens` is how a streamed response's usage reaches the counters after
+/// the fact — it is the path that decides whether a caller who streams is
+/// held to the same tpm ceiling as one who does not.
+#[tokio::test]
+async fn post_stream_tokens_count_the_same() {
+    both("add_tokens", |store| async move {
+        let limits = RateLimit {
+            tpm: Some(100),
+            ..RateLimit::default()
+        };
+        let mut out = Vec::new();
+        store
+            .acquire("k-tok", &limits, "m")
+            .await
+            .expect("first call is under the ceiling");
+        // Overrun the minute window after the fact, as a stream does.
+        store.add_tokens("k-tok", 250);
+        // Redis writes post-stream updates through a queue; let it land.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        out.push(format!(
+            "tpm_remaining={:?}",
+            store
+                .peek("k-tok", &limits)
+                .await
+                .and_then(|s| s.tpm_remaining())
+        ));
+        // The token ceiling is checked-but-not-incremented at admission, so
+        // the NEXT request is the one refused.
+        out.push(format!(
+            "next_admitted={}",
+            store.acquire("k-tok", &limits, "m2").await.is_ok()
+        ));
+        out
+    })
+    .await;
+}
+
+/// `add_tokens_all` spreads one figure across every named bucket.
+///
+/// The streaming path collects the buckets that count tokens and adds the
+/// same number to all of them in one call, so a store that applied it to only
+/// the first would silently under-count every layer but one.
+#[tokio::test]
+async fn add_tokens_all_reaches_every_named_bucket() {
+    both("add_tokens_all", |store| async move {
+        let limits = RateLimit {
+            tpm: Some(100),
+            ..RateLimit::default()
+        };
+        let keys = vec!["k-all-a".to_string(), "k-all-b".to_string()];
+        store.add_tokens_all(&keys, 40);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut out = Vec::new();
+        for k in &keys {
+            out.push(format!(
+                "{k}={:?}",
+                store.peek(k, &limits).await.and_then(|s| s.tpm_remaining())
+            ));
+        }
+        out
+    })
+    .await;
+}
