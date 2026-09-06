@@ -87,12 +87,44 @@ pub struct AccessLog<'a> {
     pub error: Option<&'a str>,
 }
 
+/// Whether [`AccessLog::emit`] writes anything, from
+/// `observability.access_log`.
+///
+/// A process-wide switch rather than a parameter because the emit is called
+/// from every handler's tail; threading a flag through all of them is the
+/// shape that lets one of them forget. Same pattern as the SSE heartbeat
+/// interval.
+/// Starts on, matching `ObservabilityConfig::default_access_log`, so an
+/// embedded use or a unit test that never calls [`init_enabled`] behaves as
+/// before.
+///
+/// An atomic rather than a `OnceLock`: a one-shot cell freezes at whatever
+/// the first READ saw, which makes the disabled case untestable in a shared
+/// test binary (any earlier `emit` pins it to on) and would freeze the
+/// setting at boot if config reload ever reaches it.
+static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Install the operator's `observability.access_log` setting.
+pub fn init_enabled(enabled: bool) {
+    ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn enabled() -> bool {
+    ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl AccessLog<'_> {
     /// Emit a single `tracing::info!` event carrying every field. The
     /// subscriber's configured format (text or JSON) determines the
     /// wire shape — operators choose via `cfg.observability.log_level`
     /// and (later) a JSON/text knob.
     pub fn emit(&self) {
+        // `observability.access_log = false` means no access log. The field
+        // was accepted, defaulted and documented with no reader at all, so an
+        // operator who turned it off kept getting every line.
+        if !enabled() {
+            return;
+        }
         tracing::info!(
             method = self.method,
             path = self.path,

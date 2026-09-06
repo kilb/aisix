@@ -57,6 +57,13 @@ pub enum ObsError {
 
 /// Install a process-wide tracing subscriber.
 pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
+    // `observability.access_log` lands here rather than at each handler's
+    // tail: the emit is called from every one of them, and threading a flag
+    // through all of them is the shape that lets one forget. Installed on the
+    // same boot call that already owns the rest of the observability config,
+    // so the two cannot be initialised out of step.
+    access_log::init_enabled(cfg.access_log);
+
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(&cfg.log_level))
         .map_err(|source| ObsError::Filter {
