@@ -3509,10 +3509,13 @@ async fn store_in_cache(
                 error = %err,
                 "response body could not be buffered for caching",
             );
+            // Anthropic 形状，不是 OpenAI 形状：这是 `/v1/messages` 的响应，
+            // 客户端是 Claude SDK 的信封解析器（#336）。`/v1/responses` 里
+            // 同一段代码用 `into_response()` 才是对的 —— 那是 OpenAI 端点。
             outcome.response = ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(
                 "response body too large to relay".to_string(),
             ))
-            .into_response();
+            .into_anthropic_response();
             return outcome;
         }
     };

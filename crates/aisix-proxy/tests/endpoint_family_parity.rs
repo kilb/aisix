@@ -555,3 +555,65 @@ fn a_handler_that_spends_the_rate_limit_window_also_reports_it() {
         );
     }
 }
+
+/// An Anthropic-family handler never renders a `ProxyError` in the OpenAI
+/// envelope.
+///
+/// `/v1/messages` and `/v1/messages/count_tokens` answer the Claude SDK,
+/// whose envelope parser expects `{type:"error", error:{type, message}}`.
+/// `IntoResponse for ProxyError` produces the OpenAI shape
+/// (`{error:{message, type, code}}`), so reaching for the blanket
+/// `.into_response()` on an error inside these files hands an Anthropic
+/// client a body it cannot parse — the failure #336 fixed at the auth and
+/// body-extractor sites.
+///
+/// It came back anyway, on a path neither of those sites covers: the
+/// `/v1/messages` cache write gate replaced the response with
+/// `ProxyError::Bridge(..).into_response()` when a body exceeded the 32 MiB
+/// buffering cap. The identical line in `responses.rs` is CORRECT — that is
+/// an OpenAI endpoint — which is exactly why copying between siblings is how
+/// this drifts. A grep for `into_response()` alone cannot tell the two apart;
+/// this one asks what is being converted.
+///
+/// Deliberately not extended to the whole crate: outside these two files the
+/// OpenAI envelope is the right answer, and a list of "which endpoint speaks
+/// which dialect" is the hand-maintained thing this test exists to avoid.
+#[test]
+fn an_anthropic_handler_never_renders_an_error_in_the_openai_envelope() {
+    const ANTHROPIC_FAMILY: &[&str] = &["messages.rs", "count_tokens.rs"];
+
+    let mut wrong = Vec::new();
+    for file in ANTHROPIC_FAMILY {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join(file);
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} is readable: {e}", path.display()));
+        let lines: Vec<&str> = src.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            // 注释里出现 `ProxyError::` 是在解释形状政策，不是在构造响应。
+            if trimmed.starts_with("//") || !line.contains("ProxyError::") {
+                continue;
+            }
+            // 一条语句可能跨多行（错误值本身就带嵌套构造），所以看到分号为止。
+            let stmt = lines[i..lines.len().min(i + 8)]
+                .join("\n")
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if stmt.contains(".into_response()") {
+                wrong.push(format!("{}:{}  {}", file, i + 1, trimmed));
+            }
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "these sites render a ProxyError in the OpenAI envelope on an \
+         Anthropic endpoint — the Claude SDK cannot parse the body:\n{}\n\n\
+         Use `.into_anthropic_response()`.",
+        wrong.join("\n"),
+    );
+}
