@@ -344,8 +344,18 @@ fn a_cached_response_is_captured_under_the_same_safety_gate() {
     );
 }
 
-/// The list itself rots: a handler deleted or renamed must not leave the guard
-/// silently checking nothing.
+/// The list itself rots BOTH ways, and only one of them was checked.
+///
+/// A deleted handler leaves an entry pointing at nothing — caught below. A
+/// NEW handler is the direction that actually costs something: the module
+/// doc asks you to add the file when you add the endpoint, and nothing made
+/// anyone. That is not hypothetical here — `jobs.rs` sat outside this list
+/// while resolving a Model, IP-checking it and spending the caller's
+/// rate-limit window, and both mechanisms it was missing went unnoticed
+/// because the list it belonged in never mentioned it.
+///
+/// Membership is decided by behaviour: calling the shared resolver is what
+/// makes a file one of these.
 #[test]
 fn the_handler_list_matches_what_is_on_disk() {
     let dir = handlers_dir();
@@ -353,6 +363,75 @@ fn the_handler_list_matches_what_is_on_disk() {
         assert!(
             dir.join(handler).exists(),
             "MODEL_DISPATCH_HANDLERS lists `{handler}`, which no longer exists"
+        );
+    }
+
+    /// Resolves a Model but is not one of these, with the reason.
+    const NOT_A_RESPONSE_HANDLER: &[(&str, &str)] = &[(
+        "realtime.rs",
+        "answers with a WebSocket upgrade, not a response an SDK reads: the \
+         shared mechanisms here are about shaping that response (rate-limit \
+         headers, cache-hit guarding, a mask over caller text in a body it \
+         does not have).",
+    )];
+
+    let mut unlisted: Vec<String> = Vec::new();
+    let mut resolvers = 0usize;
+    let mut stack = vec![dir.clone()];
+    let mut files: Vec<PathBuf> = Vec::new();
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).expect("proxy src is readable") {
+            let path = e.expect("readable entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    for path in &files {
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("utf-8 name")
+            .to_string();
+        let src = std::fs::read_to_string(path).expect("readable");
+        // A call, not a mention: `semantic.rs` discusses the resolver in a
+        // comment and resolves nothing.
+        if !src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .any(|l| l.contains("model_resolve::resolve_model("))
+        {
+            continue;
+        }
+        resolvers += 1;
+        if MODEL_DISPATCH_HANDLERS.contains(&name.as_str())
+            || NOT_A_RESPONSE_HANDLER.iter().any(|(f, _)| *f == name)
+        {
+            continue;
+        }
+        unlisted.push(format!("  {name}"));
+    }
+
+    assert!(
+        resolvers >= 10,
+        "found only {resolvers} callers of the shared resolver — the marker \
+         changed and this guard is checking almost nothing"
+    );
+    assert!(
+        unlisted.is_empty(),
+        "these resolve a Model and are in neither list, so every rule in this \
+         file skips them silently:\n{}\n\nAdd them to MODEL_DISPATCH_HANDLERS, \
+         or to NOT_A_RESPONSE_HANDLER with the reason they are not one.",
+        unlisted.join("\n"),
+    );
+
+    for (file, _) in NOT_A_RESPONSE_HANDLER {
+        assert!(
+            dir.join(file).exists(),
+            "NOT_A_RESPONSE_HANDLER lists `{file}`, which no longer exists"
         );
     }
 }
