@@ -387,7 +387,7 @@ jobs:
     # other open PRs still report the old name and would all break the
     # moment the required contexts were renamed to the two leg names.
     name: e2e (vitest) + coverage
-    needs: [e2e, mcp-conformance]
+    needs: [e2e, mcp-conformance, playwright-e2e]
     # A skipped required check counts as satisfied, so this must still run
     # when the matrix fails — otherwise the gate would vanish exactly when
     # it matters.
@@ -406,6 +406,17 @@ jobs:
         run: |
           if [ "${{ needs.mcp-conformance.result }}" != "success" ]; then
             echo "::error::mcp conformance result: ${{ needs.mcp-conformance.result }}"
+            exit 1
+          fi
+      - name: assert the Playwright suites passed
+        # Folded in for the same reason as MCP conformance: a suite that
+        # runs but gates nothing is a check no one has to satisfy, and the
+        # money contracts it covers are where nearly every billing
+        # regression has been caught. Dropping it back to advisory is
+        # removing it from `needs` and deleting this step.
+        run: |
+          if [ "${{ needs.playwright-e2e.result }}" != "success" ]; then
+            echo "::error::playwright e2e result: ${{ needs.playwright-e2e.result }}"
             exit 1
           fi
 
