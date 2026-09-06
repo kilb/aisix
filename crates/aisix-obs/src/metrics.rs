@@ -2033,12 +2033,22 @@ impl Metrics {
     }
 
     /// Observe a streaming request's time-to-first-token on
-    /// [`M_REQUEST_TTFT_SECONDS`]. Zero durations are skipped (TTFT was
-    /// never measured — e.g. the stream died before the first token).
-    pub fn record_request_ttft(&self, labels: LatencyLabels<'_>, ttft: Duration) {
-        if ttft.is_zero() {
+    /// [`M_REQUEST_TTFT_SECONDS`]. `None` means no first chunk was ever
+    /// observed (the stream died before one arrived) and records nothing.
+    ///
+    /// `Some(Duration::ZERO)` is a real measurement and IS recorded. This
+    /// used to take a bare `Duration` and skip zero, which conflated the two
+    /// — and the callers derived that `Duration` from a millisecond field, so
+    /// any first chunk arriving in under a millisecond floored to zero and
+    /// was dropped as "never measured". The histogram is denominated in
+    /// SECONDS: silently discarding its fastest samples biases every quantile
+    /// upward and leaves `_count` short of the request count. It also made
+    /// the `#1011` e2e intermittently fail against a local mock upstream,
+    /// which is how it was found.
+    pub fn record_request_ttft(&self, labels: LatencyLabels<'_>, ttft: Option<Duration>) {
+        let Some(ttft) = ttft else {
             return;
-        }
+        };
         self.cached_latency_histogram(M_REQUEST_TTFT_SECONDS, labels, ttft);
     }
 }
@@ -4167,7 +4177,7 @@ mod tests {
                 streaming: true,
                 ..labels
             },
-            Duration::from_millis(80),
+            Some(Duration::from_millis(80)),
         );
         let out = m.render();
 
@@ -4235,7 +4245,14 @@ mod tests {
     /// series keep their summary exposition — no `_bucket` lines appear
     /// for them even after the SLO buckets are configured.
     #[test]
-    fn slo_ttft_skips_zero_and_legacy_series_stay_summaries() {
+    /// Retired assertion: this used to require that a ZERO duration was not
+    /// observed. That conflated "no first chunk ever arrived" with "the first
+    /// chunk arrived in under a millisecond" — and the callers derived the
+    /// duration from a millisecond field, so every sub-millisecond
+    /// measurement was dropped as if it had never happened. A seconds-valued
+    /// histogram that silently discards its fastest samples biases every
+    /// quantile upward. The sentinel is `None` now, and zero is data.
+    fn slo_ttft_skips_unmeasured_and_legacy_series_stay_summaries() {
         let m = Metrics::new_with_env_id("e");
         let labels = LatencyLabels {
             endpoint: "/v1/chat/completions",
@@ -4244,10 +4261,19 @@ mod tests {
             status: 200,
             streaming: true,
         };
-        m.record_request_ttft(labels, Duration::ZERO);
+        m.record_request_ttft(labels, None);
         assert!(
             !m.render().contains("aisix_request_ttft_seconds"),
-            "zero TTFT must not be observed"
+            "an unmeasured TTFT must not be observed"
+        );
+
+        // …but a measured zero is a real sample. Recording it is the whole
+        // point of the `Option`: against a local upstream the first chunk
+        // genuinely can arrive inside one millisecond.
+        m.record_request_ttft(labels, Some(Duration::ZERO));
+        assert!(
+            m.render().contains("aisix_request_ttft_seconds"),
+            "a measured TTFT of zero must be observed, not dropped"
         );
 
         m.record_request(
@@ -4291,7 +4317,7 @@ mod tests {
             streaming: true,
         };
         m.record_request_e2e_latency(labels, Duration::from_millis(1500));
-        m.record_request_ttft(labels, Duration::from_millis(1500));
+        m.record_request_ttft(labels, Some(Duration::from_millis(1500)));
         let out = m.render();
 
         assert_eq!(
@@ -4323,7 +4349,7 @@ mod tests {
                 status: 200,
                 streaming: true,
             },
-            Duration::from_millis(1500),
+            Some(Duration::from_millis(1500)),
         );
         let out = m.render();
         let bucket_val = |le: &str| -> u64 {
@@ -4360,7 +4386,7 @@ mod tests {
             streaming: true,
         };
         m.record_request_e2e_latency(labels, Duration::from_millis(1500));
-        m.record_request_ttft(labels, Duration::from_millis(1500));
+        m.record_request_ttft(labels, Some(Duration::from_millis(1500)));
         m.record_guardrail_execution(&aisix_core::GuardrailExecution {
             guardrail_name: "g",
             kind: "keyword",

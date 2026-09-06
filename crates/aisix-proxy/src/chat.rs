@@ -2284,7 +2284,7 @@ async fn dispatch(
                         status: terminal.status,
                         streaming: true,
                     },
-                    Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
+                    comp.upstream_ttft,
                 );
                 metrics_for_stream.record_time_to_first_token(
                     UsageLabels {
@@ -4067,7 +4067,7 @@ async fn dispatch_ensemble(
                         status: 200,
                         streaming: true,
                     },
-                    Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
+                    comp.upstream_ttft,
                 );
                 // Release the concurrency permit(s) now the stream is done
                 // (or was cancelled) — on_complete fires on both paths (#450).
@@ -4916,6 +4916,13 @@ struct StreamCompletion {
     /// Attempt-scoped time to the UPSTREAM's first generated chunk.
     /// Set once when that chunk arrives in `build_sse_stream`.
     upstream_ttft_ms: u32,
+    /// The same measurement, unrounded, and `None` when no first chunk ever
+    /// arrived. The `_ms` field above cannot express that difference — it
+    /// reads 0 both for "never measured" and for "arrived in under a
+    /// millisecond" — and the TTFT histogram is denominated in seconds, so
+    /// it wants the precision anyway. The `_ms` field stays as it is: it is
+    /// a usage-event wire field where 0 already means "no first token".
+    upstream_ttft: Option<Duration>,
     /// Request-scoped time until the first chunk was handed DOWNSTREAM.
     /// Under a hold-back output guardrail this trails
     /// `upstream_ttft_ms` by the scan; without one they nearly coincide.
@@ -5339,8 +5346,10 @@ where
                     // what external observers report (#1225).
                     if !first_chunk_seen {
                         first_chunk_seen = true;
+                        let ttft = attempt_started.elapsed();
                         guard.comp().upstream_ttft_ms =
-                            attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                            ttft.as_millis().min(u32::MAX as u128) as u32;
+                        guard.comp().upstream_ttft = Some(ttft);
                     }
                     if let Some(usage) = chunk.usage.as_ref() {
                         observe_stream_usage(guard.comp(), usage);

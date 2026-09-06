@@ -1619,6 +1619,7 @@ async fn anthropic_passthrough_dispatch(
                     provider_model_version: usage.provider_model_version,
                     finish_reason: usage.finish_reason,
                     upstream_ttft_ms: usage.upstream_ttft_ms,
+                    upstream_ttft: usage.upstream_ttft,
                     downstream_latency_ms: usage.downstream_latency_ms,
                 };
                 state_c.metrics.record_request_e2e_latency(
@@ -2207,6 +2208,7 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
             .unwrap_or("")
             .to_string(),
         upstream_ttft_ms: 0,
+        upstream_ttft: None,
         // Non-streaming: stamped by the handler, which holds the request clock.
         downstream_latency_ms: 0,
     }
@@ -2519,6 +2521,7 @@ async fn cross_provider_dispatch(
                     provider_model_version: comp.provider_model_version,
                     finish_reason: comp.finish_reason,
                     upstream_ttft_ms: comp.upstream_ttft_ms,
+                    upstream_ttft: comp.upstream_ttft,
                     downstream_latency_ms: comp.downstream_latency_ms,
                 };
                 state_for_telem.metrics.record_request_e2e_latency(
@@ -2670,6 +2673,7 @@ async fn cross_provider_dispatch(
         provider_model_version: resp.model.clone(),
         finish_reason: finish_reason_label(&resp.finish_reason),
         upstream_ttft_ms: 0,
+        upstream_ttft: None,
         // Non-streaming: stamped by the handler, which holds the request clock.
         downstream_latency_ms: 0,
     };
@@ -2885,8 +2889,10 @@ fn build_anthropic_sse_stream(
                     // (#1225).
                     if !first_chunk_seen {
                         first_chunk_seen = true;
+                        let ttft = attempt_started.elapsed();
                         guard.comp().upstream_ttft_ms =
-                            attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                            ttft.as_millis().min(u32::MAX as u128) as u32;
+                        guard.comp().upstream_ttft = Some(ttft);
                     }
                     {
                         let comp = guard.comp();
@@ -3389,6 +3395,9 @@ struct AnthropicStreamCompletion {
     finish_reason: String,
     /// Attempt-scoped time to the upstream's first generated chunk.
     upstream_ttft_ms: u32,
+    /// The same measurement, unrounded; `None` when no first chunk ever
+    /// arrived. See `AnthropicUsageMetrics::upstream_ttft`.
+    upstream_ttft: Option<Duration>,
     /// Request-scoped time until the caller got its first response
     /// bytes. Trails `upstream_ttft_ms` by whatever the gateway did
     /// in between — most visibly a hold-back output guardrail.
@@ -3598,6 +3607,12 @@ struct AnthropicUsageMetrics {
     provider_model_version: String,
     finish_reason: String,
     upstream_ttft_ms: u32,
+    /// The same measurement, unrounded, and `None` when no first chunk ever
+    /// arrived. The `_ms` field cannot express that difference — it reads 0
+    /// both for "never measured" and for "arrived in under a millisecond" —
+    /// and the TTFT histogram is denominated in seconds. Mirrors the field of
+    /// the same name on chat's `StreamCompletion`.
+    upstream_ttft: Option<Duration>,
     downstream_latency_ms: u32,
 }
 
@@ -3767,7 +3782,9 @@ fn emit_anthropic_usage_event(
             client_type: state.client_classifier.classify(&client.user_agent),
         },
     );
-    if metrics.upstream_ttft_ms > 0 {
+    // `Some` iff a first chunk was actually seen — including one that
+    // arrived in under a millisecond, which the `_ms` field reports as 0.
+    if metrics.upstream_ttft.is_some() {
         let snap_for_labels = state.snapshot.load();
         let (bounded_model, bounded_upstream) =
             crate::usage_attr::metric_model_label_pair(&snap_for_labels, model, upstream_model);
@@ -3779,7 +3796,7 @@ fn emit_anthropic_usage_event(
                 status: status_code,
                 streaming: true,
             },
-            Duration::from_millis(u64::from(metrics.upstream_ttft_ms)),
+            metrics.upstream_ttft,
         );
         state.metrics.record_time_to_first_token(
             UsageLabels {
@@ -3866,6 +3883,9 @@ struct AnthropicStreamUsage {
     /// Attempt-scoped time to the upstream's first streamed frame,
     /// whatever its type — see `UsageEvent::upstream_ttft_ms`.
     upstream_ttft_ms: u32,
+    /// The same measurement, unrounded; `None` when no first chunk ever
+    /// arrived. See `AnthropicUsageMetrics::upstream_ttft`.
+    upstream_ttft: Option<Duration>,
     /// Request-scoped time until the caller got its first response
     /// bytes. Trails `upstream_ttft_ms` by whatever the gateway did
     /// in between — most visibly a hold-back output guardrail.
