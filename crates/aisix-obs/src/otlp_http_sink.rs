@@ -117,13 +117,18 @@ impl OtlpHttpFanOut {
     /// the process handle so telemetry loss is visible on `/metrics`; tests
     /// pass `None`.
     pub fn with_metrics(metrics: Option<Arc<crate::Metrics>>) -> Self {
-        let client = aisix_gateway::client_builder()
-            .timeout(REQUEST_TIMEOUT)
-            .user_agent(USER_AGENT)
-            .build()
-            // The client builder only fails on illegal TLS roots; the
-            // default config is always valid.
-            .expect("reqwest::Client default config is valid");
+        // Was `.expect("reqwest::Client default config is valid")`, on the
+        // premise that only illegal TLS roots can fail the build. This is not
+        // the default config — `client_builder()` applies the DEPLOYMENT's
+        // trust material, which is exactly the thing that can be illegal. And
+        // exporters are rebuilt when the snapshot changes, so the panic would
+        // land on a config reload and take a serving gateway with it.
+        let client = aisix_gateway::build_client_or_default(
+            aisix_gateway::client_builder()
+                .timeout(REQUEST_TIMEOUT)
+                .user_agent(USER_AGENT),
+            "otlp http exporter",
+        );
         Self {
             inner: Arc::new(FanOutInner {
                 exporters: {

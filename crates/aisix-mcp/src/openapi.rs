@@ -87,10 +87,10 @@ const PATH_SEGMENT_ENCODE: &AsciiSet = &CONTROLS
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        aisix_gateway::client_builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("failed to build openapi tool HTTP client")
+        aisix_gateway::build_client_or_default(
+            aisix_gateway::client_builder().redirect(reqwest::redirect::Policy::none()),
+            "openapi tool http client",
+        )
     })
 }
 

@@ -956,8 +956,16 @@ mod tests {
                     let window: String = tail.chars().take(400).collect();
                     let window = window.as_str();
                     // `build()` 之后紧跟的那一句决定了失败怎么处理。
+                    // `.expect()` 也算：它不是「悄悄吞掉」，是**直接崩**。
+                    // 这些客户端不少是在护栏索引重建时造的，而重建跟着快照走
+                    // —— 也就是说这条路在**配置热加载**上，不只在启动时。一个
+                    // 护栏的客户端造不出来就把整个正在服务的网关带走，代价和
+                    // 起因完全不成比例，而本仓库早就为这件事定过姿态：
+                    // `build_client_or_default` 记一行响亮的日志、退回默认客户
+                    // 端。原来这条守卫只禁「无声退化」，把「崩掉」放过去了。
                     if window.contains("unwrap_or_else(|_|")
                         || window.contains("unwrap_or_default()")
+                        || window.contains(".expect(")
                     {
                         out.push((
                             path.display().to_string(),
@@ -978,8 +986,10 @@ mod tests {
         );
         assert!(
             offenders.is_empty(),
-            "这些地方把 client_builder() 的失败吞掉了 —— 换来的客户端没有部署配\
-             的任何 TLS 设置，而且没有一行日志说明：{offenders:#?}"
+            "这些地方没有走 `build_client_or_default`：要么把 client_builder() 的\
+             失败无声吞掉（换来的客户端没有部署配的任何 TLS 设置，且没有一行日志\
+             说明），要么直接 panic（护栏索引跟着快照重建，所以这条路在配置热加\
+             载上——一个客户端造不出来会把整个正在服务的网关带走）：{offenders:#?}"
         );
     }
 }

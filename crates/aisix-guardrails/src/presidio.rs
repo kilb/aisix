@@ -126,9 +126,10 @@ impl PresidioGuardrail {
         // Same connection-layer settings as every provider call: a bound
         // connect phase, TCP keepalive on, and pooled connections expired
         // before a hop in front of the guardrail service reaps them.
-        let client = aisix_gateway::client_builder()
-            .build()
-            .expect("guardrail http client builds");
+        let client = aisix_gateway::build_client_or_default(
+            aisix_gateway::client_builder(),
+            "presidio guardrail",
+        );
         Self {
             row_name: row_name.into(),
             analyzer_url: cfg.analyzer_url.trim_end_matches('/').to_owned(),
