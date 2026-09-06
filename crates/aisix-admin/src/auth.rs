@@ -183,6 +183,70 @@ mod tests {
         ));
     }
 
+    /// Every admin handler must take the [`AdminAuth`] extractor.
+    ///
+    /// Authentication here is an extractor, not a router layer, so a handler
+    /// that simply omits the parameter compiles, routes, and serves the
+    /// configuration surface to anyone who can reach the listener. Nothing
+    /// about that reads as wrong at the call site — the route registration
+    /// looks identical either way.
+    ///
+    /// The exception list is explicit and carries its reason; anything else
+    /// new has to be added here deliberately, which is the point.
+    #[test]
+    fn every_admin_handler_takes_the_auth_extractor() {
+        /// Handlers deliberately outside admin authentication.
+        ///
+        /// `playground_chat_completions` forwards into the proxy router,
+        /// where the caller's *proxy* key is authenticated by the proxy's own
+        /// middleware — an admin key is the wrong credential for it and
+        /// requiring one would lock out the surface's only intended callers.
+        const NOT_ADMIN_AUTHENTICATED: &[&str] = &["playground_chat_completions"];
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut checked = 0usize;
+        let mut unguarded: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("read src/") {
+            let path = entry.expect("dir entry").path();
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            if !name.contains("handler") || !name.ends_with(".rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("read handler file");
+            // 只看生产段：测试里会自己拼请求，不经过提取器。
+            let production = src.split_once("#[cfg(test)]").map_or(&src[..], |(a, _)| a);
+            for (idx, _) in production.match_indices("pub async fn ") {
+                let rest = &production[idx + "pub async fn ".len()..];
+                let Some(paren) = rest.find('(') else {
+                    continue;
+                };
+                let fname = rest[..paren].trim().to_string();
+                let Some(close) = rest.find(')') else {
+                    continue;
+                };
+                let args = &rest[paren..close];
+                checked += 1;
+                if !args.contains("AdminAuth") && !NOT_ADMIN_AUTHENTICATED.contains(&fname.as_str())
+                {
+                    unguarded.push(format!("{name}::{fname}"));
+                }
+            }
+        }
+        assert!(
+            checked >= 20,
+            "只扫到 {checked} 个处理器，抽取多半坏了（实际有三十几个）"
+        );
+        assert!(
+            unguarded.is_empty(),
+            "这些 admin 处理器没有取 AdminAuth —— 它们对任何能连到这个监听口的\
+             人开放配置面：{unguarded:?}"
+        );
+    }
+
     #[test]
     fn is_admin_authorized_checks_key_membership() {
         let keys = vec!["admin-secret".to_string()];
