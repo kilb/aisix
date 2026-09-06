@@ -146,6 +146,77 @@ fn a_handler_that_checks_caller_text_also_masks_it() {
     );
 }
 
+/// Third leg of the mask rule: a handler that APPLIES a mask must carry the
+/// counts into its usage event.
+///
+/// The chain is check → mask → report, and the two tests above cover the
+/// first hop. A handler that masks and reports nothing is not broken in any
+/// way a caller sees — the request succeeds, the PII is gone — but the
+/// operator has no record that anything was rewritten, which is the whole
+/// basis for auditing what a `mask` rule did. `images`, `audio` and `videos`
+/// each assert this for themselves; this is the family-wide version, so the
+/// NEXT endpoint to grow a mask cannot skip it in silence.
+///
+/// Counts only, never the matched text — the event must not become the PII
+/// sink the rule exists to avoid.
+///
+/// Note on how far this was verified: the counts field is load-bearing in the
+/// type system, so deleting the plumbing from an existing handler does not
+/// compile and cannot be used to fail this test. What was checked instead is
+/// the scan itself — pointed at a marker no handler contains, it names all
+/// ten masking handlers, so both halves of the detection work. The case it
+/// really guards is a NEW handler that masks and never grows the field.
+#[test]
+fn a_handler_that_masks_also_records_that_it_masked() {
+    const APPLIES_MASKS: &[&str] = &[
+        "redacts_input(",
+        "redact_input_text(",
+        "redact::redact_",
+        "moderate_body(",
+        "moderate_structured_body(",
+    ];
+    const REPORTS_THE_COUNTS: &[&str] = &["redacted_entity_counts", "redactions"];
+
+    /// `/v1/messages/count_tokens` emits no UsageEvent at all (see
+    /// `count_tokens.rs`), so it has nowhere to put the counts. Listed by
+    /// name so a handler that DOES emit one cannot inherit the exemption.
+    const NO_USAGE_EVENT: &[&str] = &["count_tokens.rs"];
+
+    let dir = handlers_dir();
+    let mut unaudited: Vec<String> = Vec::new();
+    for handler in MODEL_DISPATCH_HANDLERS {
+        if NO_USAGE_EVENT.contains(handler) {
+            continue;
+        }
+        let src = std::fs::read_to_string(dir.join(handler)).expect("handler is readable");
+        if !APPLIES_MASKS.iter().any(|m| src.contains(m)) {
+            continue;
+        }
+        if !REPORTS_THE_COUNTS.iter().any(|m| src.contains(m)) {
+            unaudited.push(format!("  {handler}"));
+        }
+    }
+
+    assert!(
+        unaudited.is_empty(),
+        "these handlers rewrite caller text under a `mask` rule and leave no \
+         trace of it in their usage event:\n{}\n\nThe request succeeds and the \
+         PII is gone, so nothing looks wrong — but nobody can audit what the \
+         rule did. Carry the counts into `redacted_entity_counts`.",
+        unaudited.join("\n"),
+    );
+
+    // The exemption rots like every other list here.
+    for handler in NO_USAGE_EVENT {
+        let src = std::fs::read_to_string(dir.join(handler)).expect("handler is readable");
+        assert!(
+            !src.contains("UsageEvent {"),
+            "NO_USAGE_EVENT lists `{handler}`, which now builds a UsageEvent — \
+             drop the exemption and carry the counts into it"
+        );
+    }
+}
+
 /// A cache HIT is client-visible output, so it must run the output chain
 /// before being returned — the contract #448 established for
 /// `/v1/chat/completions`.
