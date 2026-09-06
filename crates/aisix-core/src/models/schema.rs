@@ -4152,4 +4152,74 @@ mod tests {
         let err = validate_model(&v).unwrap_err();
         assert!(err.message.contains("`retries`"), "{err:?}");
     }
+
+    /// `validate` masks instance values, and that one `.masked()` call is the
+    /// only thing keeping a plaintext credential out of three places at once:
+    /// a `tracing::error!` line, the rejection buffer that
+    /// `GET /status/config` serves on the UNAUTHENTICATED metrics listener,
+    /// and Admin API 400 bodies.
+    ///
+    /// It had no test. Dropping `.masked()` compiles, and every other test in
+    /// this crate keeps passing — the leak only shows on documents that fail
+    /// at the schema ROOT, where the reported instance is the whole document.
+    /// The renamed-field `anyOf` puts a very ordinary mistake there: an
+    /// `mcp_servers` row that forgot BOTH `name` and `display_name` satisfies
+    /// neither branch, so the unmasked message reads back the row it just
+    /// rejected, `secret` included.
+    #[test]
+    fn a_root_level_rejection_never_reads_back_the_credential() {
+        const SECRET: &str = "sk-live-9f2b1e-must-not-appear";
+
+        // Each case: a document that carries a plaintext credential AND fails
+        // at the root, for one of the resources whose root grew an `anyOf`
+        // through `accept_renamed_field`.
+        let cases: Vec<(&str, SchemaError)> = vec![
+            (
+                "mcp_server missing both name spellings",
+                validate_mcp_server(&json!({
+                    "url": "https://mcp.example.com/mcp",
+                    "transport": "streamable_http",
+                    "auth_type": "bearer",
+                    "secret": SECRET
+                }))
+                .expect_err("a row with neither `name` nor `display_name` must be rejected"),
+            ),
+            (
+                "a2a_agent missing both name spellings",
+                validate_a2a_agent(&json!({
+                    "url": "https://agent.example.com/a2a",
+                    "auth_type": "bearer",
+                    "secret": SECRET
+                }))
+                .expect_err("a row with neither `name` nor `display_name` must be rejected"),
+            ),
+        ];
+
+        for (what, err) in cases {
+            // Self-check FIRST: the whole point is the ROOT case, and a
+            // fixture that fails somewhere deeper passes the leak assertion
+            // for free. That is not hypothetical — the first draft of this
+            // test used `transport: "sse"`, which fails at `/transport` with
+            // a message naming only that field, and would have gone green
+            // against an entirely unmasked `validate`.
+            assert_eq!(
+                err.path, "",
+                "{what}: expected a ROOT-level rejection, got one at `{}` — \
+                 fix the fixture, otherwise this case proves nothing",
+                err.path
+            );
+            assert!(
+                !err.message.contains(SECRET),
+                "{what}: the rejection message reads the credential back:\n{}",
+                err.message
+            );
+            // `Display` is what actually reaches the log line and the 400
+            // body; asserting only on `message` would miss a future format
+            // that re-attached the instance.
+            assert!(
+                !err.to_string().contains(SECRET),
+                "{what}: the rendered error reads the credential back:\n{err}"
+            );
+        }
+    }
 }
