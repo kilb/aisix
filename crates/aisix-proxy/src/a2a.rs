@@ -85,6 +85,9 @@ struct A2aCall {
     /// monitor-mode observations they made.
     applied_guardrails: Vec<aisix_core::AppliedGuardrail>,
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    /// What a `mask` rule rewrote, by entity type. Counts only — the event
+    /// must not become the sink for the content the rule removed.
+    redactions: crate::redact::RedactionCounts,
 }
 
 /// The words exchanged on one A2A call.
@@ -260,7 +263,7 @@ async fn dispatch(
         }
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid request body").into_response(),
     };
-    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+    let mut value: serde_json::Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid JSON-RPC body").into_response(),
     };
@@ -293,6 +296,7 @@ async fn dispatch(
         guardrail_blocked: false,
         applied_guardrails: Vec::new(),
         guardrail_monitor_hits: Vec::new(),
+        redactions: crate::redact::RedactionCounts::new(),
     };
     // Read before the upstream is contacted, so a call that never lands still
     // records which task the caller was asking about.
@@ -357,6 +361,41 @@ async fn dispatch(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 &crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
             );
+        }
+
+        // #932's order: block first, then rewrite, so the masked text is what
+        // the agent receives.
+        //
+        // This module's own header is the argument for doing it here at all —
+        // content policy applies "so a rule that blocks a phrase on an LLM
+        // endpoint is not bypassable by asking an agent the same thing". A
+        // MASK rule was exactly that bypassable: the chain resolved, the text
+        // was scanned, and nothing rewrote it, so an env-scoped `pii` mask
+        // that redacts a prompt on /v1/chat/completions let the same content
+        // through here untouched — with no block, no rewrite, and no record
+        // (`would_mask` is monitor-mode only).
+        //
+        // Only `params.message.parts[].text` is rewritten, the same fields
+        // the scan above read. The ids, method name and metadata around them
+        // are protocol rather than caller content.
+        if aisix_guardrails::Guardrail::redacts_input(&guardrail_chain) {
+            let chain = &guardrail_chain;
+            // Collected outside the closure: `redact_request_text` takes an
+            // `Fn`, so the counts cannot be merged into `call` from inside it.
+            let collected = std::cell::RefCell::new(crate::redact::RedactionCounts::new());
+            let rewritten = aisix_a2a::redact_request_text(&mut value, |text| {
+                aisix_guardrails::Guardrail::redact_input_text(chain, text).map(|r| {
+                    crate::redact::merge_counts(&mut collected.borrow_mut(), r.counts);
+                    r.text
+                })
+            });
+            crate::redact::merge_counts(&mut call.redactions, collected.into_inner());
+            if rewritten > 0 {
+                // Keep the inspected copy in step with what was sent, so the
+                // usage event's token estimate and any captured content
+                // describe the same text the agent got.
+                call.text.request = aisix_a2a::request_text(&value, |b, s| b.push_str(s));
+            }
         }
     }
 
@@ -903,6 +942,7 @@ fn emit_a2a_usage(
         applied_guardrails: call.applied_guardrails.clone(),
         guardrail_blocked: call.guardrail_blocked,
         guardrail_monitor_hits: call.guardrail_monitor_hits.clone(),
+        redacted_entity_counts: call.redactions.clone(),
         upstream_ttft_ms: call
             .stream
             .ttfb
@@ -2048,5 +2088,69 @@ mod tests {
         assert_eq!(card["name"], "Invoice Agent");
         assert_eq!(card["version"], "2.1.0");
         assert_eq!(card["skills"][0]["id"], "extract");
+    }
+
+    /// A `mask` rule must rewrite the message before the agent sees it.
+    ///
+    /// This module's header is the argument: content policy applies here "so
+    /// a rule that blocks a phrase on an LLM endpoint is not bypassable by
+    /// asking an agent the same thing". A MASK rule was exactly that
+    /// bypassable — the chain resolved, the text was scanned, and nothing
+    /// rewrote it, so an env-scoped `pii` mask that redacts a prompt on
+    /// /v1/chat/completions let the same content reach an agent untouched,
+    /// with no block, no rewrite and no record (`would_mask` is monitor-mode
+    /// only, and this is enforcement).
+    #[tokio::test]
+    async fn a_mask_rule_rewrites_the_message_before_the_agent_sees_it() {
+        let agent = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "task"}}),
+            ))
+            .expect(1)
+            .mount(&agent)
+            .await;
+
+        let snap = snapshot_with(&agent.uri(), true, serde_json::json!(["*"]));
+        let guardrail: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"mask-email","enabled":true,"hook_point":"input","kind":"pii","detectors":[{"type":"email","action":"mask"}]}"#,
+        )
+        .unwrap();
+        snap.guardrails
+            .insert(ResourceEntry::new("g-mask", guardrail, 1));
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "message/send",
+            "params": {"message": {"role": "user", "parts": [
+                {"kind": "text", "text": "invoice alice@example.com please"},
+                {"kind": "text", "text": "no address in this one"}
+            ]}}
+        });
+        let req = HttpRequest::post("/a2a/invoice")
+            .header("host", "a2a.aisix.example.com")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = router_with(snap).oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "a mask must not block");
+
+        let received = agent.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let sent = String::from_utf8_lossy(&received[0].body).into_owned();
+        assert!(
+            !sent.contains("alice@example.com"),
+            "the message reached the agent unmasked:\n{sent}"
+        );
+        // The rest of the envelope is protocol, not caller content, and must
+        // survive verbatim — a blanket string rewrite would corrupt the call
+        // it is meant to protect.
+        assert!(sent.contains("message/send"), "method must survive: {sent}");
+        assert!(
+            sent.contains("no address in this one"),
+            "a part with nothing to mask must be untouched: {sent}"
+        );
     }
 }

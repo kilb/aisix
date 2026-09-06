@@ -304,6 +304,34 @@ pub fn request_text(request: &Value, push: impl Fn(&mut String, &str)) -> String
     buf
 }
 
+/// Rewrite every request text part through `mask`, returning how many parts
+/// changed.
+///
+/// The exact inverse of [`request_text`]'s traversal — same pointer, same
+/// `parts[].text` fields — so what a guardrail inspected is what gets
+/// rewritten. Only those fields: an agent call's ids, method name and
+/// metadata are protocol, not caller content, and a blanket string rewrite
+/// over the JSON-RPC envelope would corrupt the call it is meant to protect.
+pub fn redact_request_text(request: &mut Value, mask: impl Fn(&str) -> Option<String>) -> usize {
+    let Some(parts) = request
+        .pointer_mut("/params/message/parts")
+        .and_then(Value::as_array_mut)
+    else {
+        return 0;
+    };
+    let mut rewritten = 0;
+    for part in parts {
+        let Some(text) = part.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(masked) = mask(text) {
+            part["text"] = Value::String(masked);
+            rewritten += 1;
+        }
+    }
+    rewritten
+}
+
 /// The text an agent produced on one call, kept as two segments because the
 /// protocol updates them by two different rules.
 ///
