@@ -274,10 +274,10 @@ impl Default for VertexBridge {
 }
 
 fn default_client() -> Client {
-    aisix_gateway::client_builder()
-        .user_agent("aisix/0.1")
-        .build()
-        .unwrap_or_else(|_| Client::new())
+    aisix_gateway::build_client_or_default(
+        aisix_gateway::client_builder().user_agent("aisix/0.1"),
+        "vertex bridge",
+    )
 }
 
 /// The set of Vertex publishers we dispatch to.

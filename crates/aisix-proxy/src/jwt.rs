@@ -781,11 +781,12 @@ fn discovery_cache() -> &'static RwLock<HashMap<String, DiscoveryEntry>> {
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        aisix_gateway::client_builder()
-            .timeout(JWKS_FETCH_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap_or_default()
+        aisix_gateway::build_client_or_default(
+            aisix_gateway::client_builder()
+                .timeout(JWKS_FETCH_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none()),
+            "jwks fetch",
+        )
     })
 }
 

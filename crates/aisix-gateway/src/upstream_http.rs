@@ -131,6 +131,32 @@ pub fn config() -> &'static UpstreamHttpConfig {
     CONFIG.get_or_init(UpstreamHttpConfig::default)
 }
 
+/// Finish a [`client_builder`], or say loudly why the settings were lost.
+///
+/// A failed `build()` yields a client with **none** of the deployment's
+/// outbound TLS trust: no private CA, no client identity, and no
+/// `verify: false` opt-out either. Connections then fail against an
+/// internally-signed upstream, or quietly stop presenting the certificate
+/// the upstream expects — and swallowing the error leaves nothing pointing
+/// at the cause.
+///
+/// Callers that would rather not start at all keep using `expect`; this is
+/// for the ones on a request path, where the choice is between a degraded
+/// client and a panic per request. `what` names the caller in the log.
+pub fn build_client_or_default(builder: reqwest::ClientBuilder, what: &str) -> reqwest::Client {
+    match builder.build() {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                client = what,
+                "upstream.tls settings not applied: the configured HTTP client                  could not be built, falling back to a default one (no custom CA,                  no client identity, no verify opt-out)"
+            );
+            reqwest::Client::new()
+        }
+    }
+}
+
 /// A `reqwest::ClientBuilder` with the connection settings **and the
 /// deployment's outbound TLS trust** applied. Callers add their own
 /// `user_agent` and `build()`.
@@ -783,5 +809,78 @@ mod tests {
             .expect_err("nothing listens on port 1");
         assert!(!io_err.is_builder());
         assert!(matches!(send_error(io_err), BridgeError::Transport(_)));
+    }
+
+    /// A `client_builder()` may not be finished by silently discarding the
+    /// error.
+    ///
+    /// The fallback client carries none of the deployment's outbound TLS
+    /// trust, so swallowing the failure turns a misconfiguration into
+    /// connections that fail — or stop presenting a client certificate —
+    /// with nothing naming the cause. There were seven of these across the
+    /// bridges and the proxy, in three different spellings; they now go
+    /// through [`build_client_or_default`], which says what was lost.
+    ///
+    /// `expect` stays allowed: refusing to start is a legitimate answer for
+    /// a caller that is not on a request path.
+    #[test]
+    fn no_caller_finishes_a_client_builder_by_swallowing_the_error() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates/")
+            .to_path_buf();
+
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>, seen: &mut usize) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    walk(&path, out, seen);
+                    continue;
+                }
+                if path.extension().is_none_or(|x| x != "rs") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let production = src
+                    .split_once("\n#[cfg(test)]")
+                    .map_or(&src[..], |(a, _)| a);
+                for hit in production.match_indices("client_builder()") {
+                    *seen += 1;
+                    let tail = &production[hit.0..];
+                    // 按字符切，不按字节 —— 注释里有中文，字节切会切在 UTF-8
+                    // 码点中间直接 panic。
+                    let window: String = tail.chars().take(400).collect();
+                    let window = window.as_str();
+                    // `build()` 之后紧跟的那一句决定了失败怎么处理。
+                    if window.contains("unwrap_or_else(|_|")
+                        || window.contains("unwrap_or_default()")
+                    {
+                        out.push((
+                            path.display().to_string(),
+                            window.lines().take(6).collect::<Vec<_>>().join(" | "),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let mut offenders = Vec::new();
+        let mut seen = 0usize;
+        walk(&root, &mut offenders, &mut seen);
+        // 「不许出现」型的断言，扫不到东西就恒绿 —— 所以先证明扫到了。
+        assert!(
+            seen >= 8,
+            "只扫到 {seen} 处 client_builder() 调用，抽取多半坏了，这条守卫成了空转"
+        );
+        assert!(
+            offenders.is_empty(),
+            "这些地方把 client_builder() 的失败吞掉了 —— 换来的客户端没有部署配\
+             的任何 TLS 设置，而且没有一行日志说明：{offenders:#?}"
+        );
     }
 }

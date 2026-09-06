@@ -212,10 +212,10 @@ impl Default for OpenAiBridge {
 }
 
 fn default_client() -> Client {
-    aisix_gateway::client_builder()
-        .user_agent("aisix/0.1")
-        .build()
-        .unwrap_or_else(|_| Client::new())
+    aisix_gateway::build_client_or_default(
+        aisix_gateway::client_builder().user_agent("aisix/0.1"),
+        "openai bridge",
+    )
 }
 
 /// Strip a known endpoint suffix from `base`. Idempotent: if no known

@@ -62,14 +62,16 @@ fn cache() -> &'static RwLock<HashMap<String, CachedToken>> {
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        aisix_gateway::client_builder()
-            .timeout(DEFAULT_UPSTREAM_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            // Building a client with only a timeout and redirect policy set
-            // cannot fail on any supported platform; fall back to the default
-            // client if it does.
-            .unwrap_or_default()
+        // 不是「只设了超时和重定向策略」：`client_builder()` 还带着部署的出站
+        // TLS 信任（私有 CA、客户端证书、verify 开关）。所以失败时退回默认客户端
+        // 丢掉的是那些，而这条路径取的是 OAuth 令牌 —— 静默降级会让它对着内部
+        // CA 签发的令牌端点连不上，而没有一行日志指向原因。
+        aisix_gateway::build_client_or_default(
+            aisix_gateway::client_builder()
+                .timeout(DEFAULT_UPSTREAM_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none()),
+            "mcp oauth token fetch",
+        )
     })
 }
 

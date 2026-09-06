@@ -14,10 +14,10 @@ use std::sync::OnceLock;
 pub fn client() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        aisix_gateway::client_builder()
-            .user_agent("aisix/0.1")
-            .build()
-            .unwrap_or_else(|_| Client::new())
+        aisix_gateway::build_client_or_default(
+            aisix_gateway::client_builder().user_agent("aisix/0.1"),
+            "shared proxy client",
+        )
     })
 }
 

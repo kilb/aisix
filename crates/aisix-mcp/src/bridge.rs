@@ -125,7 +125,20 @@ fn build_http_client(disable_env_proxy: bool) -> rmcp_reqwest::Client {
     if disable_env_proxy {
         b = b.no_proxy();
     }
-    b.build().unwrap_or_else(|_| rmcp_reqwest::Client::new())
+    // 同上面那两个分支：失败要出声。这一个丢掉的还不止一项 —— 默认客户端把
+    // 上面配的 CA、客户端证书、`no_proxy` 全都没有了，于是连接可能改走环境里
+    // 的代理、或者对内部 CA 签发的证书连不上，而运维看不到任何线索。
+    //
+    // 这里不返回 Err：调用方拿不到可处理的失败，一个不带自定义设置的客户端
+    // 仍然比没有客户端强（它只会更严，不会更松 —— `verify: false` 也一并丢
+    // 掉了）。所以出声就是能做的全部。
+    b.build().unwrap_or_else(|e| {
+        tracing::error!(
+            error = %e,
+            "upstream.tls settings not applied to MCP upstream connections: the              configured client could not be built, falling back to a default one              (no custom CA, no client identity, no proxy opt-out)"
+        );
+        rmcp_reqwest::Client::new()
+    })
 }
 
 /// Header carrying the gateway-held key for `api_key` upstream auth.
