@@ -2799,6 +2799,51 @@ admin:
         assert!(cfg.upstream.tls.is_default());
     }
 
+    /// A tls block that sets SOMETHING but omits `verify` must still verify.
+    ///
+    /// The test above omits the block entirely, which takes
+    /// `UpstreamConfig::default()` and never runs `OutboundTlsConfig`'s
+    /// deserializer at all. A partial block is the case that does — it relies
+    /// on the container-level `#[serde(default)]` to fill `verify` from the
+    /// `Default` impl (`true`) rather than from `bool::default()` (`false`).
+    /// Moving that attribute onto the fields, which reads like a harmless
+    /// tidy-up, silently turns certificate verification OFF for every
+    /// deployment that names a private CA. Verified: under that change
+    /// `omitting_the_tls_block_keeps_verification_on` above still passes,
+    /// because its path never reaches this deserializer.
+    ///
+    /// The doc on the field spells out what that costs: no protection against
+    /// an interceptor reading and rewriting every prompt, response and
+    /// upstream API key on the connection.
+    #[test]
+    fn tls_verify_stays_on_when_the_block_names_only_a_ca() {
+        let ca = write_yaml("-----BEGIN CERTIFICATE-----\n");
+        let f = write_yaml(&format!(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+upstream:
+  tls:
+    ca_file: "{}"
+"#,
+            ca.path().display()
+        ));
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert!(
+            cfg.upstream.tls.verify,
+            "a tls block that only names a CA must not turn verification off"
+        );
+        assert!(
+            cfg.upstream.tls.ca_file.is_some(),
+            "the CA must still apply"
+        );
+    }
+
     /// Half an identity is silently dropped by every TLS stack and then
     /// surfaces much later as a 4xx from a peer that wanted mutual TLS.
     #[test]
