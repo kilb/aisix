@@ -261,15 +261,54 @@ impl SnapshotCache {
 
 /// Write `bytes` to `path` atomically: write to a sibling tmp file,
 /// fsync, rename. Survives crashes between any two of those steps.
+///
+/// Created owner-only. This file holds every document under the watched
+/// prefix, verbatim — `provider_keys` included, whose upstream credential
+/// sits in there in the clear (the entries are base64-encoded, which is
+/// transport encoding, not protection). At the usual umask of `0022`
+/// `File::create` would land it at `0644`, readable by every local account
+/// and every sidecar sharing the filesystem, which is a strictly wider
+/// audience than the process that holds those secrets in memory.
+///
+/// The mode goes on the TMP file, because `rename` carries the source
+/// inode — so the published file inherits `0600` rather than whatever a
+/// previous build left at the destination. The directory mode applies only
+/// to components this call creates; an operator-provided directory keeps
+/// the permissions the operator chose.
 async fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut b = std::fs::DirBuilder::new();
+                b.recursive(true).mode(0o700);
+                b.create(parent)?;
+            }
+            #[cfg(not(unix))]
             tokio::fs::create_dir_all(parent).await?;
         }
     }
     let tmp = path.with_extension("tmp");
     {
-        let mut f = tokio::fs::File::create(&tmp).await?;
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        // tokio 的 `OpenOptions` 在 unix 上自带 `mode()`，不需要 `OpenOptionsExt`
+        // （`aisix-portal/src/resources.rs` 里也记着这一条）。
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut f = opts.open(&tmp).await?;
+        // Re-assert: `mode()` applies only to a file this call CREATES, and a
+        // crash between the create and the rename leaves a `.tmp` behind. The
+        // next write reuses it, keeps whatever mode it had, and the rename
+        // then publishes that mode. Same reason `export::write_owner_only`
+        // re-asserts.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .await?;
+        }
         f.write_all(bytes).await?;
         f.sync_all().await?;
     }
@@ -389,5 +428,79 @@ mod tests {
         let cached = cache.load().unwrap();
         assert_eq!(cached.revision, 2);
         assert_eq!(cached.entries[0].value, b"v2".to_vec());
+    }
+
+    /// The cache holds every watched document verbatim — `provider_keys`
+    /// among them, whose upstream credential is in there in the clear. At the
+    /// usual umask of `0022` the previous `File::create` produced `0644`:
+    /// readable by every local account and every sidecar on the same
+    /// filesystem, a strictly wider audience than the one process that is
+    /// supposed to hold those secrets.
+    ///
+    /// Asserted on the mode rather than on the content, because the content
+    /// is whatever etcd held and the exposure is the mode.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_cache_file_and_its_directory_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        // A nested path so the directory is one this call creates, which is
+        // the only case whose mode is ours to set.
+        let path = dir.path().join("nested").join("snap.json");
+        let cache = SnapshotCache::new(path.clone());
+        cache
+            .store(
+                &[entry(
+                    "/aisix/provider_keys/pk-1",
+                    br#"{"display_name":"pk","api_key":"sk-live-secret"}"#,
+                    1,
+                )],
+                1,
+                &[],
+            )
+            .await;
+
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            file_mode, 0o600,
+            "the snapshot cache carries upstream credentials; it must not be \
+             readable by other local accounts (got {file_mode:o})"
+        );
+
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "a directory this code creates for that file must not be \
+             traversable by others (got {dir_mode:o})"
+        );
+
+        // The tmp sibling is gone — a leftover at a wider mode would defeat
+        // the whole thing.
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "the temporary file must not survive the rename"
+        );
+
+        // A `.tmp` left by a crash is REUSED by the next write, and
+        // `OpenOptions::mode` applies only to files it creates — so without
+        // the re-assert the old, looser mode survives the rename and gets
+        // published. Plant one and check.
+        let stale_tmp = path.with_extension("tmp");
+        std::fs::write(&stale_tmp, b"leftover").unwrap();
+        std::fs::set_permissions(&stale_tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        cache
+            .store(&[entry("/aisix/models/m-1", b"{}", 2)], 2, &[])
+            .await;
+        let after = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            after, 0o600,
+            "a crash-leftover tmp file must not publish its own looser mode \
+             (got {after:o})"
+        );
     }
 }

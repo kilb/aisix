@@ -57,6 +57,45 @@ pub struct Store {
     pool: SqlitePool,
 }
 
+/// 把库文件收成 owner-only。
+///
+/// sqlx 用默认权限建库，在常见的 `umask 0022` 下就是 `0644` —— 而这个库里有
+/// 用户邮箱、argon2 口令哈希、密钥哈希和每个人的花费。同一台机器上任何账号都
+/// 能把它读走去离线爆破。本仓库其它写敏感文件的地方都已经是 0600
+/// （`export::write_owner_only`、`resources.rs`），只有这里不是。
+///
+/// WAL 模式还会另外落 `-wal` 和 `-shm` 两个兄弟文件，`-wal` 里正是还没并回主库
+/// 的那些页 —— 只收紧主库等于漏掉一半，所以三个一起收。
+///
+/// 尽力而为：收不紧就出一条日志，不拦启动。库本身是好的，而一个起不来的门户比
+/// 一个权限偏松的文件更糟。
+#[cfg(unix)]
+fn restrict_db_files(filename: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    // 内存库没有路径。
+    if filename.as_os_str().is_empty() || filename == std::path::Path::new(":memory:") {
+        return;
+    }
+    for suffix in ["", "-wal", "-shm"] {
+        let mut raw = filename.as_os_str().to_os_string();
+        raw.push(suffix);
+        let p = std::path::PathBuf::from(raw);
+        if !p.exists() {
+            continue;
+        }
+        if let Err(e) = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)) {
+            eprintln!(
+                "warning: could not restrict {} to owner-only ({e}); it holds password \
+                 and key hashes",
+                p.display()
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_db_files(_filename: &std::path::Path) {}
+
 impl Store {
     /// 打开（或创建）一个库文件并应用 migrations。
     pub async fn open(path: &str) -> Result<Self, StoreError> {
@@ -71,7 +110,9 @@ impl Store {
             // 读（会话、余额、密钥列表），于是那几百毫秒里请求全排队，撞到
             // `busy_timeout` 就是 500。WAL 下读不被写挡住。
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
-        Self::from_options(opts, 5).await
+        let store = Self::from_options(opts.clone(), 5).await?;
+        restrict_db_files(opts.get_filename());
+        Ok(store)
     }
 
     /// 测试用的内存库。每个 `Store` 一个，互不可见。
@@ -539,5 +580,48 @@ mod tests {
                 .await
                 .expect("另一条池连接连表都读不到 —— cache=shared 没生效");
         assert_eq!(found.map(|r| r.0).as_deref(), Some("u1"));
+    }
+
+    /// 库文件里有邮箱、argon2 口令哈希、密钥哈希和每个人的花费。sqlx 按默认
+    /// 权限建库，常见 umask 下就是 0644 —— 同机任何账号都能读走去离线爆破。
+    ///
+    /// 走真正的 `open`，因为要证的是那条路上的行为；顺带覆盖 WAL 的两个兄弟
+    /// 文件，只收紧主库等于漏掉 `-wal` 里还没并回去的那些页。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_database_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aisix-portal-perm-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("portal.db");
+        let store = Store::open(&format!("sqlite:{}", path.display()))
+            .await
+            .expect("open the ledger database");
+        // 写一笔，逼出 WAL 兄弟文件。
+        store
+            .insert_user("u-perm", "perm@example.com", "argon2-hash", None)
+            .await
+            .expect("insert a row so the WAL exists");
+
+        let mut checked = 0;
+        for suffix in ["", "-wal", "-shm"] {
+            let p = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+            if !p.exists() {
+                continue;
+            }
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                0o600,
+                "{} must not be readable by other local accounts (got {mode:o})",
+                p.display()
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 2,
+            "expected the database and at least one WAL sibling to exist, checked {checked}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
