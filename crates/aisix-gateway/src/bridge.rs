@@ -765,13 +765,41 @@ pub trait Bridge: Send + Sync + 'static {
 /// Vertex and Azure each grew this check locally (#390); the OpenAI-compatible
 /// and Anthropic bridges did not, so it lives here now and every bridge calls
 /// the same one.
+/// Replace any `userinfo@` prefix in an authority with `***@` before the value
+/// goes into an error a CALLER will read.
+///
+/// `InvalidUpstreamConfig` renders as a 400 with the message in the body, so
+/// anything echoed here reaches whoever made the request. The rule below —
+/// "report the scheme-stripped prefix, never the whole value, an embedded
+/// credential is exactly what may be in there" — is the reason, and the
+/// no-scheme branch was the one place still printing the raw string: an
+/// `api_base` written as `user:pass@host/v1`, with the scheme simply
+/// forgotten, does not reach the userinfo check below. It fails here first,
+/// and used to be quoted back in full.
+fn redact_userinfo(value: &str) -> std::borrow::Cow<'_, str> {
+    let after_scheme = value.find("://").map(|i| i + 3).unwrap_or(0);
+    let authority_end = value[after_scheme..]
+        .find(['/', '?', '#'])
+        .map(|i| after_scheme + i)
+        .unwrap_or(value.len());
+    match value[after_scheme..authority_end].rfind('@') {
+        Some(at) => std::borrow::Cow::Owned(format!(
+            "{}***@{}",
+            &value[..after_scheme],
+            &value[after_scheme + at + 1..]
+        )),
+        None => std::borrow::Cow::Borrowed(value),
+    }
+}
+
 pub fn validate_api_base(provider: &str, base: &str) -> Result<(), BridgeError> {
     let Some(rest) = base
         .strip_prefix("https://")
         .or_else(|| base.strip_prefix("http://"))
     else {
+        let shown = redact_userinfo(base);
         return Err(BridgeError::InvalidUpstreamConfig(format!(
-            "{provider} provider_key api_base must use http:// or https:// scheme, got {base:?}"
+            "{provider} provider_key api_base must use http:// or https:// scheme, got {shown:?}"
         )));
     };
     // Everything below reports the SCHEME-STRIPPED prefix, never the whole
@@ -783,8 +811,9 @@ pub fn validate_api_base(provider: &str, base: &str) -> Result<(), BridgeError> 
         )));
     }
     if host_part.is_empty() {
+        let shown = redact_userinfo(base);
         return Err(BridgeError::InvalidUpstreamConfig(format!(
-            "{provider} provider_key api_base has no host, got {base:?}"
+            "{provider} provider_key api_base has no host, got {shown:?}"
         )));
     }
     if base.contains('?') || base.contains('#') {
@@ -1132,5 +1161,47 @@ mod tests {
     fn sample_model_resolves_to_openai() {
         let m = sample_model();
         assert_eq!(m.provider.as_deref(), Some("openai"));
+    }
+
+    /// `InvalidUpstreamConfig` renders as a 400 whose message reaches the
+    /// CALLER, so an `api_base` quoted back into it must not carry the
+    /// operator's credential.
+    ///
+    /// The userinfo check in `validate_api_base` refuses
+    /// `https://user:pass@host` without quoting it — but only a value that
+    /// HAS a scheme gets that far. Written without one, the same string fails
+    /// the scheme branch first, which used to echo it whole.
+    #[test]
+    fn a_rejected_api_base_never_quotes_the_credential_back() {
+        for base in [
+            // No scheme: hits the first branch.
+            "user:pass@upstream.example/v1",
+            "sk-live-9f2b1e@upstream.example/v1",
+            // Scheme present but no host: hits the no-host branch.
+            "https:///v1",
+        ] {
+            let err = validate_api_base("openai", base)
+                .expect_err("these are all invalid api_base values");
+            let msg = err.to_string();
+            for leak in ["pass", "sk-live-9f2b1e"] {
+                assert!(
+                    !msg.contains(leak),
+                    "the rejection quotes the credential back to the caller: {msg}"
+                );
+            }
+        }
+
+        // The diagnostic is still useful: the host survives, only the
+        // userinfo is replaced.
+        let err =
+            validate_api_base("openai", "user:pass@upstream.example/v1").expect_err("no scheme");
+        let msg = err.to_string();
+        assert!(msg.contains("upstream.example"), "{msg}");
+        assert!(msg.contains("***@"), "{msg}");
+
+        // A base with no userinfo is unchanged — the redaction must not
+        // mangle the ordinary case.
+        let err = validate_api_base("openai", "upstream.example/v1").expect_err("no scheme");
+        assert!(err.to_string().contains("upstream.example/v1"), "{err}");
     }
 }
