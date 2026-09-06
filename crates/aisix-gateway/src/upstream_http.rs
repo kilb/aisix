@@ -150,9 +150,20 @@ pub fn build_client_or_default(builder: reqwest::ClientBuilder, what: &str) -> r
             tracing::error!(
                 error = %e,
                 client = what,
-                "upstream.tls settings not applied: the configured HTTP client                  could not be built, falling back to a default one (no custom CA,                  no client identity, no verify opt-out)"
+                "upstream.tls settings not applied: the configured HTTP client                  could not be built, falling back to a minimal one (no custom CA,                  no client identity, no verify opt-out, no connection tuning)"
             );
-            reqwest::Client::new()
+            // NOT `Client::new()`. That is reqwest's default, which follows up
+            // to ten redirects — and on a cross-host hop reqwest strips only
+            // the four standard auth headers, so `x-api-key` / `api-key` ride
+            // along. The configured builder refuses redirects for exactly that
+            // reason; a degraded client that quietly re-enabled them would
+            // undo it at the worst possible moment. The redirect policy costs
+            // nothing to keep: it has nothing to do with the TLS material
+            // whose absence caused this.
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
         }
     }
 }
@@ -450,6 +461,52 @@ mod tests {
              follows up to ten hops and forwards `x-api-key` / `api-key` — \
              the operator's provider credential — to whatever an upstream \
              names in a cross-host `Location`."
+        );
+    }
+
+    /// The degraded client the fallback hands out must refuse redirects too.
+    ///
+    /// It used to be `reqwest::Client::new()` — reqwest's default, which
+    /// follows up to ten hops and strips only the four standard auth headers
+    /// cross-host, so `x-api-key` rides along. Every configured client refuses
+    /// redirects for that reason, and the one handed out when the configured
+    /// build FAILS was the one that did not: the moment things are already
+    /// going wrong is not the moment to re-enable it. The redirect policy has
+    /// nothing to do with the TLS material whose absence caused the fallback,
+    /// so keeping it costs nothing.
+    ///
+    /// Source-level, like its neighbours: `reqwest::Client` exposes none of
+    /// these settings for readback, and forcing a real build failure would
+    /// mean feeding it TLS material that fails inside reqwest rather than at
+    /// parse time.
+    #[test]
+    fn the_degraded_fallback_client_still_refuses_redirects() {
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/upstream_http.rs"))
+                .expect("this module is readable");
+        let body = src
+            .split_once("pub fn build_client_or_default(")
+            .expect("declared here")
+            .1
+            .split_once("\n}")
+            .expect("closed")
+            .0;
+        let calls: Vec<&str> = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        assert!(
+            calls.iter().any(|l| l.contains(".redirect(")),
+            "the fallback client sets no redirect policy, so a build failure \
+             silently re-enables following a cross-host `Location` with the \
+             provider credential attached"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|l| l.contains("reqwest::Client::new()") && !l.contains("unwrap_or_else")),
+            "`Client::new()` is reqwest's default and must only appear as the \
+             last-resort arm, never as the fallback itself"
         );
     }
 
