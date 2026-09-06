@@ -282,7 +282,16 @@ impl<C: Clock> RateStore for LocalStore<C> {
         match self.claims.entry(key.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(_) => false,
             dashmap::mapref::entry::Entry::Vacant(slot) => {
-                slot.insert(now.saturating_add(ttl.as_secs()));
+                // `.max(1)` mirrors the Redis side. `as_secs()` TRUNCATES, so
+                // any sub-second ttl became 0 — the marker then expired the
+                // instant it was written and `retain` above dropped it on the
+                // next call, so `claim_once` granted every time and the guard
+                // against a repeated non-idempotent side effect (a second
+                // charge) was a no-op. Redis clamps because `EX 0` is not a
+                // valid expiry; the same clamp is what keeps the two backends
+                // answering alike, which is the property the comment above is
+                // about.
+                slot.insert(now.saturating_add(ttl.as_secs().max(1)));
                 true
             }
         }
