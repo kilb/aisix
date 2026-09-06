@@ -4,6 +4,7 @@ import OpenAI, { toFile } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  scrapeMetrics,
   SeedClient,
   spawnApp,
   waitConfigPropagation,
@@ -30,6 +31,11 @@ import {
 // All calls go through the official OpenAI Node SDK (files/batches/
 // fineTuning namespaces) — the point of the surface is drop-in SDK
 // compatibility.
+
+const LIMITED_PLAINTEXT = "sk-jobs-e2e-limited";
+const LIMITED_KEY_HASH = createHash("sha256")
+  .update(LIMITED_PLAINTEXT)
+  .digest("hex");
 
 const CALLER_PLAINTEXT = "sk-jobs-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -384,6 +390,80 @@ describe("jobs e2e: /v1/files + /v1/batches + /v1/fine_tuning/jobs (#720)", () =
   // on a repeated name. So this pins both halves: the operator's header now
   // reaches the upstream, and one that collides with a gateway-owned name
   // neither wins nor doubles the value on the wire.
+  /// The jobs surface draws down the caller's rate-limit window, so it has to
+  /// report it — both halves, to the caller and to the operator.
+  ///
+  /// A source scan proves the call exists; only this proves the header lands
+  /// on a real response and the series appears in a real scrape, which is the
+  /// bar `CLAUDE.md` sets for a metric family ("shipped when an e2e asserts
+  /// it in GET /metrics after driving real traffic"). Before the fix this
+  /// endpoint spent the window silently: SDKs backed off blindly into 429s
+  /// and `aisix_ratelimit_remaining_requests` kept showing the reading from
+  /// the last chat request.
+  test("a job request reports the rate-limit window it spent", async (ctx) => {
+    if (!etcdReachable || !app || !upstream || !seed) {
+      ctx.skip();
+      return;
+    }
+
+    // An unlimited key has no window to report, so `peek` returns nothing and
+    // the assertions below would hold vacuously. This one has a ceiling.
+    await seed.createApiKey({
+      key_hash: LIMITED_KEY_HASH,
+      allowed_models: ["*"],
+      rate_limit: { rpm: 50 },
+    });
+
+    const upload = async () => {
+      const form = new FormData();
+      form.set("purpose", "batch");
+      form.set("model", "jobs-e2e-model");
+      form.set(
+        "file",
+        new Blob(['{"custom_id":"rl"}\n'], { type: "application/jsonl" }),
+        "rl.jsonl",
+      );
+      return fetch(`${app!.proxyUrl}/v1/files`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${LIMITED_PLAINTEXT}` },
+        body: form,
+      });
+    };
+
+    let resp: Response | undefined;
+    await waitConfigPropagation(async () => {
+      const r = await upload();
+      await r.arrayBuffer();
+      if (r.status !== 200) return false;
+      resp = r;
+      return true;
+    });
+
+    const limit = resp!.headers.get("x-ratelimit-limit-requests");
+    const remaining = resp!.headers.get("x-ratelimit-remaining-requests");
+    expect(limit, "the caller must be told the ceiling it counted against").toBe("50");
+    expect(
+      remaining === null ? null : Number(remaining),
+      "and what is left, so an SDK can schedule back-off from a real number",
+    ).toBeLessThan(50);
+
+    const samples = await scrapeMetrics(app.metricsUrl);
+    const gauge = samples.filter(
+      (s) => s.name === "aisix_ratelimit_remaining_requests",
+    );
+    expect(
+      gauge.length,
+      "the remaining-quota gauge must exist after job traffic, or an operator \
+       watching it sees the value from whatever hit chat last",
+    ).toBeGreaterThan(0);
+    expect(
+      gauge.some((s) => s.labels.model === "jobs-e2e-model"),
+      `the gauge must be attributed to the model the job resolved; got ${JSON.stringify(
+        gauge.map((s) => s.labels),
+      )}`,
+    ).toBe(true);
+  }, 60_000);
+
   test("provider-key headers reach the jobs upstream without doubling gateway headers", async (ctx) => {
     if (!etcdReachable || !app || !upstream) {
       ctx.skip();
