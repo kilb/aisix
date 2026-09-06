@@ -542,6 +542,30 @@ mod tests {
     /// be pure scrape noise sharing labels with real traffic.
     const NOT_METERED: &[&str] = &["/livez", "/readyz"];
 
+    /// Every protocol `inbound_protocol_for_endpoint` can return must survive
+    /// the usage sink's label bounding unchanged.
+    ///
+    /// Two closed sets, in two crates, describing the same thing: the request
+    /// and LLM families label a request with the first, and the usage-event
+    /// families with the second. When they disagree the same request carries
+    /// two different protocols and an operator cannot join the families on
+    /// it — which is what happened to `a2a`, `realtime`, `passthrough` and
+    /// `batch`, folded into `other` on one side while the other named them.
+    #[test]
+    fn inbound_protocol_label_set_covers_every_endpoint() {
+        for route in ROUTES {
+            let endpoint = crate::normalize_endpoint_label(route);
+            let protocol = crate::inbound_protocol_for_endpoint(endpoint);
+            assert_eq!(
+                aisix_obs::bounded_inbound_protocol(protocol),
+                protocol,
+                "{endpoint} 的协议标签 {protocol:?} 会被用量事件那侧折成 \
+                 {:?} —— 同一次请求在两个指标族里协议不同，join 不起来",
+                aisix_obs::bounded_inbound_protocol(protocol),
+            );
+        }
+    }
+
     /// Every route `build_router` registers must have a sample in [`ROUTES`]
     /// or an entry in [`NOT_METERED`].
     ///

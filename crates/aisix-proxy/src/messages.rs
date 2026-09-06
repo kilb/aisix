@@ -1842,11 +1842,17 @@ async fn anthropic_passthrough_dispatch(
                 // 花费指标不记、额度闸也不扣，反复触发护栏就能无上限地花运营
                 // 方在供应商那边的钱。
                 return Ok(DispatchOutcome {
+                    // **Anthropic 形状**的错误信封，不是默认那个。这个端点是原生
+                    // Anthropic：调用方的 SDK 按 `{type:"error", error:{…}}` 解析，
+                    // 而 `into_response()` 出来的是 OpenAI 形状。走成功路径返回
+                    // 意味着不再经过处理器那层错误转换，所以这里得自己转 —— 漏掉
+                    // 这一步，拦截仍然是 422、账也照记，但正文换成了另一种协议，
+                    // 而这正是主 e2e 抓到的那个回归。
                     response: ProxyError::ContentFiltered(crate::error::guardrail_block_message(
                         "response",
                         guardrail_name.as_deref(),
                     ))
-                    .into_response(),
+                    .into_anthropic_response(),
                     provider_label,
                     provider_key_id: pk_id.to_string(),
                     upstream_model,
@@ -2699,11 +2705,12 @@ async fn cross_provider_dispatch(
                 crate::chat::estimation_output_text(&resp)
             });
             return Ok(DispatchOutcome {
+                // 同上：原生 Anthropic 端点要 Anthropic 形状的信封。
                 response: ProxyError::ContentFiltered(crate::error::guardrail_block_message(
                     "response",
                     guardrail_name.as_deref(),
                 ))
-                .into_response(),
+                .into_anthropic_response(),
                 provider_label,
                 provider_key_id: provider_key_id.to_string(),
                 upstream_model,

@@ -697,6 +697,33 @@ fn log_provider_call(handler: &'static str, event: &UsageEvent) {
     );
 }
 
+/// Collapse an event's `inbound_protocol` onto the closed set the metric
+/// labels may carry.
+///
+/// The field is a `String` on the wire struct, so a future caller could put
+/// anything in it; a raw value in a Prometheus label is unbounded
+/// cardinality the recorder never reclaims. Everything outside the set
+/// buckets to `other`.
+///
+/// The set is every protocol this gateway itself produces. It used to name
+/// only three, so `a2a`, `realtime`, `passthrough` and `batch` events landed
+/// in `other` — while the request and LLM families label those same requests
+/// with their real protocol, leaving an operator unable to join the two by
+/// protocol. `inbound_protocol_label_set_covers_every_endpoint` in
+/// `aisix-proxy` holds the two in step.
+pub fn bounded_inbound_protocol(raw: &str) -> &'static str {
+    match raw {
+        "openai" => "openai",
+        "anthropic" => "anthropic",
+        "mcp" => "mcp",
+        "a2a" => "a2a",
+        "realtime" => "realtime",
+        "passthrough" => "passthrough",
+        "batch" => "batch",
+        _ => "other",
+    }
+}
+
 impl UsageSink {
     /// Build a real sink backed by an mpsc::Sender. The receiving end
     /// is owned by the worker spawned in aisix-server. No prometheus
@@ -747,12 +774,7 @@ impl UsageSink {
         // alloc per call AND pins prometheus cardinality at the type
         // level: a future caller that sets `event.inbound_protocol`
         // to user-controlled data still produces a bounded label.
-        let bounded_protocol: &'static str = match event.inbound_protocol.as_str() {
-            "openai" => "openai",
-            "anthropic" => "anthropic",
-            "mcp" => "mcp",
-            _ => "other",
-        };
+        let bounded_protocol = bounded_inbound_protocol(&event.inbound_protocol);
 
         // Bump the emit counter on *intent* — handler tried to emit.
         // Audit HIGH-1: paired with a drops counter bump on every

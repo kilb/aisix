@@ -130,6 +130,16 @@ export interface MoneyFixture {
    * —— 那是与请求路径完全不同的一条计费代码。
    */
   retrieveBatch(plaintext: string, batchId: string, model?: string): Promise<number>;
+  /**
+   * 同 `saying`，但把应答正文也带回来 —— 用来检查错误信封的**形状**，那是每个
+   * 端点自己的协议契约，和状态码是两回事。
+   */
+  sayingBody(
+    endpoint: "chat" | "messages" | "responses",
+    plaintext: string,
+    text: string,
+    model?: string,
+  ): Promise<{ status: number; body: string }>;
   /** 同 `saying`，但走流式 —— 流式记账是另一条代码路径。 */
   sayingStream(
     endpoint: "chat" | "messages" | "responses",
@@ -811,6 +821,28 @@ observability:
       model = "gpt-4o-mini",
     ) {
       return await sayingOn(endpoint, plaintext, text, model, false);
+    },
+    async sayingBody(
+      endpoint: "chat" | "messages" | "responses",
+      plaintext: string,
+      text: string,
+      model = "gpt-4o-mini",
+    ) {
+      const [path, payload] =
+        endpoint === "chat"
+          ? ["/v1/chat/completions", { model, messages: [{ role: "user", content: text }] }]
+          : endpoint === "messages"
+            ? [
+                "/v1/messages",
+                { model, max_tokens: 16, messages: [{ role: "user", content: text }] },
+              ]
+            : ["/v1/responses", { model, input: text }];
+      const r = await fetch(`http://127.0.0.1:${proxyPort}${path}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${plaintext}`, "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      return { status: r.status, body: await r.text() };
     },
     async chatModel(plaintext: string, model: string, stream = false) {
       const r = await fetch(`http://127.0.0.1:${proxyPort}/v1/chat/completions`, {

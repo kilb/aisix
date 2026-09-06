@@ -41,7 +41,7 @@ pub use sink::{
     PipelineConfig, SinkAck, SinkCapabilities, SinkContent, SinkError, SinkHandle, SinkHealth,
     SinkPipeline, SinkRecord, SinkResult, SinkStatsSnapshot, SCHEMA_VERSION,
 };
-pub use usage::{UsageEvent, UsageSink};
+pub use usage::{bounded_inbound_protocol, UsageEvent, UsageSink};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ObsError {

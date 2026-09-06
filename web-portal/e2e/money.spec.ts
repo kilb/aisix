@@ -854,6 +854,42 @@ test("被护栏拦下时_不得转移到下一个目标", async () => {
   }
 });
 
+test("被护栏拦下时_错误信封仍是该端点自己的形状", async () => {
+  // 拦截现在走的是「带着账的成功收尾路径」，也就是说不再经过处理器那层错误
+  // 转换 —— 正文得自己按端点的协议渲染。漏掉的话状态码还是 422、账也照记，
+  // 只有正文换成了另一种协议，而调用方的 SDK 正是按这个形状解析的。
+  //
+  // 这条是补上一次真实回归：把 `/v1/messages` 改成带账返回时，我用了默认的
+  // OpenAI 形状信封，主 e2e 抓到了它。money 这套当时只断言状态码和金额。
+  const cookie = await fx.sessionCookie();
+  await setQuota(1_000_000_000);
+  const k = await mint(cookie, "信封");
+
+  // 原生 Anthropic：`{type:"error", error:{type,message}}`。
+  //
+  // 两个模型都要打：`/v1/messages` 打到 OpenAI 上游走跨供应商桥接，打到
+  // Anthropic 上游走穿透，是**两处**各自构造应答的代码。只驱动一个的话，另一
+  // 处回错形状也不会有人发现 —— 计费那条用例当初就是这么漏的。
+  for (const model of ["gpt-4o-mini", "anthropic-direct"]) {
+    const anth = await fx.sayingBody("messages", k.plaintext, "forbidden-output-phrase", model);
+    expect(anth.status, `${model}: ${anth.body}`).toBe(422);
+    const a = JSON.parse(anth.body);
+    expect(a.type, `${model} 上 /v1/messages 的错误信封不是 Anthropic 形状: ${anth.body}`).toBe(
+      "error",
+    );
+    expect(a.error?.type, anth.body).toBe("invalid_request_error");
+  }
+
+  // OpenAI 形状的两个端点：`{error:{type,message}}`，没有顶层 `type`。
+  for (const ep of ["chat", "responses"] as const) {
+    const r = await fx.sayingBody(ep, k.plaintext, "forbidden-output-phrase");
+    expect(r.status, `${ep}: ${r.body}`).toBe(422);
+    const j = JSON.parse(r.body);
+    expect(j.error?.type, `${ep} 的错误信封不是 OpenAI 形状: ${r.body}`).toBeTruthy();
+    expect(j.type, `${ep} 冒出了 Anthropic 的顶层 type: ${r.body}`).toBeUndefined();
+  }
+});
+
 test("输出护栏拦截时_三个端点都按成功那样收钱", async () => {
   // 输出护栏在上游调用**之后**才判，那些 token 供应商已经收过钱了。所以被拦
   // 的一发和成功的一发对网关来说成本完全相同，两侧都得照收：花费指标（门户
