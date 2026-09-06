@@ -653,4 +653,66 @@ mod tests {
     fn urlencoding_decode(s: &str) -> String {
         s.replace('+', " ").replace("%2B", "+").replace("%2F", "/")
     }
+
+    /// The doc on `cache_key` asks the next person to add new fields to the
+    /// fingerprint. Nothing made them.
+    ///
+    /// A field left out is not a stale-cache nuisance, it is a credential
+    /// mix-up: two provider keys that differ ONLY in the omitted field
+    /// fingerprint identically, so they share one cache entry and whichever
+    /// minted first has its token handed to the other. A rotation that
+    /// touches only that field is the same bug seen from the other side —
+    /// the revoked credential keeps being used for the token's whole TTL.
+    ///
+    /// Read off the source rather than a hand-kept list, which is the thing
+    /// that fails: add a field to the struct and this test fails until
+    /// `cache_key` mentions it.
+    /// A twin of this guard lives in `aisix-provider-azure-openai`. Two
+    /// copies because the two minters are separate crates with separate
+    /// credential structs and no shared test crate — each reads only its
+    /// OWN source, so they cannot drift into checking the same thing.
+    #[test]
+    fn every_credential_field_feeds_the_cache_key() {
+        let src = include_str!("token_mint.rs");
+
+        let struct_body = src
+            .split_once("pub(crate) struct ServiceAccountKey {")
+            .expect("the credential struct is declared in this file")
+            .1
+            .split_once("\n}")
+            .expect("the struct declaration is closed")
+            .0;
+        let fields: Vec<&str> = struct_body
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("pub "))
+            .filter_map(|l| l.trim_start_matches("pub ").split(':').next())
+            .map(str::trim)
+            .collect();
+        assert!(
+            fields.len() >= 4,
+            "parsed {fields:?} out of the struct — the declaration shape changed \
+             and this guard is no longer reading it"
+        );
+
+        let key_body = src
+            .split_once("fn cache_key(&self) -> String {")
+            .expect("cache_key is declared in this file")
+            .1
+            .split_once("\n    }")
+            .expect("cache_key is closed")
+            .0;
+
+        let missing: Vec<&&str> = fields
+            .iter()
+            .filter(|f| !key_body.contains(&format!("self.{f}")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these credential fields do not feed the token-cache fingerprint: \
+             {missing:?}\n\nTwo credentials differing only in one of them share \
+             a cache entry, and one gets the other's access token. Add them to \
+             `cache_key`."
+        );
+    }
 }
