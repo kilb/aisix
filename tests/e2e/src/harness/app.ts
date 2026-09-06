@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { readdirSync, statSync } from "node:fs";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -169,6 +170,99 @@ export interface SpawnedApp {
 
 const BIN_PATH =
   process.env.AISIX_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "aisix");
+
+/// Refuse to run against a gateway binary older than the sources.
+///
+/// `BIN_PATH` above is the DEBUG build — the harness has never used
+/// `target/release`. A `cargo build --release` before a run therefore leaves
+/// this binary untouched, and 225 green files then describe whatever was last
+/// compiled into `target/debug` rather than the tree under test. That is not
+/// hypothetical: it produced a false PASS for a mutation check in this repo,
+/// which read as "the new e2e proves nothing" until the binary path was
+/// checked.
+///
+/// Skipped under `CI`, where the binary is provisioned deliberately — the
+/// `e2e` job downloads it from `build-bin` into `target/debug`, so its mtime
+/// reflects the artifact download rather than the build, and comparing it to
+/// a fresh checkout's mtimes would fire on every run. Locally, where a human
+/// forgets to rebuild, is the only place the comparison carries information.
+///
+/// Only real build inputs count: `crates/*/src/**/*.rs` plus the manifests.
+/// Generated output is deliberately excluded — the money fixture includes
+/// `schemas/`, and regenerating those with identical content made every
+/// binary look stale.
+function assertGatewayBinaryIsFresh(bin: string): void {
+  if (process.env.CI) return;
+
+  let binTime: number;
+  try {
+    binTime = statSync(bin).mtimeMs;
+  } catch {
+    throw new Error(
+      `${bin} does not exist.\n` +
+        `Build it first: cargo build -p aisix-server (the harness runs the ` +
+        `DEBUG binary, not --release).`,
+    );
+  }
+
+  const root = join(process.cwd(), "..", "..");
+  let newest = 0;
+  let newestFile = "";
+  const consider = (file: string) => {
+    const t = statSync(file).mtimeMs;
+    if (t > newest) {
+      newest = t;
+      newestFile = file;
+    }
+  };
+  const walk = (dir: string) => {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const full = join(dir, e.name);
+      if (e.isDirectory()) {
+        walk(full);
+      } else if (e.name.endsWith(".rs")) {
+        consider(full);
+      }
+    }
+  };
+  let crates;
+  try {
+    crates = readdirSync(join(root, "crates"), { withFileTypes: true });
+  } catch {
+    return; // not a source checkout; nothing to compare against
+  }
+  for (const c of crates) {
+    if (!c.isDirectory()) continue;
+    walk(join(root, "crates", c.name, "src"));
+    try {
+      consider(join(root, "crates", c.name, "Cargo.toml"));
+    } catch {
+      /* crate without a manifest is not ours to judge */
+    }
+  }
+  for (const f of ["Cargo.toml", "Cargo.lock"]) {
+    try {
+      consider(join(root, f));
+    } catch {
+      /* absent in some checkouts */
+    }
+  }
+
+  if (newest > binTime) {
+    throw new Error(
+      `${bin} is older than ${newestFile} — the suite would be describing ` +
+        `the last build, not this tree.\n` +
+        `Rebuild it: cargo build -p aisix-server (DEBUG; the harness never ` +
+        `loads target/release).`,
+    );
+  }
+}
 /**
  * How long to wait for a spawned binary to bind its listeners.
  *
@@ -371,6 +465,7 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     childEnv[k] = v;
   }
 
+  assertGatewayBinaryIsFresh(BIN_PATH);
   const child = spawn(BIN_PATH, ["--config", cfgPath], {
     stdio: ["ignore", "pipe", "pipe"],
     env: childEnv,
