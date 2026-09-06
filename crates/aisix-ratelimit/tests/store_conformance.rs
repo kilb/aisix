@@ -277,3 +277,50 @@ async fn a_sub_second_ttl_still_holds_the_marker() {
          deadline — that turns the one-shot guard into no guard"
     );
 }
+
+/// A cumulative allowance survives bucket reclamation on BOTH stores.
+///
+/// `granted_micro_usd` has no window and never rolls, so anything that drops
+/// it hands the caller the whole allowance back. Redis says so in the Lua
+/// that writes the counter — no EXPIRE, because an expiry "degrades it into a
+/// cap" — while the local store reclaimed the whole bucket on idle, which is
+/// that expiry by another name. Nothing compared the two.
+#[tokio::test]
+async fn a_cumulative_allowance_survives_reaping_on_both_stores() {
+    both("cumulative allowance vs reap", |store| async move {
+        let limits = RateLimit {
+            granted_micro_usd: Some(1_000),
+            ..RateLimit::default()
+        };
+        let mut out = Vec::new();
+        store
+            .acquire("k-granted", &limits, "m")
+            .await
+            .expect("first call is inside the allowance");
+        // Spend past it. `commit`'s number is what the layer counts, and for
+        // the spend layer that is micro-USD — committing 0 would consume
+        // nothing and leave this whole case proving nothing.
+        store.commit("k-granted", 1_500, "m").await;
+        out.push(format!(
+            "after_spend={}",
+            store.acquire("k-granted", &limits, "m").await.is_ok()
+        ));
+        // Reclaim idle buckets, as the gateway does every five minutes.
+        //
+        // The sleep is load-bearing and is NOT a tight timing assertion:
+        // `reap` compares `last_touched >= now - idle_for`, and the commit
+        // above set `last_touched` to the current second — so reaping in the
+        // same second reclaims nothing and this case would pass no matter
+        // what the store does. Waiting past a second-boundary makes the
+        // bucket genuinely idle. A slower machine only makes it more idle,
+        // so there is nothing here to flake.
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        store.reap(Duration::from_secs(0));
+        out.push(format!(
+            "after_reap={}",
+            store.acquire("k-granted", &limits, "m").await.is_ok()
+        ));
+        out
+    })
+    .await;
+}

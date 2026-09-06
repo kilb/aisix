@@ -115,7 +115,25 @@ impl<C: Clock> LocalStore<C> {
         let cutoff = self.clock.unix_secs().saturating_sub(idle_for.as_secs());
         self.states.retain(|_, state| {
             let s = state.lock();
-            s.in_flight > 0 || s.last_touched >= cutoff
+            // `consumed_micro_usd` has NO window and never rolls, so dropping
+            // it is not reclaiming a stale bucket — it is handing the caller
+            // their whole `granted_micro_usd` back. The idle threshold is
+            // chosen so it "can never drop a bucket whose daily window is
+            // still open", which is the right rule for rpm/rph/rpd and simply
+            // does not apply to a lifetime total: a key that goes quiet for a
+            // day would come back with the allowance refilled, turning a
+            // cumulative cap into a per-active-day one.
+            //
+            // The Redis side already states this rule, in the Lua that writes
+            // the counter: cumulative spend takes no window and no EXPIRE,
+            // "setting an expiry degrades it into a cap". Reaping the bucket
+            // is that expiry by another name.
+            //
+            // Keeping these does not make the map grow with traffic: it is
+            // keyed by configured identities (api key / model / policy), so
+            // the survivors are bounded by the configuration, and only the
+            // ones that actually spent anything survive.
+            s.in_flight > 0 || s.last_touched >= cutoff || s.consumed_micro_usd > 0
         });
     }
 }
@@ -639,5 +657,47 @@ mod allowance_tests {
         // 跨天：窗口回来了，累计额还剩 8800，所以放行。
         clock.set(DAY_SECS + 10);
         s.acquire("k", &both, "").await.unwrap();
+    }
+
+    /// Reaping an idle bucket must not hand back a CUMULATIVE allowance.
+    ///
+    /// `reap` exists for the windowed counters, and its rationale says so:
+    /// one day plus a margin, "so it can never drop a bucket whose daily
+    /// window is still open" — a bucket idle longer than that has rolled and
+    /// carries nothing worth keeping. True of rpm/rph/rpd. NOT true of
+    /// `consumed_micro_usd`, which has no window and never rolls: dropping it
+    /// resets the spend to zero and gives the caller their whole
+    /// `granted_micro_usd` back.
+    ///
+    /// That turns a lifetime allowance into a per-active-day one, silently,
+    /// for any key that goes quiet for a day.
+    #[tokio::test]
+    async fn 回收闲置桶不能把累计额度还回去() {
+        let clock = TestClock::new(0);
+        let s = LocalStore::with_clock(clock.clone());
+        let lim = granted(1_000);
+
+        s.acquire("k", &lim, "").await.unwrap();
+        s.commit("k", 1_500, "").await;
+        assert!(
+            matches!(
+                s.acquire("k", &lim, "").await,
+                Err(RateLimitError::AllowanceExhausted)
+            ),
+            "spent past the allowance, so it must refuse"
+        );
+
+        // 闲置超过回收阈值，然后回收 —— 生产里每 5 分钟跑一次。
+        clock.set(DAY_SECS + 3600);
+        s.reap(std::time::Duration::from_secs(DAY_SECS + 300));
+
+        assert!(
+            matches!(
+                s.acquire("k", &lim, "").await,
+                Err(RateLimitError::AllowanceExhausted)
+            ),
+            "the allowance is cumulative — going quiet for a day must not \
+             refill it"
+        );
     }
 }
