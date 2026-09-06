@@ -251,8 +251,11 @@ test("每把密钥的额度各自收口_且各把之和不得超过总额度", a
   await setQuota(1_000_000_000);
   const a = await mint(cookie, "甲");
   const b = await mint(cookie, "乙");
-  await waitFor(async () => (await fx.chatWith(a.plaintext)) === 200, "新铸的密钥被启用");
-  expect(await fx.chatWith(b.plaintext)).toBe(200);
+  // 两把都要等：它们是先后铸的，如果快照重载正好插在中间，甲已经生效而乙
+  // 还没有——原先这里只等甲、然后直接断言乙，于是偶发地在乙生效之前就断言
+  // 了。断言本身没变，变的是「等的东西和断言的东西对上」。
+  await waitFor(async () => (await fx.chatWith(a.plaintext)) === 200, "新铸的密钥甲被启用");
+  await waitFor(async () => (await fx.chatWith(b.plaintext)) === 200, "新铸的密钥乙被启用");
 
   // 给甲设 $2 —— 每次调用 $1，它很快就该自己撞墙；乙不设限。
   expect((await setKeyQuota(cookie, a.name, 2_000_000)).status).toBe(200);
