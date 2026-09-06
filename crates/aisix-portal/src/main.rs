@@ -504,6 +504,120 @@ mod tests {
     use super::testutil::TestApp;
     use serde_json::json;
 
+    /// 每条路由的处理器都要查身份，公开的那两条除外且写明理由。
+    ///
+    /// 身份检查写在函数体里（`session_user` / `admin_ok`），不是路由层 —— 新加
+    /// 一条路由忘了那一行照样编译、照样注册，而这个服务管的是用户余额和密钥
+    /// 铸造。控制台和 Admin 各有一条同样的守卫；这是第三处同形态的地方。
+    #[test]
+    fn 每条路由都要查身份() {
+        /// 公开路由，各带理由。
+        const PUBLIC: &[(&str, &str)] = &[
+            ("/api/register", "开户那一条，按定义在身份之前"),
+            ("/api/login", "建立会话的那一条，同上"),
+            ("/api/logout", "清掉会话；没有会话时它无事可做"),
+        ];
+        /// 处理器是闭包、按名字查不到的路由。闭包查不到就必须在这里点名 ——
+        /// 否则「查不到」会被当成「不用查」，那才是真正的洞。
+        const INLINE_HANDLER: &[(&str, &str)] = &[
+            (
+                "/metrics",
+                "另一个 router，单独监听（默认只在环回），里面是运维数据，\
+                 租户打不到",
+            ),
+            (
+                "/api/v1/query",
+                "测试里的 Prometheus 替身，不是这个服务对外的路由",
+            ),
+        ];
+
+        let src = include_str!("main.rs");
+        let production = src
+            .split_once("\n#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(src);
+
+        // `.route("<path>", get(m::f).post(m::g))` → (path, [f, g])
+        let mut pairs: Vec<(String, Vec<String>)> = Vec::new();
+        for hit in production.match_indices(".route(") {
+            let rest = &production[hit.0..];
+            let Some(end) = rest.find(")\n").or_else(|| rest.find(");")) else {
+                continue;
+            };
+            let chunk = &rest[..end];
+            let Some(path) = chunk.split('"').nth(1) else {
+                continue;
+            };
+            let mut handlers = Vec::new();
+            for verb in ["get(", "post(", "put(", "delete(", "patch("] {
+                for m in chunk.match_indices(verb) {
+                    let after = &chunk[m.0 + verb.len()..];
+                    let ident: String = after
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+                        .collect();
+                    // `keys::list` → `list`
+                    if let Some(name) = ident.rsplit("::").next() {
+                        if !name.is_empty() {
+                            handlers.push(name.to_string());
+                        }
+                    }
+                }
+            }
+            pairs.push((path.to_string(), handlers));
+        }
+        assert!(
+            pairs.len() >= 10,
+            "只认出 {} 条路由，抽取多半坏了",
+            pairs.len()
+        );
+
+        // 处理器散在几个模块里，所以按名字在整个 src/ 里找它的函数体。
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let sources: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read src/")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .map(|src| {
+                src.split_once("\n#[cfg(test)]")
+                    .map(|(a, _)| a.to_string())
+                    .unwrap_or(src)
+            })
+            .collect();
+
+        let body_of = |name: &str| -> String {
+            let needle = format!("pub async fn {name}(");
+            for src in &sources {
+                if let Some((_, rest)) = src.split_once(&needle) {
+                    if let Some((body, _)) = rest.split_once("\n}\n") {
+                        return body.to_string();
+                    }
+                }
+            }
+            panic!("找不到处理器 {name}");
+        };
+
+        for (path, handlers) in &pairs {
+            if PUBLIC.iter().any(|(p, _)| p == path)
+                || INLINE_HANDLER.iter().any(|(p, _)| p == path)
+            {
+                continue;
+            }
+            assert!(!handlers.is_empty(), "路由 {path} 没认出处理器");
+            for h in handlers {
+                let body = body_of(h);
+                assert!(
+                    body.contains("session_user(") || body.contains("admin_ok("),
+                    "{path} 的处理器 {h} 既没查会话也没查管理员令牌 —— 它对任何\
+                     能连到这个端口的人开放，而这里管着用户余额与密钥铸造。真要\
+                     公开就加进 PUBLIC 并写明理由。",
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn 口令以_argon2_落库_绝不明文() {
         let app = TestApp::start().await;
