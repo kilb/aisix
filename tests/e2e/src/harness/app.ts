@@ -191,6 +191,19 @@ const BIN_PATH =
 /// Generated output is deliberately excluded — the money fixture includes
 /// `schemas/`, and regenerating those with identical content made every
 /// binary look stale.
+/**
+ * When this module was loaded — i.e. roughly when the run started.
+ *
+ * Used only to tell two very different situations apart in the failure
+ * message: a binary that was stale before the run began (rebuild and
+ * re-run), versus a tree edited WHILE the run was in flight, which makes
+ * every later spawn fail and turns one clear signal into a screen of
+ * cascading failures. Both are real staleness and both still fail — the
+ * second one just needs to say so, or the reader goes looking for a product
+ * regression that is not there.
+ */
+const RUN_STARTED_MS = Date.now();
+
 function assertGatewayBinaryIsFresh(bin: string): void {
   if (process.env.CI) return;
 
@@ -255,9 +268,15 @@ function assertGatewayBinaryIsFresh(bin: string): void {
   }
 
   if (newest > binTime) {
+    const editedMidRun = newest > RUN_STARTED_MS;
     throw new Error(
       `${bin} is older than ${newestFile} — the suite would be describing ` +
         `the last build, not this tree.\n` +
+        (editedMidRun
+          ? `${newestFile} changed AFTER this run started, so every case ` +
+            `from here on fails this check. Nothing is wrong with the ` +
+            `product: finish the edit, rebuild, and re-run.\n`
+          : "") +
         `Rebuild it: cargo build -p aisix-server (DEBUG; the harness never ` +
         `loads target/release).`,
     );

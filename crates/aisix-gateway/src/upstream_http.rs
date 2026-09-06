@@ -536,14 +536,30 @@ mod tests {
             .split_once("\n}")
             .expect("build_http_client is closed")
             .0;
+        let code: Vec<&str> = builder
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
         assert!(
-            builder
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .any(|l| l.contains(".redirect(")),
+            code.iter().any(|l| l.contains(".redirect(")),
             "the MCP bridge client sets no redirect policy, so an MCP server \
              answering a cross-host `Location` receives the gateway-held \
              `x-api-key` it was dialled with"
+        );
+        // The same rule `build_client_or_default` is held to above, and for
+        // the same reason. Asking only "does `.redirect(` appear somewhere in
+        // this function" is what let the gap survive: the policy was on the
+        // configured builder while the degraded arm — reached whenever the
+        // operator's TLS material fails to apply, which this function logs
+        // and continues past — handed back a bare `Client::new()` carrying
+        // reqwest's follow-ten default.
+        assert!(
+            !code
+                .iter()
+                .any(|l| l.contains("Client::new()") && !l.contains("unwrap_or_else")),
+            "`Client::new()` is reqwest's default, redirects included — it \
+             may only appear as the last-resort arm of an `unwrap_or_else`, \
+             never as the fallback client itself"
         );
     }
 

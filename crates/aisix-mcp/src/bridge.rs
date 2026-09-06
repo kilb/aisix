@@ -142,14 +142,24 @@ fn build_http_client(disable_env_proxy: bool) -> rmcp_reqwest::Client {
     // 的代理、或者对内部 CA 签发的证书连不上，而运维看不到任何线索。
     //
     // 这里不返回 Err：调用方拿不到可处理的失败，一个不带自定义设置的客户端
-    // 仍然比没有客户端强（它只会更严，不会更松 —— `verify: false` 也一并丢
-    // 掉了）。所以出声就是能做的全部。
+    // 仍然比没有客户端强。丢掉的那些设置里，`verify: false` 也一并丢掉了，
+    // 所以在 TLS 这一侧确实只会更严。
+    //
+    // 但**重定向策略是例外**，而且方向相反：`Client::new()` 拿的是 reqwest
+    // 的默认策略，会跟最多十跳，跨主机只剥掉四个标准认证头 —— 上面那段注释
+    // 说明了为什么这对本客户端是个洞：它带的是 `API_KEY_HEADER`
+    // （`x-api-key`，自定义头），一台 MCP 服务器回 `302 Location:` 就能把网关
+    // 持有的上游密钥送到它指定的任何地方。所以兜底客户端必须自己重新声明这
+    // 条策略，不能靠“默认更严”。
     b.build().unwrap_or_else(|e| {
         tracing::error!(
             error = %e,
             "upstream.tls settings not applied to MCP upstream connections: the              configured client could not be built, falling back to a default one              (no custom CA, no client identity, no proxy opt-out)"
         );
-        rmcp_reqwest::Client::new()
+        rmcp_reqwest::Client::builder()
+            .redirect(rmcp_reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|_| rmcp_reqwest::Client::new())
     })
 }
 
