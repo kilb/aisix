@@ -30,6 +30,7 @@
 //!   the new master through the sentinels.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use aisix_core::{RedisConnConfig, RedisMode};
 use redis::aio::{ConnectionLike, ConnectionManager, MultiplexedConnection};
@@ -137,6 +138,50 @@ impl ConnectionLike for RedisConnHandle {
     }
 }
 
+/// How long one command may wait for its reply before the call gives up.
+///
+/// redis-rs defaults BOTH timeouts to `None` in every mode
+/// (`ConnectionManagerConfig::DEFAULT_RESPONSE_TIMEOUT`, and the cluster
+/// builder documents its own as "if enabled"), so without this a command
+/// against a Redis that accepts the connection and then stops answering —
+/// a failover, a security-group change, any blackhole — never returns.
+///
+/// Every consumer of this connection is on the request hot path and every
+/// one of them is written to DEGRADE when Redis is unavailable: the
+/// rate-limit store falls open to per-replica counting, the response cache
+/// and the semantic cache fall back to a miss. None of those paths is
+/// reachable while the await has not returned, so an unbounded wait does
+/// not merely delay the fallback — it replaces "fail open" with "hang",
+/// which is the opposite of what all three are documented to do.
+///
+/// One second is roughly two orders of magnitude above a healthy in-
+/// deployment round trip. The trade-off is deliberate and one-sided: a
+/// Redis slower than this is already failing the request it is holding up,
+/// and the degraded path it falls into is the one the operator is alerted
+/// on (`aisix_redis_failures_total`).
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Same reasoning for the TCP + handshake leg of a reconnect.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Cap on the reconnect backoff. The default ladder (`factor` 100ms,
+/// `exponent_base` 2, six retries, no cap) reaches 3.2s on its last step
+/// and sums to ~6.3s — paid by whichever request is waiting when the
+/// manager decides to reconnect.
+const MAX_RECONNECT_DELAY_MS: u64 = 1_000;
+
+/// How many times the manager re-attempts the connection before the command
+/// waiting on it gives up.
+///
+/// The default is six, and the ladder is paid by whichever request happens to
+/// be in flight when the manager decides to reconnect — measured at ~16s
+/// end-to-end against a silent server even with the two timeouts above set.
+/// Two keeps the worst case near three seconds. Fewer retries mean more
+/// reconnect attempts over a long outage, which is the right trade for a
+/// dependency every consumer is written to do without: the local fallback is
+/// correct and immediate, and waiting is not.
+const RECONNECT_RETRIES: usize = 2;
+
 /// Build a [`RedisConn`] from operator config. Validates connectivity
 /// eagerly: a single/cluster handshake or an initial sentinel master
 /// resolution must succeed, so a misconfigured backend fails at boot
@@ -151,7 +196,15 @@ pub async fn connect(cfg: &RedisConnConfig) -> RedisResult<RedisConn> {
                 Some(certs) => redis::Client::build_with_tls(url.as_str(), certs.clone())?,
                 None => redis::Client::open(url.as_str())?,
             };
-            let conn = ConnectionManager::new(client).await?;
+            let conn = ConnectionManager::new_with_config(
+                client,
+                redis::aio::ConnectionManagerConfig::new()
+                    .set_response_timeout(RESPONSE_TIMEOUT)
+                    .set_connection_timeout(CONNECT_TIMEOUT)
+                    .set_max_delay(MAX_RECONNECT_DELAY_MS)
+                    .set_number_of_retries(RECONNECT_RETRIES),
+            )
+            .await?;
             tracing::info!(target: "aisix::redis", mode = "single", "connected");
             Ok(RedisConn::Single(conn))
         }
@@ -166,7 +219,9 @@ pub async fn connect(cfg: &RedisConnConfig) -> RedisResult<RedisConn> {
             // ACL creds for the nodes can travel in the node URLs, or be
             // set explicitly here (applied to every node). Cluster has no
             // DB index, so `database` is ignored in this mode.
-            let mut builder = ClusterClient::builder(nodes);
+            let mut builder = ClusterClient::builder(nodes)
+                .response_timeout(RESPONSE_TIMEOUT)
+                .connection_timeout(CONNECT_TIMEOUT);
             if let Some(u) = &cfg.username {
                 builder = builder.username(u.clone());
             }
@@ -240,6 +295,10 @@ pub async fn connect(cfg: &RedisConnConfig) -> RedisResult<RedisConn> {
                 tls_mode,
                 redis_connection_info,
             };
+            // `SentinelClient::build` accepts no timeouts, and neither does the
+            // master connection it opens after discovery — so in THIS mode the
+            // bound above does not apply and a blackholed master can still
+            // stall. Said out loud rather than left to look covered.
             let mut client = SentinelClient::build(
                 sentinels,
                 master_name,

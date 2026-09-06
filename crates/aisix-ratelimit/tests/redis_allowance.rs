@@ -117,6 +117,21 @@ impl Redis {
         self.url.clone()
     }
 
+    /// 把自己起的那台 Redis 打掉，模拟运行中的中断。
+    ///
+    /// 只对自己起的实例有效 —— 共用那台不能动，所以用到它的用例在
+    /// `RATELIMIT_TEST_REDIS_URL` 下会跳过（并说明为什么）。
+    fn kill_owned(&mut self) -> bool {
+        match self.owned.as_mut() {
+            Some((child, _)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                true
+            }
+            None => false,
+        }
+    }
+
     async fn wait_ready(&self) -> bool {
         for _ in 0..100 {
             if let Ok(client) = redis::Client::open(self.url()) {
@@ -372,5 +387,91 @@ async fn 一次性标记跨实例只发一次() {
     assert!(
         secs > 0 && secs <= 600,
         "标记键的 TTL 不对（{secs}）—— -1 表示永不过期，那是泄漏"
+    );
+}
+
+/// Redis 挂掉时限流器**放行**（fail-open），并且这件事被计量出来。
+///
+/// 放行本身是有意的：共享计数器不可达时把所有流量拒掉，等于让一次 Redis 故障
+/// 变成一次全站宕机。代价是故障期间集群级限额不再生效 —— 每个副本各算各的。
+/// 所以这不是一个可以静悄悄发生的降级，运维必须能看见它，而唯一的看见方式就是
+/// `record_redis_failure` 这个计数。
+///
+/// 之前没有任何测试断言它被调用过：这个 crate 里唯一实现了这个方法的测试 sink
+/// 是空实现。少这一笔的症状是「一条永远不出现的曲线」，和「Redis 从没坏过」
+/// 长得一模一样。
+#[tokio::test]
+async fn a_dead_redis_falls_open_and_says_so() {
+    let Some(mut redis) = Redis::start() else {
+        eprintln!("跳过：既没有 RATELIMIT_TEST_REDIS_URL，也没有 redis-server");
+        return;
+    };
+    if !redis.wait_ready().await {
+        panic!("redis 起来了却 PING 不通 —— 环境问题，不静默跳过");
+    }
+
+    #[derive(Default)]
+    struct FailureSink {
+        ops: std::sync::Mutex<Vec<String>>,
+    }
+    impl aisix_core::RateLimitMetricsSink for FailureSink {
+        fn record_redis_failure(&self, op: &str) {
+            self.ops.lock().expect("sink").push(op.to_string());
+        }
+        fn record_post_stream_shed(&self, _dropped: u64) {}
+    }
+
+    let sink = std::sync::Arc::new(FailureSink::default());
+    let store = store(&redis).await.with_metrics(sink.clone());
+
+    let limits = RateLimit {
+        rpm: Some(1_000),
+        ..RateLimit::default()
+    };
+    let key = "fail-open-key";
+
+    // 先证明连着的时候是真的走 Redis：这一步不成立的话，后面「挂掉之后还放行」
+    // 什么都证明不了。
+    store
+        .acquire(key, &limits, "m-1")
+        .await
+        .expect("healthy redis admits the first request");
+    assert!(
+        sink.ops.lock().expect("sink").is_empty(),
+        "a healthy redis must not be counted as a failure"
+    );
+
+    if !redis.kill_owned() {
+        eprintln!("跳过后半段：共用的 Redis 不能打掉（RATELIMIT_TEST_REDIS_URL）");
+        return;
+    }
+
+    // 断开之后：这一次调用必须**及时**返回并放行，同时把降级记上一笔。
+    //
+    // 「及时」是断言的一部分，不是背景。第一版这里写的是「最多重试 20 次直到
+    // 计数出现」，结果整个用例挂死了十几分钟 —— 因为 redis-rs 默认既没有命令
+    // 超时也没有连接超时，每一次失败的 acquire 都在重连阶梯上排队。挂死本身
+    // 就是要证的东西：一个不封顶的等待不是 fail-open，是 hang。上界现在由
+    // `aisix-redis` 里那三个常量兜住（见 `blackhole_timeout` 用例）。
+    let started = std::time::Instant::now();
+    store
+        .acquire(key, &limits, "m-after")
+        .await
+        .expect("a dead redis must FALL OPEN, not refuse the request");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "falling open took {elapsed:?} — the caller waits through all of it \
+         before the local counter takes over"
+    );
+    let ops = sink.ops.lock().expect("sink").clone();
+    assert!(
+        !ops.is_empty(),
+        "the store fell open without counting it — an operator cannot tell \
+         a degraded cluster from a quiet one; got {ops:?}"
+    );
+    assert!(
+        ops.iter().any(|o| o == "acquire"),
+        "the failure must name the operation that degraded; got {ops:?}"
     );
 }
