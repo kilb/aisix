@@ -109,11 +109,21 @@ impl Drop for Redis {
     }
 }
 
-/// Run `scenario` against both stores and require the same answer.
+/// Run `scenario` against both stores and require the same answer — and
+/// require that answer to be `expected`.
 ///
 /// The scenario returns a comparable transcript rather than asserting inside,
 /// so a divergence names WHAT differed instead of just which store failed.
-async fn both<F, Fut>(label: &str, scenario: F)
+///
+/// `expected` is the half that agreement alone cannot give. A pure
+/// conformance check passes whenever the two stores are wrong TOGETHER, which
+/// is precisely what a regression in shared logic — or in the trait's
+/// contract — produces: `a_one_shot_claim_is_granted_exactly_once` would
+/// still pass if `claim_once` denied every claim on both sides. So each
+/// scenario states the transcript its own limits imply (rpm(2) over four
+/// acquires is `true,true,false,false` on any correct store), and the two
+/// implementations are then held to it rather than only to each other.
+async fn both<F, Fut>(label: &str, expected: &[&str], scenario: F)
 where
     F: Fn(std::sync::Arc<dyn RateStore>) -> Fut,
     Fut: std::future::Future<Output = Vec<String>>,
@@ -145,6 +155,11 @@ where
         "{label}: the two stores disagree — a caller's experience should differ \
          between them only in SCOPE (per-replica vs shared), never in semantics"
     );
+    assert_eq!(
+        from_local, expected,
+        "{label}: both stores agree, and both are wrong — the transcript this \
+         scenario's own limits imply is `{expected:?}`"
+    );
 }
 
 fn rpm(n: u64) -> RateLimit {
@@ -156,22 +171,31 @@ fn rpm(n: u64) -> RateLimit {
 
 #[tokio::test]
 async fn a_request_ceiling_admits_and_refuses_identically() {
-    both("rpm ceiling", |store| async move {
-        let limits = rpm(2);
-        let mut out = Vec::new();
-        for i in 0..4 {
-            let member = format!("m{i}");
-            let verdict = store.acquire("k-ceiling", &limits, &member).await;
-            out.push(format!("acquire{i}={}", verdict.is_ok()));
-        }
-        out
-    })
+    both(
+        "rpm ceiling",
+        &[
+            "acquire0=true",
+            "acquire1=true",
+            "acquire2=false",
+            "acquire3=false",
+        ],
+        |store| async move {
+            let limits = rpm(2);
+            let mut out = Vec::new();
+            for i in 0..4 {
+                let member = format!("m{i}");
+                let verdict = store.acquire("k-ceiling", &limits, &member).await;
+                out.push(format!("acquire{i}={}", verdict.is_ok()));
+            }
+            out
+        },
+    )
     .await;
 }
 
 #[tokio::test]
 async fn peek_reports_the_same_remaining_after_the_same_traffic() {
-    both("peek", |store| async move {
+    both("peek", &["rpm_remaining=Some(2)"], |store| async move {
         let limits = rpm(5);
         let mut out = Vec::new();
         for i in 0..3 {
@@ -189,31 +213,35 @@ async fn peek_reports_the_same_remaining_after_the_same_traffic() {
 
 #[tokio::test]
 async fn a_one_shot_claim_is_granted_exactly_once() {
-    both("claim_once", |store| async move {
-        let mut out = Vec::new();
-        for i in 0..3 {
+    both(
+        "claim_once",
+        &["claim0=true", "claim1=false", "claim2=false", "other=true"],
+        |store| async move {
+            let mut out = Vec::new();
+            for i in 0..3 {
+                out.push(format!(
+                    "claim{i}={}",
+                    store.claim_once("k-claim", Duration::from_secs(60)).await
+                ));
+            }
             out.push(format!(
-                "claim{i}={}",
-                store.claim_once("k-claim", Duration::from_secs(60)).await
+                "other={}",
+                store
+                    .claim_once("k-claim-other", Duration::from_secs(60))
+                    .await
             ));
-        }
-        out.push(format!(
-            "other={}",
-            store
-                .claim_once("k-claim-other", Duration::from_secs(60))
-                .await
-        ));
 
-        // Expiry TIMING is deliberately not compared here. The local
-        // deadline is floored unix SECONDS while `EX` is real time, so the
-        // local window can lapse up to a second early — a genuine granularity
-        // difference, not a semantic one, and pinning it with real sleeps
-        // produces a test that fails under load rather than one that finds
-        // bugs. The property that actually went wrong once — a DENIED claim
-        // extending the deadline — is pinned exactly, on the injectable
-        // clock, in `a_denied_claim_never_extends_the_deadline` below.
-        out
-    })
+            // Expiry TIMING is deliberately not compared here. The local
+            // deadline is floored unix SECONDS while `EX` is real time, so the
+            // local window can lapse up to a second early — a genuine granularity
+            // difference, not a semantic one, and pinning it with real sleeps
+            // produces a test that fails under load rather than one that finds
+            // bugs. The property that actually went wrong once — a DENIED claim
+            // extending the deadline — is pinned exactly, on the injectable
+            // clock, in `a_denied_claim_never_extends_the_deadline` below.
+            out
+        },
+    )
     .await;
 }
 
@@ -287,41 +315,45 @@ async fn a_sub_second_ttl_still_holds_the_marker() {
 /// that expiry by another name. Nothing compared the two.
 #[tokio::test]
 async fn a_cumulative_allowance_survives_reaping_on_both_stores() {
-    both("cumulative allowance vs reap", |store| async move {
-        let limits = RateLimit {
-            granted_micro_usd: Some(1_000),
-            ..RateLimit::default()
-        };
-        let mut out = Vec::new();
-        store
-            .acquire("k-granted", &limits, "m")
-            .await
-            .expect("first call is inside the allowance");
-        // Spend past it. `commit`'s number is what the layer counts, and for
-        // the spend layer that is micro-USD — committing 0 would consume
-        // nothing and leave this whole case proving nothing.
-        store.commit("k-granted", 1_500, "m").await;
-        out.push(format!(
-            "after_spend={}",
-            store.acquire("k-granted", &limits, "m").await.is_ok()
-        ));
-        // Reclaim idle buckets, as the gateway does every five minutes.
-        //
-        // The sleep is load-bearing and is NOT a tight timing assertion:
-        // `reap` compares `last_touched >= now - idle_for`, and the commit
-        // above set `last_touched` to the current second — so reaping in the
-        // same second reclaims nothing and this case would pass no matter
-        // what the store does. Waiting past a second-boundary makes the
-        // bucket genuinely idle. A slower machine only makes it more idle,
-        // so there is nothing here to flake.
-        tokio::time::sleep(Duration::from_millis(1_100)).await;
-        store.reap(Duration::from_secs(0));
-        out.push(format!(
-            "after_reap={}",
-            store.acquire("k-granted", &limits, "m").await.is_ok()
-        ));
-        out
-    })
+    both(
+        "cumulative allowance vs reap",
+        &["after_spend=false", "after_reap=false"],
+        |store| async move {
+            let limits = RateLimit {
+                granted_micro_usd: Some(1_000),
+                ..RateLimit::default()
+            };
+            let mut out = Vec::new();
+            store
+                .acquire("k-granted", &limits, "m")
+                .await
+                .expect("first call is inside the allowance");
+            // Spend past it. `commit`'s number is what the layer counts, and for
+            // the spend layer that is micro-USD — committing 0 would consume
+            // nothing and leave this whole case proving nothing.
+            store.commit("k-granted", 1_500, "m").await;
+            out.push(format!(
+                "after_spend={}",
+                store.acquire("k-granted", &limits, "m").await.is_ok()
+            ));
+            // Reclaim idle buckets, as the gateway does every five minutes.
+            //
+            // The sleep is load-bearing and is NOT a tight timing assertion:
+            // `reap` compares `last_touched >= now - idle_for`, and the commit
+            // above set `last_touched` to the current second — so reaping in the
+            // same second reclaims nothing and this case would pass no matter
+            // what the store does. Waiting past a second-boundary makes the
+            // bucket genuinely idle. A slower machine only makes it more idle,
+            // so there is nothing here to flake.
+            tokio::time::sleep(Duration::from_millis(1_100)).await;
+            store.reap(Duration::from_secs(0));
+            out.push(format!(
+                "after_reap={}",
+                store.acquire("k-granted", &limits, "m").await.is_ok()
+            ));
+            out
+        },
+    )
     .await;
 }
 
@@ -332,42 +364,52 @@ async fn a_cumulative_allowance_survives_reaping_on_both_stores() {
 /// the shape where they can drift apart while each side's own tests pass.
 #[tokio::test]
 async fn concurrency_admits_and_releases_identically() {
-    both("concurrency", |store| async move {
-        let limits = RateLimit {
-            concurrency: Some(2),
-            ..RateLimit::default()
-        };
-        let mut out = Vec::new();
-        for i in 0..3 {
+    both(
+        "concurrency",
+        &[
+            "acquire0=true",
+            "acquire1=true",
+            "acquire2=false",
+            "after_release=true",
+            "and_no_more=false",
+        ],
+        |store| async move {
+            let limits = RateLimit {
+                concurrency: Some(2),
+                ..RateLimit::default()
+            };
+            let mut out = Vec::new();
+            for i in 0..3 {
+                out.push(format!(
+                    "acquire{i}={}",
+                    store
+                        .acquire("k-conc", &limits, &format!("m{i}"))
+                        .await
+                        .is_ok()
+                ));
+            }
+            // Freeing one slot admits exactly one more.
+            //
+            // `RedisStore::release` is a SYNC trait method that spawns its `ZREM`,
+            // because releasing a shared slot needs I/O it cannot await here — so
+            // the freed slot becomes visible a moment later. That is a deliberate
+            // difference in TIMING, not in semantics, and asserting immediately
+            // just races it. Yielding until the spawned task has run keeps this
+            // case about what it is for: a release frees exactly one slot, not
+            // zero and not two.
+            store.release("k-conc", "m0");
+            tokio::time::sleep(Duration::from_millis(200)).await;
             out.push(format!(
-                "acquire{i}={}",
-                store
-                    .acquire("k-conc", &limits, &format!("m{i}"))
-                    .await
-                    .is_ok()
+                "after_release={}",
+                store.acquire("k-conc", &limits, "m-new").await.is_ok()
             ));
-        }
-        // Freeing one slot admits exactly one more.
-        //
-        // `RedisStore::release` is a SYNC trait method that spawns its `ZREM`,
-        // because releasing a shared slot needs I/O it cannot await here — so
-        // the freed slot becomes visible a moment later. That is a deliberate
-        // difference in TIMING, not in semantics, and asserting immediately
-        // just races it. Yielding until the spawned task has run keeps this
-        // case about what it is for: a release frees exactly one slot, not
-        // zero and not two.
-        store.release("k-conc", "m0");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        out.push(format!(
-            "after_release={}",
-            store.acquire("k-conc", &limits, "m-new").await.is_ok()
-        ));
-        out.push(format!(
-            "and_no_more={}",
-            store.acquire("k-conc", &limits, "m-extra").await.is_ok()
-        ));
-        out
-    })
+            out.push(format!(
+                "and_no_more={}",
+                store.acquire("k-conc", &limits, "m-extra").await.is_ok()
+            ));
+            out
+        },
+    )
     .await;
 }
 
@@ -379,25 +421,29 @@ async fn concurrency_admits_and_releases_identically() {
 /// second.
 #[tokio::test]
 async fn releasing_an_unknown_member_frees_nothing() {
-    both("release unknown", |store| async move {
-        let limits = RateLimit {
-            concurrency: Some(1),
-            ..RateLimit::default()
-        };
-        let mut out = Vec::new();
-        out.push(format!(
-            "held={}",
-            store.acquire("k-rel", &limits, "holder").await.is_ok()
-        ));
-        for i in 0..3 {
-            store.release("k-rel", &format!("never-held-{i}"));
-        }
-        out.push(format!(
-            "admitted_another={}",
-            store.acquire("k-rel", &limits, "other").await.is_ok()
-        ));
-        out
-    })
+    both(
+        "release unknown",
+        &["held=true", "admitted_another=false"],
+        |store| async move {
+            let limits = RateLimit {
+                concurrency: Some(1),
+                ..RateLimit::default()
+            };
+            let mut out = Vec::new();
+            out.push(format!(
+                "held={}",
+                store.acquire("k-rel", &limits, "holder").await.is_ok()
+            ));
+            for i in 0..3 {
+                store.release("k-rel", &format!("never-held-{i}"));
+            }
+            out.push(format!(
+                "admitted_another={}",
+                store.acquire("k-rel", &limits, "other").await.is_ok()
+            ));
+            out
+        },
+    )
     .await;
 }
 
@@ -408,35 +454,39 @@ async fn releasing_an_unknown_member_frees_nothing() {
 /// held to the same tpm ceiling as one who does not.
 #[tokio::test]
 async fn post_stream_tokens_count_the_same() {
-    both("add_tokens", |store| async move {
-        let limits = RateLimit {
-            tpm: Some(100),
-            ..RateLimit::default()
-        };
-        let mut out = Vec::new();
-        store
-            .acquire("k-tok", &limits, "m")
-            .await
-            .expect("first call is under the ceiling");
-        // Overrun the minute window after the fact, as a stream does.
-        store.add_tokens("k-tok", 250);
-        // Redis writes post-stream updates through a queue; let it land.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        out.push(format!(
-            "tpm_remaining={:?}",
+    both(
+        "add_tokens",
+        &["tpm_remaining=Some(0)", "next_admitted=false"],
+        |store| async move {
+            let limits = RateLimit {
+                tpm: Some(100),
+                ..RateLimit::default()
+            };
+            let mut out = Vec::new();
             store
-                .peek("k-tok", &limits)
+                .acquire("k-tok", &limits, "m")
                 .await
-                .and_then(|s| s.tpm_remaining())
-        ));
-        // The token ceiling is checked-but-not-incremented at admission, so
-        // the NEXT request is the one refused.
-        out.push(format!(
-            "next_admitted={}",
-            store.acquire("k-tok", &limits, "m2").await.is_ok()
-        ));
-        out
-    })
+                .expect("first call is under the ceiling");
+            // Overrun the minute window after the fact, as a stream does.
+            store.add_tokens("k-tok", 250);
+            // Redis writes post-stream updates through a queue; let it land.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            out.push(format!(
+                "tpm_remaining={:?}",
+                store
+                    .peek("k-tok", &limits)
+                    .await
+                    .and_then(|s| s.tpm_remaining())
+            ));
+            // The token ceiling is checked-but-not-incremented at admission, so
+            // the NEXT request is the one refused.
+            out.push(format!(
+                "next_admitted={}",
+                store.acquire("k-tok", &limits, "m2").await.is_ok()
+            ));
+            out
+        },
+    )
     .await;
 }
 
@@ -447,22 +497,26 @@ async fn post_stream_tokens_count_the_same() {
 /// the first would silently under-count every layer but one.
 #[tokio::test]
 async fn add_tokens_all_reaches_every_named_bucket() {
-    both("add_tokens_all", |store| async move {
-        let limits = RateLimit {
-            tpm: Some(100),
-            ..RateLimit::default()
-        };
-        let keys = vec!["k-all-a".to_string(), "k-all-b".to_string()];
-        store.add_tokens_all(&keys, 40);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let mut out = Vec::new();
-        for k in &keys {
-            out.push(format!(
-                "{k}={:?}",
-                store.peek(k, &limits).await.and_then(|s| s.tpm_remaining())
-            ));
-        }
-        out
-    })
+    both(
+        "add_tokens_all",
+        &["k-all-a=Some(60)", "k-all-b=Some(60)"],
+        |store| async move {
+            let limits = RateLimit {
+                tpm: Some(100),
+                ..RateLimit::default()
+            };
+            let keys = vec!["k-all-a".to_string(), "k-all-b".to_string()];
+            store.add_tokens_all(&keys, 40);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut out = Vec::new();
+            for k in &keys {
+                out.push(format!(
+                    "{k}={:?}",
+                    store.peek(k, &limits).await.and_then(|s| s.tpm_remaining())
+                ));
+            }
+            out
+        },
+    )
     .await;
 }
