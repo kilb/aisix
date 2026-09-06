@@ -977,15 +977,21 @@ pub(crate) async fn create_file(
             fields.push(UploadField::Text(name, v));
         }
 
-        let file_bytes = fields
+        // The LAST `file` part, matching what this handler has always read:
+        // `file_bytes` was overwritten on each one. Carrying the index — not
+        // just the bytes — is what keeps the scan and the rewrite on the same
+        // part, so a body with two of them cannot have one scanned and the
+        // other replaced by the first one's masked text.
+        let file_at = fields
             .iter()
-            .find_map(|f| match f {
-                UploadField::File { bytes, .. } => Some(bytes.clone()),
-                UploadField::Text(..) => None,
-            })
+            .rposition(|f| matches!(f, UploadField::File { .. }))
             .ok_or_else(|| {
                 ProxyError::InvalidRequest("multipart body must include a `file` field".into())
             })?;
+        let file_bytes = match &fields[file_at] {
+            UploadField::File { bytes, .. } => bytes.clone(),
+            UploadField::Text(..) => unreachable!("rposition matched a File"),
+        };
 
         let wanted = form_model.or_else(|| explicit_model(&params, &headers));
         let snapshot = &**snapshot.insert(state.snapshot.load());
@@ -1005,7 +1011,7 @@ pub(crate) async fn create_file(
         .await?;
 
         let mut form = reqwest::multipart::Form::new();
-        for field in fields {
+        for (i, field) in fields.into_iter().enumerate() {
             match field {
                 UploadField::Text(name, v) => form = form.text(name, v),
                 UploadField::File {
@@ -1013,7 +1019,10 @@ pub(crate) async fn create_file(
                     content_type,
                     bytes,
                 } => {
-                    let body = masked.clone().unwrap_or_else(|| bytes.to_vec());
+                    let body = match (i == file_at, masked.as_ref()) {
+                        (true, Some(m)) => m.clone(),
+                        _ => bytes.to_vec(),
+                    };
                     let mut part = reqwest::multipart::Part::bytes(body).file_name(file_name);
                     if let Some(ct) = content_type {
                         part = part.mime_str(&ct).map_err(|e| {
@@ -3344,6 +3353,79 @@ mod tests {
         assert!(
             sent.windows(payload.len()).any(|w| w == payload.as_slice()),
             "a non-text upload must reach the provider byte-for-byte"
+        );
+    }
+    /// 一个 body 里出现两个 `file` 部件时，被扫的和被改写的必须是同一个。
+    ///
+    /// 这条是给我自己改坏的地方兜底的：为了让遮蔽能落到文件上，表单从
+    /// 「边读边拼」改成了「读完再拼」，中间版本扫第一个、却把改写后的字节
+    /// 写进了每一个 —— 于是第二个部件被换成了第一个部件的内容。安静地毁掉
+    /// 用户上传的东西，比漏遮蔽还糟。
+    #[tokio::test]
+    async fn two_file_parts_keep_the_scan_and_the_rewrite_on_the_same_one() {
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(path("/v1/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "file-two", "object": "file", "purpose": "batch", "filename": "b.jsonl"
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let g: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"mask-email","enabled":true,"hook_point":"input","kind":"pii","detectors":[{"type":"email","action":"mask"}]}"#,
+        )
+        .unwrap();
+        snap.guardrails.insert(ResourceEntry::new("g-mask", g, 1));
+        let app = build_app(snap);
+
+        let boundary = "XTWOX";
+        let part = |name: &str, body: &str| {
+            format!(
+                "--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; filename=\"{name}\"\r\n\r\n{body}\r\n"
+            )
+        };
+        let mut b = String::new();
+        b.push_str(&format!(
+            "--{boundary}\r\ncontent-disposition: form-data; name=\"model\"\r\n\r\njobs-a\r\n"
+        ));
+        b.push_str(&part("first.jsonl", "FIRST-ONLY-MARKER"));
+        b.push_str(&part("second.jsonl", "SECOND mail bob@example.com"));
+        b.push_str(&format!("--{boundary}--\r\n"));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/files")
+            .header("authorization", "Bearer sk-caller")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(b))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let sent = String::from_utf8_lossy(&received[0].body).into_owned();
+        // 被扫的那个（最后一个）遮蔽掉了……
+        assert!(
+            !sent.contains("bob@example.com"),
+            "the scanned part must be masked:\n{sent}"
+        );
+        // ……另一个原封不动地转发，没有被顶替。
+        assert!(
+            sent.contains("FIRST-ONLY-MARKER"),
+            "the other file part must survive untouched:\n{sent}"
+        );
+        assert!(
+            sent.contains("filename=\"first.jsonl\"") && sent.contains("filename=\"second.jsonl\""),
+            "both parts must still be present, with their own filenames:\n{sent}"
         );
     }
 }
