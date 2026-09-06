@@ -566,6 +566,71 @@ mod tests {
         }
     }
 
+    /// Every `inbound_protocol` literal a handler writes onto a `UsageEvent`
+    /// must survive the sink's label bounding unchanged.
+    ///
+    /// The sibling test above covers the values derived from the endpoint
+    /// label. These are the ones handlers set directly on the event —
+    /// `"batch"`, `"passthrough"`, `"realtime"` — and they are what the
+    /// usage-event families label with. A handler adding a new one lands in
+    /// `other` silently: the events still flow, they just stop being
+    /// distinguishable, which looks exactly like that protocol having no
+    /// traffic.
+    ///
+    /// Read off the tree rather than listed here, so a new handler is
+    /// covered by existing.
+    #[test]
+    fn every_written_inbound_protocol_is_a_bounded_label() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    let Ok(src) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    // 只看生产段：测试里会故意写越界的值来钉住收口本身。
+                    let production = src.split_once("#[cfg(test)]").map_or(&src[..], |(a, _)| a);
+                    for chunk in production.split("inbound_protocol: \"").skip(1) {
+                        if let Some(end) = chunk.find('"') {
+                            out.push((
+                                path.file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .into(),
+                                chunk[..end].to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut found = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut found,
+        );
+        assert!(
+            found.len() >= 5,
+            "只扫到 {} 个 inbound_protocol 字面量，抽取多半坏了",
+            found.len()
+        );
+        for (file, protocol) in found {
+            assert_eq!(
+                aisix_obs::bounded_inbound_protocol(&protocol),
+                protocol,
+                "{file} 写的协议 {protocol:?} 会被用量事件那侧折成 {:?} —— \
+                 它的用量事件从此和「没有流量」看起来一样",
+                aisix_obs::bounded_inbound_protocol(&protocol),
+            );
+        }
+    }
+
     /// Every route `build_router` registers must have a sample in [`ROUTES`]
     /// or an entry in [`NOT_METERED`].
     ///

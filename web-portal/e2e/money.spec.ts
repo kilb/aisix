@@ -854,6 +854,47 @@ test("被护栏拦下时_不得转移到下一个目标", async () => {
   }
 });
 
+test("Anthropic 的缓存读与缓存写_各按各的费率计价", async () => {
+  // Anthropic 把缓存读/写记在**独立**的计数器里，不像 OpenAI 那样是
+  // prompt_tokens 的子集。三段各有各的价：缓存读比输入便宜，缓存写比输入
+  // **贵**（一个供应商的五分钟写是输入价的 1.25 倍）。按输入价一刀切的话，
+  // 缓存写那部分是**少报**，而少报没人会来投诉。
+  //
+  // 这个契约此前只有 chat（OpenAI 子集形状）那一条 e2e；Anthropic 这一侧只
+  // 被测过 token 记账，没被测过钱。
+  //
+  // 存根一发：1000 输入 + 1000 输出 + 2000 缓存读 + 400 缓存写。
+  // 价：输入 $0.5/1k、缓存读 $0.05/1k、缓存写 $1.25/1k、输出 $0.5/1k。
+  // 应为 1000*0.0005 + 2000*0.00005 + 400*0.00125 + 1000*0.0005 = $1.60。
+  // 全按输入价算会得到 (1000+2000+400)*0.0005 + 0.5 = $2.20。
+  const cookie = await fx.sessionCookie();
+  await setQuota(1_000_000_000);
+  const k = await mint(cookie, "缓存分级");
+
+  const spend = async () => {
+    const m = await fetch(fx.metricsUrl).then((r) => r.text());
+    return m
+      .split("\n")
+      .filter(
+        (l) =>
+          l.startsWith("aisix_llm_spend_micro_usd_total{") &&
+          l.includes('model="anthropic-cached"'),
+      )
+      .reduce((a, l) => a + (Number(l.slice(l.lastIndexOf("}") + 1).trim()) || 0), 0);
+  };
+
+  const before = await spend();
+  await waitFor(
+    async () => (await fx.saying("messages", k.plaintext, "hello", "anthropic-cached")) === 200,
+    "Anthropic 原生模型可用",
+  );
+  await waitFor(async () => (await spend()) > before, "这一发没记账");
+  expect(
+    (await spend()) - before,
+    "缓存读/写没有按各自的费率计价 —— 一刀切按输入价会得到 2_200_000",
+  ).toBe(1_600_000);
+});
+
 test("被护栏拦下时_错误信封仍是该端点自己的形状", async () => {
   // 拦截现在走的是「带着账的成功收尾路径」，也就是说不再经过处理器那层错误
   // 转换 —— 正文得自己按端点的协议渲染。漏掉的话状态码还是 422、账也照记，
@@ -864,6 +905,13 @@ test("被护栏拦下时_错误信封仍是该端点自己的形状", async () =
   const cookie = await fx.sessionCookie();
   await setQuota(1_000_000_000);
   const k = await mint(cookie, "信封");
+  // 先等密钥传到网关。门户写完配置才发 SIGHUP，铸完就打会拿到 401 —— 而 401
+  // 的信封形状是对的，于是断言会以「错误类型不对」的面貌失败，看起来像信封
+  // 出了问题。单跑时凑巧能过，全套跑就露出来。
+  await waitFor(
+    async () => (await fx.saying("messages", k.plaintext, "hello")) === 200,
+    "密钥传到网关",
+  );
 
   // 原生 Anthropic：`{type:"error", error:{type,message}}`。
   //

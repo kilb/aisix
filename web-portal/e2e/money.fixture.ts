@@ -369,6 +369,14 @@ export async function startMoney(): Promise<MoneyFixture> {
         res.end(`${line(1)}\n${line(2)}\n`);
         return;
       }
+      // 只有这个模型的应答带缓存计数 —— 见下面 usage 处的说明。
+      let wantsAnthropicCacheCounters = false;
+      try {
+        wantsAnthropicCacheCounters =
+          JSON.parse(body || "{}").model === "claude-cached";
+      } catch {
+        /* 不是 JSON 就当没有 */
+      }
       // Anthropic 原生的流式：事件名和 OpenAI 那套完全不同，用量在
       // message_start（输入）与 message_delta（输出）两处。回 OpenAI 形状的话
       // 网关解析不出用量，会退到估算 —— 金额变成几千 micro，测不出真问题。
@@ -422,7 +430,19 @@ export async function startMoney(): Promise<MoneyFixture> {
             model: "claude-sonnet-4",
             content: [{ type: "text", text: echoed }],
             stop_reason: "end_turn",
-            usage: { input_tokens: 1000, output_tokens: 1000 },
+            // 缓存计数只给专用的那个模型：共用的 anthropic-direct 是别的用例
+            // 用来量「一次普通调用花多少」的基准，给它加上计数会把那些用例的
+            // 金额一起改掉（第一版就是这么写的，把护栏计费那条弄红了）。
+            //
+            // Anthropic 把缓存读/写记在**独立**的计数器里（不像 OpenAI 是
+            // prompt_tokens 的子集）。
+            usage: {
+                input_tokens: 1000,
+                output_tokens: 1000,
+                ...(wantsAnthropicCacheCounters
+                  ? { cache_read_input_tokens: 2000, cache_creation_input_tokens: 400 }
+                  : {}),
+            },
           }),
         );
         return;
@@ -1030,6 +1050,18 @@ models:
     cost:
       input_per_1k: 0.5
       output_per_1k: 0.5
+  # 专供「缓存读/写各按各价」那条用例。缓存读比输入便宜、缓存写比输入贵 ——
+  # 两个方向都给个和输入不同的数，这样「按输入价一刀切」会落在一个错的金额
+  # 上，而不是碰巧相等。
+  - display_name: anthropic-cached
+    provider: anthropic
+    provider_key: stub-anthropic
+    model_name: claude-cached
+    cost:
+      input_per_1k: 0.5
+      output_per_1k: 0.5
+      cached_input_per_1k: 0.05
+      cache_write_per_1k: 1.25
   - display_name: embed-cached
     provider: openai
     provider_key: stub
