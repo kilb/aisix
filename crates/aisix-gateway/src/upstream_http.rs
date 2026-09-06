@@ -453,6 +453,43 @@ mod tests {
         );
     }
 
+    /// The MCP bridge's client is the fourth of these, and had the same gap.
+    ///
+    /// rmcp vendors its own reqwest, so it cannot share `client_builder()`
+    /// and instead mirrors it field for field — which means the redirect
+    /// policy is part of what has to mirror. It sends the gateway-held
+    /// upstream key as `x-api-key`, a custom header reqwest does not strip
+    /// cross-host, while two OTHER clients in that same crate
+    /// (`openapi.rs`, `oauth.rs`) already refused redirects and one of them
+    /// has a test for it. This is the third.
+    #[test]
+    fn the_mcp_bridge_client_does_not_follow_redirects() {
+        let path = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../aisix-mcp/src/bridge.rs"
+        ));
+        let Ok(src) = std::fs::read_to_string(path) else {
+            // Optional workspace member; absent is not a failure.
+            return;
+        };
+        let builder = src
+            .split_once("fn build_http_client(")
+            .expect("build_http_client is declared there")
+            .1
+            .split_once("\n}")
+            .expect("build_http_client is closed")
+            .0;
+        assert!(
+            builder
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .any(|l| l.contains(".redirect(")),
+            "the MCP bridge client sets no redirect policy, so an MCP server \
+             answering a cross-host `Location` receives the gateway-held \
+             `x-api-key` it was dialled with"
+        );
+    }
+
     /// The console is exempted from the scan above because it cannot call
     /// `client_builder()` — but an exemption with nothing behind it just
     /// removes it from the guard. This is what keeps it honest: its client

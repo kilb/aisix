@@ -79,6 +79,18 @@ fn shared_http_client() -> rmcp_reqwest::Client {
 fn build_http_client(disable_env_proxy: bool) -> rmcp_reqwest::Client {
     let cfg = aisix_gateway::upstream_http::config();
     let mut b = rmcp_reqwest::Client::builder()
+        // Same policy, same reason, as `aisix_gateway::client_builder` and as
+        // this crate's own `openapi.rs` / `oauth.rs` clients: reqwest follows
+        // up to ten redirects and strips only the four standard auth headers
+        // cross-host. This client sends the gateway-held upstream key as
+        // `API_KEY_HEADER` — `x-api-key`, a custom header — so an MCP server
+        // answering `302 Location: http://elsewhere/` had that credential
+        // re-sent to whatever it named.
+        //
+        // This builder mirrors `client_builder` field for field because rmcp
+        // vendors its own reqwest and cannot share ours; the redirect policy
+        // is part of what has to mirror.
+        .redirect(rmcp_reqwest::redirect::Policy::none())
         .pool_idle_timeout(cfg.pool_idle_timeout)
         .tcp_keepalive(cfg.tcp_keepalive);
     if let Some(d) = cfg.connect_timeout {
