@@ -660,6 +660,45 @@ test("流式被输出护栏拦截时_也按成功那样收钱", async () => {
   }
 });
 
+test("按路由名写的策略_也要管住它的分类子调用", async () => {
+  // 分类子调用是这个语义路由派生出来的一次分派，所以运维按**路由名**写的策略
+  // 该覆盖它 —— 路由组的 chat 目标一直是这么做的（预留里带着调用方寻址的那个
+  // 父级身份），分类这条不能两样。
+  //
+  // 这一格只有在父级身份被带进分类预留时才成立：策略的条件写的是路由名，而
+  // 分类子调用自己的模型名是 embed-parented，对不上；`model_name` 条件在目标
+  // 不匹配时会回落到父级名字，那正是要验的那一步。分类模型自己没有内联上限，
+  // 所以除此之外没有别的东西能拦住它。
+  const cookie = await fx.sessionCookie();
+  await setQuota(1_000_000_000);
+  const k = await mint(cookie, "父级条件");
+
+  const embedCalls = () => fx.embedCallCount();
+  const before = embedCalls();
+  await waitFor(
+    async () => (await fx.chatModel(k.plaintext, "semantic-parented")) === 200,
+    "带父级条件策略的语义路由可用",
+  );
+  expect(embedCalls(), "第一发的分类调用没发生，这条用例量不到东西").toBeGreaterThan(before);
+  const afterFirst = embedCalls();
+
+  // 再打四发。token 窗口在准入时是「检查但不递增」、提交在调用之后，所以第二
+  // 发仍是合法通过的（此刻已记 1000 < 1500），第三发起才被拒 —— 总共 2 次分类
+  // 调用，而不是 5 次。能拒得下来，仅当预留里带了父级身份。
+  //
+  // 请求全程 200：被策略拒掉走的是 `on_embedding_failure` 那条降级路。
+  for (let i = 0; i < 4; i++) {
+    expect(
+      await fx.chatModel(k.plaintext, "semantic-parented"),
+      "被策略拒掉之后该降级，而不是把整条请求拒掉",
+    ).toBe(200);
+  }
+  expect(
+    embedCalls() - (afterFirst - 1),
+    "按路由名写的策略没管住分类子调用 —— 预留里没带父级身份",
+  ).toBe(2);
+});
+
 test("语义路由的分类调用_要过分类模型自己的闸", async () => {
   // 分类那一发是一次真实的分派：打的是嵌入模型自己的上游，花的是真钱。它不
   // 经过 `resolve_attempt_models` 那个主干，所以只接在主干上的闸在这条路上是

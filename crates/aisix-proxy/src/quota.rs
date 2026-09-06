@@ -360,6 +360,11 @@ fn warn_inert_dimension_once(policy_name: &str, window: &str, dimension: &str) {
 ///
 /// 目标名解析不了（配置引用了不存在的行）时不作声：那是配置校验该报的错，
 /// 在这里报会把一个引用错误说成定价问题。
+///
+/// **每请求的代价**：直连模型是一次字段判断（第一行就返回）；虚拟父级要按名字
+/// 查它声明的每个目标，`any` 一命中就停。目标数是配置量级（个位数），而这个答案
+/// 对同一个（快照，模型）是恒定的 —— 真要省，该在快照构建时算成一个派生标志，
+/// 而不是在这里加缓存。目前没有测到它值得那么做。
 fn unpriced_dispatch_exists(snap: &aisix_core::AisixSnapshot, model: &aisix_core::Model) -> bool {
     let unpriced_by_name = |name: &str| {
         snap.models

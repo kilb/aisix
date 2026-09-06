@@ -1235,7 +1235,10 @@ pub(crate) async fn get_batch(
         require_safe_upstream_id(&raw)?;
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
         let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
-        let _reservation = crate::quota::enforce(
+        // 这条**不带**下划线前缀，和这个文件里其它几处不同：那几处只为 Drop 时
+        // 释放并发位而持有，这一处还要交出它的花费桶键 —— 批处理的钱是事后落账
+        // 的，那时预留早已释放，键得先拿在手上。名字带下划线会说「没人用它」。
+        let reservation = crate::quota::enforce(
             &state,
             &snapshot,
             &auth,
@@ -1269,7 +1272,7 @@ pub(crate) async fn get_batch(
                     &target,
                     &raw,
                     &v,
-                    _reservation.spend_keys(),
+                    reservation.spend_keys(),
                     &client.user_agent,
                 );
             }

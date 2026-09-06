@@ -1123,6 +1123,33 @@ models:
         - name: only
           target: cached-direct
           examples: ["hello"]
+  # 「按路由名写的策略要管住它的分类子调用」那条用例专用的一组。分类模型自己
+  # **不带**内联上限 —— 唯一能管住它的是那条按父级名字匹配的策略，所以这一格
+  # 只有在预留带上了父级身份时才会生效。
+  - display_name: embed-parented
+    provider: openai
+    provider_key: stub
+    model_name: text-embedding-3-small
+    embedding:
+      dimensions: 3
+    cost:
+      input_per_1k: 0.5
+      output_per_1k: 0.5
+  # 路由目标刻意用 Anthropic 那个模型：策略要只管住分类那一发，而 provider
+  # 是唯一没有「父级回落」的维度 —— 分类走 openai、chat 目标走 anthropic，条件
+  # 加上 provider 就把两次预留分开了。不分开的话策略会把 chat 目标也拒掉，整条
+  # 请求变成 429，而那说明不了父级身份有没有带上。
+  - display_name: semantic-parented
+    semantic:
+      embedding_model: embed-parented
+      default: anthropic-direct
+      match:
+        threshold: 0.99
+      on_embedding_failure: default
+      routes:
+        - name: only
+          target: anthropic-direct
+          examples: ["hello"]
   - display_name: semantic-1
     semantic:
       embedding_model: embed-1
@@ -1159,6 +1186,22 @@ guardrails:
     patterns:
       - kind: literal
         value: forbidden-output-phrase
+rate_limit_policies:
+  # 条件式策略：带模型属性条件的行会延到「分派目标」阶段再判。它写的是**路由
+  # 的名字**，所以只能通过预留里带着的父级身份匹配上 —— 分类子调用自己的模型
+  # 名是 embed-parented，对不上。
+  - name: only-this-routers-classifier
+    conditions:
+      - dimension: model_name
+        operator: "=="
+        value: semantic-parented
+      # provider 没有父级回落，所以这一条只有分类那一发满足（它走 openai），
+      # chat 目标走 anthropic，被排除在外。
+      - dimension: provider
+        operator: "=="
+        value: openai
+    limits:
+      tpm: 1500
 api_keys:
   - display_name: e2e-caller
     key_hash: "${keyHash}"
