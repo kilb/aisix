@@ -159,12 +159,34 @@ async fn login(State(st): State<AppState>, Json(req): Json<LoginReq>) -> Respons
         .write()
         .await
         .insert(tok.clone(), now_secs() + SESSION_TTL_SECS);
-    // HttpOnly + SameSite=Strict：控制台能改网关配置，不能让别的站点借用会话。
-    // Secure 是因为它只经 nginx 的 HTTPS 暴露。
-    let cookie = format!(
-        "aisix_console={tok}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}"
-    );
-    ([(header::SET_COOKIE, cookie)], Json(json!({"ok": true}))).into_response()
+    (
+        [(header::SET_COOKIE, session_cookie(&tok))],
+        Json(json!({"ok": true})),
+    )
+        .into_response()
+}
+
+/// 会话 cookie 的属性只在这一处拼。
+///
+/// 三条缺一不可：`HttpOnly` 防脚本读取，`SameSite=Strict` 防别的站点借用会话
+/// （控制台能改网关配置），`Secure` 因为它只经 HTTPS 暴露。
+///
+/// 设置和清除共用同一串属性是有原因的：浏览器按 name + Path（以及 Domain）
+/// 匹配要清的那条，两份字面量各自演化的话，清除的那条可能悄悄对不上，登出就
+/// 不再登出。写成一处，这种偏移写不出来。
+fn cookie_attrs() -> &'static str {
+    "HttpOnly; Secure; SameSite=Strict; Path=/"
+}
+
+fn session_cookie(tok: &str) -> String {
+    format!(
+        "aisix_console={tok}; {}; Max-Age={SESSION_TTL_SECS}",
+        cookie_attrs()
+    )
+}
+
+fn cleared_cookie() -> String {
+    format!("aisix_console=; {}; Max-Age=0", cookie_attrs())
 }
 
 async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Response {
@@ -181,10 +203,7 @@ async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Response {
         st.sessions.write().await.remove(&tok);
     }
     (
-        [(
-            header::SET_COOKIE,
-            "aisix_console=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0",
-        )],
+        [(header::SET_COOKIE, cleared_cookie())],
         Json(json!({"ok": true})),
     )
         .into_response()
@@ -1925,5 +1944,27 @@ mod tests {
         let n = 256;
         let set: std::collections::HashSet<String> = (0..n).map(|_| random_token()).collect();
         assert_eq!(set.len(), n, "生成的密钥出现重复");
+    }
+
+    /// 三条 cookie 属性是控制台会话的全部防护，而它们只是一串字面量 —— 少
+    /// 打一个词不会有任何东西报错。门户那边有这条断言，控制台没有。
+    #[test]
+    fn the_session_cookie_carries_httponly_secure_and_samesite() {
+        let set = super::session_cookie("tok-abc");
+        for attr in ["HttpOnly", "Secure", "SameSite=Strict"] {
+            assert!(set.contains(attr), "登录 cookie 少了 {attr}：{set}");
+        }
+        assert!(set.contains("aisix_console=tok-abc"), "{set}");
+
+        // 清除的那条必须带同一串属性：浏览器按 name + Path 匹配，属性对不上
+        // 就清不掉，登出于是不再登出。
+        let cleared = super::cleared_cookie();
+        assert!(cleared.contains("Max-Age=0"), "{cleared}");
+        assert!(cleared.contains("aisix_console=;"), "{cleared}");
+        assert_eq!(
+            set.contains(super::cookie_attrs()),
+            cleared.contains(super::cookie_attrs()),
+            "设置与清除必须共用同一串属性"
+        );
     }
 }
