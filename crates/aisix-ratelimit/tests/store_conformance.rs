@@ -324,3 +324,79 @@ async fn a_cumulative_allowance_survives_reaping_on_both_stores() {
     })
     .await;
 }
+
+/// Concurrency admits up to the limit, and a release frees exactly one slot.
+///
+/// The two implementations are structurally different here — local keeps an
+/// in-flight counter, Redis keeps a ZSET of leased members — which is exactly
+/// the shape where they can drift apart while each side's own tests pass.
+#[tokio::test]
+async fn concurrency_admits_and_releases_identically() {
+    both("concurrency", |store| async move {
+        let limits = RateLimit {
+            concurrency: Some(2),
+            ..RateLimit::default()
+        };
+        let mut out = Vec::new();
+        for i in 0..3 {
+            out.push(format!(
+                "acquire{i}={}",
+                store
+                    .acquire("k-conc", &limits, &format!("m{i}"))
+                    .await
+                    .is_ok()
+            ));
+        }
+        // Freeing one slot admits exactly one more.
+        //
+        // `RedisStore::release` is a SYNC trait method that spawns its `ZREM`,
+        // because releasing a shared slot needs I/O it cannot await here — so
+        // the freed slot becomes visible a moment later. That is a deliberate
+        // difference in TIMING, not in semantics, and asserting immediately
+        // just races it. Yielding until the spawned task has run keeps this
+        // case about what it is for: a release frees exactly one slot, not
+        // zero and not two.
+        store.release("k-conc", "m0");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        out.push(format!(
+            "after_release={}",
+            store.acquire("k-conc", &limits, "m-new").await.is_ok()
+        ));
+        out.push(format!(
+            "and_no_more={}",
+            store.acquire("k-conc", &limits, "m-extra").await.is_ok()
+        ));
+        out
+    })
+    .await;
+}
+
+/// Releasing a member that never held a slot must not free someone else's.
+///
+/// An implementation that decrements a bare counter on any release lets a
+/// caller hand back slots it never took, opening the limit indefinitely; one
+/// that removes a named member from a set cannot. Both must behave like the
+/// second.
+#[tokio::test]
+async fn releasing_an_unknown_member_frees_nothing() {
+    both("release unknown", |store| async move {
+        let limits = RateLimit {
+            concurrency: Some(1),
+            ..RateLimit::default()
+        };
+        let mut out = Vec::new();
+        out.push(format!(
+            "held={}",
+            store.acquire("k-rel", &limits, "holder").await.is_ok()
+        ));
+        for i in 0..3 {
+            store.release("k-rel", &format!("never-held-{i}"));
+        }
+        out.push(format!(
+            "admitted_another={}",
+            store.acquire("k-rel", &limits, "other").await.is_ok()
+        ));
+        out
+    })
+    .await;
+}

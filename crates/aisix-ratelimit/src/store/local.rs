@@ -36,7 +36,19 @@ struct KeyState {
     /// makes a granted allowance behave like an allowance instead of a
     /// per-window ceiling that refills on its own.
     consumed_micro_usd: u64,
-    in_flight: u32,
+    /// The members currently holding a concurrency slot, by name — not a
+    /// bare count.
+    ///
+    /// A counter cannot tell a release APART from a release: decrementing on
+    /// any call lets a caller hand back a slot it never took, and the limit
+    /// opens by one every time that happens. The Redis backend has always
+    /// been member-aware (a ZSET it `ZREM`s by name), so the two answered
+    /// differently for the same sequence — and the unpaired release is not
+    /// hypothetical: `RedisStore::release` calls into this store
+    /// unconditionally as a belt-and-suspenders local release, so a request
+    /// served by Redis can decrement a slot a DEGRADED request is still
+    /// holding here.
+    in_flight: std::collections::HashSet<String>,
     /// Unix seconds of the last operation on this bucket, so [`LocalStore::reap`]
     /// can tell a live key from one whose config row was deleted hours ago.
     last_touched: u64,
@@ -53,7 +65,7 @@ impl KeyState {
             tph: FixedWindowCounter::new(HOUR_SECS),
             tpd: FixedWindowCounter::new(DAY_SECS),
             consumed_micro_usd: 0,
-            in_flight: 0,
+            in_flight: std::collections::HashSet::new(),
             last_touched: now,
         }
     }
@@ -133,7 +145,7 @@ impl<C: Clock> LocalStore<C> {
             // keyed by configured identities (api key / model / policy), so
             // the survivors are bounded by the configuration, and only the
             // ones that actually spent anything survive.
-            s.in_flight > 0 || s.last_touched >= cutoff || s.consumed_micro_usd > 0
+            !s.in_flight.is_empty() || s.last_touched >= cutoff || s.consumed_micro_usd > 0
         });
     }
 }
@@ -144,7 +156,7 @@ impl<C: Clock> RateStore for LocalStore<C> {
         &self,
         key: &str,
         limits: &RateLimit,
-        _member: &str,
+        member: &str,
     ) -> Result<(), RateLimitError> {
         let now = self.clock.unix_secs();
         let state = self.state_for(key);
@@ -152,7 +164,7 @@ impl<C: Clock> RateStore for LocalStore<C> {
 
         // Concurrency first — cheapest and never consumes a window slot.
         if let Some(max) = limits.concurrency {
-            if s.in_flight >= max {
+            if s.in_flight.len() as u32 >= max {
                 return Err(RateLimitError::Concurrency);
             }
         }
@@ -256,12 +268,12 @@ impl<C: Clock> RateStore for LocalStore<C> {
             }
         }
 
-        s.in_flight += 1;
+        s.in_flight.insert(member.to_string());
         s.last_touched = now;
         Ok(())
     }
 
-    async fn commit(&self, key: &str, tokens: u64, _member: &str) {
+    async fn commit(&self, key: &str, tokens: u64, member: &str) {
         let now = self.clock.unix_secs();
         let state = self.state_for(key);
         let mut s = state.lock();
@@ -271,17 +283,17 @@ impl<C: Clock> RateStore for LocalStore<C> {
         // Spend buckets pass micro-USD through this same argument, so the
         // cumulative counter accumulates next to the windowed ones.
         s.consumed_micro_usd = s.consumed_micro_usd.saturating_add(tokens);
-        s.in_flight = s.in_flight.saturating_sub(1);
+        s.in_flight.remove(member);
         s.last_touched = now;
     }
 
-    fn release(&self, key: &str, _member: &str) {
+    fn release(&self, key: &str, member: &str) {
         // Non-inserting: a release for a never-acquired bucket is a no-op,
         // so the Redis store's belt-and-suspenders local release on the
         // happy path doesn't pollute the local map with empty state.
         if let Some(state) = self.states.get(key) {
             let mut s = state.lock();
-            s.in_flight = s.in_flight.saturating_sub(1);
+            s.in_flight.remove(member);
             s.last_touched = self.clock.unix_secs();
         }
     }
@@ -344,7 +356,7 @@ impl<C: Clock> RateStore for LocalStore<C> {
 
         let rpm_used = s.rpm.current(now);
         let tpm_used = s.tpm.current(now);
-        let in_flight = s.in_flight;
+        let in_flight = s.in_flight.len() as u32;
 
         // Seconds remaining in the current minute-window. Zero if the
         // window just started or has already rolled.
