@@ -196,7 +196,8 @@ describe("model discovery in both dialects", () => {
     // the client raises a decode error instead of surfacing the 400 it was
     // actually sent — the same client-side-only break as the wrong list
     // envelope.
-    for (const dialect of [{}, { "anthropic-version": "2023-06-01" }]) {
+    const dialects: Record<string, string>[] = [{}, { "anthropic-version": "2023-06-01" }];
+    for (const dialect of dialects) {
       for (const qs of ["limit=abc", "limit=0", "limit=99999"]) {
         const r = await get(`/v1/models?${qs}`, dialect);
         expect(r.status, `${qs} ${JSON.stringify(dialect)}`).toBe(400);

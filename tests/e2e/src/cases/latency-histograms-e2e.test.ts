@@ -199,18 +199,34 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
     expect(msg.status).toBe(200);
 
     // Streaming observation happens at stream completion; poll the scrape.
+    //
+    // The wait filters on exactly what the assertions below filter on,
+    // including the model. It used to wait on the unlabelled series while
+    // asserting on the model-labelled ones, so a scrape where another
+    // shape's series had landed but this model's had not satisfied the wait
+    // and then failed an assertion — reported as "expected 0 to be greater
+    // than 0", which says nothing about what was still missing.
+    const WANTED: Array<[string, string, Record<string, string>]> = [
+      ["non-streaming e2e", E2E_SERIES, { streaming: "false", status_class: "2xx", model: "histo-model" }],
+      ["streaming e2e", E2E_SERIES, { streaming: "true", status_class: "2xx", model: "histo-stream-model" }],
+      ["failed-request e2e", E2E_SERIES, { status_class: "5xx", model: "histo-fail-model" }],
+      ["streaming TTFT", TTFT_SERIES, { streaming: "true", model: "histo-stream-model" }],
+      ["/v1/messages e2e", E2E_SERIES, { endpoint: "/v1/messages", model: "histo-model" }],
+    ];
     let body = "";
-    const deadline = Date.now() + 10_000;
+    let missing: string[] = [];
+    const deadline = Date.now() + 30_000;
     for (;;) {
       body = await scrape();
-      const haveAll =
-        bucketLines(body, E2E_SERIES, { streaming: "false", status_class: "2xx" }).length > 0 &&
-        bucketLines(body, E2E_SERIES, { streaming: "true", status_class: "2xx" }).length > 0 &&
-        bucketLines(body, E2E_SERIES, { status_class: "5xx" }).length > 0 &&
-        bucketLines(body, TTFT_SERIES, { streaming: "true" }).length > 0;
-      if (haveAll || Date.now() > deadline) break;
+      missing = WANTED.filter(([, series, labels]) => bucketLines(body, series, labels).length === 0).map(
+        ([what]) => what,
+      );
+      if (missing.length === 0 || Date.now() > deadline) break;
       await new Promise((r) => setTimeout(r, 100));
     }
+    // Name what never showed up. A bare bucket-count assertion below would
+    // still fail, but only for whichever series it happens to check first.
+    expect(missing, `series still absent after 30s:\n${body}`).toEqual([]);
 
     // Real histogram exposition for all three request shapes + TTFT.
     const nonStream = bucketLines(body, E2E_SERIES, {

@@ -377,6 +377,26 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # `vitest` and `vite` transpile without typechecking, so a genuine type
+  # error — a helper called with the wrong argument shape, a renamed field
+  # still referenced — never fails a run. It just sits in the tree. Nothing
+  # in this workflow ran `tsc`, and one had accumulated in the e2e harness.
+  typecheck:
+    name: typecheck (ts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: tsc --noEmit
+        run: |
+          for d in tests/e2e web web-portal; do
+            echo "::group::$d"
+            (cd "$d" && npm ci --no-audit --no-fund && npx tsc --noEmit)
+            echo "::endgroup::"
+          done
+
   e2e-gate:
     # `main` requires the status check named literally `e2e (vitest) +
     # coverage`. The matrix above publishes one check per leg instead, so
@@ -387,7 +407,7 @@ jobs:
     # other open PRs still report the old name and would all break the
     # moment the required contexts were renamed to the two leg names.
     name: e2e (vitest) + coverage
-    needs: [e2e, mcp-conformance, playwright-e2e]
+    needs: [e2e, mcp-conformance, playwright-e2e, typecheck]
     # A skipped required check counts as satisfied, so this must still run
     # when the matrix fails — otherwise the gate would vanish exactly when
     # it matters.
@@ -417,6 +437,12 @@ jobs:
         run: |
           if [ "${{ needs.playwright-e2e.result }}" != "success" ]; then
             echo "::error::playwright e2e result: ${{ needs.playwright-e2e.result }}"
+            exit 1
+          fi
+      - name: assert the TypeScript projects typecheck
+        run: |
+          if [ "${{ needs.typecheck.result }}" != "success" ]; then
+            echo "::error::typecheck result: ${{ needs.typecheck.result }}"
             exit 1
           fi
 
