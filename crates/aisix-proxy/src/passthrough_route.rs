@@ -1499,9 +1499,32 @@ fn stream_response(
         telemetry.emit();
     };
 
+    // Hyper polls this generator after the middleware has returned, so it
+    // inherits no span — the three `tracing::warn!`s inside it name a route
+    // and a reason but no request, and a guardrail block on a streamed
+    // passthrough could not be joined back to the `x-aisix-request-id` the
+    // caller was handed. Wrapped from THIS stack, which is still inside the
+    // request span (`in_request_span` captures `Span::current()`), the same
+    // way every other streaming endpoint does it.
+    // This function is only reached for `route.streaming && is_sse`, so the
+    // body is always `text/event-stream` — the case the heartbeat is for, and
+    // never the opaque-binary case it would corrupt. It matters more here than
+    // on a plain relay: under a windowed output policy the gateway HOLDS
+    // frames pending inspection, so its own buffering can extend an upstream's
+    // silence past what a proxy in front will wait through.
+    //
+    // Safe to interleave because the generator above only ever yields WHOLE
+    // frames: what `SseFrameSplitter` hands back, a `guardrail_error_frame`,
+    // or the splitter's flush remainder — and that last one is the final item.
+    // A heartbeat can therefore never land inside a frame. That premise is
+    // what makes this composition correct; a future `yield` of a partial
+    // chunk would break it.
     let mut response = Response::builder()
         .status(status)
-        .body(Body::from_stream(stream))
+        .body(Body::from_stream(crate::sse_keepalive::with_heartbeat(
+            crate::request_id::in_request_span(stream),
+            crate::sse_keepalive::interval(),
+        )))
         .unwrap();
     copy_safe_headers(&resp_headers, response.headers_mut());
     // The relay re-chunks the body; a stale upstream length must not ride
