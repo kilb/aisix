@@ -768,6 +768,13 @@ pub trait Bridge: Send + Sync + 'static {
 /// Replace any `userinfo@` prefix in an authority with `***@` before the value
 /// goes into an error a CALLER will read.
 ///
+/// THE implementation, for the same reason `cidr_allows` is: a redaction
+/// copied per provider drifts. Vertex grew its own and applied it to one of
+/// its four echo branches; Azure grew none and printed the whole value in the
+/// branch that says the value embeds userinfo. This one also covers the
+/// scheme-less shape — Vertex's returned the input untouched without a
+/// `://`, which is precisely the case that reaches the no-scheme branch.
+///
 /// `InvalidUpstreamConfig` renders as a 400 with the message in the body, so
 /// anything echoed here reaches whoever made the request. The rule below —
 /// "report the scheme-stripped prefix, never the whole value, an embedded
@@ -776,7 +783,7 @@ pub trait Bridge: Send + Sync + 'static {
 /// `api_base` written as `user:pass@host/v1`, with the scheme simply
 /// forgotten, does not reach the userinfo check below. It fails here first,
 /// and used to be quoted back in full.
-fn redact_userinfo(value: &str) -> std::borrow::Cow<'_, str> {
+pub fn redact_userinfo(value: &str) -> std::borrow::Cow<'_, str> {
     let after_scheme = value.find("://").map(|i| i + 3).unwrap_or(0);
     let authority_end = value[after_scheme..]
         .find(['/', '?', '#'])

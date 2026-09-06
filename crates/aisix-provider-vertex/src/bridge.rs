@@ -72,7 +72,7 @@ use aisix_provider_openai::wire::{
 // targeted keys are absent, so they are safe to call uniformly across the
 // five publisher rails (the Gemini `contents` shape simply does not match the
 // OpenAI-style top-level keys the request transforms look for).
-use aisix_gateway::{apply_request_headers, UpstreamHeaderContext};
+use aisix_gateway::{apply_request_headers, redact_userinfo, UpstreamHeaderContext};
 use aisix_provider_openai::overrides::{
     apply_content_list_to_string, apply_default_body_fields, apply_param_constraints,
     apply_param_renames,
@@ -215,7 +215,8 @@ impl VertexBridge {
         if let Some(b) = ctx_api_base.map(str::trim).filter(|s| !s.is_empty()) {
             if !(b.starts_with("https://") || b.starts_with("http://")) {
                 return Err(BridgeError::InvalidUpstreamConfig(format!(
-                    "vertex provider_key api_base must use http:// or https:// scheme, got {b:?}",
+                    "vertex provider_key api_base must use http:// or https:// scheme, got {}",
+                    redact_userinfo(b)
                 )));
             }
             if b.contains('@') {
@@ -503,35 +504,6 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
         .model_name
         .as_deref()
         .ok_or_else(|| BridgeError::InvalidUpstreamConfig("model.model_name missing".into()))
-}
-
-/// Redact embedded userinfo from a URL string before echoing it
-/// into an error message. Specifically: `scheme://user:pass@host`
-/// becomes `scheme://<redacted>@host`. Only touches the substring
-/// between `://` and the first `@`; leaves the rest of the URL
-/// intact (including any other `@` in a path component). PR #392
-/// re-audit LOW-1.
-fn redact_userinfo(url: &str) -> String {
-    let Some(scheme_end) = url.find("://") else {
-        return url.to_string();
-    };
-    let rest_start = scheme_end + "://".len();
-    let rest = &url[rest_start..];
-    let Some(at_offset) = rest.find('@') else {
-        return url.to_string();
-    };
-    // Don't redact if the `@` is past the first path slash — that's
-    // RFC 3986 path syntax, not userinfo.
-    if let Some(slash_offset) = rest.find('/') {
-        if slash_offset < at_offset {
-            return url.to_string();
-        }
-    }
-    format!(
-        "{}://<redacted>@{}",
-        &url[..scheme_end],
-        &rest[at_offset + 1..],
-    )
 }
 
 /// Wrap a future in the optional deadline. `None` → no timeout.
@@ -2414,15 +2386,18 @@ mod tests {
                 assert!(msg.contains("userinfo") || msg.contains("@"));
                 // Defense-in-depth: the error message MUST NOT echo
                 // the original userinfo back into log output (re-audit
-                // LOW-1). The redactor replaces `user:secret` with
-                // `<redacted>` so an operator-supplied credential
-                // doesn't propagate into operational telemetry.
+                // LOW-1). The redactor replaces `user:secret` with `***` so
+                // an operator-supplied credential doesn't propagate into
+                // operational telemetry. (Marker was `<redacted>` while this
+                // bridge carried its own copy; it uses the shared
+                // `aisix_gateway::redact_userinfo` now, so the whole
+                // workspace redacts identically.)
                 assert!(
                     !msg.contains("user:secret"),
                     "error message leaked operator-supplied userinfo: {msg}"
                 );
                 assert!(
-                    msg.contains("<redacted>"),
+                    msg.contains("***@"),
                     "error message should redact userinfo: {msg}"
                 );
             }
@@ -2430,35 +2405,40 @@ mod tests {
         }
     }
 
+    /// The redaction is `aisix_gateway::redact_userinfo` now, not a local
+    /// copy, so its unit contract is asserted where it lives. What this
+    /// bridge owns is its CALL SITES — which is where the gap was: the
+    /// helper existed here and was wired into one of four branches.
+    ///
+    /// Behaviour change worth naming: the old local helper returned a
+    /// scheme-less value UNCHANGED ("No scheme → unchanged"), and the
+    /// scheme-less branch is exactly the one a credential-bearing base
+    /// reaches — `user:pass@host/v1` with the scheme simply forgotten never
+    /// gets as far as the `@` check. Over-redacting an ambiguous `@` costs a
+    /// slightly vaguer diagnostic; under-redacting it hands the caller an
+    /// operator credential, so the shared helper errs the other way.
     #[test]
-    fn redact_userinfo_strips_user_and_password() {
-        assert_eq!(
-            redact_userinfo("https://user:secret@proxy.internal"),
-            "https://<redacted>@proxy.internal",
-        );
-        assert_eq!(
-            redact_userinfo("http://just-user@host:8001/path"),
-            "http://<redacted>@host:8001/path",
-        );
-    }
-
-    #[test]
-    fn redact_userinfo_leaves_non_userinfo_at_alone() {
-        // `@` past the first path slash is NOT userinfo per RFC 3986.
-        assert_eq!(
-            redact_userinfo("https://proxy.internal/v1@my-namespace"),
-            "https://proxy.internal/v1@my-namespace",
-        );
-        // No scheme → unchanged.
-        assert_eq!(
-            redact_userinfo("proxy.internal@path"),
-            "proxy.internal@path"
-        );
-        // No `@` at all → unchanged.
-        assert_eq!(
-            redact_userinfo("https://proxy.internal/x"),
-            "https://proxy.internal/x"
-        );
+    fn a_rejected_vertex_api_base_never_quotes_the_credential_back() {
+        let bridge = VertexBridge::new();
+        for base in [
+            // No scheme — the branch the old helper did not cover.
+            "user:sk-live-9f2b1e@vertex.example/v1",
+            // With a scheme, caught by the userinfo branch.
+            "https://user:sk-live-9f2b1e@vertex.example/v1",
+        ] {
+            let err = bridge
+                .resolve_api_base("us-central1", Some(base))
+                .expect_err("both shapes are invalid");
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("sk-live-9f2b1e"),
+                "the rejection quotes the credential back: {msg}"
+            );
+            assert!(
+                msg.contains("vertex.example"),
+                "the host should survive so the message stays useful: {msg}"
+            );
+        }
     }
 
     #[test]

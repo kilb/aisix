@@ -338,8 +338,13 @@ impl AzureUpstreamRef {
                 // `rest` is post-scheme; an `@` here means userinfo
                 // (`user:pass@host`). Operators must use the
                 // api-key / AAD path for auth, never URL-embedded.
+                // Redacted before it goes in: this message renders as a 400
+                // whose body the CALLER reads, and the branch fires precisely
+                // because the value carries a credential — quoting it whole
+                // would hand over the thing the check exists to protect.
+                let shown = aisix_gateway::redact_userinfo(base);
                 return Err(BridgeError::InvalidUpstreamConfig(format!(
-                    "azure api_base {base:?} must not embed userinfo (@); use the \
+                    "azure api_base {shown:?} must not embed userinfo (@); use the \
                      api-key / AAD credentials in `provider_key.api_key` instead"
                 )));
             }
@@ -2891,6 +2896,27 @@ mod tests {
             headers.get("accept").unwrap(),
             "text/event-stream",
             "chat_stream must request SSE via Accept header"
+        );
+    }
+
+    /// `InvalidUpstreamConfig` renders as a 400 whose message the CALLER
+    /// reads, and this branch fires precisely because the value carries a
+    /// credential — so quoting it whole handed over the thing the check
+    /// exists to protect. Vertex's sibling check has redacted since #392;
+    /// this one printed the raw base.
+    #[test]
+    fn a_rejected_azure_api_base_never_quotes_the_credential_back() {
+        let err =
+            AzureUpstreamRef::resolve("dep", Some("https://user:sk-live-9f2b1e@azure.example"))
+                .expect_err("userinfo in api_base is refused");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("sk-live-9f2b1e"),
+            "the rejection quotes the credential back: {msg}"
+        );
+        assert!(
+            msg.contains("azure.example") && msg.contains("***@"),
+            "the host should survive so the message stays useful: {msg}"
         );
     }
 }
