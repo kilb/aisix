@@ -31,13 +31,24 @@ export class EtcdClient {
     for (let attempt = 0; attempt < 3; attempt++) {
       if (await this.probeOnce(timeoutMs)) return true;
     }
-    if (process.env.CI) {
-      // In CI etcd is a declared service. "Unreachable" there means the
-      // service is broken, and skipping turns that into a quietly smaller
-      // test run — the failure mode this whole comment is about.
+    // Absent etcd is a broken environment, not a smaller test plan. 215 of
+    // this suite's 221 case files gate their whole describe block on this
+    // answer, so returning `false` turns "etcd is down" into
+    // `Test Files 225 passed (225) / Tests 684 skipped` and exit 0 — a
+    // green run that measured nothing, which is exactly what a test suite
+    // must never report. Measured, not assumed: pointing
+    // AISIX_E2E_ETCD at a dead port and running two case files prints
+    // `2 passed` with every test skipped.
+    //
+    // Opting out stays possible for the handful of cases that need no
+    // etcd, but it has to be deliberate — a missing service can't buy
+    // itself a pass.
+    if (!process.env.AISIX_E2E_ALLOW_NO_ETCD) {
       throw new Error(
-        `etcd at ${this.endpoint} is unreachable, and CI is set. Skipping here ` +
-          `would silently drop most of the suite; fix the service instead.`,
+        `etcd at ${this.endpoint} is unreachable. Skipping here would ` +
+          `silently drop nearly the whole suite and still exit 0. Start etcd, ` +
+          `point AISIX_E2E_ETCD at a live one, or set ` +
+          `AISIX_E2E_ALLOW_NO_ETCD=1 to accept a run that skips most cases.`,
       );
     }
     return false;

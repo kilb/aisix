@@ -6,7 +6,8 @@ import { EtcdClient } from "./etcd.js";
  * Every spec gates its whole `describe` on `EtcdClient.ping()` and skips
  * silently when it answers false. That makes the probe's own reliability a
  * coverage question: one slow response erases a block's worth of tests and
- * the run still reports success, just with a larger skip count.
+ * the run still reports success, just with a larger skip count. Which is
+ * why answering false at all now takes an explicit opt-out.
  *
  * Observed on this repo: two runs of the same tree reported 2 and then 3
  * skipped, and the extra one was a probe that timed out — not a test with
@@ -17,6 +18,7 @@ describe("etcd reachability probe", () => {
 
   afterEach(async () => {
     delete process.env.CI;
+    delete process.env.AISIX_E2E_ALLOW_NO_ETCD;
     if (server) {
       await new Promise<void>((r) => server!.close(() => r()));
       server = undefined;
@@ -46,8 +48,8 @@ describe("etcd reachability probe", () => {
     expect(attempts).toBe(3);
   });
 
-  test("nothing listening is unreachable, and cheaply so", async () => {
-    delete process.env.CI;
+  test("an accepted no-etcd run is unreachable, and cheaply so", async () => {
+    process.env.AISIX_E2E_ALLOW_NO_ETCD = "1";
     const started = Date.now();
     const reachable = await new EtcdClient("http://127.0.0.1:1").ping();
     expect(reachable).toBe(false);
@@ -55,8 +57,10 @@ describe("etcd reachability probe", () => {
     expect(Date.now() - started).toBeLessThan(5_000);
   });
 
-  test("in CI an unreachable etcd fails instead of skipping the suite", async () => {
-    process.env.CI = "true";
+  test("an unreachable etcd fails the run instead of skipping it", async () => {
+    // 没有 CI，也没有 opt-out：默认就该炸，而不是返回 false 让 215 个用例
+    // 静默跳过后报告 “passed”。
+    delete process.env.CI;
     await expect(new EtcdClient("http://127.0.0.1:1").ping()).rejects.toThrow(
       /unreachable/,
     );
