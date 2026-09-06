@@ -25,8 +25,7 @@
 //! values tokenize on punctuation, so the raw fingerprint string (which
 //! contains `:` separators) is hashed to a plain hex token first.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use crate::key::tag_token as aisix_cache_tag_token;
 use std::time::{Duration, Instant};
 
 use aisix_core::RedisConnConfig;
@@ -138,14 +137,26 @@ impl RedisSemanticCache {
         format!("{}:doc:{policy_id}:{generation}:{dims}:", self.prefix)
     }
 
-    /// TAG-safe token for the partition fingerprint: TAG fields
-    /// tokenize on punctuation and the raw value contains separators,
-    /// so it is hashed to bare hex (same 64-bit space as the cache
-    /// fingerprints themselves).
+    /// TAG-safe token for the partition fingerprint: TAG fields tokenize on
+    /// punctuation and the raw value carries `:` separators, so it is hashed
+    /// to bare hex first.
+    ///
+    /// Was a 64-bit `DefaultHasher`, described as "the same 64-bit space as
+    /// the cache fingerprints themselves" — which those are not: they are the
+    /// low 128 bits of SHA-256. That left this token short on both properties
+    /// `key.rs` argues for at length, and both bite HERE specifically:
+    ///
+    /// - `DefaultHasher`'s algorithm is unspecified across Rust releases, and
+    ///   this is the SHARED, PERSISTENT backend — a rolling upgrade crossing a
+    ///   change to it has replicas computing different tags for the same
+    ///   scope, which reads exactly like a cold cache.
+    /// - The tag decides which entries are even CANDIDATES for a similarity
+    ///   match. Two scopes colliding share a partition, so a request can match
+    ///   an entry stored under a different model, sampling params, policy or —
+    ///   under `scope: api_key` — a different caller. 64 bits is not the
+    ///   margin that decision deserves; the exact layer already refused it.
     fn scope_tag(scope_fp: &str) -> String {
-        let mut h = DefaultHasher::new();
-        scope_fp.hash(&mut h);
-        format!("{:016x}", h.finish())
+        aisix_cache_tag_token(scope_fp)
     }
 
     /// Make sure the index for `(policy, generation, dims)` exists,

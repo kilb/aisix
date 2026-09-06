@@ -35,7 +35,7 @@ mod semantic;
 mod semantic_redis;
 
 pub use cache::{Cache, CacheError, CacheOutcome, CachedBody};
-pub use key::{body_fingerprint, semantic_prompt_text, CacheKey};
+pub use key::{body_fingerprint, semantic_prompt_text, tag_token, CacheKey};
 pub use memory::{MemoryCache, DEFAULT_CAPACITY, DEFAULT_TTL};
 #[cfg(feature = "redis")]
 pub use redis::{

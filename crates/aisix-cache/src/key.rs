@@ -270,6 +270,26 @@ pub fn body_fingerprint(parts: &[&str]) -> String {
     h.finalize_hex()
 }
 
+/// A TAG-safe token for an arbitrary string, with the same collision margin
+/// and cross-version stability as the fingerprints above.
+///
+/// Redis TAG fields tokenize on punctuation, so a value carrying `:`
+/// separators cannot be stored raw. Hex has no punctuation and is safe.
+///
+/// Uses [`FingerprintHasher`] for the two reasons the module docs give, both
+/// of which apply verbatim to anything the Redis backend persists:
+/// `DefaultHasher`'s algorithm is unspecified across Rust releases, so a
+/// rolling upgrade across a change to it would have replicas computing
+/// different tokens for the same input; and 64 bits is not enough margin for
+/// a value that partitions entries which are then served without re-checking
+/// what produced them.
+pub fn tag_token(value: &str) -> String {
+    let mut h = FingerprintHasher::default();
+    (value.len() as u64).hash(&mut h);
+    value.hash(&mut h);
+    h.finalize_hex()
+}
+
 /// Sort `extra` by key (recursively, into nested objects too) and emit
 /// a stable canonical-JSON string per value. The recursion matters: two
 /// callers can send byte-different JSON for `tools=[{...}]` if they
@@ -889,5 +909,32 @@ mod tests {
             semantic_prompt_text(&forged).unwrap(),
             semantic_prompt_text(&literal).unwrap(),
         );
+    }
+
+    /// The semantic backend's partition tag must have the same properties the
+    /// fingerprints above are argued to need — it decides which entries are
+    /// even candidates for a similarity match, and a collision puts two
+    /// scopes (different model, params, policy, or caller) in one partition.
+    ///
+    /// It was a 64-bit `DefaultHasher`, commented as "the same 64-bit space
+    /// as the cache fingerprints themselves", which they are not.
+    #[test]
+    fn the_tag_token_is_128_bit_and_tag_safe() {
+        let t = tag_token("model|0.7|policy-1|3|api-key-9");
+        assert_eq!(t.len(), 32, "128 bits, hex-encoded: {t}");
+        assert!(
+            t.chars().all(|c| c.is_ascii_hexdigit()),
+            "a Redis TAG value tokenizes on punctuation, so the token must be \
+             bare hex: {t}"
+        );
+        assert_eq!(t, tag_token("model|0.7|policy-1|3|api-key-9"), "stable");
+        assert_ne!(
+            t,
+            tag_token("model|0.7|policy-1|3|api-key-8"),
+            "a different caller scope must not share a partition"
+        );
+        // Length-prefixed like the other fingerprints: without it, two
+        // different scopes could concatenate to the same byte stream.
+        assert_ne!(tag_token("ab"), tag_token("a"), "distinct inputs differ");
     }
 }
