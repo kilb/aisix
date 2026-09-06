@@ -319,7 +319,13 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
     observability: {
       service_name: "aisix-e2e",
       log_level: overrides.logLevel ?? "warn",
-      access_log: false,
+      // Was `false`, set when this field was inert. It is honoured now, so
+      // `false` here would switch the access log off for the whole suite and
+      // quietly empty every assertion that reads one. Suites that want the
+      // line raise `logLevel` to `info`; suites that do not are already quiet
+      // at `warn`, which is how access-log noise was actually controlled all
+      // along.
+      access_log: true,
       metrics: {
         prometheus: {
           enabled: prometheusEnabled,

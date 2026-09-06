@@ -245,9 +245,9 @@ describe("body edges e2e: multi-turn, oversize body, empty messages", () => {
     // look at: a caller reporting a 413 the gateway had no record of is
     // indistinguishable from the request never arriving.
     //
-    // (`observability.access_log` in the harness config is the reserved
-    // field nothing reads today — the access log is gated by the log
-    // level alone, which is why this suite raises it to `info`.)
+    // (`observability.access_log` is honoured now — the harness leaves it
+    // on. Whether the line is VISIBLE is still the log level's job, which
+    // is why this suite raises it to `info`.)
     const filler = "x".repeat(10 * 1024 * 1024 + 512 * 1024);
     const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
       method: "POST",
