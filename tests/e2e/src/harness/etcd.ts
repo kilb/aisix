@@ -19,6 +19,31 @@ export class EtcdClient {
    * on port 2379 and we don't want to misidentify those as etcd.
    */
   async ping(timeoutMs = 1000): Promise<boolean> {
+    // Retry before concluding "no etcd here". Every spec gates its whole
+    // describe block on this answer and skips silently when it is false, so
+    // one slow response — a busy machine, a cold connection — erases that
+    // block's coverage with nothing but a `↓` in the summary. Observed: two
+    // runs of the same tree reported 2 and then 3 skipped, and the extra one
+    // was a probe that timed out, not a test that had anything to say.
+    //
+    // A genuinely absent etcd still answers immediately (connection refused),
+    // so the retries cost nothing in the local case this skip exists for.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (await this.probeOnce(timeoutMs)) return true;
+    }
+    if (process.env.CI) {
+      // In CI etcd is a declared service. "Unreachable" there means the
+      // service is broken, and skipping turns that into a quietly smaller
+      // test run — the failure mode this whole comment is about.
+      throw new Error(
+        `etcd at ${this.endpoint} is unreachable, and CI is set. Skipping here ` +
+          `would silently drop most of the suite; fix the service instead.`,
+      );
+    }
+    return false;
+  }
+
+  private async probeOnce(timeoutMs: number): Promise<boolean> {
     try {
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), timeoutMs);
