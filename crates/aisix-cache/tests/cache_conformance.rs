@@ -111,9 +111,19 @@ fn response(text: &str) -> ChatResponse {
     }
 }
 
-/// Run `scenario` against both caches and require the same transcript, so a
-/// divergence names WHAT differed rather than just which backend failed.
-async fn both<F, Fut>(label: &str, scenario: F)
+/// Run `scenario` against both caches and require the same transcript — and
+/// require that transcript to be `expected`.
+///
+/// The scenario returns a comparable transcript rather than asserting inside,
+/// so a divergence names WHAT differed rather than just which backend failed.
+///
+/// `expected` is the half agreement alone cannot give: a pure conformance
+/// check passes whenever the two backends are wrong TOGETHER, which is what a
+/// regression in shared logic or in the trait's contract produces —
+/// `a_miss_a_put_and_a_hit_read_the_same` would still pass if `get` returned
+/// `None` after every `put` on both sides. Each scenario states the
+/// transcript its own calls imply, and both backends are held to it.
+async fn both<F, Fut>(label: &str, expected: &[&str], scenario: F)
 where
     F: Fn(std::sync::Arc<dyn Cache>, String) -> Fut,
     Fut: std::future::Future<Output = Vec<String>>,
@@ -143,34 +153,47 @@ where
         "{label}: the two caches disagree — a caller's experience should differ \
          between them only in SCOPE (per-replica vs shared), never in semantics"
     );
+    assert_eq!(
+        from_local, expected,
+        "{label}: both caches agree, and both are wrong — the transcript this \
+         scenario's own calls imply is `{expected:?}`"
+    );
 }
 
 #[tokio::test]
 async fn a_miss_a_put_and_a_hit_read_the_same() {
-    both("chat round trip", |cache, k| async move {
-        let mut out = Vec::new();
-        out.push(format!(
-            "before={:?}",
-            cache.get(&k).await.map(|v| v.is_some())
-        ));
-        cache.put(&k, response("hello")).await.expect("put");
-        let got = cache.get(&k).await.expect("get");
-        out.push(format!(
-            "after={:?}",
-            got.map(|r| r.message.content_str().to_string())
-        ));
-        out.push(format!(
-            "other_key={:?}",
-            cache.get(&format!("{k}-absent")).await.map(|v| v.is_some())
-        ));
-        out
-    })
+    both(
+        "chat round trip",
+        &[
+            "before=Ok(false)",
+            "after=Some(\"hello\")",
+            "other_key=Ok(false)",
+        ],
+        |cache, k| async move {
+            let mut out = Vec::new();
+            out.push(format!(
+                "before={:?}",
+                cache.get(&k).await.map(|v| v.is_some())
+            ));
+            cache.put(&k, response("hello")).await.expect("put");
+            let got = cache.get(&k).await.expect("get");
+            out.push(format!(
+                "after={:?}",
+                got.map(|r| r.message.content_str().to_string())
+            ));
+            out.push(format!(
+                "other_key={:?}",
+                cache.get(&format!("{k}-absent")).await.map(|v| v.is_some())
+            ));
+            out
+        },
+    )
     .await;
 }
 
 #[tokio::test]
 async fn a_second_put_replaces_the_first() {
-    both("overwrite", |cache, k| async move {
+    both("overwrite", &["Some(\"second\")"], |cache, k| async move {
         cache.put(&k, response("first")).await.expect("put");
         cache.put(&k, response("second")).await.expect("put again");
         let got = cache.get(&k).await.expect("get");
@@ -184,37 +207,44 @@ async fn a_second_put_replaces_the_first() {
 
 #[tokio::test]
 async fn a_body_round_trips_with_its_content_type() {
-    both("body round trip", |cache, k| async move {
-        let mut out = Vec::new();
-        out.push(format!(
-            "before={:?}",
-            cache.get_body(&k).await.map(|v| v.is_some())
-        ));
-        cache
-            .put_body_with_ttl(
-                &k,
-                CachedBody {
-                    content_type: "application/json".into(),
-                    body: b"{\"ok\":true}".to_vec(),
-                    prompt_tokens: 7,
-                    completion_tokens: 3,
-                },
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("put body");
-        let got = cache.get_body(&k).await.expect("get body");
-        out.push(format!(
-            "after={:?}",
-            got.map(|b| (
-                b.content_type,
-                String::from_utf8_lossy(&b.body).into_owned(),
-                b.prompt_tokens,
-                b.completion_tokens,
-            ))
-        ));
-        out
-    })
+    both(
+        "body round trip",
+        &[
+            "before=Ok(false)",
+            "after=Some((\"application/json\", \"{\\\"ok\\\":true}\", 7, 3))",
+        ],
+        |cache, k| async move {
+            let mut out = Vec::new();
+            out.push(format!(
+                "before={:?}",
+                cache.get_body(&k).await.map(|v| v.is_some())
+            ));
+            cache
+                .put_body_with_ttl(
+                    &k,
+                    CachedBody {
+                        content_type: "application/json".into(),
+                        body: b"{\"ok\":true}".to_vec(),
+                        prompt_tokens: 7,
+                        completion_tokens: 3,
+                    },
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("put body");
+            let got = cache.get_body(&k).await.expect("get body");
+            out.push(format!(
+                "after={:?}",
+                got.map(|b| (
+                    b.content_type,
+                    String::from_utf8_lossy(&b.body).into_owned(),
+                    b.prompt_tokens,
+                    b.completion_tokens,
+                ))
+            ));
+            out
+        },
+    )
     .await;
 }
 
@@ -223,31 +253,38 @@ async fn a_body_round_trips_with_its_content_type() {
 /// that shared one slot would hand a caller the wrong shape entirely.
 #[tokio::test]
 async fn the_chat_and_body_families_do_not_read_each_other() {
-    both("family isolation", |cache, k| async move {
-        let mut out = Vec::new();
-        cache.put(&k, response("chat shaped")).await.expect("put");
-        out.push(format!(
-            "body_after_chat_put={:?}",
-            cache.get_body(&k).await.map(|v| v.is_some())
-        ));
-        cache
-            .put_body_with_ttl(
-                &format!("{k}-b"),
-                CachedBody {
-                    content_type: "text/plain".into(),
-                    body: b"body shaped".to_vec(),
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                },
-                Duration::from_secs(60),
-            )
-            .await
-            .expect("put body");
-        out.push(format!(
-            "chat_after_body_put={:?}",
-            cache.get(&format!("{k}-b")).await.map(|v| v.is_some())
-        ));
-        out
-    })
+    both(
+        "family isolation",
+        &[
+            "body_after_chat_put=Ok(false)",
+            "chat_after_body_put=Ok(false)",
+        ],
+        |cache, k| async move {
+            let mut out = Vec::new();
+            cache.put(&k, response("chat shaped")).await.expect("put");
+            out.push(format!(
+                "body_after_chat_put={:?}",
+                cache.get_body(&k).await.map(|v| v.is_some())
+            ));
+            cache
+                .put_body_with_ttl(
+                    &format!("{k}-b"),
+                    CachedBody {
+                        content_type: "text/plain".into(),
+                        body: b"body shaped".to_vec(),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                    },
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("put body");
+            out.push(format!(
+                "chat_after_body_put={:?}",
+                cache.get(&format!("{k}-b")).await.map(|v| v.is_some())
+            ));
+            out
+        },
+    )
     .await;
 }
