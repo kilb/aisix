@@ -159,6 +159,21 @@ impl ConnectionLike for RedisConnHandle {
 /// Redis slower than this is already failing the request it is holding up,
 /// and the degraded path it falls into is the one the operator is alerted
 /// on (`aisix_redis_failures_total`).
+///
+/// **A timed-out reply does not desynchronise the multiplexed connection**,
+/// which is the objection this cap invites and the reason to state the
+/// answer rather than re-derive it. In redis-rs 0.27.6 the timeout wraps
+/// only the caller's oneshot receiver
+/// (`src/aio/multiplexed_connection.rs::send_recv`); the request keeps its
+/// slot in the pipeline and its reply is still matched to that slot's
+/// (now dropped) sender, so no later command reads someone else's answer.
+/// The same module documents the other half — "the user can drop request
+/// futures without polling them to completion, but this doesn't mean that
+/// the actual request sent to the server is cancelled" — so a slow command
+/// still completes server-side. That is why the two `FT.DROPINDEX ... DD`
+/// calls in the semantic cache, the only commands here whose cost is
+/// O(documents) rather than O(1), already discard their result: the drop
+/// happens whether or not this client waited for it.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Same reasoning for the TCP + handshake leg of a reconnect.
