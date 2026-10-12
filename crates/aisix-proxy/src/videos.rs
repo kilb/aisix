@@ -1048,8 +1048,8 @@ impl VideoTarget {
 
 /// Shared resolve → ACL → IP-allowlist → provider gate for a Model on the
 /// videos surface. `acl_name` is the name the caller's key is checked
-/// against (the requested alias on submit, the stored display name on the
-/// GET routes).
+/// against: the requested alias, on submit and on the GET routes alike
+/// (where it is the alias carried in the id).
 fn resolve_video_target(
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
@@ -1791,13 +1791,19 @@ async fn dispatch_create(
 // ─────────────────────────── GET routes ───────────────────────────
 
 /// Decode + resolve the target for a GET route. 404 for ids this gateway
-/// could not have minted (undecodable, or naming a Model entry that no
-/// longer exists in the snapshot).
+/// could not have minted (undecodable, naming a Model entry that no
+/// longer exists in the snapshot, or naming one its alias does not
+/// resolve to).
 ///
 /// The key ACL runs against the REQUESTED ALIAS carried inside the id —
 /// the identical check the submit performed — so wildcard-alias journeys
 /// (Model `wan/*`, key allowlisted for `wan/turbo`) can poll their own
-/// tasks. Two deliberate 404 folds close a disclosure oracle on guessed
+/// tasks. The id is decodable and its parts are caller-editable, so the
+/// alias only vouches for the entry it resolves to: an id pairing an
+/// alias the key may use with another Model's entry would otherwise pass
+/// the ACL and poll that Model's upstream with its credential.
+///
+/// Two deliberate 404 folds close a disclosure oracle on guessed
 /// entry UUIDs: an ACL denial and the unsupported-provider case both
 /// surface as `video_not_found`, because a 403 (which would echo a model
 /// identity) or a 501 (which reveals the entry exists and names its
@@ -1813,9 +1819,8 @@ fn resolve_get_target(
 ) -> Result<(VideoTarget, String), ProxyError> {
     let (entry_id, alias, task_id) =
         decode_video_id(video_id).ok_or_else(|| ProxyError::VideoNotFound(video_id.to_string()))?;
-    let model_entry = snapshot
-        .models
-        .get_by_id(&entry_id)
+    let model_entry = crate::model_resolve::resolve_model(snapshot, &alias)
+        .filter(|resolved| resolved.id == entry_id)
         .ok_or_else(|| ProxyError::VideoNotFound(video_id.to_string()))?;
     match resolve_video_target(snapshot, auth, model_entry, &alias, client_ctx) {
         Ok(Ok(target)) => Ok((target, task_id)),
@@ -3211,6 +3216,48 @@ mod tests {
                 !msg.contains("my-video"),
                 "the model identity must not leak through the 404: {msg}"
             );
+        }
+    }
+
+    /// The id is decodable, so a caller can pair an alias its key may use
+    /// with another Model's entry id. The gateway never minted that id: it
+    /// is a 404, and the other Model's upstream is never contacted.
+    #[tokio::test]
+    async fn id_pairing_an_allowed_alias_with_another_entry_is_404() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": {"task_id": "task-123", "task_status": "RUNNING"}
+            })))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        // `my-video` (MODEL_ID) is off limits to the key; `open-video` is not.
+        let snap = new_snap(&upstream.uri(), "alibaba", "");
+        let open: Model = serde_json::from_str(&format!(
+            r#"{{"display_name":"open-video","provider":"alibaba","model_name":"wan-upstream","provider_key_id":"{PK_ID}"}}"#
+        ))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-video-2", open, 1));
+        let key: ApiKey = serde_json::from_str(
+            r#"{"key_hash": "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891", "allowed_models": ["open-video"]}"#,
+        )
+        .unwrap();
+        snap.apikeys.insert(ResourceEntry::new("k-1", key, 1));
+
+        let app = build_app(snap);
+        let forged = encode_video_id(MODEL_ID, "open-video", "task-123");
+        for suffix in ["", "/content"] {
+            let resp = tower::ServiceExt::oneshot(
+                app.clone(),
+                get_uri(&format!("/v1/videos/{forged}{suffix}")),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            let v = body_json(resp).await;
+            assert_eq!(v["error"]["type"], "video_not_found");
         }
     }
 

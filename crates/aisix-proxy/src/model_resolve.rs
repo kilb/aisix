@@ -63,9 +63,16 @@ fn best_wildcard_row(
         let Some(capture) = wildcard_capture(&model.display_name, requested) else {
             continue;
         };
-        // Specificity = literal (non-`*`) length; longest wins, first on a tie.
+        // Specificity = literal (non-`*`) length; longest wins. A tie goes to
+        // the lowest entry id: the table iterates in no fixed order, and a
+        // tie decided by iteration order could pick a different row on
+        // another replica or after a restart, which also breaks a video id
+        // bound to the row its submit resolved.
         let specificity = model.display_name.len() - 1;
-        if best.as_ref().is_none_or(|(s, _, _)| specificity > *s) {
+        if best
+            .as_ref()
+            .is_none_or(|(s, e, _)| specificity > *s || (specificity == *s && entry.id < e.id))
+        {
             let upstream = resolve_upstream_model_name(model, &capture);
             best = Some((specificity, entry.clone(), upstream));
         }
@@ -152,6 +159,25 @@ mod tests {
         let resolved = resolve_model(&snap, "openai/gpt-4o").unwrap();
         assert_eq!(resolved.id, "m-exact");
         assert_eq!(resolved.value.model_name.as_deref(), Some("gpt-4o-2024"));
+    }
+
+    /// Two equally specific wildcards both match: every table, whatever
+    /// its insertion and iteration order, picks the same row.
+    #[test]
+    fn tied_wildcards_resolve_to_the_same_row_in_every_table() {
+        for round in 0..64 {
+            let rows = [
+                ("m-a", direct_model("wan/*", Some("*"))),
+                ("m-b", direct_model("*-pro", Some("*"))),
+            ];
+            let rows = if round % 2 == 0 {
+                rows.into_iter().collect::<Vec<_>>()
+            } else {
+                rows.into_iter().rev().collect()
+            };
+            let snap = snapshot_with(rows);
+            assert_eq!(resolve_model(&snap, "wan/x-pro").unwrap().id, "m-a");
+        }
     }
 
     #[test]
