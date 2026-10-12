@@ -735,9 +735,13 @@ impl Guardrail for MonitorGuardrail {
 /// ever emit `Bypass`, so keyword rows wrapped here are behaviourally
 /// untouched.
 ///
-/// Stream policy + `runs_on_output` delegate to the inner guardrail so the
-/// decorator doesn't change hold-back behaviour — it only rewrites the
-/// verdict a failed evaluation produces.
+/// Everything else delegates to the inner guardrail — stream policy,
+/// `runs_on_output`, redaction, the segment pass and the monitor-hit
+/// observing checks — so the decorator changes nothing but the verdict a
+/// failed evaluation produces. In particular a masking segment moderator
+/// (bedrock/lakera/presidio/aliyun_ai_guardrail) keeps answering through the segment pass,
+/// where it can mask, rather than the blob check, where a maskable outcome
+/// is a block; and a monitor-mode row keeps its would-* hits.
 struct MandatoryGuardrail {
     row_name: String,
     inner: Arc<dyn Guardrail>,
@@ -782,6 +786,38 @@ impl Guardrail for MandatoryGuardrail {
 
     async fn check_output(&self, resp: &ChatResponse) -> GuardrailVerdict {
         self.enforce("output", self.inner.check_output(resp).await)
+    }
+
+    async fn check_input_observed(
+        &self,
+        req: &ChatFormat,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let (verdict, hits) = self.inner.check_input_observed(req).await;
+        (self.enforce("input", verdict), hits)
+    }
+
+    async fn check_output_observed(
+        &self,
+        resp: &ChatResponse,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let (verdict, hits) = self.inner.check_output_observed(resp).await;
+        (self.enforce("output", verdict), hits)
+    }
+
+    fn moderates_segments(&self) -> bool {
+        self.inner.moderates_segments()
+    }
+
+    async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
+        let mut outcome = self.inner.moderate_input_segments(texts).await;
+        outcome.verdict = self.enforce("input", outcome.verdict);
+        outcome
+    }
+
+    async fn moderate_output_segments(&self, texts: &[String]) -> SegmentsOutcome {
+        let mut outcome = self.inner.moderate_output_segments(texts).await;
+        outcome.verdict = self.enforce("output", outcome.verdict);
+        outcome
     }
 
     fn stream_output_policy(&self) -> StreamOutputPolicy {
@@ -1604,6 +1640,102 @@ mod tests {
         assert_eq!(allow.check_input(&req("hi")).await, GuardrailVerdict::Allow);
         let block = apply_mandatory(&row_with_mandatory(true), Arc::new(AlwaysBlock));
         assert!(block.check_input(&req("hi")).await.is_block());
+    }
+
+    /// A mandatory segment moderator keeps answering through the segment
+    /// pass, so its mask comes back unchanged; only an unavailable
+    /// provider's `Bypass` becomes a named `Block` there.
+    #[tokio::test]
+    async fn mandatory_segment_moderator_masks_and_blocks_only_when_unavailable() {
+        struct Segments(GuardrailVerdict, Option<Vec<String>>);
+        impl Segments {
+            fn outcome(&self) -> SegmentsOutcome {
+                SegmentsOutcome {
+                    verdict: self.0.clone(),
+                    masked: self.1.clone(),
+                    counts: std::collections::BTreeMap::new(),
+                    monitor_hits: Vec::new(),
+                }
+            }
+        }
+        #[async_trait]
+        impl Guardrail for Segments {
+            fn name(&self) -> &'static str {
+                "segments"
+            }
+            fn moderates_segments(&self) -> bool {
+                true
+            }
+            async fn moderate_input_segments(&self, _texts: &[String]) -> SegmentsOutcome {
+                self.outcome()
+            }
+            async fn moderate_output_segments(&self, _texts: &[String]) -> SegmentsOutcome {
+                self.outcome()
+            }
+        }
+        let texts = vec!["mail a@b.c".to_string()];
+
+        let masking = apply_mandatory(
+            &row_with_mandatory(true),
+            Arc::new(Segments(
+                GuardrailVerdict::Allow,
+                Some(vec!["mail <EMAIL>".into()]),
+            )),
+        );
+        assert!(masking.moderates_segments());
+        for out in [
+            masking.moderate_input_segments(&texts).await,
+            masking.moderate_output_segments(&texts).await,
+        ] {
+            assert_eq!(out.verdict, GuardrailVerdict::Allow);
+            assert_eq!(out.masked, Some(vec!["mail <EMAIL>".to_string()]));
+        }
+
+        let down = apply_mandatory(
+            &row_with_mandatory(true),
+            Arc::new(Segments(
+                GuardrailVerdict::Bypass {
+                    reason: "upstream_unreachable".into(),
+                },
+                None,
+            )),
+        );
+        for out in [
+            down.moderate_input_segments(&texts).await,
+            down.moderate_output_segments(&texts).await,
+        ] {
+            assert_eq!(
+                out.verdict,
+                GuardrailVerdict::Block {
+                    reason: "mandatory guardrail unavailable: upstream_unreachable".to_string(),
+                    guardrail_name: Some("remote".to_string()),
+                },
+            );
+        }
+    }
+
+    /// `monitor` + `mandatory`: the would-block hit the monitor wrapper
+    /// records survives the mandatory wrapper around it.
+    #[tokio::test]
+    async fn mandatory_keeps_monitor_hits() {
+        let row = parse(
+            r#"{
+                "name": "monitored",
+                "kind": "keyword",
+                "enforcement_mode": "monitor",
+                "mandatory": true,
+                "patterns": [{ "kind": "literal", "value": "AKIA" }]
+            }"#,
+        );
+        let g = build_one(&row, None).unwrap().unwrap();
+        let (verdict, hits) = g.check_input_observed(&req("key AKIAEXAMPLE")).await;
+        assert_eq!(verdict, GuardrailVerdict::Allow);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].action, "would_block");
+        assert_eq!(hits[0].guardrail_name, "monitored");
+        let (verdict, hits) = g.check_output_observed(&resp("key AKIAEXAMPLE")).await;
+        assert_eq!(verdict, GuardrailVerdict::Allow);
+        assert_eq!(hits.len(), 1, "{hits:?}");
     }
 
     fn aliyun_row_against(endpoint: &str, extra: &str) -> DomainGuardrail {

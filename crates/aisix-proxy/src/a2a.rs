@@ -426,6 +426,13 @@ async fn dispatch(
             // the method. That is a real gap, named here rather than papered
             // over — closing it needs the incremental scan the chat streaming
             // path uses.
+            //
+            // The full observed check, not the `_non_segment` one: a masking
+            // segment moderator (bedrock/lakera/presidio/aliyun_ai_guardrail)
+            // is skipped by the latter on the promise of a segment pass, and
+            // an A2A answer has no masked write-back to run one with. Like
+            // the input hook above, such a guardrail answers through its
+            // check here, where a maskable answer is blocked.
             if !guardrail_chain.is_empty() {
                 let answer = call.text.response.joined();
                 if !answer.is_empty() {
@@ -436,12 +443,11 @@ async fn dispatch(
                         finish_reason: aisix_gateway::FinishReason::Stop,
                         usage: aisix_gateway::UsageStats::default(),
                     };
-                    let (verdict, hits) =
-                        aisix_guardrails::Guardrail::check_output_non_segment_observed(
-                            &guardrail_chain,
-                            &synth,
-                        )
-                        .await;
+                    let (verdict, hits) = aisix_guardrails::Guardrail::check_output_observed(
+                        &guardrail_chain,
+                        &synth,
+                    )
+                    .await;
                     call.guardrail_monitor_hits.extend(hits);
                     if let aisix_guardrails::GuardrailVerdict::Block {
                         reason,
