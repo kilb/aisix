@@ -16,11 +16,16 @@
 
 use aisix_gateway::url_cache::cached_endpoint_url;
 use aisix_gateway::{
-    Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatFormat, ChatResponse,
-    SseDecoder, SseEvent,
+    apply_request_headers, Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream,
+    ChatFormat, ChatResponse, SseDecoder, SseEvent, UpstreamHeaderContext,
+};
+use aisix_provider_openai::overrides::{
+    apply_default_body_fields, apply_param_constraints, apply_param_renames,
+    validate_content_safe_request_overrides,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{header, Client, StatusCode};
 use std::time::{Duration, Instant};
 
@@ -204,6 +209,74 @@ fn maybe_inject_cache_breakpoints(
     }
 }
 
+/// Serialize the Messages body and apply the ProviderKey's `request`
+/// override block to it: `param_renames` → `param_constraints` →
+/// `default_body_fields`, as every other path to an Anthropic upstream
+/// does (the `/v1/messages` passthrough, `count_tokens`, Claude on
+/// Vertex AI). Shared by the streaming and non-streaming paths.
+///
+/// The body goes through JSON text rather than `serde_json::to_value`,
+/// which widens an `f32` field such as `temperature` to its exact `f64`
+/// value and would send `0.7` as `0.699999988079071`.
+fn prepare_outbound_body(
+    body: &crate::wire::AnthropicRequest<'_>,
+    ctx: &BridgeContext,
+) -> Result<serde_json::Value, BridgeError> {
+    let mut body: serde_json::Value = serde_json::to_vec(body)
+        .and_then(|bytes| serde_json::from_slice(&bytes))
+        .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?;
+    if let Some(r) = ctx.provider_key.request.as_ref() {
+        validate_content_safe_request_overrides(r).map_err(BridgeError::InvalidUpstreamConfig)?;
+        apply_param_renames(&mut body, &r.param_renames);
+        if let Some(constraints) = &r.param_constraints {
+            apply_param_constraints(&mut body, constraints);
+        }
+        apply_default_body_fields(&mut body, &r.default_body_fields);
+    }
+    Ok(body)
+}
+
+/// Build the outbound headers: the bridge-owned ones first (`x-api-key`,
+/// `anthropic-version`, `content-type`, `x-aisix-request-id`, and
+/// `accept` when streaming), then the ProviderKey's `default_headers`
+/// and allowlisted client headers, which [`apply_request_headers`] never
+/// lets replace a header already set.
+fn build_request_headers(
+    api_key: &str,
+    api_version: &'static str,
+    request_id: &str,
+    sse: bool,
+    hdr: &UpstreamHeaderContext<'_>,
+) -> Result<HeaderMap, BridgeError> {
+    let mut headers = HeaderMap::new();
+    let key = HeaderValue::from_str(api_key).map_err(|_| {
+        BridgeError::InvalidUpstreamCredentials(
+            "provider_key.api_key contains invalid header characters".into(),
+        )
+    })?;
+    headers.insert(HeaderName::from_static("x-api-key"), key);
+    headers.insert(
+        HeaderName::from_static("anthropic-version"),
+        HeaderValue::from_static(api_version),
+    );
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    let rid = HeaderValue::from_str(request_id).map_err(|e| {
+        BridgeError::Config(format!("request_id contains invalid header chars: {e}"))
+    })?;
+    headers.insert(HeaderName::from_static("x-aisix-request-id"), rid);
+    if sse {
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+    }
+    apply_request_headers(&mut headers, hdr);
+    Ok(headers)
+}
+
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     aisix_gateway::capture_upstream_error_http(
         status,
@@ -283,6 +356,14 @@ impl Bridge for AnthropicBridge {
             split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
         let mut body = build_request(req, upstream, system, messages, false);
         maybe_inject_cache_breakpoints(&mut body, ctx);
+        let body = prepare_outbound_body(&body, ctx)?;
+        let headers = build_request_headers(
+            key,
+            self.api_version,
+            &ctx.request_id,
+            false,
+            &ctx.header_ctx(),
+        )?;
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
             "anthropic/messages",
@@ -293,17 +374,12 @@ impl Bridge for AnthropicBridge {
             || Ok(format!("{}/v1/messages", resolve_base(ctx)?)),
         )?;
         let client = self.client_for(ctx);
-        let api_version = self.api_version;
         let started = Instant::now();
-        let request_id = ctx.request_id.clone();
 
         with_deadline(ctx.deadline, started, async move {
             let resp = url
                 .post_on(&client)
-                .header("x-api-key", key)
-                .header("anthropic-version", api_version)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("x-aisix-request-id", &request_id)
+                .headers(headers)
                 .json(&body)
                 .send()
                 .await
@@ -335,6 +411,14 @@ impl Bridge for AnthropicBridge {
             split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
         let mut body = build_request(req, upstream, system, messages, true);
         maybe_inject_cache_breakpoints(&mut body, ctx);
+        let body = prepare_outbound_body(&body, ctx)?;
+        let headers = build_request_headers(
+            key,
+            self.api_version,
+            &ctx.request_id,
+            true,
+            &ctx.header_ctx(),
+        )?;
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
             "anthropic/messages",
@@ -345,17 +429,11 @@ impl Bridge for AnthropicBridge {
             || Ok(format!("{}/v1/messages", resolve_base(ctx)?)),
         )?;
         let client = self.client_for(ctx);
-        let api_version = self.api_version;
         let started = Instant::now();
-        let request_id = ctx.request_id.clone();
 
         let resp = with_deadline(ctx.deadline, started, async move {
             url.post_on(&client)
-                .header("x-api-key", key)
-                .header("anthropic-version", api_version)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::ACCEPT, "text/event-stream")
-                .header("x-aisix-request-id", &request_id)
+                .headers(headers)
                 .json(&body)
                 .send()
                 .await
@@ -630,6 +708,68 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(resp.usage.prompt_tokens, 2);
         assert_eq!(resp.usage.completion_tokens, 3);
         assert_eq!(resp.usage.total_tokens, 5);
+    }
+
+    /// A ctx whose ProviderKey carries the given `request` override block.
+    fn overrides_ctx(base: &str, request: serde_json::Value) -> BridgeContext {
+        let pk: ProviderKey = serde_json::from_value(serde_json::json!({
+            "display_name": "anthropic-prod",
+            "secret": "sk-ant-test",
+            "api_base": base,
+            "request": request,
+        }))
+        .unwrap();
+        BridgeContext::new("req-1", sample_model(), Arc::new(pk))
+    }
+
+    #[tokio::test]
+    async fn non_streaming_applies_provider_key_request_overrides() {
+        let server = MockServer::start().await;
+        mount_ok_nonstream(&server).await;
+        let ctx = overrides_ctx(
+            &server.uri(),
+            serde_json::json!({
+                "param_renames": {"temperature": "temp"},
+                "default_body_fields": {"top_k": 7},
+                "default_headers": {"x-corp-trace": "on", "x-api-key": "sk-operator-typo"},
+            }),
+        );
+        let mut request = req();
+        request.temperature = Some(0.5);
+        AnthropicBridge::new().chat(&request, &ctx).await.unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(body["temp"], 0.5);
+        assert!(body.get("temperature").is_none());
+        assert_eq!(body["top_k"], 7);
+        assert_eq!(reqs[0].headers.get("x-corp-trace").unwrap(), "on");
+        // An auth header in `default_headers` never replaces the key's own.
+        assert_eq!(reqs[0].headers.get("x-api-key").unwrap(), "sk-ant-test");
+    }
+
+    #[tokio::test]
+    async fn guarded_content_override_is_rejected_before_dispatch() {
+        let server = MockServer::start().await;
+        mount_ok_nonstream(&server).await;
+        let ctx = overrides_ctx(
+            &server.uri(),
+            serde_json::json!({"default_body_fields": {"system": "injected after moderation"}}),
+        );
+        let bridge = AnthropicBridge::new();
+
+        let err = bridge.chat(&req(), &ctx).await.unwrap_err();
+        assert!(
+            matches!(err, BridgeError::InvalidUpstreamConfig(_)),
+            "{err:?}"
+        );
+        let err = bridge.chat_stream(&req(), &ctx).await.err().unwrap();
+        assert!(
+            matches!(err, BridgeError::InvalidUpstreamConfig(_)),
+            "{err:?}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@ description = "aisix: Anthropic Messages provider with full bidirectional Hub br
 [dependencies]
 aisix-core = { path = "../aisix-core" }
 aisix-gateway = { path = "../aisix-gateway" }
+aisix-provider-openai = { path = "../aisix-provider-openai" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
