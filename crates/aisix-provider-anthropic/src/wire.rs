@@ -1158,16 +1158,7 @@ pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
                 "type": "function",
                 "function": {
                     "name": name,
-                    // OpenAI emits `"{}"` (empty object) for no-args
-                    // tool calls, not `"null"`. Normalise here so SDK
-                    // consumers doing `JSON.parse(args)` get an
-                    // object back even when Anthropic's `input`
-                    // field is absent / null.
-                    "arguments": match input {
-                        serde_json::Value::Null => "{}".to_string(),
-                        other => serde_json::to_string(other)
-                            .unwrap_or_else(|_| "{}".to_string()),
-                    },
+                    "arguments": tool_arguments(input),
                 },
             })),
             _ => None,
@@ -1223,6 +1214,18 @@ pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
     }
 }
 
+/// A `tool_use` block's `input` as OpenAI `function.arguments` text.
+/// OpenAI emits `"{}"` (empty object) for no-args tool calls, not
+/// `"null"`. Normalise here so SDK consumers doing `JSON.parse(args)`
+/// get an object back even when Anthropic's `input` field is absent /
+/// null.
+fn tool_arguments(input: &serde_json::Value) -> String {
+    match input {
+        serde_json::Value::Null => "{}".to_string(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
+    }
+}
+
 fn map_stop_reason(raw: Option<&str>) -> FinishReason {
     match raw {
         Some("end_turn") | Some("stop_sequence") | None => FinishReason::Stop,
@@ -1242,8 +1245,28 @@ pub enum AnthropicStreamEvent {
     MessageStart {
         message: AnthropicStreamStartMessage,
     },
+    /// Opens a content block. Only `tool_use` blocks are read: they carry
+    /// the call `id` + `name`, and the arguments follow as
+    /// `input_json_delta` fragments.
+    #[serde(rename = "content_block_start")]
+    ContentBlockStart {
+        #[serde(default)]
+        index: Option<u64>,
+        content_block: AnthropicStreamContentBlock,
+    },
     #[serde(rename = "content_block_delta")]
-    ContentBlockDelta { delta: AnthropicStreamDelta },
+    ContentBlockDelta {
+        /// The content block the delta belongs to. Read to attach an
+        /// argument fragment to its tool call.
+        #[serde(default)]
+        index: Option<u64>,
+        delta: AnthropicStreamDelta,
+    },
+    #[serde(rename = "content_block_stop")]
+    ContentBlockStop {
+        #[serde(default)]
+        index: Option<u64>,
+    },
     #[serde(rename = "message_delta")]
     MessageDelta {
         delta: AnthropicStreamMessageDelta,
@@ -1260,8 +1283,27 @@ pub enum AnthropicStreamEvent {
     /// stream looked like a clean completion (#1222).
     #[serde(rename = "error")]
     Error { error: AnthropicStreamErrorBody },
-    /// Catch-all for content_block_start / content_block_stop / ping /
-    /// unknown event types — we don't need their state for chunk emission.
+    /// Catch-all for ping / unknown event types — we don't need their
+    /// state for chunk emission.
+    #[serde(other)]
+    Other,
+}
+
+/// The block a `content_block_start` opens. Text and thinking blocks
+/// carry nothing until their deltas, and server-tool blocks run on the
+/// upstream, so only a client `tool_use` is modeled.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+pub enum AnthropicStreamContentBlock {
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        /// `{}` on the Messages API, whose arguments stream as
+        /// fragments; kept for a block that opens with its input whole.
+        #[serde(default)]
+        input: serde_json::Value,
+    },
     #[serde(other)]
     Other,
 }
@@ -1357,6 +1399,10 @@ pub struct AnthropicStreamStartUsage {
 pub enum AnthropicStreamDelta {
     #[serde(rename = "text_delta")]
     TextDelta { text: String },
+    /// A fragment of a `tool_use` block's input as JSON text; a block's
+    /// fragments concatenate to its whole input.
+    #[serde(rename = "input_json_delta")]
+    InputJsonDelta { partial_json: String },
     #[serde(other)]
     Other,
 }
@@ -1403,6 +1449,25 @@ pub struct StreamState {
     /// onto the terminal usage so the bridge doesn't drop them (#906).
     pub cache_creation_tokens: u32,
     pub cache_read_tokens: u32,
+    /// Every `tool_use` block opened so far, in arrival order. A block's
+    /// position here is its OpenAI `tool_calls[].index`, which counts
+    /// tool calls only — a leading text block must not shift the first
+    /// call to index 1.
+    tool_blocks: Vec<StreamToolBlock>,
+    /// The tool call the current `content_block_stop` closes without an
+    /// argument fragment, and the arguments it is given then.
+    unstreamed_tool_call: Option<(usize, String)>,
+}
+
+#[derive(Debug)]
+struct StreamToolBlock {
+    /// The block's content-block index.
+    index: u64,
+    /// The `input` the block opened with, as arguments text, until an
+    /// argument fragment arrives. A block closed without one carries
+    /// this — `"{}"` for the usual empty input — as a stream reader of
+    /// the Messages API keeps the opening input when no fragment follows.
+    opening_arguments: Option<String>,
 }
 
 impl StreamState {
@@ -1428,6 +1493,28 @@ impl StreamState {
                     .as_ref()
                     .and_then(|u| u.cache_read_input_tokens)
                     .unwrap_or(0);
+            }
+            AnthropicStreamEvent::ContentBlockStart {
+                index: Some(index),
+                content_block: AnthropicStreamContentBlock::ToolUse { input, .. },
+            } => self.tool_blocks.push(StreamToolBlock {
+                index: *index,
+                opening_arguments: Some(tool_arguments(input)),
+            }),
+            AnthropicStreamEvent::ContentBlockDelta {
+                index,
+                delta: AnthropicStreamDelta::InputJsonDelta { partial_json },
+            } if !partial_json.is_empty() => {
+                if let Some(call) = self.tool_call_index(*index) {
+                    self.tool_blocks[call].opening_arguments = None;
+                }
+            }
+            AnthropicStreamEvent::ContentBlockStop { index } => {
+                let call = self.tool_call_index(*index);
+                self.unstreamed_tool_call = call.and_then(|call| {
+                    let arguments = self.tool_blocks[call].opening_arguments.take()?;
+                    Some((call, arguments))
+                });
             }
             // #952: harvest cumulative input/cache counts from
             // the terminal message_delta too (max-wins) — some backends
@@ -1455,6 +1542,7 @@ impl StreamState {
         match event {
             AnthropicStreamEvent::ContentBlockDelta {
                 delta: AnthropicStreamDelta::TextDelta { text },
+                ..
             } => Some(ChatChunk {
                 id: self.id.clone(),
                 model: self.model.clone(),
@@ -1468,6 +1556,22 @@ impl StreamState {
                 finish_reason: None,
                 usage: None,
             }),
+            AnthropicStreamEvent::ContentBlockStart {
+                index,
+                content_block: AnthropicStreamContentBlock::ToolUse { id, name, .. },
+            } => self
+                .tool_call_index(*index)
+                .map(|call| self.tool_call_chunk(call, Some((id, name)), "")),
+            AnthropicStreamEvent::ContentBlockDelta {
+                index,
+                delta: AnthropicStreamDelta::InputJsonDelta { partial_json },
+            } if !partial_json.is_empty() => self
+                .tool_call_index(*index)
+                .map(|call| self.tool_call_chunk(call, None, partial_json)),
+            AnthropicStreamEvent::ContentBlockStop { .. } => self
+                .unstreamed_tool_call
+                .as_ref()
+                .map(|(call, arguments)| self.tool_call_chunk(*call, None, arguments)),
             AnthropicStreamEvent::MessageDelta { delta, usage } => {
                 let finish = delta
                     .stop_reason
@@ -1507,6 +1611,45 @@ impl StreamState {
 
     pub fn is_terminal(event: &AnthropicStreamEvent) -> bool {
         matches!(event, AnthropicStreamEvent::MessageStop)
+    }
+
+    /// The OpenAI `tool_calls[].index` of the tool block a content-block
+    /// `index` names.
+    fn tool_call_index(&self, index: Option<u64>) -> Option<usize> {
+        let index = index?;
+        self.tool_blocks.iter().rposition(|b| b.index == index)
+    }
+
+    /// A streamed OpenAI `tool_calls` delta. The call's opening chunk
+    /// carries `id`, `type` and `function.name`; later chunks carry only
+    /// an `arguments` fragment, since clients concatenate repeated
+    /// strings. Reference:
+    /// <https://platform.openai.com/docs/api-reference/chat-streaming>
+    fn tool_call_chunk(
+        &self,
+        call: usize,
+        opening: Option<(&str, &str)>,
+        arguments: &str,
+    ) -> ChatChunk {
+        let mut tool_call = serde_json::json!({
+            "index": call,
+            "function": {"arguments": arguments},
+        });
+        if let Some((id, name)) = opening {
+            tool_call["id"] = id.into();
+            tool_call["type"] = "function".into();
+            tool_call["function"]["name"] = name.into();
+        }
+        ChatChunk {
+            id: self.id.clone(),
+            model: self.model.clone(),
+            delta: ChatDelta {
+                tool_calls: Some(vec![tool_call]),
+                ..Default::default()
+            },
+            finish_reason: None,
+            usage: None,
+        }
     }
 }
 
@@ -3850,6 +3993,81 @@ mod tests {
         // double-count cost in the control plane's pricing formula, which bills
         // cache_read as its own term.
         assert_eq!(usage.cached_prompt_tokens, 0);
+    }
+
+    /// Feed `events` through a fresh StreamState and collect every
+    /// `delta.tool_calls` entry it emits, in order.
+    fn streamed_tool_calls(events: &[serde_json::Value]) -> Vec<serde_json::Value> {
+        let mut state = StreamState::default();
+        let mut out = Vec::new();
+        for event in events {
+            let event: AnthropicStreamEvent = serde_json::from_value(event.clone()).unwrap();
+            state.update(&event);
+            if let Some(calls) = state.to_chunk(&event).and_then(|c| c.delta.tool_calls) {
+                out.extend(calls);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn stream_state_translates_tool_use_blocks_into_tool_call_deltas() {
+        // Event order per the "Streaming request with tool use" example:
+        // <https://docs.anthropic.com/en/docs/build-with-claude/streaming>.
+        let calls = streamed_tool_calls(&[
+            serde_json::json!({"type":"message_start","message":{"id":"msg_t","model":"claude","usage":{"input_tokens":5}}}),
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Checking."}}),
+            serde_json::json!({"type":"content_block_stop","index":0}),
+            serde_json::json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_a","name":"get_weather","input":{}}}),
+            serde_json::json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":""}}),
+            serde_json::json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"city\": \"Par"}}),
+            serde_json::json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"is\"}"}}),
+            serde_json::json!({"type":"content_block_stop","index":1}),
+            // A server tool runs on the upstream: neither its start nor its
+            // input fragments are a call the client must execute.
+            serde_json::json!({"type":"content_block_start","index":2,"content_block":{"type":"server_tool_use","id":"srvtoolu_x","name":"web_search","input":{}}}),
+            serde_json::json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"query\": \"paris\"}"}}),
+            serde_json::json!({"type":"content_block_stop","index":2}),
+            serde_json::json!({"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"toolu_b","name":"get_time","input":{}}}),
+            serde_json::json!({"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":""}}),
+            serde_json::json!({"type":"content_block_stop","index":3}),
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":9}}),
+            serde_json::json!({"type":"message_stop"}),
+        ]);
+        assert_eq!(
+            calls,
+            vec![
+                serde_json::json!({"index":0,"id":"toolu_a","type":"function","function":{"name":"get_weather","arguments":""}}),
+                serde_json::json!({"index":0,"function":{"arguments":"{\"city\": \"Par"}}),
+                serde_json::json!({"index":0,"function":{"arguments":"is\"}"}}),
+                serde_json::json!({"index":1,"id":"toolu_b","type":"function","function":{"name":"get_time","arguments":""}}),
+                serde_json::json!({"index":1,"function":{"arguments":"{}"}}),
+            ],
+        );
+    }
+
+    #[test]
+    fn stream_state_keeps_the_opening_input_of_a_tool_block_without_fragments() {
+        // A stream reader of the Messages API keeps a `tool_use` block's
+        // opening `input` unless argument fragments follow
+        // (anthropic-sdk-python `lib/streaming/_messages.py`).
+        let calls = streamed_tool_calls(&[
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_a","name":"f","input":{"a":1}}}),
+            serde_json::json!({"type":"content_block_stop","index":0}),
+            serde_json::json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_b","name":"g","input":{"stale":true}}}),
+            serde_json::json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"b\":2}"}}),
+            serde_json::json!({"type":"content_block_stop","index":1}),
+        ]);
+        assert_eq!(
+            calls,
+            vec![
+                serde_json::json!({"index":0,"id":"toolu_a","type":"function","function":{"name":"f","arguments":""}}),
+                serde_json::json!({"index":0,"function":{"arguments":"{\"a\":1}"}}),
+                serde_json::json!({"index":1,"id":"toolu_b","type":"function","function":{"name":"g","arguments":""}}),
+                serde_json::json!({"index":1,"function":{"arguments":"{\"b\":2}"}}),
+            ],
+        );
     }
 
     // ─── parse_inbound_request ────────────────────────────────────
