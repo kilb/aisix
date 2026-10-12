@@ -55,6 +55,7 @@ mod openapi;
 mod passthrough_routes_handlers;
 mod playground_handler;
 mod provider_keys_handlers;
+mod redaction;
 mod state;
 pub mod store;
 

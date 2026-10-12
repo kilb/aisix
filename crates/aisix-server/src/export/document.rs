@@ -27,19 +27,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use aisix_core::credentials::CredentialKind;
 use aisix_core::models::GuardrailScopeType;
 use aisix_core::AisixSnapshot;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::secrets::{
-    redact_by_key, redact_headers, redact_string_map, redact_top_level, RedactionCtx,
-    SecretPlaceholder,
-};
-
-/// Guardrail credential field names, at any nesting depth, that are
-/// always secrets in the guardrail schema.
-const GUARDRAIL_SECRET_KEYS: &[&str] = &["api_key", "access_key_secret", "secret_access_key"];
+use super::secrets::{redact_credentials, RedactionCtx, SecretPlaceholder};
 
 /// Issues surfaced during a build, split by whether they leave the
 /// exported file loadable. `blocking` issues mean the file cannot be
@@ -105,22 +99,7 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
                     reveal: reveal_secrets,
                     out: &mut placeholders,
                 };
-                redact_top_level(doc, "api_key", &mut ctx);
-                // `request.default_headers` are outbound auth headers to the
-                // upstream and `request.default_body_fields` can carry a
-                // secondary credential — neither is covered by `api_key`, and
-                // the OTLP-exporter `headers` map (same shape) is redacted, so
-                // these must be too. String values only (a `safe_prompt: true`
-                // flag stays intact).
-                if let Some(request) = doc.get_mut("request") {
-                    redact_string_map(request, "default_headers", "default header", &mut ctx);
-                    redact_string_map(
-                        request,
-                        "default_body_fields",
-                        "default body field",
-                        &mut ctx,
-                    );
-                }
+                redact_credentials(doc, CredentialKind::ProviderKey, &mut ctx);
             },
         ),
     );
@@ -193,7 +172,7 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
                 reveal: reveal_secrets,
                 out: &mut placeholders,
             };
-            redact_by_key(doc, GUARDRAIL_SECRET_KEYS, &mut ctx);
+            redact_credentials(doc, CredentialKind::Guardrail, &mut ctx);
         },
     );
     guardrails.retain(|v| {
@@ -221,7 +200,7 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
                     reveal: reveal_secrets,
                     out: &mut placeholders,
                 };
-                redact_top_level(doc, "secret", &mut ctx);
+                redact_credentials(doc, CredentialKind::McpServer, &mut ctx);
             },
         ),
     );
@@ -244,7 +223,7 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
                     reveal: reveal_secrets,
                     out: &mut placeholders,
                 };
-                redact_top_level(doc, "secret", &mut ctx);
+                redact_credentials(doc, CredentialKind::A2aAgent, &mut ctx);
             },
         ),
     );
@@ -281,7 +260,7 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
                     reveal: reveal_secrets,
                     out: &mut placeholders,
                 };
-                redact_headers(doc, &mut ctx);
+                redact_credentials(doc, CredentialKind::ObservabilityExporter, &mut ctx);
             },
         ),
     );

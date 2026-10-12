@@ -18,6 +18,7 @@
 
 pub mod config;
 pub mod config_status;
+pub mod credentials;
 pub mod error;
 pub mod filesource;
 pub mod header_template;

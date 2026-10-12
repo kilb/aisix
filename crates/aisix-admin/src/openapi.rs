@@ -473,7 +473,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "tags": [
           "Provider Keys"
         ],
-        "description": "List all configured provider key resources."
+        "description": "List all configured provider key resources. Credentials are returned as `[REDACTED]`: `api_key` and the string values of `request.default_headers` and `request.default_body_fields`."
       }
     },
     "/admin/v1/provider_keys/{id}": {
@@ -536,7 +536,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "tags": [
           "Provider Keys"
         ],
-        "description": "Get a provider key resource by ID."
+        "description": "Get a provider key resource by ID. Credentials are returned as `[REDACTED]`: `api_key` and the string values of `request.default_headers` and `request.default_body_fields`."
       }
     },
     "/admin/v1/mcp_servers": {
@@ -580,7 +580,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "tags": [
           "MCP Servers"
         ],
-        "description": "List registered upstream MCP server resources."
+        "description": "List registered upstream MCP server resources. The `secret` credential is returned as `[REDACTED]`."
       }
     },
     "/admin/v1/mcp_servers/{id}": {
@@ -643,7 +643,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "tags": [
           "MCP Servers"
         ],
-        "description": "Get an upstream MCP server resource by ID."
+        "description": "Get an upstream MCP server resource by ID. The `secret` credential is returned as `[REDACTED]`."
       }
     },
     "/admin/v1/a2a_agents": {
@@ -687,7 +687,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "tags": [
           "A2A Agents"
         ],
-        "description": "List registered upstream A2A agent resources."
+        "description": "List registered upstream A2A agent resources. The `secret` credential is returned as `[REDACTED]`."
       }
     },
     "/admin/v1/a2a_agents/{id}": {
@@ -750,7 +750,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "tags": [
           "A2A Agents"
         ],
-        "description": "Get an upstream A2A agent resource by ID."
+        "description": "Get an upstream A2A agent resource by ID. The `secret` credential is returned as `[REDACTED]`."
       }
     },
     "/admin/v1/passthrough_routes": {
@@ -901,7 +901,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "tags": [
           "Guardrails"
         ],
-        "description": "List all configured guardrail resources."
+        "description": "List all configured guardrail resources. Credentials are returned as `[REDACTED]`: `api_key`, `access_key_secret` and `secret_access_key`, wherever they appear."
       }
     },
     "/admin/v1/guardrails/{id}": {
@@ -964,7 +964,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "tags": [
           "Guardrails"
         ],
-        "description": "Get a guardrail resource by ID."
+        "description": "Get a guardrail resource by ID. Credentials are returned as `[REDACTED]`: `api_key`, `access_key_secret` and `secret_access_key`, wherever they appear."
       }
     },
     "/admin/v1/cache_policies": {
@@ -1115,7 +1115,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "tags": [
           "Observability Exporters"
         ],
-        "description": "List all configured observability exporter resources."
+        "description": "List all configured observability exporter resources. Values in `headers` are returned as `[REDACTED]`."
       }
     },
     "/admin/v1/observability_exporters/{id}": {
@@ -1178,7 +1178,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "tags": [
           "Observability Exporters"
         ],
-        "description": "Get an observability exporter resource by ID."
+        "description": "Get an observability exporter resource by ID. Values in `headers` are returned as `[REDACTED]`."
       }
     },
     "/admin/v1/health": {
