@@ -151,36 +151,71 @@ impl EtcdConfigProvider {
     }
 }
 
+/// 全量加载每页的 key 数。每页是一次普通范围读，受 `request_timeout` 约束；
+/// 配置再大也只是页数多，不会因为总量超出一次请求的预算而加载失败。
+const LOAD_PAGE_SIZE: i64 = 500;
+
+/// 前缀范围的结束键：最后一个小于 0xff 的字节加一，其后截断（与 etcd 客户端
+/// 的 `GetPrefixRangeEnd` 相同）。全是 0xff 时取到 key 空间末尾。
+fn prefix_range_end(prefix: &[u8]) -> Vec<u8> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if last < 0xff {
+            end.push(last + 1);
+            return end;
+        }
+    }
+    vec![0]
+}
+
 #[async_trait]
 impl ConfigProvider for EtcdConfigProvider {
     async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
         let mut client = self.client.lock().await;
-        let get = client.get(
-            self.prefix.as_bytes(),
-            Some(GetOptions::new().with_prefix()),
-        );
-        let resp = match self.request_timeout {
-            Some(d) => tokio::time::timeout(d, get).await.map_err(|_| {
-                ProviderError::Range(format!(
-                    "etcd range request exceeded etcd.request_timeout_ms ({} ms)",
-                    d.as_millis()
-                ))
-            })?,
-            None => get.await,
-        }
-        .map_err(|e| ProviderError::Range(format_error_chain(&e)))?;
+        // 分页读：`request_timeout` 约束的是一次请求，整份配置是一批数据。
+        // 一次读完时，前缀一大、链路一慢就超出单次预算 —— 启动失败，watch
+        // 重置后的重新同步次次超时。每页是一次普通范围读，各自受预算约束。
+        let range_end = prefix_range_end(self.prefix.as_bytes());
+        let mut start = self.prefix.as_bytes().to_vec();
+        let mut revision = 0;
+        let mut entries = Vec::new();
+        loop {
+            let mut options = GetOptions::new()
+                .with_range(range_end.clone())
+                .with_limit(LOAD_PAGE_SIZE);
+            // 后续页钉在第一页的修订号上：整份快照必须来自同一个时刻。
+            if revision > 0 {
+                options = options.with_revision(revision);
+            }
+            let get = client.get(start.clone(), Some(options));
+            let resp = match self.request_timeout {
+                Some(d) => tokio::time::timeout(d, get).await.map_err(|_| {
+                    ProviderError::Range(format!(
+                        "etcd range request exceeded etcd.request_timeout_ms ({} ms)",
+                        d.as_millis()
+                    ))
+                })?,
+                None => get.await,
+            }
+            .map_err(|e| ProviderError::Range(format_error_chain(&e)))?;
 
-        let revision = resp.header().map(|h| h.revision()).unwrap_or(0);
-
-        let entries = resp
-            .kvs()
-            .iter()
-            .map(|kv| RawEntry {
+            if revision == 0 {
+                revision = resp.header().map(|h| h.revision()).unwrap_or(0);
+            }
+            entries.extend(resp.kvs().iter().map(|kv| RawEntry {
                 key: String::from_utf8_lossy(kv.key()).into_owned(),
                 value: kv.value().to_vec(),
                 revision: kv.mod_revision(),
-            })
-            .collect();
+            }));
+            match (resp.more(), resp.kvs().last()) {
+                (true, Some(last)) => {
+                    // 下一页从紧跟最后一个 key 的位置开始。
+                    start = last.key().to_vec();
+                    start.push(0);
+                }
+                _ => break,
+            }
+        }
 
         Ok((entries, revision))
     }
