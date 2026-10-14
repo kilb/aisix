@@ -1249,7 +1249,11 @@ fn build_etcd_connect_options(etcd: &EtcdConfig) -> anyhow::Result<Option<Connec
 ///
 /// A dead peer is noticed in about 15s. 10s stays clear of etcd's default
 /// `--grpc-keepalive-min-time` of 5s, so the server will not answer these
-/// pings with GOAWAY.
+/// pings with GOAWAY — while a stream is open. On a connection with none,
+/// etcd counts every ping as a strike (`PermitWithoutStream` is hard-coded
+/// false) and sends GOAWAY `too_many_pings` after three, so pings are limited
+/// to connections carrying the watch or a request in flight, which are the
+/// two cases above.
 ///
 /// Deliberately NOT `with_timeout`: etcd-client turns that into
 /// `Endpoint::timeout`, a tonic CHANNEL-level deadline applied to every
@@ -1283,9 +1287,12 @@ fn build_etcd_connect_options_with_extra_ca(
     // builds a `balance_channel` and, with no auth configured, sends no
     // request, so it returns `Ok` against an endpoint that is not etcd at all.
     // The bounds below are what the FIRST READ and the watch rely on.
+    // 只在有活跃 stream 时 ping：etcd 把空闲连接上的 ping 记过，攒够三次就回
+    // GOAWAY `too_many_pings` 断开（见 `build_connect_options_pings_only_while_a_stream_is_open`）。
     let mut options = ConnectOptions::new()
         .with_connect_timeout(etcd.dial_timeout())
-        .with_keep_alive(ETCD_KEEPALIVE_INTERVAL, ETCD_KEEPALIVE_TIMEOUT);
+        .with_keep_alive(ETCD_KEEPALIVE_INTERVAL, ETCD_KEEPALIVE_TIMEOUT)
+        .with_keep_alive_while_idle(false);
 
     if let (Some(user), Some(env_key)) = (etcd.user.as_ref(), etcd.password_env.as_ref()) {
         let pw = std::env::var(env_key).map_err(|_| {
@@ -2221,6 +2228,36 @@ models:
             "a plain HTTP etcd still needs a bounded connection: without \
              options it gets no connect timeout and no keepalive, and a \
              silent peer never ends the first read"
+        );
+    }
+
+    /// etcd 的服务端 keepalive 策略写死 `PermitWithoutStream: false`
+    /// （`server/embed/etcd.go` `serveClients`），grpc-go 对没有活跃 stream 的
+    /// 连接上 2 小时内的 ping 记过，超过 2 次回 GOAWAY `too_many_pings`
+    /// （`internal/transport/http2_server.go` `handlePing`）。etcd-client 默认
+    /// `keep_alive_while_idle = true`，于是空闲连接 —— admin 读客户端、多端点
+    /// balance channel 里没挂 watch 的那些 —— 每三四次 ping 就被断一次、反复
+    /// 重连。只在有 stream 时 ping：在途的读和 watch 照样能发现失联的对端。
+    #[test]
+    fn build_connect_options_pings_only_while_a_stream_is_open() {
+        let etcd = aisix_core::EtcdConfig {
+            endpoints: vec!["http://127.0.0.1:2379".into()],
+            prefix: "/aisix".into(),
+            env_id: String::new(),
+            user: None,
+            password_env: None,
+            dial_timeout_ms: 5000,
+            request_timeout_ms: 5000,
+            tls: None,
+        };
+        let opts = build_etcd_connect_options(&etcd)
+            .unwrap()
+            .expect("a plain etcd still gets connect options");
+        let rendered = format!("{opts:?}");
+        assert!(
+            rendered.contains("keep_alive_while_idle: false"),
+            "idle connections must not ping an etcd that counts idle pings as \
+             abuse: {rendered}"
         );
     }
 
