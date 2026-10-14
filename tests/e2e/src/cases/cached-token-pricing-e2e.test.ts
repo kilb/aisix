@@ -45,6 +45,7 @@ const micro = (usd: number) => Math.round(usd * 1e6);
 describe("prompt-cached tokens are priced at their own rate", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
+  let streamUpstream: OpenAiUpstream | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -87,6 +88,35 @@ describe("prompt-cached tokens are priced at their own rate", () => {
         },
       },
     });
+    // 同样的 OpenAI 缓存口径，流式：用量在最后一个 chunk 里。
+    const chunk = (delta: unknown, extra: Record<string, unknown> = {}) =>
+      JSON.stringify({
+        id: "ctp-stream",
+        object: "chat.completion.chunk",
+        created: 0,
+        model: "gpt-4o-mini",
+        choices: [{ index: 0, delta, finish_reason: null }],
+        ...extra,
+      });
+    streamUpstream = await startOpenAiUpstream({
+      streamEvents: [
+        chunk({ role: "assistant", content: "ok" }),
+        JSON.stringify({
+          id: "ctp-stream",
+          object: "chat.completion.chunk",
+          created: 0,
+          model: "gpt-4o-mini",
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          usage: {
+            prompt_tokens: 1000,
+            completion_tokens: 100,
+            total_tokens: 1100,
+            prompt_tokens_details: { cached_tokens: 800 },
+          },
+        }),
+        "[DONE]",
+      ],
+    });
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
@@ -115,6 +145,26 @@ describe("prompt-cached tokens are priced at their own rate", () => {
       provider_key_id: openaiPk.id,
       cost,
     });
+    // `/v1/messages` 打到 OpenAI 兼容上游：跨协议翻译那条路。
+    await seed.createModel({
+      display_name: "ctp-messages-openai",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: openaiPk.id,
+      cost,
+    });
+    const streamPk = await seed.createProviderKey({
+      display_name: "ctp-openai-stream-pk",
+      secret: "sk-mock",
+      api_base: `${streamUpstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "ctp-messages-openai-stream",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: streamPk.id,
+      cost,
+    });
     await seed.createModel({
       display_name: "ctp-messages",
       provider: "anthropic",
@@ -135,13 +185,20 @@ describe("prompt-cached tokens are priced at their own rate", () => {
     // Last, per `tests/e2e/AGENTS.md`.
     await seed.createApiKey({
       key_hash: HASH,
-      allowed_models: ["ctp-chat", "ctp-messages", "ctp-chat-nocacherate"],
+      allowed_models: [
+        "ctp-chat",
+        "ctp-messages",
+        "ctp-chat-nocacherate",
+        "ctp-messages-openai",
+        "ctp-messages-openai-stream",
+      ],
     });
   });
 
   afterAll(async () => {
     await app?.exit();
     await upstream?.close();
+    await streamUpstream?.close();
   });
 
   const scrape = () => scrapeMetrics(app!.metricsUrl);
@@ -171,13 +228,14 @@ describe("prompt-cached tokens are priced at their own rate", () => {
       body: JSON.stringify({ model, messages: [{ role: "user", content: "hi" }] }),
     });
   }
-  function messages() {
+  function messages(model = "ctp-messages", stream = false) {
     return fetch(`${app!.proxyUrl}/v1/messages`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-api-key": CALLER },
       body: JSON.stringify({
-        model: "ctp-messages",
+        model,
         max_tokens: 64,
+        stream,
         messages: [{ role: "user", content: "hi" }],
       }),
     });
@@ -234,6 +292,66 @@ describe("prompt-cached tokens are priced at their own rate", () => {
         `${wrong} would mean 6000 billed tokens were priced at nothing`,
     ).toBe(want);
     expect(got).not.toBe(wrong);
+  }, 120_000);
+
+  // Anthropic 口径下 `input_tokens` 不含缓存命中，命中的部分单独报在
+  // `cache_read_input_tokens`（https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching：
+  // total input = cache_read + cache_creation + input_tokens）。OpenAI 的
+  // `cached_tokens` 是 `prompt_tokens` 的子集，翻译过去必须拆开。
+  const WANT_CROSS = () => micro((200 * IN_PER_1K + 800 * CACHED_PER_1K + 100 * OUT_PER_1K) / 1000);
+
+  test("a cached OpenAI prompt reached through /v1/messages is reported and billed as cached", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    await waitConfigPropagation(async () => (await messages("ctp-messages-openai")).ok);
+
+    const before = await scrape();
+    const res = await messages("ctp-messages-openai");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { usage?: Record<string, number> };
+    expect(body.usage?.input_tokens, "only the fresh part of the prompt").toBe(200);
+    expect(body.usage?.cache_read_input_tokens, "the cache hits, reported apart").toBe(800);
+    expect(body.usage?.output_tokens).toBe(100);
+
+    const got = await spendDelta(before, "/v1/messages", "ctp-messages-openai");
+    expect(
+      got,
+      "800 cached prompt tokens must bill at the cached rate, not as fresh input",
+    ).toBe(WANT_CROSS());
+  }, 120_000);
+
+  test("the same through a streamed /v1/messages", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    await waitConfigPropagation(async () => {
+      const r = await messages("ctp-messages-openai-stream", true);
+      await r.text();
+      return r.ok;
+    });
+
+    const before = await scrape();
+    const res = await messages("ctp-messages-openai-stream", true);
+    expect(res.status).toBe(200);
+    const sse = await res.text();
+    const delta = sse
+      .split("\n\n")
+      .find((frame) => frame.includes("event: message_delta"));
+    expect(delta, `no message_delta frame in:\n${sse}`).toBeDefined();
+    const data = JSON.parse(
+      delta!
+        .split("\n")
+        .find((l) => l.startsWith("data:"))!
+        .slice("data:".length),
+    ) as { usage?: Record<string, number> };
+    expect(data.usage?.input_tokens, "only the fresh part of the prompt").toBe(200);
+    expect(data.usage?.cache_read_input_tokens, "the cache hits, reported apart").toBe(800);
+
+    const got = await spendDelta(before, "/v1/messages", "ctp-messages-openai-stream");
+    expect(got).toBe(WANT_CROSS());
   }, 120_000);
 
   test("a cost block with no cache rates prices exactly as before", async (ctx) => {

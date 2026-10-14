@@ -2096,6 +2096,16 @@ pub fn chat_response_into_anthropic_json(
         content.push(serde_json::json!({"type": "text", "text": ""}));
     }
 
+    let mut usage = serde_json::Map::new();
+    insert_anthropic_input_usage(
+        &mut usage,
+        resp.usage.prompt_tokens,
+        resp.usage.cached_prompt_tokens,
+        resp.usage.cache_read_tokens,
+        resp.usage.cache_creation_tokens,
+    );
+    usage.insert("output_tokens".into(), resp.usage.completion_tokens.into());
+
     serde_json::json!({
         "id": resp.id,
         "type": "message",
@@ -2104,11 +2114,39 @@ pub fn chat_response_into_anthropic_json(
         "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": serde_json::Value::Null,
-        "usage": {
-            "input_tokens": resp.usage.prompt_tokens,
-            "output_tokens": resp.usage.completion_tokens,
-        },
+        "usage": usage,
     })
+}
+
+/// 把规范用量里的输入部分按 Anthropic 口径写进 `usage`：`input_tokens` 不含
+/// 缓存，缓存命中与缓存写入单独报（total input = cache_read + cache_creation +
+/// input_tokens，https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching）。
+///
+/// OpenAI 的 `cached_tokens` 是 `prompt_tokens` 的子集（openai-python
+/// `types/completion_usage.py`），要从里面减出来；Anthropic 自己的缓存计数本来
+/// 就和 `prompt_tokens` 分开，直接相加。与计价的拆分（`input_tokens_for_pricing`）
+/// 是同一套算术 —— 两边不一致，客户端看到的用量就对不上它付的钱。
+fn insert_anthropic_input_usage(
+    usage: &mut serde_json::Map<String, serde_json::Value>,
+    prompt_tokens: u32,
+    cached_prompt_tokens: u32,
+    cache_read_tokens: u32,
+    cache_creation_tokens: u32,
+) {
+    usage.insert(
+        "input_tokens".into(),
+        prompt_tokens.saturating_sub(cached_prompt_tokens).into(),
+    );
+    let cache_read = cached_prompt_tokens.saturating_add(cache_read_tokens);
+    if cache_read > 0 {
+        usage.insert("cache_read_input_tokens".into(), cache_read.into());
+    }
+    if cache_creation_tokens > 0 {
+        usage.insert(
+            "cache_creation_input_tokens".into(),
+            cache_creation_tokens.into(),
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -2181,6 +2219,11 @@ pub struct AnthropicSseEncoder {
     /// robust to providers that double-emit usage.
     seen_input_tokens: u32,
     seen_output_tokens: u32,
+    /// 缓存的三个计数，同样取最大值；渲染时由 [`insert_anthropic_input_usage`]
+    /// 拆成 Anthropic 口径。
+    seen_cached_prompt_tokens: u32,
+    seen_cache_read_tokens: u32,
+    seen_cache_creation_tokens: u32,
     usage_seen: bool,
 }
 
@@ -2207,6 +2250,9 @@ impl AnthropicSseEncoder {
             pending_stop_reason: None,
             seen_input_tokens: 0,
             seen_output_tokens: 0,
+            seen_cached_prompt_tokens: 0,
+            seen_cache_read_tokens: 0,
+            seen_cache_creation_tokens: 0,
             usage_seen: false,
         }
     }
@@ -2222,6 +2268,11 @@ impl AnthropicSseEncoder {
             self.usage_seen = true;
             self.seen_input_tokens = self.seen_input_tokens.max(u.prompt_tokens);
             self.seen_output_tokens = self.seen_output_tokens.max(u.completion_tokens);
+            self.seen_cached_prompt_tokens =
+                self.seen_cached_prompt_tokens.max(u.cached_prompt_tokens);
+            self.seen_cache_read_tokens = self.seen_cache_read_tokens.max(u.cache_read_tokens);
+            self.seen_cache_creation_tokens =
+                self.seen_cache_creation_tokens.max(u.cache_creation_tokens);
         }
 
         // Closing pair withheld at the stop chunk: only the trailing
@@ -2390,7 +2441,13 @@ impl AnthropicSseEncoder {
     fn closing_pair(&mut self, stop_reason: &'static str) -> Vec<AnthropicSseEvent> {
         let mut usage = serde_json::Map::new();
         if self.seen_input_tokens > 0 {
-            usage.insert("input_tokens".into(), self.seen_input_tokens.into());
+            insert_anthropic_input_usage(
+                &mut usage,
+                self.seen_input_tokens,
+                self.seen_cached_prompt_tokens,
+                self.seen_cache_read_tokens,
+                self.seen_cache_creation_tokens,
+            );
         }
         usage.insert("output_tokens".into(), self.seen_output_tokens.into());
         self.finished = true;

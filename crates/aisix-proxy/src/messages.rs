@@ -1024,7 +1024,7 @@ async fn dispatch(
                                 &target.id,
                                 crate::usage_attr::input_tokens_for_pricing(
                                     u64::from(outcome.metrics.prompt_tokens),
-                                    0,
+                                    u64::from(outcome.metrics.cached_prompt_tokens),
                                     u64::from(outcome.metrics.cache_read_tokens),
                                     u64::from(outcome.metrics.cache_creation_tokens),
                                 ),
@@ -1612,6 +1612,8 @@ async fn anthropic_passthrough_dispatch(
                     completion_tokens: usage.completion_tokens,
                     cache_creation_tokens: usage.cache_creation_tokens,
                     cache_read_tokens: usage.cache_read_tokens,
+                    // 原生 Anthropic：缓存命中在 `cache_read_tokens` 里，不是子集。
+                    cached_prompt_tokens: 0,
                     web_search_requests: usage.web_search_requests,
                     web_fetch_requests: usage.web_fetch_requests,
                     usage_estimated: usage.usage_estimated,
@@ -1645,9 +1647,7 @@ async fn anthropic_passthrough_dispatch(
                         &model_id_c,
                         crate::usage_attr::input_tokens_for_pricing(
                             u64::from(metrics.prompt_tokens),
-                            // `/v1/messages` 是原生 Anthropic：这条路径上没有
-                            // OpenAI 那个「子集」计数器。
-                            0,
+                            u64::from(metrics.cached_prompt_tokens),
                             u64::from(metrics.cache_read_tokens),
                             u64::from(metrics.cache_creation_tokens),
                         ),
@@ -2172,6 +2172,8 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
     let usage = body.get("usage");
     AnthropicUsageMetrics {
         usage_estimated: false,
+        // 原生 Anthropic 响应：缓存命中在 `cache_read_input_tokens` 里，不是子集。
+        cached_prompt_tokens: 0,
         prompt_tokens: usage
             .and_then(|u| u.get("input_tokens"))
             .and_then(Value::as_u64)
@@ -2514,6 +2516,7 @@ async fn cross_provider_dispatch(
                     completion_tokens: comp.completion_tokens,
                     cache_creation_tokens: comp.cache_creation_tokens,
                     cache_read_tokens: comp.cache_read_tokens,
+                    cached_prompt_tokens: comp.cached_prompt_tokens,
                     web_search_requests: comp.web_search_requests,
                     web_fetch_requests: comp.web_fetch_requests,
                     usage_estimated: comp.usage_estimated,
@@ -2544,7 +2547,7 @@ async fn cross_provider_dispatch(
                         &model_id_for_telem,
                         crate::usage_attr::input_tokens_for_pricing(
                             u64::from(metrics.prompt_tokens),
-                            0,
+                            u64::from(metrics.cached_prompt_tokens),
                             u64::from(metrics.cache_read_tokens),
                             u64::from(metrics.cache_creation_tokens),
                         ),
@@ -2666,6 +2669,7 @@ async fn cross_provider_dispatch(
         completion_tokens: resp.usage.completion_tokens,
         cache_creation_tokens: resp.usage.cache_creation_tokens,
         cache_read_tokens: resp.usage.cache_read_tokens,
+        cached_prompt_tokens: resp.usage.cached_prompt_tokens,
         web_search_requests: resp.usage.web_search_requests,
         web_fetch_requests: resp.usage.web_fetch_requests,
         usage_estimated: false,
@@ -2904,6 +2908,8 @@ fn build_anthropic_sse_stream(
                                 comp.cache_creation_tokens.max(u.cache_creation_tokens);
                             comp.cache_read_tokens =
                                 comp.cache_read_tokens.max(u.cache_read_tokens);
+                            comp.cached_prompt_tokens =
+                                comp.cached_prompt_tokens.max(u.cached_prompt_tokens);
                             comp.web_search_requests =
                                 comp.web_search_requests.max(u.web_search_requests);
                             comp.web_fetch_requests =
@@ -3383,6 +3389,10 @@ struct AnthropicStreamCompletion {
     completion_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// OpenAI-shape cached prompt tokens, a SUBSET of `prompt_tokens` — set
+    /// on the cross-provider path only; Anthropic reports its cache hits in
+    /// `cache_read_tokens` instead.
+    cached_prompt_tokens: u32,
     /// Server tools the provider ran, carried on the same terminal chunk
     /// as the final token counts.
     web_search_requests: u32,
@@ -3599,6 +3609,11 @@ struct AnthropicUsageMetrics {
     completion_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
+    /// OpenAI-shape cached prompt tokens, a SUBSET of `prompt_tokens`. Only a
+    /// cross-provider dispatch (an OpenAI-compatible upstream behind
+    /// `/v1/messages`) sets it; native Anthropic reports cache hits in
+    /// `cache_read_tokens`, separate from `prompt_tokens`.
+    cached_prompt_tokens: u32,
     /// Server tools the provider ran. Billed per search on top of tokens
     /// for web search; free but worth recording for web fetch.
     web_search_requests: u32,
@@ -3701,9 +3716,7 @@ fn emit_anthropic_usage_event(
             model_id,
             crate::usage_attr::input_tokens_for_pricing(
                 u64::from(metrics.prompt_tokens),
-                // `/v1/messages` is native Anthropic: there is no
-                // OpenAI-shaped subset counter on this path.
-                0,
+                u64::from(metrics.cached_prompt_tokens),
                 u64::from(metrics.cache_read_tokens),
                 u64::from(metrics.cache_creation_tokens),
             ),
@@ -3711,6 +3724,7 @@ fn emit_anthropic_usage_event(
         ),
         cache_creation_tokens: metrics.cache_creation_tokens,
         cache_read_tokens: metrics.cache_read_tokens,
+        cached_prompt_tokens: metrics.cached_prompt_tokens,
         usage_estimated: metrics.usage_estimated,
         upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         downstream_latency_ms: metrics.downstream_latency_ms,
