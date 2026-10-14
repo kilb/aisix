@@ -355,8 +355,8 @@ pub fn redact_value_strings(
 
 /// 批处理 / 微调上传的 JSONL 文件经 [`redact_jsonl_upload`] 改写后的结果。
 pub(crate) struct JsonlUploadRedaction {
-    /// 改写后的全文；`None` 表示没有任何一行被改写。
-    pub text: Option<String>,
+    /// 要转发的全文：逐行重新序列化的那份，也就是被检查过的那份。
+    pub text: String,
     pub counts: RedactionCounts,
     /// 某个协议字段（`custom_id` / `method` / `url` / `model`）命中了 mask 规则。
     /// 它既不能改写（两行会变成同一个 `custom_id`，结果再也对不回请求；改了
@@ -367,13 +367,16 @@ pub(crate) struct JsonlUploadRedaction {
 /// 一行 JSONL 里不能改写的协议字段。
 const JSONL_PROTOCOL_FIELDS: &[&str] = &["custom_id", "method", "url", "model"];
 
-/// 按行解析 JSONL 上传，只改写每行请求内容里的字符串：batch 行改 `body`，
-/// 微调行（没有 `body`）改整行，协议字段一律不动。
+/// 按行解析 JSONL 上传，改写协议字段以外的每个字符串：batch 行的 `body`
+/// （跳过 `body.model`）与顶层其余字段，微调行除协议字段外的整行。
 ///
 /// 在原始字节上做替换会改到协议字段、可能弄坏 JSON 结构，还会漏掉 JSON 转义
 /// 写出的内容（`\u0040` 解码后就是 `@`）；逐行解析后按值改写，三者都不会发生。
-/// 未改写的行逐字节保留。返回 `None` 表示这不是 JSONL（有非空行不是 JSON
-/// 对象），调用方按纯文本处理。
+///
+/// 每一行都以解析后的值重新序列化再转发，改没改都一样：检查的必须就是转发
+/// 的。原样转发原始字节时，一个重复键（解析器只保留最后一个值）就能把带 PII
+/// 的那一份藏在被检查的那一份后面送出去。返回 `None` 表示这不是 JSONL（有非
+/// 空行不是 JSON 对象），调用方按纯文本处理。
 pub(crate) fn redact_jsonl_upload(
     chain: &dyn Guardrail,
     text: &str,
@@ -391,7 +394,6 @@ pub(crate) fn redact_jsonl_upload(
 
     let mut counts = RedactionCounts::new();
     let mut unrewritable = false;
-    let mut changed = false;
     let mut out = Vec::with_capacity(parsed.len());
     for (raw, value) in parsed {
         let Some(mut value) = value else {
@@ -405,32 +407,32 @@ pub(crate) fn redact_jsonl_upload(
             JSONL_PROTOCOL_FIELDS,
             &mut counts,
         );
-        let request = if value.get("body").is_some_and(Value::is_object) {
-            &mut value["body"]
-        } else {
-            &mut value
-        };
-        unrewritable |= detect_named_structural_fields(
-            chain,
-            Direction::Input,
-            request,
-            &["model"],
-            &mut counts,
-        );
-        let mut rewritten = RedactionCounts::new();
-        if let Some(map) = request.as_object_mut() {
+        if let Some(map) = value.as_object_mut() {
             for (key, slot) in map.iter_mut() {
-                if !JSONL_PROTOCOL_FIELDS.contains(&key.as_str()) {
-                    redact_value_strings(chain, Direction::Input, slot, &mut rewritten);
+                if JSONL_PROTOCOL_FIELDS.contains(&key.as_str()) {
+                    continue;
+                }
+                match slot {
+                    // batch 行的请求体：`model` 是协议字段，其余照常改写。
+                    Value::Object(body) if key == "body" => {
+                        unrewritable |= body.get("model").is_some_and(|model| {
+                            detect_unrewritable_value_strings(
+                                chain,
+                                Direction::Input,
+                                model,
+                                &mut counts,
+                            )
+                        });
+                        for (field, inner) in body.iter_mut() {
+                            if field != "model" {
+                                redact_value_strings(chain, Direction::Input, inner, &mut counts);
+                            }
+                        }
+                    }
+                    _ => redact_value_strings(chain, Direction::Input, slot, &mut counts),
                 }
             }
         }
-        if rewritten.is_empty() {
-            out.push(raw.to_string());
-            continue;
-        }
-        merge_counts(&mut counts, rewritten);
-        changed = true;
         let mut line = serde_json::to_string(&value).ok()?;
         if raw.ends_with('\r') {
             line.push('\r');
@@ -439,7 +441,7 @@ pub(crate) fn redact_jsonl_upload(
     }
 
     Some(JsonlUploadRedaction {
-        text: changed.then(|| out.join("\n")),
+        text: out.join("\n"),
         counts,
         unrewritable,
     })
@@ -3681,6 +3683,29 @@ mod tests {
 
     fn both() -> Arc<dyn Guardrail> {
         mask_chain(aisix_core::models::GuardrailHookPoint::Both)
+    }
+
+    /// 批处理行顶层除协议字段外的任何字段都会随文件上传给上游，和 `body`
+    /// 一样是要过 mask 的内容。
+    #[test]
+    fn jsonl_upload_masks_extra_top_level_fields() {
+        let chain = both();
+        let line = r#"{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"m","messages":[]},"note":"alice@example.com"}"#;
+        let r = redact_jsonl_upload(chain.as_ref(), line).expect("a JSONL file");
+        assert!(!r.unrewritable);
+        let sent = &r.text;
+        assert!(!sent.contains("alice@example.com"), "{sent}");
+    }
+
+    /// 转发的必须是检查过的那一份。重复键时解析器只看得见最后一个值，原样
+    /// 转发原始字节会把被遮住的那个 —— 带着 PII —— 一起送出去。
+    #[test]
+    fn jsonl_upload_never_forwards_bytes_it_did_not_inspect() {
+        let chain = both();
+        let line = r#"{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"m","messages":[{"role":"user","content":"mail alice@example.com"}]},"body":{"model":"m","messages":[{"role":"user","content":"clean"}]}}"#;
+        let r = redact_jsonl_upload(chain.as_ref(), line).expect("a JSONL file");
+        let sent = &r.text;
+        assert!(!sent.contains("alice@example.com"), "{sent}");
     }
 
     /// `null` is OpenAI's documented "absent" encoding for the optional

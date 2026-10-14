@@ -539,11 +539,10 @@ async fn scan_input_blob(
                 crate::error::guardrail_block_message("request", None),
             ));
         }
-        let Some(masked) = r.text else {
-            return Ok(None);
-        };
+        // 转发的是逐行重新序列化、检查过的那份，改没改都一样（见
+        // `redact_jsonl_upload`）。
         crate::redact::merge_counts(redactions, r.counts);
-        return Ok(Some(masked.into_bytes()));
+        return Ok(Some(r.text.into_bytes()));
     }
     // 不是 JSONL 的文件是纯文本，没有协议字段，整段改写。
     let Some(r) = aisix_guardrails::Guardrail::redact_input_text(&chain, text) else {
