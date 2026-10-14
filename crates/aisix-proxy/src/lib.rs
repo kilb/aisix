@@ -69,6 +69,7 @@ pub mod sse_keepalive;
 mod state;
 mod stream_timeout;
 mod token_estimate;
+mod unread_body;
 mod usage_attr;
 mod util;
 mod videos;
@@ -236,6 +237,11 @@ pub fn build_router(state: ProxyState) -> Router {
     // from the layers above) so the whole proxy family carries
     // `x-aisix-request-id` and it equals the telemetry request_id. See
     // request_id.rs.
+    // 处理链提前作答时，把还没读完的请求体读掉再让连接收尾，调用方才收得到
+    // 那个响应而不是一个断开的管道。包住其下所有会提前拒绝的层（主机分派、
+    // 重写、鉴权、各 handler）。见 unread_body.rs。
+    let router = router.layer(middleware::from_fn(unread_body::drain_unread_body));
+
     router.layer(middleware::from_fn_with_state(
         state,
         request_id::ensure_request_id,
