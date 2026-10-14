@@ -1462,12 +1462,10 @@ fn stream_response(
                     push_capped(&mut telemetry.response_text, &delta, capture_cap);
                 }
                 scan_buf.push_str(&delta);
-                let rest = Bytes::from(rest);
-                if policy.holds_back() && !fail_opened {
-                    pending.push(rest);
-                } else {
-                    yield Ok(rest);
-                }
+                // 没有结束空行的尾段一律等扫描完再发，不论策略：先发出去再
+                // await 扫描的话，下行心跳会贴在这半帧后面，客户端把两者拼成
+                // 一行。扫描拦下时它也不再发出，错误帧单独成帧。
+                pending.push(Bytes::from(rest));
             }
             let text = format!("{overlap_tail}{scan_buf}");
             if !chain.is_empty() && !text.is_empty() {
@@ -1515,8 +1513,10 @@ fn stream_response(
     //
     // Safe to interleave because the generator above only ever yields WHOLE
     // frames: what `SseFrameSplitter` hands back, a `guardrail_error_frame`,
-    // or the splitter's flush remainder — and that last one is the final item.
-    // A heartbeat can therefore never land inside a frame. That premise is
+    // or the splitter's flush remainder — and that last one is held until the
+    // end-of-stream scan has finished, then released as the final item with
+    // nothing awaited after it. A heartbeat can therefore never land inside a
+    // frame. That premise is
     // what makes this composition correct; a future `yield` of a partial
     // chunk would break it.
     let mut response = Response::builder()
