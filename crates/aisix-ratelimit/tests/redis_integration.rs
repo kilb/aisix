@@ -682,3 +682,114 @@ async fn every_shed_post_stream_update_is_counted_not_just_the_first() {
          shed must stay visible, that is the whole point of the counter",
     );
 }
+
+/// 可开关的 TCP 转发器，夹在 store 与 Redis 之间模拟一次断线：`down` 切断所有
+/// 在途连接，并在新连接一到就关掉；`up` 恢复转发。
+struct FlakyProxy {
+    url: String,
+    up: Arc<std::sync::atomic::AtomicBool>,
+    links: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl FlakyProxy {
+    async fn start(redis_url: &str) -> Self {
+        use std::sync::atomic::Ordering;
+        let target = redis_url
+            .split("://")
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .expect("redis url carries host:port")
+            .to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
+        let url = format!("redis://{}", listener.local_addr().expect("proxy addr"));
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let links = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (up_flag, link_set) = (Arc::clone(&up), Arc::clone(&links));
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                if !up_flag.load(Ordering::SeqCst) {
+                    continue; // 丢弃即关闭
+                }
+                let target = target.clone();
+                let link = tokio::spawn(async move {
+                    if let Ok(mut outbound) = tokio::net::TcpStream::connect(&target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+                link_set.lock().expect("links").push(link);
+            }
+        });
+        Self { url, up, links }
+    }
+
+    fn down(&self) {
+        self.up.store(false, std::sync::atomic::Ordering::SeqCst);
+        for link in self.links.lock().expect("links").drain(..) {
+            link.abort();
+        }
+    }
+
+    fn up(&self) {
+        self.up.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 断线期间的 acquire 会降级到本地 store、在本地占一个并发位。Redis 恢复后
+/// 这次请求的 commit 走 Redis，本地那个位也必须一并还掉 —— 否则它永远留在
+/// 本地，下一次断线时本地并发上限就少一个，而且每次抖动都会再少一个。
+// 多线程：`RedisStore::connect` 同步等后台 worker 建连，转发器得在另一个线程上跑。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slot_taken_while_degraded_is_released_by_a_commit_after_recovery() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let proxy = FlakyProxy::start(&url).await;
+    let flaky = store(&proxy.url).await;
+    let direct = store(&url).await;
+    let key = unique_key("degraded-slot");
+    let limits = RateLimit {
+        concurrency: Some(1),
+        ..rl()
+    };
+
+    // 断线：acquire 降级，在本地占位。
+    proxy.down();
+    flaky
+        .acquire(&key, &limits, "m1")
+        .await
+        .expect("a degraded acquire is served by the local store");
+
+    // 恢复：等到 flaky 的 acquire 确实走到了 Redis —— 直连的那个副本能看见它
+    // 占的位 —— 再让 m1 的 commit 走 Redis 那条路。
+    proxy.up();
+    let probe = unique_key("degraded-probe");
+    let mut recovered = false;
+    for i in 0..100 {
+        let member = format!("p{i}");
+        if flaky.acquire(&probe, &limits, &member).await.is_ok() {
+            let seen = direct.acquire(&probe, &limits, "d").await.is_err();
+            flaky.release(&probe, &member);
+            if seen {
+                recovered = true;
+                break;
+            }
+            direct.release(&probe, "d");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        recovered,
+        "the store never went back to Redis after the outage"
+    );
+    flaky.commit(&key, 0, "m1").await;
+
+    // 再断一次：本地并发上限 1 必须完整可用。
+    proxy.down();
+    assert!(
+        flaky.acquire(&key, &limits, "m2").await.is_ok(),
+        "the slot m1 took while degraded was never released locally"
+    );
+}

@@ -624,7 +624,13 @@ impl RateStore for RedisStore {
             .invoke_async(&mut conn)
             .await;
         match res {
-            Ok(_) => self.mark_ok(),
+            Ok(_) => {
+                self.mark_ok();
+                // 这个 member 可能是断线时降级到本地占的位：Redis 侧的 commit
+                // 不碰本地，不在这里还掉就永远留在本地，下次断线时本地并发上限
+                // 少一个。本地没有这个桶时是空操作。
+                self.local.release(key, member);
+            }
             Err(e) => {
                 self.warn_degraded("commit", &e);
                 self.conn.note_error().await;
