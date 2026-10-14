@@ -472,27 +472,32 @@ impl VertexSecret {
 
 /// Validate that a path token (project id, region, model name) is
 /// safe to interpolate into the Vertex URL. GCP project ids are
-/// `[a-z][a-z0-9-]{4,28}[a-z0-9]`; region names are
-/// `[a-z]+[0-9]+(-[a-z])?`; model names are vendor-pinned strings.
-/// Reject `?`, `#`, `/`, whitespace, `..` so a malicious model_name
-/// can't redirect dispatch.
+/// `[a-z][a-z0-9-]{4,28}[a-z0-9]`, optionally domain-scoped
+/// (`example.com:my-project`); region names are `[a-z]+[0-9]+(-[a-z])?`
+/// or `global`; model names are vendor-pinned strings such as
+/// `gemini-1.5-pro` or `claude-3-5-sonnet@20241022`.
+///
+/// An allowlist, not a list of forbidden characters: the URL parser turns
+/// `\` into `/`, `%2e%2e` into `..` and drops `\r`, so a value that passes
+/// a blocklist can still climb out of its path segment. A wildcard Vertex
+/// model takes its upstream id from the caller, so that would send the
+/// operator's credential to any Vertex path. `:` is admitted for the
+/// project only — in a model id it would read as a method suffix.
 fn validate_url_token(name: &str, value: &str) -> Result<(), BridgeError> {
     if value.is_empty() {
         return Err(BridgeError::Config(format!(
             "vertex {name} is empty (expected an identifier)"
         )));
     }
-    if value.contains('/')
-        || value.contains('?')
-        || value.contains('#')
-        || value.contains(' ')
-        || value.contains('\t')
-        || value.contains('\n')
-        || value.contains("..")
-    {
+    let allowed = |b: u8| {
+        b.is_ascii_alphanumeric()
+            || matches!(b, b'-' | b'_' | b'.' | b'@')
+            || (b == b':' && name == "project")
+    };
+    if !value.bytes().all(allowed) || value.contains("..") || value.bytes().all(|b| b == b'.') {
         return Err(BridgeError::Config(format!(
             "vertex {name} {value:?} contains URL-control characters — \
-             reject `/`, `?`, `#`, whitespace, `..`"
+             expected only letters, digits, `-`, `_`, `.` and `@`"
         )));
     }
     Ok(())
@@ -2735,6 +2740,38 @@ mod tests {
             validate_url_token("upstream_id", "gemini/../admin"),
             Err(BridgeError::Config(_))
         ));
+    }
+
+    /// 黑名单拦不住 URL 解析器会还原成路径分隔符或 `..` 的写法：`\` 在
+    /// http(s) URL 里就是 `/`，`%2e%2e` 就是 `..`，`\r` 会被剥掉。通配 Vertex
+    /// 模型的上游 id 是调用方写的，所以这些载荷能把运营方的 token 送到任意
+    /// Vertex 路径上（如私有部署的 endpoint）。只放行标识符里真会出现的字符。
+    #[test]
+    fn validate_url_token_rejects_what_the_url_parser_rewrites() {
+        for (name, value) in [
+            (
+                "upstream_id",
+                r"gemini-x\%2e%2e\%2e%2e\projects\P\locations\us-central1\endpoints\1",
+            ),
+            ("upstream_id", "gemini-x\\.\r.\\.\r.\\projects\\P"),
+            ("upstream_id", "%2e%2e"),
+            ("upstream_id", "gemini-pro:rawPredict"),
+            ("project", "."),
+            ("region", "us-central1\\x"),
+        ] {
+            assert!(
+                matches!(validate_url_token(name, value), Err(BridgeError::Config(_))),
+                "{name} {value:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_url_token_accepts_domain_scoped_projects_and_global() {
+        validate_url_token("project", "example.com:my-proj").unwrap();
+        validate_url_token("region", "global").unwrap();
+        validate_url_token("upstream_id", "text-embedding-005").unwrap();
+        validate_url_token("upstream_id", "gemini_custom.v2").unwrap();
     }
 
     #[test]
