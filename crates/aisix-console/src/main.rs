@@ -1093,7 +1093,8 @@ async fn api_upstream_models(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": format!(
-                    "只允许引用 PROVIDER_KEY_ 前缀的环境变量，收到 {var:?}——                     这条限制是为了让上游凭据无法被用来读取本服务自己的密钥"
+                    "只允许引用 PROVIDER_KEY_ 前缀的环境变量，收到 {var:?}——\
+                    这条限制是为了让上游凭据无法被用来读取本服务自己的密钥"
                 )})),
             )
                 .into_response();

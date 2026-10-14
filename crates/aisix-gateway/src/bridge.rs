@@ -752,19 +752,6 @@ pub trait Bridge: Send + Sync + 'static {
     }
 }
 
-/// Reject a `ProviderKey.api_base` shape that would send the key's secret
-/// somewhere other than where the config appears to say.
-///
-/// `https://api.openai.com@evil.example/v1` reads like OpenAI to a human and
-/// resolves to `evil.example`, which then receives the Authorization header —
-/// which is why userinfo is refused outright. A query or fragment on the base
-/// is refused for the same family of reasons: the bridge appends a fixed path
-/// suffix, and a `?` or `#` in the base makes that suffix land inside the
-/// query string instead of the path.
-///
-/// Vertex and Azure each grew this check locally (#390); the OpenAI-compatible
-/// and Anthropic bridges did not, so it lives here now and every bridge calls
-/// the same one.
 /// Replace any `userinfo@` prefix in an authority with `***@` before the value
 /// goes into an error a CALLER will read.
 ///
@@ -804,6 +791,19 @@ pub fn redact_userinfo(value: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Reject a `ProviderKey.api_base` shape that would send the key's secret
+/// somewhere other than where the config appears to say.
+///
+/// `https://api.openai.com@evil.example/v1` reads like OpenAI to a human and
+/// resolves to `evil.example`, which then receives the Authorization header —
+/// which is why userinfo is refused outright. A query or fragment on the base
+/// is refused for the same family of reasons: the bridge appends a fixed path
+/// suffix, and a `?` or `#` in the base makes that suffix land inside the
+/// query string instead of the path.
+///
+/// Vertex and Azure each grew this check locally (#390); the OpenAI-compatible
+/// and Anthropic bridges did not, so it lives here now and every bridge calls
+/// the same one.
 pub fn validate_api_base(provider: &str, base: &str) -> Result<(), BridgeError> {
     let Some(rest) = base
         .strip_prefix("https://")
@@ -819,7 +819,8 @@ pub fn validate_api_base(provider: &str, base: &str) -> Result<(), BridgeError> 
     let host_part = rest.split(['/', '?', '#']).next().unwrap_or("");
     if host_part.contains('@') {
         return Err(BridgeError::InvalidUpstreamConfig(format!(
-            "{provider} provider_key api_base must not embed userinfo (@); put the              credential in `provider_key.api_key` instead"
+            "{provider} provider_key api_base must not embed userinfo (@); put the \
+             credential in `provider_key.api_key` instead"
         )));
     }
     if host_part.is_empty() {
@@ -830,7 +831,8 @@ pub fn validate_api_base(provider: &str, base: &str) -> Result<(), BridgeError> 
     }
     if base.contains('?') || base.contains('#') {
         return Err(BridgeError::InvalidUpstreamConfig(format!(
-            "{provider} provider_key api_base must not carry a query or fragment; the              bridge appends the endpoint path to it"
+            "{provider} provider_key api_base must not carry a query or fragment; the \
+             bridge appends the endpoint path to it"
         )));
     }
     Ok(())
@@ -838,6 +840,23 @@ pub fn validate_api_base(provider: &str, base: &str) -> Result<(), BridgeError> 
 
 #[cfg(test)]
 mod tests {
+    /// 这些报错以 400 的正文交给调用方。跨行的字符串字面量丢了行尾的 `\`
+    /// 续行符时，下一行的缩进会原样留在文案中间。
+    #[test]
+    fn validate_api_base_messages_carry_no_source_indentation() {
+        for base in [
+            "ftp://host/v1",
+            "https://user:pw@host/v1",
+            "https:///v1",
+            "https://host/v1?x=1",
+        ] {
+            let msg = validate_api_base("openai", base)
+                .expect_err("each shape is refused")
+                .to_string();
+            assert!(!msg.contains("  "), "{base}: {msg:?}");
+        }
+    }
+
     /// `://` 只有出现在任何 `/` `?` `#` `@` 之前才是 scheme 分隔符。query 里的
     /// `https://` 不能让脱敏把 authority 认到它后面去，否则前面的 userinfo
     /// 被原样放过。

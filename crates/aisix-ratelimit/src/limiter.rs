@@ -71,13 +71,13 @@ impl Limiter {
         Self::with_store(Arc::new(LocalStore::new()))
     }
 
-    /// Build over a specific store — the server bootstrap passes a
-    /// `RedisStore` when a shared backend is configured.
     /// 见 [`RateStore::claim_once`]。
     pub async fn claim_once(&self, key: &str, ttl: Duration) -> bool {
         self.store.claim_once(key, ttl).await
     }
 
+    /// Build over a specific store — the server bootstrap passes a
+    /// `RedisStore` when a shared backend is configured.
     pub fn with_store(store: Arc<dyn RateStore>) -> Self {
         Self {
             store,

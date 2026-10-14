@@ -150,7 +150,9 @@ pub fn build_client_or_default(builder: reqwest::ClientBuilder, what: &str) -> r
             tracing::error!(
                 error = %e,
                 client = what,
-                "upstream.tls settings not applied: the configured HTTP client                  could not be built, falling back to a minimal one (no custom CA,                  no client identity, no verify opt-out, no connection tuning)"
+                "upstream.tls settings not applied: the configured HTTP client \
+                 could not be built, falling back to a minimal one (no custom CA, \
+                 no client identity, no verify opt-out, no connection tuning)"
             );
             // NOT `Client::new()`. That is reqwest's default, which follows up
             // to ten redirects — and on a cross-host hop reqwest strips only
@@ -630,7 +632,9 @@ mod tests {
         ] {
             assert!(
                 production.contains(setting),
-                "the portal's outbound client does not set `{setting}` —                  reqwest's default there is what the workspace scan exists                  to prevent, and the portal is exempt from that scan",
+                "the portal's outbound client does not set `{setting}` — \
+                 reqwest's default there is what the workspace scan exists \
+                 to prevent, and the portal is exempt from that scan",
             );
         }
     }

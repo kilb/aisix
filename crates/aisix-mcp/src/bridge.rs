@@ -154,7 +154,9 @@ fn build_http_client(disable_env_proxy: bool) -> rmcp_reqwest::Client {
     b.build().unwrap_or_else(|e| {
         tracing::error!(
             error = %e,
-            "upstream.tls settings not applied to MCP upstream connections: the              configured client could not be built, falling back to a default one              (no custom CA, no client identity, no proxy opt-out)"
+            "upstream.tls settings not applied to MCP upstream connections: the \
+             configured client could not be built, falling back to a default one \
+             (no custom CA, no client identity, no proxy opt-out)"
         );
         rmcp_reqwest::Client::builder()
             .redirect(rmcp_reqwest::redirect::Policy::none())
