@@ -3939,7 +3939,9 @@ fn update_anthropic_usage(
     // so the figure matches external observers (#1225).
     if !*first_token_seen {
         *first_token_seen = true;
-        acc.upstream_ttft_ms = attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+        let ttft = attempt_started.elapsed();
+        acc.upstream_ttft_ms = ttft.as_millis().min(u32::MAX as u128) as u32;
+        acc.upstream_ttft = Some(ttft);
     }
     match json.get("type").and_then(Value::as_str) {
         Some("message_start") => {
@@ -6279,6 +6281,29 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     /// `drain_anthropic_sse_frames` directly with a buffer that holds
     /// one complete frame plus a partial second frame, then completes
     /// the second frame on the next call.
+    /// 首帧必须同时记下 `upstream_ttft`（Duration）。指标门控只看它：
+    /// 只写 `_ms` 的话，原生 Anthropic 流式的两条 TTFT 序列一条都不会记。
+    /// 立即到达的首帧 `_ms` 为 0，这正是 `Option<Duration>` 要区分的情形。
+    #[test]
+    fn first_frame_stamps_upstream_ttft_duration() {
+        use super::{update_anthropic_usage, AnthropicStreamUsage};
+
+        let mut acc = AnthropicStreamUsage::default();
+        let mut first_token_seen = false;
+        let started = std::time::Instant::now();
+        update_anthropic_usage(
+            &mut acc,
+            &serde_json::json!({"type": "ping"}),
+            started,
+            &mut first_token_seen,
+            0,
+        );
+        assert!(
+            acc.upstream_ttft.is_some(),
+            "the first frame must stamp upstream_ttft, which gates both TTFT series"
+        );
+    }
+
     #[test]
     fn sse_frame_parser_reassembles_split_chunks() {
         use super::{drain_anthropic_sse_frames, AnthropicStreamUsage};

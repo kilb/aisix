@@ -11,6 +11,7 @@ import {
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
+import { metricDelta, scrapeMetrics } from "../harness/metrics.js";
 
 // E2E: `upstream_ttft_ms` stops on the FIRST streamed frame of any type
 // (#1225, both rounds).
@@ -448,6 +449,64 @@ describe("upstream TTFT stops on the first streamed frame", () => {
     expect(Number.isFinite(ttft)).toBe(true);
     expect(ttft).toBeGreaterThan(0);
     expect(ttft).toBeLessThan(OUTPUT_STARTS_MS / 2);
+  });
+
+  // 原生 Anthropic 流式（Claude Code 的主路径）上，TTFT 不只要进用量事件，
+  // 两条 Prometheus 序列也都要各记一次：直方图给 SLO 用，summary 是旧面板在读。
+  test("native /v1/messages streaming lands in both TTFT metric series", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+
+    const upstream = await startOpenAiUpstream({
+      streamEvents: anthropicQuietThinkingStream(),
+      firstEventDelayMs: LEAD_MS,
+      eventDelayMs: 20,
+    });
+    upstreams.push(upstream);
+    const model = "ttft-ff-messages-native-metrics";
+    await createModel(model, upstream, "anthropic");
+    await awaitPropagation("ff-messages-native-metrics");
+
+    const want = { endpoint: "/v1/messages", model };
+    const before = await scrapeMetrics(app.metricsUrl);
+
+    const res = await fetch(`${app.proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 128,
+        messages: [{ role: "user", content: "think then answer" }],
+        stream: true,
+      }),
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+
+    // 指标在流结束的收尾里落盘，和响应体读完之间没有先后保证，所以轮询。
+    const deadline = Date.now() + 10_000;
+    let after = await scrapeMetrics(app.metricsUrl);
+    while (
+      Date.now() < deadline &&
+      metricDelta(before, after, "aisix_request_ttft_seconds_count", want) < 1
+    ) {
+      await new Promise((r) => setTimeout(r, 100));
+      after = await scrapeMetrics(app.metricsUrl);
+    }
+
+    expect(
+      metricDelta(before, after, "aisix_request_ttft_seconds_count", want),
+      "TTFT histogram observations",
+    ).toBe(1);
+    expect(
+      metricDelta(before, after, "aisix_llm_time_to_first_token_seconds_count", want),
+      "legacy TTFT summary observations",
+    ).toBe(1);
   });
 
   test("the first bridged chunk stops the clock on the /v1/messages bridge", async (ctx) => {
