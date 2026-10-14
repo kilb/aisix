@@ -92,7 +92,8 @@ export interface MoneyFixture {
   /** 桩上游至今收到的嵌入调用次数。 */
   embedCallCount(): number;
   /**
-   * 让门户对某把密钥的花费**失明**：PromQL 垫片对这把密钥的查询恒回 0。
+   * 让门户对某把密钥的花费**失明**：PromQL 垫片返回这把密钥的序列时去掉
+   * `api_key_id` 标签 —— 用户级照常扣款，只是门户归不到这把密钥上。
    *
    * 用来把两道闸拆开测。门户的持久兜底（累计花费越过额度就把密钥写成停用）会在
    * 一轮内接管，于是「网关自己有没有记账」这件事被盖住 —— 网关侧的记账完全坏掉，
@@ -599,76 +600,103 @@ export async function startMoney(): Promise<MoneyFixture> {
   await new Promise<void>((r) => upstream.listen(upPort, "127.0.0.1", r));
   servers.push(upstream);
 
-  // PromQL 垫片：只回答 sweeper 发的那一种查询。
+  // PromQL 垫片：只回答 sweeper 发的那一种查询 —— 按 user_id 选出花费计数器，
+  // 同一个查询里带上原始值、两段 `resets()`、网关进程的启动时刻（用 `aisix_part`
+  // 标签区分）。
   //
   // Prometheus 本身是我们不发布的基础设施，而这一层需要**有个东西**回答
   // PromQL。仓库里已有 otlp-mock / sls-mock / jwks-mock 的先例，这是同一类
   // 东西。真网关、真请求、真指标、真定价、真账本、真停用都在链路上；只有
   // PromQL 引擎是垫片。
   //
-  // increase() 在连续窗口上的语义就是「本次累计值 − 上次累计值」，垫片按这个
-  // 记账（无重置场景下与真 Prometheus 等价）。
-  const lastSeen = new Map<string, number>();
-  /** 门户对这些 api_key_id 的花费查询恒回 0。见 blindPortalTo。 */
+  // 垫片**不替门户算任何差**：原始值原样取自网关 /metrics，重置次数按「看到的值
+  // 比上次小」记下时刻、按查询给的窗口去数 —— 与 Prometheus 对这两个选择器的
+  // 回答一致（抓取间隔内的滞后除外）。上一版垫片按「本次累计减上次累计」自己
+  // 算好了增量，再冒充 increase() 的结果回给门户 —— 真 increase() 在首尾相接的
+  // 窗口上并不是这个数，于是门户那边的计费漏算被它整个盖住了，用真 Prometheus
+  // 一测才扣到 $0。
+  /** 门户看不见这些 api_key_id 的花费归属。见 blindPortalTo。 */
   const blind = new Set<string>();
+  /** 每条序列上次看到的值，与它被看到变小（= 重置）的那些时刻。 */
+  const lastValue = new Map<string, number>();
+  const resetsAt = new Map<string, number[]>();
   const prom = createServer((req, res) => {
     void (async () => {
       const u = new URL(req.url ?? "/", "http://x");
       const q = u.searchParams.get("query") ?? "";
-      // 门户会按 user_id 查（用户级）也会按 api_key_id 查（密钥级持久兜底）。
-      const m =
-        /user_id="([^"]+)"/.exec(q) ?? /api_key_id="([^"]+)"/.exec(q);
-      const label = q.includes("api_key_id=") ? "api_key_id" : "user_id";
-      const id = m?.[1] ?? "";
-      let cumulative = 0;
-      // 有没有匹配到任何序列。真 Prometheus 在一条都没匹配到时回**空** result，
-      // 而不是一条值为 0 的序列 —— 那两种情况在门户侧的处置完全不同（「这个人
-      // 从来没调过」vs「读不到」）。垫片必须照着真的来，否则那条分支永远测不到。
-      if (label === "api_key_id" && blind.has(id)) {
+      const reply = (result: unknown[]) => {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(
-          JSON.stringify({
-            status: "success",
-            data: { resultType: "vector", result: [{ metric: {}, value: [0, "0"] }] },
-          }),
-        );
+        res.end(JSON.stringify({ status: "success", data: { resultType: "vector", result } }));
+      };
+      const user = /aisix_llm_spend_micro_usd_total\{user_id="([^"]+)"\}/.exec(q)?.[1];
+      const span = Number(/\[(\d+)s\]\), "aisix_part", "resets_upto"/.exec(q)?.[1]);
+      const lookback = Number(/\[(\d+)s\](?: offset \d+s)?\), "aisix_part", "resets_before"/.exec(q)?.[1]);
+      const gap = Number(/ offset (\d+)s\), "aisix_part", "resets_before"/.exec(q)?.[1] ?? 0);
+      if (user === undefined || !Number.isFinite(span) || !Number.isFinite(lookback)) {
+        reply([]);
         return;
       }
-      let matched = false;
+      const now = Date.now();
+      const count = (key: string, from: number, to: number) =>
+        (resetsAt.get(key) ?? []).filter((t) => t > from && t <= to).length;
+      const result: unknown[] = [];
       try {
         const text = await fetch(`http://127.0.0.1:${metricsPort}/metrics`).then((r) => r.text());
+        const startedLine = text
+          .split("\n")
+          .map((l) => /^process_start_time_seconds\s+(\S+)$/.exec(l.trim())?.[1])
+          .find((v) => v !== undefined);
         for (const line of text.split("\n")) {
-          if (!line.startsWith("aisix_llm_spend_micro_usd_total{")) continue;
-          if (!line.includes(`${label}="${id}"`)) continue;
-          matched = true;
-          cumulative += Number(line.slice(line.lastIndexOf("}") + 1).trim()) || 0;
+          const m = /^aisix_llm_spend_micro_usd_total\{(.*)\}\s+(\S+)$/.exec(line.trim());
+          if (!m || m[1] === undefined || m[2] === undefined) continue;
+          const labels: Record<string, string> = { instance: "gateway", job: "aisix" };
+          for (const [, k, v] of m[1].matchAll(/(\w+)="((?:[^"\\]|\\.)*)"/g)) {
+            if (k !== undefined && v !== undefined) labels[k] = v;
+          }
+          if (labels.user_id !== user) continue;
+          const key = m[1];
+          const value = Number(m[2]);
+          const prev = lastValue.get(key);
+          if (prev !== undefined && value < prev) resetsAt.set(key, [...(resetsAt.get(key) ?? []), now]);
+          lastValue.set(key, value);
+          // 失明：保留这条序列（用户级照常扣），只去掉它归到哪把密钥的那个标签。
+          // blindPortalTo 在密钥铸出来、还没有流量时调用，所以同一条序列不会
+          // 先带着标签、后又不带 —— 那会被门户当成两条不同的序列。
+          if (labels.api_key_id && blind.has(labels.api_key_id)) delete labels.api_key_id;
+          const at = now / 1000;
+          result.push(
+            {
+              metric: { __name__: "aisix_llm_spend_micro_usd_total", ...labels, aisix_part: "value" },
+              value: [at, m[2]],
+            },
+            {
+              metric: { ...labels, aisix_part: "resets_upto" },
+              value: [at, String(count(key, now - span * 1000, now))],
+            },
+            {
+              metric: { ...labels, aisix_part: "resets_before" },
+              value: [at, String(count(key, now - (gap + lookback) * 1000, now - gap * 1000))],
+            },
+          );
+        }
+        // `process_start_time_seconds and on(job, instance) {sel}`：这个用户在这个
+        // 网关上有花费序列时才带上它的启动时刻。
+        const asksStarted = q.includes('"aisix_part", "started"');
+        if (asksStarted && startedLine !== undefined && result.length > 0) {
+          result.push({
+            metric: {
+              __name__: "process_start_time_seconds",
+              instance: "gateway",
+              job: "aisix",
+              aisix_part: "started",
+            },
+            value: [now / 1000, startedLine],
+          });
         }
       } catch {
-        /* 网关还没起来 */
+        /* 网关还没起来：没有序列 */
       }
-      if (!matched) {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(
-          JSON.stringify({
-            status: "success",
-            data: { resultType: "vector", result: [] },
-          }),
-        );
-        return;
-      }
-      const prev = lastSeen.get(`${label}:${id}`) ?? 0;
-      const delta = Math.max(0, cumulative - prev);
-      lastSeen.set(`${label}:${id}`, cumulative);
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          status: "success",
-          data: {
-            resultType: "vector",
-            result: [{ metric: {}, value: [0, String(delta)] }],
-          },
-        }),
-      );
+      reply(result);
     })();
   });
   await new Promise<void>((r) => prom.listen(promPort, "127.0.0.1", r));

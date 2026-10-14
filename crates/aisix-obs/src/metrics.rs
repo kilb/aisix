@@ -314,6 +314,26 @@ pub const M_A2A_STREAM_EVENTS_TOTAL: &str = "aisix_a2a_stream_events_total";
 /// tasks piling up in `input-required` or `failed`.
 pub const M_A2A_TASK_STATE_TOTAL: &str = "aisix_a2a_task_state_total";
 
+/// Unix seconds at which this gateway process started — the standard
+/// Prometheus client name. A counter that restarts from zero cannot always be
+/// told apart from one that grew: if a restarted process spends more before the
+/// first scrape than the old one had accumulated, the value only went up.
+/// Consumers billing from counters (the portal) compare this per instance to
+/// see a restart regardless of the values. Reflected at scrape time with the
+/// config series.
+pub const M_PROCESS_START_TIME_SECONDS: &str = "process_start_time_seconds";
+
+/// Captured when the process builds its metrics, i.e. at startup.
+static PROCESS_START_TIME: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+
+fn process_start_time() -> f64 {
+    *PROCESS_START_TIME.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64())
+    })
+}
+
 // ── Config load-observability series (load-observability contract) ─────────
 // Reflected from [`aisix_core::ConfigMetricsView`] at scrape time via
 // [`Metrics::sync_config_status`]. Standard Prometheus config-reload naming so
@@ -762,6 +782,8 @@ impl Metrics {
             )
             .expect("bucket lists are validated non-empty")
             .build_recorder();
+        // Pin the start time now, not at the first scrape.
+        process_start_time();
         let handle = recorder.handle();
         static NEXT_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         Self {
@@ -816,6 +838,7 @@ impl Metrics {
         use aisix_core::SourceKind;
         let etcd = matches!(view.source_kind, SourceKind::Etcd);
         metrics::with_local_recorder(&self.inner.recorder, || {
+            metrics::gauge!(M_PROCESS_START_TIME_SECONDS).set(process_start_time());
             metrics::gauge!(M_CONFIG_LAST_RELOAD_SUCCESSFUL).set(if view.last_reload_successful {
                 1.0
             } else {

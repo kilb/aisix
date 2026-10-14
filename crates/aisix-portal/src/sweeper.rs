@@ -1,23 +1,48 @@
 //! 对账控制环。
 //!
-//! 每轮做三件事：读这段时间的消费 → 入账 → 余额归零则停用该用户的密钥。
+//! 每轮做三件事：读消费 → 入账 → 余额归零则停用该用户的密钥。
 //!
-//! # 为什么按时间窗查增量，而不是在累计值上做差
+//! # 怎么读消费：逐条序列的游标，不是时间窗
 //!
-//! 花费指标是 counter，而且**每个网关副本各自暴露一份**。初版想记「已计了多少
-//! 钱」、每轮扣差值 —— 那是错的：任一副本重启都会让 `sum` 下陷，看起来就像
-//! counter 重置，按累计额做差就会把水位线重新对齐到低点，那一刻起未入账的消费
-//! 永久丢失，且毫无信号 —— 用户白得推理，账面看不出异常。
+//! 每轮读该用户每条花费序列（`aisix_llm_spend_micro_usd_total`，按完整标签区分，
+//! 含 `instance`）的**原始累计值**，与库里记下的上次读数做差，差之和就是这一轮
+//! 要扣的钱。
 //!
-//! 改成记「已经计到哪个时刻」，每轮查 `increase(...[自上次至今])`。`increase()`
-//! 是**逐时间序列**处理重置后再求和的，跨副本天然安全，也没有缺口或重叠。
+//! 之前按时间窗查 `increase(...[自上次至今])`。那在首尾相接的窗口上算不对：窗口
+//! 里少于两个采样点就返回空、被当成 0，而且只取窗口内首末两个采样之差，窗口之间
+//! 的那段增量永远算不到。抓取间隔不比对账周期短时几乎什么都扣不到 —— 用真
+//! Prometheus（抓取 15s、对账 5s）实测，$5 的消费扣了 $0。
 //!
-//! # 两个不变量
+//! 也不能对**总和**做差：花费指标每个网关副本各自暴露一份，任一副本重启都会让
+//! 总和下陷，看起来像整体重置，水位线会被拉回低点、那段消费永久丢失。游标按单条
+//! 序列记就没有这个问题。
 //!
-//! - **水位线只在入账成功后前进。** 读取失败就原地不动 —— 若此时把它推到当前
-//!   时刻，这段窗口的消费就被跳过了，又是一次静默白送。
-//! - **扣款与推进水位线在同一个事务里。** 中间崩了会重复扣或漏扣。这是本期
-//!   唯一真正需要事务的地方（见 `ledger.rs` 里的事务边界说明）。
+//! 每条序列每轮都带着「上次读数之后重置过几次」（Prometheus 的 `resets()`），与原始
+//! 读数出自同一次查询、同一个求值时刻，所以彼此一致：
+//!
+//! - 重置过 —— `resets()` 数到了，或者这条序列所在网关进程的启动时刻
+//!   （`process_start_time_seconds`）变了：这一轮的花费是重置之后的累计，即当前
+//!   读数，不论它比上次大还是小。光靠 `resets()` 不够：它只认得「值变小了」，而
+//!   重启后在第一次抓取前就花得比重启前还多时，值只是涨了 —— 用真 Prometheus 实测，
+//!   这种重启下 $5 的消费只扣到 $3。启动时刻与值无关。
+//!   只在读数变小时才查重置的话，重启后又涨过上次读数的序列只会被扣 `当前 − 上次`，
+//!   重启前那段累计被整个吞掉。
+//! - 没重置过而读数变小：读到的是旧值（高可用的两个 Prometheus 副本抓取时刻不同、
+//!   查询缓存）。不扣，游标不倒退 —— 当成重置的话会把整段累计值再扣一遍。
+//! - 没重置过而读数变大：扣差值。
+//!
+//! 重置前、上次读数之后的那一小段花费（从上次读数到进程退出）拿不到，不计；它不超过
+//! 一个对账周期的消费。
+
+//! # 三个不变量
+//!
+//! - **游标只在入账成功后前进。** 读取失败就原地不动，下一轮的读数照样包含这段
+//!   时间的消费。
+//! - **扣款、游标、密钥花费在同一个事务里。** 中间崩了会重复扣或漏扣。
+//! - **新序列从 0 算起，读到多少就是花了多少。** 新用户也一样：他的计数器生来
+//!   就是 0，第一次被读到之前的消费照扣 —— 否则注册、拿额度、铸密钥、用掉都赶在
+//!   第一轮对账之前，这段就白用了。唯一的例外是从按时间窗计费的版本升级上来的
+//!   老用户：那一轮只记下当前读数，不把历史当成新序列重扣。
 
 use chrono::{DateTime, Utc};
 
@@ -63,27 +88,36 @@ pub struct TickReport {
     pub write_failures: usize,
 }
 
+/// 一条花费序列的当前读数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpendSeries {
+    /// 序列的完整标签（排序后拼成一串）。游标按它记。
+    pub key: String,
+    /// 这条序列的 `api_key_id` 标签：把花费归到具体某把密钥上。
+    pub api_key_id: Option<String>,
+    /// 当前累计值（micro-USD）。
+    pub value: u64,
+    /// 从上次读数（`since`）到这次之间，这条序列的计数器重置过几次。
+    pub resets_since: u64,
+    /// 这条序列所在网关进程的启动时刻（毫秒）。旧网关不暴露时为 `None`。
+    pub started_ms: Option<i64>,
+}
+
 /// 消费读取器。抽成 trait 只为把 Prometheus 换成测试替身，生产实现只有一个。
 #[allow(async_fn_in_trait)]
 pub trait ConsumptionSource {
-    /// `[from, to)` 窗口内该用户的花费（micro-USD）。`None` = 读不到。
-    async fn spend_in_window(
+    /// `at` 时刻该用户名下每条花费序列的累计值，以及自 `since`（上次读数的时刻）
+    /// 以来各自重置过几次。`None` = 读不到；`Some(空)` = 这个人还没有任何花费序列。
+    ///
+    /// 两样东西必须出自同一次读：分开查的话，高可用的两个 Prometheus 副本各答
+    /// 一半，读数与重置次数可以互相矛盾。用户级扣款与密钥级花费也都从这一次读数
+    /// 里算 —— 两边用的是同一组数，账才对得上。
+    async fn spend_series(
         &self,
         user_id: &str,
-        from: DateTime<Utc>,
-        to: DateTime<Utc>,
-    ) -> Option<u64>;
-
-    /// 同一个窗口内**某一把密钥**的花费。`None` = 读不到。
-    ///
-    /// 单独一条而不是复用上面那条：标签不同（`api_key_id` 而不是 `user_id`），
-    /// 而按用户查出来的数没法拆到密钥上。
-    async fn key_spend_in_window(
-        &self,
-        api_key_id: &str,
-        from: DateTime<Utc>,
-        to: DateTime<Utc>,
-    ) -> Option<u64>;
+        since: DateTime<Utc>,
+        at: DateTime<Utc>,
+    ) -> Option<Vec<SpendSeries>>;
 }
 
 pub struct Sweeper<S: ConsumptionSource> {
@@ -111,37 +145,88 @@ impl<S: ConsumptionSource> Sweeper<S> {
         let mut exhausted: Vec<String> = Vec::new();
 
         for u in &users {
-            let from = match self.store.counted_through(&u.id).await? {
-                Some(t) => t,
-                // 第一次见到这个用户：从现在起算，不去追溯注册之前的历史。
-                None => {
-                    self.store.set_counted_through(&u.id, now).await?;
-                    continue;
-                }
+            // `None` = 门户从没对过这个用户的账；`Some(false)` = 从按时间窗计费的版本
+            // 升级上来、还没建游标。
+            let state = self.store.consumption_state(&u.id).await?;
+            let since = self.store.counted_through(&u.id).await?.unwrap_or(now);
+            let Some(series) = self.source.spend_series(&u.id, since, now).await else {
+                // 读不到就原地不动：游标不前进，下一轮的读数照样包含这段消费。
+                // 密钥级也一并跳过 —— 它们出自同一次读数。
+                r.read_failures += 1;
+                continue;
             };
-            if now <= from {
+            if state == Some(false) {
+                // 升级上来的老用户：只记下当前读数，不把历史当成新序列重扣。
+                self.settle(&u.id, 0, &series, &[], now).await?;
                 continue;
             }
 
-            match self.source.spend_in_window(&u.id, from, now).await {
-                Some(0) => {
-                    // 没有增量也要推进水位线，否则窗口会越来越长。
-                    self.store.set_counted_through(&u.id, now).await?;
-                    exhausted.extend(self.mark_key_spend(&u.id, from, now).await?);
+            let cursors: std::collections::HashMap<String, (u64, Option<i64>)> = self
+                .store
+                .spend_cursors(&u.id)
+                .await?
+                .into_iter()
+                .map(|(k, (v, started))| (k, (v.max(0) as u64, started)))
+                .collect();
+            let mut spent = 0u64;
+            let mut by_key: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+            // 这一轮之后每条序列的游标。通常就是读数；只有「变小却没重置」时留在原处。
+            let mut next = Vec::with_capacity(series.len());
+            for s in &series {
+                let restarted = |was: Option<i64>| {
+                    s.resets_since > 0
+                        || matches!((was, s.started_ms), (Some(a), Some(b)) if a != b)
+                };
+                let (delta, cursor) = match cursors.get(&s.key).copied() {
+                    // 新序列（新副本、新密钥、新用户）：从 0 算起。
+                    None => (s.value, s.value),
+                    // 重置过：这一轮的花费是重置之后的累计，不论它比上次大还是小。
+                    Some((_, was)) if restarted(was) => (s.value, s.value),
+                    Some((prev, _)) if s.value >= prev => (s.value - prev, s.value),
+                    // 变小却没有重置：读到的是旧值（落后的副本、缓存）。不扣，游标也不
+                    // 倒退 —— 倒退的话，下一轮会把这段差额再扣一次。
+                    Some((prev, _)) => (0, prev),
+                };
+                spent = spent.saturating_add(delta);
+                if let Some(id) = s.api_key_id.as_deref() {
+                    *by_key.entry(id).or_default() += delta;
                 }
-                Some(micro) => {
-                    // 扣款与推进水位线必须一起成或一起不成。
-                    self.debit_and_mark(&u.id, micro, now).await?;
-                    r.debited += 1;
-                    exhausted.extend(self.mark_key_spend(&u.id, from, now).await?);
-                }
-                None => {
-                    // 读不到就原地不动。宁可下一轮窗口更长（increase 照样正确），
-                    // 也不能把这段跳过去。
-                    //
-                    // 密钥级也一并跳过：水位线没动，下一轮会用更长的窗口重来。
-                    // 这里若照样记，那段花费会被这轮和下一轮各记一次。
-                    r.read_failures += 1;
+                next.push(SpendSeries {
+                    value: cursor,
+                    ..s.clone()
+                });
+            }
+
+            // 只给设了额度的密钥累计 —— 那是持久兜底要比的数。
+            let quotas: Vec<(String, i64)> = self
+                .store
+                .key_quotas(&u.id)
+                .await?
+                .into_iter()
+                .filter(|(_, quota)| *quota > 0)
+                .collect();
+            let key_spend: Vec<(String, i64)> = quotas
+                .iter()
+                .filter_map(|(name, _)| {
+                    let id = aisix_core::filesource::derive_id("api_keys", name);
+                    by_key
+                        .get(id.as_str())
+                        .filter(|v| **v > 0)
+                        .map(|v| (name.clone(), i64::try_from(*v).unwrap_or(i64::MAX)))
+                })
+                .collect();
+
+            self.settle(&u.id, spent, &next, &key_spend, now).await?;
+            if spent > 0 {
+                r.debited += 1;
+            }
+
+            // 花超自己额度的密钥。比的是库里的累计花费，不是这一轮的增量。
+            let totals: std::collections::HashMap<String, i64> =
+                self.store.key_spend(&u.id).await?.into_iter().collect();
+            for (name, quota) in quotas {
+                if totals.get(&name).copied().unwrap_or(0) >= quota {
+                    exhausted.push(name);
                 }
             }
         }
@@ -213,85 +298,87 @@ impl<S: ConsumptionSource> Sweeper<S> {
         Ok(r)
     }
 
-    /// 给这个用户名下设了额度的密钥累计 `[from, now)` 的花费，返回已超额的那几把。
+    /// 一轮对账的入账：扣款、所有序列的游标、密钥花费、对账时刻，一个事务。
     ///
-    /// **窗口由调用方给，而且必须是用户那一段刚用过的那个。** 第一版在用户循环
-    /// 之后再去读 `counted_through`，可那时它已经被推到 `now` 了 —— 窗口长度为
-    /// 零，密钥花费在生产上永远累计不到。单测当时全绿，因为测试替身忽略了
-    /// `from`/`to`，把这个 bug 整个盖住了。
-    ///
-    /// 只在水位线确实推进的那两条分支上调用：读失败时若照样记，那段花费会被这轮
-    /// 和下一轮各记一次。
-    ///
-    /// 存在的理由：网关那边的额度闸是**进程内**计数器，重启即归零，每把密钥的
-    /// 子额度会「续杯」。用户级不受影响（余额归零就停用，那是持久的），这一段给
-    /// 密钥级同样的兜底。
-    async fn mark_key_spend(
+    /// `debit` 为 0 时不写流水，但游标照样更新 —— 建游标的那一轮就是这样。
+    async fn settle(
         &self,
         user_id: &str,
-        from: DateTime<Utc>,
-        now: DateTime<Utc>,
-    ) -> Result<Vec<String>, StoreError> {
-        let mut exhausted = Vec::new();
-        for (name, quota) in self.store.key_quotas(user_id).await? {
-            if quota <= 0 {
-                continue;
-            }
-            let id = aisix_core::filesource::derive_id("api_keys", &name);
-            let Some(micro) = self.source.key_spend_in_window(&id, from, now).await else {
-                continue;
-            };
-            let spent = if micro > 0 {
-                self.store
-                    .add_key_spend(user_id, &name, i64::try_from(micro).unwrap_or(i64::MAX))
-                    .await?
-            } else {
-                self.store
-                    .key_spend(user_id)
-                    .await?
-                    .into_iter()
-                    .find(|(k, _)| *k == name)
-                    .map(|(_, v)| v)
-                    .unwrap_or(0)
-            };
-            if spent >= quota {
-                exhausted.push(name);
-            }
-        }
-        Ok(exhausted)
-    }
-
-    /// 扣款 + 推进水位线，一个事务。
-    async fn debit_and_mark(
-        &self,
-        user_id: &str,
-        micro: u64,
+        debit: u64,
+        series: &[SpendSeries],
+        key_spend: &[(String, i64)],
         through: DateTime<Utc>,
     ) -> Result<(), StoreError> {
         let user_id = user_id.to_string();
-        let delta = -i64::try_from(micro).unwrap_or(i64::MAX);
+        let delta = -i64::try_from(debit).unwrap_or(i64::MAX);
+        let cursors: Vec<(String, i64, Option<i64>)> = series
+            .iter()
+            .map(|s| {
+                (
+                    s.key.clone(),
+                    i64::try_from(s.value).unwrap_or(i64::MAX),
+                    s.started_ms,
+                )
+            })
+            .collect();
+        let key_spend = key_spend.to_vec();
         let through = through.to_rfc3339();
-        // 同样用 `BEGIN IMMEDIATE`：这个事务里有两条写，多个门户实例或多轮对账
+        // 同样用 `BEGIN IMMEDIATE`：这个事务里有多条写，多个门户实例或多轮对账
         // 重叠时，deferred 事务会在升级成写的那一刻当场失败而不是等待。
         self.store
             .immediate_tx(move |conn| {
                 Box::pin(async move {
-                    crate::ledger::insert_entry(
-                        &mut *conn,
-                        &user_id,
-                        delta,
-                        Source::Consumption,
-                        None,
-                    )
-                    .await?;
+                    let now = Utc::now().to_rfc3339();
+                    if delta != 0 {
+                        crate::ledger::insert_entry(
+                            &mut *conn,
+                            &user_id,
+                            delta,
+                            Source::Consumption,
+                            None,
+                        )
+                        .await?;
+                    }
+                    for (series, value, started) in &cursors {
+                        sqlx::query(
+                            "INSERT INTO spend_cursor
+                               (user_id, series, value_micro_usd, instance_started_ms, updated_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5)
+                             ON CONFLICT(user_id, series)
+                             DO UPDATE SET value_micro_usd = ?3, instance_started_ms = ?4,
+                                           updated_at = ?5",
+                        )
+                        .bind(&user_id)
+                        .bind(series)
+                        .bind(value)
+                        .bind(started)
+                        .bind(&now)
+                        .execute(&mut *conn)
+                        .await?;
+                    }
+                    for (key_name, micro) in &key_spend {
+                        sqlx::query(
+                            "INSERT INTO key_spend (user_id, key_name, spent_micro_usd, updated_at)
+                             VALUES (?1, ?2, ?3, ?4)
+                             ON CONFLICT(user_id, key_name)
+                             DO UPDATE SET spent_micro_usd = spent_micro_usd + ?3, updated_at = ?4",
+                        )
+                        .bind(&user_id)
+                        .bind(key_name)
+                        .bind(micro)
+                        .bind(&now)
+                        .execute(&mut *conn)
+                        .await?;
+                    }
                     sqlx::query(
-                        "INSERT INTO consumption_mark (user_id, counted_through, updated_at)
-                         VALUES (?1, ?2, ?3)
-                         ON CONFLICT(user_id) DO UPDATE SET counted_through = ?2, updated_at = ?3",
+                        "INSERT INTO consumption_mark (user_id, counted_through, updated_at, cursors_seeded)
+                         VALUES (?1, ?2, ?3, 1)
+                         ON CONFLICT(user_id)
+                         DO UPDATE SET counted_through = ?2, updated_at = ?3, cursors_seeded = 1",
                     )
                     .bind(&user_id)
                     .bind(&through)
-                    .bind(Utc::now().to_rfc3339())
+                    .bind(&now)
                     .execute(&mut *conn)
                     .await?;
                     Ok(())
@@ -596,68 +683,162 @@ impl PromSource {
 }
 
 impl ConsumptionSource for PromSource {
-    async fn spend_in_window(
+    async fn spend_series(
         &self,
         user_id: &str,
-        from: DateTime<Utc>,
-        to: DateTime<Utc>,
-    ) -> Option<u64> {
-        let secs = (to - from).num_seconds();
-        if secs <= 0 {
-            return Some(0);
-        }
-        let q = format!(
-            "sum(increase(aisix_llm_spend_micro_usd_total{{user_id=\"{}\"}}[{secs}s]))",
+        since: DateTime<Utc>,
+        at: DateTime<Utc>,
+    ) -> Option<Vec<SpendSeries>> {
+        // 原始计数器、两段 `resets()`、各网关进程的启动时刻放进**同一个**查询，用
+        // `aisix_part` 标签区分：同一个 Prometheus、同一个求值时刻答出来的，彼此
+        // 不会矛盾。
+        //
+        // 两段重置都从 `since - LOOKBACK` 起，相减就是 `since` 之后才发生的重置，
+        // 包括 `since` 之前最后一个采样与之后第一个采样之间的那一次（前一段含它、
+        // 后一段不含）。LOOKBACK 取 Prometheus 默认的查询回看窗口：`since` 时刻的
+        // 读数就是这个窗口里的最后一个采样。
+        const LOOKBACK_SECS: i64 = 300;
+        let sel = format!(
+            "aisix_llm_spend_micro_usd_total{{user_id=\"{}\"}}",
             crate::usage::escape_label(user_id)
         );
-        let resp = self
-            .http
-            .get(format!("{}/api/v1/query", self.base))
-            .query(&[("query", q.as_str()), ("time", &to.timestamp().to_string())])
-            .send()
-            .await
-            .ok()?;
-        let body: serde_json::Value = resp.json().await.ok()?;
-        // 读不到与读到零必须分开：前者不推进水位线，后者推进。
-        match crate::usage::scalar_of(&body) {
-            crate::usage::PromScalar::Value(v) => plausible_spend(v),
-            // 没有序列 = 这个身份从来没产生过流量 = 这段窗口花了 0。当成「读不到」
-            // 的话水位线永不推进，窗口一天天变长，失败计数每轮都涨。
-            crate::usage::PromScalar::NoSeries => Some(0),
-            crate::usage::PromScalar::Unreadable => None,
-        }
-    }
-
-    async fn key_spend_in_window(
-        &self,
-        api_key_id: &str,
-        from: DateTime<Utc>,
-        to: DateTime<Utc>,
-    ) -> Option<u64> {
-        let secs = (to - from).num_seconds();
-        if secs <= 0 {
-            return Some(0);
-        }
+        let gap = (at - since).num_seconds().max(0);
+        let span = gap + LOOKBACK_SECS;
+        let offset = if gap > 0 {
+            format!(" offset {gap}s")
+        } else {
+            String::new()
+        };
         let q = format!(
-            "sum(increase(aisix_llm_spend_micro_usd_total{{api_key_id=\"{}\"}}[{secs}s]))",
-            crate::usage::escape_label(api_key_id)
+            "label_replace({sel}, \"aisix_part\", \"value\", \"\", \"\") \
+             or label_replace(resets({sel}[{span}s]), \"aisix_part\", \"resets_upto\", \"\", \"\") \
+             or label_replace(resets({sel}[{LOOKBACK_SECS}s]{offset}), \"aisix_part\", \"resets_before\", \"\", \"\") \
+             or label_replace(process_start_time_seconds and on(job, instance) {sel}, \"aisix_part\", \"started\", \"\", \"\")"
         );
+        parse_spend_series(&self.query(&q, at).await?)
+    }
+}
+
+impl PromSource {
+    /// 在 `at` 时刻求值的即时查询。读不到、或回答不是 success，都是 `None`。
+    async fn query(&self, q: &str, at: DateTime<Utc>) -> Option<serde_json::Value> {
         let resp = self
             .http
             .get(format!("{}/api/v1/query", self.base))
-            .query(&[("query", q.as_str()), ("time", &to.timestamp().to_string())])
+            .query(&[("query", q), ("time", &at.timestamp().to_string())])
             .send()
             .await
             .ok()?;
-        let body: serde_json::Value = resp.json().await.ok()?;
-        match crate::usage::scalar_of(&body) {
-            crate::usage::PromScalar::Value(v) => plausible_spend(v),
-            // 没有序列 = 这个身份从来没产生过流量 = 这段窗口花了 0。当成「读不到」
-            // 的话水位线永不推进，窗口一天天变长，失败计数每轮都涨。
-            crate::usage::PromScalar::NoSeries => Some(0),
-            crate::usage::PromScalar::Unreadable => None,
+        resp.json().await.ok()
+    }
+}
+
+/// 解析 [`PromSource::spend_series`] 那个合并查询的结果向量，按序列归并读数与两段
+/// 重置次数。
+///
+/// 回答本身不对（不是 success、没有结果向量）才整体当成读不到。某一条序列看不懂
+/// 只跳过它：它的游标不动，下一轮仍能补上；若因为一条坏序列让整个人读不到，只要
+/// 它一直在，这个人的消费就一直扣不到。
+fn parse_spend_series(body: &serde_json::Value) -> Option<Vec<SpendSeries>> {
+    #[derive(Default)]
+    struct Parts {
+        job_instance: (String, String),
+        api_key_id: Option<String>,
+        value: Option<u64>,
+        resets_upto: u64,
+        resets_before: u64,
+    }
+    if body.get("status")?.as_str()? != "success" {
+        return None;
+    }
+    let result = body.pointer("/data/result")?.as_array()?;
+    let mut by_series: std::collections::BTreeMap<String, Parts> =
+        std::collections::BTreeMap::new();
+    // (job, instance) → 那个网关进程的启动时刻（毫秒）。
+    let mut started: std::collections::HashMap<(String, String), i64> =
+        std::collections::HashMap::new();
+    let label = |labels: &serde_json::Map<String, serde_json::Value>, name: &str| {
+        labels
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    for item in result {
+        let Some(labels) = item.get("metric").and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        if labels.get("aisix_part").and_then(serde_json::Value::as_str) == Some("started") {
+            if let Some(secs) = item
+                .pointer("/value/1")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|raw| raw.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0)
+            {
+                started.insert(
+                    (label(labels, "job"), label(labels, "instance")),
+                    (secs * 1000.0).round() as i64,
+                );
+            }
+            continue;
+        }
+        // 键里不带 `__name__` 与查询自己加的 `aisix_part`：函数（`resets()`）的结果
+        // 没有前者，三段的同一条序列必须落到同一个键上。
+        //
+        // 这个串会落库（`spend_cursor.series`）。改它的格式，库里所有游标就都对
+        // 不上了 —— 每条序列都被当成新序列、整段累计值重扣一遍。要改，先写迁移
+        // 把旧键换成新键。
+        let Some(mut pairs) = labels
+            .iter()
+            .filter(|(k, _)| !matches!(k.as_str(), "__name__" | "aisix_part"))
+            .map(|(k, v)| v.as_str().map(|v| (k.as_str(), v)))
+            .collect::<Option<Vec<(&str, &str)>>>()
+        else {
+            continue;
+        };
+        pairs.sort_unstable();
+        let key = pairs
+            .iter()
+            .map(|(k, v)| format!("{k}={v:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let Some(number) = item
+            .pointer("/value/1")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|raw| raw.parse::<f64>().ok())
+            .and_then(plausible_spend)
+        else {
+            continue;
+        };
+        let parts = by_series.entry(key).or_default();
+        match labels.get("aisix_part").and_then(serde_json::Value::as_str) {
+            Some("resets_upto") => parts.resets_upto = number,
+            Some("resets_before") => parts.resets_before = number,
+            _ => {
+                parts.value = Some(number);
+                parts.job_instance = (label(labels, "job"), label(labels, "instance"));
+                parts.api_key_id = labels
+                    .get("api_key_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+            }
         }
     }
+    // 没有当前读数的序列（已经停止上报，只在重置窗口里还有采样）不参与这一轮。
+    Some(
+        by_series
+            .into_iter()
+            .filter_map(|(key, p)| {
+                Some(SpendSeries {
+                    key,
+                    started_ms: started.get(&p.job_instance).copied(),
+                    api_key_id: p.api_key_id,
+                    value: p.value?,
+                    resets_since: p.resets_upto.saturating_sub(p.resets_before),
+                })
+            })
+            .collect(),
+    )
 }
 
 /// 把一个读数变成可入账的金额。**读数坏了要当成读不到，不能当成花了多少。**
@@ -688,107 +869,161 @@ mod tests {
     use crate::ledger::Ledger;
     use std::sync::{Arc, Mutex};
 
-    /// 一次被问过的窗口：(用户, from, to)。
-    type Window = (String, DateTime<Utc>, DateTime<Utc>);
+    /// 一条模拟的花费序列：累计值，以及每次被读之前长多少（两次读之间的流量）。
+    #[derive(Default)]
+    struct Counter {
+        value: u64,
+        per_read: u64,
+        /// 这条序列至今被重置过几次。
+        resets: u64,
+        /// 这条序列所在网关进程的启动时刻（毫秒）；每次重启都变。
+        started_ms: i64,
+    }
 
-    /// 记录被问过的窗口，并按「时间窗 → 增量」应答 —— 正是 `increase()` 的语义。
+    /// (用户, `api_key_id`, 网关实例)。
+    type SeriesId = (String, Option<String>, String);
+
+    /// 按 Prometheus **即时查询**的语义应答：返回每条序列的原始累计值。不替门户
+    /// 算任何差 —— 上一版替身自己按「本次减上次」算好了增量，于是门户那边窗口
+    /// 算法的错被它整个盖住了。
     #[derive(Default)]
     pub(super) struct FakeSource {
+        /// 每个用户那条未归到密钥的序列，每次被读之前长多少。对所有用户生效。
         increase: Mutex<u64>,
+        counters: Mutex<std::collections::HashMap<SeriesId, Counter>>,
+        /// 每次读取时各序列的重置次数：(读取时刻, 序列, 重置次数)。
+        history: Mutex<Vec<(DateTime<Utc>, SeriesId, u64)>>,
+        /// 下一次读取时，该用户那条未归到密钥的序列少报多少 —— 从一个落后的
+        /// Prometheus 副本读到的旧值。真实累计值不变。
+        lag_next: Mutex<std::collections::HashMap<String, u64>>,
         /// 指定让哪个用户的读取失败。写成按用户而不是「下一次」，因为
         /// 「下一次」会让测试依赖清扫器先访问谁 —— 那种测试无论答案如何都是
         /// 脆的（第一版就是这么挂的）。
         fail_for: Mutex<Option<String>>,
-        /// 按用户记录被问过的窗口。写成一条全局列表时，`last()` 会混进另一个
-        /// 用户的窗口 —— 又是一次顺序依赖，第二版就是这么挂的。
-        windows: Mutex<Vec<Window>>,
-        /// 按 api_key_id 指定每轮的花费增量。没指定的按 0。
-        key_increase: Mutex<std::collections::HashMap<String, u64>>,
-        /// 密钥级查询被问过的窗口，用来断言窗口不是空的。
-        key_windows: Mutex<Vec<Window>>,
     }
 
     impl FakeSource {
+        /// 每个用户每次被读之前都花掉 `v`（未归到密钥）。
         pub(super) fn set_increase(&self, v: u64) {
             *self.increase.lock().unwrap() = v;
         }
-        /// 指定某把密钥（按名字，内部转成派生 id）每轮的花费增量。
-        pub(super) fn set_key_increase(&self, key_name: &str, v: u64) {
-            self.key_increase
-                .lock()
-                .unwrap()
-                .insert(aisix_core::filesource::derive_id("api_keys", key_name), v);
-        }
-        pub(super) fn fail_for(&self, user_id: &str) {
-            *self.fail_for.lock().unwrap() = Some(user_id.to_string());
-        }
-        /// 某把密钥最后被问过的窗口。
-        pub(super) fn last_key_window(
-            &self,
-            key_name: &str,
-        ) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        /// 某把密钥（按名字）每次被读之前都花掉 `v`，记在其主人名下。
+        pub(super) fn set_key_increase(&self, user_id: &str, key_name: &str, v: u64) {
             let id = aisix_core::filesource::derive_id("api_keys", key_name);
-            self.key_windows
+            self.counters
                 .lock()
                 .unwrap()
-                .iter()
-                .rev()
-                .find(|(k, _, _)| *k == id)
-                .map(|(_, f, t)| (*f, *t))
+                .entry((user_id.to_string(), Some(id), "gw-1".into()))
+                .or_default()
+                .per_read = v;
+        }
+        /// 不经读取直接累计 `v` —— 门户没在对账的那段时间里发生的消费。
+        pub(super) fn add_spend(&self, user_id: &str, v: u64) {
+            self.series(user_id, "gw-1", v);
+        }
+        /// 某个网关实例上的那条序列累计 `v`；实例第一次出现就是一条新序列。
+        pub(super) fn series(&self, user_id: &str, instance: &str, v: u64) {
+            self.counters
+                .lock()
+                .unwrap()
+                .entry((user_id.to_string(), None, instance.into()))
+                .or_default()
+                .value += v;
+        }
+        /// 这个用户名下所有序列归零 —— 网关副本重启。
+        pub(super) fn reset(&self, user_id: &str) {
+            for ((u, _, _), c) in self.counters.lock().unwrap().iter_mut() {
+                if u == user_id {
+                    c.value = 0;
+                    c.resets += 1;
+                    c.started_ms += 1;
+                }
+            }
+        }
+        /// 网关副本重启了，但 `resets()` 看不出来：重启后、下一次抓取之前花得比
+        /// 重启前还多，抓到的值只是涨了，没有变小过。只有进程启动时刻变了。
+        pub(super) fn restart_unseen_by_resets(&self, user_id: &str) {
+            for ((u, _, _), c) in self.counters.lock().unwrap().iter_mut() {
+                if u == user_id {
+                    c.value = 0;
+                    c.started_ms += 1;
+                }
+            }
+        }
+        /// 下一次读取少报 `v`，计数器本身没有重置。
+        pub(super) fn lag_once(&self, user_id: &str, v: u64) {
+            self.lag_next.lock().unwrap().insert(user_id.to_string(), v);
         }
 
-        pub(super) fn last_window_for(&self, user_id: &str) -> (DateTime<Utc>, DateTime<Utc>) {
-            self.windows
-                .lock()
-                .unwrap()
-                .iter()
-                .rev()
-                .find(|(u, _, _)| u == user_id)
-                .map(|(_, f, t)| (*f, *t))
-                .expect("没有该用户的窗口记录")
+        pub(super) fn fail_for(&self, user_id: &str) {
+            *self.fail_for.lock().unwrap() = Some(user_id.to_string());
         }
     }
 
     impl ConsumptionSource for Arc<FakeSource> {
-        async fn spend_in_window(
+        async fn spend_series(
             &self,
             user_id: &str,
-            from: DateTime<Utc>,
-            to: DateTime<Utc>,
-        ) -> Option<u64> {
+            since: DateTime<Utc>,
+            at: DateTime<Utc>,
+        ) -> Option<Vec<SpendSeries>> {
+            let inc = *self.increase.lock().unwrap();
+            let mut counters = self.counters.lock().unwrap();
+            // 两次读之间的流量先发生 —— 读失败不会让消费不发生。
+            if inc > 0 {
+                counters
+                    .entry((user_id.to_string(), None, "gw-1".into()))
+                    .or_default()
+                    .value += inc;
+            }
+            for ((u, _, _), c) in counters.iter_mut() {
+                if u == user_id {
+                    c.value += c.per_read;
+                }
+            }
+            let mut history = self.history.lock().unwrap();
+            for (id, c) in counters.iter().filter(|((u, _, _), _)| u == user_id) {
+                history.push((at, id.clone(), c.resets));
+            }
             if self.fail_for.lock().unwrap().as_deref() == Some(user_id) {
                 return None;
             }
-            self.windows
-                .lock()
-                .unwrap()
-                .push((user_id.to_string(), from, to));
-            Some(*self.increase.lock().unwrap())
+            // 某条序列在时刻 t 之前最后一次被读时的重置次数 —— Prometheus 按采样
+            // 数重置，这里按读数近似。
+            let resets_at = |id: &SeriesId, t: DateTime<Utc>| {
+                history
+                    .iter()
+                    .rev()
+                    .find(|(when, sid, _)| sid == id && *when <= t)
+                    .map_or(0, |(_, _, n)| *n)
+            };
+            let lag = self.lag_next.lock().unwrap().remove(user_id).unwrap_or(0);
+            Some(
+                counters
+                    .iter()
+                    .filter(|((u, _, _), _)| u == user_id)
+                    .map(|(id, c)| SpendSeries {
+                        key: series_key(id),
+                        api_key_id: id.1.clone(),
+                        value: if id.1.is_none() && id.2 == "gw-1" {
+                            c.value.saturating_sub(lag)
+                        } else {
+                            c.value
+                        },
+                        resets_since: if since < at {
+                            resets_at(id, at) - resets_at(id, since)
+                        } else {
+                            0
+                        },
+                        started_ms: Some(c.started_ms),
+                    })
+                    .collect(),
+            )
         }
+    }
 
-        async fn key_spend_in_window(
-            &self,
-            api_key_id: &str,
-            from: DateTime<Utc>,
-            to: DateTime<Utc>,
-        ) -> Option<u64> {
-            // **窗口为空就回 0，跟真实现一致。** 第一版忽略了 from/to，于是
-            // 「窗口算错成零长度」这个 bug 被替身盖住了 —— 生产上密钥花费永远
-            // 累计不到，而所有单测都是绿的。
-            self.key_windows
-                .lock()
-                .unwrap()
-                .push((api_key_id.to_string(), from, to));
-            if to <= from {
-                return Some(0);
-            }
-            self.key_increase
-                .lock()
-                .unwrap()
-                .get(api_key_id)
-                .copied()
-                .or(Some(0))
-        }
+    fn series_key((u, key, instance): &SeriesId) -> String {
+        format!("api_key_id={key:?},instance={instance},user_id={u}")
     }
 
     pub(super) struct Fx {
@@ -882,7 +1117,7 @@ api_keys:
     }
 
     #[tokio::test]
-    async fn 按时间窗查增量_没有增量时不重复扣() {
+    async fn 读数增长才扣_没有增长时不重复扣() {
         let f = fx().await;
         f.ledger
             .credit(&f.uid, 5_000_000, Source::AdminGrant, None)
@@ -902,23 +1137,31 @@ api_keys:
     }
 
     #[tokio::test]
-    async fn 查询窗口从水位线接到当前_不留缺口() {
+    async fn 门户停摆期间的消费_恢复后一次入账() {
         let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 10_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
         f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
-        // 停摆十分钟后再跑：窗口必须覆盖整段空档，否则停摆期间的消费就永远
-        // 不入账了。
-        f.src.set_increase(1);
+        // 停摆十分钟，期间照常有消费。恢复后的第一轮必须把这一整段都扣上，
+        // 否则停摆期间的消费就永远不入账了。
+        f.src.add_spend(&f.uid, 7_000_000);
         f.sw.tick(t("2026-08-26T10:10:00Z")).await.unwrap();
-        let (from, to) = f.src.last_window_for(&f.uid);
-        assert_eq!(from, t("2026-08-26T10:00:00Z"));
-        assert_eq!(to, t("2026-08-26T10:10:00Z"));
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 3_000_000);
     }
 
     #[tokio::test]
     async fn 读取失败时水位线不前进() {
         let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 10_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
         f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
 
+        // 每轮 2_000 的流量；失败那一轮也照常发生。
+        f.src.set_increase(2_000);
         f.src.fail_for(&f.uid);
         let r = f.sw.tick(t("2026-08-26T10:05:00Z")).await.unwrap();
         assert_eq!(r.read_failures, 1);
@@ -929,13 +1172,10 @@ api_keys:
             Some(t("2026-08-26T10:00:00Z"))
         );
 
-        // 下一轮窗口因此更长，increase() 照样正确。
+        // 读失败的那一轮消费照常发生；下一轮的读数包含它，一分不少。
         *f.src.fail_for.lock().unwrap() = None;
-        f.src.set_increase(2_000);
         f.sw.tick(t("2026-08-26T10:06:00Z")).await.unwrap();
-        let (from, to) = f.src.last_window_for(&f.uid);
-        assert_eq!(from, t("2026-08-26T10:00:00Z"));
-        assert_eq!(to, t("2026-08-26T10:06:00Z"));
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 10_000_000 - 4_000);
     }
 
     #[tokio::test]
@@ -1016,6 +1256,243 @@ api_keys:
             .unwrap();
         // 运维自己的密钥没有 user_id，不属于任何用户，余额与它无关。
         assert!(ops.get("disabled").is_none(), "运维密钥被动过了");
+    }
+
+    #[tokio::test]
+    async fn 网关副本重启后计数从零重来_重启后的消费照扣不误() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 10_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        f.src.add_spend(&f.uid, 3_000_000);
+        f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 7_000_000);
+
+        // 重启：这条序列从 0 重新累计，重启后又花了 $1。读数比游标小 —— 既不能
+        // 当成负数，也不能当成「没花」。
+        f.src.reset(&f.uid);
+        f.src.add_spend(&f.uid, 1_000_000);
+        f.sw.tick(t("2026-08-26T10:00:30Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 6_000_000);
+    }
+
+    #[tokio::test]
+    async fn 从落后的副本读到较小的值_不当成重置_也不扣() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 10_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        f.src.add_spend(&f.uid, 3_000_000);
+        f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 7_000_000);
+
+        // 这一轮读到的是一个落后的 Prometheus 副本：比上次少 $1，但计数器没有
+        // 重置过。当成重置的话，这条序列的全部 $2 会被再扣一遍。
+        f.src.lag_once(&f.uid, 1_000_000);
+        f.sw.tick(t("2026-08-26T10:00:30Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 7_000_000);
+
+        // 游标没有跟着倒退：之后只扣真正新增的那 $1。
+        f.src.add_spend(&f.uid, 1_000_000);
+        f.sw.tick(t("2026-08-26T10:00:45Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 6_000_000);
+    }
+
+    #[tokio::test]
+    async fn 重启后又涨过上次读数_仍按重启后的累计扣() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 10_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        f.src.add_spend(&f.uid, 3_000_000);
+        f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 7_000_000);
+
+        // 重启之后、下一次读数之前就花了 $5 —— 读数 $5 比上次的 $3 大。只在读数
+        // 变小时才查重置的话，这里只会扣 $5 − $3 = $2，$3 白用。
+        f.src.reset(&f.uid);
+        f.src.add_spend(&f.uid, 5_000_000);
+        f.sw.tick(t("2026-08-26T10:00:30Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 2_000_000);
+    }
+
+    #[tokio::test]
+    async fn 新副本的序列从零算起_第一笔就扣() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 10_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        // 扩容出来的副本：一条门户从没见过的序列，第一次被读到时已经是 $2。
+        // 按时间窗算的话这一笔会被丢掉（新序列在窗口里只有一个采样点）。
+        f.src.series(&f.uid, "gw-2", 2_000_000);
+        f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 8_000_000);
+    }
+
+    #[tokio::test]
+    async fn 新用户第一次被读到之前的消费照扣() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 10_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        // 注册、拿额度、铸密钥、用掉 $4，全赶在门户第一轮对账之前。新用户的计数器
+        // 生来就是 0，读到的 $4 全是他花的；按「第一次只建游标」处理就白用了。
+        f.src.add_spend(&f.uid, 4_000_000);
+        f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 6_000_000);
+
+        // 之后照常按增量扣，不重复。
+        f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 6_000_000);
+    }
+
+    #[tokio::test]
+    async fn 从按时间窗计费的版本升级上来_第一轮不把历史当新序列扣() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 10_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        // 升级前的库：有对账时刻，没有游标。
+        f.store
+            .set_counted_through(&f.uid, t("2026-08-26T09:59:45Z"))
+            .await
+            .unwrap();
+        f.src.add_spend(&f.uid, 9_000_000);
+        f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        // 每条序列在游标表里都没有记录；若按「新序列」处理，整段历史 $9 会被
+        // 一次扣掉。
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 10_000_000);
+
+        f.src.add_spend(&f.uid, 1_000_000);
+        f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 9_000_000);
+    }
+
+    #[tokio::test]
+    async fn 重启没被resets看出来_靠进程启动时刻认出_重启前后的消费都扣() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 10_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.src.add_spend(&f.uid, 1_000_000);
+        f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 9_000_000);
+
+        // 重启前又花 $1，还没被读到，副本就重启了；重启后花了 $3，比重启前的
+        // 累计 $2 大，抓到的值只是从 2 涨到 3。
+        f.src.add_spend(&f.uid, 1_000_000);
+        f.src.restart_unseen_by_resets(&f.uid);
+        f.src.add_spend(&f.uid, 3_000_000);
+        f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
+        // 重启前没读到的那 $1 计数器已经带走了，读不回来；重启后的 $3 一分不少。
+        // 按「值涨了就扣差」只会扣 $3 - $1 = $2。
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 6_000_000);
+
+        f.src.add_spend(&f.uid, 500_000);
+        f.sw.tick(t("2026-08-26T10:00:30Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 5_500_000);
+    }
+
+    #[tokio::test]
+    async fn 升级前记下的游标没有启动时刻_不当成重启() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 10_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.src.add_spend(&f.uid, 1_000_000);
+        f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 9_000_000);
+        // 旧网关不暴露启动时刻时写下的游标。
+        sqlx::query("UPDATE spend_cursor SET instance_started_ms = NULL")
+            .execute(f.store.pool())
+            .await
+            .unwrap();
+
+        f.src.add_spend(&f.uid, 1_000_000);
+        f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
+        // 当成重启就会把累计 $2 整个再扣一遍。
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 8_000_000);
+    }
+
+    #[test]
+    fn 合并查询的各段按序列归并() {
+        let body = serde_json::json!({
+            "status": "success",
+            "data": {"resultType": "vector", "result": [
+                {"metric": {"__name__": "aisix_llm_spend_micro_usd_total", "aisix_part": "value",
+                            "user_id": "u1", "instance": "b:9090", "api_key_id": "k1"},
+                 "value": [1, "1500"]},
+                {"metric": {"aisix_part": "resets_upto", "user_id": "u1", "instance": "b:9090",
+                            "api_key_id": "k1"},
+                 "value": [1, "3"]},
+                {"metric": {"aisix_part": "resets_before", "user_id": "u1", "instance": "b:9090",
+                            "api_key_id": "k1"},
+                 "value": [1, "2"]},
+                {"metric": {"__name__": "aisix_llm_spend_micro_usd_total", "aisix_part": "value",
+                            "job": "aisix", "instance": "a:9090", "user_id": "u1"},
+                 "value": [1, "20"]},
+                {"metric": {"__name__": "process_start_time_seconds", "aisix_part": "started",
+                            "job": "aisix", "instance": "a:9090"},
+                 "value": [1, "1760436000.25"]},
+                // 别的 job 上同名实例的启动时刻不能串到这条序列上。
+                {"metric": {"__name__": "process_start_time_seconds", "aisix_part": "started",
+                            "job": "other", "instance": "b:9090"},
+                 "value": [1, "1760430000"]},
+            ]},
+        });
+        let series = parse_spend_series(&body).expect("可解析");
+        assert_eq!(
+            series,
+            vec![
+                SpendSeries {
+                    key: r#"api_key_id="k1",instance="b:9090",user_id="u1""#.into(),
+                    api_key_id: Some("k1".into()),
+                    value: 1500,
+                    resets_since: 1,
+                    started_ms: None,
+                },
+                SpendSeries {
+                    key: r#"instance="a:9090",job="aisix",user_id="u1""#.into(),
+                    api_key_id: None,
+                    value: 20,
+                    resets_since: 0,
+                    started_ms: Some(1_760_436_000_250),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn 回答本身不对才整体读不到_坏的单条只跳过它() {
+        assert_eq!(
+            parse_spend_series(&serde_json::json!({"status": "error", "error": "bad query"})),
+            None
+        );
+        let empty = serde_json::json!({"status": "success", "data": {"result": []}});
+        assert_eq!(parse_spend_series(&empty), Some(Vec::new()));
+
+        // 一条值是 NaN 的序列不能拖着同一个人的其它序列一起扣不到。
+        let body = serde_json::json!({"status": "success", "data": {"result": [
+            {"metric": {"aisix_part": "value", "user_id": "u1", "instance": "a"},
+             "value": [1, "NaN"]},
+            {"metric": {"aisix_part": "value", "user_id": "u1", "instance": "b"},
+             "value": [1, "7"]},
+        ]}});
+        let series = parse_spend_series(&body).expect("整体可读");
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].value, 7);
     }
 }
 
@@ -1478,22 +1955,25 @@ mod key_allowance_tests {
     }
 
     #[tokio::test]
-    async fn 密钥级查询的窗口与用户级一致且非空() {
+    async fn 密钥花费与用户扣款出自同一次读数() {
         let f = fx().await;
         f.ledger
             .credit(&f.uid, 50_000_000, crate::ledger::Source::AdminGrant, None)
             .await
             .unwrap();
         f.store.set_key_quota(&f.uid, "a", 2_000_000).await.unwrap();
-        // 第一轮只建水位线，第二轮才有真窗口。
+        // 第一轮只建游标。
         f.sw.tick(t("2026-08-28T10:00:00Z")).await.unwrap();
+        f.src.set_key_increase(&f.uid, "a", 1_500_000);
         f.sw.tick(t("2026-08-28T10:00:30Z")).await.unwrap();
 
-        let (kf, kt) = f.src.last_key_window("a").expect("密钥级查询根本没发生");
-        assert!(kt > kf, "密钥级的窗口是空的：[{kf}, {kt}]");
-        // 与用户级完全一致 —— 不一致的话两边的账对不上。
-        let (uf, ut) = f.src.last_window_for(&f.uid);
-        assert_eq!((kf, kt), (uf, ut), "密钥级与用户级用了不同的窗口");
+        // 同一笔花费，用户这边扣多少，密钥这边就记多少 —— 不一致的话两边的账
+        // 对不上。
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 48_500_000);
+        assert_eq!(
+            f.store.key_spend(&f.uid).await.unwrap(),
+            vec![("a".to_string(), 1_500_000)]
+        );
     }
 
     #[tokio::test]
@@ -1509,7 +1989,7 @@ mod key_allowance_tests {
         // 这一轮用户级读失败 → 水位线不动。密钥级若照样记，同一段花费会被这轮
         // 和下一轮各记一次。
         f.src.fail_for(&f.uid);
-        f.src.set_key_increase("a", 5_000_000);
+        f.src.set_key_increase(&f.uid, "a", 5_000_000);
         f.sw.tick(t("2026-08-28T10:00:30Z")).await.unwrap();
         assert_eq!(
             f.store.key_spend(&f.uid).await.unwrap(),
@@ -1542,7 +2022,7 @@ mod key_allowance_tests {
 
         // a 花掉 $3，越过它自己的 $2。用户余额还有 $500 —— 所以停它的理由只能
         // 是密钥级那道闸。网关侧那个计数器重启就归零，这条路径是持久的兜底。
-        f.src.set_key_increase("a", 3_000_000);
+        f.src.set_key_increase(&f.uid, "a", 3_000_000);
         f.sw.tick(t("2026-08-28T10:00:15Z")).await.unwrap();
 
         assert!(key_disabled(&f.path, "a"), "花超自己额度的密钥没被停用");
@@ -1564,7 +2044,7 @@ mod key_allowance_tests {
 
         // 每轮花 $1，三轮共 $3 越过 $2.5。按轮单独比的话每轮都是 $1 < $2.5，
         // 永远不会停 —— 那正是「续杯」这个 bug 的形状。
-        f.src.set_key_increase("a", 1_000_000);
+        f.src.set_key_increase(&f.uid, "a", 1_000_000);
         f.sw.tick(t("2026-08-28T10:00:15Z")).await.unwrap();
         assert!(!key_disabled(&f.path, "a"), "$1 就停了？");
         f.sw.tick(t("2026-08-28T10:00:30Z")).await.unwrap();

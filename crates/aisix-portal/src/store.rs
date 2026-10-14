@@ -374,6 +374,36 @@ impl Store {
         Ok(())
     }
 
+    /// 这个用户的对账状态：`None` = 从没对过账；`Some(false)` = 从按时间窗计费的
+    /// 版本升级上来、还没建花费游标；`Some(true)` = 游标已建好（见
+    /// `0005_spend_cursors.sql`）。
+    pub async fn consumption_state(&self, user_id: &str) -> Result<Option<bool>, StoreError> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT cursors_seeded FROM consumption_mark WHERE user_id = ?1")
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(v,)| v != 0))
+    }
+
+    /// 这个用户每条花费序列上次读到的累计值，以及那时它所在网关进程的启动时刻。
+    pub async fn spend_cursors(
+        &self,
+        user_id: &str,
+    ) -> Result<std::collections::HashMap<String, (i64, Option<i64>)>, StoreError> {
+        let rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT series, value_micro_usd, instance_started_ms FROM spend_cursor
+             WHERE user_id = ?1",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(series, value, started)| (series, (value, started)))
+            .collect())
+    }
+
     /// 已计入流水的截止时刻。`None` = 还没对过账。
     pub async fn counted_through(
         &self,

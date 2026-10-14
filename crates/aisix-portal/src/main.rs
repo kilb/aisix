@@ -265,27 +265,18 @@ mod testutil {
         p.to_string_lossy().to_string()
     }
 
-    /// 对账环需要一个消费来源，而这些用例不关心消费。返回 0 而不是 None ——
-    /// None 是「读不到」，会让水位线停在原地，那是另一条分支。
+    /// 对账环需要一个消费来源，而这些用例不关心消费。返回空序列而不是 None ——
+    /// None 是「读不到」，会让游标停在原地，那是另一条分支。
     pub struct NoConsumption;
 
     impl crate::sweeper::ConsumptionSource for NoConsumption {
-        async fn spend_in_window(
+        async fn spend_series(
             &self,
             _user_id: &str,
-            _from: chrono::DateTime<chrono::Utc>,
-            _to: chrono::DateTime<chrono::Utc>,
-        ) -> Option<u64> {
-            Some(0)
-        }
-
-        async fn key_spend_in_window(
-            &self,
-            _api_key_id: &str,
-            _from: chrono::DateTime<chrono::Utc>,
-            _to: chrono::DateTime<chrono::Utc>,
-        ) -> Option<u64> {
-            Some(0)
+            _since: chrono::DateTime<chrono::Utc>,
+            _at: chrono::DateTime<chrono::Utc>,
+        ) -> Option<Vec<crate::sweeper::SpendSeries>> {
+            Some(Vec::new())
         }
     }
 
