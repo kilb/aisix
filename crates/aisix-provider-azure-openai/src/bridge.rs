@@ -302,6 +302,23 @@ impl AzureUpstreamRef {
             ));
         }
 
+        // userinfo（`user:pass@host`）在任何写法下都拒绝，而且要在下面按写法
+        // 分流之前拒：canonical 主机与裸资源名会把整段值交给
+        // `validate_url_token`，它的报错原样回显 —— 那是调用方读得到的 400，
+        // 而这条检查触发时值里恰好带着凭据。运维应走 api-key / AAD，不能把
+        // 凭据嵌进 URL。
+        let post_scheme = base
+            .strip_prefix("https://")
+            .or_else(|| base.strip_prefix("http://"))
+            .unwrap_or(base);
+        if post_scheme.contains('@') {
+            let shown = aisix_gateway::redact_userinfo(base);
+            return Err(BridgeError::InvalidUpstreamConfig(format!(
+                "azure api_base {shown:?} must not embed userinfo (@); use the \
+                 api-key / AAD credentials in `provider_key.api_key` instead"
+            )));
+        }
+
         if let Some(rest) = base
             .strip_prefix("https://")
             .or_else(|| base.strip_prefix("http://"))
@@ -329,25 +346,11 @@ impl AzureUpstreamRef {
 
             // Verbatim-override branch — corporate proxy / private
             // endpoint / mock service. Defence-in-depth checks mirror
-            // the Vertex sibling fix (#390): reject userinfo, query,
-            // and fragment because each opens an injection / credential-
-            // leak / api-version-downgrade vector. Scheme is already
-            // constrained to `http://` or `https://` by the outer
-            // `strip_prefix` chain.
-            if rest.contains('@') {
-                // `rest` is post-scheme; an `@` here means userinfo
-                // (`user:pass@host`). Operators must use the
-                // api-key / AAD path for auth, never URL-embedded.
-                // Redacted before it goes in: this message renders as a 400
-                // whose body the CALLER reads, and the branch fires precisely
-                // because the value carries a credential — quoting it whole
-                // would hand over the thing the check exists to protect.
-                let shown = aisix_gateway::redact_userinfo(base);
-                return Err(BridgeError::InvalidUpstreamConfig(format!(
-                    "azure api_base {shown:?} must not embed userinfo (@); use the \
-                     api-key / AAD credentials in `provider_key.api_key` instead"
-                )));
-            }
+            // the Vertex sibling fix (#390): reject query and fragment
+            // (userinfo is refused above, for every shape) because each
+            // opens an injection / api-version-downgrade vector. Scheme
+            // is already constrained to `http://` or `https://` by the
+            // outer `strip_prefix` chain.
             if base.contains('?') {
                 return Err(BridgeError::InvalidUpstreamConfig(format!(
                     "azure api_base {base:?} must not contain a query string \
@@ -2918,5 +2921,24 @@ mod tests {
             msg.contains("azure.example") && msg.contains("***@"),
             "the host should survive so the message stays useful: {msg}"
         );
+    }
+    /// 同一条规则对每种 api_base 写法都成立。canonical 主机与无 scheme 的裸资源名
+    /// 在 userinfo 检查之前就交给了 `validate_url_token`，而它把原值整段回显；
+    /// query 里带 `://` 的写法则让脱敏函数把 scheme 认错位置，原样放行。
+    #[test]
+    fn every_api_base_shape_keeps_the_credential_out_of_the_rejection() {
+        for base in [
+            "https://user:sk-live-9f2b1e@myres.openai.azure.com",
+            "user:sk-live-9f2b1e@myres",
+            "user:sk-live-9f2b1e@myres/x?next=https://y",
+        ] {
+            let err = AzureUpstreamRef::resolve("dep", Some(base))
+                .expect_err("userinfo in api_base is refused");
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("sk-live-9f2b1e"),
+                "{base}: the rejection quotes the credential back: {msg}"
+            );
+        }
     }
 }

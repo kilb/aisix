@@ -784,7 +784,12 @@ pub trait Bridge: Send + Sync + 'static {
 /// forgotten, does not reach the userinfo check below. It fails here first,
 /// and used to be quoted back in full.
 pub fn redact_userinfo(value: &str) -> std::borrow::Cow<'_, str> {
-    let after_scheme = value.find("://").map(|i| i + 3).unwrap_or(0);
+    // 只有出现在任何 `/` `?` `#` `@` 之前的 `://` 才是 scheme 分隔符；query 里的
+    // `https://` 不算，否则 authority 会被认到它后面，前面的 userinfo 原样放过。
+    let after_scheme = match value.find("://") {
+        Some(i) if !value[..i].contains(['/', '?', '#', '@']) => i + 3,
+        _ => 0,
+    };
     let authority_end = value[after_scheme..]
         .find(['/', '?', '#'])
         .map(|i| after_scheme + i)
@@ -833,6 +838,18 @@ pub fn validate_api_base(provider: &str, base: &str) -> Result<(), BridgeError> 
 
 #[cfg(test)]
 mod tests {
+    /// `://` 只有出现在任何 `/` `?` `#` `@` 之前才是 scheme 分隔符。query 里的
+    /// `https://` 不能让脱敏把 authority 认到它后面去，否则前面的 userinfo
+    /// 被原样放过。
+    #[test]
+    fn redact_userinfo_ignores_a_scheme_separator_inside_the_query() {
+        let shown = redact_userinfo("user:sk-live-9f2b1e@host/v1?next=https://x");
+        assert!(
+            !shown.contains("sk-live-9f2b1e"),
+            "the userinfo survived redaction: {shown}"
+        );
+        assert_eq!(shown, "***@host/v1?next=https://x");
+    }
 
     /// `api_base` decides where the ProviderKey's secret is sent, so a shape
     /// that reads like one host and resolves to another has to be refused
