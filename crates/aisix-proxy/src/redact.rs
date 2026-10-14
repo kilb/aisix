@@ -353,6 +353,98 @@ pub fn redact_value_strings(
     }
 }
 
+/// 批处理 / 微调上传的 JSONL 文件经 [`redact_jsonl_upload`] 改写后的结果。
+pub(crate) struct JsonlUploadRedaction {
+    /// 改写后的全文；`None` 表示没有任何一行被改写。
+    pub text: Option<String>,
+    pub counts: RedactionCounts,
+    /// 某个协议字段（`custom_id` / `method` / `url` / `model`）命中了 mask 规则。
+    /// 它既不能改写（两行会变成同一个 `custom_id`，结果再也对不回请求；改了
+    /// `url` / `model` 请求就打错地方），也不能原样放行，调用方应拒绝上传。
+    pub unrewritable: bool,
+}
+
+/// 一行 JSONL 里不能改写的协议字段。
+const JSONL_PROTOCOL_FIELDS: &[&str] = &["custom_id", "method", "url", "model"];
+
+/// 按行解析 JSONL 上传，只改写每行请求内容里的字符串：batch 行改 `body`，
+/// 微调行（没有 `body`）改整行，协议字段一律不动。
+///
+/// 在原始字节上做替换会改到协议字段、可能弄坏 JSON 结构，还会漏掉 JSON 转义
+/// 写出的内容（`\u0040` 解码后就是 `@`）；逐行解析后按值改写，三者都不会发生。
+/// 未改写的行逐字节保留。返回 `None` 表示这不是 JSONL（有非空行不是 JSON
+/// 对象），调用方按纯文本处理。
+pub(crate) fn redact_jsonl_upload(
+    chain: &dyn Guardrail,
+    text: &str,
+) -> Option<JsonlUploadRedaction> {
+    let mut parsed = Vec::new();
+    for raw in text.split('\n') {
+        let line = raw.trim();
+        if line.is_empty() {
+            parsed.push((raw, None));
+            continue;
+        }
+        let value: Value = serde_json::from_str(line).ok().filter(Value::is_object)?;
+        parsed.push((raw, Some(value)));
+    }
+
+    let mut counts = RedactionCounts::new();
+    let mut unrewritable = false;
+    let mut changed = false;
+    let mut out = Vec::with_capacity(parsed.len());
+    for (raw, value) in parsed {
+        let Some(mut value) = value else {
+            out.push(raw.to_string());
+            continue;
+        };
+        unrewritable |= detect_named_structural_fields(
+            chain,
+            Direction::Input,
+            &value,
+            JSONL_PROTOCOL_FIELDS,
+            &mut counts,
+        );
+        let request = if value.get("body").is_some_and(Value::is_object) {
+            &mut value["body"]
+        } else {
+            &mut value
+        };
+        unrewritable |= detect_named_structural_fields(
+            chain,
+            Direction::Input,
+            request,
+            &["model"],
+            &mut counts,
+        );
+        let mut rewritten = RedactionCounts::new();
+        if let Some(map) = request.as_object_mut() {
+            for (key, slot) in map.iter_mut() {
+                if !JSONL_PROTOCOL_FIELDS.contains(&key.as_str()) {
+                    redact_value_strings(chain, Direction::Input, slot, &mut rewritten);
+                }
+            }
+        }
+        if rewritten.is_empty() {
+            out.push(raw.to_string());
+            continue;
+        }
+        merge_counts(&mut counts, rewritten);
+        changed = true;
+        let mut line = serde_json::to_string(&value).ok()?;
+        if raw.ends_with('\r') {
+            line.push('\r');
+        }
+        out.push(line);
+    }
+
+    Some(JsonlUploadRedaction {
+        text: changed.then(|| out.join("\n")),
+        counts,
+        unrewritable,
+    })
+}
+
 /// Mask-rewrite an already-assembled OUTPUT text buffer in place — the
 /// content-capture accumulator a streaming hold-back path hands to
 /// content-capturing exporters (#932 × #947). The wire-side

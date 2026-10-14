@@ -531,6 +531,21 @@ async fn scan_input_blob(
     let Ok(text) = std::str::from_utf8(blob) else {
         return Ok(None);
     };
+    // batch / 微调文件是 JSONL：逐行按请求内容改写，协议字段不动；协议字段
+    // 本身命中 mask 规则时拒绝上传（与其它端点对结构字段的处理一致）。
+    if let Some(r) = crate::redact::redact_jsonl_upload(&chain, text) {
+        if r.unrewritable {
+            return Err(ProxyError::ContentFiltered(
+                crate::error::guardrail_block_message("request", None),
+            ));
+        }
+        let Some(masked) = r.text else {
+            return Ok(None);
+        };
+        crate::redact::merge_counts(redactions, r.counts);
+        return Ok(Some(masked.into_bytes()));
+    }
+    // 不是 JSONL 的文件是纯文本，没有协议字段，整段改写。
     let Some(r) = aisix_guardrails::Guardrail::redact_input_text(&chain, text) else {
         return Ok(None);
     };
