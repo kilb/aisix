@@ -160,29 +160,29 @@ impl JobTarget {
     }
 }
 
-/// Which of this surface's two upstream protocols a ProviderKey speaks.
+/// Which of this surface's two upstream protocols a ProviderKey speaks,
+/// decided the way the request path decides it: a key that works on
+/// `/v1/chat/completions` works here, and a key that cannot be dispatched
+/// there is refused here too.
 ///
-/// `adapter` names a protocol family and is only needed where no
-/// vendor-specific bridge exists — and both protocols here have one, matched
-/// on `provider`, so the two most common key shapes leave `adapter` unset.
-/// The request path never asks for it; reading only `adapter` here therefore
-/// refused keys that work fine on every other endpoint.
-///
-/// The two vocabularies share their wire strings by construction
-/// (`Adapter::Openai` serialises to `"openai"`), so a provider name that *is*
-/// a family name names that family. Anything else — a vendor name such as
-/// `"deepseek"` — is still refused: whether that upstream speaks OpenAI's
-/// files/batches protocol is genuinely unknown.
+/// `Hub::dispatch_two_tier` looks the key's `provider` up among the
+/// vendor-specific bridges first — the server registers `openai` and
+/// `anthropic` — and falls back to the `adapter` family only when none
+/// matches. So `provider: openai` speaks OpenAI whatever `adapter` says,
+/// `provider: anthropic` speaks Anthropic (no files/batches protocol here),
+/// and every other provider, `azure-openai` included, needs `adapter`.
+/// A vendor name such as `"deepseek"` without one is refused: whether that
+/// upstream speaks OpenAI's files/batches protocol is genuinely unknown.
 fn supported_adapter(pk: &ProviderKey) -> Option<Adapter> {
+    match pk.provider.as_str() {
+        "openai" => return Some(Adapter::Openai),
+        "anthropic" => return None,
+        _ => {}
+    }
     match pk.adapter {
         Some(Adapter::Openai) => Some(Adapter::Openai),
         Some(Adapter::AzureOpenai) => Some(Adapter::AzureOpenai),
-        Some(_) => None,
-        None => match pk.provider.trim() {
-            "openai" => Some(Adapter::Openai),
-            "azure-openai" => Some(Adapter::AzureOpenai),
-            _ => None,
-        },
+        _ => None,
     }
 }
 
@@ -2156,50 +2156,59 @@ async fn attribute_batch_usage(
 
 #[cfg(test)]
 mod tests {
-    /// `adapter` 是可选的，而 OpenAI / Azure OpenAI 这两种最常见的密钥形状
-    /// 都不需要写它（请求路径按 `provider` 找专用桥）。这里以前只读 `adapter`，
-    /// 于是这些密钥在 files/batches/fine-tuning 上被拒，而报错说的是 provider
-    /// 不受支持 —— 指向了错误的字段。
+    /// 这个面判断一把密钥说哪种协议，必须和请求路径实际怎么分派一致：
+    /// chat 能用的密钥这里也能用，chat 分派不出去的这里也不收。
+    ///
+    /// `Hub::dispatch_two_tier` 先按 `provider` 找厂商专用 bridge（服务端
+    /// 注册的是 `openai` 与 `anthropic`），找不到才看 `adapter`。所以
+    /// `provider: openai` 不论 `adapter` 写什么都说 OpenAI 协议；
+    /// `provider: anthropic` 说 Anthropic，这个面不支持；其余 provider ——
+    /// 包括 `azure-openai` —— 都要靠 `adapter`。
     #[test]
-    fn provider_name_stands_in_for_an_unset_adapter() {
+    fn protocol_follows_the_request_path_dispatch() {
         use super::supported_adapter;
         use aisix_core::models::Adapter;
 
-        let pk = |json: serde_json::Value| -> aisix_core::ProviderKey {
-            serde_json::from_value(json).expect("fixture parses")
-        };
-        let base = |provider: &str| {
-            serde_json::json!({
+        let pk = |provider: &str, adapter: Option<&str>| -> aisix_core::ProviderKey {
+            let mut json = serde_json::json!({
                 "display_name": "k",
                 "secret": "sk-x",
                 "provider": provider,
-            })
+            });
+            if let Some(a) = adapter {
+                json["adapter"] = serde_json::Value::String(a.into());
+            }
+            serde_json::from_value(json).expect("fixture parses")
         };
 
+        // provider 命中专用 bridge：以它为准，adapter 不参与。
         assert_eq!(
-            supported_adapter(&pk(base("openai"))),
-            Some(Adapter::Openai),
-            "provider: openai 不带 adapter 是标准形状，不该被拒"
+            supported_adapter(&pk("openai", None)),
+            Some(Adapter::Openai)
         );
         assert_eq!(
-            supported_adapter(&pk(base("azure-openai"))),
+            supported_adapter(&pk("openai", Some("anthropic"))),
+            Some(Adapter::Openai),
+            "chat 把这把密钥交给 OpenAI 专用 bridge，这里不能拒"
+        );
+        assert_eq!(supported_adapter(&pk("anthropic", Some("openai"))), None);
+        // 没有专用 bridge：只看 adapter。
+        assert_eq!(
+            supported_adapter(&pk("azure-openai", None)),
+            None,
+            "chat 分派不出一把没写 adapter 的 azure-openai 密钥，这里也不收"
+        );
+        assert_eq!(
+            supported_adapter(&pk("azure-openai", Some("azure-openai"))),
             Some(Adapter::AzureOpenai)
         );
-        // 厂商名不是族名：对面说不说这套协议，这里真的不知道。
-        assert_eq!(supported_adapter(&pk(base("deepseek"))), None);
-        // 写了 adapter 就以它为准 —— 一把 provider 叫 deepseek、adapter 是
-        // openai 的密钥（仓库里 provider_key 的测试用的正是这个形状）要放行。
-        let mut explicit = base("deepseek");
-        explicit["adapter"] = serde_json::Value::String("openai".into());
-        assert_eq!(supported_adapter(&pk(explicit)), Some(Adapter::Openai));
-        // 而 adapter 明确是别的族时，provider 不再兜底。
-        let mut other = base("openai");
-        other["adapter"] = serde_json::Value::String("anthropic".into());
         assert_eq!(
-            supported_adapter(&pk(other)),
-            None,
-            "写明了 adapter 就该按它判，不该被 provider 名字翻回来"
+            supported_adapter(&pk("deepseek", Some("openai"))),
+            Some(Adapter::Openai)
         );
+        assert_eq!(supported_adapter(&pk("deepseek", None)), None);
+        // 专用 bridge 按字面匹配，不去空白。
+        assert_eq!(supported_adapter(&pk(" openai", None)), None);
     }
 
     use super::*;
