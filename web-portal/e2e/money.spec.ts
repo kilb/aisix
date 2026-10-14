@@ -211,6 +211,29 @@ async function setKeyQuota(
   return { status: r.status, body: await r.text() };
 }
 
+test("密钥标签里带插值符号_门户拒收_网关配置照常生效", async () => {
+  // 标签会原样进网关配置里的 `display_name`。`${X}` 会被网关当成环境变量展开：
+  // 一个没设的变量让整份配置加载失败、网关静默停在旧快照上 —— 所有租户的
+  // 停用闸、额度、新密钥一起冻住，而门户还以为写成功了。`$$` 会被网关转义成
+  // `$`，网关与门户对这把密钥的名字从此对不上，按密钥统计的花费就失效了。
+  const cookie = await fx.sessionCookie();
+  await setQuota(1_000_000_000);
+  for (const label of ["${AISIX_E2E_LABEL_UNSET}", "a$$b"]) {
+    const r = await fetch(`${fx.portalUrl}/api/keys`, {
+      method: "POST",
+      headers: { cookie, "content-type": "application/json" },
+      body: JSON.stringify({ label }),
+    });
+    expect(r.status, `标签 ${label} 被收下了`).toBe(400);
+    await r.text();
+  }
+  expect(fx.readResources()).not.toContain("AISIX_E2E_LABEL_UNSET");
+
+  // 之后的正常改动照样生效：网关没有被冻在旧配置上。
+  const k = await mint(cookie, "正常标签");
+  await waitFor(async () => (await fx.chatWith(k.plaintext)) === 200, "新铸的密钥在网关可用");
+});
+
 test("管理员设定的额度是绝对值_调低之后调用被拒_调高即恢复", async () => {
   // 先抬高再调低。「设定」若被实现成「追加」，网关收到的会是两次之和
   // （507000000），于是本该被收口的用户继续畅通 —— 静默白送，没有任何报错。

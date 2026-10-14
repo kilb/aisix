@@ -214,20 +214,28 @@ async fn write_atomic(path: &str, body: &str) -> Result<(), WriteError> {
 /// 文件（运维自己写错了）不该让门户从此拒绝写入 —— 那会把停用闸一起卡死，比原来
 /// 的问题更糟。
 ///
-/// `${VAR}` 一律插成占位串，而不是查门户自己的环境变量：这里要验的是**结构与
-/// 引用**，而门户与网关的环境本来就可以不同，拿门户的 env 去判会把「网关那边有
-/// 这个变量」误判成致命错。
+/// `${VAR}` 不查门户自己的环境变量：门户与网关的环境本来就可以不同，拿门户的
+/// env 去判会把「网关那边有这个变量」误判成致命错。旧文件里已经引用的变量插成
+/// 占位串 —— 那是运维写的配置，网关那边有。这次改动**新带进来**的变量则按未设置
+/// 算：它只能来自塞进字段里的用户输入（密钥标签会进 `display_name`），网关那边
+/// 多半没有，而身份字段上一个未设的变量就让整份配置加载失败。
 fn breaks_gateway(before: &str, after: &str) -> Option<String> {
-    let load = |body: &str| {
-        aisix_core::filesource::load_from_str(body, "portal-candidate", 1, &|_| {
+    // 用网关自己的解析器记下旧文件引用了哪些变量，不另写一份 `${}` 解析。
+    let known = std::cell::RefCell::new(std::collections::HashSet::new());
+    let before_loads =
+        aisix_core::filesource::load_from_str(before, "portal-current", 1, &|name| {
+            known.borrow_mut().insert(name.to_string());
             Some("placeholder".to_string())
         })
-    };
-    let err = match load(after) {
+        .is_ok();
+    let known = known.into_inner();
+    let err = match aisix_core::filesource::load_from_str(after, "portal-candidate", 1, &|name| {
+        known.contains(name).then(|| "placeholder".to_string())
+    }) {
         Ok(_) => return None,
         Err(e) => e,
     };
-    if load(before).is_err() {
+    if !before_loads {
         // 本来就坏着 —— 不是这次改动的问题，照写。
         return None;
     }
@@ -692,6 +700,56 @@ api_keys:
             })
             .await;
         assert!(r.is_ok(), "本来就坏的文件让门户彻底写不动了: {r:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 往文档里加一把 portal 风格的密钥，展示名是 `portal-1 · <label>`。
+    fn add_key_labelled(doc: &mut Value, label: &str) {
+        let mut m = serde_yaml_ng::Mapping::new();
+        m.insert(
+            Value::from("display_name"),
+            Value::from(format!("portal-1 · {label}")),
+        );
+        m.insert(Value::from("key_hash"), Value::from("bb"));
+        m.insert(
+            Value::from("allowed_models"),
+            Value::Sequence(vec![Value::from("*")]),
+        );
+        api_keys_mut(doc).push(Value::Mapping(m));
+    }
+
+    #[tokio::test]
+    async fn 这次改动新引入的变量按未设置算() {
+        // 旧文件里的 `${VAR}` 是运维写的配置，网关那边有，照旧按「有」处理。
+        // 这次改动新带进来的 `${X}` 不是：它是塞进字段里的用户输入（比如密钥
+        // 标签进了 `display_name`），网关那边多半没有这个变量 —— 而身份字段上
+        // 未设的变量让整份配置加载失败，网关从此冻在旧快照上。
+        assert!(std::env::var("AISIX_PORTAL_NEW_UNSET").is_err());
+
+        // 对照：同一把密钥换个普通标签能写进去 —— 下面的拒绝只能归因于变量。
+        let (w, path) = writer_with(VALID).await;
+        let ok = w
+            .edit(|doc| {
+                add_key_labelled(doc, "plain");
+                true
+            })
+            .await;
+        assert!(ok.is_ok(), "对照组本身被拒，这条用例量不到东西: {ok:?}");
+        let _ = std::fs::remove_file(path);
+
+        let (w, path) = writer_with(VALID).await;
+        let before = std::fs::read_to_string(&path).unwrap();
+        let r = w
+            .edit(|doc| {
+                add_key_labelled(doc, "${AISIX_PORTAL_NEW_UNSET}");
+                true
+            })
+            .await;
+        assert!(
+            matches!(r, Err(WriteError::WouldBreakGateway(_))),
+            "新引入的未设变量被当成网关那边有: {r:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         let _ = std::fs::remove_file(path);
     }
 

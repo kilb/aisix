@@ -88,6 +88,12 @@ pub async fn create(
     if label.chars().count() > MAX_LABEL_CHARS {
         return bad("名称过长");
     }
+    // `$` 是网关配置的插值符号：`${X}` 会被当成环境变量展开（没设就让整份配置
+    // 加载失败、网关冻在旧快照上），`$$` 会被转义成 `$`（网关与门户对这把密钥
+    // 的名字从此对不上）。标签只是给人看的，不需要它。
+    if label.contains('$') {
+        return bad("名称里不能包含 $");
+    }
 
     let uid2 = uid.clone();
     let hash2 = hash.clone();
