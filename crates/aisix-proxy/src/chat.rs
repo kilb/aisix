@@ -1485,6 +1485,8 @@ async fn dispatch(
     // 第三个值是这次分类调用的花费（micro-USD）：语义路由每次请求都会打一发
     // 嵌入调用，那是真金白银。它在预留建立之前发生，所以拦不住，但要在下面提交
     // 时并进去 —— 否则用户能靠语义路由白嫖这部分。
+    // 分类阶段已计过请求数的路由策略桶：目标阶段只检查、不再计（M3）。
+    let mut semantic_counted: Vec<String> = Vec::new();
     let (attempt_models, semantic_route, semantic_embed_spend): (
         Vec<AttemptModel>,
         Option<String>,
@@ -1499,6 +1501,7 @@ async fn dispatch(
             &prompt,
             &client.source_ip,
             request_id,
+            &mut semantic_counted,
         )
         .await
         .map_err(&with_model)?
@@ -1722,7 +1725,7 @@ async fn dispatch(
                 // 429 attempt and move on to the remaining targets in strategy
                 // order (same-target retries can't help — the window won't
                 // reset mid-loop).
-                let member_reservation = match crate::quota::reserve_routing_target(
+                let member_reservation = match crate::quota::reserve_routing_target_counted(
                     state,
                     snapshot,
                     auth,
@@ -1733,6 +1736,7 @@ async fn dispatch(
                     &model.display_name,
                     &attempt.id,
                     model,
+                    &semantic_counted,
                 )
                 .await
                 {
@@ -2902,7 +2906,7 @@ async fn dispatch(
             // 429 attempt and move on to the remaining targets in strategy
             // order (same-target retries can't help — the window won't
             // reset mid-loop).
-            let member_reservation = match crate::quota::reserve_routing_target(
+            let member_reservation = match crate::quota::reserve_routing_target_counted(
                 state,
                 snapshot,
                 auth,
@@ -2913,6 +2917,7 @@ async fn dispatch(
                 &model.display_name,
                 &attempt.id,
                 model,
+                &semantic_counted,
             )
             .await
             {

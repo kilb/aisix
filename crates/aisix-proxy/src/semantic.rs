@@ -137,6 +137,7 @@ impl SemanticVectorCache {
 /// of the route that matched (`None` when the request fell through to
 /// `default`). The returned `Vec<AttemptModel>` always has exactly one
 /// element; the chat dispatch loop drives it like any routing target.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve(
     state: &ProxyState,
     snapshot: &AisixSnapshot,
@@ -145,6 +146,9 @@ pub(crate) async fn resolve(
     prompt: &str,
     source_ip: &str,
     request_id: &str,
+    // 分类阶段已计过请求数、只因路由名才匹配上的策略桶，交给目标阶段去重
+    // （见 `quota::ParentCounted`）。被拒或降级时已记下的照样有效。
+    parent_counted: &mut Vec<String>,
 ) -> Result<(Vec<AttemptModel>, Option<String>, u64), ProxyError> {
     let semantic = router_entry
         .value
@@ -220,20 +224,22 @@ pub(crate) async fn resolve(
     // 被闸拒不当成错误抛给调用方，而是并入既有的「嵌入不可用」那条路：走
     // `on_embedding_failure`。语义路由本来就为这种情况准备了降级出口，而把
     // 「分类模型限流了」变成整条请求 429 会让一个保护性上限变成停服。
-    let embed_reservation = match crate::quota::reserve_model_only(
+    //
+    // 带上父级：调用方寻址的是这个语义路由，所以按路由名写的策略条件也该
+    // 覆盖它的分类子调用（#1267）—— 额度用完时分类调用根本不发出去。这类
+    // 策略按调用方请求只计一次请求数：这里记下它们，chat 目标阶段不再重计。
+    let embed_reservation = match crate::quota::reserve_semantic_classifier(
         state,
         snapshot,
         auth,
         &embed_entry.value.display_name,
         &embed_entry.id,
         &embed_entry.value,
-        // 带上父级：调用方寻址的是这个语义路由，所以按路由名写的策略条件也该
-        // 覆盖它的分类子调用（#1267）—— 这条路的 chat 目标走
-        // `reserve_routing_target` 时同样带着父级，两者要一致。
-        Some(crate::quota::RoutingParent {
+        crate::quota::RoutingParent {
             name: &router.display_name,
             entry_id: &router_entry.id,
-        }),
+        },
+        parent_counted,
     )
     .await
     {

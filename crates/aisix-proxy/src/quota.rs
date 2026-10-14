@@ -88,6 +88,23 @@ pub(crate) struct RoutingParent<'a> {
     pub entry_id: &'a str,
 }
 
+/// 一个调用方请求里，只因父级身份才匹配上的策略桶的请求计数去重。
+///
+/// 语义路由一个请求有两次分派：先是分类用的嵌入调用，再是选中的 chat 目标，
+/// 两次都带着调用方寻址的路由作为父级预留，这样按路由名写的策略在分类调用
+/// 之前就能拦下请求。但这类策略描述的是「调用方请求这个路由」，按请求只该
+/// 计一次请求数：分类阶段用 [`Self::Record`] 记下这些桶，目标阶段用
+/// [`Self::Skip`] 对它们照常检查 token 与并发、不再计 `rps/rpm/rph/rpd`。
+/// 靠被调用模型自身属性匹配上的策略（如 `provider`）仍按每次分派计数。
+pub(crate) enum ParentCounted<'a> {
+    /// 不去重：除语义路由两个阶段外的所有预留。
+    Off,
+    /// 分类阶段：记下已成功预留、且只因父级身份才匹配上的策略桶。
+    Record(&'a mut Vec<String>),
+    /// 目标阶段：这些桶本次请求已经计过请求数。
+    Skip(&'a [String]),
+}
+
 /// The request's condition-dimension values at this gate point. Model
 /// dimensions are absent when no model is resolved (MCP, A2A) — leaves
 /// on them evaluate false while OR siblings can still match.
@@ -148,6 +165,36 @@ struct SpendLayer {
 /// key + effective limits. `None` = not applicable here (wrong phase,
 /// unmatched, suspended is checked by the caller, or a `group_by`
 /// dimension the request does not carry).
+/// 这条策略是不是只因父级身份才匹配上：去掉父级后同一份输入不再匹配。
+fn matched_only_through_parent(
+    policy: &RateLimitPolicy,
+    policy_entry_id: &str,
+    input: &ConditionInput<'_>,
+    phase: PolicyPhase,
+) -> bool {
+    if input.routing_parent_model.is_none() && input.routing_parent_model_name.is_none() {
+        return false;
+    }
+    let without_parent = ConditionInput {
+        routing_parent_model: None,
+        routing_parent_model_name: None,
+        ..*input
+    };
+    match_policy_layer(policy, policy_entry_id, &without_parent, phase).is_none()
+}
+
+/// 去掉请求计数维度（`rps/rpm/rph/rpd`），保留 token、并发与额度：acquire 只
+/// 在设了上限的维度上计数，所以这样预留不会再记一次请求。
+fn without_request_counts(limits: &RateLimit) -> RateLimit {
+    RateLimit {
+        rps: None,
+        rpm: None,
+        rph: None,
+        rpd: None,
+        ..limits.clone()
+    }
+}
+
 fn match_policy_layer(
     policy: &RateLimitPolicy,
     policy_entry_id: &str,
@@ -585,7 +632,15 @@ async fn reserve_layers(
     let phase = PolicyPhase::Request {
         defer_model_properties: model_rl.is_some_and(|m| m.routing_parent),
     };
-    reserve_policy_layers(state, snapshot, &input, phase, &mut reservations).await?;
+    reserve_policy_layers(
+        state,
+        snapshot,
+        &input,
+        phase,
+        &mut reservations,
+        ParentCounted::Off,
+    )
+    .await?;
 
     Ok(MultiReservation::new(reservations))
 }
@@ -604,6 +659,7 @@ async fn reserve_policy_layers(
     input: &ConditionInput<'_>,
     phase: PolicyPhase,
     reservations: &mut Vec<aisix_ratelimit::Reservation>,
+    mut parent_counted: ParentCounted<'_>,
 ) -> Result<(), ProxyError> {
     // O(1) empty check before anything else: deployments with no
     // rate-limit policies (the default) skip the wall-clock read and
@@ -624,14 +680,26 @@ async fn reserve_policy_layers(
         let Some(layer) = match_policy_layer(policy, &entry.id, input, phase) else {
             continue;
         };
+        // 本次请求已计过请求数的桶只检查 token 与并发（见 [`ParentCounted`]）。
+        let limits = match &parent_counted {
+            ParentCounted::Skip(keys) if keys.contains(&layer.bucket_key) => {
+                std::borrow::Cow::Owned(without_request_counts(&layer.limits))
+            }
+            _ => std::borrow::Cow::Borrowed(&layer.limits),
+        };
         // 只设了花费上限的策略在 token 侧是无限制的，不必占一个空层。
-        if !layer.limits.is_unrestricted() {
+        if !limits.is_unrestricted() {
             let r = state
                 .limiter
-                .pre_commit(&layer.bucket_key, &layer.limits)
+                .pre_commit(&layer.bucket_key, &limits)
                 .await
                 .map_err(|e| reject(state, e, "policy", Some((&entry.id, &policy.name))))?;
             reservations.push(r);
+            if let ParentCounted::Record(keys) = &mut parent_counted {
+                if matched_only_through_parent(policy, &entry.id, input, phase) {
+                    keys.push(layer.bucket_key.clone());
+                }
+            }
         }
         if let Some(spend) = layer.spend {
             // 与 token 层同策略同窗口，独立桶与单位；任一超限即拒。
@@ -885,6 +953,57 @@ pub(crate) async fn reserve_model_only(
     model: &aisix_core::Model,
     routing_parent: Option<RoutingParent<'_>>,
 ) -> Result<MultiReservation, ProxyError> {
+    reserve_model_layers(
+        state,
+        snapshot,
+        auth,
+        model_name,
+        model_entry_id,
+        model,
+        routing_parent,
+        ParentCounted::Off,
+    )
+    .await
+}
+
+/// 语义路由的分类子调用：与 [`reserve_model_only`] 相同，另把只因路由名才
+/// 匹配上的策略桶记进 `parent_counted`，交给目标阶段去重（见 [`ParentCounted`]）。
+/// 预留中途被拒时，已记下的桶照样有效 —— 它们的请求数已经计过了。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn reserve_semantic_classifier(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    model_name: &str,
+    model_entry_id: &str,
+    model: &aisix_core::Model,
+    router: RoutingParent<'_>,
+    parent_counted: &mut Vec<String>,
+) -> Result<MultiReservation, ProxyError> {
+    reserve_model_layers(
+        state,
+        snapshot,
+        auth,
+        model_name,
+        model_entry_id,
+        model,
+        Some(router),
+        ParentCounted::Record(parent_counted),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reserve_model_layers(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    model_name: &str,
+    model_entry_id: &str,
+    model: &aisix_core::Model,
+    routing_parent: Option<RoutingParent<'_>>,
+    parent_counted: ParentCounted<'_>,
+) -> Result<MultiReservation, ProxyError> {
     let mut reservations = Vec::new();
 
     // Inline model rate limit.
@@ -910,6 +1029,7 @@ pub(crate) async fn reserve_model_only(
         &input,
         PolicyPhase::ModelTarget,
         &mut reservations,
+        parent_counted,
     )
     .await?;
 
@@ -936,10 +1056,37 @@ pub(crate) async fn reserve_routing_target(
     target_entry_id: &str,
     target: &aisix_core::Model,
 ) -> Result<Option<MultiReservation>, ProxyError> {
+    reserve_routing_target_counted(
+        state,
+        snapshot,
+        auth,
+        routing_parent,
+        target_name,
+        target_entry_id,
+        target,
+        &[],
+    )
+    .await
+}
+
+/// [`reserve_routing_target`]，另带本次请求已在语义分类阶段计过请求数的
+/// 策略桶（[`reserve_semantic_classifier`] 记下的那些）：它们在这里只检查
+/// token 与并发，不再计请求数。非语义请求传空切片，与前者完全一致。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn reserve_routing_target_counted(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    routing_parent: Option<RoutingParent<'_>>,
+    target_name: &str,
+    target_entry_id: &str,
+    target: &aisix_core::Model,
+    parent_counted: &[String],
+) -> Result<Option<MultiReservation>, ProxyError> {
     let Some(parent) = routing_parent else {
         return Ok(None);
     };
-    reserve_model_only(
+    reserve_model_layers(
         state,
         snapshot,
         auth,
@@ -947,6 +1094,7 @@ pub(crate) async fn reserve_routing_target(
         target_entry_id,
         target,
         Some(parent),
+        ParentCounted::Skip(parent_counted),
     )
     .await
     .map(Some)
