@@ -36,6 +36,12 @@ struct KeyState {
     /// makes a granted allowance behave like an allowance instead of a
     /// per-window ceiling that refills on its own.
     consumed_micro_usd: u64,
+    /// 最近一次 acquire 时这个桶是否带着 `granted_micro_usd`。
+    ///
+    /// `consumed_micro_usd` 在每个桶上都会涨（`commit` / `add_tokens` 不知道
+    /// 自己记的是 token 还是 micro-USD），所以它本身说明不了「这是一份不能
+    /// 还回去的累计额度」；[`LocalStore::reap`] 要靠这个标记来分辨。
+    carries_allowance: bool,
     /// The members currently holding a concurrency slot, by name — not a
     /// bare count.
     ///
@@ -65,6 +71,7 @@ impl KeyState {
             tph: FixedWindowCounter::new(HOUR_SECS),
             tpd: FixedWindowCounter::new(DAY_SECS),
             consumed_micro_usd: 0,
+            carries_allowance: false,
             in_flight: std::collections::HashSet::new(),
             last_touched: now,
         }
@@ -141,11 +148,12 @@ impl<C: Clock> LocalStore<C> {
             // "setting an expiry degrades it into a cap". Reaping the bucket
             // is that expiry by another name.
             //
-            // Keeping these does not make the map grow with traffic: it is
-            // keyed by configured identities (api key / model / policy), so
-            // the survivors are bounded by the configuration, and only the
-            // ones that actually spent anything survive.
-            !s.in_flight.is_empty() || s.last_touched >= cutoff || s.consumed_micro_usd > 0
+            // 只留下真正带着累计额度、并且已经动用过的桶。`consumed_micro_usd`
+            // 在每个提交过的桶上都大于 0（token 桶也一样），单看它会让几乎
+            // 所有桶都免于回收；`carries_allowance` 才说明它是一份额度。
+            !s.in_flight.is_empty()
+                || s.last_touched >= cutoff
+                || (s.carries_allowance && s.consumed_micro_usd > 0)
         });
     }
 }
@@ -172,6 +180,7 @@ impl<C: Clock> RateStore for LocalStore<C> {
         // Cumulative allowance — checked ahead of the windows, because it is
         // the one that does not come back on its own, so when both would
         // reject it is the more useful thing to report.
+        s.carries_allowance = limits.granted_micro_usd.is_some();
         if let Some(granted) = limits.granted_micro_usd {
             if s.consumed_micro_usd >= granted {
                 return Err(RateLimitError::AllowanceExhausted);
@@ -526,6 +535,30 @@ mod tests {
         assert!(
             store.peek("busy", &l).await.is_some(),
             "a bucket with a live concurrency permit must be kept"
+        );
+    }
+
+    /// 只有带累计额度的桶才因为「花过钱」而免于回收。`commit` / `add_tokens`
+    /// 对每个桶都累加 `consumed_micro_usd`（花费层借同一个参数传 micro-USD），
+    /// 所以一个普通的 token 桶只要提交过，这个计数就大于 0 —— 若以它为准，
+    /// 几乎没有桶会被回收，删掉的 key、轮换过的策略都会永远留在表里。
+    #[tokio::test]
+    async fn reap_drops_an_idle_token_bucket_that_has_committed() {
+        let clock = TestClock::new(1_000);
+        let store = LocalStore::with_clock(clock.clone());
+        let l = limits();
+
+        store.acquire("tokens", &l, "m1").await.unwrap();
+        store.commit("tokens", 500, "m1").await;
+        store.add_tokens("tokens", 200);
+
+        clock.advance(DAY_SECS + 1);
+        store.reap(Duration::from_secs(DAY_SECS));
+
+        assert!(
+            store.peek("tokens", &l).await.is_none(),
+            "a windowed bucket with no allowance must be reclaimed once idle, \
+             however many tokens it committed"
         );
     }
 
