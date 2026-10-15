@@ -157,7 +157,13 @@ fn append_input_item(messages: &mut Vec<ChatMessage>, item: &Value) {
             }
             messages.push(match role {
                 "assistant" => ChatMessage::assistant(text),
-                "system" | "developer" => ChatMessage::system(text),
+                "system" => ChatMessage::system(text),
+                // Kept as `developer` so an OpenAI upstream receives it as
+                // sent; the bridges send it as system everywhere else.
+                "developer" => ChatMessage {
+                    role: Role::Developer,
+                    ..ChatMessage::system(text)
+                },
                 _ => ChatMessage::user(text),
             });
         }
@@ -1540,6 +1546,22 @@ mod tests {
         assert!(matches!(chat.messages[0].role, Role::User));
         assert_eq!(chat.messages[0].content_str(), "part1part2");
         assert!(matches!(chat.messages[1].role, Role::Assistant));
+    }
+
+    #[test]
+    fn developer_input_items_keep_their_role() {
+        let body = json!({
+            "model": "m",
+            "input": [
+                {"role": "developer", "content": "answer in French"},
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "hi"},
+            ],
+        });
+        let chat = responses_request_to_chat("m", &body);
+        let roles: Vec<Role> = chat.messages.iter().map(|m| m.role).collect();
+        assert_eq!(roles, vec![Role::Developer, Role::System, Role::User]);
+        assert_eq!(chat.messages[0].content_str(), "answer in French");
     }
 
     #[test]

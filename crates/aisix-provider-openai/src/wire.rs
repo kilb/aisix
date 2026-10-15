@@ -114,11 +114,18 @@ pub fn build_request<'a>(
     }
 }
 
-pub fn messages_from(req: &ChatFormat) -> Vec<OpenAiMessage<'_>> {
+/// `forward_developer`: whether the upstream takes OpenAI's `developer` role.
+/// OpenAI and Azure OpenAI do; other OpenAI-compatible servers document only
+/// `system` (DeepSeek, Mistral) or may drop an unknown role's text (Ollama),
+/// so they receive the same instructions as a `system` message.
+pub fn messages_from(req: &ChatFormat, forward_developer: bool) -> Vec<OpenAiMessage<'_>> {
     req.messages
         .iter()
         .map(|m| OpenAiMessage {
-            role: role_str(m.role),
+            role: match m.role {
+                Role::Developer if !forward_developer => "system",
+                role => role_str(role),
+            },
             // Vision / multimodal callers send `content` as an array
             // of typed blocks; OpenAI accepts the array form natively
             // (no translation needed for OpenAI / Gemini-OpenAI-compat /
@@ -139,6 +146,7 @@ pub fn messages_from(req: &ChatFormat) -> Vec<OpenAiMessage<'_>> {
 fn role_str(role: Role) -> &'static str {
     match role {
         Role::System => "system",
+        Role::Developer => "developer",
         Role::User => "user",
         Role::Assistant => "assistant",
         Role::Tool => "tool",
@@ -1328,6 +1336,39 @@ mod tests {
     }
 
     #[test]
+    fn developer_role_is_forwarded_or_sent_as_system() {
+        // `developer` is OpenAI's name for system instructions on o1 and
+        // newer. OpenAI itself receives it as sent; an OpenAI-compatible
+        // server that only documents `system` receives it as `system`, with
+        // the rest of the message intact.
+        let req: ChatFormat = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "developer", "content": "Answer in French.", "name": "policy"},
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "hi"},
+            ],
+        }))
+        .unwrap();
+        let roles = |forward: bool| -> Vec<serde_json::Value> {
+            serde_json::to_value(messages_from(&req, forward))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+        let forwarded = roles(true);
+        assert_eq!(forwarded[0]["role"], "developer");
+        assert_eq!(forwarded[1]["role"], "system");
+        let rewritten = roles(false);
+        assert_eq!(rewritten[0]["role"], "system");
+        assert_eq!(rewritten[0]["content"], "Answer in French.");
+        assert_eq!(rewritten[0]["name"], "policy");
+        assert_eq!(rewritten[1]["role"], "system");
+        assert_eq!(rewritten[2]["role"], "user");
+    }
+
+    #[test]
     fn build_request_sets_stream_flag_and_propagates_params() {
         let req = ChatFormat {
             model: "my-model".into(),
@@ -1338,7 +1379,7 @@ mod tests {
             stream: None,
             extra: serde_json::Map::new(),
         };
-        let msgs = messages_from(&req);
+        let msgs = messages_from(&req, true);
         let built = build_request(&req, "gpt-4o", &msgs, true);
         let json = serde_json::to_value(&built).unwrap();
         assert_eq!(json["model"], "gpt-4o");
@@ -1367,7 +1408,7 @@ mod tests {
             stream: Some(true),
             extra: serde_json::Map::new(),
         };
-        let msgs = messages_from(&req);
+        let msgs = messages_from(&req, true);
         let json = serde_json::to_value(build_request(&req, "gpt-4o", &msgs, true)).unwrap();
         assert_eq!(
             json["stream_options"],
@@ -1393,7 +1434,7 @@ mod tests {
             stream: Some(true),
             extra,
         };
-        let msgs = messages_from(&req);
+        let msgs = messages_from(&req, true);
         let raw = serde_json::to_string(&build_request(&req, "gpt-4o", &msgs, true)).unwrap();
         // Exactly one stream_options key on the wire (flatten + typed
         // field would double-emit if both were set).
@@ -1418,7 +1459,7 @@ mod tests {
             stream: None,
             extra: serde_json::Map::new(),
         };
-        let msgs = messages_from(&req);
+        let msgs = messages_from(&req, true);
         let json = serde_json::to_value(build_request(&req, "gpt-4o", &msgs, false)).unwrap();
         assert!(json.get("stream_options").is_none());
     }
@@ -1437,7 +1478,7 @@ mod tests {
             stream: None,
             extra,
         };
-        let msgs = messages_from(&req);
+        let msgs = messages_from(&req, true);
         let built = build_request(&req, "gpt-4o", &msgs, false);
         let json = serde_json::to_value(&built).unwrap();
         assert_eq!(json["seed"], 42);
@@ -1469,7 +1510,7 @@ mod tests {
             stream: None,
             extra: serde_json::Map::new(),
         };
-        let msgs = messages_from(&req);
+        let msgs = messages_from(&req, true);
         let built = build_request(&req, "gpt-4o", &msgs, false);
         let json = serde_json::to_value(&built).unwrap();
         let assistant = &json["messages"][1];

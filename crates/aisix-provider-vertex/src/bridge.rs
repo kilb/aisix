@@ -1192,7 +1192,7 @@ impl VertexBridge {
             || self.openai_shim_url(&creds, ctx.provider_key.api_base.as_deref()),
         )?;
 
-        let messages = openai_messages_from(req);
+        let messages = openai_messages_from(req, false);
         let typed = build_openai_request(req, upstream_id, &messages, false);
         let mut body = serde_json::to_value(&typed)
             .map_err(|e| BridgeError::Config(format!("serialize OpenAI shim request body: {e}")))?;
@@ -1253,7 +1253,7 @@ impl VertexBridge {
             || self.openai_shim_url(&creds, ctx.provider_key.api_base.as_deref()),
         )?;
 
-        let messages = openai_messages_from(req);
+        let messages = openai_messages_from(req, false);
         let typed = build_openai_request(req, upstream_id, &messages, true);
         let mut body = serde_json::to_value(&typed)
             .map_err(|e| BridgeError::Config(format!("serialize OpenAI shim request body: {e}")))?;
@@ -1403,7 +1403,7 @@ impl VertexBridge {
         // OpenAI chat-completions body — same serializer the OpenAI-shim
         // (Llama/MaaS) rail uses. The model is KEPT in the body (Mistral /
         // AI21 on Vertex expect it in both the URL and the body).
-        let messages = openai_messages_from(req);
+        let messages = openai_messages_from(req, false);
         let typed = build_openai_request(req, upstream_id, &messages, false);
         let mut body = serde_json::to_value(&typed)
             .map_err(|e| BridgeError::Config(format!("serialize OpenAI request body: {e}")))?;
@@ -1480,7 +1480,7 @@ impl VertexBridge {
             },
         )?;
 
-        let messages = openai_messages_from(req);
+        let messages = openai_messages_from(req, false);
         let typed = build_openai_request(req, upstream_id, &messages, true);
         let mut body = serde_json::to_value(&typed)
             .map_err(|e| BridgeError::Config(format!("serialize OpenAI request body: {e}")))?;
@@ -2031,7 +2031,7 @@ fn build_gemini_request(req: &ChatFormat) -> GeminiGenerateContentRequest {
     let mut contents: Vec<GeminiContent> = Vec::new();
     for m in &req.messages {
         match m.role {
-            Role::System => system_parts.push(m.content_str().to_string()),
+            Role::System | Role::Developer => system_parts.push(m.content_str().to_string()),
             Role::User | Role::Tool => contents.push(GeminiContent {
                 role: "user",
                 parts: gemini_parts_for(m),

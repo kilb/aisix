@@ -446,7 +446,7 @@ impl Bridge for OpenAiBridge {
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
-        let messages = messages_from(req);
+        let messages = messages_from(req, upstream_takes_developer(ctx));
         let typed = build_request(req, upstream, &messages, false);
         let body = prepare_outbound_body(
             &typed,
@@ -638,7 +638,7 @@ impl Bridge for OpenAiBridge {
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
-        let messages = messages_from(req);
+        let messages = messages_from(req, upstream_takes_developer(ctx));
         let typed = build_request(req, upstream, &messages, true);
         let body = prepare_outbound_body(
             &typed,
@@ -822,6 +822,15 @@ fn parse_stream_chunk(
         aisix_gateway::capture_in_band_error(payload, aisix_gateway::UpstreamWire::OpenAI)
             .unwrap_or(BridgeError::UpstreamDecode(serde_err))
     })
+}
+
+/// Whether the upstream is OpenAI itself, which takes the `developer` role.
+/// This bridge also serves OpenAI-compatible vendors, which get `system`.
+fn upstream_takes_developer(ctx: &BridgeContext) -> bool {
+    ctx.provider_key
+        .provider
+        .trim()
+        .eq_ignore_ascii_case("openai")
 }
 
 #[cfg(test)]

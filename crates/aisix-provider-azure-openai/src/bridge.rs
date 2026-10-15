@@ -758,7 +758,7 @@ impl Bridge for AzureOpenAiBridge {
         // body's `model` field is ignored by Azure (or echoed back).
         // We still set it to the deployment name for log-trace clarity
         // and to mirror the upstream OpenAI SDK convention.
-        let messages = messages_from(req);
+        let messages = messages_from(req, true);
         let typed = build_request(req, deployment, &messages, false);
         let body = prepare_outbound_body(
             &typed,
@@ -810,7 +810,7 @@ impl Bridge for AzureOpenAiBridge {
 
         // See chat() — resolve auth before the request future.
         let auth = self.resolve_auth(ctx).await?;
-        let messages = messages_from(req);
+        let messages = messages_from(req, true);
         let typed = build_request(req, deployment, &messages, true);
         let body = prepare_outbound_body(
             &typed,

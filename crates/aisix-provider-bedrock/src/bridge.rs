@@ -1099,7 +1099,7 @@ fn build_converse_inputs(
             )?);
         }
         match msg.role {
-            Role::System => {
+            Role::System | Role::Developer => {
                 let content = msg.content_str();
                 if !content.is_empty() {
                     systems.push(SystemContentBlock::Text(content.to_string()));

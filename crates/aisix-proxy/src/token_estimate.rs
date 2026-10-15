@@ -241,7 +241,7 @@ fn count_chat_prompt(bpe: &CoreBPE, req: &aisix_gateway::chat::ChatFormat) -> u3
     let mut has_system = false;
     for m in &req.messages {
         let role = role_label(&m.role);
-        if role == "system" {
+        if m.role.is_system() {
             has_system = true;
         }
         n = n.saturating_add(TOKENS_PER_MESSAGE);
@@ -283,6 +283,7 @@ fn count_chat_prompt(bpe: &CoreBPE, req: &aisix_gateway::chat::ChatFormat) -> u3
 fn role_label(role: &aisix_gateway::chat::Role) -> &'static str {
     match role {
         aisix_gateway::chat::Role::System => "system",
+        aisix_gateway::chat::Role::Developer => "developer",
         aisix_gateway::chat::Role::User => "user",
         aisix_gateway::chat::Role::Assistant => "assistant",
         aisix_gateway::chat::Role::Tool => "tool",

@@ -515,7 +515,7 @@ pub fn split_system<'a>(
 
     for m in &req.messages {
         match m.role {
-            Role::System => {
+            Role::System | Role::Developer => {
                 if seen_non_system {
                     // System messages interleaved with user/assistant
                     // turns don't map cleanly; append as a user turn to
@@ -2585,6 +2585,30 @@ mod tests {
             system,
             Some(AnthropicSystem::Text(
                 "you are helpful\n\nrespond concisely".into()
+            ))
+        );
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "user");
+    }
+
+    #[test]
+    fn split_system_takes_developer_messages_as_system() {
+        // OpenAI's `developer` role carries system instructions; Anthropic has
+        // only the top-level `system` field for them.
+        let req: ChatFormat = serde_json::from_value(serde_json::json!({
+            "model": "claude",
+            "messages": [
+                {"role": "developer", "content": "Answer in French."},
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "hi"},
+            ],
+        }))
+        .unwrap();
+        let (system, msgs) = split_system(&req).unwrap();
+        assert_eq!(
+            system,
+            Some(AnthropicSystem::Text(
+                "Answer in French.\n\nBe brief.".into()
             ))
         );
         assert_eq!(msgs.len(), 1);

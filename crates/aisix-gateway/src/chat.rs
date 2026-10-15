@@ -22,9 +22,21 @@ use serde_json::Value;
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     System,
+    /// OpenAI's name for system instructions on o1 and newer models
+    /// (<https://platform.openai.com/docs/api-reference/chat/create>). Kept
+    /// apart from [`Role::System`] so an OpenAI upstream receives what the
+    /// caller sent; every other upstream treats it as a system message.
+    Developer,
     User,
     Assistant,
     Tool,
+}
+
+impl Role {
+    /// System instructions under either name.
+    pub fn is_system(self) -> bool {
+        matches!(self, Role::System | Role::Developer)
+    }
 }
 
 /// One element of the OpenAI-shape `messages` array.
@@ -623,6 +635,18 @@ pub struct EmbeddingUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn developer_role_parses_and_counts_as_system() {
+        let m: ChatMessage =
+            serde_json::from_value(serde_json::json!({"role": "developer", "content": "x"}))
+                .unwrap();
+        assert_eq!(m.role, Role::Developer);
+        assert!(m.role.is_system());
+        assert_eq!(serde_json::to_value(m.role).unwrap(), "developer");
+        assert!(Role::System.is_system());
+        assert!(!Role::User.is_system());
+    }
 
     #[test]
     fn chat_format_round_trips_through_json() {
