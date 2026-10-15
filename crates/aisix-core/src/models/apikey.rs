@@ -78,8 +78,8 @@ pub struct ApiKey {
     pub jwt_provider: Option<String>,
 
     /// MCP tools this key may call, as namespaced `<server>__<tool>` names
-    /// (the form the gateway exposes). Entries are matched as single-`*`
-    /// globs, mirroring `allowed_models`: `"*"` grants every tool and
+    /// (the form the gateway exposes). Entries are matched as `*` globs,
+    /// mirroring `allowed_models`: `"*"` grants every tool and
     /// `"<server>__*"` grants every tool on one server (e.g. `"github__*"`);
     /// an entry without a `*` matches one tool exactly. When omitted, set to
     /// `null`, or set to an empty list, the key has no MCP tool access —
@@ -108,7 +108,7 @@ pub struct ApiKey {
     pub mcp_rate_limits: Option<BTreeMap<String, McpRateLimit>>,
 
     /// A2A agents this key may reach, named by their registered names. Entries
-    /// are matched as single-`*` globs, mirroring `allowed_tools`: `"*"` grants
+    /// are matched as `*` globs, mirroring `allowed_tools`: `"*"` grants
     /// every agent and an entry without a `*` matches one agent exactly. When
     /// omitted, set to `null`, or set to an empty list, the key has no A2A
     /// agent access — access is granted explicitly.
@@ -116,7 +116,7 @@ pub struct ApiKey {
     pub allowed_agents: Option<Vec<String>>,
 
     /// Passthrough routes this key may use, named by their registered names.
-    /// Entries are matched as single-`*` globs, mirroring `allowed_tools`:
+    /// Entries are matched as `*` globs, mirroring `allowed_tools`:
     /// `"*"` grants every route and an entry without a `*` matches one route
     /// exactly. When omitted, set to `null`, or set to an empty list, the key
     /// may use no passthrough route — access is granted explicitly.
@@ -164,7 +164,7 @@ impl ApiKey {
 
     /// True if this key is allowed to call the given Model.
     ///
-    /// Entries are matched as single-`*` globs, so `"*"` grants every model and
+    /// Entries are matched as `*` globs, so `"*"` grants every model and
     /// `"openai/*"` grants every `openai/*` name (pairing with wildcard Models);
     /// entries without a `*` match exactly. An empty `allowed_models` list denies
     /// everything (spec §3 authz rule).
@@ -177,7 +177,7 @@ impl ApiKey {
     /// True if this key may call the given MCP tool, named in the gateway's
     /// namespaced `<server>__<tool>` form.
     ///
-    /// Entries are matched as single-`*` globs, so `"*"` grants every tool and
+    /// Entries are matched as `*` globs, so `"*"` grants every tool and
     /// `"<server>__*"` grants every tool on that server (e.g. `"github__*"`
     /// permits `github__create_issue`); entries without a `*` match exactly.
     /// A key with no `allowed_tools` (or an empty list) may call no MCP tools —
@@ -208,7 +208,7 @@ impl ApiKey {
     /// True if this key may reach the given A2A agent, named by its registered
     /// name.
     ///
-    /// Semantics mirror [`ApiKey::can_access_tool`]: entries are single-`*`
+    /// Semantics mirror [`ApiKey::can_access_tool`]: entries are `*`
     /// globs, so `"*"` grants every agent; entries without a `*` match exactly.
     /// A key with no `allowed_agents` (or an empty list) may reach no A2A agent
     /// — access is granted explicitly.
@@ -224,7 +224,7 @@ impl ApiKey {
     /// True if this key may use the given passthrough route, named by its
     /// registered name.
     ///
-    /// Semantics mirror [`ApiKey::can_access_agent`]: entries are single-`*`
+    /// Semantics mirror [`ApiKey::can_access_agent`]: entries are `*`
     /// globs, so `"*"` grants every route; entries without a `*` match
     /// exactly. A key with no `allowed_routes` (or an empty list) may use no
     /// passthrough route — access is granted explicitly.
@@ -379,7 +379,7 @@ mod tests {
         assert!(!per_server.can_access_tool("slack__post_message"));
         assert!(!per_server.can_access_tool("githubenterprise__create_issue"));
 
-        // The glob is a single `*` anywhere, not only trailing (same as
+        // A `*` may sit anywhere, not only trailing (same as
         // `allowed_models`): `"*__readonly"` is a genuine any-server grant of
         // a same-named tool. Pinned so the breadth stays intentional.
         let any_server: ApiKey = serde_json::from_str(

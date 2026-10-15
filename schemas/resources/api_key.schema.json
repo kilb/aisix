@@ -7,14 +7,14 @@
       "description": "Policy-driven MCP access configuration on an API key. When present, this block supersedes the key's `allowed_tools` list: the allow side of the key's effective grant is computed from the applicable MCP access policies and `mode`, and `allowed_tools` is not consulted.",
       "properties": {
         "allow": {
-          "description": "Namespaced `<server>__<tool>` patterns intersected with the inherited grant when `mode` is `restrict`, using the same single-`*` glob matching as `allowed_tools`. Ignored for the other modes.",
+          "description": "Namespaced `<server>__<tool>` patterns intersected with the inherited grant when `mode` is `restrict`, using the same `*` glob matching as `allowed_tools`. Ignored for the other modes.",
           "items": {
             "type": "string"
           },
           "type": "array"
         },
         "deny": {
-          "description": "Namespaced `<server>__<tool>` patterns subtracted from the key's effective grant, using the same single-`*` glob matching as `allow`.",
+          "description": "Namespaced `<server>__<tool>` patterns subtracted from the key's effective grant, using the same `*` glob matching as `allow`.",
           "items": {
             "type": "string"
           },
@@ -193,7 +193,7 @@
   },
   "properties": {
     "allowed_agents": {
-      "description": "A2A agents this key may reach, named by their registered names. Entries are matched as single-`*` globs, mirroring `allowed_tools`: `\"*\"` grants every agent and an entry without a `*` matches one agent exactly. When omitted, set to `null`, or set to an empty list, the key has no A2A agent access — access is granted explicitly.",
+      "description": "A2A agents this key may reach, named by their registered names. Entries are matched as `*` globs, mirroring `allowed_tools`: `\"*\"` grants every agent and an entry without a `*` matches one agent exactly. When omitted, set to `null`, or set to an empty list, the key has no A2A agent access — access is granted explicitly.",
       "items": {
         "type": "string"
       },
@@ -210,7 +210,7 @@
       "type": "array"
     },
     "allowed_routes": {
-      "description": "Passthrough routes this key may use, named by their registered names. Entries are matched as single-`*` globs, mirroring `allowed_tools`: `\"*\"` grants every route and an entry without a `*` matches one route exactly. When omitted, set to `null`, or set to an empty list, the key may use no passthrough route — access is granted explicitly.",
+      "description": "Passthrough routes this key may use, named by their registered names. Entries are matched as `*` globs, mirroring `allowed_tools`: `\"*\"` grants every route and an entry without a `*` matches one route exactly. When omitted, set to `null`, or set to an empty list, the key may use no passthrough route — access is granted explicitly.",
       "items": {
         "type": "string"
       },
@@ -220,7 +220,7 @@
       ]
     },
     "allowed_tools": {
-      "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names (the form the gateway exposes). Entries are matched as single-`*` globs, mirroring `allowed_models`: `\"*\"` grants every tool and `\"<server>__*\"` grants every tool on one server (e.g. `\"github__*\"`); an entry without a `*` matches one tool exactly. When omitted, set to `null`, or set to an empty list, the key has no MCP tool access — access is granted explicitly.",
+      "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names (the form the gateway exposes). Entries are matched as `*` globs, mirroring `allowed_models`: `\"*\"` grants every tool and `\"<server>__*\"` grants every tool on one server (e.g. `\"github__*\"`); an entry without a `*` matches one tool exactly. When omitted, set to `null`, or set to an empty list, the key has no MCP tool access — access is granted explicitly.",
       "items": {
         "type": "string"
       },

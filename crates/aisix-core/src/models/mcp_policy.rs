@@ -62,7 +62,7 @@ pub struct McpPolicy {
     pub mode: McpPolicyMode,
 
     /// Namespaced `<server>__<tool>` patterns granted when `mode` is
-    /// `selected`. Entries are matched as single-`*` globs, the same form as
+    /// `selected`. Entries are matched as `*` globs, the same form as
     /// an API key's `allowed_tools`: `"<server>__*"` grants every tool on one
     /// server and an entry without a `*` matches one tool exactly. Ignored
     /// for the other modes.
@@ -70,8 +70,8 @@ pub struct McpPolicy {
     pub allow: Vec<String>,
 
     /// Namespaced `<server>__<tool>` patterns subtracted from the effective
-    /// grant of every key the policy applies to, using the same single-`*`
-    /// glob matching as `allow`. Deny always wins: a tool matched here stays
+    /// grant of every key the policy applies to, using the same `*` glob
+    /// matching as `allow`. Deny always wins: a tool matched here stays
     /// unavailable even when a team policy or a key's own configuration
     /// would otherwise grant it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -119,13 +119,13 @@ pub struct McpAccess {
     pub mode: McpAccessMode,
 
     /// Namespaced `<server>__<tool>` patterns intersected with the inherited
-    /// grant when `mode` is `restrict`, using the same single-`*` glob
-    /// matching as `allowed_tools`. Ignored for the other modes.
+    /// grant when `mode` is `restrict`, using the same `*` glob matching
+    /// as `allowed_tools`. Ignored for the other modes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
 
     /// Namespaced `<server>__<tool>` patterns subtracted from the key's
-    /// effective grant, using the same single-`*` glob matching as `allow`.
+    /// effective grant, using the same `*` glob matching as `allow`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
 }

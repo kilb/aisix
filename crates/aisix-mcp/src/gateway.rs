@@ -113,7 +113,7 @@ pub struct ToolAcl {
 enum AllowLayer {
     /// The layer admits every tool.
     All,
-    /// The layer admits tools matching any of these single-`*` glob patterns.
+    /// The layer admits tools matching any of these `*` glob patterns.
     Patterns(Vec<String>),
 }
 
@@ -152,7 +152,7 @@ impl ToolAcl {
     /// Build a legacy ACL from an API key's `allowed_tools` list alone:
     /// `None` or an empty list grants no tools; a list containing `"*"`
     /// grants all; otherwise the listed patterns. Entries are matched as
-    /// single-`*` globs (see [`ToolAcl::permits`]), mirroring
+    /// `*` globs (see [`ToolAcl::permits`]), mirroring
     /// `ApiKey::can_access_tool`. Policy deny overlays are NOT applied here —
     /// any caller serving external traffic uses [`ToolAcl::resolve`].
     pub fn from_allowed(allowed: Option<&[String]>) -> Self {
@@ -243,7 +243,7 @@ impl ToolAcl {
     }
 
     /// Whether `namespaced_tool` is permitted: every allow layer must admit
-    /// it and no deny pattern may match it. Patterns are single-`*` globs:
+    /// it and no deny pattern may match it. Patterns are `*` globs:
     /// `"<server>__*"` covers every tool on that server, a pattern without a
     /// `*` matches exactly, and a bare `"*"` covers everything. Uses the same
     /// matcher as `ApiKey::can_access_tool`.

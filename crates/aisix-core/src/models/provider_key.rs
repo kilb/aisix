@@ -259,7 +259,7 @@ pub struct RequestOverrides {
     pub default_headers: HashMap<String, String>,
 
     /// Inbound client headers forwarded to the upstream provider, as
-    /// single-`*` glob patterns matched case-insensitively against the
+    /// `*` glob patterns matched case-insensitively against the
     /// header name (`"anthropic-beta"`, `"x-trace-*"`). Empty — the
     /// default — forwards nothing, which is the behavior of every
     /// standard-protocol endpoint before #1167. Auth,

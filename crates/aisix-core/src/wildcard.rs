@@ -1,11 +1,14 @@
-//! Single-`*` wildcard matching, shared by API-key model allowlists
-//! ([`crate::models::ApiKey::can_access`]) and the proxy's wildcard model
-//! resolution (`provider/*` aliases).
+//! `*` wildcard matching, shared by the access lists (API-key
+//! `allowed_models` / `allowed_tools` / `allowed_agents` / `allowed_routes`,
+//! MCP policy allow and deny, forwarded client headers) and the proxy's
+//! wildcard model resolution (`provider/*` aliases).
 //!
-//! Only one `*` per pattern is supported — enough for the common
-//! `provider/*` / `prefix-*-suffix` shapes and avoids pulling a regex engine
-//! into the hot path. The literals on either side of the `*` anchor the
-//! candidate at both ends, so a pattern matches the *whole* name.
+//! [`wildcard_matches`] accepts any number of `*`, each matching any run of
+//! characters (including none). [`wildcard_capture`] binds the text a `*`
+//! stood for, which only has one answer with a single `*`, so it supports
+//! exactly one. Neither pulls a regex engine into the hot path. The literal
+//! text before the first `*` and after the last anchors the candidate at both
+//! ends, so a pattern matches the *whole* name.
 
 /// Match `candidate` against a `*`-glob `pattern` that contains **exactly one**
 /// `*`, returning the substring bound to the `*` on success.
@@ -31,25 +34,39 @@ pub fn wildcard_capture(pattern: &str, candidate: &str) -> Option<String> {
     }
 }
 
-/// Whether `pattern` matches `candidate`. A pattern with a single `*` is
-/// glob-matched; any other pattern matches only an exactly-equal candidate.
+/// Whether `pattern` matches `candidate`. Each `*` matches any run of
+/// characters, including none; a pattern without a `*` matches only an
+/// exactly-equal candidate.
 ///
-/// Same decision as `wildcard_capture(..).is_some()` but without
-/// materialising the capture — this runs on the per-request authz path,
-/// where a bare `"*"` allowlist entry would otherwise copy the whole
-/// candidate just to discard it.
+/// Every `*` must be honoured: these patterns guard deny lists too, and a
+/// pattern that silently matched nothing there would let through exactly
+/// what it was written to block (`"*delete*"`).
+///
+/// For a single `*` this is the same decision as
+/// `wildcard_capture(..).is_some()`, but it runs on the per-request authz
+/// path and never allocates.
 pub fn wildcard_matches(pattern: &str, candidate: &str) -> bool {
-    let Some(star) = pattern.find('*') else {
+    let Some((head, tail)) = pattern.split_once('*') else {
         return pattern == candidate;
     };
-    if pattern[star + 1..].contains('*') {
-        return false; // only a single '*' is supported
+    let (middle, last) = tail.rsplit_once('*').unwrap_or(("", tail));
+    // Strip the leading literal, then the trailing one from what is left,
+    // so the two can never overlap.
+    let Some(rest) = candidate.strip_prefix(head) else {
+        return false;
+    };
+    let Some(mut rest) = rest.strip_suffix(last) else {
+        return false;
+    };
+    // Take each inner literal at its leftmost occurrence, in order: with
+    // `*` as the only wildcard, leftmost never rules out a match.
+    for part in middle.split('*').filter(|p| !p.is_empty()) {
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
     }
-    let prefix = &pattern[..star];
-    let suffix = &pattern[star + 1..];
-    candidate.len() >= prefix.len() + suffix.len()
-        && candidate.starts_with(prefix)
-        && candidate.ends_with(suffix)
+    true
 }
 
 #[cfg(test)]
@@ -93,11 +110,12 @@ mod tests {
         assert_eq!(wildcard_capture("a/*/*", "a/b/c"), None);
     }
 
-    /// Differential oracle: `wildcard_matches` must agree with
-    /// `wildcard_capture(..).is_some()` for every pattern shape — the
-    /// two are duplicate decision procedures guarding the authz
-    /// allowlists, and a future edit to either must not let them
-    /// diverge silently.
+    /// Differential oracle: for patterns with at most one `*`,
+    /// `wildcard_matches` must agree with `wildcard_capture(..).is_some()` —
+    /// the two are duplicate decision procedures guarding the authz
+    /// allowlists, and a future edit to either must not let them diverge
+    /// silently. Patterns with more `*` are checked against a regex below;
+    /// `wildcard_capture` deliberately does not support them.
     #[test]
     fn matches_agrees_with_capture_oracle() {
         let pats = [
@@ -106,8 +124,6 @@ mod tests {
             "*-sfx",
             "gpt-*-preview",
             "aa*aa",
-            "a/*/*",
-            "**",
             "lit",
             "",
         ];
@@ -133,6 +149,63 @@ mod tests {
                 assert_eq!(wildcard_matches(p, c), expected, "p={p:?} c={c:?}");
             }
         }
+    }
+
+    /// Differential oracle for any number of `*`: the pattern compiled to an
+    /// anchored regex where each `*` is `.*` and everything else is literal.
+    #[test]
+    fn matches_agrees_with_regex_oracle() {
+        let pats = [
+            "*", "**", "***", "a/*/*", "*delete*", "*__*cho", "a*b*c", "a*a*a", "*a*", "aa*aa",
+            "*-*-*", "gpt-*-*", "x*", "*x", "lit", "", "*é*",
+        ];
+        let cands = [
+            "",
+            "a",
+            "aa",
+            "aaa",
+            "aaaa",
+            "abc",
+            "aXbYc",
+            "acb",
+            "a/b/c",
+            "a/b",
+            "github__delete_repo",
+            "delete",
+            "deletx",
+            "alpha__echo",
+            "alpha__reverse",
+            "gpt-4o-mini",
+            "gpt-4o",
+            "x",
+            "café",
+            "lit",
+        ];
+        for p in pats {
+            let re = regex::Regex::new(&format!(
+                "^(?s){}$",
+                p.split('*')
+                    .map(regex::escape)
+                    .collect::<Vec<_>>()
+                    .join(".*")
+            ))
+            .unwrap();
+            for c in cands {
+                assert_eq!(wildcard_matches(p, c), re.is_match(c), "p={p:?} c={c:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn several_stars_match_as_written() {
+        assert!(wildcard_matches("*delete*", "github__delete_repo"));
+        assert!(wildcard_matches("*delete*", "delete"));
+        assert!(!wildcard_matches("*delete*", "github__create_repo"));
+        // The literal runs must appear in order and must not overlap.
+        assert!(wildcard_matches("a*b*c", "aXbYc"));
+        assert!(!wildcard_matches("a*b*c", "acb"));
+        assert!(!wildcard_matches("a*a*a", "aa"));
+        assert!(wildcard_matches("a*a*a", "aaa"));
     }
 
     #[test]

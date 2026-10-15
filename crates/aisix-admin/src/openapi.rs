@@ -1555,7 +1555,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "items": {
               "type": "string"
             },
-            "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names (the form the gateway exposes). Entries are matched as single-`*` globs, mirroring `allowed_models`: `\"*\"` grants every tool and `\"<server>__*\"` grants every tool on one server (e.g. `\"github__*\"`); an entry without a `*` matches one tool exactly. When omitted, set to `null`, or set to an empty list, the key has no MCP tool access \u2014 access is granted explicitly."
+            "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names (the form the gateway exposes). Entries are matched as `*` globs, mirroring `allowed_models`: `\"*\"` grants every tool and `\"<server>__*\"` grants every tool on one server (e.g. `\"github__*\"`); an entry without a `*` matches one tool exactly. When omitted, set to `null`, or set to an empty list, the key has no MCP tool access \u2014 access is granted explicitly."
           },
           "allowed_agents": {
             "type": [
@@ -1565,7 +1565,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "items": {
               "type": "string"
             },
-            "description": "A2A agents this key may reach, named by their registered names. Entries are matched as single-`*` globs: `\"*\"` grants every agent and an entry without a `*` matches one agent exactly. When omitted, set to `null`, or set to an empty list, the key has no A2A agent access \u2014 access is granted explicitly."
+            "description": "A2A agents this key may reach, named by their registered names. Entries are matched as `*` globs: `\"*\"` grants every agent and an entry without a `*` matches one agent exactly. When omitted, set to `null`, or set to an empty list, the key has no A2A agent access \u2014 access is granted explicitly."
           },
           "expires_at": {
             "type": [
