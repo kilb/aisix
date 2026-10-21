@@ -244,7 +244,9 @@ pub async fn image_generations(
 /// generation `prompt` so the input guardrail chain can scan it (#545).
 /// Never sent upstream.
 fn images_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat {
-    let messages = ["prompt", "user"]
+    // `user` ahead of the prompt, so the prompt stays last: a guardrail
+    // bounding how much it sends checks it first and in full.
+    let messages = ["user", "prompt"]
         .into_iter()
         .filter_map(|field| body.get(field).and_then(Value::as_str))
         .filter(|text| !text.is_empty())

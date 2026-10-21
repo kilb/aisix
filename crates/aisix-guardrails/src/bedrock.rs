@@ -564,7 +564,11 @@ impl Guardrail for BedrockGuardrail {
         true
     }
 
-    async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
+    async fn moderate_input_segments(
+        &self,
+        texts: &[String],
+        _newest_from: Option<usize>,
+    ) -> SegmentsOutcome {
         if !matches!(
             self.hook_point,
             GuardrailHookPoint::Input | GuardrailHookPoint::Both
@@ -1421,7 +1425,7 @@ mod tests {
     async fn output_only_row_skips_input_segments() {
         let mut g = build_test(true);
         g.hook_point = GuardrailHookPoint::Output;
-        let outcome = g.moderate_input_segments(&["hello".to_owned()]).await;
+        let outcome = g.moderate_input_segments(&["hello".to_owned()], None).await;
         assert_eq!(outcome, SegmentsOutcome::allow());
     }
 }

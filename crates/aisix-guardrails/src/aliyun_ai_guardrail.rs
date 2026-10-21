@@ -336,7 +336,12 @@ impl AliyunAiGuardrail {
     /// - `mask` with no usable `Desensitization` fails closed: the policy
     ///   said this content must not go out as-is, and there is nothing to
     ///   rewrite it with.
-    async fn moderate_segments(&self, texts: &[String], output: bool) -> SegmentsOutcome {
+    async fn moderate_segments(
+        &self,
+        texts: &[String],
+        newest_from: Option<usize>,
+        output: bool,
+    ) -> SegmentsOutcome {
         use futures::StreamExt as _;
         let service = service_code(&self.service_level, output);
         let fail_open = if output {
@@ -348,15 +353,17 @@ impl AliyunAiGuardrail {
         if joined.is_empty() {
             return SegmentsOutcome::allow();
         }
-        // The newest segment is checked in full; for an output, all of it.
-        let must_cover_from = if output {
-            0
+        // The newest message is checked in full; for an output, all of it.
+        // The walk says where that message begins; without it, the last
+        // non-empty segment stands in for it.
+        let newest = if output {
+            Some(0)
         } else {
-            texts
-                .iter()
-                .rposition(|t| !t.is_empty())
-                .map_or(0, |i| texts[..i].iter().map(|t| t.len() + 1).sum())
+            newest_from
+                .filter(|&i| i < texts.len())
+                .or_else(|| texts.iter().rposition(|t| !t.is_empty()))
         };
+        let must_cover_from = newest.map_or(0, |i| texts[..i].iter().map(|t| t.len() + 1).sum());
         let Some(ranges) = self.plan(service, &joined, must_cover_from) else {
             return SegmentsOutcome::from_verdict(self.too_long());
         };
@@ -449,149 +456,70 @@ impl AliyunAiGuardrail {
         single_call: bool,
         service: &str,
     ) -> SegmentsOutcome {
-        let mut counts: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+        let mut st = MaskPass::default();
         if let ([_], true) = (texts, single_call) {
             let (_, reply, diag) = flagged.into_iter().next().expect("flagged is not empty");
             return match reply.desensitization {
                 Some(masked) if !masked.is_empty() => {
-                    for label in &diag.labels {
-                        *counts.entry(label.clone()).or_insert(0) += 1;
-                    }
+                    st.count(&diag);
                     SegmentsOutcome {
                         verdict: GuardrailVerdict::Allow,
                         masked: Some(vec![masked]),
-                        counts,
+                        counts: st.counts,
                         monitor_hits: Vec::new(),
                     }
                 }
                 _ => self.mask_without_replacement(&diag),
             };
         }
-        let mut masked: Vec<String> = Vec::with_capacity(texts.len());
-        let mut rewrote_any = false;
-        let mut calls = 0usize;
+        let ranges: Vec<std::ops::Range<usize>> =
+            flagged.iter().map(|(r, _, _)| r.clone()).collect();
+        let reaches =
+            |r: &std::ops::Range<usize>| ranges.iter().any(|f| f.start < r.end && r.start < f.end);
+        let mut spans = Vec::with_capacity(texts.len());
         let mut offset = 0usize;
         for text in texts {
-            let span = offset..offset + text.len();
+            spans.push(offset..offset + text.len());
             offset += text.len() + 1;
-            let touched = !text.is_empty()
-                && flagged
-                    .iter()
-                    .any(|(f, _, _)| f.start < span.end && span.start < f.end);
-            if !touched {
-                masked.push(text.clone());
+        }
+        let touched: Vec<bool> = texts
+            .iter()
+            .zip(&spans)
+            .map(|(t, span)| !t.is_empty() && reaches(span))
+            .collect();
+        let short = |t: &String| t.chars().count() <= MAX_CONTENT_CHARS;
+
+        let mut out: Vec<Option<String>> = vec![None; texts.len()];
+        let mut i = 0;
+        while i < texts.len() {
+            if !touched[i] {
+                i += 1;
                 continue;
             }
-            let pieces = non_overlapping_pieces(text, MAX_CONTENT_CHARS);
-            // Only the pieces a flagged range reaches are re-checked: the
-            // rest of the segment either passed already or lies past the
-            // call budget, and nothing says it needs a mask.
-            let mut piece_start = span.start;
-            let recheck: Vec<bool> = pieces
-                .iter()
-                .map(|piece| {
-                    let range = piece_start..piece_start + piece.len();
-                    piece_start = range.end;
-                    flagged
-                        .iter()
-                        .any(|(f, _, _)| f.start < range.end && range.start < f.end)
-                })
-                .collect();
-            let mut rewritten: Vec<String> = Vec::new();
-            for (piece, &recheck) in pieces.iter().zip(&recheck) {
-                if !recheck {
-                    rewritten.push((*piece).to_owned());
-                    continue;
+            if !short(&texts[i]) {
+                match self
+                    .mask_long_segment(service, &texts[i], spans[i].start, &reaches, &mut st)
+                    .await
+                {
+                    Ok(rewritten) => out[i] = Some(rewritten),
+                    Err(outcome) => return outcome,
                 }
-                calls += 1;
-                if calls > MAX_CALLS_PER_CHECK {
-                    tracing::info!(
-                        row = %self.row_name,
-                        service,
-                        "aliyun AI guardrail: content too long to mask; blocking",
-                    );
-                    return SegmentsOutcome::from_verdict(self.too_long());
-                }
-                let (outcome, diag) = self.call(service, piece, None).await;
-                let reply = match outcome {
-                    Ok(r) => r,
-                    // This text was judged to need a mask; without the
-                    // rewrite it cannot go out, whatever `fail_open` says
-                    // (that is for text that could not be judged at all).
-                    Err(failure) => {
-                        return SegmentsOutcome::from_verdict(
-                            self.handle_failure(failure, &diag, false),
-                        )
-                    }
-                };
-                match reply.suggestion.as_str() {
-                    // A piece that blocks on its own kills the request —
-                    // strictest wins across the per-piece verdicts.
-                    "block" => {
-                        return SegmentsOutcome::from_verdict(GuardrailVerdict::block(format!(
-                            "aliyun AI guardrail: suggestion block (row: {})",
-                            self.row_name
-                        )))
-                    }
-                    "mask" => match reply.desensitization {
-                        Some(m) if !m.is_empty() => {
-                            for label in &diag.labels {
-                                *counts.entry(label.clone()).or_insert(0) += 1;
-                            }
-                            rewritten.push(m);
-                            rewrote_any = true;
-                        }
-                        _ => return self.mask_without_replacement(&diag),
-                    },
-                    _ => rewritten.push((*piece).to_owned()),
-                }
+                i += 1;
+                continue;
             }
-            // A span cut in two passes as two harmless halves, even when
-            // another piece of the segment was masked. Check the rewritten
-            // text across every cut; whatever still needs masking there
-            // cannot be rewritten piecewise, so it fails closed.
-            for (i, pair) in rewritten.windows(2).enumerate() {
-                // A cut between two pieces neither of which was re-checked
-                // lies outside every flagged range.
-                if !(recheck[i] || recheck[i + 1]) {
-                    continue;
-                }
-                calls += 1;
-                if calls > MAX_CALLS_PER_CHECK {
-                    return SegmentsOutcome::from_verdict(self.too_long());
-                }
-                let seam = format!(
-                    "{}{}",
-                    last_chars(&pair[0], MAX_CONTENT_CHARS / 2),
-                    first_chars(&pair[1], MAX_CONTENT_CHARS / 2)
-                );
-                let (outcome, diag) = self.call(service, &seam, None).await;
-                let reply = match outcome {
-                    Ok(r) => r,
-                    // As above: the region around this cut was judged.
-                    Err(failure) => {
-                        return SegmentsOutcome::from_verdict(
-                            self.handle_failure(failure, &diag, false),
-                        )
-                    }
-                };
-                if matches!(reply.suggestion.as_str(), "block" | "mask") {
-                    tracing::info!(
-                        row = %self.row_name,
-                        service,
-                        aliyun_request_id = %diag.request_id,
-                        aliyun_labels = %diag.labels_field(),
-                        "aliyun AI guardrail: content needing a mask spans a cut; blocking",
-                    );
-                    return SegmentsOutcome::from_verdict(GuardrailVerdict::block(format!(
-                        "aliyun AI guardrail: content requires masking (row: {})",
-                        self.row_name
-                    )));
-                }
+            // A run of consecutive short segments a flagged range reaches.
+            let run_start = i;
+            while i < texts.len() && touched[i] && short(&texts[i]) {
+                i += 1;
             }
-            masked.push(rewritten.concat());
+            if let Err(outcome) = self
+                .mask_group(service, texts, run_start..i, false, &mut out, &mut st)
+                .await
+            {
+                return outcome;
+            }
         }
-        if !rewrote_any {
+        if !st.rewrote_any {
             // Only a piece spanning a cut saw what needs masking; no
             // non-overlapping piece can be rewritten to remove it.
             let (_, _, diag) = &flagged[0];
@@ -599,10 +527,205 @@ impl AliyunAiGuardrail {
         }
         SegmentsOutcome {
             verdict: GuardrailVerdict::Allow,
-            masked: Some(masked),
-            counts,
+            masked: Some(
+                out.into_iter()
+                    .zip(texts)
+                    .map(|(m, t)| m.unwrap_or_else(|| t.clone()))
+                    .collect(),
+            ),
+            counts: st.counts,
             monitor_hits: Vec::new(),
         }
+    }
+
+    /// One mask-pass call. `Ok(None)` = passes as written, `Ok(Some(text))`
+    /// = its rewrite; `Err` ends the pass with that outcome. A failure fails
+    /// closed whatever `fail_open` says: this text was judged to need a
+    /// mask, and `fail_open` is for text that could not be judged at all.
+    async fn mask_call(
+        &self,
+        service: &str,
+        content: &str,
+        st: &mut MaskPass,
+    ) -> Result<Option<String>, SegmentsOutcome> {
+        st.calls += 1;
+        if st.calls > MAX_CALLS_PER_CHECK {
+            tracing::info!(
+                row = %self.row_name,
+                service,
+                "aliyun AI guardrail: content too long to mask; blocking",
+            );
+            return Err(SegmentsOutcome::from_verdict(self.too_long()));
+        }
+        let (outcome, diag) = self.call(service, content, None).await;
+        let reply = outcome.map_err(|failure| {
+            SegmentsOutcome::from_verdict(self.handle_failure(failure, &diag, false))
+        })?;
+        match reply.suggestion.as_str() {
+            // Strictest wins across the per-call verdicts.
+            "block" => Err(SegmentsOutcome::from_verdict(GuardrailVerdict::block(
+                format!(
+                    "aliyun AI guardrail: suggestion block (row: {})",
+                    self.row_name
+                ),
+            ))),
+            "mask" => match reply.desensitization {
+                Some(m) if !m.is_empty() => {
+                    st.count(&diag);
+                    st.rewrote_any = true;
+                    Ok(Some(m))
+                }
+                _ => Err(self.mask_without_replacement(&diag)),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    /// Mask a run of short segments by halving: a group that passes as one
+    /// call keeps its text; a flagged group splits; a single segment takes
+    /// its own rewrite. About two calls per masked segment per halving
+    /// level, instead of one call for every segment the flag reached.
+    /// `flagged` = this group is already known to need a mask. Returns how
+    /// many segments it rewrote.
+    fn mask_group<'a>(
+        &'a self,
+        service: &'a str,
+        texts: &'a [String],
+        group: std::ops::Range<usize>,
+        flagged: bool,
+        out: &'a mut [Option<String>],
+        st: &'a mut MaskPass,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<usize, SegmentsOutcome>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            if group.len() == 1 {
+                let i = group.start;
+                return match self.mask_call(service, &texts[i], st).await? {
+                    Some(m) => {
+                        out[i] = Some(m);
+                        Ok(1)
+                    }
+                    None => Ok(0),
+                };
+            }
+            let joined = texts[group.clone()].join("\n");
+            if !flagged && joined.chars().count() <= MAX_CONTENT_CHARS {
+                // One call answers for the whole group; only a mask splits it.
+                let (outcome, diag) = {
+                    st.calls += 1;
+                    if st.calls > MAX_CALLS_PER_CHECK {
+                        return Err(SegmentsOutcome::from_verdict(self.too_long()));
+                    }
+                    self.call(service, &joined, None).await
+                };
+                let reply = outcome.map_err(|failure| {
+                    SegmentsOutcome::from_verdict(self.handle_failure(failure, &diag, false))
+                })?;
+                match reply.suggestion.as_str() {
+                    "block" => {
+                        return Err(SegmentsOutcome::from_verdict(GuardrailVerdict::block(
+                            format!(
+                                "aliyun AI guardrail: suggestion block (row: {})",
+                                self.row_name
+                            ),
+                        )))
+                    }
+                    "mask" => {}
+                    _ => return Ok(0),
+                }
+            }
+            let mid = group.start + group.len() / 2;
+            let left = self
+                .mask_group(service, texts, group.start..mid, false, out, st)
+                .await?;
+            let right = self
+                .mask_group(service, texts, mid..group.end, false, out, st)
+                .await?;
+            if left + right == 0 && (flagged || joined.chars().count() <= MAX_CONTENT_CHARS) {
+                // The group needs a mask but no part of it alone does: what
+                // it flags spans segments, and no segment's rewrite removes it.
+                return Err(SegmentsOutcome::from_verdict(GuardrailVerdict::block(
+                    format!(
+                        "aliyun AI guardrail: content requires masking (row: {})",
+                        self.row_name
+                    ),
+                )));
+            }
+            Ok(left + right)
+        })
+    }
+
+    /// Mask one segment longer than a call holds: cut it into
+    /// non-overlapping pieces, re-check the pieces a flagged range reaches,
+    /// then check the rewritten text across each cut those pieces touch —
+    /// a span cut in two passes as two harmless halves.
+    async fn mask_long_segment(
+        &self,
+        service: &str,
+        text: &str,
+        span_start: usize,
+        reaches: &(dyn Fn(&std::ops::Range<usize>) -> bool + Sync),
+        st: &mut MaskPass,
+    ) -> Result<String, SegmentsOutcome> {
+        let pieces = non_overlapping_pieces(text, MAX_CONTENT_CHARS);
+        // Only the pieces a flagged range reaches are re-checked: the rest of
+        // the segment either passed already or lies past the call budget,
+        // and nothing says it needs a mask.
+        let mut piece_start = span_start;
+        let recheck: Vec<bool> = pieces
+            .iter()
+            .map(|piece| {
+                let range = piece_start..piece_start + piece.len();
+                piece_start = range.end;
+                reaches(&range)
+            })
+            .collect();
+        let mut rewritten: Vec<String> = Vec::with_capacity(pieces.len());
+        for (piece, &recheck) in pieces.iter().zip(&recheck) {
+            let text = if recheck {
+                self.mask_call(service, piece, st).await?
+            } else {
+                None
+            };
+            rewritten.push(text.unwrap_or_else(|| (*piece).to_owned()));
+        }
+        for (i, pair) in rewritten.windows(2).enumerate() {
+            // A cut between two pieces neither of which was re-checked lies
+            // outside every flagged range.
+            if !(recheck[i] || recheck[i + 1]) {
+                continue;
+            }
+            let seam = format!(
+                "{}{}",
+                last_chars(&pair[0], MAX_CONTENT_CHARS / 2),
+                first_chars(&pair[1], MAX_CONTENT_CHARS / 2)
+            );
+            st.calls += 1;
+            if st.calls > MAX_CALLS_PER_CHECK {
+                return Err(SegmentsOutcome::from_verdict(self.too_long()));
+            }
+            let (outcome, diag) = self.call(service, &seam, None).await;
+            let reply = outcome.map_err(|failure| {
+                SegmentsOutcome::from_verdict(self.handle_failure(failure, &diag, false))
+            })?;
+            if matches!(reply.suggestion.as_str(), "block" | "mask") {
+                tracing::info!(
+                    row = %self.row_name,
+                    service,
+                    aliyun_request_id = %diag.request_id,
+                    aliyun_labels = %diag.labels_field(),
+                    "aliyun AI guardrail: content needing a mask spans a cut; blocking",
+                );
+                return Err(SegmentsOutcome::from_verdict(GuardrailVerdict::block(
+                    format!(
+                        "aliyun AI guardrail: content requires masking (row: {})",
+                        self.row_name
+                    ),
+                )));
+            }
+        }
+        Ok(rewritten.concat())
     }
 
     /// `mask` suggested but no `Ext.Desensitization` came back: there is
@@ -842,6 +965,23 @@ struct CallReply {
     /// The desensitized full text of the submitted `content`, when
     /// Aliyun provided one.
     desensitization: Option<String>,
+}
+
+/// Running state of one mask pass: calls made, labels counted, whether
+/// anything was rewritten.
+#[derive(Default)]
+struct MaskPass {
+    calls: usize,
+    counts: std::collections::BTreeMap<String, u32>,
+    rewrote_any: bool,
+}
+
+impl MaskPass {
+    fn count(&mut self, diag: &AigDiagnostics) {
+        for label in &diag.labels {
+            *self.counts.entry(label.clone()).or_insert(0) += 1;
+        }
+    }
 }
 
 /// The last `n` chars of `s`.
@@ -1188,14 +1328,18 @@ impl Guardrail for AliyunAiGuardrail {
         true
     }
 
-    async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
+    async fn moderate_input_segments(
+        &self,
+        texts: &[String],
+        newest_from: Option<usize>,
+    ) -> SegmentsOutcome {
         if !matches!(
             self.hook_point,
             GuardrailHookPoint::Input | GuardrailHookPoint::Both
         ) {
             return SegmentsOutcome::allow();
         }
-        self.moderate_segments(texts, false).await
+        self.moderate_segments(texts, newest_from, false).await
     }
 
     async fn moderate_output_segments(&self, texts: &[String]) -> SegmentsOutcome {
@@ -1205,7 +1349,7 @@ impl Guardrail for AliyunAiGuardrail {
         ) {
             return SegmentsOutcome::allow();
         }
-        self.moderate_segments(texts, true).await
+        self.moderate_segments(texts, None, true).await
     }
 }
 
@@ -1330,7 +1474,9 @@ mod tests {
             .await;
         let g = build(&server.uri(), true);
         assert_eq!(g.check_input(&req("x")).await, GuardrailVerdict::Allow);
-        let seg = g.moderate_input_segments(&["watch this".to_owned()]).await;
+        let seg = g
+            .moderate_input_segments(&["watch this".to_owned()], None)
+            .await;
         assert_eq!(seg.verdict, GuardrailVerdict::Allow);
         assert!(seg.masked.is_none(), "watch must not rewrite anything");
     }
@@ -1440,7 +1586,7 @@ mod tests {
             "phone phonemask here".to_owned(),
             "regards".to_owned(),
         ];
-        let seg = g.moderate_input_segments(&texts).await;
+        let seg = g.moderate_input_segments(&texts, None).await;
         assert_eq!(seg.verdict, GuardrailVerdict::Allow);
         assert_eq!(
             seg.masked,
@@ -1497,7 +1643,7 @@ mod tests {
         text.push_str(&"b".repeat(MAX_CONTENT_CHARS - 5 - text.len()));
         text.push_str(PHONE);
         text.push_str(&"c".repeat(2_500));
-        let seg = g.moderate_input_segments(&[text]).await;
+        let seg = g.moderate_input_segments(&[text], None).await;
         match seg.verdict {
             GuardrailVerdict::Allow => {
                 let masked = seg.masked.expect("a mask verdict rewrites");
@@ -1540,7 +1686,7 @@ mod tests {
         // The failing `z` stretch lies far from the number: the mask pass
         // never needs it.
         let text = format!("{}{}{PHONE} end", "z".repeat(3_000), "a".repeat(4_000));
-        let seg = g.moderate_input_segments(&[text]).await;
+        let seg = g.moderate_input_segments(&[text], None).await;
         assert!(seg.verdict.is_bypass(), "got {:?}", seg.verdict);
         assert!(!seg.masked.expect("rewritten")[0].contains(PHONE));
     }
@@ -1570,9 +1716,41 @@ mod tests {
             .await;
         let g = build(&server.uri(), true);
         let texts = vec![format!("call {PHONE}"), format!("or {PHONE}")];
-        let seg = g.moderate_input_segments(&texts).await;
+        let seg = g.moderate_input_segments(&texts, None).await;
         assert!(seg.verdict.is_block(), "got {:?}", seg.verdict);
         assert!(seg.masked.is_none());
+    }
+
+    #[tokio::test]
+    async fn one_number_in_an_ordinary_chat_is_masked_not_blocked() {
+        // Twenty short messages (a system prompt and a normal back-and-forth)
+        // fit one check call, so a flag reaches all of them. Re-checking each
+        // one separately would spend twenty calls on one number and refuse
+        // the request as too long.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(PhoneMasker)
+            .mount(&server)
+            .await;
+        let g = build(&server.uri(), true);
+        let mut texts: Vec<String> = (0..20)
+            .map(|i| format!("turn {i}: nothing to see"))
+            .collect();
+        texts[13] = format!("my number is {PHONE}");
+        let seg = g.moderate_input_segments(&texts, None).await;
+        assert_eq!(
+            seg.verdict,
+            GuardrailVerdict::Allow,
+            "got {:?}",
+            seg.verdict
+        );
+        let masked = seg.masked.expect("rewritten");
+        assert_eq!(masked[13], "my number is [M]");
+        for (i, t) in masked.iter().enumerate().filter(|(i, _)| *i != 13) {
+            assert_eq!(t, &texts[i], "segment {i} must keep its text");
+        }
+        let calls = server.received_requests().await.unwrap().len();
+        assert!(calls <= 1 + MAX_CALLS_PER_CHECK, "{calls} calls");
     }
 
     #[tokio::test]
@@ -1620,7 +1798,7 @@ mod tests {
             .await;
         let g = build(&server.uri(), true);
         let seg = g
-            .moderate_input_segments(&["call 13812345678 now".to_owned()])
+            .moderate_input_segments(&["call 13812345678 now".to_owned()], None)
             .await;
         assert_eq!(seg.verdict, GuardrailVerdict::Allow);
         assert_eq!(seg.masked, Some(vec!["call 【手机号码】 now".to_owned()]));
@@ -1666,9 +1844,10 @@ mod tests {
             .await;
         let g = build(&server.uri(), true);
         let seg = g
-            .moderate_input_segments(&[
-                "座机010-88886666，手机13812345678，还有一个13999998888都能打".to_owned(),
-            ])
+            .moderate_input_segments(
+                &["座机010-88886666，手机13812345678，还有一个13999998888都能打".to_owned()],
+                None,
+            )
             .await;
         assert_eq!(seg.verdict, GuardrailVerdict::Allow);
         assert_eq!(
@@ -2217,7 +2396,7 @@ mod tests {
             // not just the raw call: the segment output is what the proxy
             // writes back into the request/response body.
             let seg_text = format!("我的手机号是{PHONE}，请帮我登记");
-            let seg = g.moderate_input_segments(&[seg_text]).await;
+            let seg = g.moderate_input_segments(&[seg_text], None).await;
             assert_eq!(
                 seg.verdict,
                 GuardrailVerdict::Allow,

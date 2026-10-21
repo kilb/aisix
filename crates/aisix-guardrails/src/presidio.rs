@@ -480,7 +480,11 @@ impl Guardrail for PresidioGuardrail {
         true
     }
 
-    async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
+    async fn moderate_input_segments(
+        &self,
+        texts: &[String],
+        _newest_from: Option<usize>,
+    ) -> SegmentsOutcome {
         if !self.hook_enabled(GuardrailHookPoint::Input) {
             return SegmentsOutcome::allow();
         }
@@ -664,7 +668,7 @@ mod tests {
 
         let g = build(&analyzer.uri(), &anonymizer.uri(), false);
         let texts = vec!["no pii here".to_owned(), "mail a@b.c".to_owned()];
-        let out = g.moderate_input_segments(&texts).await;
+        let out = g.moderate_input_segments(&texts, None).await;
         assert_eq!(out.verdict, GuardrailVerdict::Allow);
         let masked = out.masked.expect("mask write-back expected");
         assert_eq!(masked[0], "no pii here");
@@ -683,7 +687,9 @@ mod tests {
             .mount(&server)
             .await;
         let g = build(&server.uri(), &server.uri(), false);
-        let out = g.moderate_input_segments(&["123-45-6789".to_owned()]).await;
+        let out = g
+            .moderate_input_segments(&["123-45-6789".to_owned()], None)
+            .await;
         assert!(out.verdict.is_block(), "got {:?}", out.verdict);
         assert!(out.masked.is_none());
     }
@@ -706,7 +712,7 @@ mod tests {
             .await;
         // fail_open=false: the failure blocks.
         let g = build(&analyzer.uri(), &anonymizer.uri(), false);
-        let out = g.moderate_input_segments(&["a@b.c".to_owned()]).await;
+        let out = g.moderate_input_segments(&["a@b.c".to_owned()], None).await;
         assert!(out.verdict.is_block(), "got {:?}", out.verdict);
         assert!(out.masked.is_none());
     }
@@ -718,7 +724,7 @@ mod tests {
         let server = MockServer::start().await;
         let g = build(&server.uri(), &server.uri(), false);
         let out = g
-            .moderate_input_segments(&[String::new(), "   ".to_owned()])
+            .moderate_input_segments(&[String::new(), "   ".to_owned()], None)
             .await;
         assert_eq!(out, SegmentsOutcome::allow());
     }

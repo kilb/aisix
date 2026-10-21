@@ -540,6 +540,11 @@ pub trait Guardrail: Send + Sync + 'static {
     // that run this pass pair it with `check_*_non_segment` so the
     // guardrail is consulted exactly once per hook.
 
+    /// Called by a request walker as it starts walking one conversation
+    /// message, so a segment collector can record where messages begin. A
+    /// no-op for every guardrail; only the collector overrides it.
+    fn segment_message_start(&self) {}
+
     /// `true` when this guardrail moderates via the segment hooks below.
     /// Such a member is skipped by `check_input_non_segment` /
     /// `check_output_non_segment` (the segment pass covers it).
@@ -550,7 +555,16 @@ pub trait Guardrail: Send + Sync + 'static {
     /// Moderate the request's text segments in one remote call. Only
     /// meaningful when [`Self::moderates_segments`] is `true`; the default
     /// allows so a caller that runs the pass unconditionally is safe.
-    async fn moderate_input_segments(&self, _texts: &[String]) -> SegmentsOutcome {
+    ///
+    /// `newest_from` is the index of the first segment of the conversation's
+    /// newest message, when the walk that produced `texts` knows message
+    /// boundaries (see [`Self::segment_message_start`]). A moderator that
+    /// must bound how much it sends checks that message in full first.
+    async fn moderate_input_segments(
+        &self,
+        _texts: &[String],
+        _newest_from: Option<usize>,
+    ) -> SegmentsOutcome {
         SegmentsOutcome::allow()
     }
 

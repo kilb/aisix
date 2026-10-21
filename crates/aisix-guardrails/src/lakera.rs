@@ -519,7 +519,11 @@ impl Guardrail for LakeraGuardrail {
         true
     }
 
-    async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
+    async fn moderate_input_segments(
+        &self,
+        texts: &[String],
+        _newest_from: Option<usize>,
+    ) -> SegmentsOutcome {
         if !self.hook_enabled(GuardrailHookPoint::Input) {
             return SegmentsOutcome::allow();
         }
@@ -694,7 +698,7 @@ mod tests {
             String::new(),
             "card 4111111111111111".to_owned(),
         ];
-        let out = g.moderate_input_segments(&texts).await;
+        let out = g.moderate_input_segments(&texts, None).await;
         assert_eq!(out.verdict, GuardrailVerdict::Allow);
         let masked = out.masked.expect("mask write-back expected");
         assert_eq!(masked[0], "mail [MASKED EMAIL] ok");
@@ -722,7 +726,7 @@ mod tests {
             .mount(&server)
             .await;
         let g = build(&server.uri(), false);
-        let out = g.moderate_input_segments(&["a@b.c".to_owned()]).await;
+        let out = g.moderate_input_segments(&["a@b.c".to_owned()], None).await;
         assert!(out.verdict.is_block(), "got {:?}", out.verdict);
         assert!(out.masked.is_none());
     }
@@ -754,7 +758,7 @@ mod tests {
             .mount(&server)
             .await;
         let g = build(&server.uri(), false);
-        let out = g.moderate_input_segments(&["a@b.c".to_owned()]).await;
+        let out = g.moderate_input_segments(&["a@b.c".to_owned()], None).await;
         assert!(out.verdict.is_block(), "got {:?}", out.verdict);
     }
 

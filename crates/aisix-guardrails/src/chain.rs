@@ -513,12 +513,23 @@ impl Guardrail for GuardrailChain {
     /// (attributed like the check folds); masked texts COMPOSE — each
     /// member moderates the previous member's masked output, mirroring
     /// `fold_redactions`; the first Bypass reason sticks. Counts merge.
-    async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
-        fold_segments(&self.members, self.sink.as_deref(), texts, true).await
+    async fn moderate_input_segments(
+        &self,
+        texts: &[String],
+        newest_from: Option<usize>,
+    ) -> SegmentsOutcome {
+        fold_segments(
+            &self.members,
+            self.sink.as_deref(),
+            texts,
+            newest_from,
+            true,
+        )
+        .await
     }
 
     async fn moderate_output_segments(&self, texts: &[String]) -> SegmentsOutcome {
-        fold_segments(&self.members, self.sink.as_deref(), texts, false).await
+        fold_segments(&self.members, self.sink.as_deref(), texts, None, false).await
     }
 
     /// The check fold minus segment-moderating members — the pass those
@@ -636,6 +647,10 @@ async fn fold_segments(
     members: &[ChainMember],
     sink: Option<&dyn GuardrailMetricsSink>,
     texts: &[String],
+    // First segment of the newest message (see
+    // `Guardrail::moderate_input_segments`). Masking never changes the segment
+    // count, so it holds for every later member too.
+    newest_from: Option<usize>,
     input: bool,
 ) -> SegmentsOutcome {
     let phase = if input { "input" } else { "output" };
@@ -650,7 +665,7 @@ async fn fold_segments(
         let src: &[String] = masked.as_deref().unwrap_or(texts);
         let started = Instant::now();
         let mut outcome = if input {
-            m.guardrail.moderate_input_segments(src).await
+            m.guardrail.moderate_input_segments(src, newest_from).await
         } else {
             m.guardrail.moderate_output_segments(src).await
         };
@@ -1024,7 +1039,11 @@ mod tests {
         async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
             panic!("segment member must not be consulted via check_input_non_segment");
         }
-        async fn moderate_input_segments(&self, texts: &[String]) -> crate::SegmentsOutcome {
+        async fn moderate_input_segments(
+            &self,
+            texts: &[String],
+            _newest_from: Option<usize>,
+        ) -> crate::SegmentsOutcome {
             let mut counts = std::collections::BTreeMap::new();
             counts.insert("STUB".to_owned(), texts.len() as u32);
             crate::SegmentsOutcome {
@@ -1094,7 +1113,7 @@ mod tests {
             Vec::new(),
         );
         let texts = vec!["hello".to_owned(), "world".to_owned()];
-        let out = chain.moderate_input_segments(&texts).await;
+        let out = chain.moderate_input_segments(&texts, None).await;
         assert_eq!(out.verdict, GuardrailVerdict::Allow);
         assert_eq!(
             out.masked,
@@ -1113,7 +1132,7 @@ mod tests {
             )],
             Vec::new(),
         );
-        match blocking.moderate_input_segments(&texts).await.verdict {
+        match blocking.moderate_input_segments(&texts, None).await.verdict {
             GuardrailVerdict::Block { guardrail_name, .. } => {
                 assert_eq!(guardrail_name.as_deref(), Some("seg-blocker"))
             }
@@ -1134,7 +1153,11 @@ mod tests {
             fn moderates_segments(&self) -> bool {
                 true
             }
-            async fn moderate_input_segments(&self, _texts: &[String]) -> crate::SegmentsOutcome {
+            async fn moderate_input_segments(
+                &self,
+                _texts: &[String],
+                _newest_from: Option<usize>,
+            ) -> crate::SegmentsOutcome {
                 let mut counts = std::collections::BTreeMap::new();
                 counts.insert("EMAIL".to_owned(), 3);
                 crate::SegmentsOutcome {
@@ -1147,7 +1170,7 @@ mod tests {
         }
         let chain = GuardrailChain::new(vec![Arc::new(Drifting)]);
         let texts = vec!["a".to_owned(), "b".to_owned()];
-        let out = chain.moderate_input_segments(&texts).await;
+        let out = chain.moderate_input_segments(&texts, None).await;
         assert_eq!(out.masked, None, "drifted mask must be refused");
         assert!(
             out.counts.is_empty(),
@@ -1372,7 +1395,9 @@ mod tests {
         );
 
         // Segment pass: only the segment member records, as masked.
-        let out = chain.moderate_input_segments(&["hello".to_owned()]).await;
+        let out = chain
+            .moderate_input_segments(&["hello".to_owned()], None)
+            .await;
         assert_eq!(out.verdict, GuardrailVerdict::Allow);
         assert_eq!(
             sink.take(),

@@ -686,8 +686,15 @@ impl Guardrail for MonitorGuardrail {
         self.inner.moderates_segments()
     }
 
-    async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
-        self.observe_segments("input", self.inner.moderate_input_segments(texts).await)
+    async fn moderate_input_segments(
+        &self,
+        texts: &[String],
+        newest_from: Option<usize>,
+    ) -> SegmentsOutcome {
+        self.observe_segments(
+            "input",
+            self.inner.moderate_input_segments(texts, newest_from).await,
+        )
     }
 
     async fn moderate_output_segments(&self, texts: &[String]) -> SegmentsOutcome {
@@ -808,8 +815,12 @@ impl Guardrail for MandatoryGuardrail {
         self.inner.moderates_segments()
     }
 
-    async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
-        let mut outcome = self.inner.moderate_input_segments(texts).await;
+    async fn moderate_input_segments(
+        &self,
+        texts: &[String],
+        newest_from: Option<usize>,
+    ) -> SegmentsOutcome {
+        let mut outcome = self.inner.moderate_input_segments(texts, newest_from).await;
         outcome.verdict = self.enforce("input", outcome.verdict);
         outcome
     }
@@ -1666,7 +1677,11 @@ mod tests {
             fn moderates_segments(&self) -> bool {
                 true
             }
-            async fn moderate_input_segments(&self, _texts: &[String]) -> SegmentsOutcome {
+            async fn moderate_input_segments(
+                &self,
+                _texts: &[String],
+                _newest_from: Option<usize>,
+            ) -> SegmentsOutcome {
                 self.outcome()
             }
             async fn moderate_output_segments(&self, _texts: &[String]) -> SegmentsOutcome {
@@ -1684,7 +1699,7 @@ mod tests {
         );
         assert!(masking.moderates_segments());
         for out in [
-            masking.moderate_input_segments(&texts).await,
+            masking.moderate_input_segments(&texts, None).await,
             masking.moderate_output_segments(&texts).await,
         ] {
             assert_eq!(out.verdict, GuardrailVerdict::Allow);
@@ -1701,7 +1716,7 @@ mod tests {
             )),
         );
         for out in [
-            down.moderate_input_segments(&texts).await,
+            down.moderate_input_segments(&texts, None).await,
             down.moderate_output_segments(&texts).await,
         ] {
             assert_eq!(

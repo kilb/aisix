@@ -90,11 +90,26 @@ const SEGMENT_APPLY_MARKER: &str = "__segment_apply__";
 #[derive(Default)]
 struct SegmentCollector {
     texts: std::sync::Mutex<Vec<String>>,
+    /// Index into `texts` where each conversation message began.
+    message_starts: std::sync::Mutex<Vec<usize>>,
 }
 
 impl SegmentCollector {
     fn take(&self) -> Vec<String> {
         std::mem::take(&mut self.texts.lock().expect("collector poisoned"))
+    }
+
+    /// First segment of the newest conversation message that produced any,
+    /// when the walker marked message boundaries. Read before [`Self::take`].
+    fn newest_from(&self) -> Option<usize> {
+        let len = self.texts.lock().expect("collector poisoned").len();
+        self.message_starts
+            .lock()
+            .expect("collector poisoned")
+            .iter()
+            .rev()
+            .copied()
+            .find(|&start| start < len)
     }
 
     fn record(&self, text: &str) -> Option<aisix_guardrails::Redaction> {
@@ -109,6 +124,13 @@ impl SegmentCollector {
 impl Guardrail for SegmentCollector {
     fn name(&self) -> &'static str {
         "segment-collector"
+    }
+    fn segment_message_start(&self) {
+        let len = self.texts.lock().expect("collector poisoned").len();
+        self.message_starts
+            .lock()
+            .expect("collector poisoned")
+            .push(len);
     }
     fn redacts_input(&self) -> bool {
         true
@@ -232,6 +254,7 @@ pub async fn moderate_body(
     }
     let collector = SegmentCollector::default();
     walk(&collector);
+    let newest_from = collector.newest_from();
     let texts = collector.take();
     if texts.is_empty() {
         return BodyModeration {
@@ -240,7 +263,7 @@ pub async fn moderate_body(
         };
     }
     let mut outcome = match dir {
-        Direction::Input => chain.moderate_input_segments(&texts).await,
+        Direction::Input => chain.moderate_input_segments(&texts, newest_from).await,
         Direction::Output => chain.moderate_output_segments(&texts).await,
     };
     monitor_hits_out.append(&mut outcome.monitor_hits);
@@ -625,6 +648,7 @@ fn redact_chat_format_impl(
         redact_responses_text_value(chain, Direction::Input, content, &mut counts);
     }
     for msg in &mut req.messages {
+        chain.segment_message_start();
         if detect_keys {
             if let Some(name) = msg.name.as_deref() {
                 unrewritable_tool_key |= detect_unrewritable_value_strings(
@@ -1049,11 +1073,13 @@ pub fn redact_anthropic_request(
         );
     }
     if let Some(system) = body.get_mut("system") {
+        chain.segment_message_start();
         unrewritable_tool_key |=
             redact_anthropic_content(chain, Direction::Input, system, &mut counts);
     }
     if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
         for msg in messages {
+            chain.segment_message_start();
             if let Some(content) = msg.get_mut("content") {
                 unrewritable_tool_key |=
                     redact_anthropic_content(chain, Direction::Input, content, &mut counts);
@@ -1103,6 +1129,7 @@ async fn moderate_structured_body(
 
     let collector = SegmentCollector::default();
     let _ = walk(&collector);
+    let newest_from = collector.newest_from();
     let texts = collector.take();
     if texts.is_empty() {
         return AnthropicModeration {
@@ -1111,7 +1138,7 @@ async fn moderate_structured_body(
         };
     }
     let mut outcome = match dir {
-        Direction::Input => chain.moderate_input_segments(&texts).await,
+        Direction::Input => chain.moderate_input_segments(&texts, newest_from).await,
         Direction::Output => chain.moderate_output_segments(&texts).await,
     };
     monitor_hits_out.append(&mut outcome.monitor_hits);
@@ -1568,14 +1595,17 @@ fn redact_responses_request_impl(
         }
     }
     if let Some(instructions) = body.get_mut("instructions") {
+        chain.segment_message_start();
         apply_to_value_string(chain, Direction::Input, instructions, &mut counts);
     }
     match body.get_mut("input") {
         Some(v @ Value::String(_)) => {
+            chain.segment_message_start();
             apply_to_value_string(chain, Direction::Input, v, &mut counts)
         }
         Some(Value::Array(items)) => {
             for item in items {
+                chain.segment_message_start();
                 unrewritable_tool_key |= redact_responses_item_structured(
                     chain,
                     Direction::Input,
@@ -2014,6 +2044,10 @@ pub fn redact_completions_request_structured(
             unrewritable_tool_key: false,
         };
     }
+    // The whole request is the newest message: the prompt (every item of a
+    // prompt list), then `suffix` and `user`, both small enough to cover with
+    // it.
+    chain.segment_message_start();
     match body.get_mut("prompt") {
         Some(v @ Value::String(_)) => {
             apply_to_value_string(chain, Direction::Input, v, &mut counts)
@@ -2130,6 +2164,8 @@ pub fn redact_images_request_structured(
             unrewritable_tool_key: false,
         };
     }
+    // The prompt and `user` are one newest message.
+    chain.segment_message_start();
     if let Some(p) = body.get_mut("prompt") {
         apply_to_value_string(chain, Direction::Input, p, &mut counts);
     }
@@ -5818,7 +5854,11 @@ mod tests {
         fn moderates_segments(&self) -> bool {
             true
         }
-        async fn moderate_input_segments(&self, texts: &[String]) -> SegmentsOutcome {
+        async fn moderate_input_segments(
+            &self,
+            texts: &[String],
+            _newest_from: Option<usize>,
+        ) -> SegmentsOutcome {
             self.moderate(texts)
         }
         async fn moderate_output_segments(&self, texts: &[String]) -> SegmentsOutcome {

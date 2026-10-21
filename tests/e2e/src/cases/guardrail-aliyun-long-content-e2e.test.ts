@@ -325,6 +325,15 @@ describe("Aliyun text moderation checks content past the per-call limit", () => 
     }
   });
 
+  test("/v1/completions: `user` and `suffix` do not take the prompt's place", async (t) => {
+    if (!ctx.ready) return t.skip();
+    const prompt = `${MARKER} ${filler(40_000)}`;
+    for (const extra of [{ user: "u-1" }, { suffix: "x" }]) {
+      const r = await post(ctx, CALLER, "/v1/completions", { model: "lc-tmp-clean", prompt, ...extra });
+      expect(r.status, `${JSON.stringify(extra)}: ${r.text.slice(0, 200)}`).toBe(422);
+    }
+  });
+
   test("large tools alone do not get a clean request refused", async (t) => {
     if (!ctx.ready) return t.skip();
     for (const [path, body] of endpointRequests("lc-tmp-clean", "what is the weather today", false)) {
@@ -372,6 +381,28 @@ describe("Aliyun AI guardrail masks content past the per-call limit", () => {
     const r = await chat(ctx, CALLER, "lc-aig-clean", [{ role: "user", content }]);
     expect(r.status, r.text.slice(0, 200)).toBe(200);
     expect(forwardedMessages().at(-1)?.content).toBe(content.replace(PHONE, "[PHONE]"));
+  });
+
+  test("the whole newest message is checked, not just its last block", async (t) => {
+    if (!ctx.ready) return t.skip();
+    const before = ctx.upstreams["lc-aig-clean"]!.receivedRequests.length;
+    const r = await post(ctx, CALLER, "/v1/messages", {
+      model: "lc-aig-clean",
+      max_tokens: 16,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: `${PHONE} ${filler(40_000)}` },
+            { type: "text", text: "." },
+          ],
+        },
+      ],
+    });
+    // Too long to check in full: refused rather than passed unchecked.
+    expect(r.status, r.text.slice(0, 200)).toBe(422);
+    const sent = ctx.upstreams["lc-aig-clean"]!.receivedRequests.slice(before);
+    expect(sent.some((q) => q.body.includes(PHONE))).toBe(false);
   });
 
   test("a phone number in the newest turn is masked next to large tools", async (t) => {
