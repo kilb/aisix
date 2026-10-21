@@ -122,3 +122,35 @@ impl Drop for ReturnUnread {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    // 这两个上限是被拒绝的请求还能占住连接多久的唯一约束。
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_gives_up_on_a_body_that_never_ends() {
+        let started = tokio::time::Instant::now();
+        drain(Body::from_stream(futures::stream::pending::<
+            Result<Bytes, std::io::Error>,
+        >()))
+        .await;
+        assert!(started.elapsed() <= DRAIN_DEADLINE + Duration::from_millis(10));
+    }
+
+    #[tokio::test]
+    async fn drain_stops_after_the_byte_cap() {
+        const CHUNK: usize = 64 * 1024;
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&pulled);
+        let endless = futures::stream::repeat_with(move || {
+            counter.fetch_add(CHUNK, Ordering::SeqCst);
+            Ok::<_, std::io::Error>(Bytes::from(vec![0u8; CHUNK]))
+        });
+        drain(Body::from_stream(endless)).await;
+        assert!(pulled.load(Ordering::SeqCst) <= DRAIN_MAX_BYTES + CHUNK);
+    }
+}

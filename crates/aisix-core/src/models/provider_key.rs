@@ -261,8 +261,7 @@ pub struct RequestOverrides {
     /// Inbound client headers forwarded to the upstream provider, as
     /// `*` glob patterns matched case-insensitively against the
     /// header name (`"anthropic-beta"`, `"x-trace-*"`). Empty — the
-    /// default — forwards nothing, which is the behavior of every
-    /// standard-protocol endpoint before #1167. Auth,
+    /// default — forwards nothing. Auth,
     /// transport, and gateway-owned headers are never forwarded whatever
     /// the patterns say.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

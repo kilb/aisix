@@ -6301,12 +6301,6 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(event.provider_model_version, "mco-5");
     }
 
-    /// Issue #245: the SSE frame parser must reassemble events that
-    /// arrive split across byte-chunk boundaries (reqwest's
-    /// `bytes_stream()` makes no frame-alignment guarantees). Drives
-    /// `drain_anthropic_sse_frames` directly with a buffer that holds
-    /// one complete frame plus a partial second frame, then completes
-    /// the second frame on the next call.
     /// 首帧必须同时记下 `upstream_ttft`（Duration）。指标门控只看它：
     /// 只写 `_ms` 的话，原生 Anthropic 流式的两条 TTFT 序列一条都不会记。
     /// 立即到达的首帧 `_ms` 为 0，这正是 `Option<Duration>` 要区分的情形。
@@ -6330,6 +6324,12 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         );
     }
 
+    /// Issue #245: the SSE frame parser must reassemble events that
+    /// arrive split across byte-chunk boundaries (reqwest's
+    /// `bytes_stream()` makes no frame-alignment guarantees). Drives
+    /// `drain_anthropic_sse_frames` directly with a buffer that holds
+    /// one complete frame plus a partial second frame, then completes
+    /// the second frame on the next call.
     #[test]
     fn sse_frame_parser_reassembles_split_chunks() {
         use super::{drain_anthropic_sse_frames, AnthropicStreamUsage};

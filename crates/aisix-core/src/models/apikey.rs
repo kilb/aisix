@@ -31,7 +31,10 @@ pub struct ApiKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
 
-    /// Model identifiers this key may use. An empty array denies access to every model.
+    /// Model identifiers this key may use. Entries are matched as `*` globs:
+    /// `"*"` grants every model, `"openai/*"` grants every model name under
+    /// that prefix, and an entry without a `*` matches one model exactly. An
+    /// empty array denies access to every model.
     pub allowed_models: Vec<String>,
 
     /// Request, token, and concurrency limits for this key.

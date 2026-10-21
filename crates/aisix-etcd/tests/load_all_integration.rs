@@ -112,3 +112,76 @@ async fn a_prefix_larger_than_one_request_budget_still_loads() {
     assert_eq!(entries.len(), KEYS, "every key under the prefix is loaded");
     assert!(revision > 0);
 }
+
+/// 分页读出来的必须是**同一个修订版本**上的一份快照：第一页之后发生的写入
+/// 不能混进后面的页里 —— 否则快照里有的键属于新修订、有的属于旧修订，watch
+/// 又从第一页的修订接着走，删掉的键会凭空留下或者新键被重复应用。
+///
+/// 和上一条一样走限速链路，让加载持续约三秒；在第一页之后删掉最后一页里的
+/// 一个键、新建一个键。快照里必须还有被删的那个、没有新建的那个，返回的
+/// 修订版本早于这两次写入。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_page_reads_the_first_pages_revision() {
+    let Some(url) = etcd_url() else {
+        eprintln!("ETCD_TEST_URL not set — skipping");
+        return;
+    };
+    const KEYS: usize = 3000;
+    let prefix = unique_prefix();
+    let mut seed = Client::connect([url.as_str()], None)
+        .await
+        .expect("connect etcd");
+    let value = "x".repeat(1024);
+    for i in 0..KEYS {
+        seed.put(format!("{prefix}/models/{i:05}"), value.as_str(), None)
+            .await
+            .expect("seed key");
+    }
+
+    let proxy = throttled_proxy(&url, 1_000_000).await;
+    let provider = EtcdConfigProvider::connect_with_policy(
+        &[proxy],
+        prefix.clone(),
+        None,
+        ConnectPolicy {
+            request_timeout: Some(Duration::from_secs(1)),
+            ..ConnectPolicy::default()
+        },
+    )
+    .await
+    .expect("connect through the proxy");
+
+    let load = tokio::spawn(async move { provider.load_all().await });
+    // 第一页（约 0.5MB，1MB/s）读完之后、最后一页读到之前。
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert!(!load.is_finished(), "the load must still be paging");
+    let deleted = format!("{prefix}/models/{:05}", KEYS - 1);
+    let added = format!("{prefix}/models/{KEYS:05}");
+    let del = seed.delete(deleted.as_str(), None).await.expect("delete");
+    seed.put(added.as_str(), "y", None).await.expect("put");
+    let write_revision = del.header().map(|h| h.revision()).unwrap_or(i64::MAX);
+
+    let loaded = load.await.expect("join");
+    seed.delete(prefix.as_str(), Some(DeleteOptions::new().with_prefix()))
+        .await
+        .expect("clean up");
+    let (entries, revision) = loaded.expect("load");
+    let keys: std::collections::HashSet<&str> = entries.iter().map(|e| e.key.as_str()).collect();
+    assert_eq!(
+        entries.len(),
+        KEYS,
+        "one revision: neither the delete nor the put"
+    );
+    assert!(
+        keys.iter()
+            .any(|k| k.ends_with(&format!("/models/{:05}", KEYS - 1))),
+        "a key deleted after the first page is still in the snapshot"
+    );
+    assert!(
+        !keys
+            .iter()
+            .any(|k| k.ends_with(&format!("/models/{KEYS:05}"))),
+        "a key created after the first page must not leak into a later page"
+    );
+    assert!(revision < write_revision, "{revision} vs {write_revision}");
+}

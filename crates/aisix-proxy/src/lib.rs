@@ -230,6 +230,12 @@ pub fn build_router(state: ProxyState) -> Router {
             passthrough_route::host_dispatch,
         ));
 
+    // When a layer answers before the body is read, read the rest of the
+    // body before the connection closes, so the caller receives that answer
+    // rather than a broken pipe. Wraps every layer below that can refuse
+    // early (host dispatch, rewrite, auth, the handlers). See unread_body.rs.
+    let router = router.layer(middleware::from_fn(unread_body::drain_unread_body));
+
     // Outermost: mint the request id into the request extensions
     // before any handler/extractor runs — including the rewrite layer,
     // whose fired/failed log lines must carry the request span — and
@@ -237,11 +243,6 @@ pub fn build_router(state: ProxyState) -> Router {
     // from the layers above) so the whole proxy family carries
     // `x-aisix-request-id` and it equals the telemetry request_id. See
     // request_id.rs.
-    // 处理链提前作答时，把还没读完的请求体读掉再让连接收尾，调用方才收得到
-    // 那个响应而不是一个断开的管道。包住其下所有会提前拒绝的层（主机分派、
-    // 重写、鉴权、各 handler）。见 unread_body.rs。
-    let router = router.layer(middleware::from_fn(unread_body::drain_unread_body));
-
     router.layer(middleware::from_fn_with_state(
         state,
         request_id::ensure_request_id,

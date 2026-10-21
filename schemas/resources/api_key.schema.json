@@ -203,7 +203,7 @@
       ]
     },
     "allowed_models": {
-      "description": "Model identifiers this key may use. An empty array denies access to every model.",
+      "description": "Model identifiers this key may use. Entries are matched as `*` globs: `\"*\"` grants every model, `\"openai/*\"` grants every model name under that prefix, and an entry without a `*` matches one model exactly. An empty array denies access to every model.",
       "items": {
         "type": "string"
       },
