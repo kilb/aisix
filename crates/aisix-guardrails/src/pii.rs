@@ -131,44 +131,55 @@ fn mask_token(name: &str) -> String {
 
 /// One built-in detector: `(id, pattern, validator)`.
 ///
-/// Patterns lean conservative — `\b` boundaries and checksum validators —
+/// Patterns lean conservative — word boundaries and checksum validators —
 /// because a mask false-positive corrupts user content (worse than a
-/// keyword-blocklist false positive, which merely rejects). IDs are wire
+/// keyword-blocklist false positive, which merely rejects).
+///
+/// The boundaries are ASCII ones, `(?-u:\b)`. A Unicode `\b` counts CJK
+/// characters as word characters, so a number written flush against Chinese
+/// text — `手机号是13800138000请回电`, the usual way to write it, since
+/// Chinese puts no spaces between words — has no boundary on either side and
+/// was never detected. An ASCII boundary still refuses a slice of a longer
+/// digit or letter run. IDs are wire
 /// contract: the control plane's validator and the dashboard's detector list carry
 /// the same set.
 pub const BUILTIN_DETECTORS: &[(&str, &str, Option<MatchValidator>)] = &[
     (
         "email",
-        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+        r"(?-u:\b)[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?-u:\b)",
         None,
     ),
     // Chinese mainland mobile: 1[3-9] + 9 digits, standalone digit run.
-    ("china_mobile", r"\b1[3-9]\d{9}\b", None),
+    ("china_mobile", r"(?-u:\b)1[3-9]\d{9}(?-u:\b)", None),
     // 18-char Chinese national ID (17 digits + check char), verified with
     // the ISO 7064 MOD 11-2 checksum.
     (
         "china_id_card",
-        r"\b\d{17}[0-9Xx]\b",
+        r"(?-u:\b)\d{17}[0-9Xx](?-u:\b)",
         Some(china_id_checksum),
     ),
     // 13–19 digit PAN (bank/credit card), Luhn-verified.
-    ("bank_card", r"\b\d{13,19}\b", Some(luhn_checksum)),
-    ("us_ssn", r"\b\d{3}-\d{2}-\d{4}\b", None),
+    (
+        "bank_card",
+        r"(?-u:\b)\d{13,19}(?-u:\b)",
+        Some(luhn_checksum),
+    ),
+    ("us_ssn", r"(?-u:\b)\d{3}-\d{2}-\d{4}(?-u:\b)", None),
     (
         "ip_address",
-        r"\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\b",
+        r"(?-u:\b)(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?-u:\b)",
         None,
     ),
     // Well-known credential signatures: OpenAI, AWS access key id, GitHub
     // (classic + fine-grained), Slack, Google API key.
     (
         "api_key",
-        r"\b(?:sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35})\b",
+        r"(?-u:\b)(?:sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35})(?-u:\b)",
         None,
     ),
     (
         "jwt",
-        r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+        r"(?-u:\b)eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?-u:\b)",
         None,
     ),
     (
@@ -415,6 +426,62 @@ mod tests {
         assert_eq!(r.text, "我的手机号是 [CHINA_MOBILE_REDACTED]，请回电");
         // Embedded in a longer digit run → not a phone → untouched.
         assert!(g.redact_input_text("订单号 913800138000123").is_none());
+    }
+
+    #[test]
+    fn builtins_detect_values_flush_against_cjk_text() {
+        // Chinese puts no spaces between words, so the value usually sits
+        // right between two CJK characters. A Unicode `\b` sees no boundary
+        // there (CJK characters are word characters to it).
+        for (id, text, expected) in [
+            (
+                "china_mobile",
+                "我的手机号是13800138000请回电",
+                "我的手机号是[CHINA_MOBILE_REDACTED]请回电",
+            ),
+            (
+                "email",
+                "邮箱是zhang.san@example.com谢谢",
+                "邮箱是[EMAIL_REDACTED]谢谢",
+            ),
+            (
+                "china_id_card",
+                "身份证11010519491231002X已提交",
+                "身份证[CHINA_ID_CARD_REDACTED]已提交",
+            ),
+            (
+                "bank_card",
+                "卡号4111111111111111到账",
+                "卡号[BANK_CARD_REDACTED]到账",
+            ),
+            ("us_ssn", "号码123-45-6789已存", "号码[US_SSN_REDACTED]已存"),
+            (
+                "ip_address",
+                "服务器10.0.0.1宕机",
+                "服务器[IP_ADDRESS_REDACTED]宕机",
+            ),
+            (
+                "api_key",
+                "密钥sk-abcdefghijklmnopqrstuv泄露",
+                "密钥[API_KEY_REDACTED]泄露",
+            ),
+        ] {
+            let g = guardrail(vec![builtin(id, PiiAction::Mask)]);
+            let r = g
+                .redact_input_text(text)
+                .unwrap_or_else(|| panic!("{id} missed in {text:?}"));
+            assert_eq!(r.text, expected, "{id}");
+        }
+    }
+
+    #[test]
+    fn ascii_boundaries_still_refuse_a_slice_of_a_longer_run() {
+        let g = guardrail(vec![builtin("china_mobile", PiiAction::Mask)]);
+        // Flush against CJK, but inside a longer digit run: not a phone.
+        assert!(g.redact_input_text("订单号913800138000123已发货").is_none());
+        // Glued to ASCII letters or an underscore: part of an identifier.
+        assert!(g.redact_input_text("ref13800138000x").is_none());
+        assert!(g.redact_input_text("id_13800138000").is_none());
     }
 
     #[test]
