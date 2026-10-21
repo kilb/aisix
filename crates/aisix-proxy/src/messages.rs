@@ -2838,15 +2838,21 @@ fn build_anthropic_sse_stream(
     // guardrails), chunks are withheld from the encoder until the
     // end-of-stream scan clears (and masks) them: a block keeps matched
     // content off the wire entirely, and a mask can't rewrite bytes that
-    // already left. Window-policy guardrails (Azure/Aliyun) keep the
-    // pre-existing live-forward + end-of-stream check on this surface.
+    // already left. Window-policy guardrails (Azure/Aliyun) hold the whole
+    // response too; only an end-of-stream-check chain forwards live.
     let hold_policy = output_guardrail.as_ref().and_then(|c| {
         match aisix_guardrails::Guardrail::stream_output_policy(c.as_ref()) {
             aisix_guardrails::StreamOutputPolicy::BufferFull {
                 max_buffer_bytes,
                 on_exceeded_fail_open,
             } => Some((max_buffer_bytes, on_exceeded_fail_open)),
-            _ => None,
+            // Window means "release only what scanned clean". This surface
+            // has no incremental release, so it holds the whole response
+            // like /v1/responses does, failing closed at the default cap.
+            aisix_guardrails::StreamOutputPolicy::Window { .. } => {
+                Some((aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false))
+            }
+            aisix_guardrails::StreamOutputPolicy::EndOfStreamCheck => None,
         }
     });
     let stream = async_stream::stream! {
@@ -4300,15 +4306,21 @@ where
     // guardrails), the passthrough must buffer the raw SSE bytes rather
     // than forward them live: a block must keep matched content off the
     // wire entirely, and a mask can't be applied to bytes already sent.
-    // Window-policy guardrails (Azure/Aliyun incremental release) keep the
-    // pre-existing live-forward + end-of-stream check on this surface.
+    // Window-policy guardrails (Azure/Aliyun) hold the whole response too;
+    // only an end-of-stream-check chain forwards live.
     let hold_policy = output_guardrail.as_ref().and_then(|c| {
         match aisix_guardrails::Guardrail::stream_output_policy(c.as_ref()) {
             aisix_guardrails::StreamOutputPolicy::BufferFull {
                 max_buffer_bytes,
                 on_exceeded_fail_open,
             } => Some((max_buffer_bytes, on_exceeded_fail_open)),
-            _ => None,
+            // Window means "release only what scanned clean". This surface
+            // has no incremental release, so it holds the whole response
+            // like /v1/responses does, failing closed at the default cap.
+            aisix_guardrails::StreamOutputPolicy::Window { .. } => {
+                Some((aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false))
+            }
+            aisix_guardrails::StreamOutputPolicy::EndOfStreamCheck => None,
         }
     });
     let response_text_cap = match (hold_policy, output_guardrail.is_some(), content_cap) {
@@ -4332,7 +4344,7 @@ where
         futures::pin_mut!(upstream);
         let mut buf: Vec<u8> = Vec::new();
         let mut first_token_seen = false;
-        // Whole-response hold-back buffer (BufferFull policies only).
+        // Whole-response hold-back buffer (BufferFull and Window policies).
         let mut held: Vec<u8> = Vec::new();
         let mut cap_released = false;
         while let Some(item) = upstream.next().await {
@@ -4513,11 +4525,11 @@ where
         }
         // End-of-stream output guardrail (#448): scan the accumulated
         // assistant text. On a block, emit a terminal Anthropic `error`
-        // event. On the hold-back path (BufferFull) nothing has been
-        // forwarded yet, so a block keeps the matched content off the
-        // wire entirely; on the live-forward path (Window /
-        // EndOfStreamCheck) the bytes were already forwarded verbatim
-        // and the error frame is the trailing signal.
+        // event. On the hold-back path (BufferFull / Window) nothing has
+        // been forwarded yet, so a block keeps the matched content off the
+        // wire entirely; on the live-forward path (EndOfStreamCheck) the
+        // bytes were already forwarded verbatim and the error frame is the
+        // trailing signal.
         let mut blocked = false;
         let mut moderation_capture_safe = true;
         if let Some(chain) = output_guardrail.as_ref().filter(|_| !cap_released) {
