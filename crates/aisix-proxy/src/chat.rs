@@ -1952,6 +1952,11 @@ async fn dispatch(
         // Fold the winning target's model-layer reservation in first, so the
         // stream hold keeps its concurrency slot(s) and `post_stream_keys`
         // bills its TPM/TPD at stream end too (#1087).
+        //
+        // 语义路由那次分类调用的花费只进请求级的花费层（key、team、路由自己的
+        // 那一行），所以在并入目标的层之前记下它们：目标模型的花费层只管目标
+        // 自己的花费，分类调用已经记在嵌入模型自己的层上了。
+        let request_spend_keys = reservation.spend_keys();
         if let Some(member) = won_member_reservation.take() {
             reservation.merge(member);
         }
@@ -2128,9 +2133,10 @@ async fn dispatch(
                 // 记账成对：两批键各记各的数字。
                 limiter.add_tokens_post_stream_all(
                     &spend_post_stream_keys,
-                    // 同上：分类调用的花费也要进额度。
-                    crate::usage_attr::spend_micro_usd(stream_cost_usd) + semantic_embed_spend,
+                    crate::usage_attr::spend_micro_usd(stream_cost_usd),
                 );
+                // 分类调用的花费也要进额度，但只进请求级的层（见上）。
+                limiter.add_tokens_post_stream_all(&request_spend_keys, semantic_embed_spend);
                 let deployment_success = terminal.error_class.is_empty() && terminal.status < 400;
                 routing_for_terminal.finish_staged(
                     &state_for_telem,
@@ -3162,7 +3168,9 @@ async fn dispatch(
     let finish_reason = finish_reason_label(&upstream.finish_reason);
     // Fold the winning target's model-layer reservation in so one commit
     // bills the member's TPM/TPD alongside the request-level layers
-    // (#1087).
+    // (#1087). The request-level spend keys are taken first: the semantic
+    // classifier's spend goes to those only (see the commit below).
+    let request_spend_keys = reservation.spend_keys();
     if let Some(member) = won_member_reservation.take() {
         reservation.merge(member);
     }
@@ -3189,13 +3197,16 @@ async fn dispatch(
         completion,
     );
     reservation
-        // 加上语义路由那次分类调用的花费：它在预留建立之前发生，拦不住，但必须
-        // 记进额度 —— 不记的话用户能靠语义路由白嫖这一部分。非语义请求是 0。
-        .commit(
-            total,
-            crate::usage_attr::spend_micro_usd(cost_usd) + semantic_embed_spend,
-        )
+        .commit(total, crate::usage_attr::spend_micro_usd(cost_usd))
         .await;
+    // 语义路由那次分类调用的花费：它在预留建立之前发生，拦不住，但必须记进
+    // 额度 —— 不记的话用户能靠语义路由白嫖这一部分。只进请求级的花费层
+    // （key、team、路由自己的那一行）：目标模型的层只管目标自己的花费，分类
+    // 调用已经记在嵌入模型自己的层上，再记一次就是同一笔钱算两遍。非语义
+    // 请求是 0。
+    state
+        .limiter
+        .add_tokens_post_stream_all(&request_spend_keys, semantic_embed_spend);
 
     let (output_verdict, hits) = resolved_chain
         .check_output_non_segment_observed(&upstream)
