@@ -17,7 +17,9 @@
 mod stream;
 
 use aisix_gateway::{BridgeError, ChatMessage, ChatResponse, FinishReason, UsageStats};
-use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent};
+use aisix_obs::{
+    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent, UsageLabels,
+};
 use axum::extract::State;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -28,8 +30,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use stream::{
-    build_completion_passthrough_stream, completion_usage_with_estimates, CompletionSseAccumulator,
-    CompletionStreamFailure, CompletionStreamOutcome, PreparedCompletionStream,
+    build_completion_passthrough_stream, completion_usage_with_estimates, stamp_first_chunk,
+    CompletionSseAccumulator, CompletionStreamFailure, CompletionStreamOutcome,
+    PreparedCompletionStream,
 };
 
 use crate::auth::AuthenticatedKey;
@@ -124,6 +127,9 @@ struct CompletionUsage {
     /// True when any counter was filled by the local estimator because
     /// the upstream reported no usage (#1074).
     usage_estimated: bool,
+    /// 本次尝试起点到上游首个字节块的耗时（见 `stamp_first_chunk`）。`Some`
+    /// 当且仅当流式路径真的收到了首块；非流式恒为 `None`。
+    upstream_ttft: Option<Duration>,
 }
 
 pub async fn completions(
@@ -573,12 +579,21 @@ async fn dispatch(
                         upstream_model: crate::dispatch::require_upstream_model(&att.model)?
                             .to_string(),
                     };
+                    // 本次尝试的上游 TTFT，由 `stamp_first_chunk` 在首块到达时写入；
+                    // 随胜出的那次尝试一起带出 walk，各分支收尾时读。
+                    let upstream_ttft = Arc::new(std::sync::OnceLock::new());
+                    let attempt_started = Instant::now();
                     let prepared = if hold_back {
                         async {
                         let stream = bridge
                             .complete_stream(body, &ctx)
                             .await
                             .map_err(ProxyError::Bridge)?;
+                        let stream = stamp_first_chunk(
+                            stream,
+                            attempt_started,
+                            Arc::clone(&upstream_ttft),
+                        );
                 let mut stream =
                             crate::stream_timeout::with_read_timeout_completion(
                                 stream,
@@ -661,6 +676,11 @@ async fn dispatch(
                                 .complete_stream(body, &ctx)
                                 .await
                                 .map_err(ProxyError::Bridge)?;
+                            let stream = stamp_first_chunk(
+                                stream,
+                                attempt_started,
+                                Arc::clone(&upstream_ttft),
+                            );
                             let mut stream = crate::stream_timeout::with_read_timeout_completion(
                                 stream,
                                 att.timeouts.stream,
@@ -693,7 +713,7 @@ async fn dispatch(
                         }
                         .await
                     }?;
-                    Ok((prepared, facts))
+                    Ok((prepared, facts, upstream_ttft))
                 }
             },
         )
@@ -720,7 +740,7 @@ async fn dispatch(
             reservation.merge(member);
         }
         let deferred = outcome.deferred;
-        let (prepared, facts) = outcome.value;
+        let (prepared, facts, upstream_ttft) = outcome.value;
         let provider_label = facts.provider;
         let provider_key_id = facts.provider_key_id;
         let upstream_model = facts.upstream_model;
@@ -740,12 +760,13 @@ async fn dispatch(
                 accumulator.push(&buffer);
                 accumulator.finish();
                 let output_text = accumulator.output_text();
-                let usage = completion_usage_with_estimates(
+                let mut usage = completion_usage_with_estimates(
                     accumulator.usage.unwrap_or_default(),
                     &upstream_model,
                     body.get("prompt"),
                     &output_text,
                 );
+                usage.upstream_ttft = upstream_ttft.get().copied();
                 reservation
                     .commit(
                         u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens),
@@ -874,12 +895,13 @@ async fn dispatch(
                 }
                 state.health.record_success(&model.display_name);
                 state.runtime_status.mark_healthy(&model_entry_id);
-                let usage = completion_usage_with_estimates(
+                let mut usage = completion_usage_with_estimates(
                     accumulator.usage.unwrap_or_default(),
                     &upstream_model,
                     body.get("prompt"),
                     &output_text,
                 );
+                usage.upstream_ttft = upstream_ttft.get().copied();
                 reservation
                     .commit(
                         u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens),
@@ -911,12 +933,13 @@ async fn dispatch(
                 accumulator,
                 output_text,
             } => {
-                let usage = completion_usage_with_estimates(
+                let mut usage = completion_usage_with_estimates(
                     accumulator.usage.unwrap_or_default(),
                     &upstream_model,
                     body.get("prompt"),
                     &output_text,
                 );
+                usage.upstream_ttft = upstream_ttft.get().copied();
                 reservation
                     .commit(
                         u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens),
@@ -1048,12 +1071,13 @@ async fn dispatch(
                             );
                         }
                         let output_text = accumulator.output_text();
-                        let usage = completion_usage_with_estimates(
+                        let mut usage = completion_usage_with_estimates(
                             accumulator.usage.unwrap_or_default(),
                             &upstream_model_for_stream,
                             prompt.as_ref(),
                             &output_text,
                         );
+                        usage.upstream_ttft = upstream_ttft.get().copied();
                         let total =
                             u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens);
                         limiter.add_tokens_post_stream_all(&post_stream_keys, total);
@@ -1213,6 +1237,7 @@ async fn dispatch(
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     usage_estimated: false,
+                    upstream_ttft: None,
                 });
                 let est_model = upstream_model.as_str();
                 if u.prompt_tokens == 0 {
@@ -1425,6 +1450,8 @@ fn extract_completion_usage(body: &Value) -> Option<CompletionUsage> {
         prompt_tokens,
         completion_tokens,
         usage_estimated: false,
+        // 流式调用方在算完用量后自己填上首块时刻。
+        upstream_ttft: None,
     })
 }
 
@@ -1539,6 +1566,10 @@ fn emit_usage_event(
         // the upstream figure and what the caller waited for coincide.
         upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        // 上游首块时刻，只有流式才有；非流式为 0，线上省略。
+        upstream_ttft_ms: usage
+            .upstream_ttft
+            .map_or(0, |ttft| ttft.as_millis().min(u32::MAX as u128) as u32),
         status_code,
         provider_request_id: provider_request_id.to_string(),
         inbound_protocol: "openai".to_string(),
@@ -1564,10 +1595,11 @@ fn emit_usage_event(
         exporters.iter().map(|e| &*e.value),
     );
     let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
+    let caller = owned_caller.as_caller();
     crate::request_metrics::record_usage(
         state,
         "/v1/completions",
-        owned_caller.as_caller(),
+        caller,
         crate::request_metrics::Upstream {
             provider,
             model: requested_model,
@@ -1584,6 +1616,42 @@ fn emit_usage_event(
             client_type: state.client_classifier.classify(&client.user_agent),
         },
     );
+    // 两条 TTFT 序列。`Some` 当且仅当流式路径真的收到了上游首块（1ms 内的也算），
+    // 非流式恒为 `None`。实时转发、扣留缓冲（放行、拦截、溢出、中途失败）的收尾
+    // 都从这个函数出去，记在这里就不会有哪条漏掉。
+    //
+    // 按请求方点名的那一行记（路由组时是父模型），和同一个流的 e2e 直方图一致；
+    // 经快照收敛成配置里的名字，调用方随手写的字符串进不了标签。
+    if usage.upstream_ttft.is_some() {
+        let (bounded_model, bounded_upstream) =
+            crate::usage_attr::metric_model_label_pair(snap, requested_model, upstream_model);
+        state.metrics.record_request_ttft(
+            LatencyLabels {
+                endpoint: "/v1/completions",
+                model: bounded_model.as_ref(),
+                provider,
+                status: status_code,
+                streaming: true,
+            },
+            usage.upstream_ttft,
+        );
+        state.metrics.record_time_to_first_token(
+            UsageLabels {
+                endpoint: "/v1/completions",
+                inbound_protocol: "openai",
+                provider,
+                model: bounded_model.as_ref(),
+                upstream_model: bounded_upstream.as_ref(),
+                provider_key_id: pk.labels().id(),
+                provider_key_name: pk.labels().name(),
+                api_key_id: caller.api_key_id,
+                team_id: caller.team_id,
+                user_id: caller.user_id,
+                user_name: caller.user_name,
+            },
+            Duration::from_millis(u64::from(event.upstream_ttft_ms)),
+        );
+    }
 }
 #[allow(clippy::too_many_arguments)]
 /// Per-target facts a Model Group resolves differently per member, so none

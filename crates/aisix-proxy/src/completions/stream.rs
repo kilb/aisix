@@ -5,7 +5,8 @@ use aisix_gateway::{
 use futures::StreamExt;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 pub(super) enum PreparedCompletionStream {
     Buffered(Vec<u8>),
@@ -352,6 +353,24 @@ fn push_capped(buffer: &mut String, text: &str, cap: usize) -> usize {
     }
     buffer.push_str(&text[..end]);
     end
+}
+
+/// 上游第一个非空字节块到达时，把它相对本次尝试起点的耗时写进 `slot`，只写一次。
+/// 这就是上游 TTFT：首块是什么类型都算，和 chat / responses / messages 的口径一致。
+///
+/// 打在源头而不是某个消费者里：扣留路径在 walk 里边读边缓冲，配置了流超时的
+/// 实时路径会先偷看首块再拼回去，扣留溢出转放行时转发的又是重新拼起来的前缀——
+/// 只有源头在每条分支上看到的都是上游真正交付的时刻。
+pub(super) fn stamp_first_chunk(
+    upstream: CompletionByteStream,
+    attempt_started: Instant,
+    slot: Arc<OnceLock<Duration>>,
+) -> CompletionByteStream {
+    Box::pin(upstream.inspect(move |item| {
+        if matches!(item, Ok(bytes) if !bytes.is_empty()) {
+            slot.get_or_init(|| attempt_started.elapsed());
+        }
+    }))
 }
 
 pub(super) fn completion_usage_with_estimates(
@@ -744,6 +763,34 @@ mod tests {
 
         assert!(output.len() <= accumulator.text_cap);
         assert_eq!(output.len(), accumulator.text_bytes);
+    }
+
+    /// 首个非空字节块写下 TTFT，之后的块不再覆盖；空块不算首块。
+    #[tokio::test]
+    async fn first_non_empty_chunk_stamps_ttft_once() {
+        let slot = Arc::new(OnceLock::new());
+        let upstream: CompletionByteStream = Box::pin(futures::stream::iter([
+            Ok(bytes::Bytes::new()),
+            Ok(bytes::Bytes::from(frame("first", true))),
+            Ok(bytes::Bytes::from(frame("second", true))),
+        ]));
+        let mut stream = stamp_first_chunk(upstream, Instant::now(), Arc::clone(&slot));
+
+        assert!(stream.next().await.is_some());
+        assert!(
+            slot.get().is_none(),
+            "an empty chunk is not the first frame"
+        );
+        assert!(stream.next().await.is_some());
+        let first = *slot
+            .get()
+            .expect("the first non-empty chunk stamps the TTFT");
+        while stream.next().await.is_some() {}
+        assert_eq!(
+            slot.get(),
+            Some(&first),
+            "later chunks never move the stamp"
+        );
     }
 
     #[tokio::test]

@@ -14,7 +14,9 @@
 
 use aisix_core::AppliedGuardrail;
 use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse, FinishReason, UsageStats};
-use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent};
+use aisix_obs::{
+    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent, UsageLabels,
+};
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
@@ -325,6 +327,10 @@ struct ResponseUsage {
     /// this existed `/v1/responses` reported no TTFT at all, so codex-class
     /// clients showed blank.
     upstream_ttft_ms: u32,
+    /// 与 `upstream_ttft_ms` 同一时刻，保留亚毫秒精度。`Some` 当且仅当流式
+    /// 路径真的看到了首帧——1ms 内到达的首帧 `_ms` 为 0，两条 TTFT 指标只认
+    /// 这个字段。非流式路径恒为 `None`。
+    upstream_ttft: Option<Duration>,
     /// Request-scoped time until the caller got its first response bytes.
     /// 0 until the stream forwards something (or the handler stamps it on
     /// the non-streaming paths).
@@ -1922,6 +1928,12 @@ async fn responses_to_target(
                 // telemetry only, the buffered bytes forward untouched.
                 let usage = {
                     let mut u = responses_sse_usage(&buf).unwrap_or_default();
+                    // 首帧时刻是上面边读边缓冲时量的，事后重新解析缓冲区得不到；
+                    // 不带过来的话，扣留路径的 TTFT 就整个丢了。
+                    if let Some(observed) = observed_usage.as_ref() {
+                        u.upstream_ttft_ms = observed.upstream_ttft_ms;
+                        u.upstream_ttft = observed.upstream_ttft;
+                    }
                     // The usage gate is independent of the id: a stream whose
                     // terminal frame reported no usage still names the upstream
                     // call it was (#1289).
@@ -2758,6 +2770,7 @@ async fn responses_cross_provider_to_target(
                     cache_read_tokens: comp.cache_read_tokens,
                     usage_estimated: comp.usage_estimated,
                     upstream_ttft_ms: comp.upstream_ttft_ms,
+                    upstream_ttft: comp.upstream_ttft,
                     downstream_latency_ms: comp.downstream_latency_ms,
                     provider_request_id: comp.provider_request_id,
                 };
@@ -2932,6 +2945,7 @@ async fn responses_cross_provider_to_target(
             cache_read_tokens: resp.usage.cache_read_tokens,
             usage_estimated: false,
             upstream_ttft_ms: 0,
+            upstream_ttft: None,
             downstream_latency_ms: 0,
             // The bridged upstream's own id, not the `resp_…` re-encoded
             // below — that one is minted here and means nothing to the
@@ -3134,6 +3148,7 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         // Carried across by the caller (`drain_responses_sse_frames`), which
         // measured these before this terminal frame arrived.
         upstream_ttft_ms: 0,
+        upstream_ttft: None,
         downstream_latency_ms: 0,
         // `resp_…` straight off the upstream's own response object
         // (#1289). On the streaming path the caller carries the
@@ -3312,8 +3327,10 @@ fn drain_responses_sse_frames(
             // phase on hidden-reasoning upstreams — #1225.
             if !*first_frame_seen {
                 *first_frame_seen = true;
-                acc.get_or_insert_with(Default::default).upstream_ttft_ms =
-                    attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                let ttft = attempt_started.elapsed();
+                let usage = acc.get_or_insert_with(Default::default);
+                usage.upstream_ttft_ms = ttft.as_millis().min(u32::MAX as u128) as u32;
+                usage.upstream_ttft = Some(ttft);
             }
             // `resp_…` off any frame that carries the response object —
             // `response.created` is the first, so a stream that dies
@@ -3333,11 +3350,12 @@ fn drain_responses_sse_frames(
                 // the latency figures and the id observed before it
                 // across — an upstream that stamps the id only on
                 // `response.created` would otherwise lose it here.
-                let (ttft, down, prev_id) = acc
+                let (ttft, ttft_precise, down, prev_id) = acc
                     .as_ref()
                     .map(|a| {
                         (
                             a.upstream_ttft_ms,
+                            a.upstream_ttft,
                             a.downstream_latency_ms,
                             a.provider_request_id.clone(),
                         )
@@ -3350,6 +3368,7 @@ fn drain_responses_sse_frames(
                 };
                 *acc = Some(ResponseUsage {
                     upstream_ttft_ms: ttft,
+                    upstream_ttft: ttft_precise,
                     downstream_latency_ms: down,
                     provider_request_id,
                     ..u
@@ -4153,10 +4172,11 @@ fn emit_usage_event(
         usage.cache_read_tokens,
     );
     let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
+    let caller = owned_caller.as_caller();
     crate::request_metrics::record_usage(
         state,
         "/v1/responses",
-        owned_caller.as_caller(),
+        caller,
         crate::request_metrics::Upstream {
             provider,
             model: requested_model,
@@ -4172,6 +4192,42 @@ fn emit_usage_event(
             client_type: state.client_classifier.classify(&client.user_agent),
         },
     );
+    // 两条 TTFT 序列。`Some` 当且仅当流式路径真的看到了上游首帧（1ms 内的也算），
+    // 非流式恒为 `None`，所以这里只会记流式。原生透传、桥接、扣留缓冲三条流式
+    // 收尾都从这个函数出去，记在这里就不会有哪条漏掉。
+    //
+    // 按哪个模型记：请求方点名的那一行（路由组时是父模型），和同一个流的 e2e
+    // 直方图一致；经快照收敛成配置里的名字，调用方随手写的字符串进不了标签。
+    if usage.upstream_ttft.is_some() {
+        let (bounded_model, bounded_upstream) =
+            crate::usage_attr::metric_model_label_pair(snap, requested_model, upstream_model);
+        state.metrics.record_request_ttft(
+            LatencyLabels {
+                endpoint: "/v1/responses",
+                model: bounded_model.as_ref(),
+                provider,
+                status: status_code,
+                streaming: true,
+            },
+            usage.upstream_ttft,
+        );
+        state.metrics.record_time_to_first_token(
+            UsageLabels {
+                endpoint: "/v1/responses",
+                inbound_protocol: "openai",
+                provider,
+                model: bounded_model.as_ref(),
+                upstream_model: bounded_upstream.as_ref(),
+                provider_key_id: pk.labels().id(),
+                provider_key_name: pk.labels().name(),
+                api_key_id: caller.api_key_id,
+                team_id: caller.team_id,
+                user_id: caller.user_id,
+                user_name: caller.user_name,
+            },
+            Duration::from_millis(u64::from(usage.upstream_ttft_ms)),
+        );
+    }
 }
 
 /// Emit a zero-token `UsageEvent` for a failed / pre-dispatch attempt
@@ -6370,6 +6426,34 @@ data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\"}}\n\n";
         let usage = super::parse_responses_terminal_usage(&failed).unwrap();
         assert_eq!(usage.completion_tokens, 4);
         assert!(!usage.reached_end, "a failed response is not a healthy end");
+    }
+
+    /// 首帧必须记下 `upstream_ttft`（Duration），而且要挺过终止帧对用量的整体
+    /// 替换：两条 TTFT 指标只认这个字段，每条原生流都有终止帧，在那一步丢掉
+    /// 就一条都不记。立即到达的首帧 `_ms` 为 0，正是 `Option<Duration>` 要区分的情形。
+    #[test]
+    fn first_frame_ttft_survives_the_terminal_frame() {
+        let mut buf = b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n"
+            .to_vec();
+        let mut acc = None;
+        let mut failure = None;
+        let mut first_frame_seen = false;
+        let terminal = super::drain_responses_sse_frames(
+            &mut buf,
+            &mut acc,
+            None,
+            &mut failure,
+            std::time::Instant::now(),
+            &mut first_frame_seen,
+        );
+        assert!(terminal);
+        let usage = acc.expect("both frames parsed");
+        assert_eq!(usage.prompt_tokens, 3, "the terminal frame's usage landed");
+        assert!(
+            usage.upstream_ttft.is_some(),
+            "the first frame's upstream_ttft must survive the terminal frame"
+        );
     }
 
     #[tokio::test]

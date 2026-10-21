@@ -20,7 +20,7 @@
 //! mapping today, so it is intentionally not translated.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aisix_gateway::{
     ChatChunk, ChatChunkStream, ChatFormat, ChatMessage, ChatResponse, FinishReason, Role,
@@ -962,6 +962,9 @@ pub struct ResponsesStreamCompletion {
     pub provider_request_id: String,
     /// Attempt-scoped time to the upstream's first generated chunk.
     pub upstream_ttft_ms: u32,
+    /// 与 `upstream_ttft_ms` 同一时刻，保留亚毫秒精度。`Some` 当且仅当真的
+    /// 看到了首块——1ms 内到达的首块 `_ms` 为 0，两条 TTFT 指标只认这个字段。
+    pub upstream_ttft: Option<Duration>,
     /// Request-scoped time until the caller got its first response bytes.
     /// Trails `upstream_ttft_ms` by any hold-back guardrail scan.
     pub downstream_latency_ms: u32,
@@ -1116,8 +1119,10 @@ pub fn build_responses_bridge_stream(
                     // (#1225).
                     if !first_chunk_seen {
                         first_chunk_seen = true;
+                        let ttft = attempt_started.elapsed();
                         guard.comp().upstream_ttft_ms =
-                            attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                            ttft.as_millis().min(u32::MAX as u128) as u32;
+                        guard.comp().upstream_ttft = Some(ttft);
                     }
                     {
                         let comp = guard.comp();
