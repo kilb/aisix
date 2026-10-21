@@ -1457,6 +1457,9 @@ pub struct StreamState {
     /// The tool call the current `content_block_stop` closes without an
     /// argument fragment, and the arguments it is given then.
     unstreamed_tool_call: Option<(usize, String)>,
+    /// Whether a chunk has been emitted yet. The first one carries
+    /// `delta.role: "assistant"`, as OpenAI's stream does.
+    role_sent: bool,
 }
 
 #[derive(Debug)]
@@ -1537,8 +1540,22 @@ impl StreamState {
         }
     }
 
-    /// Translate one event into an optional chunk to yield upstream.
-    pub fn to_chunk(&self, event: &AnthropicStreamEvent) -> Option<ChatChunk> {
+    /// Translate one event into an optional chunk to yield upstream. The
+    /// first chunk of the stream names the assistant role: OpenAI's stream
+    /// opens with `delta.role: "assistant"`, and the official SDK's stream
+    /// helper refuses to assemble a message without it ("missing role for
+    /// choice 0"). It rides the first chunk emitted anyway rather than an
+    /// empty one at `message_start`, so time-to-first-token is unchanged.
+    pub fn to_chunk(&mut self, event: &AnthropicStreamEvent) -> Option<ChatChunk> {
+        let mut chunk = self.translate(event)?;
+        if !self.role_sent {
+            self.role_sent = true;
+            chunk.delta.role = Some(Role::Assistant);
+        }
+        Some(chunk)
+    }
+
+    fn translate(&self, event: &AnthropicStreamEvent) -> Option<ChatChunk> {
         match event {
             AnthropicStreamEvent::ContentBlockDelta {
                 delta: AnthropicStreamDelta::TextDelta { text },
@@ -3981,8 +3998,39 @@ mod tests {
     }
 
     #[test]
+    fn stream_state_sends_the_assistant_role_on_the_first_chunk_only() {
+        let run = |events: &[&str]| {
+            let mut state = StreamState::default();
+            let mut out = Vec::new();
+            for raw in events {
+                let ev: AnthropicStreamEvent = serde_json::from_str(raw).unwrap();
+                state.update(&ev);
+                out.extend(state.to_chunk(&ev));
+            }
+            out
+        };
+        let chunks = run(&[
+            r#"{"type":"message_start","message":{"id":"m","model":"claude","type":"message","role":"assistant","content":[],"stop_reason":null,"usage":{"input_tokens":1}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"a"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"b"}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}"#,
+        ]);
+        let roles: Vec<_> = chunks.iter().map(|c| c.delta.role).collect();
+        assert_eq!(roles, vec![Some(Role::Assistant), None, None]);
+
+        // A stream with no content still names the role on its one chunk.
+        let empty = run(&[
+            r#"{"type":"message_start","message":{"id":"m","model":"claude","type":"message","role":"assistant","content":[],"stop_reason":null,"usage":{"input_tokens":1}}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}"#,
+        ]);
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0].delta.role, Some(Role::Assistant));
+    }
+
+    #[test]
     fn stream_state_emits_finish_on_message_delta() {
-        let state = StreamState {
+        let mut state = StreamState {
             id: "msg".into(),
             model: "claude".into(),
             ..Default::default()
