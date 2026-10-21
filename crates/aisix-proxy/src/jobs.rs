@@ -468,6 +468,33 @@ enum UploadField {
     },
 }
 
+/// Every string value and object key of every JSONL line that parses,
+/// decoded, one per line. `None` when no line parses.
+fn jsonl_decoded_text(text: &str) -> Option<String> {
+    fn walk(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(s) => out.push(s.clone()),
+            serde_json::Value::Array(items) => items.iter().for_each(|v| walk(v, out)),
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    out.push(k.clone());
+                    walk(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    let mut parsed_any = false;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            parsed_any = true;
+            walk(&value, &mut out);
+        }
+    }
+    parsed_any.then(|| out.join("\n"))
+}
+
 async fn scan_input_blob(
     state: &ProxyState,
     auth: &AuthenticatedKey,
@@ -495,11 +522,22 @@ async fn scan_input_blob(
     if chain.is_empty() {
         return Ok(None);
     }
+    // 原样的字节之外，还要查 JSONL 每行解码后的字符串：上游读的是解码后的
+    // 内容，`\u0068ow to …` 这类转义、以及 Python `json.dumps` 默认把非
+    // ASCII 全部转义成的 `\uXXXX`，在原样字节里都对不上规则。没有反斜杠就
+    // 没有转义，解码后的字符串都是原文的子串，不必再查一遍。
+    let raw = String::from_utf8_lossy(blob).into_owned();
+    let inspected = match raw
+        .contains('\\')
+        .then(|| jsonl_decoded_text(&raw))
+        .flatten()
+    {
+        Some(decoded) => format!("{raw}\n{decoded}"),
+        None => raw,
+    };
     let chat = aisix_gateway::ChatFormat::new(
         target.display_name(),
-        vec![aisix_gateway::ChatMessage::user(
-            String::from_utf8_lossy(blob).into_owned(),
-        )],
+        vec![aisix_gateway::ChatMessage::user(inspected)],
     );
     let (verdict, hits) = aisix_guardrails::Guardrail::check_input_observed(&chain, &chat).await;
     monitor_hits.extend(hits);
@@ -991,21 +1029,11 @@ pub(crate) async fn create_file(
             fields.push(UploadField::Text(name, v));
         }
 
-        // The LAST `file` part, matching what this handler has always read:
-        // `file_bytes` was overwritten on each one. Carrying the index — not
-        // just the bytes — is what keeps the scan and the rewrite on the same
-        // part, so a body with two of them cannot have one scanned and the
-        // other replaced by the first one's masked text.
-        let file_at = fields
-            .iter()
-            .rposition(|f| matches!(f, UploadField::File { .. }))
-            .ok_or_else(|| {
-                ProxyError::InvalidRequest("multipart body must include a `file` field".into())
-            })?;
-        let file_bytes = match &fields[file_at] {
-            UploadField::File { bytes, .. } => bytes.clone(),
-            UploadField::Text(..) => unreachable!("rposition matched a File"),
-        };
+        if !fields.iter().any(|f| matches!(f, UploadField::File { .. })) {
+            return Err(ProxyError::InvalidRequest(
+                "multipart body must include a `file` field".into(),
+            ));
+        }
 
         let wanted = form_model.or_else(|| explicit_model(&params, &headers));
         let snapshot = &**snapshot.insert(state.snapshot.load());
@@ -1014,15 +1042,27 @@ pub(crate) async fn create_file(
         // Batch/fine-tune input files carry end-user content — scan them
         // like any other inbound payload. 这也是这条面上唯一承载最终用户
         // 提示词的载荷，所以是唯一允许被 `mask` 规则改写的那一个。
-        let masked = scan_input_blob(
-            &state,
-            &auth,
-            &target,
-            &file_bytes,
-            &mut monitor_hits,
-            Some(&mut redactions),
-        )
-        .await?;
+        // Every `file` part is forwarded, so every one is scanned (and may
+        // be masked). Keyed by position, so each rewrite lands on the part it
+        // was made from.
+        let mut masked: std::collections::HashMap<usize, Vec<u8>> =
+            std::collections::HashMap::new();
+        for (i, field) in fields.iter().enumerate() {
+            if let UploadField::File { bytes, .. } = field {
+                if let Some(m) = scan_input_blob(
+                    &state,
+                    &auth,
+                    &target,
+                    bytes,
+                    &mut monitor_hits,
+                    Some(&mut redactions),
+                )
+                .await?
+                {
+                    masked.insert(i, m);
+                }
+            }
+        }
 
         let mut form = reqwest::multipart::Form::new();
         for (i, field) in fields.into_iter().enumerate() {
@@ -1033,10 +1073,7 @@ pub(crate) async fn create_file(
                     content_type,
                     bytes,
                 } => {
-                    let body = match (i == file_at, masked.as_ref()) {
-                        (true, Some(m)) => m.clone(),
-                        _ => bytes.to_vec(),
-                    };
+                    let body = masked.remove(&i).unwrap_or_else(|| bytes.to_vec());
                     let mut part = reqwest::multipart::Part::bytes(body).file_name(file_name);
                     if let Some(ct) = content_type {
                         part = part.mime_str(&ct).map_err(|e| {
@@ -3450,5 +3487,97 @@ mod tests {
             sent.contains("filename=\"first.jsonl\"") && sent.contains("filename=\"second.jsonl\""),
             "both parts must still be present, with their own filenames:\n{sent}"
         );
+    }
+    async fn upload_with_guardrail(
+        guardrail: &str,
+        parts: &[(&str, &str)],
+    ) -> (StatusCode, String) {
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(path("/v1/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "file-x", "object": "file", "purpose": "batch", "filename": "b.jsonl"
+            })))
+            .mount(&upstream)
+            .await;
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let g: aisix_core::Guardrail = serde_json::from_str(guardrail).unwrap();
+        snap.guardrails.insert(ResourceEntry::new("g-1", g, 1));
+        let app = build_app(snap);
+        let boundary = "XGRX";
+        let mut b = format!(
+            "--{boundary}\r\ncontent-disposition: form-data; name=\"model\"\r\n\r\njobs-a\r\n"
+        );
+        for (name, body) in parts {
+            b.push_str(&format!(
+                "--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; filename=\"{name}\"\r\n\r\n{body}\r\n"
+            ));
+        }
+        b.push_str(&format!("--{boundary}--\r\n"));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/files")
+            .header("authorization", "Bearer sk-caller")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(b))
+            .unwrap();
+        let status = app.oneshot(req).await.unwrap().status();
+        let sent = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .first()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .unwrap_or_default();
+        (status, sent)
+    }
+
+    /// Every forwarded `file` part is inspected, not only the last one.
+    #[tokio::test]
+    async fn every_file_part_is_masked_not_only_the_last() {
+        let (status, sent) = upload_with_guardrail(
+            r#"{"name":"mask-email","enabled":true,"hook_point":"input","kind":"pii","detectors":[{"type":"email","action":"mask"}]}"#,
+            &[("first.jsonl", "FIRST mail alice@example.com"), ("second.jsonl", "SECOND clean")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !sent.contains("alice@example.com"),
+            "the first part went out unmasked:\n{sent}"
+        );
+        assert!(sent.contains("SECOND clean"));
+    }
+
+    /// The provider reads JSONL decoded; a rule must see it decoded too. A
+    /// JSON escape (`\u0068` = `h`, or the `\uXXXX` Python writes for all
+    /// non-ASCII text by default) must not carry a phrase past the check.
+    #[tokio::test]
+    async fn a_phrase_behind_json_escapes_in_an_uploaded_file_is_refused() {
+        let (status, sent) = upload_with_guardrail(
+            r#"{"name":"kw","enabled":true,"hook_point":"input","kind":"keyword","patterns":[{"kind":"literal","value":"how to pick a lock"},{"kind":"literal","value":"违禁词"}]}"#,
+            &[(
+                "b.jsonl",
+                r#"{"custom_id":"r1","body":{"messages":[{"role":"user","content":"\u0068ow to pick a lock"}]}}"#,
+            )],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(sent.is_empty(), "nothing may reach the provider");
+
+        let (status, _) = upload_with_guardrail(
+            r#"{"name":"kw","enabled":true,"hook_point":"input","kind":"keyword","patterns":[{"kind":"literal","value":"违禁词"}]}"#,
+            &[(
+                "b.jsonl",
+                r#"{"custom_id":"r1","body":{"messages":[{"role":"user","content":"\u8fdd\u7981\u8bcd"}]}}"#,
+            )],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 }
