@@ -777,11 +777,11 @@ pub fn redact_userinfo(value: &str) -> std::borrow::Cow<'_, str> {
         Some(i) if !value[..i].contains(['/', '?', '#', '@']) => i + 3,
         _ => 0,
     };
-    let authority_end = value[after_scheme..]
-        .find(['/', '?', '#'])
-        .map(|i| after_scheme + i)
-        .unwrap_or(value.len());
-    match value[after_scheme..authority_end].rfind('@') {
+    // The last `@` anywhere after the scheme: a password may itself hold a
+    // raw `/`, `?` or `#`, and ending the authority at the first of those
+    // would leave the rest of the password in the message. A path or query
+    // holding an `@` is over-redacted, which is harmless in a message.
+    match value[after_scheme..].rfind('@') {
         Some(at) => std::borrow::Cow::Owned(format!(
             "{}***@{}",
             &value[..after_scheme],
@@ -868,6 +868,18 @@ mod tests {
             "the userinfo survived redaction: {shown}"
         );
         assert_eq!(shown, "***@host/v1?next=https://x");
+    }
+
+    /// 密码里本身带 `/`、`?`、`#` 时，authority 不能在第一个这类字符处截断 ——
+    /// 否则密码的后半截原样出现在报错里。
+    #[test]
+    fn redact_userinfo_covers_a_password_holding_a_slash() {
+        let shown = redact_userinfo("https://u:ab/cd@res.openai.azure.com/v1");
+        assert!(
+            !shown.contains("ab/cd") && !shown.contains("cd@"),
+            "{shown}"
+        );
+        assert_eq!(shown, "https://***@res.openai.azure.com/v1");
     }
 
     /// `api_base` decides where the ProviderKey's secret is sent, so a shape

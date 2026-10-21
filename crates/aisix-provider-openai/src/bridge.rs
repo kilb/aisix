@@ -827,10 +827,8 @@ fn parse_stream_chunk(
 /// Whether the upstream is OpenAI itself, which takes the `developer` role.
 /// This bridge also serves OpenAI-compatible vendors, which get `system`.
 fn upstream_takes_developer(ctx: &BridgeContext) -> bool {
-    ctx.provider_key
-        .provider
-        .trim()
-        .eq_ignore_ascii_case("openai")
+    // The same exact match dispatch uses to pick this vendor.
+    ctx.provider_key.provider == "openai"
 }
 
 #[cfg(test)]

@@ -231,16 +231,18 @@ impl VertexBridge {
                 )));
             }
             if b.contains('?') {
-                return Err(BridgeError::InvalidUpstreamConfig(format!(
+                // The value is not quoted back: a query string is where an
+                // operator pastes a key, and this error reaches the caller.
+                return Err(BridgeError::InvalidUpstreamConfig(
                     "vertex provider_key api_base must not contain a query string (the bridge \
-                     appends `?alt=sse` on streaming; an operator query would silently merge), \
-                     got {b:?}",
-                )));
+                     appends `?alt=sse` on streaming; an operator query would silently merge)"
+                        .to_string(),
+                ));
             }
             if b.contains('#') {
-                return Err(BridgeError::InvalidUpstreamConfig(format!(
-                    "vertex provider_key api_base must not contain a fragment, got {b:?}",
-                )));
+                return Err(BridgeError::InvalidUpstreamConfig(
+                    "vertex provider_key api_base must not contain a fragment".to_string(),
+                ));
             }
             // Reject an embedded path component — only `scheme://host[:port]`
             // is a valid origin. A bare trailing slash is fine (trimmed
@@ -482,7 +484,8 @@ impl VertexSecret {
 /// a blocklist can still climb out of its path segment. A wildcard Vertex
 /// model takes its upstream id from the caller, so that would send the
 /// operator's credential to any Vertex path. `:` is admitted for the
-/// project only — in a model id it would read as a method suffix.
+/// project only — in a model id it would read as a method suffix — and `@`
+/// (a model version, `claude-3-5-sonnet@20241022`) for the model id only.
 fn validate_url_token(name: &str, value: &str) -> Result<(), BridgeError> {
     if value.is_empty() {
         return Err(BridgeError::Config(format!(
@@ -491,13 +494,14 @@ fn validate_url_token(name: &str, value: &str) -> Result<(), BridgeError> {
     }
     let allowed = |b: u8| {
         b.is_ascii_alphanumeric()
-            || matches!(b, b'-' | b'_' | b'.' | b'@')
+            || matches!(b, b'-' | b'_' | b'.')
+            || (b == b'@' && name == "upstream_id")
             || (b == b':' && name == "project")
     };
     if !value.bytes().all(allowed) || value.contains("..") || value.bytes().all(|b| b == b'.') {
         return Err(BridgeError::Config(format!(
             "vertex {name} {value:?} contains URL-control characters — \
-             expected only letters, digits, `-`, `_`, `.` and `@`"
+             expected only letters, digits, `-`, `_` and `.` (and `@` in a model id)"
         )));
     }
     Ok(())
@@ -2443,6 +2447,21 @@ mod tests {
                 msg.contains("vertex.example"),
                 "the host should survive so the message stays useful: {msg}"
             );
+        }
+    }
+
+    #[test]
+    fn a_rejected_query_string_is_not_quoted_back() {
+        let bridge = VertexBridge::new();
+        for base in [
+            "https://proxy.internal?key=SECRET-9f2b",
+            "https://proxy.internal#SECRET-9f2b",
+        ] {
+            let err = bridge
+                .resolve_api_base("us-central1", Some(base))
+                .err()
+                .unwrap();
+            assert!(!err.to_string().contains("SECRET-9f2b"), "{err}");
         }
     }
 

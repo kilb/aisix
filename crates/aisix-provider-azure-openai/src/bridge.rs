@@ -351,17 +351,21 @@ impl AzureUpstreamRef {
             // opens an injection / api-version-downgrade vector. Scheme
             // is already constrained to `http://` or `https://` by the
             // outer `strip_prefix` chain.
+            // The value is not quoted back: a query string is where an
+            // operator pastes a key (`?subscription-key=…`), and this error
+            // reaches the caller.
             if base.contains('?') {
-                return Err(BridgeError::InvalidUpstreamConfig(format!(
-                    "azure api_base {base:?} must not contain a query string \
+                return Err(BridgeError::InvalidUpstreamConfig(
+                    "azure api_base must not contain a query string \
                      (the bridge appends `?api-version=…`; an operator-supplied \
                      query would either merge or override the pinned api-version)"
-                )));
+                        .to_string(),
+                ));
             }
             if base.contains('#') {
-                return Err(BridgeError::InvalidUpstreamConfig(format!(
-                    "azure api_base {base:?} must not contain a fragment"
-                )));
+                return Err(BridgeError::InvalidUpstreamConfig(
+                    "azure api_base must not contain a fragment".to_string(),
+                ));
             }
             let override_base = base.trim_end_matches('/').to_string();
             return Ok(Self {
@@ -758,7 +762,10 @@ impl Bridge for AzureOpenAiBridge {
         // body's `model` field is ignored by Azure (or echoed back).
         // We still set it to the deployment name for log-trace clarity
         // and to mirror the upstream OpenAI SDK convention.
-        let messages = messages_from(req, true);
+        // `system`, not `developer`: the pinned api-version predates the
+        // `developer` role, and Azure treats `system` as developer
+        // instructions on the reasoning models.
+        let messages = messages_from(req, false);
         let typed = build_request(req, deployment, &messages, false);
         let body = prepare_outbound_body(
             &typed,
@@ -810,7 +817,10 @@ impl Bridge for AzureOpenAiBridge {
 
         // See chat() — resolve auth before the request future.
         let auth = self.resolve_auth(ctx).await?;
-        let messages = messages_from(req, true);
+        // `system`, not `developer`: the pinned api-version predates the
+        // `developer` role, and Azure treats `system` as developer
+        // instructions on the reasoning models.
+        let messages = messages_from(req, false);
         let typed = build_request(req, deployment, &messages, true);
         let body = prepare_outbound_body(
             &typed,
@@ -1292,6 +1302,22 @@ mod tests {
             }
             other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
+    }
+
+    /// The rejection reaches the caller, and a query string is where an
+    /// operator pastes a key: the value must not be quoted back.
+    #[test]
+    fn a_rejected_query_string_is_not_quoted_back() {
+        let err = AzureUpstreamRef::resolve(
+            "dep",
+            Some("https://apim.corp.net?subscription-key=SECRET-9f2b"),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains("SECRET-9f2b"), "{msg}");
+        let err = AzureUpstreamRef::resolve("dep", Some("https://apim.corp.net#SECRET-9f2b"))
+            .unwrap_err();
+        assert!(!err.to_string().contains("SECRET-9f2b"));
     }
 
     #[test]

@@ -115,9 +115,10 @@ pub fn build_request<'a>(
 }
 
 /// `forward_developer`: whether the upstream takes OpenAI's `developer` role.
-/// OpenAI and Azure OpenAI do; other OpenAI-compatible servers document only
-/// `system` (DeepSeek, Mistral) or may drop an unknown role's text (Ollama),
-/// so they receive the same instructions as a `system` message.
+/// OpenAI does; other OpenAI-compatible servers document only `system`
+/// (DeepSeek, Mistral) or may drop an unknown role's text (Ollama), and Azure
+/// is pinned to an api-version that predates the role, so they receive the
+/// same instructions as a `system` message.
 pub fn messages_from(req: &ChatFormat, forward_developer: bool) -> Vec<OpenAiMessage<'_>> {
     req.messages
         .iter()
