@@ -202,6 +202,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "base64 0.22.1",
  "chrono",
+ "futures",
  "hmac 0.12.1",
  "regex",
  "reqwest 0.12.28",

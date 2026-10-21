@@ -1,0 +1,291 @@
+import { createServer, type Server } from "node:http";
+import { createHash } from "node:crypto";
+import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import {
+  EtcdClient,
+  SeedClient,
+  pickFreePort,
+  spawnApp,
+  startOpenAiUpstream,
+  waitConfigPropagation,
+  type OpenAiUpstream,
+  type SpawnedApp,
+} from "../harness/index.js";
+
+// E2E：阿里云护栏审得到超过单次上限（2 000 字）的内容。
+//
+// 阿里云每次调用只收 2 000 字。护栏审的是整段对话，按 system、历史、最新一轮的
+// 顺序拼起来；只送前 2 000 字的话，对话一长，最新一轮 —— 调用方这一次真正说的
+// 话 —— 就再也审不到；模型回答超过 2 000 字的部分也一样。
+//
+// 预期：
+//   - 最新一条消息无论落在哪里、多长（在调用预算内），都被完整审到；
+//   - 最新一条消息本身长到预算装不下：拦下，而不是放行没审过的内容；
+//   - 历史再长，一次请求的调用次数有上限，每次调用不超过 2 000 字；
+//   - 模型的回答整段都审；
+//   - 要脱敏（mask）的内容在长文本里也被改写，其余文字原样、不丢不重。
+
+const MARKER = "aliyunlongcontentmarker";
+const PHONE = "13800138000";
+const PER_CALL_LIMIT = 2_000;
+
+interface MockCall {
+  action: string;
+  service: string;
+  chars: number;
+}
+
+/** One stand-in for both Aliyun APIs, keyed on `Action`. */
+async function startAliyunMock(): Promise<{ baseUrl: string; calls: MockCall[]; close(): Promise<void> }> {
+  const calls: MockCall[] = [];
+  const server: Server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c: Buffer) => (raw += c.toString("utf8")));
+    req.on("end", () => {
+      const params = new URLSearchParams(raw);
+      const action = params.get("Action") ?? "";
+      const service = params.get("Service") ?? "";
+      let content = "";
+      try {
+        const sp = JSON.parse(params.get("ServiceParameters") ?? "{}") as { content?: unknown };
+        content = typeof sp.content === "string" ? sp.content : "";
+      } catch {
+        content = "";
+      }
+      calls.push({ action, service, chars: Array.from(content).length });
+      res.writeHead(200, { "content-type": "application/json" });
+      if (action === "MultiModalGuard") {
+        const suggestion = content.includes(MARKER) ? "block" : content.includes(PHONE) ? "mask" : "pass";
+        const detail =
+          suggestion === "mask"
+            ? {
+                Type: "sensitiveData",
+                Suggestion: "mask",
+                Result: [
+                  {
+                    Label: "1814",
+                    Ext: { Desensitization: content.replaceAll(PHONE, "[PHONE]"), SensitiveData: [PHONE] },
+                  },
+                ],
+              }
+            : { Type: "contentModeration", Suggestion: suggestion, Result: [{ Label: "nonLabel" }] };
+        res.end(JSON.stringify({ Code: 200, Message: "OK", RequestId: "LC-AIG", Data: { Detail: [detail], Suggestion: suggestion } }));
+        return;
+      }
+      const risky = content.includes(MARKER);
+      res.end(
+        JSON.stringify({
+          Code: 200,
+          Message: "OK",
+          RequestId: "LC-TMP",
+          Data: {
+            RiskLevel: risky ? "high" : "none",
+            Result: risky ? [{ Label: "inappropriate_oral", Confidence: 100 }] : [{ Label: "nonLabel" }],
+          },
+        }),
+      );
+    });
+  });
+  const port = await pickFreePort();
+  await new Promise<void>((r) => server.listen(port, "127.0.0.1", r));
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
+    calls,
+    close: () => new Promise<void>((r) => server.close(() => r())),
+  };
+}
+
+const filler = (n: number) => "the quick brown fox jumps over the lazy dog. ".repeat(Math.ceil(n / 45)).slice(0, n);
+
+const chatReply = (content: string) => ({
+  id: "cmpl-long",
+  object: "chat.completion",
+  created: 0,
+  model: "gpt-4o-mini",
+  choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+  usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 },
+});
+
+interface Ctx {
+  app?: SpawnedApp;
+  aliyun?: Awaited<ReturnType<typeof startAliyunMock>>;
+  upstreams: Record<string, OpenAiUpstream>;
+  ready: boolean;
+}
+
+/** Spawn a gateway with one Aliyun guardrail of `kind` and the given models. */
+async function setup(
+  kind: "aliyun_text_moderation" | "aliyun_ai_guardrail",
+  caller: string,
+  replies: Record<string, string>,
+): Promise<Ctx> {
+  const ctx: Ctx = { upstreams: {}, ready: false };
+  const etcd = new EtcdClient();
+  if (!(await etcd.ping())) return ctx;
+  ctx.aliyun = await startAliyunMock();
+  ctx.app = await spawnApp();
+  const seed = new SeedClient(etcd, ctx.app.etcdPrefix);
+  for (const [name, reply] of Object.entries(replies)) {
+    const up = await startOpenAiUpstream({ nonStreamBody: chatReply(reply) });
+    ctx.upstreams[name] = up;
+    const pk = await seed.createProviderKey({
+      display_name: `${name}-pk`,
+      provider: "openai",
+      adapter: "openai",
+      secret: "sk-mock",
+      api_base: `${up.baseUrl}/v1`,
+    });
+    await seed.createModel({ display_name: name, provider: "openai", model_name: "gpt-4o-mini", provider_key_id: pk.id });
+  }
+  await seed.createGuardrail({
+    name: `${kind}-long`,
+    enabled: true,
+    hook_point: "both",
+    fail_open: false,
+    kind,
+    region: "cn-shanghai",
+    endpoint: ctx.aliyun.baseUrl,
+    access_key_id: "LTAI_E2E",
+    access_key_secret: "e2e-secret",
+    ...(kind === "aliyun_text_moderation" ? { risk_level_threshold: "high" } : {}),
+  });
+  await seed.createApiKey({
+    key_hash: createHash("sha256").update(caller).digest("hex"),
+    allowed_models: Object.keys(replies),
+  });
+  const first = Object.keys(replies)[0]!;
+  await waitConfigPropagation(async () => {
+    const r = await chat(ctx, caller, first, [{ role: "user", content: `probe ${MARKER}` }]);
+    return r.status === 422;
+  });
+  ctx.ready = true;
+  return ctx;
+}
+
+async function chat(ctx: Ctx, caller: string, model: string, messages: Array<{ role: string; content: string }>) {
+  const res = await fetch(`${ctx.app!.proxyUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${caller}` },
+    body: JSON.stringify({ model, messages }),
+  });
+  return { status: res.status, text: await res.text() };
+}
+
+async function teardown(ctx: Ctx) {
+  await ctx.app?.exit();
+  for (const up of Object.values(ctx.upstreams)) await up.close();
+  await ctx.aliyun?.close();
+}
+
+/** A conversation whose earlier turns total about `chars` characters. */
+const history = (chars: number) => {
+  const turns: Array<{ role: string; content: string }> = [{ role: "system", content: "You are a helpful assistant." }];
+  for (let left = chars; left > 0; left -= 1_500) {
+    turns.push({ role: "user", content: filler(Math.min(750, left)) });
+    turns.push({ role: "assistant", content: filler(Math.min(750, Math.max(left - 750, 1))) });
+  }
+  return turns;
+};
+
+describe("Aliyun text moderation checks content past the per-call limit", () => {
+  const CALLER = "sk-aliyun-long-tmp";
+  let ctx: Ctx = { upstreams: {}, ready: false };
+
+  beforeAll(async () => {
+    ctx = await setup("aliyun_text_moderation", CALLER, {
+      "lc-tmp-clean": "a short and clean reply",
+      "lc-tmp-long-risky-reply": `${filler(6_000)} ${MARKER}`,
+    });
+  }, 60_000);
+  afterAll(async () => teardown(ctx));
+
+  const calls = () => ctx.aliyun!.calls;
+
+  test("the newest message is checked however long the history before it", async (t) => {
+    if (!ctx.ready) return t.skip();
+    const r = await chat(ctx, CALLER, "lc-tmp-clean", [...history(5_000), { role: "user", content: `now ${MARKER} please` }]);
+    expect(r.status).toBe(422);
+  });
+
+  test("a phrase anywhere in a long newest message is found, cuts included", async (t) => {
+    if (!ctx.ready) return t.skip();
+    const length = 6_000;
+    for (let at = 0; at < length; at += 241) {
+      const body = filler(length);
+      const content = body.slice(0, at) + MARKER + body.slice(at);
+      const r = await chat(ctx, CALLER, "lc-tmp-clean", [{ role: "user", content }]);
+      expect(r.status, `phrase at char ${at}`).toBe(422);
+    }
+  });
+
+  test("a newest message too long for the call budget is refused, not passed unchecked", async (t) => {
+    if (!ctx.ready) return t.skip();
+    const before = calls().length;
+    const r = await chat(ctx, CALLER, "lc-tmp-clean", [{ role: "user", content: filler(60_000) }]);
+    expect(r.status).toBe(422);
+    expect(calls().length - before).toBeLessThanOrEqual(16);
+  });
+
+  test("a very long history stays within a bounded number of calls", async (t) => {
+    if (!ctx.ready) return t.skip();
+    const before = calls().length;
+    const r = await chat(ctx, CALLER, "lc-tmp-clean", [...history(100_000), { role: "user", content: "and one more question" }]);
+    expect(r.status, r.text.slice(0, 200)).toBe(200);
+    const inputCalls = calls().slice(before).filter((c) => c.service === "llm_query_moderation");
+    expect(inputCalls.length).toBeGreaterThan(1);
+    expect(inputCalls.length).toBeLessThanOrEqual(16);
+  });
+
+  test("the whole of a long reply is checked", async (t) => {
+    if (!ctx.ready) return t.skip();
+    const r = await chat(ctx, CALLER, "lc-tmp-long-risky-reply", [{ role: "user", content: "write a long essay" }]);
+    expect(r.status).toBe(422);
+    expect(r.text).not.toContain(MARKER);
+  });
+
+  test("no call exceeds the documented per-call limit", async (t) => {
+    if (!ctx.ready) return t.skip();
+    expect(calls().length).toBeGreaterThan(0);
+    expect(Math.max(...calls().map((c) => c.chars))).toBeLessThanOrEqual(PER_CALL_LIMIT);
+  });
+});
+
+describe("Aliyun AI guardrail masks content past the per-call limit", () => {
+  const CALLER = "sk-aliyun-long-aig";
+  let ctx: Ctx = { upstreams: {}, ready: false };
+
+  beforeAll(async () => {
+    ctx = await setup("aliyun_ai_guardrail", CALLER, { "lc-aig-clean": "a short and clean reply" });
+  }, 60_000);
+  afterAll(async () => teardown(ctx));
+
+  const forwardedMessages = () =>
+    (JSON.parse(ctx.upstreams["lc-aig-clean"]!.receivedRequests.at(-1)?.body ?? "{}") as {
+      messages?: Array<{ role: string; content: unknown }>;
+    }).messages ?? [];
+
+  test("a phone number in the newest message is masked after a long history", async (t) => {
+    if (!ctx.ready) return t.skip();
+    const turns = history(3_000);
+    const newest = `please call me back on ${PHONE} tomorrow`;
+    const r = await chat(ctx, CALLER, "lc-aig-clean", [...turns, { role: "user", content: newest }]);
+    expect(r.status, r.text.slice(0, 200)).toBe(200);
+    const sent = forwardedMessages();
+    expect(sent.at(-1)?.content).toBe(newest.replace(PHONE, "[PHONE]"));
+    // The history reaches the model as written.
+    expect(sent.slice(0, -1).map((m) => m.content)).toEqual(turns.map((m) => m.content));
+  });
+
+  test("a phone number deep inside one long message is masked, the rest kept exactly", async (t) => {
+    if (!ctx.ready) return t.skip();
+    const content = `${filler(4_500)} reach me at ${PHONE}. ${filler(300)}`;
+    const r = await chat(ctx, CALLER, "lc-aig-clean", [{ role: "user", content }]);
+    expect(r.status, r.text.slice(0, 200)).toBe(200);
+    expect(forwardedMessages().at(-1)?.content).toBe(content.replace(PHONE, "[PHONE]"));
+  });
+
+  test("no call exceeds the documented per-call limit", async (t) => {
+    if (!ctx.ready) return t.skip();
+    expect(Math.max(...ctx.aliyun!.calls.map((c) => c.chars))).toBeLessThanOrEqual(PER_CALL_LIMIT);
+  });
+});

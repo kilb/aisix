@@ -64,7 +64,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::aliyun::{
-    extract_error_code, percent_encode, sign, AliyunFailure, ACS_REQUEST_ID_HEADER,
+    collect_input_text, extract_error_code, percent_encode, plan_pieces, sign, AliyunFailure,
+    PiecePlan, ACS_REQUEST_ID_HEADER, CONCURRENT_CALLS, MAX_CALLS_PER_CHECK,
     MAX_ERROR_BODY_PARSE_BYTES,
 };
 use crate::{Guardrail, GuardrailVerdict, SegmentsOutcome, StreamOutputPolicy};
@@ -156,29 +157,113 @@ impl AliyunAiGuardrail {
         }
     }
 
-    /// Check one piece of text with the given service code, on the BLOB
-    /// path — the `check_input` / `check_output` families, which have no
-    /// mask write-back channel (they serve the mid-stream windows among
-    /// others). A `mask` suggestion therefore maps to Block here:
-    /// releasing the un-masked content would defeat the operator's
-    /// Aliyun-side desensitization policy. The segment path
+    /// Check `text` with the given service code on the BLOB path — the
+    /// `check_input` / `check_output` families, which have no mask
+    /// write-back channel (they serve the mid-stream windows among others).
+    /// A `mask` suggestion therefore maps to Block here: releasing the
+    /// un-masked content would defeat the operator's Aliyun-side
+    /// desensitization policy. The segment path
     /// ([`Self::moderate_segments`]) is where masking is honored.
+    ///
+    /// The text goes out in as many calls as the per-call cap requires
+    /// ([`plan_pieces`]): the newest text first, everything from byte
+    /// `must_cover_from` on without fail, older text while the call budget
+    /// lasts. The strictest verdict wins.
     ///
     /// `session_id` (when set) is forwarded as both
     /// `ServiceParameters.sessionId` and `.chatId` so Aliyun correlates
-    /// the windows of one streamed response into one console record.
+    /// the windows of one streamed response into one console record; those
+    /// calls go out one at a time, oldest first, the order Aliyun joins a
+    /// session's pieces in.
     async fn moderate(
         &self,
         service: &str,
         text: &str,
+        must_cover_from: usize,
         session_id: Option<&str>,
         fail_open: bool,
     ) -> GuardrailVerdict {
-        // Aliyun caps content per call; truncate to the cap. Streaming
-        // already windows to MAX_CONTENT_CHARS; non-streaming long inputs
-        // are clamped (the leading content carries the risk in practice).
-        let content: String = text.chars().take(MAX_CONTENT_CHARS).collect();
-        let (outcome, diag) = self.call(service, &content, session_id).await;
+        use futures::StreamExt as _;
+        let Some(mut ranges) = self.plan(service, text, must_cover_from) else {
+            return self.too_long();
+        };
+        let concurrency = if session_id.is_some() {
+            ranges.reverse();
+            1
+        } else {
+            CONCURRENT_CALLS
+        };
+        let mut verdicts = futures::stream::iter(ranges)
+            .map(|r| self.moderate_piece(service, &text[r], session_id, fail_open))
+            .buffered(concurrency);
+        let mut bypass = None;
+        while let Some(verdict) = verdicts.next().await {
+            match verdict {
+                GuardrailVerdict::Allow => {}
+                GuardrailVerdict::Bypass { .. } => {
+                    bypass.get_or_insert(verdict);
+                }
+                block @ GuardrailVerdict::Block { .. } => return block,
+            }
+        }
+        bypass.unwrap_or(GuardrailVerdict::Allow)
+    }
+
+    /// The pieces of one check ([`plan_pieces`]), or `None` when the part
+    /// that must be checked in full does not fit the call budget.
+    fn plan(
+        &self,
+        service: &str,
+        text: &str,
+        must_cover_from: usize,
+    ) -> Option<Vec<std::ops::Range<usize>>> {
+        match plan_pieces(text, must_cover_from, MAX_CONTENT_CHARS) {
+            PiecePlan::TooLong => {
+                tracing::info!(
+                    row = %self.row_name,
+                    service,
+                    chars = text[must_cover_from..].chars().count(),
+                    "aliyun AI guardrail: content too long to moderate; blocking",
+                );
+                None
+            }
+            PiecePlan::Pieces {
+                ranges,
+                unchecked_bytes,
+            } => {
+                if unchecked_bytes > 0 {
+                    tracing::info!(
+                        row = %self.row_name,
+                        service,
+                        unchecked_chars = text[..unchecked_bytes].chars().count(),
+                        "aliyun AI guardrail: earlier conversation beyond the call budget \
+                         was not moderated",
+                    );
+                }
+                Some(ranges)
+            }
+        }
+    }
+
+    /// The content to check in full exceeds what one check may send. Not
+    /// an outage, so `fail_open` does not apply: releasing it would let any
+    /// content through behind enough padding.
+    fn too_long(&self) -> GuardrailVerdict {
+        GuardrailVerdict::block(format!(
+            "aliyun AI guardrail: content too long to moderate (row: {})",
+            self.row_name
+        ))
+    }
+
+    /// One blob-path call: `content` is within the per-call cap.
+    async fn moderate_piece(
+        &self,
+        service: &str,
+        content: &str,
+        session_id: Option<&str>,
+        fail_open: bool,
+    ) -> GuardrailVerdict {
+        let (outcome, diag) = self.call(service, content, session_id).await;
         match outcome {
             Ok(reply) => {
                 let blocked = matches!(reply.suggestion.as_str(), "block" | "mask");
@@ -232,23 +317,24 @@ impl AliyunAiGuardrail {
     /// (the non-streaming bodies and the held-back tail of a streamed
     /// response — the paths that CAN rewrite content).
     ///
-    /// One call on the joined text decides the verdict (same cost as the
-    /// blob path). A non-streaming body is a single call, so the
-    /// streaming-correlation parameters (`sessionId`/`chatId`) are not
-    /// sent on this path. Only when Aliyun answers `mask` does more work
-    /// happen:
-    /// - a single segment (the common case — an assistant reply, a lone
-    ///   user message) takes the joined call's `Ext.Desensitization`
-    ///   directly;
-    /// - multiple segments are re-checked one call per segment, because
-    ///   MultiModalGuard takes ONE `content` string and returns ONE
-    ///   desensitized text — there is no per-block alignment in a single
-    ///   call the way Bedrock's content array gives (the re-calls keep
-    ///   `masked[i]` aligned with `texts[i]` by construction).
+    /// The joined text is checked piece by piece exactly as on the blob
+    /// path ([`Self::moderate`]): newest first, the newest segment (all of
+    /// an output) in full, the strictest suggestion winning. A non-streaming
+    /// body is not a stream, so `sessionId`/`chatId` are not sent. Only when
+    /// a piece answers `mask` does more work happen:
+    /// - a body that went out as one call takes that call's
+    ///   `Ext.Desensitization` directly;
+    /// - otherwise each segment a flagged piece touched is re-checked in
+    ///   non-overlapping pieces, because MultiModalGuard takes ONE
+    ///   `content` string and returns ONE desensitized text with no
+    ///   offsets — the overlapping verdict pieces cannot be stitched back,
+    ///   non-overlapping ones can, and `masked[i]` stays aligned with
+    ///   `texts[i]` by construction. Untouched segments keep their text.
     /// - `mask` with no usable `Desensitization` fails closed: the policy
     ///   said this content must not go out as-is, and there is nothing to
     ///   rewrite it with.
     async fn moderate_segments(&self, texts: &[String], output: bool) -> SegmentsOutcome {
+        use futures::StreamExt as _;
         let service = service_code(&self.service_level, output);
         let fail_open = if output {
             self.output_fail_open
@@ -259,123 +345,181 @@ impl AliyunAiGuardrail {
         if joined.is_empty() {
             return SegmentsOutcome::allow();
         }
-        let content: String = joined.chars().take(MAX_CONTENT_CHARS).collect();
-        let (outcome, diag) = self.call(service, &content, None).await;
-        let reply = match outcome {
-            Ok(r) => r,
-            Err(failure) => {
-                return SegmentsOutcome::from_verdict(
-                    self.handle_failure(failure, &diag, fail_open),
-                )
-            }
+        // The newest segment is checked in full; for an output, all of it.
+        let must_cover_from = if output {
+            0
+        } else {
+            texts
+                .iter()
+                .rposition(|t| !t.is_empty())
+                .map_or(0, |i| texts[..i].iter().map(|t| t.len() + 1).sum())
         };
-        match reply.suggestion.as_str() {
-            "block" => {
-                tracing::info!(
-                    row = %self.row_name,
-                    service,
-                    aliyun_request_id = %diag.request_id,
-                    aliyun_suggestion = %diag.suggestion,
-                    aliyun_dimensions = %diag.dimensions_field(),
-                    aliyun_labels = %diag.labels_field(),
-                    "aliyun AI guardrail blocked content",
-                );
-                SegmentsOutcome::from_verdict(GuardrailVerdict::block(format!(
-                    "aliyun AI guardrail: suggestion block (row: {})",
-                    self.row_name
-                )))
-            }
-            "mask" => {
-                tracing::info!(
-                    row = %self.row_name,
-                    service,
-                    aliyun_request_id = %diag.request_id,
-                    aliyun_dimensions = %diag.dimensions_field(),
-                    aliyun_labels = %diag.labels_field(),
-                    "aliyun AI guardrail masking content",
-                );
-                self.masked_segments(texts, service, fail_open, reply, &diag)
-                    .await
-            }
-            _ => {
-                tracing::debug!(
-                    row = %self.row_name,
-                    service,
-                    aliyun_request_id = %diag.request_id,
-                    aliyun_suggestion = %diag.suggestion,
-                    aliyun_dimensions = %diag.dimensions_field(),
-                    "aliyun AI guardrail passed content",
-                );
-                SegmentsOutcome::allow()
+        let Some(ranges) = self.plan(service, &joined, must_cover_from) else {
+            return SegmentsOutcome::from_verdict(self.too_long());
+        };
+        let single_call = ranges.len() == 1;
+        let mut replies = futures::stream::iter(ranges)
+            .map(|r| {
+                let joined = &joined;
+                async move {
+                    let reply = self.call(service, &joined[r.clone()], None).await;
+                    (r, reply)
+                }
+            })
+            .buffered(CONCURRENT_CALLS);
+        let mut flagged: Vec<(std::ops::Range<usize>, CallReply, AigDiagnostics)> = Vec::new();
+        let mut bypass = None;
+        while let Some((range, (outcome, diag))) = replies.next().await {
+            let reply = match outcome {
+                Ok(r) => r,
+                Err(failure) => {
+                    let verdict = self.handle_failure(failure, &diag, fail_open);
+                    if verdict.is_block() {
+                        return SegmentsOutcome::from_verdict(verdict);
+                    }
+                    bypass.get_or_insert(verdict);
+                    continue;
+                }
+            };
+            match reply.suggestion.as_str() {
+                "block" => {
+                    tracing::info!(
+                        row = %self.row_name,
+                        service,
+                        aliyun_request_id = %diag.request_id,
+                        aliyun_suggestion = %diag.suggestion,
+                        aliyun_dimensions = %diag.dimensions_field(),
+                        aliyun_labels = %diag.labels_field(),
+                        "aliyun AI guardrail blocked content",
+                    );
+                    return SegmentsOutcome::from_verdict(GuardrailVerdict::block(format!(
+                        "aliyun AI guardrail: suggestion block (row: {})",
+                        self.row_name
+                    )));
+                }
+                "mask" => {
+                    tracing::info!(
+                        row = %self.row_name,
+                        service,
+                        aliyun_request_id = %diag.request_id,
+                        aliyun_dimensions = %diag.dimensions_field(),
+                        aliyun_labels = %diag.labels_field(),
+                        "aliyun AI guardrail masking content",
+                    );
+                    flagged.push((range, reply, diag));
+                }
+                _ => {
+                    tracing::debug!(
+                        row = %self.row_name,
+                        service,
+                        aliyun_request_id = %diag.request_id,
+                        aliyun_suggestion = %diag.suggestion,
+                        aliyun_dimensions = %diag.dimensions_field(),
+                        "aliyun AI guardrail passed content",
+                    );
+                }
             }
         }
+        if flagged.is_empty() {
+            return bypass.map_or_else(SegmentsOutcome::allow, SegmentsOutcome::from_verdict);
+        }
+        drop(replies);
+        self.masked_segments(texts, flagged, single_call, service, fail_open)
+            .await
     }
 
-    /// Build the positionally-aligned masked replacements after the
-    /// joined call answered `mask`. See [`Self::moderate_segments`] for
-    /// the single- vs multi-segment strategy.
+    /// Build the positionally-aligned masked replacements after a piece
+    /// answered `mask`. See [`Self::moderate_segments`] for the strategy.
     async fn masked_segments(
         &self,
         texts: &[String],
+        flagged: Vec<(std::ops::Range<usize>, CallReply, AigDiagnostics)>,
+        single_call: bool,
         service: &str,
         fail_open: bool,
-        first_reply: CallReply,
-        first_diag: &AigDiagnostics,
     ) -> SegmentsOutcome {
         let mut counts: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
-        if let [only] = texts {
-            return match first_reply.desensitization {
+        if let ([_], true) = (texts, single_call) {
+            let (_, reply, diag) = flagged.into_iter().next().expect("flagged is not empty");
+            return match reply.desensitization {
                 Some(masked) if !masked.is_empty() => {
-                    for label in &first_diag.labels {
+                    for label in &diag.labels {
                         *counts.entry(label.clone()).or_insert(0) += 1;
                     }
                     SegmentsOutcome {
                         verdict: GuardrailVerdict::Allow,
-                        masked: Some(vec![reattach_clipped_tail(only, masked)]),
+                        masked: Some(vec![masked]),
                         counts,
                         monitor_hits: Vec::new(),
                     }
                 }
-                _ => self.mask_without_replacement(first_diag),
+                _ => self.mask_without_replacement(&diag),
             };
         }
-        // Multi-segment: one call per slot for aligned replacements.
         let mut masked: Vec<String> = Vec::with_capacity(texts.len());
+        let mut rewrote_any = false;
+        let mut calls = 0usize;
+        let mut offset = 0usize;
         for text in texts {
-            if text.is_empty() {
-                masked.push(String::new());
+            let span = offset..offset + text.len();
+            offset += text.len() + 1;
+            let touched = !text.is_empty()
+                && flagged
+                    .iter()
+                    .any(|(f, _, _)| f.start < span.end && span.start < f.end);
+            if !touched {
+                masked.push(text.clone());
                 continue;
             }
-            let content: String = text.chars().take(MAX_CONTENT_CHARS).collect();
-            let (outcome, diag) = self.call(service, &content, None).await;
-            let reply = match outcome {
-                Ok(r) => r,
-                Err(failure) => {
-                    return SegmentsOutcome::from_verdict(
-                        self.handle_failure(failure, &diag, fail_open),
-                    )
+            let mut rewritten = String::with_capacity(text.len());
+            for piece in non_overlapping_pieces(text, MAX_CONTENT_CHARS) {
+                calls += 1;
+                if calls > MAX_CALLS_PER_CHECK {
+                    tracing::info!(
+                        row = %self.row_name,
+                        service,
+                        "aliyun AI guardrail: content too long to mask; blocking",
+                    );
+                    return SegmentsOutcome::from_verdict(self.too_long());
                 }
-            };
-            match reply.suggestion.as_str() {
-                // A segment that blocks on its own kills the request —
-                // strictest wins across the per-segment verdicts.
-                "block" => {
-                    return SegmentsOutcome::from_verdict(GuardrailVerdict::block(format!(
-                        "aliyun AI guardrail: suggestion block (row: {})",
-                        self.row_name
-                    )))
-                }
-                "mask" => match reply.desensitization {
-                    Some(m) if !m.is_empty() => {
-                        for label in &diag.labels {
-                            *counts.entry(label.clone()).or_insert(0) += 1;
-                        }
-                        masked.push(reattach_clipped_tail(text, m));
+                let (outcome, diag) = self.call(service, piece, None).await;
+                let reply = match outcome {
+                    Ok(r) => r,
+                    Err(failure) => {
+                        return SegmentsOutcome::from_verdict(
+                            self.handle_failure(failure, &diag, fail_open),
+                        )
                     }
-                    _ => return self.mask_without_replacement(&diag),
-                },
-                _ => masked.push(text.clone()),
+                };
+                match reply.suggestion.as_str() {
+                    // A piece that blocks on its own kills the request —
+                    // strictest wins across the per-piece verdicts.
+                    "block" => {
+                        return SegmentsOutcome::from_verdict(GuardrailVerdict::block(format!(
+                            "aliyun AI guardrail: suggestion block (row: {})",
+                            self.row_name
+                        )))
+                    }
+                    "mask" => match reply.desensitization {
+                        Some(m) if !m.is_empty() => {
+                            for label in &diag.labels {
+                                *counts.entry(label.clone()).or_insert(0) += 1;
+                            }
+                            rewritten.push_str(&m);
+                            rewrote_any = true;
+                        }
+                        _ => return self.mask_without_replacement(&diag),
+                    },
+                    _ => rewritten.push_str(piece),
+                }
             }
+            masked.push(rewritten);
+        }
+        if !rewrote_any {
+            // Only a piece spanning a cut saw what needs masking; no
+            // non-overlapping piece can be rewritten to remove it.
+            let (_, _, diag) = &flagged[0];
+            return self.mask_without_replacement(diag);
         }
         SegmentsOutcome {
             verdict: GuardrailVerdict::Allow,
@@ -624,17 +768,21 @@ struct CallReply {
     desensitization: Option<String>,
 }
 
-/// Re-attach the tail of a segment that was clipped to
-/// [`MAX_CONTENT_CHARS`] before the call: the desensitized text Aliyun
-/// returned covers only the clipped prefix, and dropping the remainder
-/// on write-back would truncate the caller's content.
-fn reattach_clipped_tail(original: &str, masked_prefix: String) -> String {
-    let tail: String = original.chars().skip(MAX_CONTENT_CHARS).collect();
-    if tail.is_empty() {
-        masked_prefix
-    } else {
-        format!("{masked_prefix}{tail}")
+/// `text` cut into consecutive pieces of at most `max_chars` chars, with
+/// no overlap: the pieces concatenate back to `text`, so each piece's
+/// desensitized text can take that piece's place.
+fn non_overlapping_pieces(text: &str, max_chars: usize) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let cut = rest
+            .char_indices()
+            .nth(max_chars)
+            .map_or(rest.len(), |(i, _)| i);
+        pieces.push(&rest[..cut]);
+        rest = &rest[cut..];
     }
+    pieces
 }
 
 /// What one `MultiModalGuard` call reported about itself, for operator
@@ -893,13 +1041,14 @@ impl Guardrail for AliyunAiGuardrail {
         ) {
             return GuardrailVerdict::Allow;
         }
-        let text = collect_input_text(req);
+        let (text, newest) = collect_input_text(req);
         if text.is_empty() {
             return GuardrailVerdict::Allow;
         }
         self.moderate(
             service_code(&self.service_level, false),
             &text,
+            newest,
             None,
             self.fail_open,
         )
@@ -928,9 +1077,11 @@ impl Guardrail for AliyunAiGuardrail {
         };
         // Output uses its own fail policy (default fail-closed) so an
         // Aliyun outage can't release unscanned model output.
+        // A response is new content from end to end: all of it is checked.
         self.moderate(
             service_code(&self.service_level, true),
             &text,
+            0,
             Some(&session),
             self.output_fail_open,
         )
@@ -967,18 +1118,6 @@ impl Guardrail for AliyunAiGuardrail {
         }
         self.moderate_segments(texts, true).await
     }
-}
-
-/// Concatenate the request's user-visible message contents into one blob.
-/// (Same collector shape as the other Aliyun dispatcher — keeps the
-/// family scanning identical text.)
-fn collect_input_text(req: &ChatFormat) -> String {
-    req.messages
-        .iter()
-        .map(crate::message_scan_text)
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -1340,17 +1479,20 @@ mod tests {
     }
 
     #[test]
-    fn reattach_clipped_tail_restores_overflow() {
-        // Under the cap: the masked text stands alone.
+    fn non_overlapping_pieces_concatenate_back() {
+        // Each piece's desensitized text takes that piece's place, so the
+        // pieces must tile the text exactly: no gap, no overlap.
         assert_eq!(
-            reattach_clipped_tail("short", "masked".to_owned()),
-            "masked"
+            non_overlapping_pieces("short", MAX_CONTENT_CHARS),
+            vec!["short"]
         );
-        // Over the cap: the un-scanned remainder is re-attached so the
-        // write-back doesn't truncate the caller's content.
-        let long: String = "a".repeat(MAX_CONTENT_CHARS + 5);
-        let out = reattach_clipped_tail(&long, "MASKED".to_owned());
-        assert_eq!(out, format!("MASKED{}", "a".repeat(5)));
+        let long: String = "我a".repeat(MAX_CONTENT_CHARS + 5);
+        let pieces = non_overlapping_pieces(&long, MAX_CONTENT_CHARS);
+        assert_eq!(pieces.len(), 3);
+        assert!(pieces
+            .iter()
+            .all(|p| p.chars().count() <= MAX_CONTENT_CHARS));
+        assert_eq!(pieces.concat(), long);
     }
 
     #[tokio::test]

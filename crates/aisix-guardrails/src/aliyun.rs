@@ -67,6 +67,75 @@ const SERVICE_OUTPUT: &str = "llm_response_moderation";
 /// bound and matches the default streaming window.
 const MAX_CONTENT_CHARS: usize = 2_000;
 
+/// Chars shared by consecutive pieces of one check, so a phrase that
+/// straddles a cut still lands whole in one piece. Matches the default
+/// streaming window overlap.
+pub(crate) const PIECE_OVERLAP_CHARS: usize = 128;
+
+/// Most calls one check makes. Each call is billed and counts against the
+/// account's QPS, and the whole conversation is re-sent on every turn, so
+/// a long agent context cannot be checked end to end on every request.
+/// 16 pieces cover about 30 000 chars.
+pub(crate) const MAX_CALLS_PER_CHECK: usize = 16;
+
+/// How many of one check's calls are in flight at once.
+pub(crate) const CONCURRENT_CALLS: usize = 4;
+
+/// The pieces one check sends, each at most the per-call cap.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PiecePlan {
+    /// Byte ranges into the text, newest (rightmost) first. Text before
+    /// `unchecked_bytes` is covered by no piece.
+    Pieces {
+        ranges: Vec<std::ops::Range<usize>>,
+        unchecked_bytes: usize,
+    },
+    /// The part that has to be checked in full does not fit in
+    /// [`MAX_CALLS_PER_CHECK`] pieces.
+    TooLong,
+}
+
+/// Cut `text` into pieces of at most `max_chars` chars, from the end
+/// backwards, consecutive pieces sharing [`PIECE_OVERLAP_CHARS`]. Older text
+/// is covered while the call budget lasts; everything from byte
+/// `must_cover_from` to the end has to be covered, or the plan is
+/// [`PiecePlan::TooLong`].
+pub(crate) fn plan_pieces(text: &str, must_cover_from: usize, max_chars: usize) -> PiecePlan {
+    debug_assert!(max_chars > PIECE_OVERLAP_CHARS);
+    let mut ranges = Vec::new();
+    let mut end = text.len();
+    loop {
+        // `max_chars` chars back from `end`, or the start of the text.
+        let start = text[..end]
+            .char_indices()
+            .rev()
+            .nth(max_chars - 1)
+            .map_or(0, |(i, _)| i);
+        ranges.push(start..end);
+        if start == 0 {
+            return PiecePlan::Pieces {
+                ranges,
+                unchecked_bytes: 0,
+            };
+        }
+        if ranges.len() == MAX_CALLS_PER_CHECK {
+            return if start <= must_cover_from {
+                PiecePlan::Pieces {
+                    ranges,
+                    unchecked_bytes: start,
+                }
+            } else {
+                PiecePlan::TooLong
+            };
+        }
+        // The next piece ends `PIECE_OVERLAP_CHARS` chars into this one.
+        end = text[start..]
+            .char_indices()
+            .nth(PIECE_OVERLAP_CHARS)
+            .map_or(text.len(), |(i, _)| start + i);
+    }
+}
+
 /// One Aliyun Text Moderation row, materialised into a request-time
 /// dispatcher.
 pub struct AliyunTextModerationGuardrail {
@@ -134,21 +203,84 @@ impl AliyunTextModerationGuardrail {
         }
     }
 
-    /// Moderate one piece of text with the given service code. `session_id`
-    /// (when set) is forwarded as `ServiceParameters.sessionId` so Aliyun
-    /// correlates the chunks of one streamed response.
+    /// Moderate `text` with the given service code, in as many calls as the
+    /// per-call cap requires (see [`plan_pieces`]): the newest text first,
+    /// everything from byte `must_cover_from` on without fail, older text
+    /// while the call budget lasts. The strictest verdict wins.
+    ///
+    /// `session_id` (when set) is forwarded as `ServiceParameters.sessionId`
+    /// so Aliyun correlates the chunks of one streamed response; Aliyun
+    /// joins a session's pieces in arrival order, so those calls go out one
+    /// at a time, oldest first.
     async fn moderate(
         &self,
         service: &str,
         text: &str,
+        must_cover_from: usize,
         session_id: Option<&str>,
         fail_open: bool,
     ) -> GuardrailVerdict {
-        // Aliyun caps content per call; truncate to the cap. Streaming
-        // already windows to MAX_CONTENT_CHARS; non-streaming long inputs
-        // are clamped (the leading content carries the risk in practice).
-        let content: String = text.chars().take(MAX_CONTENT_CHARS).collect();
-        let (outcome, diag) = self.call(service, &content, session_id).await;
+        use futures::StreamExt as _;
+        let mut ranges = match plan_pieces(text, must_cover_from, MAX_CONTENT_CHARS) {
+            PiecePlan::TooLong => {
+                tracing::info!(
+                    row = %self.row_name,
+                    service,
+                    chars = text[must_cover_from..].chars().count(),
+                    "aliyun text moderation: content too long to moderate; blocking",
+                );
+                return GuardrailVerdict::block(format!(
+                    "aliyun text moderation: content too long to moderate (row: {})",
+                    self.row_name
+                ));
+            }
+            PiecePlan::Pieces {
+                ranges,
+                unchecked_bytes,
+            } => {
+                if unchecked_bytes > 0 {
+                    tracing::info!(
+                        row = %self.row_name,
+                        service,
+                        unchecked_chars = text[..unchecked_bytes].chars().count(),
+                        "aliyun text moderation: earlier conversation beyond the call \
+                         budget was not moderated",
+                    );
+                }
+                ranges
+            }
+        };
+        let concurrency = if session_id.is_some() {
+            ranges.reverse();
+            1
+        } else {
+            CONCURRENT_CALLS
+        };
+        let mut verdicts = futures::stream::iter(ranges)
+            .map(|r| self.moderate_piece(service, &text[r], session_id, fail_open))
+            .buffered(concurrency);
+        let mut bypass = None;
+        while let Some(verdict) = verdicts.next().await {
+            match verdict {
+                GuardrailVerdict::Allow => {}
+                GuardrailVerdict::Bypass { .. } => {
+                    bypass.get_or_insert(verdict);
+                }
+                block @ GuardrailVerdict::Block { .. } => return block,
+            }
+        }
+        bypass.unwrap_or(GuardrailVerdict::Allow)
+    }
+
+    /// One call: `content` is within the per-call cap.
+    async fn moderate_piece(
+        &self,
+        service: &str,
+        content: &str,
+        session_id: Option<&str>,
+        fail_open: bool,
+    ) -> GuardrailVerdict {
+        let (outcome, diag) = self.call(service, content, session_id).await;
         match outcome {
             Ok(level) => {
                 let blocked = risk_rank(&level) >= self.threshold_rank;
@@ -671,11 +803,11 @@ impl Guardrail for AliyunTextModerationGuardrail {
         ) {
             return GuardrailVerdict::Allow;
         }
-        let text = collect_input_text(req);
+        let (text, newest) = collect_input_text(req);
         if text.is_empty() {
             return GuardrailVerdict::Allow;
         }
-        self.moderate(SERVICE_INPUT, &text, None, self.fail_open)
+        self.moderate(SERVICE_INPUT, &text, newest, None, self.fail_open)
             .await
     }
 
@@ -701,21 +833,32 @@ impl Guardrail for AliyunTextModerationGuardrail {
         };
         // Output uses its own fail policy (default fail-closed) so an
         // Aliyun outage can't release unscanned model output.
-        self.moderate(SERVICE_OUTPUT, &text, Some(&session), self.output_fail_open)
-            .await
+        // A response is new content from end to end: all of it is checked.
+        self.moderate(
+            SERVICE_OUTPUT,
+            &text,
+            0,
+            Some(&session),
+            self.output_fail_open,
+        )
+        .await
     }
 }
 
-/// Concatenate the request's user-visible message contents into one blob.
-/// (Same collector shape as the Bedrock dispatcher — keeps the families
-/// scanning identical text.)
-fn collect_input_text(req: &ChatFormat) -> String {
-    req.messages
+/// Concatenate the request's user-visible message contents into one blob,
+/// with the byte offset where the newest message starts in it. (Same
+/// collector shape as the Bedrock dispatcher — keeps the families scanning
+/// identical text.) Shared by both Aliyun dispatchers.
+pub(crate) fn collect_input_text(req: &ChatFormat) -> (String, usize) {
+    let texts: Vec<String> = req
+        .messages
         .iter()
         .map(crate::message_scan_text)
         .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    let joined = texts.join("\n");
+    let newest = joined.len() - texts.last().map_or(0, String::len);
+    (joined, newest)
 }
 
 // ---------------------------------------------------------------------------
@@ -767,6 +910,96 @@ mod tests {
     }
 
     // --- pure signature / encoding tests ---
+
+    /// Every `window`-char span of `text` lies wholly inside one of the
+    /// planned pieces.
+    fn spans_covered(
+        text: &str,
+        ranges: &[std::ops::Range<usize>],
+        from: usize,
+        window: usize,
+    ) -> bool {
+        let starts: Vec<usize> = text
+            .char_indices()
+            .map(|(i, _)| i)
+            .filter(|&i| i >= from)
+            .collect();
+        starts.iter().all(|&s| {
+            let e = text[s..]
+                .char_indices()
+                .nth(window)
+                .map_or(text.len(), |(i, _)| s + i);
+            ranges.iter().any(|r| r.start <= s && e <= r.end)
+        })
+    }
+
+    #[test]
+    fn short_text_goes_out_as_one_piece() {
+        let PiecePlan::Pieces {
+            ranges,
+            unchecked_bytes,
+        } = plan_pieces("hello", 0, MAX_CONTENT_CHARS)
+        else {
+            panic!("fits one call");
+        };
+        assert_eq!((ranges.len(), unchecked_bytes), (1, 0));
+        assert_eq!(ranges[0], 0..5);
+    }
+
+    #[test]
+    fn long_text_is_cut_into_overlapping_pieces_newest_first() {
+        let text: String = "风险ab".repeat(1_500); // 6 000 chars, multi-byte
+        let PiecePlan::Pieces {
+            ranges,
+            unchecked_bytes,
+        } = plan_pieces(&text, 0, MAX_CONTENT_CHARS)
+        else {
+            panic!("fits the budget");
+        };
+        assert_eq!(unchecked_bytes, 0);
+        assert_eq!(ranges.first().map(|r| r.end), Some(text.len()));
+        assert_eq!(ranges.last().map(|r| r.start), Some(0));
+        for r in &ranges {
+            assert!(text.is_char_boundary(r.start) && text.is_char_boundary(r.end));
+            assert!(text[r.clone()].chars().count() <= MAX_CONTENT_CHARS);
+        }
+        // A phrase up to the overlap long cannot hide on a cut.
+        assert!(spans_covered(&text, &ranges, 0, PIECE_OVERLAP_CHARS));
+    }
+
+    #[test]
+    fn history_past_the_budget_is_left_unchecked_but_the_newest_message_is_not() {
+        let history = "h".repeat(100_000);
+        let newest = "n".repeat(1_000);
+        let text = format!("{history}\n{newest}");
+        let from = text.len() - newest.len();
+        let PiecePlan::Pieces {
+            ranges,
+            unchecked_bytes,
+        } = plan_pieces(&text, from, MAX_CONTENT_CHARS)
+        else {
+            panic!("the newest message fits the budget");
+        };
+        assert_eq!(ranges.len(), MAX_CALLS_PER_CHECK);
+        assert!(unchecked_bytes > 0 && unchecked_bytes <= from);
+        assert!(spans_covered(
+            &text,
+            &ranges,
+            unchecked_bytes,
+            PIECE_OVERLAP_CHARS
+        ));
+    }
+
+    #[test]
+    fn content_that_must_be_checked_in_full_but_does_not_fit_is_too_long() {
+        let text = "x".repeat(MAX_CALLS_PER_CHECK * MAX_CONTENT_CHARS);
+        assert_eq!(plan_pieces(&text, 0, MAX_CONTENT_CHARS), PiecePlan::TooLong);
+        // The same text whose newest part is short enough is planned.
+        assert!(matches!(
+            plan_pieces(&text, text.len() - 10, MAX_CONTENT_CHARS),
+            PiecePlan::Pieces { .. }
+        ));
+    }
 
     #[test]
     fn risk_rank_orders_levels() {
