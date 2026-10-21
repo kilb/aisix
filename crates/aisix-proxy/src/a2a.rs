@@ -326,9 +326,15 @@ async fn dispatch(
     // Run BEFORE the quota gate so a content-policy refusal does not burn an
     // RPM slot, matching /v1/chat/completions (#542).
     if !guardrail_chain.is_empty() && !call.text.request.is_empty() {
+        // Scan every word the agent will receive. `call.text.request` is
+        // capped for metering, and the body is forwarded whole: scanning the
+        // capped copy let anything past the cap through unread.
         let chat = aisix_gateway::ChatFormat::new(
             "",
-            vec![aisix_gateway::ChatMessage::user(call.text.request.clone())],
+            vec![aisix_gateway::ChatMessage::user(request_text(
+                &value,
+                |b, s| b.push_str(s),
+            ))],
         );
         let (verdict, hits) =
             aisix_guardrails::Guardrail::check_input_observed(&guardrail_chain, &chat).await;
@@ -472,8 +478,12 @@ async fn dispatch(
             // an A2A answer has no masked write-back to run one with. Like
             // the input hook above, such a guardrail answers through its
             // check here, where a maskable answer is blocked.
-            if !guardrail_chain.is_empty() {
-                let answer = call.text.response.joined();
+            if !guardrail_chain.is_empty() && meters_content(call.operation) {
+                // The whole answer, as the caller receives it: the metered
+                // copy in `call.text.response` is capped.
+                let mut full = ResultText::default();
+                full.observe(&response_value, |b, s| b.push_str(s));
+                let answer = full.joined();
                 if !answer.is_empty() {
                     let synth = aisix_gateway::ChatResponse {
                         id: String::new(),

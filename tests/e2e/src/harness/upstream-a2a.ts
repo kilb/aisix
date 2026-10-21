@@ -61,6 +61,8 @@ export interface A2aUpstreamOptions {
    * event sequence the streaming-relay suite counts.
    */
   streamAnswer?: boolean;
+  /** Text of the agent's answer to a unary call. Defaults to a one-liner. */
+  unaryAnswer?: string;
 }
 
 const PATH_PREFIX = "/v3/agents/serve/tenant-42";
@@ -121,6 +123,7 @@ export async function startA2aUpstream(
       token: options.token,
       wireShape: options.wireShape ?? "0.3",
       streamAnswer: options.streamAnswer ?? false,
+      unaryAnswer: options.unaryAnswer ?? "The invoice is settled.",
     }).catch((err: unknown) => {
       // `handle` rejects on a malformed body, and on a write to an already
       // closed socket. Unhandled, that terminates the test process; worse, the
@@ -157,6 +160,7 @@ async function handle(
     token?: string;
     wireShape: A2aWireShape;
     streamAnswer: boolean;
+    unaryAnswer: string;
   },
 ): Promise<void> {
   const path = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
@@ -342,7 +346,7 @@ async function handle(
         contextId,
         status: {
           state: "completed",
-          message: { role: "agent", parts: [{ kind: "text", text: "The invoice is settled." }] },
+          message: { role: "agent", parts: [{ kind: "text", text: ctx.unaryAnswer }] },
         },
         // Echoed so the gateway's forwarding can be asserted from the caller
         // side as well as from `requests`.
