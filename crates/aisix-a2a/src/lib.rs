@@ -29,6 +29,6 @@ pub use bridge::{
 pub use error::A2aError;
 pub use telemetry::{
     canonical_operation, is_stream_end, is_streaming_operation, redact_request_text,
-    request_data_would_mask, request_scan_text, request_text, result_scan_text, A2aCallFacts,
-    ResultText,
+    request_scan_text, request_text, request_would_mask_unrewritable, result_scan_text,
+    A2aCallFacts, ResultText,
 };

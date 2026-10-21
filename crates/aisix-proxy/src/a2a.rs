@@ -389,21 +389,21 @@ async fn dispatch(
         //
         // Only `params.message.parts[].text` is rewritten. The ids, method
         // name and metadata around them are protocol rather than caller
-        // content. The scan above also read data parts, which cannot be
-        // rewritten safely (see `request_data_would_mask`): a mask that would
-        // change one refuses the call, the way the other endpoints refuse a
-        // structural field they cannot rewrite, rather than forwarding the
-        // content unmasked.
+        // content. The scan above also read data parts, and any parts list
+        // outside `params.message`, which the rewrite does not reach (see
+        // `request_would_mask_unrewritable`): a mask that would change one
+        // refuses the call, the way the other endpoints refuse a structural
+        // field they cannot rewrite, rather than forwarding it unmasked.
         if aisix_guardrails::Guardrail::redacts_input(&guardrail_chain) {
             let chain = &guardrail_chain;
-            if aisix_a2a::request_data_would_mask(&value, |text| {
+            if aisix_a2a::request_would_mask_unrewritable(&value, |text| {
                 aisix_guardrails::Guardrail::redact_input_text(chain, text).map(|r| r.text)
             }) {
                 tracing::warn!(
                     guardrail_hook = "input",
                     agent = %agent,
                     operation = %call.operation,
-                    "guardrail blocked A2A request: a mask rule matched a data part, which cannot be rewritten",
+                    "guardrail blocked A2A request: a mask rule matched content the rewrite cannot reach",
                 );
                 call.guardrail_blocked = true;
                 emit_a2a_usage(

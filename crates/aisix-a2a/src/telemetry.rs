@@ -332,9 +332,9 @@ pub fn redact_request_text(request: &mut Value, mask: impl Fn(&str) -> Option<St
     rewritten
 }
 
-/// Every word a caller sends an agent, for a content policy to read: the
-/// request message's text parts, plus every string value and object key of
-/// its data parts, newline-joined and unbounded.
+/// Every word a caller sends an agent, for a content policy to read: the text
+/// parts, and every string value and object key of the data parts, of every
+/// message the request carries, newline-joined and unbounded.
 ///
 /// Scan-only. A data part (`{"kind": "data", "data": {…}}` on 0.3, the `Part`
 /// oneof's `data` field — a `google.protobuf.Value` — on 1.0) reaches the
@@ -342,34 +342,89 @@ pub fn redact_request_text(request: &mut Value, mask: impl Fn(&str) -> Option<St
 /// inside one as in a text part. It is still not language worth metering —
 /// field names and enum values would inflate the estimate — which is why
 /// [`request_text`] leaves it out and this does not.
+///
+/// Every `parts` list under `params` is read, not only `params.message`: the
+/// scan must not depend on agreeing with the agent about where a message
+/// sits, or a request shaped two ways at once is read one way here and the
+/// other way by the agent.
 pub fn request_scan_text(request: &Value) -> String {
     let mut buf = String::new();
-    if let Some(message) = request.pointer("/params/message") {
-        collect_part_scan_text(message, &mut buf);
+    if let Some(params) = request.get("params") {
+        collect_all_parts_scan_text(params, &mut buf);
     }
     buf
 }
 
-/// Whether `mask` would change any string value or object key of a request
-/// data part.
+/// Whether `mask` would change anything the request's text rewrite cannot
+/// reach.
 ///
-/// [`redact_request_text`] rewrites text parts only. A data part is a document
-/// the agent parses against its own schema: a mask token can turn an id, an
-/// enum value or a lookup field into something the agent misreads, and a key
-/// cannot be renamed at all. So a match there is reported rather than
-/// rewritten, and the caller refuses the call instead of forwarding the
-/// content unmasked.
-pub fn request_data_would_mask(request: &Value, mask: impl Fn(&str) -> Option<String>) -> bool {
-    let Some(parts) = request
-        .pointer("/params/message/parts")
-        .and_then(Value::as_array)
-    else {
+/// [`redact_request_text`] rewrites the text parts of `params.message` only.
+/// Everything else [`request_scan_text`] reads stays as sent: a data part is a
+/// document the agent parses against its own schema (a mask token can turn an
+/// id, an enum value or a lookup field into something it misreads, and a key
+/// cannot be renamed at all), and a parts list anywhere else is not where the
+/// rewrite looks. A match there is reported rather than rewritten, and the
+/// caller refuses the call instead of forwarding the content unmasked.
+pub fn request_would_mask_unrewritable(
+    request: &Value,
+    mask: impl Fn(&str) -> Option<String>,
+) -> bool {
+    let Some(params) = request.get("params") else {
         return false;
     };
-    parts
-        .iter()
-        .filter_map(|part| part.get("data"))
-        .any(|data| json_strings_would_change(data, &mask))
+    unrewritable_would_change(params, PartsOwner::Params, &mask)
+}
+
+/// Where a value sits relative to `params`, for [`unrewritable_would_change`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PartsOwner {
+    Params,
+    /// `params.message`: its text parts are what the rewrite reaches.
+    Message,
+    Other,
+}
+
+fn unrewritable_would_change(
+    value: &Value,
+    owner: PartsOwner,
+    mask: &impl Fn(&str) -> Option<String>,
+) -> bool {
+    let changes = |s: &str| mask(s).is_some_and(|masked| masked != s);
+    match value {
+        Value::Object(map) => {
+            let parts_change = map
+                .get("parts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|part| {
+                    let text = owner != PartsOwner::Message
+                        && part
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .is_some_and(changes);
+                    text || part
+                        .get("data")
+                        .is_some_and(|data| json_strings_would_change(data, mask))
+                });
+            parts_change
+                || map
+                    .iter()
+                    .filter(|(key, _)| *key != "parts")
+                    .any(|(key, child)| {
+                        let next = if owner == PartsOwner::Params && key == "message" {
+                            PartsOwner::Message
+                        } else {
+                            PartsOwner::Other
+                        };
+                        unrewritable_would_change(child, next, mask)
+                    })
+        }
+        Value::Array(items) => items
+            .iter()
+            .any(|item| unrewritable_would_change(item, PartsOwner::Other, mask)),
+        _ => false,
+    }
 }
 
 /// The text an agent produced on one call, kept as two segments because the
@@ -492,40 +547,38 @@ impl ResultText {
 /// here, and parts, artifacts and history carry the same field names in both.
 pub fn result_scan_text(response: &Value) -> String {
     let mut buf = String::new();
-    let Some(result) = response.get("result") else {
-        return buf;
-    };
-    let payload = unwrap_payload(result);
-    collect_result_scan_text(payload, &mut buf);
-    for task in payload
-        .get("tasks")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        collect_result_scan_text(task, &mut buf);
+    if let Some(result) = response.get("result") {
+        collect_all_parts_scan_text(result, &mut buf);
     }
     buf
 }
 
-/// [`result_scan_text`] for one Task / Message / update event.
-fn collect_result_scan_text(payload: &Value, buf: &mut String) {
-    collect_part_scan_text(payload, buf);
-    if let Some(message) = payload.pointer("/status/message") {
-        collect_part_scan_text(message, buf);
-    }
-    if let Some(artifact) = payload.get("artifact") {
-        collect_part_scan_text(artifact, buf);
-    }
-    for key in ["artifacts", "history"] {
-        for owner in payload
-            .get(key)
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            collect_part_scan_text(owner, buf);
+/// Collect from every `parts` list anywhere under `root`: a message, a
+/// status message, an artifact, a `history` entry, a Task of a `ListTasks`
+/// page, at whatever depth and under whatever wrapper.
+///
+/// Deliberately blind to the wire version. Reading a result the way the
+/// metering does — 0.3 if it carries a `kind`, else the first 1.0 payload
+/// wrapper — is a guess, and a result shaped both ways at once (`kind` plus a
+/// `task` wrapper, or two wrappers) would be scanned one way while a client
+/// reads it the other. Collecting from every parts list cannot disagree with
+/// any reader.
+fn collect_all_parts_scan_text(root: &Value, buf: &mut String) {
+    match root {
+        Value::Object(map) => {
+            collect_part_scan_text(root, buf);
+            for (key, child) in map {
+                if key != "parts" {
+                    collect_all_parts_scan_text(child, buf);
+                }
+            }
         }
+        Value::Array(items) => {
+            for item in items {
+                collect_all_parts_scan_text(item, buf);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -646,6 +699,54 @@ fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A result shaped two ways at once must be read every way: a client may
+    /// take either reading, so the scan cannot pick one.
+    #[test]
+    fn the_result_scan_reads_every_wire_shape_at_once() {
+        // 0.3 `kind` at the top, and a 1.0 `task` wrapper beside it.
+        let both = json!({"result": {
+            "kind": "task", "id": "t",
+            "status": {"state": "completed", "message": {"parts": [{"kind": "text", "text": "clean"}]}},
+            "task": {"id": "t", "status": {"message": {"parts": [{"text": "PHRASE-A"}]}}}
+        }});
+        assert!(result_scan_text(&both).contains("PHRASE-A"));
+        // Two 1.0 wrappers.
+        let two = json!({"result": {
+            "task": {"id": "t", "status": {"message": {"parts": [{"text": "clean"}]}}},
+            "message": {"parts": [{"text": "PHRASE-B"}]}
+        }});
+        assert!(result_scan_text(&two).contains("PHRASE-B"));
+        // A parts list under a wrapper no version defines.
+        let odd =
+            json!({"result": {"envelope": {"inner": [{"parts": [{"data": {"PHRASE-C": 1}}]}]}}});
+        assert!(result_scan_text(&odd).contains("PHRASE-C"));
+    }
+
+    #[test]
+    fn the_request_scan_reads_every_message_under_params() {
+        let request = json!({"params": {
+            "message": {"parts": [{"text": "clean"}]},
+            "request": {"message": {"parts": [{"text": "PHRASE-D"}]}}
+        }});
+        assert!(request_scan_text(&request).contains("PHRASE-D"));
+    }
+
+    /// Only the text parts of `params.message` are rewritten; a mask that
+    /// would change anything else the scan reads must be reported.
+    #[test]
+    fn a_mask_outside_the_rewritten_text_is_reported() {
+        let mask = |s: &str| s.contains("a@b.c").then(|| s.replace("a@b.c", "[M]"));
+        let rewritten = json!({"params": {"message": {"parts": [{"text": "mail a@b.c"}]}}});
+        assert!(!request_would_mask_unrewritable(&rewritten, mask));
+        let elsewhere = json!({"params": {
+            "message": {"parts": [{"text": "clean"}]},
+            "request": {"message": {"parts": [{"text": "mail a@b.c"}]}}
+        }});
+        assert!(request_would_mask_unrewritable(&elsewhere, mask));
+        let data = json!({"params": {"message": {"parts": [{"data": {"to": "a@b.c"}}]}}});
+        assert!(request_would_mask_unrewritable(&data, mask));
+    }
 
     #[test]
     fn both_wire_vocabularies_map_to_one_operation() {
@@ -1024,7 +1125,7 @@ mod tests {
             json!({"data": "alice@example.com"}),
         ] {
             assert!(
-                request_data_would_mask(&with_part(part.clone()), mask),
+                request_would_mask_unrewritable(&with_part(part.clone()), mask),
                 "{part} must be reported"
             );
         }
@@ -1037,15 +1138,18 @@ mod tests {
             json!({"kind": "data", "data": {"contact": "bob@example.com", "n": 1}}),
         ] {
             assert!(
-                !request_data_would_mask(&with_part(part.clone()), mask),
+                !request_would_mask_unrewritable(&with_part(part.clone()), mask),
                 "{part}"
             );
         }
-        assert!(!request_data_would_mask(
+        assert!(!request_would_mask_unrewritable(
             &with_part(json!({"data": {"k": "v"}})),
             |s: &str| Some(s.to_string())
         ));
-        assert!(!request_data_would_mask(&json!({"params": {}}), mask));
+        assert!(!request_would_mask_unrewritable(
+            &json!({"params": {}}),
+            mask
+        ));
     }
 
     #[test]
