@@ -90,6 +90,12 @@ const AGENTS: Record<string, (v: Wire) => Record<string, unknown>> = {
   "data-key-risky": (v) => ({
     status: completed(v, [textPart(v, "Done."), dataPart(v, { [MARKER]: true })]),
   }),
+  // 被拦词在 Task 的 metadata 与 artifact 的名字里：客户端同样拿得到。
+  "metadata-risky": (v) => ({
+    status: completed(v, [textPart(v, "Done.")]),
+    artifacts: [{ artifactId: "verdict", name: `report on ${MARKER}`, parts: [textPart(v, "ok")] }],
+    metadata: { summary: `flagged ${MARKER}` },
+  }),
   "data-clean": (v) => ({
     status: completed(v, [textPart(v, "Done.")]),
     artifacts: [
@@ -253,7 +259,22 @@ describe("A2A content guardrails read task history, data parts and tasks/get", (
       expect(clean.text).toContain("case 7: all clear");
     });
 
+    test("a forbidden phrase in the task's metadata or an artifact's name never reaches the caller", async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      expectRefused(await send(v, "metadata-risky", [textPart(v, "look up case 7")]), MARKER);
+    });
+
     // ── 调用方的请求 ──────────────────────────────────────────────────────
+
+    test("a forbidden phrase in the request message's metadata is refused before the agent sees it", async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const before = posts(v, "plain").length;
+      const res = await rpc(agentName("plain", v), SEND[v], {
+        message: { ...message(v, "user", [textPart(v, "file this form")]), metadata: { note: `please ${MARKER}` } },
+      });
+      expectRefused(res, MARKER);
+      expect(posts(v, "plain").length).toBe(before);
+    });
 
     test("a forbidden phrase inside a request data part's value is refused before the agent sees it", async (ctx) => {
       if (!etcdReachable || !app) return ctx.skip();

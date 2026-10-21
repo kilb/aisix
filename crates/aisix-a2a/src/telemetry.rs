@@ -332,25 +332,25 @@ pub fn redact_request_text(request: &mut Value, mask: impl Fn(&str) -> Option<St
     rewritten
 }
 
-/// Every word a caller sends an agent, for a content policy to read: the text
-/// parts, and every string value and object key of the data parts, of every
-/// message the request carries, newline-joined and unbounded.
+/// Every word a caller sends an agent, for a content policy to read: every
+/// string the request's `params` carries, newline-joined and unbounded —
+/// text parts, data parts, metadata, anything else — except identifiers,
+/// enum values and base64 file bytes, which are protocol rather than language
+/// (see [`collect_call_strings`]).
 ///
-/// Scan-only. A data part (`{"kind": "data", "data": {…}}` on 0.3, the `Part`
-/// oneof's `data` field — a `google.protobuf.Value` — on 1.0) reaches the
-/// agent verbatim, so a phrase a policy blocks is delivered just as surely
-/// inside one as in a text part. It is still not language worth metering —
-/// field names and enum values would inflate the estimate — which is why
-/// [`request_text`] leaves it out and this does not.
-///
-/// Every `parts` list under `params` is read, not only `params.message`: the
-/// scan must not depend on agreeing with the agent about where a message
-/// sits, or a request shaped two ways at once is read one way here and the
-/// other way by the agent.
+/// Scan-only, and deliberately inclusive. A data part (`{"kind": "data",
+/// "data": {…}}` on 0.3, the `Part` oneof's `data` field on 1.0) or a
+/// metadata map reaches the agent verbatim, so a phrase a policy blocks is
+/// delivered just as surely there as in a text part. And the scan must not
+/// depend on agreeing with the agent about which fields hold content or where
+/// a message sits: a request shaped two ways at once would be read one way
+/// here and the other way by the agent. None of this is metered — field
+/// values and enum strings would inflate the estimate — which is why
+/// [`request_text`] leaves it out.
 pub fn request_scan_text(request: &Value) -> String {
     let mut buf = String::new();
     if let Some(params) = request.get("params") {
-        collect_all_parts_scan_text(params, &mut buf);
+        collect_call_strings(params, &mut buf);
     }
     buf
 }
@@ -359,12 +359,13 @@ pub fn request_scan_text(request: &Value) -> String {
 /// reach.
 ///
 /// [`redact_request_text`] rewrites the text parts of `params.message` only.
-/// Everything else [`request_scan_text`] reads stays as sent: a data part is a
-/// document the agent parses against its own schema (a mask token can turn an
-/// id, an enum value or a lookup field into something it misreads, and a key
-/// cannot be renamed at all), and a parts list anywhere else is not where the
-/// rewrite looks. A match there is reported rather than rewritten, and the
-/// caller refuses the call instead of forwarding the content unmasked.
+/// Everything else [`request_scan_text`] reads stays as sent: a data part or a
+/// metadata map is a document the agent parses against its own schema (a mask
+/// token can turn an id, an enum value or a lookup field into something it
+/// misreads, and a key cannot be renamed at all), and any other field is not
+/// where the rewrite looks. A match there is reported rather than rewritten,
+/// and the caller refuses the call instead of forwarding the content
+/// unmasked.
 pub fn request_would_mask_unrewritable(
     request: &Value,
     mask: impl Fn(&str) -> Option<String>,
@@ -372,57 +373,108 @@ pub fn request_would_mask_unrewritable(
     let Some(params) = request.get("params") else {
         return false;
     };
-    unrewritable_would_change(params, PartsOwner::Params, &mask)
+    call_strings_would_change(params, Within::Params, &mask)
 }
 
-/// Where a value sits relative to `params`, for [`unrewritable_would_change`].
+/// Keys whose values are protocol rather than language: identifiers, enum
+/// values, timestamps, media types and base64 file bytes (`bytes` on 0.3,
+/// `raw` on 1.0). Outside free-form containers only (see
+/// [`collect_call_strings`]).
+fn is_protocol_value_key(key: &str) -> bool {
+    matches!(
+        key,
+        "kind"
+            | "role"
+            | "state"
+            | "id"
+            | "bytes"
+            | "raw"
+            | "fileWithBytes"
+            | "mimeType"
+            | "mediaType"
+            | "timestamp"
+    ) || key.ends_with("Id")
+        || key.ends_with("Ids")
+}
+
+/// Free-form containers: their keys and every value belong to whoever wrote
+/// them, so no protocol field name inside them is trusted to be harmless.
+fn is_free_form_key(key: &str) -> bool {
+    matches!(key, "data" | "metadata")
+}
+
+/// Append every string of an A2A request's `params` or a response's `result`
+/// for scanning. Inside `data` and `metadata`, every string value and object
+/// key; elsewhere every string value except under a protocol key (field names
+/// of the protocol objects themselves are not caller content).
+fn collect_call_strings(value: &Value, buf: &mut String) {
+    match value {
+        Value::String(s) => push_line(buf, s),
+        Value::Array(items) => {
+            for item in items {
+                collect_call_strings(item, buf);
+            }
+        }
+        Value::Object(map) => {
+            for (key, child) in map {
+                if is_free_form_key(key) {
+                    collect_json_strings(child, buf);
+                } else if !is_protocol_value_key(key) {
+                    collect_call_strings(child, buf);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Where a value sits relative to `params`, for [`call_strings_would_change`].
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum PartsOwner {
+enum Within {
     Params,
-    /// `params.message`: its text parts are what the rewrite reaches.
+    /// `params.message`.
     Message,
+    /// `params.message.parts`.
+    MessageParts,
+    /// One of `params.message.parts`: its `text` is what the rewrite reaches.
+    MessagePart,
     Other,
 }
 
-fn unrewritable_would_change(
+/// [`collect_call_strings`]'s traversal, asking whether `mask` changes any
+/// string it reads other than the text of a `params.message` part.
+fn call_strings_would_change(
     value: &Value,
-    owner: PartsOwner,
+    within: Within,
     mask: &impl Fn(&str) -> Option<String>,
 ) -> bool {
     let changes = |s: &str| mask(s).is_some_and(|masked| masked != s);
     match value {
-        Value::Object(map) => {
-            let parts_change = map
-                .get("parts")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .any(|part| {
-                    let text = owner != PartsOwner::Message
-                        && part
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .is_some_and(changes);
-                    text || part
-                        .get("data")
-                        .is_some_and(|data| json_strings_would_change(data, mask))
-                });
-            parts_change
-                || map
-                    .iter()
-                    .filter(|(key, _)| *key != "parts")
-                    .any(|(key, child)| {
-                        let next = if owner == PartsOwner::Params && key == "message" {
-                            PartsOwner::Message
-                        } else {
-                            PartsOwner::Other
-                        };
-                        unrewritable_would_change(child, next, mask)
-                    })
+        Value::String(s) => changes(s),
+        Value::Array(items) => {
+            let next = if within == Within::MessageParts {
+                Within::MessagePart
+            } else {
+                Within::Other
+            };
+            items
+                .iter()
+                .any(|item| call_strings_would_change(item, next, mask))
         }
-        Value::Array(items) => items
-            .iter()
-            .any(|item| unrewritable_would_change(item, PartsOwner::Other, mask)),
+        Value::Object(map) => map.iter().any(|(key, child)| {
+            if is_free_form_key(key) {
+                return json_strings_would_change(child, mask);
+            }
+            if is_protocol_value_key(key) || (within == Within::MessagePart && key == "text") {
+                return false;
+            }
+            let next = match (within, key.as_str()) {
+                (Within::Params, "message") => Within::Message,
+                (Within::Message, "parts") => Within::MessageParts,
+                _ => Within::Other,
+            };
+            call_strings_would_change(child, next, mask)
+        }),
         _ => false,
     }
 }
@@ -528,58 +580,23 @@ impl ResultText {
     }
 }
 
-/// Every word one response envelope hands the caller, for a content policy to
-/// read, newline-joined and unbounded.
+/// Every word an agent returns on one call, for a content policy to read:
+/// every string the response's `result` carries — a Message's or the status
+/// message's parts, every artifact (name and description too), every
+/// `history` message, each Task of a `ListTasks` page, data parts, metadata —
+/// except identifiers, enum values and base64 file bytes (see
+/// [`collect_call_strings`]).
 ///
-/// [`ResultText`] is the METERED reading and deliberately narrow: it follows
-/// the protocol's append/replace rules so an answer is counted once, and it
-/// reads text parts only. A policy has to read what the caller actually
-/// receives instead, and a Task carries more than its answer:
-///
-/// - the parts of a Message result, and of the message on `status`;
-/// - every artifact's parts, and a streamed `artifact` chunk's;
-/// - every message in `history` — the conversation so far, which a read such
-///   as `tasks/get` hands back whole;
-/// - each Task of a `ListTasks` result (`tasks`), read the same way.
-///
-/// In each, text parts and every string value and object key of data parts.
-/// Both wire versions: the payload wrapper is seen through as everywhere else
-/// here, and parts, artifacts and history carry the same field names in both.
+/// The metered reading ([`ResultText`]) is narrower on purpose: it counts an
+/// answer, not a document. A policy has to read what the caller actually
+/// receives, in every wire version and every shape at once, so this reads
+/// without guessing either.
 pub fn result_scan_text(response: &Value) -> String {
     let mut buf = String::new();
     if let Some(result) = response.get("result") {
-        collect_all_parts_scan_text(result, &mut buf);
+        collect_call_strings(result, &mut buf);
     }
     buf
-}
-
-/// Collect from every `parts` list anywhere under `root`: a message, a
-/// status message, an artifact, a `history` entry, a Task of a `ListTasks`
-/// page, at whatever depth and under whatever wrapper.
-///
-/// Deliberately blind to the wire version. Reading a result the way the
-/// metering does — 0.3 if it carries a `kind`, else the first 1.0 payload
-/// wrapper — is a guess, and a result shaped both ways at once (`kind` plus a
-/// `task` wrapper, or two wrappers) would be scanned one way while a client
-/// reads it the other. Collecting from every parts list cannot disagree with
-/// any reader.
-fn collect_all_parts_scan_text(root: &Value, buf: &mut String) {
-    match root {
-        Value::Object(map) => {
-            collect_part_scan_text(root, buf);
-            for (key, child) in map {
-                if key != "parts" {
-                    collect_all_parts_scan_text(child, buf);
-                }
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                collect_all_parts_scan_text(item, buf);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Append every text part of a parts-bearing object (a message or an
@@ -594,22 +611,6 @@ fn collect_part_text(owner: &Value, buf: &mut String, push: &impl Fn(&mut String
                 push(buf, "\n");
             }
             push(buf, text);
-        }
-    }
-}
-
-/// Append every word of a parts-bearing object a content policy must read:
-/// each text part, and each string value and object key of each data part.
-fn collect_part_scan_text(owner: &Value, buf: &mut String) {
-    let Some(parts) = owner.get("parts").and_then(Value::as_array) else {
-        return;
-    };
-    for part in parts {
-        if let Some(text) = str_field(part, "text") {
-            push_line(buf, text);
-        }
-        if let Some(data) = part.get("data") {
-            collect_json_strings(data, buf);
         }
     }
 }
@@ -699,6 +700,48 @@ fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Every string a call carries is read, not only parts: metadata, an
+    /// artifact's name and description, anything an agent or a client may
+    /// show. Identifiers, enum values and base64 file bytes are not language
+    /// and are skipped.
+    #[test]
+    fn the_scans_read_every_string_except_identifiers_and_bytes() {
+        let request = json!({"params": {
+            "message": {"messageId": "PHRASE-ID", "role": "user",
+                        "parts": [{"text": "clean", "metadata": {"note": "PHRASE-E"}}],
+                        "metadata": {"PHRASE-F": "x"}},
+            "metadata": {"tag": "PHRASE-G"}
+        }});
+        let scanned = request_scan_text(&request);
+        for phrase in ["PHRASE-E", "PHRASE-F", "PHRASE-G"] {
+            assert!(scanned.contains(phrase), "{phrase} unread: {scanned}");
+        }
+        assert!(
+            !scanned.contains("PHRASE-ID"),
+            "an identifier is not content"
+        );
+
+        let result = json!({"result": {"kind": "task", "id": "t", "contextId": "c",
+            "artifacts": [{"artifactId": "a", "name": "PHRASE-H", "description": "PHRASE-I",
+                           "parts": [{"kind": "file", "file": {"bytes": "UEhSQVNFLUo=", "mimeType": "text/plain"}}]}],
+            "metadata": {"summary": "PHRASE-K"}}});
+        let scanned = result_scan_text(&result);
+        for phrase in ["PHRASE-H", "PHRASE-I", "PHRASE-K"] {
+            assert!(scanned.contains(phrase), "{phrase} unread: {scanned}");
+        }
+        assert!(
+            !scanned.contains("UEhSQVNFLUo="),
+            "base64 bytes are not scanned"
+        );
+
+        // Only `params.message`'s text parts are rewritten: a mask anywhere
+        // else is reported.
+        let mask = |s: &str| s.contains("a@b.c").then(|| s.replace("a@b.c", "[M]"));
+        let in_metadata = json!({"params": {"message": {"parts": [{"text": "clean"}],
+                                 "metadata": {"contact": "a@b.c"}}}});
+        assert!(request_would_mask_unrewritable(&in_metadata, mask));
+    }
 
     /// A result shaped two ways at once must be read every way: a client may
     /// take either reading, so the scan cannot pick one.
@@ -1077,14 +1120,19 @@ mod tests {
     fn the_request_scan_reads_data_parts_in_both_versions() {
         // A data part reaches the agent verbatim, so a policy has to read its
         // strings and keys — nested ones included — in both spellings of the
-        // part. Numbers, booleans, file bytes and metadata are not words.
+        // part, and so does every other string the agent receives: a file's
+        // name, the metadata. Numbers, booleans, file bytes and protocol
+        // values (kind, role) are not words.
         let v03 = request_scan_text(&json!({"params": {"message": {"role": "user", "parts": [
             {"kind": "text", "text": "file this form"},
             {"kind": "data", "data": {"form": {"reason": "the reason"}}},
             {"kind": "data", "data": {"tags": ["a-tag", 3, true, null]}},
             {"kind": "file", "file": {"bytes": "AAAA", "name": "x.pdf"}}
         ], "metadata": {"trace": "not-content"}}}}));
-        assert_eq!(v03, "file this form\nform\nreason\nthe reason\ntags\na-tag");
+        assert_eq!(
+            v03,
+            "trace\nnot-content\nfile this form\nform\nreason\nthe reason\ntags\na-tag\nx.pdf"
+        );
 
         // 1.0: the oneof's `data` is a `google.protobuf.Value`, so it need not
         // be an object at all.
@@ -1180,7 +1228,8 @@ mod tests {
                 "{expected:?} missing from {text:?}"
             );
         }
-        assert!(!text.contains("not-content"), "{text}");
+        // Metadata reaches the caller too, so it is read like the rest.
+        assert!(text.contains("not-content"), "{text}");
 
         // A bare Message answer with a data part.
         assert_eq!(
