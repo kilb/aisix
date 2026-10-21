@@ -1332,6 +1332,7 @@ fn responses_input_to_chat(model: &str, body: &Value) -> ChatFormat {
         _ => {}
     }
 
+    let mut preamble = Vec::new();
     for field in [
         "tools",
         "tool_choice",
@@ -1344,16 +1345,20 @@ fn responses_input_to_chat(model: &str, body: &Value) -> ChatFormat {
         if let Some(value) = body.get(field) {
             let text = serde_json::to_string(value).expect("serde_json::Value always serializes");
             if text != "null" && text != "[]" {
-                messages.push(ChatMessage::user(text));
+                preamble.push(ChatMessage::user(text));
             }
         }
     }
     if let Some(prompt) = body.get("prompt") {
         let text = crate::redact::responses_prompt_inspection_text_capped(prompt, usize::MAX).0;
         if !text.is_empty() {
-            messages.push(ChatMessage::user(text));
+            preamble.push(ChatMessage::user(text));
         }
     }
+    // Ahead of the conversation, so its last message stays last: a
+    // guardrail that has to bound how much it sends checks the newest turn
+    // first and in full.
+    messages.splice(0..0, preamble);
 
     ChatFormat::new(model, messages)
 }

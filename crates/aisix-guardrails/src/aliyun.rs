@@ -209,9 +209,8 @@ impl AliyunTextModerationGuardrail {
     /// while the call budget lasts. The strictest verdict wins.
     ///
     /// `session_id` (when set) is forwarded as `ServiceParameters.sessionId`
-    /// so Aliyun correlates the chunks of one streamed response; Aliyun
-    /// joins a session's pieces in arrival order, so those calls go out one
-    /// at a time, oldest first.
+    /// so Aliyun correlates the chunks of one streamed response — on a check
+    /// that fits one call only.
     async fn moderate(
         &self,
         service: &str,
@@ -221,7 +220,7 @@ impl AliyunTextModerationGuardrail {
         fail_open: bool,
     ) -> GuardrailVerdict {
         use futures::StreamExt as _;
-        let mut ranges = match plan_pieces(text, must_cover_from, MAX_CONTENT_CHARS) {
+        let ranges = match plan_pieces(text, must_cover_from, MAX_CONTENT_CHARS) {
             PiecePlan::TooLong => {
                 tracing::info!(
                     row = %self.row_name,
@@ -250,15 +249,15 @@ impl AliyunTextModerationGuardrail {
                 ranges
             }
         };
-        let concurrency = if session_id.is_some() {
-            ranges.reverse();
-            1
-        } else {
-            CONCURRENT_CALLS
-        };
+        // With a session Aliyun joins the session's pieces and moderates
+        // only as much of the join as one call may hold, so the pieces of a
+        // check that needs several must each stand alone: they go out
+        // without it. A check that fits one call (a streamed window) keeps
+        // the session for correlation.
+        let session_id = if ranges.len() == 1 { session_id } else { None };
         let mut verdicts = futures::stream::iter(ranges)
             .map(|r| self.moderate_piece(service, &text[r], session_id, fail_open))
-            .buffered(concurrency);
+            .buffered(CONCURRENT_CALLS);
         let mut bypass = None;
         while let Some(verdict) = verdicts.next().await {
             match verdict {
@@ -1137,6 +1136,29 @@ mod tests {
             .await;
         let g = build(&server.uri(), "high", true);
         assert_eq!(g.check_output(&resp("ok")).await, GuardrailVerdict::Allow);
+    }
+
+    #[tokio::test]
+    async fn pieces_of_one_long_reply_are_each_moderated_on_their_own() {
+        // With a sessionId Aliyun joins the session's pieces and moderates
+        // only as much of the join as one call may hold, so the later
+        // pieces of one long reply might never be judged. Each piece must
+        // stand alone: no session on a multi-piece check.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("sessionId"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(risk_body("none")))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(risk_body("none")))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let g = build(&server.uri(), "high", true);
+        let long = "x".repeat(5_000);
+        assert_eq!(g.check_output(&resp(&long)).await, GuardrailVerdict::Allow);
     }
 
     #[tokio::test]

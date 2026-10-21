@@ -23,7 +23,9 @@ import {
 //   - 最新一条消息本身长到预算装不下：拦下，而不是放行没审过的内容；
 //   - 历史再长，一次请求的调用次数有上限，每次调用不超过 2 000 字；
 //   - 模型的回答整段都审；
-//   - 要脱敏（mask）的内容在长文本里也被改写，其余文字原样、不丢不重。
+//   - 要脱敏（mask）的内容在长文本里也被改写，其余文字原样、不丢不重；
+//   - 请求级字段（tools、user、metadata）再大，也不会顶替掉最新一轮、或把它挤出
+//     预算 —— Claude Code 这类客户端每次都带几万字的 tools。
 
 const MARKER = "aliyunlongcontentmarker";
 const PHONE = "13800138000";
@@ -97,6 +99,24 @@ async function startAliyunMock(): Promise<{ baseUrl: string; calls: MockCall[]; 
 
 const filler = (n: number) => "the quick brown fox jumps over the lazy dog. ".repeat(Math.ceil(n / 45)).slice(0, n);
 
+const responsesReply = (text: string) => ({
+  id: "resp-long",
+  object: "response",
+  created_at: 0,
+  status: "completed",
+  model: "gpt-4o-mini",
+  output: [
+    {
+      type: "message",
+      id: "msg-long",
+      role: "assistant",
+      status: "completed",
+      content: [{ type: "output_text", text, annotations: [] }],
+    },
+  ],
+  usage: { input_tokens: 5, output_tokens: 5, total_tokens: 10 },
+});
+
 const chatReply = (content: string) => ({
   id: "cmpl-long",
   object: "chat.completion",
@@ -126,7 +146,10 @@ async function setup(
   ctx.app = await spawnApp();
   const seed = new SeedClient(etcd, ctx.app.etcdPrefix);
   for (const [name, reply] of Object.entries(replies)) {
-    const up = await startOpenAiUpstream({ nonStreamBody: chatReply(reply) });
+    const up = await startOpenAiUpstream({
+      nonStreamBody: chatReply(reply),
+      pathBodies: { "/responses": responsesReply(reply) },
+    });
     ctx.upstreams[name] = up;
     const pk = await seed.createProviderKey({
       display_name: `${name}-pk`,
@@ -163,13 +186,64 @@ async function setup(
 }
 
 async function chat(ctx: Ctx, caller: string, model: string, messages: Array<{ role: string; content: string }>) {
-  const res = await fetch(`${ctx.app!.proxyUrl}/v1/chat/completions`, {
+  return post(ctx, caller, "/v1/chat/completions", { model, messages });
+}
+
+async function post(ctx: Ctx, caller: string, path: string, body: unknown) {
+  const res = await fetch(`${ctx.app!.proxyUrl}${path}`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${caller}` },
-    body: JSON.stringify({ model, messages }),
+    body: JSON.stringify(body),
   });
   return { status: res.status, text: await res.text() };
 }
+
+/** A tool declaration as large as the ones coding agents send on every call. */
+const BIG_TOOL_DESCRIPTION = filler(31_000);
+
+/**
+ * One request per endpoint: `content` as the only user turn, a large tool
+ * declaration, and (when `withId`) the small identifier field each API
+ * offers — the last thing in the body.
+ */
+const endpointRequests = (model: string, content: string, withId: boolean) =>
+  [
+    [
+      "/v1/chat/completions",
+      {
+        model,
+        messages: [{ role: "user", content }],
+        tools: [
+          {
+            type: "function",
+            function: { name: "lookup", description: BIG_TOOL_DESCRIPTION, parameters: { type: "object", properties: {} } },
+          },
+        ],
+        ...(withId ? { user: "u-1" } : {}),
+      },
+    ],
+    [
+      "/v1/messages",
+      {
+        model,
+        max_tokens: 16,
+        messages: [{ role: "user", content }],
+        tools: [{ name: "lookup", description: BIG_TOOL_DESCRIPTION, input_schema: { type: "object", properties: {} } }],
+        ...(withId ? { metadata: { user_id: "u-1" } } : {}),
+      },
+    ],
+    [
+      "/v1/responses",
+      {
+        model,
+        input: content,
+        tools: [
+          { type: "function", name: "lookup", description: BIG_TOOL_DESCRIPTION, parameters: { type: "object", properties: {} } },
+        ],
+        ...(withId ? { user: "u-1" } : {}),
+      },
+    ],
+  ] as const;
 
 async function teardown(ctx: Ctx) {
   await ctx.app?.exit();
@@ -243,6 +317,22 @@ describe("Aliyun text moderation checks content past the per-call limit", () => 
     expect(r.text).not.toContain(MARKER);
   });
 
+  test("large tools and a trailing identifier do not take the newest turn's place", async (t) => {
+    if (!ctx.ready) return t.skip();
+    for (const [path, body] of endpointRequests("lc-tmp-clean", `please ${MARKER} now`, true)) {
+      const r = await post(ctx, CALLER, path, body);
+      expect(r.status, `${path}: ${r.text.slice(0, 200)}`).toBe(422);
+    }
+  });
+
+  test("large tools alone do not get a clean request refused", async (t) => {
+    if (!ctx.ready) return t.skip();
+    for (const [path, body] of endpointRequests("lc-tmp-clean", "what is the weather today", false)) {
+      const r = await post(ctx, CALLER, path, body);
+      expect(r.status, `${path}: ${r.text.slice(0, 200)}`).toBe(200);
+    }
+  });
+
   test("no call exceeds the documented per-call limit", async (t) => {
     if (!ctx.ready) return t.skip();
     expect(calls().length).toBeGreaterThan(0);
@@ -282,6 +372,18 @@ describe("Aliyun AI guardrail masks content past the per-call limit", () => {
     const r = await chat(ctx, CALLER, "lc-aig-clean", [{ role: "user", content }]);
     expect(r.status, r.text.slice(0, 200)).toBe(200);
     expect(forwardedMessages().at(-1)?.content).toBe(content.replace(PHONE, "[PHONE]"));
+  });
+
+  test("a phone number in the newest turn is masked next to large tools", async (t) => {
+    if (!ctx.ready) return t.skip();
+    const content = `call me on ${PHONE} please`;
+    for (const [path, body] of endpointRequests("lc-aig-clean", content, true).slice(0, 2)) {
+      const r = await post(ctx, CALLER, path, body);
+      expect(r.status, `${path}: ${r.text.slice(0, 200)}`).toBe(200);
+      const sent = JSON.stringify(forwardedMessages());
+      expect(sent, path).not.toContain(PHONE);
+      expect(sent, path).toContain("[PHONE]");
+    }
   });
 
   test("no call exceeds the documented per-call limit", async (t) => {

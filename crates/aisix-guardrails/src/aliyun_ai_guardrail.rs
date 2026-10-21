@@ -172,9 +172,8 @@ impl AliyunAiGuardrail {
     ///
     /// `session_id` (when set) is forwarded as both
     /// `ServiceParameters.sessionId` and `.chatId` so Aliyun correlates
-    /// the windows of one streamed response into one console record; those
-    /// calls go out one at a time, oldest first, the order Aliyun joins a
-    /// session's pieces in.
+    /// the windows of one streamed response into one console record — on a
+    /// check that fits one call only.
     async fn moderate(
         &self,
         service: &str,
@@ -184,18 +183,18 @@ impl AliyunAiGuardrail {
         fail_open: bool,
     ) -> GuardrailVerdict {
         use futures::StreamExt as _;
-        let Some(mut ranges) = self.plan(service, text, must_cover_from) else {
+        let Some(ranges) = self.plan(service, text, must_cover_from) else {
             return self.too_long();
         };
-        let concurrency = if session_id.is_some() {
-            ranges.reverse();
-            1
-        } else {
-            CONCURRENT_CALLS
-        };
+        // With a session Aliyun joins the session's pieces and moderates
+        // only as much of the join as one call may hold, so the pieces of a
+        // check that needs several must each stand alone: they go out
+        // without it. A check that fits one call (a streamed window) keeps
+        // the session for correlation.
+        let session_id = if ranges.len() == 1 { session_id } else { None };
         let mut verdicts = futures::stream::iter(ranges)
             .map(|r| self.moderate_piece(service, &text[r], session_id, fail_open))
-            .buffered(concurrency);
+            .buffered(CONCURRENT_CALLS);
         let mut bypass = None;
         while let Some(verdict) = verdicts.next().await {
             match verdict {
@@ -324,12 +323,16 @@ impl AliyunAiGuardrail {
     /// a piece answers `mask` does more work happen:
     /// - a body that went out as one call takes that call's
     ///   `Ext.Desensitization` directly;
-    /// - otherwise each segment a flagged piece touched is re-checked in
-    ///   non-overlapping pieces, because MultiModalGuard takes ONE
+    /// - otherwise each segment a flagged piece touched is cut into
+    ///   non-overlapping pieces and the pieces a flagged range reaches are
+    ///   re-checked (the rest keep their text), because MultiModalGuard takes ONE
     ///   `content` string and returns ONE desensitized text with no
     ///   offsets — the overlapping verdict pieces cannot be stitched back,
     ///   non-overlapping ones can, and `masked[i]` stays aligned with
     ///   `texts[i]` by construction. Untouched segments keep their text.
+    ///   The rewritten text is then checked once more across every cut,
+    ///   because a span cut in two passes as two halves; a cut that still
+    ///   needs masking fails closed.
     /// - `mask` with no usable `Desensitization` fails closed: the policy
     ///   said this content must not go out as-is, and there is nothing to
     ///   rewrite it with.
@@ -424,8 +427,17 @@ impl AliyunAiGuardrail {
             return bypass.map_or_else(SegmentsOutcome::allow, SegmentsOutcome::from_verdict);
         }
         drop(replies);
-        self.masked_segments(texts, flagged, single_call, service, fail_open)
-            .await
+        let mut outcome = self
+            .masked_segments(texts, flagged, single_call, service)
+            .await;
+        // A piece that failed open was never checked; the rewrite of the
+        // others does not change that.
+        if let Some(bypass) = bypass {
+            if !outcome.verdict.is_block() {
+                outcome.verdict = bypass;
+            }
+        }
+        outcome
     }
 
     /// Build the positionally-aligned masked replacements after a piece
@@ -436,7 +448,6 @@ impl AliyunAiGuardrail {
         flagged: Vec<(std::ops::Range<usize>, CallReply, AigDiagnostics)>,
         single_call: bool,
         service: &str,
-        fail_open: bool,
     ) -> SegmentsOutcome {
         let mut counts: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
         if let ([_], true) = (texts, single_call) {
@@ -471,8 +482,27 @@ impl AliyunAiGuardrail {
                 masked.push(text.clone());
                 continue;
             }
-            let mut rewritten = String::with_capacity(text.len());
-            for piece in non_overlapping_pieces(text, MAX_CONTENT_CHARS) {
+            let pieces = non_overlapping_pieces(text, MAX_CONTENT_CHARS);
+            // Only the pieces a flagged range reaches are re-checked: the
+            // rest of the segment either passed already or lies past the
+            // call budget, and nothing says it needs a mask.
+            let mut piece_start = span.start;
+            let recheck: Vec<bool> = pieces
+                .iter()
+                .map(|piece| {
+                    let range = piece_start..piece_start + piece.len();
+                    piece_start = range.end;
+                    flagged
+                        .iter()
+                        .any(|(f, _, _)| f.start < range.end && range.start < f.end)
+                })
+                .collect();
+            let mut rewritten: Vec<String> = Vec::new();
+            for (piece, &recheck) in pieces.iter().zip(&recheck) {
+                if !recheck {
+                    rewritten.push((*piece).to_owned());
+                    continue;
+                }
                 calls += 1;
                 if calls > MAX_CALLS_PER_CHECK {
                     tracing::info!(
@@ -485,9 +515,12 @@ impl AliyunAiGuardrail {
                 let (outcome, diag) = self.call(service, piece, None).await;
                 let reply = match outcome {
                     Ok(r) => r,
+                    // This text was judged to need a mask; without the
+                    // rewrite it cannot go out, whatever `fail_open` says
+                    // (that is for text that could not be judged at all).
                     Err(failure) => {
                         return SegmentsOutcome::from_verdict(
-                            self.handle_failure(failure, &diag, fail_open),
+                            self.handle_failure(failure, &diag, false),
                         )
                     }
                 };
@@ -505,15 +538,58 @@ impl AliyunAiGuardrail {
                             for label in &diag.labels {
                                 *counts.entry(label.clone()).or_insert(0) += 1;
                             }
-                            rewritten.push_str(&m);
+                            rewritten.push(m);
                             rewrote_any = true;
                         }
                         _ => return self.mask_without_replacement(&diag),
                     },
-                    _ => rewritten.push_str(piece),
+                    _ => rewritten.push((*piece).to_owned()),
                 }
             }
-            masked.push(rewritten);
+            // A span cut in two passes as two harmless halves, even when
+            // another piece of the segment was masked. Check the rewritten
+            // text across every cut; whatever still needs masking there
+            // cannot be rewritten piecewise, so it fails closed.
+            for (i, pair) in rewritten.windows(2).enumerate() {
+                // A cut between two pieces neither of which was re-checked
+                // lies outside every flagged range.
+                if !(recheck[i] || recheck[i + 1]) {
+                    continue;
+                }
+                calls += 1;
+                if calls > MAX_CALLS_PER_CHECK {
+                    return SegmentsOutcome::from_verdict(self.too_long());
+                }
+                let seam = format!(
+                    "{}{}",
+                    last_chars(&pair[0], MAX_CONTENT_CHARS / 2),
+                    first_chars(&pair[1], MAX_CONTENT_CHARS / 2)
+                );
+                let (outcome, diag) = self.call(service, &seam, None).await;
+                let reply = match outcome {
+                    Ok(r) => r,
+                    // As above: the region around this cut was judged.
+                    Err(failure) => {
+                        return SegmentsOutcome::from_verdict(
+                            self.handle_failure(failure, &diag, false),
+                        )
+                    }
+                };
+                if matches!(reply.suggestion.as_str(), "block" | "mask") {
+                    tracing::info!(
+                        row = %self.row_name,
+                        service,
+                        aliyun_request_id = %diag.request_id,
+                        aliyun_labels = %diag.labels_field(),
+                        "aliyun AI guardrail: content needing a mask spans a cut; blocking",
+                    );
+                    return SegmentsOutcome::from_verdict(GuardrailVerdict::block(format!(
+                        "aliyun AI guardrail: content requires masking (row: {})",
+                        self.row_name
+                    )));
+                }
+            }
+            masked.push(rewritten.concat());
         }
         if !rewrote_any {
             // Only a piece spanning a cut saw what needs masking; no
@@ -766,6 +842,19 @@ struct CallReply {
     /// The desensitized full text of the submitted `content`, when
     /// Aliyun provided one.
     desensitization: Option<String>,
+}
+
+/// The last `n` chars of `s`.
+fn last_chars(s: &str, n: usize) -> &str {
+    s.char_indices()
+        .rev()
+        .nth(n.saturating_sub(1))
+        .map_or(s, |(i, _)| &s[i..])
+}
+
+/// The first `n` chars of `s`.
+fn first_chars(s: &str, n: usize) -> &str {
+    s.char_indices().nth(n).map_or(s, |(i, _)| &s[..i])
 }
 
 /// `text` cut into consecutive pieces of at most `max_chars` chars, with
@@ -1362,6 +1451,128 @@ mod tests {
             ]),
             "only the masking segment is rewritten; slots stay aligned"
         );
+    }
+
+    const PHONE: &str = "13812345678";
+
+    /// The `content` a request sent, decoded from the form body.
+    fn sent_content(request: &wiremock::Request) -> String {
+        url::form_urlencoded::parse(&request.body)
+            .find(|(k, _)| k == "ServiceParameters")
+            .and_then(|(_, v)| serde_json::from_str::<serde_json::Value>(&v).ok())
+            .and_then(|v| v["content"].as_str().map(str::to_owned))
+            .unwrap_or_default()
+    }
+
+    /// Answers like MultiModalGuard would for phone numbers: `mask` with
+    /// every whole number in the content replaced, `pass` when the content
+    /// holds no whole number (half of one is not a number).
+    struct PhoneMasker;
+    impl wiremock::Respond for PhoneMasker {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let content = sent_content(request);
+            if content.contains(PHONE) {
+                ResponseTemplate::new(200)
+                    .set_body_json(mask_body(Some(&content.replace(PHONE, "[M]"))))
+            } else {
+                ResponseTemplate::new(200).set_body_json(suggestion_body("pass"))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mask_never_releases_a_number_split_by_a_cut() {
+        // One whole number early in a long message, and one across char
+        // 2 000 — where text is cut into pieces of at most 2 000 chars. Each
+        // half of the second number passes on its own; the first number
+        // gets masked, so something WAS rewritten.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(PhoneMasker)
+            .mount(&server)
+            .await;
+        let g = build(&server.uri(), true);
+        let mut text = "a".repeat(100);
+        text.push_str(PHONE);
+        text.push_str(&"b".repeat(MAX_CONTENT_CHARS - 5 - text.len()));
+        text.push_str(PHONE);
+        text.push_str(&"c".repeat(2_500));
+        let seg = g.moderate_input_segments(&[text]).await;
+        match seg.verdict {
+            GuardrailVerdict::Allow => {
+                let masked = seg.masked.expect("a mask verdict rewrites");
+                assert!(
+                    !masked[0].contains(PHONE),
+                    "a number on a cut was released unmasked"
+                );
+            }
+            GuardrailVerdict::Block { .. } => {}
+            other => panic!("unexpected verdict {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fail_open_piece_still_reports_bypass_when_another_piece_masks() {
+        // One piece of a long message cannot be checked (fail-open), another
+        // asks for a mask. The rewrite goes out, but part of the text was
+        // never checked: the outcome must say so, or the body is treated as
+        // fully moderated (and safe for full-content capture).
+        struct Mixed;
+        impl wiremock::Respond for Mixed {
+            fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+                let content = sent_content(request);
+                if content.contains(PHONE) {
+                    ResponseTemplate::new(200)
+                        .set_body_json(mask_body(Some(&content.replace(PHONE, "[M]"))))
+                } else if content.contains('z') {
+                    ResponseTemplate::new(500)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(suggestion_body("pass"))
+                }
+            }
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(Mixed)
+            .mount(&server)
+            .await;
+        let g = build(&server.uri(), true);
+        // The failing `z` stretch lies far from the number: the mask pass
+        // never needs it.
+        let text = format!("{}{}{PHONE} end", "z".repeat(3_000), "a".repeat(4_000));
+        let seg = g.moderate_input_segments(&[text]).await;
+        assert!(seg.verdict.is_bypass(), "got {:?}", seg.verdict);
+        assert!(!seg.masked.expect("rewritten")[0].contains(PHONE));
+    }
+
+    #[tokio::test]
+    async fn a_flagged_region_whose_rewrite_fails_is_blocked_even_fail_open() {
+        // The check said this text needs a mask; the call that would produce
+        // the rewrite then fails. Under `fail_open` an unjudged text may go
+        // through, but this one WAS judged: releasing it as written would
+        // drop a mask verdict already in hand.
+        // Call 1 judges the body (mask), call 2 rewrites the first segment,
+        // every later call fails.
+        struct MaskThenFail(std::sync::atomic::AtomicUsize);
+        impl wiremock::Respond for MaskThenFail {
+            fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+                match self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => ResponseTemplate::new(200).set_body_json(mask_body(None)),
+                    1 => ResponseTemplate::new(200).set_body_json(mask_body(Some("call [M]"))),
+                    _ => ResponseTemplate::new(500),
+                }
+            }
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(MaskThenFail(std::sync::atomic::AtomicUsize::new(0)))
+            .mount(&server)
+            .await;
+        let g = build(&server.uri(), true);
+        let texts = vec![format!("call {PHONE}"), format!("or {PHONE}")];
+        let seg = g.moderate_input_segments(&texts).await;
+        assert!(seg.verdict.is_block(), "got {:?}", seg.verdict);
+        assert!(seg.masked.is_none());
     }
 
     #[tokio::test]

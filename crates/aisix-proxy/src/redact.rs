@@ -564,6 +564,66 @@ fn redact_chat_format_impl(
         };
     }
     let mut unrewritable_tool_key = false;
+    // Request-level fields are walked BEFORE the conversation, so the
+    // conversation's last turn is the last segment: a guardrail that has to
+    // bound how much it sends checks the newest turn first and in full.
+    // Tool descriptions and JSON-schema examples/defaults are prompt text
+    // forwarded through `ChatFormat::extra`. Structural fields (for example
+    // function names and schema types) participate in DLP inspection but are
+    // never rewritten because changing them would corrupt the tool contract.
+    for field in ["tools", "functions"] {
+        if let Some(definitions) = req.extra.get_mut(field) {
+            unrewritable_tool_key |= redact_tool_definitions(
+                chain,
+                Direction::Input,
+                definitions,
+                &mut counts,
+                detect_keys,
+            );
+        }
+    }
+    if let Some(response_format) = req.extra.get_mut("response_format") {
+        unrewritable_tool_key |= redact_tool_definitions(
+            chain,
+            Direction::Input,
+            response_format,
+            &mut counts,
+            detect_keys,
+        );
+    }
+    if detect_keys {
+        for field in ["tool_choice", "function_call"] {
+            if let Some(selector) = req.extra.get(field) {
+                unrewritable_tool_key |=
+                    detect_unrewritable_object_keys(chain, Direction::Input, selector, &mut counts);
+                unrewritable_tool_key |= detect_unrewritable_value_strings(
+                    chain,
+                    Direction::Input,
+                    selector,
+                    &mut counts,
+                );
+            }
+        }
+        for field in ["user", "safety_identifier", "prompt_cache_key"] {
+            if let Some(value) = req.extra.get(field) {
+                unrewritable_tool_key |=
+                    detect_unrewritable_value_strings(chain, Direction::Input, value, &mut counts);
+            }
+        }
+        if let Some(metadata) = req.extra.get("metadata") {
+            unrewritable_tool_key |=
+                detect_unrewritable_object_keys(chain, Direction::Input, metadata, &mut counts);
+            unrewritable_tool_key |=
+                detect_unrewritable_value_strings(chain, Direction::Input, metadata, &mut counts);
+        }
+    }
+    if let Some(content) = req
+        .extra
+        .get_mut("prediction")
+        .and_then(|prediction| prediction.get_mut("content"))
+    {
+        redact_responses_text_value(chain, Direction::Input, content, &mut counts);
+    }
     for msg in &mut req.messages {
         if detect_keys {
             if let Some(name) = msg.name.as_deref() {
@@ -640,63 +700,6 @@ fn redact_chat_format_impl(
             }
         }
     }
-    // Tool descriptions and JSON-schema examples/defaults are prompt text
-    // forwarded through `ChatFormat::extra`. Structural fields (for example
-    // function names and schema types) participate in DLP inspection but are
-    // never rewritten because changing them would corrupt the tool contract.
-    for field in ["tools", "functions"] {
-        if let Some(definitions) = req.extra.get_mut(field) {
-            unrewritable_tool_key |= redact_tool_definitions(
-                chain,
-                Direction::Input,
-                definitions,
-                &mut counts,
-                detect_keys,
-            );
-        }
-    }
-    if let Some(response_format) = req.extra.get_mut("response_format") {
-        unrewritable_tool_key |= redact_tool_definitions(
-            chain,
-            Direction::Input,
-            response_format,
-            &mut counts,
-            detect_keys,
-        );
-    }
-    if detect_keys {
-        for field in ["tool_choice", "function_call"] {
-            if let Some(selector) = req.extra.get(field) {
-                unrewritable_tool_key |=
-                    detect_unrewritable_object_keys(chain, Direction::Input, selector, &mut counts);
-                unrewritable_tool_key |= detect_unrewritable_value_strings(
-                    chain,
-                    Direction::Input,
-                    selector,
-                    &mut counts,
-                );
-            }
-        }
-        for field in ["user", "safety_identifier", "prompt_cache_key"] {
-            if let Some(value) = req.extra.get(field) {
-                unrewritable_tool_key |=
-                    detect_unrewritable_value_strings(chain, Direction::Input, value, &mut counts);
-            }
-        }
-        if let Some(metadata) = req.extra.get("metadata") {
-            unrewritable_tool_key |=
-                detect_unrewritable_object_keys(chain, Direction::Input, metadata, &mut counts);
-            unrewritable_tool_key |=
-                detect_unrewritable_value_strings(chain, Direction::Input, metadata, &mut counts);
-        }
-    }
-    if let Some(content) = req
-        .extra
-        .get_mut("prediction")
-        .and_then(|prediction| prediction.get_mut("content"))
-    {
-        redact_responses_text_value(chain, Direction::Input, content, &mut counts);
-    }
     AnthropicRequestRedaction {
         counts,
         unrewritable_tool_key,
@@ -738,6 +741,11 @@ pub async fn moderate_chat_format_structured(
 /// target for the structured moderation pass.
 pub fn chat_request_for_inspection(req: &ChatFormat) -> ChatFormat {
     let mut inspection = req.clone();
+    // The extra surfaces go BEFORE the conversation, so its last message
+    // stays last: a guardrail that has to bound how much it sends checks
+    // the newest turn first and in full, and request-level fields such as
+    // `tools` or `metadata` must not take that place.
+    let mut preamble = Vec::new();
     for message in &req.messages {
         for text in [
             message.extra.get("refusal").and_then(Value::as_str),
@@ -750,9 +758,7 @@ pub fn chat_request_for_inspection(req: &ChatFormat) -> ChatFormat {
         .into_iter()
         .flatten()
         {
-            inspection
-                .messages
-                .push(aisix_gateway::ChatMessage::user(text.to_owned()));
+            preamble.push(aisix_gateway::ChatMessage::user(text.to_owned()));
         }
     }
     for field in [
@@ -770,12 +776,11 @@ pub fn chat_request_for_inspection(req: &ChatFormat) -> ChatFormat {
         if let Some(value) = req.extra.get(field) {
             let text = serde_json::to_string(value).expect("serde_json::Value always serializes");
             if text != "null" && text != "[]" {
-                inspection
-                    .messages
-                    .push(aisix_gateway::ChatMessage::user(text));
+                preamble.push(aisix_gateway::ChatMessage::user(text));
             }
         }
     }
+    inspection.messages.splice(0..0, preamble);
     inspection
 }
 
@@ -1007,18 +1012,9 @@ pub fn redact_anthropic_request(
         };
     }
     let mut unrewritable_tool_key = false;
-    if let Some(system) = body.get_mut("system") {
-        unrewritable_tool_key |=
-            redact_anthropic_content(chain, Direction::Input, system, &mut counts);
-    }
-    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
-        for msg in messages {
-            if let Some(content) = msg.get_mut("content") {
-                unrewritable_tool_key |=
-                    redact_anthropic_content(chain, Direction::Input, content, &mut counts);
-            }
-        }
-    }
+    // Request-level fields are walked BEFORE the conversation, so the
+    // conversation's last turn is the last segment: a guardrail that has to
+    // bound how much it sends checks the newest turn first and in full.
     // Tool descriptions and JSON-schema examples/defaults are prompt text the
     // provider receives. Structural fields participate in inspection but are
     // never renamed or rewritten.
@@ -1051,6 +1047,18 @@ pub fn redact_anthropic_request(
             &["user_id"],
             &mut counts,
         );
+    }
+    if let Some(system) = body.get_mut("system") {
+        unrewritable_tool_key |=
+            redact_anthropic_content(chain, Direction::Input, system, &mut counts);
+    }
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for msg in messages {
+            if let Some(content) = msg.get_mut("content") {
+                unrewritable_tool_key |=
+                    redact_anthropic_content(chain, Direction::Input, content, &mut counts);
+            }
+        }
     }
     AnthropicRequestRedaction {
         counts,
@@ -1177,6 +1185,9 @@ pub async fn moderate_anthropic_request(
 /// projection closes that otherwise invisible provider-forwarded text surface.
 pub fn anthropic_request_for_inspection(body: &Value) -> Result<aisix_gateway::ChatFormat, ()> {
     let mut chat = aisix_provider_anthropic::parse_inbound_request(body).map_err(|_| ())?;
+    // Ahead of the conversation, so its last message stays last (see
+    // `chat_request_for_inspection`).
+    let mut preamble = Vec::new();
     if let Some(messages) = body.get("messages").and_then(Value::as_array) {
         for content in messages.iter().filter_map(|message| message.get("content")) {
             let Some(additional) = anthropic_additional_content_for_inspection(content) else {
@@ -1184,7 +1195,7 @@ pub fn anthropic_request_for_inspection(body: &Value) -> Result<aisix_gateway::C
             };
             let text = anthropic_content_inspection_text_capped(&additional, usize::MAX).0;
             if !text.is_empty() {
-                chat.messages.push(aisix_gateway::ChatMessage::user(text));
+                preamble.push(aisix_gateway::ChatMessage::user(text));
             }
         }
     }
@@ -1198,10 +1209,11 @@ pub fn anthropic_request_for_inspection(body: &Value) -> Result<aisix_gateway::C
         if let Some(value) = body.get(field) {
             let text = serde_json::to_string(value).map_err(|_| ())?;
             if text != "null" && text != "[]" {
-                chat.messages.push(aisix_gateway::ChatMessage::user(text));
+                preamble.push(aisix_gateway::ChatMessage::user(text));
             }
         }
     }
+    chat.messages.splice(0..0, preamble);
     Ok(chat)
 }
 
@@ -1515,27 +1527,10 @@ fn redact_responses_request_impl(
             unrewritable_tool_key: false,
         };
     }
-    if let Some(instructions) = body.get_mut("instructions") {
-        apply_to_value_string(chain, Direction::Input, instructions, &mut counts);
-    }
     let mut unrewritable_tool_key = false;
-    match body.get_mut("input") {
-        Some(v @ Value::String(_)) => {
-            apply_to_value_string(chain, Direction::Input, v, &mut counts)
-        }
-        Some(Value::Array(items)) => {
-            for item in items {
-                unrewritable_tool_key |= redact_responses_item_structured(
-                    chain,
-                    Direction::Input,
-                    item,
-                    &mut counts,
-                    detect_keys,
-                );
-            }
-        }
-        _ => {}
-    }
+    // Request-level fields are walked BEFORE the conversation, so the
+    // conversation's last turn is the last segment: a guardrail that has to
+    // bound how much it sends checks the newest turn first and in full.
     if let Some(tools) = body.get_mut("tools") {
         unrewritable_tool_key |=
             redact_tool_definitions(chain, Direction::Input, tools, &mut counts, detect_keys);
@@ -1571,6 +1566,26 @@ fn redact_responses_request_impl(
             unrewritable_tool_key |=
                 detect_unrewritable_value_strings(chain, Direction::Input, metadata, &mut counts);
         }
+    }
+    if let Some(instructions) = body.get_mut("instructions") {
+        apply_to_value_string(chain, Direction::Input, instructions, &mut counts);
+    }
+    match body.get_mut("input") {
+        Some(v @ Value::String(_)) => {
+            apply_to_value_string(chain, Direction::Input, v, &mut counts)
+        }
+        Some(Value::Array(items)) => {
+            for item in items {
+                unrewritable_tool_key |= redact_responses_item_structured(
+                    chain,
+                    Direction::Input,
+                    item,
+                    &mut counts,
+                    detect_keys,
+                );
+            }
+        }
+        _ => {}
     }
     AnthropicRequestRedaction {
         counts,
@@ -5005,10 +5020,10 @@ mod tests {
         let inspection = chat_request_for_inspection(&chat);
         assert!(inspection
             .messages
-            .last()
-            .unwrap()
-            .content_str()
-            .contains(sensitive_key));
+            .iter()
+            .any(|m| m.content_str().contains(sensitive_key)));
+        // The tools go ahead of the conversation, whose last turn stays last.
+        assert_eq!(inspection.messages.last().unwrap().content_str(), "clean");
         let chat_redaction = redact_chat_format_structured(chain.as_ref(), &mut chat);
         assert!(chat_redaction.unrewritable_tool_key);
         assert_eq!(

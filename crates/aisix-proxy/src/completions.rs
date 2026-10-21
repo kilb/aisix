@@ -360,11 +360,17 @@ fn completions_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFo
             .collect(),
         _ => Vec::new(),
     };
-    for field in ["suffix", "user"] {
-        if let Some(text) = body.get(field).and_then(Value::as_str) {
-            if !text.is_empty() {
-                messages.push(aisix_gateway::ChatMessage::user(text.to_string()));
-            }
+    if let Some(text) = body.get("suffix").and_then(Value::as_str) {
+        if !text.is_empty() {
+            messages.push(aisix_gateway::ChatMessage::user(text.to_string()));
+        }
+    }
+    // `user` is an identifier, not prompt text: ahead of the prompt, so the
+    // prompt's last part stays last (a guardrail bounding how much it sends
+    // checks the newest text first and in full).
+    if let Some(text) = body.get("user").and_then(Value::as_str) {
+        if !text.is_empty() {
+            messages.insert(0, aisix_gateway::ChatMessage::user(text.to_string()));
         }
     }
     aisix_gateway::ChatFormat::new(model, messages)
