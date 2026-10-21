@@ -332,6 +332,46 @@ pub fn redact_request_text(request: &mut Value, mask: impl Fn(&str) -> Option<St
     rewritten
 }
 
+/// Every word a caller sends an agent, for a content policy to read: the
+/// request message's text parts, plus every string value and object key of
+/// its data parts, newline-joined and unbounded.
+///
+/// Scan-only. A data part (`{"kind": "data", "data": {…}}` on 0.3, the `Part`
+/// oneof's `data` field — a `google.protobuf.Value` — on 1.0) reaches the
+/// agent verbatim, so a phrase a policy blocks is delivered just as surely
+/// inside one as in a text part. It is still not language worth metering —
+/// field names and enum values would inflate the estimate — which is why
+/// [`request_text`] leaves it out and this does not.
+pub fn request_scan_text(request: &Value) -> String {
+    let mut buf = String::new();
+    if let Some(message) = request.pointer("/params/message") {
+        collect_part_scan_text(message, &mut buf);
+    }
+    buf
+}
+
+/// Whether `mask` would change any string value or object key of a request
+/// data part.
+///
+/// [`redact_request_text`] rewrites text parts only. A data part is a document
+/// the agent parses against its own schema: a mask token can turn an id, an
+/// enum value or a lookup field into something the agent misreads, and a key
+/// cannot be renamed at all. So a match there is reported rather than
+/// rewritten, and the caller refuses the call instead of forwarding the
+/// content unmasked.
+pub fn request_data_would_mask(request: &Value, mask: impl Fn(&str) -> Option<String>) -> bool {
+    let Some(parts) = request
+        .pointer("/params/message/parts")
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    parts
+        .iter()
+        .filter_map(|part| part.get("data"))
+        .any(|data| json_strings_would_change(data, &mask))
+}
+
 /// The text an agent produced on one call, kept as two segments because the
 /// protocol updates them by two different rules.
 ///
@@ -433,6 +473,62 @@ impl ResultText {
     }
 }
 
+/// Every word one response envelope hands the caller, for a content policy to
+/// read, newline-joined and unbounded.
+///
+/// [`ResultText`] is the METERED reading and deliberately narrow: it follows
+/// the protocol's append/replace rules so an answer is counted once, and it
+/// reads text parts only. A policy has to read what the caller actually
+/// receives instead, and a Task carries more than its answer:
+///
+/// - the parts of a Message result, and of the message on `status`;
+/// - every artifact's parts, and a streamed `artifact` chunk's;
+/// - every message in `history` — the conversation so far, which a read such
+///   as `tasks/get` hands back whole;
+/// - each Task of a `ListTasks` result (`tasks`), read the same way.
+///
+/// In each, text parts and every string value and object key of data parts.
+/// Both wire versions: the payload wrapper is seen through as everywhere else
+/// here, and parts, artifacts and history carry the same field names in both.
+pub fn result_scan_text(response: &Value) -> String {
+    let mut buf = String::new();
+    let Some(result) = response.get("result") else {
+        return buf;
+    };
+    let payload = unwrap_payload(result);
+    collect_result_scan_text(payload, &mut buf);
+    for task in payload
+        .get("tasks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        collect_result_scan_text(task, &mut buf);
+    }
+    buf
+}
+
+/// [`result_scan_text`] for one Task / Message / update event.
+fn collect_result_scan_text(payload: &Value, buf: &mut String) {
+    collect_part_scan_text(payload, buf);
+    if let Some(message) = payload.pointer("/status/message") {
+        collect_part_scan_text(message, buf);
+    }
+    if let Some(artifact) = payload.get("artifact") {
+        collect_part_scan_text(artifact, buf);
+    }
+    for key in ["artifacts", "history"] {
+        for owner in payload
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            collect_part_scan_text(owner, buf);
+        }
+    }
+}
+
 /// Append every text part of a parts-bearing object (a message or an
 /// artifact), through the caller's bounding `push`.
 fn collect_part_text(owner: &Value, buf: &mut String, push: &impl Fn(&mut String, &str)) {
@@ -447,6 +543,68 @@ fn collect_part_text(owner: &Value, buf: &mut String, push: &impl Fn(&mut String
             push(buf, text);
         }
     }
+}
+
+/// Append every word of a parts-bearing object a content policy must read:
+/// each text part, and each string value and object key of each data part.
+fn collect_part_scan_text(owner: &Value, buf: &mut String) {
+    let Some(parts) = owner.get("parts").and_then(Value::as_array) else {
+        return;
+    };
+    for part in parts {
+        if let Some(text) = str_field(part, "text") {
+            push_line(buf, text);
+        }
+        if let Some(data) = part.get("data") {
+            collect_json_strings(data, buf);
+        }
+    }
+}
+
+/// Append every string value and object key of a JSON document. Keys count:
+/// `{"<the phrase>": true}` delivers the phrase as surely as a value does.
+fn collect_json_strings(value: &Value, buf: &mut String) {
+    match value {
+        Value::String(s) => push_line(buf, s),
+        Value::Array(items) => {
+            for item in items {
+                collect_json_strings(item, buf);
+            }
+        }
+        Value::Object(map) => {
+            for (key, child) in map {
+                push_line(buf, key);
+                collect_json_strings(child, buf);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether `mask` changes any string value or object key of a JSON document.
+fn json_strings_would_change(value: &Value, mask: &impl Fn(&str) -> Option<String>) -> bool {
+    let changes = |s: &str| mask(s).is_some_and(|masked| masked != s);
+    match value {
+        Value::String(s) => changes(s),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| json_strings_would_change(item, mask)),
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, child)| changes(key) || json_strings_would_change(child, mask)),
+        _ => false,
+    }
+}
+
+/// Newline-separated append of a non-empty segment.
+fn push_line(buf: &mut String, s: &str) {
+    if s.is_empty() {
+        return;
+    }
+    if !buf.is_empty() {
+        buf.push('\n');
+    }
+    buf.push_str(s);
 }
 
 /// The 1.0 payload `oneof` field names, in `SendMessageResponse` /
@@ -812,6 +970,190 @@ mod tests {
             ),
             ""
         );
+    }
+
+    #[test]
+    fn the_request_scan_reads_data_parts_in_both_versions() {
+        // A data part reaches the agent verbatim, so a policy has to read its
+        // strings and keys — nested ones included — in both spellings of the
+        // part. Numbers, booleans, file bytes and metadata are not words.
+        let v03 = request_scan_text(&json!({"params": {"message": {"role": "user", "parts": [
+            {"kind": "text", "text": "file this form"},
+            {"kind": "data", "data": {"form": {"reason": "the reason"}}},
+            {"kind": "data", "data": {"tags": ["a-tag", 3, true, null]}},
+            {"kind": "file", "file": {"bytes": "AAAA", "name": "x.pdf"}}
+        ], "metadata": {"trace": "not-content"}}}}));
+        assert_eq!(v03, "file this form\nform\nreason\nthe reason\ntags\na-tag");
+
+        // 1.0: the oneof's `data` is a `google.protobuf.Value`, so it need not
+        // be an object at all.
+        let v10 = request_scan_text(
+            &json!({"params": {"message": {"role": "ROLE_USER", "parts": [
+                {"text": "file this form"},
+                {"data": {"the key itself": true}},
+                {"data": ["listed", 1]},
+                {"data": "a bare string"},
+                {"raw": "AAAA", "mediaType": "application/pdf"}
+            ]}}}),
+        );
+        assert_eq!(v10, "file this form\nthe key itself\nlisted\na bare string");
+
+        // A data-only message is not an empty one.
+        assert_eq!(
+            request_scan_text(
+                &json!({"params": {"message": {"parts": [{"kind": "data", "data": {"k": "v"}}]}}})
+            ),
+            "k\nv"
+        );
+        assert_eq!(request_scan_text(&json!({"params": {"id": "t-1"}})), "");
+    }
+
+    #[test]
+    fn a_mask_that_would_change_a_data_part_is_reported() {
+        let mask = |s: &str| {
+            s.contains("alice@")
+                .then(|| s.replace("alice@", "[EMAIL]@"))
+        };
+        let with_part = |part: Value| json!({"params": {"message": {"parts": [part]}}});
+
+        // A value, nested or not, and a key — in both part spellings.
+        for part in [
+            json!({"kind": "data", "data": {"contact": "alice@example.com"}}),
+            json!({"kind": "data", "data": {"rows": [{"to": ["alice@example.com"]}]}}),
+            json!({"data": {"alice@example.com": true}}),
+            json!({"data": "alice@example.com"}),
+        ] {
+            assert!(
+                request_data_would_mask(&with_part(part.clone()), mask),
+                "{part} must be reported"
+            );
+        }
+
+        // A text part is rewritable, so it is not this function's concern; a
+        // data part the mask leaves alone, or answers with the same text, is
+        // nothing to refuse.
+        for part in [
+            json!({"kind": "text", "text": "alice@example.com"}),
+            json!({"kind": "data", "data": {"contact": "bob@example.com", "n": 1}}),
+        ] {
+            assert!(
+                !request_data_would_mask(&with_part(part.clone()), mask),
+                "{part}"
+            );
+        }
+        assert!(!request_data_would_mask(
+            &with_part(json!({"data": {"k": "v"}})),
+            |s: &str| Some(s.to_string())
+        ));
+        assert!(!request_data_would_mask(&json!({"params": {}}), mask));
+    }
+
+    #[test]
+    fn the_result_scan_reads_history_artifacts_and_data_in_0_3() {
+        let task = json!({"jsonrpc": "2.0", "id": 1, "result": {
+            "kind": "task", "id": "t", "contextId": "c",
+            "status": {"state": "completed", "message": {"kind": "message", "role": "agent",
+                "parts": [{"kind": "text", "text": "Done."}]}},
+            "artifacts": [{"artifactId": "a", "parts": [
+                {"kind": "data", "data": {"note": "in an artifact"}}
+            ]}],
+            "history": [
+                {"kind": "message", "role": "user", "parts": [{"kind": "text", "text": "the question"}]},
+                {"kind": "message", "role": "agent", "parts": [{"kind": "text", "text": "in the history"}]}
+            ],
+            "metadata": {"trace": "not-content"}
+        }});
+        let text = result_scan_text(&task);
+        for expected in [
+            "Done.",
+            "note",
+            "in an artifact",
+            "the question",
+            "in the history",
+        ] {
+            assert!(
+                text.contains(expected),
+                "{expected:?} missing from {text:?}"
+            );
+        }
+        assert!(!text.contains("not-content"), "{text}");
+
+        // A bare Message answer with a data part.
+        assert_eq!(
+            result_scan_text(
+                &json!({"result": {"kind": "message", "role": "agent", "parts": [
+                    {"kind": "text", "text": "see the table"},
+                    {"kind": "data", "data": {"row": "in a message"}}
+                ]}})
+            ),
+            "see the table\nrow\nin a message"
+        );
+    }
+
+    #[test]
+    fn the_result_scan_reads_every_1_0_shape() {
+        // `SendMessage` wraps the Task, `GetTask` returns it bare, and
+        // `ListTasks` returns a page of them; all three carry the same words.
+        let task = json!({
+            "id": "t", "contextId": "c",
+            "status": {"state": "TASK_STATE_COMPLETED", "message": {"role": "ROLE_AGENT",
+                "parts": [{"text": "Done."}]}},
+            "artifacts": [{"artifactId": "a", "parts": [{"data": {"in a key": 1}}]}],
+            "history": [{"role": "ROLE_AGENT", "parts": [{"text": "in the history"}]}]
+        });
+        for response in [
+            json!({"result": {"task": task.clone()}}),
+            json!({"result": task.clone()}),
+            json!({"result": {"tasks": [{"id": "other", "status": {"state": "TASK_STATE_WORKING"}},
+                                        task.clone()],
+                              "nextPageToken": "", "pageSize": 2, "totalSize": 2}}),
+        ] {
+            let text = result_scan_text(&response);
+            for expected in ["Done.", "in a key", "in the history"] {
+                assert!(
+                    text.contains(expected),
+                    "{expected:?} missing from {response}"
+                );
+            }
+        }
+        assert_eq!(
+            result_scan_text(&json!({"result": {"message": {"role": "ROLE_AGENT",
+                "parts": [{"data": {"k": "in a message"}}]}}})),
+            "k\nin a message"
+        );
+        // Streamed chunks read the same way, should one be passed in.
+        assert_eq!(
+            result_scan_text(&json!({"result": {"artifactUpdate": {"taskId": "t",
+                "artifact": {"artifactId": "a", "parts": [{"data": {"k": "chunk"}}]}}}})),
+            "k\nchunk"
+        );
+        // Nothing to read in an error, or in a result that carries no parts.
+        assert_eq!(
+            result_scan_text(&json!({"error": {"code": -1, "message": "x"}})),
+            ""
+        );
+        assert_eq!(
+            result_scan_text(
+                &json!({"result": {"id": "t", "status": {"state": "TASK_STATE_WORKING"}}})
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn the_metered_reading_still_leaves_history_and_data_out() {
+        // Scanning reads more than metering counts, on purpose: `history`
+        // restates the conversation and data parts are not language, so
+        // counting either would inflate the estimate.
+        let mut text = ResultText::default();
+        text.observe(
+            &json!({"result": {"kind": "task", "id": "t",
+                "status": {"state": "completed", "message": {"parts": [{"kind": "text", "text": "Done."}]}},
+                "artifacts": [{"artifactId": "a", "parts": [{"kind": "data", "data": {"k": "v"}}]}],
+                "history": [{"role": "agent", "parts": [{"kind": "text", "text": "earlier"}]}]}}),
+            push,
+        );
+        assert_eq!(text.joined(), "Done.");
     }
 
     #[test]

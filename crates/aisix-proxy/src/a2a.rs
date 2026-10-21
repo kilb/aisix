@@ -13,14 +13,14 @@
 //! control (the key's `allowed_agents`), rate-limit + budget (`quota::enforce`),
 //! and a usage event into the shared sink. The upstream credential is held
 //! gateway-side and never reaches the caller. Content policy applies too: the
-//! request text is scanned before the call and a unary answer after it, so a
-//! rule that blocks a phrase on an LLM endpoint is not bypassable by asking
-//! an agent the same thing. The chain resolves with no model and no MCP
-//! server — an A2A call has neither — so `env`, `api_key` and `team` scoped
-//! policies govern it; a per-agent scope would need a new attachment
-//! dimension in the resource model. A STREAMED answer is not scanned: an A2A
-//! task streams progress for minutes and buffering it to scan would defeat
-//! the method.
+//! request's message is scanned before the call and every unary result after
+//! it (a read such as `tasks/get` included), so a rule that blocks a phrase on
+//! an LLM endpoint is not bypassable by asking an agent the same thing. The
+//! chain resolves with no model and no MCP server — an A2A call has neither —
+//! so `env`, `api_key` and `team` scoped policies govern it; a per-agent scope
+//! would need a new attachment dimension in the resource model. A STREAMED
+//! answer is not scanned: an A2A task streams progress for minutes and
+//! buffering it to scan would defeat the method.
 //!
 //! The request body is forwarded verbatim to the upstream agent, so the caller
 //! speaks whichever A2A wire version the agent is pinned to; the gateway does
@@ -325,16 +325,22 @@ async fn dispatch(
     call.applied_guardrails = guardrail_chain.applied().to_vec();
     // Run BEFORE the quota gate so a content-policy refusal does not burn an
     // RPM slot, matching /v1/chat/completions (#542).
-    if !guardrail_chain.is_empty() && !call.text.request.is_empty() {
-        // Scan every word the agent will receive. `call.text.request` is
-        // capped for metering, and the body is forwarded whole: scanning the
-        // capped copy let anything past the cap through unread.
+    //
+    // Scan every word the agent will receive: text parts, and the string
+    // values and keys of data parts, uncapped. `call.text.request` is capped
+    // for metering and reads text parts only, and the body is forwarded
+    // whole: scanning that copy let anything past the cap, or inside a data
+    // part, through unread. Decided on the message itself rather than on the
+    // operation, so any call that hands an agent a message is read.
+    let request_words = if guardrail_chain.is_empty() {
+        String::new()
+    } else {
+        aisix_a2a::request_scan_text(&value)
+    };
+    if !request_words.is_empty() {
         let chat = aisix_gateway::ChatFormat::new(
             "",
-            vec![aisix_gateway::ChatMessage::user(request_text(
-                &value,
-                |b, s| b.push_str(s),
-            ))],
+            vec![aisix_gateway::ChatMessage::user(request_words)],
         );
         let (verdict, hits) =
             aisix_guardrails::Guardrail::check_input_observed(&guardrail_chain, &chat).await;
@@ -381,11 +387,41 @@ async fn dispatch(
         // through here untouched — with no block, no rewrite, and no record
         // (`would_mask` is monitor-mode only).
         //
-        // Only `params.message.parts[].text` is rewritten, the same fields
-        // the scan above read. The ids, method name and metadata around them
-        // are protocol rather than caller content.
+        // Only `params.message.parts[].text` is rewritten. The ids, method
+        // name and metadata around them are protocol rather than caller
+        // content. The scan above also read data parts, which cannot be
+        // rewritten safely (see `request_data_would_mask`): a mask that would
+        // change one refuses the call, the way the other endpoints refuse a
+        // structural field they cannot rewrite, rather than forwarding the
+        // content unmasked.
         if aisix_guardrails::Guardrail::redacts_input(&guardrail_chain) {
             let chain = &guardrail_chain;
+            if aisix_a2a::request_data_would_mask(&value, |text| {
+                aisix_guardrails::Guardrail::redact_input_text(chain, text).map(|r| r.text)
+            }) {
+                tracing::warn!(
+                    guardrail_hook = "input",
+                    agent = %agent,
+                    operation = %call.operation,
+                    "guardrail blocked A2A request: a mask rule matched a data part, which cannot be rewritten",
+                );
+                call.guardrail_blocked = true;
+                emit_a2a_usage(
+                    state,
+                    &snapshot,
+                    &auth,
+                    request_id,
+                    agent,
+                    &call,
+                    StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+                    Duration::ZERO,
+                );
+                return a2a_error_response(
+                    rpc_id,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    &crate::error::guardrail_block_message("request", None),
+                );
+            }
             // Collected outside the closure: `redact_request_text` takes an
             // `Fn`, so the counts cannot be merged into `call` from inside it.
             let collected = std::cell::RefCell::new(crate::redact::RedactionCounts::new());
@@ -396,10 +432,12 @@ async fn dispatch(
                 })
             });
             crate::redact::merge_counts(&mut call.redactions, collected.into_inner());
-            if rewritten > 0 {
+            if rewritten > 0 && meters_content(call.operation) {
                 // Keep the inspected copy in step with what was sent, so the
                 // usage event's token estimate and any captured content
-                // describe the same text the agent got.
+                // describe the same text the agent got. Only for a metered
+                // operation: the scan reads any call that carries a message,
+                // and rewriting one must not start metering it.
                 call.text.request = aisix_a2a::request_text(&value, |b, s| b.push_str(s));
             }
         }
@@ -478,12 +516,18 @@ async fn dispatch(
             // an A2A answer has no masked write-back to run one with. Like
             // the input hook above, such a guardrail answers through its
             // check here, where a maskable answer is blocked.
-            if !guardrail_chain.is_empty() && meters_content(call.operation) {
-                // The whole answer, as the caller receives it: the metered
-                // copy in `call.text.response` is capped.
-                let mut full = ResultText::default();
-                full.observe(&response_value, |b, s| b.push_str(s));
-                let answer = full.joined();
+            //
+            // Every unary result is checked, not only the metered operations:
+            // metering skips a read because it restates an answer already
+            // counted, but a read hands the caller those words all the same,
+            // so a `tasks/get` would read back an answer `message/send` was
+            // refused.
+            if !guardrail_chain.is_empty() {
+                // Everything the caller receives, uncapped: status message,
+                // artifacts, `history`, and the strings and keys of data
+                // parts. The metered copy in `call.text.response` is capped
+                // and reads text parts of the answer only.
+                let answer = aisix_a2a::result_scan_text(&response_value);
                 if !answer.is_empty() {
                     let synth = aisix_gateway::ChatResponse {
                         id: String::new(),
@@ -2162,5 +2206,111 @@ mod tests {
             sent.contains("no address in this one"),
             "a part with nothing to mask must be untouched: {sent}"
         );
+    }
+
+    /// A data part cannot be rewritten safely, so a mask rule that matches one
+    /// refuses the call — forwarding it unmasked is the one outcome the rule
+    /// exists to prevent.
+    #[tokio::test]
+    async fn a_mask_rule_matching_a_data_part_refuses_the_call() {
+        let agent = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "task"}}),
+            ))
+            .expect(0)
+            .mount(&agent)
+            .await;
+
+        let snap = snapshot_with(&agent.uri(), true, serde_json::json!(["*"]));
+        let guardrail: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"mask-email","enabled":true,"hook_point":"input","kind":"pii","detectors":[{"type":"email","action":"mask"}]}"#,
+        )
+        .unwrap();
+        snap.guardrails
+            .insert(ResourceEntry::new("g-mask", guardrail, 1));
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "message/send",
+            "params": {"message": {"role": "user", "parts": [
+                {"kind": "text", "text": "file this form"},
+                {"kind": "data", "data": {"contact": "alice@example.com"}}
+            ]}}
+        });
+        let req = HttpRequest::post("/a2a/invoice")
+            .header("host", "a2a.aisix.example.com")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = router_with(snap).oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["id"], 7);
+        assert_eq!(v["error"]["code"], -32000, "{v}");
+        assert!(!v.to_string().contains("alice@example.com"), "{v}");
+    }
+
+    /// `tasks/get` hands back the whole task, `history` included, so it is
+    /// checked like any other answer — and a refused read is still not
+    /// metered, because metering skips reads on its own terms.
+    #[tokio::test]
+    async fn a_read_is_checked_but_still_not_metered() {
+        use aisix_obs::UsageSink;
+
+        let agent = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1,
+                    "result": {"id": "t-1", "status": {"state": "TASK_STATE_COMPLETED"},
+                        "history": [{"role": "ROLE_AGENT", "parts": [{"text": "please BLOCKME"}]}]}
+                })),
+            )
+            .mount(&agent)
+            .await;
+
+        let snap = snapshot_with(&agent.uri(), true, serde_json::json!(["*"]));
+        let guardrail: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"kw","enabled":true,"hook_point":"output","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"BLOCKME"}]}"#,
+        )
+        .unwrap();
+        snap.guardrails
+            .insert(ResourceEntry::new("g-1", guardrail, 1));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = ProxyState::new(
+            SnapshotHandle::new(snap),
+            Arc::new(aisix_gateway::Hub::new()),
+            &proxy_cfg(),
+        )
+        .without_cache()
+        .with_usage_sink(UsageSink::new(tx));
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "GetTask", "params": {"id": "t-1"}
+        });
+        let req = HttpRequest::post("/a2a/invoice")
+            .header("host", "a2a.aisix.example.com")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = build_router(state).oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("BLOCKME"));
+
+        let event = rx.try_recv().expect("a usage event is emitted");
+        assert_eq!(event.a2a_operation, "tasks/get");
+        assert!(event.guardrail_blocked);
+        assert_eq!(event.prompt_tokens, 0);
+        assert_eq!(event.completion_tokens, 0, "a read is not metered");
     }
 }

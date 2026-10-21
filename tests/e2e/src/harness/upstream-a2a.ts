@@ -63,7 +63,22 @@ export interface A2aUpstreamOptions {
   streamAnswer?: boolean;
   /** Text of the agent's answer to a unary call. Defaults to a one-liner. */
   unaryAnswer?: string;
+  /**
+   * Further fields of the Task every unary call answers with — `history`,
+   * `artifacts`, or a `status` replacing the default one — written already in
+   * this agent's wire shape. Omitted, the Task carries only its status message.
+   */
+  unaryTask?: Record<string, unknown>;
 }
+
+/** The id of the Task every unary call answers with, so a test can read it back. */
+export const UNARY_TASK_ID = "task-e2e-1";
+
+/**
+ * 1.0 methods whose response is the bare `Task`, with no payload wrapper
+ * (`rpc GetTask(GetTaskRequest) returns (Task)`, likewise `CancelTask`).
+ */
+const V1_BARE_TASK_METHODS = new Set(["GetTask", "CancelTask"]);
 
 const PATH_PREFIX = "/v3/agents/serve/tenant-42";
 
@@ -124,6 +139,7 @@ export async function startA2aUpstream(
       wireShape: options.wireShape ?? "0.3",
       streamAnswer: options.streamAnswer ?? false,
       unaryAnswer: options.unaryAnswer ?? "The invoice is settled.",
+      unaryTask: options.unaryTask ?? {},
     }).catch((err: unknown) => {
       // `handle` rejects on a malformed body, and on a write to an already
       // closed socket. Unhandled, that terminates the test process; worse, the
@@ -161,6 +177,7 @@ async function handle(
     wireShape: A2aWireShape;
     streamAnswer: boolean;
     unaryAnswer: string;
+    unaryTask: Record<string, unknown>;
   },
 ): Promise<void> {
   const path = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
@@ -338,21 +355,27 @@ async function handle(
   }
 
   if (req.method === "POST" && path === ctx.servicePath) {
+    const task = {
+      id: UNARY_TASK_ID,
+      contextId,
+      status: {
+        state: "completed",
+        message: { role: "agent", parts: [{ kind: "text", text: ctx.unaryAnswer }] },
+      },
+      // Echoed so the gateway's forwarding can be asserted from the caller
+      // side as well as from `requests`.
+      sawVersion: header("a2a-version"),
+      sawMethod: body?.method ?? null,
+      ...ctx.unaryTask,
+    };
+    const bare =
+      ctx.wireShape === "1.0" &&
+      typeof body?.method === "string" &&
+      V1_BARE_TASK_METHODS.has(body.method);
     send(200, {
       jsonrpc: "2.0",
       id: body?.id ?? null,
-      result: payload("task", {
-        id: "task-e2e-1",
-        contextId,
-        status: {
-          state: "completed",
-          message: { role: "agent", parts: [{ kind: "text", text: ctx.unaryAnswer }] },
-        },
-        // Echoed so the gateway's forwarding can be asserted from the caller
-        // side as well as from `requests`.
-        sawVersion: header("a2a-version"),
-        sawMethod: body?.method ?? null,
-      }),
+      result: bare ? task : payload("task", task),
     });
     return;
   }
