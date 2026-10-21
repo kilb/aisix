@@ -173,19 +173,33 @@ impl<S: ConsumptionSource> Sweeper<S> {
             // 这一轮之后每条序列的游标。通常就是读数；只有「变小却没重置」时留在原处。
             let mut next = Vec::with_capacity(series.len());
             for s in &series {
-                let restarted = |was: Option<i64>| {
-                    s.resets_since > 0
-                        || matches!((was, s.started_ms), (Some(a), Some(b)) if a != b)
-                };
-                let (delta, cursor) = match cursors.get(&s.key).copied() {
+                // (这一轮扣多少, 新游标, 游标记下的进程启动时刻)
+                let (delta, cursor, started) = match (cursors.get(&s.key).copied(), s.started_ms) {
                     // 新序列（新副本、新密钥、新用户）：从 0 算起。
-                    None => (s.value, s.value),
-                    // 重置过：这一轮的花费是重置之后的累计，不论它比上次大还是小。
-                    Some((_, was)) if restarted(was) => (s.value, s.value),
-                    Some((prev, _)) if s.value >= prev => (s.value - prev, s.value),
-                    // 变小却没有重置：读到的是旧值（落后的副本、缓存）。不扣，游标也不
-                    // 倒退 —— 倒退的话，下一轮会把这段差额再扣一次。
-                    Some((prev, _)) => (0, prev),
+                    (None, now) => (s.value, s.value, now),
+                    // 两边都知道进程启动时刻：由它判断，`resets()` 不参与 —— 计数器在
+                    // 一个进程里只增不减。只认「更晚」为重启：落后的 Prometheus 副本
+                    // 还在报重启前的进程，那是旧读数；若按「不相等」算重启，它会把
+                    // 旧进程的整段累计再扣一遍，下一次读到新进程又扣一遍。
+                    (Some((prev, Some(was))), Some(now)) => {
+                        if now > was {
+                            (s.value, s.value, Some(now))
+                        } else if now < was || s.value < prev {
+                            // 更早的进程，或同一进程却变小：旧读数。不扣，游标与启动
+                            // 时刻都不倒退 —— 倒退的话，下一轮会把这段差额再扣一次。
+                            (0, prev, Some(was))
+                        } else {
+                            (s.value - prev, s.value, Some(was))
+                        }
+                    }
+                    // 至少一边不知道启动时刻（旧网关）：退回按 `resets()` 判断。重置
+                    // 之后记下这次读到的启动时刻（可能为空），免得之后补上启动时刻
+                    // 时把同一次重启再认一遍。
+                    (Some(_), now) if s.resets_since > 0 => (s.value, s.value, now),
+                    (Some((prev, was)), now) if s.value >= prev => {
+                        (s.value - prev, s.value, now.or(was))
+                    }
+                    (Some((prev, was)), _) => (0, prev, was),
                 };
                 spent = spent.saturating_add(delta);
                 if let Some(id) = s.api_key_id.as_deref() {
@@ -193,6 +207,7 @@ impl<S: ConsumptionSource> Sweeper<S> {
                 }
                 next.push(SpendSeries {
                     value: cursor,
+                    started_ms: started,
                     ..s.clone()
                 });
             }
@@ -702,7 +717,9 @@ impl ConsumptionSource for PromSource {
             "aisix_llm_spend_micro_usd_total{{user_id=\"{}\"}}",
             crate::usage::escape_label(user_id)
         );
-        let gap = (at - since).num_seconds().max(0);
+        // 按整秒算：查询在 `at` 的整秒求值，窗口两端都落在整秒上，否则
+        // `since` 的小数部分会让窗口短一秒，那一秒里的重置两次读数都看不到。
+        let gap = (at.timestamp() - since.timestamp()).max(0);
         let span = gap + LOOKBACK_SECS;
         let offset = if gap > 0 {
             format!(" offset {gap}s")
@@ -896,6 +913,8 @@ mod tests {
         /// 下一次读取时，该用户那条未归到密钥的序列少报多少 —— 从一个落后的
         /// Prometheus 副本读到的旧值。真实累计值不变。
         lag_next: Mutex<std::collections::HashMap<String, u64>>,
+        /// 下一次读取改报的 (累计值, 进程启动时刻)，见 `stale_replica_once`。
+        stale_next: Mutex<std::collections::HashMap<String, (u64, i64)>>,
         /// 指定让哪个用户的读取失败。写成按用户而不是「下一次」，因为
         /// 「下一次」会让测试依赖清扫器先访问谁 —— 那种测试无论答案如何都是
         /// 脆的（第一版就是这么挂的）。
@@ -950,6 +969,14 @@ mod tests {
                 }
             }
         }
+        /// 下一次读取来自一个还没抓到重启的 Prometheus 副本：报的是重启前那个
+        /// 进程（启动时刻 `started_ms`）的累计 `value`，也没看到重置。
+        pub(super) fn stale_replica_once(&self, user_id: &str, value: u64, started_ms: i64) {
+            self.stale_next
+                .lock()
+                .unwrap()
+                .insert(user_id.to_string(), (value, started_ms));
+        }
         /// 下一次读取少报 `v`，计数器本身没有重置。
         pub(super) fn lag_once(&self, user_id: &str, v: u64) {
             self.lag_next.lock().unwrap().insert(user_id.to_string(), v);
@@ -998,6 +1025,7 @@ mod tests {
                     .map_or(0, |(_, _, n)| *n)
             };
             let lag = self.lag_next.lock().unwrap().remove(user_id).unwrap_or(0);
+            let stale = self.stale_next.lock().unwrap().remove(user_id);
             Some(
                 counters
                     .iter()
@@ -1016,6 +1044,17 @@ mod tests {
                             0
                         },
                         started_ms: Some(c.started_ms),
+                    })
+                    .map(|mut s| {
+                        if let (Some((value, started)), true) = (
+                            stale,
+                            s.api_key_id.is_none() && s.key.contains("instance=gw-1"),
+                        ) {
+                            s.value = value;
+                            s.started_ms = Some(started);
+                            s.resets_since = 0;
+                        }
+                        s
                     })
                     .collect(),
             )
@@ -1402,6 +1441,34 @@ api_keys:
         f.src.add_spend(&f.uid, 500_000);
         f.sw.tick(t("2026-08-26T10:00:30Z")).await.unwrap();
         assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 5_500_000);
+    }
+
+    #[tokio::test]
+    async fn 落后的副本跨过一次重启_报的是旧进程_不当成重启也不重复扣() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 20_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.src.add_spend(&f.uid, 5_000_000);
+        f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 15_000_000);
+
+        // 网关重启（启动时刻 0 → 1），重启后花 $2，读到的是已经抓到新进程的副本。
+        f.src.reset(&f.uid);
+        f.src.add_spend(&f.uid, 2_000_000);
+        f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 13_000_000);
+
+        // 下一轮落到另一个副本：它还没抓到重启，报的是旧进程的 $5。
+        f.src.stale_replica_once(&f.uid, 5_000_000, 0);
+        f.sw.tick(t("2026-08-26T10:00:30Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 13_000_000);
+
+        // 回到新副本，又花了 $2：只扣这 $2。
+        f.src.add_spend(&f.uid, 2_000_000);
+        f.sw.tick(t("2026-08-26T10:00:45Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 11_000_000);
     }
 
     #[tokio::test]
