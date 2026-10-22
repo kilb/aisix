@@ -27,6 +27,8 @@ http.workspace = true
 # so the JSON-RPC 2.0 + agent-card plumbing is hand-rolled directly on the
 # workspace HTTP client rather than pulled from an SDK.
 reqwest.workspace = true
+# Decodes a file part's base64 bytes so a text file is scanned like text.
+base64.workspace = true
 
 [dev-dependencies]
 aisix-core = { path = "../aisix-core" }

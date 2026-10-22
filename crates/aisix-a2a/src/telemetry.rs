@@ -333,10 +333,9 @@ pub fn redact_request_text(request: &mut Value, mask: impl Fn(&str) -> Option<St
 }
 
 /// Every word a caller sends an agent, for a content policy to read: every
-/// string the request's `params` carries, newline-joined and unbounded —
-/// text parts, data parts, metadata, anything else — except identifiers,
-/// enum values and base64 file bytes, which are protocol rather than language
-/// (see [`collect_call_strings`]).
+/// key and string the request's `params` carries, newline-joined and
+/// unbounded — text parts, data parts, metadata, a text file's decoded bytes,
+/// anything else (see [`collect_call_strings`]).
 ///
 /// Scan-only, and deliberately inclusive. A data part (`{"kind": "data",
 /// "data": {…}}` on 0.3, the `Part` oneof's `data` field on 1.0) or a
@@ -376,37 +375,39 @@ pub fn request_would_mask_unrewritable(
     call_strings_would_change(params, Within::Params, &mask)
 }
 
-/// Keys whose values are protocol rather than language: identifiers, enum
-/// values, timestamps, media types and base64 file bytes (`bytes` on 0.3,
-/// `raw` on 1.0). Outside free-form containers only (see
-/// [`collect_call_strings`]).
-fn is_protocol_value_key(key: &str) -> bool {
-    matches!(
-        key,
-        "kind"
-            | "role"
-            | "state"
-            | "id"
-            | "bytes"
-            | "raw"
-            | "fileWithBytes"
-            | "mimeType"
-            | "mediaType"
-            | "timestamp"
-    ) || key.ends_with("Id")
-        || key.ends_with("Ids")
-}
+/// Fields holding a file part's content as base64: `bytes` (0.3 `FileWithBytes`),
+/// `raw` and `fileWithBytes` (1.0). An agent or a client decodes them, and a
+/// text file is read as text.
+const BASE64_CONTENT_KEYS: [&str; 3] = ["bytes", "raw", "fileWithBytes"];
 
-/// Free-form containers: their keys and every value belong to whoever wrote
-/// them, so no protocol field name inside them is trusted to be harmless.
-fn is_free_form_key(key: &str) -> bool {
-    matches!(key, "data" | "metadata")
+/// A base64 content field's text, when it decodes to UTF-8. Binary content
+/// (an image, a PDF) is not language and is left out.
+fn decoded_text(encoded: &str) -> Option<String> {
+    use base64::Engine as _;
+    let trimmed = encoded.trim();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(trimmed)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(trimmed))
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(trimmed))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed))
+        .ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    // Valid UTF-8 is not enough: a binary blob can be (NUL bytes are). Text
+    // carries no control characters beyond line breaks and tabs.
+    text.chars()
+        .all(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+        .then_some(text)
 }
 
 /// Append every string of an A2A request's `params` or a response's `result`
-/// for scanning. Inside `data` and `metadata`, every string value and object
-/// key; elsewhere every string value except under a protocol key (field names
-/// of the protocol objects themselves are not caller content).
+/// for scanning: every object key and every string value, at any depth, with
+/// a file part's base64 content decoded when it is text.
+///
+/// No field is skipped for looking like protocol. Every earlier, narrower
+/// reading — parts only, then everything but identifiers and enum values —
+/// was a choice about which fields hold content, and an agent or a client
+/// that reads a field the scan skipped receives it unchecked. Reading an id
+/// or an enum string costs nothing but a little noise.
 fn collect_call_strings(value: &Value, buf: &mut String) {
     match value {
         Value::String(s) => push_line(buf, s),
@@ -417,10 +418,14 @@ fn collect_call_strings(value: &Value, buf: &mut String) {
         }
         Value::Object(map) => {
             for (key, child) in map {
-                if is_free_form_key(key) {
-                    collect_json_strings(child, buf);
-                } else if !is_protocol_value_key(key) {
-                    collect_call_strings(child, buf);
+                push_line(buf, key);
+                match (BASE64_CONTENT_KEYS.contains(&key.as_str()), child) {
+                    (true, Value::String(encoded)) => {
+                        if let Some(text) = decoded_text(encoded) {
+                            push_line(buf, &text);
+                        }
+                    }
+                    _ => collect_call_strings(child, buf),
                 }
             }
         }
@@ -462,11 +467,16 @@ fn call_strings_would_change(
                 .any(|item| call_strings_would_change(item, next, mask))
         }
         Value::Object(map) => map.iter().any(|(key, child)| {
-            if is_free_form_key(key) {
-                return json_strings_would_change(child, mask);
+            if changes(key) {
+                return true;
             }
-            if is_protocol_value_key(key) || (within == Within::MessagePart && key == "text") {
+            if within == Within::MessagePart && key == "text" {
                 return false;
+            }
+            if let (true, Value::String(encoded)) =
+                (BASE64_CONTENT_KEYS.contains(&key.as_str()), child)
+            {
+                return decoded_text(encoded).is_some_and(|text| changes(&text));
             }
             let next = match (within, key.as_str()) {
                 (Within::Params, "message") => Within::Message,
@@ -583,8 +593,8 @@ impl ResultText {
 /// Every word an agent returns on one call, for a content policy to read:
 /// every string the response's `result` carries — a Message's or the status
 /// message's parts, every artifact (name and description too), every
-/// `history` message, each Task of a `ListTasks` page, data parts, metadata —
-/// except identifiers, enum values and base64 file bytes (see
+/// `history` message, each Task of a `ListTasks` page, data parts, metadata,
+/// a text file's decoded bytes — every key and string (see
 /// [`collect_call_strings`]).
 ///
 /// The metered reading ([`ResultText`]) is narrower on purpose: it counts an
@@ -612,41 +622,6 @@ fn collect_part_text(owner: &Value, buf: &mut String, push: &impl Fn(&mut String
             }
             push(buf, text);
         }
-    }
-}
-
-/// Append every string value and object key of a JSON document. Keys count:
-/// `{"<the phrase>": true}` delivers the phrase as surely as a value does.
-fn collect_json_strings(value: &Value, buf: &mut String) {
-    match value {
-        Value::String(s) => push_line(buf, s),
-        Value::Array(items) => {
-            for item in items {
-                collect_json_strings(item, buf);
-            }
-        }
-        Value::Object(map) => {
-            for (key, child) in map {
-                push_line(buf, key);
-                collect_json_strings(child, buf);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Whether `mask` changes any string value or object key of a JSON document.
-fn json_strings_would_change(value: &Value, mask: &impl Fn(&str) -> Option<String>) -> bool {
-    let changes = |s: &str| mask(s).is_some_and(|masked| masked != s);
-    match value {
-        Value::String(s) => changes(s),
-        Value::Array(items) => items
-            .iter()
-            .any(|item| json_strings_would_change(item, mask)),
-        Value::Object(map) => map
-            .iter()
-            .any(|(key, child)| changes(key) || json_strings_would_change(child, mask)),
-        _ => false,
     }
 }
 
@@ -701,46 +676,67 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Every string a call carries is read, not only parts: metadata, an
-    /// artifact's name and description, anything an agent or a client may
-    /// show. Identifiers, enum values and base64 file bytes are not language
-    /// and are skipped.
+    /// Every phrase in `expected` is in the scanned `text`.
+    fn reads(text: &str, expected: &[&str]) {
+        for phrase in expected {
+            assert!(text.contains(phrase), "{phrase:?} unread in {text:?}");
+        }
+    }
+
+    /// Every string a call carries is read, whatever field holds it: metadata,
+    /// an artifact's name and description, identifiers too — the scan must
+    /// not pick fields, or it disagrees with whatever reads the field it
+    /// skipped. A file part's base64 bytes are decoded and read when they are
+    /// text; binary bytes are not language.
     #[test]
-    fn the_scans_read_every_string_except_identifiers_and_bytes() {
+    fn the_scans_read_every_string_and_text_file_bytes() {
+        let b64 = |s: &str| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(s)
+        };
         let request = json!({"params": {
             "message": {"messageId": "PHRASE-ID", "role": "user",
-                        "parts": [{"text": "clean", "metadata": {"note": "PHRASE-E"}}],
+                        "parts": [{"text": "clean", "metadata": {"note": "PHRASE-E"}},
+                                  {"kind": "file", "file": {"bytes": b64("PHRASE-T03"), "mimeType": "text/plain"}},
+                                  {"raw": b64("PHRASE-T10"), "mediaType": "text/plain"}],
                         "metadata": {"PHRASE-F": "x"}},
             "metadata": {"tag": "PHRASE-G"}
         }});
         let scanned = request_scan_text(&request);
-        for phrase in ["PHRASE-E", "PHRASE-F", "PHRASE-G"] {
+        for phrase in [
+            "PHRASE-E",
+            "PHRASE-F",
+            "PHRASE-G",
+            "PHRASE-ID",
+            "PHRASE-T03",
+            "PHRASE-T10",
+        ] {
             assert!(scanned.contains(phrase), "{phrase} unread: {scanned}");
         }
-        assert!(
-            !scanned.contains("PHRASE-ID"),
-            "an identifier is not content"
-        );
 
+        let binary = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([0xff_u8, 0xfe, 0x00, 0x9c])
+        };
         let result = json!({"result": {"kind": "task", "id": "t", "contextId": "c",
             "artifacts": [{"artifactId": "a", "name": "PHRASE-H", "description": "PHRASE-I",
-                           "parts": [{"kind": "file", "file": {"bytes": "UEhSQVNFLUo=", "mimeType": "text/plain"}}]}],
+                           "parts": [{"kind": "file", "file": {"bytes": b64("PHRASE-J"), "mimeType": "text/plain"}},
+                                     {"kind": "file", "file": {"bytes": binary.clone(), "mimeType": "image/png"}}]}],
             "metadata": {"summary": "PHRASE-K"}}});
         let scanned = result_scan_text(&result);
-        for phrase in ["PHRASE-H", "PHRASE-I", "PHRASE-K"] {
+        for phrase in ["PHRASE-H", "PHRASE-I", "PHRASE-J", "PHRASE-K"] {
             assert!(scanned.contains(phrase), "{phrase} unread: {scanned}");
         }
-        assert!(
-            !scanned.contains("UEhSQVNFLUo="),
-            "base64 bytes are not scanned"
-        );
+        assert!(!scanned.contains(&binary), "base64 itself is not scanned");
 
         // Only `params.message`'s text parts are rewritten: a mask anywhere
-        // else is reported.
+        // else — a text file's bytes included — is reported.
         let mask = |s: &str| s.contains("a@b.c").then(|| s.replace("a@b.c", "[M]"));
         let in_metadata = json!({"params": {"message": {"parts": [{"text": "clean"}],
                                  "metadata": {"contact": "a@b.c"}}}});
         assert!(request_would_mask_unrewritable(&in_metadata, mask));
+        let in_file = json!({"params": {"message": {"parts": [{"raw": b64("mail a@b.c"), "mediaType": "text/plain"}]}}});
+        assert!(request_would_mask_unrewritable(&in_file, mask));
     }
 
     /// A result shaped two ways at once must be read every way: a client may
@@ -1121,18 +1117,29 @@ mod tests {
         // A data part reaches the agent verbatim, so a policy has to read its
         // strings and keys — nested ones included — in both spellings of the
         // part, and so does every other string the agent receives: a file's
-        // name, the metadata. Numbers, booleans, file bytes and protocol
-        // values (kind, role) are not words.
+        // name, the metadata. Numbers and booleans are not words, and binary
+        // file bytes are not read.
         let v03 = request_scan_text(&json!({"params": {"message": {"role": "user", "parts": [
             {"kind": "text", "text": "file this form"},
             {"kind": "data", "data": {"form": {"reason": "the reason"}}},
             {"kind": "data", "data": {"tags": ["a-tag", 3, true, null]}},
             {"kind": "file", "file": {"bytes": "AAAA", "name": "x.pdf"}}
         ], "metadata": {"trace": "not-content"}}}}));
-        assert_eq!(
-            v03,
-            "trace\nnot-content\nfile this form\nform\nreason\nthe reason\ntags\na-tag\nx.pdf"
+        reads(
+            &v03,
+            &[
+                "trace",
+                "not-content",
+                "file this form",
+                "form",
+                "reason",
+                "the reason",
+                "tags",
+                "a-tag",
+                "x.pdf",
+            ],
         );
+        assert!(!v03.contains('\0'), "binary bytes are not read: {v03:?}");
 
         // 1.0: the oneof's `data` is a `google.protobuf.Value`, so it need not
         // be an object at all.
@@ -1145,16 +1152,25 @@ mod tests {
                 {"raw": "AAAA", "mediaType": "application/pdf"}
             ]}}}),
         );
-        assert_eq!(v10, "file this form\nthe key itself\nlisted\na bare string");
+        reads(
+            &v10,
+            &[
+                "file this form",
+                "the key itself",
+                "listed",
+                "a bare string",
+            ],
+        );
+        assert!(!v10.contains('\0'), "binary bytes are not read: {v10:?}");
 
         // A data-only message is not an empty one.
-        assert_eq!(
-            request_scan_text(
-                &json!({"params": {"message": {"parts": [{"kind": "data", "data": {"k": "v"}}]}}})
+        reads(
+            &request_scan_text(
+                &json!({"params": {"message": {"parts": [{"kind": "data", "data": {"k": "v"}}]}}}),
             ),
-            "k\nv"
+            &["k", "v"],
         );
-        assert_eq!(request_scan_text(&json!({"params": {"id": "t-1"}})), "");
+        assert_eq!(request_scan_text(&json!({"params": {}})), "");
     }
 
     #[test]
@@ -1232,14 +1248,14 @@ mod tests {
         assert!(text.contains("not-content"), "{text}");
 
         // A bare Message answer with a data part.
-        assert_eq!(
-            result_scan_text(
+        reads(
+            &result_scan_text(
                 &json!({"result": {"kind": "message", "role": "agent", "parts": [
                     {"kind": "text", "text": "see the table"},
                     {"kind": "data", "data": {"row": "in a message"}}
-                ]}})
+                ]}}),
             ),
-            "see the table\nrow\nin a message"
+            &["see the table", "row", "in a message"],
         );
     }
 
@@ -1269,26 +1285,20 @@ mod tests {
                 );
             }
         }
-        assert_eq!(
-            result_scan_text(&json!({"result": {"message": {"role": "ROLE_AGENT",
+        reads(
+            &result_scan_text(&json!({"result": {"message": {"role": "ROLE_AGENT",
                 "parts": [{"data": {"k": "in a message"}}]}}})),
-            "k\nin a message"
+            &["k", "in a message"],
         );
         // Streamed chunks read the same way, should one be passed in.
-        assert_eq!(
-            result_scan_text(&json!({"result": {"artifactUpdate": {"taskId": "t",
+        reads(
+            &result_scan_text(&json!({"result": {"artifactUpdate": {"taskId": "t",
                 "artifact": {"artifactId": "a", "parts": [{"data": {"k": "chunk"}}]}}}})),
-            "k\nchunk"
+            &["k", "chunk"],
         );
-        // Nothing to read in an error, or in a result that carries no parts.
+        // An error carries no result to read.
         assert_eq!(
             result_scan_text(&json!({"error": {"code": -1, "message": "x"}})),
-            ""
-        );
-        assert_eq!(
-            result_scan_text(
-                &json!({"result": {"id": "t", "status": {"state": "TASK_STATE_WORKING"}}})
-            ),
             ""
         );
     }

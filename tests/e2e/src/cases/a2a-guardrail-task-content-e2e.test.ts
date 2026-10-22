@@ -47,6 +47,13 @@ const STREAM: Record<Wire, string> = { "0.3": "message/stream", "1.0": "SendStre
 // （设了哪个字段就是哪种 part），role 是枚举名。
 const textPart = (v: Wire, text: string) => (v === "0.3" ? { kind: "text", text } : { text });
 const dataPart = (v: Wire, data: unknown) => (v === "0.3" ? { kind: "data", data } : { data });
+/** 一个纯文本文件部件：内容按协议以 base64 承载，agent 与客户端都会解出来读。 */
+const textFilePart = (v: Wire, text: string) => {
+  const b64 = Buffer.from(text, "utf8").toString("base64");
+  return v === "0.3"
+    ? { kind: "file", file: { name: "note.txt", mimeType: "text/plain", bytes: b64 } }
+    : { raw: b64, mediaType: "text/plain", filename: "note.txt" };
+};
 const message = (v: Wire, role: "user" | "agent", parts: unknown[]) =>
   v === "0.3"
     ? { kind: "message", messageId: randomUUID(), role, parts }
@@ -95,6 +102,11 @@ const AGENTS: Record<string, (v: Wire) => Record<string, unknown>> = {
     status: completed(v, [textPart(v, "Done.")]),
     artifacts: [{ artifactId: "verdict", name: `report on ${MARKER}`, parts: [textPart(v, "ok")] }],
     metadata: { summary: `flagged ${MARKER}` },
+  }),
+  // 被拦词在 artifact 里一个纯文本文件的内容中（base64）。
+  "file-risky": (v) => ({
+    status: completed(v, [textPart(v, "Done.")]),
+    artifacts: [{ artifactId: "verdict", parts: [textFilePart(v, `case 7: ${MARKER}`)] }],
   }),
   "data-clean": (v) => ({
     status: completed(v, [textPart(v, "Done.")]),
@@ -264,7 +276,20 @@ describe("A2A content guardrails read task history, data parts and tasks/get", (
       expectRefused(await send(v, "metadata-risky", [textPart(v, "look up case 7")]), MARKER);
     });
 
+    test("a forbidden phrase inside a text file the answer carries never reaches the caller", async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      expectRefused(await send(v, "file-risky", [textPart(v, "look up case 7")]), MARKER);
+    });
+
     // ── 调用方的请求 ──────────────────────────────────────────────────────
+
+    test("a forbidden phrase inside a text file the request carries is refused before the agent sees it", async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const before = posts(v, "plain").length;
+      const res = await send(v, "plain", [textPart(v, "read the note"), textFilePart(v, `please ${MARKER}`)]);
+      expectRefused(res, MARKER);
+      expect(posts(v, "plain").length).toBe(before);
+    });
 
     test("a forbidden phrase in the request message's metadata is refused before the agent sees it", async (ctx) => {
       if (!etcdReachable || !app) return ctx.skip();
