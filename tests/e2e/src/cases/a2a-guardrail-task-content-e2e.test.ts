@@ -31,6 +31,8 @@ import { UNARY_TASK_ID } from "../harness/upstream-a2a.js";
 
 const KEY = "sk-a2a-guardrail-task-content";
 const MARKER = "a2ataskcontentforbidden";
+/** 一个按数字写的被拦值：数字型的 JSON 值也必须被读到。 */
+const NUMBER_MARKER = 7777777777777;
 const EMAIL = "carol.task-content@example.com";
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -48,11 +50,15 @@ const STREAM: Record<Wire, string> = { "0.3": "message/stream", "1.0": "SendStre
 const textPart = (v: Wire, text: string) => (v === "0.3" ? { kind: "text", text } : { text });
 const dataPart = (v: Wire, data: unknown) => (v === "0.3" ? { kind: "data", data } : { data });
 /** 一个纯文本文件部件：内容按协议以 base64 承载，agent 与客户端都会解出来读。 */
-const textFilePart = (v: Wire, text: string) => {
-  const b64 = Buffer.from(text, "utf8").toString("base64");
+const textFilePart = (v: Wire, text: string) => filePart(v, Buffer.from(text, "utf8"), "text/plain");
+/** 一个文件部件，内容按协议以 base64 承载；`wrap` 时按 MIME 习惯每 8 个字符断一行。 */
+const filePart = (v: Wire, bytes: Buffer, mediaType?: string, wrap = false) => {
+  let b64 = bytes.toString("base64");
+  if (wrap) b64 = b64.replace(/(.{8})/g, "$1\n");
+  const media = mediaType ? (v === "0.3" ? { mimeType: mediaType } : { mediaType }) : {};
   return v === "0.3"
-    ? { kind: "file", file: { name: "note.txt", mimeType: "text/plain", bytes: b64 } }
-    : { raw: b64, mediaType: "text/plain", filename: "note.txt" };
+    ? { kind: "file", file: { name: "note.txt", ...media, bytes: b64 } }
+    : { raw: b64, ...media, filename: "note.txt" };
 };
 const message = (v: Wire, role: "user" | "agent", parts: unknown[]) =>
   v === "0.3"
@@ -162,11 +168,19 @@ describe("A2A content guardrails read task history, data parts and tasks/get", (
       for (const [name, task] of Object.entries(AGENTS)) {
         upstreams.set(agentName(name, v), await startA2aUpstream({ wireShape: v, unaryTask: task(v) }));
       }
+      // 一个用 JSON-RPC 错误回答的 agent：错误里的内容同样交到调用方手里。
+      upstreams.set(
+        agentName("error-risky", v),
+        await startA2aUpstream({
+          wireShape: v,
+          unaryError: { code: -32000, message: `failed on ${MARKER}`, data: { detail: "x" } },
+        }),
+      );
     }
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
     for (const v of WIRES) {
-      for (const name of Object.keys(AGENTS)) {
+      for (const name of [...Object.keys(AGENTS), "error-risky"]) {
         await seed.update("a2a_agents", randomUUID(), {
           name: agentName(name, v),
           url: upstreams.get(agentName(name, v))!.url,
@@ -181,7 +195,10 @@ describe("A2A content guardrails read task history, data parts and tasks/get", (
       enabled: true,
       hook_point: "both",
       kind: "keyword",
-      patterns: [{ kind: "literal", value: MARKER }],
+      patterns: [
+        { kind: "literal", value: MARKER },
+        { kind: "literal", value: String(NUMBER_MARKER) },
+      ],
     });
     await seed.createGuardrail({
       name: "a2a-task-content-mask-email",
@@ -276,12 +293,49 @@ describe("A2A content guardrails read task history, data parts and tasks/get", (
       expectRefused(await send(v, "metadata-risky", [textPart(v, "look up case 7")]), MARKER);
     });
 
+    test("a forbidden phrase in the agent's error envelope never reaches the caller", async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      expectRefused(await send(v, "error-risky", [textPart(v, "look up case 7")]), MARKER);
+    });
+
     test("a forbidden phrase inside a text file the answer carries never reaches the caller", async (ctx) => {
       if (!etcdReachable || !app) return ctx.skip();
       expectRefused(await send(v, "file-risky", [textPart(v, "look up case 7")]), MARKER);
     });
 
     // ── 调用方的请求 ──────────────────────────────────────────────────────
+
+    test("a text file wrapped the MIME way is still read", async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const before = posts(v, "plain").length;
+      const file = filePart(v, Buffer.from(`please ${MARKER} now`, "utf8"), "text/plain", true);
+      expectRefused(await send(v, "plain", [textPart(v, "read the note"), file]), MARKER);
+      expect(posts(v, "plain").length).toBe(before);
+    });
+
+    test("content the scan cannot read is refused rather than forwarded unread", async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const before = posts(v, "plain").length;
+      const blob = Buffer.from([0x00, 0x9c, 0xff, 0x13, 0x02, 0x07, 0x81, 0x00, 0xfe, 0x01]);
+      const res = await send(v, "plain", [textPart(v, "here is a file"), filePart(v, blob, "application/octet-stream")]);
+      expect(res.status, res.text.slice(0, 300)).toBe(422);
+      expect(posts(v, "plain").length).toBe(before);
+    });
+
+    test("a file of a binary media type passes unread", async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00]);
+      const res = await send(v, "plain", [textPart(v, "here is a picture"), filePart(v, png, "image/png")]);
+      expect(res.status, res.text.slice(0, 300)).toBe(200);
+    });
+
+    test("a forbidden value written as a JSON number is read", async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const before = posts(v, "plain").length;
+      const res = await send(v, "plain", [textPart(v, "file this form"), dataPart(v, { ref: NUMBER_MARKER })]);
+      expectRefused(res, String(NUMBER_MARKER));
+      expect(posts(v, "plain").length).toBe(before);
+    });
 
     test("a forbidden phrase inside a text file the request carries is refused before the agent sees it", async (ctx) => {
       if (!etcdReachable || !app) return ctx.skip();

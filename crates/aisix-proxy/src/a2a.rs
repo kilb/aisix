@@ -332,11 +332,37 @@ async fn dispatch(
     // whole: scanning that copy let anything past the cap, or inside a data
     // part, through unread. Decided on the message itself rather than on the
     // operation, so any call that hands an agent a message is read.
-    let request_words = if guardrail_chain.is_empty() {
-        String::new()
-    } else {
-        aisix_a2a::request_scan_text(&value)
-    };
+    let request_scan = (!guardrail_chain.is_empty()).then(|| aisix_a2a::request_scan(&value));
+    // Content the scan cannot read — file bytes that are neither text nor a
+    // binary media type, a value of the wrong type where the protocol has
+    // text — is refused rather than forwarded unread: whatever reads it on
+    // the other side may decode it more leniently than any scan predicts.
+    if let Some(why) = request_scan.as_ref().and_then(|scan| scan.unreadable) {
+        tracing::warn!(
+            guardrail_hook = "input",
+            agent = %agent,
+            operation = %call.operation,
+            reason = why,
+            "guardrail blocked A2A request: content the scan cannot read",
+        );
+        call.guardrail_blocked = true;
+        emit_a2a_usage(
+            state,
+            &snapshot,
+            &auth,
+            request_id,
+            agent,
+            &call,
+            StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+            Duration::ZERO,
+        );
+        return a2a_error_response(
+            rpc_id,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &crate::error::guardrail_block_message("request", None),
+        );
+    }
+    let request_words = request_scan.map(|scan| scan.text).unwrap_or_default();
     if !request_words.is_empty() {
         let chat = aisix_gateway::ChatFormat::new(
             "",
@@ -523,11 +549,38 @@ async fn dispatch(
             // so a `tasks/get` would read back an answer `message/send` was
             // refused.
             if !guardrail_chain.is_empty() {
-                // Everything the caller receives, uncapped: status message,
-                // artifacts, `history`, and the strings and keys of data
-                // parts. The metered copy in `call.text.response` is capped
-                // and reads text parts of the answer only.
-                let answer = aisix_a2a::result_scan_text(&response_value);
+                // Everything the caller receives, uncapped: the whole
+                // envelope — `result` and `error` alike — every key, string
+                // and number, file content decoded. The metered copy in
+                // `call.text.response` is capped and reads text parts of the
+                // answer only.
+                let scan = aisix_a2a::result_scan(&response_value);
+                if let Some(why) = scan.unreadable {
+                    tracing::warn!(
+                        guardrail_hook = "output",
+                        agent = %agent,
+                        operation = %call.operation,
+                        reason = why,
+                        "guardrail blocked A2A response: content the scan cannot read",
+                    );
+                    call.guardrail_blocked = true;
+                    emit_a2a_usage(
+                        state,
+                        &snapshot,
+                        &auth,
+                        request_id,
+                        agent,
+                        &call,
+                        StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+                        latency,
+                    );
+                    return a2a_error_response(
+                        rpc_id,
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        &crate::error::guardrail_block_message("response", None),
+                    );
+                }
+                let answer = scan.text;
                 if !answer.is_empty() {
                     let synth = aisix_gateway::ChatResponse {
                         id: String::new(),

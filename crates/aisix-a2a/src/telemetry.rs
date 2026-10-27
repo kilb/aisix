@@ -332,161 +332,367 @@ pub fn redact_request_text(request: &mut Value, mask: impl Fn(&str) -> Option<St
     rewritten
 }
 
-/// Every word a caller sends an agent, for a content policy to read: every
-/// key and string the request's `params` carries, newline-joined and
-/// unbounded — text parts, data parts, metadata, a text file's decoded bytes,
-/// anything else (see [`collect_call_strings`]).
+/// What a content-policy scan of one A2A call found.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CallScan {
+    /// Every word the call carries, newline-joined and unbounded: every
+    /// object key, string and number, with file content decoded when it is
+    /// text (see [`request_scan`]).
+    pub text: String,
+    /// The part of `text` a request's mask rewrite cannot reach: all of it
+    /// but the string `text` of `params.message` parts, which
+    /// [`redact_request_text`] rewrites. Always all of it for a response.
+    pub unrewritable: String,
+    /// Why some content could not be read, when it could not: file content
+    /// that does not decode to text and is not of a binary media type, or a
+    /// value of the wrong type where the protocol has text. A caller with a
+    /// content policy refuses such a call rather than forward what it never
+    /// read.
+    pub unreadable: Option<&'static str>,
+}
+
+/// Scan a whole JSON-RPC request for a content policy.
 ///
-/// Scan-only, and deliberately inclusive. A data part (`{"kind": "data",
-/// "data": {…}}` on 0.3, the `Part` oneof's `data` field on 1.0) or a
-/// metadata map reaches the agent verbatim, so a phrase a policy blocks is
-/// delivered just as surely there as in a text part. And the scan must not
-/// depend on agreeing with the agent about which fields hold content or where
-/// a message sits: a request shaped two ways at once would be read one way
-/// here and the other way by the agent. None of this is metered — field
-/// values and enum strings would inflate the estimate — which is why
-/// [`request_text`] leaves it out.
+/// Every object key, string and number of the envelope is read, at any depth
+/// — no field is skipped for looking like protocol, because whatever reads a
+/// field the scan skipped receives it unchecked. File content (a part's `raw`
+/// on 1.0; a file's `bytes` / `fileWithBytes` / `file_with_bytes` on 0.3, and
+/// a base64 `data:` URI in either) is decoded the way lenient real decoders
+/// do — Python's `base64.b64decode`, Node's `Buffer` — and read as text;
+/// content of a binary media type (`image/*`, `audio/*`, `video/*`,
+/// `application/pdf`) is passed unread, and anything else that does not read
+/// as text is reported in [`CallScan::unreadable`]. None of this is metered:
+/// [`request_text`] is.
+pub fn request_scan(request: &Value) -> CallScan {
+    let mut walk = ScanWalk::default();
+    walk.value(request, Pos::request_root());
+    walk.done()
+}
+
+/// Scan a whole JSON-RPC response — `result`, `error`, anything else — the
+/// way [`request_scan`] reads a request. Nothing in a response is rewritten.
+pub fn result_scan(response: &Value) -> CallScan {
+    let mut walk = ScanWalk::default();
+    walk.value(response, Pos::response_root());
+    walk.done()
+}
+
+/// [`request_scan`]'s text alone.
 pub fn request_scan_text(request: &Value) -> String {
-    let mut buf = String::new();
-    if let Some(params) = request.get("params") {
-        collect_call_strings(params, &mut buf);
-    }
-    buf
+    request_scan(request).text
 }
 
 /// Whether `mask` would change anything the request's text rewrite cannot
-/// reach.
-///
-/// [`redact_request_text`] rewrites the text parts of `params.message` only.
-/// Everything else [`request_scan_text`] reads stays as sent: a data part or a
-/// metadata map is a document the agent parses against its own schema (a mask
-/// token can turn an id, an enum value or a lookup field into something it
-/// misreads, and a key cannot be renamed at all), and any other field is not
-/// where the rewrite looks. A match there is reported rather than rewritten,
-/// and the caller refuses the call instead of forwarding the content
-/// unmasked.
+/// reach ([`CallScan::unrewritable`]). Run once over the joined text rather
+/// than per string, so a body of many small strings costs one pass.
 pub fn request_would_mask_unrewritable(
     request: &Value,
     mask: impl Fn(&str) -> Option<String>,
 ) -> bool {
-    let Some(params) = request.get("params") else {
-        return false;
-    };
-    call_strings_would_change(params, Within::Params, &mask)
+    let unrewritable = request_scan(request).unrewritable;
+    !unrewritable.is_empty() && mask(&unrewritable).is_some_and(|m| m != unrewritable)
 }
 
-/// Fields holding a file part's content as base64: `bytes` (0.3 `FileWithBytes`),
-/// `raw` and `fileWithBytes` (1.0). An agent or a client decodes them, and a
-/// text file is read as text.
-const BASE64_CONTENT_KEYS: [&str; 3] = ["bytes", "raw", "fileWithBytes"];
-
-/// A base64 content field's text, when it decodes to UTF-8. Binary content
-/// (an image, a PDF) is not language and is left out.
-fn decoded_text(encoded: &str) -> Option<String> {
-    use base64::Engine as _;
-    let trimmed = encoded.trim();
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(trimmed)
-        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(trimmed))
-        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(trimmed))
-        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed))
-        .ok()?;
-    let text = String::from_utf8(bytes).ok()?;
-    // Valid UTF-8 is not enough: a binary blob can be (NUL bytes are). Text
-    // carries no control characters beyond line breaks and tabs.
-    text.chars()
-        .all(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
-        .then_some(text)
+/// Where the walk is, for the two things position decides: whether a string
+/// is what the mask rewrite reaches, and whether a field holds file content.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Pos {
+    rewrite: Rewrite,
+    part: PartPos,
 }
 
-/// Append every string of an A2A request's `params` or a response's `result`
-/// for scanning: every object key and every string value, at any depth, with
-/// a file part's base64 content decoded when it is text.
-///
-/// No field is skipped for looking like protocol. Every earlier, narrower
-/// reading — parts only, then everything but identifiers and enum values —
-/// was a choice about which fields hold content, and an agent or a client
-/// that reads a field the scan skipped receives it unchecked. Reading an id
-/// or an enum string costs nothing but a little noise.
-fn collect_call_strings(value: &Value, buf: &mut String) {
-    match value {
-        Value::String(s) => push_line(buf, s),
-        Value::Array(items) => {
-            for item in items {
-                collect_call_strings(item, buf);
-            }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rewrite {
+    /// The request envelope; its `params.message.parts[].text` is rewritten.
+    RequestRoot,
+    Params,
+    Message,
+    MessageParts,
+    MessagePart,
+    /// Nothing below here is rewritten.
+    None,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PartPos {
+    No,
+    /// A `parts` list: each element is a part.
+    PartsList,
+    Part,
+    /// A 0.3 part's `file` object.
+    File,
+}
+
+impl Pos {
+    fn request_root() -> Self {
+        Pos {
+            rewrite: Rewrite::RequestRoot,
+            part: PartPos::No,
         }
-        Value::Object(map) => {
-            for (key, child) in map {
-                push_line(buf, key);
-                match (BASE64_CONTENT_KEYS.contains(&key.as_str()), child) {
-                    (true, Value::String(encoded)) => {
-                        if let Some(text) = decoded_text(encoded) {
-                            push_line(buf, &text);
-                        }
-                    }
-                    _ => collect_call_strings(child, buf),
+    }
+    fn response_root() -> Self {
+        Pos {
+            rewrite: Rewrite::None,
+            part: PartPos::No,
+        }
+    }
+    fn child(self, key: &str) -> Self {
+        let rewrite = match (self.rewrite, key) {
+            (Rewrite::RequestRoot, "params") => Rewrite::Params,
+            (Rewrite::Params, "message") => Rewrite::Message,
+            (Rewrite::Message, "parts") => Rewrite::MessageParts,
+            _ => Rewrite::None,
+        };
+        let part = match (self.part, key) {
+            (_, "parts") => PartPos::PartsList,
+            (PartPos::Part, "file") => PartPos::File,
+            _ => PartPos::No,
+        };
+        Pos { rewrite, part }
+    }
+    fn item(self) -> Self {
+        Pos {
+            rewrite: if self.rewrite == Rewrite::MessageParts {
+                Rewrite::MessagePart
+            } else {
+                Rewrite::None
+            },
+            part: if self.part == PartPos::PartsList {
+                PartPos::Part
+            } else {
+                PartPos::No
+            },
+        }
+    }
+}
+
+#[derive(Default)]
+struct ScanWalk {
+    text: String,
+    unrewritable: String,
+    unreadable: Option<&'static str>,
+}
+
+impl ScanWalk {
+    fn done(self) -> CallScan {
+        CallScan {
+            text: self.text,
+            unrewritable: self.unrewritable,
+            unreadable: self.unreadable,
+        }
+    }
+
+    /// Read `s`; `rewritten` = the mask rewrite reaches it.
+    fn push(&mut self, s: &str, rewritten: bool) {
+        push_line(&mut self.text, s);
+        if !rewritten {
+            push_line(&mut self.unrewritable, s);
+        }
+    }
+
+    fn unreadable(&mut self, why: &'static str) {
+        self.unreadable.get_or_insert(why);
+    }
+
+    fn value(&mut self, value: &Value, pos: Pos) {
+        match value {
+            Value::String(s) => self.push(s, false),
+            Value::Number(n) => self.push(&n.to_string(), false),
+            Value::Array(items) => {
+                for item in items {
+                    self.value(item, pos.item());
                 }
             }
+            Value::Object(map) => {
+                let media = media_type(map);
+                for (key, child) in map {
+                    self.push(key, false);
+                    self.field(key, child, pos, media.as_deref());
+                }
+            }
+            Value::Bool(_) | Value::Null => {}
         }
-        _ => {}
+    }
+
+    fn field(&mut self, key: &str, child: &Value, pos: Pos, media: Option<&str>) {
+        let file_bytes = (pos.part == PartPos::Part && key == "raw")
+            || (pos.part == PartPos::File
+                && matches!(key, "bytes" | "fileWithBytes" | "file_with_bytes"));
+        let file_uri = (pos.part == PartPos::Part && key == "url")
+            || (pos.part == PartPos::File
+                && matches!(key, "uri" | "fileWithUri" | "file_with_uri"));
+        if pos.part == PartPos::Part && key == "text" {
+            match child {
+                Value::String(s) => self.push(s, pos.rewrite == Rewrite::MessagePart),
+                other => {
+                    self.unreadable("a text part whose text is not a string");
+                    self.value(other, pos.child(key));
+                }
+            }
+        } else if file_bytes {
+            match child {
+                Value::String(encoded) => self.file_content(encoded, media),
+                other => {
+                    self.unreadable("file content that is not a base64 string");
+                    self.value(other, pos.child(key));
+                }
+            }
+        } else if let (true, Value::String(uri)) = (file_uri, child) {
+            self.push(uri, false);
+            if let Some((uri_media, payload)) = base64_data_uri(uri) {
+                self.file_content_decoded(payload, uri_media.as_deref().or(media));
+            }
+        } else {
+            self.value(child, pos.child(key));
+        }
+    }
+
+    /// A field holding base64 file content: the string itself is read too —
+    /// it may not be base64 at all — then its decoding, unless the media type
+    /// says it is binary.
+    fn file_content(&mut self, encoded: &str, media: Option<&str>) {
+        if is_binary_media(media) {
+            return;
+        }
+        self.push(encoded, false);
+        self.file_content_decoded(encoded, media);
+    }
+
+    fn file_content_decoded(&mut self, encoded: &str, media: Option<&str>) {
+        if is_binary_media(media) {
+            return;
+        }
+        match lenient_base64(encoded).and_then(|bytes| bytes_as_text(&bytes)) {
+            Some(text) => self.push(&text, false),
+            None => self.unreadable("file content that is neither text nor a binary media type"),
+        }
     }
 }
 
-/// Where a value sits relative to `params`, for [`call_strings_would_change`].
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Within {
-    Params,
-    /// `params.message`.
-    Message,
-    /// `params.message.parts`.
-    MessageParts,
-    /// One of `params.message.parts`: its `text` is what the rewrite reaches.
-    MessagePart,
-    Other,
+/// The media type an object declares for its content, lowercased, without
+/// parameters.
+fn media_type(map: &serde_json::Map<String, Value>) -> Option<String> {
+    ["mimeType", "mediaType", "mime_type", "media_type"]
+        .iter()
+        .find_map(|k| map.get(*k).and_then(Value::as_str))
+        .map(|m| m.split(';').next().unwrap_or(m).trim().to_ascii_lowercase())
 }
 
-/// [`collect_call_strings`]'s traversal, asking whether `mask` changes any
-/// string it reads other than the text of a `params.message` part.
-fn call_strings_would_change(
-    value: &Value,
-    within: Within,
-    mask: &impl Fn(&str) -> Option<String>,
-) -> bool {
-    let changes = |s: &str| mask(s).is_some_and(|masked| masked != s);
-    match value {
-        Value::String(s) => changes(s),
-        Value::Array(items) => {
-            let next = if within == Within::MessageParts {
-                Within::MessagePart
-            } else {
-                Within::Other
-            };
-            items
-                .iter()
-                .any(|item| call_strings_would_change(item, next, mask))
+/// Content of these media types is not language and passes unread.
+fn is_binary_media(media: Option<&str>) -> bool {
+    media.is_some_and(|m| {
+        m.starts_with("image/")
+            || m.starts_with("audio/")
+            || m.starts_with("video/")
+            || m == "application/pdf"
+    })
+}
+
+/// `data:[<media type>][;base64],<payload>` with a base64 payload: its media
+/// type (lowercased, no parameters) and the payload.
+fn base64_data_uri(uri: &str) -> Option<(Option<String>, &str)> {
+    let rest = uri.strip_prefix("data:").or_else(|| {
+        uri.get(..5)
+            .filter(|p| p.eq_ignore_ascii_case("data:"))
+            .map(|_| &uri[5..])
+    })?;
+    let (meta, payload) = rest.split_once(',')?;
+    let mut meta_parts = meta.split(';');
+    let media = meta_parts
+        .next()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_ascii_lowercase);
+    meta_parts
+        .any(|p| p.trim().eq_ignore_ascii_case("base64"))
+        .then_some((media, payload))
+}
+
+/// Decode base64 the way lenient decoders do: anything outside the alphabet
+/// (line breaks, spaces) is ignored, both alphabets are accepted, padding is
+/// optional and may separate concatenated chunks, and stray trailing bits are
+/// allowed. `None` when nothing decodable remains.
+fn lenient_base64(encoded: &str) -> Option<Vec<u8>> {
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+    use base64::Engine as _;
+    const LENIENT: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        GeneralPurposeConfig::new()
+            .with_decode_allow_trailing_bits(true)
+            .with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    );
+    let mut out = Vec::new();
+    let mut decoded_any = false;
+    for chunk in encoded.split('=') {
+        let mut clean: String = chunk
+            .chars()
+            .filter_map(|c| match c {
+                'A'..='Z' | 'a'..='z' | '0'..='9' | '+' | '/' => Some(c),
+                '-' => Some('+'),
+                '_' => Some('/'),
+                _ => None,
+            })
+            .collect();
+        // A lone leftover character carries no whole byte.
+        if clean.len() % 4 == 1 {
+            clean.pop();
         }
-        Value::Object(map) => map.iter().any(|(key, child)| {
-            if changes(key) {
-                return true;
-            }
-            if within == Within::MessagePart && key == "text" {
-                return false;
-            }
-            if let (true, Value::String(encoded)) =
-                (BASE64_CONTENT_KEYS.contains(&key.as_str()), child)
-            {
-                return decoded_text(encoded).is_some_and(|text| changes(&text));
-            }
-            let next = match (within, key.as_str()) {
-                (Within::Params, "message") => Within::Message,
-                (Within::Message, "parts") => Within::MessageParts,
-                _ => Within::Other,
-            };
-            call_strings_would_change(child, next, mask)
-        }),
-        _ => false,
+        if clean.is_empty() {
+            continue;
+        }
+        out.extend(LENIENT.decode(clean.as_bytes()).ok()?);
+        decoded_any = true;
     }
+    decoded_any.then_some(out)
+}
+
+/// Decoded file bytes as text, when they are text: UTF-16 behind a byte-order
+/// mark, else UTF-8, read lossily so one stray byte (Latin-1, a broken
+/// sequence) does not hide the rest. Bytes that are mostly replacement or
+/// control characters are binary, and `None`. Control characters in text are
+/// read as spaces.
+fn bytes_as_text(bytes: &[u8]) -> Option<String> {
+    let text = match bytes {
+        [0xff, 0xfe, rest @ ..] => {
+            let units: Vec<u16> = rest
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
+        }
+        [0xfe, 0xff, rest @ ..] => {
+            let units: Vec<u16> = rest
+                .chunks_exact(2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
+        }
+        [0xef, 0xbb, 0xbf, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    };
+    let total = text.chars().count();
+    if total == 0 {
+        return Some(String::new());
+    }
+    let noise = text
+        .chars()
+        .filter(|&c| {
+            c == char::REPLACEMENT_CHARACTER || (c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+        })
+        .count();
+    // Text has at most the odd stray byte or control character: one in
+    // twenty, or a couple in a short text. A binary blob is noise throughout.
+    (noise <= (total / 20).max(2)).then(|| {
+        text.chars()
+            .map(|c| {
+                if c.is_control() && !matches!(c, '\n' | '\r' | '\t') {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect()
+    })
 }
 
 /// The text an agent produced on one call, kept as two segments because the
@@ -602,11 +808,7 @@ impl ResultText {
 /// receives, in every wire version and every shape at once, so this reads
 /// without guessing either.
 pub fn result_scan_text(response: &Value) -> String {
-    let mut buf = String::new();
-    if let Some(result) = response.get("result") {
-        collect_call_strings(result, &mut buf);
-    }
-    buf
+    result_scan(response).text
 }
 
 /// Append every text part of a parts-bearing object (a message or an
@@ -737,6 +939,131 @@ mod tests {
         assert!(request_would_mask_unrewritable(&in_metadata, mask));
         let in_file = json!({"params": {"message": {"parts": [{"raw": b64("mail a@b.c"), "mediaType": "text/plain"}]}}});
         assert!(request_would_mask_unrewritable(&in_file, mask));
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    /// Real decoders are lenient (Python's `b64decode`, Node's `Buffer`): the
+    /// scan must read what they read, or the difference is a way past it.
+    #[test]
+    fn file_content_is_decoded_as_leniently_as_real_agents_do() {
+        let part = |bytes: Value| {
+            json!({"params": {"message": {"parts": [
+            {"kind": "file", "file": {"mimeType": "text/plain", "bytes": bytes}}]}}})
+        };
+        let phrase = b"bad phrase here";
+        let encoded = b64(phrase);
+        // MIME line breaks inside the base64.
+        let wrapped = format!("{}\n{}", &encoded[..8], &encoded[8..]);
+        // URL-safe alphabet, no padding.
+        let urlsafe = encoded
+            .replace('+', "-")
+            .replace('/', "_")
+            .trim_end_matches('=')
+            .to_string();
+        for variant in [encoded.clone(), wrapped, urlsafe] {
+            reads(
+                &request_scan_text(&part(Value::String(variant))),
+                &["bad phrase here"],
+            );
+        }
+        // A form feed, or a Latin-1 byte, does not make text binary.
+        reads(
+            &request_scan_text(&part(Value::String(b64(b"\x0cbad phrase here")))),
+            &["bad phrase here"],
+        );
+        reads(
+            &request_scan_text(&part(Value::String(b64(b"caf\xe9 bad phrase here")))),
+            &["bad phrase here"],
+        );
+        // UTF-16 behind a byte-order mark.
+        let utf16: Vec<u8> = [0xff, 0xfe]
+            .into_iter()
+            .chain("bad phrase here".encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        reads(
+            &request_scan_text(&part(Value::String(b64(&utf16)))),
+            &["bad phrase here"],
+        );
+        // A base64 `data:` URI in a 1.0 part's `url`.
+        let uri = format!("data:text/plain;base64,{}", b64(phrase));
+        reads(
+            &request_scan_text(&json!({"params": {"message": {"parts": [{"url": uri}]}}})),
+            &["bad phrase here"],
+        );
+    }
+
+    #[test]
+    fn plain_text_and_numbers_are_read_wherever_they_sit() {
+        // A key named like file content outside a file part is just a field.
+        let scan = request_scan(&json!({"params": {"message": {"parts": [
+            {"kind": "data", "data": {"raw": "bad phrase", "card": 4111111111111111u64}}]},
+            "metadata": {"bytes": "alice@corp.example"}}}));
+        reads(
+            &scan.text,
+            &["bad phrase", "4111111111111111", "alice@corp.example"],
+        );
+        assert_eq!(scan.unreadable, None);
+    }
+
+    /// What the scan cannot read is reported, so a content policy can refuse
+    /// it instead of forwarding it unread; binary media pass unread.
+    #[test]
+    fn content_the_scan_cannot_read_is_reported() {
+        let file = |file: Value| json!({"params": {"message": {"parts": [{"kind": "file", "file": file}]}}});
+        // Not text, and not a binary media type.
+        let blob = b64(&[0x00, 0x9c, 0xff, 0x13, 0x02, 0x07, 0x81, 0x00]);
+        assert!(request_scan(&file(
+            json!({"mimeType": "application/octet-stream", "bytes": blob})
+        ))
+        .unreadable
+        .is_some());
+        assert!(request_scan(&file(json!({"bytes": blob})))
+            .unreadable
+            .is_some());
+        // A binary media type passes unread, and is not reported.
+        let png = request_scan(&file(json!({"mimeType": "image/png", "bytes": blob})));
+        assert_eq!(png.unreadable, None);
+        assert!(!png.text.contains(&blob));
+        // A byte array where base64 belongs (Node's `Buffer` would decode it).
+        assert!(request_scan(&file(
+            json!({"mimeType": "text/plain", "bytes": [98, 97, 100]})
+        ))
+        .unreadable
+        .is_some());
+        // A text part whose text is not a string.
+        let odd = request_scan(
+            &json!({"params": {"message": {"parts": [{"kind": "text", "text": ["alice@corp.example"]}]}}}),
+        );
+        assert!(odd.unreadable.is_some());
+        assert!(
+            odd.unrewritable.contains("alice@corp.example"),
+            "a non-string text is not rewritten"
+        );
+        // The same reading applies to an answer.
+        assert!(result_scan(&json!({"result": {"kind": "message", "parts": [
+            {"kind": "file", "file": {"bytes": blob}}]}}))
+        .unreadable
+        .is_some());
+    }
+
+    #[test]
+    fn only_the_rewritten_text_is_left_out_of_the_unrewritable_reading() {
+        let scan = request_scan(
+            &json!({"jsonrpc": "2.0", "id": "rq-1", "method": "message/send",
+            "params": {"message": {"parts": [{"kind": "text", "text": "REWRITTEN"}],
+                                   "metadata": {"note": "KEPT"}}}}),
+        );
+        reads(&scan.text, &["REWRITTEN", "KEPT", "rq-1"]);
+        assert!(!scan.unrewritable.contains("REWRITTEN"));
+        reads(&scan.unrewritable, &["KEPT", "rq-1"]);
+        // A batch body has no `params.message`: nothing in it is rewritten.
+        let batch =
+            request_scan(&json!([{"params": {"message": {"parts": [{"text": "IN A BATCH"}]}}}]));
+        reads(&batch.unrewritable, &["IN A BATCH"]);
     }
 
     /// A result shaped two ways at once must be read every way: a client may
@@ -1170,7 +1497,7 @@ mod tests {
             ),
             &["k", "v"],
         );
-        assert_eq!(request_scan_text(&json!({"params": {}})), "");
+        assert_eq!(request_scan_text(&json!({})), "");
     }
 
     #[test]
@@ -1296,10 +1623,10 @@ mod tests {
                 "artifact": {"artifactId": "a", "parts": [{"data": {"k": "chunk"}}]}}}})),
             &["k", "chunk"],
         );
-        // An error carries no result to read.
-        assert_eq!(
-            result_scan_text(&json!({"error": {"code": -1, "message": "x"}})),
-            ""
+        // An error envelope reaches the caller too, and is read like a result.
+        reads(
+            &result_scan_text(&json!({"error": {"code": -1, "message": "error text"}})),
+            &["error text"],
         );
     }
 

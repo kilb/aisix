@@ -69,6 +69,11 @@ export interface A2aUpstreamOptions {
    * this agent's wire shape. Omitted, the Task carries only its status message.
    */
   unaryTask?: Record<string, unknown>;
+  /**
+   * Answer every unary call with this JSON-RPC `error` member instead of a
+   * result. Omitted, unary calls answer with the Task.
+   */
+  unaryError?: Record<string, unknown>;
 }
 
 /** The id of the Task every unary call answers with, so a test can read it back. */
@@ -140,6 +145,7 @@ export async function startA2aUpstream(
       streamAnswer: options.streamAnswer ?? false,
       unaryAnswer: options.unaryAnswer ?? "The invoice is settled.",
       unaryTask: options.unaryTask ?? {},
+      unaryError: options.unaryError,
     }).catch((err: unknown) => {
       // `handle` rejects on a malformed body, and on a write to an already
       // closed socket. Unhandled, that terminates the test process; worse, the
@@ -178,6 +184,7 @@ async function handle(
     streamAnswer: boolean;
     unaryAnswer: string;
     unaryTask: Record<string, unknown>;
+    unaryError?: Record<string, unknown>;
   },
 ): Promise<void> {
   const path = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
@@ -351,6 +358,11 @@ async function handle(
       ),
     );
     res.end();
+    return;
+  }
+
+  if (req.method === "POST" && path === ctx.servicePath && ctx.unaryError) {
+    send(200, { jsonrpc: "2.0", id: body?.id ?? null, error: ctx.unaryError });
     return;
   }
 
