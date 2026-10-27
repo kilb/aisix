@@ -540,42 +540,92 @@ impl ScanWalk {
         } else if let (true, Value::String(uri)) = (file_uri, child) {
             self.push(uri, false);
             if let Some((uri_media, payload)) = base64_data_uri(uri) {
-                self.file_content_decoded(payload, uri_media.as_deref().or(media));
+                let _ = self.file_content_decoded(payload, uri_media.as_deref().or(media));
             }
         } else {
             self.value(child, pos.child(key));
         }
     }
 
-    /// A field holding base64 file content: the string itself is read too —
-    /// it may not be base64 at all — then its decoding, unless the media type
-    /// says it is binary.
+    /// A field holding base64 file content: its decoding is read when it is
+    /// text, whatever media type it claims; the string itself is read too
+    /// unless it turns out to be a verified binary file (it may not be base64
+    /// at all, and a long base64 blob is only noise).
     fn file_content(&mut self, encoded: &str, media: Option<&str>) {
-        if is_binary_media(media) {
-            return;
+        if !self.file_content_decoded(encoded, media) {
+            self.push(encoded, false);
         }
-        self.push(encoded, false);
-        self.file_content_decoded(encoded, media);
     }
 
-    fn file_content_decoded(&mut self, encoded: &str, media: Option<&str>) {
-        if is_binary_media(media) {
-            return;
+    /// Returns whether the content was a verified binary file, passed unread.
+    fn file_content_decoded(&mut self, encoded: &str, media: Option<&str>) -> bool {
+        let Some(bytes) = lenient_base64(encoded) else {
+            self.unreadable("file content that is not base64");
+            return false;
+        };
+        // Text is read whatever the label says: a declared media type is the
+        // sender's claim, and an agent may hand the bytes to a model anyway.
+        if let Some(text) = bytes_as_text(&bytes) {
+            self.push(&text, false);
+            return false;
         }
-        match lenient_base64(encoded).and_then(|bytes| bytes_as_text(&bytes)) {
-            Some(text) => self.push(&text, false),
-            None => self.unreadable("file content that is neither text nor a binary media type"),
+        // Binary passes unread only when it is a real file of the family it
+        // claims — its leading bytes carry that family's signature.
+        if is_binary_media(media) && has_family_signature(media, &bytes) {
+            return true;
         }
+        self.unreadable("file content that is neither text nor a verified binary file");
+        false
     }
 }
 
 /// The media type an object declares for its content, lowercased, without
-/// parameters.
+/// parameters. Spelled under more than one alias with different values, it
+/// declares nothing: which one a reader honours is not the scan's to guess.
 fn media_type(map: &serde_json::Map<String, Value>) -> Option<String> {
-    ["mimeType", "mediaType", "mime_type", "media_type"]
+    let mut declared = ["mimeType", "mediaType", "mime_type", "media_type"]
         .iter()
-        .find_map(|k| map.get(*k).and_then(Value::as_str))
-        .map(|m| m.split(';').next().unwrap_or(m).trim().to_ascii_lowercase())
+        .filter_map(|k| map.get(*k).and_then(Value::as_str))
+        .map(|m| m.split(';').next().unwrap_or(m).trim().to_ascii_lowercase());
+    let first = declared.next()?;
+    declared.all(|other| other == first).then_some(first)
+}
+
+/// Whether `bytes` begin with a file signature of the family `media` claims:
+/// any image format for `image/*`, any audio or video container for
+/// `audio/*` and `video/*`, `%PDF` for `application/pdf`. The family, not
+/// the exact subtype, is what matters here — the question is only whether
+/// the content is really a binary file nothing would read as text.
+fn has_family_signature(media: Option<&str>, bytes: &[u8]) -> bool {
+    let at = |offset: usize, sig: &[u8]| bytes.get(offset..offset + sig.len()) == Some(sig);
+    let iso_bmff = at(4, b"ftyp");
+    let riff = |kind: &[u8]| at(0, b"RIFF") && at(8, kind);
+    let ebml = at(0, &[0x1a, 0x45, 0xdf, 0xa3]);
+    let image = at(0, &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
+        || at(0, &[0xff, 0xd8, 0xff])
+        || at(0, b"GIF87a")
+        || at(0, b"GIF89a")
+        || riff(b"WEBP")
+        || at(0, b"BM")
+        || at(0, b"II*\0")
+        || at(0, b"MM\0*")
+        || at(0, &[0x00, 0x00, 0x01, 0x00])
+        || iso_bmff;
+    let audio = at(0, b"ID3")
+        || bytes.first() == Some(&0xff) && bytes.get(1).is_some_and(|b| b & 0xe0 == 0xe0)
+        || riff(b"WAVE")
+        || at(0, b"OggS")
+        || at(0, b"fLaC")
+        || ebml
+        || iso_bmff;
+    let video = iso_bmff || ebml || riff(b"AVI ") || at(0, b"OggS");
+    match media.map(|m| m.split('/').next().unwrap_or(m)) {
+        Some("image") => image,
+        Some("audio") => audio,
+        Some("video") => video,
+        Some("application") => media == Some("application/pdf") && at(0, b"%PDF-"),
+        _ => false,
+    }
 }
 
 /// Content of these media types is not language and passes unread.
@@ -918,7 +968,10 @@ mod tests {
 
         let binary = {
             use base64::Engine as _;
-            base64::engine::general_purpose::STANDARD.encode([0xff_u8, 0xfe, 0x00, 0x9c])
+            // A real PNG: a verified binary file passes unread.
+            base64::engine::general_purpose::STANDARD.encode([
+                0x89_u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x9c, 0xff, 0x00,
+            ])
         };
         let result = json!({"result": {"kind": "task", "id": "t", "contextId": "c",
             "artifacts": [{"artifactId": "a", "name": "PHRASE-H", "description": "PHRASE-I",
@@ -1025,9 +1078,18 @@ mod tests {
             .unreadable
             .is_some());
         // A binary media type passes unread, and is not reported.
-        let png = request_scan(&file(json!({"mimeType": "image/png", "bytes": blob})));
+        let real_png = b64(&[
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x9c, 0xff, 0x00,
+        ]);
+        let png = request_scan(&file(json!({"mimeType": "image/png", "bytes": real_png})));
         assert_eq!(png.unreadable, None);
-        assert!(!png.text.contains(&blob));
+        assert!(!png.text.contains(&real_png));
+        // The same noise merely labelled as an image is not trusted.
+        assert!(
+            request_scan(&file(json!({"mimeType": "image/png", "bytes": blob})))
+                .unreadable
+                .is_some()
+        );
         // A byte array where base64 belongs (Node's `Buffer` would decode it).
         assert!(request_scan(&file(
             json!({"mimeType": "text/plain", "bytes": [98, 97, 100]})
@@ -1048,6 +1110,48 @@ mod tests {
             {"kind": "file", "file": {"bytes": blob}}]}}))
         .unreadable
         .is_some());
+    }
+
+    /// A declared media type is the sender's claim, not a fact: content passes
+    /// unread only when it is really binary and really of that family.
+    #[test]
+    fn a_binary_label_does_not_hide_text_or_unverified_bytes() {
+        let file = |media: &str, bytes: &[u8]| {
+            json!({"params": {"message": {"parts": [
+                {"kind": "file", "file": {"mimeType": media, "bytes": b64(bytes)}}]}}})
+        };
+        // Text labelled as an image is read like any text.
+        let disguised = request_scan(&file("image/png", b"bad phrase dressed as a picture"));
+        reads(&disguised.text, &["bad phrase dressed as a picture"]);
+        // Noise labelled as an image, without the family's signature, is not
+        // trusted.
+        let noise = [0x13, 0x9c, 0xff, 0x00, 0x02, 0x07, 0x81, 0x00, 0xfe, 0x01];
+        assert!(request_scan(&file("image/png", &noise))
+            .unreadable
+            .is_some());
+        // A real image passes — of whichever image format.
+        let png = [
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+        ];
+        assert_eq!(request_scan(&file("image/png", &png)).unreadable, None);
+        assert_eq!(request_scan(&file("image/jpeg", &png)).unreadable, None);
+        let pdf = [
+            b"%PDF-1.7\n".as_slice(),
+            &[0xe2, 0xe3, 0xcf, 0xd3, 0x00, 0x9c, 0xff, 0x01],
+        ]
+        .concat();
+        assert_eq!(
+            request_scan(&file("application/pdf", &pdf)).unreadable,
+            None
+        );
+        // An image signature does not pass as a PDF.
+        assert!(request_scan(&file("application/pdf", &png))
+            .unreadable
+            .is_some());
+        // Conflicting media-type aliases: the binary claim is not taken.
+        let conflicting = json!({"params": {"message": {"parts": [{"kind": "file", "file": {
+            "mimeType": "image/png", "mediaType": "text/plain", "bytes": b64(&noise)}}]}}});
+        assert!(request_scan(&conflicting).unreadable.is_some());
     }
 
     #[test]

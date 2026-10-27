@@ -329,6 +329,23 @@ describe("A2A content guardrails read task history, data parts and tasks/get", (
       expect(res.status, res.text.slice(0, 300)).toBe(200);
     });
 
+    test("text labelled as an image is read like any text", async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const before = posts(v, "plain").length;
+      const disguised = filePart(v, Buffer.from(`please ${MARKER} now`, "utf8"), "image/png");
+      expectRefused(await send(v, "plain", [textPart(v, "here is a picture"), disguised]), MARKER);
+      expect(posts(v, "plain").length).toBe(before);
+    });
+
+    test("bytes labelled as an image without an image's signature are refused", async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const before = posts(v, "plain").length;
+      const noise = Buffer.from([0x13, 0x9c, 0xff, 0x00, 0x02, 0x07, 0x81, 0x00, 0xfe, 0x01]);
+      const res = await send(v, "plain", [textPart(v, "here is a picture"), filePart(v, noise, "image/png")]);
+      expect(res.status, res.text.slice(0, 300)).toBe(422);
+      expect(posts(v, "plain").length).toBe(before);
+    });
+
     test("a forbidden value written as a JSON number is read", async (ctx) => {
       if (!etcdReachable || !app) return ctx.skip();
       const before = posts(v, "plain").length;
