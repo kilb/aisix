@@ -21,7 +21,9 @@
 //! URL pattern (Gemini, `generateContent`):
 //! `https://<region>-aiplatform.googleapis.com/v1/projects/<project>/
 //!  locations/<region>/publishers/google/models/<model>:generateContent`
-//! (host `https://aiplatform.googleapis.com` for the `global` location).
+//! (host `https://aiplatform.googleapis.com` for the `global` location,
+//! `https://aiplatform.<us|eu>.rep.googleapis.com` for the `us` / `eu`
+//! multi-region locations).
 
 use aisix_gateway::{
     sse::{SseDecoder, SseEvent},
@@ -164,7 +166,9 @@ impl VertexBridge {
     ///      is stripped so `chat_gemini`'s URL stitching produces
     ///      a single-slash separator.
     ///   3. Canonical `https://<region>-aiplatform.googleapis.com`, or
-    ///      `https://aiplatform.googleapis.com` for the `global` location.
+    ///      `https://aiplatform.googleapis.com` for the `global` location,
+    ///      or `https://aiplatform.<us|eu>.rep.googleapis.com` for the
+    ///      `us` / `eu` multi-region locations.
     ///
     /// Mirrors the Bedrock bridge's `endpoint_url` precedence
     /// (`crates/aisix-provider-bedrock/src/bridge.rs::build_client_from_ctx`).
@@ -276,6 +280,14 @@ impl VertexBridge {
         // https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations
         if region == "global" {
             return Ok("https://aiplatform.googleapis.com".to_string());
+        }
+        // The multi-region locations have no `<location>-aiplatform` host
+        // either. The same page's "Multi-region endpoints" table lists
+        // `us` → `https://aiplatform.us.rep.googleapis.com` and
+        // `eu` → `https://aiplatform.eu.rep.googleapis.com`, with
+        // `locations/<location>` kept in the path.
+        if region == "us" || region == "eu" {
+            return Ok(format!("https://aiplatform.{region}.rep.googleapis.com"));
         }
         Ok(format!("https://{region}-aiplatform.googleapis.com"))
     }
@@ -2353,6 +2365,35 @@ mod tests {
         assert_eq!(
             bridge
                 .resolve_api_base("global", Some("http://mock-vertex:8001"))
+                .unwrap(),
+            "http://mock-vertex:8001",
+        );
+    }
+
+    #[test]
+    fn resolve_api_base_multi_region_locations_use_the_rep_hosts() {
+        // The `us` / `eu` multi-region locations have no `us-aiplatform` /
+        // `eu-aiplatform` host; Google documents
+        // `https://aiplatform.{us,eu}.rep.googleapis.com` for them, with the
+        // location still in the path.
+        let bridge = VertexBridge::new();
+        assert_eq!(
+            bridge.resolve_api_base("us", None).unwrap(),
+            "https://aiplatform.us.rep.googleapis.com",
+        );
+        assert_eq!(
+            bridge.resolve_api_base("eu", None).unwrap(),
+            "https://aiplatform.eu.rep.googleapis.com",
+        );
+        // A regional location keeps its prefixed host.
+        assert_eq!(
+            bridge.resolve_api_base("europe-west4", None).unwrap(),
+            "https://europe-west4-aiplatform.googleapis.com",
+        );
+        // An operator `api_base` still wins over the canonical host.
+        assert_eq!(
+            bridge
+                .resolve_api_base("eu", Some("http://mock-vertex:8001"))
                 .unwrap(),
             "http://mock-vertex:8001",
         );
