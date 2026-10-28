@@ -513,6 +513,9 @@ jobs:
   playwright-real-prometheus:
     name: e2e (playwright, real prometheus)
     runs-on: ubuntu-latest
+    # Two cargo builds plus the suite: bounded so a hung step fails the gate
+    # instead of holding a runner for the 6-hour default.
+    timeout-minutes: 45
     # Executes a downloaded third-party binary: keep the token read-only and
     # out of the checkout's git config, as mcp-conformance does.
     permissions:
@@ -543,8 +546,9 @@ jobs:
           # Same release CDN as protoc, with the same intermittent 504s — see
           # .github/actions/setup-protoc.
           for attempt in 1 2 3 4 5; do
+            # --max-time bounds a transfer that connects and then stalls.
             if curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 30 \
-                -o "${dest}/prometheus.tar.gz" "${url}"; then
+                --max-time 300 -o "${dest}/prometheus.tar.gz" "${url}"; then
               break
             fi
             if [ "${attempt}" = 5 ]; then
