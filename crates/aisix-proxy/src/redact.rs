@@ -760,6 +760,35 @@ pub async fn moderate_chat_format_structured(
     .await
 }
 
+/// The inspection request for an endpoint whose whole input is new content —
+/// an embeddings `input` list, a rerank `query` and its `documents`, a legacy
+/// completions request, a speech request, repeated transcription `prompt`
+/// fields: the non-empty `parts` joined by newlines into ONE user message, or
+/// no message when every part is empty.
+///
+/// A guardrail that bounds how much it sends checks the newest message in full
+/// and older ones only while its budget lasts; a part kept as a message of its
+/// own would count as older than the last one and could go unchecked. Every
+/// guardrail that joins messages joins them with a newline too, so the text it
+/// scans is the same either way.
+pub(crate) fn newest_content_for_inspection<S: AsRef<str>>(
+    model: &str,
+    parts: impl IntoIterator<Item = S>,
+) -> ChatFormat {
+    let text = parts
+        .into_iter()
+        .filter(|part| !part.as_ref().is_empty())
+        .map(|part| part.as_ref().to_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let messages = if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![aisix_gateway::ChatMessage::user(text)]
+    };
+    ChatFormat::new(model, messages)
+}
+
 /// Clone a chat request for non-segment input inspection and append tool
 /// declarations as prompt text. The original request remains the rewrite
 /// target for the structured moderation pass.
@@ -2104,6 +2133,9 @@ pub fn redact_rerank_request_structured(
         };
     }
     let mut unrewritable_tool_key = false;
+    // The whole request is the newest message: the query and every document
+    // are new content.
+    chain.segment_message_start();
     if let Some(q) = body.get_mut("query") {
         apply_to_value_string(chain, Direction::Input, q, &mut counts);
     }
@@ -2212,6 +2244,8 @@ pub fn redact_speech_request_structured(
             unrewritable_tool_key: false,
         };
     }
+    // `input` and `instructions` are one newest message.
+    chain.segment_message_start();
     for field in ["input", "instructions"] {
         if let Some(value) = body.get_mut(field) {
             apply_to_value_string(chain, Direction::Input, value, &mut counts);
@@ -3757,6 +3791,29 @@ mod tests {
         let r = redact_jsonl_upload(chain.as_ref(), line).expect("a JSONL file");
         let sent = &r.text;
         assert!(!sent.contains("alice@example.com"), "{sent}");
+    }
+
+    /// Every text slot of a rerank or speech request is new content, so the
+    /// walk marks the newest message at the first segment: a moderator that
+    /// bounds what it sends covers the whole request, not only the last
+    /// document or the instructions.
+    #[test]
+    fn rerank_and_speech_walks_start_the_newest_message_at_the_first_segment() {
+        let mut rerank =
+            json!({"model": "m", "query": "q", "documents": ["a", {"text": "b"}, "c"]});
+        let collector = SegmentCollector::default();
+        let _ = redact_rerank_request_structured(&collector, &mut rerank);
+        assert_eq!(collector.newest_from(), Some(0), "rerank");
+
+        let mut speech = json!({"model": "m", "input": "say this", "instructions": "softly"});
+        let collector = SegmentCollector::default();
+        let _ = redact_speech_request_structured(&collector, &mut speech);
+        assert_eq!(collector.newest_from(), Some(0), "speech");
+
+        let mut completions = json!({"model": "m", "prompt": ["p1", "p2"], "suffix": "s"});
+        let collector = SegmentCollector::default();
+        let _ = redact_completions_request_structured(&collector, &mut completions);
+        assert_eq!(collector.newest_from(), Some(0), "completions");
     }
 
     /// `null` is OpenAI's documented "absent" encoding for the optional

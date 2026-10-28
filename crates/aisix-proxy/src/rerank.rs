@@ -240,32 +240,27 @@ pub async fn rerank(
     }
 }
 
-/// Build a [`ChatFormat`](aisix_gateway::ChatFormat) of user messages from
-/// the rerank `query` + `documents` so the input guardrail chain can scan
-/// them (#545). Object documents are serialized in full because providers
-/// forward their caller-authored metadata as well as `text`. Never sent
-/// upstream.
+/// Build a [`ChatFormat`](aisix_gateway::ChatFormat) from the rerank
+/// `query` + `documents` so the input guardrail chain can scan them (#545).
+/// All of it is new content, so it is one newest message (see
+/// [`crate::redact::newest_content_for_inspection`]). Object documents are
+/// serialized in full because providers forward their caller-authored
+/// metadata as well as `text`. Never sent upstream.
 fn rerank_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat {
-    let mut messages = Vec::new();
+    let mut parts = Vec::new();
     if let Some(q) = body.get("query").and_then(|v| v.as_str()) {
-        if !q.is_empty() {
-            messages.push(aisix_gateway::ChatMessage::user(q.to_string()));
-        }
+        parts.push(q.to_string());
     }
     if let Some(docs) = body.get("documents").and_then(|v| v.as_array()) {
         for d in docs {
             if let Some(text) = d.as_str() {
-                if !text.is_empty() {
-                    messages.push(aisix_gateway::ChatMessage::user(text.to_string()));
-                }
+                parts.push(text.to_string());
             } else if d.is_object() {
-                messages.push(aisix_gateway::ChatMessage::user(
-                    serde_json::to_string(d).expect("serde_json::Value always serializes"),
-                ));
+                parts.push(serde_json::to_string(d).expect("serde_json::Value always serializes"));
             }
         }
     }
-    aisix_gateway::ChatFormat::new(model, messages)
+    crate::redact::newest_content_for_inspection(model, parts)
 }
 
 async fn dispatch(
@@ -2062,5 +2057,20 @@ mod tests {
             Some(&3),
             "mask counts must reach the UsageEvent"
         );
+    }
+
+    /// The query and every document are new content: the inspection request
+    /// carries them as one message, so a guardrail that checks the newest
+    /// message in full covers all of them, not only the last document.
+    #[test]
+    fn query_and_documents_are_inspected_as_one_newest_message() {
+        let body = serde_json::json!({
+            "model": "m",
+            "query": "q",
+            "documents": ["a", {"text": "b"}, "", "c"],
+        });
+        let chat = super::rerank_input_to_chat("m", &body);
+        let contents: Vec<_> = chat.messages.iter().map(|m| m.content.as_deref()).collect();
+        assert_eq!(contents, [Some("q\na\n{\"text\":\"b\"}\nc")]);
     }
 }

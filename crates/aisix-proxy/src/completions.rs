@@ -348,35 +348,25 @@ pub async fn completions(
     }
 }
 
-/// Build a [`ChatFormat`](aisix_gateway::ChatFormat) of user messages from
-/// the legacy completions `prompt` so the input guardrail chain can scan it
-/// (#545). Token-id prompts are rejected before this projection whenever an
-/// input guardrail applies because the gateway cannot safely rewrite them.
-/// Never sent upstream.
+/// Build a [`ChatFormat`](aisix_gateway::ChatFormat) from the legacy
+/// completions request so the input guardrail chain can scan it (#545).
+/// Token-id prompts are rejected before this projection whenever an input
+/// guardrail applies because the gateway cannot safely rewrite them. Never
+/// sent upstream.
 fn completions_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat {
-    let mut prompt: Vec<aisix_gateway::ChatMessage> = match body.get("prompt") {
-        Some(Value::String(s)) if !s.is_empty() => {
-            vec![aisix_gateway::ChatMessage::user(s.clone())]
-        }
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(|it| it.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| aisix_gateway::ChatMessage::user(s.to_string()))
-            .collect(),
+    let prompt: Vec<&str> = match body.get("prompt") {
+        Some(Value::String(s)) => vec![s.as_str()],
+        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).collect(),
         _ => Vec::new(),
     };
-    // `user` and `suffix` ahead of the prompt, so the prompt's last part
-    // stays last: a guardrail bounding how much it sends checks the newest
-    // text first and in full.
-    let mut messages: Vec<aisix_gateway::ChatMessage> = ["user", "suffix"]
+    // The whole request is new content — `user`, `suffix` and every prompt
+    // item — so it is one newest message, as the segment walk
+    // (`redact_completions_request_structured`) treats it.
+    let parts = ["user", "suffix"]
         .into_iter()
         .filter_map(|field| body.get(field).and_then(Value::as_str))
-        .filter(|text| !text.is_empty())
-        .map(|text| aisix_gateway::ChatMessage::user(text.to_string()))
-        .collect();
-    messages.append(&mut prompt);
-    aisix_gateway::ChatFormat::new(model, messages)
+        .chain(prompt);
+    crate::redact::newest_content_for_inspection(model, parts)
 }
 
 fn completions_prompt_uses_token_ids(body: &Value) -> bool {
@@ -3099,5 +3089,21 @@ mod tests {
             status.cooldown_until.is_some(),
             "a 500 must mark the model in cooldown, got {status:?}"
         );
+    }
+
+    /// `user`, `suffix` and every item of a `prompt` list are new content: the
+    /// inspection request carries them as one message, so a guardrail that
+    /// checks the newest message in full covers all of them.
+    #[test]
+    fn whole_request_is_inspected_as_one_newest_message() {
+        let body = serde_json::json!({
+            "model": "m",
+            "prompt": ["p1", "", "p2"],
+            "suffix": "s",
+            "user": "u",
+        });
+        let chat = super::completions_input_to_chat("m", &body);
+        let contents: Vec<_> = chat.messages.iter().map(|m| m.content.as_deref()).collect();
+        assert_eq!(contents, [Some("u\ns\np1\np2")]);
     }
 }

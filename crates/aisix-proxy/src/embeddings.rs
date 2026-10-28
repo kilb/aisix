@@ -15,7 +15,7 @@
 //! `"type": "not_implemented"`.
 
 use aisix_core::AppliedGuardrail;
-use aisix_gateway::{BridgeError, ChatFormat, ChatMessage, EmbeddingRequest};
+use aisix_gateway::{BridgeError, ChatFormat, EmbeddingRequest};
 use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -63,21 +63,18 @@ impl InputField {
     }
 }
 
-/// Build a [`ChatFormat`] of user messages from the embeddings `input` so
-/// the input guardrail chain can scan it (#719). Each non-empty string
-/// becomes one user message; the synthesized request is never sent
-/// upstream (the original `input` shape is forwarded verbatim).
+/// Build a [`ChatFormat`] from the embeddings `input` so the input
+/// guardrail chain can scan it (#719). Every item is new content, so the
+/// whole list is one newest message (see
+/// [`crate::redact::newest_content_for_inspection`]); the synthesized
+/// request is never sent upstream (the original `input` shape is forwarded
+/// verbatim).
 fn embeddings_input_to_chat(model: &str, input: &InputField) -> ChatFormat {
-    let messages = match input {
-        InputField::Single(s) if !s.is_empty() => vec![ChatMessage::user(s.clone())],
-        InputField::Single(_) => Vec::new(),
-        InputField::Multi(v) => v
-            .iter()
-            .filter(|s| !s.is_empty())
-            .map(|s| ChatMessage::user(s.clone()))
-            .collect(),
+    let items = match input {
+        InputField::Single(s) => std::slice::from_ref(s),
+        InputField::Multi(v) => v.as_slice(),
     };
-    ChatFormat::new(model, messages)
+    crate::redact::newest_content_for_inspection(model, items)
 }
 
 pub async fn embeddings(
@@ -2405,5 +2402,16 @@ mod tests {
             status.cooldown_until.is_some(),
             "a 500 must mark the model in cooldown, got {status:?}"
         );
+    }
+
+    /// Every item of an `input` list is new content: the inspection request
+    /// carries the whole list as one message, so a guardrail that checks the
+    /// newest message in full covers every item, not only the last.
+    #[test]
+    fn input_list_is_inspected_as_one_newest_message() {
+        let input = super::InputField::Multi(vec!["first".into(), String::new(), "second".into()]);
+        let chat = super::embeddings_input_to_chat("m", &input);
+        let contents: Vec<_> = chat.messages.iter().map(|m| m.content.as_deref()).collect();
+        assert_eq!(contents, [Some("first\nsecond")]);
     }
 }

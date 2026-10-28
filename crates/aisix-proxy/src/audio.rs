@@ -644,16 +644,16 @@ async fn multipart_dispatch(
     if !resolved_chain.is_empty() {
         // EVERY `prompt` field: multipart allows repeated names and the form
         // is rebuilt with all of them, so all are scanned — an empty first
-        // field must not skip a later one.
-        let prompt_messages: Vec<ChatMessage> = fields
-            .iter()
-            .filter(|(name, ..)| name == "prompt")
-            .filter_map(|(.., data)| std::str::from_utf8(data).ok())
-            .filter(|s| !s.is_empty())
-            .map(|s| ChatMessage::user(s.to_string()))
-            .collect();
-        if !prompt_messages.is_empty() {
-            let chat = aisix_gateway::ChatFormat::new(&model_name, prompt_messages);
+        // field must not skip a later one. All are new content, so they are
+        // one newest message (see `newest_content_for_inspection`).
+        let chat = crate::redact::newest_content_for_inspection(
+            &model_name,
+            fields
+                .iter()
+                .filter(|(name, ..)| name == "prompt")
+                .filter_map(|(.., data)| std::str::from_utf8(data).ok()),
+        );
+        if !chat.messages.is_empty() {
             let (verdict, hits) =
                 aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
             monitor_hits.extend(hits);
@@ -1118,15 +1118,14 @@ fn transcription_output_text(body: &[u8]) -> String {
 /// Returns `(response, provider_label, model_id)`; `model_id` lets the
 /// handler attribute a (zero-token) UsageEvent (#406).
 /// Build a [`ChatFormat`](aisix_gateway::ChatFormat) from the speech `input`
-/// text so the input guardrail chain can scan it (#545). Never sent upstream.
+/// text so the input guardrail chain can scan it (#545). `input` and
+/// `instructions` are both new content, so they are one newest message (see
+/// [`crate::redact::newest_content_for_inspection`]). Never sent upstream.
 fn speech_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat {
-    let messages = ["input", "instructions"]
+    let parts = ["input", "instructions"]
         .into_iter()
-        .filter_map(|field| body.get(field).and_then(Value::as_str))
-        .filter(|text| !text.is_empty())
-        .map(|text| aisix_gateway::ChatMessage::user(text.to_string()))
-        .collect();
-    aisix_gateway::ChatFormat::new(model, messages)
+        .filter_map(|field| body.get(field).and_then(Value::as_str));
+    crate::redact::newest_content_for_inspection(model, parts)
 }
 
 #[allow(clippy::type_complexity)]
@@ -3017,5 +3016,22 @@ mod tests {
         assert!(event.guardrail_blocked, "event must be marked blocked");
         assert_eq!(event.prompt_tokens, 21, "billed tokens must be kept");
         assert_eq!(event.completion_tokens, 7);
+    }
+
+    /// A speech request's `input` and `instructions` are both new content: the
+    /// inspection request carries them as one message, so a guardrail that
+    /// checks the newest message in full covers the input, not only the
+    /// instructions after it.
+    #[test]
+    fn speech_input_and_instructions_are_inspected_as_one_newest_message() {
+        let body = serde_json::json!({
+            "model": "m",
+            "input": "say this",
+            "instructions": "softly",
+            "voice": "alloy",
+        });
+        let chat = super::speech_input_to_chat("m", &body);
+        let contents: Vec<_> = chat.messages.iter().map(|m| m.content.as_deref()).collect();
+        assert_eq!(contents, [Some("say this\nsoftly")]);
     }
 }
