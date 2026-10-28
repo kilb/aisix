@@ -1631,6 +1631,9 @@ async fn responses_to_target(
         let output_policy = aisix_guardrails::Guardrail::stream_output_policy(chain);
         let mut upstream_stream = Some(upstream_resp.bytes_stream());
         let mut released_body_stream: Option<RawResponsesByteStream> = None;
+        // fail-open 放行时，扣留期间边读边量到的上游首帧时刻。放行后的流会把
+        // 缓冲前缀重新解析一遍，那时“看到”首帧已经是放行时刻了。
+        let mut released_ttft: Option<Duration> = None;
         if aisix_guardrails::Guardrail::runs_on_output(chain) && output_policy.holds_back() {
             // Hold the whole SSE response back to scan it, but cap the
             // buffer so a huge (or malicious) upstream response can't OOM the
@@ -1782,6 +1785,7 @@ async fn responses_to_target(
                         let remaining =
                             crate::stream_timeout::with_read_timeout_bytes(stream, read_to);
                         released_body_stream = Some(Box::pin(prefix.chain(remaining)));
+                        released_ttft = observed_usage.as_ref().and_then(|u| u.upstream_ttft);
                         break;
                     }
                     tracing::warn!(
@@ -2170,6 +2174,7 @@ async fn responses_to_target(
             body_stream,
             started,
             attempt_started,
+            released_ttft,
             content_cap,
             eos_scan,
             initial_capture_safe,
@@ -3327,10 +3332,14 @@ fn drain_responses_sse_frames(
             // phase on hidden-reasoning upstreams — #1225.
             if !*first_frame_seen {
                 *first_frame_seen = true;
-                let ttft = attempt_started.elapsed();
                 let usage = acc.get_or_insert_with(Default::default);
-                usage.upstream_ttft_ms = ttft.as_millis().min(u32::MAX as u128) as u32;
-                usage.upstream_ttft = Some(ttft);
+                // 已带着首帧时刻进来的（fail-open 放行的流）不覆盖：这一帧是
+                // 重新解析的缓冲前缀，此刻是放行时刻。
+                if usage.upstream_ttft.is_none() {
+                    let ttft = attempt_started.elapsed();
+                    usage.upstream_ttft_ms = ttft.as_millis().min(u32::MAX as u128) as u32;
+                    usage.upstream_ttft = Some(ttft);
+                }
             }
             // `resp_…` off any frame that carries the response object —
             // `response.created` is the first, so a stream that dies
@@ -3648,12 +3657,16 @@ struct EosOutputObservation {
 /// end-of-stream scan's monitor hits (#1010, empty without
 /// `eos_scan`). Bytes forward verbatim — the client sees the exact upstream
 /// SSE wire shape.
+#[allow(clippy::too_many_arguments)]
 fn build_responses_passthrough_stream<S, F>(
     upstream: S,
     // Request clock — what the CALLER waited for.
     started: Instant,
     // Attempt clock — how the UPSTREAM behaved.
     attempt_started: Instant,
+    // 首帧已在别处量过（扣留缓冲 fail-open 放行）：报这个时刻，不按本流
+    // 重新解析到首帧的时刻重新计。
+    measured_ttft: Option<Duration>,
     content_cap: Option<u32>,
     eos_scan: Option<EosOutputScan>,
     initial_capture_safe: bool,
@@ -3702,7 +3715,11 @@ where
             slot: Some((
                 on_complete,
                 ResponsesStreamState {
-                    usage: None,
+                    usage: measured_ttft.map(|ttft| ResponseUsage {
+                        upstream_ttft_ms: ttft.as_millis().min(u32::MAX as u128) as u32,
+                        upstream_ttft: Some(ttft),
+                        ..Default::default()
+                    }),
                     capture: capture_cap.map(SseTextCapture::new),
                     // A live output-guarded response is uninspected until its
                     // end-of-stream provider call completes.
@@ -6456,6 +6473,50 @@ data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\"
         );
     }
 
+    /// 扣留缓冲 fail-open 放行后，前缀会在放行时刻被重新解析；TTFT 必须是扣留时
+    /// 量到的首帧时刻，而不是这一刻。首帧解析仍按“首帧”处理（去 BOM），否则
+    /// 带 BOM 的 `response.created` 读不出来，它带的 id 就丢了。
+    #[tokio::test]
+    async fn released_stream_keeps_the_ttft_measured_before_release() {
+        use futures::StreamExt;
+        use std::sync::{Arc, Mutex};
+
+        let upstream = futures::stream::iter([Ok::<_, crate::stream_timeout::RawStreamError>(
+            bytes::Bytes::from_static(
+                "\u{FEFF}data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_released\"}}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n"
+                    .as_bytes(),
+            ),
+        )]);
+        let captured = Arc::new(Mutex::new(None));
+        let captured_out = Arc::clone(&captured);
+        let measured = std::time::Duration::from_millis(250);
+        let now = std::time::Instant::now();
+        let stream = super::build_responses_passthrough_stream(
+            upstream,
+            now,
+            now,
+            Some(measured),
+            None,
+            None,
+            true,
+            move |usage, _, _, _, _| {
+                *captured_out.lock().unwrap() = Some(usage);
+            },
+        );
+        futures::pin_mut!(stream);
+        while stream.next().await.is_some() {}
+
+        let usage = captured.lock().unwrap().take().expect("on_complete fired");
+        assert_eq!(usage.prompt_tokens, 3, "the terminal frame's usage landed");
+        assert_eq!(usage.upstream_ttft, Some(measured));
+        assert_eq!(usage.upstream_ttft_ms, 250);
+        assert_eq!(
+            usage.provider_request_id, "resp_released",
+            "the BOM-led first frame still parses as the first frame"
+        );
+    }
+
     #[tokio::test]
     async fn native_stream_stops_polling_after_response_completed() {
         use futures::StreamExt;
@@ -6475,6 +6536,7 @@ event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\
             upstream,
             now,
             now,
+            None,
             None,
             None,
             true,

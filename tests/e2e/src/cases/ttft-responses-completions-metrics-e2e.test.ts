@@ -124,6 +124,63 @@ function completionsStream(): string[] {
   ];
 }
 
+/**
+ * 第二帧的正文：一帧就超过下面扣留缓冲的上限，缓冲在它到达时（LEAD_MS + GAP_MS）
+ * 溢出、按 fail-open 放行。不含邮箱，打码检测器不会动它。
+ */
+const OVERFLOW_TEXT = "a".repeat(2_048);
+
+/** 原生 Responses SSE，第二帧撑爆扣留缓冲。 */
+function overflowingResponsesStream(): string[] {
+  return [
+    JSON.stringify({ type: "response.created", response: { id: "resp_ttft_metrics" } }),
+    JSON.stringify({ type: "response.output_text.delta", delta: OVERFLOW_TEXT }),
+    JSON.stringify({
+      type: "response.completed",
+      response: {
+        id: "resp_ttft_metrics",
+        status: "completed",
+        usage: { input_tokens: 6, output_tokens: 2 },
+      },
+    }),
+    "[DONE]",
+  ];
+}
+
+/** 桥接路径的 chat SSE，第二帧撑爆扣留缓冲。 */
+function overflowingChatStream(): string[] {
+  return [
+    chatChunk({ role: "assistant", content: "" }),
+    chatChunk({ content: OVERFLOW_TEXT }),
+    JSON.stringify({
+      id: "chatcmpl-ttft-metrics",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "deepseek-chat",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      usage: { prompt_tokens: 6, completion_tokens: 2, total_tokens: 8 },
+    }),
+    "[DONE]",
+  ];
+}
+
+/** 旧版 completions SSE，第二帧撑爆扣留缓冲。 */
+function overflowingCompletionsStream(): string[] {
+  return [
+    completionChunk("answer "),
+    completionChunk(OVERFLOW_TEXT),
+    JSON.stringify({
+      id: "cmpl-ttft-metrics",
+      object: "text_completion",
+      created: 1,
+      model: "gpt-3.5-turbo-instruct",
+      choices: [{ index: 0, text: "", finish_reason: "stop", logprobs: null }],
+      usage: { prompt_tokens: 6, completion_tokens: 2, total_tokens: 8 },
+    }),
+    "[DONE]",
+  ];
+}
+
 type Provider = "openai" | "deepseek";
 
 /**
@@ -316,6 +373,7 @@ async function expectStreamTtft(
   model: string,
   body: Record<string, unknown>,
   heldBack = false,
+  releasedAtMs = LEAD_MS + 2 * GAP_MS,
 ): Promise<void> {
   const want = { endpoint: path, model };
   const histogramWant = { ...want, streaming: "true" };
@@ -336,7 +394,7 @@ async function expectStreamTtft(
     // 场景本身成立：调用方直到上游几乎发完才收到第一个字节，确实走的是扣留路径。
     // 这样下面“TTFT 停在首帧”的上界才说明 TTFT 没有被放行时刻顶替。
     expect(firstByteMs, "caller's first byte waits for the held stream").toBeGreaterThanOrEqual(
-      LEAD_MS + 2 * GAP_MS,
+      releasedAtMs,
     );
   }
   expect(
@@ -510,5 +568,77 @@ describe("TTFT metrics on /v1/responses and /v1/completions streams under a hold
     const upstream = await streamingUpstream(fx, completionsStream());
     await createModel(fx, model, upstream, "openai", "gpt-3.5-turbo-instruct");
     await expectStreamTtft(fx, "/v1/completions", model, { prompt: "hello" }, true);
+  });
+});
+
+// 扣留缓冲溢出、按 fail-open 放行：缓冲里已有的前缀和后面的实时流一起转发。
+// 首帧在 LEAD_MS 到达、被缓冲；放行发生在第二帧把缓冲撑爆的时候
+// （LEAD_MS + GAP_MS 之后）。TTFT 报的必须是首帧到达的时刻 —— 放行后重新
+// 解析前缀时“看到”首帧的时刻是放行时刻，不是上游开口的时刻。
+describe("TTFT metrics on /v1/responses and /v1/completions streams released by a fail-open buffer overflow", () => {
+  const fx = gatewayFixture(async (seed) => {
+    await seed.createGuardrail({
+      name: "ttft-metrics-overflow-fail-open",
+      enabled: true,
+      hook_point: "output",
+      kind: "pii",
+      detectors: [{ type: "email", action: "mask" }],
+      max_buffer_bytes: 1_024,
+      on_buffer_exceeded: "fail_open",
+    });
+  });
+
+  test("released native /v1/responses stream reports the first frame's arrival", async (ctx) => {
+    if (!fx.etcdReachable || !fx.app) {
+      ctx.skip();
+      return;
+    }
+    const model = "ttft-m-of-resp-native";
+    const upstream = await streamingUpstream(fx, overflowingResponsesStream());
+    await createModel(fx, model, upstream, "openai", "gpt-4o-mini");
+    await expectStreamTtft(
+      fx,
+      "/v1/responses",
+      model,
+      { input: "hello" },
+      true,
+      LEAD_MS + GAP_MS,
+    );
+  });
+
+  test("released bridged /v1/responses stream reports the first frame's arrival", async (ctx) => {
+    if (!fx.etcdReachable || !fx.app) {
+      ctx.skip();
+      return;
+    }
+    const model = "ttft-m-of-resp-bridge";
+    const upstream = await streamingUpstream(fx, overflowingChatStream());
+    await createModel(fx, model, upstream, "deepseek", "deepseek-chat");
+    await expectStreamTtft(
+      fx,
+      "/v1/responses",
+      model,
+      { input: "hello" },
+      true,
+      LEAD_MS + GAP_MS,
+    );
+  });
+
+  test("released /v1/completions stream reports the first frame's arrival", async (ctx) => {
+    if (!fx.etcdReachable || !fx.app) {
+      ctx.skip();
+      return;
+    }
+    const model = "ttft-m-of-cmpl";
+    const upstream = await streamingUpstream(fx, overflowingCompletionsStream());
+    await createModel(fx, model, upstream, "openai", "gpt-3.5-turbo-instruct");
+    await expectStreamTtft(
+      fx,
+      "/v1/completions",
+      model,
+      { prompt: "hello" },
+      true,
+      LEAD_MS + GAP_MS,
+    );
   });
 });
