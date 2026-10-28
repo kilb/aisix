@@ -28,8 +28,8 @@ pub use bridge::{
 };
 pub use error::A2aError;
 pub use telemetry::{
-    artifact_chunk, canonical_operation, is_stream_end, is_streaming_operation,
-    redact_request_text, request_scan, request_scan_text, request_text,
+    artifact_chunk, canonical_operation, ends_streamed_answer, is_stream_end,
+    is_streaming_operation, redact_request_text, request_scan, request_scan_text, request_text,
     request_would_mask_unrewritable, requests_push_delivery, result_scan, result_scan_text,
     A2aCallFacts, ArtifactChunk, CallScan, ResultText,
 };

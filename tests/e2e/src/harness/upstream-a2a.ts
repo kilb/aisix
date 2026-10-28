@@ -62,11 +62,19 @@ export interface A2aUpstreamOptions {
    */
   streamAnswer?: boolean;
   /**
-   * Stream this answer instead of [`STREAM_ANSWER`]: each string is one
-   * continued artifact chunk, with the same progress note and closing
+   * Stream this answer instead of [`STREAM_ANSWER`]: each entry is one
+   * continued artifact chunk — a string is a single text part, an array is
+   * the chunk's parts as written — with the same progress note and closing
    * statement around them. Implies `streamAnswer`.
    */
-  streamChunks?: string[];
+  streamChunks?: Array<string | unknown[]>;
+  /**
+   * Answer a streamed call with this one Message and nothing else, the way an
+   * agent that replies without creating a task does.
+   */
+  streamMessage?: string;
+  /** Answer a streamed call with this one JSON-RPC `error` event and nothing else. */
+  streamError?: Record<string, unknown>;
   /**
    * Leave the connection open after the final event, the way some agents do:
    * a client is expected to stop reading at the final event, not wait for EOF.
@@ -157,6 +165,8 @@ export async function startA2aUpstream(
       streamChunks:
         options.streamChunks ?? (options.streamAnswer ? [...STREAM_ANSWER] : undefined),
       holdStreamOpen: options.holdStreamOpen ?? false,
+      streamMessage: options.streamMessage,
+      streamError: options.streamError,
       openStreams,
       unaryAnswer: options.unaryAnswer ?? "The invoice is settled.",
       unaryTask: options.unaryTask ?? {},
@@ -200,8 +210,10 @@ async function handle(
     cardPath: string;
     token?: string;
     wireShape: A2aWireShape;
-    streamChunks?: string[];
+    streamChunks?: Array<string | unknown[]>;
     holdStreamOpen: boolean;
+    streamMessage?: string;
+    streamError?: Record<string, unknown>;
     openStreams: Set<ServerResponse>;
     unaryAnswer: string;
     unaryTask: Record<string, unknown>;
@@ -250,6 +262,7 @@ async function handle(
    */
   const V1_PAYLOAD_KEY = {
     task: "task",
+    message: "message",
     "status-update": "statusUpdate",
     "artifact-update": "artifactUpdate",
   } as const;
@@ -304,6 +317,33 @@ async function handle(
     // the first event lands sub-millisecond and a time-to-first-event of 0 is
     // indistinguishable from one that was never recorded.
     await new Promise((resolve) => setTimeout(resolve, STREAM_GAP_MS));
+    const holdOrEnd = () => {
+      if (ctx.holdStreamOpen) {
+        ctx.openStreams.add(res);
+        res.on("close", () => ctx.openStreams.delete(res));
+        return;
+      }
+      res.end();
+    };
+    if (ctx.streamMessage !== undefined) {
+      res.write(
+        envelope(
+          payload("message", {
+            messageId: "msg-e2e-stream",
+            contextId,
+            role: ctx.wireShape === "1.0" ? "ROLE_AGENT" : "agent",
+            parts: [{ kind: "text", text: ctx.streamMessage }],
+          }),
+        ),
+      );
+      holdOrEnd();
+      return;
+    }
+    if (ctx.streamError !== undefined) {
+      res.write(`data: ${JSON.stringify({ jsonrpc: "2.0", id: body?.id ?? null, error: ctx.streamError })}\n\n`);
+      holdOrEnd();
+      return;
+    }
     res.write(
       envelope(
         payload("status-update", {
@@ -322,6 +362,8 @@ async function handle(
       envelope(payload("status-update", { taskId: "task-e2e-stream", contextId, seq: 2 })),
     );
     if (ctx.streamChunks) {
+      const parts = (chunk: string | unknown[]) =>
+        typeof chunk === "string" ? [{ kind: "text", text: chunk }] : chunk;
       const [first, ...rest] = ctx.streamChunks;
       // The answer in continued chunks with a progress note after the first:
       // an accumulator that lets a note replace the answer keeps only the note.
@@ -332,7 +374,7 @@ async function handle(
             contextId,
             artifact: {
               artifactId: "report",
-              parts: [{ kind: "text", text: first }],
+              parts: parts(first),
             },
           }),
         ),
@@ -358,7 +400,7 @@ async function handle(
               append: true,
               artifact: {
                 artifactId: "report",
-                parts: [{ kind: "text", text: chunk }],
+                parts: parts(chunk),
               },
             }),
           ),
@@ -381,12 +423,7 @@ async function handle(
         }),
       ),
     );
-    if (ctx.holdStreamOpen) {
-      ctx.openStreams.add(res);
-      res.on("close", () => ctx.openStreams.delete(res));
-      return;
-    }
-    res.end();
+    holdOrEnd();
     return;
   }
 

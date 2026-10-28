@@ -140,6 +140,15 @@ function artifactText(events: SseEvent[]): string {
 
 const isError = (e: SseEvent) => e.data.error !== undefined;
 
+/** 一段既不是文本、也没有任何文件签名的字节，按协议以 base64 承载。 */
+const NOISE_B64 = Buffer.from(Array.from({ length: 512 }, (_, i) => (i * 37 + 11) % 256)).toString("base64");
+const noiseFilePart = (v: Wire) =>
+  v === "0.3"
+    ? { kind: "file", file: { name: "blob.bin", mimeType: "application/octet-stream", bytes: NOISE_B64 } }
+    : { raw: NOISE_B64, mediaType: "application/octet-stream", filename: "blob.bin" };
+/** 比关键词护栏默认缓冲上限（256 KiB）大的一段干净文本。 */
+const HUGE_TEXT = "steady progress report line. ".repeat(10_000);
+
 describe("A2A output guardrails hold streamed answers back and refuse push delivery", () => {
   let app: SpawnedApp | undefined;
   const upstreams = new Map<string, A2aUpstream>();
@@ -156,12 +165,21 @@ describe("A2A output guardrails hold streamed answers back and refuse push deliv
       body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
     });
 
-  const AGENTS: Record<string, { streamChunks: string[]; holdStreamOpen?: boolean }> = {
-    clean: { streamChunks: CLEAN_CHUNKS },
-    risky: { streamChunks: RISKY_CHUNKS },
-    split: { streamChunks: SPLIT_CHUNKS },
-    "open-clean": { streamChunks: CLEAN_CHUNKS, holdStreamOpen: true },
-    "open-risky": { streamChunks: RISKY_CHUNKS, holdStreamOpen: true },
+  const AGENTS: Record<string, (v: Wire) => Parameters<typeof startA2aUpstream>[0]> = {
+    clean: () => ({ streamChunks: CLEAN_CHUNKS }),
+    risky: () => ({ streamChunks: RISKY_CHUNKS }),
+    split: () => ({ streamChunks: SPLIT_CHUNKS }),
+    "open-clean": () => ({ streamChunks: CLEAN_CHUNKS, holdStreamOpen: true }),
+    "open-risky": () => ({ streamChunks: RISKY_CHUNKS, holdStreamOpen: true }),
+    // 只用一条 Message 回答、然后不关连接的 agent。
+    "open-message": () => ({ streamMessage: "All done here.", holdStreamOpen: true }),
+    "open-message-risky": () => ({ streamMessage: `found ${MARKER}`, holdStreamOpen: true }),
+    // 只回一个 JSON-RPC 错误事件、然后不关连接的 agent。
+    "open-error": () => ({ streamError: { code: -32001, message: "Task not found" }, holdStreamOpen: true }),
+    // 流里的 artifact 是一个读不出内容的文件。
+    "stream-noise": (v) => ({ streamChunks: [[noiseFilePart(v)]] }),
+    // 一个超过护栏缓冲上限的干净回答。
+    "stream-huge": () => ({ streamChunks: [HUGE_TEXT] }),
   };
 
   beforeAll(async () => {
@@ -170,7 +188,7 @@ describe("A2A output guardrails hold streamed answers back and refuse push deliv
     if (!etcdReachable) return;
     for (const v of WIRES) {
       for (const [name, opts] of Object.entries(AGENTS)) {
-        upstreams.set(agentName(name, v), await startA2aUpstream({ wireShape: v, ...opts }));
+        upstreams.set(agentName(name, v), await startA2aUpstream({ wireShape: v, ...opts(v) }));
       }
     }
     app = await spawnApp();
@@ -248,6 +266,49 @@ describe("A2A output guardrails hold streamed answers back and refuse push deliv
           expect(wire).toContain(CLOSING);
         });
       }
+
+      test("a stream that is a single Message the agent leaves open is delivered at once", async (ctx) => {
+        if (!etcdReachable || !app) return ctx.skip();
+        // 用一条 Message 回答就说完了：调用方读到它就停，不会等连接关闭。
+        const res = await call(v, "open-message", STREAM[v], { message: message(v, "hello") });
+        expect(res.status).toBe(200);
+        const { wire, timedOut } = await readSse(res, (e) => JSON.stringify(e.data).includes("All done here."), 5_000);
+        expect(timedOut, `the Message never arrived; got: ${wire.slice(0, 300)}`).toBe(false);
+      });
+
+      test("a single flagged Message the agent leaves open is refused at once", async (ctx) => {
+        if (!etcdReachable || !app) return ctx.skip();
+        const res = await call(v, "open-message-risky", STREAM[v], { message: message(v, "hello") });
+        const { events, wire, timedOut } = await readSse(res, isError, 5_000);
+        expect(wire).not.toContain(MARKER);
+        expect(timedOut, `no refusal arrived; got: ${wire.slice(0, 300)}`).toBe(false);
+        expect(events.some(isError)).toBe(true);
+      });
+
+      test("a lone error event the agent leaves open is relayed at once", async (ctx) => {
+        if (!etcdReachable || !app) return ctx.skip();
+        const res = await call(v, "open-error", STREAM[v], { message: message(v, "hello") });
+        const { wire, timedOut } = await readSse(res, (e) => JSON.stringify(e.data).includes("Task not found"), 5_000);
+        expect(timedOut, `the error never arrived; got: ${wire.slice(0, 300)}`).toBe(false);
+      });
+
+      test("a streamed file the scan cannot read is refused, not relayed unread", async (ctx) => {
+        if (!etcdReachable || !app) return ctx.skip();
+        const res = await call(v, "stream-noise", STREAM[v], { message: message(v, "send the file") });
+        const { events, wire } = await readSse(res);
+        expect(wire).not.toContain(NOISE_B64.slice(0, 64));
+        expect(wire).not.toContain(CLOSING);
+        expect(res.status !== 200 || events.some(isError), wire.slice(0, 300)).toBe(true);
+      });
+
+      test("a streamed answer larger than the guardrail can hold is refused, not released unchecked", async (ctx) => {
+        if (!etcdReachable || !app) return ctx.skip();
+        // 关键词护栏默认缓冲上限以内整段扣住再审；超出且未设 fail_open 时拒绝。
+        const res = await call(v, "stream-huge", STREAM[v], { message: message(v, "write it all") });
+        const { events, wire } = await readSse(res);
+        expect(wire).not.toContain(HUGE_TEXT.slice(0, 200));
+        expect(res.status !== 200 || events.some(isError), wire.slice(0, 300)).toBe(true);
+      });
 
       test("a clean stream the agent leaves open still delivers its final event", async (ctx) => {
         if (!etcdReachable || !app) return ctx.skip();
@@ -577,4 +638,73 @@ describe("A2A streams under a window-moderated output guardrail", () => {
       expect(events.at(-1)!.at - events[0].at).toBeGreaterThan(150);
     });
   }
+});
+
+describe("A2A streams under a buffering guardrail set to fail open", () => {
+  let app: SpawnedApp | undefined;
+  let moderation: Awaited<ReturnType<typeof startModeration>> | undefined;
+  let agent: A2aUpstream | undefined;
+  const KEY_OPEN = "sk-a2a-guardrail-stream-fail-open";
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    if (!(await etcd.ping())) return;
+    moderation = await startModeration();
+    agent = await startA2aUpstream({ streamChunks: ["x".repeat(4_000), " the end"] });
+    app = await spawnApp();
+    const seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.update("a2a_agents", randomUUID(), {
+      name: "open-huge",
+      url: agent.url,
+      protocol_version: "0.3",
+      auth_type: "none",
+      enabled: true,
+    });
+    await seed.createGuardrail({
+      name: "a2a-stream-aliyun-fail-open",
+      enabled: true,
+      hook_point: "output",
+      fail_open: false,
+      kind: "aliyun_text_moderation",
+      region: "cn-shanghai",
+      endpoint: moderation.baseUrl,
+      access_key_id: "LTAI_E2E",
+      access_key_secret: "e2e-secret",
+      risk_level_threshold: "high",
+      stream_processing_mode: "buffer_full",
+      max_buffer_bytes: 1024,
+      on_buffer_exceeded: "fail_open",
+    });
+    await seed.createApiKey({ key_hash: sha256(KEY_OPEN), allowed_models: [], allowed_agents: ["*"] });
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, { headers: { authorization: `Bearer ${KEY_OPEN}` } });
+      await res.arrayBuffer();
+      return res.status === 200;
+    });
+  }, 60_000);
+
+  afterAll(async () => {
+    await app?.exit();
+    await agent?.close();
+    await moderation?.close();
+  });
+
+  test("an answer over the buffer is released in full, as the operator chose", async (ctx) => {
+    if (!app) return ctx.skip();
+    const res = await fetch(`${app.proxyUrl}/a2a/open-huge`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY_OPEN}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "message/stream",
+        params: { message: message("0.3", "write it all") },
+      }),
+    });
+    expect(res.status).toBe(200);
+    const { events, wire } = await readSse(res);
+    expect(events.some(isError), wire.slice(0, 300)).toBe(false);
+    expect(artifactText(events)).toBe("x".repeat(4_000) + " the end");
+    expect(wire).toContain(CLOSING);
+  });
 });

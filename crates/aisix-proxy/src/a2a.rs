@@ -886,9 +886,14 @@ async fn dispatch_stream(
             }
             let ends = is_stream_end(&value);
             let verdict = match review.as_mut() {
+                // Released at the end of the ANSWER, which a lone Message or
+                // a JSON-RPC error also is, not only at a task's terminal
+                // event: either may be the last thing an agent that keeps the
+                // connection open ever sends.
                 Some(review) => {
+                    let answer_ends = aisix_a2a::ends_streamed_answer(&value);
                     review
-                        .admit(&value, ends, &mut guard.call.guardrail_monitor_hits)
+                        .admit(&value, answer_ends, &mut guard.call.guardrail_monitor_hits)
                         .await
                 }
                 None => StreamVerdict::Release(vec![HeldEvent::of(&value)]),
@@ -992,7 +997,9 @@ const MAX_HELD_STREAM_BYTES: usize = 1024 * 1024;
 const DEFAULT_CARRY_CHARS: usize = 256;
 
 /// How many artifacts a review follows at once. A stream that opens more
-/// stops being followed for the oldest; each chunk is still scanned whole.
+/// stops being followed for the oldest; each chunk is still scanned whole,
+/// and a later chunk continuing a dropped artifact refuses the answer, since
+/// the phrase it finishes can no longer be read.
 const MAX_FOLLOWED_ARTIFACTS: usize = 64;
 
 /// One streamed event, serialized for the wire.
@@ -1058,6 +1065,10 @@ struct StreamReview {
     /// The end of the last scanned text, read again in front of the next.
     overlap: String,
     artifacts: Vec<FollowedArtifact>,
+    /// Set once an artifact has been dropped from `artifacts` to make room.
+    /// From then on a chunk continuing an artifact the review does not follow
+    /// may continue one it dropped, whose earlier text it no longer has.
+    dropped_artifacts: bool,
     /// Set once a fail-open buffer cap has been exceeded: from then on events
     /// pass unreviewed, as the guardrail's own setting asks.
     fail_opened: bool,
@@ -1075,6 +1086,7 @@ impl StreamReview {
             unscanned_chars: 0,
             overlap: String::new(),
             artifacts: Vec::new(),
+            dropped_artifacts: false,
             fail_opened: false,
         }
     }
@@ -1103,7 +1115,13 @@ impl StreamReview {
             };
         }
         if let Some(chunk) = aisix_a2a::artifact_chunk(event) {
-            self.follow(chunk);
+            if !self.follow(chunk) && self.policy.holds_back() {
+                return StreamVerdict::Refuse {
+                    reason: "streamed artifact continues one the review no longer follows"
+                        .to_string(),
+                    guardrail_name: None,
+                };
+            }
         }
         if !self.unscanned.is_empty() {
             self.unscanned.push('\n');
@@ -1186,8 +1204,9 @@ impl StreamReview {
     }
 
     /// Continue (or, without `append`, restart) the text of the artifact a
-    /// chunk belongs to.
-    fn follow(&mut self, chunk: aisix_a2a::ArtifactChunk) {
+    /// chunk belongs to. `false` when the chunk continues an artifact the
+    /// review may have dropped: its text can no longer be read whole.
+    fn follow(&mut self, chunk: aisix_a2a::ArtifactChunk) -> bool {
         if let Some(artifact) = self
             .artifacts
             .iter_mut()
@@ -1198,16 +1217,21 @@ impl StreamReview {
             }
             artifact.text.push_str(&chunk.text);
             artifact.fresh = true;
-            return;
+            return true;
+        }
+        if chunk.append && self.dropped_artifacts {
+            return false;
         }
         if self.artifacts.len() >= MAX_FOLLOWED_ARTIFACTS {
             self.artifacts.remove(0);
+            self.dropped_artifacts = true;
         }
         self.artifacts.push(FollowedArtifact {
             id: chunk.artifact_id,
             text: chunk.text,
             fresh: true,
         });
+        true
     }
 
     /// Scan everything read since the last scan — with the overlap carried
@@ -1557,6 +1581,149 @@ fn emit_a2a_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A review under a keyword rule on the output hook: its default policy
+    /// holds the whole answer back.
+    fn keyword_review(phrase: &str) -> StreamReview {
+        let keyword = aisix_guardrails::KeywordBlocklist::output_only(vec![
+            aisix_guardrails::KeywordRule::literal(phrase),
+        ]);
+        StreamReview::new(aisix_guardrails::GuardrailChain::new(vec![
+            std::sync::Arc::new(keyword) as std::sync::Arc<dyn aisix_guardrails::Guardrail>,
+        ]))
+    }
+
+    fn chunk(id: &str, append: bool, text: &str) -> serde_json::Value {
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
+            "kind": "artifact-update", "taskId": "t", "append": append,
+            "artifact": {"artifactId": id, "parts": [{"kind": "text", "text": text}]}}})
+    }
+
+    fn released(verdict: StreamVerdict) -> usize {
+        match verdict {
+            StreamVerdict::Release(events) => events.len(),
+            StreamVerdict::Refuse { reason, .. } => panic!("refused: {reason}"),
+        }
+    }
+
+    fn refused(verdict: StreamVerdict) -> bool {
+        matches!(verdict, StreamVerdict::Refuse { .. })
+    }
+
+    #[tokio::test]
+    async fn a_phrase_split_across_appended_chunks_is_read_whole() {
+        let mut hits = Vec::new();
+        let mut review = keyword_review("forbiddenword");
+        assert_eq!(
+            released(
+                review
+                    .admit(&chunk("a", false, "the forbid"), false, &mut hits)
+                    .await
+            ),
+            0
+        );
+        assert!(refused(
+            review
+                .admit(&chunk("a", true, "denword"), true, &mut hits)
+                .await
+        ));
+        // The same two chunks of two different artifacts are not one text.
+        let mut review = keyword_review("forbiddenword");
+        assert_eq!(
+            released(
+                review
+                    .admit(&chunk("a", false, "the forbid"), false, &mut hits)
+                    .await
+            ),
+            0
+        );
+        assert_eq!(
+            released(
+                review
+                    .admit(&chunk("b", true, "denword"), true, &mut hits)
+                    .await
+            ),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chunk_continuing_a_dropped_artifact_refuses_the_answer() {
+        let mut hits = Vec::new();
+        let mut review = keyword_review("forbiddenword");
+        review
+            .admit(&chunk("first", false, "the forbid"), false, &mut hits)
+            .await;
+        for i in 0..MAX_FOLLOWED_ARTIFACTS {
+            let verdict = review
+                .admit(
+                    &chunk(&format!("other-{i}"), false, "filler"),
+                    false,
+                    &mut hits,
+                )
+                .await;
+            assert!(!refused(verdict));
+        }
+        // `first` was dropped to make room; its continuation can no longer be
+        // read with the text before it.
+        assert!(refused(
+            review
+                .admit(&chunk("first", true, "denword"), false, &mut hits)
+                .await
+        ));
+    }
+
+    #[tokio::test]
+    async fn everything_held_is_released_when_the_answer_ends() {
+        let mut hits = Vec::new();
+        let mut review = keyword_review("forbiddenword");
+        assert_eq!(
+            released(
+                review
+                    .admit(&chunk("a", false, "all"), false, &mut hits)
+                    .await
+            ),
+            0
+        );
+        assert_eq!(
+            released(
+                review
+                    .admit(&chunk("a", true, " clear"), false, &mut hits)
+                    .await
+            ),
+            0
+        );
+        let message = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
+            "kind": "message", "role": "agent", "parts": [{"kind": "text", "text": "done"}]}});
+        assert_eq!(released(review.admit(&message, true, &mut hits).await), 3);
+    }
+
+    #[tokio::test]
+    async fn a_streamed_event_the_scan_cannot_read_refuses_the_answer() {
+        let mut hits = Vec::new();
+        let mut review = keyword_review("forbiddenword");
+        let noise: String = {
+            use base64::Engine as _;
+            let bytes: Vec<u8> = (0..512u32).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        };
+        let file = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
+            "kind": "artifact-update", "taskId": "t", "artifact": {"artifactId": "f", "parts": [
+                {"kind": "file", "file": {"mimeType": "application/octet-stream", "bytes": noise}}]}}});
+        assert!(refused(review.admit(&file, false, &mut hits).await));
+    }
+
+    #[tokio::test]
+    async fn an_answer_over_the_buffer_cap_is_refused_when_the_rule_fails_closed() {
+        let mut hits = Vec::new();
+        let mut review = keyword_review("forbiddenword");
+        let big = "x".repeat(aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES + 1);
+        assert!(refused(
+            review
+                .admit(&chunk("a", false, &big), false, &mut hits)
+                .await
+        ));
+    }
 
     #[test]
     fn error_status_maps_transport_errors_to_502() {

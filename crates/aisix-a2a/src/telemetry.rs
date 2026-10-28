@@ -190,6 +190,28 @@ pub fn is_stream_end(event: &Value) -> bool {
     STREAM_ENDING_STATES.contains(&normalize_task_state(state))
 }
 
+/// Whether a streamed event leaves nothing more for a caller to wait for:
+/// the stream's terminal event ([`is_stream_end`]), a Message — an agent that
+/// answers a streamed call with a Message rather than a Task says all it has
+/// to say in that one event — or a JSON-RPC error.
+///
+/// Wider than [`is_stream_end`] on purpose. That one marks where a TASK
+/// stream ends, for telemetry, where an error envelope is a refusal rather
+/// than a stream. Anything holding events back must release them at any of
+/// these, or a caller whose agent keeps the connection open waits forever.
+pub fn ends_streamed_answer(event: &Value) -> bool {
+    if is_stream_end(event) || event.get("error").is_some() {
+        return true;
+    }
+    let Some(result) = event.get("result") else {
+        return false;
+    };
+    match result.get("kind").and_then(Value::as_str) {
+        Some(kind) => kind == "message",
+        None => result.get("message").is_some_and(Value::is_object),
+    }
+}
+
 /// What one A2A call touched, accumulated as its request and response(s) are
 /// seen.
 ///
@@ -422,19 +444,33 @@ pub fn requests_push_delivery(request: &Value) -> bool {
             call.iter()
                 .any(|(key, value)| match normalized_name(key).as_str() {
                     "method" => value.as_str().is_some_and(method_sets_push),
-                    "params" => value.as_object().is_some_and(|params| {
-                        params.iter().any(|(key, value)| {
-                            normalized_name(key) == "configuration"
-                                && value.as_object().is_some_and(|configuration| {
-                                    configuration.iter().any(|(key, value)| {
-                                        !value.is_null() && names_push_notification(key)
-                                    })
-                                })
-                        })
-                    }),
+                    "params" => params_set_push(value),
                     _ => false,
                 })
         }
+        _ => false,
+    }
+}
+
+/// Whether a call's `params` carry a push config: under `configuration` (any
+/// non-null push key), or as a push config object directly in `params` (the
+/// shape a setter takes, and older drafts' `pushNotification`). Positional
+/// params — an array — are read item by item. A push key holding a plain
+/// value, such as the `pushNotificationConfigId` a read or delete names, is
+/// not a config.
+fn params_set_push(params: &Value) -> bool {
+    match params {
+        Value::Array(items) => items.iter().any(params_set_push),
+        Value::Object(params) => params.iter().any(|(key, value)| {
+            if normalized_name(key) == "configuration" {
+                return value.as_object().is_some_and(|configuration| {
+                    configuration
+                        .iter()
+                        .any(|(key, value)| !value.is_null() && names_push_notification(key))
+                });
+            }
+            value.is_object() && names_push_notification(key)
+        }),
         _ => false,
     }
 }
@@ -2053,6 +2089,11 @@ mod tests {
             json!({"method": "tasks/pu\u{17f}hNotificationConfig/set", "params": {}}),
             json!({"method": "message/send", "params": {"configuration": {
                 "tas\u{212a}PushNotificationConfig": webhook, "pu\u{17f}h": 1}}}),
+            // Positional params, and a push config object directly in params.
+            json!({"method": "message/send", "params": [{"configuration": {
+                "pushNotificationConfig": webhook}}]}),
+            json!({"method": "message/send", "params": {"message": {},
+                "pushNotification": webhook}}),
             // A JSON-RPC batch asks if any call in it does.
             json!([{"method": "tasks/get", "params": {}},
                    {"method": "tasks/pushNotificationConfig/set", "params": {}}]),
@@ -2075,6 +2116,9 @@ mod tests {
             json!({"method": "message/send", "params": {"message": {"metadata": {
                 "pushNotificationConfig": webhook}}}}),
             json!([{"method": "message/send", "params": {}}, {"method": "tasks/get"}]),
+            // Reading or deleting a config names it by id: not a config.
+            json!({"method": "tasks/pushNotificationConfig/delete", "params": {
+                "id": "t", "pushNotificationConfigId": "c"}}),
         ] {
             assert!(
                 !requests_push_delivery(&does_not),
@@ -2114,5 +2158,26 @@ mod tests {
             super::artifact_chunk(&json!({"result": {"task": {"id": "t", "artifacts": []}}})),
             None
         );
+    }
+
+    #[test]
+    fn a_message_or_an_error_ends_a_streamed_answer() {
+        for ends in [
+            json!({"result": {"kind": "message", "role": "agent", "parts": []}}),
+            json!({"result": {"message": {"role": "ROLE_AGENT", "parts": []}}}),
+            json!({"error": {"code": -32000, "message": "no"}}),
+            json!({"result": {"kind": "task", "id": "t", "status": {"state": "completed"}}}),
+        ] {
+            assert!(ends_streamed_answer(&ends), "{ends} ends the answer");
+        }
+        for goes_on in [
+            json!({"result": {"kind": "status-update", "taskId": "t",
+                "status": {"state": "working", "message": {"parts": []}}}}),
+            json!({"result": {"statusUpdate": {"taskId": "t",
+                "status": {"state": "TASK_STATE_WORKING"}}}}),
+            json!({"result": {"artifactUpdate": {"taskId": "t"}}}),
+        ] {
+            assert!(!ends_streamed_answer(&goes_on), "{goes_on} does not end it");
+        }
     }
 }
