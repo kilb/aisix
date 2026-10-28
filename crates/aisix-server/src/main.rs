@@ -351,6 +351,47 @@ async fn file_reload_loop(
     }
 }
 
+/// SIGHUP in etcd mode: there is no file to reload — resources arrive
+/// through the etcd watch and apply as they change — so log that and keep
+/// serving. Without a handler SIGHUP keeps its default action, which
+/// terminates the process: a terminal hang-up, or a co-located process's
+/// `pkill -HUP` meant for file-mode gateways, would take a managed gateway
+/// down. Tokio keeps the handler installed for the rest of the process
+/// once registered, so the signal stays harmless during shutdown too.
+async fn etcd_hangup_loop(mut cancel: watch::Receiver<bool>) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut hup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "cannot install SIGHUP handler; a SIGHUP will terminate the gateway");
+                return;
+            }
+        };
+        loop {
+            tokio::select! {
+                Some(()) = hup.recv() => {
+                    tracing::info!(
+                        "received SIGHUP — nothing to reload: resources come from etcd and \
+                         apply as they change",
+                    );
+                }
+                changed = cancel.changed() => {
+                    if changed.is_err() || *cancel.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // No SIGHUP on this platform.
+        let _ = cancel;
+    }
+}
+
 /// Which managed-mode mTLS bootstrap path to take, given whether a
 /// bundle is persisted on disk and whether the env/file vars supply a
 /// fresh one. Pure so the precedence rule is unit-tested independently
@@ -608,6 +649,12 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         } else {
             // ETCD MODE (unchanged behavior).
             //
+            // First, before the etcd connect (which can retry for a while
+            // when the cluster is unreachable): a stray SIGHUP must not
+            // terminate the process. Detached — it holds nothing to drain
+            // and returns on cancel.
+            tokio::spawn(etcd_hangup_loop(cancel_rx.clone()));
+
             // Before handing endpoints to tonic, probe each one via the
             // stdlib resolver. tonic's HTTP connector collapses any DNS
             // failure into an opaque "dns error" Status (see

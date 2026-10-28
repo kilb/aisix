@@ -626,7 +626,9 @@ async function waitForReady(url: string, timeoutMs: number, bearer?: string): Pr
 }
 
 async function terminate(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null) return;
+  // A signal-terminated child has exitCode === null and signalCode set;
+  // its exit event already fired, so waiting for it would hang forever.
+  if (child.exitCode !== null || child.signalCode !== null) return;
   child.kill("SIGTERM");
   const exited = await Promise.race([
     new Promise<boolean>((r) => child.once("exit", () => r(true))),
