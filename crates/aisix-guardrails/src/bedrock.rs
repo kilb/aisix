@@ -527,6 +527,10 @@ impl Guardrail for BedrockGuardrail {
         )
     }
 
+    fn checks_input_remotely(&self) -> bool {
+        self.enforces_input()
+    }
+
     fn name(&self) -> &'static str {
         // Static name keeps metric cardinality bounded; the row's
         // own name is logged via tracing fields when we hit a

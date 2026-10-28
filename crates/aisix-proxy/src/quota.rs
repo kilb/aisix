@@ -897,6 +897,34 @@ pub(crate) async fn enforce(
     reserve_layers(state, snapshot, auth, model_rl, None).await
 }
 
+/// Take a request's rate-limit reservation BEFORE its input guardrails when
+/// checking it calls a remote moderation service; `None` otherwise.
+///
+/// Input guardrails normally run before the reservation (#542), so a
+/// content-policy refusal costs the caller no slot. That made a refused
+/// request free to send, and a remote check is not free: one long request
+/// can cost a moderation service many billed calls, so a caller could keep
+/// sending refused content at any rate — running up the service's bill and
+/// draining its shared request quota, which makes OTHER callers' checks
+/// fail (and, under `fail_open`, pass unchecked). Reserving first bounds
+/// that by the key's own limits: a key at its limit is turned away with 429
+/// before any remote call, and a request the check refuses keeps the slot
+/// it took. A chain of local rules only (keyword, PII patterns) keeps the
+/// usual order, since its refusals cost nothing to make.
+///
+/// `reserve` is the reservation the endpoint takes anyway (its [`enforce`]
+/// call); the caller uses the returned one in place of taking it again
+/// after the check.
+pub(crate) async fn reserve_before_costly_check(
+    chain: &dyn aisix_guardrails::Guardrail,
+    reserve: impl std::future::Future<Output = Result<MultiReservation, ProxyError>>,
+) -> Result<Option<MultiReservation>, ProxyError> {
+    if !chain.checks_input_remotely() {
+        return Ok(None);
+    }
+    reserve.await.map(Some)
+}
+
 /// Apply multi-layer rate-limit checks for one MCP `tools/call` against
 /// `mcp_server`, the server the called tool belongs to. Same gate as
 /// [`enforce`] plus the key's per-server layer; MCP resolves no model, so

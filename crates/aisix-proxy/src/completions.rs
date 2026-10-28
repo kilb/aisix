@@ -426,6 +426,16 @@ async fn dispatch(
                 .to_string(),
         ));
     }
+    // A check that calls a remote moderation service is admitted by the
+    // key's rate limits before it runs, and a refusal keeps the slot it took
+    // (see `quota::reserve_before_costly_check`).
+    let model_rl =
+        crate::quota::ModelRateLimit::from_model(model_name, &model_entry.id, &model_entry.value);
+    let early_reservation = crate::quota::reserve_before_costly_check(
+        resolved_chain.as_ref(),
+        crate::quota::enforce(state, snapshot, auth, Some(&model_rl)),
+    )
+    .await?;
     let mut input_seg_counts = crate::redact::RedactionCounts::new();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut input_capture_safe = true;
@@ -493,9 +503,10 @@ async fn dispatch(
     );
     let captured_prompt = content_cap.map(|_| serde_json::to_string(&body).unwrap_or_default());
 
-    let model_rl =
-        crate::quota::ModelRateLimit::from_model(model_name, &model_entry.id, &model_entry.value);
-    let mut reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
+    let mut reservation = match early_reservation {
+        Some(reservation) => reservation,
+        None => crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?,
+    };
 
     // A Model Group has no provider of its own — the group walk resolves one
     // per target, so the bridge, credential, deadlines and upstream model

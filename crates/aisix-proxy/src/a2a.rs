@@ -361,8 +361,33 @@ async fn dispatch(
         )
             .into_response();
     }
-    // Run BEFORE the quota gate so a content-policy refusal does not burn an
-    // RPM slot, matching /v1/chat/completions (#542).
+    // A check that calls a remote moderation service is admitted by the
+    // key's rate limits before it runs, and a refusal keeps the slot it took
+    // (see `quota::reserve_before_costly_check`).
+    let early_reservation = match crate::quota::reserve_before_costly_check(
+        &guardrail_chain,
+        crate::quota::enforce(state, &snapshot, &auth, None),
+    )
+    .await
+    {
+        Ok(reservation) => reservation,
+        Err(err) => {
+            let response = err.into_response();
+            emit_a2a_usage(
+                state,
+                &snapshot,
+                &auth,
+                request_id,
+                agent,
+                &call,
+                response.status().as_u16(),
+                Duration::ZERO,
+            );
+            return response;
+        }
+    };
+    // Otherwise run BEFORE the quota gate so a content-policy refusal by local
+    // rules does not burn an RPM slot, matching /v1/chat/completions (#542).
     //
     // Scan every word the agent will receive: text parts, and the string
     // values and keys of data parts, uncapped. `call.text.request` is capped
@@ -521,7 +546,11 @@ async fn dispatch(
     // is deliberate — inferring a spend limit from an estimate would throttle
     // callers on a number no provider ever confirmed. On 429 /
     // budget-exceeded this returns before the upstream is contacted.
-    let reservation = match crate::quota::enforce(state, &snapshot, &auth, None).await {
+    let reservation = match early_reservation {
+        Some(reservation) => Ok(reservation),
+        None => crate::quota::enforce(state, &snapshot, &auth, None).await,
+    };
+    let reservation = match reservation {
         Ok(reservation) => reservation,
         Err(err) => {
             let response = err.into_response();

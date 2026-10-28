@@ -305,6 +305,16 @@ async fn dispatch(
     // UsageEvent surfaces them in Logs, like chat / messages. Empty when no
     // guardrail is attached.
     let applied_guardrails = resolved_chain.applied().to_vec();
+    // A check that calls a remote moderation service is admitted by the
+    // key's rate limits before it runs, and a refusal keeps the slot it took
+    // (see `quota::reserve_before_costly_check`).
+    let model_rl =
+        crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
+    let early_reservation = crate::quota::reserve_before_costly_check(
+        &resolved_chain,
+        crate::quota::enforce(state, snapshot, auth, Some(&model_rl)),
+    )
+    .await?;
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut input_capture_safe = true;
     let mut redactions = crate::redact::RedactionCounts::new();
@@ -362,9 +372,10 @@ async fn dispatch(
     );
     let captured_prompt = content_cap.map(|_| serde_json::to_string(&*body).unwrap_or_default());
 
-    let model_rl =
-        crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let mut reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
+    let mut reservation = match early_reservation {
+        Some(reservation) => reservation,
+        None => crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?,
+    };
 
     // A Model Group has no provider of its own — the walk below resolves one
     // per target.

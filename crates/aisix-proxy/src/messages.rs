@@ -580,7 +580,8 @@ async fn dispatch(
     // enforced here.)
     //
     // #542: run this BEFORE the rate-limit reservation so a content-policy
-    // block doesn't burn an RPM slot (matching /v1/chat/completions).
+    // block by local rules doesn't burn an RPM slot (matching
+    // /v1/chat/completions).
     let guardrail_ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
         model_id: &model_entry.id,
@@ -595,6 +596,16 @@ async fn dispatch(
     // event records which guardrails governed the request even when the input
     // check below blocks it (#379 / closes the anthropic gap in #519).
     *applied_out = resolved_chain.applied().to_vec();
+    // A check that calls a remote moderation service is admitted by the
+    // key's rate limits before it runs, and a refusal keeps the slot it took
+    // (see `quota::reserve_before_costly_check`).
+    let model_rl =
+        crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
+    let early_reservation = crate::quota::reserve_before_costly_check(
+        resolved_chain.as_ref(),
+        crate::quota::enforce(state, snapshot, auth, Some(&model_rl)),
+    )
+    .await?;
     if !resolved_chain.is_empty() {
         let chat = crate::redact::anthropic_request_for_inspection(body).map_err(|_| {
             *suppress_failure_content_out = true;
@@ -667,8 +678,6 @@ async fn dispatch(
         }
     }
 
-    let model_rl =
-        crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
     // `Option` so the winning streaming attempt can `take()` the reservation
     // and carry it into the end-of-stream guard (#688); non-streaming / failed
     // attempts leave it in place for the post-dispatch commit or a retry.
@@ -678,8 +687,10 @@ async fn dispatch(
     // `/v1/chat/completions` is the deliberate exception: it uses
     // `enforce_rate_limit`, which is equivalent to `enforce` for a request
     // that resolves a model (see `quota::enforce_rate_limit` doc comment).
-    let mut reservation =
-        Some(crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?);
+    let mut reservation = Some(match early_reservation {
+        Some(reservation) => reservation,
+        None => crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?,
+    });
 
     // Cache gate. Non-streaming only, for the same reason the chat gate is:
     // there is no stored shape for a stream yet, and pretending otherwise

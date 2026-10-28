@@ -495,6 +495,48 @@ fn jsonl_decoded_text(text: &str) -> Option<String> {
     parsed_any.then(|| out.join("\n"))
 }
 
+/// 按这个目标模型的限流预留一次请求：这条面上每个转发都要占的那一格。
+async fn reserve_target(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    target: &JobTarget,
+) -> Result<aisix_ratelimit::MultiReservation, ProxyError> {
+    crate::quota::enforce(
+        state,
+        snapshot,
+        auth,
+        Some(&crate::quota::ModelRateLimit::from_model(
+            target.display_name(),
+            &target.model_entry.id,
+            &target.model_entry.value,
+        )),
+    )
+    .await
+}
+
+/// 输入审查要调用远端审核服务时，审查之前先预留（见
+/// `quota::reserve_before_costly_check`）：到了限额的 key 在任何远端调用之前
+/// 就被 429 拒掉，被审查拒绝的请求也照样占掉它预留的那一格。只跑本地规则时
+/// 返回 `None`，预留照旧放在审查之后。
+async fn reserve_before_costly_scan(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    target: &JobTarget,
+) -> Result<Option<aisix_ratelimit::MultiReservation>, ProxyError> {
+    let ctx = aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
+        model_id: &target.model_entry.id,
+        mcp_server_id: "",
+        api_key_id: &auth.entry.id,
+        team_id: auth.key().team_id.as_deref(),
+    };
+    let chain = state.guardrail_index.resolve(&ctx);
+    crate::quota::reserve_before_costly_check(&chain, reserve_target(state, snapshot, auth, target))
+        .await
+}
+
 async fn scan_input_blob(
     state: &ProxyState,
     auth: &AuthenticatedKey,
@@ -1045,6 +1087,8 @@ pub(crate) async fn create_file(
         // Every `file` part is forwarded, so every one is scanned (and may
         // be masked). Keyed by position, so each rewrite lands on the part it
         // was made from.
+        let early_reservation =
+            reserve_before_costly_scan(&state, snapshot, &auth, &target).await?;
         let mut masked: std::collections::HashMap<usize, Vec<u8>> =
             std::collections::HashMap::new();
         for (i, field) in fields.iter().enumerate() {
@@ -1084,17 +1128,10 @@ pub(crate) async fn create_file(
                 }
             }
         }
-        let _reservation = crate::quota::enforce(
-            &state,
-            snapshot,
-            &auth,
-            Some(&crate::quota::ModelRateLimit::from_model(
-                target.display_name(),
-                &target.model_entry.id,
-                &target.model_entry.value,
-            )),
-        )
-        .await?;
+        let _reservation = match early_reservation {
+            Some(reservation) => reservation,
+            None => reserve_target(&state, snapshot, &auth, &target).await?,
+        };
 
         let url = upstream_url(&target, "/files", "")?;
         let (status, resp_headers, bytes) = send_upstream(
@@ -1333,18 +1370,13 @@ pub(crate) async fn create_batch(
         }
         let out_body = Bytes::from(serde_json::to_vec(&req_json).unwrap_or_default());
 
+        let early_reservation =
+            reserve_before_costly_scan(&state, &snapshot, &auth, &target).await?;
         scan_input_blob(&state, &auth, &target, &out_body, &mut monitor_hits, None).await?;
-        let _reservation = crate::quota::enforce(
-            &state,
-            &snapshot,
-            &auth,
-            Some(&crate::quota::ModelRateLimit::from_model(
-                target.display_name(),
-                &target.model_entry.id,
-                &target.model_entry.value,
-            )),
-        )
-        .await?;
+        let _reservation = match early_reservation {
+            Some(reservation) => reservation,
+            None => reserve_target(&state, &snapshot, &auth, &target).await?,
+        };
 
         let url = upstream_url(&target, "/batches", "")?;
         let (status, resp_headers, bytes) = send_upstream(
@@ -1608,18 +1640,13 @@ pub(crate) async fn create_ft_job(
         }
         let out_body = Bytes::from(serde_json::to_vec(&req_json).unwrap_or_default());
 
+        let early_reservation =
+            reserve_before_costly_scan(&state, &snapshot, &auth, &target).await?;
         scan_input_blob(&state, &auth, &target, &out_body, &mut monitor_hits, None).await?;
-        let _reservation = crate::quota::enforce(
-            &state,
-            &snapshot,
-            &auth,
-            Some(&crate::quota::ModelRateLimit::from_model(
-                target.display_name(),
-                &target.model_entry.id,
-                &target.model_entry.value,
-            )),
-        )
-        .await?;
+        let _reservation = match early_reservation {
+            Some(reservation) => reservation,
+            None => reserve_target(&state, &snapshot, &auth, &target).await?,
+        };
 
         let url = upstream_url(&target, "/fine_tuning/jobs", "")?;
         let (status, resp_headers, bytes) = send_upstream(
@@ -1795,20 +1822,15 @@ async fn forward_simple(
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
         let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
 
+        let early_reservation =
+            reserve_before_costly_scan(&state, &snapshot, &auth, &target).await?;
         if let Some(body) = &spec.body {
             scan_input_blob(&state, &auth, &target, body, &mut monitor_hits, None).await?;
         }
-        let _reservation = crate::quota::enforce(
-            &state,
-            &snapshot,
-            &auth,
-            Some(&crate::quota::ModelRateLimit::from_model(
-                target.display_name(),
-                &target.model_entry.id,
-                &target.model_entry.value,
-            )),
-        )
-        .await?;
+        let _reservation = match early_reservation {
+            Some(reservation) => reservation,
+            None => reserve_target(&state, &snapshot, &auth, &target).await?,
+        };
 
         let query = forwardable_query(spec.raw_query.as_deref());
         let url = upstream_url(&target, &spec.upstream_path, &query)?;

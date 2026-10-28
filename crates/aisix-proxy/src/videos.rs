@@ -1676,6 +1676,19 @@ async fn dispatch_create(
     };
     let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
     let applied_guardrails = resolved_chain.applied().to_vec();
+    // A check that calls a remote moderation service is admitted by the
+    // key's rate limits before it runs, and a refusal keeps the slot it took
+    // (see `quota::reserve_before_costly_check`).
+    let model_rl = crate::quota::ModelRateLimit::from_model(
+        &body.model,
+        &target.model_entry.id,
+        &target.model_entry.value,
+    );
+    let early_reservation = crate::quota::reserve_before_costly_check(
+        &resolved_chain,
+        crate::quota::enforce(state, snapshot, auth, Some(&model_rl)),
+    )
+    .await?;
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     if !resolved_chain.is_empty() {
         let chat = aisix_gateway::ChatFormat::new(
@@ -1720,12 +1733,10 @@ async fn dispatch_create(
 
     // Model-level rate limiting — the submit is a full typed endpoint
     // (#1118 decision 3; the #1116 shape).
-    let model_rl = crate::quota::ModelRateLimit::from_model(
-        &body.model,
-        &target.model_entry.id,
-        &target.model_entry.value,
-    );
-    let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
+    let reservation = match early_reservation {
+        Some(reservation) => reservation,
+        None => crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?,
+    };
 
     let upstream_model =
         crate::dispatch::require_upstream_model(&target.model_entry.value)?.to_string();

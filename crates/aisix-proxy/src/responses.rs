@@ -742,7 +742,8 @@ async fn dispatch(
     // Responses body — only Block is enforced, matching /v1/messages.)
     //
     // #542: run this BEFORE the rate-limit reservation so a content-policy
-    // block doesn't burn an RPM slot (matching /v1/chat/completions).
+    // block by local rules doesn't burn an RPM slot (matching
+    // /v1/chat/completions).
     let guardrail_ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
         model_id: &model_entry.id,
@@ -755,6 +756,16 @@ async fn dispatch(
     // guardrails (#825), mirroring /v1/messages.
     let resolved_chain = Arc::new(state.guardrail_index.resolve(&guardrail_ctx));
     *applied_out = resolved_chain.applied().to_vec();
+    // A check that calls a remote moderation service is admitted by the
+    // key's rate limits before it runs, and a refusal keeps the slot it took
+    // (see `quota::reserve_before_costly_check`).
+    let model_rl =
+        crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
+    let early_reservation = crate::quota::reserve_before_costly_check(
+        resolved_chain.as_ref(),
+        crate::quota::enforce(state, snapshot, auth, Some(&model_rl)),
+    )
+    .await?;
     if !resolved_chain.is_empty() {
         let chat = responses_input_to_chat(&model_name, body);
         let (verdict, hits) = aisix_guardrails::Guardrail::check_input_non_segment_observed(
@@ -824,13 +835,13 @@ async fn dispatch(
         // dispatch.
     }
 
-    let model_rl =
-        crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
     // `Option` so the winning streaming attempt can `take()` the reservation
     // and carry it into the end-of-stream guard (#688); non-streaming / failed
     // attempts leave it in place for the post-dispatch commit or a retry.
-    let mut reservation =
-        Some(crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?);
+    let mut reservation = Some(match early_reservation {
+        Some(reservation) => reservation,
+        None => crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?,
+    });
 
     // Cache gate. Non-streaming only, matching the chat and messages gates:
     // a stream has no stored shape yet. Keyed on the post-redaction body —

@@ -714,6 +714,12 @@ impl Guardrail for MonitorGuardrail {
         false
     }
 
+    // ...but it observes by making the same calls the enforcing guardrail
+    // would.
+    fn checks_input_remotely(&self) -> bool {
+        self.inner.checks_input_remotely()
+    }
+
     // Monitor mode observes without modifying: redaction is suppressed the
     // same way Block verdicts are downgraded. The would-be mask counts are
     // logged so operators can stage a redaction rule and audit its impact
@@ -848,6 +854,10 @@ impl Guardrail for MandatoryGuardrail {
         self.inner.enforces_input()
     }
 
+    fn checks_input_remotely(&self) -> bool {
+        self.inner.checks_input_remotely()
+    }
+
     // Mandatory only rewrites the failure (Bypass) verdict; redaction
     // passes straight through to the inner guardrail.
     fn redacts_input(&self) -> bool {
@@ -967,6 +977,10 @@ impl Guardrail for LiveGuardrailChain {
 
     fn enforces_input(&self) -> bool {
         self.current().enforces_input()
+    }
+
+    fn checks_input_remotely(&self) -> bool {
+        self.current().checks_input_remotely()
     }
 
     fn redacts_input(&self) -> bool {
@@ -1808,6 +1822,41 @@ mod tests {
                 "access_key_secret": "sk"{extra}
             }}"#,
         ))
+    }
+
+    /// `checks_input_remotely` is what makes a request's check cost a remote
+    /// call: a moderation service on the input hook, monitor mode included
+    /// (it observes by calling). Local rules never do, nor does a moderation
+    /// service attached only to the output hook.
+    #[tokio::test]
+    async fn checks_input_remotely_needs_a_remote_member_on_input() {
+        let chain_of = |rows: Vec<DomainGuardrail>| {
+            let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+            for (i, row) in rows.into_iter().enumerate() {
+                let id = format!("g-{i}");
+                table.insert(entry(&id, &id, row));
+            }
+            build_chain_from_snapshot(&table, None)
+        };
+        let keyword = |hook: &str| {
+            parse(&format!(
+                r#"{{"name": "kw", "kind": "keyword", "hook_point": "{hook}",
+                    "patterns": [{{ "kind": "literal", "value": "secret" }}]}}"#
+            ))
+        };
+        let aliyun = |hook: &str, mode: &str| {
+            aliyun_row_against(
+                "http://127.0.0.1:9",
+                &format!(r#", "hook_point": "{hook}", "enforcement_mode": "{mode}""#),
+            )
+        };
+        assert!(!chain_of(vec![keyword("input")]).checks_input_remotely());
+        assert!(chain_of(vec![aliyun("input", "block")]).checks_input_remotely());
+        assert!(chain_of(vec![aliyun("both", "block")]).checks_input_remotely());
+        assert!(chain_of(vec![aliyun("input", "monitor")]).checks_input_remotely());
+        assert!(!chain_of(vec![aliyun("output", "block")]).checks_input_remotely());
+        assert!(chain_of(vec![keyword("input"), aliyun("input", "block")]).checks_input_remotely());
+        assert!(!chain_of(vec![]).checks_input_remotely());
     }
 
     /// #1010: `enforcement_mode: "monitor"` must never block —

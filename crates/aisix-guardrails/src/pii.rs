@@ -315,6 +315,11 @@ impl Guardrail for PiiGuardrail {
         self.check_input_enabled
     }
 
+    // Local rules: checking costs no remote call.
+    fn checks_input_remotely(&self) -> bool {
+        false
+    }
+
     /// Masking a streamed response requires the whole response held back —
     /// a span can cross any chunk boundary, and a mask can't be applied
     /// retroactively to bytes already on the wire. Cap + overflow policy

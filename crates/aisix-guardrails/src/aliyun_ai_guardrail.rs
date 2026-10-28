@@ -1256,6 +1256,10 @@ impl Guardrail for AliyunAiGuardrail {
         )
     }
 
+    fn checks_input_remotely(&self) -> bool {
+        self.enforces_input()
+    }
+
     fn stream_output_policy(&self) -> StreamOutputPolicy {
         match self.stream_processing_mode.as_str() {
             "buffer_full" => StreamOutputPolicy::BufferFull {

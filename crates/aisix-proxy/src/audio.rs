@@ -638,6 +638,16 @@ async fn multipart_dispatch(
     };
     let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
     let applied_guardrails = resolved_chain.applied().to_vec();
+    // A check that calls a remote moderation service is admitted by the
+    // key's rate limits before it runs, and a refusal keeps the slot it took
+    // (see `quota::reserve_before_costly_check`).
+    let model_rl =
+        crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
+    let early_reservation = crate::quota::reserve_before_costly_check(
+        &resolved_chain,
+        crate::quota::enforce(state, snapshot, auth, Some(&model_rl)),
+    )
+    .await?;
     let mut redactions = crate::redact::RedactionCounts::new();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut input_capture_safe = true;
@@ -737,9 +747,10 @@ async fn multipart_dispatch(
         serde_json::to_string(&Value::Object(obj)).unwrap_or_default()
     });
 
-    let model_rl =
-        crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let mut reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
+    let mut reservation = match early_reservation {
+        Some(reservation) => reservation,
+        None => crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?,
+    };
 
     // Static label for retry tracing — this dispatch serves both audio
     // sub-routes, and logging translations under the transcription label
@@ -1199,6 +1210,16 @@ async fn speech_dispatch(
     // Record which guardrails govern this request (#379 parity) for the emitted
     // UsageEvent. Empty when none attached.
     let applied_guardrails = resolved_chain.applied().to_vec();
+    // A check that calls a remote moderation service is admitted by the
+    // key's rate limits before it runs, and a refusal keeps the slot it took
+    // (see `quota::reserve_before_costly_check`).
+    let model_rl =
+        crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
+    let early_reservation = crate::quota::reserve_before_costly_check(
+        &resolved_chain,
+        crate::quota::enforce(state, snapshot, auth, Some(&model_rl)),
+    )
+    .await?;
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut input_capture_safe = true;
     let mut redactions = crate::redact::RedactionCounts::new();
@@ -1257,9 +1278,10 @@ async fn speech_dispatch(
         )
     });
 
-    let model_rl =
-        crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let mut reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
+    let mut reservation = match early_reservation {
+        Some(reservation) => reservation,
+        None => crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?,
+    };
 
     // A Model Group has no provider of its own — the walk resolves one per
     // target.

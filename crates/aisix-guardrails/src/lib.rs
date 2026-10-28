@@ -507,6 +507,16 @@ pub trait Guardrail: Send + Sync + 'static {
         true
     }
 
+    /// Whether checking a request calls a remote service — a moderation API
+    /// billed per call — rather than only running local rules. Monitor mode
+    /// counts: it observes by making the same calls. A request checked this
+    /// way is admitted by the key's rate limits before the check runs, so
+    /// one key cannot cause remote calls without bound. Default: `true`
+    /// (secure-leaning); the local kinds override.
+    fn checks_input_remotely(&self) -> bool {
+        true
+    }
+
     // --- redaction (#932) -------------------------------------------------
     //
     // Redaction is a separate, synchronous, text→text capability rather

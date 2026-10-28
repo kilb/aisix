@@ -1381,8 +1381,23 @@ async fn dispatch(
     let resolved_chain: std::sync::Arc<dyn aisix_guardrails::Guardrail> =
         std::sync::Arc::new(resolved);
 
-    // Input guardrails. Run before reservation so a blocked prompt
-    // doesn't burn an RPM slot — content-policy refusals shouldn't
+    // A check that calls a remote moderation service is admitted by the
+    // key's rate limits before it runs, and a refusal keeps the slot it took
+    // (see `quota::reserve_before_costly_check`).
+    let model_rl = crate::quota::ModelRateLimit::from_model(
+        &req.model,
+        &virtual_entry.id,
+        &virtual_entry.value,
+    );
+    let early_reservation = crate::quota::reserve_before_costly_check(
+        resolved_chain.as_ref(),
+        crate::quota::enforce_rate_limit(state, snapshot, auth, Some(&model_rl)),
+    )
+    .await
+    .map_err(&with_model)?;
+
+    // Input guardrails. Otherwise run before reservation so a blocked
+    // prompt doesn't burn an RPM slot — a refusal by local rules shouldn't
     // count against quota. Bypass (remote-API guardrail unavailable
     // + fail_open=true) doesn't short-circuit; the reason is stashed
     // and attached to the telemetry event when the request finishes.
@@ -1553,14 +1568,12 @@ async fn dispatch(
     // Multi-layer rate-limit reservation (api_key inline + model inline + policies).
     // `mut` so a routing dispatch can fold the winning target's model-layer
     // reservation into it once the winner is known (#1087).
-    let model_rl = crate::quota::ModelRateLimit::from_model(
-        &req.model,
-        &virtual_entry.id,
-        &virtual_entry.value,
-    );
-    let mut reservation = crate::quota::enforce_rate_limit(state, snapshot, auth, Some(&model_rl))
-        .await
-        .map_err(&with_model)?;
+    let mut reservation = match early_reservation {
+        Some(reservation) => reservation,
+        None => crate::quota::enforce_rate_limit(state, snapshot, auth, Some(&model_rl))
+            .await
+            .map_err(&with_model)?,
+    };
 
     let now = created_ts();
 

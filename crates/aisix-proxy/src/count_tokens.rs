@@ -227,6 +227,16 @@ async fn dispatch(
         team_id: auth.key().team_id.as_deref(),
     };
     let dlp_chain = state.guardrail_index.resolve(&guardrail_ctx).dlp_only();
+    // A check that calls a remote moderation service is admitted by the
+    // key's rate limits before it runs, and a refusal keeps the slot it took
+    // (see `quota::reserve_before_costly_check`).
+    let model_rl =
+        crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
+    let early_reservation = crate::quota::reserve_before_costly_check(
+        &dlp_chain,
+        crate::quota::enforce(state, snapshot, auth, Some(&model_rl)),
+    )
+    .await?;
     if !dlp_chain.is_empty() {
         let chat = crate::redact::anthropic_request_for_inspection(body).map_err(|_| {
             ProxyError::InvalidRequest(
@@ -275,9 +285,10 @@ async fn dispatch(
         }
     }
 
-    let model_rl =
-        crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let _reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
+    let _reservation = match early_reservation {
+        Some(reservation) => reservation,
+        None => crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?,
+    };
 
     // Resolve the attempt list (routing-aware). count_tokens is
     // Anthropic-only, so we attempt the group's Anthropic targets in

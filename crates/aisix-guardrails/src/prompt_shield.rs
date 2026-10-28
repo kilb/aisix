@@ -286,6 +286,10 @@ impl Guardrail for PromptShieldGuardrail {
         )
     }
 
+    fn checks_input_remotely(&self) -> bool {
+        self.enforces_input()
+    }
+
     fn name(&self) -> &'static str {
         // Static name keeps metric cardinality bounded; the row's own
         // name is surfaced via tracing fields on failure paths.

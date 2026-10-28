@@ -124,6 +124,11 @@ impl Guardrail for KeywordBlocklist {
         self.check_input_enabled
     }
 
+    // Local rules: checking costs no remote call.
+    fn checks_input_remotely(&self) -> bool {
+        false
+    }
+
     async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
         if !self.check_input_enabled {
             return GuardrailVerdict::Allow;

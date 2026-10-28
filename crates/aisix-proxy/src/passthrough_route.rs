@@ -563,6 +563,26 @@ async fn dispatch(
     let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
 
+    // The body's `model` field reserves a configured Model's own layers only
+    // for `inject` routes, scoped to the ProviderKey's provider — the #805
+    // contract, minus the credential borrowing. `forward_client` upstreams
+    // are not configured Models, so a same-named model of some provider must
+    // never match.
+    let model_rl = pk_entry
+        .as_ref()
+        .map(|pk| pk.value.provider.to_ascii_lowercase())
+        .filter(|prov| !prov.is_empty())
+        .and_then(|prov| body_model_rate_limit(snapshot, &prov, &body_bytes));
+    // A check that calls a remote moderation service is admitted by the
+    // key's rate limits before it runs, and a refusal keeps the slot it took
+    // (see `quota::reserve_before_costly_check`).
+    let early_reservation = crate::quota::reserve_before_costly_check(
+        &resolved_chain,
+        crate::quota::enforce(state, snapshot, &auth, model_rl.as_ref()),
+    )
+    .await
+    .map_err(|e| RouteError::of(e, &auth))?;
+
     // INPUT guardrails on the (protocol-extracted) request text.
     if !resolved_chain.is_empty() {
         let text = request_guardrail_text(route.protocol, &body_bytes);
@@ -607,20 +627,14 @@ async fn dispatch(
     );
     let captured_prompt = content_cap.map(|_| request_guardrail_text(route.protocol, &body_bytes));
 
-    // Rate limits AFTER the input guardrail so a content block doesn't burn
-    // an RPM slot (matching the typed endpoints). The body's `model` field
-    // reserves a configured Model's own layers only for `inject` routes,
-    // scoped to the ProviderKey's provider — the #805 contract, minus the
-    // credential borrowing. `forward_client` upstreams are not configured
-    // Models, so a same-named model of some provider must never match.
-    let model_rl = pk_entry
-        .as_ref()
-        .map(|pk| pk.value.provider.to_ascii_lowercase())
-        .filter(|prov| !prov.is_empty())
-        .and_then(|prov| body_model_rate_limit(snapshot, &prov, &body_bytes));
-    let _reservation = crate::quota::enforce(state, snapshot, &auth, model_rl.as_ref())
-        .await
-        .map_err(|e| RouteError::of(e, &auth))?;
+    // Otherwise rate limits AFTER the input guardrail so a content block by
+    // local rules doesn't burn an RPM slot (matching the typed endpoints).
+    let _reservation = match early_reservation {
+        Some(reservation) => reservation,
+        None => crate::quota::enforce(state, snapshot, &auth, model_rl.as_ref())
+            .await
+            .map_err(|e| RouteError::of(e, &auth))?,
+    };
 
     // ----- outbound request -----
 
