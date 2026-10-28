@@ -105,6 +105,38 @@ const ENDPOINTS: Array<[string, string, () => { headers: Record<string, string>;
     },
   ],
   [
+    "/v1/audio/translations",
+    "/v1/audio/translations",
+    () => {
+      const form = new FormData();
+      form.set("model", MODEL);
+      form.set("prompt", flagged);
+      form.set("file", new Blob([new Uint8Array([0xff, 0xfb, 0x90, 0x00])], { type: "audio/mpeg" }), "a.mp3");
+      return { headers: {}, body: form };
+    },
+  ],
+  [
+    "/v1/batches",
+    "/v1/batches",
+    () => {
+      const req = json({
+        input_file_id: "file-rr",
+        endpoint: "/v1/chat/completions",
+        completion_window: "24h",
+        metadata: { note: flagged },
+      });
+      return { headers: { ...req.headers, "x-aisix-model": MODEL }, body: req.body };
+    },
+  ],
+  [
+    "/v1/fine_tuning/jobs",
+    "/v1/fine_tuning/jobs",
+    () => {
+      const req = json({ model: "gpt-4o-mini", training_file: "file-rr", suffix: flagged });
+      return { headers: { ...req.headers, "x-aisix-model": MODEL }, body: req.body };
+    },
+  ],
+  [
     "/v1/files (batch input)",
     "/v1/files",
     () => {
@@ -296,9 +328,7 @@ describe("a refusal by local rules still costs the caller nothing", () => {
     await upstream?.close();
   });
 
-  for (const [label, path, build] of ENDPOINTS.filter(([l]) =>
-    ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/a2a/:agent"].includes(l),
-  )) {
+  for (const [label, path, build] of ENDPOINTS) {
     test(`${label}: every refusal is a 422, none uses the limit`, async (ctx) => {
       if (!app) return ctx.skip();
       const statuses: number[] = [];
@@ -306,4 +336,115 @@ describe("a refusal by local rules still costs the caller nothing", () => {
       expect(statuses).toEqual(Array(LIMIT + 1).fill(422));
     });
   }
+});
+
+/** Presidio 分析服务的替身：文本里有 EMAIL 时报一个 EMAIL_ADDRESS，并记下每一次调用。 */
+const EMAIL = "carol.refusal@example.com";
+async function startPresidio(): Promise<{ baseUrl: string; calls: () => number; close(): Promise<void> }> {
+  let calls = 0;
+  const server: Server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c: Buffer) => (raw += c.toString("utf8")));
+    req.on("end", () => {
+      let text = "";
+      try {
+        const body = JSON.parse(raw) as { text?: unknown };
+        text = typeof body.text === "string" ? body.text : "";
+      } catch {
+        text = "";
+      }
+      res.setHeader("content-type", "application/json");
+      if (req.url?.startsWith("/analyze")) {
+        calls += 1;
+        const at = text.indexOf(EMAIL);
+        res.end(
+          JSON.stringify(at >= 0 ? [{ entity_type: "EMAIL_ADDRESS", start: at, end: at + EMAIL.length, score: 0.9 }] : []),
+        );
+        return;
+      }
+      res.end(JSON.stringify({ text, items: [] }));
+    });
+  });
+  const port = await pickFreePort();
+  await new Promise<void>((r) => server.listen(port, "127.0.0.1", r));
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
+    calls: () => calls,
+    close: () => new Promise<void>((r) => server.close(() => r())),
+  };
+}
+
+describe("/v1/messages/count_tokens under a remote data-loss prevention check", () => {
+  // count_tokens 只跑数据防泄漏一类的护栏（PII、Presidio）：Presidio 是其中唯一
+  // 调用远端服务的，所以这条入口要单独用它来验。
+  let app: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let presidio: Awaited<ReturnType<typeof startPresidio>> | undefined;
+  const CALLER = "sk-rr-count-tokens";
+  const PROBE = "sk-rr-count-tokens-probe";
+
+  const countTokens = (key: string) =>
+    fetch(`${app!.proxyUrl}/v1/messages/count_tokens`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+      body: JSON.stringify({ model: MODEL, messages: [{ role: "user", content: `write to ${EMAIL}` }] }),
+    });
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    if (!(await etcd.ping())) return;
+    presidio = await startPresidio();
+    upstream = await startOpenAiUpstream();
+    app = await spawnApp();
+    const seed = new SeedClient(etcd, app.etcdPrefix);
+    const pk = await seed.createProviderKey({
+      display_name: "rr-ct-pk",
+      provider: "openai",
+      adapter: "openai",
+      secret: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await seed.createModel({ display_name: MODEL, provider: "openai", model_name: "gpt-4o-mini", provider_key_id: pk.id });
+    await seed.createGuardrail({
+      name: "rr-presidio",
+      enabled: true,
+      hook_point: "input",
+      fail_open: false,
+      kind: "presidio",
+      analyzer_url: presidio.baseUrl,
+      anonymizer_url: presidio.baseUrl,
+      entities: [{ type: "EMAIL_ADDRESS", action: "block" }],
+      language: "en",
+      score_threshold: 0.5,
+    });
+    await seed.createApiKey({ key_hash: sha256(CALLER), allowed_models: ["*"], rate_limit: { rpd: LIMIT } });
+    await seed.createApiKey({ key_hash: sha256(PROBE), allowed_models: ["*"] });
+    await waitConfigPropagation(async () => {
+      const res = await countTokens(PROBE);
+      await res.text();
+      return res.status === 422;
+    });
+  }, 60_000);
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+    await presidio?.close();
+  });
+
+  test("refusals use the limit, and past it the service is not called", async (ctx) => {
+    if (!app || !presidio) return ctx.skip();
+    const statuses: number[] = [];
+    const atStart = presidio.calls();
+    let beforeLast = atStart;
+    for (let i = 0; i <= LIMIT; i++) {
+      if (i === LIMIT) beforeLast = presidio.calls();
+      const res = await countTokens(CALLER);
+      statuses.push(res.status);
+      await res.text();
+    }
+    expect(statuses).toEqual([...Array(LIMIT).fill(422), 429]);
+    expect(beforeLast - atStart).toBeGreaterThanOrEqual(LIMIT);
+    expect(presidio.calls(), "the over-limit request still reached the service").toBe(beforeLast);
+  });
 });

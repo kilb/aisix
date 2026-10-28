@@ -227,16 +227,9 @@ async fn dispatch(
         team_id: auth.key().team_id.as_deref(),
     };
     let dlp_chain = state.guardrail_index.resolve(&guardrail_ctx).dlp_only();
-    // A check that calls a remote moderation service is admitted by the
-    // key's rate limits before it runs, and a refusal keeps the slot it took
-    // (see `quota::reserve_before_costly_check`).
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let early_reservation = crate::quota::reserve_before_costly_check(
-        &dlp_chain,
-        crate::quota::enforce(state, snapshot, auth, Some(&model_rl)),
-    )
-    .await?;
+    let mut early_reservation = None;
     if !dlp_chain.is_empty() {
         let chat = crate::redact::anthropic_request_for_inspection(body).map_err(|_| {
             ProxyError::InvalidRequest(
@@ -244,6 +237,15 @@ async fn dispatch(
                     .to_string(),
             )
         })?;
+        // A check that calls a remote moderation service is admitted by the
+        // key's rate limits before it runs, and a refusal keeps the slot it
+        // took (see `quota::reserve_before_costly_check`). Taken once the
+        // body could be inspected: one that cannot never reaches the service.
+        early_reservation = crate::quota::reserve_before_costly_check(
+            &dlp_chain,
+            crate::quota::enforce(state, snapshot, auth, Some(&model_rl)),
+        )
+        .await?;
         let (verdict, _) =
             aisix_guardrails::Guardrail::check_input_non_segment_observed(&dlp_chain, &chat).await;
         let mut redactions = crate::redact::RedactionCounts::new();

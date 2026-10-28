@@ -596,16 +596,9 @@ async fn dispatch(
     // event records which guardrails governed the request even when the input
     // check below blocks it (#379 / closes the anthropic gap in #519).
     *applied_out = resolved_chain.applied().to_vec();
-    // A check that calls a remote moderation service is admitted by the
-    // key's rate limits before it runs, and a refusal keeps the slot it took
-    // (see `quota::reserve_before_costly_check`).
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let early_reservation = crate::quota::reserve_before_costly_check(
-        resolved_chain.as_ref(),
-        crate::quota::enforce(state, snapshot, auth, Some(&model_rl)),
-    )
-    .await?;
+    let mut early_reservation = None;
     if !resolved_chain.is_empty() {
         let chat = crate::redact::anthropic_request_for_inspection(body).map_err(|_| {
             *suppress_failure_content_out = true;
@@ -614,6 +607,15 @@ async fn dispatch(
                     .to_string(),
             )
         })?;
+        // A check that calls a remote moderation service is admitted by the
+        // key's rate limits before it runs, and a refusal keeps the slot it
+        // took (see `quota::reserve_before_costly_check`). Taken once the
+        // body could be inspected: one that cannot never reaches the service.
+        early_reservation = crate::quota::reserve_before_costly_check(
+            resolved_chain.as_ref(),
+            crate::quota::enforce(state, snapshot, auth, Some(&model_rl)),
+        )
+        .await?;
         let (verdict, hits) = aisix_guardrails::Guardrail::check_input_non_segment_observed(
             resolved_chain.as_ref(),
             &chat,
