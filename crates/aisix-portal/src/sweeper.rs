@@ -70,6 +70,24 @@ pub fn tick_secs() -> u64 {
         .unwrap_or(DEFAULT_TICK_SECS)
 }
 
+/// 一条序列的游标多久没被读到就剪掉。
+///
+/// 游标按完整标签记，`instance` 在其中：Kubernetes 里每次发版，每个 pod 都是一个
+/// 新的 IP:端口，也就是一批新序列，旧的那批不会再出现。不剪的话每个用户的游标随
+/// 发版只增不减，而每一轮都要把它们全部读出来。
+///
+/// 剪掉不会造成重扣。网关进程活着就一直暴露它的每条序列（回收指标句柄也不删
+/// 序列），所以一条序列整整三十天不在读数里，暴露它的进程早已退出；同样的标签再
+/// 出现，是一个新进程 —— 新 pod 恰好拿到同一个地址，或者网关重启了 —— 计数器从 0
+/// 起，启动时刻比游标里记的晚。按重启的规则这时本来就按当前读数整段扣，与没有
+/// 游标的新序列扣的是同一个数，所以游标在不在都一样。不暴露启动时刻的旧网关上，
+/// 留着游标反而更糟：重置早落在 `resets()` 的窗口之外，新进程的计数器会被拿去跟
+/// 旧进程的读数比，少扣。
+///
+/// 唯一的例外是一个网关进程一直活着、却连续三十天没被抓到，之后又被抓到：它在那
+/// 之前已经扣过的累计会再扣一次（那三十天里的消费在此之前同样一直没扣到）。
+const CURSOR_RETENTION: chrono::TimeDelta = chrono::TimeDelta::days(30);
+
 /// 一轮的结果，供调用方与测试观察。
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct TickReport {
@@ -362,7 +380,9 @@ impl<S: ConsumptionSource> Sweeper<S> {
                     if crate::store::billing_basis_on(&mut *conn, &user_id).await? != basis {
                         return Ok(false);
                     }
-                    let now = Utc::now().to_rfc3339();
+                    let wall = Utc::now();
+                    let now = wall.to_rfc3339();
+                    let stale_before = (wall - CURSOR_RETENTION).to_rfc3339();
                     if delta != 0 {
                         crate::ledger::insert_entry(
                             &mut *conn,
@@ -390,6 +410,14 @@ impl<S: ConsumptionSource> Sweeper<S> {
                         .execute(&mut *conn)
                         .await?;
                     }
+                    // 剪掉久未出现的游标（见 `CURSOR_RETENTION`）。这一轮读数里的每条
+                    // 序列上面都刚写成 `updated_at = now`，所以按时间筛出来的只会是这次
+                    // 读数里没有的。
+                    sqlx::query("DELETE FROM spend_cursor WHERE user_id = ?1 AND updated_at < ?2")
+                        .bind(&user_id)
+                        .bind(&stale_before)
+                        .execute(&mut *conn)
+                        .await?;
                     for (key_name, micro) in &key_spend {
                         sqlx::query(
                             "INSERT INTO key_spend (user_id, key_name, spent_micro_usd, updated_at)
@@ -968,6 +996,13 @@ mod tests {
                 .or_default()
                 .value += v;
         }
+        /// 这个网关实例上的序列从此不再上报 —— 那个 pod 没了。
+        pub(super) fn drop_instance(&self, user_id: &str, instance: &str) {
+            self.counters
+                .lock()
+                .unwrap()
+                .retain(|(u, _, i), _| !(u == user_id && i == instance));
+        }
         /// 这个用户名下所有序列归零 —— 网关副本重启。
         pub(super) fn reset(&self, user_id: &str) {
             for ((u, _, _), c) in self.counters.lock().unwrap().iter_mut() {
@@ -1510,6 +1545,56 @@ api_keys:
         f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
         // 当成重启就会把累计 $2 整个再扣一遍。
         assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 8_000_000);
+    }
+
+    #[tokio::test]
+    async fn 三十天没再出现的序列_游标被剪掉_仍在读数里的与刚消失的不剪() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 10_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        // 三个副本各花了 $1。
+        for gw in ["gw-1", "gw-gone", "gw-recent"] {
+            f.src.series(&f.uid, gw, 1_000_000);
+        }
+        f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 7_000_000);
+
+        // gw-1 与 gw-gone 的游标三十多天没更新过，gw-recent 的是刚写的；之后
+        // gw-gone 与 gw-recent 的 pod 没了，读数里只剩 gw-1。
+        let long_ago = (Utc::now() - chrono::TimeDelta::days(31)).to_rfc3339();
+        sqlx::query("UPDATE spend_cursor SET updated_at = ?1 WHERE series NOT LIKE '%gw-recent%'")
+            .bind(&long_ago)
+            .execute(f.store.pool())
+            .await
+            .unwrap();
+        f.src.drop_instance(&f.uid, "gw-gone");
+        f.src.drop_instance(&f.uid, "gw-recent");
+        f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
+
+        let key = |gw: &str| series_key(&(f.uid.clone(), None, gw.to_string()));
+        let mut left: Vec<String> = f
+            .store
+            .billing_basis(&f.uid)
+            .await
+            .unwrap()
+            .cursors
+            .into_keys()
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![key("gw-1"), key("gw-recent")],
+            "只该剪掉既久未更新、又不在这次读数里的那条"
+        );
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 7_000_000);
+
+        // 同一个地址上后来起了一个新进程（新 pod 拿到了同一个 IP:端口）：它的计数器
+        // 从 0 起，只扣它自己的 $0.4，旧进程那 $1 不会再扣一遍。
+        f.src.series(&f.uid, "gw-gone", 400_000);
+        f.sw.tick(t("2026-08-26T10:00:30Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 6_600_000);
     }
 
     /// 读完之后在栅栏上等另一个实例也读完：两边都在对方入账之前拿到同一份依据。
