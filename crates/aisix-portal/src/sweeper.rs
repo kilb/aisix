@@ -85,8 +85,14 @@ pub fn tick_secs() -> u64 {
 /// 留着游标反而更糟：重置早落在 `resets()` 的窗口之外，新进程的计数器会被拿去跟
 /// 旧进程的读数比，少扣。
 ///
-/// 唯一的例外是一个网关进程一直活着、却连续三十天没被抓到，之后又被抓到：它在那
-/// 之前已经扣过的累计会再扣一次（那三十天里的消费在此之前同样一直没扣到）。
+/// 读数一条序列都没有的那一轮不剪（见 `settle`）：整段抓取中断时 Prometheus 照常
+/// 应答、只是一条都没有，这时剪掉，恢复后每个还活着的进程都会把整段累计再扣一遍。
+/// 代价是网关进程真的全退了、之后再也没有新序列的用户，旧游标一直留着 —— 不会再
+/// 增长，因为也没有新序列进来。
+///
+/// 剩下的例外是一个网关进程一直活着、却连续三十天没被抓到，而同一用户别的序列照常
+/// 读得到，之后它又被抓到：它在那之前已经扣过的累计会再扣一次（那三十天里的消费在
+/// 此之前同样一直没扣到）。
 const CURSOR_RETENTION: chrono::TimeDelta = chrono::TimeDelta::days(30);
 
 /// 老用户建完游标之后的宽限期：这段时间里第一次出现的序列只记游标、不扣款。
@@ -436,11 +442,19 @@ impl<S: ConsumptionSource> Sweeper<S> {
                     // 剪掉久未出现的游标（见 `CURSOR_RETENTION`）。这一轮读数里的每条
                     // 序列上面都刚写成 `updated_at = now`，所以按时间筛出来的只会是这次
                     // 读数里没有的。
-                    sqlx::query("DELETE FROM spend_cursor WHERE user_id = ?1 AND updated_at < ?2")
+                    //
+                    // 读数一条序列都没有时不剪：那更像是抓取中断（Prometheus 照常应答，
+                    // 只是什么都没抓到），而不是这个用户的网关进程全退了。中断一长，剪掉
+                    // 的游标会让恢复后还活着的进程把整段累计再扣一遍。
+                    if !cursors.is_empty() {
+                        sqlx::query(
+                            "DELETE FROM spend_cursor WHERE user_id = ?1 AND updated_at < ?2",
+                        )
                         .bind(&user_id)
                         .bind(&stale_before)
                         .execute(&mut *conn)
                         .await?;
+                    }
                     for (key_name, micro) in &key_spend {
                         sqlx::query(
                             "INSERT INTO key_spend (user_id, key_name, spent_micro_usd, updated_at)
@@ -998,6 +1012,9 @@ mod tests {
         /// 「下一次」会让测试依赖清扫器先访问谁 —— 那种测试无论答案如何都是
         /// 脆的（第一版就是这么挂的）。
         fail_for: Mutex<Option<String>>,
+        /// 指定哪个用户的读取「成功、但一条序列都没有」：抓取中断了，Prometheus
+        /// 照常应答，网关进程和它们的计数器都还在。
+        outage_for: Mutex<Option<String>>,
     }
 
     impl FakeSource {
@@ -1071,6 +1088,10 @@ mod tests {
         pub(super) fn fail_for(&self, user_id: &str) {
             *self.fail_for.lock().unwrap() = Some(user_id.to_string());
         }
+        /// 抓取中断（`Some`）或恢复（`None`），见 `outage_for`。
+        pub(super) fn scrape_outage_for(&self, user_id: Option<&str>) {
+            *self.outage_for.lock().unwrap() = user_id.map(str::to_string);
+        }
     }
 
     impl ConsumptionSource for Arc<FakeSource> {
@@ -1100,6 +1121,9 @@ mod tests {
             }
             if self.fail_for.lock().unwrap().as_deref() == Some(user_id) {
                 return None;
+            }
+            if self.outage_for.lock().unwrap().as_deref() == Some(user_id) {
+                return Some(Vec::new());
             }
             // 某条序列在时刻 t 之前最后一次被读时的重置次数 —— Prometheus 按采样
             // 数重置，这里按读数近似。
@@ -1737,6 +1761,58 @@ api_keys:
         f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
         // 当成重启就会把累计 $2 整个再扣一遍。
         assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 8_000_000);
+    }
+
+    #[tokio::test]
+    async fn 抓取中断时读数一条序列都没有_久未更新的游标也不剪_恢复后不重扣() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 10_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        // 两个副本各花了 $1。
+        for gw in ["gw-1", "gw-2"] {
+            f.src.series(&f.uid, gw, 1_000_000);
+        }
+        f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 8_000_000);
+
+        // 抓取中断了三十多天：两条游标都过了保留期，Prometheus 照常应答却一条序列
+        // 都没有 —— 两个网关进程其实一直活着。
+        let long_ago = (Utc::now() - chrono::TimeDelta::days(31)).to_rfc3339();
+        sqlx::query("UPDATE spend_cursor SET updated_at = ?1")
+            .bind(&long_ago)
+            .execute(f.store.pool())
+            .await
+            .unwrap();
+        f.src.scrape_outage_for(Some(&f.uid));
+        f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
+
+        let key = |gw: &str| series_key(&(f.uid.clone(), None, gw.to_string()));
+        let mut left: Vec<String> = f
+            .store
+            .billing_basis(&f.uid)
+            .await
+            .unwrap()
+            .cursors
+            .into_keys()
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![key("gw-1"), key("gw-2")],
+            "读数一条都没有时不该剪游标"
+        );
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 8_000_000);
+
+        // 抓取恢复：还是那两个进程、那两个计数器，中断期间各又花了 $0.25。只扣这
+        // $0.5，之前的 $2 不会再扣一遍。
+        f.src.scrape_outage_for(None);
+        for gw in ["gw-1", "gw-2"] {
+            f.src.series(&f.uid, gw, 250_000);
+        }
+        f.sw.tick(t("2026-08-26T10:00:30Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 7_500_000);
     }
 
     #[tokio::test]
