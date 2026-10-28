@@ -155,6 +155,14 @@ impl EtcdConfigProvider {
 /// 配置再大也只是页数多，不会因为总量超出一次请求的预算而加载失败。
 const LOAD_PAGE_SIZE: i64 = 500;
 
+/// 全量加载在第一页之后遇到压缩时，从头重来的最多次数；用完就把压缩错误交给
+/// supervisor，由它按退避再试。
+const LOAD_COMPACTION_RESTARTS: u32 = 3;
+
+/// etcd 对已压缩修订号的范围读返回的错误（`ErrGRPCCompacted`）：
+/// <https://github.com/etcd-io/etcd/blob/v3.5.18/api/v3rpc/rpctypes/error.go>
+const COMPACTED_REVISION: &str = "required revision has been compacted";
+
 /// 前缀范围的结束键：最后一个小于 0xff 的字节加一，其后截断（与 etcd 客户端
 /// 的 `GetPrefixRangeEnd` 相同）。全是 0xff 时取到 key 空间末尾。
 fn prefix_range_end(prefix: &[u8]) -> Vec<u8> {
@@ -179,6 +187,7 @@ impl ConfigProvider for EtcdConfigProvider {
         let mut start = self.prefix.as_bytes().to_vec();
         let mut revision = 0;
         let mut entries = Vec::new();
+        let mut restarts = 0;
         loop {
             let mut options = GetOptions::new()
                 .with_range(range_end.clone())
@@ -196,8 +205,29 @@ impl ConfigProvider for EtcdConfigProvider {
                     ))
                 })?,
                 None => get.await,
-            }
-            .map_err(|e| ProviderError::Range(format_error_chain(&e)))?;
+            };
+            let resp = match resp {
+                Ok(resp) => resp,
+                // 第一页之后 etcd 压缩过了钉住的修订号：这个修订上的快照已经
+                // 读不全了，从第一页、在新的修订号上重来。
+                Err(e)
+                    if restarts < LOAD_COMPACTION_RESTARTS
+                        && e.to_string().contains(COMPACTED_REVISION) =>
+                {
+                    restarts += 1;
+                    tracing::warn!(
+                        revision,
+                        restart = restarts,
+                        max = LOAD_COMPACTION_RESTARTS,
+                        "etcd compacted past the load's revision between pages — restarting the load",
+                    );
+                    start = self.prefix.as_bytes().to_vec();
+                    revision = 0;
+                    entries.clear();
+                    continue;
+                }
+                Err(e) => return Err(ProviderError::Range(format_error_chain(&e))),
+            };
 
             if revision == 0 {
                 revision = resp.header().map(|h| h.revision()).unwrap_or(0);
