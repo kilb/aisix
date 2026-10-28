@@ -29,6 +29,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use aisix_core::{A2aAgent, A2aAuthType, A2aProtocolVersion};
+use aisix_gateway::redact_url_for_log;
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -190,18 +191,6 @@ impl std::fmt::Debug for A2aUpstream {
             .field("timeout", &self.timeout)
             .finish()
     }
-}
-
-fn redact_url_for_log(raw: &str) -> String {
-    let Ok(mut url) = reqwest::Url::parse(raw) else {
-        return "<invalid URL>".to_string();
-    };
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
-    url.set_path("/");
-    url.set_query(None);
-    url.set_fragment(None);
-    url.to_string()
 }
 
 /// Warn — once per (agent, url) per process — when a credentialed agent is

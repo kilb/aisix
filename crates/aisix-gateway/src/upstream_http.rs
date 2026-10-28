@@ -342,6 +342,24 @@ fn redact_url(url: &reqwest::Url) -> String {
     out.to_string()
 }
 
+/// An operator-configured upstream URL reduced to `scheme://host[:port]/`
+/// for a log line or a `Debug` rendering: userinfo, path, query, and
+/// fragment are all dropped, since any of them can carry a credential
+/// (`user:pass@`, a tenant-secret path segment, `?token=`). Unlike
+/// [`redact_url`], nothing past the origin is kept — the value identifies
+/// which upstream it is, and is never needed to reach it.
+pub fn redact_url_for_log(raw: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(raw) else {
+        return "<invalid URL>".to_string();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_path("/");
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -867,6 +885,15 @@ mod tests {
         assert!(out.contains("alt=sse"), "{out}");
         assert!(out.contains("keyword=hello"), "{out}");
         assert!(out.contains("signature_version=4"), "{out}");
+    }
+
+    #[test]
+    fn log_url_keeps_only_the_origin() {
+        let out = redact_url_for_log(
+            "https://alice:hunter2@mcp.example.com:8443/tenant-secret/mcp?token=q-secret#frag",
+        );
+        assert_eq!(out, "https://mcp.example.com:8443/");
+        assert_eq!(redact_url_for_log("not a url"), "<invalid URL>");
     }
 
     #[test]

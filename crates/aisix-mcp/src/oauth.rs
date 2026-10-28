@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::bridge::{OAuthClientConfig, DEFAULT_UPSTREAM_TIMEOUT};
+use crate::bridge::{redact_request_url, OAuthClientConfig, DEFAULT_UPSTREAM_TIMEOUT};
 use crate::error::McpError;
 
 /// Stop reusing a cached token this long before its reported expiry, so an
@@ -187,9 +187,10 @@ async fn fetch_token(cfg: &OAuthClientConfig) -> Result<(String, Duration), McpE
         .send()
         .await
         .map_err(|e| {
-            // reqwest transport errors describe the connection (and may name
-            // the non-secret token_url), never the form body.
-            McpError::Connect(format!("upstream OAuth token request failed: {e}"))
+            // reqwest transport errors describe the connection (and name the
+            // token_url, reduced here to its origin), never the form body.
+            let message = redact_request_url(e.to_string(), e.url().map(|u| u.as_str()));
+            McpError::Connect(format!("upstream OAuth token request failed: {message}"))
         })?;
 
     let status = response.status();
@@ -569,6 +570,28 @@ mod tests {
             "redirect should surface as its status: {err}"
         );
         assert_eq!(endpoint.hits(), 1, "the redirect must not be followed");
+    }
+
+    /// The error lands in the gateway log (`tools/list` / `tools/call`
+    /// failures), and reqwest's own rendering names the request URL — query
+    /// included. A `token_url` can carry a credential there, so only its
+    /// origin may appear.
+    #[tokio::test]
+    async fn token_request_failure_names_no_url_credentials() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        let cfg = config(format!(
+            "http://bob:idp-pass@127.0.0.1:{port}/idp-path?token=idp-query"
+        ));
+        let err = get_or_fetch(&cfg)
+            .await
+            .expect_err("a closed token endpoint must fail")
+            .to_string();
+        for secret in ["idp-pass", "idp-path", "idp-query", "token="] {
+            assert!(!err.contains(secret), "error leaked {secret}: {err}");
+        }
+        assert!(err.contains(&format!("http://127.0.0.1:{port}/")), "{err}");
     }
 
     #[tokio::test]

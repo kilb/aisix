@@ -15,14 +15,15 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use aisix_core::{McpAuthType, McpServer};
+use aisix_gateway::redact_url_for_log;
 use async_trait::async_trait;
 use http::{HeaderName, HeaderValue};
 use rmcp::model::{CallToolRequestParams, CallToolResponse, ClientInfo, ProtocolVersion};
-use rmcp::service::{ClientInitializeError, RoleClient, RunningService};
+use rmcp::service::{ClientInitializeError, RoleClient, RunningService, ServiceError};
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransportConfig, StreamableHttpError,
 };
-use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::{DynamicTransportError, StreamableHttpClientTransport};
 use rmcp::ClientCacheConfig;
 use rmcp::{ClientLifecycleMode, ClientServiceExt};
 
@@ -207,13 +208,15 @@ pub struct OAuthClientConfig {
 
 // Hand-written for the same reason as `McpAuth`'s: the client secret must
 // never land in logs via `{:?}`. The non-secret fields stay visible — they
-// are what an operator needs to identify the token exchange being logged.
+// are what an operator needs to identify the token exchange being logged —
+// with `token_url` reduced to its origin, since a URL can carry a
+// credential of its own.
 impl std::fmt::Debug for OAuthClientConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OAuthClientConfig")
             .field("client_id", &self.client_id)
             .field("client_secret", &"***redacted***")
-            .field("token_url", &self.token_url)
+            .field("token_url", &redact_url_for_log(&self.token_url))
             .field("scopes", &self.scopes)
             .finish()
     }
@@ -270,11 +273,12 @@ pub struct McpUpstream {
 }
 
 // Manual so a `Bearer` token cannot leak through `McpUpstream`'s `Debug`
-// (delegates to the redacting `McpAuth` impl above).
+// (delegates to the redacting `McpAuth` impl above), nor a credential the
+// URL itself carries.
 impl std::fmt::Debug for McpUpstream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("McpUpstream")
-            .field("url", &self.url)
+            .field("url", &redact_url_for_log(&self.url))
             .field("auth", &self.auth)
             .field("timeout", &self.timeout)
             .field("protocol", &self.protocol)
@@ -481,8 +485,16 @@ impl RmcpBridge {
                     // response body in the error text, which lands in gateway
                     // logs. An upstream that reflects request headers into its
                     // error body (or emits control characters for log injection)
-                    // must not get either past this point verbatim.
-                    McpError::Connect(sanitize_error_message(&e.to_string()))
+                    // must not get either past this point verbatim. The
+                    // request URL a transport failure names is redacted first,
+                    // before truncation can cut it anywhere.
+                    let message = match &e {
+                        ClientInitializeError::TransportError { error, .. } => {
+                            redact_transport_url(e.to_string(), error)
+                        }
+                        _ => e.to_string(),
+                    };
+                    McpError::Connect(sanitize_error_message(&message))
                 })
         };
         let running = tokio::time::timeout(upstream.timeout, establish)
@@ -529,6 +541,41 @@ pub(crate) fn sanitize_error_message(message: &str) -> String {
     }
 }
 
+/// `message` with the request URL it names reduced to its origin
+/// ([`redact_url_for_log`]). reqwest renders the URL it was sending to into
+/// its error text — userinfo already moved into a header, path and query
+/// intact — and the gateway logs these errors. `url` is the error's own
+/// [`reqwest::Error::url`], i.e. exactly the text reqwest rendered.
+pub(crate) fn redact_request_url(message: String, url: Option<&str>) -> String {
+    match url {
+        Some(url) if !url.is_empty() => message.replace(url, &redact_url_for_log(url)),
+        _ => message,
+    }
+}
+
+/// [`redact_request_url`] for an rmcp transport failure, which wraps the
+/// reqwest error (rmcp's own reqwest, `rmcp_reqwest`) verbatim.
+fn redact_transport_url(message: String, error: &DynamicTransportError) -> String {
+    let url = match error
+        .error
+        .downcast_ref::<StreamableHttpError<rmcp_reqwest::Error>>()
+    {
+        Some(StreamableHttpError::Client(e)) => e.url().map(|u| u.as_str()),
+        _ => None,
+    };
+    redact_request_url(message, url)
+}
+
+/// The log text of a failed MCP request on an open session.
+fn service_error_message(error: &ServiceError) -> String {
+    match error {
+        ServiceError::TransportSend(transport) => {
+            redact_transport_url(error.to_string(), transport)
+        }
+        _ => error.to_string(),
+    }
+}
+
 /// Whether a failed `initialize` handshake was an upstream `401 Unauthorized`.
 ///
 /// The reqwest transport surfaces a 401 in one of two stable shapes (rmcp is
@@ -572,7 +619,7 @@ impl McpBridge for RmcpBridge {
         let result = tokio::time::timeout(self.timeout, self.running.list_tools(None))
             .await
             .map_err(|_| McpError::Request("upstream tools/list timed out".to_string()))?
-            .map_err(|e| McpError::Request(e.to_string()))?;
+            .map_err(|e| McpError::Request(service_error_message(&e)))?;
         Ok(result.tools.into_iter().map(into_mcp_tool).collect())
     }
 
@@ -602,7 +649,7 @@ impl McpBridge for RmcpBridge {
         let response = tokio::time::timeout(self.timeout, self.running.call_tool_once(params))
             .await
             .map_err(|_| McpError::Request("upstream tools/call timed out".to_string()))?
-            .map_err(|e| McpError::Request(e.to_string()))?;
+            .map_err(|e| McpError::Request(service_error_message(&e)))?;
         let result = match response {
             CallToolResponse::Complete(result) => result,
             CallToolResponse::InputRequired(_) => {
@@ -672,17 +719,22 @@ fn is_cleartext(url: &str) -> bool {
 /// to every credentialed auth type against an `http://` server URL —
 /// `type: mcp` and `type: openapi` rows share these fields — plus, for
 /// `oauth2`, a cleartext `token_url` (it carries the client secret; a
-/// distinct finding even when `token_url` equals `url`). Pure, so tests
+/// distinct finding even when `token_url` equals `url`). The URL is the
+/// one logged, so it is reduced to its origin ([`redact_url_for_log`]):
+/// userinfo, path and query can each carry a credential. Pure, so tests
 /// pin the selection.
 pub(crate) fn cleartext_findings(server: &McpServer) -> Vec<(&'static str, String)> {
     let mut findings = Vec::new();
     if server.auth_type != McpAuthType::None && is_cleartext(&server.url) {
-        findings.push(("the gateway-held upstream credential", server.url.clone()));
+        findings.push((
+            "the gateway-held upstream credential",
+            redact_url_for_log(&server.url),
+        ));
     }
     if server.auth_type == McpAuthType::OAuth2 {
         let token_url = server.token_url.as_deref().unwrap_or_default();
         if is_cleartext(token_url) {
-            findings.push(("the OAuth client secret", token_url.to_string()));
+            findings.push(("the OAuth client secret", redact_url_for_log(token_url)));
         }
     }
     findings
@@ -838,6 +890,100 @@ mod tests {
         ));
         assert_eq!(token_only.len(), 1);
         assert_eq!(token_only[0].0, "the OAuth client secret");
+    }
+
+    /// The URL a cleartext finding carries is what the warning logs. A
+    /// server or token URL can hold a credential of its own — userinfo, a
+    /// tenant-secret path, a `token=`-style query — so only its origin may
+    /// reach the log line.
+    #[test]
+    fn cleartext_findings_log_no_url_credentials() {
+        let server: McpServer = serde_json::from_value(serde_json::json!({
+            "display_name": "s",
+            "url": "http://alice:url-pass@mcp.internal/url-path?token=url-query",
+            "auth_type": "oauth2",
+            "secret": "k",
+            "client_id": "c",
+            "token_url": "http://bob:idp-pass@idp.internal/idp-path?client_secret=idp-query",
+        }))
+        .expect("valid server");
+        let findings = cleartext_findings(&server);
+        assert_eq!(findings.len(), 2);
+        for (_, logged) in &findings {
+            for secret in [
+                "url-pass",
+                "url-path",
+                "url-query",
+                "idp-pass",
+                "idp-path",
+                "idp-query",
+                "token=",
+            ] {
+                assert!(
+                    !logged.contains(secret),
+                    "logged URL leaked {secret}: {logged}"
+                );
+            }
+        }
+        // The origin stays, so the operator can tell which upstream it is.
+        assert_eq!(findings[0].1, "http://mcp.internal/");
+        assert_eq!(findings[1].1, "http://idp.internal/");
+    }
+
+    /// A failed `tools/list` / `tools/call` lands in the gateway log, and the
+    /// transport error rmcp wraps names the request URL (reqwest moves
+    /// userinfo into a header, but keeps path and query). Only the origin may
+    /// appear. Built from a real failed send through rmcp's reqwest, so the
+    /// text is exactly what a dropped upstream produces; unlike a connect
+    /// failure, nothing truncates it.
+    #[tokio::test]
+    async fn transport_failure_names_no_url_credentials() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        let sent = rmcp_reqwest::Client::new()
+            .post(format!(
+                "http://alice:url-pass@127.0.0.1:{port}/url-path?token=url-query"
+            ))
+            .send()
+            .await;
+        let Err(reqwest_error) = sent else {
+            panic!("a closed upstream must fail");
+        };
+        let error =
+            ServiceError::TransportSend(DynamicTransportError::new::<
+                StreamableHttpClientTransport<rmcp_reqwest::Client>,
+                RoleClient,
+            >(StreamableHttpError::Client(reqwest_error)));
+        let logged = service_error_message(&error);
+        for secret in ["url-pass", "url-path", "url-query", "token="] {
+            assert!(!logged.contains(secret), "error leaked {secret}: {logged}");
+        }
+        assert!(
+            logged.contains(&format!("http://127.0.0.1:{port}/")),
+            "{logged}"
+        );
+    }
+
+    /// Same rule for the `Debug` renderings, which exist to be logged.
+    #[test]
+    fn debug_redacts_url_credentials() {
+        let mut upstream = McpUpstream::new("https://alice:url-pass@mcp.example.com/mcp?token=q1");
+        upstream.auth = McpAuth::OAuth2(OAuthClientConfig {
+            client_id: "cid".into(),
+            client_secret: "cs".into(),
+            token_url: "https://bob:idp-pass@idp.example.com/token?token=q2".into(),
+            scopes: vec![],
+        });
+        let rendered = format!("{upstream:?}");
+        for secret in ["url-pass", "idp-pass", "token=", "q1", "q2"] {
+            assert!(
+                !rendered.contains(secret),
+                "Debug leaked {secret}: {rendered}"
+            );
+        }
+        assert!(rendered.contains("https://mcp.example.com/"), "{rendered}");
+        assert!(rendered.contains("https://idp.example.com/"), "{rendered}");
     }
 
     /// The dial to an upstream that swallows SYNs must be cut by the

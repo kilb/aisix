@@ -212,13 +212,18 @@ impl OpenApiBridge {
             }
         }
 
-        // The error text (which may embed the operator-configured base URL)
-        // is logged server-side by the gateway and never returned to the
-        // agent; sanitizing bounds it and strips log-injection vectors.
+        // The error text (which names the request URL: the
+        // operator-configured base URL plus the agent's query arguments) is
+        // logged server-side by the gateway and never returned to the agent;
+        // the URL is reduced to its origin, and sanitizing bounds the text
+        // and strips log-injection vectors.
         let response = request.send().await.map_err(|e| {
             McpError::Request(format!(
                 "HTTP request failed: {}",
-                crate::bridge::sanitize_error_message(&e.to_string())
+                crate::bridge::sanitize_error_message(&crate::bridge::redact_request_url(
+                    e.to_string(),
+                    e.url().map(|u| u.as_str())
+                ))
             ))
         })?;
 
@@ -234,7 +239,10 @@ impl OpenApiBridge {
         let body = response.text().await.map_err(|e| {
             McpError::Request(format!(
                 "failed to read response: {}",
-                crate::bridge::sanitize_error_message(&e.to_string())
+                crate::bridge::sanitize_error_message(&crate::bridge::redact_request_url(
+                    e.to_string(),
+                    e.url().map(|u| u.as_str())
+                ))
             ))
         })?;
 
@@ -1165,5 +1173,40 @@ mod tests {
         assert_eq!(coerce_body(Some(&json!(5))), Some(json!({"data": 5})));
         assert_eq!(coerce_body(Some(&Value::Null)), None);
         assert_eq!(coerce_body(None), None);
+    }
+
+    /// A failed upstream call's error lands in the gateway log, and
+    /// reqwest's own rendering names the request URL: the operator's base
+    /// URL path plus the query built from the agent's arguments. Only the
+    /// origin may appear.
+    #[tokio::test]
+    async fn transport_failure_names_no_url_credentials() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        let server: McpServer = serde_json::from_value(json!({
+            "name": "erp",
+            "type": "openapi",
+            "url": format!("http://alice:url-pass@127.0.0.1:{port}/url-path"),
+            "auth_type": "none",
+            "spec": {
+                "openapi": "3.0.0",
+                "paths": { "/items": { "get": {
+                    "operationId": "listItems",
+                    "parameters": [{ "name": "q", "in": "query", "schema": { "type": "string" } }]
+                } } }
+            },
+        }))
+        .expect("valid server");
+        let bridge = OpenApiBridge::new(Arc::new(ResourceEntry::new("e1", server, 1)));
+        let err = bridge
+            .call_tool("listitems", json!({ "q": "arg-query" }))
+            .await
+            .expect_err("a closed upstream must fail")
+            .to_string();
+        for secret in ["url-pass", "url-path", "arg-query"] {
+            assert!(!err.contains(secret), "error leaked {secret}: {err}");
+        }
+        assert!(err.contains(&format!("http://127.0.0.1:{port}/")), "{err}");
     }
 }
