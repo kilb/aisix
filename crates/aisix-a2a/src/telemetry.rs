@@ -451,12 +451,24 @@ fn method_sets_push(method: &str) -> bool {
     !reads_config && names_push_notification(method)
 }
 
-/// A name lowercased with everything but letters and digits dropped, so the
-/// spellings decoders treat as one field compare equal.
+/// A name lowercased with everything but ASCII letters and digits dropped, so
+/// the spellings decoders treat as one field compare equal.
+///
+/// Lowercased by Unicode rules first, with the two letters that case-fold to
+/// an ASCII letter without lowercasing to one mapped by hand: a decoder that
+/// matches keys case-insensitively may fold `ſ` (U+017F) to `s` (Go does) and
+/// `ı` (U+0131) to `i` (.NET does), and the Kelvin sign (U+212A) lowercases
+/// to `k` on its own. Folding more spellings together only ever makes the
+/// check match more.
 fn normalized_name(name: &str) -> String {
     name.chars()
+        .flat_map(char::to_lowercase)
+        .map(|c| match c {
+            '\u{17f}' => 's',
+            '\u{131}' => 'i',
+            c => c,
+        })
         .filter(char::is_ascii_alphanumeric)
-        .map(|c| c.to_ascii_lowercase())
         .collect()
 }
 
@@ -2032,6 +2044,15 @@ mod tests {
             json!({"method": "message/send", "METHOD": "CreateTaskPushNotificationConfig"}),
             json!({"method": "message/send", "Params": {"Configuration": {
                 "PushNotificationConfig": webhook}}}),
+            // Unicode case folding binds these too: Go folds `ſ` to `s` and
+            // the Kelvin sign to `k`, .NET folds `ı` to `I`.
+            json!({"method": "message/send", "param\u{17f}": {"configuration": {
+                "pushNotificationConfig": webhook}}}),
+            json!({"method": "message/send", "params": {"conf\u{131}guration": {
+                "pu\u{17f}hNotificationConfig": webhook}}}),
+            json!({"method": "tasks/pu\u{17f}hNotificationConfig/set", "params": {}}),
+            json!({"method": "message/send", "params": {"configuration": {
+                "tas\u{212a}PushNotificationConfig": webhook, "pu\u{17f}h": 1}}}),
             // A JSON-RPC batch asks if any call in it does.
             json!([{"method": "tasks/get", "params": {}},
                    {"method": "tasks/pushNotificationConfig/set", "params": {}}]),
