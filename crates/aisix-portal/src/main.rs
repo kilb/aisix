@@ -528,7 +528,7 @@ mod tests {
             .map(|(before, _)| before)
             .unwrap_or(src);
 
-        // `.route("<path>", get(m::f).post(m::g))` → (path, [f, g])
+        // `.route("<path>", get(m::f).post(m::g))` → (path, [m::f, m::g])
         let mut pairs: Vec<(String, Vec<String>)> = Vec::new();
         for hit in production.match_indices(".route(") {
             let rest = &production[hit.0..];
@@ -547,11 +547,9 @@ mod tests {
                         .chars()
                         .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
                         .collect();
-                    // `keys::list` → `list`
-                    if let Some(name) = ident.rsplit("::").next() {
-                        if !name.is_empty() {
-                            handlers.push(name.to_string());
-                        }
+                    // 连模块一起留着：`keys::set_quota` 与 `admin::set_quota` 同名。
+                    if !ident.is_empty() {
+                        handlers.push(ident);
                     }
                 }
             }
@@ -563,31 +561,36 @@ mod tests {
             pairs.len()
         );
 
-        // 处理器散在几个模块里，所以按名字在整个 src/ 里找它的函数体。
+        // 按路由表里写的模块路径找处理器：`usage::balance` 只在 `src/usage.rs` 里找，
+        // 而且只认顶格的那一个 `pub async fn balance(`。
+        //
+        // 不能拿裸名字满 src/ 去搜：搜到哪个取决于目录列举的顺序。`ledger.rs` 里
+        // 缩进的 `Ledger::balance` 先被列到，就被当成了 `/api/balance` 的处理器；
+        // `keys::set_quota` 与 `admin::set_quota` 同名，一个丢了身份检查也能借另一个
+        // 的函数体蒙混过去。
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let sources: Vec<String> = std::fs::read_dir(&dir)
-            .expect("read src/")
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-            .filter_map(|p| std::fs::read_to_string(p).ok())
-            .map(|src| {
-                src.split_once("\n#[cfg(test)]")
-                    .map(|(a, _)| a.to_string())
-                    .unwrap_or(src)
-            })
-            .collect();
-
-        let body_of = |name: &str| -> String {
-            let needle = format!("pub async fn {name}(");
-            for src in &sources {
-                if let Some((_, rest)) = src.split_once(&needle) {
-                    if let Some((body, _)) = rest.split_once("\n}\n") {
-                        return body.to_string();
-                    }
-                }
-            }
-            panic!("找不到处理器 {name}");
+        let body_of = |handler: &str| -> String {
+            // 没写模块的处理器就在 main.rs 里。
+            let (module, name) = handler.rsplit_once("::").unwrap_or(("main", handler));
+            let file = dir.join(format!("{module}.rs"));
+            let src = std::fs::read_to_string(&file).unwrap_or_else(|e| {
+                panic!("读不到处理器 {handler} 所在的 {}: {e}", file.display())
+            });
+            let src = src
+                .split_once("\n#[cfg(test)]")
+                .map_or(src.as_str(), |(before, _)| before);
+            let needle = format!("\npub async fn {name}(");
+            let hits: Vec<usize> = src.match_indices(&needle).map(|(at, _)| at).collect();
+            assert_eq!(
+                hits.len(),
+                1,
+                "处理器 {handler}：{} 里顶格的 `pub async fn {name}(` 应恰好一处",
+                file.display(),
+            );
+            src[hits[0] + needle.len()..]
+                .split_once("\n}\n")
+                .map(|(body, _)| body.to_string())
+                .unwrap_or_else(|| panic!("处理器 {handler} 的函数体找不到结尾"))
         };
 
         for (path, handlers) in &pairs {
