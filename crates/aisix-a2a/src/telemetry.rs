@@ -406,43 +406,64 @@ pub fn request_would_mask_unrewritable(
 /// - a send carrying one in `params.configuration`: 0.3
 ///   `pushNotificationConfig`, 1.0 `taskPushNotificationConfig`.
 ///
-/// Both are recognised in any spelling a lenient parser accepts (camel or
-/// snake case, with or without the `task` prefix). A method of the push-config
-/// family that is not one of the reads (`get` / `list` / `delete`) counts as
-/// a set, so a draft or vendor spelling of the setter cannot pass as an
-/// unknown method.
+/// Both are recognised in any spelling a lenient decoder accepts: camel or
+/// snake case, with or without the `task` prefix, and the envelope's own
+/// `method` / `params` / `configuration` keys in any casing — some decoders
+/// bind keys case-insensitively, so `"Method"` names the same field there.
+/// When several keys name the method, any of them that sets push counts. A
+/// method of the push-config family that is not one of the reads (`get` /
+/// `list` / `delete`) counts as a set, so a draft or vendor spelling of the
+/// setter cannot pass as an unknown method. A JSON-RPC batch asks for push
+/// delivery when any call in it does.
 pub fn requests_push_delivery(request: &Value) -> bool {
-    let method = request
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    match request {
+        Value::Array(calls) => calls.iter().any(requests_push_delivery),
+        Value::Object(call) => {
+            call.iter()
+                .any(|(key, value)| match normalized_name(key).as_str() {
+                    "method" => value.as_str().is_some_and(method_sets_push),
+                    "params" => value.as_object().is_some_and(|params| {
+                        params.iter().any(|(key, value)| {
+                            normalized_name(key) == "configuration"
+                                && value.as_object().is_some_and(|configuration| {
+                                    configuration.iter().any(|(key, value)| {
+                                        !value.is_null() && names_push_notification(key)
+                                    })
+                                })
+                        })
+                    }),
+                    _ => false,
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Whether a method name sets up push delivery: one of the push-config family
+/// that is not a read.
+fn method_sets_push(method: &str) -> bool {
     let reads_config = matches!(
         canonical_operation(method),
         "tasks/pushNotificationConfig/get"
             | "tasks/pushNotificationConfig/list"
             | "tasks/pushNotificationConfig/delete"
     );
-    if !reads_config && names_push_notification(method) {
-        return true;
-    }
-    request
-        .pointer("/params/configuration")
-        .and_then(Value::as_object)
-        .is_some_and(|configuration| {
-            configuration
-                .iter()
-                .any(|(key, value)| !value.is_null() && names_push_notification(key))
-        })
+    !reads_config && names_push_notification(method)
+}
+
+/// A name lowercased with everything but letters and digits dropped, so the
+/// spellings decoders treat as one field compare equal.
+fn normalized_name(name: &str) -> String {
+    name.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 /// Whether a method or field name is about push notifications, however it is
 /// cased or separated.
 fn names_push_notification(name: &str) -> bool {
-    name.chars()
-        .filter(char::is_ascii_alphanumeric)
-        .map(|c| c.to_ascii_lowercase())
-        .collect::<String>()
-        .contains("pushnotification")
+    normalized_name(name).contains("pushnotification")
 }
 
 /// One chunk of a streamed artifact, as a review that reads an answer across
@@ -2005,6 +2026,17 @@ mod tests {
                 "push_notification_config": webhook}}}),
             json!({"method": "SendStreamingMessage", "params": {"configuration": {
                 "task_push_notification_config": webhook}}}),
+            // A decoder that matches keys case-insensitively binds these to
+            // the same fields, so they ask the same thing.
+            json!({"Method": "tasks/pushNotificationConfig/set", "params": {}}),
+            json!({"method": "message/send", "METHOD": "CreateTaskPushNotificationConfig"}),
+            json!({"method": "message/send", "Params": {"Configuration": {
+                "PushNotificationConfig": webhook}}}),
+            // A JSON-RPC batch asks if any call in it does.
+            json!([{"method": "tasks/get", "params": {}},
+                   {"method": "tasks/pushNotificationConfig/set", "params": {}}]),
+            json!([{"method": "message/send", "params": {"configuration": {
+                "pushNotificationConfig": webhook}}}]),
         ] {
             assert!(
                 requests_push_delivery(&asks),
@@ -2021,6 +2053,7 @@ mod tests {
             // Only the configuration asks: a mention elsewhere is content.
             json!({"method": "message/send", "params": {"message": {"metadata": {
                 "pushNotificationConfig": webhook}}}}),
+            json!([{"method": "message/send", "params": {}}, {"method": "tasks/get"}]),
         ] {
             assert!(
                 !requests_push_delivery(&does_not),

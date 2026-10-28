@@ -315,6 +315,41 @@ describe("A2A output guardrails hold streamed answers back and refuse push deliv
         expect(posts(v, "clean").length).toBe(before);
       });
 
+      test("push setup sent as a batch or with differently cased keys is refused too", async (ctx) => {
+        if (!etcdReachable || !app) return ctx.skip();
+        // 有的 agent 按 JSON-RPC 批量请求处理数组，有的解码器不分键的大小写：
+        // 这两种写法到了 agent 那里都是在设推送。
+        const before = posts(v, "clean").length;
+        for (const body of [
+          [{ jsonrpc: "2.0", id: 1, method: SET_PUSH[v], params: { taskId: "task-e2e-stream" } }],
+          {
+            jsonrpc: "2.0",
+            id: 2,
+            Method: SET_PUSH[v],
+            params: { taskId: "task-e2e-stream" },
+          },
+          {
+            jsonrpc: "2.0",
+            id: 3,
+            method: SEND[v],
+            Params: {
+              message: message(v, "write the report"),
+              Configuration: { [PUSH_FIELD[v]]: { url: WEBHOOK } },
+            },
+          },
+        ]) {
+          const res = await fetch(`${app.proxyUrl}/a2a/${agentName("clean", v)}`, {
+            method: "POST",
+            headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          const text = await res.text();
+          expect(res.status, `${JSON.stringify(body).slice(0, 80)}: ${text.slice(0, 200)}`).not.toBe(200);
+          expect((JSON.parse(text) as { error?: { code?: number } }).error?.code).toBe(PUSH_NOT_SUPPORTED);
+        }
+        expect(posts(v, "clean").length).toBe(before);
+      });
+
       test("reading a push notification config is still forwarded", async (ctx) => {
         if (!etcdReachable || !app) return ctx.skip();
         // 拒的是「设推送」，不是所有和推送相关的方法：读回配置不会把回答送出去。
