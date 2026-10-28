@@ -186,7 +186,19 @@ impl Store {
             .connect_with(opts)
             .await
             .map_err(StoreError::Db)?;
-        sqlx::migrate!("./migrations")
+        let mut migrator = sqlx::migrate!("./migrations");
+        // 库里有这个版本不认识的 migration（更新的版本已经跑过）时照样打开。sqlx
+        // 默认拒绝启动，于是回滚、或新旧两个版本先后重启时，旧版门户起不来。
+        //
+        // **只在 migration 一直是纯增量时才安全**：只加表、加列（带默认值或可空）、
+        // 加索引，不删、不改名、不收紧约束 —— 旧版本照它认识的那部分读写，碰不到
+        // 新版本加的东西。哪条 migration 做不到这一点，就得先把这里关掉再发。
+        //
+        // `migrations/` 的规矩：已经发出去的 migration 永远不改、不重排，要变就加
+        // 一条新的。改了内容 sqlx 会因校验和对不上拒绝启动；重排会让不同的库按不同
+        // 顺序跑同一批 migration。
+        migrator.set_ignore_missing(true);
+        migrator
             .run(&pool)
             .await
             .map_err(|e| StoreError::Db(sqlx::Error::Migrate(Box::new(e))))?;
@@ -711,6 +723,41 @@ mod tests {
             checked >= 2,
             "expected the database and at least one WAL sibling to exist, checked {checked}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回滚、或新旧两个版本的门户先后重启：更新的版本已经给库加了一条这个版本
+    /// 不认识的 migration，这个版本照样要能打开它（见 `from_options`）。
+    #[tokio::test]
+    async fn 库里有更新版本加的_migration_时照样能打开() {
+        let dir = std::env::temp_dir().join(format!("aisix-portal-mig-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite:{}", dir.join("portal.db").display());
+        let store = Store::open(&url).await.unwrap();
+        store.insert_user("u1", "a@b.c", "h", None).await.unwrap();
+        // 更新版本跑过的一条 migration：它建的表，和它记在 `_sqlx_migrations` 里的那一行。
+        sqlx::query("CREATE TABLE newer_feature (id TEXT PRIMARY KEY)")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+             VALUES (9999, 'newer feature', 1, X'00', 0)",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        store.pool().close().await;
+        drop(store);
+
+        let reopened = Store::open(&url)
+            .await
+            .expect("更新版本加的 migration 把这个版本挡在了库外");
+        assert_eq!(
+            reopened.user_by_email("a@b.c").await.unwrap().map(|u| u.id),
+            Some("u1".to_string())
+        );
+        reopened.pool().close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
