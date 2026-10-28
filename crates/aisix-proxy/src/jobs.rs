@@ -497,6 +497,22 @@ fn jsonl_decoded_text(text: &str) -> Option<String> {
     parsed_any.then(|| out.join("\n"))
 }
 
+/// 输入审查读的文本：原样的字节之外，还有 JSONL 每行解码后的字符串。上游读
+/// 的是解码后的内容，`\u0068ow to …` 这类转义、以及 Python `json.dumps` 默认
+/// 把非 ASCII 全部转义成的 `\uXXXX`，在原样字节里都对不上规则。没有反斜杠就
+/// 没有转义，解码后的字符串都是原文的子串，不必再查一遍。
+fn inspection_text(blob: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(blob).into_owned();
+    match raw
+        .contains('\\')
+        .then(|| jsonl_decoded_text(&raw))
+        .flatten()
+    {
+        Some(decoded) => format!("{raw}\n{decoded}"),
+        None => raw,
+    }
+}
+
 /// 按这个目标模型的限流预留一次请求：这条面上每个转发都要占的那一格。
 async fn reserve_target(
     state: &ProxyState,
@@ -566,22 +582,9 @@ async fn scan_input_blob(
     if chain.is_empty() {
         return Ok(None);
     }
-    // 原样的字节之外，还要查 JSONL 每行解码后的字符串：上游读的是解码后的
-    // 内容，`\u0068ow to …` 这类转义、以及 Python `json.dumps` 默认把非
-    // ASCII 全部转义成的 `\uXXXX`，在原样字节里都对不上规则。没有反斜杠就
-    // 没有转义，解码后的字符串都是原文的子串，不必再查一遍。
-    let raw = String::from_utf8_lossy(blob).into_owned();
-    let inspected = match raw
-        .contains('\\')
-        .then(|| jsonl_decoded_text(&raw))
-        .flatten()
-    {
-        Some(decoded) => format!("{raw}\n{decoded}"),
-        None => raw,
-    };
     let chat = aisix_gateway::ChatFormat::new(
         target.display_name(),
-        vec![aisix_gateway::ChatMessage::user(inspected)],
+        vec![aisix_gateway::ChatMessage::user(inspection_text(blob))],
     );
     let (verdict, hits) = aisix_guardrails::Guardrail::check_input_observed(&chain, &chat).await;
     monitor_hits.extend(hits);
@@ -611,6 +614,14 @@ async fn scan_input_blob(
     // 改写是在文本 span 上做替换，所以 blob 得能按 UTF-8 读回来。把 lossy
     // 转换的结果写回去会毁掉一个非文本上传 —— 那种 blob 只查不改。
     let Ok(text) = std::str::from_utf8(blob) else {
+        // 可也不能因此不经遮蔽就转发：一个 0xFF 字节就能让一整份 PII 原样过
+        // 去。遮蔽规则在审查读的文本里有任何命中，就拒绝上传。
+        if aisix_guardrails::Guardrail::redact_input_text(&chain, &inspection_text(blob)).is_some()
+        {
+            return Err(ProxyError::ContentFiltered(
+                crate::error::guardrail_block_message("request", None),
+            ));
+        }
         return Ok(None);
     };
     // batch / 微调文件是 JSONL：逐行按请求内容改写，协议字段不动；协议字段
@@ -3376,11 +3387,9 @@ mod tests {
             "a mask that leaves no trace in the usage event cannot be audited"
         );
     }
-    /// 遮蔽是在文本 span 上做替换。一个不是合法 UTF-8 的上传只查不改 ——
-    /// 把 lossy 转换的结果写回去会把文件毁掉，而"护栏开着就悄悄改坏用户
-    /// 上传的文件"比漏遮蔽更糟。
-    #[tokio::test]
-    async fn a_non_utf8_upload_is_checked_but_relayed_byte_for_byte() {
+    /// 在 email mask 规则下上传一个文件部件，返回状态码与上游收到的 body
+    /// （没有转发时为 `None`）。
+    async fn upload_bytes_under_email_mask(payload: &[u8]) -> (StatusCode, Option<Vec<u8>>) {
         let upstream = MockServer::start().await;
         Mock::given(wm_method("POST"))
             .and(path("/v1/files"))
@@ -3401,9 +3410,6 @@ mod tests {
         snap.guardrails.insert(ResourceEntry::new("g-mask", g, 1));
         let app = build_app(snap);
 
-        // 0xff / 0xfe 在 UTF-8 里永远非法；邮箱地址放在后面，确保"没改"
-        // 不是因为没匹配上。
-        let payload: Vec<u8> = [b"\xff\xfe\x00bin alice@example.com".as_slice()].concat();
         let boundary = "XBINX";
         let mut b: Vec<u8> = Vec::new();
         b.extend_from_slice(
@@ -3416,7 +3422,7 @@ mod tests {
             format!("--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; filename=\"b.bin\"\r\n\r\n")
                 .as_bytes(),
         );
-        b.extend_from_slice(&payload);
+        b.extend_from_slice(payload);
         b.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
         let req = Request::builder()
@@ -3429,16 +3435,46 @@ mod tests {
             )
             .body(axum::body::Body::from(b))
             .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let status = app.oneshot(req).await.unwrap().status();
+        let sent = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .first()
+            .map(|r| r.body.clone());
+        (status, sent)
+    }
 
-        let received = upstream.received_requests().await.unwrap();
-        assert_eq!(received.len(), 1);
-        let sent = &received[0].body;
+    /// 遮蔽是在文本 span 上做替换。一个不是合法 UTF-8 的上传只查不改 ——
+    /// 把 lossy 转换的结果写回去会把文件毁掉，而"护栏开着就悄悄改坏用户
+    /// 上传的文件"比漏遮蔽更糟。遮蔽规则命中不了它时，它逐字节原样转发。
+    #[tokio::test]
+    async fn a_non_utf8_upload_is_checked_but_relayed_byte_for_byte() {
+        // 0xff / 0xfe 在 UTF-8 里永远非法。
+        let payload: &[u8] = b"\xff\xfe\x00bin nothing to mask here";
+        let (status, sent) = upload_bytes_under_email_mask(payload).await;
+        assert_eq!(status, StatusCode::OK);
+        let sent = sent.expect("the upload reaches the provider");
         assert!(
-            sent.windows(payload.len()).any(|w| w == payload.as_slice()),
+            sent.windows(payload.len()).any(|w| w == payload),
             "a non-text upload must reach the provider byte-for-byte"
         );
+    }
+
+    /// 改写不了也不能不经遮蔽就转发：一个非法字节就能让一整份 PII 原样过去。
+    /// 遮蔽规则命中一个不是合法 UTF-8 的上传 —— 原样写出的、或 JSON 转义写出
+    /// 的 —— 时拒绝上传。
+    #[tokio::test]
+    async fn a_non_utf8_upload_a_mask_rule_matches_is_refused() {
+        for payload in [
+            b"\xff\xfe\x00bin alice@example.com".as_slice(),
+            b"{\"custom_id\":\"r1\",\"body\":{\"messages\":[{\"role\":\"user\",\"content\":\"alice\\u0040example.com\"}]}}\n\xff\n"
+                .as_slice(),
+        ] {
+            let (status, sent) = upload_bytes_under_email_mask(payload).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{payload:?}");
+            assert!(sent.is_none(), "nothing may reach the provider: {payload:?}");
+        }
     }
     /// 一个 body 里出现两个 `file` 部件时，被扫的和被改写的必须是同一个。
     ///

@@ -26,6 +26,8 @@ import { pickFreePort } from "../harness/ports.js";
 //   5. 有的行是 JSON 对象、有的行不是（`null`、乱码）的文件，既没法逐行改写，也
 //      不能当纯文本改写（会改到协议字段和键，还看不见 JSON 转义写出的内容），
 //      所以拒绝上传。
+//   6. 不是合法 UTF-8 的文件改写不了：遮蔽规则会命中它时拒绝上传；命中不了的
+//      （比如一个二进制文件）照样逐字节转发。
 
 const CALLER_PLAINTEXT = "sk-jobs-file-mask-caller";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -34,18 +36,22 @@ const MODEL = "jfm-model";
 interface FilesUpstream {
   baseUrl: string;
   uploads: string[];
+  /** 与 `uploads` 一一对应的原始字节。 */
+  rawUploads: Buffer[];
   close(): Promise<void>;
 }
 
 /** 只认 `POST /v1/files` 的上游，记下每次收到的 multipart 原文。 */
 async function startFilesUpstream(): Promise<FilesUpstream> {
   const uploads: string[] = [];
+  const rawUploads: Buffer[] = [];
   const server: Server = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
     req.on("end", () => {
       res.setHeader("content-type", "application/json");
       if (req.method === "POST" && req.url?.endsWith("/v1/files")) {
+        rawUploads.push(Buffer.concat(chunks));
         uploads.push(Buffer.concat(chunks).toString("utf8"));
         res.statusCode = 200;
         res.end(
@@ -62,6 +68,7 @@ async function startFilesUpstream(): Promise<FilesUpstream> {
   return {
     baseUrl: `http://127.0.0.1:${port}`,
     uploads,
+    rawUploads,
     async close() {
       server.closeAllConnections?.();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -131,7 +138,7 @@ describe("mask rules on an uploaded batch file act on each line's request conten
     await upstream?.close();
   });
 
-  async function upload(jsonl: string): Promise<{ status: number; body: string }> {
+  async function upload(jsonl: string | Uint8Array): Promise<{ status: number; body: string }> {
     const form = new FormData();
     form.append("purpose", "batch");
     form.append("file", new Blob([jsonl], { type: "application/jsonl" }), "input.jsonl");
@@ -281,5 +288,36 @@ describe("mask rules on an uploaded batch file act on each line's request conten
       expect.soft(res.status, `${what}: ${res.body}`).toBe(422);
       expect.soft(upstream.uploads.length, `${what}: the refused file must not reach the provider`).toBe(before);
     }
+  });
+
+  test("a file that is not valid UTF-8 is refused when a mask rule matches it", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    const files = {
+      "a plainly written email": batchLine("r1", "mail alice@example.com please"),
+      "an email behind a JSON escape": batchLine("r1", "mail alice@example.com please").replace("alice@", "alice\\u0040"),
+    };
+    for (const [what, line] of Object.entries(files)) {
+      const before = upstream.uploads.length;
+      // 0xFF 在 UTF-8 里永远非法。
+      const res = await upload(Buffer.concat([Buffer.from(line + "\n"), Buffer.from([0xff, 0x0a])]));
+      expect.soft(res.status, `${what}: ${res.body}`).toBe(422);
+      expect.soft(upstream.uploads.length, `${what}: the refused file must not reach the provider`).toBe(before);
+    }
+  });
+
+  test("a binary file no mask rule matches is uploaded byte for byte", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    const before = upstream.uploads.length;
+    const file = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe, 0x00, 0x01, 0x80, 0x7f, 0xc3]);
+    const res = await upload(file);
+    expect(res.status, res.body).toBe(200);
+    expect(upstream.uploads.length).toBe(before + 1);
+    expect(upstream.rawUploads.at(-1)!.includes(file), "the file reaches the provider unchanged").toBe(true);
   });
 });
