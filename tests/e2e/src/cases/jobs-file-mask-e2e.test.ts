@@ -207,6 +207,12 @@ describe("mask rules on an uploaded batch file act on each line's request conten
         body: { model: "gpt-4o-mini", messages: [{ role: "user", content: "hello" }] },
         "bob@example.com": 1,
       }),
+      "a key inside a protocol field's value": JSON.stringify({
+        custom_id: { "bob@example.com": 1 },
+        method: "POST",
+        url: "/v1/chat/completions",
+        body: { model: "gpt-4o-mini", messages: [{ role: "user", content: "hello" }] },
+      }),
     };
     for (const [where, line] of Object.entries(lines)) {
       const before = upstream.uploads.length;

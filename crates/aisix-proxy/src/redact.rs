@@ -431,19 +431,16 @@ pub(crate) fn redact_jsonl_upload(
             JSONL_PROTOCOL_FIELDS,
             &mut counts,
         );
+        // 改写只动值、不动键：整行每一层对象的键 —— 协议字段的值里的也算，它们
+        // 不是字符串时同样原样送到上游 —— 命中 mask 规则就报告改写不了（与 chat
+        // 对改写不了的键的处理一致）。
+        unrewritable |=
+            detect_unrewritable_object_keys(chain, Direction::Input, &value, &mut counts);
         if let Some(map) = value.as_object_mut() {
             for (key, slot) in map.iter_mut() {
                 if JSONL_PROTOCOL_FIELDS.contains(&key.as_str()) {
                     continue;
                 }
-                // 改写只动值、不动键：这一行自己的键和它值里每一层对象的键，
-                // 命中 mask 规则就报告改写不了（与 chat 对改写不了的键的处理一致）。
-                if let Some(r) = redact_str(chain, Direction::Input, key) {
-                    unrewritable |= r.text != *key;
-                    merge_counts(&mut counts, r.counts);
-                }
-                unrewritable |=
-                    detect_unrewritable_object_keys(chain, Direction::Input, slot, &mut counts);
                 match slot {
                     // batch 行的请求体：`model` 是协议字段，其余照常改写。
                     Value::Object(body) if key == "body" => {
@@ -3812,6 +3809,10 @@ mod tests {
             r#"{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"m","messages":[],"metadata":{"bob@example.com":1}}}"#,
             r#"{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"m","messages":[]},"bob@example.com":1}"#,
             r#"{"messages":[{"role":"user","content":"hi","extra":{"bob@example.com":"x"}}]}"#,
+            // 协议字段的值不是字符串、而是带键的对象时，键同样会送到上游。
+            r#"{"custom_id":{"bob@example.com":1},"method":"POST","url":"/v1/chat/completions","body":{"model":"m","messages":[]}}"#,
+            r#"{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":{"bob@example.com":"m"},"messages":[]}}"#,
+            r#"{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","model":[{"bob@example.com":true}],"body":{"messages":[]}}"#,
         ] {
             let r = redact_jsonl_upload(chain.as_ref(), line).expect("a JSONL file");
             assert!(r.unrewritable, "{line}");
