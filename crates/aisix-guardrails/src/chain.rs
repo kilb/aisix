@@ -267,6 +267,10 @@ impl Guardrail for GuardrailChain {
         self.members.iter().any(|m| m.guardrail.runs_on_output())
     }
 
+    fn enforces_input(&self) -> bool {
+        self.members.iter().any(|m| m.guardrail.enforces_input())
+    }
+
     async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
         let mut bypass: Option<String> = None;
         for m in &self.members {

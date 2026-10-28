@@ -279,6 +279,13 @@ impl Guardrail for PromptShieldGuardrail {
         )
     }
 
+    fn enforces_input(&self) -> bool {
+        matches!(
+            self.hook_point,
+            GuardrailHookPoint::Input | GuardrailHookPoint::Both
+        )
+    }
+
     fn name(&self) -> &'static str {
         // Static name keeps metric cardinality bounded; the row's own
         // name is surfaced via tracing fields on failure paths.

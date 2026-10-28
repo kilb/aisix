@@ -709,6 +709,11 @@ impl Guardrail for MonitorGuardrail {
         self.inner.runs_on_output()
     }
 
+    // Monitor mode never refuses or rewrites a request.
+    fn enforces_input(&self) -> bool {
+        false
+    }
+
     // Monitor mode observes without modifying: redaction is suppressed the
     // same way Block verdicts are downgraded. The would-be mask counts are
     // logged so operators can stage a redaction rule and audit its impact
@@ -839,6 +844,10 @@ impl Guardrail for MandatoryGuardrail {
         self.inner.runs_on_output()
     }
 
+    fn enforces_input(&self) -> bool {
+        self.inner.enforces_input()
+    }
+
     // Mandatory only rewrites the failure (Bypass) verdict; redaction
     // passes straight through to the inner guardrail.
     fn redacts_input(&self) -> bool {
@@ -954,6 +963,10 @@ impl Guardrail for LiveGuardrailChain {
 
     fn runs_on_output(&self) -> bool {
         self.current().runs_on_output()
+    }
+
+    fn enforces_input(&self) -> bool {
+        self.current().enforces_input()
     }
 
     fn redacts_input(&self) -> bool {
@@ -1512,6 +1525,37 @@ mod tests {
             !chain.stream_output_policy().holds_back(),
             "monitor-mode output rule must not hold the stream back",
         );
+    }
+
+    /// `enforces_input` is true only for a chain with a member that can refuse
+    /// or rewrite the request: attached on the input hook (or both) and not in
+    /// monitor mode. An output-only or monitor-mode chain never acts on a
+    /// request, so a call site must not refuse one on its behalf.
+    #[tokio::test]
+    async fn enforces_input_needs_an_enforcing_input_member() {
+        let chain_of = |rows: &[(&str, &str)]| {
+            let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+            for (i, (hook, mode)) in rows.iter().enumerate() {
+                let name = format!("g-{i}");
+                table.insert(entry(
+                    &name,
+                    &name,
+                    parse(&format!(
+                        r#"{{"name": "{name}", "enforcement_mode": "{mode}", "kind": "keyword",
+                            "hook_point": "{hook}",
+                            "patterns": [{{ "kind": "literal", "value": "secret" }}]}}"#
+                    )),
+                ));
+            }
+            build_chain_from_snapshot(&table, None)
+        };
+        assert!(chain_of(&[("input", "block")]).enforces_input());
+        assert!(chain_of(&[("both", "block")]).enforces_input());
+        assert!(!chain_of(&[("output", "block")]).enforces_input());
+        assert!(!chain_of(&[("input", "monitor")]).enforces_input());
+        assert!(chain_of(&[("output", "block"), ("both", "block")]).enforces_input());
+        assert!(!chain_of(&[("output", "block"), ("input", "monitor")]).enforces_input());
+        assert!(!chain_of(&[]).enforces_input());
     }
 
     /// An unrecognised enforcement_mode is treated as `block` (fail-safe).

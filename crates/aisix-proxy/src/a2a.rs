@@ -375,7 +375,13 @@ async fn dispatch(
     // binary media type, a value of the wrong type where the protocol has
     // text — is refused rather than forwarded unread: whatever reads it on
     // the other side may decode it more leniently than any scan predicts.
-    if let Some(why) = request_scan.as_ref().and_then(|scan| scan.unreadable) {
+    // Only where a guardrail would act on the request: an output-only or
+    // monitor-mode chain never refuses one.
+    if let Some(why) = request_scan
+        .as_ref()
+        .and_then(|scan| scan.unreadable)
+        .filter(|_| aisix_guardrails::Guardrail::enforces_input(&guardrail_chain))
+    {
         tracing::warn!(
             guardrail_hook = "input",
             agent = %agent,

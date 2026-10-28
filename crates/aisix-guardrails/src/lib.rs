@@ -497,6 +497,16 @@ pub trait Guardrail: Send + Sync + 'static {
         true
     }
 
+    /// Whether this guardrail can refuse or rewrite REQUEST content: it is
+    /// attached on the input hook and enforces rather than only observing
+    /// (monitor mode). A call site that refuses request content it cannot
+    /// read asks this, so that an output-only or monitor-mode guardrail never
+    /// causes such a refusal. Default: `true` (secure-leaning); impls with a
+    /// hook override to gate on it.
+    fn enforces_input(&self) -> bool {
+        true
+    }
+
     // --- redaction (#932) -------------------------------------------------
     //
     // Redaction is a separate, synchronous, text→text capability rather

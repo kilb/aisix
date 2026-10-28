@@ -350,6 +350,24 @@ describe("A2A output guardrails hold streamed answers back and refuse push deliv
         expect(posts(v, "clean").length).toBe(before);
       });
 
+      test("request content the scan cannot read still reaches the agent when only answers are checked", async (ctx) => {
+        if (!etcdReachable || !app) return ctx.skip();
+        // 这里的护栏只审回答：读不懂的请求内容没有哪条规则会去读它，拦下它就是
+        // 误拒。（有输入护栏时照样拒绝，见 a2a-guardrail-task-content。）
+        const noise = Buffer.from(Array.from({ length: 512 }, (_, i) => (i * 37 + 11) % 256)).toString("base64");
+        const file =
+          v === "0.3"
+            ? { kind: "file", file: { name: "blob.bin", mimeType: "application/octet-stream", bytes: noise } }
+            : { raw: noise, mediaType: "application/octet-stream", filename: "blob.bin" };
+        const msg = message(v, "process this file");
+        (msg.parts as unknown[]).push(file);
+        const before = posts(v, "clean").length;
+        const res = await call(v, "clean", SEND[v], { message: msg });
+        const text = await res.text();
+        expect(res.status, text.slice(0, 300)).toBe(200);
+        expect(posts(v, "clean").length).toBe(before + 1);
+      });
+
       test("reading a push notification config is still forwarded", async (ctx) => {
         if (!etcdReachable || !app) return ctx.skip();
         // 拒的是「设推送」，不是所有和推送相关的方法：读回配置不会把回答送出去。
