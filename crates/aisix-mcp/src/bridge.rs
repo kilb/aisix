@@ -566,14 +566,18 @@ fn redact_transport_url(message: String, error: &DynamicTransportError) -> Strin
     redact_request_url(message, url)
 }
 
-/// The log text of a failed MCP request on an open session.
+/// The log text of a failed MCP request on an open session. Bounded and
+/// sanitized like a connect failure: a non-success response embeds the
+/// upstream's whole body. The request URL is redacted first, before
+/// truncation can cut it anywhere.
 fn service_error_message(error: &ServiceError) -> String {
-    match error {
+    let message = match error {
         ServiceError::TransportSend(transport) => {
             redact_transport_url(error.to_string(), transport)
         }
         _ => error.to_string(),
-    }
+    };
+    sanitize_error_message(&message)
 }
 
 /// Whether a failed `initialize` handshake was an upstream `401 Unauthorized`.
@@ -934,8 +938,7 @@ mod tests {
     /// transport error rmcp wraps names the request URL (reqwest moves
     /// userinfo into a header, but keeps path and query). Only the origin may
     /// appear. Built from a real failed send through rmcp's reqwest, so the
-    /// text is exactly what a dropped upstream produces; unlike a connect
-    /// failure, nothing truncates it.
+    /// text is exactly what a dropped upstream produces.
     #[tokio::test]
     async fn transport_failure_names_no_url_credentials() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");

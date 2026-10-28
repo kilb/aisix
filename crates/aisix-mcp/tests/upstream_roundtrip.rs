@@ -452,3 +452,85 @@ async fn upstream_call_times_out_instead_of_hanging() {
         "call should give up at the ~200ms deadline, not wait out the 2s server sleep"
     );
 }
+
+/// Answer every `tools/list` / `tools/call` with a bare `500` whose plain-text
+/// body echoes a credential after a multi-line preamble — the shape of an
+/// upstream that reflects request headers into its error page. `initialize`
+/// and the `initialized` notification pass through, so the session opens and
+/// the failure lands on an already-open session.
+async fn fail_tool_requests(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let (parts, body) = request.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else {
+        return axum::http::StatusCode::BAD_REQUEST.into_response();
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    if text.contains("\"tools/list\"") || text.contains("\"tools/call\"") {
+        let body = format!(
+            "internal error\n[FAKE LOG LINE] injected\n{}\nauthorization: Bearer reflected-token-LEAK\n",
+            "x".repeat(400)
+        );
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, body).into_response();
+    }
+    next.run(axum::extract::Request::from_parts(
+        parts,
+        axum::body::Body::from(bytes),
+    ))
+    .await
+}
+
+/// A failed `tools/list` / `tools/call` on an open session lands in the
+/// gateway log just like a failed connect, and rmcp renders a non-success
+/// response as `HTTP <status>: <whole body>`. The mapped error must be
+/// bounded and free of control characters, the same as the connect path.
+#[tokio::test]
+async fn open_session_failure_bounds_and_sanitizes_the_upstream_body() {
+    let service = StreamableHttpService::new(
+        || Ok(EchoServer),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let app = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(fail_tool_requests));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    let upstream = McpUpstream::new(format!("http://{addr}/mcp"));
+    let bridge = RmcpBridge::connect(&upstream)
+        .await
+        .expect("initialize is not failed by the upstream");
+    let listed = bridge
+        .list_tools()
+        .await
+        .map(|_| ())
+        .expect_err("tools/list must fail");
+    let called = bridge
+        .call_tool("echo", serde_json::json!({ "text": "hi" }))
+        .await
+        .map(|_| ())
+        .expect_err("tools/call must fail");
+    for (op, err) in [("tools/list", listed), ("tools/call", called)] {
+        let msg = err.to_string();
+        // The failure really is the upstream's 500, not some other error.
+        assert!(msg.contains("HTTP 500"), "{op}: {msg}");
+        assert!(
+            !msg.chars().any(char::is_control),
+            "{op}: control characters reached the log text: {msg:?}"
+        );
+        assert!(
+            msg.chars().count() <= 300,
+            "{op}: upstream body not bounded ({} chars): {msg:?}",
+            msg.chars().count()
+        );
+        assert!(!msg.contains("LEAK"), "{op}: reflected credential: {msg:?}");
+    }
+}
