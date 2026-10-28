@@ -21,6 +21,7 @@
 //! URL pattern (Gemini, `generateContent`):
 //! `https://<region>-aiplatform.googleapis.com/v1/projects/<project>/
 //!  locations/<region>/publishers/google/models/<model>:generateContent`
+//! (host `https://aiplatform.googleapis.com` for the `global` location).
 
 use aisix_gateway::{
     sse::{SseDecoder, SseEvent},
@@ -162,7 +163,8 @@ impl VertexBridge {
     ///      operator-supplied value is trimmed and any trailing `/`
     ///      is stripped so `chat_gemini`'s URL stitching produces
     ///      a single-slash separator.
-    ///   3. Canonical `https://<region>-aiplatform.googleapis.com`.
+    ///   3. Canonical `https://<region>-aiplatform.googleapis.com`, or
+    ///      `https://aiplatform.googleapis.com` for the `global` location.
     ///
     /// Mirrors the Bedrock bridge's `endpoint_url` precedence
     /// (`crates/aisix-provider-bedrock/src/bridge.rs::build_client_from_ctx`).
@@ -265,6 +267,15 @@ impl VertexBridge {
                 )));
             }
             return Ok(b.trim_end_matches('/').to_string());
+        }
+        // The `global` location has no `global-aiplatform` host: Google
+        // documents `https://aiplatform.googleapis.com` for it ("When using
+        // the global endpoint, use
+        // `https://aiplatform.googleapis.com/v1/projects/${GOOGLE_CLOUD_PROJECT}/locations/global/`"),
+        // with `locations/global` kept in the path —
+        // https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations
+        if region == "global" {
+            return Ok("https://aiplatform.googleapis.com".to_string());
         }
         Ok(format!("https://{region}-aiplatform.googleapis.com"))
     }
@@ -2325,6 +2336,25 @@ mod tests {
         assert_eq!(
             bridge.resolve_api_base("us-central1", None).unwrap(),
             "https://us-central1-aiplatform.googleapis.com",
+        );
+    }
+
+    #[test]
+    fn resolve_api_base_global_location_uses_the_unprefixed_host() {
+        // `global` has no `global-aiplatform.googleapis.com` host; Google
+        // documents `https://aiplatform.googleapis.com` for it, with
+        // `locations/global` still in the path.
+        let bridge = VertexBridge::new();
+        assert_eq!(
+            bridge.resolve_api_base("global", None).unwrap(),
+            "https://aiplatform.googleapis.com",
+        );
+        // An operator `api_base` still wins over the canonical host.
+        assert_eq!(
+            bridge
+                .resolve_api_base("global", Some("http://mock-vertex:8001"))
+                .unwrap(),
+            "http://mock-vertex:8001",
         );
     }
 
