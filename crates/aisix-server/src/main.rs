@@ -351,6 +351,38 @@ async fn file_reload_loop(
     }
 }
 
+/// etcd mode's SIGHUP stream, registered by [`register_etcd_hangup`] and
+/// drained by [`etcd_hangup_loop`]. Uninhabited where there is no SIGHUP.
+#[cfg(unix)]
+type HangupSignal = tokio::signal::unix::Signal;
+#[cfg(not(unix))]
+type HangupSignal = std::convert::Infallible;
+
+/// Register etcd mode's SIGHUP handler. Called synchronously at the top of
+/// [`run`], before any startup step that can take a while (managed-mode
+/// provisioning, the etcd connect): registering is what replaces SIGHUP's
+/// default action, which terminates the process, so it is not left to a
+/// spawned task, which would do it only once first polled. Signals that
+/// arrive before [`etcd_hangup_loop`] runs are kept by the stream.
+/// `None` when registration fails (logged) or there is no SIGHUP.
+fn register_etcd_hangup() -> Option<HangupSignal> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::hangup()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::error!(error = %e, "cannot install SIGHUP handler; a SIGHUP will terminate the gateway");
+                None
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 /// SIGHUP in etcd mode: there is no file to reload — resources arrive
 /// through the etcd watch and apply as they change — so log that and keep
 /// serving. Without a handler SIGHUP keeps its default action, which
@@ -358,17 +390,10 @@ async fn file_reload_loop(
 /// `pkill -HUP` meant for file-mode gateways, would take a managed gateway
 /// down. Tokio keeps the handler installed for the rest of the process
 /// once registered, so the signal stays harmless during shutdown too.
-async fn etcd_hangup_loop(mut cancel: watch::Receiver<bool>) {
+async fn etcd_hangup_loop(hup: HangupSignal, mut cancel: watch::Receiver<bool>) {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut hup = match signal(SignalKind::hangup()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, "cannot install SIGHUP handler; a SIGHUP will terminate the gateway");
-                return;
-            }
-        };
+        let mut hup = hup;
         loop {
             tokio::select! {
                 Some(()) = hup.recv() => {
@@ -387,8 +412,9 @@ async fn etcd_hangup_loop(mut cancel: watch::Receiver<bool>) {
     }
     #[cfg(not(unix))]
     {
-        // No SIGHUP on this platform.
+        // No SIGHUP on this platform: `hup` cannot exist.
         let _ = cancel;
+        match hup {}
     }
 }
 
@@ -451,6 +477,17 @@ where
 /// Factored out of `main` so the integration tests can drive the full
 /// startup with a real config struct and still use `#[tokio::test]`.
 async fn run(mut cfg: Config) -> anyhow::Result<()> {
+    // etcd mode (no `resources_file`; managed mode is always etcd mode):
+    // a stray SIGHUP must not terminate the process at any point of the
+    // startup, so the handler is registered here, before the first step
+    // that can take a while. The loop that drains it starts with the etcd
+    // branch below.
+    let etcd_hangup = if cfg.resources_file.is_none() {
+        register_etcd_hangup()
+    } else {
+        None
+    };
+
     // Applied to every listener. `0` (the default) keeps idle client
     // connections open until the peer closes them.
     let downstream_idle_timeout = (cfg.downstream.idle_timeout_secs > 0)
@@ -649,11 +686,12 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         } else {
             // ETCD MODE (unchanged behavior).
             //
-            // First, before the etcd connect (which can retry for a while
-            // when the cluster is unreachable): a stray SIGHUP must not
-            // terminate the process. Detached — it holds nothing to drain
+            // The SIGHUP handler registered at the top of `run`: log each
+            // signal and keep serving. Detached — it holds nothing to drain
             // and returns on cancel.
-            tokio::spawn(etcd_hangup_loop(cancel_rx.clone()));
+            if let Some(hup) = etcd_hangup {
+                tokio::spawn(etcd_hangup_loop(hup, cancel_rx.clone()));
+            }
 
             // Before handing endpoints to tonic, probe each one via the
             // stdlib resolver. tonic's HTTP connector collapses any DNS
