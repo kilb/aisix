@@ -18,6 +18,45 @@ pub struct User {
     pub disabled: bool,
 }
 
+/// 一个用户的入账依据：`consumption_mark` 那一行，加上他每条花费序列的游标。
+///
+/// 对账在事务**之外**读它、读 Prometheus、算差额 —— 一次 HTTP 查询不能包进
+/// `BEGIN IMMEDIATE`，那期间门户所有的写都会被挡住。入账时在事务里再读一遍，与
+/// 算差额时的那份不一致，就说明另一个门户实例在这之间已经入过账（见
+/// `Sweeper::settle`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BillingBasis {
+    /// `None` = 门户从没对过这个用户的账。
+    pub mark: Option<ConsumptionMark>,
+    /// 每条序列上次读到的累计值，以及那时它所在网关进程的启动时刻。
+    pub cursors: std::collections::HashMap<String, (i64, Option<i64>)>,
+}
+
+/// `consumption_mark` 的一行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumptionMark {
+    /// 已计入流水的截止时刻，RFC3339 原文。按原文比较，不经解析。
+    pub counted_through: String,
+    /// `false` = 从按时间窗计费的版本升级上来、还没建花费游标（见
+    /// `0005_spend_cursors.sql`）。
+    pub cursors_seeded: bool,
+}
+
+impl BillingBasis {
+    /// 已计入流水的截止时刻。`None` = 还没对过账。
+    pub fn counted_through(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        let m = self.mark.as_ref()?;
+        chrono::DateTime::parse_from_rfc3339(&m.counted_through)
+            .ok()
+            .map(|d| d.with_timezone(&chrono::Utc))
+    }
+
+    /// 从按时间窗计费的版本升级上来、还没建游标。
+    pub fn needs_seeding(&self) -> bool {
+        self.mark.as_ref().is_some_and(|m| !m.cursors_seeded)
+    }
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     /// 邮箱已存在。注册处据此回 409，而不是 500 —— 唯一约束冲突是可预期的
@@ -374,34 +413,10 @@ impl Store {
         Ok(())
     }
 
-    /// 这个用户的对账状态：`None` = 从没对过账；`Some(false)` = 从按时间窗计费的
-    /// 版本升级上来、还没建花费游标；`Some(true)` = 游标已建好（见
-    /// `0005_spend_cursors.sql`）。
-    pub async fn consumption_state(&self, user_id: &str) -> Result<Option<bool>, StoreError> {
-        let row: Option<(i64,)> =
-            sqlx::query_as("SELECT cursors_seeded FROM consumption_mark WHERE user_id = ?1")
-                .bind(user_id)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(|(v,)| v != 0))
-    }
-
-    /// 这个用户每条花费序列上次读到的累计值，以及那时它所在网关进程的启动时刻。
-    pub async fn spend_cursors(
-        &self,
-        user_id: &str,
-    ) -> Result<std::collections::HashMap<String, (i64, Option<i64>)>, StoreError> {
-        let rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
-            "SELECT series, value_micro_usd, instance_started_ms FROM spend_cursor
-             WHERE user_id = ?1",
-        )
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(series, value, started)| (series, (value, started)))
-            .collect())
+    /// 这个用户的入账依据，见 [`BillingBasis`]。
+    pub async fn billing_basis(&self, user_id: &str) -> Result<BillingBasis, StoreError> {
+        let mut c = self.pool.acquire().await?;
+        billing_basis_on(&mut c, user_id).await
     }
 
     /// 已计入流水的截止时刻。`None` = 还没对过账。
@@ -503,6 +518,37 @@ where
     .execute(exec)
     .await?;
     Ok(())
+}
+
+/// [`Store::billing_basis`] 的语句。入账事务里用同一份再读一遍 —— 两处各写一份
+/// 的话，比的就不是同一样东西。
+pub(crate) async fn billing_basis_on(
+    conn: &mut sqlx::SqliteConnection,
+    user_id: &str,
+) -> Result<BillingBasis, StoreError> {
+    let mark: Option<(String, i64)> = sqlx::query_as(
+        "SELECT counted_through, cursors_seeded FROM consumption_mark WHERE user_id = ?1",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT series, value_micro_usd, instance_started_ms FROM spend_cursor
+         WHERE user_id = ?1",
+    )
+    .bind(user_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(BillingBasis {
+        mark: mark.map(|(counted_through, seeded)| ConsumptionMark {
+            counted_through,
+            cursors_seeded: seeded != 0,
+        }),
+        cursors: rows
+            .into_iter()
+            .map(|(series, value, started)| (series, (value, started)))
+            .collect(),
+    })
 }
 
 pub(crate) async fn drop_key_quota_on<'e, E>(

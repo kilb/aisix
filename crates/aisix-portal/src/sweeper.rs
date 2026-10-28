@@ -38,7 +38,8 @@
 //!
 //! - **游标只在入账成功后前进。** 读取失败就原地不动，下一轮的读数照样包含这段
 //!   时间的消费。
-//! - **扣款、游标、密钥花费在同一个事务里。** 中间崩了会重复扣或漏扣。
+//! - **扣款、游标、密钥花费在同一个事务里。** 中间崩了会重复扣或漏扣。事务里
+//!   先核对算差额所依据的游标还是原样，被别的门户实例动过就这一轮不入账。
 //! - **新序列从 0 算起，读到多少就是花了多少。** 新用户也一样：他的计数器生来
 //!   就是 0，第一次被读到之前的消费照扣 —— 否则注册、拿额度、铸密钥、用掉都赶在
 //!   第一轮对账之前，这段就白用了。唯一的例外是从按时间窗计费的版本升级上来的
@@ -145,28 +146,25 @@ impl<S: ConsumptionSource> Sweeper<S> {
         let mut exhausted: Vec<String> = Vec::new();
 
         for u in &users {
-            // `None` = 门户从没对过这个用户的账；`Some(false)` = 从按时间窗计费的版本
-            // 升级上来、还没建游标。
-            let state = self.store.consumption_state(&u.id).await?;
-            let since = self.store.counted_through(&u.id).await?.unwrap_or(now);
+            // 这一轮的差额全按这份依据算；入账时在事务里再核对一遍（见 `settle`）。
+            let basis = self.store.billing_basis(&u.id).await?;
+            let since = basis.counted_through().unwrap_or(now);
             let Some(series) = self.source.spend_series(&u.id, since, now).await else {
                 // 读不到就原地不动：游标不前进，下一轮的读数照样包含这段消费。
                 // 密钥级也一并跳过 —— 它们出自同一次读数。
                 r.read_failures += 1;
                 continue;
             };
-            if state == Some(false) {
+            if basis.needs_seeding() {
                 // 升级上来的老用户：只记下当前读数，不把历史当成新序列重扣。
-                self.settle(&u.id, 0, &series, &[], now).await?;
+                self.settle(&u.id, &basis, 0, &series, &[], now).await?;
                 continue;
             }
 
-            let cursors: std::collections::HashMap<String, (u64, Option<i64>)> = self
-                .store
-                .spend_cursors(&u.id)
-                .await?
-                .into_iter()
-                .map(|(k, (v, started))| (k, (v.max(0) as u64, started)))
+            let cursors: std::collections::HashMap<String, (u64, Option<i64>)> = basis
+                .cursors
+                .iter()
+                .map(|(k, &(v, started))| (k.clone(), (v.max(0) as u64, started)))
                 .collect();
             let mut spent = 0u64;
             let mut by_key: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
@@ -231,12 +229,18 @@ impl<S: ConsumptionSource> Sweeper<S> {
                 })
                 .collect();
 
-            self.settle(&u.id, spent, &next, &key_spend, now).await?;
-            if spent > 0 {
+            let settled = self
+                .settle(&u.id, &basis, spent, &next, &key_spend, now)
+                .await?;
+            if settled && spent > 0 {
                 r.debited += 1;
             }
 
             // 花超自己额度的密钥。比的是库里的累计花费，不是这一轮的增量。
+            //
+            // 这一轮让给了别的实例（`settled` 为假）也照样比：库里的累计花费已经含着
+            // 那个实例刚入的账。跳过的话，这把密钥不在 `exhausted` 里，下面那次写盘
+            // 会把那个实例刚停掉的它重新启用。
             let totals: std::collections::HashMap<String, i64> =
                 self.store.key_spend(&u.id).await?.into_iter().collect();
             for (name, quota) in quotas {
@@ -316,15 +320,19 @@ impl<S: ConsumptionSource> Sweeper<S> {
     /// 一轮对账的入账：扣款、所有序列的游标、密钥花费、对账时刻，一个事务。
     ///
     /// `debit` 为 0 时不写流水，但游标照样更新 —— 建游标的那一轮就是这样。
+    ///
+    /// 返回 `false` = 没入账：算这些差额所依据的 `basis` 在事务里已经对不上了。
     async fn settle(
         &self,
         user_id: &str,
+        basis: &crate::store::BillingBasis,
         debit: u64,
         series: &[SpendSeries],
         key_spend: &[(String, i64)],
         through: DateTime<Utc>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let user_id = user_id.to_string();
+        let basis = basis.clone();
         let delta = -i64::try_from(debit).unwrap_or(i64::MAX);
         let cursors: Vec<(String, i64, Option<i64>)> = series
             .iter()
@@ -339,10 +347,21 @@ impl<S: ConsumptionSource> Sweeper<S> {
         let key_spend = key_spend.to_vec();
         let through = through.to_rfc3339();
         // 同样用 `BEGIN IMMEDIATE`：这个事务里有多条写，多个门户实例或多轮对账
-        // 重叠时，deferred 事务会在升级成写的那一刻当场失败而不是等待。
+        // 重叠时，deferred 事务会在升级成写的那一刻当场失败而不是等待。下面的核对
+        // 也靠它：写锁在核对之前就拿到了，核对与写之间插不进别人的入账。
         self.store
             .immediate_tx(move |conn| {
                 Box::pin(async move {
+                    // **先核对依据，再写。** 差额是在事务之外按 `basis` 算的，而多个
+                    // 门户实例共用一个库时，两边的读数会落在同一段消费上。依据变了，
+                    // 说明另一个实例在我们读完之后已经入过账 —— 照这里的差额再扣一遍
+                    // 就是重复扣款。这一轮让给它：不扣、不动游标，下一轮按新的依据
+                    // 重算，这段消费一分不少。
+                    //
+                    // 此时什么都还没写，直接返回等同回滚：提交的是一个空事务。
+                    if crate::store::billing_basis_on(&mut *conn, &user_id).await? != basis {
+                        return Ok(false);
+                    }
                     let now = Utc::now().to_rfc3339();
                     if delta != 0 {
                         crate::ledger::insert_entry(
@@ -396,7 +415,7 @@ impl<S: ConsumptionSource> Sweeper<S> {
                     .bind(&now)
                     .execute(&mut *conn)
                     .await?;
-                    Ok(())
+                    Ok(true)
                 })
             })
             .await
@@ -1491,6 +1510,91 @@ api_keys:
         f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
         // 当成重启就会把累计 $2 整个再扣一遍。
         assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 8_000_000);
+    }
+
+    /// 读完之后在栅栏上等另一个实例也读完：两边都在对方入账之前拿到同一份依据。
+    struct BothReadFirst {
+        inner: Arc<FakeSource>,
+        gate: Arc<tokio::sync::Barrier>,
+    }
+
+    impl ConsumptionSource for BothReadFirst {
+        async fn spend_series(
+            &self,
+            user_id: &str,
+            since: DateTime<Utc>,
+            at: DateTime<Utc>,
+        ) -> Option<Vec<SpendSeries>> {
+            let read = self.inner.spend_series(user_id, since, at).await;
+            self.gate.wait().await;
+            read
+        }
+    }
+
+    #[tokio::test]
+    async fn 两个门户实例交错对账_同一段消费只扣一次() {
+        let f = fx().await;
+        // 两个实例：同一个库文件、各自的连接池 —— 两个进程就是这样共用一个库的。
+        let dir = std::path::Path::new(&f.path)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let db = format!("sqlite:{}", dir.join("portal.db").display());
+        let a = Store::open(&db).await.unwrap();
+        let b = Store::open(&db).await.unwrap();
+        a.insert_user(&f.uid, "u1@b.c", "h", None).await.unwrap();
+        let ledger = Ledger::new(a.clone());
+        ledger
+            .credit(&f.uid, 10_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        let plain = |store: &Store| {
+            Sweeper::new(
+                store.clone(),
+                f.src.clone(),
+                crate::resources::Writer::new(f.path.clone()),
+            )
+        };
+
+        // 先对一轮账，建好游标。
+        f.src.add_spend(&f.uid, 1_000_000);
+        plain(&a).tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        assert_eq!(ledger.balance(&f.uid).await.unwrap(), 9_000_000);
+
+        // 又花了 $3。两个实例都在对方入账之前读完：同一份游标、同一个读数。
+        f.src.add_spend(&f.uid, 3_000_000);
+        let gate = Arc::new(tokio::sync::Barrier::new(2));
+        let gated = |store: &Store| {
+            Sweeper::new(
+                store.clone(),
+                BothReadFirst {
+                    inner: f.src.clone(),
+                    gate: gate.clone(),
+                },
+                crate::resources::Writer::new(f.path.clone()),
+            )
+        };
+        let (sa, sb) = (gated(&a), gated(&b));
+        let at = t("2026-08-26T10:00:15Z");
+        let (ra, rb) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(sa.tick(at), sb.tick(at))
+        })
+        .await
+        .expect("两个实例互相等住了");
+        let (ra, rb) = (ra.unwrap(), rb.unwrap());
+
+        // 各按自己算出的差额入账的话，这 $3 被扣两次。
+        assert_eq!(ledger.balance(&f.uid).await.unwrap(), 6_000_000);
+        assert_eq!(
+            ra.debited + rb.debited,
+            1,
+            "只该有一个实例入账: {ra:?} / {rb:?}"
+        );
+
+        // 让出去的那个实例留下的游标照样对：之后只扣新增的那 $0.5。
+        f.src.add_spend(&f.uid, 500_000);
+        plain(&b).tick(t("2026-08-26T10:00:30Z")).await.unwrap();
+        assert_eq!(ledger.balance(&f.uid).await.unwrap(), 5_500_000);
     }
 
     #[test]
