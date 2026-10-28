@@ -19,8 +19,8 @@ import { statSync, readdirSync } from "node:fs";
  * `startOpenAiUpstream` 的做法一致。
  */
 
-const GATEWAY_BIN = join(process.cwd(), "..", "target", "release", "aisix");
-const PORTAL_BIN = join(process.cwd(), "..", "target", "debug", "aisix-portal");
+export const GATEWAY_BIN = join(process.cwd(), "..", "target", "release", "aisix");
+export const PORTAL_BIN = join(process.cwd(), "..", "target", "debug", "aisix-portal");
 export const ADMIN_TOKEN = "e2e-money-admin";
 export const CALLER_KEY = "e2e-caller-plaintext-key-0001";
 
@@ -43,7 +43,7 @@ function killTree(p: ChildProcess): void {
   }
 }
 
-async function freePort(): Promise<number> {
+export async function freePort(): Promise<number> {
   return new Promise((res, rej) => {
     const s = netServer();
     s.once("error", rej);
@@ -57,7 +57,7 @@ async function freePort(): Promise<number> {
   });
 }
 
-async function waitReady(url: string, label: string, ok = (s: number) => s < 500) {
+export async function waitReady(url: string, label: string, ok = (s: number) => s < 500) {
   for (let i = 0; i < 200; i++) {
     try {
       if (ok((await fetch(url)).status)) return;
@@ -189,7 +189,7 @@ function deriveKeyId(displayName: string): string {
 }
 
 /** sha256 —— 与网关 `key_hash` 的算法一致。 */
-async function sha256Hex(s: string): Promise<string> {
+export async function sha256Hex(s: string): Promise<string> {
   const b = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
   return [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
 }
@@ -276,7 +276,8 @@ export function assertFresh(bin: string, crateDirs: string[]): void {
   }
 }
 
-export async function startMoney(): Promise<MoneyFixture> {
+/** 门户与网关两个二进制都不比各自依赖的源码旧。两套钱路夹具共用这一道闸。 */
+export function assertMoneyBinariesFresh(): void {
   // 按**实际依赖**分开比，不是笼统地比整个 `crates/`。
   //
   // 只盯自己那一个目录会漏：网关受 aisix-core、aisix-ratelimit 影响（那次流式
@@ -293,6 +294,10 @@ export async function startMoney(): Promise<MoneyFixture> {
   const gatewayDeps = all.filter((d) => !/aisix-(portal|console)$/.test(d));
   assertFresh(PORTAL_BIN, portalDeps);
   assertFresh(GATEWAY_BIN, gatewayDeps);
+}
+
+export async function startMoney(): Promise<MoneyFixture> {
+  assertMoneyBinariesFresh();
 
   const dir = mkdtempSync(join(tmpdir(), "aisix-money-e2e-"));
   const resourcesPath = join(dir, "resources.yaml");
