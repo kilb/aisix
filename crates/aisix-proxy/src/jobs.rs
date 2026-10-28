@@ -1105,8 +1105,17 @@ pub(crate) async fn create_file(
             reserve_before_costly_scan(&state, snapshot, &auth, &target).await?;
         let mut masked: std::collections::HashMap<usize, Vec<u8>> =
             std::collections::HashMap::new();
+        let mut file_parts = 0usize;
         for (i, field) in fields.iter().enumerate() {
             if let UploadField::File { bytes, .. } = field {
+                // 审查调远端服务时，第一个以外的每个 file 部件也各算一次请求，
+                // 在审它之前就占：否则一个表单塞上几十个部件，只占一格限额就换
+                // 来几十倍的远端调用。这一格马上放掉 —— 要的只是计数，并发名额
+                // 由上面那一格占着。
+                if early_reservation.is_some() && file_parts > 0 {
+                    drop(reserve_target(&state, snapshot, &auth, &target).await?);
+                }
+                file_parts += 1;
                 if let Some(m) = scan_input_blob(
                     &state,
                     &auth,

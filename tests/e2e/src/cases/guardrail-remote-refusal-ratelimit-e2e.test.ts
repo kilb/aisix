@@ -23,6 +23,10 @@ import {
 //   - 只跑本地规则（关键词、PII 正则）的护栏拦下的请求不花什么，照旧不占限额。
 //
 // 每个带输入护栏的入口都要这样：一个漏掉的入口就是一条不受限的通道。
+//
+// 一次 /v1/files 上传里的每个 file 部件各审一遍。远端审核时，第一个以外的每个
+// 部件也各算一次请求，在审它之前就占：否则一个表单塞上几十个部件，就只占一格
+// 限额换来几十倍的远端调用。只跑本地规则时照旧一次上传算一次。
 
 const MARKER = "remoterefusalratemarker";
 /** 每个调用方的请求限额：两次。 */
@@ -31,9 +35,15 @@ const MODEL = "rr-openai";
 const VIDEO_MODEL = "rr-video";
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
-/** 阿里云文本审核的替身：内容含被拦词时判高风险，并记下每一次调用。 */
-async function startModeration(): Promise<{ baseUrl: string; calls: () => number; close(): Promise<void> }> {
+/** 阿里云文本审核的替身：内容含被拦词时判高风险，并记下每一次调用与它审的内容。 */
+async function startModeration(): Promise<{
+  baseUrl: string;
+  calls: () => number;
+  contents: string[];
+  close(): Promise<void>;
+}> {
   let calls = 0;
+  const contents: string[] = [];
   const server: Server = createServer((req, res) => {
     let raw = "";
     req.on("data", (c: Buffer) => (raw += c.toString("utf8")));
@@ -48,6 +58,7 @@ async function startModeration(): Promise<{ baseUrl: string; calls: () => number
       } catch {
         content = "";
       }
+      contents.push(content);
       const risky = content.includes(MARKER);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
@@ -68,6 +79,7 @@ async function startModeration(): Promise<{ baseUrl: string; calls: () => number
   return {
     baseUrl: `http://127.0.0.1:${port}`,
     calls: () => calls,
+    contents,
     close: () => new Promise<void>((r) => server.close(() => r())),
   };
 }
@@ -175,6 +187,33 @@ const ENDPOINTS: Array<[string, string, () => { headers: Record<string, string>;
 
 const callerFor = (label: string) => `sk-rr-${sha256(label).slice(0, 12)}`;
 
+/** 多部件上传各用一个调用方，限额同样是 LIMIT。 */
+const FILE_PART_CALLERS = ["files: three parts", "files: one part", "files: three parts, local rules"];
+
+/** 一次 /v1/files 上传，每个 `parts` 一个 file 部件（一行干净的 batch 请求）。 */
+async function uploadParts(app: SpawnedApp, label: string, parts: string[]) {
+  const form = new FormData();
+  form.append("purpose", "batch");
+  parts.forEach((text, i) => {
+    const line = JSON.stringify({
+      custom_id: `r${i}`,
+      method: "POST",
+      url: "/v1/chat/completions",
+      body: { model: "gpt-4o-mini", messages: [{ role: "user", content: text }] },
+    });
+    form.append("file", new Blob([line + "\n"], { type: "application/jsonl" }), `part-${i}.jsonl`);
+  });
+  const res = await fetch(`${app.proxyUrl}/v1/files`, {
+    method: "POST",
+    headers: { "x-aisix-model": MODEL, authorization: `Bearer ${callerFor(label)}` },
+    body: form,
+  });
+  return { status: res.status, text: await res.text() };
+}
+
+const uploadsReceived = (upstream: OpenAiUpstream) =>
+  upstream.receivedRequests.filter((r) => r.method === "POST" && r.path.endsWith("/files")).length;
+
 /** 起一个网关：所有入口用到的模型、路由与 agent，加上给定的护栏，每个入口一个限额为 LIMIT 的调用方。 */
 async function setup(guardrail: Record<string, unknown>, probe: string) {
   const etcd = new EtcdClient();
@@ -217,7 +256,7 @@ async function setup(guardrail: Record<string, unknown>, probe: string) {
     enabled: true,
   });
   await seed.createGuardrail(guardrail);
-  for (const [label] of ENDPOINTS) {
+  for (const label of [...ENDPOINTS.map(([l]) => l), ...FILE_PART_CALLERS]) {
     await seed.createApiKey({
       key_hash: sha256(callerFor(label)),
       allowed_models: ["*"],
@@ -302,6 +341,29 @@ describe("a refusal by a remote moderation service counts against the caller's r
       expect(moderation.calls(), "the over-limit request still reached the moderation service").toBe(beforeLast);
     });
   }
+
+  test("/v1/files: each file part past the first uses a request of its own, before it is checked", async (ctx) => {
+    if (!app || !upstream || !moderation) return ctx.skip();
+    const before = uploadsReceived(upstream);
+    const parts = ["first part pmfirstpart", "second part pmsecondpart", "third part pmthirdpart"];
+    const res = await uploadParts(app, "files: three parts", parts);
+    expect(res.status, res.text.slice(0, 200)).toBe(429);
+    const checked = moderation.contents.join("\n");
+    expect(checked, "the first two parts are checked").toContain("pmfirstpart");
+    expect(checked).toContain("pmsecondpart");
+    expect(checked, "the part past the limit reached the moderation service").not.toContain("pmthirdpart");
+    expect(uploadsReceived(upstream), "a refused upload must not reach the provider").toBe(before);
+  });
+
+  test("/v1/files: a one-part upload is one request", async (ctx) => {
+    if (!app || !upstream) return ctx.skip();
+    const before = uploadsReceived(upstream);
+    for (let i = 0; i < LIMIT; i++) {
+      const res = await uploadParts(app, "files: one part", [`one clean part ${i}`]);
+      expect(res.status, res.text.slice(0, 200)).toBe(200);
+    }
+    expect(uploadsReceived(upstream)).toBe(before + LIMIT);
+  });
 });
 
 describe("a refusal by local rules still costs the caller nothing", () => {
@@ -336,6 +398,16 @@ describe("a refusal by local rules still costs the caller nothing", () => {
       expect(statuses).toEqual(Array(LIMIT + 1).fill(422));
     });
   }
+
+  test("/v1/files: a three-part upload is still one request", async (ctx) => {
+    if (!app || !upstream) return ctx.skip();
+    const before = uploadsReceived(upstream);
+    for (let i = 0; i < LIMIT; i++) {
+      const res = await uploadParts(app, "files: three parts, local rules", ["one", "two", "three"]);
+      expect(res.status, res.text.slice(0, 200)).toBe(200);
+    }
+    expect(uploadsReceived(upstream)).toBe(before + LIMIT);
+  });
 });
 
 /** Presidio 分析服务的替身：文本里有 EMAIL 时报一个 EMAIL_ADDRESS，并记下每一次调用。 */
