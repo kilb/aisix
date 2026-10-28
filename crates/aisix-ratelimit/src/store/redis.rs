@@ -629,6 +629,10 @@ impl RateStore for RedisStore {
         match res {
             Ok(_) => {
                 self.mark_ok();
+                // 与 `add_tokens_all` 一样，这笔花费也记一份进本地备份：断线时的
+                // 本地降级要接着用同一份累计额度和 token 窗口。只记流式的话，非流式
+                // 花掉的额度在断线期间又能花一遍。
+                self.local.add_tokens(key, tokens);
                 // 这个 member 可能是断线时降级到本地占的位：Redis 侧的 commit
                 // 不碰本地，不在这里还掉就永远留在本地，下次断线时本地并发上限
                 // 少一个。本地没有这个桶时是空操作。

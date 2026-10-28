@@ -841,3 +841,51 @@ async fn stream_spend_on_an_allowance_survives_reaping_into_the_next_outage() {
         "the local fallback started the allowance over after reaping: {r:?}"
     );
 }
+
+/// 非流式的花费（`commit`）同样要记一份进本地备份，与流式的 `add_tokens_all`
+/// 一致。只记流式的话，Redis 断线时本地降级看到的累计额度里没有非流式花掉的
+/// 那部分 —— 已经用完的额度在断线期间又放行了。
+// 多线程：`RedisStore::connect` 同步等后台 worker 建连，转发器得在另一个线程上跑。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unary_spend_on_an_allowance_is_enforced_by_the_local_fallback() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let proxy = FlakyProxy::start(&url).await;
+    let flaky = store(&proxy.url).await;
+    let direct = store(&url).await;
+    let key = unique_key("unary-allowance");
+    let limits = RateLimit {
+        concurrency: Some(1),
+        granted_micro_usd: Some(1_000),
+        ..rl()
+    };
+
+    // 连着 Redis。直连的副本拿不到并发位，说明这次 acquire 确实走的是 Redis ——
+    // 降级到本地的话本地 commit 自己就会记账，这条用例什么都证明不了。
+    flaky
+        .acquire(&key, &limits, "m1")
+        .await
+        .expect("inside the allowance");
+    assert!(
+        direct.acquire(&key, &limits, "d").await.is_err(),
+        "the first acquire did not go through Redis"
+    );
+    // 非流式请求结束：花费越过额度，经 commit 记账（同时还掉并发位）。
+    flaky.commit(&key, 1_500, "m1").await;
+    // commit 也走的是 Redis：直连的副本这时看到的是用完的额度。
+    let seen = direct.acquire(&key, &limits, "d").await;
+    assert!(
+        matches!(seen, Err(RateLimitError::AllowanceExhausted)),
+        "the commit did not reach Redis: {seen:?}"
+    );
+
+    // 断线：降级到本地，这笔非流式花费必须也在本地那份里。
+    proxy.down();
+    let r = flaky.acquire(&key, &limits, "m2").await;
+    assert!(
+        matches!(r, Err(RateLimitError::AllowanceExhausted)),
+        "the local fallback never saw the unary spend: {r:?}"
+    );
+}
