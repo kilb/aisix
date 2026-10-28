@@ -174,8 +174,8 @@ impl<S: ConsumptionSource> Sweeper<S> {
     pub async fn tick(&self, now: DateTime<Utc>) -> Result<TickReport, StoreError> {
         let mut r = TickReport::default();
         let users = self.store.all_users().await?;
-        // 花超自己额度的密钥。在用户循环里就地收集 —— 那里才拿得到真正的窗口。
-        let mut exhausted: Vec<String> = Vec::new();
+        // 这一轮读不到消费的用户。他们的密钥这一轮只许停、不许启（见 `apply_key_state_to`）。
+        let mut unread: Vec<String> = Vec::new();
 
         for u in &users {
             // 这一轮的差额全按这份依据算；入账时在事务里再核对一遍（见 `settle`）。
@@ -183,8 +183,9 @@ impl<S: ConsumptionSource> Sweeper<S> {
             let since = basis.counted_through().unwrap_or(now);
             let Some(series) = self.source.spend_series(&u.id, since, now).await else {
                 // 读不到就原地不动：游标不前进，下一轮的读数照样包含这段消费。
-                // 密钥级也一并跳过 —— 它们出自同一次读数。
+                // 密钥级花费也一并不记 —— 它们出自同一次读数。
                 r.read_failures += 1;
+                unread.push(u.id.clone());
                 continue;
             };
             if basis.needs_seeding() {
@@ -273,16 +274,18 @@ impl<S: ConsumptionSource> Sweeper<S> {
             if settled && spent > 0 {
                 r.debited += 1;
             }
+        }
 
-            // 花超自己额度的密钥。比的是库里的累计花费，不是这一轮的增量。
-            //
-            // 这一轮让给了别的实例（`settled` 为假）也照样比：库里的累计花费已经含着
-            // 那个实例刚入的账。跳过的话，这把密钥不在 `exhausted` 里，下面那次写盘
-            // 会把那个实例刚停掉的它重新启用。
+        // 花超自己额度的密钥。比的是库里的累计花费，不是这一轮的增量，所以放在用户
+        // 循环之外、对**每个**用户都比：这一轮读不到消费的、只建游标的、让给了别的
+        // 实例（库里的累计花费已经含着那个实例刚入的账）的都在内。漏掉一个人，他
+        // 已经花超、已经停掉的密钥不在 `exhausted` 里，下面那次写盘会把它重新启用。
+        let mut exhausted: Vec<String> = Vec::new();
+        for u in &users {
             let totals: std::collections::HashMap<String, i64> =
                 self.store.key_spend(&u.id).await?.into_iter().collect();
-            for (name, quota) in quotas {
-                if totals.get(&name).copied().unwrap_or(0) >= quota {
+            for (name, quota) in self.store.key_quotas(&u.id).await? {
+                if quota > 0 && totals.get(&name).copied().unwrap_or(0) >= quota {
                     exhausted.push(name);
                 }
             }
@@ -335,7 +338,7 @@ impl<S: ConsumptionSource> Sweeper<S> {
             .edit(move |doc| {
                 let mut changed = apply_key_allowances_to(doc, &quotas);
                 changed |= apply_allowances_to(doc, &grants);
-                changed |= apply_key_state_to(doc, &wanted, &exhausted, &o1, &o2);
+                changed |= apply_key_state_to(doc, &wanted, &exhausted, &unread, &o1, &o2);
                 changed
             })
             .await;
@@ -698,12 +701,17 @@ fn apply_allowances_to(doc: &mut serde_yaml_ng::Value, grants: &[(String, i64)])
 /// `wanted` 是按**用户**算出来的期望状态；`exhausted` 是按**密钥**算出来的那几把
 /// 已经花超自己额度的。两者取更严的一侧：用户没问题但这把超了，也停。
 ///
+/// `unread` 是这一轮读不到消费的用户：他们的密钥只许停、不许启。停的依据（账号
+/// 停用、已入账的余额与密钥花费）都是库里的定数，而没读到的消费只会让真实花费更
+/// 高，所以该停照样停；启却可能放出一个在读不到的这段时间里已经花超的人。
+///
 /// 走共用的写盘：铸密钥也写这个文件，两条路径不串行就会互相覆盖。改动用泛型
 /// `Value`，不经过窄结构体（那会抹掉门户不认识的字段）。
 fn apply_key_state_to(
     doc: &mut serde_yaml_ng::Value,
     wanted: &[(String, bool)],
     exhausted: &[String],
+    unread: &[String],
     o1: &std::sync::atomic::AtomicUsize,
     o2: &std::sync::atomic::AtomicUsize,
 ) -> bool {
@@ -732,7 +740,7 @@ fn apply_key_state_to(
             .get("disabled")
             .and_then(serde_yaml_ng::Value::as_bool)
             .unwrap_or(false);
-        if now == *want {
+        if now == *want || (!*want && unread.iter().any(|id| id == uid)) {
             continue;
         }
         if let Some(m) = k.as_mapping_mut() {
@@ -1293,6 +1301,129 @@ api_keys:
         *f.src.fail_for.lock().unwrap() = None;
         f.sw.tick(t("2026-08-26T10:06:00Z")).await.unwrap();
         assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 10_000_000 - 4_000);
+    }
+
+    /// 把夹具里某把密钥直接写成停用 —— 门户之前某一轮（或升级前的版本）停掉的。
+    fn mark_disabled(path: &str, key: &str) {
+        let doc = std::fs::read_to_string(path).unwrap();
+        let from = format!("  - display_name: {key}\n");
+        assert!(doc.contains(&from), "夹具里没有密钥 {key}");
+        std::fs::write(
+            path,
+            doc.replace(&from, &format!("{from}    disabled: true\n")),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn 读不到消费的那一轮_花超额度停掉的密钥不被重新启用() {
+        let f = fx().await;
+        for u in [&f.uid, &f.other] {
+            f.ledger
+                .credit(u, 5_000_000, Source::AdminGrant, None)
+                .await
+                .unwrap();
+        }
+        f.store.set_key_quota(&f.uid, "a", 1_000_000).await.unwrap();
+        f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        f.src.set_key_increase(&f.uid, "a", 1_200_000);
+        f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
+        assert!(read_disabled(&f.path, &f.uid), "前提：花超额度的密钥被停用");
+
+        // 余额还有 $3.8，账号级不停；只有这把密钥自己花超了。这一轮读不到他的消费。
+        f.src.set_key_increase(&f.uid, "a", 0);
+        f.src.fail_for(&f.uid);
+        let r = f.sw.tick(t("2026-08-26T10:00:30Z")).await.unwrap();
+        assert_eq!(r.read_failures, 1);
+        assert!(
+            read_disabled(&f.path, &f.uid),
+            "读不到消费的那一轮，花超额度的密钥被重新启用了: {r:?}"
+        );
+        assert_eq!(r.reenabled, 0, "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn 读不到消费的那一轮_已入账的花费够停就照样停() {
+        let f = fx().await;
+        for u in [&f.uid, &f.other] {
+            f.ledger
+                .credit(u, 5_000_000, Source::AdminGrant, None)
+                .await
+                .unwrap();
+        }
+        f.store.set_key_quota(&f.uid, "a", 3_000_000).await.unwrap();
+        f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        f.src.set_key_increase(&f.uid, "a", 1_200_000);
+        f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
+        assert!(!read_disabled(&f.path, &f.uid), "前提：还没花超额度");
+
+        // 用户把这把密钥的额度调到了它已经花掉的数之下，这一轮又读不到他的消费。
+        // 已入账的 $1.2 就够停了 —— 没读到的只会更多。
+        f.src.set_key_increase(&f.uid, "a", 0);
+        f.store.set_key_quota(&f.uid, "a", 1_000_000).await.unwrap();
+        f.src.fail_for(&f.uid);
+        let r = f.sw.tick(t("2026-08-26T10:00:30Z")).await.unwrap();
+        assert!(
+            read_disabled(&f.path, &f.uid),
+            "读不到消费的那一轮，已入账就花超额度的密钥没被停用: {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn 读不到消费的那一轮_补了额也不重新启用_读到之后才启用() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 1_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        f.src.set_increase(1_200_000);
+        f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
+        assert!(read_disabled(&f.path, &f.uid), "前提：余额耗尽被停用");
+
+        // 补了 $5，可这一轮读不到他的消费：停用之后、这一刻之前他花了多少不知道，
+        // 库里的余额只是上次入账之后的数。
+        f.ledger
+            .credit(&f.uid, 5_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.src.set_increase(0);
+        f.src.fail_for(&f.uid);
+        let r = f.sw.tick(t("2026-08-26T10:00:30Z")).await.unwrap();
+        assert!(
+            read_disabled(&f.path, &f.uid),
+            "读不到消费的那一轮把密钥重新启用了: {r:?}"
+        );
+        assert_eq!(r.reenabled, 0, "{r:?}");
+
+        // 读到了、账也入了，才按补额之后的余额启用。
+        *f.src.fail_for.lock().unwrap() = None;
+        let r = f.sw.tick(t("2026-08-26T10:00:45Z")).await.unwrap();
+        assert!(!read_disabled(&f.path, &f.uid), "读到之后仍没启用: {r:?}");
+        assert_eq!(r.reenabled, 1, "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn 升级上来建游标的那一轮_花超额度停掉的密钥不被重新启用() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 5_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        // 升级前的库：有对账时刻、没有游标；那把密钥已经花超额度，旧版本停掉了它。
+        f.store
+            .set_counted_through(&f.uid, t("2026-08-26T09:59:45Z"))
+            .await
+            .unwrap();
+        f.store.set_key_quota(&f.uid, "a", 1_000_000).await.unwrap();
+        f.store.add_key_spend(&f.uid, "a", 1_200_000).await.unwrap();
+        mark_disabled(&f.path, "a");
+
+        let r = f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        assert!(
+            read_disabled(&f.path, &f.uid),
+            "建游标那一轮把花超额度的密钥重新启用了: {r:?}"
+        );
     }
 
     #[tokio::test]
