@@ -244,15 +244,15 @@ pub async fn image_generations(
 /// generation `prompt` so the input guardrail chain can scan it (#545).
 /// Never sent upstream.
 fn images_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat {
-    // `user` ahead of the prompt, so the prompt stays last: a guardrail
-    // bounding how much it sends checks it first and in full.
-    let messages = ["user", "prompt"]
+    // `user` and the prompt are both new content, so they are one newest
+    // message, as the segment walk (`redact_images_request_structured`)
+    // treats them: `user` is unbounded, and kept as an older message of its
+    // own, a guardrail bounding how much it sends could leave its front
+    // unchecked.
+    let parts = ["user", "prompt"]
         .into_iter()
-        .filter_map(|field| body.get(field).and_then(Value::as_str))
-        .filter(|text| !text.is_empty())
-        .map(|text| aisix_gateway::ChatMessage::user(text.to_string()))
-        .collect();
-    aisix_gateway::ChatFormat::new(model, messages)
+        .filter_map(|field| body.get(field).and_then(Value::as_str));
+    crate::redact::newest_content_for_inspection(model, parts)
 }
 
 fn images_output_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatResponse {
@@ -1624,5 +1624,16 @@ mod tests {
             status.cooldown_until.is_some(),
             "a 500 must mark the model in cooldown, got {status:?}"
         );
+    }
+
+    /// `user` and the prompt are both new content: the inspection request
+    /// carries them as one message, so a guardrail that checks the newest
+    /// message in full covers a long `user` too.
+    #[test]
+    fn user_and_prompt_are_inspected_as_one_newest_message() {
+        let body = serde_json::json!({"model": "m", "prompt": "p", "user": "u"});
+        let chat = super::images_input_to_chat("m", &body);
+        let contents: Vec<_> = chat.messages.iter().map(|m| m.content.as_deref()).collect();
+        assert_eq!(contents, [Some("u\np")]);
     }
 }

@@ -28,8 +28,8 @@ import {
 //     预算 —— Claude Code 这类客户端每次都带几万字的 tools。
 //   - 一组全是这次新送来的内容 —— embeddings 的 input 列表、rerank 的 query 和
 //     documents、completions 的 prompt 列表、语音合成的 input 和 instructions、
-//     转写的多个 prompt —— 整组都算最新内容：预算内整组都审，超出预算就拦下，
-//     不会只审最后一项、把前面的当成历史放过去。
+//     转写的多个 prompt、图像生成的 user 和 prompt —— 整组都算最新内容：预算内
+//     整组都审，超出预算就拦下，不会只审最后一项、把前面的当成历史放过去。
 
 const MARKER = "aliyunlongcontentmarker";
 const PHONE = "13800138000";
@@ -419,6 +419,20 @@ describe("Aliyun text moderation checks content past the per-call limit", () => 
       const r = await post(ctx, CALLER, "/v1/completions", { model: "lc-tmp-clean", prompt, ...extra });
       expect(r.status, `${JSON.stringify(extra)}: ${r.text.slice(0, 200)}`).toBe(422);
     }
+  });
+
+  test("/v1/images/generations: a long `user` is not checked from its end only", async (t) => {
+    if (!ctx.ready) return t.skip();
+    const up = ctx.upstreams["lc-tmp-clean"]!;
+    const before = { calls: calls().length, sent: up.receivedRequests.length };
+    const r = await post(ctx, CALLER, "/v1/images/generations", {
+      model: "lc-tmp-clean",
+      prompt: "a watercolor of a lighthouse",
+      user: `${MARKER} ${filler(40_000)}`,
+    });
+    expect(r.status, r.text.slice(0, 200)).toBe(422);
+    expect(calls().length - before.calls).toBeLessThanOrEqual(16);
+    expect(up.receivedRequests.length, "the refused request reached the model").toBe(before.sent);
   });
 
   test("a list of new content within the budget is checked whole", async (t) => {
