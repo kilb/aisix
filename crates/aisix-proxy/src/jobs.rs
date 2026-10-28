@@ -570,7 +570,7 @@ async fn scan_input_blob(
         return Ok(None);
     };
     // batch / 微调文件是 JSONL：逐行按请求内容改写，协议字段不动；协议字段
-    // 本身命中 mask 规则时拒绝上传（与其它端点对结构字段的处理一致）。
+    // 本身或对象的键命中 mask 规则时拒绝上传（与其它端点对结构字段的处理一致）。
     if let Some(r) = crate::redact::redact_jsonl_upload(&chain, text) {
         if r.unrewritable {
             return Err(ProxyError::ContentFiltered(

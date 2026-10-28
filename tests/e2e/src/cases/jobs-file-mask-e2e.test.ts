@@ -19,6 +19,9 @@ import { pickFreePort } from "../harness/ports.js";
 //   2. 协议字段本身命中 mask 规则时（`custom_id` 是邮箱），网关既不能改写它
 //      （两行会变成同一个 id，结果再也对不回请求），也不能原样放行（规则就白
 //      设了），所以拒绝这次上传，上游一个字节都收不到。
+//   3. 对象的键命中 mask 规则时也一样：键改不了（改了，上游读到的就是另一个字
+//      段），原样放行又白设了规则，所以拒绝上传 —— 和 /v1/chat/completions 对
+//      改写不了的键的处理一致。
 
 const CALLER_PLAINTEXT = "sk-jobs-file-mask-caller";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -179,5 +182,38 @@ describe("mask rules on an uploaded batch file act on each line's request conten
     const res = await upload(jsonl);
     expect(res.status, res.body).toBe(422);
     expect(upstream.uploads.length, "the refused file must not reach the provider").toBe(before);
+  });
+
+  test("an object key matching a mask rule refuses the upload instead of passing it unmasked", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    const lines = {
+      "a key inside the request body": JSON.stringify({
+        custom_id: "r1",
+        method: "POST",
+        url: "/v1/chat/completions",
+        body: {
+          model: "gpt-4o-mini",
+          messages: [{ role: "user", content: "hello" }],
+          metadata: { "bob@example.com": "1" },
+        },
+      }),
+      "a key at the top of a line": JSON.stringify({
+        custom_id: "r1",
+        method: "POST",
+        url: "/v1/chat/completions",
+        body: { model: "gpt-4o-mini", messages: [{ role: "user", content: "hello" }] },
+        "bob@example.com": 1,
+      }),
+    };
+    for (const [where, line] of Object.entries(lines)) {
+      const before = upstream.uploads.length;
+      const res = await upload(line + "\n");
+      expect.soft(res.status, `${where}: ${res.body}`).toBe(422);
+      expect.soft(res.body, where).not.toContain("bob@example.com");
+      expect.soft(upstream.uploads.length, `${where}: the refused file must not reach the provider`).toBe(before);
+    }
   });
 });

@@ -384,6 +384,7 @@ pub(crate) struct JsonlUploadRedaction {
     /// 某个协议字段（`custom_id` / `method` / `url` / `model`）命中了 mask 规则。
     /// 它既不能改写（两行会变成同一个 `custom_id`，结果再也对不回请求；改了
     /// `url` / `model` 请求就打错地方），也不能原样放行，调用方应拒绝上传。
+    /// 协议字段以外某个对象的键命中时也一样：改了键，上游读到的就是另一个字段。
     pub unrewritable: bool,
 }
 
@@ -435,6 +436,14 @@ pub(crate) fn redact_jsonl_upload(
                 if JSONL_PROTOCOL_FIELDS.contains(&key.as_str()) {
                     continue;
                 }
+                // 改写只动值、不动键：这一行自己的键和它值里每一层对象的键，
+                // 命中 mask 规则就报告改写不了（与 chat 对改写不了的键的处理一致）。
+                if let Some(r) = redact_str(chain, Direction::Input, key) {
+                    unrewritable |= r.text != *key;
+                    merge_counts(&mut counts, r.counts);
+                }
+                unrewritable |=
+                    detect_unrewritable_object_keys(chain, Direction::Input, slot, &mut counts);
                 match slot {
                     // batch 行的请求体：`model` 是协议字段，其余照常改写。
                     Value::Object(body) if key == "body" => {
@@ -3791,6 +3800,27 @@ mod tests {
         let r = redact_jsonl_upload(chain.as_ref(), line).expect("a JSONL file");
         let sent = &r.text;
         assert!(!sent.contains("alice@example.com"), "{sent}");
+    }
+
+    /// 对象的键改写不了：改了键，上游读到的就是另一个字段。键命中 mask 规则时，
+    /// 原样转发等于规则白设，所以报告为改写不了，由调用方拒绝上传 —— 和 chat
+    /// 对改写不了的键的处理一致。
+    #[test]
+    fn jsonl_upload_reports_an_object_key_a_mask_rule_would_change() {
+        let chain = both();
+        for line in [
+            r#"{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"m","messages":[],"metadata":{"bob@example.com":1}}}"#,
+            r#"{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"m","messages":[]},"bob@example.com":1}"#,
+            r#"{"messages":[{"role":"user","content":"hi","extra":{"bob@example.com":"x"}}]}"#,
+        ] {
+            let r = redact_jsonl_upload(chain.as_ref(), line).expect("a JSONL file");
+            assert!(r.unrewritable, "{line}");
+        }
+        // 键里没有要遮蔽的内容时照常改写，不拒绝。
+        let line = r#"{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"m","messages":[],"metadata":{"owner":"bob@example.com"}}}"#;
+        let r = redact_jsonl_upload(chain.as_ref(), line).expect("a JSONL file");
+        assert!(!r.unrewritable);
+        assert!(!r.text.contains("bob@example.com"), "{}", r.text);
     }
 
     /// Every text slot of a rerank or speech request is new content, so the
