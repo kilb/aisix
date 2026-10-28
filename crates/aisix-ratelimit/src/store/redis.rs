@@ -581,6 +581,9 @@ impl RateStore for RedisStore {
         match invocation.invoke_async::<Vec<i64>>(&mut conn).await {
             Ok(reply) => {
                 self.mark_ok();
+                // 本地备份要知道这个桶带不带累计额度，否则断线前攒下的流式花费会在
+                // 空闲回收时连桶一起丢掉（见 `LocalStore::note_allowance`）。
+                self.local.note_allowance(key, limits);
                 let code = reply.first().copied().unwrap_or(CODE_OK);
                 let retry = reply.get(1).copied().unwrap_or(0).max(0) as u64;
                 match code {

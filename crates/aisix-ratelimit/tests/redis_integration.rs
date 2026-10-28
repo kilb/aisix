@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aisix_core::{RateLimit, RateLimitScope, RedisConnConfig, RedisMode};
-use aisix_ratelimit::{Limiter, MultiReservation, RateStore, RedisStore};
+use aisix_ratelimit::{Limiter, MultiReservation, RateLimitError, RateStore, RedisStore};
 
 /// 读一个**闸门**环境变量：没设就跳过这条用例，但在 CI 上直接失败。
 ///
@@ -791,5 +791,53 @@ async fn a_slot_taken_while_degraded_is_released_by_a_commit_after_recovery() {
     assert!(
         flaky.acquire(&key, &limits, "m2").await.is_ok(),
         "the slot m1 took while degraded was never released locally"
+    );
+}
+
+/// 流式花费在 Redis 模式下也记一份进本地备份（`add_tokens_all`），供断线时的本地
+/// 降级接着用。累计额度的那份不能因为空闲被回收：桶的 acquire 走的是 Redis，本地
+/// 从没见过它带的限额，回收认不出这是一份额度，空闲一天后整个收走 —— 下一次断线时
+/// 本地降级从 0 起算，用完的额度又放行了。
+// 多线程：`RedisStore::connect` 同步等后台 worker 建连，转发器得在另一个线程上跑。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_spend_on_an_allowance_survives_reaping_into_the_next_outage() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let proxy = FlakyProxy::start(&url).await;
+    let flaky = store(&proxy.url).await;
+    let direct = store(&url).await;
+    let key = unique_key("stream-allowance");
+    let limits = RateLimit {
+        concurrency: Some(1),
+        granted_micro_usd: Some(1_000),
+        ..rl()
+    };
+
+    // 连着 Redis。直连的副本拿不到并发位，说明这次 acquire 确实走的是 Redis ——
+    // 降级到本地的话本地 acquire 自己就会记下额度，这条用例什么都证明不了。
+    flaky
+        .acquire(&key, &limits, "m1")
+        .await
+        .expect("inside the allowance");
+    assert!(
+        direct.acquire(&key, &limits, "d").await.is_err(),
+        "the first acquire did not go through Redis"
+    );
+    flaky.release(&key, "m1");
+    // 流结束：花费越过额度，经 add_tokens 记账。
+    flaky.add_tokens(&key, 1_500);
+
+    // 例行回收。睡过一个整秒边界，桶才算真的空闲（`reap` 按整秒比较）。
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    flaky.reap(Duration::from_secs(0));
+
+    // 断线：降级到本地，那份累计额度必须还在。
+    proxy.down();
+    let r = flaky.acquire(&key, &limits, "m2").await;
+    assert!(
+        matches!(r, Err(RateLimitError::AllowanceExhausted)),
+        "the local fallback started the allowance over after reaping: {r:?}"
     );
 }

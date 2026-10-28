@@ -121,6 +121,24 @@ impl<C: Clock> LocalStore<C> {
             .clone()
     }
 
+    /// 记下这个桶是否带着累计额度，不计数、不占位。
+    ///
+    /// 给 Redis 后端用：它的 acquire 走 Redis，本地这份备份只在流式记账
+    /// （`add_tokens`）时被写到，而那条路不知道自己记的是 token 还是 micro-USD。
+    /// 这些桶的 `carries_allowance` 于是永远是 false，空闲一天后被 [`Self::reap`]
+    /// 收走，下一次断线时本地降级从 0 起算累计额度。由成功的那次 Redis acquire
+    /// 把它带的限额告诉本地，回收就认得出这是一份额度。
+    ///
+    /// 不带额度时只改已有的桶：Redis 正常时本地表里多半没有它，不必为每个桶建
+    /// 一份空状态。
+    pub(crate) fn note_allowance(&self, key: &str, limits: &RateLimit) {
+        if limits.granted_micro_usd.is_some() {
+            self.state_for(key).lock().carries_allowance = true;
+        } else if let Some(state) = self.states.get(key) {
+            state.lock().carries_allowance = false;
+        }
+    }
+
     /// Drop buckets untouched for longer than `idle_for`, so state for
     /// api keys, models and policies the control plane deleted does not
     /// accrue for the process lifetime. Bucket keys are config-derived, so
@@ -559,6 +577,40 @@ mod tests {
             store.peek("tokens", &l).await.is_none(),
             "a windowed bucket with no allowance must be reclaimed once idle, \
              however many tokens it committed"
+        );
+    }
+
+    /// Redis 模式下本地这份备份只被 `add_tokens` 写到，从没在本地 acquire 过；带不带
+    /// 累计额度由 Redis 那次成功的 acquire 经 `note_allowance` 告诉它。带着额度、
+    /// 花过钱的不回收；额度后来撤掉了的照常回收。
+    #[tokio::test]
+    async fn reap_keeps_a_noted_allowance_bucket_filled_only_by_add_tokens() {
+        let clock = TestClock::new(1_000);
+        let store = LocalStore::with_clock(clock.clone());
+        let granted = RateLimit {
+            granted_micro_usd: Some(1_000),
+            ..Default::default()
+        };
+
+        store.note_allowance("kept", &granted);
+        store.add_tokens("kept", 1_500);
+        store.note_allowance("dropped", &granted);
+        store.add_tokens("dropped", 1_500);
+        store.note_allowance("dropped", &RateLimit::default());
+
+        clock.advance(DAY_SECS + 1);
+        store.reap(Duration::from_secs(DAY_SECS));
+
+        assert!(
+            matches!(
+                store.acquire("kept", &granted, "m").await,
+                Err(RateLimitError::AllowanceExhausted)
+            ),
+            "reaping handed back an allowance spent through add_tokens"
+        );
+        assert!(
+            store.peek("dropped", &granted).await.is_none(),
+            "a bucket whose allowance was withdrawn must be reclaimed once idle"
         );
     }
 
