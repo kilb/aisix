@@ -43,7 +43,8 @@
 //! - **新序列从 0 算起，读到多少就是花了多少。** 新用户也一样：他的计数器生来
 //!   就是 0，第一次被读到之前的消费照扣 —— 否则注册、拿额度、铸密钥、用掉都赶在
 //!   第一轮对账之前，这段就白用了。唯一的例外是从按时间窗计费的版本升级上来的
-//!   老用户：那一轮只记下当前读数，不把历史当成新序列重扣。
+//!   老用户：那一轮只记下当前读数，不把历史当成新序列重扣；之后一小段宽限期里
+//!   第一次出现的序列也一样（见 [`SEED_GRACE`]）。
 
 use chrono::{DateTime, Utc};
 
@@ -87,6 +88,19 @@ pub fn tick_secs() -> u64 {
 /// 唯一的例外是一个网关进程一直活着、却连续三十天没被抓到，之后又被抓到：它在那
 /// 之前已经扣过的累计会再扣一次（那三十天里的消费在此之前同样一直没扣到）。
 const CURSOR_RETENTION: chrono::TimeDelta = chrono::TimeDelta::days(30);
+
+/// 老用户建完游标之后的宽限期：这段时间里第一次出现的序列只记游标、不扣款。
+///
+/// 从按时间窗计费的版本升级上来的老用户，第一轮只记下当时读到的序列。那一次读数
+/// 未必齐 —— 抓取空档、落后的 Prometheus 副本、恰好那一刻没被抓到的实例 —— 漏掉的
+/// 序列下一轮以「没有游标的新序列」出现，按从 0 算起会把它的整段历史再扣一遍，而
+/// 那段历史旧版本早已扣过。
+///
+/// 代价：宽限期里真正新出现的序列（新副本、新密钥）第一次读数不扣，这个用户少收
+/// 那一笔，即这条序列从出现到第一次被读到之间的消费；之后照常按差额扣。反过来，
+/// 漏读得比宽限期还久的序列（一个缺席超过十分钟的副本）出现时仍按新序列整段扣。
+/// 十分钟盖得住几轮抓取空档与副本落后，又短到少收的那一笔只落在升级当时。
+const SEED_GRACE: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
 
 /// 一轮的结果，供调用方与测试观察。
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -184,6 +198,9 @@ impl<S: ConsumptionSource> Sweeper<S> {
                 .iter()
                 .map(|(k, &(v, started))| (k.clone(), (v.max(0) as u64, started)))
                 .collect();
+            let seeding_grace = basis
+                .cursors_seeded_at()
+                .is_some_and(|at| now < at + SEED_GRACE);
             let mut spent = 0u64;
             let mut by_key: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
             // 这一轮之后每条序列的游标。通常就是读数；只有「变小却没重置」时留在原处。
@@ -191,6 +208,9 @@ impl<S: ConsumptionSource> Sweeper<S> {
             for s in &series {
                 // (这一轮扣多少, 新游标, 游标记下的进程启动时刻)
                 let (delta, cursor, started) = match (cursors.get(&s.key).copied(), s.started_ms) {
+                    // 老用户刚建完游标、还在宽限期里时第一次出现的序列：多半是建游标那一
+                    // 轮漏读的，它的历史旧版本扣过了。只记游标，不扣（见 `SEED_GRACE`）。
+                    (None, now) if seeding_grace => (0, s.value, now),
                     // 新序列（新副本、新密钥、新用户）：从 0 算起。
                     (None, now) => (s.value, s.value, now),
                     // 两边都知道进程启动时刻：由它判断，`resets()` 不参与 —— 计数器在
@@ -432,11 +452,15 @@ impl<S: ConsumptionSource> Sweeper<S> {
                         .execute(&mut *conn)
                         .await?;
                     }
+                    // 老用户从「没建游标」变成「建好了」的这一轮，记下时刻 —— 宽限期从
+                    // 这里算起（见 `SEED_GRACE`）。`CASE` 里读到的是更新前的那一行。
                     sqlx::query(
                         "INSERT INTO consumption_mark (user_id, counted_through, updated_at, cursors_seeded)
                          VALUES (?1, ?2, ?3, 1)
                          ON CONFLICT(user_id)
-                         DO UPDATE SET counted_through = ?2, updated_at = ?3, cursors_seeded = 1",
+                         DO UPDATE SET counted_through = ?2, updated_at = ?3, cursors_seeded = 1,
+                                       cursors_seeded_at = CASE WHEN cursors_seeded = 0 THEN ?2
+                                                                ELSE cursors_seeded_at END",
                     )
                     .bind(&user_id)
                     .bind(&through)
@@ -1469,6 +1493,43 @@ api_keys:
         f.src.add_spend(&f.uid, 1_000_000);
         f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
         assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 9_000_000);
+    }
+
+    #[tokio::test]
+    async fn 升级后建游标那一轮漏读的序列_宽限期内第一次出现只记游标不扣() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 10_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        // 升级前的库：有对账时刻，没有游标。
+        f.store
+            .set_counted_through(&f.uid, t("2026-08-26T09:59:45Z"))
+            .await
+            .unwrap();
+        f.src.series(&f.uid, "gw-1", 9_000_000);
+        f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 10_000_000);
+
+        // gw-2 上早有 $4 的历史，按时间窗计费的旧版本已经扣过；建游标那一轮恰好没
+        // 读到它（落在了一个还没抓到它的 Prometheus 副本上），这一轮才第一次出现。
+        f.src.series(&f.uid, "gw-2", 4_000_000);
+        f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
+        assert_eq!(
+            f.ledger.balance(&f.uid).await.unwrap(),
+            10_000_000,
+            "建游标那一轮漏读的序列，整段历史被当成新消费又扣了一遍"
+        );
+
+        // 之后它照常按差额扣。
+        f.src.series(&f.uid, "gw-2", 1_000_000);
+        f.sw.tick(t("2026-08-26T10:00:30Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 9_000_000);
+
+        // 宽限期过后，新出现的序列照常从 0 算起，第一笔就扣。
+        f.src.series(&f.uid, "gw-3", 2_000_000);
+        f.sw.tick(t("2026-08-26T10:10:30Z")).await.unwrap();
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 7_000_000);
     }
 
     #[tokio::test]

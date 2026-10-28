@@ -40,6 +40,9 @@ pub struct ConsumptionMark {
     /// `false` = 从按时间窗计费的版本升级上来、还没建花费游标（见
     /// `0005_spend_cursors.sql`）。
     pub cursors_seeded: bool,
+    /// 升级上来的老用户建游标那一轮的时刻，RFC3339 原文；其他人为空（见
+    /// `0006_cursor_seeding_time.sql`）。
+    pub cursors_seeded_at: Option<String>,
 }
 
 impl BillingBasis {
@@ -54,6 +57,14 @@ impl BillingBasis {
     /// 从按时间窗计费的版本升级上来、还没建游标。
     pub fn needs_seeding(&self) -> bool {
         self.mark.as_ref().is_some_and(|m| !m.cursors_seeded)
+    }
+
+    /// 升级上来的老用户建游标那一轮的时刻。`None` = 不是这样建的游标。
+    pub fn cursors_seeded_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        let at = self.mark.as_ref()?.cursors_seeded_at.as_deref()?;
+        chrono::DateTime::parse_from_rfc3339(at)
+            .ok()
+            .map(|d| d.with_timezone(&chrono::Utc))
     }
 }
 
@@ -526,8 +537,9 @@ pub(crate) async fn billing_basis_on(
     conn: &mut sqlx::SqliteConnection,
     user_id: &str,
 ) -> Result<BillingBasis, StoreError> {
-    let mark: Option<(String, i64)> = sqlx::query_as(
-        "SELECT counted_through, cursors_seeded FROM consumption_mark WHERE user_id = ?1",
+    let mark: Option<(String, i64, Option<String>)> = sqlx::query_as(
+        "SELECT counted_through, cursors_seeded, cursors_seeded_at FROM consumption_mark
+         WHERE user_id = ?1",
     )
     .bind(user_id)
     .fetch_optional(&mut *conn)
@@ -540,9 +552,10 @@ pub(crate) async fn billing_basis_on(
     .fetch_all(&mut *conn)
     .await?;
     Ok(BillingBasis {
-        mark: mark.map(|(counted_through, seeded)| ConsumptionMark {
+        mark: mark.map(|(counted_through, seeded, seeded_at)| ConsumptionMark {
             counted_through,
             cursors_seeded: seeded != 0,
+            cursors_seeded_at: seeded_at,
         }),
         cursors: rows
             .into_iter()
