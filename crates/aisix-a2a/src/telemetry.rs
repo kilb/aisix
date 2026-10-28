@@ -393,6 +393,92 @@ pub fn request_would_mask_unrewritable(
     !unrewritable.is_empty() && mask(&unrewritable).is_some_and(|m| m != unrewritable)
 }
 
+/// Whether a call asks the agent to deliver task updates by push notification.
+///
+/// A push notification is the agent POSTing a task's progress straight to a
+/// webhook the caller names, so whatever an agent says that way never passes
+/// back through the gateway. Two shapes ask for it
+/// (<https://a2a-protocol.org/v0.3.0/specification/> §7.1.2 and §7.5;
+/// <https://a2a-protocol.org/latest/specification/> §3.2.2 and §9.4.7):
+///
+/// - setting a task's push config: `tasks/pushNotificationConfig/set`, 1.0
+///   `CreateTaskPushNotificationConfig`;
+/// - a send carrying one in `params.configuration`: 0.3
+///   `pushNotificationConfig`, 1.0 `taskPushNotificationConfig`.
+///
+/// Both are recognised in any spelling a lenient parser accepts (camel or
+/// snake case, with or without the `task` prefix). A method of the push-config
+/// family that is not one of the reads (`get` / `list` / `delete`) counts as
+/// a set, so a draft or vendor spelling of the setter cannot pass as an
+/// unknown method.
+pub fn requests_push_delivery(request: &Value) -> bool {
+    let method = request
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let reads_config = matches!(
+        canonical_operation(method),
+        "tasks/pushNotificationConfig/get"
+            | "tasks/pushNotificationConfig/list"
+            | "tasks/pushNotificationConfig/delete"
+    );
+    if !reads_config && names_push_notification(method) {
+        return true;
+    }
+    request
+        .pointer("/params/configuration")
+        .and_then(Value::as_object)
+        .is_some_and(|configuration| {
+            configuration
+                .iter()
+                .any(|(key, value)| !value.is_null() && names_push_notification(key))
+        })
+}
+
+/// Whether a method or field name is about push notifications, however it is
+/// cased or separated.
+fn names_push_notification(name: &str) -> bool {
+    name.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect::<String>()
+        .contains("pushnotification")
+}
+
+/// One chunk of a streamed artifact, as a review that reads an answer across
+/// its chunks needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactChunk {
+    pub artifact_id: String,
+    /// The chunk continues the artifact's earlier chunks (`append: true`)
+    /// rather than replacing them.
+    pub append: bool,
+    /// The chunk's text parts, joined as [`ResultText`] joins them.
+    pub text: String,
+}
+
+/// The artifact chunk a streamed event carries, if it is an artifact update
+/// (0.3 `kind: "artifact-update"`, 1.0 `artifactUpdate`).
+///
+/// An agent streaming an answer sends it in chunks that continue one another,
+/// so a phrase can start in one event and end in the next: read one event at
+/// a time, neither half is the phrase.
+pub fn artifact_chunk(event: &Value) -> Option<ArtifactChunk> {
+    let payload = unwrap_payload(event.get("result")?);
+    let artifact = payload.get("artifact")?;
+    let mut text = String::new();
+    collect_part_text(artifact, &mut text, &|buf: &mut String, s: &str| {
+        buf.push_str(s)
+    });
+    Some(ArtifactChunk {
+        artifact_id: str_field(artifact, "artifactId")
+            .unwrap_or_default()
+            .to_string(),
+        append: payload.get("append").and_then(Value::as_bool) == Some(true),
+        text,
+    })
+}
+
 /// Where the walk is, for the two things position decides: whether a string
 /// is what the mask rewrite reaches, and whether a field holds file content.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1901,5 +1987,78 @@ mod tests {
         facts.observe_result(&json!({"result": {"taskId": "", "contextId": null}}));
         assert_eq!(facts.task_id, "t-6");
         assert_eq!(facts.context_id, "c-6");
+    }
+
+    #[test]
+    fn push_delivery_is_recognised_in_every_spelling_that_sets_it() {
+        let webhook = json!({"url": "https://hooks.example/a2a"});
+        for asks in [
+            json!({"method": "tasks/pushNotificationConfig/set", "params": {"taskId": "t"}}),
+            json!({"method": "CreateTaskPushNotificationConfig", "params": {"taskId": "t"}}),
+            // A setter spelling neither version defines: still a setter.
+            json!({"method": "SetTaskPushNotificationConfig", "params": {}}),
+            json!({"method": "message/send", "params": {"configuration": {
+                "pushNotificationConfig": webhook}}}),
+            json!({"method": "SendMessage", "params": {"configuration": {
+                "taskPushNotificationConfig": webhook}}}),
+            json!({"method": "message/stream", "params": {"configuration": {
+                "push_notification_config": webhook}}}),
+            json!({"method": "SendStreamingMessage", "params": {"configuration": {
+                "task_push_notification_config": webhook}}}),
+        ] {
+            assert!(
+                requests_push_delivery(&asks),
+                "{asks} asks for push delivery"
+            );
+        }
+        for does_not in [
+            json!({"method": "tasks/pushNotificationConfig/get", "params": {"id": "t"}}),
+            json!({"method": "GetTaskPushNotificationConfig", "params": {"id": "t"}}),
+            json!({"method": "ListTaskPushNotificationConfigs", "params": {}}),
+            json!({"method": "tasks/pushNotificationConfig/delete", "params": {}}),
+            json!({"method": "message/send", "params": {"configuration": {
+                "blocking": true, "pushNotificationConfig": null}}}),
+            // Only the configuration asks: a mention elsewhere is content.
+            json!({"method": "message/send", "params": {"message": {"metadata": {
+                "pushNotificationConfig": webhook}}}}),
+        ] {
+            assert!(
+                !requests_push_delivery(&does_not),
+                "{does_not} does not ask for push delivery"
+            );
+        }
+    }
+
+    #[test]
+    fn an_artifact_chunk_is_read_in_both_wire_versions() {
+        let v03 = json!({"result": {"kind": "artifact-update", "taskId": "t", "append": true,
+            "artifact": {"artifactId": "r", "parts": [{"kind": "text", "text": "half"}]}}});
+        assert_eq!(
+            super::artifact_chunk(&v03),
+            Some(ArtifactChunk {
+                artifact_id: "r".into(),
+                append: true,
+                text: "half".into()
+            })
+        );
+        let v10 = json!({"result": {"artifactUpdate": {"taskId": "t",
+            "artifact": {"artifactId": "r", "parts": [{"text": "one"}, {"text": "two"}]}}}});
+        assert_eq!(
+            super::artifact_chunk(&v10),
+            Some(ArtifactChunk {
+                artifact_id: "r".into(),
+                append: false,
+                text: "one\ntwo".into()
+            })
+        );
+        // A status update or a whole Task is not a chunk.
+        assert_eq!(
+            super::artifact_chunk(&json!({"result": {"kind": "status-update", "taskId": "t"}})),
+            None
+        );
+        assert_eq!(
+            super::artifact_chunk(&json!({"result": {"task": {"id": "t", "artifacts": []}}})),
+            None
+        );
     }
 }

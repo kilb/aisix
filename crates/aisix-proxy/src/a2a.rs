@@ -19,8 +19,10 @@
 //! chain resolves with no model and no MCP server — an A2A call has neither —
 //! so `env`, `api_key` and `team` scoped policies govern it; a per-agent scope
 //! would need a new attachment dimension in the resource model. A STREAMED
-//! answer is not scanned: an A2A task streams progress for minutes and
-//! buffering it to scan would defeat the method.
+//! answer is held back and released as it scans clean, under the same
+//! streamed-output policy the LLM streaming paths apply; and while an output
+//! guardrail applies, a call that would set up push notifications is refused,
+//! since the agent would deliver those straight to the caller's webhook.
 //!
 //! The request body is forwarded verbatim to the upstream agent, so the caller
 //! speaks whichever A2A wire version the agent is pinned to; the gateway does
@@ -323,6 +325,42 @@ async fn dispatch(
             team_id: auth.key().team_id.as_deref(),
         });
     call.applied_guardrails = guardrail_chain.applied().to_vec();
+    // A push notification is the agent POSTing the task's progress straight
+    // to a webhook the caller names, so an answer delivered that way never
+    // comes back through here for the output check — asking for one routes
+    // around it. While an output guardrail can refuse an answer, a call that
+    // sets up push delivery is answered the way the specification has an
+    // agent without push support answer it, so a client falls back to
+    // polling or streaming, both of which are checked.
+    if enforces_output(&guardrail_chain) && aisix_a2a::requests_push_delivery(&value) {
+        tracing::warn!(
+            guardrail_hook = "output",
+            agent = %agent,
+            operation = %call.operation,
+            "guardrail refused A2A push notification setup",
+        );
+        call.guardrail_blocked = true;
+        emit_a2a_usage(
+            state,
+            &snapshot,
+            &auth,
+            request_id,
+            agent,
+            &call,
+            StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+            Duration::ZERO,
+        );
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            axum::Json(a2a_error_envelope_coded(
+                rpc_id,
+                PUSH_NOTIFICATION_NOT_SUPPORTED,
+                "push notifications are not available while a content policy reviews this \
+                 agent's answers; poll or stream the task instead",
+            )),
+        )
+            .into_response();
+    }
     // Run BEFORE the quota gate so a content-policy refusal does not burn an
     // RPM slot, matching /v1/chat/completions (#542).
     //
@@ -507,6 +545,7 @@ async fn dispatch(
             call,
             rpc_id,
             reservation,
+            guardrail_chain,
         )
         .await;
     }
@@ -530,11 +569,8 @@ async fn dispatch(
             // than preventing it — the same trade the LLM output hook makes,
             // and the reason the usage event is still emitted.
             //
-            // Streaming calls are NOT scanned: an A2A task streams progress
-            // for minutes and buffering it to scan would defeat the point of
-            // the method. That is a real gap, named here rather than papered
-            // over — closing it needs the incremental scan the chat streaming
-            // path uses.
+            // A streamed answer is reviewed in `dispatch_stream`, held back
+            // under the chain's streamed-output policy.
             //
             // The full observed check, not the `_non_segment` one: a masking
             // segment moderator (bedrock/lakera/presidio/aliyun_ai_guardrail)
@@ -555,7 +591,13 @@ async fn dispatch(
                 // `call.text.response` is capped and reads text parts of the
                 // answer only.
                 let scan = aisix_a2a::result_scan(&response_value);
-                if let Some(why) = scan.unreadable {
+                // Refused only where a guardrail would act on the answer: an
+                // input-only or monitor-mode chain never refuses one, and
+                // must not start doing so here.
+                if let Some(why) = scan
+                    .unreadable
+                    .filter(|_| enforces_output(&guardrail_chain))
+                {
                     tracing::warn!(
                         guardrail_hook = "output",
                         agent = %agent,
@@ -582,18 +624,7 @@ async fn dispatch(
                 }
                 let answer = scan.text;
                 if !answer.is_empty() {
-                    let synth = aisix_gateway::ChatResponse {
-                        id: String::new(),
-                        model: String::new(),
-                        message: aisix_gateway::ChatMessage::assistant(answer),
-                        finish_reason: aisix_gateway::FinishReason::Stop,
-                        usage: aisix_gateway::UsageStats::default(),
-                    };
-                    let (verdict, hits) = aisix_guardrails::Guardrail::check_output_observed(
-                        &guardrail_chain,
-                        &synth,
-                    )
-                    .await;
+                    let (verdict, hits) = check_answer(&guardrail_chain, answer).await;
                     call.guardrail_monitor_hits.extend(hits);
                     if let aisix_guardrails::GuardrailVerdict::Block {
                         reason,
@@ -724,9 +755,11 @@ impl Drop for StreamUsageOnDrop {
 
 /// Forward a streaming JSON-RPC call as SSE, event by event.
 ///
-/// The gateway does not buffer the task: each event the upstream pushes is
-/// relayed as it arrives, which is the entire point of `message/stream` — a
-/// caller watches a long-running task progress instead of waiting for it.
+/// Each event the upstream pushes is relayed as it arrives, which is the
+/// entire point of `message/stream` — a caller watches a long-running task
+/// progress instead of waiting for it. Under an output guardrail the events
+/// first pass a [`StreamReview`], which holds them only as long as the
+/// guardrail's streamed-output policy asks.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_stream(
     auth: AuthenticatedKey,
@@ -739,6 +772,7 @@ async fn dispatch_stream(
     call: A2aCall,
     rpc_id: Option<serde_json::Value>,
     reservation: aisix_ratelimit::MultiReservation,
+    guardrail_chain: aisix_guardrails::GuardrailChain,
 ) -> Response {
     let started = Instant::now();
     let bridge = HttpBridge::new(upstream);
@@ -775,6 +809,8 @@ async fn dispatch_stream(
         _concurrency: reservation.into_stream_hold(),
     };
     let agent_label = agent.to_string();
+    let mut review = aisix_guardrails::Guardrail::runs_on_output(&guardrail_chain)
+        .then(|| StreamReview::new(guardrail_chain));
 
     // Re-attach the request span: the body is polled after the request-id
     // middleware has returned, so a mid-stream failure would otherwise be
@@ -782,61 +818,120 @@ async fn dispatch_stream(
     // the request (#1060).
     let sse = crate::request_id::in_request_span(async_stream::stream! {
         let mut events = events;
+        // What the stream ends with once the review has had its say: the
+        // upstream's own fault, relayed after whatever cleared before it.
+        let mut upstream_fault = None;
+        let mut refusal = None;
         while let Some(event) = events.next().await {
-            match event {
-                Ok(value) => {
-                    // Read the task's progress off the event on its way past —
-                    // the relay itself stays verbatim.
-                    guard.call.facts.observe_result(&value);
-                    // An agent may refuse a streaming call with a JSON-RPC
-                    // error at HTTP 200, which arrives here as a lone
-                    // envelope carrying `error` instead of `result`. It is
-                    // relayed, but it is not a task stream: counting it would
-                    // inflate the event counter and put a near-zero
-                    // observation into the time-to-first-event histogram,
-                    // dragging the percentile of real streams down with it.
-                    if meters_content(guard.call.operation) {
-                        guard
-                            .call
-                            .text
-                            .response
-                            .observe(&value, crate::token_estimate::push_capped);
-                    }
-                    if value.get("result").is_some() {
-                        guard.call.stream.event_count += 1;
-                        // The agent's own time to first byte. Stamped on the
-                        // first event of any kind, matching how the LLM paths
-                        // stamp TTFT, so the two figures answer the same
-                        // question.
-                        guard.call.stream.ttfb.get_or_insert_with(|| started.elapsed());
-                    }
-                    // Forwarding the terminal event IS the end of the
-                    // response, and it has to be recorded BEFORE the yield:
-                    // an A2A client stops reading here, and the loop below
-                    // only resumes when the consumer pulls again — which,
-                    // for an agent that leaves the connection open after
-                    // finishing, never happens. Marking the end at the loop
-                    // exit instead reported every such completed task as
-                    // abandoned.
-                    if is_stream_end(&value) {
-                        guard.call.stream.reached_end = true;
-                    }
-                    yield Ok::<_, std::convert::Infallible>(
-                        axum::response::sse::Event::default().data(value.to_string()),
-                    );
-                }
+            let value = match event {
+                Ok(value) => value,
                 Err(err) => {
-                    // Mid-stream the status line is long gone, so the failure
-                    // can only be told to the caller in-band. Relay it as a
-                    // JSON-RPC error event and stop, rather than cutting the
-                    // connection and leaving a truncated task looking complete.
-                    tracing::warn!(agent = %agent_label, error = %err, "A2A stream failed mid-flight");
-                    guard.status = a2a_error_status(&err).as_u16();
-                    yield Ok(axum::response::sse::Event::default()
-                        .data(a2a_error_envelope(rpc_id.clone(), &err.to_string()).to_string()));
+                    upstream_fault = Some(err);
                     break;
                 }
+            };
+            // Read the task's progress off the event on its way past —
+            // the relay itself stays verbatim.
+            guard.call.facts.observe_result(&value);
+            if meters_content(guard.call.operation) {
+                guard
+                    .call
+                    .text
+                    .response
+                    .observe(&value, crate::token_estimate::push_capped);
             }
+            // An agent may refuse a streaming call with a JSON-RPC error at
+            // HTTP 200, which arrives here as a lone envelope carrying
+            // `error` instead of `result`; it is not a task stream, so it
+            // does not stamp the time to first event. The agent's own time
+            // to first byte is when the event ARRIVED, however long a
+            // review then holds it, matching how the LLM paths stamp TTFT.
+            if value.get("result").is_some() {
+                guard.call.stream.ttfb.get_or_insert_with(|| started.elapsed());
+            }
+            let ends = is_stream_end(&value);
+            let verdict = match review.as_mut() {
+                Some(review) => {
+                    review
+                        .admit(&value, ends, &mut guard.call.guardrail_monitor_hits)
+                        .await
+                }
+                None => StreamVerdict::Release(vec![HeldEvent::of(&value)]),
+            };
+            let released = match verdict {
+                StreamVerdict::Release(released) => released,
+                StreamVerdict::Refuse { reason, guardrail_name } => {
+                    refusal = Some((reason, guardrail_name));
+                    break;
+                }
+            };
+            // Forwarding the terminal event IS the end of the response, and
+            // it has to be recorded BEFORE the yield: an A2A client stops
+            // reading here, and the loop only resumes when the consumer
+            // pulls again — which, for an agent that leaves the connection
+            // open after finishing, never happens. Marking the end at the
+            // loop exit instead reported every such completed task as
+            // abandoned. For the same reason a review releases everything
+            // it holds at the terminal event rather than at EOF.
+            if ends {
+                guard.call.stream.reached_end = true;
+            }
+            for event in released {
+                if event.is_result {
+                    guard.call.stream.event_count += 1;
+                }
+                yield Ok::<_, std::convert::Infallible>(
+                    axum::response::sse::Event::default().data(event.data),
+                );
+            }
+        }
+        // Whatever the review still holds was read off the upstream before
+        // it ran out or faulted: it is released if it scans clean.
+        if refusal.is_none() {
+            if let Some(review) = review.as_mut() {
+                match review.finish(&mut guard.call.guardrail_monitor_hits).await {
+                    StreamVerdict::Release(released) => {
+                        for event in released {
+                            if event.is_result {
+                                guard.call.stream.event_count += 1;
+                            }
+                            yield Ok(axum::response::sse::Event::default().data(event.data));
+                        }
+                    }
+                    StreamVerdict::Refuse { reason, guardrail_name } => {
+                        refusal = Some((reason, guardrail_name));
+                    }
+                }
+            }
+        }
+        if let Some((reason, guardrail_name)) = refusal {
+            tracing::warn!(
+                guardrail_hook = "output",
+                agent = %agent_label,
+                operation = %guard.call.operation,
+                reason = %reason,
+                "guardrail blocked A2A stream",
+            );
+            // Mid-stream the status line is long gone, so the refusal is
+            // told in-band, like the unary refusal's envelope, and nothing
+            // the agent sends after it reaches the caller.
+            guard.call.guardrail_blocked = true;
+            guard.status = StatusCode::UNPROCESSABLE_ENTITY.as_u16();
+            guard.call.stream.reached_end = true;
+            yield Ok(axum::response::sse::Event::default().data(
+                a2a_error_envelope(
+                    rpc_id.clone(),
+                    &crate::error::guardrail_block_message("response", guardrail_name.as_deref()),
+                )
+                .to_string(),
+            ));
+        } else if let Some(err) = upstream_fault {
+            // Relayed as a JSON-RPC error event rather than by cutting the
+            // connection, which would leave a truncated task looking complete.
+            tracing::warn!(agent = %agent_label, error = %err, "A2A stream failed mid-flight");
+            guard.status = a2a_error_status(&err).as_u16();
+            yield Ok(axum::response::sse::Event::default()
+                .data(a2a_error_envelope(rpc_id.clone(), &err.to_string()).to_string()));
         }
         // The upstream ran out or faulted without ever marking the stream
         // finished. Either way the caller was handed everything there was.
@@ -849,6 +944,308 @@ async fn dispatch_stream(
         response = response.keep_alive(axum::response::sse::KeepAlive::new().interval(interval));
     }
     response.into_response()
+}
+
+/// Upper bound on what a [`StreamReview`] holds, or reads without scanning,
+/// whatever the policy's own threshold. An A2A task may stream for hours: a
+/// window whose character threshold events with little text never reach, or
+/// a policy that scans only at the end, must not grow without bound.
+const MAX_HELD_STREAM_BYTES: usize = 1024 * 1024;
+
+/// How much of each artifact's text a review keeps across scans when the
+/// policy names no overlap of its own (whole-answer hold-back, monitor mode).
+const DEFAULT_CARRY_CHARS: usize = 256;
+
+/// How many artifacts a review follows at once. A stream that opens more
+/// stops being followed for the oldest; each chunk is still scanned whole.
+const MAX_FOLLOWED_ARTIFACTS: usize = 64;
+
+/// One streamed event, serialized for the wire.
+struct HeldEvent {
+    data: String,
+    /// Carries a `result` — the events the stream series count.
+    is_result: bool,
+}
+
+impl HeldEvent {
+    fn of(event: &serde_json::Value) -> Self {
+        Self {
+            data: event.to_string(),
+            is_result: event.get("result").is_some(),
+        }
+    }
+}
+
+/// What a [`StreamReview`] decided about the events read so far.
+enum StreamVerdict {
+    /// These events are cleared for the caller now, in arrival order. Empty
+    /// while the policy is still holding.
+    Release(Vec<HeldEvent>),
+    /// The answer is refused: nothing still held reaches the caller.
+    Refuse {
+        reason: String,
+        guardrail_name: Option<String>,
+    },
+}
+
+/// The text of one artifact as the caller assembles it from its chunks, for
+/// the part not yet scanned plus what is carried from the last scan.
+struct FollowedArtifact {
+    id: String,
+    text: String,
+    /// Grew since the last scan.
+    fresh: bool,
+}
+
+/// Output review of a streamed answer: holds events back under the chain's
+/// streamed-output policy and releases them once they scan clean — the same
+/// policies, with the same meaning, as the LLM streaming paths apply. A
+/// whole-answer policy holds every event until the stream's terminal event; a
+/// window releases events as each window scans clean, carrying its overlap
+/// into the next; a chain whose output members are all in monitor mode
+/// forwards live and only observes.
+///
+/// An A2A event is a whole JSON-RPC message, so the unit held and released is
+/// an event, never part of one. Each event is read the way a unary result is
+/// — every key, string and number, file content decoded — and an event with
+/// content the scan cannot read refuses the answer, as a unary result would.
+/// An answer streamed in artifact chunks is ALSO read as the caller assembles
+/// it: a chunk with `append` continues its artifact's text, so a phrase
+/// started in one event and finished in the next is read whole.
+struct StreamReview {
+    chain: aisix_guardrails::GuardrailChain,
+    policy: aisix_guardrails::StreamOutputPolicy,
+    held: Vec<HeldEvent>,
+    held_bytes: usize,
+    /// Scan text of the events read since the last scan, newline-separated.
+    unscanned: String,
+    unscanned_chars: usize,
+    /// The end of the last scanned text, read again in front of the next.
+    overlap: String,
+    artifacts: Vec<FollowedArtifact>,
+    /// Set once a fail-open buffer cap has been exceeded: from then on events
+    /// pass unreviewed, as the guardrail's own setting asks.
+    fail_opened: bool,
+}
+
+impl StreamReview {
+    fn new(chain: aisix_guardrails::GuardrailChain) -> Self {
+        let policy = aisix_guardrails::Guardrail::stream_output_policy(&chain);
+        Self {
+            chain,
+            policy,
+            held: Vec::new(),
+            held_bytes: 0,
+            unscanned: String::new(),
+            unscanned_chars: 0,
+            overlap: String::new(),
+            artifacts: Vec::new(),
+            fail_opened: false,
+        }
+    }
+
+    /// Read one event off the upstream. `ends` marks the stream's terminal
+    /// event, at which everything held is scanned and released at once: a
+    /// client stops reading there, so holding on for EOF would leave it
+    /// waiting on an agent that keeps the connection open.
+    async fn admit(
+        &mut self,
+        event: &serde_json::Value,
+        ends: bool,
+        hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
+    ) -> StreamVerdict {
+        use aisix_guardrails::StreamOutputPolicy;
+
+        let held = HeldEvent::of(event);
+        if self.fail_opened {
+            return StreamVerdict::Release(vec![held]);
+        }
+        let scan = aisix_a2a::result_scan(event);
+        if let Some(why) = scan.unreadable.filter(|_| self.policy.holds_back()) {
+            return StreamVerdict::Refuse {
+                reason: format!("streamed {why}"),
+                guardrail_name: None,
+            };
+        }
+        if let Some(chunk) = aisix_a2a::artifact_chunk(event) {
+            self.follow(chunk);
+        }
+        if !self.unscanned.is_empty() {
+            self.unscanned.push('\n');
+        }
+        self.unscanned_chars += scan.text.chars().count();
+        self.unscanned.push_str(&scan.text);
+
+        match self.policy.clone() {
+            StreamOutputPolicy::EndOfStreamCheck => {
+                // Observing only: the event goes out now, and the text is
+                // read in bounded batches rather than kept until the end.
+                if ends || self.unscanned.len() > MAX_HELD_STREAM_BYTES {
+                    if let Some(refusal) = self.scan(hits).await {
+                        return refusal;
+                    }
+                }
+                StreamVerdict::Release(vec![held])
+            }
+            StreamOutputPolicy::Window { size_chars, .. } => {
+                self.hold(held);
+                if ends
+                    || self.unscanned_chars >= size_chars
+                    || self.held_bytes > MAX_HELD_STREAM_BYTES
+                {
+                    self.release_if_clean(hits).await
+                } else {
+                    StreamVerdict::Release(Vec::new())
+                }
+            }
+            StreamOutputPolicy::BufferFull {
+                max_buffer_bytes,
+                on_exceeded_fail_open,
+            } => {
+                self.hold(held);
+                if self.held_bytes > max_buffer_bytes {
+                    if on_exceeded_fail_open {
+                        tracing::warn!(
+                            "A2A stream exceeded the guardrail buffer cap; releasing it unscanned (fail-open)",
+                        );
+                        self.fail_opened = true;
+                        return StreamVerdict::Release(std::mem::take(&mut self.held));
+                    }
+                    return StreamVerdict::Refuse {
+                        reason: "streamed answer exceeded the guardrail buffer cap".to_string(),
+                        guardrail_name: None,
+                    };
+                }
+                if ends {
+                    self.release_if_clean(hits).await
+                } else {
+                    StreamVerdict::Release(Vec::new())
+                }
+            }
+        }
+    }
+
+    /// The upstream is done, with or without a terminal event: scan what has
+    /// not been scanned and release what is still held.
+    async fn finish(&mut self, hits: &mut Vec<aisix_core::GuardrailMonitorHit>) -> StreamVerdict {
+        if self.fail_opened || (self.unscanned.is_empty() && self.held.is_empty()) {
+            return StreamVerdict::Release(std::mem::take(&mut self.held));
+        }
+        self.release_if_clean(hits).await
+    }
+
+    fn hold(&mut self, event: HeldEvent) {
+        self.held_bytes += event.data.len();
+        self.held.push(event);
+    }
+
+    async fn release_if_clean(
+        &mut self,
+        hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
+    ) -> StreamVerdict {
+        if let Some(refusal) = self.scan(hits).await {
+            return refusal;
+        }
+        self.held_bytes = 0;
+        StreamVerdict::Release(std::mem::take(&mut self.held))
+    }
+
+    /// Continue (or, without `append`, restart) the text of the artifact a
+    /// chunk belongs to.
+    fn follow(&mut self, chunk: aisix_a2a::ArtifactChunk) {
+        if let Some(artifact) = self
+            .artifacts
+            .iter_mut()
+            .find(|a| a.id == chunk.artifact_id)
+        {
+            if !chunk.append {
+                artifact.text.clear();
+            }
+            artifact.text.push_str(&chunk.text);
+            artifact.fresh = true;
+            return;
+        }
+        if self.artifacts.len() >= MAX_FOLLOWED_ARTIFACTS {
+            self.artifacts.remove(0);
+        }
+        self.artifacts.push(FollowedArtifact {
+            id: chunk.artifact_id,
+            text: chunk.text,
+            fresh: true,
+        });
+    }
+
+    /// Scan everything read since the last scan — with the overlap carried
+    /// from it, and each artifact that grew read as one text — and roll the
+    /// carried state forward when it is clean.
+    async fn scan(
+        &mut self,
+        hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
+    ) -> Option<StreamVerdict> {
+        let mut text = format!("{}{}", self.overlap, self.unscanned);
+        for artifact in self.artifacts.iter().filter(|a| a.fresh) {
+            text.push('\n');
+            text.push_str(&artifact.text);
+        }
+        if !text.trim().is_empty() {
+            let (verdict, found) = check_answer(&self.chain, text).await;
+            hits.extend(found);
+            if let aisix_guardrails::GuardrailVerdict::Block {
+                reason,
+                guardrail_name,
+            } = verdict
+            {
+                return Some(StreamVerdict::Refuse {
+                    reason,
+                    guardrail_name,
+                });
+            }
+        }
+        let carry = match self.policy {
+            aisix_guardrails::StreamOutputPolicy::Window { overlap_chars, .. } => overlap_chars,
+            _ => DEFAULT_CARRY_CHARS,
+        };
+        self.overlap = tail_chars(&format!("{}{}", self.overlap, self.unscanned), carry);
+        for artifact in self.artifacts.iter_mut().filter(|a| a.fresh) {
+            artifact.text = tail_chars(&artifact.text, carry);
+            artifact.fresh = false;
+        }
+        self.unscanned.clear();
+        self.unscanned_chars = 0;
+        None
+    }
+}
+
+/// The last `n` characters of `s`.
+fn tail_chars(s: &str, n: usize) -> String {
+    let skip = s.chars().count().saturating_sub(n);
+    s.chars().skip(skip).collect()
+}
+
+/// Whether an output guardrail that can refuse an answer applies: one on the
+/// output hook that is not in monitor mode. The same test the LLM streaming
+/// paths use to decide whether to hold a stream back.
+fn enforces_output(chain: &aisix_guardrails::GuardrailChain) -> bool {
+    use aisix_guardrails::Guardrail as _;
+    chain.runs_on_output() && chain.stream_output_policy().holds_back()
+}
+
+/// Run the output check over an agent's words, read as one assistant answer.
+async fn check_answer(
+    chain: &aisix_guardrails::GuardrailChain,
+    text: String,
+) -> (
+    aisix_guardrails::GuardrailVerdict,
+    Vec<aisix_core::GuardrailMonitorHit>,
+) {
+    let synth = aisix_gateway::ChatResponse {
+        id: String::new(),
+        model: String::new(),
+        message: aisix_gateway::ChatMessage::assistant(text),
+        finish_reason: aisix_gateway::FinishReason::Stop,
+        usage: aisix_gateway::UsageStats::default(),
+    };
+    aisix_guardrails::Guardrail::check_output_observed(chain, &synth).await
 }
 
 /// Serve the upstream agent's card at `/a2a/:agent/.well-known/agent-card.json`,
@@ -979,10 +1376,25 @@ fn a2a_error_response(
 /// is no status line left to carry the failure, so the same envelope has to
 /// travel as an event.
 fn a2a_error_envelope(id: Option<serde_json::Value>, message: &str) -> serde_json::Value {
+    a2a_error_envelope_coded(id, -32000, message)
+}
+
+/// `PushNotificationNotSupportedError`: the code the specification has an
+/// agent answer push notification setup with when it does not offer push
+/// (<https://a2a-protocol.org/v0.3.0/specification/> §8.2,
+/// <https://a2a-protocol.org/latest/specification/> §5.4).
+const PUSH_NOTIFICATION_NOT_SUPPORTED: i64 = -32003;
+
+/// A JSON-RPC error envelope carrying a specific error code.
+fn a2a_error_envelope_coded(
+    id: Option<serde_json::Value>,
+    code: i64,
+    message: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": id.unwrap_or(serde_json::Value::Null),
-        "error": { "code": -32000, "message": message },
+        "error": { "code": code, "message": message },
     })
 }
 

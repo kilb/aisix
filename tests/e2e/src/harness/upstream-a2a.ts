@@ -61,6 +61,17 @@ export interface A2aUpstreamOptions {
    * event sequence the streaming-relay suite counts.
    */
   streamAnswer?: boolean;
+  /**
+   * Stream this answer instead of [`STREAM_ANSWER`]: each string is one
+   * continued artifact chunk, with the same progress note and closing
+   * statement around them. Implies `streamAnswer`.
+   */
+  streamChunks?: string[];
+  /**
+   * Leave the connection open after the final event, the way some agents do:
+   * a client is expected to stop reading at the final event, not wait for EOF.
+   */
+  holdStreamOpen?: boolean;
   /** Text of the agent's answer to a unary call. Defaults to a one-liner. */
   unaryAnswer?: string;
   /**
@@ -129,6 +140,7 @@ export async function startA2aUpstream(
 ): Promise<A2aUpstream> {
   const mount: A2aCardMount = options.cardMount ?? "origin";
   const requests: A2aReceivedRequest[] = [];
+  const openStreams = new Set<ServerResponse>();
   const servicePath = mount === "path" ? PATH_PREFIX : "/a2a";
   const cardPath =
     mount === "path"
@@ -142,7 +154,10 @@ export async function startA2aUpstream(
       cardPath,
       token: options.token,
       wireShape: options.wireShape ?? "0.3",
-      streamAnswer: options.streamAnswer ?? false,
+      streamChunks:
+        options.streamChunks ?? (options.streamAnswer ? [...STREAM_ANSWER] : undefined),
+      holdStreamOpen: options.holdStreamOpen ?? false,
+      openStreams,
       unaryAnswer: options.unaryAnswer ?? "The invoice is settled.",
       unaryTask: options.unaryTask ?? {},
       unaryError: options.unaryError,
@@ -168,7 +183,11 @@ export async function startA2aUpstream(
   return {
     url: `http://127.0.0.1:${address.port}${servicePath}`,
     requests,
-    close: () => new Promise((resolve) => httpServer.close(() => resolve())),
+    close: () => {
+      // A stream held open never ends on its own, so `close` would wait forever.
+      for (const res of openStreams) res.end();
+      return new Promise((resolve) => httpServer.close(() => resolve()));
+    },
   };
 }
 
@@ -181,7 +200,9 @@ async function handle(
     cardPath: string;
     token?: string;
     wireShape: A2aWireShape;
-    streamAnswer: boolean;
+    streamChunks?: string[];
+    holdStreamOpen: boolean;
+    openStreams: Set<ServerResponse>;
     unaryAnswer: string;
     unaryTask: Record<string, unknown>;
     unaryError?: Record<string, unknown>;
@@ -300,8 +321,9 @@ async function handle(
     res.write(
       envelope(payload("status-update", { taskId: "task-e2e-stream", contextId, seq: 2 })),
     );
-    if (ctx.streamAnswer) {
-      // The answer in two continued chunks with a progress note between them:
+    if (ctx.streamChunks) {
+      const [first, ...rest] = ctx.streamChunks;
+      // The answer in continued chunks with a progress note after the first:
       // an accumulator that lets a note replace the answer keeps only the note.
       res.write(
         envelope(
@@ -310,7 +332,7 @@ async function handle(
             contextId,
             artifact: {
               artifactId: "report",
-              parts: [{ kind: "text", text: STREAM_ANSWER[0] }],
+              parts: [{ kind: "text", text: first }],
             },
           }),
         ),
@@ -327,19 +349,21 @@ async function handle(
           }),
         ),
       );
-      res.write(
-        envelope(
-          payload("artifact-update", {
-            taskId: "task-e2e-stream",
-            contextId,
-            append: true,
-            artifact: {
-              artifactId: "report",
-              parts: [{ kind: "text", text: STREAM_ANSWER[1] }],
-            },
-          }),
-        ),
-      );
+      for (const chunk of rest) {
+        res.write(
+          envelope(
+            payload("artifact-update", {
+              taskId: "task-e2e-stream",
+              contextId,
+              append: true,
+              artifact: {
+                artifactId: "report",
+                parts: [{ kind: "text", text: chunk }],
+              },
+            }),
+          ),
+        );
+      }
     }
     await new Promise((resolve) => setTimeout(resolve, STREAM_GAP_MS));
     res.write(
@@ -347,7 +371,7 @@ async function handle(
         payload("task", {
           id: "task-e2e-stream",
           contextId,
-          status: ctx.streamAnswer
+          status: ctx.streamChunks
             ? {
                 state: "completed",
                 message: { role: "agent", parts: [{ kind: "text", text: "Report generated." }] },
@@ -357,6 +381,11 @@ async function handle(
         }),
       ),
     );
+    if (ctx.holdStreamOpen) {
+      ctx.openStreams.add(res);
+      res.on("close", () => ctx.openStreams.delete(res));
+      return;
+    }
     res.end();
     return;
   }

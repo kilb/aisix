@@ -402,7 +402,7 @@ describe("A2A content guardrails read task history, data parts and tasks/get", (
 
     test("a streamed call's request data part is read the same way", async (ctx) => {
       if (!etcdReachable || !app) return ctx.skip();
-      // 流式回答不在检查范围内，但流式调用的请求在派发前照样要检查。
+      // 流式调用的请求在派发前照样要检查。
       const before = posts(v, "plain").length;
       const streamParams = (data: unknown) => ({
         message: message(v, "user", [textPart(v, "file this form"), dataPart(v, data)]),
