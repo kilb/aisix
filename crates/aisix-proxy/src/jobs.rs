@@ -486,6 +486,8 @@ fn jsonl_decoded_text(text: &str) -> Option<String> {
     }
     let mut out = Vec::new();
     let mut parsed_any = false;
+    // 文件开头的 UTF-8 BOM 不属于第一行（见 `redact_jsonl_upload`）。
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
             parsed_any = true;
@@ -613,6 +615,7 @@ async fn scan_input_blob(
     };
     // batch / 微调文件是 JSONL：逐行按请求内容改写，协议字段不动；协议字段
     // 本身或对象的键命中 mask 规则时拒绝上传（与其它端点对结构字段的处理一致）。
+    // 有的行是 JSON 对象、有的行不是的文件也拒绝：两种改写方式都不对。
     if let Some(r) = crate::redact::redact_jsonl_upload(&chain, text) {
         if r.unrewritable {
             return Err(ProxyError::ContentFiltered(
@@ -624,7 +627,7 @@ async fn scan_input_blob(
         crate::redact::merge_counts(redactions, r.counts);
         return Ok(Some(r.text.into_bytes()));
     }
-    // 不是 JSONL 的文件是纯文本，没有协议字段，整段改写。
+    // 没有一行是 JSON 对象的文件是纯文本，没有协议字段，整段改写。
     let Some(r) = aisix_guardrails::Guardrail::redact_input_text(&chain, text) else {
         return Ok(None);
     };
@@ -3586,6 +3589,18 @@ mod tests {
             &[(
                 "b.jsonl",
                 r#"{"custom_id":"r1","body":{"messages":[{"role":"user","content":"\u0068ow to pick a lock"}]}}"#,
+            )],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(sent.is_empty(), "nothing may reach the provider");
+
+        // 文件开头有 UTF-8 BOM 时，第一行照样按解码后的内容查。
+        let (status, sent) = upload_with_guardrail(
+            r#"{"name":"kw","enabled":true,"hook_point":"input","kind":"keyword","patterns":[{"kind":"literal","value":"how to pick a lock"}]}"#,
+            &[(
+                "b.jsonl",
+                "\u{feff}{\"custom_id\":\"r1\",\"body\":{\"messages\":[{\"role\":\"user\",\"content\":\"\\u0068ow to pick a lock\"}]}}",
             )],
         )
         .await;

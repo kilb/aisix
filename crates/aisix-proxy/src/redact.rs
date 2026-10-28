@@ -385,6 +385,8 @@ pub(crate) struct JsonlUploadRedaction {
     /// 它既不能改写（两行会变成同一个 `custom_id`，结果再也对不回请求；改了
     /// `url` / `model` 请求就打错地方），也不能原样放行，调用方应拒绝上传。
     /// 协议字段以外某个对象的键命中时也一样：改了键，上游读到的就是另一个字段。
+    /// 文件有的行是 JSON 对象、有的行不是时也是这样（此时 `text` 为空）：逐行
+    /// 改写不了，当纯文本改写又会改到协议字段和键、看不见 JSON 转义写出的内容。
     pub unrewritable: bool,
 }
 
@@ -399,21 +401,43 @@ const JSONL_PROTOCOL_FIELDS: &[&str] = &["custom_id", "method", "url", "model"];
 ///
 /// 每一行都以解析后的值重新序列化再转发，改没改都一样：检查的必须就是转发
 /// 的。原样转发原始字节时，一个重复键（解析器只保留最后一个值）就能把带 PII
-/// 的那一份藏在被检查的那一份后面送出去。返回 `None` 表示这不是 JSONL（有非
-/// 空行不是 JSON 对象），调用方按纯文本处理。
+/// 的那一份藏在被检查的那一份后面送出去。文件开头的 UTF-8 BOM 不属于第一行，
+/// 解析时跳过、转发时原样放回。返回 `None` 表示没有一行是 JSON 对象，调用方按
+/// 纯文本处理；有的行是、有的行不是时报告为改写不了。
 pub(crate) fn redact_jsonl_upload(
     chain: &dyn Guardrail,
     text: &str,
 ) -> Option<JsonlUploadRedaction> {
+    // U+FEFF 不是空白，`trim` 去不掉它。
+    let (bom, text) = match text.strip_prefix('\u{feff}') {
+        Some(rest) => ("\u{feff}", rest),
+        None => ("", text),
+    };
     let mut parsed = Vec::new();
+    let mut other_lines = false;
     for raw in text.split('\n') {
         let line = raw.trim();
         if line.is_empty() {
             parsed.push((raw, None));
             continue;
         }
-        let value: Value = serde_json::from_str(line).ok().filter(Value::is_object)?;
-        parsed.push((raw, Some(value)));
+        match serde_json::from_str::<Value>(line)
+            .ok()
+            .filter(Value::is_object)
+        {
+            Some(value) => parsed.push((raw, Some(value))),
+            None => other_lines = true,
+        }
+    }
+    if other_lines {
+        return parsed
+            .iter()
+            .any(|(_, value)| value.is_some())
+            .then(|| JsonlUploadRedaction {
+                text: String::new(),
+                counts: RedactionCounts::new(),
+                unrewritable: true,
+            });
     }
 
     let mut counts = RedactionCounts::new();
@@ -470,7 +494,7 @@ pub(crate) fn redact_jsonl_upload(
     }
 
     Some(JsonlUploadRedaction {
-        text: out.join("\n"),
+        text: format!("{bom}{}", out.join("\n")),
         counts,
         unrewritable,
     })
@@ -3822,6 +3846,38 @@ mod tests {
         let r = redact_jsonl_upload(chain.as_ref(), line).expect("a JSONL file");
         assert!(!r.unrewritable);
         assert!(!r.text.contains("bob@example.com"), "{}", r.text);
+    }
+
+    /// 文件开头的 UTF-8 BOM 不是第一行 JSON 的一部分：照样逐行按值改写，BOM
+    /// 原样留在转发的文件开头。
+    #[test]
+    fn jsonl_upload_reads_past_a_byte_order_mark_and_keeps_it() {
+        let chain = both();
+        let text = "\u{feff}{\"custom_id\":\"r1\",\"body\":{\"messages\":[{\"role\":\"user\",\"content\":\"mail bob\\u0040example.com\"}]}}\n";
+        let r = redact_jsonl_upload(chain.as_ref(), text).expect("a JSONL file");
+        assert!(!r.unrewritable);
+        let line = r.text.strip_prefix('\u{feff}').expect("the BOM is kept");
+        let value: Value = serde_json::from_str(line.trim()).expect("still JSON");
+        assert_eq!(value["custom_id"], "r1");
+        assert!(!r.text.contains("bob@example.com"), "{}", r.text);
+        assert!(!r.text.contains("bob\\u0040"), "{}", r.text);
+    }
+
+    /// 有的行是 JSON 对象、有的行不是的文件，逐行改写不了；当纯文本改写又会改
+    /// 到协议字段和键、看不见 JSON 转义写出的内容：报告为改写不了。一行 JSON
+    /// 对象都没有的文件才是纯文本。
+    #[test]
+    fn jsonl_upload_reports_a_file_mixing_objects_with_other_lines() {
+        let chain = both();
+        let line = r#"{"custom_id":"r1","body":{"messages":[]}}"#;
+        for other in ["null", "not json", "[1]", "\"text\""] {
+            let r = redact_jsonl_upload(chain.as_ref(), &format!("{line}\n{other}\n"))
+                .expect("a file with a JSON object line");
+            assert!(r.unrewritable, "{other}");
+        }
+        assert!(
+            redact_jsonl_upload(chain.as_ref(), "plain text\nnull\nalice@example.com\n").is_none()
+        );
     }
 
     /// Every text slot of a rerank or speech request is new content, so the

@@ -22,6 +22,10 @@ import { pickFreePort } from "../harness/ports.js";
 //   3. 对象的键命中 mask 规则时也一样：键改不了（改了，上游读到的就是另一个字
 //      段），原样放行又白设了规则，所以拒绝上传 —— 和 /v1/chat/completions 对
 //      改写不了的键的处理一致。
+//   4. 文件以 UTF-8 BOM 开头时照样逐行按 JSON 语义遮蔽，BOM 原样保留。
+//   5. 有的行是 JSON 对象、有的行不是（`null`、乱码）的文件，既没法逐行改写，也
+//      不能当纯文本改写（会改到协议字段和键，还看不见 JSON 转义写出的内容），
+//      所以拒绝上传。
 
 const CALLER_PLAINTEXT = "sk-jobs-file-mask-caller";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -220,6 +224,62 @@ describe("mask rules on an uploaded batch file act on each line's request conten
       expect.soft(res.status, `${where}: ${res.body}`).toBe(422);
       expect.soft(res.body, where).not.toContain("bob@example.com");
       expect.soft(upstream.uploads.length, `${where}: the refused file must not reach the provider`).toBe(before);
+    }
+  });
+
+  test("a file starting with a byte-order mark is masked line by line, the mark kept", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    const before = upstream.uploads.length;
+    const jsonl =
+      "\uFEFF" +
+      [
+        batchLine("r1", "mail alice@example.com please"),
+        batchLine("r2", "mail bob@example.com please").replace("bob@", "bob\\u0040"),
+      ].join("\n") +
+      "\n";
+
+    const res = await upload(jsonl);
+    expect(res.status, res.body).toBe(200);
+    expect(upstream.uploads.length).toBe(before + 1);
+
+    const sent = jsonlLinesOf(upstream.uploads.at(-1)!);
+    expect(sent[0]?.startsWith("\uFEFF{"), "the byte-order mark stays in front of the first line").toBe(true);
+    const lines = sent.map((l) => l.replace(/^\uFEFF/, ""));
+    expect(lines.length, "both lines reach the provider").toBe(2);
+    const parsed = lines.map((l) => JSON.parse(l));
+    expect(parsed.map((l) => l.custom_id)).toEqual(["r1", "r2"]);
+    for (const l of parsed) {
+      expect(l.method).toBe("POST");
+      expect(l.url).toBe("/v1/chat/completions");
+      expect(l.body.model).toBe("gpt-4o-mini");
+    }
+    const contents = parsed.map((l) => String(l.body.messages[0].content));
+    expect(contents[0], "a plainly written email is masked").not.toContain("alice@example.com");
+    expect(contents[1], "a JSON-escaped email is masked too").not.toContain("bob@example.com");
+  });
+
+  test("a file mixing JSON lines with lines that are not JSON objects is refused", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    const files = {
+      "a null line": [batchLine("r1", "mail alice@example.com please"), "null"],
+      "a line that is not JSON": [batchLine("r1", "mail alice@example.com please"), "not json at all"],
+      "an email behind a JSON escape": [
+        batchLine("r1", "mail bob@example.com please").replace("bob@", "bob\\u0040"),
+        "null",
+      ],
+      "an email in a protocol field": [batchLine("carol@example.com", "hello"), "null"],
+    };
+    for (const [what, lines] of Object.entries(files)) {
+      const before = upstream.uploads.length;
+      const res = await upload(lines.join("\n") + "\n");
+      expect.soft(res.status, `${what}: ${res.body}`).toBe(422);
+      expect.soft(upstream.uploads.length, `${what}: the refused file must not reach the provider`).toBe(before);
     }
   });
 });
