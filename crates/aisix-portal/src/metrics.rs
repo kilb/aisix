@@ -29,6 +29,7 @@ struct Inner {
     keys_reenabled: AtomicU64,
     read_failures: AtomicU64,
     write_failures: AtomicU64,
+    series_without_start_time: AtomicU64,
 }
 
 impl Metrics {
@@ -49,6 +50,8 @@ impl Metrics {
             .fetch_add(r.read_failures as u64, Ordering::Relaxed);
         i.write_failures
             .fetch_add(r.write_failures as u64, Ordering::Relaxed);
+        i.series_without_start_time
+            .fetch_add(r.series_without_start_time as u64, Ordering::Relaxed);
     }
 
     /// 记一轮整体失败的对账（`tick` 自己返回了错）。
@@ -95,6 +98,11 @@ impl Metrics {
                 "aisix_portal_config_write_failures_total",
                 "写网关配置失败的次数（额度与启停都推不下去）",
                 i.write_failures.load(Ordering::Relaxed),
+            ),
+            (
+                "aisix_portal_spend_series_without_start_time_total",
+                "读到的不带进程启动时刻的花费序列条数；不为 0 时重启只能按 resets() 认，多个 Prometheus 副本下可能漏扣",
+                i.series_without_start_time.load(Ordering::Relaxed),
             ),
         ] {
             out.push_str(&format!(

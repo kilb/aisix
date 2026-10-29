@@ -125,7 +125,19 @@ pub struct TickReport {
     /// 这次改动（比如库里有条记录指向已不存在的密钥），对账环会照常报成功，
     /// 而额度从此再也推不下去 —— 没有任何东西会说出来。
     pub write_failures: usize,
+    /// 读到的、不带进程启动时刻的花费序列条数（每轮每条计一次）。
+    ///
+    /// 不带启动时刻时重启只能靠 `resets()` 认：单个 Prometheus 下照样记得准，但多个
+    /// 副本轮流应答时，一次重启可能哪边都没认出来，重启前那段累计就漏扣了 —— 门户
+    /// 从读数里分不出「漏认的重启」和「落后的副本」，两者给出的数一模一样。所以这里
+    /// 不去猜，只把这种降级状态报出来：网关太旧、或抓取配置丢了这个指标时它不为 0。
+    pub series_without_start_time: usize,
 }
+
+/// 只在进程里第一次读到不带启动时刻的序列时警告一次：之后每轮都会读到，逐轮
+/// 刷日志没有用，计数在指标里。
+static WARNED_NO_START_TIME: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// 一条花费序列的当前读数。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +206,16 @@ impl<S: ConsumptionSource> Sweeper<S> {
                 unread.push(u.id.clone());
                 continue;
             };
+            r.series_without_start_time += series.iter().filter(|s| s.started_ms.is_none()).count();
+            if r.series_without_start_time > 0
+                && !WARNED_NO_START_TIME.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                eprintln!(
+                    "花费序列读不到 process_start_time_seconds（网关太旧，或抓取配置丢了这个指标）：\
+                     重启只能按 resets() 认，多个 Prometheus 副本轮流应答时可能漏扣一次重启前的累计。\
+                     计数见 aisix_portal_spend_series_without_start_time_total"
+                );
+            }
             if basis.needs_seeding() {
                 // 升级上来的老用户：只记下当前读数，不把历史当成新序列重扣。
                 self.settle(&u.id, &basis, 0, &series, &[], now).await?;
@@ -1015,6 +1037,8 @@ mod tests {
         /// 指定哪个用户的读取「成功、但一条序列都没有」：抓取中断了，Prometheus
         /// 照常应答，网关进程和它们的计数器都还在。
         outage_for: Mutex<Option<String>>,
+        /// 读数不带进程启动时刻 —— 不暴露 `process_start_time_seconds` 的旧网关。
+        no_start_time: Mutex<bool>,
     }
 
     impl FakeSource {
@@ -1088,6 +1112,10 @@ mod tests {
         pub(super) fn fail_for(&self, user_id: &str) {
             *self.fail_for.lock().unwrap() = Some(user_id.to_string());
         }
+        /// 之后的读数都不带进程启动时刻 —— 换成了不暴露它的旧网关。
+        pub(super) fn without_start_time(&self) {
+            *self.no_start_time.lock().unwrap() = true;
+        }
         /// 抓取中断（`Some`）或恢复（`None`），见 `outage_for`。
         pub(super) fn scrape_outage_for(&self, user_id: Option<&str>) {
             *self.outage_for.lock().unwrap() = user_id.map(str::to_string);
@@ -1153,7 +1181,7 @@ mod tests {
                         } else {
                             0
                         },
-                        started_ms: Some(c.started_ms),
+                        started_ms: (!*self.no_start_time.lock().unwrap()).then_some(c.started_ms),
                     })
                     .map(|mut s| {
                         if let (Some((value, started)), true) = (
@@ -1761,6 +1789,30 @@ api_keys:
         f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
         // 当成重启就会把累计 $2 整个再扣一遍。
         assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 8_000_000);
+    }
+
+    #[tokio::test]
+    async fn 读到不带启动时刻的序列时_每轮报出条数_照样按_resets_记账() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 10_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        for gw in ["gw-1", "gw-2"] {
+            f.src.series(&f.uid, gw, 1_000_000);
+        }
+        let r = f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        assert_eq!(r.series_without_start_time, 0, "带启动时刻的读数不算");
+
+        // 换成不暴露启动时刻的旧网关：两条序列每轮都报。
+        f.src.without_start_time();
+        f.src.series(&f.uid, "gw-1", 500_000);
+        let r = f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
+        assert_eq!(r.series_without_start_time, 2);
+        // 单个 Prometheus 下，按 resets() 记账照样准：两轮共扣 $2.50。
+        assert_eq!(f.ledger.balance(&f.uid).await.unwrap(), 7_500_000);
+        let r = f.sw.tick(t("2026-08-26T10:00:30Z")).await.unwrap();
+        assert_eq!(r.series_without_start_time, 2);
     }
 
     #[tokio::test]

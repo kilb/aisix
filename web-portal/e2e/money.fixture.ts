@@ -101,6 +101,11 @@ export interface MoneyFixture {
    */
   blindPortalTo(keyName: string): void;
   /**
+   * PromQL 垫片的回答里去掉（或恢复）网关的进程启动时刻 —— 就像网关太旧、不暴露
+   * `process_start_time_seconds`，或抓取配置把它丢了。花费序列本身照常应答。
+   */
+  hideStartTime(hidden: boolean): void;
+  /**
    * 打一次流式 `/v1/messages`（Anthropic 形状）或 `/v1/responses`（Codex 形状）。
    *
    * 这三个端点各有自己的流式记账调用点。只驱动 chat 的话，另两个端点上的同类
@@ -622,6 +627,8 @@ export async function startMoney(): Promise<MoneyFixture> {
   // 一测才扣到 $0。
   /** 门户看不见这些 api_key_id 的花费归属。见 blindPortalTo。 */
   const blind = new Set<string>();
+  /** 见 hideStartTime。 */
+  let startTimeHidden = false;
   /** 每条序列上次看到的值，与它被看到变小（= 重置）的那些时刻。 */
   const lastValue = new Map<string, number>();
   const resetsAt = new Map<string, number[]>();
@@ -687,7 +694,7 @@ export async function startMoney(): Promise<MoneyFixture> {
         // `process_start_time_seconds and on(job, instance) {sel}`：这个用户在这个
         // 网关上有花费序列时才带上它的启动时刻。
         const asksStarted = q.includes('"aisix_part", "started"');
-        if (asksStarted && startedLine !== undefined && result.length > 0) {
+        if (asksStarted && !startTimeHidden && startedLine !== undefined && result.length > 0) {
           result.push({
             metric: {
               __name__: "process_start_time_seconds",
@@ -928,6 +935,9 @@ observability:
     },
     blindPortalTo(keyName: string) {
       blind.add(deriveKeyId(keyName));
+    },
+    hideStartTime(hidden: boolean) {
+      startTimeHidden = hidden;
     },
     async callOn(endpoint: "chat" | "messages" | "responses", plaintext: string, model: string) {
       if (endpoint !== "chat") return await callNonChat(endpoint, plaintext, model, false);

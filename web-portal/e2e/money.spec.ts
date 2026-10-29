@@ -422,6 +422,51 @@ test("门户自己的指标能被抓到_而且是真流量驱动出来的", asyn
   expect(valueOf("aisix_portal_keys_reenabled_total")).toBeGreaterThan(0);
 });
 
+test("读数不带网关启动时刻时_门户在指标里报出来_扣款照样准", async () => {
+  // 不带启动时刻，重启只能靠 resets() 认。单个 Prometheus 下照样准，但多个副本轮流
+  // 应答时一次重启可能谁都没认出来 —— 门户从读数里分不出这种情形，所以不去猜，
+  // 而是把降级状态报到指标里，运维才知道该升级网关或修抓取配置。
+  const countOf = async () => {
+    const text = await fetch(fx.portalMetricsUrl).then((x) => x.text());
+    return Number(
+      text
+        .split("\n")
+        .find((l) => l.startsWith("aisix_portal_spend_series_without_start_time_total "))
+        ?.split(" ")[1] ?? -1,
+    );
+  };
+  await setQuota(1_000_000_000);
+  const cookie = await fx.sessionCookie();
+  const k = await mint(cookie, "启动时刻");
+  await waitFor(async () => (await fx.chatWith(k.plaintext)) === 200, "新密钥可用");
+
+  // 带着启动时刻的读数不算：等一轮对账，计数不动。
+  const atStart = await countOf();
+  expect(atStart).toBeGreaterThanOrEqual(0);
+  const ticksOf = async () => {
+    const text = await fetch(fx.portalMetricsUrl).then((x) => x.text());
+    return Number(text.split("\n").find((l) => l.startsWith("aisix_portal_reconcile_ticks_total "))?.split(" ")[1] ?? -1);
+  };
+  const t0 = await ticksOf();
+  await waitFor(async () => (await ticksOf()) > t0 + 1, "对账轮数没有增长");
+  expect(await countOf()).toBe(atStart);
+
+  fx.hideStartTime(true);
+  try {
+    await waitFor(async () => (await countOf()) > atStart, "不带启动时刻的序列没有被报出来");
+    // 单个 Prometheus 下照样按 resets() 记账：再打一次，余额按价扣、一分不多。
+    const before = await balance(cookie);
+    expect(await fx.chatWith(k.plaintext)).toBe(200);
+    await waitFor(async () => (await balance(cookie)) < before, "这一次没有扣款");
+    const t1 = await ticksOf();
+    await waitFor(async () => (await ticksOf()) > t1 + 1, "对账轮数没有增长");
+    // 每次调用花 $1。
+    expect(before - (await balance(cookie))).toBe(1_000_000);
+  } finally {
+    fx.hideStartTime(false);
+  }
+});
+
 test("从未产生流量的用户_水位线照样推进_失败计数不涨", async () => {
   // 这是生产上真发生过的那个形态：Prometheus 正常应答但没有任何序列（这个人
   // 从来没调过），旧写法把它当成「读不到」—— 水位线永不推进，查询窗口一天天
