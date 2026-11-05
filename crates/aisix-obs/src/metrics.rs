@@ -542,7 +542,7 @@ pub const M_PROCESS_START_TIME_SECONDS: &str = "process_start_time_seconds";
 /// Captured when the process builds its metrics, i.e. at startup.
 static PROCESS_START_TIME: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 
-fn process_start_time() -> f64 {
+pub fn process_start_time_seconds() -> f64 {
     *PROCESS_START_TIME.get_or_init(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1240,7 +1240,7 @@ impl Metrics {
         );
         let recorder = Arc::new(PrometheusRecorder::new(distributions));
         // Pin the start time now, not at the first scrape.
-        process_start_time();
+        process_start_time_seconds();
         let handle = recorder.clone();
         let recorder = LabelRecorder::new(recorder, selection, env_id);
         static NEXT_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1362,7 +1362,7 @@ impl Metrics {
                 // Not `p.start_time_seconds`: `/proc/stat`'s `btime` moves when
                 // the wall clock is stepped, and the portal bills a whole counter
                 // when this value changes. One value for the process's lifetime.
-                metrics::gauge!(M_PROCESS_START_TIME_SECONDS).set(process_start_time());
+                metrics::gauge!(M_PROCESS_START_TIME_SECONDS).set(process_start_time_seconds());
             }
             if let Some(limit) = limit {
                 metrics::gauge!(M_MEMORY_LIMIT_BYTES).set(limit as f64);
@@ -1614,7 +1614,7 @@ impl Metrics {
         use aisix_core::SourceKind;
         let etcd = matches!(view.source_kind, SourceKind::Etcd);
         metrics::with_local_recorder(&self.inner.recorder, || {
-            metrics::gauge!(M_PROCESS_START_TIME_SECONDS).set(process_start_time());
+            metrics::gauge!(M_PROCESS_START_TIME_SECONDS).set(process_start_time_seconds());
             metrics::gauge!(M_CONFIG_LAST_RELOAD_SUCCESSFUL).set(if view.last_reload_successful {
                 1.0
             } else {

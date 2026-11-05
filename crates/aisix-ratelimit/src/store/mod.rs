@@ -215,9 +215,9 @@ pub trait RateStore: Send + Sync + 'static {
     ///
     /// Lives in this store, so it lasts exactly as long as the counters do:
     /// a shared store holds the claim across restarts and across instances,
-    /// the in-process store only for one process's lifetime. That pairing is
-    /// the point — it guards side effects on the counters in this same
-    /// store, so a claim can never outlive or fall short of what it protects.
+    /// the in-process store only for one process's lifetime. A consumer that
+    /// keeps what it reads off a counter outlives both, so a caller guarding
+    /// a charge also has to ask [`RateStore::claims_outlive_process`].
     ///
     /// For work that may legitimately be redone but whose accounting must
     /// not repeat. The after-the-fact spend attribution of a completed batch
@@ -227,6 +227,13 @@ pub trait RateStore: Send + Sync + 'static {
     /// whenever a process that has forgotten the batch sees it completed
     /// again.
     async fn claim_once(&self, key: &str, ttl: Duration) -> bool;
+
+    /// Whether a claim survives this process. `false` means a claim is
+    /// forgotten on restart, so "not claimed" says nothing about what an
+    /// earlier process already did.
+    fn claims_outlive_process(&self) -> bool {
+        false
+    }
 
     /// Keys this process holds counters for; `None` for a shared store
     /// whose counters live elsewhere.

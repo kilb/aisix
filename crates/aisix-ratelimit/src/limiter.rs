@@ -76,6 +76,11 @@ impl Limiter {
         self.store.claim_once(key, ttl).await
     }
 
+    /// 见 [`RateStore::claims_outlive_process`]。
+    pub fn claims_outlive_process(&self) -> bool {
+        self.store.claims_outlive_process()
+    }
+
     /// Build over a specific store — the server bootstrap passes a
     /// `RedisStore` when a shared backend is configured.
     pub fn with_store(store: Arc<dyn RateStore>) -> Self {

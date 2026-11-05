@@ -1083,6 +1083,10 @@ impl RateStore for RedisStore {
         }
     }
 
+    fn claims_outlive_process(&self) -> bool {
+        true
+    }
+
     async fn claim_once(&self, key: &str, ttl: std::time::Duration) -> bool {
         // `SET … NX EX` 是原子的，所以并发的两个实例只有一个拿到标记。
         //

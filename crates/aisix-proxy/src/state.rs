@@ -251,10 +251,15 @@ impl CacheBackends {
 }
 
 /// How long a completed batch's id stays in the process-local dedup map.
-/// Long enough to cover any realistic re-poll of the same terminal batch,
-/// short enough that the map cannot grow for the life of the process.
+/// As long as a provider keeps a finished batch: a list keeps showing it for
+/// that long, and an expired entry costs one more download of its output.
+/// Short enough that the map cannot grow for the life of the process.
 pub(crate) const BILLED_BATCH_DEDUP_WINDOW: std::time::Duration =
-    std::time::Duration::from_secs(3600);
+    std::time::Duration::from_secs(31 * 24 * 3600);
+
+/// A batch poll a minute: results arrive hours apart, and a charge landing a
+/// minute late changes nothing.
+const DEFAULT_BATCH_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Record that this process has attributed `batch_id`, returning `false` when
 /// it was already recorded inside the dedup window.
@@ -372,6 +377,8 @@ pub struct ProxyStateInner {
     /// deterministic `request_id = "batch-<id>"` on the emitted events is
     /// what keeps cross-restart re-emission idempotent on the control plane side.
     pub billed_batches: Arc<dashmap::DashMap<String, std::time::Instant>>,
+    /// How often [`crate::jobs`] re-reads a batch it created until it ends.
+    pub batch_watch_interval: std::time::Duration,
     /// Boot-compiled User-Agent → `client_type` classifier: operator
     /// rules from `observability.metrics.client_type_rules` first, then
     /// the built-in allowlist (#1045). Default = built-ins
@@ -537,6 +544,7 @@ impl ProxyState {
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
             expose_debug_headers: cfg.expose_debug_headers,
             billed_batches: Arc::new(dashmap::DashMap::new()),
+            batch_watch_interval: DEFAULT_BATCH_WATCH_INTERVAL,
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
             default_timeouts: crate::routing::TimeoutDefaults::default(),
@@ -593,6 +601,7 @@ impl ProxyState {
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
             expose_debug_headers: cfg.expose_debug_headers,
             billed_batches: Arc::new(dashmap::DashMap::new()),
+            batch_watch_interval: DEFAULT_BATCH_WATCH_INTERVAL,
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
             default_timeouts: crate::routing::TimeoutDefaults::default(),
@@ -673,6 +682,7 @@ impl ProxyState {
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
             expose_debug_headers: cfg.expose_debug_headers,
             billed_batches: Arc::new(dashmap::DashMap::new()),
+            batch_watch_interval: DEFAULT_BATCH_WATCH_INTERVAL,
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
             default_timeouts: crate::routing::TimeoutDefaults::default(),
@@ -739,6 +749,12 @@ impl ProxyState {
     /// the sender worker.
     pub fn with_usage_sink(mut self, sink: UsageSink) -> Self {
         Arc::make_mut(&mut self.inner).usage_sink = sink;
+        self
+    }
+    /// Poll a created batch this often instead of once a minute.
+    #[cfg(test)]
+    pub(crate) fn with_batch_watch_interval(mut self, every: std::time::Duration) -> Self {
+        Arc::make_mut(&mut self.inner).batch_watch_interval = every;
         self
     }
     /// Wire the config-freshness probe used by `GET /readyz` (#591). The

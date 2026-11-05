@@ -756,6 +756,34 @@ async fn reserve_policy_layers(
     Ok(())
 }
 
+/// 这把密钥调用这个模型时要记 micro-USD 的那些桶键，不预留、不计数。
+///
+/// 给事后才知道花了多少的路径用：批处理跑几天才结束，付钱的那把密钥当时可能根本
+/// 没有在途请求，手上没有预留可以取键。与 [`reserve_policy_layers`] 走同一个匹配，
+/// 所以两边记的是同一组桶。批处理只路由到直连模型，模型层策略也在这一相位匹配。
+pub(crate) fn spend_bucket_keys(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    model_rl: &ModelRateLimit,
+) -> Vec<String> {
+    if snapshot.rate_limit_policies.is_empty() {
+        return Vec::new();
+    }
+    let input = condition_input(auth, Some(model_rl), None);
+    let phase = PolicyPhase::Request {
+        defer_model_properties: false,
+    };
+    let now = chrono::Utc::now();
+    let index = state.policy_index.for_table(&snapshot.rate_limit_policies);
+    index
+        .candidates(&input)
+        .filter(|entry| !entry.value.suspended_at(now))
+        .filter_map(|entry| match_policy_layer(&entry.value, &entry.id, &input, phase))
+        .filter_map(|layer| layer.spend.map(|spend| spend.bucket_key))
+        .collect()
+}
+
 /// Convert a store-level rejection into the surfaced [`ProxyError`],
 /// counting it under `aisix_ratelimit_rejections_total{scope,layer}` —
 /// the gate is the one point every endpoint funnels through, so the
@@ -1947,6 +1975,42 @@ mod tests {
             vec!["spend:api_key:k1:pol-1".to_string()],
             "缺花费层"
         );
+    }
+
+    /// 事后落账取键的那条路与预留走的是同一个匹配：两边记的必须是同一组桶，
+    /// 否则批处理的钱记到了一个没人比对的桶上。
+    #[tokio::test]
+    async fn spend_bucket_keys_are_the_ones_a_reservation_would_hold() {
+        let snap = snapshot_with_policy(make_spend_policy(
+            "api_key",
+            "k1",
+            "day",
+            None,
+            Some(5_000_000),
+        ));
+        let state = test_state(&snap);
+        let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "m",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "pk",
+        }))
+        .unwrap();
+        let model_rl = ModelRateLimit::from_model("m", "m-id", &model);
+
+        let holder = test_auth_key("k1");
+        let reserved = reserve_layers(&state, &snap, &holder, Some(&model_rl), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            spend_bucket_keys(&state, &snap, &holder, &model_rl),
+            reserved.spend_keys()
+        );
+        assert!(!reserved.spend_keys().is_empty());
+
+        // 策略不覆盖的密钥没有桶。
+        let other = test_auth_key("k2");
+        assert!(spend_bucket_keys(&state, &snap, &other, &model_rl).is_empty());
     }
 
     /// 只设花费上限的策略——预算的典型形态——也必须预留花费层。

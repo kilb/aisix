@@ -37,14 +37,16 @@
 //! ## Usage / cost attribution
 //!
 //! Management calls emit zero-token UsageEvents (parity with
-//! `/passthrough`, #699). When a **batch retrieve** first observes
-//! `status == "completed"`, the gateway downloads the output JSONL once
-//! (per-process dedup + a deterministic UUIDv5 `request_id` derived
+//! `/passthrough`, #699). When the gateway first observes a batch that ended
+//! with billable output — its own watch of a batch it created
+//! ([`watch_batch`]), a retrieve, or a list — it downloads the output JSONL
+//! once (per-process dedup + a deterministic UUIDv5 `request_id` derived
 //! from the batch identity — the telemetry contract requires a UUID),
 //! aggregates per-line `usage`, and
 //! emits real token counts grouped by the provider-billed model —
 //! LiteLLM's `_handle_completed_batch` equivalent
-//! (`litellm/batches/batch_utils.py`).
+//! (`litellm/batches/batch_utils.py`). The key that submitted the batch pays,
+//! not the one that happened to observe it ([`BATCH_SUBMITTER_KEY`]).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -85,6 +87,21 @@ const AZURE_JOBS_API_VERSION: &str = "2024-10-21";
 /// attribution task. Deliberately generous — completed batch output
 /// files can be large, and the task runs detached from any caller.
 const BATCH_ATTRIBUTION_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 批次提交时由网关写进上游 `metadata` 的键：这个批次是哪把密钥提交的。付钱的
+/// 就是它，而不是碰巧观察到完成的那把。
+///
+/// 放在上游而不是网关这边：归因可能发生在提交几天之后的另一个进程里，文件模式的
+/// 网关没有能跨重启的存储。调用方写的同名键在提交时被覆盖，批次建好之后上游也不
+/// 让改，所以调用方伪造不了。应答里会摘掉（[`rewrite_response_ids`]）。
+const BATCH_SUBMITTER_KEY: &str = "aisix_api_key_id";
+/// 同上：这个批次走的是哪个模型行，按它定价。否则读批次时换一个 `?model=` 就能
+/// 换一个价钱。
+const BATCH_MODEL_KEY: &str = "aisix_model";
+/// 上游 `metadata` 的键值对上限。调用方已经写满时不打标记，退回按观察者归因。
+const BATCH_METADATA_MAX_PAIRS: usize = 16;
+/// 多久还没结束就不再看了。上游最长的完成窗口之外留一天给收尾。
+const BATCH_WATCH_LIMIT: Duration = Duration::from_secs(8 * 24 * 3600);
 
 // ─────────────────────────── id codec ───────────────────────────
 
@@ -139,6 +156,7 @@ pub(crate) fn require_safe_upstream_id(raw: &str) -> Result<(), ProxyError> {
 // ──────────────────────── target resolution ────────────────────────
 
 /// The Model + ProviderKey a jobs request routes through.
+#[derive(Clone)]
 pub(crate) struct JobTarget {
     pub model_entry: Arc<ResourceEntry<Model>>,
     pub pk_entry: Arc<ResourceEntry<ProviderKey>>,
@@ -365,25 +383,16 @@ enum UpstreamBody {
     Multipart(reqwest::multipart::Form),
 }
 
-/// Send one upstream request with per-adapter auth, the model's E2E
-/// timeout, and cooldown accounting on transport failures (parity with
-/// `/passthrough`, #701).
-async fn send_upstream(
-    state: &ProxyState,
+/// One upstream request with per-adapter auth and the operator and client
+/// headers, so every round-trip on this surface sends the same set (#1112).
+fn upstream_request(
     target: &JobTarget,
-    method: Method,
+    method: reqwest::Method,
     url: &str,
-    body: UpstreamBody,
     request_id: &str,
-) -> Result<(StatusCode, HeaderMap, Bytes), ProxyError> {
+) -> reqwest::RequestBuilder {
     let client =
         crate::http_client::client_for(target.pk_entry.value.upstream_connection().as_ref());
-    let mut builder = client.request(
-        reqwest::Method::from_bytes(method.as_str().as_bytes())
-            .map_err(|_| ProxyError::InvalidRequest("unsupported method".into()))?,
-        url,
-    );
-
     // Gateway-owned headers go into the map first; the operator / client set
     // is merged on top and skips any name already there.
     // `RequestBuilder::header` APPENDS on a repeat name, so building the map
@@ -413,7 +422,27 @@ async fn send_upstream(
     // the gateway's, and the upstream must receive exactly one.
     target.forwarded_client.apply(&mut headers);
 
-    builder = builder.headers(headers);
+    client.request(method, url).headers(headers)
+}
+
+/// Send one upstream request with per-adapter auth, the model's E2E
+/// timeout, and cooldown accounting on transport failures (parity with
+/// `/passthrough`, #701).
+async fn send_upstream(
+    state: &ProxyState,
+    target: &JobTarget,
+    method: Method,
+    url: &str,
+    body: UpstreamBody,
+    request_id: &str,
+) -> Result<(StatusCode, HeaderMap, Bytes), ProxyError> {
+    let mut builder = upstream_request(
+        target,
+        reqwest::Method::from_bytes(method.as_str().as_bytes())
+            .map_err(|_| ProxyError::InvalidRequest("unsupported method".into()))?,
+        url,
+        request_id,
+    );
 
     builder = match body {
         UpstreamBody::Empty => builder,
@@ -817,6 +846,11 @@ const ID_FIELDS: &[&str] = &[
 
 fn rewrite_response_ids(v: &mut Value, model: &str) {
     let Some(obj) = v.as_object_mut() else { return };
+    // 网关自己的标记不是调用方写的 metadata，不该出现在给它的应答里。
+    if let Some(Value::Object(metadata)) = obj.get_mut("metadata") {
+        metadata.remove(BATCH_SUBMITTER_KEY);
+        metadata.remove(BATCH_MODEL_KEY);
+    }
     for field in ID_FIELDS {
         if let Some(Value::String(s)) = obj.get_mut(*field) {
             if !s.is_empty() && !s.starts_with(ROUTED_ID_PREFIX) {
@@ -1639,6 +1673,10 @@ pub(crate) async fn create_batch(
         };
         crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_entry.id)?;
 
+        // 放在审查之后：审查看的是调用方写的内容，不是网关自己的标记。
+        stamp_batch_submitter(&mut req_json, &auth.entry.id, target.display_name());
+        let out_body = Bytes::from(serde_json::to_vec(&req_json).unwrap_or_default());
+
         let url = upstream_url(&target, "/batches", "")?;
         let (status, resp_headers, bytes) = send_upstream(
             &state,
@@ -1649,6 +1687,13 @@ pub(crate) async fn create_batch(
             &request_id,
         )
         .await?;
+        // 放在输出审查之前：审查拦下应答，批次在上游也已经建好了，照样要花钱。
+        if status.is_success() {
+            let created = serde_json::from_slice::<Value>(&bytes).ok();
+            if let Some(raw_id) = created.as_ref().and_then(|v| v["id"].as_str()) {
+                watch_batch(&state, &auth, &client, &target, raw_id);
+            }
+        }
         scan_output_blob(
             &state,
             &auth,
@@ -1716,10 +1761,7 @@ pub(crate) async fn get_batch(
         require_safe_upstream_id(&raw)?;
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
         let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
-        // 这条**不带**下划线前缀，和这个文件里其它几处不同：那几处只为 Drop 时
-        // 释放并发位而持有，这一处还要交出它的花费桶键 —— 批处理的钱是事后落账
-        // 的，那时预留早已释放，键得先拿在手上。名字带下划线会说「没人用它」。
-        let reservation = crate::quota::enforce(
+        let _reservation = crate::quota::enforce(
             &state,
             &snapshot,
             &auth,
@@ -1759,15 +1801,7 @@ pub(crate) async fn get_batch(
         // batch downloads the output JSONL and emits real token usage.
         if status == StatusCode::OK {
             if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-                maybe_attribute_batch(
-                    &state,
-                    &auth,
-                    &client,
-                    &target,
-                    &raw,
-                    &v,
-                    reservation.spend_keys(),
-                );
+                maybe_attribute_batch(&state, &auth, &client, &target, &raw, &v);
             }
         }
 
@@ -2209,6 +2243,9 @@ async fn forward_simple(
         };
         let (status, resp_headers, bytes) =
             send_upstream(&state, &target, spec.method, &url, body, &request_id).await?;
+        if surface == crate::operation::BATCHES && method == Method::GET && status.is_success() {
+            attribute_listed_batches(&state, &auth, &client, &target, &bytes);
+        }
         // The files surface answers with opaque payloads, not model output:
         // a download is whatever the provider stored under an id. Screening
         // it as one synthetic message is #1120's job, per record, through
@@ -2314,36 +2351,116 @@ fn batch_attribution_request_id(raw_batch_id: &str, idx: usize, multi: bool) -> 
     uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, name.as_bytes()).to_string()
 }
 
-/// First-completed-observation hook: claim the batch in the process-lifetime
-/// billed set (so this process attributes it once), then attribute usage in
-/// a detached task. Re-emission from a restarted process or another replica
-/// is deduplicated by the control plane on the deterministic `request_id`
-/// (see [`batch_attribution_request_id`]).
-fn maybe_attribute_batch(
+/// 写进提交给上游的请求体里，见 [`BATCH_SUBMITTER_KEY`]。
+fn stamp_batch_submitter(req: &mut Value, api_key_id: &str, model: &str) {
+    let Some(obj) = req.as_object_mut() else {
+        return;
+    };
+    let metadata = obj.entry("metadata").or_insert(Value::Null);
+    if metadata.is_null() {
+        *metadata = Value::Object(serde_json::Map::new());
+    }
+    let Some(metadata) = metadata.as_object_mut() else {
+        return;
+    };
+    metadata.remove(BATCH_SUBMITTER_KEY);
+    metadata.remove(BATCH_MODEL_KEY);
+    if metadata.len() + 2 <= BATCH_METADATA_MAX_PAIRS {
+        metadata.insert(BATCH_SUBMITTER_KEY.into(), api_key_id.into());
+        metadata.insert(BATCH_MODEL_KEY.into(), model.into());
+    }
+}
+
+/// 这个批次标记的提交者，密钥还在的话。
+fn batch_submitter(snap: &aisix_core::AisixSnapshot, batch: &Value) -> Option<AuthenticatedKey> {
+    let id = batch.get("metadata")?.get(BATCH_SUBMITTER_KEY)?.as_str()?;
+    let entry = snap.apikeys.get_by_id(id)?;
+    Some(AuthenticatedKey::new(snap, entry, None, false))
+}
+
+/// 给这个批次定价的模型行：提交时标记的那一行，否则是这次请求路由到的那一行。
+/// 只认同一把上游密钥下的行 —— 批次就是在那把密钥名下跑的。
+fn batch_priced_model(
+    snap: &aisix_core::AisixSnapshot,
+    batch: &Value,
+    target: &JobTarget,
+) -> Arc<ResourceEntry<Model>> {
+    batch
+        .get("metadata")
+        .and_then(|m| m.get(BATCH_MODEL_KEY))
+        .and_then(Value::as_str)
+        .and_then(|name| snap.models.get_by_name(name))
+        .filter(|row| row.value.provider_key_id.as_deref() == Some(&*target.pk_entry.id))
+        .unwrap_or_else(|| Arc::clone(&target.model_entry))
+}
+
+/// 批次结束的时刻（上游的 unix 秒）。过期和取消的批次同样可能带部分结果 ——
+/// 已经跑完的行上游照样收钱，只认 `completed` 的话，提交之后赶在完成前取消就
+/// 成了免费的办法。别的状态返回外层 `None`：还没到要结算的时候。
+fn batch_ended_at(batch: &Value) -> Option<Option<f64>> {
+    let field = match batch.get("status").and_then(Value::as_str)? {
+        "completed" => "completed_at",
+        "expired" => "expired_at",
+        "cancelled" => "cancelled_at",
+        _ => return None,
+    };
+    Some(batch.get(field).and_then(Value::as_f64))
+}
+
+/// 这个批次的花费能不能记进计数器。
+///
+/// 一次性标记只跟计数器同寿（[`aisix_ratelimit::Limiter::claims_outlive_process`]），
+/// 而按这个计数器扣款的账本是持久的：进程内存储下，重启之后再看到同一个批次，标记
+/// 是空的、新进程的计数器涨上去，账本就把这批再扣一遍。所以这种存储下，结束得比本
+/// 进程还早的批次一律不记：它多半已经被前一个进程记过，真没记过的那些（结束在停机
+/// 窗口里）漏一笔，比多收一笔好 —— 漏记还能从用量事件里补，多收不能。
+fn batch_credit_is_ruled_out(state: &ProxyState, ended_at: Option<f64>) -> bool {
+    !state.limiter.claims_outlive_process()
+        && ended_at.is_some_and(|t| t < aisix_obs::metrics::process_start_time_seconds())
+}
+
+/// 一次批次归因要用到的全部东西，在观察到结束的那一刻定下来。
+struct BatchAttribution {
+    state: ProxyState,
+    target: JobTarget,
+    /// 付钱的那把密钥：提交者，认不出提交者时是观察者。
+    payer: AuthenticatedKey,
+    model: Arc<ResourceEntry<Model>>,
+    price: Option<aisix_core::models::model::ModelCost>,
+    /// 付钱的那把密钥在定价模型上的花费桶。批处理的钱是事后落账的，那时没有
+    /// 任何预留可以取键。
+    spend_keys: Vec<String>,
+    raw_batch_id: String,
+    output_file_id: String,
+    ended_at: Option<f64>,
+    request_id: String,
+    /// 观察到它的那次请求的头。观察者不是付钱的人时不带：那些头描述的是别人。
+    request_headers: std::collections::BTreeMap<String, String>,
+    user_agent: String,
+}
+
+/// 第一次观察到一个结束了、带结果文件的批次：记进进程内的集合（本进程只归因一次），
+/// 把归因要用的东西定下来。不该归因时返回 `None`。Re-emission from a restarted
+/// process or another replica is deduplicated by the control plane on the
+/// deterministic `request_id` (see [`batch_attribution_request_id`]).
+fn prepare_batch_attribution(
     state: &ProxyState,
     auth: &AuthenticatedKey,
-    // The request that observed completion — the same one the caller
-    // identity below is taken from.
+    // The request that observed the end.
     client: &ClientContext,
     target: &JobTarget,
     raw_batch_id: &str,
     batch: &Value,
-    spend_keys: Vec<String>,
-) {
-    if batch.get("status").and_then(Value::as_str) != Some("completed") {
-        return;
-    }
-    let Some(output_file_id) = batch
+) -> Option<BatchAttribution> {
+    let ended_at = batch_ended_at(batch)?;
+    let output_file_id = batch
         .get("output_file_id")
         .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-    else {
-        return;
-    };
+        .filter(|s| !s.is_empty())?
+        .to_string();
     if require_safe_upstream_id(&output_file_id).is_err() {
         tracing::warn!(batch_id = %raw_batch_id, "batch output_file_id failed charset guard; skipping attribution");
-        return;
+        return None;
     }
     if !crate::state::remember_billed_batch(
         &state.billed_batches,
@@ -2351,64 +2468,74 @@ fn maybe_attribute_batch(
         std::time::Instant::now(),
         crate::state::BILLED_BATCH_DEDUP_WINDOW,
     ) {
-        return; // already attributed by this process
+        return None; // already attributed by this process
     }
 
-    let state = state.clone();
-    let api_key_id = auth.entry.id.clone();
-    // The caller that observed the batch complete, resolved now: its
-    // member, team and tags are what the attribution rows carry, so with
-    // `tag_claims` the tags are the observer's, not the submitter's.
-    let caller = auth.caller();
-    let jwt = auth.jwt.clone();
-    let request_headers = client.request_headers.clone();
-    let model_id = target.model_entry.id.clone();
-    let display_name = target.display_name().to_string();
-    // Resolved before the spawn, off the live snapshot, through the same
-    // index `least_cost` ranks with: `pricing_key` first, inline `cost`
-    // second. The completed batch is priced at what the model costs when
-    // its output is collected.
     let snap = state.snapshot.load();
-    let cost = state
+    let (payer, request_headers, user_agent) = match batch_submitter(&snap, batch) {
+        Some(submitter) if submitter.entry.id != auth.entry.id => {
+            (submitter, Default::default(), String::new())
+        }
+        _ => (
+            auth.clone(),
+            client.request_headers.clone(),
+            client.user_agent.clone(),
+        ),
+    };
+    // Through the same index `least_cost` ranks with: `pricing_key` first,
+    // inline `cost` second. The batch is priced at what the model costs when
+    // its output is collected.
+    let model = batch_priced_model(&snap, batch, target);
+    let price = state
         .pricing
         .for_snapshot(&snap)
-        .resolve(&target.model_entry.value)
+        .resolve(&model.value)
         .cloned();
-    drop(snap);
-    let pk_id = target.pk_entry.id.to_string();
-    let secret = target.secret.clone();
-    let adapter = target.adapter;
-    let api_base = target.pk_entry.value.api_base.clone();
-    let pk_conn = target.pk_entry.value.upstream_connection();
-    let raw_batch_id = raw_batch_id.to_string();
-    let user_agent = client.user_agent.clone();
+    let spend_keys = crate::quota::spend_bucket_keys(
+        state,
+        &snap,
+        &payer,
+        &crate::quota::ModelRateLimit::from_model(
+            &model.value.display_name,
+            &model.id,
+            &model.value,
+        ),
+    );
+    Some(BatchAttribution {
+        state: state.clone(),
+        target: target.clone(),
+        payer,
+        model,
+        price,
+        spend_keys,
+        raw_batch_id: raw_batch_id.to_string(),
+        output_file_id,
+        ended_at,
+        request_id: client.request_id.clone(),
+        request_headers,
+        user_agent,
+    })
+}
 
+/// 请求路径上观察到批次结束：归因放到后台去，这次应答不等它。
+fn maybe_attribute_batch(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    target: &JobTarget,
+    raw_batch_id: &str,
+    batch: &Value,
+) {
+    let Some(job) = prepare_batch_attribution(state, auth, client, target, raw_batch_id, batch)
+    else {
+        return;
+    };
     tokio::spawn(async move {
-        if let Err(e) = attribute_batch_usage(
-            &state,
-            &api_key_id,
-            jwt.as_ref(),
-            &caller,
-            &request_headers,
-            &model_id,
-            &display_name,
-            cost.as_ref(),
-            &pk_id,
-            &secret,
-            adapter,
-            api_base.as_deref(),
-            pk_conn.as_ref(),
-            &raw_batch_id,
-            &output_file_id,
-            &spend_keys,
-            &user_agent,
-        )
-        .await
-        {
+        if let Err(e) = attribute_batch_usage(&job).await {
             // Release the guard so a later retrieve can retry the download.
-            state.billed_batches.remove(&raw_batch_id);
+            job.state.billed_batches.remove(&job.raw_batch_id);
             tracing::warn!(
-                batch_id = %raw_batch_id,
+                batch_id = %job.raw_batch_id,
                 error = %e,
                 "batch usage attribution failed; will retry on next retrieve",
             );
@@ -2416,62 +2543,141 @@ fn maybe_attribute_batch(
     });
 }
 
+/// 列表也能看到批次结束：只查列表、再按 `output_file_id` 下结果文件的调用方永远
+/// 走不到按 id 读的那条路。
+///
+/// 只认带提交者标记、而且提交者还在的行：列表里是这把上游密钥名下所有调用方的批次，
+/// 没有标记的那些说不清该谁付，不能算到正在列表的这把密钥头上。
+fn attribute_listed_batches(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    target: &JobTarget,
+    bytes: &[u8],
+) {
+    let Ok(list) = serde_json::from_slice::<Value>(bytes) else {
+        return;
+    };
+    let snap = state.snapshot.load();
+    for batch in list["data"].as_array().into_iter().flatten() {
+        let Some(raw_id) = batch["id"].as_str() else {
+            continue;
+        };
+        if require_safe_upstream_id(raw_id).is_err() || batch_submitter(&snap, batch).is_none() {
+            continue;
+        }
+        // 列表回头会看到同一批：记不进计数器的就不必再下载一遍结果文件。
+        if batch_ended_at(batch).is_some_and(|t| batch_credit_is_ruled_out(state, t)) {
+            continue;
+        }
+        maybe_attribute_batch(state, auth, client, target, raw_id, batch);
+    }
+}
+
+/// 网关自己盯着它创建的批次，直到结束：调用方可能根本不来读（下载结果用不着按 id
+/// 读批次），而上游照样收钱。
+///
+/// 只活在这个进程里。重启之后还没结束的批次没人盯，由按 id 读和列表兜底。
+fn watch_batch(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    client: &ClientContext,
+    target: &JobTarget,
+    raw_batch_id: &str,
+) {
+    if require_safe_upstream_id(raw_batch_id).is_err() {
+        return;
+    }
+    let (state, auth, client, target, raw_batch_id) = (
+        state.clone(),
+        auth.clone(),
+        client.clone(),
+        target.clone(),
+        raw_batch_id.to_string(),
+    );
+    let span = tracing::Span::current();
+    tokio::spawn(tracing::Instrument::instrument(
+        async move {
+            let started = Instant::now();
+            while started.elapsed() < BATCH_WATCH_LIMIT {
+                tokio::time::sleep(state.batch_watch_interval).await;
+                let Some(batch) = poll_batch(&target, &raw_batch_id, &client.request_id).await
+                else {
+                    continue;
+                };
+                match batch.get("status").and_then(Value::as_str) {
+                    Some("completed" | "expired" | "cancelled") => {
+                        let Some(job) = prepare_batch_attribution(
+                            &state,
+                            &auth,
+                            &client,
+                            &target,
+                            &raw_batch_id,
+                            &batch,
+                        ) else {
+                            // 没有结果文件，或者别的路径已经在归因了。
+                            return;
+                        };
+                        match attribute_batch_usage(&job).await {
+                            Ok(()) => return,
+                            Err(e) => {
+                                state.billed_batches.remove(&raw_batch_id);
+                                tracing::warn!(
+                                    batch_id = %raw_batch_id,
+                                    error = %e,
+                                    "batch usage attribution failed; retrying",
+                                );
+                            }
+                        }
+                    }
+                    Some("failed") => return,
+                    _ => {}
+                }
+            }
+        },
+        span,
+    ));
+}
+
+/// 读一次批次的当前状态。读不到不算什么：下一轮再读，不进熔断也不进部署指标。
+async fn poll_batch(target: &JobTarget, raw_batch_id: &str, request_id: &str) -> Option<Value> {
+    let url = upstream_url(target, &format!("/batches/{raw_batch_id}"), "").ok()?;
+    let resp = upstream_request(target, reqwest::Method::GET, &url, request_id)
+        .timeout(BATCH_ATTRIBUTION_TIMEOUT)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json().await.ok()
+}
+
 /// Download the completed batch's output JSONL and emit aggregated
 /// UsageEvents (one per provider-billed model appearing in the lines).
 /// LiteLLM parity: `_handle_completed_batch` → per-line usage/cost.
-#[allow(clippy::too_many_arguments)]
-async fn attribute_batch_usage(
-    state: &ProxyState,
-    api_key_id: &str,
-    jwt: Option<&std::sync::Arc<crate::auth::JwtIdentity>>,
-    caller: &aisix_gateway::CallerIdentity,
-    request_headers: &std::collections::BTreeMap<String, String>,
-    model_id: &str,
-    display_name: &str,
-    cost: Option<&aisix_core::models::model::ModelCost>,
-    pk_id: &str,
-    secret: &str,
-    adapter: Adapter,
-    api_base: Option<&str>,
-    conn: Option<&aisix_core::models::provider_key::UpstreamConnection>,
-    raw_batch_id: &str,
-    output_file_id: &str,
-    // 这次请求的花费桶键，取自 retrieve 时那次预留。批处理的钱是事后落账的，
-    // 落账时预留早就没了 —— 键先拿在手上，才能把这笔钱回扣到额度上。
-    spend_keys: &[String],
-    // 归入 `aisix_llm_tokens_by_client_total` 的客户端分类。
-    user_agent: &str,
-) -> Result<(), String> {
-    let url = match adapter {
-        Adapter::AzureOpenai => {
-            let base = api_base
-                .map(str::trim)
-                .filter(|b| !b.is_empty())
-                .ok_or("azure provider_key has no api_base")?
-                .trim_end_matches('/');
-            format!(
-                "{base}/openai/files/{output_file_id}/content?api-version={AZURE_JOBS_API_VERSION}"
-            )
-        }
-        _ => {
-            let base = api_base
-                .map(str::trim)
-                .filter(|b| !b.is_empty())
-                .ok_or("provider_key has no api_base")?;
-            crate::dispatch::build_openai_url(
-                base.trim_end_matches('/'),
-                &format!("/files/{output_file_id}/content"),
-            )
-        }
-    };
+async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
+    let state = &job.state;
+    let api_key_id = job.payer.entry.id.as_str();
+    let jwt = job.payer.jwt.as_ref();
+    let caller = &job.payer.caller();
+    let model_id = job.model.id.as_str();
+    let display_name = job.model.value.display_name.as_str();
+    let cost = job.price.as_ref();
+    let pk_id = job.target.pk_entry.id.as_str();
+    let raw_batch_id = job.raw_batch_id.as_str();
+    let spend_keys = &job.spend_keys;
+    let request_headers = &job.request_headers;
+    let user_agent = job.user_agent.as_str();
 
-    let client = crate::http_client::client_for(conn);
-    let mut builder = client.get(&url).timeout(BATCH_ATTRIBUTION_TIMEOUT);
-    builder = match adapter {
-        Adapter::AzureOpenai => builder.header("api-key", secret),
-        _ => builder.header(header::AUTHORIZATION, format!("Bearer {secret}")),
-    };
-    let resp = builder
+    let url = upstream_url(
+        &job.target,
+        &format!("/files/{}/content", job.output_file_id),
+        "",
+    )
+    .map_err(|e| e.to_string())?;
+    let resp = upstream_request(&job.target, reqwest::Method::GET, &url, &job.request_id)
+        .timeout(BATCH_ATTRIBUTION_TIMEOUT)
         .send()
         .await
         .map_err(|e| aisix_gateway::transport_error_message(&e))?;
@@ -2548,14 +2754,16 @@ async fn attribute_batch_usage(
     //
     // 每片的确切模型名仍然记在事件的 `provider_model_version` 上，那是它该去的
     // 地方；多片批次在指标上合并成一条 series，总量不变。
-    let row = snap.models.get_by_id(model_id);
-    let provider_label = row
-        .as_ref()
-        .and_then(|e| e.value.provider.clone())
+    let provider_label = job
+        .model
+        .value
+        .provider
+        .clone()
         .unwrap_or_else(|| "unknown".to_string());
-    let configured_upstream = row
-        .as_ref()
-        .and_then(|e| e.value.upstream_model())
+    let configured_upstream = job
+        .model
+        .value
+        .upstream_model()
         .unwrap_or("unknown")
         .to_string();
     // Same exporter set for every model slice of one batch.
@@ -2567,24 +2775,31 @@ async fn attribute_batch_usage(
     // 都没有那层保护，重放一次就是把这批多收一遍。
     //
     // 所以只给这两条加闸，且闸放在与计数器同一个存储里：共享存储下跨重启、跨
-    // 实例都只记一次，进程内存储下只在本进程有效 —— 而那种部署里计数器本身也
-    // 只在本进程里，两者同寿。TTL 取 30 天：供应商保留已完成批次的量级就是这
-    // 个，之后不可能再被重取。
+    // 实例都只记一次。进程内存储下标记活不过重启，所以还要先看批次结束的时刻
+    // （见 [`batch_credit_is_ruled_out`]）。TTL 取 30 天：供应商保留已完成批次的
+    // 量级就是这个，之后不可能再被重取。
     //
     // 事件仍然无条件发 —— 它本来就该在重放时也到达消费端。
-    let credit = state
-        .limiter
-        .claim_once(
-            &format!("batch-spend:{raw_batch_id}"),
-            std::time::Duration::from_secs(30 * 24 * 3600),
-        )
-        .await;
+    let credit = if batch_credit_is_ruled_out(state, job.ended_at) {
+        tracing::warn!(
+            batch_id = %raw_batch_id,
+            "batch ended before this process started and the rate-limit store does not \
+             outlive a process: its spend is left uncounted rather than risk charging it twice",
+        );
+        false
+    } else {
+        state
+            .limiter
+            .claim_once(
+                &format!("batch-spend:{raw_batch_id}"),
+                std::time::Duration::from_secs(30 * 24 * 3600),
+            )
+            .await
+    };
     // 先回扣额度，再发事件与指标。顺序是有意的：观察者只能看见事件和指标，
     // 把额度放在它们之后，就存在一个「指标已到、额度未到」的窗口，任何据此
     // 判断的检查都会间歇性地看错。
     //
-    // 用 retrieve 时那次预留的键：预留本身早已释放（它只在准入时挡人），但键
-    // 是纯字符串，事后照样能记。
     // 一处算价，两处用（额度那笔、事件那笔）。上一版把公式抄了两遍 —— 那正是
     // 两个数字会各自漂走的形状。
     //
@@ -2690,7 +2905,9 @@ async fn attribute_batch_usage(
         //
         // 与额度同受 `credit` 管：这是个计数器，重放一次就多收一次。
         if credit {
-            let owned_caller = crate::request_metrics::Caller::from_api_key_id(&snap, api_key_id);
+            // 取付钱那把密钥本身，不按 id 回查快照：批次跑了几天，密钥可能已经被
+            // 吊销，而这笔钱还是它的主人花的。
+            let owned_caller = crate::request_metrics::Owned::from_auth(&job.payer);
             crate::request_metrics::record_usage(
                 state,
                 "/v1/batches",
@@ -3484,6 +3701,434 @@ mod tests {
         assert!(
             !rendered.contains(aisix_obs::metrics::M_LLM_SPEND_MICRO_USD_TOTAL),
             "重放把这批的钱又收了一遍: {rendered}"
+        );
+    }
+
+    /// 一把只属于「另一个人」的密钥：明文 `sk-other`。
+    fn other_apikey_entry() -> ResourceEntry<ApiKey> {
+        use sha2::{Digest, Sha256};
+        let hash = format!("{:x}", Sha256::digest(b"sk-other"));
+        let k: ApiKey = serde_json::from_str(&format!(
+            r#"{{"key_hash":"{hash}","allowed_models":["*"]}}"#
+        ))
+        .unwrap();
+        ResourceEntry::new("k-other", k, 1)
+    }
+
+    /// 一个结束了的批次和它的结果文件：一行 1000+1000 token。按 `priced_model`
+    /// 的 $0.5/1k，整批是 $1，即 1_000_000 micro-USD。
+    async fn mount_ended_batch(upstream: &MockServer, batch: Value) {
+        let id = batch["id"].as_str().unwrap().to_string();
+        Mock::given(wm_method("GET"))
+            .and(path(format!("/v1/batches/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(batch))
+            .mount(upstream)
+            .await;
+        let line = serde_json::json!({
+            "id": "batch_req_1",
+            "response": {"status_code": 200, "body": {
+                "model": "gpt-4o",
+                "usage": {"prompt_tokens": 1000, "completion_tokens": 1000}
+            }}
+        });
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/files/file-out/content"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(format!("{line}\n"), "application/jsonl"),
+            )
+            .mount(upstream)
+            .await;
+    }
+
+    fn ended_batch_snapshot(upstream: &MockServer) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(priced_model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.apikeys.insert(other_apikey_entry());
+        snap
+    }
+
+    fn get_as(uri: String, key: &str) -> Request<axum::body::Body> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("authorization", format!("Bearer {key}"))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    /// 花费序列渐渐出现（归因在后台跑）：等它的 `(api_key_id, 值)` 落定。
+    async fn spend_series(state: &crate::ProxyState) -> Vec<(String, u64)> {
+        for _ in 0..60 {
+            let rendered = state.metrics.render();
+            let series: Vec<(String, u64)> = rendered
+                .lines()
+                .filter(|l| l.starts_with(aisix_obs::metrics::M_LLM_SPEND_MICRO_USD_TOTAL))
+                .map(|l| {
+                    let key = l
+                        .split("api_key_id=\"")
+                        .nth(1)
+                        .and_then(|rest| rest.split('"').next())
+                        .unwrap_or_default()
+                        .to_string();
+                    let value = l.rsplit(' ').next().unwrap().parse().unwrap();
+                    (key, value)
+                })
+                .collect();
+            if !series.is_empty() {
+                return series;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Vec::new()
+    }
+
+    /// 看批次的是另一把密钥，付钱的还是提交它的那把 —— 否则知道 id 的人一读，
+    /// 账就记到了他头上。
+    #[tokio::test]
+    async fn the_submitter_pays_for_a_batch_another_key_reads() {
+        let upstream = MockServer::builder().start().await;
+        mount_ended_batch(
+            &upstream,
+            serde_json::json!({
+                "id": "batch_1",
+                "status": "completed",
+                "output_file_id": "file-out",
+                "metadata": {BATCH_SUBMITTER_KEY: "k-1", BATCH_MODEL_KEY: "jobs-a"}
+            }),
+        )
+        .await;
+        let (app, _rx, state) = build_app_with_sink_and_state(ended_batch_snapshot(&upstream));
+
+        let encoded = encode_routed_id("batch_1", "jobs-a");
+        let resp = app
+            .oneshot(get_as(format!("/v1/batches/{encoded}"), "sk-other"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["metadata"].get(BATCH_SUBMITTER_KEY).is_none(),
+            "网关的标记不该出现在给调用方的应答里: {v}"
+        );
+
+        assert_eq!(
+            spend_series(&state).await,
+            vec![("k-1".to_string(), 1_000_000)]
+        );
+    }
+
+    /// 读批次时换一个更便宜的 `?model=`（同一把上游密钥下）不能换一个价钱。
+    #[tokio::test]
+    async fn a_batch_is_priced_on_the_model_it_was_submitted_through() {
+        let upstream = MockServer::builder().start().await;
+        mount_ended_batch(
+            &upstream,
+            serde_json::json!({
+                "id": "batch_1",
+                "status": "completed",
+                "output_file_id": "file-out",
+                "metadata": {BATCH_SUBMITTER_KEY: "k-1", BATCH_MODEL_KEY: "jobs-a"}
+            }),
+        )
+        .await;
+        let snap = ended_batch_snapshot(&upstream);
+        let cheap: Model = serde_json::from_str(&format!(
+            r#"{{"display_name":"jobs-cheap","provider":"openai","model_name":"gpt-4o","provider_key_id":"{PK_A}","cost":{{"input_per_1k":0.0,"output_per_1k":0.0}}}}"#
+        ))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-cheap", cheap, 1));
+        let (app, _rx, state) = build_app_with_sink_and_state(snap);
+
+        let resp = app
+            .oneshot(get_as(
+                "/v1/batches/batch_1?model=jobs-cheap".to_string(),
+                "sk-caller",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            spend_series(&state).await,
+            vec![("k-1".to_string(), 1_000_000)]
+        );
+    }
+
+    /// 取消或过期的批次带着部分结果，已经跑完的行上游照样收钱。只认 `completed`
+    /// 的话，赶在完成前取消就成了免费的办法。
+    #[tokio::test]
+    async fn a_cancelled_or_expired_batch_with_output_is_charged() {
+        for status in ["cancelled", "expired"] {
+            let upstream = MockServer::builder().start().await;
+            mount_ended_batch(
+                &upstream,
+                serde_json::json!({
+                    "id": "batch_1",
+                    "status": status,
+                    "output_file_id": "file-out"
+                }),
+            )
+            .await;
+            let (app, _rx, state) = build_app_with_sink_and_state(ended_batch_snapshot(&upstream));
+            let encoded = encode_routed_id("batch_1", "jobs-a");
+            let resp = app
+                .oneshot(get_as(format!("/v1/batches/{encoded}"), "sk-caller"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                spend_series(&state).await,
+                vec![("k-1".to_string(), 1_000_000)],
+                "{status}"
+            );
+        }
+    }
+
+    /// 只查列表、再下载结果文件的调用方走不到按 id 读的路。列表里带提交者标记的
+    /// 批次记到提交者头上；没有标记的说不清是谁的，不能算到正在列表的这把密钥上。
+    #[tokio::test]
+    async fn a_listed_batch_is_charged_to_its_submitter_and_only_a_marked_one() {
+        let upstream = MockServer::builder().start().await;
+        mount_ended_batch(
+            &upstream,
+            serde_json::json!({"id": "batch_unused", "status": "completed"}),
+        )
+        .await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/batches"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    {
+                        "id": "batch_mine",
+                        "status": "completed",
+                        "output_file_id": "file-out",
+                        "metadata": {BATCH_SUBMITTER_KEY: "k-1", BATCH_MODEL_KEY: "jobs-a"}
+                    },
+                    {
+                        "id": "batch_unmarked",
+                        "status": "completed",
+                        "output_file_id": "file-out"
+                    },
+                    {
+                        "id": "batch_running",
+                        "status": "in_progress",
+                        "metadata": {BATCH_SUBMITTER_KEY: "k-1", BATCH_MODEL_KEY: "jobs-a"}
+                    }
+                ]
+            })))
+            .mount(&upstream)
+            .await;
+        let (app, _rx, state) = build_app_with_sink_and_state(ended_batch_snapshot(&upstream));
+
+        let resp = app
+            .oneshot(get_as("/v1/batches?model=jobs-a".to_string(), "sk-other"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            spend_series(&state).await,
+            vec![("k-1".to_string(), 1_000_000)],
+            "只有带标记的那一批入账，而且记在提交者头上"
+        );
+    }
+
+    /// 调用方压根不读批次也要入账：结果可以按 `output_file_id` 直接下，而上游照样
+    /// 收钱。网关盯着自己创建的批次，不靠任何一次后续请求。
+    #[tokio::test]
+    async fn a_created_batch_is_charged_when_nobody_ever_reads_it() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(wm_method("POST"))
+            .and(path("/v1/batches"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "batch_1",
+                "object": "batch",
+                "status": "validating"
+            })))
+            .mount(&upstream)
+            .await;
+        // 没带标记的上游（调用方写满了 metadata，或上游不回显）：盯的时候用的是
+        // 提交那一刻的身份。
+        mount_ended_batch(
+            &upstream,
+            serde_json::json!({
+                "id": "batch_1",
+                "status": "completed",
+                "output_file_id": "file-out"
+            }),
+        )
+        .await;
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ObsUsageEvent>(32);
+        let state = crate::ProxyState::new(
+            SnapshotHandle::new(ended_batch_snapshot(&upstream)),
+            Arc::new(Hub::new()),
+            &cfg(),
+        )
+        .without_cache()
+        .with_usage_sink(UsageSink::new(tx))
+        .with_batch_watch_interval(Duration::from_millis(20));
+        let app = crate::build_router(state.clone());
+
+        let body = serde_json::json!({
+            "input_file_id": encode_routed_id("file-in", "jobs-a"),
+            "endpoint": "/v1/chat/completions",
+            "completion_window": "24h"
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/batches")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+        assert_eq!(
+            spend_series(&state).await,
+            vec![("k-1".to_string(), 1_000_000)]
+        );
+    }
+
+    /// 提交者与定价模型记到上游的批次上；调用方自己写的同名键不算数，这样才伪造
+    /// 不了别人来付钱。它写的其它 metadata 原样留着，而给它的应答里看不到标记。
+    #[tokio::test]
+    async fn a_created_batch_carries_its_submitter_upstream_and_a_forged_one_is_replaced() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(wm_method("POST"))
+            .and(path("/v1/batches"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "batch_1",
+                "status": "validating",
+                "metadata": {"note": "x", BATCH_SUBMITTER_KEY: "k-1", BATCH_MODEL_KEY: "jobs-a"}
+            })))
+            .mount(&upstream)
+            .await;
+        let (app, _rx, _state) = build_app_with_sink_and_state(ended_batch_snapshot(&upstream));
+
+        let body = serde_json::json!({
+            "input_file_id": encode_routed_id("file-in", "jobs-a"),
+            "endpoint": "/v1/chat/completions",
+            "completion_window": "24h",
+            "metadata": {"note": "x", BATCH_SUBMITTER_KEY: "k-other", BATCH_MODEL_KEY: "free"}
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/batches")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = upstream.received_requests().await.unwrap();
+        let sent: Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(
+            sent["metadata"],
+            serde_json::json!({"note": "x", BATCH_SUBMITTER_KEY: "k-1", BATCH_MODEL_KEY: "jobs-a"})
+        );
+
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["metadata"], serde_json::json!({"note": "x"}), "{v}");
+    }
+
+    /// 上游的 metadata 有键值对上限：调用方已经写满时不打标记，请求照样发得出去。
+    #[test]
+    fn a_full_metadata_is_left_alone() {
+        let mut full = serde_json::Map::new();
+        for i in 0..BATCH_METADATA_MAX_PAIRS {
+            full.insert(format!("k{i}"), Value::String("v".into()));
+        }
+        let mut req = serde_json::json!({"metadata": full});
+        stamp_batch_submitter(&mut req, "k-1", "jobs-a");
+        assert_eq!(
+            req["metadata"].as_object().unwrap().len(),
+            BATCH_METADATA_MAX_PAIRS
+        );
+        assert!(req["metadata"].get(BATCH_SUBMITTER_KEY).is_none());
+
+        // 留得下两个键才打；null 当成没写。
+        let mut req = serde_json::json!({"metadata": null});
+        stamp_batch_submitter(&mut req, "k-1", "jobs-a");
+        assert_eq!(req["metadata"][BATCH_SUBMITTER_KEY], "k-1");
+    }
+
+    /// 进程内存储的一次性标记活不过重启，而账本活得过：重启之后再读同一个批次，
+    /// 新进程的计数器涨一笔，账本就再扣一遍。结束得比本进程还早的批次不再进计数器，
+    /// 用量事件照发（消费端按确定性 id 去重）。
+    #[tokio::test]
+    async fn a_batch_that_ended_before_this_process_started_is_not_charged_again() {
+        let upstream = MockServer::builder().start().await;
+        mount_ended_batch(
+            &upstream,
+            serde_json::json!({
+                "id": "batch_1",
+                "status": "completed",
+                "completed_at": 1_000_000_000,
+                "output_file_id": "file-out"
+            }),
+        )
+        .await;
+        let (app, mut rx, state) = build_app_with_sink_and_state(ended_batch_snapshot(&upstream));
+        assert!(
+            !state.limiter.claims_outlive_process(),
+            "这条用例说的就是进程内存储"
+        );
+
+        let encoded = encode_routed_id("batch_1", "jobs-a");
+        let resp = app
+            .oneshot(get_as(format!("/v1/batches/{encoded}"), "sk-caller"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut saw_batch_event = false;
+        for _ in 0..40 {
+            match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                Ok(Some(ev)) if ev.inbound_protocol == "batch" => {
+                    saw_batch_event = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(saw_batch_event, "事件本来就是幂等的，该发还是发");
+        let rendered = state.metrics.render();
+        assert!(
+            !rendered.contains(aisix_obs::metrics::M_LLM_SPEND_MICRO_USD_TOTAL),
+            "前一个进程可能已经记过的批次又进了计数器: {rendered}"
+        );
+    }
+
+    /// 反过来，本进程启动之后才结束的批次照常入账 —— 上面那条闸不能把正常的账挡掉。
+    #[tokio::test]
+    async fn a_batch_that_ended_after_this_process_started_is_charged() {
+        let upstream = MockServer::builder().start().await;
+        mount_ended_batch(
+            &upstream,
+            serde_json::json!({
+                "id": "batch_1",
+                "status": "completed",
+                "completed_at": aisix_obs::metrics::process_start_time_seconds() + 1.0,
+                "output_file_id": "file-out"
+            }),
+        )
+        .await;
+        let (app, _rx, state) = build_app_with_sink_and_state(ended_batch_snapshot(&upstream));
+        let encoded = encode_routed_id("batch_1", "jobs-a");
+        let resp = app
+            .oneshot(get_as(format!("/v1/batches/{encoded}"), "sk-caller"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            spend_series(&state).await,
+            vec![("k-1".to_string(), 1_000_000)]
         );
     }
 
