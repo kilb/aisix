@@ -957,6 +957,14 @@ async fn dispatch(
                                 (crate::CLIENT_CLOSED_REQUEST, "")
                             }
                         };
+                        // A refusal is the 200 its head committed, however the
+                        // upstream ended: a truncation counts against the upstream
+                        // above, not on the row.
+                        let terminal_status = if refusal.is_some() {
+                            200
+                        } else {
+                            terminal_status
+                        };
                         if let Some(deferred) = &deferred_for_stream {
                             deferred.finish(
                                 &state_for_stream,
@@ -2263,6 +2271,52 @@ mod tests {
             .expect("usage sink closed");
         assert_eq!(event.status_code, 502);
         assert!(!event.guardrail_blocked);
+    }
+
+    /// A refusal does not turn a truncated answer into the upstream's success:
+    /// the row is the refusal's 200, and the upstream's health takes the failure,
+    /// as on `/v1/responses`.
+    #[tokio::test]
+    async fn a_refused_truncated_completion_counts_against_the_upstream() {
+        let upstream = MockServer::builder().start().await;
+        let sse = "data: {\"id\":\"cmpl-cut\",\"object\":\"text_completion\",\"choices\":[{\"index\":0,\"text\":\"BLOCKME\"}]}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&upstream)
+            .await;
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("instruct"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(aisix_obs::UsageSink::new(tx));
+        // One more failure degrades it; a success would reset it.
+        for _ in 0..3 {
+            state.health.record_failure("instruct");
+        }
+        let resp = tower::ServiceExt::oneshot(
+            crate::build_router(state.clone()),
+            make_req(serde_json::json!({"model": "instruct", "prompt": "hi", "stream": true})),
+        )
+        .await
+        .unwrap();
+        let bytes = to_bytes(resp.into_body(), 65_536).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("content_filter"));
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the guard must emit")
+            .expect("usage sink closed");
+        assert_eq!(event.status_code, 200);
+        assert!(event.guardrail_blocked);
+        assert_eq!(
+            state.health.level("instruct"),
+            crate::health::HealthLevel::Degraded
+        );
     }
 
     /// The head of a held completion goes out ahead of the verdict, and a caller

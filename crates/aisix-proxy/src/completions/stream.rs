@@ -578,7 +578,8 @@ where
             // wire-buffer limit so usage/token estimates include the
             // complete observed prefix without retaining it all.
             let generated_before = accumulator.generated_bytes();
-            accumulator.push(&chunk);
+            let wire = accumulator.push(&chunk);
+            let done = accumulator.saw_done;
             held_content.hold(accumulator.generated_bytes() - generated_before, chunk.len());
             if held_content.exceeds(max_buffer_bytes) {
                 if fail_open {
@@ -642,8 +643,13 @@ where
                 yield Ok(failure_frame(&frame));
                 return;
             }
-            buffer.extend_from_slice(&chunk);
+            buffer.extend_from_slice(&chunk[..wire]);
             buffer_held.set(buffer.len());
+            // The semantic terminal ends the response, as on every other relay:
+            // bytes after it belong to no completion.
+            if done {
+                break;
+            }
         }
         // A read that failed, or a frame nobody can parse: what was held is not
         // sent alongside the gateway's terminal error. Its usage is kept for
@@ -772,10 +778,11 @@ where
                 )),
                 ..Default::default()
             });
+            // A refusal does not make a truncated answer the upstream's success.
             if let Some((complete, accumulator)) = guard.slot.take() {
                 complete(
                     accumulator,
-                    CompletionStreamOutcome::CleanEof,
+                    upstream_end,
                     CompletionOutputObservation {
                         monitor_hits,
                         capture_safe: false,
@@ -1531,6 +1538,58 @@ mod tests {
         assert_eq!(hits.monitor_hits.len(), 1);
         assert_eq!(hits.monitor_hits[0].guardrail_name, "monitor-hit");
         assert!(hits.capture_safe);
+    }
+
+    /// A held completion ends at its `[DONE]`, as every other relay does, rather
+    /// than at an upstream that keeps the body open after it.
+    #[tokio::test]
+    async fn a_held_completion_is_released_at_its_done() {
+        struct Holds;
+        #[async_trait::async_trait]
+        impl aisix_guardrails::Guardrail for Holds {
+            fn name(&self) -> &'static str {
+                "holds"
+            }
+            fn stream_output_policy(&self) -> aisix_guardrails::StreamOutputPolicy {
+                aisix_guardrails::StreamOutputPolicy::BufferFull {
+                    max_buffer_bytes: 1 << 20,
+                    on_exceeded_fail_open: false,
+                }
+            }
+        }
+        let mut body = frame("hello", true);
+        body.extend_from_slice(b"data: [DONE]\n\ndata: after the end\n\n");
+        let upstream: CompletionByteStream = Box::pin(
+            futures::stream::iter([Ok(bytes::Bytes::from(body))]).chain(futures::stream::pending()),
+        );
+        let chain = Arc::new(aisix_guardrails::GuardrailChain::new(vec![
+            Arc::new(Holds) as Arc<dyn aisix_guardrails::Guardrail>
+        ]));
+        let outcome = Arc::new(std::sync::Mutex::new(None));
+        let outcome_in_callback = Arc::clone(&outcome);
+        let stream = build_held_completion_stream(
+            upstream,
+            chain,
+            "model".to_string(),
+            "model".to_string(),
+            Instant::now(),
+            None,
+            None,
+            Arc::new(OnceLock::new()),
+            move |_, terminal, _| *outcome_in_callback.lock().unwrap() = Some(terminal),
+        );
+        futures::pin_mut!(stream);
+        let released = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("released at its [DONE]")
+            .unwrap()
+            .unwrap();
+        let released = String::from_utf8_lossy(&released);
+        assert!(released.ends_with("data: [DONE]\n\n"), "{released}");
+        assert_eq!(
+            *outcome.lock().unwrap(),
+            Some(CompletionStreamOutcome::CleanEof)
+        );
     }
 
     /// Past the live bound the scan reads what was kept, the capture is off,
