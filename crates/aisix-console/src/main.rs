@@ -903,9 +903,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// 每个请求一行的结构化访问日志，从 journald 读回来。
 ///
 /// 网关把它写到 stdout，systemd 收进 journal —— 独立部署下这是唯一不需要
-/// 外部服务就能拿到的逐请求记录。两个限制照实说，不在界面上假装没有：
-/// 流式请求的行是在 SSE body 开始推之前写的，所以没有 token 数；journald
-/// 的留存是它自己的配置，不是无限历史。
+/// 外部服务就能拿到的逐请求记录。journald 的留存是它自己的配置，不是无限历史，
+/// 这一点照实说，不在界面上假装没有。
 #[derive(Deserialize)]
 struct LogQuery {
     /// 只看这个 api_key_id 的记录；空则全部。
@@ -916,6 +915,10 @@ struct LogQuery {
 }
 
 /// 从一行 tracing 输出里取出 `key=value` / `key="value"` 对。
+///
+/// 字符串值按 Debug 写，里面的引号是 `\"`。停在第一个 `"` 的话，后半截会被当成
+/// 新的键值对读 —— 而模型名是调用方给的，一个不存在的模型名会被原样写进 `error`，
+/// 调用方就能借它改写这一行的 `api_key_id` 与 `status_code`。
 fn parse_kv(line: &str) -> serde_json::Map<String, Value> {
     let mut out = serde_json::Map::new();
     let b = line.as_bytes();
@@ -940,11 +943,12 @@ fn parse_kv(line: &str) -> serde_json::Map<String, Value> {
             j += 1;
             let st = j;
             while j < b.len() && b[j] != b'"' {
-                j += 1;
+                j += if b[j] == b'\\' { 2 } else { 1 };
             }
-            let v = &line[st..j];
-            j += 1;
-            v.to_string()
+            let j_end = j.min(b.len());
+            let v = line[st..j_end].replace("\\\"", "\"").replace("\\\\", "\\");
+            j = j_end + 1;
+            v
         } else {
             let st = j;
             while j < b.len() && b[j] != b' ' {
@@ -1074,12 +1078,10 @@ async fn api_upstream_models(
             .into_response();
     };
 
-    let provider = pk
-        .get("provider")
-        .and_then(Value::as_str)
-        .unwrap_or("openai");
+    let provider = upstream_vendor(pk);
     let raw_key = pk
         .get("api_key")
+        .or_else(|| pk.get("secret"))
         .and_then(Value::as_str)
         .unwrap_or_default();
     // resources.yaml 支持 ${VAR}，这里要解出真实值才能调上游。
@@ -1103,15 +1105,23 @@ async fn api_upstream_models(
     } else {
         raw_key.to_string()
     };
-    let base = pk
-        .get("api_base")
-        .and_then(Value::as_str)
-        .map(|b| b.trim_end_matches('/').to_string())
-        .unwrap_or_else(|| match provider {
-            "anthropic" => "https://api.anthropic.com/v1".into(),
-            "deepseek" => "https://api.deepseek.com/v1".into(),
-            _ => "https://api.openai.com/v1".into(),
-        });
+    let base = match pk.get("api_base").and_then(Value::as_str) {
+        Some(b) => b.trim_end_matches('/').to_string(),
+        None => match default_models_base(provider) {
+            Some(b) => b.to_string(),
+            // 猜一个地址就是把这家的密钥发给另一家。
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!(
+                        "不知道 {provider} 的模型清单地址，密钥不会发出去——\
+                        请先给这个供应商填上 API 基址"
+                    )})),
+                )
+                    .into_response();
+            }
+        },
+    };
 
     // 上游地址必须是 https 且不能指向内网：否则同一个入口就是一把 SSRF——
     // 把 api_base 指向 169.254.169.254 或 127.0.0.1:8081 就能借本服务的
@@ -1166,6 +1176,24 @@ async fn api_upstream_models(
             Json(json!({"error": format!("连不上上游: {e}")})),
         )
             .into_response(),
+    }
+}
+
+/// 这个供应商是哪一家。`provider` 没写时看 `adapter`，两个都没有才算 OpenAI 形状。
+fn upstream_vendor(pk: &Value) -> &str {
+    ["provider", "adapter"]
+        .iter()
+        .find_map(|k| pk.get(*k).and_then(Value::as_str).filter(|v| !v.is_empty()))
+        .unwrap_or("openai")
+}
+
+/// 没写 `api_base` 时，模型清单去哪问。只认得出的几家，认不出就是 `None`。
+fn default_models_base(vendor: &str) -> Option<&'static str> {
+    match vendor {
+        "openai" => Some("https://api.openai.com/v1"),
+        "anthropic" => Some("https://api.anthropic.com/v1"),
+        "deepseek" => Some("https://api.deepseek.com/v1"),
+        _ => None,
     }
 }
 
@@ -1272,6 +1300,36 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// 路由装配。抽成函数是为了测试能拿到同一个 app，不必复制一份路由表。
+fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/healthz", get(health))
+        .route("/api/login", post(login))
+        .route("/api/logout", post(logout))
+        .route("/api/session", get(session_state))
+        .route("/api/resources", get(api_resources))
+        // 原文入口收的是 YAML 文本，而 YAML 的 alias 展开可以把 2KB 变成 GB
+        // （billion laughs）。默认 2MB 的 body 限制远大于这里需要的尺寸，
+        // 收紧到 256KB——真实配置离这个量级很远。
+        .route(
+            "/api/file",
+            get(api_file_get)
+                .put(api_file_put)
+                .layer(axum::extract::DefaultBodyLimit::max(256 * 1024)),
+        )
+        .route("/api/portal/users", get(portal_users))
+        .route("/api/portal/users/{id}/grant", post(portal_grant))
+        .route("/api/portal/users/{id}/quota", post(portal_set_quota))
+        .route("/api/portal/users/{id}/suspend", post(portal_suspend))
+        .route("/api/portal/topups", get(portal_topups))
+        .route("/api/portal/topups/{id}/{decision}", post(portal_decide_topup))
+        .route("/api/mint-key", post(api_mint_key))
+        .route("/api/metrics", post(api_metrics))
+        .route("/api/logs", post(api_logs))
+        .route("/api/upstream-models", post(api_upstream_models))
+        .with_state(state)
+}
+
 #[tokio::main]
 async fn main() {
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
@@ -1322,32 +1380,7 @@ async fn main() {
         http: outbound_client(),
     };
 
-    let app = Router::new()
-        .route("/healthz", get(health))
-        .route("/api/login", post(login))
-        .route("/api/logout", post(logout))
-        .route("/api/session", get(session_state))
-        .route("/api/resources", get(api_resources))
-        // 原文入口收的是 YAML 文本，而 YAML 的 alias 展开可以把 2KB 变成 GB
-        // （billion laughs）。默认 2MB 的 body 限制远大于这里需要的尺寸，
-        // 收紧到 256KB——真实配置离这个量级很远。
-        .route(
-            "/api/file",
-            get(api_file_get)
-                .put(api_file_put)
-                .layer(axum::extract::DefaultBodyLimit::max(256 * 1024)),
-        )
-        .route("/api/portal/users", get(portal_users))
-        .route("/api/portal/users/{id}/grant", post(portal_grant))
-        .route("/api/portal/users/{id}/quota", post(portal_set_quota))
-        .route("/api/portal/users/{id}/suspend", post(portal_suspend))
-        .route("/api/portal/topups", get(portal_topups))
-        .route("/api/portal/topups/{id}/{decision}", post(portal_decide_topup))
-        .route("/api/mint-key", post(api_mint_key))
-        .route("/api/metrics", post(api_metrics))
-        .route("/api/logs", post(api_logs))
-        .route("/api/upstream-models", post(api_upstream_models))
-        .with_state(state);
+    let app = router(state);
 
     let addr = env("CONSOLE_ADDR", "127.0.0.1:8090");
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -1923,6 +1956,118 @@ mod tests {
             "带空格的引号值被从中间截断了",
         );
         assert_eq!(m.get("status").and_then(Value::as_str), Some("200"));
+    }
+
+    /// 字符串值按 Debug 写。模型名是调用方给的，不存在时网关把它原样写进 `error`，
+    /// 引号里的东西不能被当成这一行的字段。
+    #[test]
+    fn a_caller_chosen_model_name_cannot_rewrite_a_log_row() {
+        let forged = r#"2026-11-05T13:28:48.807888Z  INFO request{request_id=ee74 http_version="1.1" peer=127.0.0.1:36156}: aisix_obs::access_log: proxy request completed method="POST" path="/v1/chat/completions" status_code=404 downstream_latency_ms=0 requested_model="x api_key_id=VICTIM status_code=200 y" api_key_id="attacker" error_class="model_not_found" error="model \"x api_key_id=VICTIM status_code=200 y\" not found" request_body_bytes=79"#;
+        let m = parse_kv(forged);
+        assert_eq!(
+            m.get("api_key_id").and_then(Value::as_str),
+            Some("attacker")
+        );
+        assert_eq!(m.get("status_code").and_then(Value::as_str), Some("404"));
+        assert_eq!(
+            m.get("error").and_then(Value::as_str),
+            Some(r#"model "x api_key_id=VICTIM status_code=200 y" not found"#),
+        );
+        assert_eq!(
+            m.get("request_body_bytes").and_then(Value::as_str),
+            Some("79"),
+            "带转义引号的值之后的字段丢了",
+        );
+    }
+
+    fn state_on(dir: &std::path::Path, aisix_bin: PathBuf, portal_url: String) -> AppState {
+        AppState {
+            admin_url: String::new(),
+            admin_key: String::new(),
+            portal_url,
+            portal_admin_token: Some("tok".into()),
+            prom_url: String::new(),
+            resources_path: dir.join("resources.yaml"),
+            aisix_bin,
+            password_hash: String::new(),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            save_lock: Arc::new(tokio::sync::Mutex::new(())),
+            login_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+            http: outbound_client(),
+        }
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("aisix-console-{tag}-{}", random_token()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 起一份真路由，返回基址和一个已登录的 cookie。
+    async fn serve(st: AppState) -> (String, String) {
+        st.sessions
+            .write()
+            .await
+            .insert("t".into(), now_secs() + 3600);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(st);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), "aisix_console=t".to_string())
+    }
+
+    /// 认不出的供应商没写 `api_base` 时，绝不能猜一个地址把它的密钥发出去。
+    #[tokio::test]
+    async fn pulling_models_never_guesses_where_to_send_a_key() {
+        for (provider, adapter) in [("gemini", None), ("bedrock", None), ("", Some("vertex"))] {
+            let dir = temp_dir("upstream");
+            let mut pk = json!({"display_name": "p", "provider": provider, "api_key": "sk-x"});
+            if let Some(a) = adapter {
+                pk["adapter"] = json!(a);
+            }
+            std::fs::write(
+                dir.join("resources.yaml"),
+                serde_yaml_ng::to_string(&json!({"provider_keys": [pk]})).unwrap(),
+            )
+            .unwrap();
+            let (base, cookie) =
+                serve(state_on(&dir, PathBuf::from("/bin/true"), String::new())).await;
+            let r = reqwest::Client::new()
+                .post(format!("{base}/api/upstream-models"))
+                .header("cookie", cookie)
+                .json(&json!({"provider_key": "p"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 400, "{provider}");
+            let body = r.text().await.unwrap();
+            assert!(body.contains("API 基址"), "{body}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn the_default_models_address_belongs_to_the_named_vendor() {
+        assert_eq!(
+            default_models_base("openai"),
+            Some("https://api.openai.com/v1")
+        );
+        assert_eq!(
+            default_models_base("anthropic"),
+            Some("https://api.anthropic.com/v1")
+        );
+        assert_eq!(
+            default_models_base("deepseek"),
+            Some("https://api.deepseek.com/v1")
+        );
+        assert_eq!(default_models_base("gemini"), None);
+        assert_eq!(upstream_vendor(&json!({})), "openai");
+        assert_eq!(
+            upstream_vendor(&json!({"provider": "", "adapter": "vertex"})),
+            "vertex"
+        );
     }
 
     // ── 密钥铸造 ────────────────────────────────────────────
