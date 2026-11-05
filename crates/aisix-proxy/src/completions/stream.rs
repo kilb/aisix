@@ -82,6 +82,9 @@ pub(super) struct CompletionSseAccumulator {
     text_cap: usize,
     first_frame: bool,
     pub(super) saw_done: bool,
+    /// Where, in the bytes of the [`Self::push`] that found it, the `[DONE]`
+    /// frame began — `0` when it began in an earlier push.
+    pub(super) done_frame_start: usize,
     pub(super) malformed_data: bool,
     pub(super) usage: Option<CompletionUsage>,
     pub(super) provider_request_id: String,
@@ -100,6 +103,7 @@ impl Default for CompletionSseAccumulator {
             text_cap: crate::token_estimate::OUTPUT_ACCUMULATION_CAP,
             first_frame: true,
             saw_done: false,
+            done_frame_start: 0,
             malformed_data: false,
             usage: None,
             provider_request_id: String::new(),
@@ -128,6 +132,9 @@ impl CompletionSseAccumulator {
             return 0;
         }
         self.observed_bytes |= !bytes.is_empty();
+        // Where the frame being read began in `bytes`: 0 for one carried over
+        // from an earlier push.
+        let mut frame_start = 0;
         for (offset, byte) in bytes.iter().enumerate() {
             loop {
                 match self.boundary.feed(*byte) {
@@ -138,14 +145,18 @@ impl CompletionSseAccumulator {
                         self.push_frame_byte(*byte);
                         self.finish_frame();
                         if self.saw_done {
+                            self.done_frame_start = frame_start;
                             return offset + 1;
                         }
+                        frame_start = offset + 1;
                     }
                     SseBoundary::EndBeforeByte => {
                         self.finish_frame();
                         if self.saw_done {
+                            self.done_frame_start = frame_start;
                             return offset;
                         }
+                        frame_start = offset;
                         continue;
                     }
                 }
@@ -484,12 +495,35 @@ where
                         error_class: "upstream_decode_error",
                     };
                     guard.drop_outcome = failure;
+                    let done_frame_start = guard
+                        .slot
+                        .as_ref()
+                        .map_or(0, |(_, accumulator)| accumulator.done_frame_start);
                     if let Some((complete, accumulator)) = guard.slot.take() {
                         complete(
                             accumulator,
                             failure,
                             CompletionOutputObservation::uninspected(),
                         );
+                    }
+                    // What came before the `[DONE]` frame in this read is
+                    // relayed as it would have been had it arrived on its
+                    // own; only the success terminal is withheld. Otherwise
+                    // what the caller saw would hang on how the upstream's
+                    // writes were coalesced on the way.
+                    if let Ok(bytes) = &item {
+                        let before_done = done_frame_start.min(bytes.len());
+                        if before_done > 0 {
+                            yield Ok(bytes.slice(..before_done));
+                            // Pending once before the failure, so the server
+                            // flushes those bytes first. Polled again at once,
+                            // it would buffer them and abort the response on
+                            // the error with them still unsent — the same
+                            // bytes arriving in their own read reach the
+                            // caller because the wait for the next read is
+                            // that pause.
+                            tokio::task::yield_now().await;
+                        }
                     }
                     yield Err(BridgeError::UpstreamDecode(
                         "malformed SSE data before [DONE]".into(),
@@ -901,6 +935,32 @@ mod tests {
                 error_class: "upstream_decode_error",
             })
         );
+    }
+
+    /// The malformed frame and `[DONE]` arriving in ONE upstream read must be
+    /// relayed the same way as when they arrive in two: everything before the
+    /// `[DONE]` frame reaches the caller, then the decode failure. Dropping
+    /// the whole read made what the caller saw depend on how the upstream's
+    /// writes were coalesced on the way.
+    #[tokio::test]
+    async fn malformed_data_coalesced_with_done_is_still_relayed() {
+        let upstream: CompletionByteStream = Box::pin(futures::stream::iter([
+            Ok(bytes::Bytes::from(frame("partial", true))),
+            Ok(bytes::Bytes::from_static(
+                b"data: not-json\n\ndata: [DONE]\n\n",
+            )),
+        ]));
+        let stream =
+            build_completion_passthrough_stream(upstream, None, "model".to_string(), |_, _, _| {});
+        futures::pin_mut!(stream);
+        let first = stream.next().await.unwrap().unwrap();
+        let second = stream.next().await.unwrap().unwrap();
+        let terminal = stream.next().await.unwrap().unwrap_err();
+
+        assert!(String::from_utf8_lossy(&first).contains("partial"));
+        assert_eq!(&second[..], b"data: not-json\n\n");
+        assert!(matches!(terminal, BridgeError::UpstreamDecode(_)));
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]

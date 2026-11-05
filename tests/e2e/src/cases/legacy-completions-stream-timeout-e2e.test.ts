@@ -165,6 +165,7 @@ describe("legacy completions stream timeout", () => {
   let malformed: OpenAiUpstream | undefined;
   let malformedDone: OpenAiUpstream | undefined;
   let doneTrailer: OpenAiUpstream | undefined;
+  let malformedWithDone: OpenAiUpstream | undefined;
   let slowModelId = "";
   let midModelId = "";
   let truncatedModelId = "";
@@ -208,6 +209,15 @@ describe("legacy completions stream timeout", () => {
         `data: ${chunk("complete-before-done")}\n\ndata: [DONE]\n\ndata: not-json-after-done\n\n`,
       ],
     });
+    // The same malformed stream, with the bad event and [DONE] written in one
+    // go: how the upstream's writes are split on the way must not change what
+    // the caller gets.
+    malformedWithDone = await startOpenAiUpstream({
+      rawSseChunks: [
+        `data: ${chunk("billed-before-coalesced-done")}\n\n`,
+        "data: not-json-coalesced\n\ndata: [DONE]\n\n",
+      ],
+    });
 
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
@@ -227,6 +237,10 @@ describe("legacy completions stream timeout", () => {
     const malformedDonePk = await providerKey(
       "legacy-malformed-before-done",
       malformedDone,
+    );
+    const malformedWithDonePk = await providerKey(
+      "legacy-malformed-with-done",
+      malformedWithDone,
     );
     const doneTrailerPk = await providerKey(
       "legacy-done-with-trailer",
@@ -282,6 +296,14 @@ describe("legacy completions stream timeout", () => {
     });
     malformedDoneModelId = malformedDoneModel.id;
     await seed.createModel({
+      display_name: "legacy-malformed-with-done",
+      provider: "openai",
+      model_name: "gpt-3.5-turbo-instruct",
+      provider_key_id: malformedWithDonePk,
+      retries: 0,
+      cooldown: { default_seconds: 60 },
+    });
+    await seed.createModel({
       display_name: "legacy-done-with-trailer",
       provider: "openai",
       model_name: "gpt-3.5-turbo-instruct",
@@ -300,6 +322,7 @@ describe("legacy completions stream timeout", () => {
         "legacy-truncated",
         "legacy-malformed",
         "legacy-malformed-before-done",
+        "legacy-malformed-with-done",
         "legacy-done-with-trailer",
       ],
     });
@@ -319,6 +342,7 @@ describe("legacy completions stream timeout", () => {
         ids.has("legacy-truncated") &&
         ids.has("legacy-malformed") &&
         ids.has("legacy-malformed-before-done") &&
+        ids.has("legacy-malformed-with-done") &&
         ids.has("legacy-done-with-trailer")
       );
     });
@@ -333,6 +357,7 @@ describe("legacy completions stream timeout", () => {
       malformed?.close(),
       malformedDone?.close(),
       doneTrailer?.close(),
+      malformedWithDone?.close(),
     ]);
   });
 
@@ -477,6 +502,19 @@ describe("legacy completions stream timeout", () => {
         (await outputTokenCounter("legacy-malformed-before-done")) >
         outputBaseline,
     );
+  });
+
+  test("malformed SSE written together with DONE reaches the caller the same way", async (ctx) => {
+    if (!etcdReachable || !app || !malformedWithDone) {
+      ctx.skip();
+      return;
+    }
+    const response = await completion("legacy-malformed-with-done");
+    expect(response.status).toBe(200);
+    const body = await readCommittedStream(response);
+    expect(body).toContain("billed-before-coalesced-done");
+    expect(body).toContain("not-json-coalesced");
+    expect(body).not.toContain("[DONE]");
   });
 
   test("DONE cuts off malformed data coalesced into the same upstream chunk", async (ctx) => {
