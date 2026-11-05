@@ -1044,23 +1044,25 @@ mod abuse_tests {
     /// 两个同时来的登录都该拿到真正的判定。
     #[tokio::test]
     async fn 登录在闸前排队_不是一见忙就拒() {
+        // 闸自己占住，而不是靠两次 argon2 撞时间：机器一忙，那种写法就成了随机失败。
         let store = Store::open_memory().await.unwrap();
-        let base = serve(AppState::with_admin_token(store, 1, None)).await;
-        let attempt = |email: &'static str| {
-            let url = format!("{base}/api/login");
-            async move {
-                reqwest::Client::new()
-                    .post(url)
-                    .json(&json!({"email": email, "password": "wrong wrong wrong"}))
-                    .send()
-                    .await
-                    .unwrap()
-                    .status()
-                    .as_u16()
-            }
-        };
-        let (a, b) = tokio::join!(attempt("a@b.c"), attempt("b@b.c"));
-        assert_eq!((a, b), (401, 401));
+        let state = AppState::with_admin_token(store, 1, None);
+        let busy = state.hold_gate().await;
+        let base = serve(state).await;
+        let login = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{base}/api/login"))
+                .json(&json!({"email": "a@b.c", "password": "wrong wrong wrong"}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!login.is_finished(), "闸忙着时登录没有排队，直接回了");
+        drop(busy);
+        assert_eq!(login.await.unwrap(), 401);
     }
 }
 

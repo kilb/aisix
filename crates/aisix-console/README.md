@@ -55,9 +55,16 @@ validate` 二进制、resources schema 的字段名、`aisix_*` 指标名、Admi
    一定会漂移，而漂移方向永远是「控制台放行了网关拒绝的东西」）；
 3. 校验通过才 `rename` 覆盖，坏配置绝不落盘；
 4. `pkill -HUP -x aisix` 热加载。控制台以 `aisix` 用户运行，所以能直接给同
-   用户的网关进程发信号，不需要任何 sudo 授权。信号送到不等于网关收下了：配了
-   `AISIX_STATUS_URL`（网关指标口的基址）时，控制台会问它的 `/status/config`，把
-   「已用上」和「拒收，原因是……」如实告诉界面；没配就只说信号发出去了。
+   用户的网关进程发信号，不需要任何 sudo 授权。信号没送到时文件已经写了，界面
+   会说网关还在用旧配置。
+5. 确认网关收下了：问网关的 `/status/config`（`AISIX_STATUS_URL`，网关指标口的
+   基址，即 `observability.metrics.prometheus.addr`）。网关拒收就把文件恢复成
+   保存前的样子，并把原因告诉界面。
+
+**部署时必须设 `AISIX_STATUS_URL`。** 回滚全靠它：不设的话控制台发现不了拒收，
+被拒的文件就留在盘上 —— 之后谁写都被网关整份拒收（门户的停用密钥也不生效），
+网关下次重启干脆起不来。控制台启动时没设会在日志里告警；界面上每次保存都只能
+说「已通知网关重载（未确认是否用上）」。
 
 控制台一旦接管 `resources.yaml`，就由它整体重写 —— 手写的注释会在第一次保存
 后消失。原始带注释的版本留在 `/etc/aisix/resources.yaml.orig`。
@@ -85,6 +92,7 @@ AISIX_ADMIN_URL=http://127.0.0.1:8081 \
 PROMETHEUS_URL=http://127.0.0.1:9090 \
 AISIX_RESOURCES=/path/to/resources.yaml \
 AISIX_BIN=/path/to/aisix \
+AISIX_STATUS_URL=http://127.0.0.1:<网关指标口> \
 CONSOLE_ADDR=127.0.0.1:8090 \
 cargo run --release
 ```

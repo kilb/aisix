@@ -351,6 +351,12 @@ impl AppState {
         self.verifications.load(Ordering::SeqCst)
     }
 
+    /// 占住 argon2 闸的唯一许可，模拟它正忙。
+    #[cfg(test)]
+    pub async fn hold_gate(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.gate.clone().acquire_owned().await.unwrap()
+    }
+
     /// 换一个注册上限，让用例不必真的注册六十个人。
     #[cfg(test)]
     pub fn with_register_max(mut self, max: usize) -> Self {

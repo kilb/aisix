@@ -1117,21 +1117,13 @@ async fn api_file_put(
     }
     // 原文优先：两个字段都给时以原文为准，因为那是用户实际看到并编辑的东西。
     let doc = match (&req.raw, &req.doc) {
-        (Some(text), _) if yaml_has_alias(text) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "原文里不能用 YAML 别名（*名字）：请把它展开再保存"})),
-            )
-                .into_response();
-        }
-        (Some(text), _) => match serde_yaml_ng::from_str::<Value>(text) {
+        (Some(text), _) => match yaml_refusal(text).map_or_else(
+            || serde_yaml_ng::from_str::<Value>(text).map_err(|e| format!("YAML 解析失败：{e}")),
+            Err,
+        ) {
             Ok(v) => v,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": format!("YAML 解析失败：{e}")})),
-                )
-                    .into_response();
+            Err(why) => {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error": why}))).into_response();
             }
         },
         (None, Some(d)) => d.clone(),
@@ -1177,18 +1169,24 @@ async fn api_file_put(
     }
 }
 
-/// 文本里有没有 YAML 别名。只过一遍事件流，不展开。
+/// 原文能不能拿去解析。不能就是给人看的原因。只过一遍事件流，不展开。
 ///
 /// 别名的展开没有总量上限（serde_yaml_ng 只限跳转次数）：N 个别名指向一个 N 项的锚
 /// 就是 N² 个节点，二十 KB 的原文能把控制台撑到六百多 MB。控制台保存时本来就把别名
-/// 展开写回，所以原文里不需要它。解析不了的交给后面的解析去报错。
-fn yaml_has_alias(text: &str) -> bool {
+/// 展开写回，所以原文里不需要它。
+///
+/// 这一步读不懂的也拒：后面解析用的是另一个库，这一步报错时若当成「没有别名」放过去，
+/// 两个解析器在边角上读法不一，别名就可能从这道缝里过去。网关读配置用的也是这一个库。
+fn yaml_refusal(text: &str) -> Option<String> {
     use yaml_rust2::parser::{Event, Parser};
     let mut parser = Parser::new_from_str(text);
     loop {
         match parser.next_token() {
-            Ok((Event::Alias(_), _)) => return true,
-            Ok((Event::StreamEnd, _)) | Err(_) => return false,
+            Ok((Event::Alias(_), _)) => {
+                return Some("原文里不能用 YAML 别名（*名字）：请把它展开再保存".into());
+            }
+            Ok((Event::StreamEnd, _)) => return None,
+            Err(e) => return Some(format!("YAML 解析失败：{e}")),
             Ok(_) => {}
         }
     }
@@ -1666,6 +1664,16 @@ fn password_to_hash(arg: Option<&str>, mut stdin: impl std::io::BufRead) -> Opti
     (!p.is_empty()).then(|| p.to_string())
 }
 
+/// 没设 `AISIX_STATUS_URL` 时启动要说的话。它不是可有可无的：网关拒收的保存全靠它才
+/// 发现得了、回滚得了。
+fn status_url_warning(status_url: Option<&str>) -> Option<&'static str> {
+    status_url.is_none().then_some(
+        "警告：AISIX_STATUS_URL 未设置。控制台发现不了网关拒收的保存，也就不会回滚：\
+         被拒的文件会留在盘上，之后的每次写都被网关整份拒收，网关下次重启起不来。\
+         请设成网关指标口的基址（observability.metrics.prometheus.addr）。",
+    )
+}
+
 /// 路由装配。抽成函数是为了测试能拿到同一个 app，不必复制一份路由表。
 fn router(state: AppState) -> Router {
     // 公开的几条：不需要会话。
@@ -1771,6 +1779,10 @@ async fn main() {
         login_gate: Arc::new(tokio::sync::Semaphore::new(2)),
         http: outbound_client(),
     };
+
+    if let Some(warning) = status_url_warning(state.status_url.as_deref()) {
+        eprintln!("{warning}");
+    }
 
     let app = router(state);
 
@@ -2549,22 +2561,23 @@ mod tests {
             .hash_password(b"right", &salt)
             .unwrap()
             .to_string();
+        // 闸自己占住，而不是靠几次 argon2 撞时间：机器一忙，那种写法就成了随机失败。
+        let busy = st.login_gate.clone().acquire_owned().await.unwrap();
         let (base, _) = serve(st).await;
-        let attempt = |pw: &'static str| {
-            let url = format!("{base}/api/login");
-            async move {
-                reqwest::Client::new()
-                    .post(url)
-                    .json(&json!({"password": pw}))
-                    .send()
-                    .await
-                    .unwrap()
-                    .status()
-                    .as_u16()
-            }
-        };
-        let (a, b, c) = tokio::join!(attempt("wrong"), attempt("wrong"), attempt("right"));
-        assert_eq!((a, b, c), (401, 401, 200));
+        let login = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{base}/api/login"))
+                .json(&json!({"password": "right"}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!login.is_finished(), "闸忙着时登录没有排队，直接回了");
+        drop(busy);
+        assert_eq!(login.await.unwrap(), 200);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2727,13 +2740,18 @@ mod tests {
             .unwrap();
         assert_eq!(r.status(), 400);
         assert!(r.text().await.unwrap().contains("别名"));
-        assert!(!yaml_has_alias(
-            "models:\n- display_name: openai/*\n  model_name: '*'\n"
-        ));
-        assert!(!yaml_has_alias(
-            "guardrails:\n- name: g\n  script: |\n    * a * b\n"
-        ));
-        assert!(yaml_has_alias("a: &x 1\nb: *x\n"));
+        assert_eq!(
+            yaml_refusal("models:\n- display_name: openai/*\n  model_name: '*'\n"),
+            None
+        );
+        assert_eq!(
+            yaml_refusal("guardrails:\n- name: g\n  script: |\n    * a * b\n"),
+            None
+        );
+        assert!(yaml_refusal("a: &x 1\nb: *x\n").is_some_and(|w| w.contains("别名")));
+        // 这一步读不懂的不能当成「没有别名」放过去。
+        assert!(yaml_refusal("a: [1, 2\n").is_some_and(|w| w.contains("解析失败")));
+        assert!(yaml_refusal("a: *undefined\n").is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2799,12 +2817,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 回滚全靠它，所以没设时启动要说出后果。
+    #[test]
+    fn starting_without_a_status_url_warns_that_rejected_saves_stay() {
+        let w = status_url_warning(None).expect("没设却不告警");
+        assert!(
+            w.contains("AISIX_STATUS_URL") && w.contains("不会回滚"),
+            "{w}"
+        );
+        assert!(w.contains("起不来"), "{w}");
+        assert_eq!(status_url_warning(Some("http://127.0.0.1:9100")), None);
+        let src = include_str!("main.rs");
+        let main_fn = src
+            .split_once("\n#[cfg(test)]")
+            .map_or(src, |(p, _)| p)
+            .split_once("async fn main()")
+            .map(|(_, r)| r)
+            .unwrap();
+        assert!(main_fn.contains("status_url_warning(state.status_url"));
+    }
+
     /// 生产上用的就是 `pkill`；测试里的替身只在测试状态里。
     #[test]
     fn production_reloads_the_gateway_with_pkill() {
         assert_eq!(RELOAD_COMMAND, ["pkill", "-HUP", "-x", "aisix"]);
         let src = include_str!("main.rs");
         let main_fn = src
+            .split_once("\n#[cfg(test)]")
+            .map_or(src, |(p, _)| p)
             .split_once("async fn main()")
             .map(|(_, rest)| rest)
             .unwrap();
