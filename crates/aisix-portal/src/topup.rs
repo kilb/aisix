@@ -40,6 +40,9 @@ const MAX_PENDING_TOPUPS: i64 = 5;
 /// 定一个的话，迟早只有一处被调。
 pub const MAX_TOPUP_MICRO_USD: i64 = 10_000_000_000;
 
+/// 备注的长度上限。转账单号用不了更长，而它会一直留在表里、显示在管理员的待办上。
+const MAX_NOTE_CHARS: usize = 200;
+
 #[derive(Deserialize)]
 pub struct CreateReq {
     /// 有意收 `i64`：负数要能进来才能被明确拒绝，收 u64 会在反序列化就失败，
@@ -63,6 +66,13 @@ pub async fn create(
     }
     if req.micro_usd > MAX_TOPUP_MICRO_USD {
         return bad("单笔充值金额过大，请联系管理员");
+    }
+    if req
+        .note
+        .as_deref()
+        .is_some_and(|n| n.chars().count() > MAX_NOTE_CHARS)
+    {
+        return bad("备注过长");
     }
     // 未处理的申请有个数上限。不设的话，一个登录用户可以一直提，把管理员的待办
     // 列表和这张表一起刷爆 —— 而管理员没法批量清理（只能一笔笔驳回）。

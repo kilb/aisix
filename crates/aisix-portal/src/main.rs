@@ -30,6 +30,10 @@ use store::Store;
 /// 陌生人，不闸就是一条内存耗尽 DoS。
 const ARGON2_GATE_PERMITS: usize = 4;
 
+/// 请求体上限。门户的接口收的都是几个短字段；框架默认的 2 MiB 只是在替未认证的
+/// 调用方放大它能塞进来的东西。
+const MAX_BODY_BYTES: usize = 16 * 1024;
+
 /// 路由装配。抽成函数是为了测试能拿到同一个 app 而不必复制路由表 ——
 /// 复制出来的路由表迟早跟生产的那份漂开。
 pub fn router(state: AppState) -> Router {
@@ -55,6 +59,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/users/{id}/grant", post(admin::grant))
         .route("/admin/users/{id}/quota", post(admin::set_quota))
         .route("/admin/users/{id}/suspend", post(admin::suspend))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 
@@ -818,6 +823,206 @@ mod login_tests {
             .await;
         assert_eq!(reg, 429, "注册没有过闸");
         assert_eq!(log, 429, "登录没有过闸");
+    }
+}
+
+#[cfg(test)]
+mod oversized_input_tests {
+    use super::testutil::TestApp;
+    use serde_json::json;
+
+    /// 登录失败要按邮箱记一条，留在内存里一分钟。记的是调用方给的原文的话，未认证
+    /// 的请求就能用超长「邮箱」把门户撑到 OOM，而对账环跑在同一个进程里。
+    #[tokio::test]
+    async fn 超长邮箱的登录失败不留在内存里() {
+        let app = TestApp::start().await;
+        let (s, _) = app
+            .post(
+                "/api/login",
+                json!({"email": format!("{}@b.c", "x".repeat(8_000)), "password": "p"}),
+            )
+            .await;
+        assert_eq!(s, 401);
+        assert_eq!(app.state.failure_key_bytes().await, 0);
+
+        // 对照：正常长度的失败仍然记下，否则上面那条断言什么也没量到。
+        let (s, _) = app
+            .post("/api/login", json!({"email": "a@b.c", "password": "p"}))
+            .await;
+        assert_eq!(s, 401);
+        assert_eq!(app.state.failure_key_bytes().await, "a@b.c".len());
+    }
+
+    #[tokio::test]
+    async fn 请求体超过上限直接拒绝() {
+        let app = TestApp::start().await;
+        let (s, _) = app
+            .post(
+                "/api/login",
+                json!({"email": "x".repeat(1_000_000), "password": "p"}),
+            )
+            .await;
+        assert_eq!(s, 413);
+        assert_eq!(app.state.failure_key_bytes().await, 0);
+    }
+
+    #[tokio::test]
+    async fn 注册拒绝超长的邮箱与展示名() {
+        let app = TestApp::start().await;
+        let (s, _) = app
+            .post(
+                "/api/register",
+                json!({"email": format!("{}@b.c", "x".repeat(300)), "password": "correct horse battery"}),
+            )
+            .await;
+        assert_eq!(s, 400);
+        let (s, _) = app
+            .post(
+                "/api/register",
+                json!({"email": "a@b.c", "password": "correct horse battery", "display_name": "名".repeat(129)}),
+            )
+            .await;
+        assert_eq!(s, 400);
+        assert!(app.store.user_by_email("a@b.c").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn 充值备注有长度上限() {
+        let app = TestApp::start().await;
+        app.register("a@b.c", "correct horse battery").await;
+        let (s, _) = app
+            .post(
+                "/api/login",
+                json!({"email": "a@b.c", "password": "correct horse battery"}),
+            )
+            .await;
+        assert_eq!(s, 200);
+        let (s, _) = app
+            .post(
+                "/api/topups",
+                json!({"micro_usd": 1_000_000, "note": "备".repeat(201)}),
+            )
+            .await;
+        assert_eq!(s, 400);
+        let (s, _) = app
+            .post(
+                "/api/topups",
+                json!({"micro_usd": 1_000_000, "note": "备".repeat(200)}),
+            )
+            .await;
+        assert_eq!(s, 201);
+    }
+}
+
+#[cfg(test)]
+mod disconnect_tests {
+    use super::*;
+    use serde_json::{json, Value};
+    use tokio::io::AsyncWriteExt;
+
+    /// 真监听、真文件库：客户端在设额度的请求途中断开。
+    ///
+    /// 事务被丢在半路时，连接带着写锁回到池里 —— 之后别的连接上的写全撞
+    /// `busy_timeout`，对账环入账失败，这一轮连停用密钥都走不到。用文件库是因为
+    /// 要的正是文件锁的行为。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn 客户端在设额度途中断开_之后的写不受影响() {
+        let dir = std::env::temp_dir().join(format!("aisix-disc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&format!("sqlite:{}", dir.join("portal.db").display()))
+            .await
+            .unwrap();
+        let path = testutil::temp_resources(
+            "_format_version: \"1\"\nprovider_keys:\n  - {display_name: p, provider: openai, api_key: k}\nmodels:\n  - {display_name: m, provider: openai, provider_key: p, model_name: m}\n",
+        );
+        let state = AppState::build(store, 4, Some("tok".into()), String::new(), path);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(state);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base = format!("http://{addr}");
+        let http = reqwest::Client::new();
+        let body = json!({"email": "d@b.c", "password": "correct horse battery"});
+        let reg: Value = http
+            .post(format!("{base}/api/register"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let login = http
+            .post(format!("{base}/api/login"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let cookie = login.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        http.post(format!(
+            "{base}/admin/users/{}/quota",
+            reg["user_id"].as_str().unwrap()
+        ))
+        .bearer_auth("tok")
+        .json(&json!({"micro_usd": 1_000_000_000}))
+        .send()
+        .await
+        .unwrap();
+        let minted: Value = http
+            .post(format!("{base}/api/keys"))
+            .header("cookie", &cookie)
+            .json(&json!({"label": "k"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let name = minted["name"].as_str().unwrap();
+
+        let quota = r#"{"micro_usd":1000}"#;
+        let raw = format!(
+            "PUT /api/keys/{name}/quota HTTP/1.1\r\nhost: x\r\ncookie: {cookie}\r\n\
+             content-type: application/json\r\ncontent-length: {}\r\n\r\n{quota}",
+            quota.len()
+        );
+        for round in 0..40u64 {
+            let mut set = tokio::task::JoinSet::new();
+            for i in 0..64u64 {
+                let raw = raw.clone();
+                set.spawn(async move {
+                    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    let _ = s.write_all(raw.as_bytes()).await;
+                    // 断开的时机扫一遍：请求走到哪一步被丢下，要看它落在哪个 await 上。
+                    tokio::time::sleep(std::time::Duration::from_micros(
+                        (round * 7 + i * 21) % 1300,
+                    ))
+                    .await;
+                    let _ = s.set_linger(Some(std::time::Duration::ZERO));
+                });
+            }
+            while set.join_next().await.is_some() {}
+        }
+
+        for micro in [2_000, 3_000, 4_000] {
+            let r = http
+                .put(format!("{base}/api/keys/{name}/quota"))
+                .header("cookie", &cookie)
+                .json(&json!({"micro_usd": micro}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200, "断开之后设额度失败：写锁被留下的事务占着");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

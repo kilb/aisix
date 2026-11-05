@@ -219,27 +219,45 @@ impl Store {
     /// `IMMEDIATE` 一开始就拿写锁，于是第二个事务是**等待**而不是失败。
     ///
     /// 单条 INSERT 不需要这个（一条语句本身原子）；先读后写的才需要。
+    ///
+    /// **整段跑在独立任务里。** 客户端断开时 axum 会直接丢弃 handler 的 future；
+    /// 丢在 `BEGIN` 与 `COMMIT` 之间的话，连接带着没结束的事务回到池里，写锁一直
+    /// 不放：别的连接上的写全部撞 `busy_timeout`，这条连接上的单条写返回成功却永远
+    /// 不提交，连接关掉时一起消失，而对账环入账失败，这一轮连停用密钥都走不到。
+    /// `Pool::begin_with` 的回滚守卫挡不全：实测断开得够多时，它自己也会留下
+    /// 「事务深度不为零」的连接。
     pub async fn immediate_tx<T, F>(&self, f: F) -> Result<T, StoreError>
     where
+        T: Send + 'static,
+        F: Send + 'static,
         F: for<'c> FnOnce(
             &'c mut sqlx::SqliteConnection,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<T, StoreError>> + Send + 'c>,
         >,
     {
-        let mut conn = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
-        match f(&mut conn).await {
-            Ok(v) => {
-                sqlx::query("COMMIT").execute(&mut *conn).await?;
-                Ok(v)
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            let mut conn = pool.acquire().await?;
+            sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+            match f(&mut conn).await {
+                Ok(v) => {
+                    if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
+                        // `COMMIT` 失败时事务还开着，不收掉就是上面说的那个状态。
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        return Err(e.into());
+                    }
+                    Ok(v)
+                }
+                Err(e) => {
+                    // 回滚失败也不掩盖原始错误 —— 那才是要报出去的东西。
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    Err(e)
+                }
             }
-            Err(e) => {
-                // 回滚失败也不掩盖原始错误 —— 那才是要报出去的东西。
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                Err(e)
-            }
-        }
+        })
+        .await
+        .map_err(|e| StoreError::Db(sqlx::Error::Protocol(format!("账本事务任务异常结束: {e}"))))?
     }
 
     pub async fn insert_user(
@@ -723,6 +741,67 @@ mod tests {
             checked >= 2,
             "expected the database and at least one WAL sibling to exist, checked {checked}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 调用方被取消（客户端断开时 axum 直接丢弃 handler 的 future）不能把事务留在
+    /// 半路 —— 否则写锁一直不放，之后所有的写都失败。
+    #[tokio::test]
+    async fn 调用方被取消时事务照样走完_不留下写锁() {
+        let dir = std::env::temp_dir().join(format!("aisix-portal-tx-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&format!("sqlite:{}", dir.join("portal.db").display()))
+            .await
+            .unwrap();
+        store.insert_user("u1", "a@b.c", "h", None).await.unwrap();
+
+        let (started_tx, started) = tokio::sync::oneshot::channel::<()>();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let s2 = store.clone();
+        let caller = tokio::spawn(async move {
+            s2.immediate_tx(move |conn| {
+                Box::pin(async move {
+                    crate::ledger::insert_entry(
+                        &mut *conn,
+                        "u1",
+                        7,
+                        crate::ledger::Source::AdminGrant,
+                        None,
+                    )
+                    .await?;
+                    let _ = started_tx.send(());
+                    let _ = released.await;
+                    Ok(())
+                })
+            })
+            .await
+        });
+        started.await.unwrap();
+        caller.abort();
+        let _ = caller.await;
+        let _ = release.send(());
+
+        store
+            .immediate_tx(|conn| {
+                Box::pin(async move {
+                    crate::ledger::insert_entry(
+                        &mut *conn,
+                        "u1",
+                        2,
+                        crate::ledger::Source::AdminGrant,
+                        None,
+                    )
+                    .await
+                })
+            })
+            .await
+            .expect("上一个调用方被取消之后，这条写被它留下的事务挡住了");
+        let (sum,): (i64,) = sqlx::query_as("SELECT SUM(delta_micro_usd) FROM ledger")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(sum, 9, "被取消的那个事务应当走完并提交");
+        store.pool().close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 

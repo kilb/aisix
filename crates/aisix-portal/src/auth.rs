@@ -30,6 +30,13 @@ use crate::store::{Store, StoreError};
 /// 口令下限。低于此长度的口令挡在注册处，而不是留给用户自己负责。
 const MIN_PASSWORD_LEN: usize = 12;
 const SESSION_TTL_SECS: u64 = 12 * 3600;
+/// 邮箱的长度上限（SMTP 路径本身就不超过这个数）。
+///
+/// 登录失败要按邮箱记一条冷却记录，留在内存里一分钟。不设上限的话，未认证的请求
+/// 可以用每次一个请求体大小的「邮箱」把门户撑到 OOM，而对账环就跑在同一个进程里。
+const MAX_EMAIL_BYTES: usize = 254;
+/// 展示名的长度上限。它进库之后每轮对账都跟着读出来。
+const MAX_DISPLAY_NAME_CHARS: usize = 128;
 /// 同一个邮箱连续失败多少次之后进入冷却。
 const LOGIN_FAILURES_BEFORE_COOLDOWN: u32 = 5;
 /// 铸密钥的频率窗口。
@@ -296,6 +303,12 @@ impl AppState {
     pub fn verification_count(&self) -> u64 {
         self.verifications.load(Ordering::SeqCst)
     }
+
+    /// 失败记录占着的键字节数。测试用来断言超长输入没有留在内存里。
+    #[cfg(test)]
+    pub async fn failure_key_bytes(&self) -> usize {
+        self.failures.read().await.keys().map(String::len).sum()
+    }
 }
 
 #[derive(Deserialize)]
@@ -316,6 +329,13 @@ pub async fn register(State(st): State<AppState>, Json(req): Json<RegisterReq>) 
     let email = req.email.trim().to_ascii_lowercase();
     if !plausible_email(&email) {
         return bad_request("邮箱格式不正确");
+    }
+    if req
+        .display_name
+        .as_deref()
+        .is_some_and(|n| n.chars().count() > MAX_DISPLAY_NAME_CHARS)
+    {
+        return bad_request("显示名称过长");
     }
     if req.password.chars().count() < MIN_PASSWORD_LEN {
         return bad_request(&format!("口令至少 {MIN_PASSWORD_LEN} 个字符"));
@@ -350,11 +370,15 @@ pub struct LoginReq {
 
 /// `POST /api/login`
 pub async fn login(State(st): State<AppState>, Json(req): Json<LoginReq>) -> Response {
+    let email = req.email.trim().to_ascii_lowercase();
+    // 这么长的不可能是账号（注册处就挡了）。在这里挡，它就进不了下面的失败记录。
+    if email.len() > MAX_EMAIL_BYTES {
+        return invalid_credentials();
+    }
+
     let Ok(_permit) = st.gate.try_acquire() else {
         return busy();
     };
-
-    let email = req.email.trim().to_ascii_lowercase();
 
     // 连续失败太多次就先冷却。**在跑 argon2 之前挡**，否则爆破照样能让每次尝试
     // 都吃掉一次 19 MiB 的散列计算。
@@ -397,11 +421,7 @@ pub async fn login(State(st): State<AppState>, Json(req): Json<LoginReq>) -> Res
     let Some(uid) = expect_id.filter(|_| ok) else {
         st.note_failure(&email).await;
         // 口令错、账号不存在、账号被停用 —— 三者返回完全一致。
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "邮箱或口令不正确"})),
-        )
-            .into_response();
+        return invalid_credentials();
     };
     // 成功就清计数：一个人偶尔输错几次，攒够阈值就被锁在门外才是更常见的伤害。
     st.clear_failures(&email).await;
@@ -481,11 +501,22 @@ fn now_secs() -> u64 {
 /// 只做最低限度的形状检查。真正的可达性由邮箱验证流程负责（一期不做，
 /// 见计划裁决 4），这里挡掉的是明显不是邮箱的输入。
 fn plausible_email(s: &str) -> bool {
+    if s.len() > MAX_EMAIL_BYTES {
+        return false;
+    }
     let mut parts = s.split('@');
     let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
         return false;
     };
     !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
+}
+
+fn invalid_credentials() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": "邮箱或口令不正确"})),
+    )
+        .into_response()
 }
 
 fn busy() -> Response {
