@@ -4886,10 +4886,9 @@ data: [DONE]\n\n"
     /// land here — and the guardrail chain has already run and already
     /// failed open by then.
     ///
-    /// The second key's budget is exhausted, a refusal that comes after the
-    /// chain has run: a limit a remote check reserves ahead of would refuse
-    /// before it (`quota::reserve_before_costly_check`). The first key's
-    /// request goes upstream unscreened, the second's is refused before
+    /// The second model's provider key has an exhausted budget, a refusal that
+    /// comes from target resolution, after the chain has run. The first
+    /// request goes upstream unscreened, the second is refused before
     /// dispatch. Both events must name the bypass; the refusal is not what
     /// stopped the FIRST one from leaving.
     #[tokio::test]
@@ -4920,18 +4919,29 @@ data: [DONE]\n\n"
             "rl-open",
             serde_json::json!({}),
         ));
-        snap.apikeys.insert(apikey_entry("sk-caller", &["rl-open"]));
-        let budgeted = apikey_entry("sk-budgeted", &["rl-open"]);
-        let budgeted = ResourceEntry::new("key-id-budgeted", (*budgeted.value).clone(), 1);
-        snap.apikeys.insert(budgeted);
+        const SPENT_PK: &str = "22222222-2222-2222-2222-222222222222";
+        let spent_pk = provider_key_entry(&upstream.uri());
+        snap.provider_keys
+            .insert(ResourceEntry::new(SPENT_PK, (*spent_pk.value).clone(), 1));
+        let spent_model: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "rl-spent",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": SPENT_PK,
+        }))
+        .unwrap();
+        snap.models
+            .insert(ResourceEntry::new("model-id-spent", spent_model, 1));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["rl-open", "rl-spent"]));
         let budget: aisix_core::models::Budget = serde_json::from_value(serde_json::json!({
-            "scope": "api_key",
-            "scope_ref": "key-id-budgeted",
+            "scope": "provider_key",
+            "scope_ref": SPENT_PK,
             "period": "month",
             "exhausted": {"reason": {
                 "message": "monthly cap exceeded",
-                "scope": "api_key",
-                "scope_ref": "key-id-budgeted",
+                "scope": "provider_key",
+                "scope_ref": SPENT_PK,
                 "limit_usd": "10.00",
                 "spent_usd": "10.50",
                 "period": "month"
@@ -4957,25 +4967,29 @@ data: [DONE]\n\n"
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
 
-        let make_req = |key: &str| {
+        let make_req = |model: &str| {
             Request::builder()
                 .method("POST")
                 .uri("/v1/chat/completions")
-                .header("authorization", format!("Bearer {key}"))
+                .header("authorization", "Bearer sk-caller")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"model":"rl-open","messages":[{"role":"user","content":"go"}]}"#,
+                    serde_json::json!({
+                        "model": model,
+                        "messages": [{"role": "user", "content": "go"}]
+                    })
+                    .to_string(),
                 ))
                 .unwrap()
         };
 
-        let first = run(build_router(state.clone()), make_req("sk-caller")).await;
+        let first = run(build_router(state.clone()), make_req("rl-open")).await;
         assert_eq!(
             first.status(),
             StatusCode::OK,
             "premise: a fail-open row must not refuse",
         );
-        let second = run(build_router(state.clone()), make_req("sk-budgeted")).await;
+        let second = run(build_router(state.clone()), make_req("rl-spent")).await;
         assert_eq!(
             second.status(),
             StatusCode::TOO_MANY_REQUESTS,

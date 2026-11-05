@@ -1713,7 +1713,7 @@ async fn dispatch(
     );
     let early_reservation = crate::quota::reserve_before_costly_check(
         resolved_chain.as_ref(),
-        crate::quota::enforce_rate_limit(state, snapshot, auth, Some(&model_rl)),
+        crate::quota::enforce(state, snapshot, auth, Some(&model_rl)),
     )
     .await
     .map_err(&with_model)?;
