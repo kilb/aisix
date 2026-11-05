@@ -3614,11 +3614,11 @@ fn tool_message_from_tool_result(block: &serde_json::Value, markers: CacheMarker
             }
             // Text only, always. OpenAI rejects a `tool` message carrying
             // an image part outright ("Image URLs are only allowed for
-            // messages with role 'user'"), and no bridge reads blocks off
-            // a tool message — an Anthropic target filters a tool result
-            // back down to its text blocks — so forwarding the image
-            // turned a tool result that used to answer into a 400 without
-            // any upstream gaining the image.
+            // messages with role 'user'"), and an Anthropic target filters a
+            // tool result back down to its text blocks. Only Converse reads
+            // media off a tool message, and the target is not known here, so
+            // forwarding the image would turn a tool result that answers into
+            // a 400 on every other route.
             (Some(text), None)
         }
         _ => (Some(String::new()), None),
