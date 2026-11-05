@@ -2022,7 +2022,7 @@ async fn anthropic_passthrough_dispatch(
                     cache_read_tokens: usage.cache_read_tokens,
                     web_search_requests: usage.web_search_requests,
                     web_fetch_requests: usage.web_fetch_requests,
-                    reasoning_tokens: 0,
+                    reasoning_tokens: usage.reasoning_tokens,
                     upstream_total_tokens: 0,
                     reasoning_folded_into_completion: 0,
                     usage_estimated: usage.usage_estimated,
@@ -2763,7 +2763,11 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
         cache_creation_ttl: aisix_gateway::CacheCreationTtl::from_anthropic(
             usage.and_then(|u| u.get("cache_creation")),
         ),
-        reasoning_tokens: 0,
+        reasoning_tokens: usage
+            .and_then(|u| u.pointer("/output_tokens_details/thinking_tokens"))
+            .and_then(Value::as_u64)
+            .map(crate::usage_attr::token_count)
+            .unwrap_or(0),
         upstream_total_tokens: 0,
         reasoning_folded_into_completion: 0,
         prompt_tokens: usage
@@ -4727,6 +4731,9 @@ fn emit_anthropic_usage_event(
 /// corresponding frame.
 #[derive(Default)]
 struct AnthropicStreamUsage {
+    /// `usage.output_tokens_details.thinking_tokens`, on the final
+    /// `message_delta`: the reasoning share of `completion_tokens`.
+    reasoning_tokens: u32,
     /// `true` once the upstream's semantic terminal (`message_stop`) arrived.
     /// Not the same as "the response was forwarded in full": under a
     /// hold-back policy the relay may have withheld an unterminated frame it
@@ -5009,6 +5016,12 @@ fn update_anthropic_usage(
                 if let Some(tier) = aisix_gateway::chat::anthropic_usage_service_tier(usage) {
                     acc.service_tier = Some(tier);
                 }
+                if let Some(t) = usage
+                    .pointer("/output_tokens_details/thinking_tokens")
+                    .and_then(Value::as_u64)
+                {
+                    acc.reasoning_tokens = acc.reasoning_tokens.max(t as u32);
+                }
                 if let Some(v) = usage.get("output_tokens") {
                     if let Some(t) = v.as_u64() {
                         acc.completion_tokens = acc.completion_tokens.max(t as u32);
@@ -5081,6 +5094,7 @@ pub(crate) fn anthropic_usage_stats(body: &Value) -> Option<aisix_gateway::Usage
     let m = anthropic_metrics_from_response_json(body);
     Some(aisix_gateway::UsageStats {
         cache_creation_ttl: m.cache_creation_ttl,
+        reasoning_tokens: m.reasoning_tokens,
         ..aisix_gateway::UsageStats::with_cache(
             m.prompt_tokens,
             m.completion_tokens,
@@ -5105,6 +5119,7 @@ pub(crate) fn anthropic_stream_usage_stats(event: &Value) -> Option<aisix_gatewa
     update_anthropic_usage(&mut acc, event, Instant::now(), &mut true, 0);
     Some(aisix_gateway::UsageStats {
         cache_creation_ttl: acc.cache_creation_ttl,
+        reasoning_tokens: acc.reasoning_tokens,
         ..aisix_gateway::UsageStats::with_cache(
             acc.prompt_tokens,
             acc.completion_tokens,
@@ -6059,6 +6074,27 @@ mod stream_failure_tests {
 
 #[cfg(test)]
 mod tests {
+    /// The reasoning share of the output is read wherever Claude's usage is:
+    /// on a whole answer, and on the stream's final frame.
+    #[test]
+    fn thinking_tokens_are_read_as_reasoning_tokens() {
+        let usage = serde_json::json!({
+            "input_tokens": 3,
+            "output_tokens": 40,
+            "output_tokens_details": {"thinking_tokens": 30},
+        });
+        let whole = super::anthropic_usage_stats(&serde_json::json!({"usage": usage})).unwrap();
+        assert_eq!((whole.completion_tokens, whole.reasoning_tokens), (40, 30));
+        let streamed = super::anthropic_stream_usage_stats(&serde_json::json!({
+            "type": "message_delta",
+            "usage": usage,
+        }))
+        .unwrap();
+        assert_eq!(
+            (streamed.completion_tokens, streamed.reasoning_tokens),
+            (40, 30)
+        );
+    }
 
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;

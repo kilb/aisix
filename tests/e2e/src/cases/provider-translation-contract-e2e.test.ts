@@ -44,7 +44,13 @@ const claudeAnswer = {
   model: "claude",
   content: [{ type: "text", text: "Paris." }],
   stop_reason: "end_turn",
-  usage: { input_tokens: 3, output_tokens: 2, cache_creation_input_tokens: null, cache_read_input_tokens: null },
+  usage: {
+    input_tokens: 3,
+    output_tokens: 2,
+    cache_creation_input_tokens: null,
+    cache_read_input_tokens: null,
+    output_tokens_details: { thinking_tokens: 1 },
+  },
 };
 
 const refusal = "I can't help with that.";
@@ -234,6 +240,15 @@ describe("request fields and answers follow the upstream's contract", () => {
     const out = await chat(CLAUDE);
     expect(out.status, out.raw).toBe(200);
     expect(JSON.parse(out.raw).choices[0].message.content).toBe("Paris.");
+  });
+
+  test("the reasoning share of a Claude answer is reported as reasoning tokens", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const out = await chat(CLAUDE);
+    expect(out.status, out.raw).toBe(200);
+    const usage = JSON.parse(out.raw).usage;
+    expect(usage.completion_tokens).toBe(2);
+    expect(usage.completion_tokens_details.reasoning_tokens).toBe(1);
   });
 
   test("a Gemini 200 that reports an error is a failure, not an empty answer", async (ctx) => {

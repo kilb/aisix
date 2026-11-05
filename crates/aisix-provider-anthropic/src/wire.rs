@@ -2105,6 +2105,15 @@ pub enum AnthropicResponseBlock {
 // token counter deserializes to 0 rather than failing the whole body
 // decode (same bug class as OpenAI usage, #474).
 
+/// The breakdown of `output_tokens`, per
+/// <https://platform.claude.com/docs/en/build-with-claude/extended-thinking>.
+#[derive(Debug, Default, Deserialize)]
+pub struct AnthropicOutputDetails {
+    /// The part of `output_tokens` that was the model's reasoning.
+    #[serde(default)]
+    pub thinking_tokens: Option<u32>,
+}
+
 /// Server-side tool invocations the provider ran and reports separately
 /// from tokens, per
 /// <https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool>
@@ -2134,6 +2143,8 @@ fn nullable_count<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u
 pub struct AnthropicUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    #[serde(default)]
+    pub output_tokens_details: Option<AnthropicOutputDetails>,
     /// Server tools the provider ran for this request. Absent on a
     /// request that declared none.
     #[serde(default)]
@@ -2259,6 +2270,9 @@ pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
             if let Some(stu) = u.server_tool_use.as_ref() {
                 usage.web_search_requests = stu.web_search_requests;
                 usage.web_fetch_requests = stu.web_fetch_requests;
+            }
+            if let Some(thinking) = u.output_tokens_details.and_then(|d| d.thinking_tokens) {
+                usage.reasoning_tokens = thinking;
             }
             usage
         })
@@ -2563,6 +2577,9 @@ pub struct AnthropicStreamMessageDelta {
 pub struct AnthropicStreamUsage {
     #[serde(default)]
     pub output_tokens: Option<u32>,
+    /// Sent on the final `message_delta` only.
+    #[serde(default)]
+    pub output_tokens_details: Option<AnthropicOutputDetails>,
     /// Server-tool counters ride the terminal `message_delta` alongside
     /// the final token counts.
     #[serde(default)]
@@ -2900,6 +2917,13 @@ impl StreamState {
                         if let Some(stu) = u.server_tool_use.as_ref() {
                             stats.web_search_requests = stu.web_search_requests;
                             stats.web_fetch_requests = stu.web_fetch_requests;
+                        }
+                        if let Some(thinking) = u
+                            .output_tokens_details
+                            .as_ref()
+                            .and_then(|d| d.thinking_tokens)
+                        {
+                            stats.reasoning_tokens = thinking;
                         }
                         stats
                     })
@@ -10217,6 +10241,26 @@ mod request_contract_tests {
         let chat = response_into_chat_response(parsed);
         assert_eq!(chat.usage.prompt_tokens, 3);
         assert_eq!(chat.usage.cache_read_tokens, 0);
+    }
+
+    /// The reasoning share of `output_tokens` reaches the usage record, on a
+    /// whole answer and on the stream's final frame.
+    #[test]
+    fn thinking_tokens_are_read_as_reasoning() {
+        let body = r#"{"id":"m","model":"c","content":[],"stop_reason":"end_turn",
+            "usage":{"input_tokens":3,"output_tokens":40,
+                     "output_tokens_details":{"thinking_tokens":30}}}"#;
+        let parsed: AnthropicResponse = serde_json::from_str(body).unwrap();
+        let usage = response_into_chat_response(parsed).usage;
+        assert_eq!((usage.completion_tokens, usage.reasoning_tokens), (40, 30));
+
+        let event: AnthropicStreamEvent = serde_json::from_str(
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},
+                "usage":{"output_tokens":40,"output_tokens_details":{"thinking_tokens":30}}}"#,
+        )
+        .unwrap();
+        let chunk = StreamState::default().next_chunk(&event).unwrap();
+        assert_eq!(chunk.usage.unwrap().reasoning_tokens, 30);
     }
 
     #[test]
