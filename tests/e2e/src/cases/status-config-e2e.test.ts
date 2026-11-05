@@ -54,6 +54,7 @@ interface StatusConfig {
     resource_id: string;
     last_error_kind: string;
     last_error: string;
+    serving_stale_since?: string;
     first_seen_at: string;
     last_seen_at: string;
   }>;
@@ -462,6 +463,76 @@ describe("status/config: etcd watch source", () => {
     await etcd.delete(`${app.etcdPrefix}/a2a_agents/${signatureId}`);
     await etcd.delete(`${app.etcdPrefix}/a2a_agents/${cleanId}`);
     await seed!.delete("api_keys", barrier.id);
+  });
+
+  test("a bad edit to a guardrail in force leaves the rule in force, and says so", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+    const WORD = "STATUS-LAST-GOOD-WORD";
+    const NEW_WORD = "STATUS-REPAIRED-WORD";
+    const guardrail = await seed.createGuardrail(
+      {
+        name: "status-last-good",
+        enabled: true,
+        hook_point: "input",
+        kind: "keyword",
+        patterns: [{ kind: "literal", value: WORD }],
+      },
+      { attach: false },
+    );
+    const attachment = await seed.attachGuardrailToEnv(guardrail.id);
+    const plaintext = `sk-status-last-good-${randomUUID()}`;
+    const key = await seed.createApiKey({
+      key_hash: createHash("sha256").update(plaintext).digest("hex"),
+      allowed_models: ["status-model"],
+    });
+    const proxy = new ProxyClient(app.proxyUrl, plaintext);
+    const statusOf = async (content: string) =>
+      (
+        await proxy.chat({
+          model: "status-model",
+          messages: [{ role: "user", content }],
+        })
+      ).status;
+    await waitConfigPropagation(async () => (await statusOf(WORD)) === 422);
+
+    await seed.update("guardrails", guardrail.id, {
+      name: "status-last-good",
+      enabled: true,
+      hook_point: "input",
+      kind: "keyword",
+      patterns: [{ kind: "regex", value: "oops[(" }],
+    });
+    let cfg: StatusConfig | undefined;
+    await waitConfigPropagation(async () => {
+      await statusOf("trigger the rebuild");
+      cfg = await getStatusConfig(app!);
+      return cfg.rejected.some((r) => r.resource_id === guardrail.id);
+    });
+    expect(cfg!.state).toBe("degraded");
+    const rejection = cfg!.rejected.find((r) => r.resource_id === guardrail.id)!;
+    expect(rejection.serving_stale_since).toBeTruthy();
+    expect(await statusOf(WORD)).toBe(422);
+
+    await seed.update("guardrails", guardrail.id, {
+      name: "status-last-good",
+      enabled: true,
+      hook_point: "input",
+      kind: "keyword",
+      patterns: [{ kind: "literal", value: NEW_WORD }],
+    });
+    await waitConfigPropagation(async () => (await statusOf(NEW_WORD)) === 422);
+    expect(await statusOf(WORD)).toBe(200);
+    await waitConfigPropagation(async () => {
+      await statusOf("trigger the rebuild");
+      cfg = await getStatusConfig(app!);
+      return !cfg.rejected.some((r) => r.resource_id === guardrail.id);
+    });
+    await seed.delete("guardrail_attachments", attachment.id);
+    await seed.delete("guardrails", guardrail.id);
+    await seed.delete("api_keys", key.id);
   });
 
   test("a lazy guardrail build failure degrades status and clears after repair", async (ctx) => {

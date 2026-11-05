@@ -68,9 +68,9 @@ fn sorted_guardrail_entries(
 ///
 /// Rows are evaluated in deterministic `created_at`-ascending order (see
 /// [`sorted_guardrail_entries`]). Each row produces at most one runtime
-/// `dyn Guardrail`. Failures (invalid regex, etc.) are logged and the
-/// row is skipped — same contract the loader uses for malformed etcd
-/// rows.
+/// `dyn Guardrail`. Failures (invalid regex, etc.) are logged, and the row
+/// serves its last good build, or nothing if it has none — same contract the
+/// loader uses for malformed etcd rows.
 ///
 /// `bedrock_endpoint_url` is the deployment-wide override for the
 /// AWS Bedrock endpoint URL (sourced from
@@ -111,22 +111,18 @@ fn build_chain_from_snapshot_reported(
         if !row.enabled {
             continue;
         }
-        match instances.instance(
+        let outcome = instances.instance(
             entry,
             bedrock_endpoint_url,
             embedder,
             &mut BuildReuse::default(),
-        ) {
-            Ok(Some(g)) => {
-                chain.push((row.name.clone(), g, row.input_messages));
-                applied.push(applied_for(row));
-            }
-            Ok(None) => {
-                // Rule was technically valid but inert (e.g. empty
-                // keyword list). Skip silently — operators see this
-                // shape when they're staging a rule.
-            }
-            Err(rejection) => rejected.push(rejection),
+        );
+        rejected.extend(outcome.rejection);
+        // `None`: technically valid but inert (e.g. empty keyword list), which
+        // operators see when they're staging a rule, or it has never built.
+        if let Some(g) = outcome.serving {
+            chain.push((row.name.clone(), g, row.input_messages));
+            applied.push(applied_for(row));
         }
     }
 
@@ -213,7 +209,15 @@ struct GuardrailInstances {
 
 struct MemoSlot {
     row: Arc<aisix_core::resource::ResourceEntry<DomainGuardrail>>,
-    outcome: Result<Option<Arc<dyn Guardrail>>, GuardrailBuildRejection>,
+    outcome: BuildOutcome,
+}
+
+/// What a row contributes to the chain, and why its current config does not.
+#[derive(Clone)]
+struct BuildOutcome {
+    /// `None` for an inert row, or one that has never built.
+    serving: Option<Arc<dyn Guardrail>>,
+    rejection: Option<GuardrailBuildRejection>,
 }
 
 /// How much of a build was construction and how much was reuse. Logged so
@@ -232,7 +236,7 @@ impl GuardrailInstances {
         bedrock_endpoint_url: Option<&str>,
         embedder: &GuardrailEmbedderSlot,
         reuse: &mut BuildReuse,
-    ) -> Result<Option<Arc<dyn Guardrail>>, GuardrailBuildRejection> {
+    ) -> BuildOutcome {
         if let Some(slot) = self.by_id.get(&entry.id) {
             if Arc::ptr_eq(&slot.row, entry) {
                 reuse.reused += 1;
@@ -241,18 +245,33 @@ impl GuardrailInstances {
         }
         reuse.constructed += 1;
         let outcome = match build_one(&entry.value, bedrock_endpoint_url, embedder) {
-            Ok(built) => Ok(built),
+            Ok(serving) => BuildOutcome {
+                serving,
+                rejection: None,
+            },
             Err(err) => {
+                // A bad edit must not switch a rule off: the instance the row
+                // last built keeps serving until an edit builds, as the loader
+                // keeps the last good copy of a row it cannot parse.
+                let serving = self
+                    .by_id
+                    .get(&entry.id)
+                    .and_then(|slot| slot.outcome.serving.clone());
                 tracing::warn!(
                     guardrail_id = %entry.id,
                     guardrail_name = %entry.value.name,
                     error = %err,
-                    "skipping guardrail with invalid config",
+                    keeps_serving_last_good = serving.is_some(),
+                    "guardrail has an invalid config",
                 );
-                Err(GuardrailBuildRejection {
-                    id: entry.id.clone(),
-                    reason: err.status_reason(),
-                })
+                BuildOutcome {
+                    rejection: Some(GuardrailBuildRejection {
+                        id: entry.id.clone(),
+                        reason: err.status_reason(),
+                        serving_stale: serving.is_some(),
+                    }),
+                    serving,
+                }
             }
         };
         self.by_id.insert(
@@ -1421,6 +1440,8 @@ pub fn build_index_from_snapshot(
 struct GuardrailBuildRejection {
     id: String,
     reason: String,
+    /// The row's last good instance is what is still enforcing.
+    serving_stale: bool,
 }
 
 /// Build the production index and retain one failure per guardrail row.
@@ -1473,15 +1494,15 @@ fn build_index_from_snapshot_reported(
         // One instance per ROW, shared by all its attachments: `build_one`
         // reads only the row, and everything the attachment contributes
         // (scope, priority) lands on the index entry below.
-        let runtime_guardrail =
-            match instances.instance(&guardrail_arc, bedrock_endpoint_url, embedder, &mut reuse) {
-                Ok(Some(g)) => g,
-                Ok(None) => continue, // inert (e.g. empty keyword list)
-                Err(rejection) => {
-                    rejected.entry(gid.clone()).or_insert(rejection);
-                    continue;
-                }
-            };
+        let outcome =
+            instances.instance(&guardrail_arc, bedrock_endpoint_url, embedder, &mut reuse);
+        if let Some(rejection) = outcome.rejection {
+            rejected.entry(gid.clone()).or_insert(rejection);
+        }
+        // `None`: inert (e.g. empty keyword list), or it has never built.
+        let Some(runtime_guardrail) = outcome.serving else {
+            continue;
+        };
 
         let scope_kind = match attachment.scope_type {
             GuardrailScopeType::Env => ScopeKind::Env,
@@ -1534,7 +1555,7 @@ fn publish_build_rejections(
                 last_error_kind: "schema_failed".to_string(),
                 last_error: row.reason,
                 seen_at,
-                serving_stale_since: None,
+                serving_stale_since: row.serving_stale.then_some(seen_at),
             })
             .collect(),
     );
@@ -4314,6 +4335,60 @@ mod tests {
             .await
             .is_block());
         assert!(!live.is_empty());
+    }
+
+    /// An edit that cannot build must not switch off the rule it was editing:
+    /// the last good instance keeps enforcing, and status says it is stale.
+    #[tokio::test]
+    async fn a_bad_edit_keeps_the_last_good_instance_enforcing() {
+        let snapshot_of = |row: &str| {
+            let snap = AisixSnapshot::new();
+            snap.guardrails.insert(entry("kw", "g-1", parse(row)));
+            snap.guardrail_attachments.insert(attachment_entry(
+                "a-1",
+                parse_attachment(r#"{"guardrail_id": "g-1", "scope_type": "env", "priority": 50}"#),
+            ));
+            snap
+        };
+        let good = r#"{"name": "kw", "kind": "keyword",
+            "patterns": [{"kind": "literal", "value": "AKIA"}]}"#;
+        let bad = r#"{"name": "kw", "kind": "keyword",
+            "patterns": [{"kind": "literal", "value": "OTHER"}, {"kind": "regex", "value": "oops[("}]}"#;
+        let fixed = r#"{"name": "kw", "kind": "keyword",
+            "patterns": [{"kind": "literal", "value": "OTHER"}]}"#;
+
+        let handle = SnapshotHandle::new(snapshot_of(good));
+        let status = ConfigStatus::new(aisix_core::SourceKind::Etcd);
+        let live = LiveGuardrailIndex::new_with_sink_and_status(
+            handle.clone(),
+            None,
+            None,
+            GuardrailEmbedderSlot::none(),
+            Some(status.clone()),
+        );
+        assert!(live
+            .resolve(&any_ctx())
+            .check_input(&req("AKIA123"))
+            .await
+            .is_block());
+
+        handle.store(snapshot_of(bad));
+        assert!(
+            live.resolve(&any_ctx())
+                .check_input(&req("AKIA123"))
+                .await
+                .is_block(),
+            "the rule in force before the bad edit is still in force"
+        );
+        let rejections = status.rejection_snapshots();
+        assert_eq!(rejections.len(), 1, "{rejections:?}");
+        assert!(rejections[0].stale_serving_since_unix_secs.is_some());
+
+        handle.store(snapshot_of(fixed));
+        let repaired = live.resolve(&any_ctx());
+        assert!(repaired.check_input(&req("OTHER")).await.is_block());
+        assert!(!repaired.check_input(&req("AKIA123")).await.is_block());
+        assert!(status.rejection_snapshots().is_empty());
     }
 
     #[tokio::test]

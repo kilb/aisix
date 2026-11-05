@@ -338,10 +338,11 @@ fn run_validate(resources: &Path) -> anyhow::Result<()> {
     };
     // Loading only proves the file parses. A guardrail row whose config
     // does not build — an invalid regex, an unknown detector, a
-    // `kind: custom` script with a syntax error — is dropped from the
-    // chain while the gateway keeps serving. Runtime status reports that
-    // rejection, but this command still needs to fail synchronously rather
-    // than validate a file whose screening rule cannot run.
+    // `kind: custom` script with a syntax error — keeps its last good build
+    // on a reload and has none to keep on a fresh start, while the gateway
+    // keeps serving. Runtime status reports that rejection, but this command
+    // still needs to fail synchronously rather than validate a file whose
+    // screening rule cannot run.
     let unbuildable = aisix_guardrails::unbuildable_guardrail_rows(&snapshot.guardrails, None);
     if !unbuildable.is_empty() {
         eprintln!(
