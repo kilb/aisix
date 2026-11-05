@@ -262,7 +262,7 @@ describe("native stream protocol failures are not healthy completions", () => {
       ),
     });
 
-  test("malformed or truncated held SSE is suppressed and counted as upstream failure", async (ctx) => {
+  test("held SSE: malformed is suppressed, truncated delivers its scanned frames then fails, both count as upstream failure", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
       return;
@@ -274,6 +274,7 @@ describe("native stream protocol failures are not healthy completions", () => {
         upstream: upstreams.messagesMalformed!,
         reason: "upstream_decode_error",
         rawMarker: "billed malformed output",
+        deliversScanned: false,
       },
       {
         endpoint: "/v1/responses" as const,
@@ -281,6 +282,7 @@ describe("native stream protocol failures are not healthy completions", () => {
         upstream: upstreams.responsesMalformed!,
         reason: "upstream_decode_error",
         rawMarker: "billed malformed output",
+        deliversScanned: false,
       },
       {
         endpoint: "/v1/responses" as const,
@@ -288,6 +290,7 @@ describe("native stream protocol failures are not healthy completions", () => {
         upstream: upstreams.responsesTruncated!,
         reason: "transport_error",
         rawMarker: "billed truncated output",
+        deliversScanned: true,
       },
     ];
     for (const scenario of cases) {
@@ -302,7 +305,11 @@ describe("native stream protocol failures are not healthy completions", () => {
       expect(response.status).toBe(200);
       const body = await response.text();
       expect(body).toContain("upstream stream failed");
-      expect(body).not.toContain(scenario.rawMarker);
+      if (scenario.deliversScanned) {
+        expect(body).toContain(scenario.rawMarker);
+      } else {
+        expect(body).not.toContain(scenario.rawMarker);
+      }
       expect(body).not.toContain("not-json");
       expect(body).not.toContain('"type":"message_stop"');
       expect(body).not.toContain("response.completed");
