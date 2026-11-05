@@ -207,13 +207,20 @@ impl OpenApiBridge {
             .as_deref()
             .filter(|h| !h.is_empty())
             .unwrap_or(DEFAULT_API_KEY_HEADER);
+        // What the gateway sends is noted, so a REST API that quotes it in an
+        // error does not hand it to the agent.
+        let secret = server.secret.as_deref().unwrap_or("");
         let request = match server.auth_type {
             McpAuthType::None => request,
             McpAuthType::Bearer if claims("authorization") => request,
-            McpAuthType::Bearer => request.bearer_auth(server.secret.as_deref().unwrap_or("")),
+            McpAuthType::Bearer => {
+                aisix_gateway::note_sent_credential(secret);
+                request.bearer_auth(secret)
+            }
             McpAuthType::ApiKey if claims(api_key_header.to_ascii_lowercase().as_str()) => request,
             McpAuthType::ApiKey => {
-                request.header(api_key_header, server.secret.as_deref().unwrap_or(""))
+                aisix_gateway::note_sent_credential(secret);
+                request.header(api_key_header, secret)
             }
             McpAuthType::OAuth2 if claims("authorization") => request,
             McpAuthType::OAuth2 => {
@@ -223,6 +230,7 @@ impl OpenApiBridge {
                 )
                 .await
                 .map_err(|_| tool_call_timed_out())??;
+                aisix_gateway::note_sent_credential(&token);
                 request.bearer_auth(token)
             }
             McpAuthType::OauthDelegate if claims("authorization") => request,
@@ -236,7 +244,9 @@ impl OpenApiBridge {
             },
             McpAuthType::OAuth2TokenExchange if claims("authorization") => request,
             McpAuthType::OAuth2TokenExchange => {
-                request.bearer_auth(self.token_exchange().token(deadline).await?)
+                let token = self.token_exchange().token(deadline).await?;
+                aisix_gateway::note_sent_credential(&token);
+                request.bearer_auth(token)
             }
             // `type: mcp` only; a row combining it with `type: openapi` fails
             // both schemas and never gets here.
@@ -369,7 +379,12 @@ impl OpenApiBridge {
                 is_error: false,
             })
         } else {
-            Ok(tool_error(format!("HTTP {}: {}", status.as_u16(), body)))
+            // The REST API's own error, through the gateway's shared scrubber.
+            Ok(tool_error(format!(
+                "HTTP {}: {}",
+                status.as_u16(),
+                aisix_gateway::scrub_upstream_error_text(&body)
+            )))
         }
     }
 }
@@ -454,8 +469,13 @@ impl McpBridge for OpenApiBridge {
             .iter()
             .find(|t| t.name == name)
             .ok_or_else(|| McpError::Request(format!("unknown tool '{name}'")))?;
-        self.execute(tool, &arguments, tokio::time::Instant::now() + self.timeout)
-            .await
+        // Its own scope for the credentials it sends: a tool call may run on a
+        // session task outside the request's.
+        aisix_gateway::response_tap::scope(
+            aisix_gateway::response_tap::detached(),
+            self.execute(tool, &arguments, tokio::time::Instant::now() + self.timeout),
+        )
+        .await
     }
 
     async fn preflight_auth(&self) -> Result<(), McpError> {

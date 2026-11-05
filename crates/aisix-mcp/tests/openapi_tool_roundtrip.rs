@@ -81,7 +81,18 @@ async fn spawn_erp_api() -> SocketAddr {
         )
         .route(
             "/v1/fail",
-            get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
+            // Quotes the credential it was sent, as some APIs do in an error.
+            get(|headers: HeaderMap| async move {
+                let saw = headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("boom; saw {saw}"),
+                )
+            }),
         );
     serve(app).await
 }
@@ -220,6 +231,10 @@ async fn openapi_server_lists_and_calls_generated_tools() {
     let text = first_text(&result);
     assert!(text.starts_with("HTTP 500:"), "got: {text}");
     assert!(text.contains("boom"), "got: {text}");
+    assert!(
+        !text.contains(ERP_TOKEN),
+        "the gateway's credential reached the agent: {text}"
+    );
 
     // Argument mistake (missing required path param) → tool-level error the
     // agent can read and fix, not an opaque protocol error.
