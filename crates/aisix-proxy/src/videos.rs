@@ -2161,18 +2161,26 @@ async fn dispatch_create(
 
 // ─────────────────────────── GET routes ───────────────────────────
 
-/// Decode + resolve the target for a GET route. 404 for ids this gateway
-/// could not have minted (undecodable, naming a Model entry that no
-/// longer exists in the snapshot, or naming one its alias does not
-/// resolve to).
+/// Decode + resolve the target for a GET route. 404 for an id that does not
+/// decode or that names a Model entry no longer in the snapshot.
 ///
 /// The key ACL runs against the REQUESTED ALIAS carried inside the id —
 /// the identical check the submit performed — so wildcard-alias journeys
 /// (Model `wan/*`, key allowlisted for `wan/turbo`) can poll their own
 /// tasks. The id is decodable and its parts are caller-editable, so the
-/// alias only vouches for the entry it resolves to: an id pairing an
-/// alias the key may use with another Model's entry would otherwise pass
-/// the ACL and poll that Model's upstream with its credential.
+/// alias only vouches for an entry it leads to: the one it resolves to, or
+/// a target of the Model Group it names. Any other alias vouches for
+/// nothing and the ACL runs against the entry's own name, because an id
+/// pairing an alias the key may use with another Model's entry would
+/// otherwise pass the ACL and poll that Model's upstream with its
+/// credential. Such an id, forged or left behind by a row renamed since
+/// submit, therefore still polls for a key that may use the entry itself.
+///
+/// This gate binds both identities. A direct or embedding Model and a
+/// wildcard alias address the entry that holds the task, so the two
+/// coincide. A Model Group adds its own `allowed_cidrs` to its target's, as
+/// on the submit. An ensemble or semantic Model cannot hold a task: a
+/// submit to one fails the provider gate, and so does a poll naming one.
 ///
 /// Two deliberate 404 folds close a disclosure oracle on guessed
 /// entry UUIDs: an ACL denial and the unsupported-provider case both
@@ -2194,13 +2202,35 @@ fn resolve_get_target(
     video_id: &str,
     client_ctx: &ClientContext,
 ) -> Result<(VideoTarget, String, String), ProxyError> {
-    let (entry_id, alias, task_id) =
-        decode_video_id(video_id).ok_or_else(|| ProxyError::VideoNotFound(video_id.to_string()))?;
-    let model_entry = crate::model_resolve::resolve_model(snapshot, &alias)
-        .filter(|resolved| resolved.id == entry_id)
-        .ok_or_else(|| ProxyError::VideoNotFound(video_id.to_string()))?;
-    match resolve_video_target(snapshot, auth, model_entry, &alias, client_ctx) {
-        Ok(Ok(target)) => Ok((target, task_id, alias)),
+    let not_found = || ProxyError::VideoNotFound(video_id.to_string());
+    let (entry_id, alias, task_id) = decode_video_id(video_id).ok_or_else(not_found)?;
+    let resolved =
+        crate::model_resolve::resolve_model(snapshot, &alias).filter(|r| r.id == entry_id);
+    let (model_entry, acl_name, group) = match resolved {
+        Some(entry) => (entry, alias.clone(), None),
+        None => {
+            let row = snapshot.models.get_by_id(&entry_id).ok_or_else(not_found)?;
+            let group = snapshot
+                .models
+                .get_by_name(&alias)
+                .filter(|_| group_routes_to(snapshot, &alias, &row.value.display_name));
+            let acl_name = if group.is_some() {
+                alias.clone()
+            } else {
+                row.value.display_name.clone()
+            };
+            (row, acl_name, group)
+        }
+    };
+    match resolve_video_target(snapshot, auth, model_entry, &acl_name, client_ctx) {
+        Ok(Ok(target)) => {
+            // After the ACL, so a key that may not use the group learns
+            // nothing about its allowlist.
+            if let Some(group) = group {
+                crate::dispatch::check_ip_access(&group.value, &client_ctx.source_ip)?;
+            }
+            Ok((target, task_id, alias))
+        }
         // Unsupported provider → uniform 404 (oracle fold, see above).
         Ok(Err(_)) => Err(ProxyError::VideoNotFound(video_id.to_string())),
         // ACL denial → uniform 404 (oracle fold, see above).
@@ -3782,6 +3812,123 @@ mod tests {
             let v = body_json(resp).await;
             assert_eq!(v["error"]["type"], "video_not_found");
         }
+    }
+
+    /// A Model Group naming `my-video`, the entry `new_snap` seeds, as its
+    /// only target.
+    fn insert_group(snap: &AisixSnapshot, extra: &str) {
+        let group: Model = serde_json::from_str(&format!(
+            r#"{{"display_name":"video-group","routing":{{"strategy":"failover","targets":[{{"model":"my-video"}}]}}{extra}}}"#
+        ))
+        .unwrap();
+        snap.models
+            .insert(ResourceEntry::new("m-video-group", group, 1));
+    }
+
+    fn running_task_upstream() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "output": {"task_id": "task-123", "task_status": "RUNNING"}
+        }))
+    }
+
+    /// A task submitted through a Model Group is held by a target, and the
+    /// key was only ever checked against the group: the id it was handed
+    /// polls under that name, though the alias does not resolve to the entry.
+    #[tokio::test]
+    async fn a_group_task_polls_for_a_key_allowed_only_the_group() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("GET"))
+            .respond_with(running_task_upstream())
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri(), "alibaba", "");
+        insert_group(&snap, "");
+        let key: ApiKey = serde_json::from_str(
+            r#"{"key_hash": "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891", "allowed_models": ["video-group"]}"#,
+        )
+        .unwrap();
+        snap.apikeys.insert(ResourceEntry::new("k-1", key, 1));
+
+        let id = encode_video_id(MODEL_ID, "video-group", "task-123");
+        let resp =
+            tower::ServiceExt::oneshot(build_app(snap), get_uri(&format!("/v1/videos/{id}")))
+                .await
+                .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["model"], "video-group");
+    }
+
+    /// The same id, for a key that may not use the group, vouches for nothing.
+    #[tokio::test]
+    async fn a_group_task_is_404_for_a_key_without_the_group() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("GET"))
+            .respond_with(running_task_upstream())
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri(), "alibaba", "");
+        insert_group(&snap, "");
+        let key: ApiKey = serde_json::from_str(
+            r#"{"key_hash": "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891", "allowed_models": ["other-model"]}"#,
+        )
+        .unwrap();
+        snap.apikeys.insert(ResourceEntry::new("k-1", key, 1));
+
+        let id = encode_video_id(MODEL_ID, "video-group", "task-123");
+        let resp =
+            tower::ServiceExt::oneshot(build_app(snap), get_uri(&format!("/v1/videos/{id}")))
+                .await
+                .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A group's `allowed_cidrs` governs its submit, and it governs the poll
+    /// through it too: the target carries no allowlist of its own here, so
+    /// nothing else stands in front of the upstream. An in-process request
+    /// has no source address, which an allowlist refuses.
+    #[tokio::test]
+    async fn a_group_allowlist_binds_the_poll_through_it() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("GET"))
+            .respond_with(running_task_upstream())
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri(), "alibaba", "");
+        insert_group(&snap, r#","allowed_cidrs":["10.99.0.0/24"]"#);
+
+        let id = encode_video_id(MODEL_ID, "video-group", "task-123");
+        let resp =
+            tower::ServiceExt::oneshot(build_app(snap), get_uri(&format!("/v1/videos/{id}")))
+                .await
+                .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// An alias the entry does not serve is not echoed, and the key answers
+    /// for the entry's own name instead. Allowed there, the poll is served
+    /// under that name; the refusal is `id_pairing_an_allowed_alias_with_another_entry_is_404`.
+    #[tokio::test]
+    async fn an_alias_the_entry_does_not_serve_polls_under_the_entry_name() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("GET"))
+            .respond_with(running_task_upstream())
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let app = build_app(new_snap(&upstream.uri(), "alibaba", ""));
+        let id = encode_video_id(MODEL_ID, "not-a-name-this-row-serves", "task-123");
+        let resp = tower::ServiceExt::oneshot(app, get_uri(&format!("/v1/videos/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["model"], "my-video");
     }
 
     /// MED-5 (PR #811 audit): an alibaba ProviderKey configured with the
