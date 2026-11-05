@@ -976,10 +976,17 @@ fn refresh_remaining(
 /// `reserve` is the reservation the endpoint takes anyway (its [`enforce`]
 /// call); the caller uses the returned one in place of taking it again
 /// after the check.
+///
+/// Every route that runs an input chain comes through here first, so this is
+/// also where the request's noted body comes off its failure rows until the
+/// chain has finished with it ([`crate::usage_attr::hold_failure_request`]): both
+/// this 429 and a caller hanging up during the check that follows are written
+/// before any mask has run.
 pub(crate) async fn reserve_before_costly_check(
     chain: &dyn aisix_guardrails::Guardrail,
     reserve: impl std::future::Future<Output = Result<MultiReservation, ProxyError>>,
 ) -> Result<Option<MultiReservation>, ProxyError> {
+    crate::usage_attr::hold_failure_request(chain);
     if !chain.checks_input_remotely() {
         return Ok(None);
     }

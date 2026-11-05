@@ -930,7 +930,7 @@ async fn dispatch(
     }
 
     if *failure_content_safe_out {
-        crate::usage_attr::note_failure_request(snapshot, || {
+        crate::usage_attr::note_screened_request(snapshot, || {
             serde_json::to_string(&*body).unwrap_or_default()
         });
     }

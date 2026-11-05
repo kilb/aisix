@@ -523,7 +523,7 @@ async fn dispatch(
     if let Some(prompt) = &captured_prompt {
         // Nothing when a check failed open: the success path's capture
         // withholds that request too.
-        crate::usage_attr::note_failure_request(snapshot, || {
+        crate::usage_attr::note_screened_request(snapshot, || {
             if input_capture_safe {
                 prompt.clone()
             } else {

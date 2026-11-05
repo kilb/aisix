@@ -710,6 +710,56 @@ pub(crate) fn note_failure_request(snap: &AisixSnapshot, prompt: impl FnOnce() -
     }
 }
 
+/// Take the noted body off this request's failure rows until `chain` has
+/// finished with it, when an enforcing input rule applies. The note is the text
+/// as the caller sent it: a row written while the rule has not run, because a
+/// rate limit turned the request away or the caller hung up during a remote
+/// check, must not carry what the rule is there to refuse or mask. A monitored
+/// rule changes nothing, so it holds nothing.
+///
+/// [`crate::quota::reserve_before_costly_check`] calls this, since every route
+/// that runs an input chain passes through it before the first await. What ends
+/// the hold is [`note_screened_request`], or [`release_failure_request`] on a
+/// route that does not rewrite the body. A route that forgets exports no body.
+pub(crate) fn hold_failure_request(chain: &dyn aisix_guardrails::Guardrail) {
+    if chain.enforces_input() {
+        crate::attribution::hold_failure_request();
+    }
+}
+
+/// The input chain has finished with the request and the noted body stands.
+pub(crate) fn release_failure_request() {
+    crate::attribution::release_failure_request();
+}
+
+/// [`note_failure_request`] for the body the input chain has finished with,
+/// masks written back: this is what ends [`hold_failure_request`].
+pub(crate) fn note_screened_request(snap: &AisixSnapshot, prompt: impl FnOnce() -> String) {
+    release_failure_request();
+    note_failure_request(snap, prompt);
+}
+
+/// Note the copy of a request turned away before `chain` ran that its failure
+/// rows report: masked, or no body when that cannot be proved
+/// ([`aisix_guardrails::mask_unscreened_request`]). For a route whose rate limit
+/// comes ahead of its chain. `prompt` runs only under a full-content export.
+pub(crate) fn note_unscreened_request(
+    snap: &AisixSnapshot,
+    chain: &dyn aisix_guardrails::Guardrail,
+    prompt: impl FnOnce() -> String,
+) {
+    if let Some(cap) = content_cap(snap) {
+        if let Some(masked) = aisix_guardrails::mask_unscreened_request(chain, &prompt()) {
+            release_failure_request();
+            crate::attribution::note_failure_request(aisix_obs::CapturedContent::new(
+                &masked,
+                "",
+                cap as usize,
+            ));
+        }
+    }
+}
+
 /// Hold the copy of a request an input guardrail refused that its failure rows
 /// report: the body with every hit of the chain's input rules masked, or no
 /// body when that cannot be proved ([`aisix_guardrails::mask_refused_request`])
@@ -772,12 +822,25 @@ fn failure_row_content(
     if !is_failure_row(event) {
         return None;
     }
-    let (noted_request, noted_error, refused) = crate::attribution::failure_notes();
+    let crate::attribution::FailureNotes {
+        request: noted_request,
+        client_error: noted_error,
+        refused,
+        held,
+    } = crate::attribution::failure_notes();
     let row = match content {
         // Not what the route captured: nothing masked that.
         _ if refused => {
             noted_request.unwrap_or_else(|| aisix_obs::CapturedContent::new("", "", cap))
         }
+        // The chain has not finished with the request, so no request text at all.
+        Some(c) if held => aisix_obs::CapturedContent {
+            prompt: String::new(),
+            prompt_truncated: false,
+            truncated: c.response_truncated,
+            ..c.clone()
+        },
+        None if held => aisix_obs::CapturedContent::new("", "", cap),
         Some(c) if !c.prompt.is_empty() => c.clone(),
         given => {
             // A bodyless request's note says nothing; `given` may hold a response.
@@ -1581,6 +1644,86 @@ mod tests {
             assert_eq!(prompt(None), "masked-copy");
         })
         .await;
+    }
+
+    /// While an enforcing input rule has not finished with a request, its row
+    /// reports no request text: not the note taken before the chain ran, not a
+    /// note the route's error arm takes meanwhile, and not what the route
+    /// captured. What the route captured of the response stays.
+    #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)] // A literal here would read as an emitter to the scans below.
+    async fn a_held_request_row_reports_no_request_text_until_the_chain_has_finished() {
+        let cell = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
+        crate::attribution::scope(cell, async {
+            let mut event = UsageEvent::default();
+            event.status_code = 429;
+            let event = event;
+            let row = |content| {
+                failure_row_content(&event, content, None, true, 1000)
+                    .unwrap_or_else(|| aisix_obs::CapturedContent::new("", "", 1000))
+            };
+            let captured = aisix_obs::CapturedContent::new("route-captured", "answer", 1000);
+            crate::attribution::note_failure_request(aisix_obs::CapturedContent::new(
+                "raw-note", "", 1000,
+            ));
+            assert_eq!(row(None).prompt, "raw-note");
+
+            crate::attribution::hold_failure_request();
+            assert_eq!(row(None).prompt, "");
+            let held = row(Some(&captured));
+            assert_eq!(held.prompt, "");
+            assert_eq!(held.response, "answer");
+            crate::attribution::note_failure_request(aisix_obs::CapturedContent::new(
+                "raw-error-arm-note",
+                "",
+                1000,
+            ));
+            assert_eq!(row(None).prompt, "", "a plain note does not end the hold");
+
+            // The cancel path reads the same answer.
+            let mut body = Some(String::new());
+            crate::attribution::with_cancel_for_test(|c| {
+                body = c.failure_body().map(|b| b.prompt.clone());
+            });
+            assert_eq!(body, None);
+
+            release_failure_request();
+            assert_eq!(row(None).prompt, "raw-error-arm-note");
+        })
+        .await;
+    }
+
+    /// The hold comes on where every input chain passes, whether or not the
+    /// reservation goes through, and only for a chain that enforces.
+    #[tokio::test]
+    async fn the_reservation_ahead_of_a_check_holds_the_body_for_an_enforcing_chain() {
+        struct Row(bool);
+        #[async_trait::async_trait]
+        impl aisix_guardrails::Guardrail for Row {
+            fn name(&self) -> &'static str {
+                "row"
+            }
+            fn enforces_input(&self) -> bool {
+                self.0
+            }
+        }
+        for (enforcing, held) in [(true, true), (false, false)] {
+            let cell = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
+            crate::attribution::scope(cell, async {
+                let chain =
+                    aisix_guardrails::GuardrailChain::new(vec![
+                        std::sync::Arc::new(Row(enforcing))
+                            as std::sync::Arc<dyn aisix_guardrails::Guardrail>,
+                    ]);
+                let refused = crate::quota::reserve_before_costly_check(&chain, async {
+                    Err(ProxyError::InvalidRequest("over the limit".into()))
+                })
+                .await;
+                assert!(refused.is_err());
+                assert_eq!(crate::attribution::failure_notes().held, held);
+            })
+            .await;
+        }
     }
 
     #[test]

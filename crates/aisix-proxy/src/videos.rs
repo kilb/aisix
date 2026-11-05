@@ -2007,6 +2007,7 @@ async fn dispatch_create(
     }
     // A failure row reports the masked text, and nothing when a check failed
     // open, as on every other prompt-bearing endpoint.
+    crate::usage_attr::release_failure_request();
     if !redactions.is_empty() || !input_capture_safe {
         crate::usage_attr::note_failure_request(snapshot, || {
             if input_capture_safe {

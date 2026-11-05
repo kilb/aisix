@@ -510,6 +510,8 @@ async fn dispatch(
     {
         return response;
     }
+    // What the chain masked is noted, and an unread body noted empty.
+    crate::usage_attr::release_failure_request();
 
     // Reuse the LLM path's rate-limit + budget gate. The reservation is held
     // for the call and released without committing tokens: the counts this

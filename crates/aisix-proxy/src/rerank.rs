@@ -463,7 +463,7 @@ async fn dispatch(
     // What a mask rule rewrote above is what a failure row may report, and
     // nothing when a check failed open: the success path's capture withholds
     // that request too.
-    crate::usage_attr::note_failure_request(snapshot, || {
+    crate::usage_attr::note_screened_request(snapshot, || {
         if input_capture_safe {
             body.to_string()
         } else {

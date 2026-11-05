@@ -1822,7 +1822,7 @@ async fn dispatch(
     // The structured local rewrite above runs before any downstream use, so
     // semantic routing, cache keys, and upstream dispatch see only masked text.
     if *failure_content_safe_out {
-        crate::usage_attr::note_failure_request(snapshot, || captured_request_json(req));
+        crate::usage_attr::note_screened_request(snapshot, || captured_request_json(req));
     }
 
     // Key-level budgets, decided from the pushed budget documents. 策略的花费层

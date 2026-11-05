@@ -562,7 +562,7 @@ async fn dispatch(
     )
     .await?;
     if !screening.capture_unsafe {
-        crate::usage_attr::note_failure_request(snapshot, || body.to_string());
+        crate::usage_attr::note_screened_request(snapshot, || body.to_string());
     }
 
     let _reservation = match early_reservation {

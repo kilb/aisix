@@ -757,6 +757,10 @@ async fn dispatch(
         }
     }
 
+    // This route forwards the bytes as sent, so the body noted before the chain
+    // is the one a failure row reports.
+    crate::usage_attr::release_failure_request();
+
     // Content capture (exporter-gated): the request body text, in the same
     // exporter-only channel the typed endpoints use.
     let content_cap = aisix_obs::content_capture_cap(

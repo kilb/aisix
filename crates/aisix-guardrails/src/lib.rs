@@ -479,7 +479,7 @@ pub use pii::{builtin_rule, PiiAction, PiiGuardrail, PiiRule, BUILTIN_DETECTORS}
 pub use presidio::PresidioGuardrail;
 #[cfg(feature = "azure-content-safety")]
 pub use prompt_shield::PromptShieldGuardrail;
-pub use refused_export::mask_refused_request;
+pub use refused_export::{mask_refused_request, mask_unscreened_request};
 pub use semantic::SemanticGuardrail;
 #[cfg(feature = "azure-content-safety")]
 pub use text_moderation::TextModerationGuardrail;
@@ -964,6 +964,14 @@ pub trait Guardrail: Send + Sync + 'static {
     /// carry a hook point override to gate on it.
     fn runs_on_input(&self) -> bool {
         true
+    }
+
+    /// Whether this guardrail decides what happens to a request: it reads the
+    /// INPUT hook and is not in monitor mode. While such a guardrail has not
+    /// finished with a request, the request's text may still hold what it is
+    /// there to refuse or mask. Default: [`Self::runs_on_input`].
+    fn enforces_input(&self) -> bool {
+        self.runs_on_input()
     }
 
     /// Whether checking a request calls a remote service — a moderation API

@@ -613,6 +613,7 @@ async fn dispatch(
     mask_input(&resolved_chain, &mut body.input, &mut redactions);
     // A failure row reports the masked text, and nothing when a check failed
     // open: the success path's capture withholds that request too.
+    crate::usage_attr::release_failure_request();
     if !redactions.is_empty() || !input_capture_safe {
         crate::usage_attr::note_failure_request(snapshot, || {
             if input_capture_safe {

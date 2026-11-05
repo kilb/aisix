@@ -820,6 +820,10 @@ impl Guardrail for GuardrailChain {
         self.members.iter().any(|m| m.guardrail.runs_on_input())
     }
 
+    fn enforces_input(&self) -> bool {
+        self.members.iter().any(|m| m.guardrail.enforces_input())
+    }
+
     fn fails_closed_on_input(&self) -> bool {
         self.members
             .iter()

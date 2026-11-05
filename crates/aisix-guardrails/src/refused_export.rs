@@ -27,6 +27,20 @@ use crate::Guardrail;
 /// its text and keys and numbers are scanned too; anything else is masked as
 /// plain text. Run this before any truncation, which can cut a match in half.
 pub fn mask_refused_request(chain: &dyn Guardrail, body: &str) -> Option<String> {
+    let (masked, located) = masked_copy(chain, body)?;
+    located.then_some(masked)
+}
+
+/// [`mask_refused_request`] for a request that was turned away before its chain
+/// ran, a rate limit say: nothing refused it, so finding no hit means there is
+/// none rather than that something read a form this walk does not see.
+pub fn mask_unscreened_request(chain: &dyn Guardrail, body: &str) -> Option<String> {
+    masked_copy(chain, body).map(|(masked, _)| masked)
+}
+
+/// `body` with every hit masked and whether there was one; `None` when a member
+/// cannot locate its hits, or masking left one behind.
+fn masked_copy(chain: &dyn Guardrail, body: &str) -> Option<(String, bool)> {
     if !chain.locates_input_hits() {
         return None;
     }
@@ -42,7 +56,7 @@ pub fn mask_refused_request(chain: &dyn Guardrail, body: &str) -> Option<String>
         }
         Err(_) => pass.text(body),
     };
-    (pass.located && !pass.left_behind).then_some(masked)
+    (!pass.left_behind).then_some((masked, pass.located))
 }
 
 struct MaskPass<'a> {
@@ -236,6 +250,24 @@ mod tests {
     }
 
     /// What decided read a form of the text the walk cannot see.
+    /// Turned away before the chain ran: the hits go, a body without any stays,
+    /// and a member that could not say what it would find leaves no body.
+    #[test]
+    fn an_unscreened_request_exports_its_body_masked_or_not_at_all() {
+        let c = chain(vec![keyword("forbidden"), pii()]);
+        assert_eq!(
+            mask_unscreened_request(&c, "keep forbidden, write to a@b.co").as_deref(),
+            Some("keep [KEYWORD_REDACTED], write to [EMAIL_REDACTED]")
+        );
+        assert_eq!(
+            mask_unscreened_request(&c, "nothing here").as_deref(),
+            Some("nothing here")
+        );
+
+        let c = chain(vec![keyword("forbidden"), Arc::new(Remote)]);
+        assert_eq!(mask_unscreened_request(&c, "keep forbidden"), None);
+    }
+
     #[test]
     fn a_refusal_with_nothing_located_exports_nothing() {
         let c = chain(vec![keyword("forbidden")]);

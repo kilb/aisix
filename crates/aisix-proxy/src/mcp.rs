@@ -524,6 +524,33 @@ async fn dispatch(
         (String::new(), String::new())
     };
 
+    // Resolve the guardrail chain once and run BOTH directions through the SAME
+    // chain as LLM traffic: the tool arguments (input) before the call, and the
+    // tool result (output) after. MCP has no model, so an empty `model_id`
+    // never matches a Model-scoped guardrail; the called server's id carries
+    // the MCP-side dimension instead, so env / mcp-server / api-key / team
+    // scopes all apply. An unregistered server name (a malformed namespaced
+    // tool) leaves the id empty and simply matches no MCP-server scope.
+    // An empty chain short-circuits, keeping the no-guardrail path cheap (and
+    // skipping the response buffering the output check needs).
+    let guardrail_chain = is_tool_call
+        .then(|| {
+            let mcp_server_id = snapshot
+                .mcp_servers
+                .get_by_name(&mcp_server)
+                .map(|entry| entry.id.clone())
+                .unwrap_or_default();
+            let ctx = aisix_guardrails::RequestContext {
+                passthrough_route_id: "",
+                model_id: "",
+                mcp_server_id: &mcp_server_id,
+                api_key_id: &auth.entry.id,
+                team_id: auth.key().team_id.as_deref(),
+            };
+            state.guardrail_index.resolve(&ctx)
+        })
+        .filter(|chain| !chain.is_empty());
+
     // Reuse the LLM path's rate-limit + budget gate on the unit of work, plus
     // the key's own limit for the MCP server this tool belongs to
     // (#1079). The reservation is held for the duration of the call
@@ -533,11 +560,21 @@ async fn dispatch(
     // recorded.
     if is_tool_call {
         crate::usage_attr::note_failure_request(&snapshot, || tool_call_prompt(&bytes));
+        if let Some(chain) = &guardrail_chain {
+            crate::usage_attr::hold_failure_request(chain);
+        }
     }
     let _reservation = if is_tool_call {
         match crate::quota::enforce_mcp(state, &snapshot, &auth, &mcp_server).await {
             Ok(reservation) => Some(reservation),
             Err(err) => {
+                // This limit comes ahead of the chain, so no rule has read the
+                // arguments the row would report.
+                if let Some(chain) = &guardrail_chain {
+                    crate::usage_attr::note_unscreened_request(&snapshot, chain, || {
+                        tool_call_prompt(&bytes)
+                    });
+                }
                 crate::usage_attr::note_client_error(&snapshot, &err);
                 emit_tool_call_usage(
                     state,
@@ -564,33 +601,7 @@ async fn dispatch(
         None
     };
 
-    // Resolve the guardrail chain once and run BOTH directions through the SAME
-    // chain as LLM traffic: the tool arguments (input) before the call, and the
-    // tool result (output) after. MCP has no model, so an empty `model_id`
-    // never matches a Model-scoped guardrail; the called server's id carries
-    // the MCP-side dimension instead, so env / mcp-server / api-key / team
-    // scopes all apply. An unregistered server name (a malformed namespaced
-    // tool) leaves the id empty and simply matches no MCP-server scope.
-    // An empty chain short-circuits, keeping the no-guardrail path cheap (and
-    // skipping the response buffering the output check needs).
     let rpc_id = peek.as_ref().and_then(|p| p.id.clone());
-    let guardrail_chain = is_tool_call
-        .then(|| {
-            let mcp_server_id = snapshot
-                .mcp_servers
-                .get_by_name(&mcp_server)
-                .map(|entry| entry.id.clone())
-                .unwrap_or_default();
-            let ctx = aisix_guardrails::RequestContext {
-                passthrough_route_id: "",
-                model_id: "",
-                mcp_server_id: &mcp_server_id,
-                api_key_id: &auth.entry.id,
-                team_id: auth.key().team_id.as_deref(),
-            };
-            state.guardrail_index.resolve(&ctx)
-        })
-        .filter(|chain| !chain.is_empty());
 
     // Input guardrails: scan the tool arguments.
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
@@ -850,7 +861,7 @@ async fn dispatch(
     // (same ordering rule as the LLM path — mask first, capture after).
     let captured_args = capture_cap.map(|_| bytes.clone());
     if is_tool_call {
-        crate::usage_attr::note_failure_request(&snapshot, || tool_call_prompt(&bytes));
+        crate::usage_attr::note_screened_request(&snapshot, || tool_call_prompt(&bytes));
     }
 
     // Scope the gateway to the tools this caller's key permits — resolved

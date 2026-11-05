@@ -642,7 +642,7 @@ async fn dispatch(
     crate::redact::merge_counts(&mut redactions, input_seg_counts);
     // A failure row reports the masked text, and nothing when a check failed
     // open: the success path's capture withholds that request too.
-    crate::usage_attr::note_failure_request(snapshot, || {
+    crate::usage_attr::note_screened_request(snapshot, || {
         if input_capture_safe {
             body.to_string()
         } else {

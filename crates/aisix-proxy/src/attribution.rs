@@ -247,6 +247,11 @@ pub(crate) struct CancelContext {
     /// ever set under a full-content export. See
     /// [`crate::usage_attr::note_failure_request`].
     pub failure_request: Option<aisix_obs::CapturedContent>,
+    /// An enforcing input guardrail applies and has not finished with this
+    /// request, so `failure_request` may hold what it is there to refuse or
+    /// mask: until it has, a failure row reports no request body. See
+    /// [`crate::usage_attr::hold_failure_request`].
+    pub failure_request_held: bool,
     /// An input guardrail refused this request, so `failure_request` no longer
     /// speaks for it: its rows report `refused_request` or no body. Set where
     /// the refusal is built, which is what a route that forgets the note
@@ -1724,6 +1729,21 @@ pub(crate) fn note_failure_request(content: aisix_obs::CapturedContent) {
     with_cancel(|c| c.failure_request = Some(content));
 }
 
+#[cfg(test)]
+pub(crate) fn with_cancel_for_test(f: impl FnOnce(&mut CancelContext)) {
+    with_cancel(f);
+}
+
+/// See [`CancelContext::failure_request_held`].
+pub(crate) fn hold_failure_request() {
+    with_cancel(|c| c.failure_request_held = true);
+}
+
+/// See [`CancelContext::failure_request_held`].
+pub(crate) fn release_failure_request() {
+    with_cancel(|c| c.failure_request_held = false);
+}
+
 /// See [`CancelContext::client_error_body`].
 pub(crate) fn note_client_error_body(body: String) {
     with_cancel(|c| c.client_error_body = Some(body));
@@ -1744,6 +1764,8 @@ impl CancelContext {
     pub(crate) fn failure_body(&self) -> Option<&aisix_obs::CapturedContent> {
         if self.request_refused {
             self.refused_request.as_ref()
+        } else if self.failure_request_held {
+            None
         } else {
             self.failure_request.as_ref()
         }
@@ -1751,17 +1773,27 @@ impl CancelContext {
 }
 
 /// For a failure row: the request body it reports, the client error body, and
-/// whether an input guardrail refused the request.
-pub(crate) fn failure_notes() -> (Option<aisix_obs::CapturedContent>, Option<String>, bool) {
-    let mut notes = (None, None, false);
+/// whether an input guardrail refused the request or has not finished with it.
+pub(crate) fn failure_notes() -> FailureNotes {
+    let mut notes = FailureNotes::default();
     with_cancel(|c| {
-        notes = (
-            c.failure_body().cloned(),
-            c.client_error_body.clone(),
-            c.request_refused,
-        );
+        notes = FailureNotes {
+            request: c.failure_body().cloned(),
+            client_error: c.client_error_body.clone(),
+            refused: c.request_refused,
+            held: c.failure_request_held,
+        };
     });
     notes
+}
+
+/// See [`failure_notes`].
+#[derive(Default)]
+pub(crate) struct FailureNotes {
+    pub request: Option<aisix_obs::CapturedContent>,
+    pub client_error: Option<String>,
+    pub refused: bool,
+    pub held: bool,
 }
 
 /// The streamed output captured so far, moved out (see

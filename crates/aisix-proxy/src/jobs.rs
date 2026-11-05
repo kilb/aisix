@@ -675,6 +675,10 @@ async fn scan_input_blob(
         ));
     }
 
+    // 审查放行了：这条路线之前记下的请求体（控制体，或上传表单的字段和文件
+    // 哈希）就是失败行该报告的内容。
+    crate::usage_attr::release_failure_request();
+
     // #932 的顺序：先过阻断，再改写，改写后的字节才是上游收到的东西。
     let Some(redactions) = redactions else {
         return Ok(None);

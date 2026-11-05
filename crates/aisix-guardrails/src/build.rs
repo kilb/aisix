@@ -1088,6 +1088,11 @@ impl Guardrail for MonitorGuardrail {
         false
     }
 
+    /// False: a monitored row observes a request and changes nothing about it.
+    fn enforces_input(&self) -> bool {
+        false
+    }
+
     /// Response-side counterpart of [`Self::refuses_unevaluable_input`].
     fn refuses_unevaluable_output(&self) -> bool {
         false
@@ -1306,6 +1311,10 @@ impl Guardrail for LiveGuardrailChain {
 
     fn runs_on_input(&self) -> bool {
         self.current().runs_on_input()
+    }
+
+    fn enforces_input(&self) -> bool {
+        self.current().enforces_input()
     }
 
     fn fails_closed_on_input(&self) -> bool {
@@ -2503,6 +2512,40 @@ mod tests {
         assert!(
             !chain.stream_output_policy().holds_back(),
             "monitor-mode output rule must not hold the stream back",
+        );
+    }
+
+    /// A monitored row decides nothing about a request and holds nothing back,
+    /// yet the row's own `max_buffer_bytes` still reaches the chain.
+    #[tokio::test]
+    async fn a_monitored_row_enforces_nothing_and_keeps_its_buffer_size() {
+        let chain_of = |mode: &str, hook: &str| {
+            let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+            table.insert(entry(
+                "row",
+                "g-1",
+                parse(&format!(
+                    r#"{{
+                        "name": "row",
+                        "enforcement_mode": "{mode}",
+                        "kind": "pii",
+                        "hook_point": "{hook}",
+                        "max_buffer_bytes": 1024,
+                        "detectors": [{{ "type": "email", "action": "mask" }}]
+                    }}"#,
+                )),
+            ));
+            build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none())
+        };
+        assert!(chain_of("block", "input").enforces_input());
+        assert!(chain_of("block", "both").enforces_input());
+        assert!(!chain_of("block", "output").enforces_input());
+        assert!(!chain_of("monitor", "input").enforces_input());
+        assert_eq!(chain_of("monitor", "output").output_buffer_bytes(), 1024);
+        assert_eq!(chain_of("block", "output").output_buffer_bytes(), 1024);
+        assert_eq!(
+            GuardrailChain::new(Vec::new()).output_buffer_bytes(),
+            crate::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
         );
     }
 
