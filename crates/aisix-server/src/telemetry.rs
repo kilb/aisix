@@ -136,6 +136,15 @@ const RETRY_BUDGET: Duration = Duration::from_secs(30 * 60);
 /// budget instead.
 const MAX_ANSWERED_FAILURES: usize = 8;
 
+/// How long the shutdown drain keeps posting what is queued.
+///
+/// A control plane that answers gets through a full queue well inside this.
+/// One that has stopped answering costs the request timeout per batch, and the
+/// queue is at its fullest exactly then, so without a limit the exit would take
+/// the better part of half an hour and the platform would kill it first, losing
+/// the count of what was dropped along with the log flush.
+const FINAL_DRAIN_BUDGET: Duration = Duration::from_secs(20);
+
 /// `aisix_usage_event_drops_total{reason}` for a batch given up on without
 /// ever being re-sent: the control plane answered without
 /// [`USAGE_BATCH_DEDUP_HEADER`] (so re-sending could double-count), the
@@ -314,22 +323,47 @@ async fn run(
             //
             // `Retry::Disabled`: every batch here gets one attempt. Waiting
             // out a backoff would hold the whole shutdown open for a
-            // control plane that is already failing.
+            // control plane that is already failing, and so would posting
+            // into one that has stopped answering, one timeout per batch:
+            // past `FINAL_DRAIN_BUDGET` what is left is counted and given up on.
+            let drain_deadline = Instant::now() + FINAL_DRAIN_BUDGET;
             loop {
                 fill_ready_batch(&mut buffer, &mut rx);
                 if buffer.is_empty() {
                     break;
                 }
-                flush(
-                    &client,
-                    &cfg,
-                    &metrics,
-                    &mut state,
-                    &mut buffer,
-                    Retry::Disabled,
-                    cancel,
+                let mut events = std::mem::take(&mut buffer);
+                let delivered = tokio::time::timeout_at(
+                    drain_deadline,
+                    deliver(
+                        &client,
+                        &cfg,
+                        &metrics,
+                        &mut state,
+                        &events,
+                        Retry::Disabled,
+                        cancel,
+                    ),
                 )
                 .await;
+                if delivered.is_err() {
+                    while let Ok(event) = rx.try_recv() {
+                        events.push(event);
+                    }
+                    drop_batch(
+                        &metrics,
+                        DROP_SEND_FAILED,
+                        &events,
+                        Uuid::new_v4(),
+                        0,
+                        Some(&SendFailure::NoResponse {
+                            error: anyhow::anyhow!(
+                                "the shutdown drain ran out of time before this batch was answered"
+                            ),
+                        }),
+                    );
+                    break;
+                }
             }
             tracing::info!("telemetry sender shutting down");
             return;
@@ -2435,6 +2469,58 @@ mod tests {
         assert_eq!(drops_with_reason(&metrics, DROP_SEND_FAILED), 4);
         assert_eq!(drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED), 0);
     }
+    /// One deadline for the whole drain, not one timeout per batch. A control
+    /// plane that stops answering is what fills the queue, and the exit must
+    /// still happen before the platform kills it, with what it could not send
+    /// counted.
+    #[tokio::test]
+    async fn a_control_plane_that_stopped_answering_cannot_hold_the_exit() {
+        const QUEUED: usize = MAX_BATCH * 8;
+        const STEP: Duration = Duration::from_millis(250);
+
+        let (server, posts) = scripted_server(vec![Answer {
+            stalled: true,
+            ..dedups(200)
+        }])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (tx, rx) = tokio::sync::mpsc::channel(QUEUED);
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        tokio::time::pause();
+        let mut sender = Box::pin(run(cfg, metrics.clone(), rx, &mut cancel_rx));
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        for event in ordered_events(QUEUED) {
+            tx.try_send(event).unwrap();
+        }
+        cancel_tx.send(true).unwrap();
+
+        let started = Instant::now();
+        let wall_clock_deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while poll_sender(sender.as_mut()).await.is_pending() {
+            assert!(
+                started.elapsed() <= FINAL_DRAIN_BUDGET + Duration::from_secs(1),
+                "still posting {:?} into the stall, after {} POSTs",
+                started.elapsed(),
+                posts.lock().unwrap().len(),
+            );
+            assert!(
+                std::time::Instant::now() < wall_clock_deadline,
+                "wall clock"
+            );
+            tokio::time::advance(STEP).await;
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            drops_with_reason(&metrics, DROP_SEND_FAILED),
+            QUEUED as u64,
+            "everything the drain could not deliver is counted",
+        );
+        assert!(tx.is_closed());
+    }
+
 
     /// `managed.cp_base_url` may carry a password. It is used as configured
     /// and displayed nowhere: not in `Debug`, the startup line, or the text of

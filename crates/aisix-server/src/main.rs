@@ -176,6 +176,16 @@ const CONTROL_RUNTIME_THREADS: usize = 2;
 /// every time.
 const LOG_FLUSH_DEADLINE: Duration = Duration::from_secs(5);
 
+/// How long a connection may hold its listener open once the drain has ended.
+///
+/// A request still in transit at that moment is owed its answer, and the wait
+/// for what is in flight covers it from the moment it arrives; this only has to
+/// outlast the transit. A connection still silent after that has nothing to
+/// lose, and nothing else would end it on the default config: anyone who can
+/// reach the port could otherwise keep the process from ever exiting, and the
+/// platform's kill would then take the usage drain and the log flush with it.
+const CONNECTION_GRACE_AFTER_DRAIN: Duration = Duration::from_secs(5);
+
 /// How long the exit waits for the exporter pipelines to deliver what they
 /// hold.
 ///
@@ -3323,10 +3333,11 @@ async fn accept_loop(
     // what is left here is idle pooled connections, which end as soon as
     // `serve_connection` hands them the cancel signal, and connections that
     // have not sent a request yet, which are served first and so are held
-    // for up to `downstream.idle_timeout_secs` (unbounded when it is 0; a
-    // TLS handshake that stalls is not bounded by it either).
+    // for up to `CONNECTION_GRACE_AFTER_DRAIN`: `downstream.idle_timeout_secs`
+    // is unbounded when it is 0, and does not bound a TLS handshake that
+    // stalls either. One still silent then goes with its runtime.
     drop(alive);
-    let _ = all_connections_ended.recv().await;
+    let _ = tokio::time::timeout(CONNECTION_GRACE_AFTER_DRAIN, all_connections_ended.recv()).await;
     // A connection that upgraded ends its task at the 101, but its session
     // is still in flight (a Realtime WebSocket holds a drain guard until
     // it closes). The drain's own wait is over by now, so this one is what
@@ -5550,6 +5561,29 @@ managed:
                 held.push(sock);
             }
         });
+    /// A connection that never says anything cannot keep the listener, and
+    /// so the process, from finishing. Nothing else bounds one on the default
+    /// config, which sets no idle timeout.
+    #[tokio::test]
+    async fn a_connection_that_never_speaks_does_not_hold_the_listener_open() {
+        let harness = drain_harness().await;
+        let _silent = tokio::net::TcpStream::connect(harness.addr)
+            .await
+            .expect("connect");
+        // Accepted before the drain ends, so the loop has taken it on.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        harness.cancel.send(true).expect("cancel");
+        let served = tokio::time::timeout(
+            CONNECTION_GRACE_AFTER_DRAIN + Duration::from_secs(5),
+            harness.serving,
+        )
+        .await
+        .expect("accept_loop must return past the grace, whoever is still connected")
+        .expect("join");
+        assert!(served.is_ok(), "{served:?}");
+    }
+
 
         let cfg = aisix_core::config::EtcdConfig {
             endpoints: vec![format!("http://127.0.0.1:{port}")],
