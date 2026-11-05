@@ -770,6 +770,31 @@ describe("per-user OAuth to an upstream MCP server", () => {
     expect(landed.searchParams.get("code")).toBeNull();
   });
 
+  test("a refusal before consent sends the browser nowhere but a client on this machine", async () => {
+    if (!etcdReachable) return;
+    // Anyone can write this link, and an authorization server answers a scope
+    // it refuses without showing the user anything. Nobody has allowed the
+    // address in it, so it must not become a redirect off this gateway's name.
+    const browser = new Browser();
+    const authorize = authorizeUrl(url("main"), {
+      redirect_uri: "https://evil.example/phish",
+      state: "mine",
+    });
+    const toUpstream = new URL((await browser.request(authorize.toString())).headers.get("location")!);
+    const callback = `${stack.base}/mcp-oauth/callback?state=${toUpstream.searchParams.get("state")}`;
+    const back = await browser.request(`${callback}&error=invalid_scope&error_description=call%20us`);
+    expect(back.status).toBe(400);
+    expect(back.headers.get("location")).toBeNull();
+
+    const again = new Browser();
+    const second = new URL((await again.request(authorize.toString())).headers.get("location")!);
+    const noCode = await again.request(
+      `${stack.base}/mcp-oauth/callback?state=${second.searchParams.get("state")}&iss=https://other.example&code=x`,
+    );
+    expect(noCode.status).toBe(400);
+    expect(noCode.headers.get("location")).toBeNull();
+  });
+
   test("the discovery documents are what the client relies on", async () => {
     if (!etcdReachable) return;
     const resource = await (await fetch(`${stack.base}/.well-known/oauth-protected-resource/mcp/main`)).json();

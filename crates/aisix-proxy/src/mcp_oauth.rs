@@ -359,7 +359,7 @@ pub(crate) fn refuse_to_client(
     oauth_error(status, error, description)
 }
 
-fn may_receive_unconsented_redirect(redirect_uri: &str) -> bool {
+pub(crate) fn may_receive_unconsented_redirect(redirect_uri: &str) -> bool {
     url::Url::parse(redirect_uri).is_ok_and(|url| {
         !matches!(url.scheme(), "http" | "https") || url.host().is_some_and(|h| is_loopback(&h))
     })

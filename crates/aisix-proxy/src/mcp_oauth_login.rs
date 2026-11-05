@@ -51,9 +51,9 @@ use serde_json::json;
 use crate::auth::{AuthenticatedKey, JwtIdentity};
 use crate::error::ProxyError;
 use crate::mcp_oauth::{
-    callback_url, caller_ip, failure_response, no_store, oauth_error, observed, query_params,
-    redirect, redirect_to_client, refuse_to_client, resource_matches, sign_in_entry,
-    sign_in_server, unknown_server, SignInMode,
+    callback_url, caller_ip, failure_response, may_receive_unconsented_redirect, no_store,
+    oauth_error, observed, query_params, redirect, redirect_to_client, refuse_to_client,
+    resource_matches, sign_in_entry, sign_in_server, unknown_server, SignInMode,
 };
 use crate::state::ProxyState;
 
@@ -338,8 +338,21 @@ fn render_consent(base: &str, flow: &FlowState) -> Response {
     consent_page(base, flow, identity)
 }
 
+/// End a flow that never reached consent. A client on this machine hears about
+/// it at its `redirect_uri`. Any other address is whatever the link said and
+/// nobody has allowed it, so sending the browser there would make the gateway an
+/// open redirector, on a failure anyone can cause by asking the upstream for a
+/// scope it refuses (see [`crate::mcp_oauth::refuse_to_client`]).
 fn back_to_client(base: &str, flow: &FlowState, params: &[(&str, &str)]) -> Response {
-    let mut response = redirect_to_client(&flow.redirect_uri, flow.client_state.as_deref(), params);
+    let mut response = if may_receive_unconsented_redirect(&flow.redirect_uri) {
+        redirect_to_client(&flow.redirect_uri, flow.client_state.as_deref(), params)
+    } else {
+        error_page(
+            StatusCode::BAD_REQUEST,
+            "This sign-in was refused",
+            "The sign-in could not be finished. Start again from the MCP client.",
+        )
+    };
     clear_flow_cookie(base, &flow.handle, &mut response);
     response
 }
