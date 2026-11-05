@@ -341,6 +341,14 @@ pub const LEGACY_STICKY_AS_CONSISTENT_HASH: &str =
 /// Reported when a stored `sticky` sits beside any other strategy, which never
 /// read it.
 pub const LEGACY_STICKY_IGNORED: &str = "legacy:routing.sticky_ignored";
+/// Reported when a stored `strategy: weighted` row's `weight: 0` target loads
+/// as a backup tier.
+pub const LEGACY_WEIGHT_ZERO_AS_BACKUP_TIER: &str = "legacy:routing.weight_zero_as_backup_tier";
+
+/// The tier a stored `weighted` row's `weight: 0` target moves to: the
+/// convention for a backup, below the default `0` every other target of such
+/// a row is in.
+const BACKUP_TIER: i32 = -1;
 
 /// Bring the `routing` block of a stored model document forward from the two
 /// settings a later release retired, returning a report label per change.
@@ -357,6 +365,12 @@ pub const LEGACY_STICKY_IGNORED: &str = "legacy:routing.sticky_ignored";
 ///   weights in aggregate; that is `consistent_hash` under its default
 ///   `hash_on`.
 /// - `sticky` beside any other strategy did nothing, and still does nothing.
+/// - `weighted` read a weight only to pick where to start, then fell back
+///   through every target in order, a `weight: 0` one included: that was how
+///   a backup was written. `weight: 0` now keeps a target out of rotation
+///   altogether, so such a target moves to a tier below the rest, reached only
+///   once they have all failed or are unavailable. No build had both
+///   `weighted` and `priority`, so no such row is tiered already.
 ///
 /// For the read path only: a document being written is refused, because the
 /// strict schema knows neither spelling. Rewrites the document ahead of its
@@ -380,7 +394,64 @@ pub fn upgrade_stored_routing(model: &mut serde_json::Value) -> Vec<&'static str
         ("round_robin", LEGACY_WEIGHTED_AS_ROUND_ROBIN)
     };
     routing.insert("strategy".to_string(), strategy.into());
-    vec![label]
+    let mut labels = vec![label];
+    let weight = |t: &serde_json::Value| {
+        t.get("weight")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1)
+    };
+    if let Some(targets) = routing
+        .get_mut("targets")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        // With every target at 0 none was a backup: they shared the start.
+        let mut demoted = false;
+        if targets.iter().any(|t| weight(t) > 0) {
+            for target in targets.iter_mut().filter(|t| weight(t) == 0) {
+                if let Some(target) = target.as_object_mut() {
+                    target.remove("weight");
+                    target.insert("priority".to_string(), BACKUP_TIER.into());
+                    demoted = true;
+                }
+            }
+        }
+        if demoted {
+            labels.push(LEGACY_WEIGHT_ZERO_AS_BACKUP_TIER);
+        }
+    }
+    labels
+}
+
+/// What to write instead, for the retired settings [`upgrade_stored_routing`]
+/// reported: the same sentence for a stored row that loads anyway and for a
+/// write that is refused.
+pub fn retired_routing_rewrite(labels: &[&str]) -> String {
+    labels
+        .iter()
+        .filter_map(|label| match *label {
+            LEGACY_WEIGHTED_AS_ROUND_ROBIN => Some(
+                "`routing.strategy: weighted` is retired: write `round_robin`, which splits \
+                 traffic by the same target weights",
+            ),
+            LEGACY_STICKY_AS_CONSISTENT_HASH => Some(
+                "`routing.strategy: weighted` with `sticky: true` is retired: write \
+                 `strategy: consistent_hash` without `sticky`, which keeps a key on one target \
+                 by the same weights, keyed on the `x-aisix-routing-key` header, else the \
+                 caller's API key",
+            ),
+            LEGACY_STICKY_IGNORED => Some(
+                "`routing.sticky` is retired: remove it, as nothing but `strategy: weighted` \
+                 ever read it",
+            ),
+            LEGACY_WEIGHT_ZERO_AS_BACKUP_TIER => Some(
+                "a `weight: 0` target, which `weighted` fell back to once the others failed, \
+                 is written as `priority: -1` without a weight: `weight: 0` now keeps a target \
+                 out of rotation altogether",
+            ),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 impl Routing {
@@ -632,6 +703,66 @@ mod tests {
 
         let mut direct = serde_json::json!({ "display_name": "m", "provider": "openai" });
         assert!(upgrade_stored_routing(&mut direct).is_empty());
+    }
+
+    /// A stored `weighted` group's `weight: 0` target was its backup: never the
+    /// first choice, still tried once the others failed. It loads as that.
+    #[test]
+    fn a_stored_weighted_backup_stays_a_backup() {
+        for sticky in [false, true] {
+            let mut doc = serde_json::json!({ "display_name": "g", "routing": {
+                "strategy": "weighted",
+                "sticky": sticky,
+                "targets": [
+                    { "model": "primary", "weight": 100 },
+                    { "model": "backup", "weight": 0 },
+                    { "model": "spare", "weight": 0 }
+                ]
+            }});
+            let labels = upgrade_stored_routing(&mut doc);
+            assert_eq!(labels.last(), Some(&LEGACY_WEIGHT_ZERO_AS_BACKUP_TIER));
+            assert_eq!(labels.len(), 2, "{labels:?}");
+            let routing: Routing = serde_json::from_value(doc["routing"].clone()).unwrap();
+            let tiers: Vec<(&str, i32, u32)> = routing
+                .targets
+                .iter()
+                .map(|t| {
+                    (
+                        t.model.as_str(),
+                        t.priority_or_default(),
+                        t.weight_or_default(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                tiers,
+                [("primary", 0, 100), ("backup", -1, 1), ("spare", -1, 1)],
+                "sticky={sticky}"
+            );
+        }
+
+        // Every target at 0: none was a backup, they shared the start.
+        let mut doc = serde_json::json!({ "display_name": "g", "routing": {
+            "strategy": "weighted",
+            "targets": [{ "model": "a", "weight": 0 }, { "model": "b", "weight": 0 }]
+        }});
+        assert_eq!(
+            upgrade_stored_routing(&mut doc),
+            [LEGACY_WEIGHTED_AS_ROUND_ROBIN]
+        );
+        assert!(doc["routing"]["targets"][1].get("priority").is_none());
+
+        // A group written in the current shape keeps `weight: 0` as written:
+        // there it takes the target out of rotation.
+        for strategy in ["round_robin", "consistent_hash", "least_busy"] {
+            let routing = serde_json::json!({
+                "strategy": strategy,
+                "targets": [{ "model": "a", "weight": 1 }, { "model": "b", "weight": 0 }]
+            });
+            let mut doc = serde_json::json!({ "display_name": "g", "routing": routing.clone() });
+            assert!(upgrade_stored_routing(&mut doc).is_empty());
+            assert_eq!(doc["routing"], routing, "{strategy}");
+        }
     }
 
     #[test]

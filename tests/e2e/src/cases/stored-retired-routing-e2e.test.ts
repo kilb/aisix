@@ -154,6 +154,55 @@ describe("a stored group using a retired routing setting", () => {
       ),
     ).toBe(true);
   });
+
+  // `weighted` used a weight only to choose where to start and fell back
+  // through the rest in order, so `weight: 0` was how a backup was written:
+  // never chosen first, still tried when the primary failed.
+  test("a `weight: 0` target is still the backup when the primary fails", async (ctx) => {
+    if (!etcdReachable || !seed) {
+      ctx.skip();
+      return;
+    }
+    const failing = await startOpenAiUpstream({ status: 500 });
+    try {
+      const pk = await seed.createProviderKey({
+        display_name: "stored-routing-failing-pk",
+        provider: "openai",
+        api_key: "sk-mock",
+        api_base: `${failing.baseUrl}/v1`,
+      });
+      await seed.createModel({
+        display_name: "stored-routing-failing-primary",
+        provider: "openai",
+        model_name: "gpt-4o-mini",
+        provider_key_id: pk.id,
+      });
+      await seed.createModel({
+        display_name: "stored-backup-group",
+        routing: {
+          strategy: "weighted",
+          targets: [
+            { model: "stored-routing-failing-primary", weight: 100 },
+            { model: "stored-routing-target-1", weight: 0 },
+          ],
+        },
+      });
+      await waitConfigPropagation(async () => (await chat("stored-backup-group")) !== 404);
+
+      for (let i = 0; i < 5; i++) {
+        const before = hits()[1]!;
+        const primaryBefore = failing.receivedRequests.length;
+        expect(await chat("stored-backup-group")).toBe(200);
+        expect(failing.receivedRequests.length).toBeGreaterThan(primaryBefore);
+        expect(hits()[1]!).toBe(before + 1);
+      }
+
+      const cfg = await statusConfig();
+      expect(cfg.rejected).toEqual([]);
+    } finally {
+      await failing.close();
+    }
+  });
 });
 
 describe("a resources file using a retired routing setting", () => {

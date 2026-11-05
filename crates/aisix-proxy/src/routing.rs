@@ -2906,6 +2906,57 @@ mod tests {
         }
     }
 
+    /// A stored `weighted` group's `weight: 0` target was its backup: never
+    /// the first choice, still tried once the others failed or went down.
+    /// Loaded through the stored-row upgrade, it still is, whichever strategy
+    /// the row lands on.
+    #[test]
+    fn a_stored_weighted_backup_stays_a_fallback() {
+        let snap = snap_of(&["primary", "backup"]);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-aisix-routing-key",
+            "cohort".parse().expect("header value"),
+        );
+        for sticky in [false, true] {
+            let mut doc = serde_json::json!({ "display_name": "group", "routing": {
+                "strategy": "weighted",
+                "sticky": sticky,
+                "targets": [
+                    { "model": "primary", "weight": 100 },
+                    { "model": "backup", "weight": 0 }
+                ]
+            }});
+            aisix_core::models::upgrade_stored_routing(&mut doc);
+            let routing: Routing = serde_json::from_value(doc["routing"].clone()).unwrap();
+            let status = crate::ModelRuntimeStatusTracker::new();
+            let req = || RoutingRequest {
+                headers: Some(&headers),
+                ..Default::default()
+            };
+            for _ in 0..8 {
+                assert_eq!(
+                    select(
+                        &RoutingRegistry::new(),
+                        &status,
+                        &snap,
+                        routing.clone(),
+                        req()
+                    )
+                    .unwrap(),
+                    ["primary", "backup"],
+                    "sticky={sticky}"
+                );
+            }
+            status.mark_unhealthy("id-primary", Some(503), "background_check_failed");
+            assert_eq!(
+                select(&RoutingRegistry::new(), &status, &snap, routing, req()).unwrap(),
+                ["backup"],
+                "sticky={sticky}"
+            );
+        }
+    }
+
     /// `failover` documents that it does not read `weight`, so a 0 there
     /// changes nothing.
     #[test]

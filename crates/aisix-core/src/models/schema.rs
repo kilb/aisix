@@ -536,10 +536,7 @@ pub fn validate_model(value: &Value) -> Result<(), SchemaError> {
     if !retired.is_empty() && validate(&SCHEMAS.model, &upgraded).is_ok() {
         return Err(SchemaError {
             path: err.path,
-            message: "`routing.strategy: weighted` and `routing.sticky` are retired: \
-                      `round_robin` honours the same target weights, and \
-                      `consistent_hash` keeps a key on one target"
-                .to_string(),
+            message: super::routing::retired_routing_rewrite(&retired),
         });
     }
     let Ok(mut model) = serde_json::from_value::<Model>(value.clone()) else {
@@ -3424,17 +3421,34 @@ mod tests {
     /// to write instead.
     #[test]
     fn a_write_of_a_retired_routing_setting_is_refused_with_its_replacement() {
-        for routing in [
-            json!({"strategy": "weighted", "targets": [{"model": "a"}]}),
-            json!({"strategy": "weighted", "sticky": true, "targets": [{"model": "a"}]}),
-            json!({"strategy": "round_robin", "sticky": true, "targets": [{"model": "a"}]}),
+        for (routing, rewrite) in [
+            (
+                json!({"strategy": "weighted", "targets": [{"model": "a"}]}),
+                &["`routing.strategy: weighted`", "`round_robin`"][..],
+            ),
+            (
+                json!({"strategy": "weighted", "sticky": true, "targets": [{"model": "a"}]}),
+                &[
+                    "`sticky: true`",
+                    "`strategy: consistent_hash` without `sticky`",
+                ],
+            ),
+            (
+                json!({"strategy": "round_robin", "sticky": true, "targets": [{"model": "a"}]}),
+                &["`routing.sticky`", "remove it"],
+            ),
+            (
+                json!({"strategy": "weighted", "targets": [
+                    {"model": "a", "weight": 100}, {"model": "b", "weight": 0}
+                ]}),
+                &["`round_robin`", "`weight: 0`", "`priority: -1`"],
+            ),
         ] {
             let doc = json!({"display_name": "g", "routing": routing});
             let err = validate_model(&doc).expect_err("a write must be refused");
-            assert!(
-                err.message.contains("round_robin") && err.message.contains("consistent_hash"),
-                "{err}"
-            );
+            for part in rewrite {
+                assert!(err.message.contains(part), "{part}: {err}");
+            }
         }
         // An unrelated fault keeps its own error rather than this one.
         let doc = json!({

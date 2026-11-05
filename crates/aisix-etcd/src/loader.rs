@@ -327,10 +327,12 @@ pub fn build_snapshot(prefixes: &PrefixSet, entries: &[RawEntry]) -> (AisixSnaps
                             &raw.key,
                             row_kind,
                             &fields,
-                            "row loaded with a retired routing setting, serving what replaced \
-                             it: `strategy: weighted` as `round_robin`, and with `sticky: true` \
-                             as `consistent_hash`; rewrite the row, a write of this shape is \
-                             refused",
+                            &format!(
+                                "row loaded with a retired routing setting, serving what \
+                                 replaced it; rewrite the row, a write of this shape is \
+                                 refused: {}",
+                                aisix_core::models::retired_routing_rewrite(&retired)
+                            ),
                         );
                         merge_partial_compat_fields(&mut stats, &raw.key, row_kind, fields);
                     }
@@ -961,6 +963,50 @@ mod tests {
                 ("legacy:routing.strategy_weighted_as_round_robin", 1),
             ],
             "the setting's new meaning is reported, not an unknown-field path"
+        );
+    }
+
+    /// A stored `weighted` group's `weight: 0` target was its backup. It loads
+    /// as one, in a tier below the rest, and the row says so.
+    #[test]
+    fn a_stored_weighted_backup_loads_as_a_backup_tier() {
+        let row = serde_json::to_vec(&serde_json::json!({
+            "display_name": "g",
+            "routing": {
+                "strategy": "weighted",
+                "targets": [
+                    { "model": "primary", "weight": 100 },
+                    { "model": "backup", "weight": 0 }
+                ]
+            }
+        }))
+        .unwrap();
+        let (snap, stats) = build_snapshot(
+            &env_prefixes(),
+            &[raw("/aisix/models/primary-backup", &row, 2)],
+        );
+
+        assert!(stats.rejections.is_empty(), "{:?}", stats.rejections);
+        let entry = snap.models.get_by_id("primary-backup").expect("loaded");
+        let routing = entry.value.routing.as_ref().expect("a group");
+        let tiers: Vec<(&str, i32)> = routing
+            .targets
+            .iter()
+            .map(|t| (t.model.as_str(), t.priority_or_default()))
+            .collect();
+        assert_eq!(tiers, [("primary", 0), ("backup", -1)]);
+        assert!(routing.targets[1].weight_or_default() > 0);
+        let reported: Vec<&str> = stats
+            .partially_compatible
+            .iter()
+            .map(|e| e.field.as_str())
+            .collect();
+        assert_eq!(
+            reported,
+            [
+                "legacy:routing.strategy_weighted_as_round_robin",
+                "legacy:routing.weight_zero_as_backup_tier",
+            ]
         );
     }
 
