@@ -206,14 +206,7 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
              live socket. Covered by the realtime e2e suite.",
         ),
     ),
-    (
-        "/v1/files",
-        Posture::Unscreened(
-            "an uploaded file is a batch of independent requests, not one message: a whole-blob \
-             scan answers with a single verdict over decoded JSON syntax and can rewrite nothing. \
-             Screening it per record, through the ordinary request chain, is #1120.",
-        ),
-    ),
+    ("/v1/files", Posture::Enforced),
     ("/v1/batches", Posture::Enforced),
     ("/v1/fine_tuning/jobs", Posture::Enforced),
     (
@@ -668,9 +661,11 @@ pub(crate) fn fixture(surface: &str) -> Option<Request<Body>> {
                 "params": { "name": "tool", "arguments": {} },
             }),
         ),
-        // The jobs surfaces that still screen: both send a re-serialised
-        // JSON request body, and both route off the encoded file id rather
-        // than a `model` field, so neither needs a prior upload to drive.
+        // A form with no `purpose`: the chain decides over the file part.
+        "/v1/files" => form(surface, &[("model", "census-openai"), ("file", "x")]),
+        // The jobs surfaces that send a re-serialised JSON request body. Both
+        // route off the encoded file id rather than a `model` field, so neither
+        // needs a prior upload to drive.
         "/v1/batches" => json(
             surface,
             serde_json::json!({

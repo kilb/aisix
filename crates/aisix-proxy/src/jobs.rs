@@ -4163,6 +4163,8 @@ mod tests {
     /// on, so one upload exercises both ways a scan of the whole blob
     /// could stop it.
     const BLOB_UPLOAD: &[u8] = b"{\"custom_id\":\"r1\",\"note\":\"\xc4\xe3\xba\xc3\"}";
+    /// [`BLOB_UPLOAD`] without what `seed_blocking_input_guardrail` matches.
+    const CLEAN_BLOB_UPLOAD: &[u8] = b"{\"id\":\"r1\",\"note\":\"\xc4\xe3\xba\xc3\"}";
 
     /// A fail-closed input row matching `custom_id`, which every request
     /// fixture below carries. The files surface must forward regardless;
@@ -4227,15 +4229,60 @@ mod tests {
             })))
     }
 
-    /// An upload reaches the provider whatever the chain says, under every
-    /// class of declared `purpose`: one whose payload is contractually
-    /// JSONL, one that legitimately carries binary, and none at all. The
-    /// fixture is both undecodable AND a policy hit, so each leg covers
-    /// the two ways a whole-blob scan used to stop an upload.
-    ///
-    /// The usage event must not claim a bypass either: nothing offered to
-    /// screen this request, which is not the same as a check that ran and
-    /// was let past.
+    /// An upload whose content matches a block rule is refused before the
+    /// provider is contacted, under every class of declared `purpose`: one
+    /// whose payload is contractually JSONL, one that legitimately carries
+    /// binary, and none at all. The fixture is not valid UTF-8 either, which
+    /// must not take it past the scan.
+    #[tokio::test]
+    async fn a_matching_upload_is_refused_under_every_purpose_class() {
+        for purpose in [Some("batch"), Some("assistants"), None] {
+            let upstream = MockServer::builder().start().await;
+            files_upstream_mock().expect(0).mount(&upstream).await;
+
+            let snap = AisixSnapshot::new();
+            snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+            snap.models.insert(model("m-a", "jobs-a", PK_A));
+            snap.apikeys.insert(apikey_entry(&["*"]));
+            seed_blocking_input_guardrail(&snap);
+            let (app, mut rx) = build_app_with_sink(snap);
+
+            let resp = app
+                .oneshot(upload_request_with_purpose(
+                    "XBOUNDARYX",
+                    purpose,
+                    BLOB_UPLOAD,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "purpose {purpose:?}"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], "content_filter", "{body}");
+            assert_eq!(
+                body["error"]["message"],
+                "request blocked by content policy (guardrail 'blocks-a-term')",
+            );
+            assert!(
+                upstream.received_requests().await.unwrap().is_empty(),
+                "purpose {purpose:?}: nothing reaches the provider"
+            );
+
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("/v1/files must emit a usage event")
+                .expect("channel open");
+            assert!(ev.guardrail_blocked, "purpose {purpose:?}: {ev:?}");
+        }
+    }
+
+    /// A clean upload reaches the provider byte for byte under the same
+    /// classes, though it is not valid UTF-8: a block rule that matches nothing
+    /// has no reason to look further, and nothing went unscreened.
     #[tokio::test]
     async fn an_upload_is_forwarded_under_every_purpose_class() {
         for purpose in [Some("batch"), Some("assistants"), None] {
@@ -4253,7 +4300,7 @@ mod tests {
                 .oneshot(upload_request_with_purpose(
                     "XBOUNDARYX",
                     purpose,
-                    BLOB_UPLOAD,
+                    CLEAN_BLOB_UPLOAD,
                 ))
                 .await
                 .unwrap();
@@ -4264,8 +4311,8 @@ mod tests {
             assert!(
                 received[0]
                     .body
-                    .windows(BLOB_UPLOAD.len())
-                    .any(|w| w == BLOB_UPLOAD),
+                    .windows(CLEAN_BLOB_UPLOAD.len())
+                    .any(|w| w == CLEAN_BLOB_UPLOAD),
                 "purpose {purpose:?}: the original bytes must forward byte-for-byte"
             );
 

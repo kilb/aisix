@@ -9,20 +9,16 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: guardrails do not apply to the files surface (#1120). An uploaded
-// file is a batch of independent requests, not one message, so scanning
-// the whole blob as a single synthetic turn answered with one verdict over
-// decoded JSON syntax and could rewrite nothing. Screening it per record,
-// through the ordinary request chain, is #1120's job.
+// E2E: an upload is screened like any other request, on the way in only. Every
+// leg attaches a guardrail whose pattern IS present in a fixture, on both hooks
+// and fail-closed. An upload whose content matches is refused before the
+// provider sees it, under every class of `purpose`, and one whose content does
+// not reaches the provider byte for byte. What comes back is relayed: the
+// output scan was removed from this surface on purpose. The upstream recorder
+// is the load-bearing half of each upload leg.
 //
-// Every leg here attaches a guardrail whose pattern IS present in the
-// fixture, on both hooks and fail-closed, so a scan anywhere on the path
-// would refuse. The upstream recorder is the load-bearing half of the
-// upload legs: the bytes must reach the provider unchanged.
-//
-// The last leg is the scope boundary. `/v1/batches` sends a serialised
-// JSON request body rather than a caller's blob, and is still screened —
-// it fails if the removal was widened past the files surface.
+// The last leg is the scope boundary. `/v1/batches` sends a serialised JSON
+// request body rather than a caller's blob, and is screened too.
 
 const KEY = "sk-files-guardrail-scope";
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -38,6 +34,14 @@ const BLOCKED_TERM = "zzz-blocked-term-zzz";
  *  valid UTF-8. Both are ways a whole-blob scan could stop the upload. */
 const BLOB = Buffer.concat([
   Buffer.from(`{"custom_id":"r1","note":"${BLOCKED_TERM}","raw":"`, "utf8"),
+  Buffer.from([0xc4, 0xe3, 0xba, 0xc3]),
+  Buffer.from('"}\n', "utf8"),
+]);
+
+/** {@link BLOB} without the policy hit. It is still not valid UTF-8, so
+ *  forwarding it proves a clean binary upload is left alone. */
+const CLEAN_BLOB = Buffer.concat([
+  Buffer.from(`{"custom_id":"r1","note":"nothing to see","raw":"`, "utf8"),
   Buffer.from([0xc4, 0xe3, 0xba, 0xc3]),
   Buffer.from('"}\n', "utf8"),
 ]);
@@ -174,7 +178,7 @@ const upload = (
     body: multipartUpload("XFILESSCOPEX", MODEL, purpose, file, filename),
   });
 
-describe("files: the surface is not guardrail-screened", () => {
+describe("files: an upload is screened, what comes back is not", () => {
   beforeAll(async () => {
     const etcd = new EtcdClient();
     etcdReachable = await etcd.ping();
@@ -220,17 +224,33 @@ describe("files: the surface is not guardrail-screened", () => {
   // Every class of declared `purpose`: contractually JSONL, legitimately
   // binary, and none at all.
   for (const purpose of ["batch", "assistants", null]) {
-    test(`an upload with purpose=${purpose ?? "(none)"} is forwarded`, async (ctx) => {
+    test(`an upload with purpose=${purpose ?? "(none)"} that matches a block rule is refused`, async (ctx) => {
       if (!etcdReachable) {
         ctx.skip();
         return;
       }
       const before = upstream!.uploads.length;
-      const res = await upload(purpose);
+      const res = await upload(purpose, BLOB);
+      expect(res.status).toBe(422);
+      const body = (await res.json()) as { error?: { type?: string; message?: string } };
+      expect(body.error?.type).toBe("content_filter");
+      expect(body.error?.message).toBe(
+        `request blocked by content policy (guardrail '${guardrail.name}')`,
+      );
+      expect(upstream!.uploads).toHaveLength(before);
+    });
+
+    test(`a clean upload with purpose=${purpose ?? "(none)"} is forwarded byte for byte`, async (ctx) => {
+      if (!etcdReachable) {
+        ctx.skip();
+        return;
+      }
+      const before = upstream!.uploads.length;
+      const res = await upload(purpose, CLEAN_BLOB);
       expect(res.status).toBe(200);
       await res.json();
       expect(upstream!.uploads).toHaveLength(before + 1);
-      expect(upstream!.uploads[before].includes(BLOB)).toBe(true);
+      expect(upstream!.uploads[before].includes(CLEAN_BLOB)).toBe(true);
     });
   }
 
@@ -240,8 +260,8 @@ describe("files: the surface is not guardrail-screened", () => {
       return;
     }
     // The upstream echoes the filename, so the response body carries the
-    // blocked term on the way back.
-    const res = await upload("batch", BLOB, `${BLOCKED_TERM}.jsonl`);
+    // blocked term on the way back; the content that was screened is clean.
+    const res = await upload("batch", CLEAN_BLOB, `${BLOCKED_TERM}.jsonl`);
     expect(res.status).toBe(200);
     const body = (await res.json()) as { filename?: string };
     expect(body.filename).toBe(`${BLOCKED_TERM}.jsonl`);

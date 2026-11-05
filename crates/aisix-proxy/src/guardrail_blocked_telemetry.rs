@@ -366,7 +366,7 @@ fn fixture_for(surface: &str, model: &str, text: &str) -> Request<Body> {
 /// and the jobs surfaces are deliberately absent: the multipart ones screen
 /// a prompt part rather than a JSON field, `/v1/batches` and
 /// `/v1/fine_tuning/jobs` screen a re-serialised request envelope rather
-/// than caller prose, and `/v1/files` is not screened at all. A keyword
+/// than caller prose, and `/v1/files` screens an uploaded file. A keyword
 /// fixture there would assert nothing they don't already share with
 /// `/v1/audio/speech` — they all go through the same
 /// `usage_attr::build_error_usage_event` emitter this list already covers
