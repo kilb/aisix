@@ -6195,10 +6195,12 @@ fn stream_response(
     };
     let route_name = telemetry.route_name.clone();
     let capture_cap = telemetry.content_cap;
+    // A hold-back policy derives its cap from its own raw-byte limit, so an
+    // unterminated frame cannot outgrow the bytes it may hold.
     let splitter_cap = policy
         .hold_cap()
         .map(|(cap, _)| cap.saturating_mul(crate::held_content::RAW_HOLD_FACTOR))
-        .unwrap_or(MAX_HELD_STREAM_BYTES);
+        .unwrap_or(aisix_gateway::sse::MAX_SSE_FRAME_BYTES);
     let mut lease_loss = stream_hold.lease_loss_receiver();
 
     let stream = async_stream::stream! {
@@ -7608,6 +7610,9 @@ fn emit_access_log(
 
 #[cfg(test)]
 mod tests {
+    /// A frame cap the splitter tests can outgrow cheaply.
+    const MAX_HELD_STREAM_BYTES: usize = 1024 * 1024;
+
     use super::*;
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;
@@ -11959,6 +11964,51 @@ data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\"
 data: [DONE]\n\n";
 
     const MALFORMED_SUPPLEMENTAL_SSE: &str = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"input\":\"clean\",\"name\":1}}\n\n";
+
+    /// A terminal frame past a mebibyte is still one frame: usage is the
+    /// metering it carries, and there is no estimator behind this relay.
+    #[tokio::test]
+    async fn a_large_terminal_frame_still_meters_the_relay() {
+        use aisix_obs::UsageSink;
+        let upstream = MockServer::builder().start().await;
+        let sse = format!(
+            "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"r\",\"output\":[{{\"type\":\"image_generation_call\",\"id\":\"ig\",\"result\":\"{}\"}}],\"usage\":{{\"input_tokens\":123456,\"output_tokens\":7890,\"total_tokens\":131346}}}}}}\n\ndata: [DONE]\n\n",
+            "A".repeat(2 * 1024 * 1024),
+        );
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&upstream)
+            .await;
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry("http://unused"));
+        snap.apikeys.insert(apikey_entry("sk-caller", Some(&["*"])));
+        snap.passthrough_routes
+            .insert(inject_route(&upstream.uri()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), Arc::new(Hub::new()), &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/passthrough/openai/v1/responses")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({"model": "x", "stream": true, "input": "hi"}).to_string(),
+            ))
+            .unwrap();
+        let resp = crate::build_router(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = to_bytes(resp.into_body(), 8 << 20).await.unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.prompt_tokens, 123_456);
+        assert_eq!(event.completion_tokens, 7_890);
+    }
 
     /// A refusal ending a relayed Anthropic Messages stream is the frame
     /// `/v1/messages` emits for it: an SDK-legal `error.type` and the

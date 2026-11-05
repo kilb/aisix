@@ -2024,6 +2024,8 @@ async fn responses_to_target(
             let mut responses_held_content = crate::held_content::ResponsesHeldContent::default();
             let mut counted_upto = 0usize;
             let mut parsed_upto = 0usize;
+            // How much of `buf[parsed_upto..]` is known to hold no frame end.
+            let mut scanned = 0usize;
             let mut exceeded = false;
             loop {
                 // #554: bound each read so a stalled upstream fails over —
@@ -2106,8 +2108,11 @@ async fn responses_to_target(
                 // A provider may coalesce later frames into the same transport
                 // item; those bytes are not part of this response.
                 let mut semantic_terminal = false;
-                while let Some(end) = crate::redact::first_sse_event_end(&buf[parsed_upto..]) {
+                while let Some(end) =
+                    aisix_gateway::sse::find_frame_end_from(&buf[parsed_upto..], scanned)
+                {
                     let frame_end = parsed_upto + end;
+                    scanned = 0;
                     semantic_terminal = observe_responses_sse_frame(
                         &buf[parsed_upto..frame_end],
                         &mut observed_usage,
@@ -2122,16 +2127,17 @@ async fn responses_to_target(
                         break;
                     }
                 }
+                scanned = buf.len() - parsed_upto;
                 buf_held.set(buf.len());
                 let end = counted_upto + crate::redact::last_frame_end(&buf[counted_upto..]);
                 held_content.hold(
                     crate::held_content::responses_sse_held_frames(
                         &mut responses_held_content,
-                        &buf[counted_upto..end],
+                        &buf[counted_upto..parsed_upto],
                     ),
                     chunk.len(),
                 );
-                counted_upto = end;
+                counted_upto = parsed_upto;
                 if held_content.exceeds(max_buffer_bytes) {
                     exceeded = true;
                     break;
@@ -4138,6 +4144,8 @@ fn responses_sse_provider_request_id(bytes: &[u8]) -> String {
 #[allow(clippy::too_many_arguments)]
 fn drain_responses_sse_frames(
     buf: &mut Vec<u8>,
+    // How much of `buf` an earlier call scanned without finding a frame end.
+    scanned: &mut usize,
     acc: &mut Option<ResponseUsage>,
     mut capture: Option<&mut SseTextCapture>,
     failure: &mut Option<crate::stream_timeout::RawStreamFailure>,
@@ -4150,8 +4158,9 @@ fn drain_responses_sse_frames(
     if failure.is_some() || acc.as_ref().is_some_and(|usage| usage.reached_end) {
         return true;
     }
-    while let Some(end) = crate::redact::first_sse_event_end(buf) {
+    while let Some(end) = aisix_gateway::sse::find_frame_end_from(buf, *scanned) {
         let frame: Vec<u8> = buf.drain(..end).collect();
+        *scanned = 0;
         let restamped = crate::model_echo::restamp_sse_frame(
             &frame,
             client_facing_model,
@@ -4175,6 +4184,7 @@ fn drain_responses_sse_frames(
             return true;
         }
     }
+    *scanned = buf.len();
     false
 }
 
@@ -4576,7 +4586,7 @@ where
     // on (#1074) — whether estimation is needed is only known
     // at end-of-stream — with the estimation cap as the floor. The cap
     // bounds delta accumulation; a terminal event's full output text is
-    // instead bounded by MAX_SSE_FRAME_BUF_BYTES (an oversized frame
+    // instead bounded by MAX_SSE_FRAME_BYTES (an oversized frame
     // never parses). The end-of-stream scan reads all of it, so with one
     // the accumulator keeps up to the scan's own bound;
     // `CapturedContent::new` re-truncates to the exporter cap either way.
@@ -4611,6 +4621,7 @@ where
         };
         futures::pin_mut!(upstream);
         let mut buf: Vec<u8> = Vec::new();
+        let mut scanned = 0usize;
         // Already measured when `upstream` replays bytes held back earlier.
         let mut first_frame_seen = measured_ttft.is_some();
         // A frame that outgrew the buffer went out unparsed, so whether a
@@ -4641,6 +4652,7 @@ where
             let state = guard.state();
             let terminal_seen = drain_responses_sse_frames(
                 &mut buf,
+                &mut scanned,
                 &mut state.usage,
                 state.capture.as_mut(),
                 &mut state.failure,
@@ -4654,7 +4666,7 @@ where
                 // Parsed through the exact semantic-terminal boundary. Later
                 // frames coalesced into this transport item are discarded.
                 buf.clear();
-            } else if buf.len() > crate::messages::MAX_SSE_FRAME_BUF_BYTES {
+            } else if buf.len() > aisix_gateway::sse::MAX_SSE_FRAME_BYTES {
                 // Bound the frame buffer: the happy path drains complete frames
                 // above so `buf` only holds a partial trailing frame. A
                 // non-conformant upstream streaming bytes without a blank-line
@@ -4664,14 +4676,12 @@ where
                 // are lost, and its text never reached the capture, so the
                 // capture no longer speaks for the whole response.
                 //
-                // The restamp cannot be recovered here, and not for want of
-                // trying: at the cap the frame is genuinely still arriving, so
-                // its JSON is incomplete, so `json_splice` refuses it and falls
-                // back to verbatim by design. Reaching this needs a single SSE
-                // frame over 1 MiB — on this surface `response.completed`
-                // carries the whole Response object, so a caller with a very
-                // large `tools[]` can get there. Named in the PR description as
-                // a known limit rather than papered over.
+                // The bound is the one every SSE reader shares, generous on
+                // purpose: `response.completed` carries the whole Response
+                // object, image results included, and it is the only frame that
+                // reports the usage. A frame that does not fit has stopped being
+                // one: at the cap its JSON is incomplete, so `json_splice`
+                // refuses it and falls back to verbatim by design.
                 tracing::warn!(
                     buffered = buf.len(),
                     "responses stream: SSE frame buffer exceeded cap without a \
@@ -4746,6 +4756,7 @@ where
             let state = guard.state();
             drain_responses_sse_frames(
                 &mut buf,
+                &mut 0,
                 &mut state.usage,
                 state.capture.as_mut(),
                 &mut state.failure,
@@ -6260,6 +6271,66 @@ mod tests {
         assert_eq!(event.completion_tokens, 17, "{streamed}");
         assert!(!event.usage_estimated, "the frame was read, not guessed");
         assert_eq!(event.provider_request_id, "resp_eof");
+    /// `response.completed` carries the whole Response object, so an image
+    /// result takes it well past a mebibyte, and it is the only frame that
+    /// reports the usage: the row must have the provider's counts, not a guess.
+    #[tokio::test]
+    async fn a_terminal_frame_past_a_mebibyte_still_reports_its_usage() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::builder().start().await;
+        let sse = format!(
+            "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_big\",\"model\":\"gpt-4o-2024-11-20\"}}}}\n\nevent: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_big\",\"model\":\"gpt-4o-2024-11-20\",\"output\":[{{\"type\":\"image_generation_call\",\"id\":\"ig_1\",\"result\":\"{}\"}}],\"usage\":{{\"input_tokens\":123456,\"output_tokens\":7890,\"total_tokens\":131346}}}}}}\n\n",
+            "A".repeat(2 * 1024 * 1024),
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "hi",
+                "stream": true,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let streamed = to_bytes(resp.into_body(), 8 << 20).await.unwrap();
+        let streamed = String::from_utf8_lossy(&streamed);
+        assert!(streamed.contains(r#""model":"gpt-4o-resp""#));
+        assert!(
+            !streamed.contains("gpt-4o-2024-11-20"),
+            "the large frame is restamped like any other"
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("usage event must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.status_code, 200);
+        assert_eq!(event.prompt_tokens, 123_456);
+        assert_eq!(event.completion_tokens, 7_890);
+        assert!(!event.usage_estimated, "the frame was read, not guessed");
+    }
+
     }
 
     /// The same tail, but ending in ONE newline — a provider that wrote half
@@ -8352,6 +8423,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\"
         let mut out = Vec::new();
         let terminal = super::drain_responses_sse_frames(
             &mut buf,
+            &mut 0,
             &mut acc,
             None,
             &mut failure,
@@ -9600,6 +9672,7 @@ data: [DONE]\n\n";
         let mut first = false;
         super::drain_responses_sse_frames(
             &mut buf,
+            &mut 0,
             &mut acc,
             None,
             &mut failure,
@@ -9630,6 +9703,7 @@ data: [DONE]\n\n";
         let mut first = false;
         super::drain_responses_sse_frames(
             &mut buf,
+            &mut 0,
             &mut acc,
             None,
             &mut failure,

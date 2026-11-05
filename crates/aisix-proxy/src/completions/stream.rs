@@ -100,7 +100,7 @@ impl Default for CompletionSseAccumulator {
             dropping_oversized_frame: false,
             text_by_choice: BTreeMap::new(),
             text_bytes: 0,
-            frame_cap: crate::messages::MAX_SSE_FRAME_BUF_BYTES,
+            frame_cap: aisix_gateway::sse::MAX_SSE_FRAME_BYTES,
             text_cap: crate::token_estimate::OUTPUT_ACCUMULATION_CAP,
             text_truncated: false,
             saw_done: false,

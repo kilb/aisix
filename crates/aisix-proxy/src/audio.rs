@@ -1082,7 +1082,7 @@ where
         // telemetry for that pathological case) rather than OOM. Same
         // bound and same trade as the `/v1/responses` passthrough.
         let mut decoder = Some(aisix_gateway::SseDecoder::with_max_frame_bytes(
-            crate::messages::MAX_SSE_FRAME_BUF_BYTES,
+            aisix_gateway::sse::MAX_SSE_FRAME_BYTES,
         ));
         futures::pin_mut!(upstream);
         while let Some(item) = upstream.next().await {

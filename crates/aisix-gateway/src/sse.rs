@@ -99,6 +99,13 @@ pub fn find_frame_end(buf: &[u8]) -> Option<usize> {
     scan(buf, 0).map(|(_, end)| end)
 }
 
+/// [`find_frame_end`] for a caller that keeps its own buffer: `from` is how much
+/// of `buf` an earlier call already scanned without finding a frame end, so a
+/// frame that arrives in many reads costs one pass over its bytes.
+pub fn find_frame_end_from(buf: &[u8], from: usize) -> Option<usize> {
+    scan(buf, from).map(|(_, end)| end)
+}
+
 /// Like [`find_frame_end`], also saying where the frame's content ends:
 /// `buf[..content_end]` is its lines without the last one's terminator, and
 /// `buf[content_end..frame_end]` is that terminator plus the blank line —
@@ -707,6 +714,27 @@ mod tests {
         }
         assert_eq!(find_frame_end(b"data: a\r\ndata: b\r\n"), None);
         assert_eq!(find_frame_end(b"data: a\r"), None);
+    }
+
+    /// Resuming where the last scan stopped finds the same frame end as
+    /// scanning the whole buffer, wherever the read boundary fell, a split
+    /// `\r\n` included.
+    #[test]
+    fn a_resumed_scan_finds_the_frame_end_a_whole_scan_does() {
+        for raw in [
+            &b"data: a\n\nrest"[..],
+            b"data: a\r\n\r\nrest",
+            b"data: a\r\rrest",
+            b"event: x\r\ndata: a\n\r\nrest",
+        ] {
+            let whole = find_frame_end(raw);
+            for cut in 0..raw.len() {
+                // Only a prefix with no frame end yet is resumed from.
+                if find_frame_end(&raw[..cut]).is_none() {
+                    assert_eq!(find_frame_end_from(raw, cut), whole, "cut={cut}");
+                }
+            }
+        }
     }
 
     /// A chunk boundary at every byte of a CRLF stream: the frames always

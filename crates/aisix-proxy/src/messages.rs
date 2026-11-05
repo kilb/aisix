@@ -4642,13 +4642,6 @@ fn emit_anthropic_usage_event(
 // end-of-stream OR on client-disconnect (mirroring chat.rs's
 // `CompleteOnDrop`), so a streamed request always ships a UsageEvent.
 
-/// Upper bound on the in-flight SSE frame buffer (PR #436 audit
-/// MEDIUM-2). Real Anthropic SSE frames are a few KB at most; this
-/// ceiling only trips on a non-conformant upstream that never emits a
-/// frame terminator, guarding against per-request memory exhaustion.
-/// Shared with the `/v1/responses` streaming usage parser (#808).
-pub(crate) const MAX_SSE_FRAME_BUF_BYTES: usize = 1 << 20; // 1 MiB
-
 /// Accumulated usage observed across an Anthropic SSE stream.
 /// Sourced from `message_start` (input + cache tokens, id, model) and
 /// `message_delta` (running output_tokens, stop_reason). All fields
@@ -5056,8 +5049,11 @@ pub(crate) fn anthropic_stream_usage_stats(event: &Value) -> Option<aisix_gatewa
 /// unit — every conforming parser buffers to the blank-line terminator
 /// anyway — so holding a partial one back is not observable to a client,
 /// and `buf` retains only that partial tail.
+#[allow(clippy::too_many_arguments)]
 fn drain_anthropic_sse_frames(
     buf: &mut Vec<u8>,
+    // How much of `buf` an earlier call scanned without finding a frame end.
+    scanned: &mut usize,
     acc: &mut AnthropicStreamUsage,
     attempt_started: Instant,
     first_token_seen: &mut bool,
@@ -5068,8 +5064,9 @@ fn drain_anthropic_sse_frames(
     if acc.reached_end || acc.stream_failure.is_some() {
         return Some(0);
     }
-    while let Some(end) = aisix_gateway::sse::find_frame_end(buf) {
+    while let Some(end) = aisix_gateway::sse::find_frame_end_from(buf, *scanned) {
         let frame: Vec<u8> = buf.drain(..end).collect();
+        *scanned = 0;
         // The frame's WHOLE payload, not just its first `data:` line: this
         // is what feeds `response_text`, the text the end-of-stream output
         // guardrail scans, and a payload split over several `data:` lines
@@ -5102,6 +5099,7 @@ fn drain_anthropic_sse_frames(
             return Some(0);
         }
     }
+    *scanned = buf.len();
     None
 }
 
@@ -5263,6 +5261,7 @@ where
         };
         futures::pin_mut!(upstream);
         let mut buf: Vec<u8> = Vec::new();
+        let mut scanned = 0usize;
         let mut first_token_seen = false;
         // Whole-response hold-back buffer (BufferFull and Window policies).
         let mut held: Vec<u8> = Vec::new();
@@ -5326,6 +5325,7 @@ where
             let mut forward: Vec<u8> = Vec::new();
             let terminal_seen = drain_anthropic_sse_frames(
                 &mut buf,
+                &mut scanned,
                 guard.usage(),
                 attempt_started,
                 &mut first_token_seen,
@@ -5345,9 +5345,8 @@ where
             // few hundred bytes. A malformed / hostile upstream
             // that streams bytes WITHOUT a blank-line terminator
             // would otherwise grow `buf` unboundedly (per-request
-            // memory exhaustion). Real Anthropic SSE frames are
-            // well under a few KB, so a 1 MiB ceiling can only be
-            // hit by a non-conformant stream.
+            // memory exhaustion). The bound is the one every SSE reader
+            // shares, so only a stream that has stopped framing reaches it.
             //
             // Under a hold-back policy those bytes fail closed, for the
             // same reason the EOF tail below does: an unterminated frame
@@ -5360,7 +5359,7 @@ where
             // remainder goes downstream rather than being dropped or held
             // until OOM. Delivery is preserved — only that frame's usage
             // parse and model restamp are lost.
-            if buf.len() > MAX_SSE_FRAME_BUF_BYTES {
+            if buf.len() > aisix_gateway::sse::MAX_SSE_FRAME_BYTES {
                 if hold.is_some() {
                     tracing::warn!(
                         guardrail_hook = "output",
@@ -5388,6 +5387,7 @@ where
                 );
                 guard.usage().released_unparsed_frame = true;
                 forward.append(&mut buf);
+                scanned = 0;
             }
             if let Some((max_hold, fail_open)) = hold {
                 // Hold-back: withhold the bytes until the end-of-stream
@@ -7813,6 +7813,7 @@ event: message_delta\rdata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         let mut out: Vec<u8> = Vec::new();
         drain_anthropic_sse_frames(
             &mut buf,
+            &mut 0,
             &mut acc,
             std::time::Instant::now(),
             &mut first_token_seen,
@@ -7855,6 +7856,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         let mut out: Vec<u8> = Vec::new();
         drain_anthropic_sse_frames(
             &mut buf,
+            &mut 0,
             &mut acc,
             started,
             &mut first_token_seen,
@@ -7886,6 +7888,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         buf.extend_from_slice(b"3}}\n\n");
         drain_anthropic_sse_frames(
             &mut buf,
+            &mut 0,
             &mut acc,
             started,
             &mut first_token_seen,
@@ -7923,6 +7926,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             buf.push(*byte);
             drain_anthropic_sse_frames(
                 &mut buf,
+                &mut 0,
                 &mut acc,
                 started,
                 &mut first_token_seen,
@@ -7946,6 +7950,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         let mut buf = b"data: not-json\r\r".to_vec();
         drain_anthropic_sse_frames(
             &mut buf,
+            &mut 0,
             &mut acc,
             started,
             &mut first_token_seen,
@@ -8632,6 +8637,7 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
         let expected = buf.clone();
         drain_anthropic_sse_frames(
             &mut buf,
+            &mut 0,
             &mut acc,
             started,
             &mut first_token_seen,
@@ -8672,6 +8678,7 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\"}}\n\n"
 
         let terminal = drain_anthropic_sse_frames(
             &mut buf,
+            &mut 0,
             &mut acc,
             std::time::Instant::now(),
             &mut first,
@@ -9771,13 +9778,13 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         assert!(!streamed.contains("claude-3-5-haiku-20241022"));
     }
 
-    /// A single frame that never terminates and runs past the 1 MiB frame
+    /// A single frame that never terminates and runs past the frame
     /// cap. Same bypass as the tail, reached by size instead of by EOF, so it
     /// takes the same refusal — and `unscannable_body` rather than a
     /// size-shaped tag, because the scan is what it missed.
     #[tokio::test]
     async fn holdback_refuses_a_frame_that_overruns_the_cap_without_terminating() {
-        let huge = "y".repeat(super::MAX_SSE_FRAME_BUF_BYTES + 1024);
+        let huge = "y".repeat(aisix_gateway::sse::MAX_SSE_FRAME_BYTES + 1024);
         let sse = format!(
             concat!(
                 "event: content_block_delta\n",
