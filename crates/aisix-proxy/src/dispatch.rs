@@ -690,7 +690,8 @@ pub(crate) fn build_anthropic_url(base: &str, path: &str) -> String {
 
 /// The upstream API key — `provider_key.api_key`. Empty string is
 /// treated as a config error (ProviderKey rows shouldn't be empty,
-/// but a hand-edited kine row could surface one).
+/// but a hand-edited kine row could surface one). Noted as sent
+/// ([`aisix_gateway::note_sent_credential`]).
 pub(crate) fn require_api_key<'a>(
     provider_key: &'a ProviderKey,
     model: &Model,
@@ -701,6 +702,9 @@ pub(crate) fn require_api_key<'a>(
             model.display_name
         )));
     }
+    // Every route that sends its own request reads its credential here, so
+    // here is where an upstream's echo of it is armed against.
+    aisix_gateway::note_sent_credential(&provider_key.api_key);
     Ok(provider_key.api_key.as_str())
 }
 

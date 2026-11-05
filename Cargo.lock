@@ -202,6 +202,7 @@ dependencies = [
  "http 1.4.0",
  "hyper-util",
  "rcgen",
+ "regex",
  "reqwest 0.12.28",
  "rustls",
  "rustls-native-certs 0.8.3",

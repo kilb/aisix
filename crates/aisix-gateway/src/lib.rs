@@ -42,6 +42,7 @@ pub mod ssrf;
 pub mod structured_output;
 pub mod tool_calls;
 pub mod upstream_dial;
+pub mod upstream_error_scrub;
 pub mod upstream_headers;
 pub mod upstream_http;
 pub mod upstream_tls;
@@ -65,15 +66,19 @@ pub use chat::{
 pub use credential::credential_fingerprint;
 pub use hub::{upstream_protocol, Hub, UPSTREAM_PROTOCOL_UNKNOWN};
 pub use response_tap::{
-    capture_header_values, note_upstream_error_body, note_upstream_response, provider_request_id,
-    wants_upstream_error_body, warn_error_body_unread, ResponseHeaderTap, UpstreamResponseCapture,
-    PROVIDER_REQUEST_ID_HEADERS,
+    capture_header_values, note_sent_credential, note_upstream_error_body, note_upstream_response,
+    provider_request_id, wants_upstream_error_body, warn_error_body_unread, ResponseHeaderTap,
+    UpstreamResponseCapture, PROVIDER_REQUEST_ID_HEADERS,
 };
 pub use sse::{SseDecoder, SseEvent, SseFrameTooLarge};
 pub use structured_output::{
     apply_schema_limits, close_object_schemas, json_schema_from_response_format,
     response_into_fake_stream_chunks, seal_object_schemas, unwrap_json_tool_call, SchemaLimits,
     ANTHROPIC_SCHEMA_LIMITS, GEMINI_OPENAPI_SCHEMA_LIMITS, JSON_TOOL_DESCRIPTION, JSON_TOOL_NAME,
+};
+pub use upstream_error_scrub::{
+    scrub_upstream_error_body, scrub_upstream_error_bytes, scrub_upstream_error_frame,
+    scrub_upstream_error_text,
 };
 pub use upstream_headers::{
     apply_request_headers, client_header_forwardable, header_forward_blocked,

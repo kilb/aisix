@@ -422,7 +422,11 @@ where
             loop {
                 match splitter.next_frame() {
                     Ok(Some(frame)) if strip_usage && is_usage_only_frame(&frame) => {}
-                    Ok(Some(frame)) => out.extend_from_slice(&frame),
+                    // An error event goes out less the credentials this
+                    // request sent.
+                    Ok(Some(frame)) => {
+                        out.extend_from_slice(&aisix_gateway::scrub_upstream_error_frame(&frame))
+                    }
                     Ok(None) => break,
                     Err(_) => {
                         out.extend_from_slice(&splitter.take_rest());

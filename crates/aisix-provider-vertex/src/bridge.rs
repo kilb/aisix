@@ -2356,6 +2356,7 @@ fn build_request_headers(
         ));
     }
     let mut headers = HeaderMap::new();
+    aisix_gateway::note_sent_credential(access_token);
     let auth = HeaderValue::from_str(&format!("Bearer {access_token}")).map_err(|_| {
         BridgeError::Config("access_token contains invalid header characters".into())
     })?;

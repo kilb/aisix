@@ -1002,6 +1002,7 @@ async fn dispatch(
     // what `forward_client_headers` promises on this surface.
     if let Some(pk) = pk_entry.as_ref() {
         let api_key = pk.value.api_key.as_str();
+        aisix_gateway::note_sent_credential(api_key);
         let provider_lower = pk.value.provider.to_ascii_lowercase();
         if provider_lower == "anthropic" {
             // Anthropic's documented auth shape (#166): `x-api-key` +
@@ -1240,6 +1241,13 @@ async fn dispatch(
         };
         RouteError::of(ProxyError::Bridge(err), &auth)
     })?;
+    // A provider's error body is relayed as sent, less the credential this
+    // route injected. A success body is the provider's answer, untouched.
+    let resp_body = if status.is_success() {
+        resp_body
+    } else {
+        aisix_gateway::scrub_upstream_error_body(&resp_body)
+    };
 
     // Output guardrails govern generated successful answers. A provider's
     // non-success body is its error contract, so preserve its status, headers,
@@ -6163,6 +6171,13 @@ fn stream_opaque_response(
                     telemetry.mark_first_delivery();
                     // An opaque relay of a refusal is still that attempt's
                     // upstream answer. A fail-open success stays uncaptured.
+                    // A refusal's bytes go out less the credential this route
+                    // injected; one split across two reads is not found.
+                    let chunk = if status.is_success() {
+                        chunk
+                    } else {
+                        aisix_gateway::scrub_upstream_error_body(&chunk)
+                    };
                     if !status.is_success() {
                         telemetry.keep_error_detail(&chunk);
                         if let Some(cap) = telemetry.content_cap.filter(|_| !telemetry.error_body_encoded) {

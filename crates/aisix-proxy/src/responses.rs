@@ -3813,26 +3813,32 @@ fn drain_responses_sse_frames(
     while let Some(end) = aisix_gateway::sse::find_frame_end_from(buf, *scanned) {
         let frame: Vec<u8> = buf.drain(..end).collect();
         *scanned = 0;
-        let restamped = crate::model_echo::restamp_sse_frame(
-            &frame,
-            client_facing_model,
-            crate::model_echo::responses_snapshot_model,
-        );
-        let forwarded = restamped.as_deref().unwrap_or(&frame);
-        match mark.apply_to_sse_frame(forwarded) {
-            Some(tagged) => out.extend_from_slice(&tagged),
-            None => out.extend_from_slice(forwarded),
-        }
         // This site only READS the frame — the bytes forwarded to the client
-        // are the ones above.
-        if observe_responses_sse_frame(
+        // are the ones below.
+        let terminal = observe_responses_sse_frame(
             &frame,
             acc,
             capture.as_deref_mut(),
             failure,
             attempt_started,
             first_frame_seen,
-        ) {
+        );
+        let restamped = crate::model_echo::restamp_sse_frame(
+            &frame,
+            client_facing_model,
+            crate::model_echo::responses_snapshot_model,
+        );
+        let forwarded = restamped.as_deref().unwrap_or(&frame);
+        let tagged = mark.apply_to_sse_frame(forwarded);
+        let forwarded = tagged.as_deref().unwrap_or(forwarded);
+        // A failure the upstream reported reaches the caller as sent, less the
+        // credentials this request sent it.
+        if failure.is_some() {
+            out.extend_from_slice(&aisix_gateway::scrub_upstream_error_bytes(forwarded));
+        } else {
+            out.extend_from_slice(forwarded);
+        }
+        if terminal {
             return true;
         }
     }

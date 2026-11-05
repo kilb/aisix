@@ -558,7 +558,10 @@ impl BedrockSecret {
             ));
         }
         let provider = match aisix_gateway::aws_auth::resolve(&self.auth) {
-            AwsAuth::Bearer(token) => return Ok(RequestAuth::Bearer(token)),
+            AwsAuth::Bearer(token) => {
+                aisix_gateway::note_sent_credential(&token);
+                return Ok(RequestAuth::Bearer(token));
+            }
             AwsAuth::SigV4(provider) => provider,
         };
         let started = Instant::now();
@@ -574,6 +577,10 @@ impl BedrockSecret {
         };
         // The cause is in the gateway log, not in the caller's error: an
         // STS refusal names the gateway's own account and role.
+        // The secret key signs and never travels; the session token does.
+        if let Some(token) = fetched.as_ref().ok().and_then(|c| c.session_token()) {
+            aisix_gateway::note_sent_credential(token);
+        }
         fetched.map(RequestAuth::SigV4).map_err(|e| {
             let msg = format!(
                 "bedrock: could not obtain AWS credentials for auth_type \"{}\"{} — \

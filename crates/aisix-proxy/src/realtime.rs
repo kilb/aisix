@@ -377,7 +377,7 @@ async fn read_refused_body(
     }
     body.truncate(aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES);
     aisix_gateway::UpstreamErrorBody {
-        bytes: body.into(),
+        bytes: aisix_gateway::scrub_upstream_error_body(&body.into()),
         read_error,
     }
 }
@@ -598,6 +598,9 @@ pub(crate) async fn realtime(
             // only after `run_session` has emitted the session's
             // UsageEvent, so the usage sender cannot stop between the two.
             let in_flight = crate::DrainGuard::new(state.livez.clone());
+            // The session reads the upstream's errors off the request, so it
+            // takes the credentials the request noted with it.
+            let tap = aisix_gateway::response_tap::detached();
             ws.protocols(["realtime"])
                 // State the frame bounds rather than inheriting them. These
                 // are today's tungstenite defaults, so this changes nothing
@@ -613,11 +616,14 @@ pub(crate) async fn realtime(
                 .max_frame_size(REALTIME_MAX_FRAME_BYTES)
                 .on_upgrade(move |socket| {
                     use tracing::Instrument as _;
-                    async move {
-                        run_session(state2, prep, socket, client2, request_id, started).await;
-                        drop(in_flight);
-                    }
-                    .instrument(span)
+                    aisix_gateway::response_tap::scope(
+                        tap,
+                        async move {
+                            run_session(state2, prep, socket, client2, request_id, started).await;
+                            drop(in_flight);
+                        }
+                        .instrument(span),
+                    )
                 })
         }
         Err((auth, err)) => {
@@ -1640,6 +1646,7 @@ async fn run_session(
                     let mut client_gone = false;
                     for text in frames {
                         let text = restamp_session_model_out(text, &requested_model);
+                        let text = without_sent_credentials(text);
                         if client_tx.send(AxMessage::Text(text)).await.is_err() {
                             client_gone = true;
                             break;
@@ -1897,6 +1904,15 @@ fn upstream_failure_content(
     ))
 }
 
+/// An upstream frame on its way to the client, less the credentials this
+/// session sent when it is an error ([`aisix_gateway::scrub_upstream_error_frame`]).
+fn without_sent_credentials(text: String) -> String {
+    match aisix_gateway::scrub_upstream_error_frame(text.as_bytes()) {
+        std::borrow::Cow::Borrowed(_) => text,
+        std::borrow::Cow::Owned(scrubbed) => String::from_utf8_lossy(&scrubbed).into_owned(),
+    }
+}
+
 /// An upstream that completes the upgrade and then reports an error instead of
 /// opening a session, which is how OpenAI answers a wrong key, a model it does
 /// not serve, or the beta header.
@@ -1926,7 +1942,7 @@ impl SessionOpening {
                 if self.refusal.is_none() {
                     self.refusal = Some(SessionRefusal {
                         error,
-                        frame: text.unwrap_or_default().to_string(),
+                        frame: without_sent_credentials(text.unwrap_or_default().to_string()),
                     });
                 }
             }

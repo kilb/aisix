@@ -717,6 +717,9 @@ fn build_request_headers(
     hdr: &UpstreamHeaderContext<'_>,
 ) -> Result<HeaderMap, BridgeError> {
     let mut headers = HeaderMap::new();
+    if let Some(credential) = auth.api_key.as_ref().or(auth.bearer_token.as_ref()) {
+        aisix_gateway::note_sent_credential(credential);
+    }
     match (&auth.api_key, &auth.bearer_token) {
         (Some(key), None) => {
             let value = HeaderValue::from_str(key).map_err(|e| {

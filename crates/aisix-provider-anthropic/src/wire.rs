@@ -2559,7 +2559,7 @@ pub fn stream_error_into_bridge_error(err: &AnthropicStreamErrorBody) -> BridgeE
     let message = err
         .message
         .as_deref()
-        .map(|m| aisix_gateway::truncate_lossy(m, cap));
+        .map(|m| aisix_gateway::truncate_lossy(&aisix_gateway::scrub_upstream_error_text(m), cap));
     BridgeError::UpstreamInBand {
         status,
         message: message

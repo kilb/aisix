@@ -347,7 +347,7 @@ fn stream_error(
         .filter(|m| !m.is_empty())
         .map(|m| {
             aisix_gateway::truncate_lossy(
-                &crate::errors::scrub_aws_identifiers(m),
+                &aisix_gateway::scrub_upstream_error_text(m),
                 aisix_gateway::MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
             )
         })

@@ -544,6 +544,11 @@ async fn send_upstream(
     aisix_gateway::note_upstream_response(&headers);
     let bytes = resp.bytes().await;
     crate::attribution::note_upstream_wait_end(bytes.is_ok());
+    // A refusal is relayed as sent, less the credentials this request sent.
+    let bytes = match bytes {
+        Ok(body) if !status.is_success() => Ok(aisix_gateway::scrub_upstream_error_body(&body)),
+        other => other,
+    };
     if let (false, Ok(body)) = (status.is_success(), &bytes) {
         aisix_gateway::note_upstream_error_body(body);
         crate::attribution::note_relayed_error_body(body);

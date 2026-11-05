@@ -706,13 +706,25 @@ pub async fn capture_upstream_error_http(
 /// envelope verbatim — the cap exists exactly to prevent that. AWS exception
 /// codes / Anthropic types / OpenAI codes are bounded vocabulary in practice
 /// but the cap applies defensively.
+///
+/// Each string passes [`crate::upstream_error_scrub`] first, so a cut cannot
+/// leave part of a credential behind.
 fn cap_error_view(mut v: UpstreamErrorView) -> UpstreamErrorView {
-    let cap = MAX_UPSTREAM_ERROR_MESSAGE_BYTES;
-    v.message = v.message.map(|m| truncate_lossy(&m, cap));
-    v.kind = v.kind.map(|k| truncate_lossy(&k, cap));
-    v.code = v.code.map(|c| truncate_lossy(&c, cap));
-    v.param = v.param.map(|p| truncate_lossy(&p, cap));
+    let cap = |s: String| scrubbed_and_capped(&s);
+    v.message = v.message.map(cap);
+    v.kind = v.kind.map(cap);
+    v.code = v.code.map(cap);
+    v.param = v.param.map(cap);
     v
+}
+
+/// An upstream's error text as it may leave the gateway: through the shared
+/// scrubber, then cut at [`MAX_UPSTREAM_ERROR_MESSAGE_BYTES`].
+fn scrubbed_and_capped(text: &str) -> String {
+    truncate_lossy(
+        &crate::upstream_error_scrub::scrub_upstream_error_text(text),
+        MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
+    )
 }
 
 /// The human-readable message of an upstream error body: `error.message`
@@ -720,14 +732,9 @@ fn cap_error_view(mut v: UpstreamErrorView) -> UpstreamErrorView {
 /// bare-string `error`, a `detail` string or `detail.message` (FastAPI-style
 /// servers), or else the body text itself — truncated at
 /// [`MAX_UPSTREAM_ERROR_MESSAGE_BYTES`]. The caller receives it as the
-/// upstream wrote it.
+/// upstream wrote it, less what [`crate::upstream_error_scrub`] takes out.
 pub fn upstream_error_message(body: &[u8]) -> String {
-    upstream_error_text(body).unwrap_or_else(|| {
-        truncate_lossy(
-            &String::from_utf8_lossy(body),
-            MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
-        )
-    })
+    upstream_error_text(body).unwrap_or_else(|| scrubbed_and_capped(&String::from_utf8_lossy(body)))
 }
 
 /// The text [`upstream_error_message`] reads out of a JSON error body, when the
@@ -746,7 +753,7 @@ fn upstream_error_text(body: &[u8]) -> Option<String> {
     texts()
         .find(|text| !text.trim().is_empty())
         .or_else(|| texts().next())
-        .map(|message| truncate_lossy(message, MAX_UPSTREAM_ERROR_MESSAGE_BYTES))
+        .map(scrubbed_and_capped)
 }
 
 /// Whether a top-level `error` value reports a failure: a non-empty
@@ -789,8 +796,8 @@ pub fn in_band_error_reported(error: &serde_json::Value) -> bool {
 /// - a bare-string `error` value becomes the message (OpenAI-compatible
 ///   aggregators send this form).
 ///
-/// All captured strings are truncated at
-/// [`MAX_UPSTREAM_ERROR_MESSAGE_BYTES`], same as
+/// All captured strings pass [`crate::upstream_error_scrub`] and are
+/// truncated at [`MAX_UPSTREAM_ERROR_MESSAGE_BYTES`], same as
 /// [`capture_upstream_error_http`].
 pub fn capture_in_band_error(payload: &str, wire: UpstreamWire) -> Option<BridgeError> {
     let value: serde_json::Value = serde_json::from_str(payload).ok()?;
@@ -846,13 +853,12 @@ pub fn capture_in_band_error_value(
     if !in_band_error_reported(error) {
         return None;
     }
-    let cap = MAX_UPSTREAM_ERROR_MESSAGE_BYTES;
     let text = |v: Option<&serde_json::Value>| match v {
-        Some(serde_json::Value::String(s)) => Some(truncate_lossy(s, cap)),
+        Some(serde_json::Value::String(s)) => Some(scrubbed_and_capped(s)),
         _ => None,
     };
     let (status, message, parsed) = match error {
-        serde_json::Value::String(s) => (None, truncate_lossy(s, cap), None),
+        serde_json::Value::String(s) => (None, scrubbed_and_capped(s), None),
         inner => {
             let code = inner.get("code");
             let numeric_status = match code {
@@ -863,9 +869,9 @@ pub fn capture_in_band_error_value(
             .and_then(|n| u16::try_from(n).ok())
             .filter(|n| (400..=599).contains(n));
             let message = match inner.get("message") {
-                Some(serde_json::Value::String(s)) => Some(truncate_lossy(s, cap)),
+                Some(serde_json::Value::String(s)) => Some(scrubbed_and_capped(s)),
                 Some(serde_json::Value::Null) | None => None,
-                Some(other) => Some(truncate_lossy(&other.to_string(), cap)),
+                Some(other) => Some(scrubbed_and_capped(&other.to_string())),
             };
             let view = UpstreamErrorView {
                 kind: text(inner.get("type")).or_else(|| text(inner.get("status"))),
@@ -876,7 +882,7 @@ pub fn capture_in_band_error_value(
             let message = view
                 .message
                 .clone()
-                .unwrap_or_else(|| truncate_lossy(&error.to_string(), cap));
+                .unwrap_or_else(|| scrubbed_and_capped(&error.to_string()));
             (numeric_status, message, Some(Box::new(view)))
         }
     };
@@ -908,9 +914,10 @@ impl UpstreamErrorBody {
 
 /// Read an upstream error response's body, keeping at most `limit` bytes.
 /// Used to bound upstream-error parsing cost regardless of `Content-Length`.
-/// THE read of every non-2xx upstream body: it hands the bytes to the request's
-/// full-content exports ([`crate::response_tap::note_upstream_error_body`])
-/// and logs a failed read.
+/// THE read of every non-2xx upstream body: it takes out the credentials the
+/// request sent ([`crate::upstream_error_scrub`]), hands the bytes to the
+/// request's full-content exports
+/// ([`crate::response_tap::note_upstream_error_body`]) and logs a failed read.
 ///
 /// Public so non-OpenAI / non-Anthropic bridges (Vertex) can
 /// enforce the same cap when they need a custom parse path (e.g.
@@ -940,7 +947,9 @@ pub async fn read_body_capped(resp: reqwest::Response, limit: usize) -> Upstream
     if let Some(reason) = &read_error {
         crate::response_tap::warn_error_body_unread(status, reason);
     }
-    let bytes = buf.freeze();
+    // Every reader gets the bytes less the credentials this request sent:
+    // some relay them, or hand them on, as they are.
+    let bytes = crate::upstream_error_scrub::scrub_upstream_error_body(&buf.freeze());
     crate::response_tap::note_upstream_error_body(&bytes);
     UpstreamErrorBody { bytes, read_error }
 }

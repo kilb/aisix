@@ -2,8 +2,10 @@
 //! bridge calls (InvokeModel, Converse, ConverseStream, the runtime's
 //! OpenAI-compatible Chat Completions endpoint, embeddings).
 //!
-//! The caller receives the upstream's own error message, less the AWS
-//! identifiers it embeds ([`scrub_aws_identifiers`]). The exception name
+//! The caller receives the upstream's own error message, less what the
+//! gateway's shared scrubber takes out of every provider's
+//! ([`aisix_gateway::upstream_error_scrub`]): the AWS identifiers it embeds
+//! among them. The exception name
 //! decides how the gateway treats the failure: a model timeout is a timeout,
 //! a model-side processing failure is an upstream fault worth another
 //! target, and a context-window overflow carries the `context_length_exceeded`
@@ -40,46 +42,6 @@ fn context_window_code(message: &str) -> Option<String> {
         .then(|| CONTEXT_LENGTH_EXCEEDED.to_string())
 }
 
-/// `message` with the AWS identifiers it embeds taken out: ARNs, and bare
-/// 12-digit account ids. AWS writes these into its error text
-/// (`User: arn:aws:iam::123456789012:user/x is not authorized …`), and they
-/// are the operator's account layout and IAM principal names, not something
-/// the caller of a gateway should learn. The rest of the message is the
-/// upstream's own and reaches the caller as written.
-pub(crate) fn scrub_aws_identifiers(message: &str) -> String {
-    let is_arn_end = |c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ',' | ';');
-    let mut out = String::with_capacity(message.len());
-    let mut rest = message;
-    while let Some(c) = rest.chars().next() {
-        let at_boundary = out.chars().next_back().is_none_or(|p| !p.is_alphanumeric());
-        if at_boundary && rest.starts_with("arn:") {
-            let end = rest.find(is_arn_end).unwrap_or(rest.len());
-            out.push_str("<redacted>");
-            rest = &rest[end..];
-            continue;
-        }
-        if at_boundary && c.is_ascii_digit() {
-            let end = rest
-                .find(|d: char| !d.is_ascii_digit())
-                .unwrap_or(rest.len());
-            let followed_by_word = rest[end..]
-                .chars()
-                .next()
-                .is_some_and(char::is_alphanumeric);
-            if end == 12 && !followed_by_word {
-                out.push_str("<redacted>");
-            } else {
-                out.push_str(&rest[..end]);
-            }
-            rest = &rest[end..];
-            continue;
-        }
-        out.push(c);
-        rest = &rest[c.len_utf8()..];
-    }
-    out
-}
-
 /// The AWS exception name, without the namespace suffix the
 /// `x-amzn-errortype` header carries (`ValidationException:http://…`).
 pub(crate) fn exception_name(raw: &str) -> &str {
@@ -99,7 +61,7 @@ pub(crate) fn upstream_error(
     started: Instant,
 ) -> BridgeError {
     let message = truncate_lossy(
-        &scrub_aws_identifiers(&message),
+        &aisix_gateway::scrub_upstream_error_text(&message),
         MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
     );
     let kind = kind.map(|k| exception_name(&k).to_string());
@@ -139,7 +101,7 @@ pub(crate) fn in_band_error(
     message: String,
 ) -> BridgeError {
     let message = truncate_lossy(
-        &scrub_aws_identifiers(&message),
+        &aisix_gateway::scrub_upstream_error_text(&message),
         MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
     );
     let code = context_window_code(&message);
@@ -236,37 +198,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn scrub_takes_out_arns_and_account_ids_and_nothing_else() {
-        for (raw, want) in [
-            (
-                "User: arn:aws:iam::123456789012:user/x is not authorized",
-                "User: <redacted> is not authorized",
-            ),
-            (
-                "role \"arn:aws:sts::123456789012:assumed-role/r/s\", retry",
-                "role \"<redacted>\", retry",
-            ),
-            (
-                "Too many requests for account 123456789012",
-                "Too many requests for account <redacted>",
-            ),
-            // Not an ARN or an account id: the upstream's text stands.
-            (
-                "max_tokens: 123456789012345 exceeds",
-                "max_tokens: 123456789012345 exceeds",
-            ),
-            ("id 123456789012abc", "id 123456789012abc"),
-            ("warn: learn:more about it", "warn: learn:more about it"),
-            (
-                "Input is too long for requested model.",
-                "Input is too long for requested model.",
-            ),
-        ] {
-            assert_eq!(scrub_aws_identifiers(raw), want);
-        }
-    }
 
     #[test]
     fn every_error_shape_carries_the_scrubbed_message() {

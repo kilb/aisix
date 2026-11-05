@@ -103,7 +103,7 @@ impl UpstreamResponseCapture {
 
 /// One request's response-header capture: the names its exporters asked
 /// for, and what the latest upstream response carried.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ResponseHeaderTap {
     names: Vec<String>,
     /// Whether an exporter of this request runs at `content_mode: full`.
@@ -111,6 +111,21 @@ pub struct ResponseHeaderTap {
     keeps_error_bodies: bool,
     request_id: String,
     latest: Mutex<UpstreamResponseCapture>,
+    /// Every credential the gateway put on an upstream request for this
+    /// caller's request, for [`crate::upstream_error_scrub`]. Kept across
+    /// attempts: an error a fallback relays may quote an earlier one.
+    sent_credentials: Mutex<Vec<String>>,
+}
+
+impl std::fmt::Debug for ResponseHeaderTap {
+    // By hand: the credentials must not reach a `Debug` rendering.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResponseHeaderTap")
+            .field("names", &self.names)
+            .field("keeps_error_bodies", &self.keeps_error_bodies)
+            .field("request_id", &self.request_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ResponseHeaderTap {
@@ -120,6 +135,7 @@ impl ResponseHeaderTap {
             keeps_error_bodies,
             request_id,
             latest: Mutex::default(),
+            sent_credentials: Mutex::default(),
         }
     }
 
@@ -169,13 +185,68 @@ pub fn note_upstream_response(headers: &http::HeaderMap) {
 }
 
 /// Keep the non-2xx body of the response last noted, for the same attempt's
-/// failure row. Sharing `body`, so nothing is copied.
+/// failure row, less the credentials this request sent
+/// ([`crate::upstream_error_scrub::scrub_upstream_error_body`]). Shared with
+/// `body` unless it held one.
 pub fn note_upstream_error_body(body: &bytes::Bytes) {
     let _ = TAP.try_with(|tap| {
         if tap.keeps_error_bodies {
-            tap.lock().error_body = Some(body.clone());
+            let body = crate::upstream_error_scrub::scrub_upstream_error_body(body);
+            tap.lock().error_body = Some(body);
         }
     });
+}
+
+/// The most credentials one request keeps: a request reaches a handful of
+/// upstreams at most (retries, fallbacks, a judge).
+const MAX_SENT_CREDENTIALS: usize = 16;
+/// Shorter values are not looked for: they would match ordinary text.
+const MIN_SENT_CREDENTIAL_BYTES: usize = 8;
+
+/// Note a credential the gateway is putting on an upstream request, so that an
+/// error the upstream answers with cannot hand it to the caller. Call it where
+/// the credential goes on the request: a provider key, a minted token, a
+/// route's injected secret. Outside a request scope it is a no-op, and there
+/// is no caller to hand anything to.
+pub fn note_sent_credential(value: &str) {
+    let value = value.trim();
+    if value.len() < MIN_SENT_CREDENTIAL_BYTES {
+        return;
+    }
+    let _ = TAP.try_with(|tap| {
+        let mut sent = tap
+            .sent_credentials
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if sent.len() < MAX_SENT_CREDENTIALS && !sent.iter().any(|v| v == value) {
+            sent.push(value.to_owned());
+        }
+    });
+}
+
+/// A tap for work the request hands to a task of its own (a realtime session
+/// after its upgrade): the request's id and the credentials it noted, so that
+/// an error read there is scrubbed as one read on the request would be.
+pub fn detached() -> Arc<ResponseHeaderTap> {
+    let request_id = TAP
+        .try_with(|tap| tap.request_id.clone())
+        .unwrap_or_default();
+    let tap = ResponseHeaderTap::new(Vec::new(), false, request_id);
+    *tap.sent_credentials
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = sent_credentials();
+    Arc::new(tap)
+}
+
+/// What [`note_sent_credential`] noted for the current request.
+pub(crate) fn sent_credentials() -> Vec<String> {
+    TAP.try_with(|tap| {
+        tap.sent_credentials
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    })
+    .unwrap_or_default()
 }
 
 /// Log an error response whose body could not be read. Names the request

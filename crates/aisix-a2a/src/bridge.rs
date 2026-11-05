@@ -424,6 +424,9 @@ impl HttpBridge {
         let forwarded = &self.forwarded_client_headers;
         let claims = |name: &str| forwarded.iter().any(|(n, _)| n.as_str() == name);
         let req = req.header(VERSION_HEADER, self.upstream.protocol_version.as_wire_str());
+        if let A2aAuth::Bearer(secret) | A2aAuth::ApiKey(secret) = &self.upstream.auth {
+            aisix_gateway::note_sent_credential(secret);
+        }
         let req = match &self.upstream.auth {
             A2aAuth::None => req,
             A2aAuth::Bearer(token) if !claims("authorization") => req.bearer_auth(token),

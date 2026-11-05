@@ -561,6 +561,7 @@ fn build_request_headers(
     hdr: &UpstreamHeaderContext<'_>,
 ) -> Result<HeaderMap, BridgeError> {
     let mut headers = HeaderMap::new();
+    aisix_gateway::note_sent_credential(api_key_str);
     let auth = HeaderValue::from_str(&format!("Bearer {api_key_str}")).map_err(|e| {
         BridgeError::InvalidUpstreamCredentials(format!(
             "api key contains invalid header chars: {e}"

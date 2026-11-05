@@ -339,6 +339,7 @@ fn build_request_headers(
     // upstream pick. The caller's gateway key claims no slot, so it never
     // displaces this one.
     if !aisix_gateway::ForwardedClientHeaders::resolve(hdr).claims("x-api-key") {
+        aisix_gateway::note_sent_credential(api_key_str);
         let key = HeaderValue::from_str(api_key_str).map_err(|e| {
             BridgeError::InvalidUpstreamCredentials(format!(
                 "api key contains invalid header chars: {e}"

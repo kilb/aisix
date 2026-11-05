@@ -5195,7 +5195,9 @@ fn drain_anthropic_sse_frames(
             acc.note_stream_failure(crate::stream_timeout::RawStreamFailure::UpstreamDecode);
             return Some(frame.len());
         }
+        let mut reports_failure = false;
         if let Some(json) = json {
+            reports_failure = json.get("type").and_then(Value::as_str) == Some("error");
             update_anthropic_usage(
                 acc,
                 &json,
@@ -5204,13 +5206,18 @@ fn drain_anthropic_sse_frames(
                 response_text_cap,
             );
         }
-        match crate::model_echo::restamp_sse_frame(
+        let forwarded = crate::model_echo::restamp_sse_frame(
             &frame,
             client_facing_model,
             crate::model_echo::anthropic_message_model,
-        ) {
-            Some(rewritten) => out.extend_from_slice(&rewritten),
-            None => out.extend_from_slice(&frame),
+        );
+        let forwarded = forwarded.as_deref().unwrap_or(&frame);
+        // The upstream's error event reaches the caller as sent, less the
+        // credentials this request sent it.
+        if reports_failure {
+            out.extend_from_slice(&aisix_gateway::scrub_upstream_error_bytes(forwarded));
+        } else {
+            out.extend_from_slice(forwarded);
         }
         if acc.reached_end || acc.stream_failure.is_some() {
             return Some(0);

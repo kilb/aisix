@@ -725,6 +725,7 @@ async fn classify_inner(
             format!("encoding the classifier request: {e}"),
         )
     })?;
+    aisix_gateway::note_sent_credential(&pk.value.api_key);
     let resp = crate::http_client::client_for(pk.value.upstream_connection().as_ref())
         .post(format!("{base}/v1/systemone"))
         .bearer_auth(&pk.value.api_key)
