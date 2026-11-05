@@ -126,6 +126,43 @@ async function startEmbeddingMock(): Promise<EmbeddingMock> {
   };
 }
 
+interface SwitchableChat {
+  baseUrl: string;
+  /** Answer 500 from now on. */
+  fail(): void;
+  close(): Promise<void>;
+}
+
+/** A chat upstream that answers until told to fail. */
+async function startSwitchableChat(content: string): Promise<SwitchableChat> {
+  let failing = false;
+  const server: Server = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      if (failing) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: { message: "boom", type: "server_error" } }));
+        return;
+      }
+      res.statusCode = 200;
+      res.end(JSON.stringify(chatBody(content)));
+    });
+  });
+  const port = await pickFreePort();
+  await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
+    fail() {
+      failing = true;
+    },
+    async close() {
+      server.closeAllConnections?.();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
 describe("routing selection e2e", () => {
   let app: SpawnedApp | undefined;
   let admin: AdminClient | undefined;
@@ -138,6 +175,7 @@ describe("routing selection e2e", () => {
   let embedMock: EmbeddingMock | undefined;
   let limitEmbedMock: EmbeddingMock | undefined;
   let releaseOlderAnswer: () => void = () => {};
+  let switchable: SwitchableChat | undefined;
 
   async function upstream(name: string, opts: OpenAiUpstreamOptions): Promise<OpenAiUpstream> {
     const u = await startOpenAiUpstream(opts);
@@ -229,7 +267,12 @@ describe("routing selection e2e", () => {
     const etcd = new EtcdClient();
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
-    app = await spawnApp({ admin: false });
+    // Loopback is a trusted proxy, so a case can name the client IP with
+    // `x-forwarded-for`; without that header every request is loopback.
+    app = await spawnApp({
+      admin: false,
+      realIp: { trusted_proxies: ["127.0.0.1/32"], recursive: true },
+    });
     admin = new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl);
     seed = new SeedClient(etcd, app.etcdPrefix);
 
@@ -274,6 +317,70 @@ describe("routing selection e2e", () => {
         { model: "w-live", weight: 1 },
         { model: "w-drained", weight: 0 },
       ],
+    });
+
+    // ── a standby at weight 0 behind a deleted member ──
+    await member("ws-standby", { nonStreamBody: chatBody("ws-standby") });
+    await group("ws-group", {
+      strategy: "round_robin",
+      targets: [
+        { model: "ws-deleted", weight: 1 },
+        { model: "ws-standby", weight: 0 },
+      ],
+    });
+
+    // ── consistent_hash keys while one target cools ──
+    await member("ch-a", { nonStreamBody: chatBody("ch-a") });
+    await member("ch-b", { nonStreamBody: chatBody("ch-b") });
+    switchable = await startSwitchableChat("ch-c");
+    closers.push(switchable.close);
+    const switchablePk = await seed.createProviderKey({
+      display_name: "ch-c-pk",
+      secret: "sk-mock",
+      api_base: `${switchable.baseUrl}/v1`,
+    });
+    modelIds["ch-c"] = (
+      await seed.createModel({
+        display_name: "ch-c",
+        provider: "openai",
+        model_name: "gpt-4o-mini",
+        provider_key_id: switchablePk.id,
+        retries: 0,
+        cooldown: { enabled: true, default_seconds: 300 },
+      })
+    ).id;
+    await group("ch-group", {
+      strategy: "consistent_hash",
+      targets: [
+        { model: "ch-a", weight: 2 },
+        { model: "ch-b", weight: 2 },
+        { model: "ch-c", weight: 1 },
+      ],
+    });
+
+    // ── a cached answer behind a member allowlist and a deleted member ──
+    await member(
+      "al-live",
+      {
+        pathBodies: {
+          "/v1/embeddings": {
+            object: "list",
+            model: "m",
+            data: [{ object: "embedding", index: 0, embedding: [1, 0] }],
+            usage: { prompt_tokens: 1, total_tokens: 1 },
+          },
+        },
+      },
+      { allowed_cidrs: ["10.0.0.0/8"] },
+    );
+    await group("al-group", {
+      strategy: "failover",
+      targets: [{ model: "al-live" }, { model: "al-deleted" }],
+    });
+    await seed.createCachePolicy({
+      name: "al-group-cache",
+      enabled: true,
+      applies_to: "model:al-group",
     });
 
     // ── a member deleted while the group still names it ──
@@ -610,6 +717,56 @@ describe("routing selection e2e", () => {
     const refused = await chat("del-empty");
     expect(refused.status).toBe(400);
     expect(await refused.text()).not.toContain("del-secret-member");
+  });
+
+  test("a standby at weight 0 serves when the only weighted member was deleted", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const res = await chat("ws-group");
+    expect(res.status, await res.clone().text()).toBe(200);
+    expect(await answerOf(res)).toBe("ws-standby");
+  });
+
+  test("a cooling target moves only its own consistent_hash keys", async (ctx) => {
+    if (!etcdReachable || !app || !admin || !switchable) return ctx.skip();
+    const keys = Array.from({ length: 60 }, (_, i) => `session-${i}`);
+    const served = async () => {
+      const out: string[] = [];
+      for (const key of keys) {
+        const res = await chat("ch-group", { "x-aisix-routing-key": key });
+        expect(res.status).toBe(200);
+        out.push(await answerOf(res));
+      }
+      return out;
+    };
+    const before = await served();
+    expect(before).toContain("ch-c");
+
+    switchable.fail();
+    expect((await chat("ch-c")).status).toBeGreaterThanOrEqual(500);
+    await expect
+      .poll(
+        async () =>
+          (await admin!.listModelStatuses()).find((r) => r.id === modelIds["ch-c"])?.status,
+        { timeout: 5000 },
+      )
+      .toBe("cooldown");
+
+    const after = await served();
+    keys.forEach((key, i) => {
+      if (before[i] !== "ch-c") expect(after[i], key).toBe(before[i]);
+      else expect(after[i], key).not.toBe("ch-c");
+    });
+  });
+
+  test("a deleted member does not open a member-allowlisted cached answer to any client", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const embed = (ip: string) =>
+      post("/v1/embeddings", { model: "al-group", input: "hello" }, { "x-forwarded-for": ip });
+    const inside = await embed("10.1.1.1");
+    expect(inside.status, await inside.clone().text()).toBe(200);
+    // The same answer, cached now, for a client the live member refuses.
+    const outside = await embed("8.8.8.8");
+    expect(outside.status, await outside.clone().text()).toBe(403);
   });
 
   test("a member whose own configuration is unusable fails over on every endpoint", async (ctx) => {

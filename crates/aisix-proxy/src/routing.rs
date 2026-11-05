@@ -968,11 +968,54 @@ const RING_POINTS_PER_UNIT: usize = 160;
 /// ring memory per tier regardless of the configured weight magnitudes.
 const RING_MAX_UNITS: u64 = 64;
 
+/// How a tier's weights become ring units: divided by their gcd, then scaled
+/// down when they add up to more than [`RING_MAX_UNITS`]. Taken from the
+/// tier as configured, never from the subset one request can use, so a
+/// target's point count depends on its own weight alone. Derived from the
+/// subset, removing one target (a cooldown, a caller's tags) could change
+/// the gcd or the sum, and so every other target's points, and keys would
+/// move between targets that are both still up.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct RingScale {
+    gcd: u64,
+    sum: u64,
+}
+
+impl RingScale {
+    fn of<'a>(configured_tier: impl Iterator<Item = &'a RoutingTarget>) -> Self {
+        fn gcd(mut a: u64, mut b: u64) -> u64 {
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
+            a
+        }
+        let weights: Vec<u64> = configured_tier
+            .map(|t| u64::from(t.weight_or_default().max(1)))
+            .collect();
+        let gcd = weights.iter().fold(0, |acc, w| gcd(acc, *w)).max(1);
+        Self {
+            gcd,
+            sum: weights.iter().map(|w| w / gcd).sum(),
+        }
+    }
+
+    /// The ring units for one target's weight.
+    fn units(self, weight: u32) -> u64 {
+        let units = (u64::from(weight.max(1)) / self.gcd).max(1);
+        if self.sum > RING_MAX_UNITS {
+            ((units * RING_MAX_UNITS) / self.sum).max(1)
+        } else {
+            units
+        }
+    }
+}
+
 /// One tier's ketama-style consistent-hash ring. Every target owns
 /// `160 × weight-units` pseudo-random points on the u64 hash circle; a key
 /// maps to the first point at or after its own hash. Removing a target
 /// (health filtering) moves only that target's keys — each lands on its
-/// ring successor — and every other key keeps its mapping.
+/// ring successor — and every other key keeps its mapping, because the
+/// units come from the configured tier ([`RingScale`]).
 struct HashRing {
     fingerprint: u64,
     /// (hash point, index into the tier's target list), sorted by point.
@@ -980,29 +1023,14 @@ struct HashRing {
 }
 
 impl HashRing {
-    fn build(fingerprint: u64, targets: &[RoutingTarget]) -> Self {
-        fn gcd(mut a: u64, mut b: u64) -> u64 {
-            while b != 0 {
-                (a, b) = (b, a % b);
-            }
-            a
-        }
-        // A 0 only gets here when every candidate is at 0
-        // (`targets_with_share`): they have no share to compare, so each
-        // gets one unit rather than the ring going empty.
-        let weights: Vec<u64> = targets
+    fn build(fingerprint: u64, targets: &[RoutingTarget], scale: RingScale) -> Self {
+        // A 0 only gets here when every candidate is at 0 (see the weight
+        // filter in `resolve_attempt_models`): they have no share to compare,
+        // so each gets one unit rather than the ring going empty.
+        let units: Vec<u64> = targets
             .iter()
-            .map(|t| u64::from(t.weight_or_default().max(1)))
+            .map(|t| scale.units(t.weight_or_default()))
             .collect();
-        let g = weights.iter().fold(0, |acc, w| gcd(acc, *w)).max(1);
-        let mut units: Vec<u64> = weights.iter().map(|w| w / g).collect();
-        let sum: u64 = units.iter().sum();
-        if sum > RING_MAX_UNITS {
-            units = units
-                .iter()
-                .map(|u| ((u * RING_MAX_UNITS) / sum).max(1))
-                .collect();
-        }
         let total_points = units.iter().sum::<u64>() as usize * RING_POINTS_PER_UNIT;
         let mut points = Vec::with_capacity(total_points);
         for (idx, (target, units)) in targets.iter().zip(&units).enumerate() {
@@ -1112,7 +1140,13 @@ impl RoutingRegistry {
                     order.extend(attempt_order(&tier, start, tier.len()));
                 }
                 RoutingStrategy::ConsistentHash => {
-                    let ring = self.ring_for(virtual_name, priority, &tier);
+                    let scale = RingScale::of(
+                        routing
+                            .targets
+                            .iter()
+                            .filter(|t| t.priority_or_default() == priority),
+                    );
+                    let ring = self.ring_for(virtual_name, priority, &tier, scale);
                     for idx in ring.preference_order(stable_hash(hash_key), tier.len()) {
                         order.push(tier[idx as usize].model.clone());
                     }
@@ -1185,15 +1219,19 @@ impl RoutingRegistry {
         virtual_name: &str,
         priority: i32,
         tier: &[RoutingTarget],
+        scale: RingScale,
     ) -> std::sync::Arc<HashRing> {
-        let fingerprint = tier_fingerprint(tier);
+        let fingerprint = fnv1a_extend(
+            fnv1a_extend(tier_fingerprint(tier), &scale.gcd.to_le_bytes()),
+            &scale.sum.to_le_bytes(),
+        );
         let key = (virtual_name.to_string(), priority);
         if let Some(ring) = self.rings.get(&key) {
             if ring.fingerprint == fingerprint {
                 return ring.clone();
             }
         }
-        let ring = std::sync::Arc::new(HashRing::build(fingerprint, tier));
+        let ring = std::sync::Arc::new(HashRing::build(fingerprint, tier, scale));
         self.rings.insert(key, ring.clone());
         ring
     }
@@ -1691,8 +1729,10 @@ pub(crate) fn cache_vary_tags(model: &Model, tags: &[String]) -> Option<String> 
 
 /// Refuse a caller no routing target admits, for an answer that will not reach
 /// [`resolve_attempt_models`]: a cache hit dispatches nothing, and an allowlist
-/// on a member has to hold for it all the same. Only the IP half of that walk;
-/// a target that names nothing is left for dispatch to report.
+/// on a member has to hold for it all the same. Only the IP half of that walk.
+/// A target that names nothing admits nobody, since nothing could be
+/// dispatched to it; only when every target names nothing is the request left
+/// for dispatch to report.
 pub(crate) fn check_member_ip_access(
     snapshot: &AisixSnapshot,
     virtual_name: &str,
@@ -1704,45 +1744,15 @@ pub(crate) fn check_member_ip_access(
         return Ok(());
     };
     let eligible = eligible_targets(&routing.targets, tags);
-    let admitted = eligible.is_empty()
-        || eligible.iter().any(|t| {
-            snapshot
-                .models
-                .get_by_name(&t.model_ref(snapshot))
-                .is_none_or(|entry| entry.value.ip_allowed(source_ip))
-        });
+    let mut live = eligible
+        .iter()
+        .filter_map(|t| snapshot.models.get_by_name(&t.model_ref(snapshot)))
+        .peekable();
+    let admitted = live.peek().is_none() || live.any(|entry| entry.value.ip_allowed(source_ip));
     if admitted {
         Ok(())
     } else {
         Err(ProxyError::ModelIpRestricted(virtual_name.to_string()))
-    }
-}
-
-/// Drop the targets a weight-using strategy gives no share to: `weight: 0`
-/// takes a target out of rotation, which is how an operator drains one.
-/// With every candidate at 0 there is no share to compare, so they all stay
-/// and the strategies treat them as equal rather than refuse the request.
-/// `failover`, `least_cost` and `least_latency` do not read the field.
-fn targets_with_share<'a>(
-    strategy: RoutingStrategy,
-    targets: std::borrow::Cow<'a, [RoutingTarget]>,
-) -> std::borrow::Cow<'a, [RoutingTarget]> {
-    let weighted = matches!(
-        strategy,
-        RoutingStrategy::RoundRobin | RoutingStrategy::ConsistentHash | RoutingStrategy::LeastBusy
-    );
-    if !weighted || targets.iter().all(|t| t.weight_or_default() > 0) {
-        return targets;
-    }
-    let kept: Vec<RoutingTarget> = targets
-        .iter()
-        .filter(|t| t.weight_or_default() > 0)
-        .cloned()
-        .collect();
-    if kept.is_empty() {
-        targets
-    } else {
-        std::borrow::Cow::Owned(kept)
     }
 }
 
@@ -1925,7 +1935,6 @@ pub(crate) fn resolve_attempt_models(
         Some(gate) => targets_within_budget(snapshot, gate, eligible)?,
         None => eligible,
     };
-    let eligible = targets_with_share(routing.strategy, eligible);
 
     // Everything still eligible, resolved. A name that resolves to nothing
     // is a member deleted while the group still names it, and it costs the
@@ -1954,6 +1963,20 @@ pub(crate) fn resolve_attempt_models(
         return Err(ProxyError::InvalidRequest(
             "routing model has no target that resolves to a Model".into(),
         ));
+    }
+    // `weight: 0` takes a target out of rotation on the strategies that read
+    // weight, which is how an operator drains one, as long as another
+    // candidate has a share. Judged after resolution: a deleted member is no
+    // candidate, so it must not drain a standby kept at 0. With every
+    // candidate at 0 there is no share to compare, so they all stay and the
+    // strategies treat them as equal rather than refuse the request.
+    // `failover`, `least_cost` and `least_latency` do not read the field.
+    if matches!(
+        routing.strategy,
+        RoutingStrategy::RoundRobin | RoutingStrategy::ConsistentHash | RoutingStrategy::LeastBusy
+    ) && candidates.iter().any(|c| c.weight > 0)
+    {
+        candidates.retain(|c| c.weight > 0);
     }
 
     // The health and cooldown filter runs ahead of the strategy, like the
@@ -2178,7 +2201,11 @@ mod tests {
             RoutingTarget::new("a").with_weight(50),
             RoutingTarget::new("b").with_weight(50),
         ];
-        let ring = HashRing::build(tier_fingerprint(&targets), &targets);
+        let ring = HashRing::build(
+            tier_fingerprint(&targets),
+            &targets,
+            RingScale::of(targets.iter()),
+        );
         let first = ring.preference_order(stable_hash("session-1"), targets.len());
         assert_eq!(first.len(), 2);
         for _ in 0..50 {
@@ -2196,7 +2223,11 @@ mod tests {
             RoutingTarget::new("a").with_weight(50),
             RoutingTarget::new("b").with_weight(50),
         ];
-        let ring = HashRing::build(tier_fingerprint(&targets), &targets);
+        let ring = HashRing::build(
+            tier_fingerprint(&targets),
+            &targets,
+            RingScale::of(targets.iter()),
+        );
         let mut seen = [false; 2];
         for i in 0..200 {
             seen[ring.preference_order(stable_hash(&format!("k{i}")), 2)[0] as usize] = true;
@@ -2210,7 +2241,11 @@ mod tests {
             RoutingTarget::new("heavy").with_weight(90),
             RoutingTarget::new("light").with_weight(10),
         ];
-        let ring = HashRing::build(tier_fingerprint(&targets), &targets);
+        let ring = HashRing::build(
+            tier_fingerprint(&targets),
+            &targets,
+            RingScale::of(targets.iter()),
+        );
         let mut heavy = 0;
         for i in 0..1000 {
             if ring.preference_order(stable_hash(&format!("k{i}")), 2)[0] == 0 {
@@ -2233,9 +2268,10 @@ mod tests {
             RoutingTarget::new("b"),
             RoutingTarget::new("c"),
         ];
-        let ring = HashRing::build(tier_fingerprint(&full), &full);
+        let scale = RingScale::of(full.iter());
+        let ring = HashRing::build(tier_fingerprint(&full), &full, scale);
         let shrunk: Vec<RoutingTarget> = vec![full[0].clone(), full[2].clone()]; // drop "b"
-        let shrunk_ring = HashRing::build(tier_fingerprint(&shrunk), &shrunk);
+        let shrunk_ring = HashRing::build(tier_fingerprint(&shrunk), &shrunk, scale);
         for i in 0..500 {
             let h = stable_hash(&format!("k{i}"));
             let before = full[ring.preference_order(h, 3)[0] as usize].model.clone();
@@ -2946,6 +2982,124 @@ mod tests {
     }
 
     /// A deleted member must not use up the fallback budget either.
+    /// The first target each of `keys` routing keys lands on.
+    fn first_by_key(
+        registry: &RoutingRegistry,
+        status: &crate::ModelRuntimeStatusTracker,
+        snap: &AisixSnapshot,
+        targets: &[RoutingTarget],
+        keys: usize,
+    ) -> Vec<String> {
+        (0..keys)
+            .map(|i| {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    "x-aisix-routing-key",
+                    format!("session-{i}").parse().expect("header value"),
+                );
+                select(
+                    registry,
+                    status,
+                    snap,
+                    r(RoutingStrategy::ConsistentHash, targets.to_vec(), Some(0)),
+                    RoutingRequest {
+                        headers: Some(&headers),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .remove(0)
+            })
+            .collect()
+    }
+
+    /// A target cooling moves its own keys and no others, whatever the
+    /// weights: a ring scaled from the subset that is up reshuffled keys
+    /// between two targets that both stayed up, and each move is a lost
+    /// prompt cache or session.
+    #[test]
+    fn a_cooling_target_moves_only_its_own_consistent_hash_keys() {
+        let snap = snap_of(&["a", "b", "c"]);
+        for weights in [[2, 2, 1], [33, 33, 34]] {
+            let targets: Vec<RoutingTarget> = ["a", "b", "c"]
+                .iter()
+                .zip(weights)
+                .map(|(name, w)| RoutingTarget::new(*name).with_weight(w))
+                .collect();
+            let registry = RoutingRegistry::new();
+            let up = crate::ModelRuntimeStatusTracker::new();
+            let before = first_by_key(&registry, &up, &snap, &targets, 2000);
+            let after = first_by_key(&registry, &cooling(&["c"]), &snap, &targets, 2000);
+            let moved = before
+                .iter()
+                .zip(&after)
+                .filter(|(was, now)| *was != "c" && was != now)
+                .count();
+            assert_eq!(moved, 0, "weights {weights:?}");
+            assert!(after.iter().all(|t| t != "c"), "weights {weights:?}");
+        }
+    }
+
+    /// A deleted member is no candidate, so it cannot be the positive weight
+    /// that drains a standby kept at 0.
+    #[test]
+    fn a_deleted_member_does_not_drain_a_standby_at_weight_zero() {
+        let snap = snap_of(&["standby"]);
+        for strategy in [
+            RoutingStrategy::RoundRobin,
+            RoutingStrategy::ConsistentHash,
+            RoutingStrategy::LeastBusy,
+        ] {
+            let routing = r(
+                strategy,
+                vec![
+                    RoutingTarget::new("deleted").with_weight(1),
+                    RoutingTarget::new("standby").with_weight(0),
+                ],
+                None,
+            );
+            assert_eq!(
+                select(
+                    &RoutingRegistry::new(),
+                    &crate::ModelRuntimeStatusTracker::new(),
+                    &snap,
+                    routing,
+                    RoutingRequest::default()
+                )
+                .unwrap(),
+                ["standby"],
+                "{strategy:?}",
+            );
+        }
+    }
+
+    /// A target whose row was deleted admits nobody to an answer that skips
+    /// dispatch, since nothing could be dispatched to it. A group whose every
+    /// target is gone is left for dispatch to report.
+    #[test]
+    fn a_dangling_target_admits_nobody_to_a_member_allowlisted_answer() {
+        let snap = ip_snapshot(&[("restricted", Some(vec!["10.0.0.0/8"]))]);
+        let group = group_model(r(
+            RoutingStrategy::Failover,
+            vec![
+                RoutingTarget::new("restricted"),
+                RoutingTarget::new("deleted"),
+            ],
+            None,
+        ));
+        assert!(matches!(
+            check_member_ip_access(&snap, "group", &group, &[], "8.8.8.8"),
+            Err(ProxyError::ModelIpRestricted(_))
+        ));
+        assert!(check_member_ip_access(&snap, "group", &group, &[], "10.1.2.3").is_ok());
+        let all_gone = group_model(r(
+            RoutingStrategy::Failover,
+            vec![RoutingTarget::new("deleted")],
+            None,
+        ));
+        assert!(check_member_ip_access(&snap, "group", &all_gone, &[], "8.8.8.8").is_ok());
+    }
+
     #[test]
     fn a_deleted_member_does_not_spend_the_fallback_budget() {
         let snap = snap_of(&["good"]);
@@ -3488,8 +3642,8 @@ mod tests {
 
     #[test]
     fn wrr_zero_weights_clamp_to_one() {
-        // Candidates that are ALL at 0 reach the strategy (see
-        // `targets_with_share`): they have no share to compare, so each counts
+        // Candidates that are ALL at 0 reach the strategy (see the weight
+        // filter in `resolve_attempt_models`): they have no share to compare, so each counts
         // as 1 rather than the rotation dividing by nothing.
         let reg = RoutingRegistry::new();
         let routing = r(

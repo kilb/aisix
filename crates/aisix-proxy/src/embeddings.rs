@@ -2369,6 +2369,59 @@ mod tests {
         assert_eq!(outside.status(), StatusCode::FORBIDDEN);
     }
 
+    /// A member whose row was deleted is no way into a cached answer: the
+    /// one live member's allowlist decides, as it does on a miss.
+    #[tokio::test]
+    async fn a_dangling_member_does_not_open_a_group_cache_hit_to_any_ip() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let snap = new_snap(&upstream.uri());
+        let member: Model = serde_json::from_str(&format!(
+            r#"{{"display_name":"embed-live","provider":"openai","model_name":"text-embedding-3-small","provider_key_id":"{PK_ID}","allowed_cidrs":["10.0.0.0/8"]}}"#
+        ))
+        .unwrap();
+        snap.models
+            .insert(ResourceEntry::new("m-embed-live", member, 1));
+        let group: Model = serde_json::from_str(
+            r#"{"display_name":"embed-group","routing":{"strategy":"failover","targets":[
+                {"model":"embed-live"},{"model":"embed-deleted"}
+            ]}}"#,
+        )
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-group", group, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let policy: aisix_core::CachePolicy = serde_json::from_str(
+            r#"{"name":"embed-cache","enabled":true,"backend":"memory","ttl_seconds":60,"applies_to":"all"}"#,
+        )
+        .unwrap();
+        snap.cache_policies
+            .insert(ResourceEntry::new("cp-1", policy, 1));
+        let app = build_app_with_cache(snap);
+        let request = |ip: &str| {
+            let mut req = make_req(serde_json::json!({"model": "embed-group", "input": "hello"}));
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(std::net::SocketAddr::new(
+                    ip.parse().unwrap(),
+                    40000,
+                )));
+            req
+        };
+
+        let inside = tower::ServiceExt::oneshot(app.clone(), request("10.1.1.1"))
+            .await
+            .unwrap();
+        assert_eq!(inside.status(), StatusCode::OK);
+        let outside = tower::ServiceExt::oneshot(app, request("8.8.8.8"))
+            .await
+            .unwrap();
+        assert_eq!(outside.status(), StatusCode::FORBIDDEN);
+    }
+
     /// A different `input` under the same policy is a different entry — the
     /// key has to cover the request, not just the model.
     #[tokio::test]
