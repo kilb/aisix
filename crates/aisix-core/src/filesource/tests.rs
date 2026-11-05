@@ -1855,3 +1855,34 @@ fn an_openapi_mcp_server_serving_no_tools_is_a_load_error_and_collisions_load() 
     .expect("colliding operationIds load");
     assert_eq!(snap.mcp_servers.len(), 1);
 }
+
+#[test]
+fn referenced_vars_cover_interpolation_and_key_env_and_placeholders_are_per_variable() {
+    let contents = r#"
+_format_version: "1"
+provider_keys:
+  - display_name: pk
+    provider: openai
+    api_key: "${UP_KEY}"
+models:
+  - display_name: m
+    provider: openai
+    provider_key: pk
+    model_name: m
+api_keys:
+  - display_name: one
+    key_env: KEY_ONE
+    allowed_models: ["*"]
+  - display_name: two
+    key_env: KEY_TWO
+    allowed_models: ["*"]
+"#;
+    let vars = referenced_env_vars(contents);
+    for name in ["UP_KEY", "KEY_ONE", "KEY_TWO"] {
+        assert!(vars.contains(name), "{name} missing from {vars:?}");
+    }
+    // Two `key_env` entries must not collapse into one credential under
+    // placeholders, or a healthy file reads as broken.
+    load_from_str(contents, "x", 1, &|name| Some(env_placeholder(name)))
+        .expect("a file with two key_env entries loads under placeholders");
+}

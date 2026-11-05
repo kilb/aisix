@@ -6,9 +6,11 @@
 //! 「读全文 → 改一处 → 写回」，不串行就会互相覆盖 —— 后写的那次带着自己读到
 //! 的旧全文，把中间那次改动整段抹掉。所以两条路径共用同一个 [`Writer`]。
 //!
-//! 进程外还有一个写入者（管理控制台）。那个用内容比对处理：写之前确认文件
-//! 与读到时一致，不一致就重来。这挡不住 TOCTOU 的最后一瞬，但一期的写入频率
-//! 极低（铸密钥、余额归零），而二期换成 Admin API 写 etcd 之后整个问题消失。
+//! 进程外还有一个写入者（管理控制台）。两边在「比对 → 校验 → 替换 → 发信号」
+//! 这一整段上共用 `<配置路径>.lock` 上的一把 flock：比对之后的那几步要跑完整的
+//! 校验（控制台那边是起一个子进程），这段窗口里插进来的写会被静默盖掉 —— 被盖掉的
+//! 可能是一次吊销，那把密钥就又活了；也可能是刚铸的密钥，明文已经交给用户，而配置
+//! 是密钥唯一的存放处，再也找不回来。
 //!
 //! # 为什么改动走泛型 Value
 //!
@@ -58,6 +60,41 @@ const BANNER: &str = "\
 # 重写走 YAML 反序列化再序列化，**注释不会保留**。要写给人看的说明，请放在\n\
 # 同目录的 resources.README 里，不要放在这个文件里。\n\
 \n";
+
+/// 等跨进程写锁最多等多久。控制台持锁时在跑 `aisix validate`，正常不过几百毫秒；
+/// 等不到就算这次没写成，铸密钥回 409，对账环下一轮再来。
+const FILE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 拿跨进程写锁，返回的文件活着锁就在。控制台（`crates/aisix-console`）用同一个
+/// 文件名，改一边要改两边，那边有一条测试盯着。
+///
+/// 轮询 `try_lock` 而不是阻塞等：阻塞的话对方卡住（比如校验子进程挂了），对账环就
+/// 跟着永远卡在这里，连停用密钥都走不到。
+async fn lock_for_write(path: &str) -> Result<std::fs::File, WriteError> {
+    use std::fs::TryLockError;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(format!("{path}.lock"))
+        .map_err(|e| WriteError::Io(e.to_string()))?;
+    let deadline = tokio::time::Instant::now() + FILE_LOCK_WAIT;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(TryLockError::Error(e)) => return Err(WriteError::Io(e.to_string())),
+            Err(TryLockError::WouldBlock) if tokio::time::Instant::now() >= deadline => {
+                return Err(WriteError::Contended)
+            }
+            Err(TryLockError::WouldBlock) => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
 
 /// 独占写这个文件的闸口。
 #[derive(Clone)]
@@ -134,6 +171,10 @@ impl Writer {
             if !edit(&mut doc) {
                 return Ok(false);
             }
+            // 从这里到发完信号都持着锁：比对之后的每一步都不能被控制台插进来。
+            // 信号也在锁内，因为控制台持锁时正跑着一个 `aisix validate` 子进程，
+            // 而 `pkill -x aisix` 不分对象，打到它身上就是一次莫名的校验失败。
+            let _file_lock = lock_for_write(&self.path).await?;
             // 进程外的写入者（控制台）可能刚好插在中间。
             if self.read().await? != before {
                 continue;
@@ -220,23 +261,18 @@ async fn write_atomic(path: &str, body: &str) -> Result<(), WriteError> {
 /// 算：它只能来自塞进字段里的用户输入（密钥标签会进 `display_name`），网关那边
 /// 多半没有，而身份字段上一个未设的变量就让整份配置加载失败。
 fn breaks_gateway(before: &str, after: &str) -> Option<String> {
+    use aisix_core::filesource::{env_placeholder, load_from_str, referenced_env_vars};
     // 用网关自己的解析器记下旧文件引用了哪些变量，不另写一份 `${}` 解析。
-    let known = std::cell::RefCell::new(std::collections::HashSet::new());
-    let before_loads =
-        aisix_core::filesource::load_from_str(before, "portal-current", 1, &|name| {
-            known.borrow_mut().insert(name.to_string());
-            Some("placeholder".to_string())
-        })
-        .is_ok();
-    let known = known.into_inner();
-    let err = match aisix_core::filesource::load_from_str(after, "portal-candidate", 1, &|name| {
-        known.contains(name).then(|| "placeholder".to_string())
-    }) {
+    let known = referenced_env_vars(before);
+    let assume = |name: &str| known.contains(name).then(|| env_placeholder(name));
+    let before_loads = load_from_str(before, "portal-current", 1, &assume).is_ok();
+    let err = match load_from_str(after, "portal-candidate", 1, &assume) {
         Ok(_) => return None,
         Err(e) => e,
     };
     if !before_loads {
-        // 本来就坏着 —— 不是这次改动的问题，照写。
+        // 本来就坏着 —— 不是这次改动的问题，照写。这时这道闸是开着的，得说出来。
+        eprintln!("写前校验没有拦这次改动：当前配置本身就加载不了，网关多半停在旧快照上: {err}");
         return None;
     }
     Some(err.to_string())
@@ -701,6 +737,86 @@ api_keys:
             .await;
         assert!(r.is_ok(), "本来就坏的文件让门户彻底写不动了: {r:?}");
         let _ = std::fs::remove_file(path);
+    }
+
+    /// `key_env` 是文档写明的用法。两把都用它时，占位串若是同一个值，它们就散列
+    /// 成同一个凭据：旧文件被判成「本来就坏」，这道闸从此不再拦任何东西。
+    #[tokio::test]
+    async fn 两把_key_env_密钥不会把这道闸悄悄关掉() {
+        let doc = format!(
+            "{VALID}  - display_name: e1\n    key_env: KEY_ONE\n    allowed_models: [\"*\"]\n\
+             \x20 - display_name: e2\n    key_env: KEY_TWO\n    allowed_models: [\"*\"]\n"
+        );
+        let (w, path) = writer_with(&doc).await;
+        let before = std::fs::read_to_string(&path).unwrap();
+        let r = w.edit(add_bogus_policy).await;
+        assert!(
+            matches!(r, Err(WriteError::WouldBreakGateway(_))),
+            "坏文档被放过去了: {r:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 控制台持着跨进程写锁时，门户不能写 —— 否则它正在校验的那份文档一替换上去，
+    /// 这边刚写的就没了。这里拿同一把锁扮演控制台。
+    #[tokio::test]
+    async fn 进程外持着写锁时不写_放开之后才写() {
+        let (w, path) = writer_with(VALID).await;
+        let before = std::fs::read_to_string(&path).unwrap();
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(format!("{path}.lock"))
+            .unwrap();
+        held.lock().unwrap();
+
+        let w2 = w.clone();
+        let writing = tokio::spawn(async move {
+            w2.edit(|d| {
+                api_keys_mut(d)[0]
+                    .as_mapping_mut()
+                    .unwrap()
+                    .insert(Value::from("disabled"), Value::from(true));
+                true
+            })
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "别人持着写锁时写进去了"
+        );
+
+        held.unlock().unwrap();
+        assert!(matches!(writing.await.unwrap(), Ok(true)));
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("disabled: true"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 发信号必须在锁内。控制台持锁时跑着 `aisix validate`，`pkill -x aisix` 打到
+    /// 那个子进程上，它就被信号杀死，操作者看到一次没有原因的校验失败。
+    ///
+    /// 只能看源码序：`pkill` 从 PATH 上找，换掉它会影响同进程里所有的用例。
+    #[test]
+    fn 发信号在持锁的那一段里() {
+        let src = include_str!("resources.rs");
+        let body = src
+            .split_once("pub async fn edit<F>")
+            .and_then(|(_, rest)| rest.split_once("Err(WriteError::Contended)"))
+            .map(|(b, _)| b)
+            .expect("找不到 edit");
+        let lock = body
+            .find("let _file_lock = lock_for_write")
+            .expect("没有拿锁");
+        let rename = body.find("write_atomic(").expect("没有写盘");
+        let signal = body.find("signal_reload()").expect("没有发信号");
+        assert!(lock < rename && rename < signal, "顺序不对");
+        assert!(!body.contains("drop(_file_lock)"), "发信号之前放了锁");
     }
 
     /// 往文档里加一把 portal 风格的密钥，展示名是 `portal-1 · <label>`。

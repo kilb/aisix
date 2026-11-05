@@ -47,7 +47,7 @@ pub use desugar::{derive_id, FILE_RESOURCE_NAMESPACE};
 pub use status::load_resources_file_tracked;
 
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use yaml_rust2::{Yaml, YamlLoader};
 
@@ -379,6 +379,30 @@ fn model_ref_id_field(kind: &str, doc: &mut Value) -> Option<&'static ModelRefId
 /// stamped on every entry (the file source's generation counter: 1 at
 /// boot, incremented per successful reload).
 pub fn load_resources_file(path: &Path, revision: i64) -> Result<AisixSnapshot, FileSourceErrors> {
+    load_path(path, revision, &|name| std::env::var(name).ok())
+}
+
+/// Like [`load_resources_file`], for a process that does not share the
+/// gateway's environment: a variable in `assumed_set` counts as set even when
+/// this process does not have it. See [`referenced_env_vars`].
+pub fn load_resources_file_assuming(
+    path: &Path,
+    revision: i64,
+    assumed_set: &HashSet<String>,
+) -> Result<AisixSnapshot, FileSourceErrors> {
+    load_path(path, revision, &|name| {
+        std::env::var(name)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| assumed_set.contains(name).then(|| env_placeholder(name)))
+    })
+}
+
+fn load_path(
+    path: &Path,
+    revision: i64,
+    env: EnvLookup<'_>,
+) -> Result<AisixSnapshot, FileSourceErrors> {
     let label = path.display().to_string();
     let contents = std::fs::read_to_string(path).map_err(|e| FileSourceErrors {
         file: label.clone(),
@@ -387,9 +411,31 @@ pub fn load_resources_file(path: &Path, revision: i64) -> Result<AisixSnapshot, 
             message: format!("cannot read file: {e}"),
         }],
     })?;
-    load_from_str(&contents, &label, revision, &|name| {
-        std::env::var(name).ok()
-    })
+    load_from_str(&contents, &label, revision, env)
+}
+
+/// The value a variable takes when a file is checked away from the environment
+/// it will run in. Distinct per variable: two `key_env` entries that resolved to
+/// one value would hash to one credential and fail the load, which reads as the
+/// file being broken when only the check is.
+pub fn env_placeholder(name: &str) -> String {
+    format!("placeholder-{name}")
+}
+
+/// Every environment variable `contents` references, through `${VAR}` or
+/// `key_env`, found by running the real pipeline with a recording lookup rather
+/// than parsing `${}` a second time.
+///
+/// A file already on disk is what the gateway runs with, so what it references
+/// exists over there. A checker on another process uses this to tell those apart
+/// from a variable an edit newly introduces.
+pub fn referenced_env_vars(contents: &str) -> HashSet<String> {
+    let seen = std::cell::RefCell::new(HashSet::new());
+    let _ = load_from_str(contents, "baseline", 1, &|name| {
+        seen.borrow_mut().insert(name.to_string());
+        Some(env_placeholder(name))
+    });
+    seen.into_inner()
 }
 
 /// The full pipeline over in-memory contents. Separated from

@@ -130,6 +130,12 @@ enum CliCommand {
         /// Path to the resources file to validate.
         #[arg(long)]
         resources: PathBuf,
+        /// The file currently in service. Variables it references count as
+        /// set even when this process does not have them: they are the
+        /// gateway's, and a tool validating on another process need not hold
+        /// them. A variable it does not reference still has to be set here.
+        #[arg(long)]
+        baseline: Option<PathBuf>,
     },
     /// Export the resources currently stored in etcd as a `resources.yaml`
     /// the file source (`resources_file`) can load back — the migration /
@@ -213,7 +219,10 @@ fn main() -> anyhow::Result<()> {
     // Subcommands run without loading the bootstrap config or booting
     // any listener.
     match cli.command {
-        Some(CliCommand::Validate { resources }) => return run_validate(&resources),
+        Some(CliCommand::Validate {
+            resources,
+            baseline,
+        }) => return run_validate(&resources, baseline.as_deref()),
         Some(CliCommand::Export {
             etcd,
             prefix,
@@ -328,8 +337,8 @@ async fn async_main(cfg: Config) -> anyhow::Result<()> {
 /// guardrail row actually builds. Exit 0 on success; on failure the
 /// aggregated error report (every problem, with kind / entry / field
 /// context) goes to stderr and the process exits non-zero.
-fn run_validate(resources: &Path) -> anyhow::Result<()> {
-    let snapshot = match aisix_core::filesource::load_resources_file(resources, 1) {
+fn run_validate(resources: &Path, baseline: Option<&Path>) -> anyhow::Result<()> {
+    let snapshot = match load_for_validate(resources, baseline) {
         Ok(snapshot) => snapshot,
         Err(report) => {
             eprintln!("{report}");
@@ -409,6 +418,26 @@ fn run_validate(resources: &Path) -> anyhow::Result<()> {
         snapshot.total_entries(),
     );
     Ok(())
+}
+
+/// The load `aisix validate` judges. A baseline that cannot be read grants
+/// nothing: every variable then has to be set in this process.
+fn load_for_validate(
+    resources: &Path,
+    baseline: Option<&Path>,
+) -> Result<AisixSnapshot, aisix_core::filesource::FileSourceErrors> {
+    use aisix_core::filesource::{
+        load_resources_file, load_resources_file_assuming, referenced_env_vars,
+    };
+    match baseline {
+        None => load_resources_file(resources, 1),
+        Some(baseline) => {
+            let assumed = std::fs::read_to_string(baseline)
+                .map(|b| referenced_env_vars(&b))
+                .unwrap_or_default();
+            load_resources_file_assuming(resources, 1, &assumed)
+        }
+    }
 }
 
 /// `(server name, colliding base tool names)` for each `type: openapi`
@@ -4366,13 +4395,56 @@ mod tests {
         let cli = Cli::try_parse_from(["aisix", "validate", "--resources", "/tmp/r.yaml"]).unwrap();
         assert!(cli.config.is_none());
         match cli.command {
-            Some(CliCommand::Validate { resources }) => {
+            Some(CliCommand::Validate {
+                resources,
+                baseline,
+            }) => {
                 assert_eq!(resources, PathBuf::from("/tmp/r.yaml"));
+                assert_eq!(baseline, None);
             }
             other => panic!("expected Validate subcommand, got {other:?}"),
         }
         // … and --resources itself is mandatory for the subcommand.
         assert!(Cli::try_parse_from(["aisix", "validate"]).is_err());
+    }
+
+    /// A variable the file in service already references is the gateway's, and
+    /// the validating process need not hold it. One an edit newly introduces is
+    /// not: it is as likely a typo, and a gateway missing it rejects the reload.
+    #[test]
+    fn validate_trusts_the_baselines_variables_and_no_others() {
+        use std::io::Write as _;
+        fn doc(var: &str) -> String {
+            format!(
+                r#"
+_format_version: "1"
+provider_keys:
+  - display_name: pk
+    provider: openai
+    api_key: "${{{var}}}"
+models:
+  - display_name: m1
+    provider: openai
+    model_name: gpt-4o
+    provider_key: pk
+"#
+            )
+        }
+        let write = |body: String| {
+            let mut f = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+            f.write_all(body.as_bytes()).unwrap();
+            f
+        };
+        let known = "AISIX_TEST_VALIDATE_BASELINE_KNOWN";
+        let new = "AISIX_TEST_VALIDATE_BASELINE_NEW";
+        assert!(std::env::var(known).is_err() && std::env::var(new).is_err());
+        let baseline = write(doc(known));
+
+        assert!(load_for_validate(write(doc(known)).path(), None).is_err());
+        assert!(load_for_validate(write(doc(known)).path(), Some(baseline.path())).is_ok());
+        assert!(load_for_validate(write(doc(new)).path(), Some(baseline.path())).is_err());
+        // A baseline that cannot be read grants nothing.
+        assert!(load_for_validate(write(doc(known)).path(), Some(Path::new("/nope"))).is_err());
     }
 
     #[test]
@@ -4395,7 +4467,7 @@ models:
         .unwrap();
         // Success path returns Ok; the failure path exits the process,
         // which is covered end-to-end by the e2e fail-fast case.
-        run_validate(f.path()).unwrap();
+        run_validate(f.path(), None).unwrap();
     }
 
     #[test]
@@ -4417,7 +4489,7 @@ mcp_servers:
 "#,
         )
         .unwrap();
-        run_validate(f.path()).unwrap();
+        run_validate(f.path(), None).unwrap();
         let snapshot = aisix_core::filesource::load_resources_file(f.path(), 1).unwrap();
         assert_eq!(
             openapi_tool_name_collisions(&snapshot.mcp_servers),
