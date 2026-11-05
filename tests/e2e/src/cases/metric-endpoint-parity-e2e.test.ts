@@ -407,6 +407,7 @@ describe("every proxy route emits every per-request metric family", () => {
 
   const ROWS: Row[] = [
     { route: "/v1/models", name: "GET /v1/models", endpoint: "/v1/models", families: [...REQUEST], drive: async () => void (await expectCall("/v1/models")) },
+    { route: "/v1/models/:id", name: "GET /v1/models/:id", endpoint: "/v1/models/:id", families: [...REQUEST], drive: async () => void (await expectCall("/v1/models/par-chat")) },
     {
       route: "/v1/chat/completions",
       name: "chat",
@@ -849,6 +850,7 @@ describe("every proxy route emits every per-request metric family", () => {
   /** Routes that authenticate through the `AuthenticatedKey` extractor. */
   const AUTH_ROUTES: Array<[string, string, string]> = [
     ["GET", "/v1/models", "/v1/models"],
+    ["GET", "/v1/models/x", "/v1/models/:id"],
     ["POST", "/v1/chat/completions", "/v1/chat/completions"],
     ["POST", "/v1/completions", "/v1/completions"],
     ["POST", "/v1/embeddings", "/v1/embeddings"],
