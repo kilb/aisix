@@ -528,6 +528,20 @@ pub fn validate_model(value: &Value) -> Result<(), SchemaError> {
         Ok(()) => return validate_allowed_cidrs(value),
         Err(err) => err,
     };
+    // A setting a later release retired is refused on write and still loads
+    // from a stored row (`upgrade_stored_routing`). When it is the whole
+    // story, say what to write instead of naming a failed `oneOf`.
+    let mut upgraded = value.clone();
+    let retired = super::routing::upgrade_stored_routing(&mut upgraded);
+    if !retired.is_empty() && validate(&SCHEMAS.model, &upgraded).is_ok() {
+        return Err(SchemaError {
+            path: err.path,
+            message: "`routing.strategy: weighted` and `routing.sticky` are retired: \
+                      `round_robin` honours the same target weights, and \
+                      `consistent_hash` keeps a key on one target"
+                .to_string(),
+        });
+    }
     let Ok(mut model) = serde_json::from_value::<Model>(value.clone()) else {
         return Err(err);
     };
@@ -3400,6 +3414,33 @@ mod tests {
             }
         });
         assert!(validate_model(&v).is_err());
+    }
+
+    /// A retired routing setting still loads from a stored row, so the read
+    /// path must not be what refuses it; the write path does, and says what
+    /// to write instead.
+    #[test]
+    fn a_write_of_a_retired_routing_setting_is_refused_with_its_replacement() {
+        for routing in [
+            json!({"strategy": "weighted", "targets": [{"model": "a"}]}),
+            json!({"strategy": "weighted", "sticky": true, "targets": [{"model": "a"}]}),
+            json!({"strategy": "round_robin", "sticky": true, "targets": [{"model": "a"}]}),
+        ] {
+            let doc = json!({"display_name": "g", "routing": routing});
+            let err = validate_model(&doc).expect_err("a write must be refused");
+            assert!(
+                err.message.contains("round_robin") && err.message.contains("consistent_hash"),
+                "{err}"
+            );
+        }
+        // An unrelated fault keeps its own error rather than this one.
+        let doc = json!({
+            "display_name": "g",
+            "retries": "many",
+            "routing": {"strategy": "weighted", "targets": [{"model": "a"}]},
+        });
+        let err = validate_model(&doc).expect_err("still refused");
+        assert!(!err.message.contains("consistent_hash"), "{err}");
     }
 
     #[test]

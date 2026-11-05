@@ -197,22 +197,38 @@ impl EtcdConfigStore {
     }
 }
 
+/// A stored model document, read the way the snapshot loader reads it: a row
+/// the gateway is serving under a retired routing setting must not be missing
+/// from what this surface lists.
+fn stored_model(mut doc: serde_json::Value) -> Result<Model, serde_json::Error> {
+    aisix_core::models::upgrade_stored_routing(&mut doc);
+    serde_json::from_value(doc)
+}
+
 #[async_trait::async_trait]
 impl ConfigStore for EtcdConfigStore {
     async fn get_model(&self, id: &str) -> Result<Option<ResourceEntry<Model>>, StoreError> {
         let key = self.key_for(MODELS_SUBKEY, id);
-        Ok(self
-            .get_one::<Model>(&key)
-            .await?
-            .map(|(v, rev)| ResourceEntry::new(id, v, rev)))
+        let Some((doc, rev)) = self.get_one::<serde_json::Value>(&key).await? else {
+            return Ok(None);
+        };
+        let model =
+            stored_model(doc).map_err(|e| StoreError::Backend(format!("decode {key}: {e}")))?;
+        Ok(Some(ResourceEntry::new(id, model, rev)))
     }
 
     async fn list_models(&self) -> Result<Vec<ResourceEntry<Model>>, StoreError> {
         Ok(self
-            .list_range::<Model>(MODELS_SUBKEY)
+            .list_range::<serde_json::Value>(MODELS_SUBKEY)
             .await?
             .into_iter()
-            .map(|(id, v, rev)| ResourceEntry::new(id, v, rev))
+            .filter_map(|(id, doc, rev)| match stored_model(doc) {
+                Ok(model) => Some(ResourceEntry::new(id, model, rev)),
+                Err(error) => {
+                    tracing::warn!(id = %id, %error, "skipping malformed etcd value");
+                    None
+                }
+            })
             .collect())
     }
 
@@ -392,6 +408,19 @@ mod tests {
 
     fn dummy_store() -> EtcdConfigStore {
         store_for("/aisix")
+    }
+
+    #[test]
+    fn a_stored_retired_routing_setting_reads_like_the_loader_reads_it() {
+        let model = stored_model(serde_json::json!({
+            "display_name": "g",
+            "routing": { "strategy": "weighted", "targets": [{ "model": "a" }] },
+        }))
+        .unwrap();
+        assert_eq!(
+            model.routing.map(|r| r.strategy),
+            Some(aisix_core::models::RoutingStrategy::RoundRobin)
+        );
     }
 
     #[test]

@@ -24,8 +24,8 @@
 //! rest."
 
 use aisix_core::models::{
-    validate_a2a_agent_lenient, validate_a2a_agent_url, validate_apikey_lenient,
-    validate_cache_policy_lenient, validate_claim_mapping_lenient,
+    upgrade_stored_routing, validate_a2a_agent_lenient, validate_a2a_agent_url,
+    validate_apikey_lenient, validate_cache_policy_lenient, validate_claim_mapping_lenient,
     validate_guardrail_attachment_lenient, validate_guardrail_lenient,
     validate_mcp_auth_settings_lenient, validate_mcp_policy_lenient, validate_mcp_server_lenient,
     validate_model_lenient, validate_observability_exporter_lenient,
@@ -229,7 +229,7 @@ pub fn build_snapshot(prefixes: &PrefixSet, entries: &[RawEntry]) -> (AisixSnaps
             }
         };
 
-        let value: Value = match serde_json::from_slice(&raw.value) {
+        let mut value: Value = match serde_json::from_slice(&raw.value) {
             Ok(v) => v,
             Err(err) => {
                 tracing::warn!(key = %raw.key, error = %err, "skipping non-JSON etcd entry");
@@ -285,6 +285,9 @@ pub fn build_snapshot(prefixes: &PrefixSet, entries: &[RawEntry]) -> (AisixSnaps
         match parsed.kind {
             "models" => {
                 let row_kind = parsed.kind;
+                // Ahead of the schema: a retired routing setting is what the
+                // schema would refuse the row over.
+                let retired = upgrade_stored_routing(&mut value);
                 if let Some(mut entry) = validate_and_parse::<Model>(
                     &raw.key,
                     raw.revision,
@@ -315,6 +318,20 @@ pub fn build_snapshot(prefixes: &PrefixSet, entries: &[RawEntry]) -> (AisixSnaps
                         // the supervisor keys its retained report by etcd
                         // key — two rows for one key would drop one half
                         // (resync overwrites, watch takes the first).
+                        merge_partial_compat_fields(&mut stats, &raw.key, row_kind, fields);
+                    }
+                    if !retired.is_empty() {
+                        let fields: Vec<String> =
+                            retired.iter().map(|f| (*f).to_string()).collect();
+                        warn_compat_deduped(
+                            &raw.key,
+                            row_kind,
+                            &fields,
+                            "row loaded with a retired routing setting, serving what replaced \
+                             it: `strategy: weighted` as `round_robin`, and with `sticky: true` \
+                             as `consistent_hash`; rewrite the row, a write of this shape is \
+                             refused",
+                        );
                         merge_partial_compat_fields(&mut stats, &raw.key, row_kind, fields);
                     }
                     snapshot.models.insert(entry);
@@ -806,6 +823,19 @@ fn merge_partial_compat_fields(stats: &mut BuildStats, key: &str, kind: &str, fi
 /// since" and "removed since". Naming the field and its consequence is
 /// the whole of what this side can say.
 fn warn_partial_compat_deduped(key: &str, kind: &str, fields: &[String]) {
+    warn_compat_deduped(
+        key,
+        kind,
+        fields,
+        "row loaded with unknown fields ignored (partially compatible); this \
+         build does not define them, so whatever they configure is not \
+         enforced here",
+    );
+}
+
+/// [`warn_partial_compat_deduped`] with the line's own wording, for a row this
+/// build understands and is serving differently from how it reads.
+fn warn_compat_deduped(key: &str, kind: &str, fields: &[String], message: &str) {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
 
@@ -828,9 +858,7 @@ fn warn_partial_compat_deduped(key: &str, kind: &str, fields: &[String]) {
         key = %key,
         kind = %kind,
         ignored_fields = %entry.1,
-        "row loaded with unknown fields ignored (partially compatible); this \
-         build does not define them, so whatever they configure is not \
-         enforced here"
+        "{message}"
     );
     if warned.len() < MAX_REMEMBERED {
         warned.insert(entry);
@@ -875,6 +903,66 @@ mod tests {
         "key_hash": "1460db1b6902f8b1fc2a40d9381a24d0fd22c3bc1b2c6f999c521da73776fbe0",
         "allowed_models": ["my-gpt4"]
     }"#;
+
+    /// A row written while these settings shipped keeps serving through the
+    /// deprecation window: rejecting it takes its model group offline at the
+    /// next restart, since a new process has no last-known-good to pin.
+    #[test]
+    fn a_stored_retired_routing_setting_loads_as_what_replaced_it() {
+        let row = |routing: Value| {
+            serde_json::to_vec(&serde_json::json!({ "display_name": "g", "routing": routing }))
+                .unwrap()
+        };
+        let targets = serde_json::json!([{ "model": "a", "weight": 9 }, { "model": "b" }]);
+        let entries = vec![
+            raw(
+                "/aisix/models/weighted",
+                &row(serde_json::json!({ "strategy": "weighted", "targets": targets })),
+                2,
+            ),
+            raw(
+                "/aisix/models/sticky",
+                &row(serde_json::json!({
+                    "strategy": "weighted", "sticky": true, "targets": targets
+                })),
+                3,
+            ),
+            raw(
+                "/aisix/models/ignored",
+                &row(serde_json::json!({
+                    "strategy": "failover", "sticky": true, "targets": targets
+                })),
+                4,
+            ),
+        ];
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
+
+        assert!(stats.rejections.is_empty(), "{:?}", stats.rejections);
+        let strategy = |id: &str| {
+            snap.models
+                .get_by_id(id)
+                .and_then(|e| e.value.routing.as_ref().map(|r| r.strategy))
+        };
+        use aisix_core::models::RoutingStrategy;
+        assert_eq!(strategy("weighted"), Some(RoutingStrategy::RoundRobin));
+        assert_eq!(strategy("sticky"), Some(RoutingStrategy::ConsistentHash));
+        assert_eq!(strategy("ignored"), Some(RoutingStrategy::Failover));
+
+        let reported: Vec<(&str, usize)> = stats
+            .partially_compatible
+            .iter()
+            .map(|e| (e.field.as_str(), e.count))
+            .collect();
+        assert_eq!(
+            reported,
+            [
+                ("legacy:routing.sticky_ignored", 1),
+                ("legacy:routing.sticky_weighted_as_consistent_hash", 1),
+                ("legacy:routing.strategy_weighted_as_round_robin", 1),
+            ],
+            "the setting's new meaning is reported, not an unknown-field path"
+        );
+    }
 
     #[test]
     fn builds_snapshot_for_happy_entries() {

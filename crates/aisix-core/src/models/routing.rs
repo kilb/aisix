@@ -331,6 +331,57 @@ pub struct Routing {
     pub hash_on: Option<Vec<HashOnSource>>,
 }
 
+/// Reported when a stored `strategy: weighted` row loads as `round_robin`.
+pub const LEGACY_WEIGHTED_AS_ROUND_ROBIN: &str = "legacy:routing.strategy_weighted_as_round_robin";
+/// Reported when a stored `strategy: weighted` + `sticky: true` row loads as
+/// `consistent_hash`.
+pub const LEGACY_STICKY_AS_CONSISTENT_HASH: &str =
+    "legacy:routing.sticky_weighted_as_consistent_hash";
+/// Reported when a stored `sticky` sits beside any other strategy, which never
+/// read it.
+pub const LEGACY_STICKY_IGNORED: &str = "legacy:routing.sticky_ignored";
+
+/// Bring the `routing` block of a stored model document forward from the two
+/// settings a later release retired, returning a report label per change.
+///
+/// `weighted` and `sticky` shipped, and control planes stored rows carrying
+/// them, so a row must keep loading through the deprecation window rather than
+/// take its model group offline at the next restart. Each one maps to what
+/// replaced it, which is the same behaviour:
+///
+/// - `weighted` sampled each target in proportion to its `weight`; so does
+///   `round_robin`, which took the weights over.
+/// - `weighted` with `sticky: true` held a key (the `x-aisix-routing-key`
+///   header, else the caller's API key) on one target while honouring the
+///   weights in aggregate; that is `consistent_hash` under its default
+///   `hash_on`.
+/// - `sticky` beside any other strategy did nothing, and still does nothing.
+///
+/// For the read path only: a document being written is refused, because the
+/// strict schema knows neither spelling. Rewrites the document ahead of its
+/// schema check, so nothing downstream has to know about either.
+pub fn upgrade_stored_routing(model: &mut serde_json::Value) -> Vec<&'static str> {
+    let Some(routing) = model
+        .get_mut("routing")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Vec::new();
+    };
+    let sticky = routing.remove("sticky");
+    let is_weighted =
+        routing.get("strategy").and_then(serde_json::Value::as_str) == Some("weighted");
+    if !is_weighted {
+        return sticky.map(|_| LEGACY_STICKY_IGNORED).into_iter().collect();
+    }
+    let (strategy, label) = if sticky.and_then(|v| v.as_bool()) == Some(true) {
+        ("consistent_hash", LEGACY_STICKY_AS_CONSISTENT_HASH)
+    } else {
+        ("round_robin", LEGACY_WEIGHTED_AS_ROUND_ROBIN)
+    };
+    routing.insert("strategy".to_string(), strategy.into());
+    vec![label]
+}
+
 impl Routing {
     // No `retries_or_default()`: an unset group budget no longer means
     // zero, it means "defer to the target, then to the deployment default".
@@ -526,6 +577,60 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sticky.strategy, RoutingStrategy::RoundRobin);
+    }
+
+    #[test]
+    fn stored_retired_settings_map_to_what_replaced_them() {
+        let upgraded = |routing: serde_json::Value| {
+            let mut doc = serde_json::json!({ "display_name": "g", "routing": routing });
+            let labels = upgrade_stored_routing(&mut doc);
+            (doc["routing"].clone(), labels)
+        };
+        let targets = serde_json::json!([{ "model": "a", "weight": 9 }]);
+
+        let (routing, labels) =
+            upgraded(serde_json::json!({ "strategy": "weighted", "targets": targets }));
+        assert_eq!(routing["strategy"], "round_robin");
+        assert_eq!(labels, [LEGACY_WEIGHTED_AS_ROUND_ROBIN]);
+
+        let (routing, labels) = upgraded(
+            serde_json::json!({ "strategy": "weighted", "sticky": false, "targets": targets }),
+        );
+        assert_eq!(routing["strategy"], "round_robin");
+        assert!(routing.get("sticky").is_none());
+        assert_eq!(labels, [LEGACY_WEIGHTED_AS_ROUND_ROBIN]);
+
+        let (routing, labels) = upgraded(
+            serde_json::json!({ "strategy": "weighted", "sticky": true, "targets": targets }),
+        );
+        assert_eq!(routing["strategy"], "consistent_hash");
+        assert!(routing.get("sticky").is_none());
+        assert_eq!(labels, [LEGACY_STICKY_AS_CONSISTENT_HASH]);
+        let parsed: Routing = serde_json::from_value(routing).unwrap();
+        assert_eq!(
+            parsed.hash_on_or_default(),
+            [
+                HashOnSource::header("x-aisix-routing-key"),
+                HashOnSource::api_key()
+            ],
+            "sticky keyed on this header, then the caller's API key"
+        );
+
+        // Sticky was only ever read by `weighted`.
+        let (routing, labels) = upgraded(
+            serde_json::json!({ "strategy": "failover", "sticky": true, "targets": targets }),
+        );
+        assert_eq!(routing["strategy"], "failover");
+        assert!(routing.get("sticky").is_none());
+        assert_eq!(labels, [LEGACY_STICKY_IGNORED]);
+
+        let (routing, labels) =
+            upgraded(serde_json::json!({ "strategy": "round_robin", "targets": targets }));
+        assert_eq!(routing["strategy"], "round_robin");
+        assert!(labels.is_empty());
+
+        let mut direct = serde_json::json!({ "display_name": "m", "provider": "openai" });
+        assert!(upgrade_stored_routing(&mut direct).is_empty());
     }
 
     #[test]
