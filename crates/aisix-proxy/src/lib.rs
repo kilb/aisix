@@ -4740,9 +4740,12 @@ data: [DONE]\n\n"
     /// land here — and the guardrail chain has already run and already
     /// failed open by then.
     ///
-    /// Driven with `rpm: 1`: the first request goes upstream unscreened,
-    /// the second is refused before dispatch. Both events must name the
-    /// bypass; the refusal is not what stopped the FIRST one from leaving.
+    /// The second key's budget is exhausted, a refusal that comes after the
+    /// chain has run: a limit a remote check reserves ahead of would refuse
+    /// before it (`quota::reserve_before_costly_check`). The first key's
+    /// request goes upstream unscreened, the second's is refused before
+    /// dispatch. Both events must name the bypass; the refusal is not what
+    /// stopped the FIRST one from leaving.
     #[tokio::test]
     async fn a_pre_dispatch_failure_after_a_fail_open_still_reports_the_bypass() {
         use aisix_obs::UsageSink;
@@ -4769,9 +4772,27 @@ data: [DONE]\n\n"
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry_with_rate_limit(
             "rl-open",
-            serde_json::json!({"rpm": 1}),
+            serde_json::json!({}),
         ));
         snap.apikeys.insert(apikey_entry("sk-caller", &["rl-open"]));
+        let budgeted = apikey_entry("sk-budgeted", &["rl-open"]);
+        let budgeted = ResourceEntry::new("key-id-budgeted", (*budgeted.value).clone(), 1);
+        snap.apikeys.insert(budgeted);
+        let budget: aisix_core::models::Budget = serde_json::from_value(serde_json::json!({
+            "scope": "api_key",
+            "scope_ref": "key-id-budgeted",
+            "period": "month",
+            "exhausted": {"reason": {
+                "message": "monthly cap exceeded",
+                "scope": "api_key",
+                "scope_ref": "key-id-budgeted",
+                "limit_usd": "10.00",
+                "spent_usd": "10.50",
+                "period": "month"
+            }}
+        }))
+        .unwrap();
+        snap.budgets.insert(ResourceEntry::new("b-1", budget, 1));
         // Faults instead of deciding. Input hook only: `custom` reads its
         // output policy from `output_fail_open`, which fails CLOSED by
         // default, and a refused response would not be a bypass.
@@ -4790,11 +4811,11 @@ data: [DONE]\n\n"
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
 
-        let make_req = || {
+        let make_req = |key: &str| {
             Request::builder()
                 .method("POST")
                 .uri("/v1/chat/completions")
-                .header("authorization", "Bearer sk-caller")
+                .header("authorization", format!("Bearer {key}"))
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{"model":"rl-open","messages":[{"role":"user","content":"go"}]}"#,
@@ -4802,13 +4823,13 @@ data: [DONE]\n\n"
                 .unwrap()
         };
 
-        let first = run(build_router(state.clone()), make_req()).await;
+        let first = run(build_router(state.clone()), make_req("sk-caller")).await;
         assert_eq!(
             first.status(),
             StatusCode::OK,
             "premise: a fail-open row must not refuse",
         );
-        let second = run(build_router(state.clone()), make_req()).await;
+        let second = run(build_router(state.clone()), make_req("sk-budgeted")).await;
         assert_eq!(
             second.status(),
             StatusCode::TOO_MANY_REQUESTS,

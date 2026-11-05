@@ -143,6 +143,17 @@ async fn body_json(resp: axum::http::Response<Body>) -> Value {
 
 /// Seed a document directly, read it back through the Admin HTTP layer
 /// (list + get), then delete it directly and assert both reads lose it.
+/// What the read API redacts in a collection's documents, for the collections
+/// these round trips write a credential to.
+fn credential_kind(collection: &str) -> Option<aisix_core::credentials::CredentialKind> {
+    use aisix_core::credentials::CredentialKind;
+    match collection {
+        "provider_keys" => Some(CredentialKind::ProviderKey),
+        "mcp_servers" => Some(CredentialKind::McpServer),
+        _ => None,
+    }
+}
+
 async fn direct_write_read_round_trip(
     url: &str,
     kind: &str,
@@ -178,8 +189,13 @@ async fn direct_write_read_round_trip(
         "GET {item_uri}: {got}"
     );
     // The served value may add defaults, but every written field must come
-    // back with the content that was written.
-    for (field, written) in payload.as_object().expect("payload object") {
+    // back with the content that was written, a credential as the read API
+    // shows it: redacted.
+    let mut served = payload.clone();
+    if let Some(credentials) = credential_kind(kind) {
+        aisix_core::credentials::redact_credentials(credentials, &mut served);
+    }
+    for (field, written) in served.as_object().expect("payload object") {
         assert_eq!(
             &got["value"][field], written,
             "GET {item_uri} field {field}: {got}"
