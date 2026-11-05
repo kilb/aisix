@@ -206,23 +206,12 @@ impl OtlpHttpFanOut {
     ) where
         I: IntoIterator<Item = &'a ObservabilityExporter>,
     {
-        let mut reconciled_generation = self.inner.reconciled_generation.lock();
-        if snapshot_generation < *reconciled_generation {
-            return;
-        }
-        *reconciled_generation = snapshot_generation;
-
         let exporters: Vec<_> = exporters.into_iter().collect();
-        let desired: std::collections::HashMap<_, _> = exporters
-            .iter()
-            .filter(|exp| exp.enabled)
-            .map(|exp| (exp.name.clone(), fingerprint_exporter(exp)))
-            .collect();
-        // The caller supplies the current live-snapshot set. Reconcile before
-        // enqueuing so deleted or disabled exporters release their worker,
-        // queue, and sink on the first request that observes the change.
-        self.reconcile_pipelines(&desired);
 
+        // Everything that copies a request's content happens ahead of the
+        // lock below. Every worker takes that lock on every event, and the
+        // record of a full-capture exporter is a copy of the prompt and the
+        // response.
         let settled;
         let event = match event.settled_cache_creation_ttl() {
             ttl if ttl == event.cache_creation_ttl => event,
@@ -237,113 +226,22 @@ impl OtlpHttpFanOut {
         // The shared metadata-only record, built once on first sighting and
         // reused by every exporter that does not capture content.
         let mut metadata_record: Option<Arc<SinkRecord>> = None;
-        for exp in exporters {
+        let mut records: Vec<(&ObservabilityExporter, Arc<SinkRecord>)> =
+            Vec::with_capacity(exporters.len());
+        for exp in exporters.iter().copied() {
             if !exp.enabled {
                 continue;
             }
-
-            // Dispatch on kind: each arm fingerprints its delivery-relevant
-            // config (so a dashboard edit rebuilds the pipeline) and lazily
-            // builds the matching sink. All kinds share one `ExporterPipelines`
-            // manager and the pooled client. A new `ExporterKind` variant
-            // makes this `match` non-exhaustive — a compile-time prompt to wire
-            // its sink here.
-            let client = self.inner.client.clone();
-            let handle = match &exp.kind {
-                ExporterKind::OtlpHttp(cfg) => {
-                    // Per-request sampling (#519 B.2), decided here — before
-                    // any pipeline work — so an unsampled request enqueues
-                    // nothing for THIS exporter (other exporters in the loop
-                    // still see the event). Deterministic on `request_id`, so
-                    // every attempt span of one request drops or ships
-                    // together.
-                    if !otlp_should_sample(cfg.sample_rate, &event.request_id) {
-                        continue;
-                    }
-                    let fingerprint = fingerprint_otlp(cfg);
-                    let name = exp.name.clone();
-                    let endpoint = cfg.endpoint.clone();
-                    let headers = cfg.headers.clone();
-                    let service_name = self
-                        .inner
-                        .service_name
-                        .get()
-                        .cloned()
-                        .unwrap_or_else(|| DEFAULT_SERVICE_NAME.to_string());
-                    self.inner
-                        .exporters
-                        .get_or_create(&exp.name, fingerprint, move || {
-                            Arc::new(
-                                OtlpSink::new(name, endpoint, headers, client)
-                                    .with_service_name(service_name),
-                            ) as Arc<dyn ObservabilitySink>
-                        })
+            // Per-request sampling (#519 B.2), decided here — before any
+            // pipeline work — so an unsampled request enqueues nothing for
+            // THIS exporter (other exporters in the loop still see the
+            // event). Deterministic on `request_id`, so every attempt span of
+            // one request drops or ships together.
+            if let ExporterKind::OtlpHttp(cfg) = &exp.kind {
+                if !otlp_should_sample(cfg.sample_rate, &event.request_id) {
+                    continue;
                 }
-                ExporterKind::AliyunSls(cfg) => {
-                    let fingerprint = fingerprint_sls(cfg);
-                    let name = exp.name.clone();
-                    let cfg = cfg.clone();
-                    self.inner
-                        .exporters
-                        .get_or_create(&exp.name, fingerprint, move || {
-                            // Resolve the AccessKey from the DP's local env at
-                            // build time (the key never rode the kine path).
-                            // Missing creds → empty key → SLS 401 surfaces as a
-                            // delivery-health auth error, not a silent drop.
-                            let (ak_id, ak_secret) =
-                                resolve_sls_credential(&cfg.credential_ref).unwrap_or_default();
-                            Arc::new(AliyunSlsSink::new(
-                                name,
-                                &cfg.endpoint,
-                                &cfg.project,
-                                &cfg.logstore,
-                                ak_id,
-                                ak_secret,
-                                client,
-                            )) as Arc<dyn ObservabilitySink>
-                        })
-                }
-                ExporterKind::ObjectStore(cfg) => {
-                    let fingerprint = fingerprint_object_store(cfg);
-                    let name = exp.name.clone();
-                    let cfg = cfg.clone();
-                    self.inner
-                        .exporters
-                        .get_or_create(&exp.name, fingerprint, move || {
-                            // Resolve cloud creds from the DP's local env and
-                            // build the backend at build time. Missing creds or
-                            // an un-buildable backend yield a sink that reports
-                            // the reason via delivery health (never a silent
-                            // drop) — mirroring the SLS path.
-                            build_object_store_sink(name, &cfg)
-                        })
-                }
-                ExporterKind::Datadog(cfg) => {
-                    let fingerprint = fingerprint_datadog(cfg);
-                    let name = exp.name.clone();
-                    let cfg = cfg.clone();
-                    self.inner
-                        .exporters
-                        .get_or_create(&exp.name, fingerprint, move || {
-                            // Resolve the Datadog API key from the DP's local
-                            // env at build time (the key never rode the kine
-                            // path). Missing key → empty → Datadog 403 surfaces
-                            // as a delivery-health auth error, not a silent drop
-                            // — mirroring the SLS path.
-                            let api_key =
-                                resolve_datadog_credential(&cfg.credential_ref).unwrap_or_default();
-                            Arc::new(DatadogSink::new(
-                                name,
-                                &cfg.site,
-                                api_key,
-                                &cfg.ddsource,
-                                &cfg.tags,
-                                &cfg.service,
-                                client,
-                            )) as Arc<dyn ObservabilitySink>
-                        })
-                }
-            };
+            }
 
             // A content-bearing record for an SLS exporter that opted into
             // full capture (and only when the handler captured content); the
@@ -383,7 +281,139 @@ impl OtlpHttpFanOut {
                         )
                     }))
                 });
-            handle.try_enqueue(record);
+            records.push((exp, record));
+        }
+
+        let mut reconciled_generation = self.inner.reconciled_generation.lock();
+        // A generation newer than this request's list has already been
+        // reconciled. The list may name an exporter that generation revoked,
+        // so this event may only reach a pipeline that generation kept:
+        // nothing here may start one, or an older in-flight request could
+        // bring a deleted exporter back. The window is short, but it opens on
+        // every publish (the reconcile runs just ahead of the swap), so a
+        // live exporter must not lose the events inside it.
+        let stale = snapshot_generation < *reconciled_generation;
+        if !stale {
+            *reconciled_generation = snapshot_generation;
+            let desired: std::collections::HashMap<_, _> = exporters
+                .iter()
+                .filter(|exp| exp.enabled)
+                .map(|exp| (exp.name.clone(), fingerprint_exporter(exp)))
+                .collect();
+            // The caller supplies the current live-snapshot set. Reconcile
+            // before enqueuing so deleted or disabled exporters release their
+            // worker, queue, and sink on the first request that observes the
+            // change.
+            self.reconcile_pipelines(&desired);
+        }
+
+        for (exp, record) in records {
+            if stale
+                && !self
+                    .inner
+                    .exporters
+                    .is_running(&exp.name, fingerprint_exporter(exp))
+            {
+                continue;
+            }
+            self.pipeline_for(exp).try_enqueue(record);
+        }
+    }
+
+    /// The pipeline delivering to `exp`, started on first sighting.
+    ///
+    /// Dispatch on kind: each arm fingerprints its delivery-relevant config
+    /// (so a dashboard edit rebuilds the pipeline) and lazily builds the
+    /// matching sink. All kinds share one `ExporterPipelines` manager and the
+    /// pooled client. A new `ExporterKind` variant makes this `match`
+    /// non-exhaustive — a compile-time prompt to wire its sink here.
+    fn pipeline_for(&self, exp: &ObservabilityExporter) -> crate::sink::SinkHandle {
+        let client = self.inner.client.clone();
+        match &exp.kind {
+            ExporterKind::OtlpHttp(cfg) => {
+                let fingerprint = fingerprint_otlp(cfg);
+                let name = exp.name.clone();
+                let endpoint = cfg.endpoint.clone();
+                let headers = cfg.headers.clone();
+                let service_name = self
+                    .inner
+                    .service_name
+                    .get()
+                    .cloned()
+                    .unwrap_or_else(|| DEFAULT_SERVICE_NAME.to_string());
+                self.inner
+                    .exporters
+                    .get_or_create(&exp.name, fingerprint, move || {
+                        Arc::new(
+                            OtlpSink::new(name, endpoint, headers, client)
+                                .with_service_name(service_name),
+                        ) as Arc<dyn ObservabilitySink>
+                    })
+            }
+            ExporterKind::AliyunSls(cfg) => {
+                let fingerprint = fingerprint_sls(cfg);
+                let name = exp.name.clone();
+                let cfg = cfg.clone();
+                self.inner
+                    .exporters
+                    .get_or_create(&exp.name, fingerprint, move || {
+                        // Resolve the AccessKey from the DP's local env at
+                        // build time (the key never rode the kine path).
+                        // Missing creds → empty key → SLS 401 surfaces as a
+                        // delivery-health auth error, not a silent drop.
+                        let (ak_id, ak_secret) =
+                            resolve_sls_credential(&cfg.credential_ref).unwrap_or_default();
+                        Arc::new(AliyunSlsSink::new(
+                            name,
+                            &cfg.endpoint,
+                            &cfg.project,
+                            &cfg.logstore,
+                            ak_id,
+                            ak_secret,
+                            client,
+                        )) as Arc<dyn ObservabilitySink>
+                    })
+            }
+            ExporterKind::ObjectStore(cfg) => {
+                let fingerprint = fingerprint_object_store(cfg);
+                let name = exp.name.clone();
+                let cfg = cfg.clone();
+                self.inner
+                    .exporters
+                    .get_or_create(&exp.name, fingerprint, move || {
+                        // Resolve cloud creds from the DP's local env and
+                        // build the backend at build time. Missing creds or
+                        // an un-buildable backend yield a sink that reports
+                        // the reason via delivery health (never a silent
+                        // drop) — mirroring the SLS path.
+                        build_object_store_sink(name, &cfg)
+                    })
+            }
+            ExporterKind::Datadog(cfg) => {
+                let fingerprint = fingerprint_datadog(cfg);
+                let name = exp.name.clone();
+                let cfg = cfg.clone();
+                self.inner
+                    .exporters
+                    .get_or_create(&exp.name, fingerprint, move || {
+                        // Resolve the Datadog API key from the DP's local
+                        // env at build time (the key never rode the kine
+                        // path). Missing key → empty → Datadog 403 surfaces
+                        // as a delivery-health auth error, not a silent drop
+                        // — mirroring the SLS path.
+                        let api_key =
+                            resolve_datadog_credential(&cfg.credential_ref).unwrap_or_default();
+                        Arc::new(DatadogSink::new(
+                            name,
+                            &cfg.site,
+                            api_key,
+                            &cfg.ddsource,
+                            &cfg.tags,
+                            &cfg.service,
+                            client,
+                        )) as Arc<dyn ObservabilitySink>
+                    })
+            }
         }
     }
 
@@ -433,6 +463,12 @@ impl OtlpHttpFanOut {
     /// Drain every exporter pipeline at graceful shutdown.
     pub async fn shutdown(&self) {
         self.inner.exporters.shutdown().await;
+    }
+
+    /// [`Self::shutdown`], giving up at `deadline`. Returns whether every
+    /// pipeline finished.
+    pub async fn shutdown_within(&self, deadline: Duration) -> bool {
+        self.inner.exporters.shutdown_within(deadline).await
     }
 }
 
@@ -3921,6 +3957,89 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         f.shutdown().await;
+    }
+
+    /// Under thread-per-core serving the first event an exporter sees comes
+    /// from a request worker, whose runtime goes away at the end of the drain.
+    /// The pipeline has to outlive it, or nothing is left to drain at exit.
+    #[test]
+    fn a_pipeline_outlives_the_worker_runtime_that_first_saw_its_exporter() {
+        let control = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (fan_out, server, exp) = control.block_on(async {
+            let server = wiremock::MockServer::builder().start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(wiremock::ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let mut exp = sample_exporter();
+            if let ExporterKind::OtlpHttp(cfg) = &mut exp.kind {
+                cfg.endpoint = format!("{}/v1/traces", server.uri());
+            }
+            (OtlpHttpFanOut::new(), server, exp)
+        });
+
+        let on_worker = (fan_out.clone(), exp);
+        std::thread::spawn(move || {
+            let worker = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (fan_out, exp) = on_worker;
+            worker.block_on(async {
+                fan_out.fan_out(&sample_event(), None, None, None, 1, std::iter::once(&exp));
+            });
+        })
+        .join()
+        .unwrap();
+
+        control.block_on(async {
+            fan_out.shutdown().await;
+            let received = server.received_requests().await.unwrap_or_default();
+            assert_eq!(
+                received.len(),
+                1,
+                "the record queued from the worker must be delivered by the drain"
+            );
+        });
+    }
+
+    /// The reconcile for a new generation runs just ahead of the swap, so a
+    /// request can still hold the previous generation's list. That list must
+    /// keep reaching an exporter the new generation kept.
+    #[tokio::test]
+    async fn an_older_generation_still_reaches_a_pipeline_the_new_one_kept() {
+        let server = wiremock::MockServer::builder().start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut exp = sample_exporter();
+        if let ExporterKind::OtlpHttp(cfg) = &mut exp.kind {
+            cfg.endpoint = format!("{}/v1/traces", server.uri());
+        }
+        let f = OtlpHttpFanOut::new();
+        let mut older = sample_event();
+        older.request_id = "older-generation".into();
+        f.fan_out(&sample_event(), None, None, None, 7, std::iter::once(&exp));
+        f.reconcile(8, std::iter::once(&exp));
+        f.fan_out(&older, None, None, None, 7, std::iter::once(&exp));
+        f.shutdown().await;
+
+        let delivered: String = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert!(
+            delivered.contains("older-generation"),
+            "the event from the previous generation was lost: {delivered}"
+        );
     }
 
     #[tokio::test]

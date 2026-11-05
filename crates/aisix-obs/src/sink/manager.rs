@@ -45,6 +45,14 @@ pub struct ExporterPipelines {
     /// hard delivery failures reach the Prometheus scrape and not only the
     /// heartbeat. `None` in tests and standalone construction.
     metrics: Option<Metrics>,
+    /// Where pipelines run: the runtime this manager was built on.
+    ///
+    /// A pipeline starts on first sighting, which happens on the request
+    /// path. Spawned from there, under thread-per-core serving, it would live
+    /// on one request worker's runtime: its batch encoding would stall that
+    /// worker's requests, and the worker dropping its runtime at the end of
+    /// the drain would kill it before [`Self::shutdown`] could drain it.
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl ExporterPipelines {
@@ -55,6 +63,7 @@ impl ExporterPipelines {
             running: Mutex::new(HashMap::new()),
             cfg,
             metrics: None,
+            runtime: tokio::runtime::Handle::try_current().ok(),
         }
     }
 
@@ -95,6 +104,7 @@ impl ExporterPipelines {
             // immediately, then rebuild below. Draining here could deliver
             // captured content after the operator revoked that config.
             if let Some(old) = running.remove(key) {
+                old.handle.count_queued_as_dropped();
                 old.worker.abort();
                 tracing::info!(exporter = %key, "rebuilding reconfigured exporter pipeline");
             }
@@ -103,7 +113,10 @@ impl ExporterPipelines {
         let (handle, pipeline) =
             SinkPipeline::with_metrics(sink, self.cfg.clone(), self.metrics.clone());
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        let worker = tokio::spawn(pipeline.run(cancel_rx));
+        let worker = match &self.runtime {
+            Some(runtime) => runtime.spawn(pipeline.run(cancel_rx)),
+            None => tokio::spawn(pipeline.run(cancel_rx)),
+        };
         running.insert(
             key.to_string(),
             Running {
@@ -127,16 +140,26 @@ impl ExporterPipelines {
         running.retain(|key, pipeline| match desired.get(key) {
             Some(fingerprint) if *fingerprint == pipeline.fingerprint => true,
             Some(_) => {
+                pipeline.handle.count_queued_as_dropped();
                 pipeline.worker.abort();
                 tracing::info!(exporter = %key, "stopping reconfigured exporter pipeline");
                 false
             }
             None => {
+                pipeline.handle.count_queued_as_dropped();
                 pipeline.worker.abort();
                 tracing::info!(exporter = %key, "stopping removed exporter pipeline");
                 false
             }
         });
+    }
+
+    /// Whether a pipeline for `key` is running this exact configuration.
+    pub fn is_running(&self, key: &str, fingerprint: u64) -> bool {
+        self.running
+            .lock()
+            .get(key)
+            .is_some_and(|pipeline| pipeline.fingerprint == fingerprint)
     }
 
     /// Per-exporter delivery stats, keyed by exporter name (health/dashboard).
@@ -168,6 +191,33 @@ impl ExporterPipelines {
         for pipeline in pipelines {
             let _ = pipeline.worker.await;
         }
+    }
+
+    /// [`Self::shutdown`], giving up at `deadline`, for the process exit.
+    ///
+    /// A pipeline bounds its own drain, but only between deliveries: a sink
+    /// that never returns from one holds it for as long as that sink's own
+    /// timeout, which is the sink's to decide. Returns whether every pipeline
+    /// finished; what a pipeline given up on still holds is counted as lost.
+    pub async fn shutdown_within(&self, deadline: std::time::Duration) -> bool {
+        let pipelines: Vec<Running> = self.running.lock().drain().map(|(_, p)| p).collect();
+        for pipeline in &pipelines {
+            let _ = pipeline.cancel.send(true);
+        }
+        let until = tokio::time::Instant::now() + deadline;
+        let mut finished = true;
+        for pipeline in pipelines {
+            let abort = pipeline.worker.abort_handle();
+            if tokio::time::timeout_at(until, pipeline.worker)
+                .await
+                .is_err()
+            {
+                pipeline.handle.count_queued_as_dropped();
+                abort.abort();
+                finished = false;
+            }
+        }
+        finished
     }
 }
 
@@ -241,6 +291,101 @@ mod tests {
         move || {
             builds.fetch_add(1, Ordering::Relaxed);
             Arc::new(CountingSink { delivered }) as Arc<dyn ObservabilitySink>
+        }
+    }
+
+    /// A sink that never finishes a delivery, so records stay queued.
+    struct StuckSink;
+
+    #[async_trait::async_trait]
+    impl ObservabilitySink for StuckSink {
+        fn name(&self) -> &str {
+            "stuck"
+        }
+        fn capabilities(&self) -> SinkCapabilities {
+            SinkCapabilities {
+                idempotency: IdempotencyScheme::None,
+                ordering: OrderingScope::None,
+                batch_unit: BatchUnit::Records,
+                max_batch_bytes: None,
+                supports_partial_batch: false,
+                supports_streaming_ingest: false,
+            }
+        }
+        async fn append_batch(
+            &self,
+            _batch: &EventBatch,
+            _marker: &IdempotencyMarker,
+        ) -> SinkResult {
+            std::future::pending().await
+        }
+        async fn healthcheck(&self) -> SinkHealth {
+            SinkHealth::healthy()
+        }
+    }
+
+    /// A sink that never comes back from a delivery must not hold the exit:
+    /// nothing after the drain runs until it returns.
+    #[tokio::test(start_paused = true)]
+    async fn an_exit_gives_up_on_a_sink_that_never_returns() {
+        let metrics = Metrics::new(false);
+        let mgr = ExporterPipelines::new(PipelineConfig {
+            flush_interval: std::time::Duration::from_secs(60),
+            max_batch: 1,
+            ..PipelineConfig::default()
+        })
+        .with_metrics(metrics.clone());
+        let handle = mgr.get_or_create("stuck", 1, || {
+            Arc::new(StuckSink) as Arc<dyn ObservabilitySink>
+        });
+        for _ in 0..3 {
+            assert!(handle.try_enqueue(rec()));
+        }
+        tokio::task::yield_now().await;
+
+        let started = tokio::time::Instant::now();
+        let finished = mgr
+            .shutdown_within(std::time::Duration::from_secs(10))
+            .await;
+        assert!(!finished, "the stuck pipeline did not finish");
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(10));
+        assert!(mgr.is_empty());
+        assert!(
+            handle.stats().dropped > 0,
+            "what it still held has to be accounted for"
+        );
+    }
+
+    /// Discarding a revoked exporter's queue is deliberate, but it is still
+    /// lost telemetry, and the drop counter is what an operator reads to learn
+    /// how much of it there was.
+    #[tokio::test]
+    async fn discarding_a_stopped_pipelines_queue_is_counted() {
+        for reconfigured in [false, true] {
+            let metrics = Metrics::new(false);
+            let mgr = manager().with_metrics(metrics.clone());
+            let handle = mgr.get_or_create("gone", 1, || {
+                Arc::new(StuckSink) as Arc<dyn ObservabilitySink>
+            });
+            for _ in 0..3 {
+                assert!(handle.try_enqueue(rec()));
+            }
+            if reconfigured {
+                mgr.get_or_create("gone", 2, || {
+                    Arc::new(StuckSink) as Arc<dyn ObservabilitySink>
+                });
+            } else {
+                mgr.reconcile(&HashMap::new());
+            }
+            assert_eq!(handle.stats().dropped, 3);
+            let rendered = metrics.render();
+            assert!(
+                rendered.lines().any(|line| line
+                    .starts_with(crate::metrics::M_OTLP_FANOUT_DROPS_TOTAL)
+                    && line.contains("reason=\"worker_stopped\"")
+                    && line.ends_with(" 3")),
+                "reconfigured={reconfigured}: {rendered}"
+            );
         }
     }
 

@@ -176,6 +176,15 @@ const CONTROL_RUNTIME_THREADS: usize = 2;
 /// every time.
 const LOG_FLUSH_DEADLINE: Duration = Duration::from_secs(5);
 
+/// How long the exit waits for the exporter pipelines to deliver what they
+/// hold.
+///
+/// A pipeline's own drain gives up on a failing receiver after a few seconds
+/// and counts what it lost; this is the backstop for a sink that does not come
+/// back from a delivery at all, so it only has to outlast one delivery on top
+/// of that.
+const EXPORTER_DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+
 fn main() -> anyhow::Result<()> {
     // Install the process-level rustls CryptoProvider before anything
     // else touches TLS. rustls 0.23 dropped implicit provider selection
@@ -1564,6 +1573,7 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
     // The same parsed list `proxy.real_ip` judges forwarded headers by, so
     // the two trust decisions cannot drift apart.
     let proxy_protocol_trust: ProxyProtocolTrust = proxy_state.real_ip.trusted.clone().into();
+    let exporter_fan_out = proxy_state.otlp_fan_out.clone();
     let proxy_router = aisix_proxy::build_router(proxy_state);
 
     let background_check_task = tokio::spawn(async move {
@@ -1858,6 +1868,19 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
     telemetry::stop_after(proxy_serve, &usage_stop_tx)
         .await
         .map_err(|e| anyhow::anyhow!("proxy serve error: {e}"))?;
+    // Nothing is served any more, so nothing else lands in these queues. What
+    // they hold was queued for a backend, and the runtime going away next
+    // would discard it.
+    if !exporter_fan_out
+        .shutdown_within(EXPORTER_DRAIN_DEADLINE)
+        .await
+    {
+        tracing::warn!(
+            deadline_secs = EXPORTER_DRAIN_DEADLINE.as_secs(),
+            "an exporter did not finish delivering inside the shutdown drain; \
+             what it still held is lost",
+        );
+    }
     if let Some(handle) = admin_serve_handle {
         match handle.await {
             Ok(Ok(())) => {}

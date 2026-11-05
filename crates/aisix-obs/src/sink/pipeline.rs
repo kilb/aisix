@@ -222,6 +222,20 @@ impl SinkHandle {
         }
     }
 
+    /// Account for what the queue holds, for a caller about to abort the
+    /// worker. The discard itself is deliberate (a revoked exporter must not
+    /// receive what was queued for it), but it is a loss like any other.
+    pub(crate) fn count_queued_as_dropped(&self) {
+        let queued = self.queued();
+        if queued == 0 {
+            return;
+        }
+        self.stats.add_dropped(queued);
+        if let Some(m) = &self.metrics {
+            m.record_otlp_fanout_drop(&self.name, "worker_stopped", queued);
+        }
+    }
+
     /// Snapshot of this sink's delivery counters.
     pub fn stats(&self) -> SinkStatsSnapshot {
         self.stats.snapshot()
