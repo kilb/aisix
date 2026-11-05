@@ -179,10 +179,11 @@ describe("streaming /v1/messages output guardrail (#448)", () => {
     expect(upstream.receivedRequests).toHaveLength(cleanBaseline + 1);
     expect(upstream.receivedRequests.at(-1)?.body).toContain(cleanMarker);
     expect(cleanBody).not.toContain("content_filter");
+    // Relayed as sent, except that `message.model` echoes the caller's alias.
     expect(parseSseFrames(cleanBody)).toEqual(
       CLEAN_STREAM_EVENTS.map((data) => ({
         event: (JSON.parse(data) as { type: string }).type,
-        data,
+        data: data.replace('"model":"claude-3-5-haiku-20241022"', '"model":"msgstream-gr"'),
       })),
     );
   });
