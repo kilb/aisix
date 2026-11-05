@@ -6180,7 +6180,6 @@ fn stream_opaque_response(
                 error = %telemetry.error_message,
                 "passthrough-route opaque SSE relay timed out mid-stream",
             );
-            upstream_failed = true;
         }
         telemetry.stream_reached_end = true;
         telemetry.emit();
@@ -6692,7 +6691,6 @@ fn stream_response(
                 error = %telemetry.error_message,
                 "passthrough-route upstream stream timed out mid-relay",
             );
-            upstream_failed = true;
         }
 
         if !blocked {
