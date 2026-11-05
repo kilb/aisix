@@ -46,7 +46,7 @@ use aisix_a2a::{
 use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::body::to_bytes;
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 
@@ -80,16 +80,35 @@ struct A2aCall {
     stream: A2aStreamProgress,
     /// What was said, for token metering and opt-in content capture.
     text: A2aCallText,
-    /// Set when a content policy blocked this call, so the usage event
-    /// records it the way a blocked LLM request is recorded.
-    guardrail_blocked: bool,
     /// The `{kind, hook}` set of policies that governed the call, and any
-    /// monitor-mode observations they made.
+    /// monitor-mode observations they made. Kept on the call because a
+    /// streamed emit may happen from `Drop`, long after the handler frame
+    /// that resolved the chain has returned.
     applied_guardrails: Vec<aisix_core::AppliedGuardrail>,
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    guardrail_audit: crate::usage_attr::GuardrailAudit,
     /// What a `mask` rule rewrote, by entity type. Counts only — the event
     /// must not become the sink for the content the rule removed.
     redactions: crate::redact::RedactionCounts,
+    /// `UsageEvent::request_headers`, captured off the inbound request.
+    request_headers: std::collections::BTreeMap<String, String>,
+    /// When the gateway received the request — the origin of the
+    /// caller-side time to first event.
+    request_started: Instant,
+    /// The normalised inbound client, for the by-client token series.
+    client_type: String,
+}
+
+impl A2aCall {
+    /// A `result` event is on its way to the caller: count it, and stamp the
+    /// caller-side time to first event, however long a review held it.
+    fn note_result_delivered(&mut self) {
+        self.stream.event_count += 1;
+        let request_started = self.request_started;
+        self.stream
+            .downstream_ttfb
+            .get_or_insert_with(|| request_started.elapsed());
+    }
 }
 
 /// The words exchanged on one A2A call.
@@ -119,6 +138,9 @@ struct A2aStreamProgress {
     /// one arrives — a stream that opens and produces nothing never sets it,
     /// and no figure is invented for it.
     ttfb: Option<Duration>,
+    /// Time from the gateway receiving the request to that first event being
+    /// handed to the caller.
+    downstream_ttfb: Option<Duration>,
     /// Events relayed downstream.
     event_count: u32,
     /// Set when the upstream stream ends — exhausted or faulted. Still false
@@ -156,56 +178,110 @@ pub async fn a2a_endpoint(
         .get::<crate::request_id::RequestId>()
         .map(|r| r.0.clone())
         .unwrap_or_else(new_request_id);
+    // The request's trace bundle (AISIX-Cloud#1279), minted beside the id.
+    let trace = request
+        .extensions()
+        .get::<std::sync::Arc<aisix_obs::RequestTraceBundle>>()
+        .cloned();
     let api_key_id = auth.entry.id.clone();
     let http_method = request.method().clone();
     // `dispatch` takes the key by value; the terminal emit below still needs
     // the caller's team / user labels (the handle is an `Arc` clone).
     let caller_auth = auth.clone();
 
-    let response = dispatch(auth, &client, &agent, &state, request, &request_id).await;
+    let response = dispatch(
+        auth,
+        &client,
+        &agent,
+        &state,
+        request,
+        &request_id,
+        trace,
+        started,
+    )
+    .await;
 
     let elapsed = started.elapsed();
     let status = response.status().as_u16();
-    AccessLog {
-        method: http_method.as_str(),
-        path: "/a2a",
-        status,
-        latency: elapsed,
-        provider: Some("a2a"),
-        model: None,
-        api_key_id: Some(&api_key_id),
-        // Counted inside `dispatch`, which hands back only a rendered
-        // `Response` — and for a stream, not until its drop guard fires, long
-        // after this line. The usage event carries them.
-        prompt_tokens: None,
-        completion_tokens: None,
-        total_tokens: None,
-        request_id: &request_id,
-        // Same as `/mcp`: `dispatch` returns an already-rendered `Response`,
-        // so no typed error reaches this point.
-        error_kind: None,
-        error: None,
-        provider_request_id: None,
-        served_by_model: None,
-        routing_attempt_count: None,
-        routing_fallback_count: None,
+    let streamed = crate::attribution::stream_owns_access_log();
+    let a2a_upstream = crate::request_metrics::Upstream {
+        provider: "a2a",
+        model: A2A_MODEL_LABEL,
+        stream: streamed,
+        ..Default::default()
+    };
+    if streamed {
+        // A streamed call ends when the agent's last event is relayed or
+        // the caller walks away, both of which are below this frame and
+        // minutes away. Park the line; `StreamUsageOnDrop` writes it beside
+        // the usage event that already reports that ending
+        // (AISIX-Cloud#1571).
+        crate::attribution::defer_access_log(
+            crate::attribution::PendingAccessLog::new(
+                http_method.as_str(),
+                "/a2a",
+                &request_id,
+                &api_key_id,
+                started,
+            )
+            .with_model("a2a", ""),
+            crate::request_metrics::PendingRequestMetrics::at_stream_end(
+                &state,
+                "/a2a",
+                crate::request_metrics::Caller::new(&caller_auth),
+                a2a_upstream,
+                started,
+            ),
+        );
+    } else {
+        let target = crate::attribution::AccessLogTarget::current();
+        crate::attribution::emit_access_log(AccessLog {
+            method: http_method.as_str(),
+            path: "/a2a",
+            status,
+            latency: elapsed,
+            duration: elapsed,
+            provider: Some("a2a"),
+            model: None,
+            upstream_model: target.upstream_model(),
+            provider_key_id: target.provider_key_id(),
+            api_key_id: Some(&api_key_id),
+            // Counted inside `dispatch`, which hands back only a rendered
+            // `Response`; filled from the request's terminal usage event
+            // (`attribution::note_terminal_event`).
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            request_id: &request_id,
+            // Same as `/mcp`: `dispatch` returns an already-rendered
+            // `Response`, so no typed error reaches this point; the
+            // request's terminal usage event names the failure on this line
+            // when it is completed (`attribution::note_terminal_event`).
+            error_kind: None,
+            error: None,
+            provider_request_id: None,
+            served_by_model: None,
+            routing_attempt_count: None,
+            routing_fallback_count: None,
+            mcp: None,
+            cache: None,
+            request_body_bytes: None,
+            response_body_bytes: None,
+        });
+        crate::request_metrics::record(
+            &state,
+            "/a2a",
+            crate::request_metrics::Caller::new(&caller_auth),
+            a2a_upstream,
+            status,
+            crate::attribution::rendered_error_source(status),
+            elapsed,
+        );
     }
-    .emit();
-    crate::request_metrics::record(
-        &state,
-        "/a2a",
-        crate::request_metrics::Caller::new(&caller_auth),
-        crate::request_metrics::Upstream {
-            provider: "a2a",
-            model: A2A_MODEL_LABEL,
-            ..Default::default()
-        },
-        status,
-        elapsed,
-    );
     response
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     auth: AuthenticatedKey,
     client: &crate::client_ip::ClientContext,
@@ -213,6 +289,8 @@ async fn dispatch(
     state: &ProxyState,
     request: Request,
     request_id: &str,
+    trace: Option<std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+    request_started: Instant,
 ) -> Response {
     // Resolve the agent from the live snapshot. A disabled agent is treated as
     // absent — not served, same as a missing one.
@@ -251,7 +329,14 @@ async fn dispatch(
 
     let upstream = upstream_from_a2a_agent(&entry.value);
 
-    let (_parts, body) = request.into_parts();
+    let (parts, body) = request.into_parts();
+    let request_headers =
+        crate::client_ip::capture_request_headers(&parts.headers, &state.snapshot.load());
+    crate::attribution::note_request_headers(&request_headers);
+    // Resolved here rather than inside the bridge: the inbound headers exist
+    // only on this side, and the same resolved set serves the buffered and the
+    // streaming dispatch below.
+    let forwarded = aisix_a2a::forwarded_client_headers(&entry.value, Some(&parts.headers));
     let body_limit = state.request_body_limit_for("/a2a/:agent");
     let bytes = match to_bytes(body, crate::error::body_read_cap(body_limit)).await {
         Ok(bytes) => bytes,
@@ -276,6 +361,15 @@ async fn dispatch(
         .to_string();
     let rpc_id = value.get("id").cloned();
     let operation = canonical_operation(&method);
+    // A call with no words to capture (a task read, a cancel) reports its
+    // JSON-RPC body on a failure row.
+    crate::usage_attr::note_failure_request(&snapshot, || value.to_string());
+    // To the request's attribution cell, so a caller that hangs up while the
+    // agent is still thinking files a row naming the agent and the call
+    // rather than an anonymous 499 (AISIX-Cloud#1571). Both spellings: the
+    // raw method, and the canonical operation a per-operation figure groups
+    // by — the completed row carries both, so this one must too.
+    crate::attribution::note_a2a_call(agent, &method, operation);
     let mut call = A2aCall {
         operation,
         method,
@@ -295,10 +389,22 @@ async fn dispatch(
             },
             response: ResultText::default(),
         },
-        guardrail_blocked: false,
         applied_guardrails: Vec::new(),
         guardrail_monitor_hits: Vec::new(),
+        guardrail_audit: None,
         redactions: crate::redact::RedactionCounts::new(),
+        request_headers,
+        request_started,
+        client_type: state
+            .client_classifier
+            .classify(
+                parts
+                    .headers
+                    .get(axum::http::header::USER_AGENT)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default(),
+            )
+            .to_string(),
     };
     // Read before the upstream is contacted, so a call that never lands still
     // records which task the caller was asking about.
@@ -325,6 +431,7 @@ async fn dispatch(
             team_id: auth.key().team_id.as_deref(),
         });
     call.applied_guardrails = guardrail_chain.applied().to_vec();
+    call.guardrail_audit = guardrail_chain.audit_log();
     // A push notification is the agent POSTing the task's progress straight
     // to a webhook the caller names, so an answer delivered that way never
     // comes back through here for the output check — asking for one routes
@@ -339,7 +446,13 @@ async fn dispatch(
             operation = %call.operation,
             "guardrail refused A2A push notification setup",
         );
-        call.guardrail_blocked = true;
+        let envelope = a2a_error_envelope_coded(
+            rpc_id,
+            PUSH_NOTIFICATION_NOT_SUPPORTED,
+            "push notifications are not available while a content policy reviews this \
+             agent's answers; poll or stream the task instead",
+        );
+        crate::usage_attr::note_client_error_body(&snapshot, || envelope.to_string());
         emit_a2a_usage(
             state,
             &snapshot,
@@ -349,17 +462,12 @@ async fn dispatch(
             &call,
             StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
             Duration::ZERO,
+            trace.as_ref(),
+            /* dispatched */ false,
+            Some(&crate::error::guardrail_block_error("request", None, None)),
+            None,
         );
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            axum::Json(a2a_error_envelope_coded(
-                rpc_id,
-                PUSH_NOTIFICATION_NOT_SUPPORTED,
-                "push notifications are not available while a content policy reviews this \
-                 agent's answers; poll or stream the task instead",
-            )),
-        )
-            .into_response();
+        return (StatusCode::UNPROCESSABLE_ENTITY, axum::Json(envelope)).into_response();
     }
     // A check that calls a remote moderation service is admitted by the
     // key's rate limits before it runs, and a refusal keeps the slot it took
@@ -372,170 +480,35 @@ async fn dispatch(
     {
         Ok(reservation) => reservation,
         Err(err) => {
-            let response = err.into_response();
-            emit_a2a_usage(
+            return quota_refusal(
                 state,
                 &snapshot,
                 &auth,
                 request_id,
                 agent,
                 &call,
-                response.status().as_u16(),
-                Duration::ZERO,
-            );
-            return response;
+                trace.as_ref(),
+                err,
+            )
         }
     };
     // Otherwise run BEFORE the quota gate so a content-policy refusal by local
     // rules does not burn an RPM slot, matching /v1/chat/completions (#542).
-    //
-    // Scan every word the agent will receive: text parts, and the string
-    // values and keys of data parts, uncapped. `call.text.request` is capped
-    // for metering and reads text parts only, and the body is forwarded
-    // whole: scanning that copy let anything past the cap, or inside a data
-    // part, through unread. Decided on the message itself rather than on the
-    // operation, so any call that hands an agent a message is read.
-    let request_scan = (!guardrail_chain.is_empty()).then(|| aisix_a2a::request_scan(&value));
-    // Content the scan cannot read — file bytes that are neither text nor a
-    // binary media type, a value of the wrong type where the protocol has
-    // text — is refused rather than forwarded unread: whatever reads it on
-    // the other side may decode it more leniently than any scan predicts.
-    // Only where a guardrail would act on the request: an output-only or
-    // monitor-mode chain never refuses one.
-    if let Some(why) = request_scan
-        .as_ref()
-        .and_then(|scan| scan.unreadable)
-        .filter(|_| aisix_guardrails::Guardrail::enforces_input(&guardrail_chain))
+    if let Some(response) = guardrail_block_response(
+        state,
+        &snapshot,
+        &auth,
+        request_id,
+        agent,
+        &guardrail_chain,
+        &mut call,
+        &mut value,
+        rpc_id.clone(),
+        trace.as_ref(),
+    )
+    .await
     {
-        tracing::warn!(
-            guardrail_hook = "input",
-            agent = %agent,
-            operation = %call.operation,
-            reason = why,
-            "guardrail blocked A2A request: content the scan cannot read",
-        );
-        call.guardrail_blocked = true;
-        emit_a2a_usage(
-            state,
-            &snapshot,
-            &auth,
-            request_id,
-            agent,
-            &call,
-            StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
-            Duration::ZERO,
-        );
-        return a2a_error_response(
-            rpc_id,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            &crate::error::guardrail_block_message("request", None),
-        );
-    }
-    let request_words = request_scan.map(|scan| scan.text).unwrap_or_default();
-    if !request_words.is_empty() {
-        let chat = aisix_gateway::ChatFormat::new(
-            "",
-            vec![aisix_gateway::ChatMessage::user(request_words)],
-        );
-        let (verdict, hits) =
-            aisix_guardrails::Guardrail::check_input_observed(&guardrail_chain, &chat).await;
-        call.guardrail_monitor_hits.extend(hits);
-        if let aisix_guardrails::GuardrailVerdict::Block {
-            reason,
-            guardrail_name,
-        } = verdict
-        {
-            tracing::warn!(
-                guardrail_hook = "input",
-                agent = %agent,
-                operation = %call.operation,
-                reason = %reason,
-                "guardrail blocked A2A request",
-            );
-            call.guardrail_blocked = true;
-            emit_a2a_usage(
-                state,
-                &snapshot,
-                &auth,
-                request_id,
-                agent,
-                &call,
-                StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
-                Duration::ZERO,
-            );
-            return a2a_error_response(
-                rpc_id,
-                StatusCode::UNPROCESSABLE_ENTITY,
-                &crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
-            );
-        }
-
-        // #932's order: block first, then rewrite, so the masked text is what
-        // the agent receives.
-        //
-        // This module's own header is the argument for doing it here at all —
-        // content policy applies "so a rule that blocks a phrase on an LLM
-        // endpoint is not bypassable by asking an agent the same thing". A
-        // MASK rule was exactly that bypassable: the chain resolved, the text
-        // was scanned, and nothing rewrote it, so an env-scoped `pii` mask
-        // that redacts a prompt on /v1/chat/completions let the same content
-        // through here untouched — with no block, no rewrite, and no record
-        // (`would_mask` is monitor-mode only).
-        //
-        // Only `params.message.parts[].text` is rewritten. The ids, method
-        // name and metadata around them are protocol rather than caller
-        // content. The scan above also read data parts, and any parts list
-        // outside `params.message`, which the rewrite does not reach (see
-        // `request_would_mask_unrewritable`): a mask that would change one
-        // refuses the call, the way the other endpoints refuse a structural
-        // field they cannot rewrite, rather than forwarding it unmasked.
-        if aisix_guardrails::Guardrail::redacts_input(&guardrail_chain) {
-            let chain = &guardrail_chain;
-            if aisix_a2a::request_would_mask_unrewritable(&value, |text| {
-                aisix_guardrails::Guardrail::redact_input_text(chain, text).map(|r| r.text)
-            }) {
-                tracing::warn!(
-                    guardrail_hook = "input",
-                    agent = %agent,
-                    operation = %call.operation,
-                    "guardrail blocked A2A request: a mask rule matched content the rewrite cannot reach",
-                );
-                call.guardrail_blocked = true;
-                emit_a2a_usage(
-                    state,
-                    &snapshot,
-                    &auth,
-                    request_id,
-                    agent,
-                    &call,
-                    StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
-                    Duration::ZERO,
-                );
-                return a2a_error_response(
-                    rpc_id,
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    &crate::error::guardrail_block_message("request", None),
-                );
-            }
-            // Collected outside the closure: `redact_request_text` takes an
-            // `Fn`, so the counts cannot be merged into `call` from inside it.
-            let collected = std::cell::RefCell::new(crate::redact::RedactionCounts::new());
-            let rewritten = aisix_a2a::redact_request_text(&mut value, |text| {
-                aisix_guardrails::Guardrail::redact_input_text(chain, text).map(|r| {
-                    crate::redact::merge_counts(&mut collected.borrow_mut(), r.counts);
-                    r.text
-                })
-            });
-            crate::redact::merge_counts(&mut call.redactions, collected.into_inner());
-            if rewritten > 0 && meters_content(call.operation) {
-                // Keep the inspected copy in step with what was sent, so the
-                // usage event's token estimate and any captured content
-                // describe the same text the agent got. Only for a metered
-                // operation: the scan reads any call that carries a message,
-                // and rewriting one must not start metering it.
-                call.text.request = aisix_a2a::request_text(&value, |b, s| b.push_str(s));
-            }
-        }
+        return response;
     }
 
     // Reuse the LLM path's rate-limit + budget gate. The reservation is held
@@ -553,18 +526,16 @@ async fn dispatch(
     let reservation = match reservation {
         Ok(reservation) => reservation,
         Err(err) => {
-            let response = err.into_response();
-            emit_a2a_usage(
+            return quota_refusal(
                 state,
                 &snapshot,
                 &auth,
                 request_id,
                 agent,
                 &call,
-                response.status().as_u16(),
-                Duration::ZERO,
-            );
-            return response;
+                trace.as_ref(),
+                err,
+            )
         }
     };
 
@@ -575,7 +546,9 @@ async fn dispatch(
             state,
             &snapshot,
             request_id,
+            trace.clone(),
             upstream,
+            forwarded,
             value,
             call,
             rpc_id,
@@ -586,9 +559,11 @@ async fn dispatch(
     }
     let _reservation = reservation;
 
-    let bridge = HttpBridge::new(upstream);
+    let bridge = HttpBridge::new(upstream).with_forwarded_client_headers(forwarded);
     let started = Instant::now();
+    crate::attribution::note_upstream_wait_begin();
     let result = bridge.send(&value).await;
+    crate::attribution::note_upstream_wait_end(result.is_ok());
     let latency = started.elapsed();
 
     match result {
@@ -640,21 +615,20 @@ async fn dispatch(
                         reason = why,
                         "guardrail blocked A2A response: content the scan cannot read",
                     );
-                    call.guardrail_blocked = true;
-                    emit_a2a_usage(
+                    return guardrail_refusal(
                         state,
                         &snapshot,
                         &auth,
                         request_id,
                         agent,
                         &call,
-                        StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
-                        latency,
-                    );
-                    return a2a_error_response(
                         rpc_id,
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        &crate::error::guardrail_block_message("response", None),
+                        "response",
+                        None,
+                        Some(crate::error::TAG_UNSCANNABLE_BODY),
+                        latency,
+                        trace.as_ref(),
+                        /* dispatched */ true,
                     );
                 }
                 let answer = scan.text;
@@ -664,33 +638,33 @@ async fn dispatch(
                     if let aisix_guardrails::GuardrailVerdict::Block {
                         reason,
                         guardrail_name,
+                        unavailable,
                     } = verdict
                     {
                         tracing::warn!(
+                            guardrail_name = crate::guardrail_stream::guardrail_name_field(
+                                guardrail_name.as_deref()
+                            ),
                             guardrail_hook = "output",
                             agent = %agent,
                             operation = %call.operation,
                             reason = %reason,
                             "guardrail blocked A2A response",
                         );
-                        call.guardrail_blocked = true;
-                        emit_a2a_usage(
+                        return guardrail_refusal(
                             state,
                             &snapshot,
                             &auth,
                             request_id,
                             agent,
                             &call,
-                            StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
-                            latency,
-                        );
-                        return a2a_error_response(
                             rpc_id,
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            &crate::error::guardrail_block_message(
-                                "response",
-                                guardrail_name.as_deref(),
-                            ),
+                            "response",
+                            guardrail_name.as_deref(),
+                            unavailable.as_deref(),
+                            latency,
+                            trace.as_ref(),
+                            /* dispatched */ true,
                         );
                     }
                 }
@@ -704,12 +678,19 @@ async fn dispatch(
                 &call,
                 StatusCode::OK.as_u16(),
                 latency,
+                trace.as_ref(),
+                /* dispatched */ true,
+                /* refusal */ None,
+                /* failure */ None,
             );
             axum::Json(response_value).into_response()
         }
         Err(err) => {
             let status = a2a_error_status(&err);
             tracing::warn!(agent = %agent, error = %err, "A2A upstream call failed");
+            crate::usage_attr::note_client_error_body(&snapshot, || {
+                a2a_error_envelope(rpc_id.clone(), &err.to_string()).to_string()
+            });
             emit_a2a_usage(
                 state,
                 &snapshot,
@@ -719,6 +700,10 @@ async fn dispatch(
                 &call,
                 status.as_u16(),
                 latency,
+                trace.as_ref(),
+                /* dispatched */ true,
+                /* refusal */ None,
+                Some(&A2aFailure::of(&err)),
             );
             a2a_error_response(rpc_id, status, &err.to_string())
         }
@@ -753,6 +738,13 @@ struct StreamUsageOnDrop {
     /// caller and is downgraded if the stream later faults — once the headers
     /// are out, the usage event is the only place that can say so.
     status: u16,
+    /// What faulted the stream, for that same event.
+    failure: Option<A2aFailure>,
+    /// The guardrail refusal that ended the stream, for that same event.
+    refusal: Option<crate::error::ProxyError>,
+    /// The request's trace bundle (AISIX-Cloud#1279) — the Drop emit is
+    /// the request's terminal emission, so it carries the terminal spans.
+    trace: Option<std::sync::Arc<aisix_obs::RequestTraceBundle>>,
     _concurrency: aisix_ratelimit::StreamConcurrencyGuard,
 }
 
@@ -784,6 +776,10 @@ impl Drop for StreamUsageOnDrop {
             &self.call,
             status,
             self.started.elapsed(),
+            self.trace.as_ref(),
+            /* dispatched */ true,
+            self.refusal.as_ref(),
+            self.failure.as_ref(),
         );
     }
 }
@@ -802,7 +798,9 @@ async fn dispatch_stream(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     request_id: &str,
+    trace: Option<std::sync::Arc<aisix_obs::RequestTraceBundle>>,
     upstream: aisix_a2a::A2aUpstream,
+    forwarded: Vec<(HeaderName, HeaderValue)>,
     request: serde_json::Value,
     call: A2aCall,
     rpc_id: Option<serde_json::Value>,
@@ -810,7 +808,10 @@ async fn dispatch_stream(
     guardrail_chain: aisix_guardrails::GuardrailChain,
 ) -> Response {
     let started = Instant::now();
-    let bridge = HttpBridge::new(upstream);
+    let bridge = HttpBridge::new(upstream).with_forwarded_client_headers(forwarded);
+    // Left open for the whole stream: `/a2a` reports the whole stream as the
+    // caller's wait, and the agent is working for all of it.
+    crate::attribution::note_upstream_wait_begin();
     let events = match bridge.send_stream(&request).await {
         Ok(events) => events,
         // The upstream refused before any event: the headers have not gone out,
@@ -818,6 +819,9 @@ async fn dispatch_stream(
         Err(err) => {
             let status = a2a_error_status(&err);
             tracing::warn!(agent = %agent, error = %err, "A2A upstream stream failed to open");
+            crate::usage_attr::note_client_error_body(snapshot, || {
+                a2a_error_envelope(rpc_id.clone(), &err.to_string()).to_string()
+            });
             drop(reservation);
             emit_a2a_usage(
                 state,
@@ -828,6 +832,10 @@ async fn dispatch_stream(
                 &call,
                 status.as_u16(),
                 started.elapsed(),
+                trace.as_ref(),
+                /* dispatched */ true,
+                /* refusal */ None,
+                Some(&A2aFailure::of(&err)),
             );
             return a2a_error_response(rpc_id, status, &err.to_string());
         }
@@ -841,6 +849,9 @@ async fn dispatch_stream(
         call,
         started,
         status: StatusCode::OK.as_u16(),
+        failure: None,
+        refusal: None,
+        trace,
         _concurrency: reservation.into_stream_hold(),
     };
     let agent_label = agent.to_string();
@@ -900,8 +911,8 @@ async fn dispatch_stream(
             };
             let released = match verdict {
                 StreamVerdict::Release(released) => released,
-                StreamVerdict::Refuse { reason, guardrail_name } => {
-                    refusal = Some((reason, guardrail_name));
+                StreamVerdict::Refuse { reason, guardrail_name, unavailable } => {
+                    refusal = Some((reason, guardrail_name, unavailable));
                     break;
                 }
             };
@@ -918,7 +929,7 @@ async fn dispatch_stream(
             }
             for event in released {
                 if event.is_result {
-                    guard.call.stream.event_count += 1;
+                    guard.call.note_result_delivered();
                 }
                 yield Ok::<_, std::convert::Infallible>(
                     axum::response::sse::Event::default().data(event.data),
@@ -933,19 +944,20 @@ async fn dispatch_stream(
                     StreamVerdict::Release(released) => {
                         for event in released {
                             if event.is_result {
-                                guard.call.stream.event_count += 1;
+                                guard.call.note_result_delivered();
                             }
                             yield Ok(axum::response::sse::Event::default().data(event.data));
                         }
                     }
-                    StreamVerdict::Refuse { reason, guardrail_name } => {
-                        refusal = Some((reason, guardrail_name));
+                    StreamVerdict::Refuse { reason, guardrail_name, unavailable } => {
+                        refusal = Some((reason, guardrail_name, unavailable));
                     }
                 }
             }
         }
-        if let Some((reason, guardrail_name)) = refusal {
+        if let Some((reason, guardrail_name, unavailable)) = refusal {
             tracing::warn!(
+                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                 guardrail_hook = "output",
                 agent = %agent_label,
                 operation = %guard.call.operation,
@@ -955,21 +967,22 @@ async fn dispatch_stream(
             // Mid-stream the status line is long gone, so the refusal is
             // told in-band, like the unary refusal's envelope, and nothing
             // the agent sends after it reaches the caller.
-            guard.call.guardrail_blocked = true;
+            let refused = crate::error::guardrail_block_error(
+                "response",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
+            );
+            let frame = a2a_error_envelope(rpc_id.clone(), &refused.to_string()).to_string();
+            guard.refusal = Some(refused);
             guard.status = StatusCode::UNPROCESSABLE_ENTITY.as_u16();
             guard.call.stream.reached_end = true;
-            yield Ok(axum::response::sse::Event::default().data(
-                a2a_error_envelope(
-                    rpc_id.clone(),
-                    &crate::error::guardrail_block_message("response", guardrail_name.as_deref()),
-                )
-                .to_string(),
-            ));
+            yield Ok(axum::response::sse::Event::default().data(frame));
         } else if let Some(err) = upstream_fault {
             // Relayed as a JSON-RPC error event rather than by cutting the
             // connection, which would leave a truncated task looking complete.
             tracing::warn!(agent = %agent_label, error = %err, "A2A stream failed mid-flight");
             guard.status = a2a_error_status(&err).as_u16();
+            guard.failure = Some(A2aFailure::of(&err));
             yield Ok(axum::response::sse::Event::default()
                 .data(a2a_error_envelope(rpc_id.clone(), &err.to_string()).to_string()));
         }
@@ -978,6 +991,12 @@ async fn dispatch_stream(
         guard.call.stream.reached_end = true;
         drop(guard);
     });
+
+    // The endpoint tail below owns this request's access-log line, and from
+    // there the response is opaque — it cannot tell this stream from a
+    // rendered error. Say so here, so the tail parks the line for the guard
+    // above to write at the call's real end (AISIX-Cloud#1571).
+    crate::attribution::note_stream_owns_access_log();
 
     let mut response = axum::response::Sse::new(sse);
     if let Some(interval) = crate::sse_keepalive::interval() {
@@ -1027,6 +1046,9 @@ enum StreamVerdict {
     Refuse {
         reason: String,
         guardrail_name: Option<String>,
+        /// The bounded failure tag when the answer could not be evaluated
+        /// rather than was refused on its content.
+        unavailable: Option<String>,
     },
 }
 
@@ -1112,6 +1134,7 @@ impl StreamReview {
             return StreamVerdict::Refuse {
                 reason: format!("streamed {why}"),
                 guardrail_name: None,
+                unavailable: Some(crate::error::TAG_UNSCANNABLE_BODY.to_string()),
             };
         }
         if let Some(chunk) = aisix_a2a::artifact_chunk(event) {
@@ -1120,6 +1143,7 @@ impl StreamReview {
                     reason: "streamed artifact continues one the review no longer follows"
                         .to_string(),
                     guardrail_name: None,
+                    unavailable: Some(crate::error::TAG_UNSCANNABLE_BODY.to_string()),
                 };
             }
         }
@@ -1158,15 +1182,15 @@ impl StreamReview {
                 self.hold(held);
                 if self.held_bytes > max_buffer_bytes {
                     if on_exceeded_fail_open {
-                        tracing::warn!(
-                            "A2A stream exceeded the guardrail buffer cap; releasing it unscanned (fail-open)",
-                        );
+                        crate::guardrail_stream::release_output_buffer_unscanned(&self.chain);
                         self.fail_opened = true;
                         return StreamVerdict::Release(std::mem::take(&mut self.held));
                     }
+                    aisix_guardrails::Guardrail::record_output_buffer_exceeded(&self.chain);
                     return StreamVerdict::Refuse {
                         reason: "streamed answer exceeded the guardrail buffer cap".to_string(),
                         guardrail_name: None,
+                        unavailable: Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED.to_string()),
                     };
                 }
                 if ends {
@@ -1252,11 +1276,13 @@ impl StreamReview {
             if let aisix_guardrails::GuardrailVerdict::Block {
                 reason,
                 guardrail_name,
+                unavailable,
             } = verdict
             {
                 return Some(StreamVerdict::Refuse {
                     reason,
                     guardrail_name,
+                    unavailable,
                 });
             }
         }
@@ -1290,6 +1316,8 @@ fn enforces_output(chain: &aisix_guardrails::GuardrailChain) -> bool {
 }
 
 /// Run the output check over an agent's words, read as one assistant answer.
+/// An answer has no channel to write a mask back, so a mask rule that matches
+/// is reported rather than promising a redaction nobody performs.
 async fn check_answer(
     chain: &aisix_guardrails::GuardrailChain,
     text: String,
@@ -1297,14 +1325,8 @@ async fn check_answer(
     aisix_guardrails::GuardrailVerdict,
     Vec<aisix_core::GuardrailMonitorHit>,
 ) {
-    let synth = aisix_gateway::ChatResponse {
-        id: String::new(),
-        model: String::new(),
-        message: aisix_gateway::ChatMessage::assistant(text),
-        finish_reason: aisix_gateway::FinishReason::Stop,
-        usage: aisix_gateway::UsageStats::default(),
-    };
-    aisix_guardrails::Guardrail::check_output_observed(chain, &synth).await
+    let synth = crate::guardrail_stream::synth_chat_response(A2A_MODEL_LABEL, text);
+    aisix_guardrails::Guardrail::check_output_unmaskable_observed(chain, &synth).await
 }
 
 /// Serve the upstream agent's card at `/a2a/:agent/.well-known/agent-card.json`,
@@ -1316,13 +1338,51 @@ pub async fn a2a_agent_card(
     State(state): State<ProxyState>,
     uri: axum::http::Uri,
     headers: HeaderMap,
+    method: axum::http::Method,
+    request_id: Option<axum::Extension<crate::request_id::RequestId>>,
 ) -> Response {
+    let started = Instant::now();
+    let response = agent_card(&auth, &agent, &state, &uri, &headers).await;
+    crate::reject::emit_unrouted_access_log(
+        method.as_str(),
+        uri.path(),
+        request_id
+            .as_ref()
+            .map(|r| r.0 .0.as_str())
+            .unwrap_or_default(),
+        Some(&auth.entry.id),
+        response.status().as_u16(),
+        started,
+    );
+    crate::reject::record_undispatched(
+        &state,
+        uri.path(),
+        crate::request_metrics::Caller::new(&auth),
+        response.status().as_u16(),
+        crate::attribution::rendered_error_source(response.status().as_u16()),
+        started,
+    );
+    response
+}
+
+async fn agent_card(
+    auth: &AuthenticatedKey,
+    agent: &str,
+    state: &ProxyState,
+    uri: &axum::http::Uri,
+    headers: &HeaderMap,
+) -> Response {
+    // Discovery files no usage row on any outcome, and it normalizes to the
+    // same `/a2a` label the calls do — so it has to say so, or a caller that
+    // hangs up during the card fetch below (a real upstream round trip) is
+    // filed as an abandoned agent call (AISIX-Cloud#1571).
+    crate::attribution::note_unmetered_route();
     let snapshot = state.snapshot.load();
-    let entry = match snapshot.a2a_agents.get_by_name(&agent) {
+    let entry = match snapshot.a2a_agents.get_by_name(agent) {
         Some(entry) if entry.value.enabled => entry,
         _ => return (StatusCode::NOT_FOUND, format!("unknown A2A agent: {agent}")).into_response(),
     };
-    if !auth.key().can_access_agent(&agent) {
+    if !auth.key().can_access_agent(agent) {
         return (
             StatusCode::FORBIDDEN,
             format!("this key may not reach A2A agent: {agent}"),
@@ -1332,7 +1392,7 @@ pub async fn a2a_agent_card(
     // Resolved BEFORE the upstream is contacted: without a public base there is
     // no card this gateway can serve, and finding that out after the fetch only
     // wastes an upstream round trip.
-    let Some(base) = gateway_base(&uri, &headers) else {
+    let Some(base) = gateway_base(uri, headers) else {
         tracing::warn!(
             agent = %agent,
             "cannot derive the gateway's public base for an A2A agent card; refusing to serve one"
@@ -1346,11 +1406,14 @@ pub async fn a2a_agent_card(
 
     let upstream = upstream_from_a2a_agent(&entry.value);
 
-    let bridge = HttpBridge::new(upstream);
+    let bridge = HttpBridge::new(upstream).with_forwarded_client_headers(
+        aisix_a2a::forwarded_client_headers(&entry.value, Some(headers)),
+    );
     let mut card = match bridge.fetch_agent_card().await {
         Ok(card) => card,
         Err(err) => {
             tracing::warn!(agent = %agent, error = %err, "A2A agent card fetch failed");
+            crate::attribution::note_error_source(aisix_obs::ErrorSource::Upstream);
             return (StatusCode::BAD_GATEWAY, err.to_string()).into_response();
         }
     };
@@ -1416,8 +1479,281 @@ fn gateway_base(uri: &axum::http::Uri, headers: &HeaderMap) -> Option<String> {
 /// a bad gateway.
 fn a2a_error_status(err: &A2aError) -> StatusCode {
     match err {
-        A2aError::Connect(_) | A2aError::Request(_) => StatusCode::BAD_GATEWAY,
+        A2aError::Connect(_) | A2aError::UpstreamStatus(_) | A2aError::Request(_) => {
+            StatusCode::BAD_GATEWAY
+        }
     }
+}
+
+/// The failure an upstream agent's error leaves on the call's usage event. The
+/// message is what the caller was told: the agent's error body stays unread
+/// unless a full-content exporter wants it, where it reaches the row's response.
+struct A2aFailure {
+    class: &'static str,
+    message: String,
+}
+
+impl A2aFailure {
+    fn of(err: &A2aError) -> Self {
+        Self {
+            class: match err {
+                A2aError::Connect(_) => "transport",
+                A2aError::UpstreamStatus(_) => "upstream_status",
+                A2aError::Request(_) => "upstream_decode",
+            },
+            message: crate::attempt::sanitize_error_message(&err.to_string()),
+        }
+    }
+}
+
+/// Screen the caller's A2A request on the input hook, and apply a mask rule
+/// to it. `Some(response)` = refused, and the refused call is recorded as an
+/// undispatched usage event the way a quota refusal is.
+///
+/// Scans every word the agent will receive: text parts, and the string values
+/// and keys of data parts, uncapped. `call.text.request` is capped for metering
+/// and reads text parts only, and the body is forwarded whole: scanning that
+/// copy let anything past the cap, or inside a data part, through unread.
+/// Decided on the message itself rather than on the operation, so any call
+/// that hands an agent a message is read.
+///
+/// Operations that carry no message (`tasks/get`, `tasks/cancel`) still run
+/// the chain on empty text. That is the point: a guardrail that decides
+/// about the CALL rather than about its words must get to decide.
+#[allow(clippy::too_many_arguments)]
+async fn guardrail_block_response(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    request_id: &str,
+    agent: &str,
+    chain: &aisix_guardrails::GuardrailChain,
+    call: &mut A2aCall,
+    value: &mut serde_json::Value,
+    rpc_id: Option<serde_json::Value>,
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+) -> Option<Response> {
+    if chain.is_empty() {
+        return None;
+    }
+    let scan = aisix_a2a::request_scan(value);
+    // Content the scan cannot read — file bytes that are neither text nor a
+    // binary media type, a value of the wrong type where the protocol has
+    // text — is refused rather than forwarded unread: whatever reads it on
+    // the other side may decode it more leniently than any scan predicts.
+    // Only where a guardrail would act on the request: an output-only or
+    // monitor-mode chain never refuses one.
+    if let Some(why) = scan
+        .unreadable
+        .filter(|_| aisix_guardrails::Guardrail::enforces_input(chain))
+    {
+        tracing::warn!(
+            guardrail_hook = "input",
+            agent = %agent,
+            operation = %call.operation,
+            reason = why,
+            "guardrail blocked A2A request: content the scan cannot read",
+        );
+        return Some(guardrail_refusal(
+            state,
+            snapshot,
+            auth,
+            request_id,
+            agent,
+            call,
+            rpc_id,
+            "request",
+            None,
+            Some(crate::error::TAG_UNSCANNABLE_BODY),
+            Duration::ZERO,
+            trace,
+            /* dispatched */ false,
+        ));
+    }
+    let chat = aisix_gateway::ChatFormat::new(
+        A2A_MODEL_LABEL,
+        vec![aisix_gateway::ChatMessage::user(scan.text)],
+    );
+    let (verdict, hits) = aisix_guardrails::Guardrail::check_input_observed(chain, &chat).await;
+    call.guardrail_monitor_hits.extend(hits);
+    if let aisix_guardrails::GuardrailVerdict::Block {
+        reason,
+        guardrail_name,
+        unavailable,
+    } = verdict
+    {
+        tracing::warn!(
+            guardrail_name =
+                crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
+            guardrail_hook = "input",
+            agent = %agent,
+            operation = %call.operation,
+            reason = %reason,
+            "guardrail blocked A2A request",
+        );
+        return Some(guardrail_refusal(
+            state,
+            snapshot,
+            auth,
+            request_id,
+            agent,
+            call,
+            rpc_id,
+            "request",
+            guardrail_name.as_deref(),
+            unavailable.as_deref(),
+            Duration::ZERO,
+            trace,
+            /* dispatched */ false,
+        ));
+    }
+
+    // #932's order: block first, then rewrite, so the masked text is what
+    // the agent receives.
+    //
+    // This module's own header is the argument for doing it here at all —
+    // content policy applies "so a rule that blocks a phrase on an LLM
+    // endpoint is not bypassable by asking an agent the same thing". A
+    // MASK rule was exactly that bypassable: the chain resolved, the text
+    // was scanned, and nothing rewrote it, so an env-scoped `pii` mask
+    // that redacts a prompt on /v1/chat/completions let the same content
+    // through here untouched — with no block, no rewrite, and no record
+    // (`would_mask` is monitor-mode only).
+    //
+    // Only `params.message.parts[].text` is rewritten. The ids, method
+    // name and metadata around them are protocol rather than caller
+    // content. The scan above also read data parts, and any parts list
+    // outside `params.message`, which the rewrite does not reach (see
+    // `request_would_mask_unrewritable`): a mask that would change one
+    // refuses the call, the way the other endpoints refuse a structural
+    // field they cannot rewrite, rather than forwarding it unmasked.
+    if aisix_guardrails::Guardrail::redacts_input(chain) {
+        if aisix_a2a::request_would_mask_unrewritable(value, |text| {
+            aisix_guardrails::Guardrail::redact_input_text(chain, text).map(|r| r.text)
+        }) {
+            tracing::warn!(
+                guardrail_hook = "input",
+                agent = %agent,
+                operation = %call.operation,
+                "guardrail blocked A2A request: a mask rule matched content the rewrite cannot reach",
+            );
+            return Some(guardrail_refusal(
+                state,
+                snapshot,
+                auth,
+                request_id,
+                agent,
+                call,
+                rpc_id,
+                "request",
+                None,
+                None,
+                Duration::ZERO,
+                trace,
+                /* dispatched */ false,
+            ));
+        }
+        // Collected outside the closure: `redact_request_text` takes an
+        // `Fn`, so the counts cannot be merged into `call` from inside it.
+        let collected = std::cell::RefCell::new(crate::redact::RedactionCounts::new());
+        let rewritten = aisix_a2a::redact_request_text(value, |text| {
+            aisix_guardrails::Guardrail::redact_input_text(chain, text).map(|r| {
+                crate::redact::merge_counts(&mut collected.borrow_mut(), r.counts);
+                r.text
+            })
+        });
+        crate::redact::merge_counts(&mut call.redactions, collected.into_inner());
+        if rewritten > 0 {
+            // A failure row reports the request the agent would have got, not
+            // the text the rule removed.
+            crate::usage_attr::note_failure_request(snapshot, || value.to_string());
+            if meters_content(call.operation) {
+                // Keep the inspected copy in step with what was sent, so the
+                // usage event's token estimate and any captured content
+                // describe the same text the agent got. Only for a metered
+                // operation: the scan reads any call that carries a message,
+                // and rewriting one must not start metering it.
+                call.text.request = aisix_a2a::request_text(value, |b, s| b.push_str(s));
+            }
+        }
+    }
+    None
+}
+
+/// Answer a call a guardrail refused and record it: the JSON-RPC error the
+/// caller reads, and the usage event naming the same refusal.
+#[allow(clippy::too_many_arguments)]
+fn guardrail_refusal(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    request_id: &str,
+    agent: &str,
+    call: &A2aCall,
+    rpc_id: Option<serde_json::Value>,
+    side: &str,
+    guardrail_name: Option<&str>,
+    unavailable: Option<&str>,
+    latency: Duration,
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+    dispatched: bool,
+) -> Response {
+    let refusal = crate::error::guardrail_block_error(side, guardrail_name, unavailable);
+    crate::usage_attr::note_client_error_body(snapshot, || {
+        a2a_error_envelope(rpc_id.clone(), &refusal.to_string()).to_string()
+    });
+    let response = a2a_error_response(
+        rpc_id,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        &refusal.to_string(),
+    );
+    emit_a2a_usage(
+        state,
+        snapshot,
+        auth,
+        request_id,
+        agent,
+        call,
+        response.status().as_u16(),
+        latency,
+        trace,
+        dispatched,
+        // This IS the guardrail refusal.
+        Some(&refusal),
+        None,
+    );
+    response
+}
+
+/// Answer a call the rate-limit + budget gate refused, and record it. It
+/// refuses before any upstream contact.
+#[allow(clippy::too_many_arguments)]
+fn quota_refusal(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    request_id: &str,
+    agent: &str,
+    call: &A2aCall,
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+    err: crate::error::ProxyError,
+) -> Response {
+    crate::usage_attr::note_client_error(snapshot, &err);
+    emit_a2a_usage(
+        state,
+        snapshot,
+        auth,
+        request_id,
+        agent,
+        call,
+        err.status().as_u16(),
+        Duration::ZERO,
+        trace,
+        /* dispatched */ false,
+        Some(&err),
+        None,
+    );
+    err.into_response()
 }
 
 /// Build a JSON-RPC error envelope for a gateway-side failure, echoing the
@@ -1479,7 +1815,20 @@ fn emit_a2a_usage(
     call: &A2aCall,
     status_code: u16,
     latency: Duration,
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+    // Whether the call reached the upstream agent — false for a quota
+    // rejection, which refuses before any upstream contact.
+    dispatched: bool,
+    // The gateway's own refusal of the call — a guardrail block or a quota
+    // rejection — named on the event like every other surface names it.
+    // `/a2a` emits exactly one event per call, so this row is the only
+    // place a refusal can appear to the dashboard's "Guardrail blocks"
+    // view (AISIX-Cloud#1428).
+    refusal: Option<&crate::error::ProxyError>,
+    // The upstream agent's failure, for a call that reached it.
+    failure: Option<&A2aFailure>,
 ) {
+    let guardrail_blocked = refusal.is_some_and(crate::error::ProxyError::is_guardrail_block);
     // No model resolves on this endpoint, so the estimator falls back to its
     // default encoding — the same thing it does for any non-OpenAI model.
     let response_text = call.text.response.joined();
@@ -1487,13 +1836,13 @@ fn emit_a2a_usage(
     let completion_tokens = crate::token_estimate::count_text("", &response_text);
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
-        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         api_key_id: auth.entry.id.clone(),
         status_code,
         // Single-attempt endpoint: the attempt spans the whole request, so
         // the upstream figure and what the caller waited for coincide.
-        upstream_latency_ms: latency.as_millis().min(u32::MAX as u128) as u32,
-        downstream_latency_ms: latency.as_millis().min(u32::MAX as u128) as u32,
+        upstream_latency_ms: crate::attempt::measured_ms(latency),
+        downstream_latency_ms: crate::attempt::measured_ms(latency),
         inbound_protocol: "a2a".to_string(),
         a2a_agent_name: agent.to_string(),
         a2a_method: call.method.clone(),
@@ -1503,6 +1852,7 @@ fn emit_a2a_usage(
         a2a_context_id: call.facts.context_id.clone(),
         a2a_task_state: call.facts.task_state.to_string(),
         a2a_stream_event_count: call.stream.event_count,
+        request_headers: call.request_headers.clone(),
         // An A2A agent reports no usage of its own, so these are the
         // gateway's own count of the words that passed through — flagged as
         // estimated, which is exactly what `usage_estimated` is for. Cost
@@ -1517,35 +1867,30 @@ fn emit_a2a_usage(
         // The content policies that governed the call, and whether one of
         // them blocked it — the same fields the Blocked tab reads for an LLM
         // request, so an A2A block is visible in the same place.
-        applied_guardrails: call.applied_guardrails.clone(),
-        guardrail_blocked: call.guardrail_blocked,
-        guardrail_monitor_hits: call.guardrail_monitor_hits.clone(),
         redacted_entity_counts: call.redactions.clone(),
         upstream_ttft_ms: call
             .stream
             .ttfb
-            .map(|d| d.as_millis().min(u32::MAX as u128) as u32)
+            .map(crate::attempt::measured_ms)
             .unwrap_or_default(),
+        guardrail_blocked,
+        error_class: refusal
+            .map(crate::attempt::error_class)
+            .or(failure.map(|f| f.class))
+            .unwrap_or_default()
+            .to_string(),
+        error_message: refusal
+            .map(crate::attempt::gateway_error_message)
+            .or(failure.map(|f| f.message.clone()))
+            .unwrap_or_default(),
+        applied_guardrails: call.applied_guardrails.clone(),
+        guardrail_monitor_hits: call.guardrail_monitor_hits.clone(),
+        guardrail_enforced_hits: crate::usage_attr::enforced_hits(&call.guardrail_audit),
+        guardrail_scores: crate::usage_attr::guardrail_scores(&call.guardrail_audit),
+        guardrail_bypassed_reason: crate::usage_attr::bypass_reason(&call.guardrail_audit),
         ..Default::default()
     };
-    crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
-    // The client-perceived duration of the call. Nothing else records it for
-    // `/a2a`: the handler returns the moment a stream's response head is out,
-    // so `aisix_proxy_request_duration_seconds` times only how long a stream
-    // took to OPEN. Recorded here rather than at the stream's drop guard so
-    // the unary, quota-rejected and failed-to-open paths are in the sample
-    // too — a streaming-only series would report `/a2a` as having no failures
-    // at all.
-    state.metrics.record_request_e2e_latency(
-        aisix_obs::LatencyLabels {
-            endpoint: "/a2a",
-            model: A2A_MODEL_LABEL,
-            provider: "a2a",
-            status: status_code,
-            streaming: is_streaming_operation(call.operation),
-        },
-        latency,
-    );
+    crate::usage_attr::apply_caller_identity(&mut event, auth.jwt.as_ref(), &auth.caller());
     // The `aisix_a2a_*` family rides on the same chokepoint as the usage
     // event, so a path that accounts for a call cannot skip metering it.
     state.metrics.record_a2a_call(
@@ -1560,21 +1905,65 @@ fn emit_a2a_usage(
             task_state: call.facts.task_state,
         },
     );
-    state.usage_sink.try_emit("a2a", event.clone());
-    let exporters = crate::usage_attr::live_exporters(state, snap);
+    let caller = crate::request_metrics::Caller::new(auth);
+    let upstream = crate::request_metrics::Upstream {
+        provider: "a2a",
+        model: A2A_MODEL_LABEL,
+        stream: call.stream.ttfb.is_some(),
+        ..Default::default()
+    };
+    if let (Some(upstream_ttfb), Some(downstream_ttfb)) =
+        (call.stream.ttfb, call.stream.downstream_ttfb)
+    {
+        crate::request_metrics::record_stream_ttft(
+            state,
+            "/a2a",
+            caller,
+            upstream,
+            status_code,
+            upstream_ttfb,
+            downstream_ttfb,
+        );
+    }
+    // The gateway's own count of the words, flagged `usage_estimated` on the
+    // event — recorded like any estimated count chat records, and only for a
+    // call the agent actually received.
+    if dispatched {
+        crate::request_metrics::record_usage(
+            state,
+            "/a2a",
+            caller,
+            upstream,
+            crate::request_metrics::Tokens {
+                input: prompt_tokens,
+                output: completion_tokens,
+                total: prompt_tokens.saturating_add(completion_tokens),
+                spend_usd: event.cost_usd,
+                client_type: &call.client_type,
+                ..Default::default()
+            },
+        );
+    }
+    // As with MCP: an agent call has no model and no ProviderKey, so the
+    // attribution labels are the placeholder (AISIX-Cloud#1317).
     // Opt-in content capture, on the same terms as every other endpoint: only
     // an exporter configured for full content sees the words, and they never
-    // travel to the control plane — the usage event above carries counts
-    // only. The captured text is the message parts, not the JSON-RPC
-    // envelopes, so it reads as a prompt and a completion rather than as
-    // protocol scaffolding.
+    // travel to the control plane — the usage event carries counts only. The
+    // captured text is the message parts, not the JSON-RPC envelopes, so it
+    // reads as a prompt and a completion rather than as protocol scaffolding.
+    let exporters = crate::usage_attr::live_exporters(state, snap);
     let captured = content_capture_cap(exporters.iter().map(|e| &*e.value))
         .map(|cap| CapturedContent::new(&call.text.request, &response_text, cap as usize));
-    state.otlp_fan_out.fan_out(
-        &event,
+    crate::usage_attr::emit_usage(
+        state,
+        snap,
+        crate::operation::A2A,
+        event,
+        aisix_obs::UsageEventLabels::default(),
         captured.as_ref(),
-        exporters.generation(),
-        exporters.iter().map(|e| &*e.value),
+        trace,
+        /* terminal */ true,
+        dispatched,
     );
 }
 
@@ -1855,6 +2244,155 @@ mod tests {
         // Dropped before the body was ever polled: nothing was delivered, so
         // this is the client hanging up, not a completed call.
         assert_eq!(event.status_code, crate::CLIENT_CLOSED_REQUEST);
+        // And exactly once. This guard is built OUTSIDE the stream's
+        // generator, so it fires even on a body nobody polled — which is
+        // the same window the request-level cancel guard covers for the
+        // families whose guard is built inside one. The two must not both
+        // speak: the interlock is `TelemetryBody` dropping the body inside
+        // the request's attribution cell, so this emission is visible to
+        // the guard that runs a moment later (AISIX-Cloud#1571).
+        assert!(
+            rx.try_recv().is_err(),
+            "the stream's own guard already filed this call — a second row would contradict it",
+        );
+    }
+
+    /// An agent that accepts the call and never answers, so a test can
+    /// abandon the request while it is still in flight.
+    async fn spawn_unresponsive_agent() -> String {
+        let app = axum::Router::new().route(
+            "/a2a",
+            axum::routing::post(|| async {
+                std::future::pending::<()>().await;
+                axum::Json(serde_json::json!({}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}/a2a")
+    }
+
+    /// A caller that hangs up while the agent is still thinking.
+    ///
+    /// `/a2a` names no model, so the cancel guard used to skip it entirely:
+    /// the call left a `499` access-log line and no usage row, on exactly
+    /// the surface whose calls are long-running by nature. The row it files
+    /// now is attributed the way this family's completed rows are — by
+    /// agent and method (AISIX-Cloud#1571).
+    #[tokio::test]
+    async fn a_call_abandoned_while_the_agent_is_thinking_is_still_metered() {
+        use aisix_obs::{UsageEvent, UsageSink};
+
+        let agent_url = spawn_unresponsive_agent().await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UsageEvent>(8);
+        let handle = SnapshotHandle::new(snapshot_with(&agent_url, true, serde_json::json!(["*"])));
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let state = ProxyState::new(handle, hub, &proxy_cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let router = build_router(state);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            router.oneshot(
+                HttpRequest::post("/a2a/invoice")
+                    .header("host", "gw.example.com")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":"s","method":"message/send"}"#,
+                    ))
+                    .unwrap(),
+            ),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the agent answered — this is not modelling a cancel",
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("an abandoned A2A call emitted no usage event")
+            .expect("sender dropped without sending");
+        assert_eq!(event.status_code, crate::CLIENT_CLOSED_REQUEST, "{event:?}");
+        assert_eq!(event.error_class, "client_disconnected", "{event:?}");
+        assert_eq!(
+            event.error_message,
+            "client closed the request before the response head was written",
+        );
+        assert_eq!(event.operation, "a2a");
+        assert_eq!(event.inbound_protocol, "a2a");
+        assert_eq!(event.a2a_agent_name, "invoice");
+        assert_eq!(event.a2a_method, "message/send");
+        // The raw method is unbounded caller text; the canonical operation
+        // is what a per-operation figure groups by, so a row carrying only
+        // the first one falls out of every A2A breakdown.
+        assert_eq!(event.a2a_operation, "message/send");
+        assert_eq!(event.requested_model, "", "this surface names no model");
+        assert_eq!(event.model_id, "");
+        assert!(rx.try_recv().is_err(), "one call, one row");
+    }
+
+    /// An agent whose CARD fetch never answers, so a test can abandon the
+    /// discovery request while it is in flight.
+    async fn spawn_unresponsive_card_agent() -> String {
+        let app = axum::Router::new().fallback(|| async {
+            std::future::pending::<()>().await;
+            axum::Json(serde_json::json!({}))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}/a2a")
+    }
+
+    /// Discovery is not a call. A caller that hangs up while the gateway is
+    /// fetching the agent's card files NO usage row — the route meters
+    /// nothing at any outcome, and it only reaches the cancel guard's `/a2a`
+    /// surface because it normalizes to the same label the calls do.
+    #[tokio::test]
+    async fn an_abandoned_agent_card_fetch_is_not_metered_as_a_call() {
+        use aisix_obs::{UsageEvent, UsageSink};
+
+        let agent_url = spawn_unresponsive_card_agent().await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UsageEvent>(8);
+        let handle = SnapshotHandle::new(snapshot_with(&agent_url, true, serde_json::json!(["*"])));
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let state = ProxyState::new(handle, hub, &proxy_cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let router = build_router(state);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            router.oneshot(
+                HttpRequest::get("/a2a/invoice/.well-known/agent-card.json")
+                    .header("host", "gw.example.com")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the card fetch answered — this is not modelling a cancel",
+        );
+
+        assert!(
+            rx.try_recv().is_err(),
+            "an abandoned card fetch was filed as an abandoned agent call",
+        );
     }
 
     /// An agent that answers `message/send` with a Task in the state the
@@ -1913,6 +2451,80 @@ mod tests {
         let _ = axum::body::to_bytes(response.into_body(), 1_048_576).await;
         tokio::task::yield_now().await;
         rx.try_recv().expect("a usage event is emitted")
+    }
+
+    #[tokio::test]
+    async fn a2a_event_carries_all_guardrail_attribution() {
+        use aisix_obs::UsageSink;
+
+        let agent_url = spawn_task_agent().await;
+        let snap = snapshot_with(&agent_url, true, serde_json::json!(["*"]));
+        let guardrail: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
+            "name": "observe-secret",
+            "enabled": true,
+            "hook_point": "input",
+            "enforcement_mode": "monitor",
+            "kind": "keyword",
+            "patterns": [{"kind": "literal", "value": "SECRET"}]
+        }))
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-1-monitor", guardrail, 1));
+        let enforcing: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
+            "name": "enforce-secret",
+            "enabled": true,
+            "hook_point": "input",
+            "kind": "keyword",
+            "patterns": [{"kind": "literal", "value": "SECRET"}]
+        }))
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-2-enforce", enforcing, 1));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = ProxyState::new(
+            SnapshotHandle::new(snap),
+            Arc::new(aisix_gateway::Hub::new()),
+            &proxy_cfg(),
+        )
+        .without_cache()
+        .with_usage_sink(UsageSink::new(tx));
+        let response = build_router(state)
+            .oneshot(
+                HttpRequest::post("/a2a/invoice")
+                    .header("host", "gw.example.com")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "message/send",
+                            "params": {"message": {"role": "user", "parts": [
+                                {"kind": "text", "text": "SECRET"}
+                            ]}}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let event = rx.recv().await.expect("A2A emits one terminal event");
+        assert_eq!(event.applied_guardrails.len(), 2, "{event:?}");
+        assert_eq!(event.applied_guardrails[0].kind, "keyword");
+        assert_eq!(event.guardrail_monitor_hits.len(), 1, "{event:?}");
+        assert_eq!(
+            event.guardrail_monitor_hits[0].guardrail_name,
+            "observe-secret"
+        );
+        assert_eq!(event.guardrail_enforced_hits.len(), 1, "{event:?}");
+        assert_eq!(
+            event.guardrail_enforced_hits[0].guardrail_name,
+            "enforce-secret"
+        );
+        assert_eq!(event.guardrail_enforced_hits[0].action, "blocked");
+        assert!(event.guardrail_blocked);
     }
 
     /// An agent that reports a task's progress and then keeps the stream open
@@ -2467,11 +3079,13 @@ mod tests {
     fn proxy_cfg() -> ProxyConfig {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: Some(1_048_576),
+            request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),
+            expose_debug_headers: false,
             tls: None,
+            listeners: Vec::new(),
             thread_per_core: None,
             workers: None,
         }
@@ -2511,7 +3125,7 @@ mod tests {
     /// refuse the call — and never contact the agent.
     #[tokio::test]
     async fn an_env_guardrail_blocks_an_a2a_message_before_the_agent_is_called() {
-        let agent = wiremock::MockServer::start().await;
+        let agent = wiremock::MockServer::builder().start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "task"}}),
@@ -2526,8 +3140,7 @@ mod tests {
             r#"{"name":"kw","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"BLOCKME"}]}"#,
         )
         .unwrap();
-        snap.guardrails
-            .insert(ResourceEntry::new("g-1", guardrail, 1));
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-1", guardrail, 1));
 
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -2558,7 +3171,7 @@ mod tests {
     /// than the endpoint refusing everything once a policy exists.
     #[tokio::test]
     async fn a_benign_a2a_message_passes_the_guardrail_through_to_the_agent() {
-        let agent = wiremock::MockServer::start().await;
+        let agent = wiremock::MockServer::builder().start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "task"}}),
@@ -2572,8 +3185,7 @@ mod tests {
             r#"{"name":"kw","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"BLOCKME"}]}"#,
         )
         .unwrap();
-        snap.guardrails
-            .insert(ResourceEntry::new("g-1", guardrail, 1));
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-1", guardrail, 1));
 
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -2598,7 +3210,7 @@ mod tests {
     /// the same restriction unavailable for the agent sitting beside it.
     #[tokio::test]
     async fn an_agent_outside_the_ip_allowlist_refuses_the_caller() {
-        let agent = wiremock::MockServer::start().await;
+        let agent = wiremock::MockServer::builder().start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "task"}}),
@@ -2642,7 +3254,7 @@ mod tests {
     /// peer address at all; that half is pinned by the e2e.
     #[tokio::test]
     async fn an_empty_allowlist_is_not_a_deny_all() {
-        let agent = wiremock::MockServer::start().await;
+        let agent = wiremock::MockServer::builder().start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "task"}}),
@@ -2823,7 +3435,7 @@ mod tests {
     /// only, and this is enforcement).
     #[tokio::test]
     async fn a_mask_rule_rewrites_the_message_before_the_agent_sees_it() {
-        let agent = wiremock::MockServer::start().await;
+        let agent = wiremock::MockServer::builder().start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "task"}}),
@@ -2837,8 +3449,7 @@ mod tests {
             r#"{"name":"mask-email","enabled":true,"hook_point":"input","kind":"pii","detectors":[{"type":"email","action":"mask"}]}"#,
         )
         .unwrap();
-        snap.guardrails
-            .insert(ResourceEntry::new("g-mask", guardrail, 1));
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-mask", guardrail, 1));
 
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -2880,7 +3491,7 @@ mod tests {
     /// exists to prevent.
     #[tokio::test]
     async fn a_mask_rule_matching_a_data_part_refuses_the_call() {
-        let agent = wiremock::MockServer::start().await;
+        let agent = wiremock::MockServer::builder().start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "task"}}),
@@ -2894,8 +3505,7 @@ mod tests {
             r#"{"name":"mask-email","enabled":true,"hook_point":"input","kind":"pii","detectors":[{"type":"email","action":"mask"}]}"#,
         )
         .unwrap();
-        snap.guardrails
-            .insert(ResourceEntry::new("g-mask", guardrail, 1));
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-mask", guardrail, 1));
 
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -2930,7 +3540,7 @@ mod tests {
     async fn a_read_is_checked_but_still_not_metered() {
         use aisix_obs::UsageSink;
 
-        let agent = wiremock::MockServer::start().await;
+        let agent = wiremock::MockServer::builder().start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2947,8 +3557,7 @@ mod tests {
             r#"{"name":"kw","enabled":true,"hook_point":"output","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"BLOCKME"}]}"#,
         )
         .unwrap();
-        snap.guardrails
-            .insert(ResourceEntry::new("g-1", guardrail, 1));
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-1", guardrail, 1));
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let state = ProxyState::new(
             SnapshotHandle::new(snap),
@@ -2979,5 +3588,45 @@ mod tests {
         assert!(event.guardrail_blocked);
         assert_eq!(event.prompt_tokens, 0);
         assert_eq!(event.completion_tokens, 0, "a read is not metered");
+    }
+
+    /// A streamed `/a2a` call writes ONE access-log line, at the task's end
+    /// rather than when the head went out, so each of the three endings
+    /// reports its own outcome (AISIX-Cloud#1571). The tail that writes this
+    /// family's line sees only an opaque `Response`, so the streaming branch
+    /// tells it to park the line instead.
+    ///
+    /// `downstream_latency_ms` is deliberately NOT asserted to be a time-to-first-event
+    /// here: an agent's stream of task updates is the call's product rather
+    /// than a delivery mechanism, so `/a2a` records the WHOLE stream as what
+    /// the caller waited for — and the line reports the same figure its
+    /// usage event does.
+    #[tokio::test]
+    async fn a_streamed_call_writes_one_line_per_stream_ending() {
+        let agent_url = spawn_progressing_stream_agent().await;
+        let handle = SnapshotHandle::new(snapshot_with(&agent_url, true, serde_json::json!(["*"])));
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let state = ProxyState::new(handle, hub, &proxy_cfg()).without_cache();
+        let metrics = state.metrics.clone();
+        let router = build_router(state);
+
+        let endings = crate::test_log::three_stream_endings(router, || {
+            HttpRequest::post("/a2a/invoice")
+                .header("host", "gw.example.com")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":"s","method":"message/stream"}"#,
+                ))
+                .unwrap()
+        })
+        .await;
+        crate::test_log::assert_one_line_per_ending(&endings, "/a2a", "ak-1");
+        crate::test_log::assert_request_families_follow_the_endings(&metrics, "/a2a", false);
+        assert_eq!(
+            endings.delivered.field("provider").as_deref(),
+            Some("a2a"),
+            "the line must keep naming the family it belongs to",
+        );
     }
 }

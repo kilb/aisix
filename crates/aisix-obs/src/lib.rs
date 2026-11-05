@@ -7,8 +7,6 @@
 //!   by the proxy handler at end-of-request.
 //! - [`metrics::Metrics`] — Prometheus counters + histogram for
 //!   requests/duration/rate-limits/tokens.
-//! - [`otlp::install_otlp_tracer`] — optional OTLP export handshake
-//!   (concrete pipeline wired in a follow-up PR).
 //! - [`sink`] — pluggable observability-sink framework: the
 //!   capability-typed [`sink::ObservabilitySink`] adapter contract
 //!   (#692).
@@ -16,32 +14,60 @@
 #![deny(rust_2018_idioms)]
 
 pub mod access_log;
+pub mod genai;
+pub mod heap_profile;
+mod log_writer;
+pub mod memory;
+pub mod metric_labels;
 pub mod metrics;
-pub mod otlp;
 pub mod otlp_http_sink;
+pub mod output;
+mod prometheus;
+mod scrape;
 pub mod sink;
+pub mod trace;
 pub mod usage;
+pub mod usage_delivery;
 
 use std::io::IsTerminal as _;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use aisix_core::ObservabilityConfig;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-pub use access_log::AccessLog;
-pub use metrics::{
-    client_type_from_user_agent, A2aCallOutcome, A2aLabels, ClientTypeClassifier, DeploymentLabels,
-    DeploymentState, HistogramBuckets, LatencyLabels, LlmUsage, Metrics, RequestLabels,
-    RequestOutcome, UsageLabels,
+pub use access_log::{
+    request_failed_message, AccessLog, AccessLogRecord, CacheAccessLog, McpAccessLog,
+    SemanticAccessLog, SemanticFallback,
 };
-pub use otlp::{install_otlp_tracer, shutdown_otlp, OtlpError, OtlpHandle};
+pub use genai::{
+    genai_provider_name, GenAiRequestParams, HttpServerFacts, SpanFacts, UpstreamFacts,
+};
+pub use metrics::{
+    client_type_from_user_agent, A2aCallOutcome, A2aLabels, BudgetGauges, BudgetLabels,
+    CancelledLabels, ClientTypeClassifier, DeploymentLabels, DeploymentState, ErrorSource,
+    GaugeFamily, GaugeLiveness, HistogramBuckets, LatencyLabels, LatencySide, LiveGaugeSeries,
+    LlmUsage, Metrics, RequestLabels, RequestOutcome, UsageEventLabels, UsageLabels,
+};
 pub use otlp_http_sink::{content_capture_cap, OtlpHttpFanOut, OtlpSink};
+pub use output::{
+    responses_finish_reason, OutputCapture, OutputCollector, OutputWire, ResponsesFinishObserver,
+};
 pub use sink::{
     AliyunSlsSink, BatchUnit, CapturedContent, ChannelKey, DatadogSink, EventBatch,
     ExporterPipelines, IdempotencyMarker, IdempotencyScheme, ObservabilitySink, OrderingScope,
     PipelineConfig, SinkAck, SinkCapabilities, SinkContent, SinkError, SinkHandle, SinkHealth,
     SinkPipeline, SinkRecord, SinkResult, SinkStatsSnapshot, SCHEMA_VERSION,
 };
-pub use usage::{bounded_inbound_protocol, UsageEvent, UsageSink};
+pub use trace::{
+    parse_traceparent, screen_tracestate, RemoteTraceContext, RequestTraceBundle, SpanEmit,
+    SpanRole, TraceEmission, TRACEPARENT_HEADER, TRACESTATE_HEADER,
+};
+pub use usage::{
+    bounded_inbound_protocol, GatewayEmbeddingCall, GatewayEmbeddingOutcome,
+    GatewayEmbeddingPurpose, GatewayEmbeddingUsageSource, UsageEvent, UsageSink,
+};
+pub use usage_delivery::UsageDeliveryHealth;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ObsError {
@@ -55,22 +81,49 @@ pub enum ObsError {
     AlreadyInitialised,
 }
 
-/// Install a process-wide tracing subscriber.
-pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
-    // `observability.access_log` lands here rather than at each handler's
-    // tail: the emit is called from every one of them, and threading a flag
-    // through all of them is the shape that lets one forget. Installed on the
-    // same boot call that already owns the rest of the observability config,
-    // so the two cannot be initialised out of step.
-    access_log::init_enabled(cfg.access_log);
+/// Third-party log targets pinned below WARN. Applied after the
+/// configured level and after `RUST_LOG`, so they hold for these targets
+/// either way — a `log`-crate record's level is fixed at its callsite and
+/// a subscriber can only filter it, never re-level it, so keeping these
+/// out of the log is the available form of "not a warning".
+///
+/// `lofty` is the audio-metadata reader behind the transcription duration
+/// probe (`aisix-proxy::audio`). Every real mp3 upload logs one or more
+/// parse observations at WARN — `Chunk exceeds reader size, stopping`,
+/// `MPEG: Using bitrate to estimate duration` — that describe the
+/// uploaded container, not a gateway fault, and that no operator can act
+/// on: the probe already treats an unreadable file as a zero cost basis
+/// rather than an error. Left at WARN they turn every transcription into
+/// a warning line and fail the e2e log scan (#998).
+const QUIET_TARGETS: &[&str] = &["lofty=error"];
 
-    let filter = EnvFilter::try_from_default_env()
+/// The subscriber's level filter: `RUST_LOG` when set, else the
+/// configured level, with [`QUIET_TARGETS`] applied on top.
+fn build_filter(cfg: &ObservabilityConfig) -> Result<EnvFilter, ObsError> {
+    let mut filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(&cfg.log_level))
         .map_err(|source| ObsError::Filter {
             directive: cfg.log_level.clone(),
             source,
         })?;
+    for directive in QUIET_TARGETS {
+        filter = filter.add_directive(
+            directive
+                .parse()
+                .expect("QUIET_TARGETS holds valid filter directives"),
+        );
+    }
+    Ok(filter)
+}
 
+/// Install a process-wide tracing subscriber.
+pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
+    let filter = build_filter(cfg)?;
+
+    // Events go through a bounded queue and one writer thread, so a log
+    // consumer that stops reading costs log lines instead of request
+    // latency — see `log_writer`.
+    //
     // Colorize only for a human at a terminal. When stderr is a pipe or a
     // file — every real deployment, where logs go to a container runtime and
     // on to a log store — the escapes land BETWEEN a field's name and its
@@ -78,16 +131,25 @@ pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
     // structured fields are only searchable by bare value
     // (#1060). tracing-subscriber's `ansi` default feature is on
     // and it does not probe the writer itself.
+    let (queue, writer) = log_writer::LogWriter::start(std::io::stderr(), log_writer::CAPACITY);
     let fmt_layer = fmt::layer()
         .with_target(true)
         .with_ansi(std::io::stderr().is_terminal())
-        .with_writer(std::io::stderr);
+        .with_writer(queue);
 
-    tracing_subscriber::registry()
+    if tracing_subscriber::registry()
         .with(filter)
         .with(fmt_layer)
         .try_init()
-        .map_err(|_| ObsError::AlreadyInitialised)?;
+        .is_err()
+    {
+        // Nothing was logged yet, so this drains instantly. Without it the
+        // writer thread and its queue outlive the failed call.
+        writer.shutdown(Duration::from_secs(1));
+        return Err(ObsError::AlreadyInitialised);
+    }
+    let _ = LOG_WRITER.set(writer);
+    access_log::set_enabled(cfg.access_log);
 
     tracing::info!(
         service = %cfg.service_name,
@@ -97,9 +159,94 @@ pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
     Ok(())
 }
 
+/// The process-wide writer thread, once [`init_tracing`] has installed one.
+static LOG_WRITER: OnceLock<log_writer::LogWriter> = OnceLock::new();
+
+/// Log lines waiting for the writer thread, and their bytes; zero before
+/// [`init_tracing`] has run.
+pub fn log_queue_depth() -> (u64, u64) {
+    LOG_WRITER
+        .get()
+        .map_or((0, 0), log_writer::LogWriter::depth)
+}
+
+/// Drain the log queue and retire the writer thread.
+///
+/// Called on the way out of `main`: whatever the gateway logged while
+/// shutting down is the part an operator reads to find out why, and the
+/// process exiting would otherwise discard it. Returns whether the queue
+/// emptied within `deadline`. A no-op when [`init_tracing`] was never
+/// called.
+///
+/// A `false` here cannot be reported anywhere. It means the log sink is
+/// not accepting bytes, so `eprintln!` would block on the same descriptor
+/// — and on the very lock the abandoned writer thread is holding inside
+/// its own `write`. The loss shows up as `aisix_log_lines_dropped_total`
+/// and as a log that stops before the shutdown lines; the exit stays
+/// prompt, which is the property worth keeping.
+pub fn shutdown_logging(deadline: Duration) -> bool {
+    LOG_WRITER
+        .get()
+        .is_none_or(|writer| writer.shutdown(deadline))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// Collect emitted log bytes into an in-memory buffer.
+    #[derive(Clone, Default)]
+    struct VecWriter {
+        buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+    impl std::io::Write for VecWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.buf.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for VecWriter {
+        type Writer = VecWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// #998: the audio-metadata reader's parse chatter must not reach the
+    /// log as a WARN, while the gateway's own WARNs still do.
+    #[test]
+    fn quiet_targets_drop_lofty_warnings_only() {
+        let writer = VecWriter::default();
+        let cfg = ObservabilityConfig {
+            log_level: "info".into(),
+            ..Default::default()
+        };
+        let subscriber = tracing_subscriber::registry()
+            .with(build_filter(&cfg).expect("filter builds"))
+            .with(fmt::layer().with_ansi(false).with_writer(writer.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "lofty::mpeg::properties", "MPEG: Using bitrate to estimate duration");
+            tracing::error!(target: "lofty::iff::chunk", "unreadable");
+            tracing::warn!(target: "aisix_proxy::audio", "transcription failed");
+        });
+        let logged = String::from_utf8_lossy(&writer.buf.lock().unwrap()).into_owned();
+        assert!(
+            !logged.contains("Using bitrate"),
+            "lofty WARN chatter must be filtered out, got: {logged}"
+        );
+        assert!(
+            logged.contains("unreadable"),
+            "a lofty ERROR must still surface, got: {logged}"
+        );
+        assert!(
+            logged.contains("transcription failed"),
+            "the gateway's own WARNs must be unaffected, got: {logged}"
+        );
+    }
 
     #[test]
     fn already_initialised_variant_is_displayable() {

@@ -1,70 +1,143 @@
+import { configuredEtcdEndpoints } from "./forks.js";
 import { harnessRequest } from "./http.js";
+
+const DEFAULT_ETCD = "http://127.0.0.1:2379";
+
+/**
+ * True inside GitHub Actions (or anything else setting CI).
+ *
+ * `CI=false` and `CI=0` mean NOT on CI — a widely used way to turn CI
+ * behaviour off — and a bare presence check reads them as true. That
+ * would refuse ping()'s no-etcd opt-out and skip the stale-binary check
+ * for a developer who exports either. Same test std-env uses.
+ */
+export function onCI(): boolean {
+  return !["", "0", "false"].includes(process.env.CI ?? "");
+}
+
+/**
+ * The etcd endpoint THIS vitest fork uses. Every etcd reference in the
+ * suite must come from here — the spawned gateway's config, the seeder,
+ * and any case that talks to etcd directly. A case that resolves the
+ * endpoint itself will read a different cluster than the gateway it just
+ * spawned the moment more than one is in play, and the failure looks
+ * like a propagation bug rather than a wiring one.
+ * (harness/etcd-endpoint.test.ts fails if a file resolves it itself.)
+ *
+ * With `AISIX_E2E_ETCD_ENDPOINTS` set to a comma-separated list, forks
+ * are spread across the entries by `VITEST_POOL_ID`. Concurrency in this
+ * suite was capped at two forks because 20+ files' gateways sharing one
+ * etcd pushed watch-dispatch latency past `waitConfigPropagation` (#157);
+ * one cluster per fork is what lifts that cap, the same way ports.ts
+ * carves a disjoint port range per fork rather than serialising.
+ *
+ * Correctness never depends on the split — every spawned gateway already
+ * gets a fresh random etcd prefix — so more forks than endpoints only
+ * costs the contention back, and a single endpoint behaves exactly as
+ * before.
+ */
+export function etcdEndpoint(): string {
+  const poolId = Number(process.env.VITEST_POOL_ID);
+  return etcdEndpointForPool(Number.isFinite(poolId) && poolId >= 0 ? poolId : process.pid);
+}
+
+/**
+ * The endpoint a given VITEST_POOL_ID maps to.
+ *
+ * Exported so the global setup can probe exactly the clusters the run
+ * will reach instead of re-deriving the mapping. Re-deriving is how the
+ * two drift: `VITEST_POOL_ID` is ONE-based, so a 4-entry list running 2
+ * forks uses entries 1 and 2 — not the first two — and a setup that
+ * probed `slice(0, 2)` would clear an endpoint nobody touches while
+ * leaving the one fork 2 depends on unchecked.
+ */
+export function etcdEndpointForPool(poolId: number): string {
+  const list = configuredEtcdEndpoints();
+  if (list.length === 0) return process.env.AISIX_E2E_ETCD ?? DEFAULT_ETCD;
+  return list[poolId % list.length];
+}
 
 /**
  * Minimal etcd v3 helper that talks to the JSON gRPC-gateway
  * (`/v3/kv/*` endpoints). Avoids pulling a heavy etcd npm dependency.
  */
 export class EtcdClient {
-  constructor(
-    private readonly endpoint: string = process.env.AISIX_E2E_ETCD ??
-      "http://127.0.0.1:2379",
-  ) {}
+  constructor(private readonly endpoint: string = etcdEndpoint()) {}
 
   /**
-   * Best-effort connectivity probe — returns false if etcd isn't reachable.
+   * Connectivity probe. Absent etcd THROWS. It returns false only when the
+   * run opted out with `AISIX_E2E_ALLOW_NO_ETCD`, which CI never honours.
    *
-   * Beyond a 200 status we also confirm the response is JSON containing the
-   * expected `header.cluster_id` field. A stray Docker port-mapping or a
-   * dev-tool's "service unavailable" HTML page can return 200 to anything
-   * on port 2379 and we don't want to misidentify those as etcd.
+   * ~246 call sites read this as `if (!(await etcd.ping())) return;` or
+   * `ctx.skip()`, so answering false turns "etcd is down" into
+   * `Test Files 225 passed (225) / Tests 684 skipped` and exit 0 — a green
+   * run that measured nothing, which is exactly what a test suite must never
+   * report. Measured, not assumed: pointing AISIX_E2E_ETCD at a dead port and
+   * running two case files prints `2 passed` with every test skipped. With a
+   * cluster per fork it is worse, since one dead endpoint costs only the
+   * files bound to that fork and the leg stays green while a quarter of the
+   * suite silently evaporates. `file-resource-source-e2e` already carried
+   * this rule for itself; it belongs here, once, for everyone.
+   *
+   * Opting out stays possible for the handful of cases that need no etcd,
+   * but it has to be deliberate — a missing service can't buy itself a pass.
+   *
+   * Retries before concluding "down", on every machine. One slow response —
+   * a busy machine, a cold connection, a contended container under fork
+   * concurrency — must not read as an absent etcd. Observed: two runs of the
+   * same tree reported 2 and then 3 skipped, and the extra one was a probe
+   * that timed out, not a test that had anything to say.
+   *
+   * The SLEEP between attempts is the part that does the work. A
+   * container that is restarting REFUSES the connection in about a
+   * millisecond rather than hanging, so escalating only the abort
+   * timeout spans nothing at all: three attempts against a closed port
+   * complete in ~8ms and prove only that it was closed 8ms ago.
    */
   async ping(timeoutMs = 1000): Promise<boolean> {
-    // Retry before concluding "no etcd here". Every spec gates its whole
-    // describe block on this answer and skips silently when it is false, so
-    // one slow response — a busy machine, a cold connection — erases that
-    // block's coverage with nothing but a `↓` in the summary. Observed: two
-    // runs of the same tree reported 2 and then 3 skipped, and the extra one
-    // was a probe that timed out, not a test that had anything to say.
-    //
-    // A genuinely absent etcd still answers immediately (connection refused),
-    // so the retries cost nothing in the local case this skip exists for.
-    for (let attempt = 0; attempt < 3; attempt++) {
-      if (await this.probeOnce(timeoutMs)) return true;
+    const attempts = 3;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      if (await this.reachable(timeoutMs * attempt)) return true;
+      if (attempt < attempts) await new Promise((r) => setTimeout(r, 500 * attempt));
     }
-    // Absent etcd is a broken environment, not a smaller test plan. 215 of
-    // this suite's 221 case files gate their whole describe block on this
-    // answer, so returning `false` turns "etcd is down" into
-    // `Test Files 225 passed (225) / Tests 684 skipped` and exit 0 — a
-    // green run that measured nothing, which is exactly what a test suite
-    // must never report. Measured, not assumed: pointing
-    // AISIX_E2E_ETCD at a dead port and running two case files prints
-    // `2 passed` with every test skipped.
-    //
-    // Opting out stays possible for the handful of cases that need no
-    // etcd, but it has to be deliberate — a missing service can't buy
-    // itself a pass.
-    if (!process.env.AISIX_E2E_ALLOW_NO_ETCD) {
+    if (onCI() || !process.env.AISIX_E2E_ALLOW_NO_ETCD) {
       throw new Error(
-        `etcd at ${this.endpoint} is unreachable. Skipping here would ` +
-          `silently drop nearly the whole suite and still exit 0. Start etcd, ` +
-          `point AISIX_E2E_ETCD at a live one, or set ` +
+        `etcd at ${this.endpoint} is unreachable after ${attempts} attempts. Skipping ` +
+          `here would silently drop nearly the whole suite and still exit 0. Start etcd, ` +
+          `point AISIX_E2E_ETCD_ENDPOINTS or AISIX_E2E_ETCD at a live one, or, off CI, set ` +
           `AISIX_E2E_ALLOW_NO_ETCD=1 to accept a run that skips most cases.`,
       );
     }
     return false;
   }
 
-  private async probeOnce(timeoutMs: number): Promise<boolean> {
+  /**
+   * The raw probe: true when the endpoint answers as etcd.
+   *
+   * Beyond a 200 status we also confirm the response is JSON containing the
+   * expected `header.cluster_id` field. A stray Docker port-mapping or a
+   * dev-tool's "service unavailable" HTML page can return 200 to anything
+   * on port 2379 and we don't want to misidentify those as etcd.
+   *
+   * Used directly by the global setup, which needs to report EVERY dead
+   * endpoint rather than throw on the first.
+   */
+  async reachable(timeoutMs = 1000): Promise<boolean> {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), timeoutMs);
       const res = await harnessRequest(`${this.endpoint}/v3/maintenance/status`, {
         method: "POST",
         body: "{}",
         headers: { "content-type": "application/json" },
         signal: ctrl.signal,
       });
-      clearTimeout(t);
+      // The timer stays armed until the BODY is consumed, not just until
+      // the headers land. The 200 this method distrusts is exactly the
+      // kind that can come from something that is not etcd, and one that
+      // then never finishes its body would hang here forever with the
+      // abort disarmed — blocking the global setup that probes every
+      // endpoint at once, or a case file's beforeAll.
       if (res.statusCode !== 200) {
         await res.body.dump();
         return false;
@@ -78,6 +151,8 @@ export class EtcdClient {
       }
     } catch {
       return false;
+    } finally {
+      clearTimeout(t);
     }
   }
 
@@ -98,6 +173,41 @@ export class EtcdClient {
     if (res.statusCode >= 300) {
       const body = await res.body.text();
       throw new Error(`etcd put failed (${res.statusCode}): ${body}`);
+    }
+    // An unread body holds its connection; a spec that writes in a loop
+    // would run the pool dry.
+    await res.body.dump();
+  }
+
+  /**
+   * Put many key/values in as few round trips as etcd allows (etcd v3
+   * `/v3/kv/txn`, whose `success` branch applies every op atomically).
+   *
+   * etcd caps a transaction at 128 operations (`--max-txn-ops`) and a
+   * whole request at 1.5 MiB (`--max-request-bytes`), so entries are sent
+   * in chunks of 128 and callers with large values may need smaller ones.
+   * For a fixture of tens of thousands of keys, one `put` per key is tens
+   * of thousands of round trips.
+   */
+  async putMany(entries: Array<[key: string, value: string]>): Promise<void> {
+    const CHUNK = 128;
+    for (let i = 0; i < entries.length; i += CHUNK) {
+      const ops = entries.slice(i, i + CHUNK).map(([key, value]) => ({
+        requestPut: {
+          key: Buffer.from(key, "utf8").toString("base64"),
+          value: Buffer.from(value, "utf8").toString("base64"),
+        },
+      }));
+      const res = await harnessRequest(`${this.endpoint}/v3/kv/txn`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ success: ops }),
+      });
+      if (res.statusCode >= 300) {
+        const body = await res.body.text();
+        throw new Error(`etcd txn failed (${res.statusCode}): ${body}`);
+      }
+      await res.body.dump();
     }
   }
 
@@ -134,6 +244,55 @@ export class EtcdClient {
       const body = await res.body.text();
       throw new Error(`etcd deleterange failed (${res.statusCode}): ${body}`);
     }
+    // An unread body holds its connection; a spec that writes in a loop
+    // would run the pool dry.
+    await res.body.dump();
+  }
+
+  /** The store's current revision (the header of an empty range read). */
+  async currentRevision(): Promise<number> {
+    const res = await harnessRequest(`${this.endpoint}/v3/kv/range`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key: Buffer.from("\0", "utf8").toString("base64"), count_only: true }),
+    });
+    const text = await res.body.text();
+    if (res.statusCode >= 300) throw new Error(`etcd range failed (${res.statusCode}): ${text}`);
+    return Number((JSON.parse(text) as { header: { revision: string } }).header.revision);
+  }
+
+  /**
+   * Discard every revision older than `revision` (etcd v3
+   * `/v3/kv/compaction`). A watch that still has to catch up from before
+   * it is cancelled by etcd with the compaction revision.
+   */
+  async compact(revision: number): Promise<void> {
+    const res = await harnessRequest(`${this.endpoint}/v3/kv/compaction`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ revision: String(revision), physical: true }),
+    });
+    const text = await res.body.text();
+    if (res.statusCode >= 300) throw new Error(`etcd compaction failed (${res.statusCode}): ${text}`);
+  }
+
+  /**
+   * How many responses etcd has handed to watch streams, on every stream
+   * in the cluster (`grpc_server_msg_sent_total` for `Watch`). Monotonic,
+   * so a delta over an interval is exact; a send counts once gRPC has
+   * taken the message, which stops when the stream's flow-control window
+   * is full.
+   */
+  async watchResponsesSent(): Promise<number> {
+    const res = await harnessRequest(`${this.endpoint}/metrics`, { method: "GET" });
+    const text = await res.body.text();
+    if (res.statusCode >= 300) throw new Error(`etcd /metrics failed (${res.statusCode})`);
+    const m =
+      /^grpc_server_msg_sent_total\{grpc_method="Watch",grpc_service="etcdserverpb\.Watch",grpc_type="bidi_stream"\} (\S+)$/m.exec(
+        text,
+      );
+    if (!m) throw new Error("etcd /metrics carries no grpc_server_msg_sent_total for Watch");
+    return Number(m[1]);
   }
 
   /** Delete every key under `prefix` (range delete in etcd v3 semantics). */
@@ -149,6 +308,9 @@ export class EtcdClient {
       const body = await res.body.text();
       throw new Error(`etcd deleterange failed (${res.statusCode}): ${body}`);
     }
+    // An unread body holds its connection; a spec that writes in a loop
+    // would run the pool dry.
+    await res.body.dump();
   }
 }
 

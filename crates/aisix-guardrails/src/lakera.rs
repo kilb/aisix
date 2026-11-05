@@ -47,6 +47,7 @@
 //! | timeout                         | true        | Bypass { "lakera_timeout" }      |
 //! | 429 Throttling                  | true        | Bypass { "lakera_throttled" }    |
 //! | 5xx / IO error                  | true        | Bypass { "lakera_5xx" }          |
+//! | 413, or size wording in the body | true       | Bypass { "lakera_too_large" }    |
 //! | 4xx (non-429, e.g. 401/400)     | true        | Bypass { "lakera_config_error" } |
 //! | any failure                     | false       | Block { "lakera unavailable …" } |
 
@@ -58,6 +59,7 @@ use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::call_error::{CallClock, CallFailure};
 use crate::{Guardrail, GuardrailVerdict, SegmentsOutcome, StreamOutputPolicy};
 
 /// Default Lakera Guard endpoint (the config's `endpoint` overrides it).
@@ -134,7 +136,7 @@ impl LakeraGuardrail {
     async fn call_api(
         &self,
         messages: &[GuardMessage<'_>],
-    ) -> Result<GuardResponse, LakeraFailure> {
+    ) -> Result<GuardResponse, CallFailure<LakeraFailure>> {
         let url = format!("{}{}", self.endpoint, GUARD_PATH);
         let body = GuardRequest {
             messages,
@@ -146,6 +148,7 @@ impl LakeraGuardrail {
             breakdown: true,
         };
 
+        let mut clock = CallClock::start(self.timeout);
         let future = self
             .client
             .post(&url)
@@ -153,35 +156,50 @@ impl LakeraGuardrail {
             .json(&body)
             .send();
 
-        let resp = match tokio::time::timeout(self.timeout, future).await {
-            Err(_elapsed) => return Err(LakeraFailure::Timeout),
-            Ok(Err(_e)) => return Err(LakeraFailure::IoError),
+        let resp = match clock.within(future).await {
+            Err(_elapsed) => return Err(clock.fail(LakeraFailure::Timeout)),
+            Ok(Err(e)) => return Err(clock.fail_with(LakeraFailure::IoError, &e)),
             Ok(Ok(r)) => r,
         };
+        clock.responded(resp.status());
 
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(LakeraFailure::Throttled);
+            return Err(clock.fail(LakeraFailure::Throttled));
+        }
+        if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+            return Err(clock.fail(LakeraFailure::TooLarge));
         }
         if status.is_server_error() {
-            return Err(LakeraFailure::ServerError);
+            return Err(clock.fail(LakeraFailure::ServerError));
         }
         if !status.is_success() {
             // 4xx other than 429 — almost always a misconfiguration
             // (bad api_key / project_id / endpoint). Error level: with
             // fail_open=true this silently bypasses the guardrail on every
             // request until the operator notices.
-            let response_body = crate::read_error_body_capped(resp).await;
+            let Ok(response_body) = clock
+                .within(crate::read_error_body_capped(resp, &self.row_name))
+                .await
+            else {
+                return Err(clock.fail(LakeraFailure::Timeout));
+            };
             tracing::error!(
-                row = %self.row_name,
+                guardrail_name = %self.row_name,
                 http_status = status.as_u16(),
                 response_body = %response_body,
                 "lakera guard returned 4xx — check endpoint, api_key, and project_id configuration",
             );
-            return Err(LakeraFailure::ConfigError);
+            if crate::too_large::body_says_too_large(&response_body) {
+                return Err(clock.fail(LakeraFailure::TooLarge));
+            }
+            return Err(clock.fail(LakeraFailure::ConfigError));
         }
 
-        resp.json().await.map_err(|_| LakeraFailure::ServerError)
+        match clock.within(resp.json()).await {
+            Ok(r) => r.map_err(|e| clock.fail_with(LakeraFailure::ServerError, &e)),
+            Err(_) => Err(clock.fail(LakeraFailure::Timeout)),
+        }
     }
 
     /// Blob-mode guard: one message, verdict only. Serves `check_input`/
@@ -276,21 +294,29 @@ impl LakeraGuardrail {
         ))
     }
 
-    fn handle_failure(&self, failure: LakeraFailure, fail_open: bool) -> GuardrailVerdict {
-        let tag = failure.bypass_tag();
+    fn handle_failure(
+        &self,
+        failure: CallFailure<LakeraFailure>,
+        fail_open: bool,
+    ) -> GuardrailVerdict {
+        let tag = failure.failure.bypass_tag();
         // ConfigError is already logged at error level in call_api().
-        if !matches!(failure, LakeraFailure::ConfigError) {
+        if !matches!(failure.failure, LakeraFailure::ConfigError) {
             tracing::warn!(
-                row = %self.row_name,
-                failure = ?failure,
+                guardrail_name = %self.row_name,
+                failure = ?failure.failure,
+                http_status = failure.http_status,
                 fail_open = fail_open,
+                error = failure.error.as_deref(),
+                error_kind = failure.error_kind.map(tracing::field::display),
+                elapsed_ms = failure.elapsed_ms,
                 "lakera guard call failed",
             );
         }
         if fail_open {
             GuardrailVerdict::Bypass { reason: tag.into() }
         } else {
-            GuardrailVerdict::block(format!("lakera guard unavailable ({tag})"))
+            GuardrailVerdict::block_unavailable(format!("lakera guard unavailable ({tag})"), tag)
         }
     }
 }
@@ -305,6 +331,11 @@ enum LakeraFailure {
     IoError,
     ServerError,
     ConfigError,
+    /// The provider refused the payload for its size. Lakera publishes
+    /// neither a size limit nor an error shape, so this is reached only
+    /// through a standard `413` or generic size wording — see
+    /// `crate::too_large` (AISIX-Cloud#1386).
+    TooLarge,
 }
 
 impl LakeraFailure {
@@ -314,6 +345,7 @@ impl LakeraFailure {
             Self::Throttled => "lakera_throttled",
             Self::IoError | Self::ServerError => "lakera_5xx",
             Self::ConfigError => "lakera_config_error",
+            Self::TooLarge => "lakera_too_large",
         }
     }
 }
@@ -479,7 +511,7 @@ impl Guardrail for LakeraGuardrail {
         )
     }
 
-    fn enforces_input(&self) -> bool {
+    fn runs_on_input(&self) -> bool {
         matches!(
             self.hook_point,
             GuardrailHookPoint::Input | GuardrailHookPoint::Both
@@ -487,7 +519,15 @@ impl Guardrail for LakeraGuardrail {
     }
 
     fn checks_input_remotely(&self) -> bool {
-        self.enforces_input()
+        self.runs_on_input()
+    }
+
+    fn fails_closed_on_input(&self) -> bool {
+        !self.fail_open
+    }
+
+    fn fails_closed_on_output(&self) -> bool {
+        !self.output_fail_open
     }
 
     /// Masking a streamed response requires the whole response held back —
@@ -616,7 +656,7 @@ mod tests {
 
     #[tokio::test]
     async fn clean_input_allows() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v2/guard"))
             .and(bearer_token("lk-test-key"))
@@ -633,7 +673,7 @@ mod tests {
 
     #[tokio::test]
     async fn flagged_injection_blocks_with_detector_name() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v2/guard"))
             .respond_with(ResponseTemplate::new(200).set_body_json(injection_response()))
@@ -653,7 +693,7 @@ mod tests {
     async fn pii_only_blob_path_blocks() {
         // The blob path has no write-back channel, so PII-only maps to
         // Block there (kind=bedrock ANONYMIZE contract).
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v2/guard"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -678,7 +718,7 @@ mod tests {
 
     #[tokio::test]
     async fn pii_only_segment_path_masks_by_offsets() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         // slot 1 is empty and must NOT be sent; slot 2's detection is
         // message_id=1 (the second SENT message).
         Mock::given(method("POST"))
@@ -721,7 +761,7 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_pii_and_injection_blocks_on_segment_path() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v2/guard"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -744,7 +784,7 @@ mod tests {
 
     #[tokio::test]
     async fn flagged_without_breakdown_blocks() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v2/guard"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "flagged": true })))
@@ -758,7 +798,7 @@ mod tests {
     async fn pii_only_without_payload_spans_blocks_on_segment_path() {
         // Maskable classification but no spans to rewrite — releasing the
         // content would defeat the policy.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v2/guard"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -775,7 +815,7 @@ mod tests {
 
     #[tokio::test]
     async fn five_xx_fail_open_bypasses_fail_closed_blocks() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v2/guard"))
             .respond_with(ResponseTemplate::new(500))
@@ -794,7 +834,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_error_4xx_tagged_separately() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v2/guard"))
             .respond_with(ResponseTemplate::new(401))
@@ -811,7 +851,7 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_respects_fail_open() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v2/guard"))
             .respond_with(
@@ -834,7 +874,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_only_hook_skips_output_and_stream_holdback() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let g = LakeraGuardrail::new("t", &cfg(&server.uri()), GuardrailHookPoint::Input, false);
         assert!(!g.runs_on_output());
         let out = g.moderate_output_segments(&["x".to_owned()]).await;
@@ -869,5 +909,85 @@ mod tests {
         let (masked, counts) = mask_slots(&texts, &[0], &payload);
         assert_eq!(masked[0], "héllo [MASKED EMAIL]");
         assert_eq!(counts.get("EMAIL"), Some(&1));
+    }
+
+    /// A refused connection is logged with its cause, not just `IoError`
+    /// (AISIX-Cloud#1786).
+    #[tokio::test]
+    async fn refused_connection_logs_the_underlying_error() {
+        use crate::call_error::testing::*;
+        let endpoint = refused_endpoint();
+        let logged = capture_logs(|| async {
+            let g = build(&endpoint, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_refusal_logged(&logged, "lakera guard call failed", &["lk-test-key"]);
+    }
+
+    /// A response that does not decode is logged with where it failed, and
+    /// none of the text it quoted.
+    #[tokio::test]
+    async fn undecodable_response_logs_the_underlying_error() {
+        use crate::call_error::testing::*;
+        let server = undecodable_server("DECODE-REQ-1").await;
+        let uri = server.uri();
+        let logged = capture_logs(|| async {
+            let g = build(&uri, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_decode_logged(&logged, "lakera guard call failed", "ServerError");
+    }
+
+    /// A 5xx is logged with its status (AISIX-Cloud#1786).
+    #[tokio::test]
+    async fn server_error_logs_the_status() {
+        use crate::call_error::testing::*;
+        let server = status_server(503).await;
+        let uri = server.uri();
+        let logged = capture_logs(|| async {
+            let g = build(&uri, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_status_logged(&logged, "lakera guard call failed", 503);
+    }
+
+    /// `timeout_ms` covers the response body, not just its headers: a body
+    /// that stalls ends the call as a timeout instead of hanging it.
+    #[tokio::test]
+    async fn stalled_body_times_out() {
+        use crate::call_error::testing::*;
+        let uri = stalled_body_server(200).await;
+        let logged = capture_logs(|| async {
+            let mut g = build(&uri, true);
+            g.timeout = Duration::from_millis(200);
+            let verdict =
+                tokio::time::timeout(Duration::from_secs(5), g.check_input(&req(PROMPT_MARKER)))
+                    .await
+                    .expect("the guardrail call must end at its own timeout");
+            assert!(verdict.is_bypass());
+        })
+        .await;
+        assert_stall_logged(&logged, "lakera guard call failed", 200);
+    }
+
+    /// An error body that stalls is bounded by `timeout_ms` too.
+    #[tokio::test]
+    async fn stalled_error_body_times_out() {
+        use crate::call_error::testing::*;
+        let uri = stalled_body_server(403).await;
+        let logged = capture_logs(|| async {
+            let mut g = build(&uri, true);
+            g.timeout = Duration::from_millis(200);
+            let verdict =
+                tokio::time::timeout(Duration::from_secs(5), g.check_input(&req(PROMPT_MARKER)))
+                    .await
+                    .expect("the guardrail call must end at its own timeout");
+            assert!(verdict.is_bypass());
+        })
+        .await;
+        assert_stall_logged(&logged, "lakera guard call failed", 403);
     }
 }

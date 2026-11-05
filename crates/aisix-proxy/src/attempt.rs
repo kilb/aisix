@@ -25,7 +25,7 @@ use std::time::Instant;
 use std::{sync::Arc, sync::Mutex};
 
 use aisix_gateway::BridgeError;
-use aisix_obs::RequestOutcome;
+use aisix_obs::{ErrorSource, RequestOutcome};
 
 use crate::error::ProxyError;
 
@@ -91,6 +91,27 @@ pub(crate) struct RoutingTelemetry {
     /// THIS group have to fall back", so the group is the useful key and
     /// the target it moved to is the second label.
     requested_model: String,
+    /// The request's trace bundle (AISIX-Cloud#1279). [`Self::begin_attempt`]
+    /// and [`Self::record`] stamp each attempt's span start/end into it —
+    /// the same chokepoints the per-attempt metrics use, so a dispatch
+    /// path cannot record an attempt without its span boundaries.
+    trace: Option<std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+}
+
+/// The target of an attempt about to be dispatched, as
+/// [`RoutingTelemetry::begin_attempt`] needs to describe it.
+#[derive(Clone, Copy)]
+pub(crate) struct AttemptTarget<'a> {
+    /// The target Model's configured name. Drives the
+    /// initial/retry/fallback classification, so it is the real name even
+    /// for a direct model — unlike `target_model` below.
+    pub display_name: &'a str,
+    /// What [`AttemptRecord::target_model`] will carry: the routing target
+    /// display name, or empty for a direct model, where `model_id` already
+    /// identifies the single model.
+    pub target_model: &'a str,
+    /// What [`AttemptRecord::target_model_id`] will carry.
+    pub model_id: &'a str,
 }
 
 impl RoutingTelemetry {
@@ -102,6 +123,15 @@ impl RoutingTelemetry {
             requested_model: requested_model.to_string(),
             ..Self::default()
         }
+    }
+
+    /// Attach the request's trace bundle so attempt boundaries land on it.
+    pub fn with_trace(
+        mut self,
+        trace: Option<std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+    ) -> Self {
+        self.trace = trace;
+        self
     }
 
     /// Record one resolved attempt: emit its per-attempt metrics, then
@@ -116,13 +146,29 @@ impl RoutingTelemetry {
     /// caller.
     pub fn record(&mut self, state: &crate::state::ProxyState, rec: AttemptRecord) {
         self.emit_metrics(state, &rec);
+        self.settle(&rec);
         self.attempts.push(rec);
     }
 
     /// Retain a streamed winner for request-level attribution without
     /// declaring the upstream attempt successful before its terminal event.
     pub fn stage(&mut self, rec: AttemptRecord) {
+        self.settle(&rec);
         self.attempts.push(rec);
+    }
+
+    fn settle(&self, rec: &AttemptRecord) {
+        // The attempt settled — stamp its span end (#1279). For
+        // a streaming winner this is commit time; the terminal emission
+        // extends it to the measured stream end.
+        if let Some(trace) = &self.trace {
+            trace.end_attempt(rec.index);
+        }
+        // …and hand the settled record to the attribution cell, so a cancel
+        // arriving later still emits the attempts that already failed
+        // (#1571). The handler's own `emit_failed_attempts` runs
+        // only when the handler runs; exactly one of the two ever fires.
+        crate::attribution::note_attempt_settled(rec);
     }
 
     /// Emit the deferred per-deployment outcome once a streamed winner has a
@@ -147,10 +193,7 @@ impl RoutingTelemetry {
 
     fn emit_metrics(&self, state: &crate::state::ProxyState, rec: &AttemptRecord) {
         if rec.dispatched {
-            state.runtime_status.record_deployment_attempt(
-                &rec.target_model_id,
-                RequestOutcome::from_status(rec.status),
-            );
+            Self::record_deployment(state, &rec.target_model_id, rec.status);
         }
         if rec.kind == "fallback" {
             state.metrics.record_routing_fallback(
@@ -161,20 +204,49 @@ impl RoutingTelemetry {
         }
     }
 
-    /// Classify the next attempt against `display_name` and advance the
-    /// last-target tracker. Returns `(index, kind)` to stamp onto the
+    /// The `aisix_deployment_*` half of [`Self::record`], for the surfaces
+    /// that call one direct model outside a routing loop and so keep no
+    /// attempt list (`/v1/realtime`, the jobs routes, the video follow-up
+    /// routes). Call it once per upstream call that was dispatched, with the
+    /// status the upstream answered or the error's status.
+    pub fn record_deployment(state: &crate::state::ProxyState, model_id: &str, status: u16) {
+        state
+            .runtime_status
+            .record_deployment_attempt(model_id, RequestOutcome::from_status(status));
+    }
+
+    /// Classify the next attempt against `target.display_name` and advance
+    /// the last-target tracker. Returns `(index, kind)` to stamp onto the
     /// `AttemptRecord` the caller pushes once the attempt resolves. Call
     /// once per attempt, before dispatch.
-    pub fn begin_attempt(&mut self, display_name: &str) -> (u32, &'static str) {
+    ///
+    /// Takes the whole target rather than just its name because this is
+    /// also where the attempt is published to the request's attribution
+    /// cell (AISIX-Cloud#1571): a caller that hangs up mid-attempt is
+    /// served entirely from `Drop`, and the guard can only name the target
+    /// it was waiting on if the target was recorded BEFORE the dispatch it
+    /// may never come back from.
+    pub fn begin_attempt(&mut self, target: AttemptTarget<'_>) -> (u32, &'static str) {
         let index = self.attempts.len() as u32;
         let kind = if self.attempts.is_empty() {
             "initial"
-        } else if self.last_target.as_deref() != Some(display_name) {
+        } else if self.last_target.as_deref() != Some(target.display_name) {
             "fallback"
         } else {
             "retry"
         };
-        self.last_target = Some(display_name.to_string());
+        self.last_target = Some(target.display_name.to_string());
+        // Mint the attempt's span id and stamp its start at the real
+        // dispatch boundary (AISIX-Cloud#1279).
+        if let Some(trace) = &self.trace {
+            trace.start_attempt(index);
+        }
+        crate::attribution::note_attempt_started(crate::attribution::InFlightAttempt {
+            index,
+            kind,
+            target_model: target.target_model.to_string(),
+            model_id: target.model_id.to_string(),
+        });
         (index, kind)
     }
 
@@ -196,6 +268,28 @@ impl RoutingTelemetry {
     pub fn winner(&self) -> Option<&AttemptRecord> {
         self.attempts.iter().rfind(|a| a.success)
     }
+
+    /// The routing summary every family's access-log line carries (#655):
+    /// the winning routing target, and the attempt and fallback counts,
+    /// each absent when empty or zero.
+    pub fn access_log_summary(&self) -> AccessLogRouting<'_> {
+        AccessLogRouting {
+            served_by_model: self
+                .winner()
+                .map(|w| w.target_model.as_str())
+                .filter(|s| !s.is_empty()),
+            attempt_count: Some(self.attempt_count()).filter(|&n| n > 0),
+            fallback_count: Some(self.fallback_count()).filter(|&n| n > 0),
+        }
+    }
+}
+
+/// See [`RoutingTelemetry::access_log_summary`].
+#[derive(Clone, Copy, Default)]
+pub(crate) struct AccessLogRouting<'a> {
+    pub served_by_model: Option<&'a str>,
+    pub attempt_count: Option<u32>,
+    pub fallback_count: Option<u32>,
 }
 
 /// Winning-attempt / failed-attempt classification stamped onto an
@@ -255,16 +349,52 @@ impl DeferredAttempt {
     }
 }
 
-/// Bounded, low-sensitivity error class for the per-attempt `error_class`
-/// telemetry field (#655).
+/// The failure class a request's records carry: the access log's and the
+/// usage event's `error_class`, on every path —
+/// non-streamed, streamed, per attempt, and terminal.
+///
+/// Both read it from here so the two cannot drift into two vocabularies
+/// again. An upstream failure reports its [`routing_error_class`], a
+/// semantic router's failed decision `semantic_decision_failed`, and every
+/// other failure its [`ProxyError::kind`].
+///
+/// NOT the client-facing envelope's `error.type`, which stays
+/// [`ProxyError::kind`]: that one is public API, and for a bridge error it
+/// keeps its own spelling (`upstream_error`, `transport_error`, …).
+pub(crate) fn error_class(err: &ProxyError) -> &'static str {
+    match err {
+        ProxyError::Bridge(be) => routing_error_class(be),
+        // Its `error.type` is the generic `api_error`, which would hide
+        // the failure among every other gateway-side fault.
+        ProxyError::SemanticDecisionFailed { .. } => "semantic_decision_failed",
+        other => other.kind(),
+    }
+}
+
+/// Bounded, low-sensitivity error class of an upstream failure — see
+/// [`error_class`], which every record of a failed request goes through.
 pub(crate) fn routing_error_class(err: &BridgeError) -> &'static str {
     match err {
         BridgeError::Timeout { .. } => "timeout",
         BridgeError::UpstreamStatus { .. } => "upstream_status",
-        BridgeError::UpstreamDecode(_) => "upstream_decode",
+        BridgeError::UpstreamDecode(_)
+        | BridgeError::UpstreamBodyUnread { .. }
+        | BridgeError::TokenExchangeDecode(_) => "upstream_decode",
         BridgeError::UpstreamInBand { .. } => "upstream_in_band",
-        BridgeError::Config(_) => "config",
+        // Deliberately the same class `Config` reports: this variant was
+        // spelled as a `Config` until #1093, and giving it a class of its
+        // own would retire one series and create another for a failure that
+        // did not change.
+        BridgeError::Config(_) | BridgeError::UnsupportedCapability(_) => "config",
         BridgeError::InvalidUpstreamConfig(_) => "invalid_config",
+        // A refusal of the caller's request, not of the target's
+        // configuration: the class the gateway's own refusals of a request
+        // (`ProxyError::InvalidRequest` / `RequestTooLarge`) record, and the
+        // `error.type` the caller is sent, so one refusal reads the same
+        // whichever layer raised it.
+        BridgeError::InvalidRequest(_) | BridgeError::RequestTooLarge { .. } => {
+            "invalid_request_error"
+        }
         BridgeError::InvalidUpstreamCredentials(_) => "invalid_credentials",
         BridgeError::Transport(_) => "transport",
         BridgeError::StreamAborted => "stream_aborted",
@@ -288,7 +418,7 @@ const MAX_ATTEMPT_ERROR_MESSAGE_CHARS: usize = 2048;
 /// the telemetry field and the access log. U+2028/U+2029 are listed
 /// explicitly: they are `Zl`/`Zp`, not `Cc`, so `is_control()` lets them
 /// through even though plenty of viewers break lines on them.
-fn sanitize_error_message(s: &str) -> String {
+pub(crate) fn sanitize_error_message(s: &str) -> String {
     s.chars()
         .filter(|c| !c.is_control() && !matches!(c, '\u{2028}' | '\u{2029}'))
         .take(MAX_ATTEMPT_ERROR_MESSAGE_CHARS)
@@ -302,31 +432,207 @@ pub(crate) fn attempt_error_message(err: &BridgeError) -> String {
     sanitize_error_message(&err.to_string())
 }
 
-/// Failure class + reason for the access log's `error_kind` / `error`
-/// fields.
+/// An upstream-side failure that ended a stream after its `200` headers
+/// had gone out: a mid-stream upstream, transport, decode or timeout error,
+/// an in-band upstream error, or a stream that carried no response.
 ///
-/// Deliberately NOT [`attempt_error_from_proxy`]: that one leaves the
-/// message empty for every non-bridge variant, which is fine for a
-/// per-attempt record (the class is the point) but would put a failed
-/// request back to carrying no reason at all — the gap this exists to
-/// close. Here every variant contributes its `Display`, because the access
-/// log is the one line an operator gets per request.
+/// The terminal usage event records the status the same error would have
+/// produced had it arrived before the headers ([`BridgeError::http_status`]),
+/// and the error itself as its `error_class` / `error_message` — not the
+/// `200` the client's response line says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamFailure {
+    pub status: u16,
+    pub error_class: &'static str,
+    pub error_message: String,
+}
+
+impl StreamFailure {
+    pub fn from_bridge(err: &BridgeError) -> Self {
+        Self {
+            status: err.http_status(),
+            error_class: routing_error_class(err),
+            error_message: attempt_error_message(err),
+        }
+    }
+
+    /// Record `err` unless an earlier failure already ended the stream: the
+    /// first one is the cause, whatever the relay reported after it.
+    pub fn record(slot: &mut Option<Self>, err: &BridgeError) {
+        if slot.is_none() {
+            *slot = Some(Self::from_bridge(err));
+        }
+    }
+
+    /// Stamp this failure onto an attempt record bound for a usage event.
+    pub fn apply_to(&self, attempt: &mut AttemptInfo) {
+        attempt.error_class = self.error_class.to_string();
+        attempt.error_message = self.error_message.clone();
+    }
+}
+
+/// A guardrail refusal that ended a stream after its `200` head. The
+/// stream keeps that status; its terminal usage event names the refusal
+/// with the class and text a buffered refusal carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamRefusal {
+    pub error_message: String,
+}
+
+impl StreamRefusal {
+    /// The refusal whose error frame carries `guardrail_name` / `unavailable`.
+    pub fn new(guardrail_name: Option<&str>, unavailable: Option<&str>) -> Self {
+        let err = crate::error::guardrail_block_error("response", guardrail_name, unavailable);
+        Self {
+            error_message: gateway_error_message(&err),
+        }
+    }
+
+    /// Stamp this refusal onto an attempt record bound for a usage event.
+    pub fn apply_to(&self, attempt: &mut AttemptInfo) {
+        attempt.error_class = GUARDRAIL_BLOCK_CLASS.to_string();
+        attempt.error_message = self.error_message.clone();
+    }
+}
+
+/// A stream's completion record, which a guardrail refusal can end.
+pub(crate) trait RecordsStreamRefusal {
+    fn refusal_slots(&mut self) -> (&mut bool, &mut Option<StreamRefusal>);
+
+    /// Mark the stream refused, with the text of the error frame it ends
+    /// on. The first refusal is the one recorded.
+    fn record_refusal(&mut self, guardrail_name: Option<&str>, unavailable: Option<&str>) {
+        let (blocked, refusal) = self.refusal_slots();
+        *blocked = true;
+        refusal.get_or_insert_with(|| StreamRefusal::new(guardrail_name, unavailable));
+    }
+}
+
+/// The class and message a stream's terminal event carries: its refusal's
+/// if a guardrail ended it, otherwise its upstream failure's.
+pub(crate) fn stream_error_fields(
+    refusal: Option<&StreamRefusal>,
+    failure: Option<&StreamFailure>,
+) -> (String, String) {
+    match (refusal, failure) {
+        (Some(r), _) => (GUARDRAIL_BLOCK_CLASS.to_string(), r.error_message.clone()),
+        (None, Some(f)) => (f.error_class.to_string(), f.error_message.clone()),
+        (None, None) => (String::new(), String::new()),
+    }
+}
+
+/// The usage-event status of a stream no guardrail refused: its upstream
+/// failure's status if it had one, `499` if the caller went away first,
+/// otherwise `200`. A failure outranks the disconnect: a relay that passes
+/// a transport error on aborts the connection, which reads as the caller
+/// leaving, and the failure is what ended the stream.
+pub(crate) fn stream_status(reached_end: bool, failure: Option<&StreamFailure>) -> u16 {
+    match failure {
+        Some(f) => f.status,
+        None if reached_end => 200,
+        None => crate::CLIENT_CLOSED_REQUEST,
+    }
+}
+
+/// Failure class + reason for the access log's `error_class` / `error`
+/// fields: every variant contributes its `Display`.
 pub(crate) fn access_log_error(err: &ProxyError) -> (&'static str, String) {
-    (err.kind(), sanitize_error_message(&err.to_string()))
+    (error_class(err), sanitize_error_message(&err.to_string()))
 }
 
 /// Bounded error class + short message for a per-attempt record, derived
-/// from a `ProxyError`. Bridge errors carry the upstream-mapped class +
-/// message; everything else uses the DP-stable `ProxyError::kind`. Shared
-/// by the `/v1/messages` and `/v1/responses` dispatch loops.
+/// from a `ProxyError`: its [`error_class`] and [`gateway_error_message`].
+/// Shared by the `/v1/messages` and `/v1/responses` dispatch loops.
 pub(crate) fn attempt_error_from_proxy(err: &ProxyError) -> (String, String) {
-    match err {
-        ProxyError::Bridge(be) => (
-            routing_error_class(be).to_string(),
-            attempt_error_message(be),
-        ),
-        other => (other.kind().to_string(), String::new()),
+    (error_class(err).to_string(), gateway_error_message(err))
+}
+
+/// The class of a guardrail refusal ([`ProxyError::ContentFiltered`]), for
+/// the paths that answer an output refusal without carrying the error
+/// itself to the usage event.
+pub(crate) const GUARDRAIL_BLOCK_CLASS: &str = "content_filter";
+
+/// The `error_message` a failure's usage event carries: the access log's
+/// text, for every variant. The event travels further than the access log
+/// (the control plane's store, OTLP, SLS), and this text can echo what the
+/// caller sent or an upstream answered; a guardrail refusal alone is held to
+/// policy wording and the guardrail's name (`guardrail_block_message`), so a
+/// matched value never gets here through one.
+pub(crate) fn gateway_error_message(err: &ProxyError) -> String {
+    access_log_error(err).1
+}
+
+/// The classes an upstream's own failure reports, from
+/// [`routing_error_class`]. Every other class is the gateway's.
+const UPSTREAM_ERROR_CLASSES: &[&str] = &[
+    "timeout",
+    "upstream_status",
+    "upstream_decode",
+    "upstream_in_band",
+    "transport",
+    "stream_aborted",
+];
+
+/// What ended a request whose record names `class` ([`error_class`], or the
+/// class a stream's terminal event was given). The one mapping behind every
+/// `error_source` label, so a failed request cannot read as the gateway's on
+/// one path and the upstream's on another.
+pub(crate) fn error_source_of_class(class: &str) -> ErrorSource {
+    if class.is_empty() || class == crate::CLIENT_DISCONNECTED_KIND {
+        ErrorSource::None
+    } else if UPSTREAM_ERROR_CLASSES.contains(&class) {
+        ErrorSource::Upstream
+    } else {
+        ErrorSource::Aisix
     }
+}
+
+/// See [`error_source_of_class`].
+pub(crate) fn error_source(err: &ProxyError) -> ErrorSource {
+    error_source_of_class(error_class(err))
+}
+
+/// What ended a request a handler answered with a response rather than an
+/// error: a guardrail's refusal of the upstream's answer, or the route's own
+/// 501 for a provider lacking the capability (the last attempt, failed and
+/// never dispatched), and otherwise nothing.
+pub(crate) fn answered_error_source(
+    guardrail_blocked: bool,
+    routing: &RoutingTelemetry,
+) -> ErrorSource {
+    if guardrail_blocked || crate::usage_attr::failed_attempts_are_terminal(routing) {
+        ErrorSource::Aisix
+    } else {
+        ErrorSource::None
+    }
+}
+
+/// What ended a request answered by relaying an upstream's response as sent:
+/// the upstream when it answered with a failure, otherwise nothing.
+pub(crate) fn relayed_error_source(status: u16) -> ErrorSource {
+    if relayed_response_failed(status) {
+        ErrorSource::Upstream
+    } else {
+        ErrorSource::None
+    }
+}
+
+/// Whether a relayed upstream response is a failure: a redirect is a success
+/// on every request family.
+pub(crate) fn relayed_response_failed(status: u16) -> bool {
+    !(200..400).contains(&status)
+}
+
+/// The longest prefix of a relayed error body a route keeps for its failure
+/// row whatever the request's exporters are: the cap of `error_message`.
+pub(crate) const MAX_RELAYED_ERROR_DETAIL_BYTES: usize = MAX_ATTEMPT_ERROR_MESSAGE_CHARS;
+
+/// The class and message of an upstream's failure a route relays as sent, in
+/// the wording `BridgeError::UpstreamStatus` gives every other route. `body`
+/// is at most the [`MAX_RELAYED_ERROR_DETAIL_BYTES`] prefix.
+pub(crate) fn relayed_failure(status: u16, body: &[u8]) -> (&'static str, String) {
+    let err = BridgeError::upstream_status(status, aisix_gateway::upstream_error_message(body));
+    (routing_error_class(&err), attempt_error_message(&err))
 }
 
 /// Whether a failed attempt actually reached its upstream — the
@@ -347,104 +653,325 @@ pub(crate) fn attempt_error_from_proxy(err: &ProxyError) -> (String, String) {
 pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
     match err {
         ProxyError::Bridge(be) => be.reached_upstream(),
-        ProxyError::ContentFiltered(_) => true,
-        ProxyError::MissingAuth
+        ProxyError::ContentFiltered { .. } => true,
+        ProxyError::MissingAuth(_)
+        | ProxyError::MissingRouteAuthHeader(_)
         | ProxyError::InvalidApiKey
         | ProxyError::ApiKeyExpired
         | ProxyError::ApiKeyDisabled
         | ProxyError::JwtInvalid
         | ProxyError::JwtExpired
         | ProxyError::JwtClaimsRejected
+        | ProxyError::JwtInsufficientScope { .. }
         | ProxyError::JwtIdentityUnmapped
         | ProxyError::JwksUnavailable
+        | ProxyError::McpTokenExchange(_)
+        | ProxyError::McpUserOAuth { .. }
         | ProxyError::ModelNotFound(_)
         | ProxyError::VideoNotFound(_)
         | ProxyError::ModelForbidden(_)
         | ProxyError::ModelIpRestricted(_)
         | ProxyError::RouteIpRestricted(_)
         | ProxyError::RouteForbidden(_)
-        | ProxyError::Gone(_)
         | ProxyError::InvalidRequest(_)
         | ProxyError::WebSocketUpgradeRequired { .. }
         | ProxyError::ProviderUnavailable
+        | ProxyError::SemanticDecisionFailed { .. }
         | ProxyError::AllCandidatesUnavailable { .. }
         | ProxyError::BudgetExceeded(_)
+        | ProxyError::BudgetUnverified
         | ProxyError::RequestTooLarge { .. }
         | ProxyError::RateLimit(_)
         | ProxyError::PolicyRateLimit { .. } => false,
     }
 }
 
-/// Milliseconds elapsed since `started`, saturating at `u32::MAX`.
+/// Milliseconds elapsed since `started`; see [`measured_ms`].
 pub(crate) fn ms_since(started: Instant) -> u32 {
-    started.elapsed().as_millis().min(u32::MAX as u128) as u32
+    measured_ms(started.elapsed())
+}
+
+/// A latency in whole milliseconds, for the telemetry fields where 0 means
+/// "not measured": a measured duration reads as at least 1, so a
+/// sub-millisecond wait (a cache hit's caller latency) is not reported as
+/// missing.
+/// `Duration::ZERO` is what callers pass for nothing measured (an attempt
+/// refused before dispatch), and stays 0. Saturates at `u32::MAX`.
+pub(crate) fn measured_ms(elapsed: std::time::Duration) -> u32 {
+    if elapsed.is_zero() {
+        return 0;
+    }
+    elapsed.as_millis().clamp(1, u128::from(u32::MAX)) as u32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aisix_gateway::{UpstreamWire, MAX_UPSTREAM_ERROR_MESSAGE_BYTES};
+    use aisix_gateway::{BridgeCapability, UpstreamWire, MAX_UPSTREAM_ERROR_MESSAGE_BYTES};
 
-    /// The `aisix_deployment_*` families read as upstream health, so an
-    /// error raised while the request was still being assembled has to stay
-    /// out of them. Both matches are exhaustive, so a NEW variant is already
-    /// a compile error; this pins the classification of the existing ones,
-    /// which is what a well-meaning refactor would silently flip.
+    /// 0 is the "not measured" sentinel on every latency field, so a
+    /// measured wait under a millisecond must not collapse into it — and
+    /// an unmeasured one must not leave it.
     #[test]
-    fn only_errors_that_reached_the_provider_count_as_upstream_attempts() {
-        for err in [
-            BridgeError::Config("serialize request body: eof".into()),
-            BridgeError::InvalidUpstreamConfig("model.model_name missing".into()),
-            BridgeError::InvalidUpstreamCredentials("provider_key.api_key is empty".into()),
-        ] {
-            assert!(
-                !err.reached_upstream(),
-                "{err} is raised before the request is sent"
-            );
-            assert!(!attempt_reached_upstream(&ProxyError::Bridge(err)));
-        }
+    fn a_measured_latency_is_at_least_one_millisecond() {
+        use std::time::Duration;
+        assert_eq!(measured_ms(Duration::ZERO), 0, "nothing measured");
+        assert_eq!(measured_ms(Duration::from_nanos(1)), 1);
+        assert_eq!(measured_ms(Duration::from_micros(400)), 1);
+        assert_eq!(measured_ms(Duration::from_micros(2_700)), 2);
+        assert_eq!(measured_ms(Duration::from_secs(u64::MAX)), u32::MAX);
+    }
 
-        // A timeout or a refused connection IS upstream health: we tried to
-        // reach the provider and could not. Excluding these would hide the
-        // outage the family exists to show.
-        for err in [
+    /// One sample of every `BridgeError` variant.
+    ///
+    /// Hand-written, because the enum carries no reflection — but the
+    /// classification below is an EXHAUSTIVE match, so a variant added to
+    /// `BridgeError` stops this file compiling until someone decides which
+    /// side of the network boundary it sits on and which telemetry class it
+    /// reports. That is the decision this test exists to force. It does not
+    /// force the sample to be added here as well; the compile error is what
+    /// brings a reader to this function.
+    fn bridge_error_samples() -> Vec<BridgeError> {
+        vec![
             BridgeError::Timeout {
                 elapsed_ms: 7167,
                 cause: String::new(),
             },
-            BridgeError::Transport("connection refused".into()),
             BridgeError::upstream_status(502, "bad gateway"),
             BridgeError::UpstreamDecode("unparseable body".into()),
+            BridgeError::TokenExchangeDecode("unparseable token".into()),
             BridgeError::UpstreamInBand {
                 status: Some(500),
                 message: "overloaded".into(),
                 parsed: None,
                 wire: UpstreamWire::Unknown,
             },
+            BridgeError::Transport("connection refused".into()),
             BridgeError::StreamAborted,
-        ] {
-            assert!(
-                err.reached_upstream(),
-                "{err} means the provider was contacted"
-            );
-            assert!(attempt_reached_upstream(&ProxyError::Bridge(err)));
-        }
+            BridgeError::Config("serialize request body: eof".into()),
+            BridgeError::UnsupportedCapability(BridgeCapability::Embeddings),
+            BridgeError::InvalidUpstreamConfig("model.model_name missing".into()),
+            BridgeError::InvalidRequest("`functions` is not supported for this model".into()),
+            BridgeError::RequestTooLarge {
+                limit_bytes: 1024,
+                inbound_bytes: 1000,
+                downloaded_bytes: 100,
+            },
+            BridgeError::InvalidUpstreamCredentials("provider_key.api_key is empty".into()),
+        ]
+    }
 
+    /// One vocabulary for a failure's records: the access log's and the
+    /// usage event's `error_class` both name an upstream failure by
+    /// its routing class, while the client's envelope keeps its own public
+    /// `error.type`. The two used to differ for the same failure — the
+    /// non-streamed line said `upstream_error` where the row said
+    /// `upstream_status`.
+    #[test]
+    fn every_record_of_a_failure_names_it_with_one_class() {
+        let expected = [
+            ("timeout", "timeout"),
+            ("upstream_status", "upstream_error"),
+            ("upstream_decode", "upstream_decode_error"),
+            ("upstream_decode", "upstream_decode_error"),
+            ("upstream_in_band", "upstream_in_band_error"),
+            ("transport", "transport_error"),
+            ("stream_aborted", "stream_aborted"),
+            ("config", "config_error"),
+            ("config", "config_error"),
+            ("invalid_config", "invalid_request_error"),
+            ("invalid_request_error", "invalid_request_error"),
+            ("invalid_request_error", "invalid_request_error"),
+            ("invalid_credentials", "authentication_error"),
+        ];
+        let samples = bridge_error_samples();
+        assert_eq!(samples.len(), expected.len());
+        for (be, (class, envelope)) in samples.into_iter().zip(expected) {
+            let routing = routing_error_class(&be);
+            let err = ProxyError::Bridge(be);
+            assert_eq!(error_class(&err), class, "{err:?}");
+            assert_eq!(routing, class, "the attempt record: {err:?}");
+            assert_eq!(access_log_error(&err).0, class, "the access log: {err:?}");
+            assert_eq!(attempt_error_from_proxy(&err).0, class, "{err:?}");
+            assert_eq!(
+                err.kind(),
+                envelope,
+                "the client envelope is public API: {err:?}"
+            );
+        }
+        // A failure only one vocabulary ever named keeps its name.
+        let not_found = ProxyError::ModelNotFound("m".into());
+        assert_eq!(error_class(&not_found), "model_not_found");
+        assert_eq!(access_log_error(&not_found).0, "model_not_found");
+    }
+
+    /// The `aisix_deployment_*` families read as upstream health, so an
+    /// error raised while the request was still being assembled has to stay
+    /// out of them — and `error_class` is a telemetry label, so a variant
+    /// silently minting a new series retires the one dashboards read.
+    #[test]
+    fn every_bridge_error_declares_its_side_of_the_network_and_its_class() {
+        for err in bridge_error_samples() {
+            let (reached, class) = match &err {
+                // A timeout or a refused connection IS upstream health: we
+                // tried to reach the provider and could not. Excluding these
+                // would hide the outage the family exists to show.
+                BridgeError::Timeout { .. } => (true, "timeout"),
+                BridgeError::UpstreamStatus { .. } => (true, "upstream_status"),
+                BridgeError::UpstreamDecode(_)
+                | BridgeError::UpstreamBodyUnread { .. }
+                | BridgeError::TokenExchangeDecode(_) => (true, "upstream_decode"),
+                BridgeError::UpstreamInBand { .. } => (true, "upstream_in_band"),
+                BridgeError::Transport(_) => (true, "transport"),
+                BridgeError::StreamAborted => (true, "stream_aborted"),
+                BridgeError::Config(_) => (false, "config"),
+                // Raised by the `Bridge` default impl itself, so no request
+                // was ever assembled — and it keeps the class `Config`
+                // reports, because until #1093 it WAS a `Config`. A class of
+                // its own would retire a series nothing else feeds.
+                BridgeError::UnsupportedCapability(_) => (false, "config"),
+                BridgeError::InvalidUpstreamConfig(_) => (false, "invalid_config"),
+                BridgeError::InvalidRequest(_) => (false, "invalid_request_error"),
+                BridgeError::RequestTooLarge { .. } => (false, "invalid_request_error"),
+                BridgeError::InvalidUpstreamCredentials(_) => (false, "invalid_credentials"),
+            };
+            assert_eq!(
+                routing_error_class(&err),
+                class,
+                "{err} reports the wrong attempt error_class"
+            );
+            assert_eq!(
+                err.reached_upstream(),
+                reached,
+                "{err} is on the wrong side of the network boundary"
+            );
+            assert_eq!(attempt_reached_upstream(&ProxyError::Bridge(err)), reached);
+        }
+    }
+
+    #[test]
+    fn only_errors_that_reached_the_provider_count_as_upstream_attempts() {
         // Only the output hook can fire inside a dispatch call, so the
         // provider had already answered — the attempt did reach it.
-        assert!(attempt_reached_upstream(&ProxyError::ContentFiltered(
-            "blocked by response guardrail".into()
-        )));
+        assert!(attempt_reached_upstream(&ProxyError::ContentFiltered {
+            message: "blocked by response guardrail".into(),
+            unavailable: None,
+        }));
         // Gateway-side refusals never contacted anyone.
         assert!(!attempt_reached_upstream(&ProxyError::ModelNotFound(
             "nope".into()
         )));
     }
 
+    /// Every failure names itself on its usage event, whoever wrote the text,
+    /// and a guardrail refusal stays policy wording and the guardrail's name.
+    #[test]
+    fn gateway_error_message_carries_every_failures_text() {
+        let semantic = ProxyError::SemanticDecisionFailed {
+            router: "router-a".into(),
+            reason: crate::semantic::DecisionFailure::ClassifierTimeout,
+        };
+        assert_eq!(
+            gateway_error_message(&semantic),
+            "semantic router 'router-a' could not pick a route (classifier_timeout)"
+        );
+        assert_eq!(
+            gateway_error_message(&ProxyError::ModelNotFound("ghost".into())),
+            "model \"ghost\" not found"
+        );
+        for (quoting, text) in [
+            (
+                ProxyError::InvalidRequest("invalid type: string \"my prompt\"".into()),
+                "my prompt",
+            ),
+            (ProxyError::VideoNotFound("caller-id".into()), "caller-id"),
+            (
+                ProxyError::Bridge(BridgeError::upstream_status(502, "upstream said x")),
+                "upstream said x",
+            ),
+        ] {
+            assert!(
+                gateway_error_message(&quoting).contains(text),
+                "{quoting:?}"
+            );
+            assert_eq!(
+                attempt_error_from_proxy(&quoting).1,
+                gateway_error_message(&quoting),
+                "an attempt row and a terminal row read the same"
+            );
+        }
+        let refusal = crate::error::guardrail_block_error("response", Some("g"), None);
+        assert_eq!(error_class(&refusal), GUARDRAIL_BLOCK_CLASS);
+        assert_eq!(
+            gateway_error_message(&refusal),
+            "response blocked by content policy (guardrail 'g')"
+        );
+    }
+
+    /// One mapping behind every `error_source` label: an upstream failure is
+    /// exactly a bridge error that reached the upstream, and no gateway
+    /// refusal shares a class with one. A status decides none of it.
+    #[test]
+    fn error_source_follows_the_failure_and_never_its_status() {
+        for err in bridge_error_samples() {
+            let expected = if err.reached_upstream() {
+                ErrorSource::Upstream
+            } else {
+                ErrorSource::Aisix
+            };
+            assert_eq!(error_source(&ProxyError::Bridge(err)), expected);
+        }
+        let upstream_429 = ProxyError::Bridge(BridgeError::upstream_status(429, "slow down"));
+        let budget = ProxyError::BudgetUnverified;
+        let refusal = crate::error::guardrail_block_error("response", None, None);
+        assert_eq!(error_source(&upstream_429), ErrorSource::Upstream);
+        for gateway in [
+            budget,
+            refusal,
+            ProxyError::InvalidApiKey,
+            ProxyError::ModelForbidden("m".into()),
+            ProxyError::ModelNotFound("m".into()),
+            ProxyError::InvalidRequest("bad".into()),
+            ProxyError::RequestTooLarge { limit_bytes: 1 },
+            ProxyError::ProviderUnavailable,
+            ProxyError::JwksUnavailable,
+        ] {
+            assert_eq!(error_source(&gateway), ErrorSource::Aisix, "{gateway:?}");
+        }
+        assert_eq!(
+            error_source_of_class(crate::CLIENT_DISCONNECTED_KIND),
+            ErrorSource::None
+        );
+        assert_eq!(error_source_of_class(""), ErrorSource::None);
+        assert_eq!(
+            error_source_of_class("rate_limit_lease_lost"),
+            ErrorSource::Aisix
+        );
+    }
+
+    /// A relayed failure reads like any route's upstream failure, in the three
+    /// forms an upstream's answer can take.
+    #[test]
+    fn a_relayed_failure_reports_what_the_upstream_said() {
+        assert_eq!(
+            relayed_failure(500, br#"{"error":{"message":"boom"}}"#),
+            ("upstream_status", "upstream returned HTTP 500: boom".into())
+        );
+        assert_eq!(
+            relayed_failure(503, b"plain text").1,
+            "upstream returned HTTP 503: plain text"
+        );
+        assert_eq!(
+            relayed_failure(404, b"").1,
+            "upstream returned HTTP 404 with no error detail in the response"
+        );
+        assert!(!relayed_response_failed(204));
+        assert!(!relayed_response_failed(302));
+        assert!(relayed_response_failed(499));
+    }
+
     /// #1093: the access log is the one line an operator gets
-    /// per request, so EVERY failure has to name itself there — including
-    /// the variants `attempt_error_from_proxy` deliberately leaves
-    /// message-less because a per-attempt record only needs the class.
+    /// per request, so EVERY failure has to name itself there.
     #[test]
     fn access_log_error_names_every_variant_not_just_bridge_ones() {
         // The cause added for #1093 has to survive into the access log —
@@ -461,17 +988,10 @@ mod tests {
              tcp connect error: Connection timed out (os error 110)"
         );
 
-        // A non-bridge variant: `attempt_error_from_proxy` yields "" here,
-        // which would put the access log right back to naming no cause.
-        let not_found = ProxyError::ModelNotFound("model \"ghost\" not found".into());
+        let not_found = ProxyError::ModelNotFound("ghost".into());
         let (kind, msg) = access_log_error(&not_found);
         assert_eq!(kind, "model_not_found");
         assert!(msg.contains("ghost"), "{msg}");
-        assert!(
-            attempt_error_from_proxy(&not_found).1.is_empty(),
-            "per-attempt records intentionally carry no message here — \
-             that is why the access log needs its own helper"
-        );
     }
 
     /// Control chars would break the one-line-per-request shape that makes
@@ -501,6 +1021,7 @@ mod tests {
             parsed: None,
             wire: UpstreamWire::OpenAI,
             retry_after: None,
+            diagnostic: None,
         }
     }
 
@@ -559,5 +1080,34 @@ mod tests {
     fn control_chars_are_stripped() {
         let got = attempt_error_message(&upstream_status("line one\nline\ttwo"));
         assert!(got.ends_with("line onelinetwo"), "got: {got}");
+    }
+
+    /// An upstream failure outranks a lost caller: a relay that passes a
+    /// transport error on aborts the connection, which is indistinguishable
+    /// from the caller leaving. Without one, a stream that did not reach its
+    /// end is the caller's `499`.
+    #[test]
+    fn stream_status_prefers_the_upstream_failure_to_the_disconnect() {
+        let failure = StreamFailure::from_bridge(&BridgeError::Timeout {
+            elapsed_ms: 10,
+            cause: String::new(),
+        });
+        assert_eq!(stream_status(false, Some(&failure)), 504);
+        assert_eq!(stream_status(true, Some(&failure)), 504);
+        assert_eq!(stream_status(false, None), crate::CLIENT_CLOSED_REQUEST);
+        assert_eq!(stream_status(true, None), 200);
+        assert_eq!(failure.error_class, "timeout");
+    }
+
+    /// The first failure is the cause; what the relay reports after it does
+    /// not replace it.
+    #[test]
+    fn the_first_stream_failure_is_kept() {
+        let mut slot = None;
+        StreamFailure::record(&mut slot, &upstream_status("first"));
+        StreamFailure::record(&mut slot, &BridgeError::Transport("second".into()));
+        let kept = slot.unwrap();
+        assert_eq!(kept.error_class, "upstream_status");
+        assert!(kept.error_message.contains("first"), "{kept:?}");
     }
 }

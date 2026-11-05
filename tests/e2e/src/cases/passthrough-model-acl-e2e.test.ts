@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -11,7 +12,7 @@ import {
 } from "../harness/index.js";
 
 // E2E: passthrough routes are an explicit grant on the API key
-// (`allowed_routes`, mirroring `allowed_tools`/`allowed_agents`). The
+// (`allowed_routes`, mirroring `allowed_agents`). The
 // removed implicit tunnel derived authorization from the key's model ACL
 // (#449); routes carry their own dimension: a key with no grant for the
 // route's name must not reach the route's upstream credential, whatever
@@ -56,6 +57,8 @@ describe("passthrough route ACL (allowed_routes)", () => {
       allowed_models: ["*"],
       allowed_routes: ["unrelated-route"],
     });
+    const proxy = new ProxyClient(app.proxyUrl, DENIED);
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
   });
 
   afterAll(async () => {

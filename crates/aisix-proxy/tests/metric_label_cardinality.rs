@@ -83,11 +83,13 @@ fn snapshot() -> AisixSnapshot {
 fn cfg() -> ProxyConfig {
     ProxyConfig {
         addr: "127.0.0.1:0".into(),
-        request_body_limit_bytes: Some(1_048_576),
+        request_body_limit_bytes: 1_048_576,
         real_ip: Default::default(),
         request_id: Default::default(),
         url_rewrites: Vec::new(),
+        expose_debug_headers: false,
         tls: None,
+        listeners: Vec::new(),
         thread_per_core: None,
         workers: None,
     }

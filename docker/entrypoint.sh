@@ -7,7 +7,7 @@
 #   Standalone — operator mounts their own config:
 #       docker run -v ./config.yaml:/etc/aisix/config.yaml ghcr.io/api7/aisix:dev
 #
-#   Managed (connected to AISIX Cloud) — use the baked-in template + env vars:
+#   Managed (connected to AISIX Enterprise or AISIX Cloud) — use the baked-in template + env vars:
 #       docker run \
 #         -e AISIX_CONFIG_PATH=/etc/aisix/config.managed.yaml \
 #         -e AISIX_MANAGED__CP_BASE_URL \
@@ -34,13 +34,5 @@ if [ ! -f "$CONFIG_PATH" ]; then
     echo "aisix-entrypoint: AISIX_CONFIG_PATH=/etc/aisix/config.managed.yaml" >&2
     exit 64
 fi
-
-# AISIX_CONFIG_PATH is ours, not the binary's. The Rust Config
-# loader scrapes every AISIX_* env var as a deserialisation override,
-# so leaving CONFIG_PATH in the environment makes it try to
-# deserialise a field called "config_path" (which doesn't exist on
-# the root Config struct) and fail with "unknown field `config_path`".
-# Unset before exec so the binary never sees it.
-unset AISIX_CONFIG_PATH
 
 exec /usr/local/bin/aisix --config "$CONFIG_PATH"

@@ -9,8 +9,17 @@
 //! `embedding_model`, scores it against each route's example embeddings
 //! (cosine, aggregated per route), and dispatches to the highest route
 //! whose score clears its threshold — or to `default` when none does.
-//! Route example vectors are computed once at apply time and cached, so
-//! the per-request cost is a single embedding call plus local arithmetic.
+//! Route example vectors are populated lazily during request handling and
+//! cached. A cold route request passes its prompt and every distinct uncached
+//! route-example text as one logical embedding batch. Providers without batch
+//! support may issue multiple upstream calls (Bedrock Titan does). In steady
+//! state, the batch contains only the prompt, followed by local arithmetic.
+//!
+//! A router that carries a `classifier` block decides differently: the
+//! latest user message is sent once to a hosted decision model, which
+//! picks one of the configured routes by its `description`. The embedding
+//! fields, `match`, and the per-route `examples` / `threshold` do not
+//! apply in that mode and are rejected there.
 //!
 //! Routes reference direct Models by `display_name`, the same way routing
 //! targets and ensemble panel members do. Mutual exclusivity with the
@@ -50,29 +59,56 @@ pub enum Aggregation {
 /// them dispatches to `target`.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct SemanticRoute {
-    /// Operator-facing route label. Surfaced in the `x-aisix-route`
-    /// response header and access logs (e.g. `prod-chat -> route:legal`).
+    /// Operator-facing route label. Surfaced in access logs (e.g.
+    /// `prod-chat -> route:legal`), and in the `x-aisix-route` response
+    /// header only when `proxy.expose_debug_headers` is enabled.
     #[schemars(length(min = 1))]
     pub name: String,
     /// Direct model alias that receives traffic matching this route.
+    /// Read only when `target_id` is absent.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     #[schemars(length(min = 1))]
     pub target: String,
-    /// Human-facing description. Documentation only — v1 matches on
-    /// `examples`, not on this field.
+    /// Resource id of the direct model that receives traffic matching this
+    /// route. Present, it is authoritative and `target` is ignored: the id
+    /// is resolved against the models in the current configuration, so
+    /// renaming that model keeps this route pointing at it with no edit to
+    /// this document. An id resolving to no model is a route target that
+    /// does not exist, exactly as a `target` naming no model is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub target_id: Option<String>,
+    /// What requests this route handles. With a `classifier`, this is
+    /// the text the decision model reads to pick the route, and it is
+    /// required. Without one, it is documentation only: routes are
+    /// matched on `examples`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
     pub description: Option<String>,
-    /// Example utterances that define this route. AISIX embeds each example
-    /// when applying the configuration and caches the vector. A request is
-    /// matched against these examples. At least one example is required.
+    /// Example utterances that define this route. AISIX caches their vectors
+    /// lazily. A cold route request passes its prompt and every distinct
+    /// uncached example text as one logical embedding batch. Providers without
+    /// batch support may issue multiple upstream calls (Bedrock Titan does).
+    /// Required, with at least one example, when the router has no
+    /// `classifier`; not accepted when it has one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(min = 1), inner(length(min = 1)))]
     pub examples: Vec<String>,
     /// Per-route similarity threshold. A request matches this route only
     /// when its aggregated score is `>=` this value. When omitted, the
-    /// router-level threshold applies.
+    /// router-level threshold applies. Not accepted with a `classifier`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0.0, max = 1.0))]
     pub threshold: Option<f32>,
+}
+
+impl SemanticRoute {
+    /// The display name of the model this route dispatches to, resolved
+    /// against the current configuration: `target_id` when it is set,
+    /// `target` otherwise.
+    pub fn target_ref<'a>(&'a self, snapshot: &super::AisixSnapshot) -> std::borrow::Cow<'a, str> {
+        super::resolve_model_ref(snapshot, &self.target, self.target_id.as_deref())
+    }
 }
 
 /// Matching parameters shared across every route in a semantic router.
@@ -113,11 +149,21 @@ pub enum EmbeddingFailureMode {
 pub enum OnEmbeddingFailure {
     /// `"default"` or `"fail"`.
     Mode(EmbeddingFailureMode),
-    /// `{ "target": "<direct alias>" }` — route to a specific safe model.
+    /// `{ "target": "<direct alias>" }` (or `{ "target_id": "<id>" }`) —
+    /// route to a specific safe model.
     Target {
-        /// Direct-model alias to route to when embedding fails.
+        /// Direct-model alias to route to when embedding fails. Read only
+        /// when `target_id` is absent.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         #[schemars(length(min = 1))]
         target: String,
+        /// Resource id of the direct model to route to when embedding
+        /// fails. Present, it is authoritative and `target` is ignored, so
+        /// renaming that model keeps this fallback pointing at it with no
+        /// edit to this document.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(min = 1))]
+        target_id: Option<String>,
     },
 }
 
@@ -127,21 +173,124 @@ impl Default for OnEmbeddingFailure {
     }
 }
 
+/// The `provider` a Provider Key must carry to authenticate a `jev`
+/// classifier.
+pub const TYPESAFE_PROVIDER: &str = "typesafe";
+
+/// Hosted decision model a semantic router can use in place of embeddings.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ClassifierType {
+    /// TypeSafe's jev decision model.
+    #[default]
+    Jev,
+}
+
+fn default_classifier_model() -> String {
+    "jev-latest".to_string()
+}
+
+fn default_min_confidence() -> f64 {
+    0.5
+}
+
+fn default_classifier_timeout_ms() -> u64 {
+    3000
+}
+
+/// Route selection by a hosted decision model. For each request the
+/// latest user message is sent to the model together with every route's
+/// `name` and `description`, and the model picks one route. A request goes
+/// to the picked route's target, or to the router's `default` when the
+/// model's confidence in its pick is below `min_confidence`. To catch
+/// requests that fit none of the routes, configure a route for them.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
+pub struct SemanticClassifier {
+    /// Decision model family. `jev` is the only supported value.
+    pub r#type: ClassifierType,
+    /// Resource id of the Provider Key that authenticates the decision
+    /// calls. The key's `provider` must be `typesafe`; its API key is sent
+    /// as the bearer token, and its `api_base`, when set, replaces the
+    /// default endpoint `https://api.typesafe.ai`.
+    #[schemars(length(min = 1))]
+    pub provider_key_id: String,
+    /// Decision model to call.
+    #[serde(default = "default_classifier_model")]
+    #[schemars(length(min = 1))]
+    pub model: String,
+    /// Lowest confidence at which the picked route is used. A decision
+    /// below it sends the request to `default`.
+    #[serde(default = "default_min_confidence")]
+    #[schemars(range(min = 0.0, max = 1.0))]
+    pub min_confidence: f64,
+    /// Deadline for the decision call, in milliseconds.
+    #[serde(default = "default_classifier_timeout_ms")]
+    #[schemars(range(min = 1))]
+    pub timeout_ms: u64,
+    /// Behavior when the decision call fails, times out, or returns an
+    /// answer that names no route. Same values as `on_embedding_failure`.
+    #[serde(default, skip_serializing_if = "is_default_failure")]
+    pub on_failure: OnEmbeddingFailure,
+}
+
+impl SemanticClassifier {
+    /// Per-call deadline for the decision request.
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.timeout_ms)
+    }
+}
+
 /// Semantic-routing config: pick a target by request meaning.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct Semantic {
+    /// Route selection by a hosted decision model instead of embeddings.
+    /// When set, `embedding_model`, `embedding_model_id`,
+    /// `embedding_timeout_ms`, `on_embedding_failure` and `match` are not
+    /// accepted, every route needs a `description` and takes no `examples`
+    /// or `threshold`. When omitted, routes are matched by embedding
+    /// similarity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier: Option<SemanticClassifier>,
     /// Alias of an `embedding`-modality Model used to embed the request
-    /// and (at apply time) the route examples.
+    /// and, lazily on the first request that needs them, the route examples.
+    /// Read only when
+    /// `embedding_model_id` is absent. Required, under this name or as
+    /// `embedding_model_id`, when there is no `classifier`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     #[schemars(length(min = 1))]
     pub embedding_model: String,
+    /// Resource id of the `embedding`-modality Model used to embed the
+    /// request and the route examples. Present, it is authoritative and
+    /// `embedding_model` is ignored: the id is resolved against the models
+    /// in the current configuration, so renaming that model keeps this
+    /// router pointing at it with no edit to this document. An id
+    /// resolving to no model is an embedding model that does not exist,
+    /// exactly as an `embedding_model` naming no model is — the router
+    /// applies `on_embedding_failure`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub embedding_model_id: Option<String>,
     /// Routes evaluated for each request. At least one is required.
     #[schemars(length(min = 1))]
     pub routes: Vec<SemanticRoute>,
-    /// Direct model alias used when no route clears its threshold.
+    /// Direct model alias used when no route clears its threshold. Read
+    /// only when `default_id` is absent.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     #[schemars(length(min = 1))]
     pub default: String,
+    /// Resource id of the direct model used when no route clears its
+    /// threshold. Present, it is authoritative and `default` is ignored,
+    /// so renaming that model keeps this router pointing at it with no
+    /// edit to this document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub default_id: Option<String>,
     /// Shared matching parameters (metric, aggregation, default threshold).
-    pub r#match: SemanticMatch,
+    /// Required when there is no `classifier`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#match: Option<SemanticMatch>,
     /// Per-call deadline for the embedding request in milliseconds. `0` or
     /// absent disables the embedding-specific deadline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -157,10 +306,36 @@ fn is_default_failure(p: &OnEmbeddingFailure) -> bool {
 }
 
 impl Semantic {
+    /// The display name of the embedding model this router uses, resolved
+    /// against the current configuration: `embedding_model_id` when it is
+    /// set, `embedding_model` otherwise.
+    pub fn embedding_model_ref<'a>(
+        &'a self,
+        snapshot: &super::AisixSnapshot,
+    ) -> std::borrow::Cow<'a, str> {
+        super::resolve_model_ref(
+            snapshot,
+            &self.embedding_model,
+            self.embedding_model_id.as_deref(),
+        )
+    }
+
+    /// The display name of the model this router falls through to,
+    /// resolved against the current configuration: `default_id` when it is
+    /// set, `default` otherwise.
+    pub fn default_ref<'a>(&'a self, snapshot: &super::AisixSnapshot) -> std::borrow::Cow<'a, str> {
+        super::resolve_model_ref(snapshot, &self.default, self.default_id.as_deref())
+    }
+
     /// Effective threshold for a route: its own `threshold` if set,
-    /// otherwise the router-level `match.threshold`.
+    /// otherwise the router-level `match.threshold`. A router with neither
+    /// (only a `classifier` router, which never scores by threshold)
+    /// matches nothing.
     pub fn route_threshold(&self, route: &SemanticRoute) -> f32 {
-        route.threshold.unwrap_or(self.r#match.threshold)
+        route
+            .threshold
+            .or(self.r#match.as_ref().map(|m| m.threshold))
+            .unwrap_or(f32::INFINITY)
     }
 
     /// Per-call embedding deadline. Folds the `0`/absent sentinel into
@@ -171,9 +346,11 @@ impl Semantic {
             .map(std::time::Duration::from_millis)
     }
 
-    /// Every direct-model alias this router can dispatch to: each route's
-    /// `target` plus `default`. Used by the loader for reference-integrity
-    /// checks and the runtime for resolution.
+    /// Every direct-model alias this router can dispatch to, as CONFIGURED:
+    /// each route's `target` plus `default`. Name form only — a reference
+    /// written as `target_id` / `default_id` is not reported here, so this
+    /// is usable only where the id form cannot appear (the resources file,
+    /// which rejects it).
     pub fn referenced_targets(&self) -> impl Iterator<Item = &str> {
         self.routes
             .iter()
@@ -216,7 +393,7 @@ mod tests {
         assert_eq!(s.routes[0].target, "claude-opus");
         assert_eq!(s.routes[0].examples.len(), 2);
         assert_eq!(s.default, "gpt-4o");
-        assert_eq!(s.r#match.threshold, 0.75);
+        assert_eq!(s.r#match.as_ref().unwrap().threshold, 0.75);
         // Per-route override beats the router default; absent override
         // falls back to it.
         assert_eq!(s.route_threshold(&s.routes[0]), 0.8);
@@ -228,7 +405,8 @@ mod tests {
         assert_eq!(
             s.on_embedding_failure,
             OnEmbeddingFailure::Target {
-                target: "gpt-4o-mini".into()
+                target: "gpt-4o-mini".into(),
+                target_id: None,
             }
         );
     }
@@ -244,8 +422,11 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(s.r#match.distance_metric, DistanceMetric::Cosine);
-        assert_eq!(s.r#match.aggregation, Aggregation::Max);
+        assert_eq!(
+            s.r#match.as_ref().unwrap().distance_metric,
+            DistanceMetric::Cosine
+        );
+        assert_eq!(s.r#match.as_ref().unwrap().aggregation, Aggregation::Max);
         assert_eq!(s.embedding_timeout(), None);
         // Absent on_embedding_failure defaults to routing to `default`.
         assert_eq!(s.on_embedding_failure, OnEmbeddingFailure::default());
@@ -316,6 +497,7 @@ mod tests {
         // Target round-trips as { "target": "alias" }, not a nested object.
         let target = OnEmbeddingFailure::Target {
             target: "safe".into(),
+            target_id: None,
         };
         assert_eq!(
             serde_json::to_value(&target).unwrap(),

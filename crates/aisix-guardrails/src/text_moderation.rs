@@ -29,11 +29,13 @@
 //! config; this dispatcher only implements the non-streaming
 //! `check_input` / `check_output` hooks.
 //!
-//! NOTE: the HTTP transport (`chunk_text`, the `AcsFailure` buckets, the
-//! fail-open verdict mapping, the `Ocp-Apim-Subscription-Key` + tokio
-//! timeout call shape) is duplicated from `prompt_shield.rs`. Extracting a
-//! shared `azure_common` module is tracked as a follow-up so this slice
-//! stays surgical (it does not touch the shipped P1 dispatcher).
+//! NOTE: the HTTP transport (the `AcsFailure` buckets, the fail-open
+//! verdict mapping, the `Ocp-Apim-Subscription-Key` + tokio timeout call
+//! shape) is duplicated from `prompt_shield.rs`. Extracting a shared
+//! `azure_common` module is tracked as a follow-up so this slice stays
+//! surgical (it does not touch the shipped P1 dispatcher). The text
+//! splitting itself is no longer duplicated — it lives in `crate::chunk`,
+//! the family-wide chokepoint (AISIX-Cloud#1382).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -44,6 +46,8 @@ use aisix_gateway::{ChatFormat, ChatResponse, Role};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::call_error::{CallClock, CallFailure};
+use crate::chunk::chunk_text;
 use crate::{Guardrail, GuardrailVerdict, StreamOutputPolicy};
 
 /// Maximum characters per `text:analyze` call. Azure CS enforces a
@@ -146,7 +150,7 @@ impl TextModerationGuardrail {
     }
 
     /// POST one chunk to `text:analyze` and return the parsed result.
-    async fn analyze(&self, text: &str) -> Result<AnalyzeResponse, AcsFailure> {
+    async fn analyze(&self, text: &str) -> Result<AnalyzeResponse, CallFailure<AcsFailure>> {
         let url = format!("{}{}", self.endpoint, ANALYZE_PATH);
         let body = AnalyzeRequest {
             text,
@@ -156,6 +160,7 @@ impl TextModerationGuardrail {
             output_type: &self.output_type,
         };
 
+        let mut clock = CallClock::start(self.timeout);
         let future = self
             .client
             .post(&url)
@@ -163,33 +168,40 @@ impl TextModerationGuardrail {
             .json(&body)
             .send();
 
-        let resp = match tokio::time::timeout(self.timeout, future).await {
-            Err(_elapsed) => return Err(AcsFailure::Timeout),
-            Ok(Err(_e)) => return Err(AcsFailure::IoError),
+        let resp = match clock.within(future).await {
+            Err(_elapsed) => return Err(clock.fail(AcsFailure::Timeout)),
+            Ok(Err(e)) => return Err(clock.fail_with(AcsFailure::IoError, &e)),
             Ok(Ok(r)) => r,
         };
+        clock.responded(resp.status());
 
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(AcsFailure::Throttled);
+            return Err(clock.fail(AcsFailure::Throttled));
         }
         if status.is_server_error() {
-            return Err(AcsFailure::ServerError);
+            return Err(clock.fail(AcsFailure::ServerError));
         }
         if !status.is_success() {
-            let response_body = crate::read_error_body_capped(resp).await;
+            let Ok(response_body) = clock
+                .within(crate::read_error_body_capped(resp, &self.row_name))
+                .await
+            else {
+                return Err(clock.fail(AcsFailure::Timeout));
+            };
             tracing::error!(
-                row = %self.row_name,
+                guardrail_name = %self.row_name,
                 http_status = status.as_u16(),
                 response_body = %response_body,
                 "azure content safety text:analyze returned 4xx — check endpoint and api_key configuration",
             );
-            return Err(AcsFailure::ConfigError);
+            return Err(clock.fail(AcsFailure::ConfigError));
         }
 
-        resp.json::<AnalyzeResponse>()
-            .await
-            .map_err(|_| AcsFailure::ServerError)
+        match clock.within(resp.json::<AnalyzeResponse>()).await {
+            Ok(r) => r.map_err(|e| clock.fail_with(AcsFailure::ServerError, &e)),
+            Err(_) => Err(clock.fail(AcsFailure::Timeout)),
+        }
     }
 
     /// Apply the threshold + blocklist policy to one analyze response.
@@ -217,20 +229,31 @@ impl TextModerationGuardrail {
         None
     }
 
-    fn handle_failure(&self, failure: AcsFailure, fail_open: bool) -> GuardrailVerdict {
-        let tag = failure.bypass_tag();
-        if !matches!(failure, AcsFailure::ConfigError) {
+    fn handle_failure(
+        &self,
+        failure: CallFailure<AcsFailure>,
+        fail_open: bool,
+    ) -> GuardrailVerdict {
+        let tag = failure.failure.bypass_tag();
+        if !matches!(failure.failure, AcsFailure::ConfigError) {
             tracing::warn!(
-                row = %self.row_name,
-                failure = ?failure,
+                guardrail_name = %self.row_name,
+                failure = ?failure.failure,
+                http_status = failure.http_status,
                 fail_open,
+                error = failure.error.as_deref(),
+                error_kind = failure.error_kind.map(tracing::field::display),
+                elapsed_ms = failure.elapsed_ms,
                 "azure content safety text moderation call failed",
             );
         }
         if fail_open {
             GuardrailVerdict::Bypass { reason: tag.into() }
         } else {
-            GuardrailVerdict::block(format!("azure content safety unavailable ({tag})"))
+            GuardrailVerdict::block_unavailable(
+                format!("azure content safety unavailable ({tag})"),
+                tag,
+            )
         }
     }
 
@@ -344,7 +367,7 @@ impl Guardrail for TextModerationGuardrail {
         )
     }
 
-    fn enforces_input(&self) -> bool {
+    fn runs_on_input(&self) -> bool {
         matches!(
             self.hook_point,
             GuardrailHookPoint::Input | GuardrailHookPoint::Both
@@ -352,7 +375,15 @@ impl Guardrail for TextModerationGuardrail {
     }
 
     fn checks_input_remotely(&self) -> bool {
-        self.enforces_input()
+        self.runs_on_input()
+    }
+
+    fn fails_closed_on_input(&self) -> bool {
+        !self.fail_open
+    }
+
+    fn fails_closed_on_output(&self) -> bool {
+        !self.output_fail_open
     }
 
     fn stream_output_policy(&self) -> StreamOutputPolicy {
@@ -365,6 +396,8 @@ impl Guardrail for TextModerationGuardrail {
             _ => StreamOutputPolicy::Window {
                 size_chars: self.window_size as usize,
                 overlap_chars: self.window_overlap_size as usize,
+                max_buffer_bytes: self.max_buffer_bytes as usize,
+                on_exceeded_fail_open: self.on_buffer_exceeded == "fail_open",
             },
         }
     }
@@ -398,47 +431,6 @@ impl Guardrail for TextModerationGuardrail {
         // Azure outage can't release unscanned model output.
         self.scan(&text, self.output_fail_open).await
     }
-}
-
-/// Split `text` into chunks of at most `max_chars` characters on
-/// whitespace boundaries. A single word over the limit is split into
-/// max_chars-sized pieces so the entire token is evaluated (#448).
-/// (Forked from `prompt_shield::chunk_text`; see the module note.)
-fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
-    if text.is_empty() {
-        return vec![];
-    }
-    if text.chars().count() <= max_chars {
-        return vec![text.to_owned()];
-    }
-    let mut chunks: Vec<String> = Vec::new();
-    let mut current = String::with_capacity(max_chars);
-    for word in text.split_whitespace() {
-        let word_chars = word.chars().count();
-        let sep = if current.is_empty() { 0usize } else { 1 };
-        if current.chars().count() + sep + word_chars > max_chars {
-            if !current.is_empty() {
-                chunks.push(std::mem::take(&mut current));
-            }
-            if word_chars > max_chars {
-                // Split the oversized token fully instead of truncating to
-                // the prefix, which let the trailing part bypass scanning.
-                let word_chars_vec: Vec<char> = word.chars().collect();
-                for piece in word_chars_vec.chunks(max_chars) {
-                    chunks.push(piece.iter().collect());
-                }
-                continue;
-            }
-        }
-        if !current.is_empty() {
-            current.push(' ');
-        }
-        current.push_str(word);
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
 }
 
 // ---------------------------------------------------------------------------
@@ -506,11 +498,14 @@ mod tests {
 
     fn resp(content: &str) -> ChatResponse {
         ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "r".into(),
             model: "m".into(),
             message: ChatMessage::assistant(content),
             finish_reason: FinishReason::Stop,
             usage: UsageStats::new(0, 0),
+            service_tier: None,
         }
     }
 
@@ -553,9 +548,17 @@ mod tests {
             g.stream_output_policy(),
             StreamOutputPolicy::Window {
                 size_chars: 10_000,
-                overlap_chars: 256
+                overlap_chars: 256,
+                max_buffer_bytes: 262_144,
+                on_exceeded_fail_open: false,
             }
         );
+        // Window mode carries the row's cap + on_exceeded policy too, for a
+        // relay that holds the whole response.
+        let mut gw = build("http://unused", true);
+        gw.max_buffer_bytes = 1000;
+        gw.on_buffer_exceeded = "fail_open".to_owned();
+        assert_eq!(gw.stream_output_policy().hold_cap(), Some((1000, true)),);
         // buffer_full mode surfaces the cap + on_exceeded policy.
         let mut g2 = build("http://unused", true);
         g2.stream_processing_mode = "buffer_full".to_owned();
@@ -635,7 +638,7 @@ mod tests {
     #[test]
     fn timeout_fail_open_true_returns_bypass() {
         let g = build("http://unused", true);
-        match g.handle_failure(AcsFailure::Timeout, true) {
+        match g.handle_failure(CallFailure::bare(AcsFailure::Timeout), true) {
             GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "azure_cs_timeout"),
             other => panic!("expected Bypass, got {other:?}"),
         }
@@ -648,7 +651,7 @@ mod tests {
         assert!(!g.output_fail_open, "output must default to fail-closed");
         // An output-side failure with fail_open=false must Block.
         assert!(g
-            .handle_failure(AcsFailure::Timeout, g.output_fail_open)
+            .handle_failure(CallFailure::bare(AcsFailure::Timeout), g.output_fail_open)
             .is_block());
     }
 
@@ -697,7 +700,7 @@ mod tests {
 
     #[tokio::test]
     async fn clean_input_returns_allow_and_sends_wire_shape() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:analyze"))
             .and(query_param("api-version", "2024-09-01"))
@@ -720,7 +723,7 @@ mod tests {
 
     #[tokio::test]
     async fn high_severity_input_returns_block() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:analyze"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -736,7 +739,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_5xx_fail_open_true_returns_bypass() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:analyze"))
             .respond_with(ResponseTemplate::new(500))
@@ -752,7 +755,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_5xx_fails_closed_by_default() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:analyze"))
             .respond_with(ResponseTemplate::new(500))
@@ -769,7 +772,7 @@ mod tests {
 
     #[tokio::test]
     async fn high_severity_output_returns_block() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:analyze"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -781,5 +784,83 @@ mod tests {
 
         let g = build(&server.uri(), true);
         assert!(g.check_output(&resp("violent output")).await.is_block());
+    }
+
+    /// A refused connection is logged with its cause, not just `IoError`
+    /// (AISIX-Cloud#1786).
+    #[tokio::test]
+    async fn refused_connection_logs_the_underlying_error() {
+        use crate::call_error::testing::*;
+        let endpoint = refused_endpoint();
+        let logged = capture_logs(|| async {
+            let g = build(&endpoint, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_refusal_logged(
+            &logged,
+            "azure content safety text moderation call failed",
+            &["test-key-abc"],
+        );
+    }
+
+    /// A response that does not decode is logged with where it failed, and
+    /// none of the text it quoted.
+    #[tokio::test]
+    async fn undecodable_response_logs_the_underlying_error() {
+        use crate::call_error::testing::*;
+        let server = undecodable_server("DECODE-REQ-1").await;
+        let uri = server.uri();
+        let logged = capture_logs(|| async {
+            let g = build(&uri, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_decode_logged(
+            &logged,
+            "azure content safety text moderation call failed",
+            "ServerError",
+        );
+    }
+
+    /// A 5xx is logged with its status (AISIX-Cloud#1786).
+    #[tokio::test]
+    async fn server_error_logs_the_status() {
+        use crate::call_error::testing::*;
+        let server = status_server(503).await;
+        let uri = server.uri();
+        let logged = capture_logs(|| async {
+            let g = build(&uri, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_status_logged(
+            &logged,
+            "azure content safety text moderation call failed",
+            503,
+        );
+    }
+
+    /// `timeout_ms` covers the response body, not just its headers: a body
+    /// that stalls ends the call as a timeout instead of hanging it.
+    #[tokio::test]
+    async fn stalled_body_times_out() {
+        use crate::call_error::testing::*;
+        let uri = stalled_body_server(200).await;
+        let logged = capture_logs(|| async {
+            let mut g = build(&uri, true);
+            g.timeout = Duration::from_millis(200);
+            let verdict =
+                tokio::time::timeout(Duration::from_secs(5), g.check_input(&req(PROMPT_MARKER)))
+                    .await
+                    .expect("the guardrail call must end at its own timeout");
+            assert!(verdict.is_bypass());
+        })
+        .await;
+        assert_stall_logged(
+            &logged,
+            "azure content safety text moderation call failed",
+            200,
+        );
     }
 }

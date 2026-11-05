@@ -6,18 +6,25 @@
 
 use super::a2a_agent::A2aAgent;
 use super::apikey::ApiKey;
+use super::budget::{Budget, BudgetPolicy};
 use super::cache_policy::CachePolicy;
 use super::claim_mapping::ClaimMapping;
 use super::guardrail::{Guardrail, GuardrailAttachment};
+use super::mcp_auth_settings::McpAuthSettings;
 use super::mcp_policy::McpPolicy;
 use super::mcp_server::McpServer;
 use super::model::Model;
 use super::observability_exporter::ObservabilityExporter;
 use super::oidc_provider::OidcProvider;
 use super::passthrough_route::PassthroughRoute;
+use super::pricing::Pricing;
 use super::provider_key::ProviderKey;
 use super::rate_limit_policy::RateLimitPolicy;
+use super::team::Team;
+use super::user::User;
+use crate::resource::ResourceEntry;
 use crate::snapshot::ResourceTable;
+use std::sync::Arc;
 
 /// Composite of every typed [`ResourceTable`] the gateway reads on the hot
 /// path. Cheap to construct empty; populated by the loader.
@@ -69,6 +76,36 @@ pub struct AisixSnapshot {
     /// proxy matches them after the typed routes (path) or before them
     /// (foreign `Host`).
     pub passthrough_routes: ResourceTable<PassthroughRoute>,
+    /// The environment's inbound MCP OAuth discovery identity:
+    /// `/aisix/<env>/mcp_auth_settings/<env-uuid>` — a singleton row
+    /// (cp-api keys it by the environment id). Together with at least
+    /// one enabled `oidc_providers` row it activates the `/mcp`
+    /// RFC 9728 discovery surface (AISIX-Cloud#1143).
+    pub mcp_auth_settings: ResourceTable<McpAuthSettings>,
+    /// The environment's own pricing documents:
+    /// `/aisix/<env>/pricing/<uuid>`. Indexed by `key`, and consulted
+    /// before [`AisixSnapshot::global_pricing`] so an organization can
+    /// override a catalog price.
+    pub pricing: ResourceTable<Pricing>,
+    /// The shared pricing catalog: `/aisix/global/pricing/<uuid>` — the
+    /// one collection the gateway reads from outside its own environment
+    /// prefix, and the only kind accepted there.
+    pub global_pricing: ResourceTable<Pricing>,
+    /// Team display names: `/aisix/<env>/teams/<team-id>`, keyed by the
+    /// id API keys carry in `team_id`. Read only to label telemetry —
+    /// see [`KeyOwnerNames`].
+    pub teams: ResourceTable<Team>,
+    /// Member display names: `/aisix/<env>/users/<user-id>`, keyed by the
+    /// id API keys carry in `user_id`. Read only to label telemetry —
+    /// see [`KeyOwnerNames`].
+    pub users: ResourceTable<User>,
+    /// Hard-stop budgets that apply in the environment:
+    /// `/aisix/<env>/budgets/<budget-id>`. The proxy decides every
+    /// request's budget locally from these rows.
+    pub budgets: ResourceTable<Budget>,
+    /// What budgeted traffic does while usage cannot reach the control
+    /// plane: `/aisix/<env>/budget_policy/<env-id>` — a singleton row.
+    pub budget_policy: ResourceTable<BudgetPolicy>,
 }
 
 impl AisixSnapshot {
@@ -93,6 +130,77 @@ impl AisixSnapshot {
             + self.oidc_providers.len()
             + self.claim_mappings.len()
             + self.passthrough_routes.len()
+            + self.mcp_auth_settings.len()
+            + self.pricing.len()
+            + self.global_pricing.len()
+            + self.teams.len()
+            + self.users.len()
+            + self.budgets.len()
+            + self.budget_policy.len()
+    }
+}
+
+/// The team and member documents an API key's `team_id` / `user_id` name,
+/// resolved once per request from the snapshot the request authenticated
+/// against.
+///
+/// The ONE resolution every telemetry label and every gauge-liveness check
+/// goes through: a label minted from one rule and judged live by another
+/// would retire live series or keep dead ones. Holds the rows rather than
+/// copies of their names, so resolving costs two map reads and no
+/// allocation.
+#[derive(Debug, Clone, Default)]
+pub struct KeyOwnerNames {
+    team: Option<Arc<ResourceEntry<Team>>>,
+    user: Option<Arc<ResourceEntry<User>>>,
+}
+
+impl KeyOwnerNames {
+    pub fn resolve(snap: &AisixSnapshot, key: &ApiKey) -> Self {
+        Self {
+            team: key
+                .team_id
+                .as_deref()
+                .and_then(|id| snap.teams.get_by_id(id)),
+            user: key
+                .user_id
+                .as_deref()
+                .and_then(|id| snap.users.get_by_id(id)),
+        }
+    }
+
+    /// The team's display name; `None` when the key names no team, no
+    /// `teams` document exists for it, or the document's name is empty.
+    pub fn team_name(&self) -> Option<&str> {
+        self.team
+            .as_ref()
+            .map(|e| e.value.name.as_str())
+            .filter(|n| !n.is_empty())
+    }
+
+    /// The member's display name. A `users` document for the key's
+    /// `user_id` is authoritative — an empty name there is unresolved, not
+    /// a reason to read the key. Only when no such document exists does the
+    /// key's own inline `user_name` apply, which is what a resources file
+    /// and a control plane that has not projected `users` yet provide.
+    pub fn user_name<'a>(&'a self, key: &'a ApiKey) -> Option<&'a str> {
+        match &self.user {
+            Some(e) => Some(e.value.name.as_str()).filter(|n| !n.is_empty()),
+            None => key.user_name.as_deref(),
+        }
+    }
+
+    /// The cost-attribution tags a request takes from documents: per tag
+    /// key, the key's own value, else the team's, else the member's
+    /// ([`crate::models::effective_tags`]). Only the key's own `team_id` /
+    /// `user_id` count. A JWT request overrides these per key with its
+    /// provider's `tag_claims`.
+    pub fn effective_tags(&self, key: &ApiKey) -> crate::models::Tags {
+        crate::models::effective_tags(
+            &key.tags,
+            self.team.as_ref().map(|e| &e.value.tags),
+            self.user.as_ref().map(|e| &e.value.tags),
+        )
     }
 }
 
@@ -111,6 +219,59 @@ mod tests {
             }"#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn owner_names_resolve_from_the_named_documents() {
+        let snap = AisixSnapshot::new();
+        let key = |json: &str| serde_json::from_str::<ApiKey>(json).unwrap();
+        let named = |name: &str| Team {
+            name: name.into(),
+            tags: Default::default(),
+            runtime_id: String::new(),
+        };
+        snap.teams
+            .insert(ResourceEntry::new("t-1", named("Platform"), 1));
+        snap.teams
+            .insert(ResourceEntry::new("t-empty", named(""), 1));
+        snap.users.insert(ResourceEntry::new(
+            "u-1",
+            User {
+                name: "Alice".into(),
+                tags: Default::default(),
+                runtime_id: String::new(),
+            },
+            1,
+        ));
+        snap.users.insert(ResourceEntry::new(
+            "u-empty",
+            User {
+                name: String::new(),
+                tags: Default::default(),
+                runtime_id: String::new(),
+            },
+            1,
+        ));
+
+        let k = key(r#"{"key_hash":"h","team_id":"t-1","user_id":"u-1","user_name":"inline"}"#);
+        let owner = KeyOwnerNames::resolve(&snap, &k);
+        assert_eq!(owner.team_name(), Some("Platform"));
+        // The users document wins over the key's own copy.
+        assert_eq!(owner.user_name(&k), Some("Alice"));
+
+        // No document: the inline name is the fallback; no team name.
+        let k = key(r#"{"key_hash":"h","team_id":"t-x","user_id":"u-x","user_name":"inline"}"#);
+        let owner = KeyOwnerNames::resolve(&snap, &k);
+        assert_eq!(owner.team_name(), None);
+        assert_eq!(owner.user_name(&k), Some("inline"));
+
+        // An empty name in a document is unresolved — not a reason to
+        // fall back to the key.
+        let k =
+            key(r#"{"key_hash":"h","team_id":"t-empty","user_id":"u-empty","user_name":"inline"}"#);
+        let owner = KeyOwnerNames::resolve(&snap, &k);
+        assert_eq!(owner.team_name(), None);
+        assert_eq!(owner.user_name(&k), None);
     }
 
     fn sample_apikey() -> ApiKey {

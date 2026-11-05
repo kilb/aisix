@@ -144,11 +144,17 @@ pub(crate) struct JobTarget {
     pub pk_entry: Arc<ResourceEntry<ProviderKey>>,
     pub secret: String,
     pub adapter: Adapter,
-    /// The ProviderKey's rendered `default_headers` plus the client headers
-    /// its `forward_client_headers` allowlist admits, resolved once when the
-    /// target is resolved so every round-trip on this surface (upload, poll,
-    /// download) sends the same set (#1112 / #1167).
+    /// The ProviderKey's rendered `default_headers`, resolved once when the
+    /// target is resolved so every round-trip on this surface (upload,
+    /// poll, download) sends the same set (#1112).
     pub extra_headers: Vec<(axum::http::HeaderName, axum::http::HeaderValue)>,
+    /// The client headers this ProviderKey's `forward_client_headers`
+    /// admits, resolved from the same inbound request and reused on the
+    /// same round-trips (AISIX-Cloud#1167). Kept beside `extra_headers`
+    /// because it OVERWRITES its slots while `extra_headers` merges with
+    /// skip-if-present — a forwarded credential is meant to displace the
+    /// gateway's own.
+    forwarded_client: aisix_gateway::ForwardedClientHeaders,
 }
 
 impl JobTarget {
@@ -214,11 +220,9 @@ pub(crate) fn resolve_target(
     let model_entry = match wanted {
         Some(name) => {
             let entry = crate::model_resolve::resolve_model(snapshot, name)
-                .ok_or_else(|| ProxyError::ModelNotFound(format!("model {name:?} not found")))?;
-            if !auth.key().can_access(name) {
-                return Err(ProxyError::ModelForbidden(format!(
-                    "api key is not authorized for model {name:?}"
-                )));
+                .ok_or_else(|| ProxyError::ModelNotFound(name.to_string()))?;
+            if !auth.key().can_access(snapshot, name) {
+                return Err(ProxyError::ModelForbidden(name.to_string()));
             }
             let m = &entry.value;
             if m.is_routing() || m.is_ensemble() || m.is_semantic() {
@@ -239,7 +243,7 @@ pub(crate) fn resolve_target(
                     && !m.is_ensemble()
                     && !m.is_semantic()
                     && !m.display_name.contains('*')
-                    && auth.key().can_access(&m.display_name)
+                    && auth.key().can_access(snapshot, &m.display_name)
                     && m.provider_key_id
                         .as_deref()
                         .and_then(|id| snapshot.provider_keys.get_by_id(id))
@@ -269,20 +273,22 @@ pub(crate) fn resolve_target(
     })?;
     let secret = crate::dispatch::require_api_key(&pk_entry.value, model)?.to_string();
 
-    let extra_headers =
-        aisix_gateway::resolve_extra_headers(&crate::dispatch::upstream_header_ctx(
-            &pk_entry.value,
-            &pk_entry.id,
-            model,
-            &model_entry.id,
-            client_ctx,
-        ));
+    let header_ctx = crate::dispatch::upstream_header_ctx(
+        &pk_entry.value,
+        &pk_entry.id,
+        model,
+        &model_entry.id,
+        client_ctx,
+    );
+    let forwarded_client = aisix_gateway::ForwardedClientHeaders::resolve(&header_ctx);
+    let extra_headers = aisix_gateway::resolve_default_headers(&header_ctx);
     Ok(JobTarget {
         model_entry,
         pk_entry,
         secret,
         adapter,
         extra_headers,
+        forwarded_client,
     })
 }
 
@@ -370,7 +376,8 @@ async fn send_upstream(
     body: UpstreamBody,
     request_id: &str,
 ) -> Result<(StatusCode, HeaderMap, Bytes), ProxyError> {
-    let client = crate::http_client::client_for(target.pk_entry.value.tls.as_ref());
+    let client =
+        crate::http_client::client_for(target.pk_entry.value.upstream_connection().as_ref());
     let mut builder = client.request(
         reqwest::Method::from_bytes(method.as_str().as_bytes())
             .map_err(|_| ProxyError::InvalidRequest("unsupported method".into()))?,
@@ -401,6 +408,11 @@ async fn send_upstream(
             headers.insert(name.clone(), value.clone());
         }
     }
+    // Last, and overwriting: an operator who forwards the caller's own
+    // credential into the slot the gateway just filled is choosing it over
+    // the gateway's, and the upstream must receive exactly one.
+    target.forwarded_client.apply(&mut headers);
+
     builder = builder.headers(headers);
 
     builder = match body {
@@ -418,33 +430,54 @@ async fn send_upstream(
         builder = builder.timeout(d);
     }
 
-    let resp = builder
-        .send()
-        .await
+    crate::attribution::note_upstream_wait_begin();
+    let sent = builder.send().await;
+    if sent.is_err() {
+        crate::attribution::note_upstream_wait_end(false);
+    }
+    let note_deployment = |status: u16| {
+        crate::attempt::RoutingTelemetry::record_deployment(state, &target.model_entry.id, status)
+    };
+    let resp = sent
         .map_err(|e| {
+            let err =
+                aisix_gateway::BridgeError::Transport(aisix_gateway::transport_error_message(&e));
+            note_deployment(err.http_status());
             crate::cooldown::note_failure(
                 &state.runtime_status,
                 &target.model_entry.id,
                 target.model_entry.value.cooldown.as_ref(),
-                aisix_gateway::BridgeError::Transport(aisix_gateway::transport_error_message(&e)),
+                err,
             )
         })
         .map_err(ProxyError::Bridge)?;
 
     let status = resp.status();
     let headers = resp.headers().clone();
-    let bytes = resp
-        .bytes()
-        .await
+    aisix_gateway::note_upstream_response(&headers);
+    let bytes = resp.bytes().await;
+    crate::attribution::note_upstream_wait_end(bytes.is_ok());
+    if let (false, Ok(body)) = (status.is_success(), &bytes) {
+        aisix_gateway::note_upstream_error_body(body);
+        crate::attribution::note_relayed_error_body(body);
+    }
+    let bytes = bytes
         .map_err(|e| {
+            let err = if status.is_success() {
+                aisix_gateway::upstream_body_read_error(&e)
+            } else {
+                aisix_gateway::BridgeError::upstream_body_unread(status.as_u16(), &e)
+            };
+            note_deployment(err.http_status());
             crate::cooldown::note_failure(
                 &state.runtime_status,
                 &target.model_entry.id,
                 target.model_entry.value.cooldown.as_ref(),
-                aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
+                err,
             )
         })
         .map_err(ProxyError::Bridge)?;
+    note_deployment(status.as_u16());
 
     Ok((
         StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -453,8 +486,6 @@ async fn send_upstream(
     ))
 }
 
-/// Run the resolved input-guardrail chain over an opaque blob (whole-body
-/// lossy text scan — the `/passthrough` precedent from #911 [6]).
 /// One multipart field of a `/v1/files` upload, held verbatim until the file
 /// body has been through the guardrail chain. The form cannot be assembled
 /// during the read: a `mask` rule rewrites the file part, and `reqwest`'s
@@ -555,12 +586,26 @@ async fn reserve_before_costly_scan(
         .await
 }
 
+/// Run the resolved input-guardrail chain over an opaque blob (whole-body
+/// lossy text scan — the `/passthrough` precedent from #911 [6]).
+#[allow(clippy::too_many_arguments)]
 async fn scan_input_blob(
     state: &ProxyState,
     auth: &AuthenticatedKey,
     target: &JobTarget,
     blob: &[u8],
     monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
+    // Accumulated rather than handed back as one handle: the input and
+    // output scans resolve their own chain, so a request can produce two
+    // audit logs (AISIX-Cloud#1330 / #1024).
+    enforced_hits: &mut Vec<aisix_core::GuardrailEnforcedHit>,
+    scores: &mut Vec<aisix_core::GuardrailScore>,
+    // The request's fail-open bypass tag, accumulated the same way and
+    // for the same reason. First one sticks, matching the chain folds.
+    bypass: &mut String,
+    // The applied set. Both scans resolve the same context, so the first
+    // non-empty chain's set is the request's.
+    applied: &mut Vec<aisix_core::AppliedGuardrail>,
     // `Some(..)` 表示这个 blob 是最终用户内容：`mask` 规则可以改写它，改写
     // 的计数就记进来。传计数槽本身就是开启遮蔽的开关 —— 于是「遮蔽了却没
     // 有审计痕迹」这种状态压根写不出来。
@@ -582,25 +627,42 @@ async fn scan_input_blob(
     if chain.is_empty() {
         return Ok(None);
     }
+    if applied.is_empty() {
+        *applied = chain.applied().to_vec();
+    }
     let chat = aisix_gateway::ChatFormat::new(
         target.display_name(),
         vec![aisix_gateway::ChatMessage::user(inspection_text(blob))],
     );
-    let (verdict, hits) = aisix_guardrails::Guardrail::check_input_observed(&chain, &chat).await;
+    let (verdict, hits) =
+        aisix_guardrails::Guardrail::check_input_unmaskable_observed(&chain, &chat).await;
     monitor_hits.extend(hits);
+    // Drained BEFORE the block branch: a `blocked` hit is exactly the one
+    // that leaves through `Err`, and the caller's `?` would drop it.
+    enforced_hits.extend(chain.enforced_hits());
+    scores.extend(chain.scores());
+    if bypass.is_empty() {
+        if let Some(reason) = chain.bypass_reason() {
+            *bypass = reason;
+        }
+    }
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
+        unavailable,
     } = verdict
     {
         tracing::warn!(
+            guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
             guardrail_hook = "input",
             model = %target.display_name(),
             reason = %reason,
             "guardrail blocked jobs request",
         );
-        return Err(ProxyError::ContentFiltered(
-            crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
+        return Err(crate::error::guardrail_block_error(
+            "request",
+            guardrail_name.as_deref(),
+            unavailable.as_deref(),
         ));
     }
 
@@ -618,9 +680,7 @@ async fn scan_input_blob(
         // 去。遮蔽规则在审查读的文本里有任何命中，就拒绝上传。
         if aisix_guardrails::Guardrail::redact_input_text(&chain, &inspection_text(blob)).is_some()
         {
-            return Err(ProxyError::ContentFiltered(
-                crate::error::guardrail_block_message("request", None),
-            ));
+            return Err(crate::error::guardrail_block_error("request", None, None));
         }
         return Ok(None);
     };
@@ -629,9 +689,7 @@ async fn scan_input_blob(
     // 有的行是 JSON 对象、有的行不是的文件也拒绝：两种改写方式都不对。
     if let Some(r) = crate::redact::redact_jsonl_upload(&chain, text) {
         if r.unrewritable {
-            return Err(ProxyError::ContentFiltered(
-                crate::error::guardrail_block_message("request", None),
-            ));
+            return Err(crate::error::guardrail_block_error("request", None, None));
         }
         // 转发的是逐行重新序列化、检查过的那份，改没改都一样（见
         // `redact_jsonl_upload`）。
@@ -646,13 +704,27 @@ async fn scan_input_blob(
     Ok(Some(r.text.into_bytes()))
 }
 
-/// Output-side twin of [`scan_input_blob`].
+/// Run the resolved output-guardrail chain over an upstream body, as one
+/// synthetic assistant turn. The body is decoded best-effort and relayed
+/// as the provider sent it.
+#[allow(clippy::too_many_arguments)]
 async fn scan_output_blob(
     state: &ProxyState,
     auth: &AuthenticatedKey,
     target: &JobTarget,
     blob: &[u8],
     monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
+    // Accumulated rather than handed back as one handle: the input and
+    // output scans resolve their own chain, so a request can produce two
+    // audit logs (AISIX-Cloud#1330 / #1024).
+    enforced_hits: &mut Vec<aisix_core::GuardrailEnforcedHit>,
+    scores: &mut Vec<aisix_core::GuardrailScore>,
+    // The request's fail-open bypass tag, accumulated the same way and
+    // for the same reason. First one sticks, matching the chain folds.
+    bypass: &mut String,
+    // The applied set. Both scans resolve the same context, so the first
+    // non-empty chain's set is the request's.
+    applied: &mut Vec<aisix_core::AppliedGuardrail>,
 ) -> Result<(), ProxyError> {
     let ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
@@ -665,28 +737,47 @@ async fn scan_output_blob(
     if chain.is_empty() {
         return Ok(());
     }
+    if applied.is_empty() {
+        *applied = chain.applied().to_vec();
+    }
     let synth = aisix_gateway::ChatResponse {
+        logprobs: None,
+        more_choices: Vec::new(),
         id: String::new(),
         model: target.display_name().to_string(),
         message: aisix_gateway::ChatMessage::assistant(String::from_utf8_lossy(blob).into_owned()),
         finish_reason: aisix_gateway::FinishReason::Stop,
         usage: aisix_gateway::UsageStats::default(),
+        service_tier: None,
     };
-    let (verdict, hits) = aisix_guardrails::Guardrail::check_output_observed(&chain, &synth).await;
+    let (verdict, hits) =
+        aisix_guardrails::Guardrail::check_output_unmaskable_observed(&chain, &synth).await;
     monitor_hits.extend(hits);
+    // See `scan_input_blob`.
+    enforced_hits.extend(chain.enforced_hits());
+    scores.extend(chain.scores());
+    if bypass.is_empty() {
+        if let Some(reason) = chain.bypass_reason() {
+            *bypass = reason;
+        }
+    }
     if let aisix_guardrails::GuardrailVerdict::Block {
         reason,
         guardrail_name,
+        unavailable,
     } = verdict
     {
         tracing::warn!(
+            guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
             guardrail_hook = "output",
             model = %target.display_name(),
             reason = %reason,
             "guardrail blocked jobs response",
         );
-        return Err(ProxyError::ContentFiltered(
-            crate::error::guardrail_block_message("response", guardrail_name.as_deref()),
+        return Err(crate::error::guardrail_block_error(
+            "response",
+            guardrail_name.as_deref(),
+            unavailable.as_deref(),
         ));
     }
     Ok(())
@@ -730,6 +821,20 @@ fn rewrite_response_ids(v: &mut Value, model: &str) {
 
 // ─────────────────────── telemetry plumbing ───────────────────────
 
+/// A multipart field joins the capture beside any earlier one of its name:
+/// every repeat is forwarded, so none may disappear from the export.
+fn push_captured(captured: &mut serde_json::Map<String, Value>, key: String, value: String) {
+    match captured.get_mut(&key) {
+        Some(Value::String(existing)) => {
+            existing.push('\n');
+            existing.push_str(&value);
+        }
+        _ => {
+            captured.insert(key, Value::String(value));
+        }
+    }
+}
+
 /// Zero-token UsageEvent for one management call (create/list/retrieve/
 /// cancel/delete). Same contract as the `/passthrough` event (#699),
 /// but with the resolved Model attributed.
@@ -738,7 +843,7 @@ fn emit_job_usage_event(
     state: &ProxyState,
     // The request's snapshot, loaded once by the handler (#941).
     snap: &aisix_core::AisixSnapshot,
-    label: &'static str,
+    surface: crate::operation::Surface,
     request_id: &str,
     auth: &AuthenticatedKey,
     target: &JobTarget,
@@ -748,37 +853,67 @@ fn emit_job_usage_event(
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     // 遮蔽只记类型和条数，不记被遮蔽的内容 —— 事件本身不能变成 PII 汇集点。
     redacted_entity_counts: crate::redact::RedactionCounts,
+    applied_guardrails: Vec<aisix_core::AppliedGuardrail>,
+    // What an ENFORCING guardrail actually did to this request
+    // (AISIX-Cloud#1330).
+    guardrail_enforced_hits: Vec<aisix_core::GuardrailEnforcedHit>,
+    guardrail_scores: Vec<aisix_core::GuardrailScore>,
+    guardrail_bypassed_reason: String,
 ) {
+    // A refused job call is answered with the upstream's own response, so no
+    // error reaches this point.
+    let (error_class, error_message) = if crate::attempt::relayed_response_failed(status_code) {
+        let (class, message) = crate::attempt::relayed_failure(
+            status_code,
+            &crate::attribution::relayed_error_body().unwrap_or_default(),
+        );
+        (class.to_string(), message)
+    } else {
+        Default::default()
+    };
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
-        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         model_id: target.model_entry.id.clone(),
         api_key_id: auth.entry.id.clone(),
         requested_model: target.display_name().to_string(),
+        // The jobs surface only routes to a direct model, which is the entry
+        // `requested_model` names here, including the auto-selected one.
+        requested_model_id: target.model_entry.id.clone(),
         status_code,
         // Single-attempt endpoint: the attempt spans the whole request, so
         // the upstream figure and what the caller waited for coincide.
-        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
-        downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        upstream_latency_ms: crate::attempt::measured_ms(elapsed),
+        downstream_latency_ms: crate::attempt::measured_ms(elapsed),
         inbound_protocol: "openai".to_string(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        request_headers: client.request_headers.clone(),
         guardrail_monitor_hits,
         redacted_entity_counts,
+        applied_guardrails,
+        guardrail_enforced_hits,
+        guardrail_scores,
+        guardrail_bypassed_reason,
+        error_class,
+        error_message,
         ..Default::default()
     };
-    crate::usage_attr::apply_pk_telemetry(
-        &mut event,
-        &crate::usage_attr::ResolvedPk::resolve(snap, &target.pk_entry.id),
-    );
-    crate::usage_attr::apply_jwt_identity(&mut event, auth.jwt.as_ref());
-    state.usage_sink.try_emit(label, event.clone());
-    let exporters = crate::usage_attr::live_exporters(state, snap);
-    state.otlp_fan_out.fan_out(
-        &event,
+    let pk = crate::usage_attr::ResolvedPk::resolve(snap, &target.pk_entry.id);
+    crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
+    crate::usage_attr::apply_caller_identity(&mut event, auth.jwt.as_ref(), &auth.caller());
+    let usage_model =
+        crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
+    crate::usage_attr::emit_usage(
+        state,
+        snap,
+        surface,
+        event,
+        crate::usage_attr::usage_event_labels(&usage_model, &pk),
         None,
-        exporters.generation(),
-        exporters.iter().map(|e| &*e.value),
+        client.trace.as_ref(),
+        /* terminal */ true,
+        /* dispatched */ true,
     );
 }
 
@@ -800,13 +935,17 @@ fn emit_access_log(
         }
         None => (None, None),
     };
-    AccessLog {
+    let log_target = crate::attribution::AccessLogTarget::current();
+    crate::attribution::emit_access_log(AccessLog {
         method: method.as_str(),
         path,
         status,
         latency: elapsed,
+        duration: elapsed,
         provider: target.map(|t| t.provider_label()).filter(|p| !p.is_empty()),
         model: target.map(|t| t.display_name()),
+        upstream_model: log_target.upstream_model(),
+        provider_key_id: log_target.provider_key_id(),
         api_key_id: Some(api_key_id),
         prompt_tokens: None,
         completion_tokens: None,
@@ -821,8 +960,11 @@ fn emit_access_log(
         routing_fallback_count: None,
         error_kind,
         error: error.as_deref(),
-    }
-    .emit();
+        mcp: None,
+        cache: None,
+        request_body_bytes: None,
+        response_body_bytes: None,
+    });
 }
 
 /// Shared success/error tail for every handler: access log, metrics,
@@ -831,7 +973,7 @@ fn emit_access_log(
 async fn finish(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
-    label: &'static str,
+    surface: crate::operation::Surface,
     method: Method,
     path: String,
     auth: &AuthenticatedKey,
@@ -841,6 +983,10 @@ async fn finish(
     result: Result<(Response, JobTarget), ProxyError>,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     redactions: crate::redact::RedactionCounts,
+    enforced_hits: Vec<aisix_core::GuardrailEnforcedHit>,
+    scores: Vec<aisix_core::GuardrailScore>,
+    bypass: String,
+    applied: Vec<aisix_core::AppliedGuardrail>,
 ) -> Response {
     let elapsed = started.elapsed();
     // `path` carries the real job/file id — bounded route template only.
@@ -868,12 +1014,13 @@ async fn finish(
                     ..Default::default()
                 },
                 status,
+                crate::attempt::relayed_error_source(status),
                 elapsed,
             );
             emit_job_usage_event(
                 state,
                 snapshot,
-                label,
+                surface,
                 &request_id,
                 auth,
                 &target,
@@ -882,6 +1029,10 @@ async fn finish(
                 client,
                 monitor_hits,
                 redactions,
+                applied,
+                enforced_hits,
+                scores,
+                bypass,
             );
             // 这条路和 /v1/chat/completions 花的是同一个 key 级配额桶
             // （`quota::enforce` 预留的就是请求级那几层），所以也得照实
@@ -911,6 +1062,7 @@ async fn finish(
         }
         Err(err) => {
             let status = err.status().as_u16();
+            crate::usage_attr::note_client_error(snapshot, &err);
             emit_access_log(
                 &method,
                 &path,
@@ -927,23 +1079,29 @@ async fn finish(
                 crate::request_metrics::Caller::new(auth),
                 crate::request_metrics::Upstream {
                     provider: "",
-                    model: label,
+                    model: surface.handler,
                     ..Default::default()
                 },
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
             crate::usage_attr::emit_error_usage_event(
                 state,
                 snapshot,
-                label,
+                surface,
                 "openai",
                 &request_id,
                 "",
                 &auth.entry.id,
                 status,
-                err.kind(),
+                crate::usage_attr::EventError::of(&err),
+                err.is_guardrail_block(),
                 client,
+                applied,
+                enforced_hits,
+                scores,
+                bypass,
             );
             err.into_response()
         }
@@ -1023,6 +1181,10 @@ pub(crate) async fn create_file(
     };
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut redactions = crate::redact::RedactionCounts::new();
+    let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
+    let mut scores: Vec<aisix_core::GuardrailScore> = Vec::new();
+    let mut bypass = String::new();
+    let mut applied: Vec<aisix_core::AppliedGuardrail> = Vec::new();
     // Loaded below, after the upload is drained — see the note in
     // `audio::multipart_dispatch` (#941 audit M2).
     let mut snapshot = None;
@@ -1036,6 +1198,10 @@ pub(crate) async fn create_file(
         // 变了样。
         let mut fields: Vec<UploadField> = Vec::new();
         let mut form_model: Option<String> = None;
+        // The upload as a failure row reports it: the text fields, with the
+        // file represented by its checksum (the audio convention).
+        let capture = crate::usage_attr::content_cap(&state.snapshot.load()).is_some();
+        let mut captured = serde_json::Map::new();
 
         while let Some(field) = multipart.next_field().await.map_err(|e| {
             crate::error::proxy_error_from_multipart(
@@ -1068,6 +1234,14 @@ pub(crate) async fn create_file(
                         "failed to read file field",
                     )
                 })?;
+                if capture {
+                    use sha2::Digest;
+                    push_captured(
+                        &mut captured,
+                        "file_sha256".to_string(),
+                        format!("{:x}", sha2::Sha256::digest(&bytes)),
+                    );
+                }
                 fields.push(UploadField::File {
                     file_name,
                     content_type,
@@ -1082,8 +1256,14 @@ pub(crate) async fn create_file(
                     "malformed multipart field",
                 )
             })?;
+            if capture {
+                push_captured(&mut captured, name.clone(), v.clone());
+            }
             fields.push(UploadField::Text(name, v));
         }
+
+        let snapshot = &**snapshot.insert(state.snapshot.load());
+        crate::usage_attr::note_failure_request(snapshot, || Value::Object(captured).to_string());
 
         if !fields.iter().any(|f| matches!(f, UploadField::File { .. })) {
             return Err(ProxyError::InvalidRequest(
@@ -1092,7 +1272,6 @@ pub(crate) async fn create_file(
         }
 
         let wanted = form_model.or_else(|| explicit_model(&params, &headers));
-        let snapshot = &**snapshot.insert(state.snapshot.load());
         let target = resolve_target(snapshot, &auth, wanted.as_deref(), &client)?;
 
         // Batch/fine-tune input files carry end-user content — scan them
@@ -1122,6 +1301,10 @@ pub(crate) async fn create_file(
                     &target,
                     bytes,
                     &mut monitor_hits,
+                    &mut enforced_hits,
+                    &mut scores,
+                    &mut bypass,
+                    &mut applied,
                     Some(&mut redactions),
                 )
                 .await?
@@ -1140,8 +1323,11 @@ pub(crate) async fn create_file(
                     content_type,
                     bytes,
                 } => {
-                    let body = masked.remove(&i).unwrap_or_else(|| bytes.to_vec());
-                    let mut part = reqwest::multipart::Part::bytes(body).file_name(file_name);
+                    // Over the `Bytes` itself, not a `Vec` copy of the file.
+                    let body = masked.remove(&i).map_or(bytes, Bytes::from);
+                    let len = body.len() as u64;
+                    let mut part = reqwest::multipart::Part::stream_with_length(body, len)
+                        .file_name(file_name);
                     if let Some(ct) = content_type {
                         part = part.mime_str(&ct).map_err(|e| {
                             ProxyError::InvalidRequest(format!("invalid file content-type: {e}"))
@@ -1155,6 +1341,7 @@ pub(crate) async fn create_file(
             Some(reservation) => reservation,
             None => reserve_target(&state, snapshot, &auth, &target).await?,
         };
+        crate::budget::gate(&state, snapshot).check_provider_key(&target.pk_entry.id)?;
 
         let url = upstream_url(&target, "/files", "")?;
         let (status, resp_headers, bytes) = send_upstream(
@@ -1166,7 +1353,6 @@ pub(crate) async fn create_file(
             &request_id,
         )
         .await?;
-        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits).await?;
         let model = target.display_name().to_string();
         Ok((
             json_response(status, &resp_headers, bytes, Some(&model)),
@@ -1180,7 +1366,7 @@ pub(crate) async fn create_file(
         // A form that failed before the model field was read never loaded
         // one.
         &snapshot.unwrap_or_else(|| state.snapshot.load()),
-        "files",
+        crate::operation::FILES,
         Method::POST,
         "/v1/files".into(),
         &auth,
@@ -1190,6 +1376,10 @@ pub(crate) async fn create_file(
         result,
         monitor_hits,
         redactions,
+        enforced_hits,
+        scores,
+        bypass,
+        applied,
     )
     .await
 }
@@ -1209,7 +1399,7 @@ pub(crate) async fn list_files(
         params,
         headers,
         FwdSpec {
-            label: "files",
+            surface: crate::operation::FILES,
             method: Method::GET,
             log_path: "/v1/files".into(),
             upstream_path: "/files".into(),
@@ -1239,7 +1429,7 @@ pub(crate) async fn get_file(
         params,
         headers,
         FwdSpec {
-            label: "files",
+            surface: crate::operation::FILES,
             method: Method::GET,
             log_path: format!("/v1/files/{id}"),
             upstream_path: format!("/files/{raw}"),
@@ -1269,7 +1459,7 @@ pub(crate) async fn delete_file(
         params,
         headers,
         FwdSpec {
-            label: "files",
+            surface: crate::operation::FILES,
             method: Method::DELETE,
             log_path: format!("/v1/files/{id}"),
             upstream_path: format!("/files/{raw}"),
@@ -1299,7 +1489,7 @@ pub(crate) async fn file_content(
         params,
         headers,
         FwdSpec {
-            label: "files",
+            surface: crate::operation::FILES,
             method: Method::GET,
             log_path: format!("/v1/files/{id}/content"),
             upstream_path: format!("/files/{raw}/content"),
@@ -1350,9 +1540,16 @@ pub(crate) async fn create_batch(
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     // 控制体路线只查不改：计数表恒空，仍然交给 `finish`，这样签名只有一份。
     let redactions = crate::redact::RedactionCounts::new();
+    let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
+    let mut scores: Vec<aisix_core::GuardrailScore> = Vec::new();
+    let mut bypass = String::new();
+    let mut applied: Vec<aisix_core::AppliedGuardrail> = Vec::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
+    crate::usage_attr::note_failure_request(&snapshot, || {
+        String::from_utf8_lossy(&body).into_owned()
+    });
 
     let result = async {
         let mut req_json: Value = serde_json::from_slice(&body)
@@ -1395,11 +1592,24 @@ pub(crate) async fn create_batch(
 
         let early_reservation =
             reserve_before_costly_scan(&state, &snapshot, &auth, &target).await?;
-        scan_input_blob(&state, &auth, &target, &out_body, &mut monitor_hits, None).await?;
+        scan_input_blob(
+            &state,
+            &auth,
+            &target,
+            &out_body,
+            &mut monitor_hits,
+            &mut enforced_hits,
+            &mut scores,
+            &mut bypass,
+            &mut applied,
+            None,
+        )
+        .await?;
         let _reservation = match early_reservation {
             Some(reservation) => reservation,
             None => reserve_target(&state, &snapshot, &auth, &target).await?,
         };
+        crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_entry.id)?;
 
         let url = upstream_url(&target, "/batches", "")?;
         let (status, resp_headers, bytes) = send_upstream(
@@ -1411,7 +1621,18 @@ pub(crate) async fn create_batch(
             &request_id,
         )
         .await?;
-        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits).await?;
+        scan_output_blob(
+            &state,
+            &auth,
+            &target,
+            &bytes,
+            &mut monitor_hits,
+            &mut enforced_hits,
+            &mut scores,
+            &mut bypass,
+            &mut applied,
+        )
+        .await?;
         let model = target.display_name().to_string();
         Ok((
             json_response(status, &resp_headers, bytes, Some(&model)),
@@ -1423,7 +1644,7 @@ pub(crate) async fn create_batch(
     finish(
         &state,
         &snapshot,
-        "batches",
+        crate::operation::BATCHES,
         Method::POST,
         "/v1/batches".into(),
         &auth,
@@ -1433,6 +1654,10 @@ pub(crate) async fn create_batch(
         result,
         monitor_hits,
         redactions,
+        enforced_hits,
+        scores,
+        bypass,
+        applied,
     )
     .await
 }
@@ -1451,6 +1676,10 @@ pub(crate) async fn get_batch(
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     // 控制体路线只查不改：计数表恒空，仍然交给 `finish`，这样签名只有一份。
     let redactions = crate::redact::RedactionCounts::new();
+    let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
+    let mut scores: Vec<aisix_core::GuardrailScore> = Vec::new();
+    let mut bypass = String::new();
+    let mut applied: Vec<aisix_core::AppliedGuardrail> = Vec::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
@@ -1473,6 +1702,7 @@ pub(crate) async fn get_batch(
             )),
         )
         .await?;
+        crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_entry.id)?;
 
         let url = upstream_url(&target, &format!("/batches/{raw}"), "")?;
         let (status, resp_headers, bytes) = send_upstream(
@@ -1484,7 +1714,18 @@ pub(crate) async fn get_batch(
             &request_id,
         )
         .await?;
-        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits).await?;
+        scan_output_blob(
+            &state,
+            &auth,
+            &target,
+            &bytes,
+            &mut monitor_hits,
+            &mut enforced_hits,
+            &mut scores,
+            &mut bypass,
+            &mut applied,
+        )
+        .await?;
 
         // Batch cost attribution (#720): first observation of a completed
         // batch downloads the output JSONL and emits real token usage.
@@ -1493,11 +1734,11 @@ pub(crate) async fn get_batch(
                 maybe_attribute_batch(
                     &state,
                     &auth,
+                    &client,
                     &target,
                     &raw,
                     &v,
                     reservation.spend_keys(),
-                    &client.user_agent,
                 );
             }
         }
@@ -1513,7 +1754,7 @@ pub(crate) async fn get_batch(
     finish(
         &state,
         &snapshot,
-        "batches",
+        crate::operation::BATCHES,
         Method::GET,
         format!("/v1/batches/{id}"),
         &auth,
@@ -1523,6 +1764,10 @@ pub(crate) async fn get_batch(
         result,
         monitor_hits,
         redactions,
+        enforced_hits,
+        scores,
+        bypass,
+        applied,
     )
     .await
 }
@@ -1543,7 +1788,7 @@ pub(crate) async fn cancel_batch(
         params,
         headers,
         FwdSpec {
-            label: "batches",
+            surface: crate::operation::BATCHES,
             method: Method::POST,
             log_path: format!("/v1/batches/{id}/cancel"),
             upstream_path: format!("/batches/{raw}/cancel"),
@@ -1572,7 +1817,7 @@ pub(crate) async fn list_batches(
         params,
         headers,
         FwdSpec {
-            label: "batches",
+            surface: crate::operation::BATCHES,
             method: Method::GET,
             log_path: "/v1/batches".into(),
             upstream_path: "/batches".into(),
@@ -1623,9 +1868,16 @@ pub(crate) async fn create_ft_job(
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     // 控制体路线只查不改：计数表恒空，仍然交给 `finish`，这样签名只有一份。
     let redactions = crate::redact::RedactionCounts::new();
+    let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
+    let mut scores: Vec<aisix_core::GuardrailScore> = Vec::new();
+    let mut bypass = String::new();
+    let mut applied: Vec<aisix_core::AppliedGuardrail> = Vec::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
+    crate::usage_attr::note_failure_request(&snapshot, || {
+        String::from_utf8_lossy(&body).into_owned()
+    });
 
     let result = async {
         let mut req_json: Value = serde_json::from_slice(&body)
@@ -1665,11 +1917,24 @@ pub(crate) async fn create_ft_job(
 
         let early_reservation =
             reserve_before_costly_scan(&state, &snapshot, &auth, &target).await?;
-        scan_input_blob(&state, &auth, &target, &out_body, &mut monitor_hits, None).await?;
+        scan_input_blob(
+            &state,
+            &auth,
+            &target,
+            &out_body,
+            &mut monitor_hits,
+            &mut enforced_hits,
+            &mut scores,
+            &mut bypass,
+            &mut applied,
+            None,
+        )
+        .await?;
         let _reservation = match early_reservation {
             Some(reservation) => reservation,
             None => reserve_target(&state, &snapshot, &auth, &target).await?,
         };
+        crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_entry.id)?;
 
         let url = upstream_url(&target, "/fine_tuning/jobs", "")?;
         let (status, resp_headers, bytes) = send_upstream(
@@ -1681,7 +1946,18 @@ pub(crate) async fn create_ft_job(
             &request_id,
         )
         .await?;
-        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits).await?;
+        scan_output_blob(
+            &state,
+            &auth,
+            &target,
+            &bytes,
+            &mut monitor_hits,
+            &mut enforced_hits,
+            &mut scores,
+            &mut bypass,
+            &mut applied,
+        )
+        .await?;
         let model = target.display_name().to_string();
         Ok((
             json_response(status, &resp_headers, bytes, Some(&model)),
@@ -1693,7 +1969,7 @@ pub(crate) async fn create_ft_job(
     finish(
         &state,
         &snapshot,
-        "fine_tuning",
+        crate::operation::FINE_TUNING,
         Method::POST,
         "/v1/fine_tuning/jobs".into(),
         &auth,
@@ -1703,6 +1979,10 @@ pub(crate) async fn create_ft_job(
         result,
         monitor_hits,
         redactions,
+        enforced_hits,
+        scores,
+        bypass,
+        applied,
     )
     .await
 }
@@ -1723,7 +2003,7 @@ pub(crate) async fn get_ft_job(
         params,
         headers,
         FwdSpec {
-            label: "fine_tuning",
+            surface: crate::operation::FINE_TUNING,
             method: Method::GET,
             log_path: format!("/v1/fine_tuning/jobs/{id}"),
             upstream_path: format!("/fine_tuning/jobs/{raw}"),
@@ -1753,7 +2033,7 @@ pub(crate) async fn cancel_ft_job(
         params,
         headers,
         FwdSpec {
-            label: "fine_tuning",
+            surface: crate::operation::FINE_TUNING,
             method: Method::POST,
             log_path: format!("/v1/fine_tuning/jobs/{id}/cancel"),
             upstream_path: format!("/fine_tuning/jobs/{raw}/cancel"),
@@ -1782,7 +2062,7 @@ pub(crate) async fn list_ft_jobs(
         params,
         headers,
         FwdSpec {
-            label: "fine_tuning",
+            surface: crate::operation::FINE_TUNING,
             method: Method::GET,
             log_path: "/v1/fine_tuning/jobs".into(),
             upstream_path: "/fine_tuning/jobs".into(),
@@ -1799,7 +2079,7 @@ pub(crate) async fn list_ft_jobs(
 // ─────────────────────── shared simple forward ───────────────────────
 
 struct FwdSpec {
-    label: &'static str,
+    surface: crate::operation::Surface,
     method: Method,
     log_path: String,
     upstream_path: String,
@@ -1826,13 +2106,22 @@ async fn forward_simple(
     let request_id = client.request_id.clone();
     let method = spec.method.clone();
     let log_path = spec.log_path.clone();
-    let label = spec.label;
+    let surface = spec.surface;
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     // 控制体路线只查不改：计数表恒空，仍然交给 `finish`，这样签名只有一份。
     let redactions = crate::redact::RedactionCounts::new();
+    let mut enforced_hits: Vec<aisix_core::GuardrailEnforcedHit> = Vec::new();
+    let mut scores: Vec<aisix_core::GuardrailScore> = Vec::new();
+    let mut bypass = String::new();
+    let mut applied: Vec<aisix_core::AppliedGuardrail> = Vec::new();
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
+    if let Some(body) = &spec.body {
+        crate::usage_attr::note_failure_request(&snapshot, || {
+            String::from_utf8_lossy(body).into_owned()
+        });
+    }
 
     let result = async {
         let embedded = match &spec.id {
@@ -1848,12 +2137,25 @@ async fn forward_simple(
         let early_reservation =
             reserve_before_costly_scan(&state, &snapshot, &auth, &target).await?;
         if let Some(body) = &spec.body {
-            scan_input_blob(&state, &auth, &target, body, &mut monitor_hits, None).await?;
+            scan_input_blob(
+                &state,
+                &auth,
+                &target,
+                body,
+                &mut monitor_hits,
+                &mut enforced_hits,
+                &mut scores,
+                &mut bypass,
+                &mut applied,
+                None,
+            )
+            .await?;
         }
         let _reservation = match early_reservation {
             Some(reservation) => reservation,
             None => reserve_target(&state, &snapshot, &auth, &target).await?,
         };
+        crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_entry.id)?;
 
         let query = forwardable_query(spec.raw_query.as_deref());
         let url = upstream_url(&target, &spec.upstream_path, &query)?;
@@ -1863,7 +2165,25 @@ async fn forward_simple(
         };
         let (status, resp_headers, bytes) =
             send_upstream(&state, &target, spec.method, &url, body, &request_id).await?;
-        scan_output_blob(&state, &auth, &target, &bytes, &mut monitor_hits).await?;
+        // The files surface answers with opaque payloads, not model output:
+        // a download is whatever the provider stored under an id. Screening
+        // it as one synthetic message is #1120's job, per record, through
+        // the ordinary response chain. An upload IS screened, line by line,
+        // in `create_file`.
+        if surface != crate::operation::FILES {
+            scan_output_blob(
+                &state,
+                &auth,
+                &target,
+                &bytes,
+                &mut monitor_hits,
+                &mut enforced_hits,
+                &mut scores,
+                &mut bypass,
+                &mut applied,
+            )
+            .await?;
+        }
 
         let resp = if spec.relay_raw_body {
             let mut resp = Response::builder()
@@ -1885,7 +2205,7 @@ async fn forward_simple(
     finish(
         &state,
         &snapshot,
-        label,
+        surface,
         method,
         log_path,
         &auth,
@@ -1895,19 +2215,52 @@ async fn forward_simple(
         result,
         monitor_hits,
         redactions,
+        enforced_hits,
+        scores,
+        bypass,
+        applied,
     )
     .await
 }
 
 // ─────────────────── batch completion attribution ───────────────────
 
+/// The service tier of one aggregated batch row: known only while every
+/// line folded into the row reports the same non-empty tier.
+#[derive(Default)]
+enum TierAgreement {
+    #[default]
+    NoLines,
+    Agreed(String),
+    Mixed,
+}
+
+impl TierAgreement {
+    fn observe(&mut self, line_tier: Option<&str>) {
+        let line_tier = line_tier.filter(|t| !t.is_empty());
+        *self = match (std::mem::take(self), line_tier) {
+            (Self::NoLines, Some(t)) => Self::Agreed(t.to_owned()),
+            (Self::Agreed(prev), Some(t)) if prev == t => Self::Agreed(prev),
+            _ => Self::Mixed,
+        };
+    }
+
+    fn agreed(&self) -> Option<&str> {
+        match self {
+            Self::Agreed(t) => Some(t),
+            Self::NoLines | Self::Mixed => None,
+        }
+    }
+}
+
 /// Deterministic UUIDv5 request_id for a batch attribution event.
 ///
-/// The `/dp/telemetry` contract requires `request_id` to be a UUID
-/// (the control plane rejects the event otherwise — and with it the whole flush),
-/// while attribution needs a *stable* id per (batch, model-slice) so
-/// re-emission after a DP restart + re-retrieve doesn't mint a new
-/// identity. UUIDv5 over the batch identity gives both.
+/// The same (batch, model-slice) always gets the same id: a restarted
+/// process or another replica re-emits a batch's rows under it, and the
+/// control plane drops the re-sent row at ingest by `(env_id, request_id)`
+/// while the original is still within usage retention. A UUID rather than a
+/// readable id keeps a synthesized batch row distinguishable from a
+/// caller-supplied request id.
 fn batch_attribution_request_id(raw_batch_id: &str, idx: usize, multi: bool) -> String {
     let name = if multi {
         format!("aisix:batch:{raw_batch_id}:{idx}")
@@ -1917,19 +2270,21 @@ fn batch_attribution_request_id(raw_batch_id: &str, idx: usize, multi: bool) -> 
     uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, name.as_bytes()).to_string()
 }
 
-/// First-completed-observation hook: dedup via the process-local billed
-/// set, then attribute usage in a detached task. The deterministic
-/// UUIDv5 `request_id` (see [`batch_attribution_request_id`]) keeps
-/// repeated emission (DP restart + re-retrieve) stable per
-/// (batch, model-slice) on the control plane side.
+/// First-completed-observation hook: claim the batch in the process-lifetime
+/// billed set (so this process attributes it once), then attribute usage in
+/// a detached task. Re-emission from a restarted process or another replica
+/// is deduplicated by the control plane on the deterministic `request_id`
+/// (see [`batch_attribution_request_id`]).
 fn maybe_attribute_batch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
+    // The request that observed completion — the same one the caller
+    // identity below is taken from.
+    client: &ClientContext,
     target: &JobTarget,
     raw_batch_id: &str,
     batch: &Value,
     spend_keys: Vec<String>,
-    user_agent: &str,
 ) {
     if batch.get("status").and_then(Value::as_str) != Some("completed") {
         return;
@@ -1957,23 +2312,40 @@ fn maybe_attribute_batch(
 
     let state = state.clone();
     let api_key_id = auth.entry.id.clone();
+    // The caller that observed the batch complete, resolved now: its
+    // member, team and tags are what the attribution rows carry, so with
+    // `tag_claims` the tags are the observer's, not the submitter's.
+    let caller = auth.caller();
     let jwt = auth.jwt.clone();
+    let request_headers = client.request_headers.clone();
     let model_id = target.model_entry.id.clone();
     let display_name = target.display_name().to_string();
-    let cost = target.model_entry.value.cost.clone();
+    // Resolved before the spawn, off the live snapshot, through the same
+    // index `least_cost` ranks with: `pricing_key` first, inline `cost`
+    // second. The completed batch is priced at what the model costs when
+    // its output is collected.
+    let snap = state.snapshot.load();
+    let cost = state
+        .pricing
+        .for_snapshot(&snap)
+        .resolve(&target.model_entry.value)
+        .cloned();
+    drop(snap);
     let pk_id = target.pk_entry.id.to_string();
     let secret = target.secret.clone();
     let adapter = target.adapter;
     let api_base = target.pk_entry.value.api_base.clone();
-    let pk_tls = target.pk_entry.value.tls.clone();
+    let pk_conn = target.pk_entry.value.upstream_connection();
     let raw_batch_id = raw_batch_id.to_string();
-    let user_agent = user_agent.to_string();
+    let user_agent = client.user_agent.clone();
 
     tokio::spawn(async move {
         if let Err(e) = attribute_batch_usage(
             &state,
             &api_key_id,
             jwt.as_ref(),
+            &caller,
+            &request_headers,
             &model_id,
             &display_name,
             cost.as_ref(),
@@ -1981,7 +2353,7 @@ fn maybe_attribute_batch(
             &secret,
             adapter,
             api_base.as_deref(),
-            pk_tls.as_ref(),
+            pk_conn.as_ref(),
             &raw_batch_id,
             &output_file_id,
             &spend_keys,
@@ -2008,6 +2380,8 @@ async fn attribute_batch_usage(
     state: &ProxyState,
     api_key_id: &str,
     jwt: Option<&std::sync::Arc<crate::auth::JwtIdentity>>,
+    caller: &aisix_gateway::CallerIdentity,
+    request_headers: &std::collections::BTreeMap<String, String>,
     model_id: &str,
     display_name: &str,
     cost: Option<&aisix_core::models::model::ModelCost>,
@@ -2015,7 +2389,7 @@ async fn attribute_batch_usage(
     secret: &str,
     adapter: Adapter,
     api_base: Option<&str>,
-    tls: Option<&aisix_core::models::provider_key::ProviderKeyTls>,
+    conn: Option<&aisix_core::models::provider_key::UpstreamConnection>,
     raw_batch_id: &str,
     output_file_id: &str,
     // 这次请求的花费桶键，取自 retrieve 时那次预留。批处理的钱是事后落账的，
@@ -2047,17 +2421,23 @@ async fn attribute_batch_usage(
         }
     };
 
-    let client = crate::http_client::client_for(tls);
+    let client = crate::http_client::client_for(conn);
     let mut builder = client.get(&url).timeout(BATCH_ATTRIBUTION_TIMEOUT);
     builder = match adapter {
         Adapter::AzureOpenai => builder.header("api-key", secret),
         _ => builder.header(header::AUTHORIZATION, format!("Bearer {secret}")),
     };
-    let resp = builder.send().await.map_err(|e| e.to_string())?;
+    let resp = builder
+        .send()
+        .await
+        .map_err(|e| aisix_gateway::transport_error_message(&e))?;
     if !resp.status().is_success() {
         return Err(format!("output file download returned {}", resp.status()));
     }
-    let body = resp.bytes().await.map_err(|e| e.to_string())?;
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| aisix_gateway::transport_error_message(&e))?;
 
     // Aggregate per provider-billed model (`response.body.model`).
     #[derive(Default)]
@@ -2065,7 +2445,10 @@ async fn attribute_batch_usage(
         prompt: u64,
         completion: u64,
         cached: u64,
+        modality: aisix_gateway::ModalityTokens,
+        total: crate::usage_attr::ReportedTotalSum,
         lines: u64,
+        service_tier: TierAgreement,
     }
     let mut per_model: std::collections::BTreeMap<String, Agg> = Default::default();
     for line in body.split(|b| *b == b'\n') {
@@ -2090,7 +2473,16 @@ async fn attribute_batch_usage(
         agg.prompt += prompt;
         agg.completion += completion;
         agg.cached += cached;
+        // Lines that counted nothing were skipped above.
+        agg.total.add(usage, true);
+        agg.modality =
+            agg.modality
+                .saturating_add(&aisix_gateway::ModalityTokens::from_openai_details(
+                    usage.get("prompt_tokens_details"),
+                    usage.get("completion_tokens_details"),
+                ));
         agg.lines += 1;
+        agg.service_tier.observe(resp_body["service_tier"].as_str());
     }
 
     if per_model.is_empty() {
@@ -2171,28 +2563,67 @@ async fn attribute_batch_usage(
     for (idx, (provider_model, agg)) in per_model.iter().enumerate() {
         let request_id = batch_attribution_request_id(raw_batch_id, idx, multi);
         let mut event = UsageEvent {
+            // NO-GUARDRAIL-CHAIN: a retroactive billing row for work the
+            // provider did inside a batch. There is no request here, so no
+            // chain was ever resolved and nothing could have been bypassed.
             request_id,
-            occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
             model_id: model_id.to_string(),
             api_key_id: api_key_id.to_string(),
             requested_model: display_name.to_string(),
+            // A batch dispatches to one direct model, which is the entry
+            // its caller addressed. Taken from the batch's own record, not
+            // looked up by name: the poll runs long after the request, and
+            // the model may have been renamed since.
+            requested_model_id: model_id.to_string(),
             prompt_tokens: agg.prompt.min(u32::MAX as u64) as u32,
             completion_tokens: agg.completion.min(u32::MAX as u64) as u32,
+            total_tokens: agg.total.recorded(),
             cached_prompt_tokens: agg.cached.min(u32::MAX as u64) as u32,
+            modality_tokens: agg.modality,
             status_code: 200,
             provider_model_version: provider_model.clone(),
+            // This path bypasses the emission chokepoint, so the bound it
+            // applies is applied here.
+            service_tier: agg
+                .service_tier
+                .agreed()
+                .map(|t| crate::chat::sanitize_tag(t.to_owned()))
+                .filter(|t| !t.is_empty()),
             cost_usd: slice_cost_usd(agg),
             inbound_protocol: "batch".to_string(),
+            // Set here rather than by the emit chokepoint: this path
+            // deliberately bypasses it (no live request, so no trace
+            // bundle), and both labels still come from one constant.
+            operation: crate::operation::BATCH_COMPLETION.operation.to_string(),
+            // Each slice has its own request id, so each is its own last row.
+            is_final_attempt: true,
+            request_headers: request_headers.clone(),
             ..Default::default()
         };
         crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
         // Attribution names the identity that observed completion — the
         // same caller the event's api_key_id already reflects.
-        crate::usage_attr::apply_jwt_identity(&mut event, jwt);
-        state.usage_sink.try_emit("batch", event.clone());
+        crate::usage_attr::apply_caller_identity(&mut event, jwt, caller);
+        let usage_model =
+            crate::usage_attr::usage_event_model_label(&snap, &event.requested_model).into_owned();
+        state.usage_sink.try_emit(
+            crate::operation::BATCH_COMPLETION.handler,
+            event.clone(),
+            crate::usage_attr::usage_event_labels(&usage_model, &pk),
+        );
+        // A background poll attributes usage after the fact — there is no
+        // live request and therefore no trace bundle; the exporter falls
+        // back to the legacy flat span (#1279).
+        let facts = std::sync::Arc::new(aisix_obs::SpanFacts {
+            upstream: crate::span_facts::upstream_facts(&snap, &event, pk_id),
+            ..Default::default()
+        });
         state.otlp_fan_out.fan_out(
             &event,
             None,
+            None,
+            Some(&facts),
             exporters.generation(),
             exporters.iter().map(|e| &*e.value),
         );
@@ -2218,8 +2649,10 @@ async fn attribute_batch_usage(
                     input: event.prompt_tokens,
                     output: event.completion_tokens,
                     total: event.prompt_tokens.saturating_add(event.completion_tokens),
+                    cached: event.cached_prompt_tokens,
                     spend_usd: event.cost_usd,
                     client_type: state.client_classifier.classify(user_agent),
+                    ..Default::default()
                 },
             );
         }
@@ -2309,11 +2742,13 @@ mod tests {
     fn cfg() -> ProxyConfig {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: Some(1_048_576),
+            request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),
+            expose_debug_headers: false,
             tls: None,
+            listeners: Vec::new(),
             thread_per_core: None,
             workers: None,
         }
@@ -2407,6 +2842,23 @@ mod tests {
     // ---- id codec ----
 
     #[test]
+    fn a_batch_row_has_a_tier_only_when_every_line_agrees() {
+        let fold = |lines: &[Option<&str>]| {
+            let mut t = TierAgreement::default();
+            for l in lines {
+                t.observe(*l);
+            }
+            t.agreed().map(str::to_owned)
+        };
+        assert_eq!(fold(&[Some("flex"), Some("flex")]).as_deref(), Some("flex"));
+        assert_eq!(fold(&[Some("flex"), Some("default")]), None);
+        assert_eq!(fold(&[Some("flex"), None]), None);
+        assert_eq!(fold(&[None, Some("flex")]), None);
+        assert_eq!(fold(&[Some("")]), None);
+        assert_eq!(fold(&[]), None);
+    }
+
+    #[test]
     fn batch_attribution_request_id_is_a_stable_uuid() {
         let single = batch_attribution_request_id("batch_1", 0, false);
         uuid::Uuid::parse_str(&single).expect("must be a UUID");
@@ -2459,6 +2911,23 @@ mod tests {
     // ---- files ----
 
     fn multipart_body(boundary: &str, model: Option<&str>) -> Vec<u8> {
+        multipart_body_with_file(boundary, model, br#"{"custom_id":"r1"}"#)
+    }
+
+    /// [`multipart_body`] with the `file` part's bytes chosen by the
+    /// caller, so a test can upload something that is not valid UTF-8.
+    fn multipart_body_with_file(boundary: &str, model: Option<&str>, file: &[u8]) -> Vec<u8> {
+        multipart_body_with_purpose(boundary, model, Some("batch"), file)
+    }
+
+    /// [`multipart_body_with_file`] with the declared `purpose` chosen by
+    /// the caller — `None` omits the field entirely.
+    fn multipart_body_with_purpose(
+        boundary: &str,
+        model: Option<&str>,
+        purpose: Option<&str>,
+        file: &[u8],
+    ) -> Vec<u8> {
         let mut b = Vec::new();
         if let Some(m) = model {
             b.extend_from_slice(
@@ -2468,25 +2937,29 @@ mod tests {
                 .as_bytes(),
             );
         }
+        if let Some(p) = purpose {
+            b.extend_from_slice(
+                format!(
+                    "--{boundary}\r\ncontent-disposition: form-data; name=\"purpose\"\r\n\r\n{p}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
         b.extend_from_slice(
             format!(
-                "--{boundary}\r\ncontent-disposition: form-data; name=\"purpose\"\r\n\r\nbatch\r\n"
+                "--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; filename=\"input.jsonl\"\r\ncontent-type: application/jsonl\r\n\r\n"
             )
             .as_bytes(),
         );
-        b.extend_from_slice(
-            format!(
-                "--{boundary}\r\ncontent-disposition: form-data; name=\"file\"; filename=\"input.jsonl\"\r\ncontent-type: application/jsonl\r\n\r\n{{\"custom_id\":\"r1\"}}\r\n"
-            )
-            .as_bytes(),
-        );
+        b.extend_from_slice(file);
+        b.extend_from_slice(b"\r\n");
         b.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
         b
     }
 
     #[tokio::test]
     async fn create_file_routes_by_form_model_and_encodes_response_id() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .and(path("/v1/files"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2555,7 +3028,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_content_relays_bytes_with_query_model_routing() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("GET"))
             .and(path("/v1/files/file-raw/content"))
             .respond_with(
@@ -2591,8 +3064,8 @@ mod tests {
         // Two providers; the encoded file id names model B — the request
         // must land on upstream B with the RAW file id and no gateway
         // routing fields.
-        let upstream_a = MockServer::start().await;
-        let upstream_b = MockServer::start().await;
+        let upstream_a = MockServer::builder().start().await;
+        let upstream_b = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .and(path("/v1/batches"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2663,7 +3136,7 @@ mod tests {
     /// 得到 10*0.01 + 5*0.02 = $0.20。
     #[tokio::test]
     async fn batch_cached_tokens_are_priced_at_the_cache_rate() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("GET"))
             .and(path("/v1/batches/batch_1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2738,7 +3211,7 @@ mod tests {
     /// series（总量不变），每片的确切模型名留在事件的 `provider_model_version`。
     #[tokio::test]
     async fn batch_metric_labels_come_from_config_not_from_the_output_lines() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("GET"))
             .and(path("/v1/batches/batch_1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2833,7 +3306,7 @@ mod tests {
     /// 本来就要求的形态（见 `granted_micro_usd` 的字段说明）。
     #[tokio::test]
     async fn a_replayed_batch_attribution_re_emits_the_event_but_not_the_counters() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("GET"))
             .and(path("/v1/batches/batch_1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2907,7 +3380,7 @@ mod tests {
 
     #[tokio::test]
     async fn completed_batch_retrieve_attributes_usage_once() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("GET"))
             .and(path("/v1/batches/batch_1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2924,6 +3397,7 @@ mod tests {
             "custom_id": "r1",
             "response": {"status_code": 200, "body": {
                 "model": "gpt-4o-2024-08-06",
+                "service_tier": "default",
                 "usage": {"prompt_tokens": 10, "completion_tokens": 5,
                            "prompt_tokens_details": {"cached_tokens": 2}}
             }}
@@ -2933,6 +3407,7 @@ mod tests {
             "custom_id": "r2",
             "response": {"status_code": 200, "body": {
                 "model": "gpt-4o-2024-08-06",
+                "service_tier": "default",
                 "usage": {"prompt_tokens": 7, "completion_tokens": 3}
             }}
         });
@@ -2999,33 +3474,38 @@ mod tests {
             agg.request_id,
             batch_attribution_request_id("batch_1", 0, false)
         );
+        assert!(agg.is_final_attempt, "a batch row stands for itself");
         assert_eq!(agg.prompt_tokens, 17);
         assert_eq!(agg.completion_tokens, 8);
         assert_eq!(agg.cached_prompt_tokens, 2);
         assert_eq!(agg.provider_model_version, "gpt-4o-2024-08-06");
+        // Every line of the row reported the same tier.
+        assert_eq!(agg.service_tier.as_deref(), Some("default"));
         assert_eq!(agg.requested_model, "jobs-a");
 
-        // Second retrieve: management event only — the attribution is
-        // process-deduped.
-        let resp = app.clone().oneshot(mk_req()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-            .await
-            .expect("management event expected")
-            .expect("sink closed");
-        assert_ne!(ev.inbound_protocol, "batch");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            rx.try_recv().is_err(),
-            "no second aggregated event for the same batch"
-        );
+        // Every later retrieve: management event only — this process
+        // attributes a batch once for as long as it runs.
+        for _ in 0..3 {
+            let resp = app.clone().oneshot(mk_req()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .expect("management event expected")
+                .expect("sink closed");
+            assert_ne!(ev.inbound_protocol, "batch");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                rx.try_recv().is_err(),
+                "no second aggregated event for the same batch"
+            );
+        }
     }
 
     // ---- fine-tuning ----
 
     #[tokio::test]
     async fn ft_create_routes_by_training_file_and_reencodes_ids() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .and(path("/v1/fine_tuning/jobs"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3084,7 +3564,7 @@ mod tests {
 
     #[tokio::test]
     async fn azure_adapter_uses_api_key_header_and_resource_scoped_path() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("GET"))
             .and(path("/openai/batches/batch_az"))
             .and(query_param("api-version", AZURE_JOBS_API_VERSION))
@@ -3228,7 +3708,7 @@ mod tests {
     /// 真实请求来断言可观测到的那一面。
     #[tokio::test]
     async fn a_job_route_reports_the_window_it_spent() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .and(path("/v1/batches"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3307,7 +3787,7 @@ mod tests {
     /// #932 half-wiring, one endpoint later.
     #[tokio::test]
     async fn a_mask_rule_rewrites_the_uploaded_file_before_it_leaves() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .and(path("/v1/files"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3327,7 +3807,7 @@ mod tests {
             r#"{"name":"mask-email","enabled":true,"hook_point":"input","kind":"pii","detectors":[{"type":"email","action":"mask"}]}"#,
         )
         .unwrap();
-        snap.guardrails.insert(ResourceEntry::new("g-mask", g, 1));
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-mask", g, 1));
         let (app, mut rx) = build_app_with_sink(snap);
 
         let boundary = "XBOUNDARYX";
@@ -3399,7 +3879,7 @@ mod tests {
     /// 在 email mask 规则下上传一个文件部件，返回状态码与上游收到的 body
     /// （没有转发时为 `None`）。
     async fn upload_bytes_under_email_mask(payload: &[u8]) -> (StatusCode, Option<Vec<u8>>) {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .and(path("/v1/files"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3416,7 +3896,7 @@ mod tests {
             r#"{"name":"mask-email","enabled":true,"hook_point":"input","kind":"pii","detectors":[{"type":"email","action":"mask"}]}"#,
         )
         .unwrap();
-        snap.guardrails.insert(ResourceEntry::new("g-mask", g, 1));
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-mask", g, 1));
         let app = build_app(snap);
 
         let boundary = "XBINX";
@@ -3493,7 +3973,7 @@ mod tests {
     /// 用户上传的东西，比漏遮蔽还糟。
     #[tokio::test]
     async fn two_file_parts_keep_the_scan_and_the_rewrite_on_the_same_one() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .and(path("/v1/files"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3510,7 +3990,7 @@ mod tests {
             r#"{"name":"mask-email","enabled":true,"hook_point":"input","kind":"pii","detectors":[{"type":"email","action":"mask"}]}"#,
         )
         .unwrap();
-        snap.guardrails.insert(ResourceEntry::new("g-mask", g, 1));
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-mask", g, 1));
         let app = build_app(snap);
 
         let boundary = "XTWOX";
@@ -3562,7 +4042,7 @@ mod tests {
         guardrail: &str,
         parts: &[(&str, &str)],
     ) -> (StatusCode, String) {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .and(path("/v1/files"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3575,7 +4055,7 @@ mod tests {
         snap.models.insert(model("m-a", "jobs-a", PK_A));
         snap.apikeys.insert(apikey_entry(&["*"]));
         let g: aisix_core::Guardrail = serde_json::from_str(guardrail).unwrap();
-        snap.guardrails.insert(ResourceEntry::new("g-1", g, 1));
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-1", g, 1));
         let app = build_app(snap);
         let boundary = "XGRX";
         let mut b = format!(
@@ -3661,5 +4141,276 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// GBK bytes for 你好 inside an otherwise well-formed JSONL line.
+    /// `0xC4` opens a two-byte sequence and `0xE3` is not a continuation
+    /// byte, so the blob does not decode as UTF-8. It also carries
+    /// `custom_id`, the literal [`seed_blocking_input_guardrail`] blocks
+    /// on, so one upload exercises both ways a scan of the whole blob
+    /// could stop it.
+    const BLOB_UPLOAD: &[u8] = b"{\"custom_id\":\"r1\",\"note\":\"\xc4\xe3\xba\xc3\"}";
+
+    /// A fail-closed input row matching `custom_id`, which every request
+    /// fixture below carries. The files surface must forward regardless;
+    /// `a_batch_create_is_still_screened` is what proves the literal still
+    /// matches, so a pattern that quietly stopped matching cannot turn the
+    /// forwarding assertions into tautologies.
+    fn seed_blocking_input_guardrail(snap: &AisixSnapshot) {
+        let g: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"blocks-a-term","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"custom_id"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(
+            snap,
+            aisix_core::resource::ResourceEntry::new("g-in", g, 1),
+        );
+    }
+
+    /// The response-side counterpart, matching `forbidden-term`, which
+    /// every response fixture below carries.
+    /// `a_fine_tuning_job_read_is_still_screened` pins that it matches.
+    fn seed_blocking_output_guardrail(snap: &AisixSnapshot) {
+        let g: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"blocks-a-term","enabled":true,"hook_point":"output","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"forbidden-term"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(
+            snap,
+            aisix_core::resource::ResourceEntry::new("g-out", g, 1),
+        );
+    }
+
+    fn upload_request_with_purpose(
+        boundary: &str,
+        purpose: Option<&str>,
+        file: &[u8],
+    ) -> Request<axum::body::Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/files")
+            .header("authorization", "Bearer sk-caller")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(multipart_body_with_purpose(
+                boundary,
+                Some("jobs-a"),
+                purpose,
+                file,
+            )))
+            .unwrap()
+    }
+
+    fn files_upstream_mock() -> Mock {
+        Mock::given(wm_method("POST"))
+            .and(path("/v1/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "file-abc",
+                "object": "file",
+                "purpose": "batch",
+                "filename": "forbidden-term.jsonl"
+            })))
+    }
+
+    /// An upload reaches the provider whatever the chain says, under every
+    /// class of declared `purpose`: one whose payload is contractually
+    /// JSONL, one that legitimately carries binary, and none at all. The
+    /// fixture is both undecodable AND a policy hit, so each leg covers
+    /// the two ways a whole-blob scan used to stop an upload.
+    ///
+    /// The usage event must not claim a bypass either: nothing offered to
+    /// screen this request, which is not the same as a check that ran and
+    /// was let past.
+    #[tokio::test]
+    async fn an_upload_is_forwarded_under_every_purpose_class() {
+        for purpose in [Some("batch"), Some("assistants"), None] {
+            let upstream = MockServer::builder().start().await;
+            files_upstream_mock().expect(1).mount(&upstream).await;
+
+            let snap = AisixSnapshot::new();
+            snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+            snap.models.insert(model("m-a", "jobs-a", PK_A));
+            snap.apikeys.insert(apikey_entry(&["*"]));
+            seed_blocking_input_guardrail(&snap);
+            let (app, mut rx) = build_app_with_sink(snap);
+
+            let resp = app
+                .oneshot(upload_request_with_purpose(
+                    "XBOUNDARYX",
+                    purpose,
+                    BLOB_UPLOAD,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "purpose {purpose:?}");
+
+            let received = upstream.received_requests().await.unwrap();
+            assert_eq!(received.len(), 1, "purpose {purpose:?}");
+            assert!(
+                received[0]
+                    .body
+                    .windows(BLOB_UPLOAD.len())
+                    .any(|w| w == BLOB_UPLOAD),
+                "purpose {purpose:?}: the original bytes must forward byte-for-byte"
+            );
+
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("/v1/files must emit a usage event")
+                .expect("channel open");
+            assert!(
+                ev.guardrail_enforced_hits.is_empty(),
+                "purpose {purpose:?}: {ev:?}"
+            );
+            assert_eq!(
+                ev.guardrail_bypassed_reason, "",
+                "purpose {purpose:?}: nothing offered to screen this request, \
+                 so nothing was bypassed: {ev:?}"
+            );
+        }
+    }
+
+    /// The upload's response is relayed too. The row matches `input.jsonl`,
+    /// which the provider echoes back as the stored file's `filename`.
+    #[tokio::test]
+    async fn an_upload_response_is_relayed_past_a_blocking_output_row() {
+        let upstream = MockServer::builder().start().await;
+        files_upstream_mock().expect(1).mount(&upstream).await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        seed_blocking_output_guardrail(&snap);
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(upload_request_with_purpose(
+                "XBOUNDARYX",
+                Some("batch"),
+                br#"{"custom_id":"r1"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["filename"], "forbidden-term.jsonl");
+    }
+
+    /// And a download: `GET /v1/files/{id}/content` relays the provider's
+    /// bytes verbatim, matching row or not.
+    #[tokio::test]
+    async fn a_file_download_is_relayed_past_a_blocking_output_row() {
+        const STORED: &[u8] = b"{\"custom_id\":\"r1\",\"note\":\"forbidden-term\"}\n";
+
+        let upstream = MockServer::builder().start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/files/file-abc/content"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(STORED))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        seed_blocking_output_guardrail(&snap);
+        let app = build_app(snap);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/files/file-abc/content?model=jobs-a")
+            .header("authorization", "Bearer sk-caller")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert_eq!(bytes.as_ref(), STORED);
+    }
+
+    /// The scope boundary, request side: `/v1/batches` sends a serialised
+    /// JSON request body, which is a different thing from a caller's
+    /// uploaded blob and is still screened.
+    #[tokio::test]
+    async fn a_batch_create_is_still_screened() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(wm_method("POST"))
+            .and(path("/v1/batches"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "batch_777",
+                "object": "batch",
+                "status": "validating"
+            })))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        seed_blocking_input_guardrail(&snap);
+        let app = build_app(snap);
+
+        let body = serde_json::json!({
+            "input_file_id": encode_routed_id("file-real", "jobs-a"),
+            "endpoint": "/v1/chat/completions",
+            "completion_window": "24h",
+            "metadata": { "note": "custom_id" }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/batches")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter", "{v}");
+    }
+
+    /// The scope boundary, response side. Fine-tuning reads share
+    /// `forward_simple` with the files reads, so this is what fails if the
+    /// files surface is exempted by deleting that scan rather than by
+    /// naming the surface it belongs to.
+    #[tokio::test]
+    async fn a_fine_tuning_job_read_is_still_screened() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/fine_tuning/jobs/ftjob-9"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "ftjob-9",
+                "object": "fine_tuning.job",
+                "status": "forbidden-term"
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        seed_blocking_output_guardrail(&snap);
+        let app = build_app(snap);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/fine_tuning/jobs/ftjob-9?model=jobs-a")
+            .header("authorization", "Bearer sk-caller")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter", "{v}");
     }
 }

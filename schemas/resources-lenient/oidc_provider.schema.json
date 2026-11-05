@@ -1,0 +1,132 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "BoundClaimExpect": {
+      "anyOf": [
+        {
+          "description": "The claim must equal (or, for array claims, contain) this value.",
+          "type": "string"
+        },
+        {
+          "description": "The claim must equal (or, for array claims, contain) at least one of these values.",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      ],
+      "description": "Expected value(s) for one bound claim: a single string, or a list matched as any-of."
+    },
+    "OidcLogin": {
+      "description": "The OAuth client the gateway signs users in with at this identity provider, for MCP clients that present no gateway credential.",
+      "properties": {
+        "client_id": {
+          "description": "Client identifier registered at the identity provider. Its redirect URI is the gateway's public address followed by `/mcp-oauth/login/callback`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "client_secret": {
+          "description": "Client secret, sent to the token endpoint in the request body. Omit it for a public client.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "scopes": {
+          "description": "Scopes to request beside `openid` and the provider's `required_scopes`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "client_id"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "audiences": {
+      "description": "Accepted `aud` values. The token's audience (a string or an array) must contain at least one of these. Required unless `hmac_secret` is set; when a shared-secret provider omits it, the `aud` claim is ignored.\n\nAn empty list means exactly what omitting the field means — it carries no `minItems`, deliberately. The runtime reads \"no accepted audiences\" off `is_empty()`, so a schema that rejected `[]` would make the two planes disagree about what an empty list means and kill the whole row over a projection that spelled \"unset\" the other way. What stays rejected is a JWKS provider with no audiences at all, which `validate_semantics` owns.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "bound_claims": {
+      "additionalProperties": {
+        "$ref": "#/definitions/BoundClaimExpect"
+      },
+      "description": "Additional claim requirements, all of which must hold. Keys name claims (read as one claim of exactly that name, then with dots traversing nested objects, e.g. `\"realm_access.roles\"`); each requirement is satisfied when the claim equals — or, for array claims, contains — one of the expected values.",
+      "type": "object"
+    },
+    "enabled": {
+      "default": true,
+      "description": "Whether the provider participates in JWT authentication. A disabled provider is kept but ignored. Treated as `true` when omitted.",
+      "type": "boolean"
+    },
+    "hmac_secret": {
+      "description": "Shared secret for HMAC-signed tokens, whose presence selects HMAC verification for this provider. Its UTF-8 bytes are the HMAC key as-is — nothing is base64-decoded or derived — and it must be at least 32 bytes long. Tokens are then accepted only under `HS256`, `HS384` or `HS512`, no signing keys are fetched, and `issuer` / `audiences` become optional. Omit it for a standard OIDC provider whose tokens are verified against a JWKS.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "identity_claim": {
+      "default": "sub",
+      "description": "Claim whose value selects the API key to act as: the request is bound to the key whose `jwt_subject` equals this claim's value. The value is first read as one claim of exactly this name, then with dots traversing nested objects (e.g. `\"resource_access.account\"`). Defaults to `sub`.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "issuer": {
+      "description": "Expected `iss` claim, compared byte-for-byte against the token's issuer. A JWT carrying this issuer is verified against this provider and no other. Required unless `hmac_secret` is set; when a shared-secret provider omits it, the token's `iss` claim is not consulted at all.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "jwks_uri": {
+      "description": "JWKS endpoint URL the signing keys are fetched from. When omitted, the endpoint is resolved once from the issuer's OIDC discovery document (`<issuer>/.well-known/openid-configuration`) and cached. Must be absent when `hmac_secret` is set — a shared-secret provider fetches no keys.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "leeway_secs": {
+      "description": "Clock-skew allowance in seconds applied to time-based claims (`exp`, `nbf`). Defaults to 0.",
+      "format": "uint64",
+      "maximum": 300.0,
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "login": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/OidcLogin"
+        }
+      ],
+      "description": "Signs users in at this provider when they connect an MCP client with no gateway credential to an MCP server with `auth_type: oauth2_authorization_code`. When exactly one enabled provider in the environment has it, every such server uses this sign-in; when none does, those servers keep relaying the client's sign-in and need a gateway credential. Usable only on an enabled provider with `issuer` and no `hmac_secret`, whose endpoints come from the issuer's OIDC discovery document. A second enabled provider with it, or one on a provider that cannot use it, makes sign-in fail with `mcp_oauth_misconfigured`. The gateway checks the ID token's audience against `client_id`, so `audiences` need not list it."
+    },
+    "name": {
+      "description": "Human-readable provider name, unique within the environment (e.g. `\"corp-keycloak\"`).",
+      "minLength": 1,
+      "type": "string"
+    },
+    "required_scopes": {
+      "description": "Scopes that must all be present in the token's `scope` claim (a space-delimited string or an array of strings). An empty list requires nothing.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "tag_claims": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Cost-attribution tags read from the verified token, as tag key to claim path — for example `{\"department\": \"department\", \"subsidiary\": \"org.subsidiary\"}`. For each request this provider authenticates, the value a path yields takes precedence, per tag key, over the `tags` of the API key, its team and its member; a session from an MCP client's sign-in reads the claims recorded at sign-in. The token is not written back to any of those documents.\n\nA path is first read as one claim of exactly that name, then with dots traversing nested objects. A string is used as is and a number as its JSON text. An array of strings and numbers becomes its distinct values, sorted and joined with commas. Any other value, an empty array, or a value, array element or joined result that is not 1 to 128 characters, contains a control character, or starts or ends with whitespace yields nothing, and the tag key keeps the value the API key, team or member gives it.\n\nKeys match `^[a-z][a-z0-9_]{0,62}$`, paths are non-empty, and at most 32 entries are allowed. Omitted or empty means tags are not read from tokens.",
+      "type": [
+        "object",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "name"
+  ],
+  "title": "OidcProvider",
+  "type": "object"
+}

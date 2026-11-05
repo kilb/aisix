@@ -10,11 +10,24 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  type CallToolResult,
 } from "@modelcontextprotocol/sdk/types.js";
 
 export interface McpUpstream {
   /** Streamable HTTP endpoint of this upstream (`http://127.0.0.1:<port>/mcp`). */
   url: string;
+  /**
+   * Raw request bodies this upstream received, in arrival order — exactly
+   * the bytes the gateway's MCP client sent, so a masking suite can
+   * byte-diff what reached the upstream.
+   */
+  received: string[];
+  /**
+   * Request headers this upstream received, lowercased, in the same
+   * arrival order as `received` — what a header-forwarding suite asserts
+   * on.
+   */
+  receivedHeaders: Record<string, string>[];
   close(): Promise<void>;
 }
 
@@ -26,6 +39,33 @@ export interface McpUpstreamOptions {
    * every other suite asserts on stays `echo` + `reverse`.
    */
   structuredTool?: boolean;
+  /**
+   * Also expose a `report` tool returning fixed rich content regardless of
+   * its arguments: a text summary block, an embedded resource carrying
+   * `log` as `resource.text` (the natural shape for a compile/sim log),
+   * and a `structuredContent` object with a `log` string leaf plus a
+   * numeric field. The mask write-back suite owns the strings.
+   */
+  reportContent?: { summary: string; log: string; structuredLog: string };
+  /**
+   * Also expose a `count` tool that answers with a constant text block and
+   * `structuredContent: { count: <n> }`, `n` being its numeric `n`
+   * argument — a tool result carrying a JSON number rather than a string.
+   */
+  numericTool?: boolean;
+  /**
+   * Also expose a `media` tool answering with exactly these content blocks and
+   * this `structuredContent`, marked `isError` when its `failed` argument is
+   * true.
+   */
+  mediaResult?: { content: unknown[]; structuredContent?: Record<string, unknown> };
+  /**
+   * Answer `401` (with a bare `WWW-Authenticate: Bearer`) to any request
+   * whose `Authorization` this predicate rejects — an OAuth-protected
+   * upstream. The request is still recorded first, so a suite can see what
+   * was refused.
+   */
+  rejectAuthorization?: (authorization: string | undefined) => boolean;
 }
 
 /**
@@ -45,8 +85,10 @@ export async function startMcpUpstream(
   label: string,
   options: McpUpstreamOptions = {},
 ): Promise<McpUpstream> {
+  const received: string[] = [];
+  const receivedHeaders: Record<string, string>[] = [];
   const httpServer: HttpServer = createServer((req, res) => {
-    void handle(label, req, res, options);
+    void handle(label, req, res, options, received, receivedHeaders);
   });
   await new Promise<void>((resolve) =>
     httpServer.listen(0, "127.0.0.1", resolve),
@@ -57,6 +99,8 @@ export async function startMcpUpstream(
   }
   return {
     url: `http://127.0.0.1:${address.port}/mcp`,
+    received,
+    receivedHeaders,
     close: () =>
       new Promise((resolve) => httpServer.close(() => resolve())),
   };
@@ -67,6 +111,8 @@ async function handle(
   req: IncomingMessage,
   res: ServerResponse,
   options: McpUpstreamOptions,
+  received: string[],
+  receivedHeaders: Record<string, string>[],
 ): Promise<void> {
   try {
     if (req.method !== "POST") {
@@ -75,7 +121,23 @@ async function handle(
     }
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk as Buffer);
-    const body: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const raw = Buffer.concat(chunks).toString("utf8");
+    received.push(raw);
+    receivedHeaders.push(
+      Object.fromEntries(
+        Object.entries(req.headers).map(([k, v]) => [
+          k.toLowerCase(),
+          Array.isArray(v) ? v.join(", ") : (v ?? ""),
+        ]),
+      ),
+    );
+    if (options.rejectAuthorization?.(req.headers.authorization)) {
+      res
+        .writeHead(401, { "www-authenticate": "Bearer", "content-type": "application/json" })
+        .end(JSON.stringify({ error: "unauthorized" }));
+      return;
+    }
+    const body: unknown = JSON.parse(raw);
 
     const server = new Server(
       { name: `${label}-upstream`, version: "0.1.0" },
@@ -111,10 +173,72 @@ async function handle(
               },
             ]
           : []),
+        ...(options.numericTool
+          ? [
+              {
+                name: "count",
+                description: "return the number as structured output",
+                inputSchema: {
+                  type: "object" as const,
+                  properties: { n: { type: "number" } },
+                },
+              },
+            ]
+          : []),
+        ...(options.mediaResult
+          ? [
+              {
+                name: "media",
+                description: "return fixed media content",
+                inputSchema: { type: "object" as const, properties: {} },
+              },
+            ]
+          : []),
+        ...(options.reportContent
+          ? [
+              {
+                name: "report",
+                description: "return a fixed rich report (text + resource + structured)",
+                inputSchema: {
+                  type: "object" as const,
+                  properties: { text: { type: "string" } },
+                },
+              },
+            ]
+          : []),
       ],
     }));
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const text = String(request.params.arguments?.text ?? "");
+      if (request.params.name === "report" && options.reportContent) {
+        const { summary, log, structuredLog } = options.reportContent;
+        return {
+          content: [
+            { type: "text", text: summary },
+            {
+              type: "resource",
+              resource: {
+                uri: "file:///run.log",
+                mimeType: "text/plain",
+                text: log,
+              },
+            },
+          ],
+          structuredContent: { log: structuredLog, cells: 42 },
+        };
+      }
+      if (request.params.name === "media" && options.mediaResult) {
+        return {
+          ...options.mediaResult,
+          ...(request.params.arguments?.failed === true ? { isError: true } : {}),
+        } as CallToolResult;
+      }
+      if (request.params.name === "count" && options.numericTool) {
+        return {
+          content: [{ type: "text", text: "counted" }],
+          structuredContent: { count: Number(request.params.arguments?.n ?? 0) },
+        };
+      }
       if (request.params.name === "lookup") {
         // The text block is deliberately constant and clean: only
         // `structuredContent` carries the caller's value, which is exactly

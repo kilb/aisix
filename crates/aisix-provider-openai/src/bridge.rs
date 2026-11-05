@@ -20,6 +20,7 @@
 //! - elapsed deadline → `BridgeError::Timeout { elapsed_ms }`
 
 use aisix_core::{RequestOverrides, ResponseOverrides, StreamDoneMarker};
+use aisix_gateway::structured_output::close_object_schemas;
 use aisix_gateway::url_cache::cached_endpoint_url;
 use aisix_gateway::{
     apply_request_headers, Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream,
@@ -27,6 +28,7 @@ use aisix_gateway::{
     SseDecoder, SseEvent, UpstreamHeaderContext,
 };
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::StreamExt;
 use http::{
     header::{HeaderName, HeaderValue},
@@ -41,11 +43,40 @@ use crate::overrides::{
     apply_param_renames, apply_stream_done_marker_policy, extract_reasoning_field,
     StreamDoneOutcome,
 };
+use crate::reasoning::{is_reasoning_model, ReasoningFamily};
 use crate::wire::{
     build_request, embed_request_body, embed_response_into, messages_from,
-    response_into_chat_response, stream_chunk_into_chat_chunk, OpenAiEmbedResponse, OpenAiResponse,
-    OpenAiStreamChunk,
+    response_into_chat_response, stream_chunk_into_chat_chunks, DeveloperRoleMode,
+    OpenAiEmbedResponse, OpenAiResponse, OpenAiStreamChunk, ToolCallIndexer,
 };
+
+/// Whether this dispatch moves a reasoning model's `max_tokens` to
+/// `max_completion_tokens`. Only OpenAI's own API defines the second
+/// field; an OpenAI-compatible platform serving the same model names
+/// (OpenRouter documents only `max_tokens`) gets the field the caller
+/// sent.
+fn renames_token_cap(ctx: &BridgeContext, upstream: &str) -> bool {
+    developer_role_mode(ctx) == DeveloperRoleMode::Preserve
+        && is_reasoning_model(ReasoningFamily::Openai, upstream)
+}
+
+fn developer_role_mode(ctx: &BridgeContext) -> DeveloperRoleMode {
+    let provider = ctx.provider_key.provider.trim();
+    // Mirror `resolve_base`: a legacy empty-provider key with no explicit
+    // base still reaches `OPENAI_DEFAULT_BASE`, so it must preserve the
+    // canonical OpenAI wire role too.
+    let uses_default_openai_base = provider.is_empty()
+        && ctx
+            .provider_key
+            .api_base
+            .as_deref()
+            .is_none_or(|base| base.trim().is_empty());
+    if provider.eq_ignore_ascii_case("openai") || uses_default_openai_base {
+        DeveloperRoleMode::Preserve
+    } else {
+        DeveloperRoleMode::MapToSystem
+    }
+}
 
 /// Default OpenAI upstream host. Used only when `ProviderKey.api_base`
 /// is empty AND the dispatching PK identifies the openai vendor — the
@@ -82,11 +113,12 @@ impl OpenAiBridge {
     }
 
     /// The client this dispatch runs on: the bridge's shared one, unless
-    /// the resolved Provider Key carries its own TLS settings.
+    /// the resolved Provider Key carries its own connection overrides
+    /// (TLS trust settings, a name-resolution address).
     fn client_for(&self, ctx: &BridgeContext) -> Client {
         aisix_gateway::upstream_tls::client_for_provider_key(
             &self.client,
-            ctx.provider_key.tls.as_ref(),
+            ctx.provider_key.upstream_connection().as_ref(),
         )
     }
 
@@ -102,18 +134,25 @@ impl OpenAiBridge {
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
-        let mut outbound = body.clone();
-        if let Some(obj) = outbound.as_object_mut() {
-            obj.insert(
-                "model".to_string(),
-                serde_json::Value::String(upstream.to_string()),
-            );
-        }
-        let outbound = prepare_outbound_body(
-            &outbound,
-            ctx.provider_key.request.as_ref(),
-            ctx.provider_key.response.as_ref(),
-        )?;
+        let outbound = {
+            // Replace the `model` field with the upstream provider id.
+            let mut outbound = body.clone();
+            if let Some(obj) = outbound.as_object_mut() {
+                obj.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(upstream.to_string()),
+                );
+            }
+            // Apply the PK's request overrides like `chat()` (#867 consistency
+            // follow-up); no-op when none are configured.
+            apply_outbound_overrides(
+                &mut outbound,
+                false,
+                ctx.provider_key.request.as_ref(),
+                ctx.provider_key.response.as_ref(),
+            )?;
+            outbound_bytes(&outbound)?
+        };
         let headers = build_request_headers(key, &ctx.request_id, stream, &ctx.header_ctx())?;
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
@@ -128,11 +167,12 @@ impl OpenAiBridge {
         let resp = url
             .post_on(&client)
             .headers(headers)
-            .json(&outbound)
+            .body(outbound)
             .send()
             .await
             .map_err(aisix_gateway::send_error)?;
 
+        aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status();
         if !status.is_success() {
             return Err(map_http_error(status, resp).await);
@@ -163,6 +203,14 @@ impl OpenAiBridge {
     /// Closes the openrouter / xai / future-long-tail half of
     /// api7/#417. The control plane must populate `api_base` for every
     /// catalog vendor via adapter_map / provider_metadata.api_base_url.
+    ///
+    /// The routes that build their URL without this bridge (audio, image
+    /// edits, jobs, realtime, responses, messages) resolve through
+    /// `falls_back_to_openai_default` in `aisix-proxy`'s dispatch module,
+    /// which states this same fallback plus the `adapter: openai` check
+    /// that dispatch applies before an empty-vendor key ever reaches this
+    /// bridge. Change the two together, or chat and the other routes
+    /// disagree about where the same key goes.
     fn resolve_base(&self, ctx: &BridgeContext) -> Result<String, BridgeError> {
         let raw = match ctx.provider_key.api_base.as_deref() {
             Some(b) if !b.trim().is_empty() => b.trim().to_string(),
@@ -201,6 +249,13 @@ impl OpenAiBridge {
         // #390 landed this on Vertex and Azure and stopped there; an
         // OpenAI-compatible base is the one operators paste most often.
         aisix_gateway::validate_api_base("openai-compatible", &raw)?;
+        if crate::cohere::is_cohere(&ctx.provider_key.provider) {
+            return Ok(format!(
+                "{}{}",
+                crate::cohere::api_root(strip_known_endpoint(&raw)),
+                crate::cohere::COMPATIBILITY_PATH
+            ));
+        }
         Ok(normalize_api_base(&raw))
     }
 }
@@ -212,10 +267,7 @@ impl Default for OpenAiBridge {
 }
 
 fn default_client() -> Client {
-    aisix_gateway::build_client_or_default(
-        aisix_gateway::client_builder().user_agent("aisix/0.1"),
-        "openai bridge",
-    )
+    aisix_gateway::build_client_or_default(aisix_gateway::client_builder(), "openai bridge")
 }
 
 /// Strip a known endpoint suffix from `base`. Idempotent: if no known
@@ -314,20 +366,32 @@ fn parse_openai_error_envelope(body: &[u8]) -> Option<aisix_gateway::UpstreamErr
     struct Outer {
         error: Inner,
     }
+    // Every field but the message is read leniently: compatible servers
+    // send a numeric `code` (`429`) or a non-string `param`, and one such
+    // field must not cost the caller the upstream's message.
     #[derive(serde::Deserialize)]
     struct Inner {
         message: Option<String>,
-        #[serde(rename = "type")]
-        kind: Option<String>,
-        code: Option<String>,
-        param: Option<String>,
+        #[serde(rename = "type", default)]
+        kind: Option<Value>,
+        #[serde(default)]
+        code: Option<Value>,
+        #[serde(default)]
+        param: Option<Value>,
+    }
+    fn text(v: Option<Value>) -> Option<String> {
+        match v? {
+            Value::String(s) => Some(s),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        }
     }
     let outer: Outer = serde_json::from_slice(body).ok()?;
     Some(aisix_gateway::UpstreamErrorView {
-        kind: outer.error.kind,
+        kind: text(outer.error.kind),
         message: outer.error.message,
-        code: outer.error.code,
-        param: outer.error.param,
+        code: text(outer.error.code),
+        param: text(outer.error.param),
     })
 }
 
@@ -362,34 +426,102 @@ where
 /// gateway convention). Anything not configured is a no-op.
 fn prepare_outbound_body<T: serde::Serialize>(
     typed: &T,
+    gateway_strict_schema: bool,
+    reasoning_model: bool,
     request: Option<&RequestOverrides>,
     response: Option<&ResponseOverrides>,
 ) -> Result<Value, BridgeError> {
     let mut body = serde_json::to_value(typed)
         .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?;
+    close_strict_response_format_schema(&mut body, gateway_strict_schema);
+    apply_outbound_overrides(&mut body, reasoning_model, request, response)?;
+    Ok(body)
+}
+
+/// The override pipeline [`prepare_outbound_body`] runs, on a body the
+/// caller already owns as a `Value`.
+fn apply_outbound_overrides(
+    body: &mut Value,
+    reasoning_model: bool,
+    request: Option<&RequestOverrides>,
+    response: Option<&ResponseOverrides>,
+) -> Result<(), BridgeError> {
+    // Before `param_renames`, so an operator's explicit rename wins.
+    if reasoning_model {
+        crate::reasoning::apply_reasoning_token_cap(body);
+    }
     if let Some(r) = request {
         crate::overrides::validate_content_safe_request_overrides(r)
             .map_err(BridgeError::InvalidUpstreamConfig)?;
-        apply_param_renames(&mut body, &r.param_renames);
+        apply_param_renames(body, &r.param_renames);
         if let Some(constraints) = &r.param_constraints {
-            apply_param_constraints(&mut body, constraints);
+            apply_param_constraints(body, constraints);
         }
-        apply_default_body_fields(&mut body, &r.default_body_fields);
+        // A default `max_tokens` fills a cap the caller did not send, so a
+        // reasoning model needs it converted as well; a `max_tokens` already
+        // present here was put back by the operator's own rename and stays.
+        let had_max_tokens = body.get("max_tokens").is_some();
+        apply_default_body_fields(body, &r.default_body_fields);
+        if reasoning_model && !had_max_tokens {
+            crate::reasoning::apply_reasoning_token_cap(body);
+        }
     }
     if response.is_some_and(|r| r.content_list_to_string) {
-        apply_content_list_to_string(&mut body);
+        apply_content_list_to_string(body);
     }
-    Ok(body)
+    Ok(())
+}
+
+/// The wire bytes of an outbound body. Called where the `Value` is a
+/// temporary, so it is gone before the upstream is awaited — see
+/// [`aisix_gateway::json_body`].
+fn outbound_bytes(body: &Value) -> Result<Bytes, BridgeError> {
+    aisix_gateway::json_body(body)
+        .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))
+}
+
+/// Apply OpenAI strict mode's schema rule at the edge that declares it,
+/// for a `strict` the gateway set itself (`gateway_strict_schema`, from
+/// translating another protocol's structured output): when
+/// `response_format.json_schema.strict` is true, every object in
+/// the schema must carry `additionalProperties: false` and list each of
+/// its declared properties in `required`, or the API rejects it.
+///
+/// Public because every OpenAI-wire edge has to apply it — Azure
+/// OpenAI builds its own body from the same typed structs, and an
+/// edge that skips this rejects a strict schema the caller never had
+/// to write out in full.
+///
+/// This lives here rather than wherever the `response_format` was
+/// assembled because the promotion is only correct for *this* wire. The
+/// same normalised request also reaches the Anthropic, Bedrock and
+/// Gemini edges, and there `required` is an ordinary keyword whose
+/// contents are the caller's own statement — promoting it would silently
+/// make their optional fields mandatory. A caller who sent `strict`
+/// themselves gets their schema forwarded as written, and OpenAI's own
+/// validation answers it.
+pub fn close_strict_response_format_schema(body: &mut Value, gateway_strict_schema: bool) {
+    if !gateway_strict_schema {
+        return;
+    }
+    let Some(json_schema) = body.pointer_mut("/response_format/json_schema") else {
+        return;
+    };
+    if json_schema.get("strict").and_then(|s| s.as_bool()) != Some(true) {
+        return;
+    }
+    if let Some(schema) = json_schema.get_mut("schema") {
+        close_object_schemas(schema);
+    }
 }
 
 /// Build the base outbound `HeaderMap` (Authorization, Content-Type,
 /// x-aisix-request-id, and optionally Accept: text/event-stream
 /// for streaming calls), then merge any `default_headers` the PK carries.
-/// Bridge-owned headers are inserted before the merge so
-/// [`apply_request_headers`] cannot overwrite them — its skip-if-present
-/// rule plus `RESERVED_UPSTREAM_HEADERS` gives two layers of defense
-/// against an operator-supplied `default_headers` entry (or a forwarded
-/// client header) clobbering auth.
+/// Bridge-owned headers are inserted before the merge, which is what makes
+/// a `default_headers` entry unable to displace them — that merge is
+/// skip-if-present. A FORWARDED client header does displace the credential,
+/// deliberately: see [`apply_request_headers`].
 ///
 /// The previous `bridge_name` parameter + `X-Aisix-Bridge` outbound
 /// header was removed in #468: after the Phase A clean
@@ -438,21 +570,40 @@ impl Bridge for OpenAiBridge {
         "openai"
     }
 
+    fn wire_protocol(&self) -> &'static str {
+        aisix_core::Adapter::Openai.wire_protocol()
+    }
+
     async fn chat(
         &self,
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
+        self.chat_cow(std::borrow::Cow::Borrowed(req), ctx).await
+    }
+
+    async fn chat_cow(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
+        ctx: &BridgeContext,
+    ) -> Result<ChatResponse, BridgeError> {
+        let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
-        let messages = messages_from(req, upstream_takes_developer(ctx));
-        let typed = build_request(req, upstream, &messages, false);
-        let body = prepare_outbound_body(
-            &typed,
-            ctx.provider_key.request.as_ref(),
-            ctx.provider_key.response.as_ref(),
-        )?;
+        let body = {
+            let messages = messages_from(&req, developer_role_mode(ctx));
+            let typed = build_request(&req, upstream, &messages, false);
+            outbound_bytes(&prepare_outbound_body(
+                &typed,
+                req.gateway_strict_schema,
+                renames_token_cap(ctx, upstream),
+                ctx.provider_key.request.as_ref(),
+                ctx.provider_key.response.as_ref(),
+            )?)?
+        };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
         let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
@@ -470,21 +621,22 @@ impl Bridge for OpenAiBridge {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
+            aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
             }
+            let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
 
-            let parsed: OpenAiResponse = resp
-                .json()
-                .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
-            Ok(response_into_chat_response(parsed))
+            let parsed: OpenAiResponse =
+                aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::OpenAI)
+                    .await?;
+            Ok(response_into_chat_response(parsed).with_fallback_service_tier(header_tier))
         })
         .await
     }
@@ -501,11 +653,13 @@ impl Bridge for OpenAiBridge {
         // default_body_fields / default_headers) just like `chat()` — operators
         // expect them on every endpoint that key serves, not chat only (#867
         // consistency follow-up). No-op when the PK carries no overrides.
-        let body = prepare_outbound_body(
+        let body = outbound_bytes(&prepare_outbound_body(
             &embed_request_body(req, upstream),
+            false,
+            false,
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
-        )?;
+        )?)?;
         let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
@@ -522,20 +676,20 @@ impl Bridge for OpenAiBridge {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
+            aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
             }
 
-            let parsed: OpenAiEmbedResponse = resp
-                .json()
-                .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+            let parsed: OpenAiEmbedResponse =
+                aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::OpenAI)
+                    .await?;
             Ok(embed_response_into(parsed))
         })
         .await
@@ -548,11 +702,8 @@ impl Bridge for OpenAiBridge {
     ) -> Result<serde_json::Value, BridgeError> {
         let started = Instant::now();
         with_deadline(ctx.deadline, started, async {
-            self.send_completion_raw(body, ctx, false)
-                .await?
-                .json::<serde_json::Value>()
-                .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
+            let resp = self.send_completion_raw(body, ctx, false).await?;
+            aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::OpenAI).await
         })
         .await
     }
@@ -581,21 +732,25 @@ impl Bridge for OpenAiBridge {
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
-        // Replace the `model` field with the upstream provider id.
-        let mut outbound = body.clone();
-        if let Some(obj) = outbound.as_object_mut() {
-            obj.insert(
-                "model".to_string(),
-                serde_json::Value::String(upstream.to_string()),
-            );
-        }
-        // Apply the PK's request overrides like `chat()` (#867 consistency
-        // follow-up); no-op when none are configured.
-        let outbound = prepare_outbound_body(
-            &outbound,
-            ctx.provider_key.request.as_ref(),
-            ctx.provider_key.response.as_ref(),
-        )?;
+        let outbound = {
+            // Replace the `model` field with the upstream provider id.
+            let mut outbound = body.clone();
+            if let Some(obj) = outbound.as_object_mut() {
+                obj.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(upstream.to_string()),
+                );
+            }
+            // Apply the PK's request overrides like `chat()` (#867 consistency
+            // follow-up); no-op when none are configured.
+            apply_outbound_overrides(
+                &mut outbound,
+                false,
+                ctx.provider_key.request.as_ref(),
+                ctx.provider_key.response.as_ref(),
+            )?;
+            outbound_bytes(&outbound)?
+        };
         let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
 
         let url = cached_endpoint_url(
@@ -613,19 +768,18 @@ impl Bridge for OpenAiBridge {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&outbound)
+                .body(outbound)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
+            aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
             }
 
-            resp.json::<serde_json::Value>()
-                .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
+            aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::OpenAI).await
         })
         .await
     }
@@ -635,16 +789,32 @@ impl Bridge for OpenAiBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
+        self.chat_stream_cow(std::borrow::Cow::Borrowed(req), ctx)
+            .await
+    }
+
+    async fn chat_stream_cow(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
+        ctx: &BridgeContext,
+    ) -> Result<ChatChunkStream, BridgeError> {
+        let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
-        let messages = messages_from(req, upstream_takes_developer(ctx));
-        let typed = build_request(req, upstream, &messages, true);
-        let body = prepare_outbound_body(
-            &typed,
-            ctx.provider_key.request.as_ref(),
-            ctx.provider_key.response.as_ref(),
-        )?;
+        let body = {
+            let messages = messages_from(&req, developer_role_mode(ctx));
+            let typed = build_request(&req, upstream, &messages, true);
+            outbound_bytes(&prepare_outbound_body(
+                &typed,
+                req.gateway_strict_schema,
+                renames_token_cap(ctx, upstream),
+                ctx.provider_key.request.as_ref(),
+                ctx.provider_key.response.as_ref(),
+            )?)?
+        };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
         let headers = build_request_headers(key, &ctx.request_id, true, &ctx.header_ctx())?;
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
@@ -661,13 +831,14 @@ impl Bridge for OpenAiBridge {
         let resp = with_deadline(ctx.deadline, started, async move {
             url.post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)
         })
         .await?;
 
+        aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status();
         if !status.is_success() {
             return Err(map_http_error(status, resp).await);
@@ -689,6 +860,7 @@ impl Bridge for OpenAiBridge {
         let bridge_name = "openai";
         let request_id_for_log = ctx.request_id.clone();
 
+        let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
         let byte_stream = resp.bytes_stream();
         let stream = build_chunk_stream(
             byte_stream,
@@ -696,6 +868,7 @@ impl Bridge for OpenAiBridge {
             done_marker_policy,
             bridge_name,
             request_id_for_log,
+            header_tier,
         );
         Ok(Box::pin(stream))
     }
@@ -707,12 +880,14 @@ fn build_chunk_stream<S>(
     done_marker_policy: Option<StreamDoneMarker>,
     bridge_name: &'static str,
     request_id: String,
+    header_tier: Option<aisix_gateway::ServiceTier>,
 ) -> impl futures::Stream<Item = Result<ChatChunk, BridgeError>> + Send
 where
     S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
 {
     async_stream::try_stream! {
         let mut decoder = SseDecoder::new();
+        let mut tool_call_indexer = ToolCallIndexer::default();
         let mut stream = Box::pin(byte_stream);
         let mut done_marker_seen = false;
         let mut semantic_terminal_seen = false;
@@ -727,7 +902,7 @@ where
                 }
             };
             for event in decoder
-                .feed_checked(chunk.as_ref())
+                .feed(chunk.as_ref())
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
             {
                 match event {
@@ -737,9 +912,10 @@ where
                     }
                     SseEvent::Data(payload) => {
                         let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
-                        let chunk = stream_chunk_into_chat_chunk(parsed);
-                        semantic_terminal_seen |= chunk.finish_reason.is_some();
-                        yield chunk;
+                        for chunk in stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
+                            semantic_terminal_seen |= chunk.finish_reason.is_some();
+                            yield chunk.with_fallback_service_tier(&header_tier);
+                        }
                     }
                 }
             }
@@ -752,7 +928,7 @@ where
         // tolerates both), so we treat `finish()`-returned Done the
         // same as a feed()-returned Done.
         match decoder
-            .finish_checked()
+            .finish()
             .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
         {
             Some(SseEvent::Done) => {
@@ -760,9 +936,10 @@ where
             }
             Some(SseEvent::Data(payload)) => {
                 let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
-                let chunk = stream_chunk_into_chat_chunk(parsed);
-                semantic_terminal_seen |= chunk.finish_reason.is_some();
-                yield chunk;
+                for chunk in stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
+                    semantic_terminal_seen |= chunk.finish_reason.is_some();
+                    yield chunk.with_fallback_service_tier(&header_tier);
+                }
             }
             None => {}
         }
@@ -824,16 +1001,109 @@ fn parse_stream_chunk(
     })
 }
 
-/// Whether the upstream is OpenAI itself, which takes the `developer` role.
-/// This bridge also serves OpenAI-compatible vendors, which get `system`.
-fn upstream_takes_developer(ctx: &BridgeContext) -> bool {
-    // The same exact match dispatch uses to pick this vendor.
-    ctx.provider_key.provider == "openai"
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── strict structured outputs at the OpenAI edge ──────────────────
+
+    /// The exact `response_format` an Anthropic-shaped `/v1/messages`
+    /// request used to put on the OpenAI wire, when the strict closing
+    /// still happened during the inbound translation. The closing moved
+    /// here so the Anthropic, Bedrock and Gemini edges stop inheriting
+    /// it; this pins that the OpenAI body did not move with it.
+    #[test]
+    fn a_translated_messages_request_reaches_openai_byte_for_byte_as_before() {
+        use aisix_gateway::{ChatFormat, ChatMessage};
+        use aisix_provider_anthropic::wire::translate_extras_to_openai_shape;
+
+        // What the `/v1/messages` caller sent.
+        let mut extra = serde_json::json!({
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "days": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {"high": {"type": "number"}},
+                                },
+                            },
+                        },
+                    },
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let gateway_strict =
+            translate_extras_to_openai_shape(&mut extra, aisix_core::MappedEffort::AsWritten);
+        assert!(gateway_strict);
+
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("weather?")]);
+        req.extra = extra;
+        let messages = messages_from(&req, DeveloperRoleMode::Preserve);
+        let typed = build_request(&req, "gpt-4o", &messages, false);
+        let body = prepare_outbound_body(&typed, gateway_strict, false, None, None).unwrap();
+
+        assert_eq!(
+            body["response_format"],
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "structured_output",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["city", "days"],
+                        "properties": {
+                            "city": {"type": "string"},
+                            "days": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["high"],
+                                    "properties": {"high": {"type": "number"}},
+                                },
+                            },
+                        },
+                    },
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_response_format_that_is_not_strict_reaches_openai_untouched() {
+        use aisix_gateway::{ChatFormat, ChatMessage};
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+            "required": ["a"],
+        });
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("hi")]);
+        req.extra.insert(
+            "response_format".into(),
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {"name": "answer", "schema": schema, "strict": false},
+            }),
+        );
+        let messages = messages_from(&req, DeveloperRoleMode::Preserve);
+        let typed = build_request(&req, "gpt-4o", &messages, false);
+        let body = prepare_outbound_body(&typed, false, false, None, None).unwrap();
+        // Not strict: the caller's `required` is theirs, and OpenAI does
+        // not demand the closing.
+        assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
+    }
     use aisix_core::{Model, ProviderKey};
     use aisix_gateway::{ChatMessage, FinishReason, Role};
     use std::sync::Arc;
@@ -891,8 +1161,8 @@ mod tests {
     /// revalidation), never serve the previously cached host.
     #[tokio::test]
     async fn url_cache_follows_api_base_edit_for_same_key_id() {
-        let s1 = MockServer::start().await;
-        let s2 = MockServer::start().await;
+        let s1 = MockServer::builder().start().await;
+        let s2 = MockServer::builder().start().await;
         mount_ok(&s1).await;
         mount_ok(&s2).await;
 
@@ -921,7 +1191,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_streaming_happy_path() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(header("authorization", "Bearer sk-test"))
@@ -951,7 +1221,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_streaming_429_maps_to_upstream_status() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
@@ -979,7 +1249,7 @@ mod tests {
     /// `read_body_capped` end-to-end through the OpenAI bridge.
     #[tokio::test]
     async fn non_streaming_oversize_error_body_truncated_to_max_message_bytes() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         // 200 KB body — well above the 64 KB read cap and the 1024-byte
         // message cap.
         let huge_body = "x".repeat(200 * 1024);
@@ -1015,7 +1285,7 @@ mod tests {
     /// HIGH-2 from the audit.
     #[tokio::test]
     async fn non_streaming_oversize_parsed_message_truncated() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let huge = "y".repeat(60 * 1024);
         let body = format!(r#"{{"error":{{"message":"{huge}","type":"big","code":"big_code"}}}}"#);
         Mock::given(method("POST"))
@@ -1053,7 +1323,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_streaming_429_surfaces_retry_after_header() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(
@@ -1082,7 +1352,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_streaming_503_with_garbled_retry_after_is_none() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(
@@ -1118,7 +1388,7 @@ mod tests {
     /// envelope. (Already worked pre-#543.)
     #[tokio::test]
     async fn non_streaming_401_json_content_type_surfaces_code() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(401).set_body_raw(
@@ -1148,7 +1418,7 @@ mod tests {
     /// body into `message` and emitting an empty `code`.
     #[tokio::test]
     async fn non_streaming_401_non_json_content_type_still_surfaces_code() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(
@@ -1183,7 +1453,7 @@ mod tests {
     /// over-parsing.
     #[tokio::test]
     async fn non_streaming_non_json_error_body_falls_back() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(
@@ -1206,7 +1476,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_streaming_decode_error_on_malformed_body() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
@@ -1221,7 +1491,7 @@ mod tests {
 
     #[tokio::test]
     async fn deadline_elapses_to_timeout_error() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(
@@ -1255,9 +1525,75 @@ mod tests {
         assert_eq!(err.error_type(), "authentication_error");
     }
 
+    /// Gemini names its serving tier in a response header; the body's own
+    /// `service_tier` wins, and the header is the fallback.
+    #[tokio::test]
+    async fn the_gemini_tier_header_is_the_fallback_for_a_body_without_one() {
+        use aisix_gateway::ServiceTier;
+        let body = |tier: Option<&str>| {
+            let mut b = serde_json::json!({
+                "id": "c", "model": "gemini-2.5-flash",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"},
+                             "finish_reason": "stop"}]
+            });
+            if let Some(t) = tier {
+                b["service_tier"] = t.into();
+            }
+            b
+        };
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-gemini-service-tier", "priority")
+                    .set_body_json(body(None)),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-gemini-service-tier", "standard")
+                    .set_body_json(body(Some("flex"))),
+            )
+            .mount(&server)
+            .await;
+        let bridge = OpenAiBridge::new();
+        let ctx = sample_ctx(&server.uri());
+        assert_eq!(
+            bridge.chat(&req(), &ctx).await.unwrap().service_tier,
+            Some(ServiceTier::Native("priority".into()))
+        );
+        assert_eq!(
+            bridge.chat(&req(), &ctx).await.unwrap().service_tier,
+            Some(ServiceTier::OpenAi("flex".into()))
+        );
+
+        let stream_server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .insert_header("x-gemini-service-tier", "flex")
+                    .set_body_string(
+                        "data: {\"id\":\"s\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+                    ),
+            )
+            .mount(&stream_server)
+            .await;
+        let ctx = sample_ctx(&stream_server.uri());
+        let mut stream = bridge.chat_stream(&req(), &ctx).await.unwrap();
+        let chunk = stream.next().await.unwrap().unwrap();
+        assert_eq!(chunk.service_tier, Some(ServiceTier::Native("flex".into())));
+    }
+
     #[tokio::test]
     async fn streaming_happy_path_emits_chunks_then_done() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let sse = "\
 data: {\"id\":\"cmpl-s\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
 data: {\"id\":\"cmpl-s\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n\
@@ -1290,7 +1626,7 @@ data: [DONE]\n\n";
 
     #[tokio::test]
     async fn streaming_eof_before_done_or_finish_is_aborted() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let sse = "data: {\"id\":\"cmpl-s\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
@@ -1326,7 +1662,7 @@ data: [DONE]\n\n";
 
     #[tokio::test]
     async fn streaming_upstream_error_surfaces_before_stream_start() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(500).set_body_string("oops"))
@@ -1349,7 +1685,7 @@ data: [DONE]\n\n";
     /// type/message were lost.
     #[tokio::test]
     async fn streaming_in_band_error_frame_surfaces_as_typed_error() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let sse = "\
 data: {\"id\":\"cmpl-s\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n\
 data: {\"error\":{\"message\":\"The server had an error processing your request\",\"type\":\"server_error\",\"code\":\"server_error\"}}\n\n";
@@ -1387,6 +1723,21 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
         assert!(stream.next().await.is_none());
     }
 
+    /// An error frame that carries a chunk `id` but no `choices` is still
+    /// the provider's in-band error, not a chunk to drop.
+    #[test]
+    fn parse_stream_chunk_error_frame_with_an_id_is_in_band() {
+        let err = parse_stream_chunk(
+            r#"{"id":"chatcmpl-x","error":{"message":"overloaded","type":"server_error"}}"#,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, BridgeError::UpstreamInBand { message, .. } if message == "overloaded"),
+            "{err:?}"
+        );
+    }
+
     /// Garbage that is not an error envelope keeps the historical
     /// `UpstreamDecode` classification.
     #[test]
@@ -1422,6 +1773,50 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     fn pk_with_base(api_base: &str) -> ProviderKey {
         let cfg = format!(r#"{{"display_name":"x","secret":"k","api_base":"{api_base}"}}"#);
         serde_json::from_str(&cfg).unwrap()
+    }
+
+    #[test]
+    fn developer_role_mode_matches_provider_endpoint_identity() {
+        let legacy_pk: ProviderKey =
+            serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
+        let legacy_ctx = BridgeContext::new("rid", sample_model(), Arc::new(legacy_pk));
+        assert_eq!(
+            developer_role_mode(&legacy_ctx),
+            DeveloperRoleMode::Preserve,
+            "legacy empty-provider keys without api_base resolve to canonical OpenAI"
+        );
+
+        let custom_ctx = BridgeContext::new(
+            "rid",
+            sample_model(),
+            Arc::new(pk_with_base("https://compatible.example/v1")),
+        );
+        assert_eq!(
+            developer_role_mode(&custom_ctx),
+            DeveloperRoleMode::MapToSystem,
+            "an empty provider with a custom endpoint is not canonical OpenAI"
+        );
+
+        let deepseek_pk: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"ds","secret":"k","provider":"deepseek","adapter":"openai","api_base":"https://api.deepseek.com"}"#,
+        )
+        .unwrap();
+        let deepseek_ctx = BridgeContext::new("rid", sample_model(), Arc::new(deepseek_pk));
+        assert_eq!(
+            developer_role_mode(&deepseek_ctx),
+            DeveloperRoleMode::MapToSystem
+        );
+
+        let openai_pk: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"oai","secret":"k","provider":" OpenAI ","adapter":"openai","api_base":"https://proxy.example/v1"}"#,
+        )
+        .unwrap();
+        let openai_ctx = BridgeContext::new("rid", sample_model(), Arc::new(openai_pk));
+        assert_eq!(
+            developer_role_mode(&openai_ctx),
+            DeveloperRoleMode::Preserve,
+            "an explicitly declared OpenAI key preserves the canonical role through a proxy"
+        );
     }
 
     /// `OpenAiBridge::new()` is the `Adapter::Openai` family bridge.
@@ -1610,7 +2005,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     #[tokio::test]
     async fn chat_applies_param_renames_to_outbound_body() {
         use wiremock::matchers::body_partial_json;
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(body_partial_json(serde_json::json!({
@@ -1641,7 +2036,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     #[tokio::test]
     async fn chat_applies_param_constraints_clamp_to_outbound_body() {
         use wiremock::matchers::body_partial_json;
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(body_partial_json(serde_json::json!({"temperature": 1.0})))
@@ -1669,7 +2064,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     #[tokio::test]
     async fn chat_applies_default_body_fields_to_outbound_body() {
         use wiremock::matchers::body_partial_json;
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(body_partial_json(serde_json::json!({"safe_prompt": true})))
@@ -1694,7 +2089,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     /// must carry it.
     #[tokio::test]
     async fn chat_applies_default_headers_to_outbound_request() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(header("x-custom", "trace-on"))
@@ -1718,7 +2113,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     /// override value.
     #[tokio::test]
     async fn chat_default_headers_cannot_override_authorization() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(header("authorization", "Bearer sk-test"))
@@ -1745,7 +2140,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     #[tokio::test]
     async fn embed_applies_request_overrides_like_chat() {
         use wiremock::matchers::body_partial_json;
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
             .and(body_partial_json(serde_json::json!({"safe_flag": true})))
@@ -1766,11 +2161,15 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
         );
         let ctx = BridgeContext::new("req-1", sample_model(), pk);
         let request = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
             model: "my-embed".into(),
             input: vec!["hi".into()],
             input_was_single: true,
             encoding_format: None,
             dimensions: None,
+            input_type: None,
+            embedding_types: None,
         };
         bridge
             .embed(&request, &ctx)
@@ -1782,7 +2181,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     #[tokio::test]
     async fn complete_applies_request_overrides_like_chat() {
         use wiremock::matchers::body_partial_json;
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .and(body_partial_json(serde_json::json!({"safe_flag": true})))
@@ -1811,7 +2210,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     #[tokio::test]
     async fn generate_image_applies_request_overrides_like_chat() {
         use wiremock::matchers::body_partial_json;
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/images/generations"))
             .and(body_partial_json(serde_json::json!({"safe_flag": true})))
@@ -1845,7 +2244,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     #[tokio::test]
     async fn chat_content_list_to_string_flattens_text_blocks_in_outbound_body() {
         use wiremock::matchers::body_partial_json;
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(body_partial_json(serde_json::json!({
@@ -1882,7 +2281,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     /// `reasoning_content="step1"` for the downstream emitter.
     #[tokio::test]
     async fn chat_stream_extracts_reasoning_field_onto_canonical_slot() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         // Upstream chunk uses `delta.thinking` (hypothetical vendor
         // shape); after extract_reasoning_field the parsed chunk's
         // delta should have reasoning_content="step1".
@@ -1922,7 +2321,7 @@ data: [DONE]\n\n";
     /// omitted the `[DONE]` marker.
     #[tokio::test]
     async fn chat_stream_done_marker_required_but_missing_does_not_error() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         // No `data: [DONE]` line — Required policy will fire a
         // MissingDoneMarker warning, but the stream must still
         // complete cleanly.
@@ -1957,7 +2356,7 @@ data: {\"id\":\"cmpl-s\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\
     /// — the typed↔Value detour must not swallow parse errors.
     #[tokio::test]
     async fn chat_stream_malformed_chunk_surfaces_decode_error_via_reasoning_path() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let sse = "data: not-json\n\ndata: [DONE]\n\n";
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
@@ -1993,7 +2392,7 @@ data: {\"id\":\"cmpl-s\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\
     /// arrive intact.)
     #[tokio::test]
     async fn chat_stream_done_marker_in_decoder_finish_tail_is_counted_as_seen() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         // Note: NO trailing `\n\n` after [DONE] — exercises the
         // decoder.finish() flush path rather than feed().
         let sse = "\
@@ -2033,7 +2432,7 @@ data: [DONE]\n";
     /// through and the response parses.
     #[tokio::test]
     async fn chat_with_no_overrides_behaves_like_pre_d2() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(header("authorization", "Bearer sk-test"))

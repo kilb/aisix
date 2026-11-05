@@ -49,7 +49,7 @@ impl<'a> MakeWriter<'a> for VecWriter {
 }
 
 fn capture(enabled: bool) -> String {
-    aisix_obs::access_log::init_enabled(enabled);
+    aisix_obs::access_log::set_enabled(enabled);
     let writer = VecWriter::default();
     let subscriber = fmt()
         .with_writer(writer.clone())
@@ -63,8 +63,11 @@ fn capture(enabled: bool) -> String {
             path: "/v1/chat/completions",
             status: 200,
             latency: Duration::from_millis(1),
+            duration: Duration::from_millis(1),
             provider: None,
             model: None,
+            upstream_model: None,
+            provider_key_id: None,
             api_key_id: None,
             prompt_tokens: None,
             completion_tokens: None,
@@ -76,6 +79,10 @@ fn capture(enabled: bool) -> String {
             routing_fallback_count: None,
             error_kind: None,
             error: None,
+            mcp: None,
+            cache: None,
+            request_body_bytes: None,
+            response_body_bytes: None,
         }
         .emit()
     });

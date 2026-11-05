@@ -36,9 +36,9 @@ use serde_json::{json, Map, Value};
 const OPENAPI_JSON_BASE: &str = r##"{
   "openapi": "3.1.0",
   "info": {
-    "title": "AISIX Admin API",
+    "title": "AISIX OSS Admin API",
     "version": "dev",
-    "description": "The AISIX Admin API is the read-only operational surface of an open-source AISIX gateway: list and inspect the loaded models, caller API keys, provider credentials, guardrails, MCP servers, A2A agents, cache policies, and observability exporters, check per-model upstream health, and drive the playground.\n\nResource write endpoints were removed in favor of declarative configuration: declare resources in a `resources_file` (`resources.yaml`) and reload with SIGHUP, or write them to etcd directly. See the resources file reference at https://docs.api7.ai/ai-gateway/reference/resources-file.\n\nGateways connected to AISIX Cloud do not expose this listener. Configure them through AISIX Cloud."
+    "description": "The AISIX OSS Admin API is an optional operational interface for inspecting a directly operated open-source AISIX gateway. Its resource-management routes are read-only: they list loaded models, caller API keys, provider credentials, guardrails, MCP servers, A2A agents, cache policies, and observability exporters, and report per-model upstream health. The same listener provides a playground that forwards test completion requests through the gateway.\n\nConfigure resources declaratively through a `resources_file` (`resources.yaml`, reloaded on SIGHUP) or direct etcd writes. The API does not create, update, or delete resources. See the resources file reference at https://docs.api7.ai/ai-gateway/reference/resources-file.\n\nGateways connected to AISIX Enterprise or AISIX Cloud do not expose this listener. Configure them through the corresponding control plane."
   },
   "paths": {
     "/livez": {
@@ -67,22 +67,12 @@ const OPENAPI_JSON_BASE: &str = r##"{
                 }
               }
             }
-          },
-          "503": {
-            "description": "Process is shutting down (graceful drain)",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
           }
         },
         "tags": [
           "Health"
         ],
-        "description": "Process liveness: 200 while the process is alive, 503 once graceful shutdown has begun (an expected drain, not a crash). Use /readyz for traffic eligibility (readiness)."
+        "description": "Process liveness: should this instance be restarted? Answers 200 whenever it answers at all, including throughout a graceful drain \u2014 draining is deliberate work, and restarting an instance that is finishing the requests it accepted would kill exactly those. Use /readyz for traffic eligibility (readiness), which is what reports the drain."
       }
     },
     "/readyz": {
@@ -901,7 +891,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "tags": [
           "Guardrails"
         ],
-        "description": "List all configured guardrail resources. Credentials are returned as `[REDACTED]`: `api_key`, `access_key_secret` and `secret_access_key`, wherever they appear."
+        "description": "List all configured guardrail resources. Credentials are returned as `[REDACTED]`: `api_key`, `access_key_secret`, `secret_access_key` and `session_token`, wherever they appear, and every string value of `secrets`."
       }
     },
     "/admin/v1/guardrails/{id}": {
@@ -964,7 +954,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "tags": [
           "Guardrails"
         ],
-        "description": "Get a guardrail resource by ID. Credentials are returned as `[REDACTED]`: `api_key`, `access_key_secret` and `secret_access_key`, wherever they appear."
+        "description": "Get a guardrail resource by ID. Credentials are returned as `[REDACTED]`: `api_key`, `access_key_secret`, `secret_access_key` and `session_token`, wherever they appear, and every string value of `secrets`."
       }
     },
     "/admin/v1/cache_policies": {
@@ -1522,6 +1512,28 @@ const OPENAPI_JSON_BASE: &str = r##"{
         },
         "description": "Admin API error response envelope."
       },
+      "McpToolRef": {
+        "type": "object",
+        "required": [
+          "server_id",
+          "tool"
+        ],
+        "properties": {
+          "server_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Resource id of the registered MCP server this entry refers to. An id matching no registered server refers to nothing: the entry never matches, and the other entries are unaffected.",
+            "example": "9b1b6d9c-1f5e-4c1e-9f8f-2f5f5b9d1c11"
+          },
+          "tool": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Tool on that server, matched as a `*` glob against the bare tool name \u2014 the part after the `<server>__` namespace prefix. `\"*\"` covers every tool the server exposes.",
+            "example": "create_issue"
+          }
+        },
+        "description": "One tool on one MCP server, the server named by its resource id and the tool by name. The server half is compared as an exact id, never glob-matched."
+      },
       "PublicApiKey": {
         "type": "object",
         "required": [
@@ -1538,16 +1550,12 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "items": {
               "type": "string"
             },
-            "description": "Model aliases this caller API key may use.",
+            "description": "Model names this caller API key may use, matched as `*` globs. Read only when `allowed_model_ids` is omitted or null; an array there, `[]` included, takes over entirely.",
             "example": [
               "gpt-4o"
             ]
           },
-          "rate_limit": {
-            "$ref": "#/components/schemas/RateLimit",
-            "description": "Request, token, and concurrency limits for this key."
-          },
-          "allowed_tools": {
+          "allowed_model_ids": {
             "type": [
               "array",
               "null"
@@ -1555,7 +1563,60 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "items": {
               "type": "string"
             },
-            "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names (the form the gateway exposes). Entries are matched as `*` globs, mirroring `allowed_models`: `\"*\"` grants every tool and `\"<server>__*\"` grants every tool on one server (e.g. `\"github__*\"`); an entry without a `*` matches one tool exactly. When omitted, set to `null`, or set to an empty list, the key has no MCP tool access \u2014 access is granted explicitly."
+            "description": "Models this caller API key may use, named by resource id. An array here, `[]` included, is authoritative and `allowed_models` is ignored: each id resolves against the models currently in the configuration and the resolved name is glob-matched, and an id resolving to no model grants nothing. Omitted or null falls back to `allowed_models`, so `[]` and not null is how access is removed.",
+            "example": [
+              "9b1b6d9c-1f5e-4c1e-9f8f-2f5f5b9d1c11"
+            ]
+          },
+          "rate_limit": {
+            "$ref": "#/components/schemas/RateLimit",
+            "description": "Request, token, and concurrency limits for this key."
+          },
+          "mcp_access": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "allow": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Namespaced `<server>__<tool>` glob patterns this key allows, intersected with the environment and team layers. Read only when `allow_ids` is omitted or null; an array there, `[]` included, takes over entirely."
+              },
+              "allow_ids": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "$ref": "#/components/schemas/McpToolRef"
+                },
+                "description": "The same allow side written by MCP server resource id instead of by server name, so renaming a server does not change what the key may reach. An array here, `[]` included, is authoritative and `allow` is ignored. Omitted or null falls back to `allow`. Cannot express \"every server\": each entry names one server exactly and `server_id` is never a glob, so an enumeration of the servers registered today silently fails to cover one registered tomorrow — to cover every server, present and future, omit this and use the name form's `\"*\"`."
+              },
+              "deny": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Namespaced `<server>__<tool>` glob patterns subtracted from this key's effective grant. Deny always wins. Read only when `deny_ids` is omitted or null."
+              },
+              "deny_ids": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "$ref": "#/components/schemas/McpToolRef"
+                },
+                "description": "The same deny side written by MCP server resource id instead of by server name. An array here, `[]` included, is authoritative and `deny` is ignored. Omitted or null falls back to `deny`. Writing it requires `deny` beside it, so a gateway one release behind the control plane still reads the denial. Cannot express \"every server\": each entry names one server exactly and `server_id` is never a glob, so an enumeration of the servers registered today silently fails to cover one registered tomorrow — to cover every server, present and future, omit this and use the name form's `\"*\"`."
+              }
+            },
+            "required": [
+              "allow"
+            ],
+            "description": "This key's own layer of the MCP tool ACL, as namespaced `<server>__<tool>` glob patterns or as `allow_ids` / `deny_ids` entries naming the server by resource id. Intersected with the environment and team MCP access policies: every present layer must allow a tool and no layer may deny it. When omitted the key adds no constraint of its own; with no layer present anywhere the grant is empty."
           },
           "allowed_agents": {
             "type": [
@@ -2138,7 +2199,11 @@ fn add_variant_titles(doc: &mut Value) {
     let variant_titles: &[(&str, &[&str])] = &[
         (
             "/components/schemas/BedrockAWSCredentials/oneOf",
-            &["Static credentials"],
+            &[
+                "Static credentials",
+                "Bedrock API key",
+                "Default credential chain",
+            ],
         ),
         (
             "/components/schemas/BedrockLatencyMode/oneOf",
@@ -2160,7 +2225,9 @@ fn add_variant_titles(doc: &mut Value) {
                 "PII Detection and Redaction",
                 "Lakera Guard",
                 "OpenAI Moderation",
-                "Microsoft Presidio",
+                "Presidio",
+                "Semantic Screening",
+                "Custom Script",
             ],
         ),
         (
@@ -2168,12 +2235,12 @@ fn add_variant_titles(doc: &mut Value) {
             &["Input", "Output", "Both"],
         ),
         (
-            "/components/schemas/KeywordPattern/oneOf",
-            &["Literal", "Regex"],
+            "/components/schemas/GuardrailInputMessages/oneOf",
+            &["All messages", "Latest turn only"],
         ),
         (
-            "/components/schemas/McpAccessMode/oneOf",
-            &["Inherit", "Restrict", "Deny"],
+            "/components/schemas/KeywordPattern/oneOf",
+            &["Literal", "Regex"],
         ),
         (
             "/components/schemas/McpProtocolVersion/oneOf",
@@ -2194,6 +2261,7 @@ fn add_variant_titles(doc: &mut Value) {
         ),
         ("/components/schemas/DistanceMetric/oneOf", &["Cosine"]),
         ("/components/schemas/Aggregation/oneOf", &["Max"]),
+        ("/components/schemas/ClassifierType/oneOf", &["Jev"]),
         (
             "/components/schemas/EmbeddingFailureMode/oneOf",
             &["Default", "Fail"],
@@ -2222,12 +2290,16 @@ fn add_variant_titles(doc: &mut Value) {
             "/components/schemas/RoutingStrategy/oneOf",
             &[
                 "Round robin",
-                "Weighted",
+                "Consistent hash",
                 "Failover",
                 "Least cost",
                 "Least latency",
                 "Least busy",
             ],
+        ),
+        (
+            "/components/schemas/HashOnType/oneOf",
+            &["Header", "Cookie", "API key", "Client IP"],
         ),
         (
             "/components/schemas/SlsContentMode/oneOf",
@@ -2259,90 +2331,69 @@ fn title_schema_variants(doc: &mut Value, pointer: &str, titles: &[&str]) {
     }
 }
 
+/// Locate a property on the `oneOf` branch a schema selects through its
+/// `kind` discriminator.
+///
+/// Branch order follows the Rust enum's declaration order, so a pointer that
+/// names a branch by index addresses a different variant the moment one is
+/// inserted ahead of it — silently, because a stale index can only mislabel,
+/// never fail. That is how the `aliyun_ai_guardrail` guardrail came to be
+/// documented with the `pii` text (#1037). Select by discriminator instead.
+fn variant_property_mut<'a>(
+    doc: &'a mut Value,
+    schema: &str,
+    kind: &str,
+    property: &str,
+) -> Option<&'a mut Map<String, Value>> {
+    let Some(Value::Array(branches)) =
+        doc.pointer_mut(&format!("/components/schemas/{schema}/oneOf"))
+    else {
+        return None;
+    };
+    branches
+        .iter_mut()
+        .find(|branch| {
+            branch
+                .pointer("/properties/kind/enum/0")
+                .and_then(Value::as_str)
+                == Some(kind)
+        })
+        .and_then(|branch| branch.pointer_mut(&format!("/properties/{property}")))
+        .and_then(Value::as_object_mut)
+}
+
+/// Descriptions the derived schemas do not carry themselves. Every other
+/// `oneOf` family describes its own variants where the type is defined, in
+/// `aisix_core::models::schema`; these observability exporter kinds are the
+/// remaining set that does not, so they are filled in here.
 fn add_missing_property_descriptions(doc: &mut Value) {
-    for (pointer, description) in [
+    for (schema, kind, property, description) in [
         (
-            "/components/schemas/BedrockAWSCredentials/oneOf/0/properties/kind",
-            "Credential mode for explicitly configured AWS access keys.",
-        ),
-        (
-            "/components/schemas/BedrockLatencyMode/oneOf/0/properties/kind",
-            "Latency mode that waits for the Bedrock guardrail response.",
-        ),
-        (
-            "/components/schemas/BedrockLatencyMode/oneOf/1/properties/kind",
-            "Latency mode that stops waiting after `timeout_ms`.",
-        ),
-        (
-            "/components/schemas/Guardrail/oneOf/0/properties/kind",
-            "Guardrail provider type for literal and regular expression matching.",
-        ),
-        (
-            "/components/schemas/Guardrail/oneOf/1/properties/kind",
-            "Guardrail provider type for Amazon Bedrock Guardrails.",
-        ),
-        (
-            "/components/schemas/Guardrail/oneOf/2/properties/kind",
-            "Guardrail provider type for Azure Prompt Shield.",
-        ),
-        (
-            "/components/schemas/Guardrail/oneOf/3/properties/kind",
-            "Guardrail provider type for Azure text moderation.",
-        ),
-        (
-            "/components/schemas/Guardrail/oneOf/4/properties/kind",
-            "Guardrail provider type for Aliyun text moderation.",
-        ),
-        (
-            "/components/schemas/Guardrail/oneOf/5/properties/kind",
-            "Guardrail provider type for in-process sensitive-data detection and redaction.",
-        ),
-        (
-            "/components/schemas/Guardrail/oneOf/6/properties/kind",
-            "Guardrail provider type for Lakera Guard screening.",
-        ),
-        (
-            "/components/schemas/Guardrail/oneOf/7/properties/kind",
-            "Guardrail provider type for the OpenAI Moderation API.",
-        ),
-        (
-            "/components/schemas/Guardrail/oneOf/8/properties/kind",
-            "Guardrail provider type for self-hosted Microsoft Presidio PII detection and anonymization.",
-        ),
-        (
-            "/components/schemas/KeywordPattern/oneOf/0/properties/kind",
-            "Pattern type for matching the value as plain text.",
-        ),
-        (
-            "/components/schemas/KeywordPattern/oneOf/1/properties/kind",
-            "Pattern type for matching the value as a regular expression.",
-        ),
-        (
-            "/components/schemas/KeywordPattern/oneOf/0/properties/value",
-            "Literal string to match.",
-        ),
-        (
-            "/components/schemas/KeywordPattern/oneOf/1/properties/value",
-            "Regular expression pattern to match.",
-        ),
-        (
-            "/components/schemas/ObservabilityExporter/oneOf/0/properties/kind",
+            "ObservabilityExporter",
+            "otlp_http",
+            "kind",
             "Exporter type. Use `otlp_http` to send telemetry to an OTLP HTTP endpoint.",
         ),
         (
-            "/components/schemas/ObservabilityExporter/oneOf/1/properties/kind",
+            "ObservabilityExporter",
+            "aliyun_sls",
+            "kind",
             "Exporter type. Use `aliyun_sls` to send telemetry to Aliyun SLS.",
         ),
         (
-            "/components/schemas/ObservabilityExporter/oneOf/2/properties/kind",
+            "ObservabilityExporter",
+            "object_store",
+            "kind",
             "Exporter type. Use `object_store` to write telemetry batches to object storage.",
         ),
         (
-            "/components/schemas/ObservabilityExporter/oneOf/3/properties/kind",
+            "ObservabilityExporter",
+            "datadog",
+            "kind",
             "Exporter type. Use `datadog` to send telemetry to Datadog Logs intake.",
         ),
     ] {
-        if let Some(Value::Object(map)) = doc.pointer_mut(pointer) {
+        if let Some(map) = variant_property_mut(doc, schema, kind, property) {
             map.entry("description".to_string())
                 .or_insert_with(|| Value::String(description.to_string()));
         }
@@ -2357,7 +2408,7 @@ fn add_schema_defaults(doc: &mut Value) {
         ),
         (
             "/components/schemas/CooldownConfig/properties/enabled",
-            serde_json::json!(true),
+            serde_json::json!(false),
         ),
         (
             "/components/schemas/CooldownConfig/properties/honor_retry_after",
@@ -2380,10 +2431,6 @@ fn add_schema_defaults(doc: &mut Value) {
             serde_json::json!([401, 408, 429, 500, 502, 503, 504]),
         ),
         (
-            "/components/schemas/ObservabilityExporter/oneOf/0/properties/sample_rate",
-            serde_json::json!(1.0),
-        ),
-        (
             "/components/schemas/RequestOverrides/properties/param_renames",
             serde_json::json!({}),
         ),
@@ -2395,6 +2442,15 @@ fn add_schema_defaults(doc: &mut Value) {
         if let Some(Value::Object(map)) = doc.pointer_mut(pointer) {
             map.entry("default".to_string()).or_insert(default_value);
         }
+    }
+
+    // Variant-scoped, so it is selected by discriminator like the
+    // descriptions above rather than by branch index.
+    if let Some(map) =
+        variant_property_mut(doc, "ObservabilityExporter", "otlp_http", "sample_rate")
+    {
+        map.entry("default".to_string())
+            .or_insert(serde_json::json!(1.0));
     }
 }
 
@@ -2434,7 +2490,7 @@ fn wrap_ref_siblings_for_redoc(v: &mut Value) {
 /// JSON Schema, but ReDoc renders it as a two-tab choice for optional fields.
 /// Collapse that generated nullable shape in the served OpenAPI so optionality
 /// is expressed by the field being absent from `required`, matching the
-/// hand-written API7/AISIX Cloud Admin API style.
+/// hand-written AISIX Cloud Admin API style.
 fn collapse_nullable_any_of(v: &mut Value) {
     match v {
         Value::Object(map) => {
@@ -2562,6 +2618,15 @@ mod tests {
         // Validate by parsing — guards against typos in the literal block.
         let parsed: serde_json::Value =
             serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        assert_eq!(parsed["info"]["title"], "AISIX OSS Admin API");
+        let description = parsed["info"]["description"]
+            .as_str()
+            .expect("info.description must be a string");
+        assert!(description.contains("resource-management routes are read-only"));
+        assert!(description.contains("open-source AISIX gateway"));
+        assert!(description.contains("playground that forwards test completion requests"));
+        assert!(description.contains("does not create, update, or delete resources"));
+        assert!(description.contains("AISIX Enterprise or AISIX Cloud"));
         // Every route mounted in build_router should be documented.
         for path in [
             "/livez",
@@ -2938,6 +3003,21 @@ mod tests {
         }
     }
 
+    /// Select a `oneOf` branch by its `kind` discriminator.
+    ///
+    /// Reaching for a branch by index makes a test fail on a reorder that
+    /// left the generated document perfectly correct — the mirror image of
+    /// the defect this module now guards against (#1037), and just as
+    /// misleading.
+    fn variant_by_kind<'a>(schema: &'a serde_json::Value, kind: &str) -> &'a serde_json::Value {
+        schema["oneOf"]
+            .as_array()
+            .expect("schema is a `oneOf` over its kinds")
+            .iter()
+            .find(|branch| branch["properties"]["kind"]["enum"][0] == kind)
+            .unwrap_or_else(|| panic!("schema has no `{kind}` branch"))
+    }
+
     #[tokio::test]
     async fn openapi_documents_admin_enum_schemas() {
         let parsed: serde_json::Value =
@@ -2962,7 +3042,8 @@ mod tests {
             "Aggregate health summary derived from per-model health and config freshness. `ok` = all models healthy and config fresh; `degraded` = at least one model degraded or the config watch is stale/not yet applied; `unhealthy` = at least one model is down. Use `models[].health` and `config` for the per-dimension detail."
         );
         assert_eq!(
-            schemas["ObservabilityExporter"]["oneOf"][0]["properties"]["sample_rate"]["default"],
+            variant_by_kind(&schemas["ObservabilityExporter"], "otlp_http")["properties"]
+                ["sample_rate"]["default"],
             serde_json::json!(1.0),
             "runtime default for OTLP sampling should be visible in OpenAPI"
         );
@@ -2970,6 +3051,13 @@ mod tests {
             schemas["CooldownConfig"]["properties"]["trigger_statuses"]["default"],
             serde_json::json!([401, 408, 429, 500, 502, 503, 504]),
             "runtime default cooldown trigger statuses should be visible in OpenAPI"
+        );
+        // Cooldown is opt-in (AISIX-Cloud#1499): the reference must not
+        // advertise a feature the gateway does not switch on by itself.
+        assert_eq!(
+            schemas["CooldownConfig"]["properties"]["enabled"]["default"],
+            serde_json::json!(false),
+            "cooldown must be documented as off unless the operator enables it"
         );
         assert_eq!(
             schemas["Routing"]["properties"]["when_all_unavailable"]["default"],
@@ -3000,8 +3088,10 @@ mod tests {
             "optional object fields should not render as nullable ReDoc tabs"
         );
 
-        let content_mode = &parsed["components"]["schemas"]["ObservabilityExporter"]["oneOf"][0]
-            ["properties"]["content_mode"];
+        let content_mode = &variant_by_kind(
+            &parsed["components"]["schemas"]["ObservabilityExporter"],
+            "otlp_http",
+        )["properties"]["content_mode"];
         assert_eq!(
             content_mode["allOf"][0]["$ref"],
             "#/components/schemas/SlsContentMode"
@@ -3056,11 +3146,194 @@ mod tests {
         );
     }
 
+    /// Both carriers of a guardrail branch's identity are pinned by
+    /// discriminator here, because both are authored as position-ordered
+    /// lists: the ReDoc tab titles in `add_variant_titles`, and the `oneOf`
+    /// order the descriptions ride in. Reordering either one hands a kind its
+    /// neighbour's text, which nothing else fails on (#1037).
+    #[tokio::test]
+    async fn openapi_guardrail_variants_keep_their_own_metadata() {
+        let expected_titles = [
+            ("keyword", "Keyword"),
+            ("bedrock", "AWS Bedrock"),
+            (
+                "azure_content_safety",
+                "Azure AI Content Safety Prompt Shield",
+            ),
+            (
+                "azure_content_safety_text_moderation",
+                "Azure AI Content Safety Text Moderation",
+            ),
+            ("aliyun_text_moderation", "Aliyun Text Moderation"),
+            ("aliyun_ai_guardrail", "Aliyun AI Guardrails"),
+            ("pii", "PII Detection and Redaction"),
+            ("lakera", "Lakera Guard"),
+            ("openai_moderation", "OpenAI Moderation"),
+            ("presidio", "Presidio"),
+            ("semantic", "Semantic Screening"),
+            ("custom", "Custom Script"),
+        ];
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        let branches = parsed["components"]["schemas"]["Guardrail"]["oneOf"]
+            .as_array()
+            .expect("the guardrail schema is a `oneOf` over the kinds");
+        assert_eq!(
+            branches.len(),
+            expected_titles.len(),
+            "a guardrail kind was added or removed without updating this test"
+        );
+
+        // The kind descriptions have exactly one source, beside the type in
+        // `aisix_core`. Assembly here must not become a second one.
+        let source = aisix_core::models::schema::guardrail_root_schema(true);
+        let source_branches = source["oneOf"]
+            .as_array()
+            .expect("the guardrail root schema is a `oneOf` over the kinds");
+
+        for branch in branches {
+            let kind = branch["properties"]["kind"]["enum"][0]
+                .as_str()
+                .expect("each branch pins exactly one kind");
+            let (_, title) = expected_titles
+                .iter()
+                .find(|(expected, _)| *expected == kind)
+                .unwrap_or_else(|| {
+                    panic!("guardrail kind `{kind}` has no expected ReDoc tab title")
+                });
+            assert_eq!(
+                branch["title"].as_str(),
+                Some(*title),
+                "guardrail kind `{kind}` carries another kind's title"
+            );
+
+            let source_branch = source_branches
+                .iter()
+                .find(|candidate| candidate["properties"]["kind"]["enum"][0].as_str() == Some(kind))
+                .unwrap_or_else(|| {
+                    panic!("guardrail kind `{kind}` is absent from the root schema")
+                });
+            assert_eq!(
+                branch["properties"]["kind"]["description"],
+                source_branch["properties"]["kind"]["description"],
+                "guardrail kind `{kind}` was re-described during OpenAPI assembly"
+            );
+        }
+    }
+
+    /// The observability exporter kinds are the one family whose `kind`
+    /// descriptions are written during assembly rather than beside the type,
+    /// so this is the only place their branch-to-text binding can be checked.
+    /// Each sentence names its own kind, which is exactly what selecting the
+    /// wrong branch breaks.
+    ///
+    /// The ReDoc tab titles are pinned here too. `add_variant_titles` still
+    /// assigns titles positionally, which is safe for adding or removing a
+    /// kind — `title_schema_variants` bails on a length mismatch and every
+    /// title in the family disappears, failing
+    /// `openapi_titles_schema_variants_for_redoc_tabs` loudly. A
+    /// length-preserving reorder is the one edit that would slip through, so
+    /// the two families that grow pin their titles by discriminator instead.
+    #[tokio::test]
+    async fn openapi_exporter_kind_metadata_lands_on_its_own_variant() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        let branches = parsed["components"]["schemas"]["ObservabilityExporter"]["oneOf"]
+            .as_array()
+            .expect("the exporter schema is a `oneOf` over the kinds");
+        assert!(!branches.is_empty(), "the exporter family has no kinds");
+
+        for branch in branches {
+            let kind = branch["properties"]["kind"]["enum"][0]
+                .as_str()
+                .expect("each branch pins exactly one kind");
+            let description = branch["properties"]["kind"]["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("exporter kind `{kind}` has no description"));
+            assert!(
+                description.contains(&format!("`{kind}`")),
+                "exporter kind `{kind}` carries another kind's description: {description}"
+            );
+        }
+
+        let expected_titles = [
+            ("otlp_http", "OTLP HTTP"),
+            ("aliyun_sls", "Aliyun SLS"),
+            ("object_store", "Object storage"),
+            ("datadog", "Datadog"),
+        ];
+        assert_eq!(
+            branches.len(),
+            expected_titles.len(),
+            "an exporter kind was added or removed without updating this test"
+        );
+        for branch in branches {
+            let kind = branch["properties"]["kind"]["enum"][0]
+                .as_str()
+                .expect("each branch pins exactly one kind");
+            let (_, title) = expected_titles
+                .iter()
+                .find(|(expected, _)| *expected == kind)
+                .unwrap_or_else(|| {
+                    panic!("exporter kind `{kind}` has no expected ReDoc tab title")
+                });
+            assert_eq!(
+                branch["title"].as_str(),
+                Some(*title),
+                "exporter kind `{kind}` carries another kind's title"
+            );
+        }
+
+        let otlp = variant_by_kind(
+            &parsed["components"]["schemas"]["ObservabilityExporter"],
+            "otlp_http",
+        );
+        assert_eq!(
+            otlp["properties"]["sample_rate"]["default"],
+            serde_json::json!(1.0),
+            "the documented sample_rate default landed on the wrong exporter branch"
+        );
+    }
+
+    /// A subschema that states a cross-field REQUIREMENT and nothing
+    /// else: `required`, optionally with a bare type pin on each field it
+    /// names. The "name or id" alternative every model reference carries
+    /// is written this way — the type pin is there because `required` in
+    /// JSON Schema is satisfied by a key whose value is `null`, and the
+    /// id fields accept `null`.
+    ///
+    /// ReDoc renders no tab for such a branch and it defines no property
+    /// of its own, so the title and description guards below skip it —
+    /// exactly as they already skip `if`/`then`/`else`.
+    fn is_requiredness_constraint(node: &serde_json::Value) -> bool {
+        let Some(map) = node.as_object() else {
+            return false;
+        };
+        if !map.contains_key("required")
+            || !map
+                .keys()
+                .all(|k| matches!(k.as_str(), "required" | "properties"))
+        {
+            return false;
+        }
+        let Some(serde_json::Value::Object(properties)) = map.get("properties") else {
+            return true;
+        };
+        properties.values().all(|p| {
+            p.as_object()
+                .is_some_and(|o| o.len() == 1 && o.contains_key("type"))
+        })
+    }
+
     fn collect_missing_property_descriptions(
         value: &serde_json::Value,
         path: String,
         missing: &mut Vec<String>,
     ) {
+        if is_requiredness_constraint(value) {
+            return;
+        }
         match value {
             serde_json::Value::Object(map) => {
                 if map.get("type").is_some_and(|kind| kind == "object")
@@ -3188,6 +3461,14 @@ mod tests {
                 for key in ["oneOf", "anyOf"] {
                     if let Some(serde_json::Value::Array(variants)) = map.get(key) {
                         for (index, variant) in variants.iter().enumerate() {
+                            // A cross-field requirement is not a shape a
+                            // reader picks between, so ReDoc gives it no
+                            // tab and a title on it would name something
+                            // nobody sees. Same exemption the `not`
+                            // subschemas get below.
+                            if is_requiredness_constraint(variant) {
+                                continue;
+                            }
                             if variant["title"].as_str().is_none_or(str::is_empty) {
                                 missing.push(format!("{path}/{key}/{index}"));
                             }
@@ -3304,8 +3585,12 @@ mod tests {
             "verbose"
         );
         // Graceful shutdown is documented as 503 (drain), not 500 (#591).
-        assert!(parsed["paths"]["/livez"]["get"]["responses"]["503"].is_object());
+        // Liveness has no failure response to document: a draining
+        // instance answers 200 like any other, and an instance that
+        // cannot answer does not reply at all.
+        assert!(parsed["paths"]["/livez"]["get"]["responses"]["503"].is_null());
         assert!(parsed["paths"]["/livez"]["get"]["responses"]["500"].is_null());
+        assert!(parsed["paths"]["/readyz"]["get"]["responses"]["503"].is_object());
         // /readyz is documented with 200 + 503 (readiness).
         assert!(parsed["paths"]["/readyz"]["get"]["responses"]["200"].is_object());
         assert!(parsed["paths"]["/readyz"]["get"]["responses"]["503"].is_object());

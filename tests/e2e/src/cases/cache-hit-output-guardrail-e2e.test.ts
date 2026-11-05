@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -35,7 +36,7 @@ describe("cache hit runs output guardrails (#448)", () => {
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     upstream = await startOpenAiUpstream();
-    app = await spawnApp();
+    app = await spawnApp({ exposeDebugHeaders: true });
     seed = new SeedClient(etcd, app.etcdPrefix);
     const pk = await seed.createProviderKey({
       display_name: "cache-gr-pk",
@@ -58,7 +59,8 @@ describe("cache hit runs output guardrails (#448)", () => {
     // is written after it. A resource seeded afterwards can still be
     // propagating when the gate opens.
     await seed.createApiKey({ key_hash: HASH, allowed_models: ["cache-gr"] });
-
+    const proxy = new ProxyClient(app.proxyUrl, CALLER);
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
   });
 
   afterAll(async () => {
@@ -78,9 +80,6 @@ describe("cache hit runs output guardrails (#448)", () => {
       ctx.skip();
       return;
     }
-
-    // Wait until model+key+pk+cache are live (clean prompt → 200 + cache miss).
-    await waitConfigPropagation(async () => (await chat("ready-probe")).ok);
 
     // 1) Cache the response BEFORE any output guardrail exists.
     const first = await chat(CACHED_PROMPT);

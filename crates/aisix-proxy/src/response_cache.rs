@@ -144,7 +144,7 @@ impl BodyCache {
             entry.value.enabled
                 && entry
                     .value
-                    .parsed_applies_to()
+                    .parsed_applies_to(snapshot)
                     .matches(model_name, &auth.entry.id)
         })?;
         let cache = state

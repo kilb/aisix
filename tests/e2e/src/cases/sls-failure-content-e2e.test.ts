@@ -3,11 +3,12 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
   SeedClient,
-  lz4DecompressBlock,
+  slsLogsFor,
   spawnApp,
   startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForSlsLog,
   type MockSls,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -20,14 +21,22 @@ import {
 // real `aisix` binary + etcd against a hard-failing mock upstream and a
 // keyword guardrail, and reads the delivered SLS protobuf back:
 //
-//   1. upstream failure (chat)        → record carries `prompt`
-//   2. guardrail input block 422      → record exists WITHOUT `prompt`
-//   3. 403 model-forbidden            → record exists WITHOUT `prompt`
-//      (auth-class failures stay body-less by design)
-//   4. /v1/messages upstream failure  → record carries `prompt`
-//   5. unrewritable sensitive tool key → record exists WITHOUT `prompt`
-//   6. malformed /v1/messages DLP shape → record exists WITHOUT `prompt`
-//   7. /v1/responses upstream failure → record carries `prompt`
+//   1. upstream failure (chat)        → record carries `input_messages`
+//   2. guardrail input block 422      → UNDECIDED, both cases below; see the note
+//   3. 403 model-forbidden            → record carries `input_messages`
+//   4. /v1/messages upstream failure  → record carries `input_messages`
+//   5. unrewritable sensitive tool key → record exists WITHOUT `input_messages`
+//   6. malformed /v1/messages DLP shape → record exists WITHOUT `input_messages`
+//   7. /v1/responses upstream failure → record carries `input_messages`
+//
+// Case 2 is an open contradiction, left for a human to settle. "carries the
+// prompt" and "captures the POST-mask body" (with
+// `failure-row-block-mask-parity-e2e`) export a blocked request's body masked.
+// "suppresses the prompt", "never exports the rejected body" and the
+// /v1/responses metadata case export no body at all, because a keyword's or a
+// blocking detector's match is not masked and would reach the logstore in the
+// clear. Both sets stay, so one of them fails until that is decided; neither
+// may be loosened to fit the other.
 //
 // A metadata_only exporter runs alongside and must never see any prompt.
 
@@ -61,97 +70,9 @@ const MALFORMED_MESSAGES_SECRET = "malformed-messages@example.com";
 const KEYWORD_BLOCK_REQUEST_ID = "55555555-5555-4555-8555-555555555555";
 const PII_BLOCK_REQUEST_ID = "66666666-6666-4666-8666-666666666666";
 
-// --- Minimal SLS LogGroup protobuf reader (see sink/sls.rs encoder) -----
-// LogGroup { Logs = 1 (message) { Time = 1 (varint), Contents = 2 (message)
-// { Key = 1 (string), Value = 2 (string) } } }; unknown fields skipped.
-
-function readVarint(buf: Buffer, pos: number): [number, number] {
-  let result = 0;
-  let shift = 0;
-  for (;;) {
-    const b = buf[pos]!;
-    pos += 1;
-    result += (b & 0x7f) * 2 ** shift;
-    if ((b & 0x80) === 0) return [result, pos];
-    shift += 7;
-  }
-}
-
-function skipField(buf: Buffer, pos: number, wireType: number): number {
-  if (wireType === 0) return readVarint(buf, pos)[1];
-  if (wireType === 2) {
-    const [len, p] = readVarint(buf, pos);
-    return p + len;
-  }
-  if (wireType === 5) return pos + 4;
-  if (wireType === 1) return pos + 8;
-  throw new Error(`unsupported wire type ${wireType}`);
-}
-
-function parseContentPair(buf: Buffer): [string, string] {
-  let pos = 0;
-  let key = "";
-  let value = "";
-  while (pos < buf.length) {
-    const [tag, p] = readVarint(buf, pos);
-    pos = p;
-    const field = tag >>> 3;
-    const wireType = tag & 7;
-    if (wireType === 2) {
-      const [len, q] = readVarint(buf, pos);
-      const bytes = buf.subarray(q, q + len);
-      pos = q + len;
-      if (field === 1) key = bytes.toString("utf8");
-      else if (field === 2) value = bytes.toString("utf8");
-    } else {
-      pos = skipField(buf, pos, wireType);
-    }
-  }
-  return [key, value];
-}
-
-function parseLog(buf: Buffer): Map<string, string> {
-  const out = new Map<string, string>();
-  let pos = 0;
-  while (pos < buf.length) {
-    const [tag, p] = readVarint(buf, pos);
-    pos = p;
-    const field = tag >>> 3;
-    const wireType = tag & 7;
-    if (field === 2 && wireType === 2) {
-      const [len, q] = readVarint(buf, pos);
-      const [k, v] = parseContentPair(buf.subarray(q, q + len));
-      out.set(k, v);
-      pos = q + len;
-    } else {
-      pos = skipField(buf, pos, wireType);
-    }
-  }
-  return out;
-}
-
 /** Decode every log delivered to `logstore` into flat key→value maps. */
 function logsFor(sls: MockSls, logstore: string): Map<string, string>[] {
-  const logs: Map<string, string>[] = [];
-  for (const r of sls.requests) {
-    if (r.logstore !== logstore || r.rawSize === 0 || r.body.length === 0) continue;
-    const group = lz4DecompressBlock(r.body, r.rawSize);
-    let pos = 0;
-    while (pos < group.length) {
-      const [tag, p] = readVarint(group, pos);
-      pos = p;
-      const field = tag >>> 3;
-      const wireType = tag & 7;
-      if (field === 1 && wireType === 2) {
-        const [len, q] = readVarint(group, pos);
-        logs.push(parseLog(group.subarray(q, q + len)));
-        pos = q + len;
-      } else {
-        pos = skipField(group, pos, wireType);
-      }
-    }
-  }
-  return logs;
+  return slsLogsFor(sls, logstore);
 }
 
 /** Poll until a log in `logstore` matching `pred` arrives (or time out). */
@@ -162,13 +83,7 @@ async function waitForLog(
   logstore = FULL_LOGSTORE,
   timeoutMs = 10_000,
 ): Promise<Map<string, string>> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const hit = logsFor(sls, logstore).find(pred);
-    if (hit) return hit;
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  throw new Error(`no SLS log matching: ${what}`);
+  return waitForSlsLog(sls, logstore, pred, what, timeoutMs);
 }
 
 // -------------------------------------------------------------------------
@@ -270,8 +185,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: okPk.id,
     });
-    // Second hard-failing target so a routing group can fail on BOTH
-    // targets (content must ride the LAST attempt only).
+    // Second hard-failing target so a routing group can fail on BOTH targets.
     await seed.createModel({
       display_name: "failure-content-fail-b",
       provider: "openai",
@@ -289,8 +203,8 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
         ],
       },
     });
-    // Fail-then-recover group: the failed attempt must stay content-less
-    // while the winner's success event carries the prompt.
+    // Fail-then-recover group: both the failed attempt and the winner's
+    // success event carry the prompt.
     await seed.createModel({
       display_name: "failure-content-recover",
       routing: {
@@ -386,17 +300,37 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
 
     const log = await waitForLog(
       sls,
-      (l) => (l.get("prompt") ?? "").includes(UPSTREAM_FAIL_SENTINEL),
+      (l) => (l.get("input_messages") ?? "").includes(UPSTREAM_FAIL_SENTINEL),
       "failed-upstream chat record with prompt",
     );
-    // It is the FAILED request's record: non-2xx status, no response text.
+    // It is the FAILED request's record: non-2xx status, the upstream's answer.
     expect(Number(log.get("status_code"))).toBeGreaterThanOrEqual(400);
-    expect(log.get("response") ?? "").toBe("");
-    // The prompt is the request body — valid JSON with the messages array.
-    const prompt = JSON.parse(log.get("prompt")!) as {
-      messages: Array<{ content: string }>;
-    };
-    expect(prompt.messages[0]!.content).toContain(UPSTREAM_FAIL_SENTINEL);
+    expect(log.get("response")).toContain("mock upstream exploded");
+    expect(log.has("output_messages")).toBe(false);
+    // The request's messages, in the GenAI conventions' shape.
+    const input = JSON.parse(log.get("input_messages")!) as Array<{
+      role: string;
+      parts: Array<{ type: string; content: string }>;
+    }>;
+    expect(input[0]!.role).toBe("user");
+    expect(input[0]!.parts[0]!.content).toContain(UPSTREAM_FAIL_SENTINEL);
+  });
+
+  test("guardrail input block (422): the record carries the prompt", async (ctx) => {
+    if (!etcdReachable || !app || !sls) {
+      ctx.skip();
+      return;
+    }
+    const res = await chat("failure-content-ok", GUARDRAIL_SENTINEL);
+    expect(res.status).toBe(422);
+
+    const log = await waitForLog(
+      sls,
+      (l) => (l.get("input_messages") ?? "").includes(GUARDRAIL_SENTINEL),
+      "guardrail-blocked record with prompt",
+    );
+    expect(log.get("status_code")).toBe("422");
+    expect(log.get("guardrail_blocked")).toBe("true");
   });
 
   test("guardrail input block (422): the record suppresses the prompt", async (ctx) => {
@@ -419,6 +353,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     expect(log.get("status_code")).toBe("422");
     expect(log.get("guardrail_blocked")).toBe("true");
     expect(log.has("prompt")).toBe(false);
+    expect(log.has("input_messages")).toBe(false);
     expect([...log.values()].join("\n")).not.toContain(GUARDRAIL_SENTINEL);
   });
 
@@ -449,6 +384,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     );
     expect(log.get("guardrail_blocked")).toBe("true");
     expect(log.get("prompt")).toBeUndefined();
+    expect(log.get("input_messages")).toBeUndefined();
     for (const value of log.values()) {
       expect(value).not.toContain(FORBIDDEN_WORD);
     }
@@ -490,7 +426,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     });
   });
 
-  test("403 model-forbidden: the record exists but stays body-less", async (ctx) => {
+  test("403 model-forbidden: the record carries the prompt", async (ctx) => {
     if (!etcdReachable || !app || !sls) {
       ctx.skip();
       return;
@@ -498,7 +434,6 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     const res = await chat("failure-content-offlimits", FORBIDDEN_MODEL_SENTINEL);
     expect(res.status).toBe(403);
 
-    // The 403 event lands in SLS…
     const log = await waitForLog(
       sls,
       (l) =>
@@ -506,11 +441,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
         (l.get("requested_model") ?? "") === "failure-content-offlimits",
       "403 record",
     );
-    // …but carries no prompt, and the sentinel never reaches the logstore.
-    expect(log.get("prompt")).toBeUndefined();
-    for (const l of logsFor(sls, FULL_LOGSTORE)) {
-      expect(l.get("prompt") ?? "").not.toContain(FORBIDDEN_MODEL_SENTINEL);
-    }
+    expect(log.get("input_messages")).toContain(FORBIDDEN_MODEL_SENTINEL);
   });
 
   test("/v1/messages upstream failure: the record carries the prompt", async (ctx) => {
@@ -536,7 +467,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
 
     const log = await waitForLog(
       sls,
-      (l) => (l.get("prompt") ?? "").includes(MESSAGES_SENTINEL),
+      (l) => (l.get("input_messages") ?? "").includes(MESSAGES_SENTINEL),
       "failed /v1/messages record with prompt",
     );
     expect(Number(log.get("status_code"))).toBeGreaterThanOrEqual(400);
@@ -591,6 +522,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     expect(log.get("status_code")).toBe("422");
     expect(log.get("guardrail_blocked")).toBe("true");
     expect(log.get("prompt")).toBeUndefined();
+    expect(log.get("input_messages")).toBeUndefined();
     for (const entry of logsFor(sls, FULL_LOGSTORE)) {
       for (const value of entry.values()) {
         expect(value).not.toContain(SENSITIVE_TOOL_KEY);
@@ -605,6 +537,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     expect(metadataLog.get("status_code")).toBe("422");
     expect(metadataLog.get("guardrail_blocked")).toBe("true");
     expect(metadataLog.get("prompt")).toBeUndefined();
+    expect(metadataLog.get("input_messages")).toBeUndefined();
     for (const value of metadataLog.values()) {
       expect(value).not.toContain(SENSITIVE_TOOL_KEY);
     }
@@ -644,6 +577,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
       );
       expect(log.get("status_code")).toBe("400");
       expect(log.get("prompt")).toBeUndefined();
+      expect(log.get("input_messages")).toBeUndefined();
       for (const value of log.values()) {
         expect(value).not.toContain(MALFORMED_MESSAGES_SECRET);
       }
@@ -671,10 +605,41 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
 
     const log = await waitForLog(
       sls,
-      (l) => (l.get("prompt") ?? "").includes(RESPONSES_SENTINEL),
+      (l) => (l.get("input_messages") ?? "").includes(RESPONSES_SENTINEL),
       "failed /v1/responses record with prompt",
     );
     expect(Number(log.get("status_code"))).toBeGreaterThanOrEqual(400);
+  });
+
+  test("blocked request carrying maskable PII captures the POST-mask body", async (ctx) => {
+    if (!etcdReachable || !app || !sls) {
+      ctx.skip();
+      return;
+    }
+    // The china_id_card detector blocks; the email detector masks. The
+    // captured prompt must show what the success path would have sent —
+    // the masked email — never the raw address.
+    const res = await chat(
+      "failure-content-ok",
+      `${MASKED_BLOCK_SENTINEL} write to ${EMAIL} about id ${CN_ID}`,
+    );
+    expect(res.status).toBe(422);
+
+    const log = await waitForLog(
+      sls,
+      (l) => (l.get("input_messages") ?? "").includes(MASKED_BLOCK_SENTINEL),
+      "pii-blocked record with prompt",
+    );
+    expect(log.get("guardrail_blocked")).toBe("true");
+    const prompt = log.get("input_messages")!;
+    expect(prompt).toContain("[EMAIL_REDACTED]");
+    expect(prompt).not.toContain(EMAIL);
+    // And the raw address never reaches the logstore in any record.
+    for (const l of logsFor(sls, FULL_LOGSTORE)) {
+      for (const v of l.values()) {
+        expect(v).not.toContain(EMAIL);
+      }
+    }
   });
 
   test("blocked request carrying PII never exports the rejected body", async (ctx) => {
@@ -696,6 +661,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     );
     expect(log.get("guardrail_blocked")).toBe("true");
     expect(log.has("prompt")).toBe(false);
+    expect(log.has("input_messages")).toBe(false);
     for (const l of logsFor(sls, FULL_LOGSTORE)) {
       for (const v of l.values()) {
         expect(v).not.toContain(EMAIL);
@@ -704,7 +670,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     }
   });
 
-  test("all targets failed: exactly one record carries the prompt, on the last attempt", async (ctx) => {
+  test("all targets failed: every attempt's record carries the prompt", async (ctx) => {
     if (!etcdReachable || !app || !sls) {
       ctx.skip();
       return;
@@ -714,31 +680,25 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
 
     const withPrompt = await waitForLog(
       sls,
-      (l) => (l.get("prompt") ?? "").includes(GROUP_SENTINEL),
+      (l) => (l.get("input_messages") ?? "").includes(GROUP_SENTINEL),
       "all-targets-failed record with prompt",
     );
     const requestId = withPrompt.get("request_id")!;
     expect(requestId).toBeTruthy();
 
-    // Both attempts produced a record…
-    const requestLogs = logsFor(sls, FULL_LOGSTORE).filter(
-      (l) => l.get("request_id") === requestId,
-    );
-    expect(requestLogs.length).toBeGreaterThanOrEqual(2);
-    // …but exactly ONE carries the prompt, and it is the LAST attempt
-    // (the failure the caller actually saw), not the first.
-    const promptBearers = requestLogs.filter((l) =>
-      (l.get("prompt") ?? "").includes(GROUP_SENTINEL),
-    );
-    expect(promptBearers.length).toBe(1);
-    const maxAttempt = Math.max(
-      ...requestLogs.map((l) => Number(l.get("attempt_index") ?? "0")),
-    );
-    expect(Number(promptBearers[0]!.get("attempt_index"))).toBe(maxAttempt);
-    expect(maxAttempt).toBeGreaterThanOrEqual(1);
+    const deadline = Date.now() + 10_000;
+    const requestLogs = () =>
+      logsFor(sls!, FULL_LOGSTORE).filter((l) => l.get("request_id") === requestId);
+    while (requestLogs().length < 2 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(requestLogs().length).toBeGreaterThanOrEqual(2);
+    for (const log of requestLogs()) {
+      expect(log.get("input_messages")).toContain(GROUP_SENTINEL);
+    }
   });
 
-  test("fallback recovers: failed attempt stays content-less, the success record carries the prompt", async (ctx) => {
+  test("fallback recovers: the failed attempt and the success record both carry the prompt", async (ctx) => {
     if (!etcdReachable || !app || !sls) {
       ctx.skip();
       return;
@@ -749,24 +709,19 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     const successLog = await waitForLog(
       sls,
       (l) =>
-        (l.get("prompt") ?? "").includes(RECOVER_SENTINEL) &&
+        (l.get("input_messages") ?? "").includes(RECOVER_SENTINEL) &&
         l.get("status_code") === "200",
       "recovered request's success record with prompt",
     );
     const requestId = successLog.get("request_id")!;
-    // The failed first attempt is recorded — without the prompt.
-    const deadline = Date.now() + 10_000;
-    let failedAttempt: Map<string, string> | undefined;
-    while (Date.now() < deadline && !failedAttempt) {
-      failedAttempt = logsFor(sls, FULL_LOGSTORE).find(
-        (l) =>
-          l.get("request_id") === requestId &&
-          Number(l.get("status_code") ?? "0") >= 400,
-      );
-      if (!failedAttempt) await new Promise((r) => setTimeout(r, 100));
-    }
-    expect(failedAttempt, "failed attempt record").toBeDefined();
-    expect(failedAttempt!.get("prompt")).toBeUndefined();
+    const failedAttempt = await waitForLog(
+      sls,
+      (l) =>
+        l.get("request_id") === requestId && Number(l.get("status_code") ?? "0") >= 400,
+      "failed attempt record",
+    );
+    expect(failedAttempt.get("input_messages")).toContain(RECOVER_SENTINEL);
+    expect(failedAttempt.get("response")).toContain("mock upstream exploded");
   });
 
   test("metadata_only exporter never receives any failed-request prompt", async (ctx) => {
@@ -802,6 +757,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     }
     for (const l of logsFor(sls, META_LOGSTORE)) {
       expect(l.get("prompt")).toBeUndefined();
+      expect(l.get("input_messages")).toBeUndefined();
     }
   });
 });

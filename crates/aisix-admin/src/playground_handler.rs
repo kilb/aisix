@@ -77,11 +77,13 @@ mod tests {
     fn proxy_cfg() -> ProxyConfig {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: Some(1_048_576),
+            request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),
+            expose_debug_headers: false,
             tls: None,
+            listeners: Vec::new(),
             thread_per_core: None,
             workers: None,
         }
@@ -139,7 +141,7 @@ mod tests {
 
     #[tokio::test]
     async fn playground_forwards_to_proxy_and_returns_completion() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

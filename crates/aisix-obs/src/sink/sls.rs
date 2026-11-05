@@ -23,8 +23,8 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use serde::Deserialize;
 
 use super::{
-    BatchUnit, EventBatch, IdempotencyMarker, IdempotencyScheme, ObservabilitySink, OrderingScope,
-    SinkAck, SinkCapabilities, SinkError, SinkHealth, SinkRecord, SinkResult,
+    BatchUnit, ErrorRedactor, EventBatch, IdempotencyMarker, IdempotencyScheme, ObservabilitySink,
+    OrderingScope, SinkAck, SinkCapabilities, SinkError, SinkHealth, SinkRecord, SinkResult,
 };
 
 /// `x-log-bodyrawsize`: the *uncompressed* protobuf size. SLS uses it to size
@@ -183,7 +183,7 @@ impl ObservabilitySink for AliyunSlsSink {
             Err(e) => {
                 return Err(SinkError::Transient(format!(
                     "sls: POST {}: {}",
-                    self.endpoint_url,
+                    aisix_gateway::redact_url_for_log(&self.endpoint_url),
                     super::error_chain(&e)
                 )))
             }
@@ -197,20 +197,20 @@ impl ObservabilitySink for AliyunSlsSink {
             });
         }
 
+        let retry_after = super::retry_after_of(status, resp.headers());
         let body = resp.text().await.unwrap_or_default();
         let (error_code, detail) = parse_sls_error(status, &body);
         // 5xx / 408 / 429 are always worth retrying; SLS also signals back-
         // pressure (quota / busy / clock skew) on a 4xx with a code whose plain
         // meaning is transient, so promote those rather than drop a log batch.
-        if status.is_server_error()
-            || status == reqwest::StatusCode::REQUEST_TIMEOUT
-            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-            || is_transient_error_code(&error_code)
-        {
-            Err(SinkError::Transient(detail))
-        } else {
-            Err(SinkError::Permanent(detail))
-        }
+        Err(
+            match super::http_status_error(status, retry_after, detail) {
+                SinkError::Permanent(detail) if is_transient_error_code(&error_code) => {
+                    SinkError::Transient(detail)
+                }
+                err => err,
+            },
+        )
     }
 
     async fn healthcheck(&self) -> SinkHealth {
@@ -219,6 +219,12 @@ impl ObservabilitySink for AliyunSlsSink {
         // reports healthy and its delivery errors surface via
         // `SinkStats::last_error`. (Mirrors `OtlpSink`.)
         SinkHealth::healthy()
+    }
+
+    fn error_redactor(&self) -> ErrorRedactor {
+        ErrorRedactor::default()
+            .url(&self.endpoint_url)
+            .secret(&self.access_key_secret)
     }
 }
 
@@ -238,18 +244,58 @@ fn to_log(record: &SinkRecord) -> Result<Log, SinkError> {
         .map_err(|e| SinkError::Permanent(format!("sls: serialize usage: {e}")))?;
     if let serde_json::Value::Object(fields) = usage {
         for (key, value) in fields {
+            // One field per cost-attribution tag, so each is a column an
+            // SLS query can filter on without parsing JSON.
+            if key == "tags" {
+                continue;
+            }
             if let Some(rendered) = render_scalar(&value) {
                 log.add_content_kv(key, rendered);
             }
         }
     }
+    for (key, value) in &record.usage.tags {
+        log.add_content_kv(format!("tags.{key}"), value.as_str());
+    }
+    for (key, headers) in [
+        ("request_headers", &record.request_headers),
+        (
+            "upstream_response_headers",
+            &record.upstream_response_headers,
+        ),
+    ] {
+        if !headers.is_empty() {
+            let rendered = serde_json::to_value(headers).unwrap_or_default();
+            if let Some(rendered) = render_scalar(&rendered) {
+                log.add_content_kv(key, rendered);
+            }
+        }
+    }
 
-    // Opt-in captured content as flat, queryable fields (the SLS customer case
-    // wants prompt / response columns, not a nested blob). Absent on the
+    // Opt-in captured content, one field per piece: the GenAI conventions'
+    // structured messages as compact JSON strings, and a side that could not
+    // be structured as flat `prompt` / `response` text. Absent on the
     // default metadata-only path, so prompts never leak there.
     if let Some(content) = &record.content {
-        log.add_content_kv("prompt", content.prompt.as_str());
-        log.add_content_kv("response", content.response.as_str());
+        let enc = content.encode(&record.usage);
+        for (key, value) in [
+            ("input_messages", enc.structured.input_messages.as_deref()),
+            (
+                "system_instructions",
+                enc.structured.system_instructions.as_deref(),
+            ),
+            (
+                "tool_definitions",
+                enc.structured.tool_definitions.as_deref(),
+            ),
+            ("output_messages", enc.structured.output_messages.as_deref()),
+            ("prompt", enc.flat_prompt()),
+            ("response", enc.flat_response()),
+        ] {
+            if let Some(value) = value {
+                log.add_content_kv(key, value);
+            }
+        }
         if content.truncated {
             log.add_content_kv("content_truncated", "true");
         }
@@ -351,8 +397,8 @@ fn base_url_for(endpoint: &str, project: &str) -> String {
 /// reference is upper-cased with non-alphanumerics folded to `_`, then read
 /// from `SLS_CRED_<REF>_AK_ID` / `SLS_CRED_<REF>_AK_SECRET`. The prefix is
 /// deliberately NOT `AISIX_`: that namespace is owned by the config loader
-/// (`Environment::with_prefix("AISIX")`), so an `AISIX_`-named secret would be
-/// reinterpreted as a config override. Returns `None` when either half is
+/// (`Environment::with_prefix("AISIX")`), which reads such a name as a
+/// configuration override or warns about it on every boot. Returns `None` when either half is
 /// unset or blank — the caller then lets the misconfiguration surface as a
 /// delivery-health auth error rather than signing with an empty key. BYOK
 /// variants (customer KMS / uploaded key) plug in here as alternative
@@ -474,7 +520,7 @@ mod tests {
 
     #[tokio::test]
     async fn appends_batch_posts_signed_lz4_protobuf() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(ResponseTemplate::new(200))
@@ -486,10 +532,13 @@ mod tests {
             request_id: "req-42".into(),
             occurred_at: "2026-05-01T12:00:00Z".into(),
             model_id: "gpt-4o".into(),
+            requested_model_id: "group-uuid".into(),
+            service_tier: Some("flex".into()),
             status_code: 200,
             prompt_tokens: 5,
             completion_tokens: 7,
             upstream_latency_ms: 123,
+            operation: "image_generation".into(),
             ..UsageEvent::default()
         };
         let ack = sink
@@ -555,6 +604,15 @@ mod tests {
             Some("2026-05-01T12:00:00Z")
         );
         assert_eq!(contents.get("model_id").map(String::as_str), Some("gpt-4o"));
+        // The addressed entry's id rides beside the dispatched target's.
+        assert_eq!(
+            contents.get("requested_model_id").map(String::as_str),
+            Some("group-uuid")
+        );
+        assert_eq!(
+            contents.get("service_tier").map(String::as_str),
+            Some("flex")
+        );
         assert_eq!(contents.get("status_code").map(String::as_str), Some("200"));
         assert_eq!(contents.get("prompt_tokens").map(String::as_str), Some("5"));
         assert_eq!(
@@ -572,11 +630,131 @@ mod tests {
         assert!(!contents.contains_key("finish_reason"));
         // Metadata-only path never carries a prompt.
         assert!(!contents.contains_key("prompt"));
+        // …which is precisely why the request classification has to ride the
+        // metadata (AISIX-Cloud#1461): with no prompt to inspect, `operation`
+        // is the only thing on this record that says what kind of call it
+        // was, and it must arrive as its own indexable column rather than
+        // buried in some composite value.
+        assert_eq!(
+            contents.get("operation").map(String::as_str),
+            Some("image_generation")
+        );
     }
 
+    /// The exporter's selected headers ride beside the usage fields, and a
+    /// complete chat capture is reported as the GenAI conventions'
+    /// structured messages, each a compact JSON string, with no flat
+    /// prompt/response.
     #[tokio::test]
-    async fn full_content_record_emits_prompt_and_response() {
-        let server = MockServer::start().await;
+    async fn selected_headers_ride_the_log_and_content_is_structured() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let sink = sink_for(&server);
+        let output = crate::output::OutputCollector::from_body(
+            crate::output::OutputWire::OpenAiChat,
+            4096,
+            &serde_json::json!({"choices": [{"index": 0, "message": {
+                "reasoning_content": "pondering", "content": "4"}}]}),
+        );
+        let record = SinkRecord::metadata_only(UsageEvent {
+            request_id: "req-headers".into(),
+            status_code: 200,
+            operation: "chat".into(),
+            finish_reason: "stop".into(),
+            api_key_name: "key-a".into(),
+            team_id: "team-1".into(),
+            tags: [
+                ("department".to_string(), "rnd".to_string()),
+                ("bg".to_string(), "cloud".to_string()),
+            ]
+            .into(),
+            request_headers: [
+                ("x-sub-user".to_string(), "alice".to_string()),
+                ("x-department".to_string(), "eng".to_string()),
+            ]
+            .into(),
+            upstream_response_headers: [("x-upstream-id".to_string(), "u-1".to_string())].into(),
+            ..UsageEvent::default()
+        })
+        .with_exporter_headers(&["x-sub-user".to_string()], &["x-upstream-id".to_string()])
+        .with_content(SinkContent {
+            prompt: serde_json::json!({"model": "m",
+                "messages": [{"role": "user", "content": "what is 2+2?"}],
+                "tools": [{"type": "function", "function": {"name": "add",
+                    "description": "Add", "parameters": {"type": "object"}}}]})
+            .to_string(),
+            response: "4".into(),
+            truncated: false,
+            prompt_truncated: false,
+            response_truncated: false,
+            max_bytes: None,
+            output: Some(output),
+        });
+        sink.append_batch(&batch_of(vec![record]), &IdempotencyMarker::None)
+            .await
+            .expect("delivery succeeds");
+
+        let requests = server.received_requests().await.unwrap();
+        let contents = decode_single_log(&requests[0]);
+        assert_eq!(
+            contents.get("request_headers").map(String::as_str),
+            Some(r#"{"x-sub-user":"alice"}"#)
+        );
+        assert_eq!(
+            contents
+                .get("upstream_response_headers")
+                .map(String::as_str),
+            Some(r#"{"x-upstream-id":"u-1"}"#)
+        );
+        assert_eq!(
+            contents.get("api_key_name").map(String::as_str),
+            Some("key-a")
+        );
+        assert_eq!(contents.get("team_id").map(String::as_str), Some("team-1"));
+        assert_eq!(
+            contents.get("tags.department").map(String::as_str),
+            Some("rnd")
+        );
+        assert_eq!(contents.get("tags.bg").map(String::as_str), Some("cloud"));
+        assert!(!contents.contains_key("tags"));
+        let json = |key: &str| -> serde_json::Value {
+            serde_json::from_str(contents.get(key).expect(key)).unwrap()
+        };
+        assert_eq!(
+            json("input_messages"),
+            serde_json::json!([{"role": "user",
+                "parts": [{"type": "text", "content": "what is 2+2?"}]}])
+        );
+        assert_eq!(
+            json("tool_definitions"),
+            serde_json::json!([{"type": "function", "name": "add",
+                "description": "Add", "parameters": {"type": "object"}}])
+        );
+        assert_eq!(
+            json("output_messages"),
+            serde_json::json!([{"role": "assistant", "finish_reason": "stop", "parts": [
+                {"type": "reasoning", "content": "pondering"},
+                {"type": "text", "content": "4"},
+            ]}])
+        );
+        // Chat keeps its system message inside `input_messages`.
+        assert!(!contents.contains_key("system_instructions"));
+        assert!(!contents.contains_key("prompt"));
+        assert!(!contents.contains_key("response"));
+        assert!(!contents.contains_key("content_truncated"));
+        assert!(!String::from_utf8_lossy(&requests[0].body).contains("x-department"));
+    }
+
+    /// A side the cap cut stays flat text with the truncated marker; the
+    /// other side is still structured.
+    #[tokio::test]
+    async fn truncated_side_falls_back_to_flat_text() {
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(ResponseTemplate::new(200))
@@ -587,12 +765,18 @@ mod tests {
         let record = SinkRecord::metadata_only(UsageEvent {
             request_id: "req-content".into(),
             status_code: 200,
+            operation: "chat".into(),
+            finish_reason: "stop".into(),
             ..UsageEvent::default()
         })
         .with_content(SinkContent {
-            prompt: "what is 2+2?".into(),
+            prompt: r#"{"messages":[{"role":"user","content":"what is"#.into(),
             response: "4".into(),
             truncated: true,
+            prompt_truncated: true,
+            response_truncated: false,
+            max_bytes: None,
+            output: None,
         });
         sink.append_batch(&batch_of(vec![record]), &IdempotencyMarker::None)
             .await
@@ -602,18 +786,54 @@ mod tests {
         let contents = decode_single_log(&requests[0]);
         assert_eq!(
             contents.get("prompt").map(String::as_str),
-            Some("what is 2+2?")
+            Some(r#"{"messages":[{"role":"user","content":"what is"#)
         );
-        assert_eq!(contents.get("response").map(String::as_str), Some("4"));
+        assert!(!contents.contains_key("input_messages"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&contents["output_messages"]).unwrap(),
+            serde_json::json!([{"role": "assistant", "finish_reason": "stop",
+                "parts": [{"type": "text", "content": "4"}]}])
+        );
+        assert!(!contents.contains_key("response"));
         assert_eq!(
             contents.get("content_truncated").map(String::as_str),
             Some("true")
         );
     }
 
+    /// A scheme-qualified endpoint may carry `user:pass@`, and a transport
+    /// failure names the endpoint. The text reaches the log and the heartbeat.
+    #[tokio::test]
+    async fn a_transport_failure_never_shows_a_password_in_the_endpoint() {
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let sink = AliyunSlsSink::from_base_url(
+            "sls-test",
+            format!("http://svc:url-LEAK@127.0.0.1:{closed}"),
+            LOGSTORE,
+            "test-akid",
+            "test-secret",
+            reqwest::Client::new(),
+        );
+        let err = sink
+            .append_batch(
+                &batch_of(vec![SinkRecord::metadata_only(UsageEvent::default())]),
+                &IdempotencyMarker::None,
+            )
+            .await
+            .expect_err("nothing listens there")
+            .to_string();
+        assert!(err.contains(&format!("127.0.0.1:{closed}")), "{err}");
+        assert!(!err.contains("url-LEAK"), "{err}");
+        let quoted = sink.error_redactor().redact(&sink.endpoint_url);
+        assert!(!quoted.contains("url-LEAK"), "{quoted}");
+    }
+
     #[tokio::test]
     async fn server_error_is_transient() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(ResponseTemplate::new(500).set_body_string(
@@ -634,7 +854,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_error_is_permanent() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(ResponseTemplate::new(403).set_body_string(
@@ -657,7 +877,7 @@ mod tests {
     async fn quota_exceeded_on_4xx_is_transient() {
         // SLS signals shard write throttling with a 4xx + a quota code; a log
         // sink must back off and retry, not drop the batch.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(ResponseTemplate::new(403).set_body_string(

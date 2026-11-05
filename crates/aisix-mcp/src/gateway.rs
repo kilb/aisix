@@ -19,9 +19,11 @@
 //! serves that server's tools under their original, un-namespaced names while
 //! ACL decisions keep evaluating the namespaced form.
 //!
-//! The aggregator holds no per-request or per-session state, so governance
-//! never depends on a transport session — which keeps it aligned with the
-//! stateless direction of the MCP 2026-07-28 revision.
+//! The aggregator holds no per-session state, so governance never depends on
+//! a transport session — which keeps it aligned with the stateless direction
+//! of the MCP 2026-07-28 revision. Its only per-request state is the
+//! [`ToolsListCounts`] slot a `tools/list` fills in for the mount's access
+//! log, and a gateway is built per request.
 //!
 //! Wiring this endpoint behind the gateway's auth / per-tool ACL / quota /
 //! observability pipeline (and sourcing upstreams from the resource snapshot)
@@ -29,7 +31,7 @@
 //! yet mounted on any production listener.
 
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
@@ -41,11 +43,18 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use rmcp::{RoleServer, ServerHandler};
 
 use aisix_core::models::{
-    ApiKey, McpAccessMode, McpPolicy, McpPolicyMode, McpPolicyScope, McpServerType,
+    ApiKey, LiveMcpServerIndex, McpPolicy, McpPolicyScope, McpServerAllowlist, McpServerIndex,
+    McpServerType, McpToolRef,
 };
 use aisix_core::{AisixSnapshot, ResourceEntry};
 
-use crate::bridge::{upstream_from_mcp_server, EphemeralBridge, McpBridge};
+use crate::bridge::{
+    forwarded_client_headers, upstream_from_mcp_server, CallerCredentials, EphemeralBridge,
+    McpAuth, McpBridge,
+};
+use crate::error::{
+    McpError, TokenExchangeError, TokenExchangeFailure, UserOAuthError, UserOAuthFailure,
+};
 use crate::openapi::OpenApiBridge;
 
 /// Separator between an upstream server's registered name and a tool name in
@@ -80,9 +89,10 @@ struct NamedUpstream {
 /// Strip `server`'s namespace prefix from `name`: `Some(bare)` when `name`
 /// is `<server>__<bare>`, `None` otherwise. The one primitive both the
 /// scoped gateway and the proxy's attribution peek use to interpret a tool
-/// name on `/mcp/{server}`, so the two can never drift. Prefix matching is
-/// by whole-string prefix (not first-separator split), so a server name
-/// that itself ends in `_` still namespaces cleanly.
+/// name on `/mcp/{server}`, so the two can never drift. The server name
+/// rule excludes `__` and a trailing `_`, so for any valid `server` this
+/// returns `Some(bare)` exactly when `split_once("__")` yields
+/// `(server, bare)`.
 pub fn strip_server_prefix<'a>(server: &str, name: &'a str) -> Option<&'a str> {
     name.strip_prefix(server)
         .and_then(|rest| rest.strip_prefix(TOOL_NAMESPACE_SEPARATOR))
@@ -93,20 +103,43 @@ pub fn strip_server_prefix<'a>(server: &str, name: &'a str) -> Option<&'a str> {
 /// the environment's / the key's team's MCP access policies, so MCP tool
 /// access is governed by the same key object as LLM access.
 ///
-/// A tool is permitted only when **every** allow layer admits it and **no**
-/// deny pattern matches it. A legacy key (no `mcp_access` block) carries a
-/// single allow layer built from its `allowed_tools`; a policy-driven key
-/// carries the inherited policy grant and, in `restrict` mode, its own
-/// `allow` patterns as a second conjunctive layer — a key can narrow the
-/// inherited grant but never widen it. Deny patterns are unioned across the
-/// environment policy, the team policy, and the key, and always win.
+/// Three layers of identical shape contribute: the environment policy, the
+/// key's team policy, and the key's own `mcp_access` block. A tool is
+/// permitted only when **every present** allow layer admits it and **no**
+/// deny pattern matches it — allow intersects, deny unions, and no layer can
+/// widen what another one already narrowed. A layer that is absent or
+/// disabled contributes nothing; with no allow layer at all the ACL grants
+/// nothing, so MCP access is always granted explicitly.
+///
+/// Each side of each layer is written EITHER as `<server>__<tool>` name
+/// patterns or as `{server_id, tool}` entries naming the server by resource
+/// id ([`McpToolRef`]); the id spelling wins for the side that carries it.
+/// The two decide the same question, so the ACL keeps a resolved
+/// name → id index of the registered servers and evaluates whichever
+/// spelling a layer used against the one tool name the caller addressed.
 #[derive(Clone)]
 pub struct ToolAcl {
     /// Conjunctive allow layers: a tool must match every layer.
     allow: Vec<AllowLayer>,
-    /// Deny patterns; any match rejects the tool, overriding every allow
+    /// Deny rules; any match rejects the tool, overriding every allow
     /// layer.
-    deny: Vec<String>,
+    deny: Vec<DenyRule>,
+    /// The registered servers this ACL resolves ids against, as of the
+    /// snapshot it was built from. Only [`ToolAcl::resolve`] populates it;
+    /// [`ToolAcl::allow_all`] and [`ToolAcl::from_allowed`] leave it empty.
+    ///
+    /// An id-form layer on an ACL without it resolves nothing and so
+    /// admits nothing — fail-closed, but indistinguishable from a grant
+    /// that is simply empty. That used to be unreachable, because only
+    /// `resolve` could produce an id-form layer;
+    /// [`ToolAcl::narrowed_to_allowlist`] can now append one to any ACL,
+    /// so the pairing is asserted there instead.
+    servers: Arc<McpServerIndex>,
+    /// Whether any layer here came from actual configuration, as opposed to
+    /// the deny-by-default empty layer [`ToolAcl::resolve`] falls back to.
+    /// Read only by [`ToolAcl::has_grant`], to tell the two reasons an empty
+    /// `tools/list` can have apart.
+    granted: bool,
 }
 
 #[derive(Clone)]
@@ -115,6 +148,29 @@ enum AllowLayer {
     All,
     /// The layer admits tools matching any of these `*` glob patterns.
     Patterns(Vec<String>),
+    /// The layer admits tools named by server id plus a tool-name glob. An
+    /// empty list admits nothing, exactly as an empty pattern list does.
+    Refs(Vec<McpToolRef>),
+}
+
+/// One deny entry, in whichever spelling its layer used.
+#[derive(Clone)]
+enum DenyRule {
+    Pattern(String),
+    Ref(McpToolRef),
+}
+
+/// Whether `entry` names the tool the caller addressed, which
+/// [`McpServerIndex::address`] has resolved to `(server id, bare tool)`.
+///
+/// The server half is compared as an exact id, never glob-matched: a
+/// registered name may legally contain a `*`, so pasting the resolved name
+/// into a pattern would let one server's grant reach another's tools.
+fn ref_matches(entry: &McpToolRef, addressed: Option<(&str, &str)>) -> bool {
+    let Some((server_id, tool)) = addressed else {
+        return false;
+    };
+    entry.server_id == server_id && aisix_core::wildcard::wildcard_matches(&entry.tool, tool)
 }
 
 impl AllowLayer {
@@ -129,12 +185,40 @@ impl AllowLayer {
         }
     }
 
-    fn admits(&self, namespaced_tool: &str) -> bool {
+    /// The layer for one `allow` / `allow_ids` pair: the id spelling decides
+    /// whenever it is present, an empty array included.
+    fn from_sides(patterns: &[String], ids: Option<&Vec<McpToolRef>>) -> Self {
+        match ids {
+            Some(refs) => Self::Refs(refs.clone()),
+            None => Self::from_patterns(patterns),
+        }
+    }
+
+    fn admits(&self, namespaced_tool: &str, addressed: Option<(&str, &str)>) -> bool {
         match self {
             Self::All => true,
             Self::Patterns(patterns) => patterns
                 .iter()
                 .any(|p| aisix_core::wildcard::wildcard_matches(p, namespaced_tool)),
+            Self::Refs(refs) => refs.iter().any(|r| ref_matches(r, addressed)),
+        }
+    }
+}
+
+impl DenyRule {
+    /// The deny rules for one `deny` / `deny_ids` pair, in the spelling the
+    /// layer used.
+    fn from_sides(patterns: &[String], ids: Option<&Vec<McpToolRef>>) -> Vec<Self> {
+        match ids {
+            Some(refs) => refs.iter().cloned().map(Self::Ref).collect(),
+            None => patterns.iter().cloned().map(Self::Pattern).collect(),
+        }
+    }
+
+    fn matches(&self, namespaced_tool: &str, addressed: Option<(&str, &str)>) -> bool {
+        match self {
+            Self::Pattern(p) => aisix_core::wildcard::wildcard_matches(p, namespaced_tool),
+            Self::Ref(r) => ref_matches(r, addressed),
         }
     }
 }
@@ -146,40 +230,100 @@ impl ToolAcl {
         Self {
             allow: vec![AllowLayer::All],
             deny: Vec::new(),
+            servers: Arc::new(McpServerIndex::default()),
+            granted: true,
         }
     }
 
-    /// Build a legacy ACL from an API key's `allowed_tools` list alone:
-    /// `None` or an empty list grants no tools; a list containing `"*"`
-    /// grants all; otherwise the listed patterns. Entries are matched as
-    /// `*` globs (see [`ToolAcl::permits`]), mirroring
-    /// `ApiKey::can_access_tool`. Policy deny overlays are NOT applied here —
-    /// any caller serving external traffic uses [`ToolAcl::resolve`].
+    /// Narrow this ACL to the tools of the allowlisted servers, as an
+    /// additional conjunctive allow layer: the result permits a tool only
+    /// if the ACL already did AND the tool belongs to one of them.
+    ///
+    /// Used for anonymous callers (#1313), whose configured
+    /// server allowlist is a ceiling on the bound principal rather than
+    /// just an entry gate. Expressing it as a layer — instead of
+    /// filtering `tools/list` at the endpoint — is what makes the
+    /// aggregated and scoped endpoints agree: `permits` is the single
+    /// point both listing and calling go through, and it evaluates the
+    /// namespaced form on either endpoint.
+    ///
+    /// Either spelling of the allowlist becomes the layer it already has:
+    /// names become `<server>__*` patterns, ids become `{server_id, tool:
+    /// "*"}` entries resolved against this ACL's server index. An empty
+    /// allowlist admits nothing under both, which is exactly right: an
+    /// anonymous principal with no listed server has no tools.
+    pub fn narrowed_to_allowlist(mut self, allowlist: &McpServerAllowlist) -> Self {
+        self.allow.push(match allowlist {
+            // Built directly rather than via `from_patterns`: every entry
+            // here is `<server>__*`, never a bare `*`, so the
+            // all-admitting fold that helper performs must not apply.
+            //
+            // An entry names one server exactly. A stored name may hold a
+            // `*` (new names cannot), and pasted into a pattern it would
+            // match other servers on this unauthenticated surface: `gh*__*`
+            // admits every `gh...` server's tools. Such an entry admits
+            // nothing.
+            McpServerAllowlist::Names(names) => AllowLayer::Patterns(
+                names
+                    .iter()
+                    .filter(|s| !s.contains('*'))
+                    .map(|s| format!("{s}{TOOL_NAMESPACE_SEPARATOR}*"))
+                    .collect(),
+            ),
+            McpServerAllowlist::Ids(ids) => {
+                debug_assert!(
+                    ids.is_empty() || !self.servers.is_empty(),
+                    "an id-spelled ceiling resolves through the index only \
+                     `ToolAcl::resolve` builds; laid over an ACL without one it \
+                     admits nothing at all"
+                );
+                AllowLayer::Refs(
+                    ids.iter()
+                        .map(|id| McpToolRef {
+                            server_id: id.clone(),
+                            tool: "*".to_string(),
+                        })
+                        .collect(),
+                )
+            }
+        });
+        self
+    }
+
+    /// Build a single-layer ACL from one allow list: an empty list grants no
+    /// tools, a list containing `"*"` grants all, otherwise the listed
+    /// patterns are matched as `*` globs (see [`ToolAcl::permits`]).
+    /// No deny side — any caller serving external traffic resolves the full
+    /// layered ACL with [`ToolAcl::resolve`] instead.
     pub fn from_allowed(allowed: Option<&[String]>) -> Self {
         Self {
             allow: vec![AllowLayer::from_patterns(allowed.unwrap_or(&[]))],
             deny: Vec::new(),
+            servers: Arc::new(McpServerIndex::default()),
+            granted: true,
         }
     }
 
     /// Resolve the effective ACL for `key` from the `mcp_policies` in
     /// `snapshot`.
     ///
-    /// - A key without an `mcp_access` block keeps its legacy allow side
-    ///   (`allowed_tools`, no inheritance) — with enabled policies' `deny`
-    ///   patterns still subtracted, since deny applies to every key a policy
-    ///   covers.
-    /// - `deny` mode grants nothing.
-    /// - `inherit` / `restrict` take the base grant from the key's team
-    ///   policy when one is enabled, else the environment-default policy,
-    ///   else nothing; `restrict` intersects the key's own `allow` patterns
-    ///   on top.
-    /// - Deny patterns are unioned across the environment policy, the team
-    ///   policy, and the key — an environment-level deny holds even when a
-    ///   team policy replaces the environment's grant.
+    /// Up to three layers apply, each an `allow`/`deny` pair: the
+    /// environment policy, the key's team policy, and the key's own
+    /// `mcp_access` block. Allow sides intersect (a layer can only narrow
+    /// what the others left), deny sides union and always win. A layer that
+    /// is absent — no row, a disabled row, or no `mcp_access` block —
+    /// contributes neither side.
     ///
-    /// Disabled policies neither grant nor deny.
-    pub fn resolve(snapshot: &AisixSnapshot, key: &ApiKey) -> Self {
+    /// Each layer writes each of its two sides either as `<server>__<tool>`
+    /// name patterns or as `{server_id, tool}` entries; a side that carries
+    /// the id spelling is decided by it alone, an empty array included. The
+    /// two spellings mix freely across layers and across the two sides of
+    /// one layer, because every layer is resolved against the same
+    /// addressed tool.
+    ///
+    /// With no allow layer at all the ACL grants nothing: MCP access is
+    /// granted explicitly, never by the absence of configuration.
+    pub fn resolve(snapshot: &AisixSnapshot, servers: &LiveMcpServerIndex, key: &ApiKey) -> Self {
         // Grant side: pick the governing row per scope deterministically
         // (lowest id wins) so a duplicated row — the writer enforces
         // uniqueness — can only ever produce a stable outcome. Deny side:
@@ -188,7 +332,7 @@ impl ToolAcl {
         // tie-break.
         let mut env_policy: Option<Arc<ResourceEntry<McpPolicy>>> = None;
         let mut team_policy: Option<Arc<ResourceEntry<McpPolicy>>> = None;
-        let mut deny: Vec<String> = Vec::new();
+        let mut deny: Vec<DenyRule> = Vec::new();
         for entry in snapshot.mcp_policies.entries() {
             if !entry.value.enabled {
                 continue;
@@ -204,56 +348,138 @@ impl ToolAcl {
                     &mut team_policy
                 }
             };
-            deny.extend(entry.value.deny.iter().cloned());
+            deny.extend(DenyRule::from_sides(
+                &entry.value.deny,
+                entry.value.deny_ids.as_ref(),
+            ));
             match slot {
                 Some(current) if current.id <= entry.id => {}
                 _ => *slot = Some(entry),
             }
         }
 
-        let Some(access) = &key.mcp_access else {
-            return Self {
-                allow: vec![AllowLayer::from_patterns(
-                    key.allowed_tools.as_deref().unwrap_or(&[]),
-                )],
-                deny,
-            };
-        };
-
-        match access.mode {
-            McpAccessMode::Deny => Self {
-                allow: vec![AllowLayer::Patterns(Vec::new())],
-                deny: Vec::new(),
-            },
-            mode @ (McpAccessMode::Inherit | McpAccessMode::Restrict) => {
-                let governing = team_policy.as_ref().or(env_policy.as_ref());
-                let base = match governing.map(|p| (p.value.mode, &p.value.allow)) {
-                    None | Some((McpPolicyMode::None, _)) => AllowLayer::Patterns(Vec::new()),
-                    Some((McpPolicyMode::All, _)) => AllowLayer::All,
-                    Some((McpPolicyMode::Selected, allow)) => AllowLayer::from_patterns(allow),
-                };
-                let mut allow = vec![base];
-                if mode == McpAccessMode::Restrict {
-                    allow.push(AllowLayer::from_patterns(&access.allow));
-                }
-                deny.extend(access.deny.iter().cloned());
-                Self { allow, deny }
-            }
+        let mut allow: Vec<AllowLayer> = Vec::new();
+        for policy in [env_policy.as_ref(), team_policy.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            allow.push(AllowLayer::from_sides(
+                &policy.value.allow,
+                policy.value.allow_ids.as_ref(),
+            ));
+        }
+        if let Some(access) = &key.mcp_access {
+            allow.push(AllowLayer::from_sides(
+                &access.allow,
+                access.allow_ids.as_ref(),
+            ));
+            deny.extend(DenyRule::from_sides(&access.deny, access.deny_ids.as_ref()));
+        }
+        // Deny-by-default: an unconfigured key in an unconfigured
+        // environment has no MCP access, rather than the empty conjunction's
+        // "everything".
+        let granted = !allow.is_empty();
+        if allow.is_empty() {
+            allow.push(AllowLayer::Patterns(Vec::new()));
+        }
+        Self {
+            allow,
+            deny,
+            servers: servers.for_snapshot(snapshot),
+            granted,
         }
     }
 
+    /// Whether any MCP grant applies to this caller at all — an environment
+    /// or team policy, or the key's own `mcp_access`. `false` means the ACL
+    /// is the deny-by-default fallback, which is why an empty `tools/list`
+    /// needs the two different explanations the `/mcp` mount logs.
+    pub fn has_grant(&self) -> bool {
+        self.granted
+    }
+
+    /// Whether this ACL can permit ANY tool of the registered server
+    /// `name` (stored under `id`). Decided from the rules alone, before the
+    /// server's tools are known: every allow layer must have an entry that
+    /// could match a `<name>__…` tool or that names the server's id, and no
+    /// deny may cover the whole server. Errs towards `true` only where a
+    /// glob genuinely could match one of the server's tools.
+    pub fn may_reach_server(&self, name: &str, id: &str) -> bool {
+        let prefix = format!("{name}{TOOL_NAMESPACE_SEPARATOR}");
+        let allowed = self.allow.iter().all(|layer| match layer {
+            AllowLayer::All => true,
+            AllowLayer::Patterns(patterns) => patterns
+                .iter()
+                .any(|p| pattern_may_match_prefix(p, &prefix)),
+            AllowLayer::Refs(refs) => refs.iter().any(|r| r.server_id == id),
+        });
+        let denied = self.deny.iter().any(|rule| match rule {
+            // A trailing-`*` glob whose head every `<name>__…` tool starts
+            // with (`*`, `gh__*`, `g*`) covers the whole server.
+            DenyRule::Pattern(p) => p
+                .strip_suffix('*')
+                .is_some_and(|head| !head.contains('*') && prefix.starts_with(head)),
+            DenyRule::Ref(r) => r.server_id == id && r.tool == "*",
+        });
+        allowed && !denied
+    }
+
     /// Whether `namespaced_tool` is permitted: every allow layer must admit
-    /// it and no deny pattern may match it. Patterns are `*` globs:
+    /// it and no deny rule may match it. Name patterns are `*` globs:
     /// `"<server>__*"` covers every tool on that server, a pattern without a
-    /// `*` matches exactly, and a bare `"*"` covers everything. Uses the same
-    /// matcher as `ApiKey::can_access_tool`.
+    /// `*` matches exactly, and a bare `"*"` covers everything.
+    ///
+    /// An id-form entry is decided against the server the addressed tool
+    /// actually belongs to: the `<server>__<tool>` name is split as it always
+    /// was, the server half is resolved through the registered-server index,
+    /// and the entry matches when its `server_id` equals that server's id and
+    /// its `tool` glob covers the bare tool name. A tool naming no registered
+    /// server, and an entry whose `server_id` names no registered server,
+    /// therefore match no id-form entry at all — the fail-closed answer for
+    /// an allow side, and one that leaves the layer's other entries intact.
     pub fn permits(&self, namespaced_tool: &str) -> bool {
-        self.allow.iter().all(|layer| layer.admits(namespaced_tool))
+        // Resolved once per decision and shared by both sides: with only
+        // name patterns configured nothing reads it, and `address` is one
+        // split plus one hash lookup when something does.
+        let addressed = self.servers.address(namespaced_tool);
+        self.allow
+            .iter()
+            .all(|layer| layer.admits(namespaced_tool, addressed))
             && !self
                 .deny
                 .iter()
-                .any(|p| aisix_core::wildcard::wildcard_matches(p, namespaced_tool))
+                .any(|rule| rule.matches(namespaced_tool, addressed))
     }
+}
+
+/// Whether the `*` glob `pattern` can match some string that starts with
+/// `prefix`, under the matching rule of
+/// `aisix_core::wildcard::wildcard_matches`. Only the literal before the first
+/// `*` can rule that out: the `*` absorbs whatever of the prefix is left, and
+/// everything after it can follow the prefix in the matched string.
+fn pattern_may_match_prefix(pattern: &str, prefix: &str) -> bool {
+    let Some(star) = pattern.find('*') else {
+        return pattern.starts_with(prefix);
+    };
+    let head = &pattern[..star];
+    // A head at least as long as the prefix must start with it; a shorter
+    // one only has to agree with it, and the `*` covers the rest.
+    if head.len() >= prefix.len() {
+        head.starts_with(prefix)
+    } else {
+        prefix.starts_with(head)
+    }
+}
+
+/// What one `tools/list` produced, before and after the caller's ACL — the
+/// only way an operator can tell an empty list caused by the ACL apart from
+/// an upstream that has no tools.
+#[derive(Clone, Copy, Debug)]
+pub struct ToolsListCounts {
+    /// Tools the upstreams returned, summed across them, before filtering.
+    pub total: u32,
+    /// Tools left after the caller's ACL filtered the list.
+    pub returned: u32,
 }
 
 /// Aggregates N upstream MCP servers behind one downstream MCP server surface.
@@ -263,6 +489,22 @@ impl ToolAcl {
 pub struct McpGateway {
     upstreams: Arc<[NamedUpstream]>,
     tool_acl: ToolAcl,
+    /// The `tools/list` counts, written once by the handler and read by the
+    /// mount when it emits the access log. Shared with every clone the
+    /// transport makes. It holds the FIRST list a gateway served, which is
+    /// the request's own only for a per-request gateway — the `/mcp` mount
+    /// builds one from `*_for_request`; a gateway kept alive across requests
+    /// (conformance server, tests) keeps the first numbers forever.
+    tools_list: Arc<OnceLock<ToolsListCounts>>,
+    /// The first token-exchange failure an upstream operation hit while
+    /// serving the request, shared with every clone like `tools_list`. The
+    /// single-server endpoint answers it with an HTTP status rather than
+    /// inside a JSON-RPC result, where a client never looks for an
+    /// authorization challenge.
+    auth_failure: Arc<OnceLock<TokenExchangeError>>,
+    /// The same, for an `oauth2_authorization_code` server: the HTTP status
+    /// is where an MCP client looks for the sign-in challenge.
+    user_oauth_failure: Arc<OnceLock<UserOAuthError>>,
     /// When set, this gateway serves exactly one upstream under its **original**
     /// tool names: `tools/list` strips the `<server>__` namespace prefix and
     /// `tools/call` accepts both the bare and the prefixed form. ACL decisions
@@ -283,6 +525,11 @@ struct ScopedServer {
     /// Disabled servers stay reserved so this scope's callable name surface
     /// does not shift when another server's `enabled` flag is toggled.
     foreign: std::collections::HashSet<String>,
+    /// Whether the caller's ACL can reach this server. One it cannot gets
+    /// no caller credentials, so its token-exchange failure is a missing
+    /// grant, not a sign-in the caller could repeat: it is the ACL that
+    /// answers (an empty list, a refused call), never an auth challenge.
+    reachable: bool,
 }
 
 impl McpGateway {
@@ -320,6 +567,9 @@ impl McpGateway {
             upstreams: deduped.into(),
             tool_acl: ToolAcl::allow_all(),
             scoped: None,
+            tools_list: Arc::new(OnceLock::new()),
+            auth_failure: Arc::new(OnceLock::new()),
+            user_oauth_failure: Arc::new(OnceLock::new()),
         }
     }
 
@@ -331,6 +581,76 @@ impl McpGateway {
         self
     }
 
+    /// Handle on this request's [`ToolsListCounts`], for the mount to read
+    /// after the transport has run the handler. Clone it BEFORE handing the
+    /// gateway to [`streamable_http_service`] — the slot is shared with every
+    /// clone the transport makes, so the counts the handler writes are
+    /// visible through this handle. Only meaningful on a gateway built per
+    /// request ([`McpGateway::from_snapshot_for_request`] and its scoped
+    /// twin); the slot is written once for the life of the gateway.
+    pub fn tools_list_counts(&self) -> Arc<OnceLock<ToolsListCounts>> {
+        self.tools_list.clone()
+    }
+
+    /// Handle on the first token-exchange failure this gateway hit, read by
+    /// the mount after the transport ran — cloned out the same way as
+    /// [`McpGateway::tools_list_counts`].
+    pub fn token_exchange_failure(&self) -> Arc<OnceLock<TokenExchangeError>> {
+        self.auth_failure.clone()
+    }
+
+    /// Handle on the first per-user OAuth failure this gateway hit, cloned
+    /// out the same way as [`McpGateway::token_exchange_failure`].
+    pub fn user_oauth_failure(&self) -> Arc<OnceLock<UserOAuthError>> {
+        self.user_oauth_failure.clone()
+    }
+
+    /// Whether the single upstream of a scoped gateway can be called for this
+    /// caller with the token it has, checked before any MCP message is served
+    /// for the same reason as [`McpGateway::preflight_upstream_auth`].
+    pub async fn preflight_user_oauth(&self) -> Option<UserOAuthFailure> {
+        if !self.scoped.as_ref()?.reachable {
+            return None;
+        }
+        let upstream = self.upstreams.first()?;
+        match upstream.bridge.preflight_auth().await {
+            Err(McpError::UserOAuth(error)) => Some(error.failure),
+            _ => None,
+        }
+    }
+
+    /// Run, before any MCP message is served, the token exchange the single
+    /// upstream of a scoped gateway needs for this caller (an
+    /// `oauth2_token_exchange` server). The `initialize` handshake never
+    /// reaches an upstream otherwise, and a client decides whether to sign
+    /// in from how its first request is answered. Other auth types, and the
+    /// aggregated gateway, pass without contacting anything.
+    pub async fn preflight_upstream_auth(&self) -> Option<TokenExchangeFailure> {
+        if !self.scoped.as_ref()?.reachable {
+            return None;
+        }
+        let upstream = self.upstreams.first()?;
+        match upstream.bridge.preflight_auth().await {
+            Err(McpError::TokenExchange(error)) => Some(error.failure),
+            _ => None,
+        }
+    }
+
+    fn note_auth_failure(&self, error: &McpError) {
+        if self.scoped.as_ref().is_some_and(|scoped| !scoped.reachable) {
+            return;
+        }
+        match error {
+            McpError::TokenExchange(error) => {
+                let _ = self.auth_failure.set(error.clone());
+            }
+            McpError::UserOAuth(error) => {
+                let _ = self.user_oauth_failure.set(error.clone());
+            }
+            _ => {}
+        }
+    }
+
     /// Build a gateway whose upstreams are the **enabled** `mcp_servers` in the
     /// snapshot: a `type: mcp` server is reached through an [`EphemeralBridge`]
     /// (connect per request), a `type: openapi` server through an
@@ -339,25 +659,50 @@ impl McpGateway {
     /// iteration order; duplicate names are deduped (first wins) by
     /// [`McpGateway::new`], though the Admin API already enforces uniqueness.
     pub fn from_snapshot(snapshot: &AisixSnapshot) -> Self {
-        Self::from_snapshot_for_client(snapshot, "")
+        Self::from_snapshot_for_request(
+            snapshot,
+            None,
+            &CallerCredentials::default(),
+            ToolAcl::allow_all(),
+            "",
+        )
     }
 
-    /// Build the aggregated gateway as ONE caller sees it: a server whose
-    /// `allowed_cidrs` excludes `source_ip` is absent for them — its tools are
-    /// not listed and a call naming one cannot resolve.
+    /// [`McpGateway::from_snapshot`] as ONE caller sees it, additionally
+    /// forwarding the inbound request's headers to every registered server
+    /// whose `forward_client_headers` admits them.
     ///
-    /// Filtering here rather than at the call site is what makes the allowlist
-    /// whole: a gate applied only when a tool is invoked would still publish
-    /// the server's entire tool inventory to a caller who may not reach it,
-    /// and an inventory is exactly what an attacker probing a private MCP
-    /// server wants. Absent-for-this-caller is the same treatment a disabled
-    /// server gets, and the same existence fold `/v1/videos` applies to an
-    /// ACL denial.
+    /// Separate from the plain constructor because the headers are a
+    /// property of the REQUEST, not of the snapshot: the `/mcp` handler
+    /// builds a gateway per request and is the only place that holds them.
+    /// `None` forwards nothing, which is what every server does by
+    /// default. `caller` carries the agent's own credentials to the
+    /// `oauth_delegate` and `oauth2_token_exchange` servers — only to those
+    /// `acl` (the caller's tool ACL, which also scopes the gateway) can
+    /// reach. Any other server is still listed, without them, and its
+    /// tools are filtered out by the same ACL.
+    ///
+    /// A server whose `allowed_cidrs` excludes `source_ip` is absent for this
+    /// caller — its tools are not listed and a call naming one cannot
+    /// resolve. Filtering here rather than at the call site is what makes the
+    /// allowlist whole: a gate applied only when a tool is invoked would still
+    /// publish the server's entire tool inventory to a caller who may not
+    /// reach it, and an inventory is exactly what an attacker probing a
+    /// private MCP server wants. Absent-for-this-caller is the same treatment
+    /// a disabled server gets, and the same existence fold `/v1/videos`
+    /// applies to an ACL denial.
     ///
     /// An empty `source_ip` means the caller's address is unknown, which
     /// `McpServer::ip_allowed` fails closed on — so a restricted server stays
     /// absent rather than becoming reachable when attribution is missing.
-    pub fn from_snapshot_for_client(snapshot: &AisixSnapshot, source_ip: &str) -> Self {
+    pub fn from_snapshot_for_request(
+        snapshot: &AisixSnapshot,
+        client_headers: Option<&http::HeaderMap>,
+        caller: &CallerCredentials,
+        acl: ToolAcl,
+        source_ip: &str,
+    ) -> Self {
+        crate::openapi::sweep_tool_cache(&snapshot.mcp_servers);
         let upstreams = snapshot
             .mcp_servers
             .entries()
@@ -369,16 +714,11 @@ impl McpGateway {
                 // cleartext warning covers both.
                 crate::bridge::warn_cleartext_credential(&entry.value);
                 let name = entry.value.name.clone();
-                let bridge: Arc<dyn McpBridge> = match entry.value.server_type {
-                    McpServerType::Mcp => {
-                        let upstream = upstream_from_mcp_server(&entry.value);
-                        Arc::new(EphemeralBridge::new(upstream))
-                    }
-                    McpServerType::Openapi => Arc::new(OpenApiBridge::new(entry)),
-                };
+                let bridge = bridge_for(entry, client_headers, caller, &acl);
                 (name, bridge)
-            });
-        McpGateway::new(upstreams)
+            })
+            .collect::<Vec<_>>();
+        McpGateway::new(upstreams).with_tool_acl(acl)
     }
 
     /// Build a gateway scoped to the single **enabled** `mcp_servers` entry
@@ -387,16 +727,28 @@ impl McpGateway {
     /// registered or is disabled — a disabled server is treated as absent,
     /// same as the aggregated endpoint skipping it.
     pub fn from_snapshot_scoped(snapshot: &AisixSnapshot, server: &str) -> Option<Self> {
-        Self::from_snapshot_scoped_for_client(snapshot, server, "")
+        Self::from_snapshot_scoped_for_request(
+            snapshot,
+            server,
+            None,
+            &CallerCredentials::default(),
+            ToolAcl::allow_all(),
+            "",
+        )
     }
 
-    /// [`McpGateway::from_snapshot_scoped`] for one caller: `None` also when
-    /// the server's `allowed_cidrs` excludes `source_ip`.
-    pub fn from_snapshot_scoped_for_client(
+    /// [`McpGateway::from_snapshot_scoped`] for one caller, forwarding client
+    /// headers the same way [`McpGateway::from_snapshot_for_request`] does:
+    /// `None` also when the server's `allowed_cidrs` excludes `source_ip`.
+    pub fn from_snapshot_scoped_for_request(
         snapshot: &AisixSnapshot,
         server: &str,
+        client_headers: Option<&http::HeaderMap>,
+        caller: &CallerCredentials,
+        acl: ToolAcl,
         source_ip: &str,
     ) -> Option<Self> {
+        crate::openapi::sweep_tool_cache(&snapshot.mcp_servers);
         let entry = snapshot.mcp_servers.get_by_name(server)?;
         if !entry.value.ip_allowed(source_ip) {
             return None;
@@ -406,13 +758,8 @@ impl McpGateway {
         }
         crate::bridge::warn_cleartext_credential(&entry.value);
         let name = entry.value.name.clone();
-        let bridge: Arc<dyn McpBridge> = match entry.value.server_type {
-            McpServerType::Mcp => {
-                let upstream = upstream_from_mcp_server(&entry.value);
-                Arc::new(EphemeralBridge::new(upstream))
-            }
-            McpServerType::Openapi => Arc::new(OpenApiBridge::new(entry)),
-        };
+        let reachable = acl.may_reach_server(&name, &entry.id);
+        let bridge = bridge_for(entry, client_headers, caller, &acl);
         let foreign = snapshot
             .mcp_servers
             .entries()
@@ -420,8 +767,12 @@ impl McpGateway {
             .filter(|e| e.value.name != name)
             .map(|e| e.value.name.clone())
             .collect();
-        let mut gateway = McpGateway::new([(name.clone(), bridge)]);
-        gateway.scoped = Some(Arc::new(ScopedServer { name, foreign }));
+        let mut gateway = McpGateway::new([(name.clone(), bridge)]).with_tool_acl(acl);
+        gateway.scoped = Some(Arc::new(ScopedServer {
+            name,
+            foreign,
+            reachable,
+        }));
         Some(gateway)
     }
 
@@ -454,7 +805,38 @@ impl ServerHandler for McpGateway {
                 Ok(upstream_tools) => {
                     tools.extend(upstream_tools.into_iter().map(|t| prefixed_tool(server, t)));
                 }
+                // A caller with nothing to exchange is the expected state
+                // for every API-key caller on the aggregated endpoint, not
+                // an upstream failure worth a warning per request.
+                Err(
+                    error @ McpError::TokenExchange(TokenExchangeError {
+                        failure: TokenExchangeFailure::NoSubject,
+                        ..
+                    }),
+                ) => {
+                    self.note_auth_failure(&error);
+                    tracing::debug!(
+                        upstream = server,
+                        "skipping upstream in tools/list: no verified caller token to exchange"
+                    );
+                }
+                // Likewise a user who has not signed in to this server, on the
+                // aggregated endpoint.
+                Err(
+                    error @ McpError::UserOAuth(UserOAuthError {
+                        failure:
+                            UserOAuthFailure::NoSubject | UserOAuthFailure::AuthorizationRequired,
+                        ..
+                    }),
+                ) => {
+                    self.note_auth_failure(&error);
+                    tracing::debug!(
+                        upstream = server,
+                        "skipping upstream in tools/list: the caller is not signed in to it"
+                    );
+                }
                 Err(error) => {
+                    self.note_auth_failure(&error);
                     // Degrade gracefully: drop this upstream's tools, keep the
                     // rest. Detail is logged server-side (never client-visible).
                     tracing::warn!(
@@ -465,8 +847,16 @@ impl ServerHandler for McpGateway {
                 }
             }
         }
+        let total = tools.len() as u32;
         // Per-tool ACL: expose only the tools this caller's key permits.
         tools.retain(|tool| self.tool_acl.permits(tool.name.as_ref()));
+        // Recorded here rather than returned, because the handler's only
+        // channel back to the mount is the JSON-RPC result. `set` keeps the
+        // first write: one request is one `tools/list` on this transport.
+        let _ = self.tools_list.set(ToolsListCounts {
+            total,
+            returned: tools.len() as u32,
+        });
         // A scoped gateway serves its single upstream's tools under their
         // original names — the namespace prefix exists to disambiguate the
         // aggregate, and a single-server endpoint has nothing to disambiguate.
@@ -594,6 +984,7 @@ impl ServerHandler for McpGateway {
             .unwrap_or(serde_json::Value::Null);
 
         let result = bridge.call_tool(tool, arguments).await.map_err(|error| {
+            self.note_auth_failure(&error);
             // Generic client-facing message; the upstream's detail (which may
             // include its URL) is logged server-side, not surfaced to the agent.
             tracing::warn!(
@@ -602,6 +993,9 @@ impl ServerHandler for McpGateway {
                 error = %error,
                 "upstream tools/call failed"
             );
+            if let McpError::UserOAuth(error) = &error {
+                return user_oauth_tool_error(server, error.failure);
+            }
             ErrorData::internal_error(
                 format!("upstream MCP server '{server}' failed to call tool"),
                 None,
@@ -657,6 +1051,75 @@ impl ServerHandler for McpGateway {
             }
         }
         info
+    }
+}
+
+/// A `tools/call` that the caller's stored token could not serve, naming what
+/// to do about it. Only the aggregated endpoint's clients read this: the
+/// single-server endpoint answers the failure with an HTTP status.
+fn user_oauth_tool_error(server: &str, failure: UserOAuthFailure) -> ErrorData {
+    let endpoint = format!("/mcp/{server}");
+    let message = match failure {
+        UserOAuthFailure::AuthorizationRequired => format!(
+            "MCP server '{server}' is not connected for this user: connect to {endpoint} \
+             to sign in"
+        ),
+        UserOAuthFailure::NoSubject => format!(
+            "MCP server '{server}' ({endpoint}) signs in each user individually, and this \
+             gateway credential has no user"
+        ),
+        UserOAuthFailure::Misconfigured => {
+            format!("MCP server '{server}' ({endpoint}) cannot sign in users as configured")
+        }
+        UserOAuthFailure::Unavailable => format!(
+            "MCP server '{server}' ({endpoint}): this user's upstream token is temporarily \
+             unavailable"
+        ),
+    };
+    ErrorData::invalid_request(message, None)
+}
+
+/// The bridge to one registered server, carrying this request's forwarded
+/// client headers and caller credentials.
+fn bridge_for(
+    entry: Arc<ResourceEntry<aisix_core::McpServer>>,
+    client_headers: Option<&http::HeaderMap>,
+    caller: &CallerCredentials,
+    acl: &ToolAcl,
+) -> Arc<dyn McpBridge> {
+    let mut forwarded = forwarded_client_headers(&entry.value, client_headers);
+    if matches!(
+        entry.value.auth_type,
+        aisix_core::McpAuthType::OauthDelegate
+            | aisix_core::McpAuthType::OAuth2TokenExchange
+            | aisix_core::McpAuthType::OAuth2AuthorizationCode
+    ) {
+        // The auth type owns the `authorization` slot: a forwarded copy
+        // would relay the caller's `Authorization` even when it was the
+        // gateway credential itself.
+        forwarded.retain(|(name, _)| name != http::header::AUTHORIZATION);
+    }
+    let no_caller = CallerCredentials::default();
+    let caller = if acl.may_reach_server(&entry.value.name, &entry.id) {
+        caller
+    } else {
+        &no_caller
+    };
+    match entry.value.server_type {
+        McpServerType::Mcp => {
+            let mut upstream = upstream_from_mcp_server(&entry.value)
+                .with_forwarded_client_headers(forwarded)
+                .with_caller_credentials(caller);
+            if let McpAuth::UserOAuth(auth) = &mut upstream.auth {
+                auth.server.id.clone_from(&entry.id);
+            }
+            Arc::new(EphemeralBridge::new(upstream))
+        }
+        McpServerType::Openapi => Arc::new(
+            OpenApiBridge::new(entry)
+                .with_forwarded_client_headers(forwarded)
+                .with_caller_credentials(caller.clone()),
+        ),
     }
 }
 
@@ -761,6 +1224,238 @@ mod tests {
     fn http_sse_generation_stays_unsupported() {
         assert!(!SUPPORTED_PROTOCOL_VERSION_NAMES.contains(&"2024-11-05"));
         assert!(!SUPPORTED_PROTOCOL_VERSIONS.contains(&ProtocolVersion::V_2024_11_05));
+    }
+
+    /// An index over `(id, name)` pairs, so the id-spelled ceilings below
+    /// have registered servers to resolve against.
+    fn server_index(servers: &[(&str, &str)]) -> Arc<McpServerIndex> {
+        let snap = AisixSnapshot::default();
+        for (id, name) in servers {
+            let server: aisix_core::models::McpServer = serde_json::from_str(&format!(
+                r#"{{"name":"{name}","url":"https://example.test/mcp"}}"#
+            ))
+            .unwrap();
+            snap.mcp_servers.insert(ResourceEntry::new(*id, server, 1));
+        }
+        Arc::new(McpServerIndex::build(&snap.mcp_servers))
+    }
+
+    /// A wide-open ACL that resolves ids against `servers` — what
+    /// `ToolAcl::resolve` produces for a principal granted `*`.
+    fn wide_acl_over(servers: Arc<McpServerIndex>) -> ToolAcl {
+        ToolAcl {
+            allow: vec![AllowLayer::All],
+            deny: Vec::new(),
+            servers,
+            granted: true,
+        }
+    }
+
+    fn names(servers: &[&str]) -> McpServerAllowlist {
+        McpServerAllowlist::Names(servers.iter().map(|s| s.to_string()).collect())
+    }
+
+    fn ids(servers: &[&str]) -> McpServerAllowlist {
+        McpServerAllowlist::Ids(servers.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn a_server_is_reachable_only_where_some_rule_could_admit_its_tools() {
+        let acl = |allow: &[&str], deny: &[&str]| ToolAcl {
+            allow: vec![AllowLayer::from_patterns(
+                &allow.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )],
+            deny: deny
+                .iter()
+                .map(|s| DenyRule::Pattern(s.to_string()))
+                .collect(),
+            servers: Arc::new(McpServerIndex::default()),
+            granted: true,
+        };
+        assert!(acl(&["*"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(acl(&["gh__*"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(acl(&["gh__read"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(acl(&["g*"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(acl(&["*__read"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(!acl(&["slack__*"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(!acl(&["ghost__*"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(!acl(&["gh_x*"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(!acl(&[], &[]).may_reach_server("gh", "id-gh"));
+        assert!(!acl(&["*"], &["gh__*"]).may_reach_server("gh", "id-gh"));
+        assert!(!acl(&["*"], &["g*"]).may_reach_server("gh", "id-gh"));
+        assert!(!acl(&["*"], &["*"]).may_reach_server("gh", "id-gh"));
+        assert!(acl(&["*"], &["ghost*"]).may_reach_server("gh", "id-gh"));
+        assert!(acl(&["*"], &["*__write"]).may_reach_server("gh", "id-gh"));
+        assert!(acl(&["*"], &["gh__write"]).may_reach_server("gh", "id-gh"));
+        let by_id = ToolAcl {
+            allow: vec![AllowLayer::Refs(vec![McpToolRef {
+                server_id: "id-gh".into(),
+                tool: "read".into(),
+            }])],
+            deny: Vec::new(),
+            servers: Arc::new(McpServerIndex::default()),
+            granted: true,
+        };
+        assert!(by_id.may_reach_server("gh", "id-gh"));
+        assert!(!by_id.may_reach_server("slack", "id-slack"));
+    }
+
+    /// `may_reach_server` prefilters a grant before the server's tools are
+    /// known, so it must agree with `permits`, which honours every `*`: a
+    /// grant with several must keep its server, or the caller's credentials
+    /// are withheld from a tool `permits` would admit.
+    #[test]
+    fn may_reach_server_honours_every_star() {
+        let acl = |allow: &[&str]| ToolAcl {
+            allow: vec![AllowLayer::from_patterns(
+                &allow.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )],
+            deny: Vec::new(),
+            servers: Arc::new(McpServerIndex::default()),
+            granted: true,
+        };
+        for reaches in ["*read*", "gh__*read*", "*__*", "g*__*", "gh*r*d", "**"] {
+            assert!(
+                acl(&[reaches]).may_reach_server("gh", "id-gh"),
+                "{reaches} can match a gh__ tool"
+            );
+            assert!(
+                acl(&[reaches]).permits("gh__read"),
+                "{reaches} must admit what it reaches"
+            );
+        }
+        for misses in ["slack__*read*", "x*y*", "gh_x*r*", "ghost__*r*"] {
+            assert!(
+                !acl(&[misses]).may_reach_server("gh", "id-gh"),
+                "{misses} can match no gh__ tool"
+            );
+        }
+    }
+
+    /// The anonymous ceiling intersects — it can only ever remove tools.
+    /// A principal whose own grant is `*` must still be confined to the
+    /// listed servers, which is what stops an anonymous caller from
+    /// reaching an unlisted server by naming `<server>__<tool>` on the
+    /// aggregated endpoint while its scoped entry is closed.
+    #[test]
+    fn server_ceiling_narrows_a_wide_grant() {
+        let wide = ToolAcl::from_allowed(Some(&["*".to_string()]));
+        assert!(wide.permits("kb__search"));
+
+        let capped = ToolAcl::from_allowed(Some(&["*".to_string()]))
+            .narrowed_to_allowlist(&names(&["docs"]));
+        assert!(capped.permits("docs__search"));
+        assert!(!capped.permits("kb__search"));
+        // A bare tool name belongs to no server and is never admitted.
+        assert!(!capped.permits("search"));
+        // The `__` boundary is respected: a server whose name merely
+        // starts with an allowed one does not inherit its grant.
+        assert!(!capped.permits("docsecret__search"));
+    }
+
+    /// A stored server may hold a `*` in its name (new names cannot), and a
+    /// ceiling entry names one server exactly. Pasting such a name into a
+    /// pattern would let `gh*__*` admit every `gh...` server's tools to an
+    /// unauthenticated caller, so a ceiling entry holding a `*` admits nothing.
+    #[test]
+    fn a_ceiling_entry_holding_a_star_admits_no_other_server() {
+        let capped = ToolAcl::from_allowed(Some(&["*".to_string()]))
+            .narrowed_to_allowlist(&names(&["gh*", "docs"]));
+        assert!(capped.permits("docs__search"), "the entry beside it stands");
+        assert!(!capped.permits("github__read"));
+        assert!(!capped.permits("ghost__read"));
+        assert!(!capped.permits("gh__read"));
+        assert!(!capped.permits("gh*__read"));
+
+        let only =
+            ToolAcl::from_allowed(Some(&["*".to_string()])).narrowed_to_allowlist(&names(&["*"]));
+        assert!(!only.permits("docs__search"));
+        assert!(!only.may_reach_server("docs", "id-docs"));
+    }
+
+    /// The id spelling of the same ceiling, resolved through the server
+    /// index: same admissions, addressed by the id the server is stored
+    /// under rather than by the name a caller types.
+    #[test]
+    fn an_id_spelled_ceiling_narrows_a_wide_grant() {
+        let index = server_index(&[("s-docs", "docs"), ("s-kb", "kb")]);
+        let capped = wide_acl_over(Arc::clone(&index)).narrowed_to_allowlist(&ids(&["s-docs"]));
+        assert!(capped.permits("docs__search"));
+        assert!(!capped.permits("kb__search"));
+        assert!(!capped.permits("search"));
+        assert!(!capped.permits("docsecret__search"));
+    }
+
+    /// The whole point of the id spelling: the ceiling follows the server
+    /// through a rename, with the settings document untouched.
+    #[test]
+    fn an_id_spelled_ceiling_follows_a_rename() {
+        let allowlist = ids(&["s-docs"]);
+        let before = wide_acl_over(server_index(&[("s-docs", "docs"), ("s-kb", "kb")]))
+            .narrowed_to_allowlist(&allowlist);
+        assert!(before.permits("docs__search"));
+
+        // Same id, new name — the allowlist above is reused verbatim.
+        let after = wide_acl_over(server_index(&[("s-docs", "handbook"), ("s-kb", "kb")]))
+            .narrowed_to_allowlist(&allowlist);
+        assert!(after.permits("handbook__search"));
+        assert!(!after.permits("docs__search"));
+        assert!(!after.permits("kb__search"));
+    }
+
+    /// An id naming no registered server admits nothing, and leaves the
+    /// entries beside it alone.
+    #[test]
+    fn an_unresolvable_id_in_the_ceiling_admits_nothing() {
+        let index = server_index(&[("s-docs", "docs"), ("s-kb", "kb")]);
+        let acl =
+            wide_acl_over(Arc::clone(&index)).narrowed_to_allowlist(&ids(&["s-gone", "s-docs"]));
+        assert!(acl.permits("docs__search"));
+        assert!(!acl.permits("kb__search"));
+
+        let only_gone = wide_acl_over(index).narrowed_to_allowlist(&ids(&["s-gone"]));
+        assert!(!only_gone.permits("docs__search"));
+        assert!(!only_gone.permits("kb__search"));
+    }
+
+    /// The ceiling never widens: a narrow grant stays narrow even when
+    /// the allowlist names more servers than the key can reach.
+    #[test]
+    fn server_ceiling_cannot_widen_a_grant() {
+        let acl = ToolAcl::from_allowed(Some(&["docs__search".to_string()]))
+            .narrowed_to_allowlist(&names(&["docs", "kb"]));
+        assert!(acl.permits("docs__search"));
+        assert!(!acl.permits("docs__write"));
+        assert!(!acl.permits("kb__search"));
+
+        let index = server_index(&[("s-docs", "docs"), ("s-kb", "kb")]);
+        let by_id = ToolAcl {
+            allow: vec![AllowLayer::from_patterns(&["docs__search".to_string()])],
+            deny: Vec::new(),
+            servers: index,
+            granted: true,
+        }
+        .narrowed_to_allowlist(&ids(&["s-docs", "s-kb"]));
+        assert!(by_id.permits("docs__search"));
+        assert!(!by_id.permits("docs__write"));
+        assert!(!by_id.permits("kb__search"));
+    }
+
+    /// An empty allowlist admits nothing — an anonymous principal with
+    /// no listed server has no tools, rather than all of them. True of
+    /// both spellings, and of the id one even though it is the spelling
+    /// an operator uses to deny every anonymous caller.
+    #[test]
+    fn server_ceiling_with_no_servers_admits_nothing() {
+        let acl =
+            ToolAcl::from_allowed(Some(&["*".to_string()])).narrowed_to_allowlist(&names(&[]));
+        assert!(!acl.permits("docs__search"));
+        assert!(!acl.permits("anything"));
+
+        let by_id =
+            wide_acl_over(server_index(&[("s-docs", "docs")])).narrowed_to_allowlist(&ids(&[]));
+        assert!(!by_id.permits("docs__search"));
+        assert!(!by_id.permits("anything"));
     }
 
     /// The exact served set, as literals: growing or shrinking it is a

@@ -21,7 +21,7 @@
 //! `model` field*, so every dispatch shape qualifies: direct models and
 //! the virtual aliases (routing / semantic / ensemble) alike. A Model
 //! Group is the stable public entry point its operator intends callers
-//! to use, and the same `allowed_models` ACL that authorizes the request
+//! to use, and the same key→model ACL that authorizes the request
 //! decides whether it appears here.
 //!
 //! OpenAI shape (<https://platform.openai.com/docs/api-reference/models>):
@@ -197,7 +197,7 @@ fn permitted_model_names(
         .collect();
     let mut names: Vec<String> = auth
         .key()
-        .accessible_models(all.iter().map(|s: &String| s.as_str()))
+        .accessible_models(snapshot, all.iter().map(|s: &String| s.as_str()))
         .into_iter()
         .map(str::to_string)
         .collect();
@@ -275,20 +275,71 @@ fn paginate(names: &[String], params: &ListParams) -> (Vec<String>, bool) {
     (page, end < names.len())
 }
 
+/// The access-log line and request metrics a discovery request owes: these
+/// routes have no dispatch path to write them.
+fn record_discovery(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    method: &axum::http::Method,
+    path: &str,
+    request_id: Option<&axum::Extension<crate::request_id::RequestId>>,
+    response: &Response,
+    started: std::time::Instant,
+) {
+    crate::reject::emit_unrouted_access_log(
+        method.as_str(),
+        path,
+        request_id.map(|r| r.0 .0.as_str()).unwrap_or_default(),
+        Some(&auth.entry.id),
+        response.status().as_u16(),
+        started,
+    );
+    crate::reject::record_undispatched(
+        state,
+        path,
+        crate::request_metrics::Caller::new(auth),
+        response.status().as_u16(),
+        crate::attribution::rendered_error_source(response.status().as_u16()),
+        started,
+    );
+}
+
 pub async fn list_models(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     headers: HeaderMap,
+    method: axum::http::Method,
+    request_id: Option<axum::Extension<crate::request_id::RequestId>>,
     Query(raw): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let params = match ListParams::parse(&raw) {
+    let started = std::time::Instant::now();
+    let response = model_list(&state, &auth, &headers, &raw);
+    record_discovery(
+        &state,
+        &auth,
+        &method,
+        "/v1/models",
+        request_id.as_ref(),
+        &response,
+        started,
+    );
+    response
+}
+
+fn model_list(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    headers: &HeaderMap,
+    raw: &std::collections::HashMap<String, String>,
+) -> Response {
+    let params = match ListParams::parse(raw) {
         Ok(p) => p,
-        Err(e) => return dialect_error(&headers, e),
+        Err(e) => return dialect_error(headers, e),
     };
     let snapshot = state.snapshot.load();
-    let names = permitted_model_names(&snapshot, &auth);
+    let names = permitted_model_names(&snapshot, auth);
 
-    if !wants_anthropic_shape(&headers) {
+    if !wants_anthropic_shape(headers) {
         // OpenAI's list endpoint defines no pagination — every permitted
         // model, in one page.
         return Json(ModelList {
@@ -319,18 +370,41 @@ pub async fn get_model(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     headers: HeaderMap,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    request_id: Option<axum::Extension<crate::request_id::RequestId>>,
     crate::reject::AisixPath(id): crate::reject::AisixPath<String>,
+) -> Response {
+    let started = std::time::Instant::now();
+    let response = model_retrieve(&state, &auth, &headers, id);
+    record_discovery(
+        &state,
+        &auth,
+        &method,
+        uri.path(),
+        request_id.as_ref(),
+        &response,
+        started,
+    );
+    response
+}
+
+fn model_retrieve(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    headers: &HeaderMap,
+    id: String,
 ) -> Response {
     let snapshot = state.snapshot.load();
     let known = snapshot
         .models
         .get_by_name(&id)
         .is_some_and(|e| !e.value.display_name.contains('*'));
-    if !known || !auth.key().can_access(&id) {
-        return dialect_error(&headers, ProxyError::ModelNotFound(id));
+    if !known || !auth.key().can_access(&snapshot, &id) {
+        return dialect_error(headers, ProxyError::ModelNotFound(id));
     }
 
-    if wants_anthropic_shape(&headers) {
+    if wants_anthropic_shape(headers) {
         Json(anthropic_model(&id)).into_response()
     } else {
         Json(openai_model(&snapshot, &id)).into_response()
@@ -353,11 +427,13 @@ mod tests {
     fn cfg() -> ProxyConfig {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: Some(1_048_576),
+            request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),
+            expose_debug_headers: false,
             tls: None,
+            listeners: Vec::new(),
             thread_per_core: None,
             workers: None,
         }

@@ -2,7 +2,7 @@
 
 This page lists capabilities that are planned or in progress but not yet generally available. It shows direction, not dates, and is not a delivery commitment.
 
-For what the gateway does today — including [semantic routing](https://docs.api7.ai/ai-gateway/routing/semantic-routing), [ensemble models](https://docs.api7.ai/ai-gateway/routing/ensemble-models), [caching](https://docs.api7.ai/ai-gateway/traffic-controls/caching), and [guardrails](https://docs.api7.ai/ai-gateway/traffic-controls/guardrails/overview) — see the [AISIX AI Gateway documentation](https://docs.api7.ai/ai-gateway/).
+For what the gateway does today — including [semantic routing](https://docs.api7.ai/ai-gateway/routing/semantic-routing), [ensemble models](https://docs.api7.ai/ai-gateway/routing/ensemble-models), [caching](https://docs.api7.ai/ai-gateway/traffic-controls/caching), and [guardrails](https://docs.api7.ai/ai-gateway/traffic-controls/guardrails/overview) — see the [AISIX documentation](https://docs.api7.ai/ai-gateway/).
 
 ## How to read this page
 
@@ -10,42 +10,37 @@ For what the gateway does today — including [semantic routing](https://docs.ap
 - **Next** — planned after the current focus.
 - **Later** — on the longer-term horizon.
 
-The **Surface** column shows where a capability lands: **Gateway** is the AISIX AI Gateway runtime; **Cloud** is the AISIX Cloud control plane and dashboard.
+The **Products** column identifies the products expected to expose the capability. A shared gateway or control-plane implementation does not imply availability in every product.
 
 ## Now
 
-| Capability | What's planned | Surface |
+| Capability | What's planned | Products |
 | --- | --- | --- |
-| MCP governance in Cloud | Manage registered MCP servers, per-tool access, and per-server usage from the dashboard and Cloud Admin API. The gateway-side MCP surface already ships. | Cloud |
-| Enterprise SSO | Single sign-on through SAML and generic OIDC, beyond today's social logins. | Cloud |
-| Directory sync (SCIM) | Provision and deprovision users and groups from your identity provider. | Cloud |
-| Service accounts | Login-less, first-class principals for automated callers. | Cloud |
-| Semantic caching | Serve responses for prompts close in meaning, on top of today's exact-match cache. | Gateway |
-| Hourly token limits on keys and models | Set a per-hour token budget directly on an API key or a model, alongside today's per-minute and per-day figures. The gateway enforces it today — including through an hourly rate-limit policy, which needs no further Cloud work — so what remains is exposing the inline field. | Cloud |
-| Network allowlists for MCP servers and A2A agents | Restrict which client networks may reach a registered MCP server or A2A agent, the way model network allowlists already work. The gateway enforces the restriction today; setting it from the dashboard and Cloud Admin API is what remains. | Cloud |
+| Additional SSO protocols | Single sign-on through SAML and generic OIDC, beyond today's social logins. | AISIX Enterprise · AISIX Cloud |
+| Service accounts | Login-less, first-class principals for automated callers. | AISIX Enterprise · AISIX Cloud |
+| Hourly token limits on keys and models | Set a per-hour token budget directly on an API key or a model, alongside today's per-minute and per-day figures. The gateway enforces it today — including through an hourly rate-limit policy, which needs no further control-plane work — so what remains is exposing the inline field. | AISIX Enterprise · AISIX Cloud |
+| Network allowlists for MCP servers and A2A agents | Restrict which client networks may reach a registered MCP server or A2A agent, the way model network allowlists already work. The gateway enforces the restriction today; setting it from the dashboard and AISIX Cloud Admin API is what remains. | AISIX Enterprise · AISIX Cloud |
 
 ## Next
 
-| Capability | What's planned | Surface |
+| Capability | What's planned | Products |
 | --- | --- | --- |
-| Fine-grained authorization | Custom roles with per-resource and per-action permissions, beyond today's fixed roles and read/write scopes. | Cloud |
-| Conditional and wildcard routing | Route on request metadata, headers, and tags, and match upstreams by wildcard names such as `provider/*`. | Gateway |
-| Prompt management | Store, version, and reuse prompt templates with variables, resolved at the gateway. | Gateway · Cloud |
-| Caller key rotation experience | Self-service key rotation in the dashboard, plus scheduled auto-rotation with a grace overlap. | Cloud |
-| Production-path playground | Run the Cloud playground through a connected AISIX gateway so it reflects real routing, caching, guardrails, and rate limiting. | Cloud |
-| Cross-provider endpoint parity | Consistent embeddings, image generation, and Responses behavior across more providers. | Gateway |
+| Prompt management | Store, version, and reuse prompt templates with variables, resolved at the gateway. | AISIX OSS · AISIX Enterprise · AISIX Cloud |
+| Scheduled key rotation | Scheduled auto-rotation of caller keys with a grace overlap, on top of today's manual rotation. | AISIX Enterprise · AISIX Cloud |
+| Production-path playground | Run the dashboard playground through a connected AISIX gateway so it reflects real routing, caching, guardrails, and rate limiting. | AISIX Enterprise · AISIX Cloud |
+| Cross-provider endpoint parity | Consistent embeddings, image generation, and Responses behavior across more providers. | AISIX OSS · AISIX Enterprise · AISIX Cloud |
 
 ## Later
 
-| Capability | What's planned | Surface |
+| Capability | What's planned | Products |
 | --- | --- | --- |
-| External secret management | Manage provider and API credentials through external KMS and secret stores such as Vault. | Gateway · Cloud |
-| Expanded observability export | OTLP export for metrics and logs, alerting integrations such as Slack and PagerDuty, and first-party data-warehouse sinks. | Gateway · Cloud |
-| Metered usage billing | Usage-based billing in addition to subscription plans. | Cloud |
-| SDKs and agent-framework integrations | First-party SDKs and integrations with common agent frameworks. | Gateway · Cloud |
+| External secret management | Manage provider and API credentials through external KMS and secret stores such as Vault. | AISIX OSS · AISIX Enterprise · AISIX Cloud |
+| Expanded observability export | OTLP export for metrics and logs, and alerting integrations such as Slack and PagerDuty. | AISIX OSS · AISIX Enterprise · AISIX Cloud |
+| Metered usage billing | Usage-based billing in addition to subscription plans. | AISIX Cloud |
+| SDKs and agent-framework integrations | First-party SDKs and integrations with common agent frameworks. | AISIX OSS · AISIX Enterprise · AISIX Cloud |
 
 ## Related pages
 
-- [AISIX AI Gateway documentation](https://docs.api7.ai/ai-gateway/)
+- [AISIX documentation](https://docs.api7.ai/ai-gateway/)
 - [AISIX Cloud](https://api7.ai/ai-gateway)
 - Tracked live in [issues](https://github.com/api7/aisix/issues)

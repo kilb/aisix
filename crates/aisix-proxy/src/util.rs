@@ -1,52 +1,69 @@
 //! Small shared helpers for the proxy layer.
 
-/// Truncate `s` to at most `max_bytes` bytes, rounding down to a UTF-8
-/// char boundary, and append an ellipsis when truncation occurred.
-///
-/// Slicing a `String`/`str` at a fixed byte offset (`&s[..n]`) panics
-/// when the offset splits a multibyte codepoint. A non-ASCII upstream
-/// error body can trigger that on the error-handling path (issue #420),
-/// so every site that truncates an upstream error body for a log line
-/// or error envelope must go through this helper rather than a raw
-/// byte slice.
-pub(crate) fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> String {
-    if s.len() <= max_bytes {
-        return s.to_string();
+/// Borrow a request object when its only outbound rewrite is `model`.
+/// Earlier effort/billing/thinking rewrites are gated by the caller's `Cow`;
+/// signatures and provider body overrides still need the owned rewrite path.
+pub(crate) fn model_only_fields<'a>(
+    body: &'a serde_json::Value,
+    pk: &aisix_core::ProviderKey,
+    signature_field: Option<&str>,
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    let fields = body.as_object()?;
+    if pk.request.as_ref().is_some_and(|r| r.rewrites_body()) {
+        return None;
     }
-    let end = (0..=max_bytes)
-        .rev()
-        .find(|&i| s.is_char_boundary(i))
-        .unwrap_or(0);
-    format!("{}…", &s[..end])
+    let signatures = signature_field
+        .and_then(|field| fields.get(field))
+        .is_some_and(aisix_gateway::tool_calls::body_has_thought_signatures);
+    (!signatures).then_some(fields)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// The same bytes as cloning an object, replacing an existing `model`,
+/// and serializing it, without the intermediate owned object.
+pub(crate) struct ModelRenamed<'a> {
+    pub fields: &'a serde_json::Map<String, serde_json::Value>,
+    pub model: &'a str,
+}
 
-    #[test]
-    fn short_string_is_returned_unchanged() {
-        assert_eq!(truncate_on_char_boundary("hello", 1024), "hello");
+impl serde::Serialize for ModelRenamed<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.fields.len()))?;
+        for (key, value) in self.fields {
+            if key == "model" {
+                map.serialize_entry(key, self.model)?;
+            } else {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
     }
+}
 
-    #[test]
-    fn ascii_over_limit_truncates_and_appends_ellipsis() {
-        let s = "a".repeat(2000);
-        assert_eq!(
-            truncate_on_char_boundary(&s, 1024),
-            format!("{}…", "a".repeat(1024))
-        );
-    }
+/// Wire bytes of a request body a proxy route sends upstream itself,
+/// bypassing the provider bridges. Build the outbound `Value` inside a block
+/// that ends here, so only these bytes — which reqwest holds until the
+/// response head — outlive it; see [`aisix_gateway::json_body`]. A reader
+/// that needs the outbound form after the upstream answered uses
+/// [`outbound_text`] / [`outbound_value`] instead of a kept copy.
+pub(crate) fn outbound_json<T: serde::Serialize + ?Sized>(
+    body: &T,
+) -> Result<bytes::Bytes, crate::error::ProxyError> {
+    aisix_gateway::json_body(body).map_err(|e| {
+        crate::error::ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+            "serialize request body: {e}"
+        )))
+    })
+}
 
-    #[test]
-    fn multibyte_body_does_not_panic_and_rounds_down_to_boundary() {
-        // '€' is 3 bytes; 1024 is not a multiple of 3, so a raw
-        // `&s[..1024]` slice would split a codepoint and panic. The
-        // helper must round down to byte 1023 (341 whole '€').
-        let s = "€".repeat(1000); // 3000 bytes
-        let out = truncate_on_char_boundary(&s, 1024);
-        let kept = out.strip_suffix('…').expect("ellipsis appended");
-        assert_eq!(kept, "€".repeat(341)); // 341 * 3 = 1023 bytes
-        assert!(kept.len() <= 1024);
-    }
+/// The outbound request as text, for content capture: the wire bytes are
+/// exactly what `serde_json::to_string` of the body would produce.
+pub(crate) fn outbound_text(outbound: &[u8]) -> String {
+    String::from_utf8_lossy(outbound).into_owned()
+}
+
+/// The outbound request as a `Value`, rebuilt from its wire bytes for a
+/// reader that runs after the upstream has answered.
+pub(crate) fn outbound_value(outbound: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(outbound).unwrap_or_default()
 }

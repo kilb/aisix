@@ -1,4 +1,4 @@
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderName, HeaderValue};
 use axum::middleware::Next;
 use axum::response::Response;
@@ -17,6 +17,21 @@ pub(crate) const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-aisi
 pub(crate) fn new_request_id() -> String {
     Uuid::new_v4().to_string()
 }
+
+/// The correlation id a fronting proxy stamps on the requests it
+/// forwards. `x-request-id` is what Envoy, nginx and the ingresses built
+/// on them all emit by default, which is why it is fixed here rather than
+/// configurable.
+///
+/// It is **recorded, never adopted**: whether a caller-supplied id becomes
+/// this gateway's own `request_id` stays governed by
+/// `proxy.request_id.accept_headers`, which by default takes only
+/// `x-aisix-request-id`. So a deployment behind an ingress logs two ids
+/// that mean different things — the ingress's `downstream_request_id` and
+/// the gateway's `request_id` — and neither can be mistaken for the other.
+/// When an operator does list this header in `accept_headers`, the two
+/// carry the same value, which is the honest report of what happened.
+const DOWNSTREAM_REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
 
 /// Longest caller-supplied request id accepted. Matches the control plane's
 /// `maxRequestIDLen`.
@@ -70,6 +85,18 @@ fn client_request_id(headers: &axum::http::HeaderMap, accept: &[HeaderName]) -> 
     None
 }
 
+/// The fronting proxy's own request id, when it sent an acceptable one.
+///
+/// Screened by the same [`is_acceptable`] rule as an adopted id: this
+/// value is written into logs verbatim, so it has to be visible ASCII of
+/// bounded length whether or not the gateway ever hands it back.
+fn downstream_request_id(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(&DOWNSTREAM_REQUEST_ID_HEADER)
+        .and_then(|raw| raw.to_str().ok())
+        .filter(|id| is_acceptable(id))
+}
+
 /// The per-request correlation id, stashed in the request extensions by
 /// [`ensure_request_id`] so every handler resolves the SAME id for both
 /// its usage event and the response header. Handlers with a
@@ -77,6 +104,34 @@ fn client_request_id(headers: &axum::http::HeaderMap, accept: &[HeaderName]) -> 
 /// the few that don't take one use an `Extension<RequestId>` extractor.
 #[derive(Debug, Clone)]
 pub(crate) struct RequestId(pub String);
+
+/// The downstream protocol, as a bounded label for the request span.
+///
+/// It rides the span alongside `peer` because it is the same kind of
+/// fact — a property of the connection rather than of the request — and
+/// so reaches the access log, the per-attempt `provider call completed`
+/// line, and every diagnostic in between without 29 call sites having to
+/// thread it down.
+///
+/// It is worth a field because the two protocols retire differently
+/// during a drain, and an operator sizing
+/// `terminationGracePeriodSeconds` has to know which they have: an
+/// HTTP/1.1 connection retires itself through `Connection: close` as it
+/// is used, while an HTTP/2 one retires on the GOAWAY the listener sends
+/// when the drain starts (AISIX-Cloud#1395). Until this field existed
+/// nothing the gateway logged said which a deployment was seeing.
+///
+/// The set is closed, so it is safe as a metric label too.
+fn http_version_label(version: axum::http::Version) -> &'static str {
+    match version {
+        axum::http::Version::HTTP_09 => "0.9",
+        axum::http::Version::HTTP_10 => "1.0",
+        axum::http::Version::HTTP_11 => "1.1",
+        axum::http::Version::HTTP_2 => "2",
+        axum::http::Version::HTTP_3 => "3",
+        _ => "other",
+    }
+}
 
 /// Ingress+egress middleware that resolves the request id — the caller's
 /// own when they supplied one, a fresh UUID otherwise — and gives every
@@ -113,6 +168,30 @@ pub(crate) struct RequestId(pub String);
 /// across an await would leak the span onto whatever else the executor
 /// runs on this thread.
 ///
+/// Two connection-level identities ride the same span, for the same
+/// reason and with the same reach — the access log, the per-attempt
+/// `provider call completed` line, and every diagnostic in between:
+///
+/// - `peer`, the accepted socket's remote address INCLUDING its port — or,
+///   when a trusted peer opened the connection with a PROXY protocol
+///   header, the source address that header names. It
+///   is deliberately not the resolved client IP that
+///   [`ClientContext::source_ip`](crate::client_ip::ClientContext) already
+///   carries: that one answers "who is the caller", follows
+///   `proxy.real_ip`, and has no port. This one answers "which TCP
+///   connection", and the port is the whole of its value — behind a
+///   layer-4 load balancer with the gateway on the host network it is the
+///   only field that joins a gateway log line to the fronting proxy's
+///   record of the same connection.
+/// - `downstream_request_id`, from [`DOWNSTREAM_REQUEST_ID_HEADER`], so a
+///   trace id minted before the gateway can be searched for here.
+///
+/// Both are recorded rather than declared, so a request that carried
+/// neither logs neither field instead of an empty one.
+///
+/// `http_version` is the third, and it is always known, so it is
+/// declared. See [`http_version_label`] for why it is worth a field.
+///
 /// Response-body streams (SSE) are polled after this middleware returns,
 /// so they fall outside the span. Generators that moderate streamed
 /// output re-attach it explicitly — see `chat::build_sse_stream`.
@@ -129,7 +208,38 @@ pub(crate) async fn ensure_request_id(
         .unwrap_or_else(new_request_id);
     request.extensions_mut().insert(RequestId(id.clone()));
 
-    let span = tracing::info_span!("request", request_id = %id);
+    // The request's trace identity (AISIX-Cloud#1279), minted at the same
+    // single point as the request id so every usage event and exported
+    // span of this request shares one trace. A valid inbound W3C
+    // `traceparent` continues the caller's trace; anything malformed —
+    // or a duplicated header — degrades to a locally-rooted one, and the
+    // caller's `tracestate` is only kept alongside a valid parent.
+    let remote = remote_trace_context(request.headers());
+    let http = server_span_request(&request);
+    request.extensions_mut().insert(std::sync::Arc::new(
+        aisix_obs::RequestTraceBundle::new(remote).with_http_server(http),
+    ));
+
+    let span = tracing::info_span!(
+        "request",
+        request_id = %id,
+        http_version = http_version_label(request.version()),
+        peer = tracing::field::Empty,
+        downstream_request_id = tracing::field::Empty,
+    );
+    if let Some(peer) = request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+    {
+        span.record("peer", tracing::field::display(peer.0));
+    }
+    if let Some(downstream) = downstream_request_id(request.headers()) {
+        // Recorded as a string, not `display`: the value is caller-supplied
+        // and `is_acceptable` permits `{`, `}` and `:` — the characters the
+        // fmt subscriber delimits a span's field list with. As a string it
+        // is rendered quoted and escaped, so it cannot forge one.
+        span.record("downstream_request_id", downstream);
+    }
     let mut response = next.run(request).instrument(span).await;
 
     // If the handler already stamped the header (from the same id), keep
@@ -140,6 +250,73 @@ pub(crate) async fn ensure_request_id(
         }
     }
     response
+}
+
+/// The scheme of the listener a request arrived on — `https` behind a
+/// `tls` block, else `http`. Inserted per listener by the server; read for
+/// the SERVER span's `url.scheme`.
+#[derive(Debug, Clone, Copy)]
+pub struct DownstreamScheme(pub &'static str);
+
+/// The inbound request as the SERVER span reports it. `http.route` is set
+/// only when the path is itself one of the gateway's static routes: every
+/// other path is matched by prefix or parameter, and the HTTP conventions
+/// forbid reporting a raw path as a route.
+fn server_span_request(request: &Request) -> aisix_obs::HttpServerFacts {
+    let path = request.uri().path();
+    let label = crate::normalize_endpoint_label(path);
+    aisix_obs::HttpServerFacts::new(
+        request.method().as_str(),
+        path,
+        (label == path).then_some(label),
+        request.extensions().get::<DownstreamScheme>().map(|s| s.0),
+    )
+    .with_query(request.uri().query())
+}
+
+/// The caller's W3C trace context, when it arrived intact.
+///
+/// Strict on purpose — this value decides what the gateway's own
+/// telemetry is filed under. Exactly one `traceparent` header (the spec
+/// invalidates a duplicated one), parsed by the strict v00 grammar in
+/// `aisix_obs::parse_traceparent`; `tracestate` (spec: multiple headers
+/// combine as a comma-joined list) is screened and kept only when the
+/// parent it travelled with was valid. Invalid → `None` → a
+/// locally-rooted trace, never a rejected request.
+fn remote_trace_context(headers: &axum::http::HeaderMap) -> Option<aisix_obs::RemoteTraceContext> {
+    let mut parents = headers.get_all(aisix_obs::TRACEPARENT_HEADER).iter();
+    let parent = parents.next()?;
+    if parents.next().is_some() {
+        tracing::debug!("multiple traceparent headers; starting a local trace");
+        return None;
+    }
+    let Some((trace_id, parent_span_id, flags)) =
+        parent.to_str().ok().and_then(aisix_obs::parse_traceparent)
+    else {
+        tracing::debug!("unusable traceparent header; starting a local trace");
+        return None;
+    };
+    let tracestate = {
+        // All-or-nothing: joining only the readable values would forward a
+        // list the caller never sent. One unreadable value discards the
+        // whole tracestate (the traceparent stays valid — the spec treats
+        // state as optional refinement).
+        let values: Result<Vec<&str>, _> = headers
+            .get_all(aisix_obs::TRACESTATE_HEADER)
+            .iter()
+            .map(|v| v.to_str())
+            .collect();
+        match values {
+            Ok(values) if !values.is_empty() => aisix_obs::screen_tracestate(&values.join(",")),
+            _ => None,
+        }
+    };
+    Some(aisix_obs::RemoteTraceContext {
+        trace_id,
+        parent_span_id,
+        flags,
+        tracestate,
+    })
 }
 
 /// Stream adapter that enters `span` for the duration of every
@@ -200,14 +377,27 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
+    /// The label is a metric-safe closed set, and the two versions that
+    /// actually reach the proxy listener have to be told apart — that is
+    /// the whole reason the field exists.
+    #[test]
+    fn http_version_labels_are_a_closed_set() {
+        assert_eq!(http_version_label(axum::http::Version::HTTP_11), "1.1");
+        assert_eq!(http_version_label(axum::http::Version::HTTP_2), "2");
+        assert_eq!(http_version_label(axum::http::Version::HTTP_10), "1.0");
+        assert_eq!(http_version_label(axum::http::Version::HTTP_09), "0.9");
+        assert_eq!(http_version_label(axum::http::Version::HTTP_3), "3");
+    }
+
     fn state_accepting(accept_headers: &[&str]) -> ProxyState {
         ProxyState::new(
             SnapshotHandle::new(AisixSnapshot::new()),
             Arc::new(Hub::new()),
             &ProxyConfig {
                 addr: "127.0.0.1:0".into(),
-                request_body_limit_bytes: Some(1_048_576),
+                request_body_limit_bytes: 1_048_576,
                 tls: None,
+                listeners: Vec::new(),
                 real_ip: Default::default(),
                 request_id: RequestIdConfig {
                     accept_headers: accept_headers.iter().map(|s| (*s).to_owned()).collect(),
@@ -215,6 +405,7 @@ mod tests {
                 thread_per_core: None,
                 workers: None,
                 url_rewrites: Vec::new(),
+                expose_debug_headers: false,
             },
         )
     }

@@ -21,41 +21,60 @@ pub mod config_status;
 pub mod credentials;
 pub mod error;
 pub mod filesource;
+pub mod forwarded_headers;
 pub mod header_template;
+pub mod host;
+pub mod mcp_openapi;
 pub mod models;
 pub mod resource;
+pub mod sched;
+pub mod similarity;
 pub mod snapshot;
+pub mod url_redact;
 pub mod version;
 pub mod wildcard;
 
 pub use config::{
-    AdminConfig, CacheBackend, CacheConfig, ClientTypeRule, Config, EtcdConfig, EtcdTlsConfig,
-    HistogramBucketsConfig, ManagedConfig, ObservabilityConfig, ProxyConfig, RateLimitBackend,
+    AdminConfig, AutoDumpConfig, CacheBackend, CacheConfig, ClientTypeRule, Config,
+    DebugListenerConfig, EtcdConfig, EtcdTlsConfig, HeapProfilingConfig, HistogramBucketsConfig,
+    ManagedConfig, ObservabilityConfig, ProxyConfig, ProxyListener, RateLimitBackend,
     RateLimitConfig, RealIpConfig, RedisConnConfig, RedisMode, RequestIdConfig, TlsConfig,
-    UrlRewriteRule, RESERVED_UPSTREAM_HEADERS,
+    UrlRewriteRule, CREDENTIAL_HEADERS,
 };
 pub use config_status::{
-    hash_bytes, hash_entries, AppliedSnapshot, ConfigMetricsView, ConfigState, ConfigStatus,
-    ConfigStatusView, IncomingRejection, LoadObservation, RejectedResource, SourceKind,
+    hash_bytes, hash_entries, AppliedSnapshot, ConfigMetricsView, ConfigRejectionSnapshot,
+    ConfigState, ConfigStatus, ConfigStatusView, IncomingRejection, LazyHash, LoadObservation,
+    RejectedResource, SourceKind, UnknownKindResource,
 };
 pub use error::{
     AdminError, AdminErrorEnvelope, BootstrapError, ProxyError, ProxyErrorEnvelope, RateLimitScope,
+};
+pub use forwarded_headers::{
+    client_header_forwardable, displaces_a_gateway_header, exact_match_only, exact_match_only_with,
+    forward_pattern_admits, forward_pattern_admits_with, header_forward_blocked,
+    resolve_forwarded_client_headers, CREDENTIAL_SLOT_HEADERS, GATEWAY_HEADER_PREFIX,
+    NEVER_FORWARD_FROM_CLIENT, NEVER_FORWARD_FROM_CLIENT_PREFIXES, NON_FORWARDABLE_HEADERS,
 };
 pub use header_template::{render_header_template, HeaderVars, HEADER_TEMPLATE_VARS};
 pub use models::{
     validate_a2a_agent, validate_apikey, validate_cache_policy, validate_guardrail,
     validate_mcp_server, validate_model, validate_observability_exporter, validate_provider_key,
     validate_rate_limit_policy, A2aAgent, A2aAuthType, A2aProtocolVersion, Adapter, AisixSnapshot,
-    ApiKey, AppliedGuardrail, CachePolicy, CooldownConfig, ExporterKind, Guardrail,
-    GuardrailExecution, GuardrailHookPoint, GuardrailKind, GuardrailMetricsSink,
-    GuardrailMonitorHit, InputTokens, KeywordConfig, KeywordPattern, McpAuthType,
-    McpProtocolVersion, McpRateLimit, McpServer, McpServerType, McpTransport, Model, ModelCost,
-    ObservabilityExporter, ParamConstraints, PassthroughAuthMode, PassthroughCredentialMode,
-    PassthroughProtocol, PassthroughRoute, PolicyScope, PolicyWindow, ProviderKey, RateLimit,
-    RateLimitMetricsSink, RateLimitPolicy, RequestOverrides, ResponseOverrides, Routing,
-    RoutingStrategy, RoutingTarget, SchemaError, StreamDoneMarker, TelemetryKind, TelemetryTags,
+    ApiEndpoint, ApiKey, ApiSurface, AppliedGuardrail, CachePolicy, CooldownConfig, EffortAction,
+    ExporterKind, Guardrail, GuardrailEnforcedHit, GuardrailExecution, GuardrailHookPoint,
+    GuardrailInputMessages, GuardrailKind, GuardrailMetricsSink, GuardrailMonitorHit,
+    GuardrailScore, HashOnSource, HashOnType, InputTokens, KeyOwnerNames, KeywordConfig,
+    KeywordPattern, MappedEffort, McpAuthType, McpProtocolVersion, McpRateLimit, McpServer,
+    McpServerType, McpTokenExchangeProfile, McpTransport, Model, ModelCost, ObservabilityExporter,
+    ParamConstraints, PassthroughAuthMode, PassthroughCredentialMode, PassthroughRoute,
+    PolicyScope, PolicyWindow, ProviderApis, ProviderKey, RateLimit, RateLimitMetricsSink,
+    RateLimitPolicy, RequestOverrides, ResponseOverrides, Routing, RoutingStrategy, RoutingTarget,
+    SchemaError, StreamDoneMarker, Tags, Team, TelemetryKind, TelemetryTags, User,
     WhenAllUnavailablePolicy, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use resource::{Resource, ResourceEntry};
+pub use sched::{demote_current_thread, run_demoted};
+pub use similarity::{best_similarity, best_similarity_by, cosine_similarity};
 pub use snapshot::{ResourceTable, SnapshotHandle};
-pub use version::BUILD_VERSION;
+pub use url_redact::{redact_url_for_log, redact_userinfo};
+pub use version::{BUILD_VERSION, HEARTBEAT_VERSION};

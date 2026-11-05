@@ -16,8 +16,8 @@
 
 use aisix_gateway::url_cache::cached_endpoint_url;
 use aisix_gateway::{
-    apply_request_headers, Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream,
-    ChatFormat, ChatResponse, SseDecoder, SseEvent, UpstreamHeaderContext,
+    Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatFormat, ChatResponse,
+    SseDecoder, SseEvent,
 };
 use aisix_provider_openai::overrides::{
     apply_default_body_fields, apply_param_constraints, apply_param_renames,
@@ -25,13 +25,16 @@ use aisix_provider_openai::overrides::{
 };
 use async_trait::async_trait;
 use futures::StreamExt;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{header, Client, StatusCode};
 use std::time::{Duration, Instant};
 
+use aisix_gateway::media_fetch::{fetch_media_urls, Encoding};
+use aisix_gateway::structured_output::{response_into_fake_stream_chunks, unwrap_json_tool_call};
+
 use crate::wire::{
-    build_request, inject_cache_breakpoints, response_into_chat_response, split_system,
-    AnthropicResponse, AnthropicStreamEvent, StreamState,
+    anthropic_needs_fetch, apply_auto_prompt_caching, build_request, response_into_chat_response,
+    split_system_with, structured_output_for, AnthropicResponse, AnthropicStreamEvent, MediaUrls,
+    StreamState, StructuredOutput,
 };
 
 /// Matches the API header that Anthropic bakes backwards-compat into.
@@ -62,11 +65,12 @@ impl AnthropicBridge {
     }
 
     /// The client this dispatch runs on: the bridge's shared one, unless
-    /// the resolved Provider Key carries its own TLS settings.
+    /// the resolved Provider Key carries its own connection overrides
+    /// (TLS trust settings, a name-resolution address).
     fn client_for(&self, ctx: &BridgeContext) -> Client {
         aisix_gateway::upstream_tls::client_for_provider_key(
             &self.client,
-            ctx.provider_key.tls.as_ref(),
+            ctx.provider_key.upstream_connection().as_ref(),
         )
     }
 
@@ -83,10 +87,7 @@ impl Default for AnthropicBridge {
 }
 
 fn default_client() -> Client {
-    aisix_gateway::build_client_or_default(
-        aisix_gateway::client_builder().user_agent("aisix/0.1"),
-        "anthropic bridge",
-    )
+    aisix_gateway::build_client_or_default(aisix_gateway::client_builder(), "anthropic bridge")
 }
 
 /// Path suffixes the Anthropic bridge appends. If an operator
@@ -115,7 +116,44 @@ fn normalize_api_base(base: &str) -> String {
     trimmed.to_string()
 }
 
+/// The `apis.messages` base this key declares, or `""`. Feeds the URL
+/// cache fingerprint so editing the entry rebuilds the cached URL, the
+/// same way editing `api_base` does.
+fn declared_messages_base(ctx: &BridgeContext) -> &str {
+    ctx.provider_key
+        .apis
+        .as_ref()
+        .and_then(|apis| apis.messages.as_ref())
+        .and_then(|entry| entry.base.as_deref())
+        .unwrap_or("")
+}
+
+/// The verbatim `/v1/messages` and `count_tokens` passthrough builds its
+/// URL without this bridge, through `resolve_base_url_for` in
+/// `aisix-proxy`'s dispatch module; its `falls_back_to_anthropic_default`
+/// states this same fallback plus the `adapter: anthropic` check dispatch
+/// applies before an empty-vendor key reaches this bridge. Change the two
+/// together, or the translated and the verbatim path send one key to two
+/// different hosts.
 fn resolve_base(ctx: &BridgeContext) -> Result<String, BridgeError> {
+    // A Provider Key that declares `apis.messages` names where the
+    // Anthropic wire lives on this upstream, which is where this bridge
+    // dispatches — so the declaration has to reach here too, or the
+    // `/v1/messages` passthrough and the translated path would send the
+    // same upstream route to two different hosts.
+    if let Some(base) = ctx
+        .provider_key
+        .apis
+        .as_ref()
+        .and_then(|apis| apis.messages.as_ref())
+        .and_then(|entry| entry.base.as_deref())
+        .map(str::trim)
+        .filter(|base| !base.is_empty())
+    {
+        // The key's secret goes here just as it does to `api_base`.
+        aisix_gateway::validate_api_base("anthropic", base)?;
+        return Ok(normalize_api_base(base));
+    }
     match ctx.provider_key.api_base.as_deref() {
         Some(b) if !b.trim().is_empty() => {
             // Same check the Vertex and Azure bridges grew in #390.
@@ -190,40 +228,16 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
         .ok_or_else(|| BridgeError::InvalidUpstreamConfig("model.model_name missing".into()))
 }
 
-/// Apply the Model's `auto_prompt_caching` setting to the outbound
-/// request. A no-op unless the operator enabled it; the wire-level
-/// stand-down (a caller who set their own markers wins) lives in
-/// [`inject_cache_breakpoints`]. Shared by the streaming and
-/// non-streaming paths so they can't drift.
-fn maybe_inject_cache_breakpoints(
-    body: &mut crate::wire::AnthropicRequest<'_>,
-    ctx: &BridgeContext,
-) {
-    if let Some(apc) = ctx
-        .model
-        .auto_prompt_caching
-        .as_ref()
-        .filter(|apc| apc.enabled)
-    {
-        inject_cache_breakpoints(body, apc.ttl_or_default().as_wire_str());
-    }
-}
-
 /// Serialize the Messages body and apply the ProviderKey's `request`
 /// override block to it: `param_renames` → `param_constraints` →
 /// `default_body_fields`, as every other path to an Anthropic upstream
 /// does (the `/v1/messages` passthrough, `count_tokens`, Claude on
 /// Vertex AI). Shared by the streaming and non-streaming paths.
-///
-/// The body goes through JSON text rather than `serde_json::to_value`,
-/// which widens an `f32` field such as `temperature` to its exact `f64`
-/// value and would send `0.7` as `0.699999988079071`.
 fn prepare_outbound_body(
     body: &crate::wire::AnthropicRequest<'_>,
     ctx: &BridgeContext,
 ) -> Result<serde_json::Value, BridgeError> {
-    let mut body: serde_json::Value = serde_json::to_vec(body)
-        .and_then(|bytes| serde_json::from_slice(&bytes))
+    let mut body = serde_json::to_value(body)
         .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?;
     if let Some(r) = ctx.provider_key.request.as_ref() {
         validate_content_safe_request_overrides(r).map_err(BridgeError::InvalidUpstreamConfig)?;
@@ -236,48 +250,11 @@ fn prepare_outbound_body(
     Ok(body)
 }
 
-/// Build the outbound headers: the bridge-owned ones first (`x-api-key`,
-/// `anthropic-version`, `content-type`, `x-aisix-request-id`, and
-/// `accept` when streaming), then the ProviderKey's `default_headers`
-/// and allowlisted client headers, which [`apply_request_headers`] never
-/// lets replace a header already set.
-fn build_request_headers(
-    api_key: &str,
-    api_version: &'static str,
-    request_id: &str,
-    sse: bool,
-    hdr: &UpstreamHeaderContext<'_>,
-) -> Result<HeaderMap, BridgeError> {
-    let mut headers = HeaderMap::new();
-    let key = HeaderValue::from_str(api_key).map_err(|_| {
-        BridgeError::InvalidUpstreamCredentials(
-            "provider_key.api_key contains invalid header characters".into(),
-        )
-    })?;
-    headers.insert(HeaderName::from_static("x-api-key"), key);
-    headers.insert(
-        HeaderName::from_static("anthropic-version"),
-        HeaderValue::from_static(api_version),
-    );
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    let rid = HeaderValue::from_str(request_id).map_err(|e| {
-        BridgeError::Config(format!("request_id contains invalid header chars: {e}"))
-    })?;
-    headers.insert(HeaderName::from_static("x-aisix-request-id"), rid);
-    if sse {
-        headers.insert(
-            header::ACCEPT,
-            HeaderValue::from_static("text/event-stream"),
-        );
-    }
-    apply_request_headers(&mut headers, hdr);
-    Ok(headers)
-}
-
-async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
+/// A non-2xx answer from an Anthropic-wire endpoint as a [`BridgeError`]
+/// carrying the upstream's own `error.type` and `error.message`, never the
+/// raw body as the message. Shared with the proxy's `/v1/messages` and
+/// `count_tokens` passthroughs.
+pub async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     aisix_gateway::capture_upstream_error_http(
         status,
         resp,
@@ -338,10 +315,77 @@ where
     }
 }
 
+/// Build this bridge's outbound `HeaderMap`.
+///
+/// Bridge-owned headers go in FIRST, then the ProviderKey's
+/// `request.default_headers` / `request.forward_client_headers` through the
+/// shared pipeline: a static operator header cannot displace them, and a
+/// forwarded client header displaces only the credential slot it was
+/// explicitly pointed at. Building a map rather than chaining
+/// `RequestBuilder::header` — which APPENDS — is what keeps a slot both
+/// sides name single-valued on the wire.
+fn build_request_headers(
+    api_key_str: &str,
+    api_version: &'static str,
+    request_id: &str,
+    sse: bool,
+    hdr: &aisix_gateway::UpstreamHeaderContext<'_>,
+) -> Result<reqwest::header::HeaderMap, BridgeError> {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+    let mut headers = HeaderMap::new();
+    // Suppressed when the operator forwards the caller's own credential
+    // into this slot: two `x-api-key` values would let the upstream pick.
+    if !aisix_gateway::ForwardedClientHeaders::resolve(hdr).claims("x-api-key") {
+        let key = HeaderValue::from_str(api_key_str).map_err(|e| {
+            BridgeError::InvalidUpstreamCredentials(format!(
+                "api key contains invalid header chars: {e}"
+            ))
+        })?;
+        headers.insert(HeaderName::from_static("x-api-key"), key);
+    }
+    headers.insert(
+        HeaderName::from_static("anthropic-version"),
+        HeaderValue::from_static(api_version),
+    );
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    let rid = HeaderValue::from_str(request_id).map_err(|e| {
+        BridgeError::Config(format!("request_id contains invalid header chars: {e}"))
+    })?;
+    headers.insert(HeaderName::from_static("x-aisix-request-id"), rid);
+    if sse {
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+    }
+    aisix_gateway::apply_request_headers(&mut headers, hdr);
+    Ok(headers)
+}
+
+/// The wire bytes of a translated request, built where the translation is
+/// a temporary so it is gone before the upstream is awaited — see
+/// [`aisix_gateway::json_body`].
+fn outbound_bytes<T: serde::Serialize>(body: &T) -> Result<bytes::Bytes, BridgeError> {
+    aisix_gateway::json_body(body)
+        .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))
+}
+
 #[async_trait]
 impl Bridge for AnthropicBridge {
     fn name(&self) -> &'static str {
         "anthropic"
+    }
+
+    fn wire_protocol(&self) -> &'static str {
+        aisix_core::Adapter::Anthropic.wire_protocol()
+    }
+
+    fn reads_cache_markers(&self, _ctx: &BridgeContext) -> bool {
+        true
     }
 
     async fn chat(
@@ -349,25 +393,43 @@ impl Bridge for AnthropicBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
+        self.chat_cow(std::borrow::Cow::Borrowed(req), ctx).await
+    }
+
+    async fn chat_cow(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
+        ctx: &BridgeContext,
+    ) -> Result<ChatResponse, BridgeError> {
+        let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
+        let (req, legacy) = aisix_gateway::tool_calls::legacy_functions_as_tools(req)?;
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
-        let (system, messages) =
-            split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
-        let mut body = build_request(req, upstream, system, messages, false);
-        maybe_inject_cache_breakpoints(&mut body, ctx);
-        let body = prepare_outbound_body(&body, ctx)?;
-        let headers = build_request_headers(
-            key,
-            self.api_version,
-            &ctx.request_id,
-            false,
-            &ctx.header_ctx(),
-        )?;
+        let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, |m| {
+            anthropic_needs_fetch(m, MediaUrls::Accepted)
+        })
+        .await?;
+        let charged = fetched.charge(ctx);
+        let ctx = &*charged;
+        let body = {
+            let (system, messages) = split_system_with(&req, MediaUrls::Accepted, &fetched)
+                .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
+            let mut body = build_request(&req, upstream, system, messages, false)?;
+            apply_auto_prompt_caching(&mut body, &ctx.model);
+            outbound_bytes(&prepare_outbound_body(&body, ctx)?)?
+        };
+        let synthetic_json_tool = matches!(
+            structured_output_for(&req, upstream),
+            StructuredOutput::Tool(_)
+        );
+        // The owned request is not needed past its wire bytes.
+        drop(req);
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
             "anthropic/messages",
             &[
+                declared_messages_base(ctx),
                 ctx.provider_key.api_base.as_deref().unwrap_or(""),
                 &ctx.provider_key.provider,
             ],
@@ -375,26 +437,31 @@ impl Bridge for AnthropicBridge {
         )?;
         let client = self.client_for(ctx);
         let started = Instant::now();
+        let request_id = ctx.request_id.clone();
+        let headers =
+            build_request_headers(key, self.api_version, &request_id, false, &ctx.header_ctx())?;
 
         with_deadline(ctx.deadline, started, async move {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
+            aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
             }
 
-            let parsed: AnthropicResponse = resp
-                .json()
-                .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
-            Ok(response_into_chat_response(parsed))
+            let parsed: AnthropicResponse = crate::wire::decode_success_body(resp).await?;
+            let mut chat = response_into_chat_response(parsed);
+            if synthetic_json_tool {
+                unwrap_json_tool_call(&mut chat);
+            }
+            Ok(legacy.reply(chat))
         })
         .await
     }
@@ -404,25 +471,60 @@ impl Bridge for AnthropicBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
+        self.chat_stream_cow(std::borrow::Cow::Borrowed(req), ctx)
+            .await
+    }
+
+    async fn chat_stream_cow(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
+        ctx: &BridgeContext,
+    ) -> Result<ChatChunkStream, BridgeError> {
+        let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
+        let (req, legacy) = aisix_gateway::tool_calls::legacy_functions_as_tools(req)?;
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
-        let (system, messages) =
-            split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
-        let mut body = build_request(req, upstream, system, messages, true);
-        maybe_inject_cache_breakpoints(&mut body, ctx);
-        let body = prepare_outbound_body(&body, ctx)?;
-        let headers = build_request_headers(
-            key,
-            self.api_version,
-            &ctx.request_id,
-            true,
-            &ctx.header_ctx(),
-        )?;
+        // The tool path's JSON only exists once the synthetic tool call
+        // has been assembled, so it cannot be streamed as it arrives.
+        // Run the request non-streaming and fake-stream the translated
+        // result: the client sees an ordinary chunk sequence, and usage
+        // rides its own terminal chunk exactly as on a real stream.
+        if matches!(
+            structured_output_for(&req, upstream),
+            StructuredOutput::Tool(_)
+        ) {
+            // The leg is not streaming, so it runs under the budget a
+            // non-streaming call would have got — the streaming budget
+            // this context carries bounds a chunk gap, not a completion.
+            let chunks = response_into_fake_stream_chunks(
+                self.chat_cow(req, &ctx.non_streaming_ctx()).await?,
+            );
+            return Ok(
+                legacy.reply_stream(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+            );
+        }
+
+        let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, |m| {
+            anthropic_needs_fetch(m, MediaUrls::Accepted)
+        })
+        .await?;
+        let charged = fetched.charge(ctx);
+        let ctx = &*charged;
+        let body = {
+            let (system, messages) = split_system_with(&req, MediaUrls::Accepted, &fetched)
+                .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
+            let mut body = build_request(&req, upstream, system, messages, true)?;
+            apply_auto_prompt_caching(&mut body, &ctx.model);
+            outbound_bytes(&prepare_outbound_body(&body, ctx)?)?
+        };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
             "anthropic/messages",
             &[
+                declared_messages_base(ctx),
                 ctx.provider_key.api_base.as_deref().unwrap_or(""),
                 &ctx.provider_key.provider,
             ],
@@ -430,17 +532,21 @@ impl Bridge for AnthropicBridge {
         )?;
         let client = self.client_for(ctx);
         let started = Instant::now();
+        let request_id = ctx.request_id.clone();
+        let headers =
+            build_request_headers(key, self.api_version, &request_id, true, &ctx.header_ctx())?;
 
         let resp = with_deadline(ctx.deadline, started, async move {
             url.post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)
         })
         .await?;
 
+        aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status();
         if !status.is_success() {
             return Err(map_http_error(status, resp).await);
@@ -448,7 +554,7 @@ impl Bridge for AnthropicBridge {
 
         let byte_stream = resp.bytes_stream();
         let stream = build_chunk_stream(byte_stream);
-        Ok(Box::pin(stream))
+        Ok(legacy.reply_stream(Box::pin(stream)))
     }
 }
 
@@ -462,46 +568,47 @@ where
         let mut decoder = SseDecoder::new();
         let mut stream = Box::pin(byte_stream);
         let mut state = StreamState::default();
+        // `message_stop` ends the stream below. A `stop_reason` already said
+        // the answer is complete, so a body that ends after one (and before
+        // `message_stop`) is whole; one that ends before either is truncated.
+        let mut semantic_terminal_seen = false;
 
-        while let Some(next) = stream.next().await {
-            let chunk = next.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
-            for event in decoder
-                .feed_checked(chunk.as_ref())
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
-            {
+        loop {
+            // At EOF, `finish` flushes a last frame the upstream never
+            // terminated, and reports a frame that outgrew the bound after
+            // the last events were returned.
+            let (events, eof) = match stream.next().await {
+                Some(next) => {
+                    let chunk = next.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                    (decoder.feed(chunk.as_ref()).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?, false)
+                }
+                None => (
+                    decoder.finish().map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?.into_iter().collect(),
+                    true,
+                ),
+            };
+            for event in events {
                 let SseEvent::Data(payload) = event else { continue };
                 let parsed: AnthropicStreamEvent = serde_json::from_str(&payload)
                     .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
                 if let AnthropicStreamEvent::Error { error } = &parsed {
                     Err(crate::wire::stream_error_into_bridge_error(error))?;
                 }
-                state.update(&parsed);
-                if let Some(c) = state.to_chunk(&parsed) {
+                if let Some(c) = state.next_chunk(&parsed) {
+                    semantic_terminal_seen |= c.finish_reason.is_some();
                     yield c;
                 }
                 if StreamState::is_terminal(&parsed) {
                     return;
                 }
             }
-        }
-        if let Some(SseEvent::Data(payload)) = decoder
-            .finish_checked()
-            .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
-        {
-            let parsed: AnthropicStreamEvent = serde_json::from_str(&payload)
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
-            if let AnthropicStreamEvent::Error { error } = &parsed {
-                Err(crate::wire::stream_error_into_bridge_error(error))?;
-            }
-            state.update(&parsed);
-            if let Some(c) = state.to_chunk(&parsed) {
-                yield c;
-            }
-            if StreamState::is_terminal(&parsed) {
-                return;
+            if eof {
+                break;
             }
         }
-        Err(BridgeError::StreamAborted)?;
+        if !semantic_terminal_seen {
+            Err(BridgeError::StreamAborted)?;
+        }
     }
 }
 
@@ -513,6 +620,61 @@ mod tests {
     use std::sync::Arc;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn collect_stream(chunks: Vec<Vec<u8>>) -> Vec<Result<ChatChunk, BridgeError>> {
+        let bytes = futures::stream::iter(
+            chunks
+                .into_iter()
+                .map(|c| Ok::<_, reqwest::Error>(bytes::Bytes::from(c))),
+        );
+        build_chunk_stream(bytes).collect().await
+    }
+
+    fn sse(event: &str, data: serde_json::Value) -> String {
+        format!("event: {event}\ndata: {data}\n\n")
+    }
+
+    /// A last chunk that completes a frame and then outgrows the frame bound
+    /// fails the stream once the body ends, rather than ending it cleanly on
+    /// truncated output.
+    #[tokio::test]
+    async fn stream_fails_when_the_last_chunk_ends_in_an_oversized_frame() {
+        let mut last = sse(
+            "content_block_delta",
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}),
+        )
+        .into_bytes();
+        last.extend(b"data: ");
+        last.extend(std::iter::repeat_n(
+            b'x',
+            aisix_gateway::sse::MAX_SSE_FRAME_BYTES,
+        ));
+        let items = collect_stream(vec![last]).await;
+        assert!(
+            matches!(items.last(), Some(Err(BridgeError::UpstreamDecode(_)))),
+            "{:?}",
+            items.iter().map(|i| i.is_ok()).collect::<Vec<_>>()
+        );
+    }
+
+    /// A last frame the upstream never terminated is still read.
+    #[tokio::test]
+    async fn stream_reads_an_unterminated_last_frame() {
+        let mut body = sse(
+            "content_block_delta",
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}),
+        );
+        body.push_str(&format!(
+            "event: message_delta\ndata: {}",
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}})
+        ));
+        let items = collect_stream(vec![body.into_bytes()]).await;
+        let chunks: Vec<ChatChunk> = items.into_iter().map(Result::unwrap).collect();
+        assert_eq!(
+            chunks.last().and_then(|c| c.finish_reason.clone()),
+            Some(FinishReason::Stop)
+        );
+    }
 
     fn sample_model() -> Arc<Model> {
         Arc::new(
@@ -576,8 +738,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_small_stream_budget_does_not_cut_the_fake_stream_leg() {
+        // On a streaming dispatch the deadline is the streaming budget,
+        // which bounds a chunk gap rather than a whole completion. The
+        // tool route's upstream leg is not streaming, so it runs under
+        // the end-to-end budget carried beside it.
+        let server = MockServer::builder().start().await;
+        Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(250))
+                    .set_body_json(serde_json::json!({
+                        "id": "msg_json",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-3-5-haiku-20241022",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "toolu_json",
+                            "name": "json_tool_call",
+                            "input": {"name": "Ada"},
+                        }],
+                        "stop_reason": "tool_use",
+                        "usage": {"input_tokens": 9, "output_tokens": 4},
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let model: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "my-claude",
+            "provider": "anthropic",
+            // Older family: takes the tool route, which cannot stream.
+            "model_name": "claude-3-5-haiku-20241022",
+            "provider_key_id": "11111111-1111-1111-1111-111111111111",
+        }))
+        .unwrap();
+        let ctx = BridgeContext::new("req-1", Arc::new(model), sample_provider_key(&server.uri()))
+            .with_deadline(std::time::Duration::from_millis(50))
+            .with_non_streaming_deadline(Some(std::time::Duration::from_secs(30)));
+
+        let mut req = ChatFormat::new("my-claude", vec![ChatMessage::user("who is Ada")]);
+        req.stream = Some(true);
+        req.extra.insert(
+            "response_format".into(),
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "person",
+                    "schema": {"type": "object", "properties": {"name": {"type": "string"}}},
+                    "strict": true,
+                },
+            }),
+        );
+
+        let stream = AnthropicBridge::new()
+            .chat_stream(&req, &ctx)
+            .await
+            .expect("the fake-stream leg must not be cut by the chunk-gap budget");
+        let chunks: Vec<ChatChunk> = futures::StreamExt::collect::<Vec<_>>(stream)
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            chunks[1].delta.content.as_deref(),
+            Some(r#"{"name":"Ada"}"#)
+        );
+    }
+
+    #[tokio::test]
     async fn non_streaming_injects_breakpoints_when_enabled() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         mount_ok_nonstream(&server).await;
         let ctx = caching_ctx(
             &server.uri(),
@@ -609,7 +842,7 @@ mod tests {
     async fn non_streaming_does_not_inject_when_disabled() {
         // Field present but enabled:false must inject nothing — distinct
         // from the field-absent case sample_ctx covers.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         mount_ok_nonstream(&server).await;
         let ctx = caching_ctx(&server.uri(), serde_json::json!({"enabled": false}));
         AnthropicBridge::new().chat(&req(), &ctx).await.unwrap();
@@ -627,7 +860,7 @@ mod tests {
         // The streaming path must inject identically to the
         // non-streaming path (handler-families lockstep). Capture the
         // outbound body, not just the streamed chunks.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let sse = "\
 event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"claude-sonnet-4-5\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1}}}\n\n\
@@ -680,7 +913,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn non_streaming_happy_path() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .and(header("x-api-key", "sk-ant-test"))
@@ -724,7 +957,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn non_streaming_applies_provider_key_request_overrides() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         mount_ok_nonstream(&server).await;
         let ctx = overrides_ctx(
             &server.uri(),
@@ -751,7 +984,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn guarded_content_override_is_rejected_before_dispatch() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         mount_ok_nonstream(&server).await;
         let ctx = overrides_ctx(
             &server.uri(),
@@ -774,7 +1007,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn non_streaming_400_bad_request_surfaces_message() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(ResponseTemplate::new(400).set_body_raw(
@@ -814,7 +1047,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     /// the shared-fn change on the Anthropic side.
     #[tokio::test]
     async fn non_streaming_400_non_json_content_type_still_surfaces_message() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(ResponseTemplate::new(400).set_body_raw(
@@ -845,7 +1078,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn non_streaming_decode_error_on_malformed_body() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
@@ -860,7 +1093,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn deadline_elapses_to_timeout_error() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(
@@ -918,13 +1151,13 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
-    async fn tool_role_without_tool_call_id_is_rejected_as_config_error() {
+    async fn tool_role_without_tool_call_id_is_rejected_as_a_request_error() {
         // Tool role IS supported (translates to Anthropic
         // `{role:"user", content:[{type:"tool_result", ...}]}`)
         // when paired with a tool_call_id. Without one, there's no
         // way to pair the result with its originating tool_use, so
-        // the gateway rejects with Config.
-        let server = MockServer::start().await;
+        // the request is refused.
+        let server = MockServer::builder().start().await;
         let bridge = AnthropicBridge::new();
         let ctx = sample_ctx(&server.uri());
         let req = ChatFormat::new(
@@ -939,12 +1172,12 @@ data: {\"type\":\"message_stop\"}\n\n";
             }],
         );
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
-        assert!(matches!(err, BridgeError::InvalidUpstreamConfig(_)));
+        assert!(matches!(err, BridgeError::InvalidRequest(_)));
     }
 
     #[tokio::test]
     async fn streaming_happy_path_emits_text_deltas_then_finish() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let sse = "\
 event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"model\":\"claude-sonnet-4-5\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1}}}\n\n\
@@ -989,7 +1222,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn streaming_eof_before_message_stop_is_aborted() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_partial\",\"model\":\"claude-sonnet-4-5\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n";
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
@@ -1029,7 +1262,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     /// (pre-fix the final usage carried prompt_tokens=0).
     #[tokio::test]
     async fn streaming_harvests_input_tokens_from_message_delta() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let sse = "\
 event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"gen_952\",\"model\":\"claude-sonnet-4-5\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null}}\n\n\
@@ -1072,7 +1305,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn streaming_upstream_error_surfaces_before_stream_start() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .respond_with(ResponseTemplate::new(500).set_body_string("oops"))
@@ -1095,7 +1328,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     /// then looked like a clean completion.
     #[tokio::test]
     async fn streaming_in_band_error_event_surfaces_as_typed_error() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let sse = "\
 event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"model\":\"claude-sonnet-4-5\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1}}}\n\n\

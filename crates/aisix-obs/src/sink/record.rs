@@ -6,11 +6,12 @@
 //! single-sourced; content lives in a separate field so the default
 //! metadata-only path can never carry a prompt.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde::Serialize;
 
-use super::truncate::truncate_content;
+use super::truncate::{omit_base64_media_in_json, truncate_content};
 use crate::usage::UsageEvent;
 
 /// Current canonical event schema version, emitted on every [`SinkRecord`]
@@ -30,6 +31,22 @@ pub struct SinkContent {
     pub response: String,
     /// True when either field was truncated to a configured size cap.
     pub truncated: bool,
+    /// Which of the two was cut, for an encoder that reports each side on
+    /// its own terms. `truncated` is their OR.
+    #[serde(skip)]
+    pub prompt_truncated: bool,
+    #[serde(skip)]
+    pub response_truncated: bool,
+    /// The exporter's per-field cap the content was captured under. An
+    /// encoder that re-shapes the content holds the result to the same
+    /// bound. `None` when no cap is known.
+    #[serde(skip)]
+    pub max_bytes: Option<usize>,
+    /// The response as structured parts, for the encoders that report them
+    /// through [`SinkContent::encode`]. `None` when it was not captured that
+    /// way.
+    #[serde(skip)]
+    pub output: Option<crate::output::OutputCapture>,
 }
 
 impl SinkContent {
@@ -45,7 +62,107 @@ impl SinkContent {
             prompt: prompt.into_owned(),
             response: response.into_owned(),
             truncated: p_cut || r_cut,
+            prompt_truncated: p_cut,
+            response_truncated: r_cut,
+            max_bytes: Some(max_bytes),
+            output: None,
         }
+    }
+}
+
+/// How one record's captured content is reported — the decision every
+/// content-carrying encoder (OTLP, Datadog, SLS) shares, so the three agree
+/// on which side is structured and which falls back to flat text.
+///
+/// A message-shaped side whose capture is complete becomes the GenAI
+/// conventions' structured content, each value held to the exporter's
+/// per-field cap; the two sides are judged independently. Everything else —
+/// a non-message payload, content the cap cut, content that does not
+/// convert — is left in `raw_prompt` / `raw_response`. An MCP call's whole
+/// arguments and successful result are named on their own.
+#[derive(Debug, Default)]
+pub(crate) struct ContentEncoding<'a> {
+    /// Only the sides that were accepted are set.
+    pub structured: crate::genai::StructuredContent,
+    pub tool_call_arguments: Option<&'a str>,
+    pub tool_call_result: Option<&'a str>,
+    pub raw_prompt: Option<&'a str>,
+    pub raw_response: Option<&'a str>,
+}
+
+impl ContentEncoding<'_> {
+    /// The flat prompt text for a sink without the MCP-specific fields:
+    /// whatever was not structured, written even when empty, as these
+    /// sinks always have.
+    pub fn flat_prompt(&self) -> Option<&str> {
+        self.raw_prompt.or(self.tool_call_arguments).or(self
+            .structured
+            .input_messages
+            .is_none()
+            .then_some(""))
+    }
+
+    /// The flat response counterpart of [`Self::flat_prompt`].
+    pub fn flat_response(&self) -> Option<&str> {
+        self.raw_response.or(self.tool_call_result).or(self
+            .structured
+            .output_messages
+            .is_none()
+            .then_some(""))
+    }
+}
+
+pub(crate) fn is_mcp(event: &UsageEvent) -> bool {
+    event.operation == "mcp" || event.inbound_protocol == "mcp"
+}
+
+impl SinkContent {
+    pub(crate) fn encode(&self, event: &UsageEvent) -> ContentEncoding<'_> {
+        let fits = |value: &str| self.max_bytes.is_none_or(|cap| value.len() <= cap);
+        // Each side is judged on its own: a long answer cut by the cap does
+        // not make a complete prompt any less complete.
+        let prompt_whole = !self.prompt.is_empty() && !self.prompt_truncated;
+        let response_whole = !self.response.is_empty() && !self.response_truncated;
+        // The structured parts stand on their own completeness, not the flat
+        // text's: they hold reasoning and tool calls the text never carried.
+        let output = self.output.as_ref().filter(|o| !o.truncated);
+        let mut enc = ContentEncoding {
+            raw_prompt: (!self.prompt.is_empty()).then_some(self.prompt.as_str()),
+            raw_response: (!self.response.is_empty()).then_some(self.response.as_str()),
+            ..Default::default()
+        };
+        if is_mcp(event) {
+            // Arguments and result are captured as JSON already; the result
+            // is reported only for a call that succeeded.
+            if prompt_whole {
+                enc.tool_call_arguments = enc.raw_prompt.take();
+            }
+            if response_whole && (200..300).contains(&event.status_code) {
+                enc.tool_call_result = enc.raw_response.take();
+            }
+        } else if let Some(wire) = crate::genai::PromptWire::for_operation(&event.operation) {
+            let structured = crate::genai::structured_content(
+                wire,
+                if prompt_whole { &self.prompt } else { "" },
+                if response_whole { &self.response } else { "" },
+                output,
+                &event.finish_reason,
+            );
+            let input_fits = structured.input_messages.as_deref().is_some_and(fits)
+                && structured.system_instructions.as_deref().is_none_or(fits)
+                && structured.tool_definitions.as_deref().is_none_or(fits);
+            if input_fits {
+                enc.structured.input_messages = structured.input_messages;
+                enc.structured.system_instructions = structured.system_instructions;
+                enc.structured.tool_definitions = structured.tool_definitions;
+                enc.raw_prompt = None;
+            }
+            if let Some(output) = structured.output_messages.filter(|v| fits(v)) {
+                enc.structured.output_messages = Some(output);
+                enc.raw_response = None;
+            }
+        }
+        enc
     }
 }
 
@@ -64,21 +181,52 @@ pub struct CapturedContent {
     pub prompt: String,
     pub response: String,
     pub truncated: bool,
+    /// Which side the capture cap cut; `truncated` is their OR.
+    pub prompt_truncated: bool,
+    pub response_truncated: bool,
+    /// The response as structured parts ([`crate::output`]), when the
+    /// surface captures it that way.
+    pub output: Option<crate::output::OutputCapture>,
 }
 
 impl CapturedContent {
+    /// Attach the response's structured parts.
+    pub fn with_output(mut self, output: Option<crate::output::OutputCapture>) -> Self {
+        self.output = output;
+        self
+    }
+
+    /// Set the response of a failure row, under the same cap and cut rule as
+    /// [`Self::new`].
+    pub fn with_response(mut self, response: &str, max_bytes: usize) -> Self {
+        let (response, cut) = truncate_content(response, max_bytes);
+        self.response = response.into_owned();
+        self.response_truncated = cut;
+        self.truncated = self.prompt_truncated || cut;
+        self
+    }
+
     /// Capture `prompt` and `response`, truncating each to `max_bytes`
     /// (structure-preserving for JSON, UTF-8-boundary cut otherwise) to
     /// bound the held buffer at the largest cap any content-capturing
     /// exporter requested. `truncated` is set if either was cut here; a
     /// per-exporter `SinkContent` ORs in its own (smaller) cap.
+    ///
+    /// The prompt's base64 media is omitted first, so no structured or flat
+    /// field can carry it and a large attachment alone never pushes a prompt
+    /// over the cap. A prompt that is not JSON has no fields to recognise and is
+    /// only truncated.
     pub fn new(prompt: &str, response: &str, max_bytes: usize) -> Self {
-        let (prompt, p_cut) = truncate_content(prompt, max_bytes);
+        let prompt = omit_base64_media_in_json(prompt);
+        let (prompt, p_cut) = truncate_content(&prompt, max_bytes);
         let (response, r_cut) = truncate_content(response, max_bytes);
         Self {
             prompt: prompt.into_owned(),
             response: response.into_owned(),
             truncated: p_cut || r_cut,
+            prompt_truncated: p_cut,
+            response_truncated: r_cut,
+            output: None,
         }
     }
 }
@@ -97,6 +245,30 @@ pub struct SinkRecord {
     /// Opt-in captured content; omitted entirely under `metadata_only`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<SinkContent>,
+    /// The event's span snapshot (AISIX-Cloud#1279): ids + boundaries
+    /// frozen at emission time, so the encoder — which runs inside the
+    /// delivery retry loop — reproduces byte-identical ids on every retry.
+    /// `serde(skip)`: this is OTLP structure, not record data; the
+    /// Datadog/SLS/object-store wire shapes are unchanged. (The public
+    /// `UsageEvent::trace_id` correlation key rides the flattened usage
+    /// fields instead.)
+    #[serde(skip)]
+    pub trace: Option<crate::trace::TraceEmission>,
+    /// Export-only facts the OTLP encoder reports beside the usage fields
+    /// (request parameters, the dispatched upstream, the inbound HTTP
+    /// request). `serde(skip)` for the same reason as `trace`: none of it
+    /// is part of the usage-event wire.
+    #[serde(skip)]
+    pub facts: Option<std::sync::Arc<crate::genai::SpanFacts>>,
+    /// The request headers THIS exporter lists, out of the request's
+    /// captured set (`UsageEvent::request_headers`). Never on the control
+    /// plane's wire, which carries the usage event alone.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub request_headers: BTreeMap<String, String>,
+    /// The upstream response headers THIS exporter lists, off this
+    /// attempt's upstream response (`UsageEvent::upstream_response_headers`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub upstream_response_headers: BTreeMap<String, String>,
 }
 
 impl SinkRecord {
@@ -106,12 +278,43 @@ impl SinkRecord {
             schema_version: SCHEMA_VERSION,
             usage,
             content: None,
+            trace: None,
+            facts: None,
+            request_headers: BTreeMap::new(),
+            upstream_response_headers: BTreeMap::new(),
         }
+    }
+
+    /// Keep the captured headers `request` / `response` name — one
+    /// exporter's own lists.
+    pub fn with_exporter_headers(mut self, request: &[String], response: &[String]) -> Self {
+        let pick = |captured: &BTreeMap<String, String>, names: &[String]| {
+            captured
+                .iter()
+                .filter(|(name, _)| names.contains(name))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+        self.request_headers = pick(&self.usage.request_headers, request);
+        self.upstream_response_headers = pick(&self.usage.upstream_response_headers, response);
+        self
     }
 
     /// Attach captured content (`content_mode = full`).
     pub fn with_content(mut self, content: SinkContent) -> Self {
         self.content = Some(content);
+        self
+    }
+
+    /// Attach the event's export-only span facts.
+    pub fn with_facts(mut self, facts: Option<std::sync::Arc<crate::genai::SpanFacts>>) -> Self {
+        self.facts = facts;
+        self
+    }
+
+    /// Attach the request's span snapshot (AISIX-Cloud#1279).
+    pub fn with_trace(mut self, trace: Option<crate::trace::TraceEmission>) -> Self {
+        self.trace = trace;
         self
     }
 }
@@ -154,6 +357,145 @@ mod tests {
         // content key is absent, and metadata is flattened (no `usage` nesting)
         assert!(json.get("content").is_none());
         assert_eq!(json["request_id"], "req-1");
+        assert_eq!(json["is_final_attempt"], false);
+    }
+
+    /// The public correlation key (AISIX-Cloud#1279): `trace_id` rides the
+    /// flattened usage fields on every sink wire when set — the exact key
+    /// the CP column and `{trace_id}` link template consume — and is
+    /// absent (→ SQL NULL) when the emitting path predates the bundle.
+    #[test]
+    fn trace_id_rides_the_flattened_wire_when_set_and_is_absent_when_empty() {
+        let rec = SinkRecord::metadata_only(UsageEvent {
+            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".into(),
+            ..UsageEvent::default()
+        });
+        let json = serde_json::to_value(&rec).unwrap();
+        assert_eq!(json["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736");
+
+        let bare = serde_json::to_value(SinkRecord::metadata_only(UsageEvent::default())).unwrap();
+        assert!(bare.get("trace_id").is_none());
+    }
+
+    /// AISIX-Cloud#1330: the enforced-hit audit array must reach the
+    /// SOC/SIEM exporters too, not just the control plane. `SinkRecord`
+    /// flattens `UsageEvent`, so this is a guard against a future
+    /// `#[serde(skip)]` — the attribute that already keeps `trace`
+    /// off the wire — being applied to it by mistake.
+    #[test]
+    fn enforced_hits_ride_the_flattened_exporter_wire() {
+        let rec = SinkRecord::metadata_only(UsageEvent {
+            guardrail_enforced_hits: vec![
+                aisix_core::GuardrailEnforcedHit {
+                    guardrail_name: "eda-mask".into(),
+                    hook: "output".into(),
+                    action: "masked".into(),
+                    counts: [("eda_version".to_owned(), 2u32)].into_iter().collect(),
+                    duration_us: 41,
+                    ..Default::default()
+                },
+                // AISIX-Cloud#1365: the fail-closed refusal is a distinct
+                // action carrying a bounded cause, and the SOC exporters must
+                // see the distinction the /logs badge sees — an auditor
+                // reading the NDJSON drop has no control plane to ask.
+                aisix_core::GuardrailEnforcedHit {
+                    guardrail_name: "lakera-prod".into(),
+                    hook: "input".into(),
+                    action: "blocked_unavailable".into(),
+                    error_type: "lakera_timeout".into(),
+                    ..Default::default()
+                },
+            ],
+            ..UsageEvent::default()
+        });
+        let json = serde_json::to_value(&rec).unwrap();
+        let hits = json["guardrail_enforced_hits"]
+            .as_array()
+            .expect("flattened onto the record, not nested under `usage`");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0]["guardrail_name"], "eda-mask");
+        assert_eq!(hits[0]["action"], "masked");
+        assert_eq!(hits[0]["counts"]["eda_version"], 2);
+        assert!(hits[0].get("error_type").is_none());
+        assert_eq!(hits[1]["action"], "blocked_unavailable");
+        assert_eq!(hits[1]["error_type"], "lakera_timeout");
+
+        let bare = serde_json::to_value(SinkRecord::metadata_only(UsageEvent::default())).unwrap();
+        assert!(bare.get("guardrail_enforced_hits").is_none());
+    }
+
+    /// AISIX-Cloud#1467: the similarity summaries ride the same flattened
+    /// wire. An operator tuning a threshold reads them wherever their logs
+    /// land — a self-hosted SIEM has no control plane to ask.
+    #[test]
+    fn guardrail_scores_ride_the_flattened_exporter_wire() {
+        let rec = SinkRecord::metadata_only(UsageEvent {
+            guardrail_scores: vec![aisix_core::GuardrailScore {
+                guardrail_name: "topic-guard".into(),
+                hook: "input".into(),
+                direction: "deny".into(),
+                score: 0.62,
+                threshold: 0.75,
+                matched: false,
+                top_example_index: 1,
+                embedding_model: "text-embedding-3-small".into(),
+            }],
+            ..UsageEvent::default()
+        });
+        let json = serde_json::to_value(&rec).unwrap();
+        let scores = json["guardrail_scores"]
+            .as_array()
+            .expect("flattened onto the record, not nested under `usage`");
+        assert_eq!(scores.len(), 1);
+        assert_eq!(scores[0]["guardrail_name"], "topic-guard");
+        assert_eq!(scores[0]["direction"], "deny");
+        assert_eq!(scores[0]["matched"], false);
+        assert_eq!(scores[0]["top_example_index"], 1);
+        assert_eq!(scores[0]["embedding_model"], "text-embedding-3-small");
+
+        let bare = serde_json::to_value(SinkRecord::metadata_only(UsageEvent::default())).unwrap();
+        assert!(bare.get("guardrail_scores").is_none());
+    }
+
+    /// AISIX-Cloud#1747: a gateway-initiated embedding remains child work
+    /// of the caller's request, but its token/count/latency audit must ride
+    /// the same metadata-only exporter wire as the parent event. This keeps
+    /// the record visible without folding a different model's usage into the
+    /// parent's billable token fields.
+    #[test]
+    fn gateway_embedding_calls_ride_the_flattened_exporter_wire() {
+        let rec = SinkRecord::metadata_only(UsageEvent {
+            gateway_embedding_calls: vec![crate::usage::GatewayEmbeddingCall {
+                count: 1,
+                purpose: crate::usage::GatewayEmbeddingPurpose::SemanticCache,
+                embedding_model_id: "embedding-model-id".into(),
+                prompt_tokens: 12,
+                total_tokens: 15,
+                usage_source: crate::usage::GatewayEmbeddingUsageSource::Reported,
+                latency_ms: 34,
+                outcome: crate::usage::GatewayEmbeddingOutcome::Succeeded,
+            }],
+            gateway_embedding_calls_dropped: 2,
+            ..UsageEvent::default()
+        });
+        let json = serde_json::to_value(&rec).unwrap();
+        let calls = json["gateway_embedding_calls"]
+            .as_array()
+            .expect("flattened onto the record, not nested under `usage`");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["count"], 1);
+        assert_eq!(calls[0]["purpose"], "semantic_cache");
+        assert_eq!(calls[0]["embedding_model_id"], "embedding-model-id");
+        assert_eq!(calls[0]["prompt_tokens"], 12);
+        assert_eq!(calls[0]["total_tokens"], 15);
+        assert_eq!(calls[0]["usage_source"], "reported");
+        assert_eq!(calls[0]["latency_ms"], 34);
+        assert_eq!(calls[0]["outcome"], "succeeded");
+        assert_eq!(json["gateway_embedding_calls_dropped"], 2);
+
+        let bare = serde_json::to_value(SinkRecord::metadata_only(UsageEvent::default())).unwrap();
+        assert!(bare.get("gateway_embedding_calls").is_none());
+        assert!(bare.get("gateway_embedding_calls_dropped").is_none());
     }
 
     #[test]
@@ -162,6 +504,10 @@ mod tests {
             prompt: "hi".into(),
             response: "hello".into(),
             truncated: false,
+            prompt_truncated: false,
+            response_truncated: false,
+            max_bytes: None,
+            output: None,
         });
         let json = serde_json::to_value(&rec).unwrap();
         assert_eq!(json["content"]["prompt"], "hi");

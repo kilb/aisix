@@ -1,5 +1,6 @@
 # Rust
 /target
+/target-anon
 # PGO phase target dirs (native runs of the three-phase release recipe)
 /target-pgo-gen
 /target-pgo
@@ -51,3 +52,7 @@ web-portal/node_modules/
 web-portal/dist/
 web-portal/test-results/
 web-portal/playwright-report/
+
+# Binaries staged for the container image (scripts/build-image-binary.sh)
+/bin
+/target-pgo-data

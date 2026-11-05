@@ -19,11 +19,134 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use aisix_core::{AisixSnapshot, ProviderKey, ResourceEntry};
-use aisix_obs::UsageEvent;
+use aisix_obs::{UsageEvent, UsageEventLabels};
 
 use crate::chat::sanitize_tag;
 use crate::client_ip::ClientContext;
+use crate::error::ProxyError;
+use crate::operation::Surface;
 use crate::state::ProxyState;
+
+/// The request's ENFORCE-mode guardrail audit handle (AISIX-Cloud#1330),
+/// cloned off the resolved chain with
+/// [`GuardrailChain::audit_log`](aisix_guardrails::GuardrailChain::audit_log)
+/// at the point the chain is resolved.
+///
+/// Threaded rather than re-derived because the read has to happen at
+/// terminal-event time, which is routinely a different frame from the
+/// chain's: a streaming emitter runs from a `move` closure after the
+/// handler returned, and `chat.rs` erases its chain to `Arc<dyn Guardrail>`
+/// before the output hook even runs. `None` — no chain resolved, the
+/// dominant guardrail-free deployment — reads identically to an empty
+/// snapshot, so no call site needs to branch on it.
+pub(crate) type GuardrailAudit = Option<Arc<aisix_guardrails::GuardrailAuditLog>>;
+
+/// Snapshot `audit` into a terminal `UsageEvent`'s
+/// `guardrail_enforced_hits`.
+///
+/// Terminal events only: guardrails run once per request, not once per
+/// attempt, so stamping a per-attempt event would report the same hit
+/// once per retry.
+///
+/// Reading does not consume the log, and that is load-bearing rather than
+/// incidental: the retrying families call this from emitters that also
+/// serve superseded attempts, and a destructive read would leave whichever
+/// event happened to go out first holding the only copy.
+pub(crate) fn enforced_hits(audit: &GuardrailAudit) -> Vec<aisix_core::GuardrailEnforcedHit> {
+    audit.as_ref().map(|a| a.snapshot()).unwrap_or_default()
+}
+
+/// Snapshot `audit` into a `UsageEvent`'s `applied_guardrails`: the
+/// `{kind, hook}` set of the chain the request resolved.
+///
+/// The failure path reads it here rather than off the chain because the
+/// chain is resolved inside a dispatch frame the `Err` has already left,
+/// and a guardrail refusal — the one failure whose row an operator is
+/// certain to open — would otherwise claim that no guardrail governed it.
+pub(crate) fn applied_guardrails(audit: &GuardrailAudit) -> Vec<aisix_core::AppliedGuardrail> {
+    audit
+        .as_ref()
+        .map(|a| a.applied().to_vec())
+        .unwrap_or_default()
+}
+
+/// Snapshot `audit` into a `UsageEvent`'s `guardrail_bypassed_reason`:
+/// the bounded tag of the first guardrail this request failed OPEN on,
+/// empty when none did.
+///
+/// Not terminal-only, unlike [`enforced_hits`]. A bypass says the request
+/// went upstream unscreened, which is true of every attempt the request
+/// made, and `chat.rs` has stamped it on its per-attempt events since the
+/// field existed — a retry that dropped it would read as a screened
+/// attempt.
+///
+/// `chat.rs` keeps threading its own copy instead of calling this: it
+/// hands the value to per-attempt and ensemble sub-call emitters at
+/// points where the value is deliberately the one captured EARLIER in the
+/// request, which a request-scoped snapshot cannot express.
+pub(crate) fn bypass_reason(audit: &GuardrailAudit) -> String {
+    audit
+        .as_ref()
+        .and_then(|a| a.bypass_reason())
+        .unwrap_or_default()
+}
+
+/// Snapshot `audit` into a terminal `UsageEvent`'s `guardrail_scores`
+/// (AISIX-Cloud#1467). Same handle, same terminal-only rule and same
+/// non-destructive read as [`enforced_hits`] — a scoring guardrail runs
+/// once per request, so a per-attempt event would repeat its numbers once
+/// per retry and make a single screening look like several.
+pub(crate) fn guardrail_scores(audit: &GuardrailAudit) -> Vec<aisix_core::GuardrailScore> {
+    audit
+        .as_ref()
+        .map(|a| a.score_snapshot())
+        .unwrap_or_default()
+}
+
+/// [`guardrail_scores`] for the retrying families — see
+/// [`terminal_enforced_hits`].
+pub(crate) fn terminal_guardrail_scores(
+    terminal: bool,
+    audit: &GuardrailAudit,
+) -> Vec<aisix_core::GuardrailScore> {
+    if terminal {
+        guardrail_scores(audit)
+    } else {
+        Vec::new()
+    }
+}
+
+/// [`enforced_hits`] for the retrying families (chat / messages /
+/// responses), whose emitters serve both the terminal event and the
+/// superseded per-attempt ones and are told which they are building.
+///
+/// Written as one helper rather than an `if` at each emitter so the rule
+/// — request-scoped attribution rides the terminal event only — is stated
+/// once and cannot be applied inconsistently across the three.
+pub(crate) fn terminal_enforced_hits(
+    terminal: bool,
+    audit: &GuardrailAudit,
+) -> Vec<aisix_core::GuardrailEnforcedHit> {
+    if terminal {
+        enforced_hits(audit)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Stamp how the caller established its principal onto a usage event.
+///
+/// The ordinary credential path leaves the field empty (the shape on the
+/// wire for the overwhelming majority of events); a principal inherited
+/// from an entry's anonymous configuration is marked, so a key that
+/// doubles as an anonymous principal can still be told apart in the
+/// usage record. Every handler that can serve an anonymous caller —
+/// today `/mcp` and the passthrough routes — calls this on its emitter.
+pub(crate) fn apply_auth_type(event: &mut UsageEvent, auth: &crate::auth::AuthenticatedKey) {
+    if auth.anonymous {
+        event.auth_type = "anonymous".to_string();
+    }
+}
 
 /// The provider's own response object `id`, read off a JSON response body —
 /// OpenAI's `chat.completion.id`, a Responses-API `resp_…`, a legacy
@@ -83,6 +206,13 @@ pub(crate) struct ResolvedPk<'a> {
     /// or names a row with a blank display name. Borrowed in the
     /// fallback case so the common pre-dispatch failure allocates nothing.
     name: Cow<'a, str>,
+    /// The upstream wire protocol this key dispatches through
+    /// (AISIX-Cloud#1403) — [`aisix_gateway::upstream_protocol`] of the
+    /// resolved row, [`aisix_gateway::UPSTREAM_PROTOCOL_UNKNOWN`] when
+    /// there is no row. Computed HERE rather than at the emit so it
+    /// rides along with the id and name the same row produced, on the
+    /// one snapshot read this type exists to make.
+    protocol: &'static str,
     entry: Option<Arc<ResourceEntry<ProviderKey>>>,
 }
 
@@ -108,7 +238,16 @@ impl<'a> ResolvedPk<'a> {
             }
             None => Cow::Borrowed(UNKNOWN_PK),
         };
-        Self { id, name, entry }
+        let protocol = entry
+            .as_ref()
+            .map(|e| aisix_gateway::upstream_protocol(&e.value))
+            .unwrap_or(aisix_gateway::UPSTREAM_PROTOCOL_UNKNOWN);
+        Self {
+            id,
+            name,
+            protocol,
+            entry,
+        }
     }
 
     /// A completion that never reached a ProviderKey — the pre-dispatch
@@ -119,15 +258,17 @@ impl<'a> ResolvedPk<'a> {
         ResolvedPk {
             id: "",
             name: Cow::Borrowed(UNKNOWN_PK),
+            protocol: aisix_gateway::UPSTREAM_PROTOCOL_UNKNOWN,
             entry: None,
         }
     }
 
-    /// The id + name pair for the metric label set.
+    /// The ProviderKey dimensions of the metric label set.
     pub(crate) fn labels(&self) -> PkLabels<'_> {
         PkLabels {
             id: self.id,
             name: &self.name,
+            protocol: self.protocol,
         }
     }
 
@@ -143,26 +284,39 @@ impl<'a> ResolvedPk<'a> {
     }
 }
 
-/// The ProviderKey dimensions of a metric label set: the id and the
-/// readable name that is 1:1 with it (so the pair adds no series).
+/// The ProviderKey dimensions of a metric label set: the id, the
+/// readable name, and the upstream wire protocol — all three functions
+/// of one ProviderKey row, so the trio adds no series beyond the id.
 ///
 /// The fields are private on purpose. [`ResolvedPk::labels`] and
-/// [`PkLabels::default`] are the only ways to build one, so a name can
-/// never be paired with an id it was not read off — which is the whole
-/// reason `Upstream` takes this type instead of a bare id.
+/// [`PkLabels::default`] are the only ways to build one, so a name or a
+/// protocol can never be paired with an id it was not read off — which
+/// is the whole reason `Upstream` takes this type instead of a bare id.
 #[derive(Clone, Copy)]
 pub(crate) struct PkLabels<'a> {
     id: &'a str,
     name: &'a str,
+    protocol: &'static str,
 }
 
 impl<'a> PkLabels<'a> {
+    /// Rebuild the labels from their parts, for a sample recorded after the
+    /// `ResolvedPk` that produced them is gone (a parked stream sample).
+    pub(crate) fn from_parts(id: &'a str, name: &'a str, protocol: &'static str) -> Self {
+        Self { id, name, protocol }
+    }
+
     pub(crate) fn id(self) -> &'a str {
         self.id
     }
 
     pub(crate) fn name(self) -> &'a str {
         self.name
+    }
+
+    /// The `upstream_protocol` label (AISIX-Cloud#1403).
+    pub(crate) fn protocol(self) -> &'static str {
+        self.protocol
     }
 }
 
@@ -171,6 +325,7 @@ impl Default for PkLabels<'_> {
         Self {
             id: UNKNOWN_PK,
             name: UNKNOWN_PK,
+            protocol: aisix_gateway::UPSTREAM_PROTOCOL_UNKNOWN,
         }
     }
 }
@@ -239,10 +394,51 @@ pub(crate) fn total_tokens_with_cache(
         + u64::from(cache_read_tokens)
 }
 
+/// The `total_tokens` a JSON `usage` object reports, verbatim — the value
+/// `UsageEvent::total_tokens` records (`UsageStats::upstream_total_tokens`).
+/// `None` when the object carries none: the event leaves the field unset
+/// then, and is never given a total summed here.
+pub(crate) fn reported_total_tokens(usage: Option<&serde_json::Value>) -> Option<u32> {
+    usage
+        .and_then(|u| u.get("total_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .map(|n| n.min(u64::from(u32::MAX)) as u32)
+}
+
+/// The upstream total of a usage record built from several reports (a
+/// realtime session's frames, a batch's output lines): their sum, standing
+/// only while every report that counted tokens carried a total.
+#[derive(Debug, Default)]
+pub(crate) struct ReportedTotalSum {
+    sum: u64,
+    unreported: bool,
+}
+
+impl ReportedTotalSum {
+    /// Fold one report in. A report that counted no tokens (a cancelled
+    /// response's empty usage) neither adds nor breaks the total.
+    pub(crate) fn add(&mut self, usage: &serde_json::Value, counted_tokens: bool) {
+        match reported_total_tokens(Some(usage)) {
+            Some(total) => self.sum += u64::from(total),
+            None if counted_tokens => self.unreported = true,
+            None => {}
+        }
+    }
+
+    /// The value the usage event records; 0 (unset) without a total.
+    pub(crate) fn recorded(&self) -> u32 {
+        if self.unreported {
+            0
+        } else {
+            self.sum.min(u64::from(u32::MAX)) as u32
+        }
+    }
+}
+
 /// The `model` metric label for a request whose client-supplied `model`
 /// field never resolved to a configured model (e.g. model-not-found). See
 /// [`metric_model_label`].
-pub(crate) const UNRESOLVED_MODEL_LABEL: &str = "unresolved";
+pub const UNRESOLVED_MODEL_LABEL: &str = "unresolved";
 
 /// Bound the `model` metric label to the configured set. A request's `model`
 /// field is arbitrary caller-controlled text until it resolves against the
@@ -294,11 +490,25 @@ pub(crate) fn request_cost_usd(
     input: aisix_core::InputTokens,
     completion_tokens: u64,
 ) -> f64 {
-    snap.models
-        .get_by_id(model_id)
-        .and_then(|entry| entry.value.cost.clone())
+    let Some(entry) = snap.models.get_by_id(model_id) else {
+        return 0.0;
+    };
+    pricing_index(snap)
+        .resolve(&entry.value)
         .map(|cost| cost.calculate_with_cache(input, completion_tokens))
         .unwrap_or(0.0)
+}
+
+/// 这份快照的定价索引：`pricing_key` 先查定价文档，再落到模型自己的 `cost`。
+/// 所有读模型价钱的地方都要走它，否则按文档定价的模型在那个地方被算成零。
+///
+/// 进程级缓存，这样 [`request_cost_usd`] 的几十个调用点不必各带一份 state。
+/// 缓存键是两张定价表的 generation，而 generation 是进程级唯一戳，所以不同
+/// 快照之间不会串价；命中只是一次原子读。
+pub(crate) fn pricing_index(snap: &AisixSnapshot) -> Arc<aisix_core::models::PricingIndex> {
+    static INDEX: std::sync::LazyLock<aisix_core::models::LivePricingIndex> =
+        std::sync::LazyLock::new(aisix_core::models::LivePricingIndex::new);
+    INDEX.for_snapshot(snap)
 }
 
 /// USD → micro-USD，花费计数器用的整数单位（1 USD = 1_000_000）。
@@ -413,24 +623,163 @@ pub(crate) fn apply_pk_telemetry(event: &mut UsageEvent, pk: &ResolvedPk<'_>) {
     event.byo_label = sanitize_tag(tags.byo_label.unwrap_or_default());
 }
 
-/// Stamp the JWT identity attribution fields onto an in-progress
-/// UsageEvent (#564). A `None` identity (the API-key path)
-/// leaves the fields empty, which skip-serialize to wire NULL. One
-/// source of truth for the mapping so the handler family can't drift —
-/// same rationale as [`apply_pk_telemetry`]. The values are sanitised
-/// like every other externally-influenced tag: the subject is a claim
-/// from a verified token, but the identity provider is still not a
-/// trusted emitter of control characters or unbounded strings.
-pub(crate) fn apply_jwt_identity(
+/// Stamp the caller-identity attribution fields onto an in-progress
+/// UsageEvent: the JWT identity (AISIX-Cloud#564), the org member and team
+/// the authenticating key belongs to (AISIX-Cloud#1389), and the request's
+/// effective cost-attribution tags. An absent value leaves its field empty,
+/// which skip-serializes to wire NULL. One source of truth for the mapping
+/// so the handler family can't drift — same rationale as
+/// [`apply_pk_telemetry`]. The ids are sanitised like every other
+/// externally-influenced tag: the subject is a claim from a verified token,
+/// but the identity provider is still not a trusted emitter of control
+/// characters or unbounded strings.
+///
+/// `caller` is one ApiKey row's identity, resolved once against the
+/// snapshot the request authenticated on, so every event of a request
+/// carries the same member, team and tags, and a name can never sit beside
+/// another member's id. A JWT request runs AS a key, so the same identity
+/// covers both auth surfaces and the member filter sees every credential a
+/// member calls through.
+pub(crate) fn apply_caller_identity(
     event: &mut UsageEvent,
     jwt: Option<&std::sync::Arc<crate::auth::JwtIdentity>>,
+    caller: &aisix_gateway::CallerIdentity,
 ) {
+    if let Some(name) = caller.api_key_name.as_deref().filter(|n| !n.is_empty()) {
+        event.api_key_name = sanitize_tag(name.to_string());
+    }
+    if let Some(user_id) = caller.user_id.as_deref() {
+        event.user_id = sanitize_tag(user_id.to_string());
+    }
+    if let Some(team_id) = caller.team_id.as_deref() {
+        event.team_id = sanitize_tag(team_id.to_string());
+    }
+    // Request-scoped, like the member pair: resolved once from the
+    // snapshot the request authenticated on, so every event of the request
+    // carries the same set. Values are operator-typed or identity-provider
+    // text bound for line-oriented sinks, so they get the same treatment as
+    // the ids above.
+    event.tags = caller
+        .tags
+        .iter()
+        .map(|(k, v)| (k.clone(), sanitize_tag(v.clone())))
+        .collect();
+    if let Some(user_name) = caller.user_name.as_deref() {
+        // NOT `sanitize_tag`, unlike the id above. That call exists to keep
+        // operator-typed text safe on the cp-api wire and in the log line;
+        // `user_name` reaches neither (`#[serde(skip)]`, and
+        // `log_provider_call` does not render it). Its only destination is
+        // the `user_name` metric label, which the four #890 families
+        // already stamp raw off the same ApiKey row — sanitising this one
+        // copy would make a long or odd name read differently on
+        // `aisix_usage_event*` than on `aisix_llm_*`, and break the
+        // cross-family join on the pair for exactly that member. The
+        // prometheus exporter escapes exposition characters itself.
+        event.user_name = user_name.to_string();
+    }
     let Some(jwt) = jwt else {
         return;
     };
     event.jwt_subject = sanitize_tag(jwt.subject.clone());
     event.jwt_provider = sanitize_tag(jwt.provider.clone());
     event.jwt_claim_mapping = sanitize_tag(jwt.claim_mapping.clone().unwrap_or_default());
+}
+
+/// The content cap the snapshot's enabled exporters ask for, `None` when none
+/// of them runs at `content_mode: full`.
+pub(crate) fn content_cap(snap: &AisixSnapshot) -> Option<u32> {
+    aisix_obs::content_capture_cap(
+        snap.observability_exporters
+            .entries()
+            .iter()
+            .map(|e| &*e.value),
+    )
+}
+
+/// Hold the request body every failure row of this request reports, in the
+/// representation the endpoint's success path captures. `prompt` runs only
+/// under a full-content export. Call again once a guardrail has masked the
+/// request: the latest note is the one reported.
+pub(crate) fn note_failure_request(snap: &AisixSnapshot, prompt: impl FnOnce() -> String) {
+    if let Some(cap) = content_cap(snap) {
+        crate::attribution::note_failure_request(aisix_obs::CapturedContent::new(
+            &prompt(),
+            "",
+            cap as usize,
+        ));
+    }
+}
+
+/// Hold the error body the caller is about to be sent, for the terminal
+/// failure row. Only a full-content export reads it.
+pub(crate) fn note_client_error(snap: &AisixSnapshot, err: &ProxyError) {
+    note_client_error_body(snap, || {
+        serde_json::to_string(&err.envelope()).unwrap_or_default()
+    });
+}
+
+/// [`note_client_error`] for a route that does not answer with the OpenAI
+/// envelope.
+pub(crate) fn note_client_error_body(snap: &AisixSnapshot, body: impl FnOnce() -> String) {
+    if content_cap(snap).is_some() {
+        crate::attribution::note_client_error_body(body());
+    }
+}
+
+/// Whether `event` reports a failure, whatever its status told the caller.
+fn is_failure_row(event: &UsageEvent) -> bool {
+    event.status_code >= 400 || !event.error_class.is_empty()
+}
+
+/// What a failure row exports (AISIX-Cloud#1921): the request body and
+/// the attempt's upstream response body, or, for an attempt no upstream
+/// answered, the gateway's own error body, except on a `499`, which went to
+/// no one. `None` for any other row, whose
+/// `content` stands as given.
+fn failure_row_content(
+    event: &UsageEvent,
+    content: Option<&aisix_obs::CapturedContent>,
+    upstream_body: Option<&[u8]>,
+    terminal: bool,
+    cap: usize,
+) -> Option<aisix_obs::CapturedContent> {
+    if !is_failure_row(event) {
+        return None;
+    }
+    let (noted_request, noted_error) = crate::attribution::failure_notes();
+    let row = match content {
+        Some(c) if !c.prompt.is_empty() => c.clone(),
+        given => {
+            // A bodyless request's note says nothing; `given` may hold a response.
+            let request = noted_request
+                .filter(|noted| !noted.prompt.is_empty())
+                .or_else(|| given.cloned());
+            request.unwrap_or_else(|| aisix_obs::CapturedContent::new("", "", cap))
+        }
+    };
+    if !row.response.is_empty() {
+        return Some(row);
+    }
+    // A stream that failed mid-way ends with no finish reason, which is what
+    // the structured output field needs: what it delivered goes here instead.
+    let delivered = row
+        .output
+        .as_ref()
+        .and_then(aisix_obs::OutputCapture::parts_json)
+        .map(|parts| serde_json::Value::Array(parts).to_string());
+    let response = match (delivered, upstream_body.filter(|b| !b.is_empty())) {
+        (Some(delivered), _) => delivered,
+        (None, Some(body)) => String::from_utf8_lossy(body).into_owned(),
+        // The caller left: nothing was sent to report.
+        (None, None) if event.status_code == crate::CLIENT_CLOSED_REQUEST => return Some(row),
+        (None, None) => noted_error.filter(|_| terminal).unwrap_or_else(|| {
+            serde_json::json!({
+                "error": { "message": event.error_message, "type": event.error_class }
+            })
+            .to_string()
+        }),
+    };
+    Some(row.with_response(&response, cap))
 }
 
 /// Emit ONE zero-token `UsageEvent` for a FAILED request on a non-chat handler
@@ -441,94 +790,700 @@ pub(crate) fn apply_jwt_identity(
 /// zero-token event per failed attempt; the single-attempt non-chat handlers
 /// emit one terminal event here.
 ///
-/// `model_id` is intentionally left empty — on the error path the resolved
-/// Model id isn't threaded back out of dispatch, but `requested_model`,
-/// `api_key_id`, `status_code` and `error_class` are enough for the request to
-/// appear in Logs. `label` is the usage_sink bucket (#408).
+/// `model_id` follows [`crate::attribution::unattempted_model_id`]: the
+/// target that settled, else the addressed entry when it is a direct model,
+/// else empty (a group that failed before selecting a target).
+/// `label` is the usage_sink bucket (#408).
 /// `inbound_protocol` must match what the caller's success path emits (e.g.
 /// `"passthrough"` for `/passthrough/...`, `"realtime"` for `/v1/realtime`,
 /// `"openai"` for the OpenAI-shaped handlers) so Logs protocol filtering sees
 /// failures and successes under the same tag.
+///
+/// A guardrail refusal reaches this function like any other failure, so
+/// `guardrail_blocked` is a REQUIRED argument rather than a default: a
+/// handler that forgets it produces a 422 the "Guardrail blocks" view
+/// cannot find, which reads to an operator as "the gateway logged no
+/// guardrail activity at all" (AISIX-Cloud#1428).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_error_usage_event(
     state: &ProxyState,
     snap: &AisixSnapshot,
-    label: &'static str,
+    surface: Surface,
     inbound_protocol: &'static str,
     request_id: &str,
     requested_model: &str,
     api_key_id: &str,
     status_code: u16,
-    error_class: &str,
+    error: EventError,
+    // Whether this failure IS a guardrail refusal, from
+    // [`ProxyError::is_guardrail_block`]. Every caller but the realtime
+    // connect failure — which synthesizes its class without a `ProxyError`
+    // — reads it off the error it is reporting.
+    guardrail_blocked: bool,
     client: &ClientContext,
+    // The request's applied guardrail set, from [`applied_guardrails`].
+    // Required for the same reason as `guardrail_blocked`: a refusal whose
+    // row names no governing guardrail contradicts its own enforced hit.
+    applied: Vec<aisix_core::AppliedGuardrail>,
+    // The request's enforced guardrail hits. The failure path is where a
+    // `blocked` hit lands — a guardrail refusal IS the error — so the
+    // error event is the one that must not drop it. Drained by the caller
+    // (`enforced_hits(&audit)`) rather than taken as a handle: the jobs
+    // surface accumulates across two separately resolved chains.
+    enforced: Vec<aisix_core::GuardrailEnforcedHit>,
+    // The request's similarity scores (AISIX-Cloud#1467), drained the same
+    // way. A refusal by a `kind: semantic` row lands HERE, so an error
+    // event without them would leave the block — the one outcome an
+    // operator is certain to look at — as the only execution with no
+    // number attached.
+    scores: Vec<aisix_core::GuardrailScore>,
+    // The request's fail-open bypass tag, drained the same way. A request
+    // that went upstream unscreened and THEN failed is still a request
+    // that went upstream unscreened, so dropping the tag here would make
+    // the field answerable only for the requests that succeeded.
+    bypass: String,
 ) {
+    let event = build_error_usage_event(
+        inbound_protocol,
+        request_id,
+        requested_model,
+        api_key_id,
+        status_code,
+        error,
+        guardrail_blocked,
+        client,
+        applied,
+        enforced,
+        scores,
+        bypass,
+    );
+    // The failed request's own attribution, off the same cell
+    // `request_metrics::LastTarget` reads — so the usage-event counters and
+    // the request counters agree on which key a failure belongs to
+    // (AISIX-Cloud#1317 / #1325).
+    let attributed = crate::attribution::current().unwrap_or_default();
+    let pk = ResolvedPk::resolve(snap, &attributed.provider_key_id);
+    let model = usage_event_model_label(snap, requested_model);
+    emit_prepared_usage_event(
+        state,
+        snap,
+        surface,
+        event,
+        usage_event_labels(&model, &pk),
+        client.trace.as_ref(),
+    );
+}
+
+/// The failure a request's terminal error event names: its
+/// [`crate::attempt::error_class`] and
+/// [`crate::attempt::gateway_error_message`].
+pub(crate) struct EventError {
+    class: &'static str,
+    message: String,
+    /// The model an unknown- or forbidden-model refusal names. Some
+    /// surfaces read the caller's `model` only inside dispatch and emit
+    /// with an empty `requested_model`; the event records it there, so
+    /// the message never carries a name the event does not.
+    model: Option<String>,
+}
+
+impl EventError {
+    pub(crate) fn of(err: &ProxyError) -> Self {
+        let model = match err {
+            ProxyError::ModelNotFound(model) | ProxyError::ModelForbidden(model) => {
+                Some(model.clone())
+            }
+            _ => None,
+        };
+        Self {
+            class: crate::attempt::error_class(err),
+            message: crate::attempt::gateway_error_message(err),
+            model,
+        }
+    }
+}
+
+/// Emit one zero-token `UsageEvent` per FAILED attempt a single-shot
+/// dispatch recorded (`routing::dispatch_with_failover`) — the #655 shape
+/// chat / messages / responses already have, for completions, embeddings,
+/// rerank, images, audio and video submits.
+///
+/// Every event names the target it actually hit (`model_id`, ProviderKey,
+/// `attempt_*`) and carries no tokens and no cost: a failed attempt bills
+/// nothing, exactly as on chat. The winner, if any, is the handler's own
+/// event. When there is none, pass `terminal_last` and the LAST failed
+/// attempt in `attempts` becomes the request's terminal event — the one carrying the
+/// request-scoped guardrail attribution (`guardrail_blocked`, the enforced
+/// hits, scores, `monitor_hits`, `redactions`), which the superseded
+/// attempts never repeat. No-op when nothing failed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_failed_attempts(
+    state: &ProxyState,
+    snap: &AisixSnapshot,
+    surface: Surface,
+    request_id: &str,
+    requested_model: &str,
+    api_key_id: &str,
+    client: &ClientContext,
+    applied_guardrails: &[aisix_core::AppliedGuardrail],
+    attempts: &[crate::attempt::AttemptRecord],
+    terminal_last: bool,
+    guardrail_blocked: bool,
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    redactions: crate::redact::RedactionCounts,
+    audit: &GuardrailAudit,
+) {
+    emit_failed_attempts_as(
+        state,
+        snap,
+        surface,
+        "openai",
+        request_id,
+        requested_model,
+        api_key_id,
+        client,
+        applied_guardrails,
+        attempts,
+        terminal_last,
+        guardrail_blocked,
+        monitor_hits,
+        redactions,
+        audit,
+    );
+}
+
+/// [`emit_failed_attempts`] for a route whose callers speak a protocol
+/// other than OpenAI's — `/v1/messages/count_tokens` records `anthropic`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_failed_attempts_as(
+    state: &ProxyState,
+    snap: &AisixSnapshot,
+    surface: Surface,
+    inbound_protocol: &str,
+    request_id: &str,
+    requested_model: &str,
+    api_key_id: &str,
+    client: &ClientContext,
+    applied_guardrails: &[aisix_core::AppliedGuardrail],
+    attempts: &[crate::attempt::AttemptRecord],
+    terminal_last: bool,
+    guardrail_blocked: bool,
+    mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    mut redactions: crate::redact::RedactionCounts,
+    audit: &GuardrailAudit,
+) {
+    let last_failed = attempts.iter().rposition(|a| !a.success);
+    let usage_model = usage_event_model_label(snap, requested_model).into_owned();
+    for (i, rec) in attempts.iter().enumerate().filter(|(_, a)| !a.success) {
+        let terminal = terminal_last && Some(i) == last_failed;
+        let mut event = UsageEvent {
+            request_id: request_id.to_string(),
+            occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
+            model_id: rec.target_model_id.clone(),
+            api_key_id: api_key_id.to_string(),
+            requested_model: requested_model.to_string(),
+            upstream_latency_ms: rec.latency_ms,
+            status_code: rec.status,
+            inbound_protocol: inbound_protocol.to_string(),
+            applied_guardrails: applied_guardrails.to_vec(),
+            client_source_ip: client.source_ip.clone(),
+            client_user_agent: client.user_agent.clone(),
+            request_headers: client.request_headers.clone(),
+            guardrail_blocked: terminal && guardrail_blocked,
+            guardrail_monitor_hits: if terminal {
+                std::mem::take(&mut monitor_hits)
+            } else {
+                Vec::new()
+            },
+            redacted_entity_counts: if terminal {
+                std::mem::take(&mut redactions)
+            } else {
+                crate::redact::RedactionCounts::new()
+            },
+            guardrail_enforced_hits: terminal_enforced_hits(terminal, audit),
+            guardrail_scores: terminal_guardrail_scores(terminal, audit),
+            // Request-scoped, and every attempt of a request that failed
+            // open went upstream unscreened — the same rule chat applies.
+            guardrail_bypassed_reason: bypass_reason(audit),
+            attempt_index: rec.index,
+            attempt_kind: rec.kind.to_string(),
+            attempt_model: rec.target_model.clone(),
+            error_class: rec.error_class.clone(),
+            error_message: rec.error_message.clone(),
+            ..Default::default()
+        };
+        let pk = ResolvedPk::resolve(snap, &rec.provider_key_id);
+        apply_pk_telemetry(&mut event, &pk);
+        apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
+        emit_usage(
+            state,
+            snap,
+            surface,
+            event,
+            usage_event_labels(&usage_model, &pk),
+            None,
+            client.trace.as_ref(),
+            terminal,
+            // The record's own network-boundary fact: a rate-limit-refused
+            // attempt, or a route's own 501, never reached an upstream.
+            rec.dispatched,
+        );
+    }
+}
+
+/// Whether a single-shot request's attempts already produced its terminal
+/// usage event: some attempt was made and none succeeded, so
+/// [`emit_failed_attempts`] marks the last one terminal and the handler must
+/// not emit another.
+pub(crate) fn failed_attempts_are_terminal(routing: &crate::attempt::RoutingTelemetry) -> bool {
+    !routing.attempts.is_empty() && routing.winner().is_none()
+}
+
+/// A single-shot success branch's attempts that [`emit_failed_attempts`]
+/// owns. When the request was answered by the route's own 501 for a
+/// provider lacking the capability — the LAST record, failed and never
+/// dispatched — that refusal is the handler's own terminal event, so it is
+/// left out of the slice.
+pub(crate) fn split_route_refusal(
+    routing: &crate::attempt::RoutingTelemetry,
+) -> &[crate::attempt::AttemptRecord] {
+    if failed_attempts_are_terminal(routing) {
+        &routing.attempts[..routing.attempts.len() - 1]
+    } else {
+        &routing.attempts
+    }
+}
+
+/// Stamp the attempt that answered onto a single-shot handler's success
+/// event: its index / kind / target, and its own upstream latency — the
+/// failed attempts before it emitted their own events, so the whole
+/// request's elapsed time would count them twice. `None` (nothing was
+/// dispatched) leaves the event as built. The route's own 501 answers through
+/// the same event, so a failed record also names the failure on it.
+pub(crate) fn apply_winning_attempt(
+    event: &mut UsageEvent,
+    winner: Option<&crate::attempt::AttemptRecord>,
+) {
+    if let Some(w) = winner {
+        event.attempt_index = w.index;
+        event.attempt_kind = w.kind.to_string();
+        event.attempt_model = w.target_model.clone();
+        event.upstream_latency_ms = w.latency_ms;
+        if !w.success {
+            event.error_class = w.error_class.clone();
+            event.error_message = w.error_message.clone();
+        }
+    }
+}
+
+/// The [`emit_error_usage_event`] event without the emission, for a caller
+/// that attributes handler-specific fields (e.g. the passthrough route name)
+/// before handing it to [`emit_prepared_usage_event`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_error_usage_event(
+    inbound_protocol: &'static str,
+    request_id: &str,
+    requested_model: &str,
+    api_key_id: &str,
+    status_code: u16,
+    error: EventError,
+    // See [`emit_error_usage_event`].
+    guardrail_blocked: bool,
+    client: &ClientContext,
+    applied: Vec<aisix_core::AppliedGuardrail>,
+    enforced: Vec<aisix_core::GuardrailEnforcedHit>,
+    scores: Vec<aisix_core::GuardrailScore>,
+    // See [`emit_error_usage_event`].
+    bypass: String,
+) -> UsageEvent {
+    let requested_model = match error.model {
+        Some(model) if requested_model.is_empty() => model,
+        _ => requested_model.to_string(),
+    };
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
-        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         api_key_id: api_key_id.to_string(),
-        requested_model: requested_model.to_string(),
+        model_id: crate::attribution::unattempted_model_id(&requested_model),
+        requested_model,
         status_code,
         inbound_protocol: inbound_protocol.to_string(),
-        error_class: error_class.to_string(),
+        error_class: error.class.to_string(),
+        error_message: error.message,
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        request_headers: client.request_headers.clone(),
+        guardrail_blocked,
+        applied_guardrails: applied,
+        guardrail_enforced_hits: enforced,
+        guardrail_scores: scores,
+        guardrail_bypassed_reason: bypass,
         ..Default::default()
     };
-    apply_jwt_identity(&mut event, client.jwt.as_ref());
-    state.usage_sink.try_emit(label, event.clone());
+    apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
+    event
+}
+
+/// The `model` label for the usage-event counters (AISIX-Cloud#1317).
+///
+/// `unknown` when the request carried no model at all — the MCP, A2A and
+/// passthrough tunnels, and every path that failed before resolution —
+/// otherwise collapsed to the configured set exactly like the request
+/// families do, because `UsageEvent::requested_model` is caller-controlled
+/// text and would otherwise mint one series per made-up name (#451).
+pub(crate) fn usage_event_model_label<'a>(
+    snap: &AisixSnapshot,
+    requested_model: &'a str,
+) -> Cow<'a, str> {
+    if requested_model.is_empty() {
+        Cow::Borrowed(crate::request_metrics::UNKNOWN)
+    } else {
+        metric_model_label(snap, requested_model)
+    }
+}
+
+/// Pair that label with the ProviderKey the event is attributed to.
+///
+/// Takes the resolved key rather than an id for the same reason
+/// `request_metrics::Upstream` does: the readable name and the upstream
+/// protocol can only come off the row its id names.
+pub(crate) fn usage_event_labels<'a>(
+    model: &'a str,
+    pk: &'a ResolvedPk<'_>,
+) -> UsageEventLabels<'a> {
+    let labels = pk.labels();
+    UsageEventLabels {
+        model,
+        // `ResolvedPk` reports an unresolved id verbatim, including the
+        // empty string the pre-dispatch paths pass. An empty label value
+        // would sit next to `unknown` as a second "nothing resolved"
+        // series, so collapse it here.
+        provider_key_id: if labels.id().is_empty() {
+            UNKNOWN_PK
+        } else {
+            labels.id()
+        },
+        provider_key_name: labels.name(),
+        // Both overwritten by `UsageSink::try_emit` from the event's own
+        // member pair (AISIX-Cloud#1389, #1455) — one place, so no handler
+        // in this family can build a label set that disagrees with the row.
+        user_id: "unknown",
+        user_name: "unknown",
+        // Same `PkLabels` the request families read (AISIX-Cloud#1403), so
+        // `aisix_usage_events_emitted_total` joins with them on
+        // `upstream_protocol` instead of dropping out of the aggregation.
+        upstream_protocol: labels.protocol(),
+    }
+}
+
+pub(crate) fn emit_prepared_usage_event(
+    state: &ProxyState,
+    snap: &AisixSnapshot,
+    surface: Surface,
+    mut event: UsageEvent,
+    labels: UsageEventLabels<'_>,
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+) {
+    // It speaks for no attempt of its own: after the failed attempts of a
+    // single-shot failover whose winner then failed, it follows them.
+    event.attempt_index = event
+        .attempt_index
+        .max(crate::attribution::next_attempt_index());
+    // An error event is the request's terminal emission. Its
+    // builder leaves `upstream_latency_ms` at 0, so no upstream span is
+    // derivable either way — `dispatched: false` states the common case
+    // (most error events never reached a provider).
+    emit_usage(
+        state, snap, surface, event, labels, None, trace, true, false,
+    );
+}
+
+/// Fill `requested_model_id` from the request's attribution cell, where
+/// `resolve_model` recorded the entry the caller's name resolved to. Read
+/// here, at the one point every usage event passes through, so every
+/// attempt, ensemble member and judge event of a group request carries the
+/// group's id beside its own target's `model_id`, and no family can miss it.
+///
+/// Only taken when the event's `requested_model` is the name that resolved:
+/// a name the request never resolved (an unknown model, the passthrough
+/// namespace's body `model`) borrows no entry's id. An emitter that runs
+/// outside the request scope (the realtime session end, the batch poll)
+/// sets the field itself.
+fn stamp_requested_model_id(event: &mut UsageEvent) {
+    if !event.requested_model_id.is_empty() || event.requested_model.is_empty() {
+        return;
+    }
+    if let Some(id) = crate::attribution::requested_model_id(&event.requested_model) {
+        event.requested_model_id = id;
+    }
+}
+
+/// THE emission chokepoint (AISIX-Cloud#1279): every usage event leaves
+/// through here, so the CP telemetry leg and the exporter fan-out cannot
+/// drift, and the trace snapshot is taken in exactly one place.
+///
+/// A usage event is the observability record of a request, not a billing
+/// line: every request that reaches dispatch emits one, at zero tokens when
+/// the upstream reported none or nothing was billable. Never skip it for
+/// lack of usage. The one exception is by design: polling a video job
+/// (`GET /v1/videos/:id`) and retrieving its content emit none.
+///
+/// `trace` is the request's bundle (`ClientContext::trace`); `terminal`
+/// says whether this event ends the request — the terminal event carries
+/// the SERVER + logical spans (ending the SERVER span at NOW, the real
+/// body EOF/drop), a non-terminal one carries its own attempt span alone.
+/// It is also the wire's `is_final_attempt`, so an emitter owes exactly one
+/// `true` per request, on the last row it writes.
+/// `dispatched` is the caller's statement that this event describes work
+/// that actually reached an upstream — a cache hit and a pre-dispatch
+/// error pass `false`, which zeroes the event's `upstream_*` latencies and
+/// keeps an upstream CLIENT span from being fabricated. The event's public
+/// `trace_id` is stamped here so the CP row and the exported spans always
+/// agree.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_usage(
+    state: &ProxyState,
+    snap: &AisixSnapshot,
+    surface: Surface,
+    mut event: UsageEvent,
+    labels: UsageEventLabels<'_>,
+    content: Option<&aisix_obs::CapturedContent>,
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+    terminal: bool,
+    dispatched: bool,
+) {
+    // Stamped here rather than at each construction site: this is the one
+    // point every usage event passes through, so the operation cannot be
+    // present on a family's success path and missing from its error or
+    // streaming one (AISIX-Cloud#1461).
+    event.operation = surface.operation.to_string();
+    event.is_final_attempt = terminal;
+    stamp_requested_model_id(&mut event);
+    // Upstream-supplied text bound for line-oriented stores: the same
+    // control-character strip and cap as the provider's response id.
+    event.service_tier = event
+        .service_tier
+        .take()
+        .map(crate::chat::sanitize_tag)
+        .filter(|t| !t.is_empty());
+    // Same reasoning, for the other shape of a caller walking away
+    // (AISIX-Cloud#1571). A stream the consumer abandoned is reported as
+    // 499 by six different families, each through its own emit helper and
+    // none of them naming the outcome; a head-phase cancel names it
+    // explicitly and would otherwise be the only 499 an operator could
+    // filter on. Filling it only when the class is still empty keeps this
+    // from overwriting a more specific one, and leaves the head-phase
+    // event's own message alone.
+    stamp_client_disconnect(
+        event.status_code,
+        &mut event.error_class,
+        &mut event.error_message,
+    );
+    // A route names its own failures; this is for the one that did not.
+    if is_failure_row(&event) && event.error_message.trim().is_empty() {
+        event.error_message = aisix_obs::request_failed_message(event.status_code);
+    }
+    let mut upstream_error_body = None;
+    if dispatched {
+        let response = crate::attribution::take_attempt_upstream_response(event.attempt_index);
+        upstream_error_body = response.error_body;
+        // A surface that runs detached from the request scope (`/v1/realtime`)
+        // read its own off the upgrade response.
+        if event.upstream_response_headers.is_empty() {
+            event.upstream_response_headers = response.headers;
+        }
+        // The response object's id when it had one; otherwise — a failed
+        // attempt, a token count, an embedding, an image, a Bedrock answer —
+        // the provider's request-id header, which is what its support traces
+        // the call by.
+        if event.provider_request_id.is_empty() {
+            event.provider_request_id = sanitize_provider_response_id(&response.request_id);
+        }
+    } else {
+        // The `upstream_*` latencies time one upstream attempt. An event that
+        // reached no upstream has none, whatever duration its builder had at
+        // hand (a cache hit's or a refusal's handler time).
+        event.upstream_latency_ms = 0;
+        event.upstream_ttft_ms = 0;
+    }
+    // The request's access-log line, for the families that deferred it to
+    // their stream (AISIX-Cloud#1571). Here, and after the stamping above,
+    // so the line and the event cannot disagree about the outcome: one
+    // status, one error class, one message, whichever of a stream's three
+    // endings this is. A request that wrote its line inline — everything
+    // non-streamed — parked nothing, and this is a no-op for it.
+    if terminal {
+        crate::attribution::note_terminal_event(
+            &event,
+            // Only an upstream's own id: a cache hit's stored one is not this
+            // request's call.
+            if dispatched {
+                &event.provider_request_id
+            } else {
+                ""
+            },
+        );
+        crate::attribution::emit_deferred_access_log(&event);
+    }
+    // The `upstream` side of the request's end-to-end latency is the
+    // terminal attempt's own upstream duration — this figure, so the metric
+    // and the row cannot disagree — and only when that attempt reached an
+    // upstream at all.
+    if terminal && dispatched {
+        crate::attribution::note_terminal_upstream(std::time::Duration::from_millis(u64::from(
+            event.upstream_latency_ms,
+        )));
+    }
+    // Request-level guardrail blocks are recorded from the terminal event,
+    // not from an individual timed execution. Some fail-closed paths (for
+    // example a streamed-output buffer overflow) reject before a guardrail
+    // member runs, while retries and ensembles can emit several non-terminal
+    // events for one request.
+    if terminal && event.guardrail_blocked {
+        state.metrics.record_guardrail_blocked_request();
+    }
+    // Gateway-initiated semantic embeddings are child work of this request,
+    // never attempts for the model the caller addressed. Attach their bounded
+    // ledger only to the one terminal parent event: a retry can emit
+    // non-terminal attempt rows, and a stream's terminal emitter may run much
+    // later, but neither may duplicate or replace the parent's
+    // token/cost/model fields.
+    if terminal {
+        attach_gateway_embedding_audit(&mut event);
+    }
+    stamp_latency_breakdown(&mut event, terminal);
+    // A Responses result carries no finish reason of its own; it is derived
+    // from what the caller received, native or bridged alike.
+    if terminal && surface.operation == crate::operation::RESPONSES.operation {
+        if let Some(finish) = crate::attribution::take_responses_finish() {
+            event.finish_reason = finish.to_string();
+        }
+    }
+    let emission = trace.map(|bundle| {
+        event.trace_id = bundle.trace_id_hex();
+        bundle.emission(
+            terminal,
+            event.attempt_index,
+            event.upstream_latency_ms,
+            dispatched,
+        )
+    });
+    // Tell the request's own cell that an event has gone out, so a cancel
+    // landing in the moments after cannot double it (AISIX-Cloud#1571). A
+    // no-op outside a request scope, which is where the detached stream
+    // emitters and the cancel guard itself both run.
+    crate::attribution::note_usage_emitted(terminal, event.attempt_index);
+    let provider_key_id = labels.provider_key_id;
+    state
+        .usage_sink
+        .try_emit(surface.handler, event.clone(), labels);
     let exporters = live_exporters(state, snap);
+    if exporters.is_empty() {
+        return;
+    }
+    // A streamed response's parts were read off the frames the caller got;
+    // they belong to the event that ends the request.
+    let streamed;
+    let content = match content {
+        Some(c) if terminal && c.output.is_none() => match crate::attribution::take_stream_output()
+        {
+            Some(output) => {
+                streamed = c.clone().with_output(Some(output));
+                Some(&streamed)
+            }
+            None => Some(c),
+        },
+        other => other,
+    };
+    let failure_content = aisix_obs::content_capture_cap(exporters.iter().map(|e| &*e.value))
+        .and_then(|cap| {
+            failure_row_content(
+                &event,
+                content,
+                upstream_error_body.as_deref(),
+                terminal,
+                cap as usize,
+            )
+        });
+    let content = failure_content.as_ref().or(content);
+    // Export-only span facts: the request-scoped ones the bundle holds, and
+    // this event's own upstream, read off the request's snapshot. Only the
+    // OTLP encoder reads them, so nothing is resolved without one.
+    let facts = exporters
+        .iter()
+        .any(|e| e.value.enabled && matches!(e.value.kind, aisix_core::ExporterKind::OtlpHttp(_)))
+        .then(|| {
+            let mut upstream = crate::span_facts::upstream_facts(snap, &event, provider_key_id);
+            // An event that never reached its upstream (a cache hit, a
+            // refusal) names the model it addressed but no server it called.
+            if !dispatched {
+                if let Some(u) = upstream.as_mut() {
+                    u.server_address.clear();
+                    u.server_port = None;
+                }
+            }
+            std::sync::Arc::new(match trace {
+                Some(bundle) => bundle.span_facts(upstream),
+                None => aisix_obs::SpanFacts {
+                    upstream,
+                    ..Default::default()
+                },
+            })
+        });
     state.otlp_fan_out.fan_out(
         &event,
-        None,
+        content,
+        emission.as_ref(),
+        facts.as_ref(),
         exporters.generation(),
         exporters.iter().map(|e| &*e.value),
     );
 }
 
-/// Error-event variant for handlers whose guardrail chain resolves inside
-/// dispatch. Keeping the common identity and exporter plumbing here ensures a
-/// pre-upstream content block is represented the same way as a successful
-/// guardrail-governed request.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_guardrail_error_usage_event(
-    state: &ProxyState,
-    snap: &AisixSnapshot,
-    label: &'static str,
-    inbound_protocol: &'static str,
-    request_id: &str,
-    requested_model: &str,
-    api_key_id: &str,
-    status_code: u16,
-    error_class: &str,
-    client: &ClientContext,
-    guardrail_blocked: bool,
-    applied_guardrails: Vec<aisix_core::AppliedGuardrail>,
-    guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
-) {
-    let mut event = UsageEvent {
-        request_id: request_id.to_string(),
-        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        api_key_id: api_key_id.to_string(),
-        requested_model: requested_model.to_string(),
-        status_code,
-        inbound_protocol: inbound_protocol.to_string(),
-        error_class: error_class.to_string(),
-        client_source_ip: client.source_ip.clone(),
-        client_user_agent: client.user_agent.clone(),
-        guardrail_blocked,
-        applied_guardrails,
-        guardrail_monitor_hits,
-        ..Default::default()
-    };
-    apply_jwt_identity(&mut event, client.jwt.as_ref());
-    state.usage_sink.try_emit(label, event.clone());
-    let exporters = live_exporters(state, snap);
-    state.otlp_fan_out.fan_out(
-        &event,
-        None,
-        exporters.generation(),
-        exporters.iter().map(|e| &*e.value),
-    );
+/// `gateway_overhead_ms` on the event that carries `downstream_latency_ms`,
+/// and `upstream_tpot_ms` on a successful streamed attempt. Here, at the
+/// chokepoint, so no family can carry the latency it reports without them.
+///
+/// The overhead's subtrahend is the request's upstream wait, measured from
+/// monotonic timestamps at the attempt boundaries and the winner's first
+/// streamed frame ([`crate::attribution::upstream_wait`]); its window is the
+/// same one `downstream_latency_ms` reports.
+fn stamp_latency_breakdown(event: &mut UsageEvent, terminal: bool) {
+    if terminal && event.downstream_latency_ms > 0 {
+        if let Some(waited) = crate::attribution::upstream_wait() {
+            let window = std::time::Duration::from_millis(u64::from(event.downstream_latency_ms));
+            let overhead = window.saturating_sub(waited).as_millis();
+            event.gateway_overhead_ms = Some(u32::try_from(overhead).unwrap_or(u32::MAX));
+        }
+    }
+    let output_tokens = event.genai_output_tokens();
+    let succeeded = (200..300).contains(&event.status_code) && event.error_class.is_empty();
+    if succeeded && event.upstream_ttft_ms > 0 && output_tokens >= 2 {
+        let generating = event
+            .upstream_latency_ms
+            .saturating_sub(event.upstream_ttft_ms);
+        event.upstream_tpot_ms = Some(f64::from(generating) / f64::from(output_tokens - 1));
+    }
+}
+
+/// Name a `499` that nothing else named: a stream the caller abandoned.
+/// [`emit_usage`] applies it to every event; a surface that writes its
+/// access-log line before handing the event over applies it first, so the
+/// line carries the same class.
+pub(crate) fn stamp_client_disconnect(status: u16, class: &mut String, message: &mut String) {
+    if status == crate::CLIENT_CLOSED_REQUEST && class.is_empty() {
+        *class = crate::CLIENT_DISCONNECTED_KIND.to_string();
+        *message = crate::cancel::CANCELLED_MID_STREAM.to_string();
+    }
+}
+
+/// Move the bounded gateway-embedding child audit to the terminal parent
+/// event. Kept beside the emission chokepoint so no request family can attach
+/// an unbounded or duplicated child trail on an intermediate attempt.
+fn attach_gateway_embedding_audit(event: &mut UsageEvent) {
+    let audit = crate::attribution::take_gateway_embedding_audit();
+    event.gateway_embedding_calls = audit.calls;
+    event.gateway_embedding_calls_dropped = audit.dropped;
 }
 
 #[cfg(test)]
@@ -696,6 +1651,145 @@ mod tests {
     }
     use super::*;
 
+    /// Routes name their failures, so no request drives this fallback. It is
+    /// the chokepoint's own guarantee for one that forgets, read at the sink
+    /// every consumer of the event reads.
+    #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)]
+    async fn emit_usage_names_a_failure_row_nothing_named() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = crate::ProxyState::new(
+            aisix_core::snapshot::SnapshotHandle::new(AisixSnapshot::new()),
+            std::sync::Arc::new(aisix_gateway::Hub::new()),
+            &aisix_core::ProxyConfig {
+                addr: "127.0.0.1:0".into(),
+                request_body_limit_bytes: 1_048_576,
+                real_ip: Default::default(),
+                request_id: Default::default(),
+                url_rewrites: Vec::new(),
+                expose_debug_headers: false,
+                tls: None,
+                listeners: Vec::new(),
+                thread_per_core: None,
+                workers: None,
+            },
+        )
+        .without_cache()
+        .with_usage_sink(aisix_obs::UsageSink::new(tx));
+        let snap = state.snapshot.load();
+        let mut emit = |status_code: u16, class: &str, message: &str| {
+            let mut event = UsageEvent::default();
+            event.status_code = status_code;
+            event.error_class = class.to_string();
+            event.error_message = message.to_string();
+            emit_usage(
+                &state,
+                &snap,
+                crate::operation::CHAT,
+                event,
+                usage_event_labels("m", &ResolvedPk::unresolved()),
+                None,
+                None,
+                true,
+                false,
+            );
+            rx.try_recv()
+                .expect("the event reaches the sink")
+                .error_message
+        };
+        assert_eq!(emit(500, "", ""), "request failed with status 500");
+        assert_eq!(
+            emit(422, "some_class", ""),
+            "request failed with status 422"
+        );
+        assert_eq!(
+            emit(200, "some_class", ""),
+            "request failed with status 200"
+        );
+        assert_eq!(emit(500, "", " "), "request failed with status 500");
+        assert_eq!(emit(502, "some_class", "named"), "named");
+        assert_eq!(emit(200, "", ""), "");
+    }
+
+    #[test]
+    fn summed_upstream_total_stands_only_while_every_counting_report_carried_one() {
+        let with = |n: u64| serde_json::json!({ "input_tokens": 1, "total_tokens": n });
+        let without = serde_json::json!({ "input_tokens": 1 });
+
+        let mut all = ReportedTotalSum::default();
+        all.add(&with(4), true);
+        all.add(&with(6), true);
+        // A cancelled response's empty usage counted nothing.
+        all.add(&serde_json::Value::Null, false);
+        assert_eq!(all.recorded(), 10);
+
+        let mut gap = ReportedTotalSum::default();
+        gap.add(&with(4), true);
+        gap.add(&without, true);
+        gap.add(&with(6), true);
+        assert_eq!(gap.recorded(), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_event_receives_the_bounded_gateway_embedding_audit_once() {
+        let parent = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
+        crate::attribution::scope(parent, async {
+            for index in 0..=crate::attribution::MAX_GATEWAY_EMBEDDING_CALLS {
+                crate::attribution::note_gateway_embedding_call(aisix_obs::GatewayEmbeddingCall {
+                    count: 1,
+                    purpose: aisix_obs::GatewayEmbeddingPurpose::SemanticCache,
+                    embedding_model_id: format!("embed-{index}"),
+                    prompt_tokens: index as u32,
+                    total_tokens: index as u32,
+                    usage_source: aisix_obs::GatewayEmbeddingUsageSource::Reported,
+                    latency_ms: index as u32,
+                    outcome: aisix_obs::GatewayEmbeddingOutcome::Succeeded,
+                });
+            }
+
+            let mut terminal = UsageEvent::default();
+            attach_gateway_embedding_audit(&mut terminal);
+            assert_eq!(
+                terminal.gateway_embedding_calls.len(),
+                crate::attribution::MAX_GATEWAY_EMBEDDING_CALLS,
+            );
+            assert_eq!(
+                terminal.gateway_embedding_calls[0].embedding_model_id,
+                "embed-0"
+            );
+            assert_eq!(terminal.gateway_embedding_calls_dropped, 1);
+
+            let mut duplicate_terminal = UsageEvent::default();
+            attach_gateway_embedding_audit(&mut duplicate_terminal);
+            assert!(duplicate_terminal.gateway_embedding_calls.is_empty());
+            assert_eq!(duplicate_terminal.gateway_embedding_calls_dropped, 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn terminal_usage_event_replaces_an_unsafe_embedding_model_id_with_unknown() {
+        let parent = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
+        crate::attribution::scope(parent, async {
+            crate::attribution::note_gateway_embedding_call(aisix_obs::GatewayEmbeddingCall {
+                count: 1,
+                purpose: aisix_obs::GatewayEmbeddingPurpose::SemanticRoute,
+                embedding_model_id: "界".repeat(100),
+                prompt_tokens: 1,
+                total_tokens: 1,
+                usage_source: aisix_obs::GatewayEmbeddingUsageSource::Reported,
+                latency_ms: 1,
+                outcome: aisix_obs::GatewayEmbeddingOutcome::Succeeded,
+            });
+
+            let mut terminal = UsageEvent::default();
+            attach_gateway_embedding_audit(&mut terminal);
+            let model_id = &terminal.gateway_embedding_calls[0].embedding_model_id;
+            assert_eq!(model_id, "unknown");
+        })
+        .await;
+    }
+
     #[test]
     fn live_exporters_uses_current_membership_when_the_request_started_empty() {
         let frozen = AisixSnapshot::new();
@@ -705,13 +1799,15 @@ mod tests {
             std::sync::Arc::new(aisix_gateway::Hub::new()),
             &aisix_core::ProxyConfig {
                 addr: "127.0.0.1:0".into(),
-                request_body_limit_bytes: None,
+                request_body_limit_bytes: 0,
                 tls: None,
                 real_ip: Default::default(),
                 request_id: Default::default(),
                 thread_per_core: None,
                 workers: None,
                 url_rewrites: Vec::new(),
+                expose_debug_headers: false,
+                listeners: Vec::new(),
             },
         );
         let current = AisixSnapshot::new();
@@ -855,10 +1951,75 @@ mod tests {
             ResolvedPk::resolve(&snap, PK_ID),
         ] {
             assert_eq!(pk.labels().name, "unknown");
+            // AISIX-Cloud#1403: same fallback, same reason — a request
+            // that reached no key reached no protocol either.
+            assert_eq!(pk.labels().protocol, "unknown");
             assert_eq!(pk.telemetry_tags(), aisix_core::TelemetryTags::default());
         }
         assert_eq!(PkLabels::default().id, "unknown");
         assert_eq!(PkLabels::default().name, "unknown");
+        assert_eq!(PkLabels::default().protocol, "unknown");
+    }
+
+    /// AISIX-Cloud#1403: the protocol is read off the SAME row as the id
+    /// and the name, on the one lookup this type exists to make, so the
+    /// three can never describe different keys.
+    #[test]
+    fn resolved_key_carries_its_upstream_protocol() {
+        let snap = snap_with_pk("prod-openai", "");
+        let pk = ResolvedPk::resolve(&snap, PK_ID);
+        assert_eq!(pk.labels().id, PK_ID);
+        assert_eq!(pk.labels().protocol, "openai");
+
+        // A key whose vendor has no specialized bridge takes its
+        // adapter's wire value.
+        let json = r#"{"display_name":"byo-anthropic","secret":"sk","provider":"byo","adapter":"anthropic"}"#;
+        let byo: ProviderKey = serde_json::from_str(json).unwrap();
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(ResourceEntry::new(PK_ID, byo, 1));
+        assert_eq!(
+            ResolvedPk::resolve(&snap, PK_ID).labels().protocol,
+            "anthropic",
+            "an open vendor string cannot stand in for the adapter"
+        );
+    }
+
+    /// …and the usage-event counter's label set is built off that same
+    /// resolved key, so `aisix_usage_events_emitted_total` reports the
+    /// protocol of the key its `provider_key_id` names.
+    ///
+    /// It was the one family carrying `inbound_protocol` that had the
+    /// value in hand and did not emit it (found in 0.11.0-rc.2 QA), which
+    /// left it unjoinable with the families that did:
+    /// `sum by (upstream_protocol)` returned an aggregate with this
+    /// counter silently missing from it.
+    #[test]
+    fn usage_event_labels_carry_the_resolved_upstream_protocol() {
+        let snap = snap_with_pk("prod-openai", "");
+        let pk = ResolvedPk::resolve(&snap, PK_ID);
+        let labels = usage_event_labels("gpt-4o", &pk);
+        assert_eq!(labels.provider_key_id, PK_ID);
+        assert_eq!(labels.provider_key_name, "prod-openai");
+        // The UPSTREAM's protocol. An Anthropic-protocol caller served by
+        // this key must still read `openai` here — the inbound protocol
+        // travels on its own label.
+        assert_eq!(labels.upstream_protocol, "openai");
+
+        // Nothing resolved: `unknown`, matching the id/name fallback
+        // beside it and the value the request families use for a
+        // pre-dispatch rejection.
+        let unresolved = ResolvedPk::unresolved();
+        let labels = usage_event_labels("unknown", &unresolved);
+        assert_eq!(labels.provider_key_id, UNKNOWN_PK);
+        assert_eq!(labels.upstream_protocol, "unknown");
+
+        // A deleted id keeps reaching the label verbatim, but there is no
+        // row left to read a protocol off.
+        let empty = AisixSnapshot::new();
+        let gone = ResolvedPk::resolve(&empty, "pk-deleted");
+        let labels = usage_event_labels("gpt-4o", &gone);
+        assert_eq!(labels.provider_key_id, "pk-deleted");
+        assert_eq!(labels.upstream_protocol, "unknown");
     }
 
     /// The id reaches the label verbatim even when it resolves to nothing —
@@ -912,5 +2073,490 @@ mod tests {
 
         let snap = snap_with_pk("\u{1}\u{2}", "");
         assert_eq!(ResolvedPk::resolve(&snap, PK_ID).labels().name, "unknown");
+    }
+
+    /// Every `UsageEvent` this crate builds must set
+    /// `guardrail_bypassed_reason` and `applied_guardrails`, and an emitter
+    /// that genuinely has no chain behind it must say so where it is
+    /// written.
+    ///
+    /// Both fields default to empty, so an emitter that forgets one reports
+    /// "nothing was bypassed" for a request that went upstream unscreened,
+    /// or "no guardrail governed this" for one a guardrail refused — and no
+    /// behavioural test can see the omission, because an unset field and an
+    /// unguarded request produce the same row. That is exactly how the
+    /// bypass reason spent its whole life written on
+    /// `/v1/chat/completions` and nowhere else, and how every
+    /// single-attempt failure row lost its applied set (api7/aisix#1030).
+    ///
+    /// A parse of the source rather than a list of emitters, for the reason
+    /// `guardrail_coverage` parses the router instead of listing routes: a
+    /// hand-written list nobody updates agrees with itself forever, and the
+    /// emitter family here has sixteen members that keep gaining a
+    /// seventeenth.
+    #[test]
+    fn every_usage_event_this_crate_builds_answers_the_guardrail_questions() {
+        /// Written inside an emitter that has no guardrail chain behind it
+        /// at all, followed by why.
+        const EXEMPT: &str = "NO-GUARDRAIL-CHAIN:";
+
+        let literals = usage_event_literals();
+        let blocks = literals.len();
+        let mut missing = Vec::new();
+        for (site, block) in &literals {
+            if block.contains(EXEMPT) {
+                continue;
+            }
+            for field in ["guardrail_bypassed_reason", "applied_guardrails"] {
+                if !sets_field(block, field) {
+                    missing.push(format!("{site} ({field})"));
+                }
+            }
+        }
+
+        // The parse must actually find the emitters, not silently yield an
+        // empty set that makes the assertion below vacuous.
+        // The crate's real count. A floor rather than an equality so
+        // adding an emitter does not fail here (the `missing` check
+        // already governs a new one) — but losing four to a parse that
+        // quietly stopped matching is the drift this exists to catch.
+        assert!(
+            blocks >= 18,
+            "the UsageEvent literal scan found only {blocks} — it has stopped tracking the \
+             emitter family",
+        );
+        assert!(
+            missing.is_empty(),
+            "these UsageEvent emitters neither set the named field nor carry a \
+             `{EXEMPT} <why>` comment saying they have no guardrail chain: {missing:?}\n\
+             An unset field reads as an unguarded request, so an emitter that skips it makes \
+             the field unusable as a negative answer.",
+        );
+    }
+
+    /// Every `UsageEvent` this crate builds carries the request's
+    /// `request_headers`, so the operator-selected headers reach every
+    /// event of every family — success, failure, per-attempt, cancel, and
+    /// the after-the-fact batch rows alike. An emitter that forgot it would
+    /// export rows silently missing the attribution, which no test of
+    /// another family can see.
+    #[test]
+    fn every_usage_event_this_crate_builds_carries_the_request_headers() {
+        let literals = usage_event_literals();
+        assert!(
+            literals.len() >= 18,
+            "the UsageEvent literal scan found only {}",
+            literals.len()
+        );
+        // The cancel emitter's literals spread a base event that sets it.
+        let missing: Vec<&str> = literals
+            .iter()
+            .filter(|(_, block)| {
+                !sets_field(block, "request_headers") && !block.contains("..base_event(")
+            })
+            .map(|(site, _)| site.as_str())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these UsageEvent literals do not set request_headers: {missing:?}"
+        );
+    }
+
+    /// Every `UsageEvent` this crate builds carries the caller identity —
+    /// the member, the team and the request's effective cost-attribution
+    /// tags — so every row of a request (each attempt, the terminal and
+    /// cancel rows, the after-the-fact batch rows) is attributed alike. The
+    /// fields default to empty, which reads as "no team, no tags" rather
+    /// than as a missing stamp, so no behavioural test of another family
+    /// can see an emitter that forgot it.
+    ///
+    /// The stamp is `apply_caller_identity`, called on the built event in
+    /// the rest of the block the literal sits in; the cancel emitter's
+    /// literals spread a base event that calls it. An emitter with no
+    /// authenticated caller behind it says so with a `NO-CALLER-IDENTITY:`
+    /// comment.
+    #[test]
+    fn every_usage_event_this_crate_builds_carries_the_caller_identity() {
+        const EXEMPT: &str = "NO-CALLER-IDENTITY:";
+        let literals = usage_event_literals_in_context();
+        assert!(
+            literals.len() >= 18,
+            "the UsageEvent literal scan found only {}",
+            literals.len()
+        );
+        let missing: Vec<&str> = literals
+            .iter()
+            .filter(|(_, block, rest)| {
+                !block.contains("..base_event(")
+                    && !block.contains(EXEMPT)
+                    && !rest.contains("apply_caller_identity(")
+            })
+            .map(|(site, _, _)| site.as_str())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these UsageEvent literals are never handed to apply_caller_identity: {missing:?}"
+        );
+    }
+
+    /// [`usage_event_literals`] with, for each, the rest of the innermost
+    /// block the literal sits in — where the event it builds is stamped.
+    fn usage_event_literals_in_context() -> Vec<(String, String, String)> {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        for path in crate_rs_files(&src_dir) {
+            let src = std::fs::read_to_string(&path).expect("source must read");
+            let name = path
+                .strip_prefix(&src_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            let code = code_mask(&src);
+            for (idx, _) in src.match_indices("UsageEvent {") {
+                if !code[idx] {
+                    continue;
+                }
+                let before = src[..idx]
+                    .trim_end()
+                    .trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':')
+                    .trim_end();
+                if before.ends_with("->") {
+                    continue;
+                }
+                let open = idx + "UsageEvent ".len();
+                let block = braced_block(&src, &code, open).expect("balanced literal");
+                let after = open + block.len();
+                let b = src.as_bytes();
+                let mut depth = 0i64;
+                let mut end = b.len();
+                for i in after..b.len() {
+                    if !code[i] {
+                        continue;
+                    }
+                    match b[i] {
+                        b'{' => depth += 1,
+                        b'}' if depth == 0 => {
+                            end = i;
+                            break;
+                        }
+                        b'}' => depth -= 1,
+                        _ => {}
+                    }
+                }
+                let line = src[..idx].lines().count();
+                out.push((
+                    format!("{name}:{line}"),
+                    block.to_string(),
+                    src[after..end].to_string(),
+                ));
+            }
+        }
+        out
+    }
+
+    /// Every `UsageEvent { .. }` literal in this crate's source, as
+    /// `("<file>:<line>", block)`. A parse of the source rather than a list
+    /// of emitters — see the guardrail census above for why.
+    fn usage_event_literals() -> Vec<(String, String)> {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        for path in crate_rs_files(&src_dir) {
+            let src = std::fs::read_to_string(&path).expect("source must read");
+            let name = path
+                .strip_prefix(&src_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            let code = code_mask(&src);
+            for (idx, _) in src.match_indices("UsageEvent {") {
+                // Skip anything that is not Rust code: this file writes the
+                // token it searches for in a string literal and in a
+                // comment, and both would otherwise be counted as emitters
+                // — a check inflating its own coverage.
+                if !code[idx] {
+                    continue;
+                }
+                // `-> UsageEvent {` (optionally path-qualified) is a
+                // return type followed by a function body, not a literal.
+                let before = src[..idx]
+                    .trim_end()
+                    .trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':')
+                    .trim_end();
+                if before.ends_with("->") {
+                    continue;
+                }
+                let open = idx + "UsageEvent ".len();
+                let Some(block) = braced_block(&src, &code, open) else {
+                    panic!("{name}: unbalanced UsageEvent literal at byte {idx}");
+                };
+                let line = src[..idx].lines().count();
+                out.push((format!("{name}:{line}"), block.to_string()));
+            }
+        }
+        out
+    }
+
+    /// Every `.rs` file under `dir`, sorted. Recursive: `src/` is flat
+    /// today, and a refactor that moved a handler into a subdirectory would
+    /// otherwise take its emitter out of scope while a scan stayed green.
+    fn crate_rs_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let entries = std::fs::read_dir(dir).expect("the crate's own src/ must be readable");
+            for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(dir, &mut files);
+        files.sort();
+        files
+    }
+
+    /// Every `occurred_at` this crate stamps goes through
+    /// `UsageEvent::occurred_at_now`, so the whole emitter family writes one
+    /// format (millisecond RFC 3339, AISIX-Cloud#1368). A hand-rolled
+    /// `to_rfc3339_opts` at one site would put a second-precision stamp back
+    /// on that surface, and nothing downstream rejects it: it still parses,
+    /// it just ties with every other row of the same second.
+    #[test]
+    fn every_occurred_at_is_stamped_by_the_shared_helper() {
+        const HELPER: &str = "occurred_at: aisix_obs::UsageEvent::occurred_at_now()";
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stamped = 0usize;
+        let mut hand_rolled = Vec::new();
+        for path in crate_rs_files(&src_dir) {
+            let src = std::fs::read_to_string(&path).expect("source must read");
+            let code = code_mask(&src);
+            for (idx, _) in src.match_indices("occurred_at:") {
+                if !code[idx] {
+                    continue;
+                }
+                if src[idx..].starts_with(HELPER) {
+                    stamped += 1;
+                } else {
+                    let line = src[..idx].lines().count();
+                    hand_rolled.push(format!("{}:{line}", path.display()));
+                }
+            }
+        }
+        // The crate's real count is twenty; a floor keeps the scan from
+        // passing vacuously if it stops matching.
+        assert!(
+            stamped >= 20,
+            "the occurred_at scan found only {stamped} stamps"
+        );
+        assert!(
+            hand_rolled.is_empty(),
+            "these sites set occurred_at without UsageEvent::occurred_at_now: {hand_rolled:?}",
+        );
+    }
+
+    /// A byte mask over `src` marking the bytes that are Rust CODE —
+    /// false inside string literals (raw ones included), char literals,
+    /// line comments and nestable block comments.
+    ///
+    /// A real lexer pass rather than a per-line heuristic. The heuristic
+    /// this replaces judged a match by whether its line prefix held a `//`
+    /// or an odd number of quotes, which gets two things wrong that occur
+    /// in ordinary code: a literal after a completed string on the same
+    /// line (`let u = "https://x"; ... UsageEvent {`) reads as commented
+    /// out, and an escaped quote miscounts the parity.
+    fn code_mask(src: &str) -> Vec<bool> {
+        #[derive(Clone, Copy)]
+        enum St {
+            Code,
+            Str,
+            Raw(usize),
+            Char,
+            Line,
+            Block(usize),
+        }
+        let b = src.as_bytes();
+        let mut mask = vec![false; b.len()];
+        let mut st = St::Code;
+        let mut i = 0;
+        while i < b.len() {
+            match st {
+                St::Code => {
+                    mask[i] = true;
+                    match b[i] {
+                        b'/' if b.get(i + 1) == Some(&b'/') => {
+                            st = St::Line;
+                            mask[i] = false;
+                        }
+                        b'/' if b.get(i + 1) == Some(&b'*') => {
+                            st = St::Block(1);
+                            mask[i] = false;
+                            i += 2;
+                            continue;
+                        }
+                        b'"' => st = St::Str,
+                        // A char literal is `'x'` or `'\\n'`; anything
+                        // else starting with a quote is a LIFETIME
+                        // (`&'a str`), and treating one as a literal
+                        // swallows every byte up to the next apostrophe.
+                        b'\'' if b.get(i + 1) == Some(&b'\\') || b.get(i + 2) == Some(&b'\'') => {
+                            st = St::Char
+                        }
+                        b'r' => {
+                            // `r"…"` / `r#"…"#`, but not an identifier
+                            // ending in `r`, and not a lifetime.
+                            let prev_ident =
+                                i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+                            let mut j = i + 1;
+                            while b.get(j) == Some(&b'#') {
+                                j += 1;
+                            }
+                            if !prev_ident && b.get(j) == Some(&b'"') {
+                                st = St::Raw(j - i - 1);
+                                i = j + 1;
+                                continue;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                St::Str => {
+                    if b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'"' {
+                        st = St::Code;
+                    }
+                }
+                St::Raw(hashes) => {
+                    if b[i] == b'"' && b[i + 1..].iter().take(hashes).all(|c| *c == b'#') {
+                        st = St::Code;
+                        i += hashes + 1;
+                        continue;
+                    }
+                }
+                St::Char => {
+                    if b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'\'' {
+                        st = St::Code;
+                    }
+                }
+                St::Line => {
+                    if b[i] == b'\n' {
+                        st = St::Code;
+                    }
+                }
+                St::Block(depth) => {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        st = St::Block(depth + 1);
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        st = if depth == 1 {
+                            St::Code
+                        } else {
+                            St::Block(depth - 1)
+                        };
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+        mask
+    }
+
+    /// Whether an emitter block ASSIGNS `field`, rather than merely
+    /// mentioning it.
+    ///
+    /// `block.contains(field)` would be satisfied by a comment, and by
+    /// `guardrail_bypassed_reason: String::new()` — which is exactly the
+    /// shape of a reverted fix, so the check would have been unfalsifiable
+    /// in the one dimension it is here to guard.
+    fn sets_field(block: &str, field: &str) -> bool {
+        let Some(at) = block
+            .find(&format!("{field}:"))
+            .or_else(|| block.find(&format!("{field},")))
+        else {
+            return false;
+        };
+        let rest = &block[at + field.len()..];
+        // Field-init shorthand (`guardrail_bypassed_reason,`) takes its
+        // value from a binding, which cannot be an inline empty literal.
+        let Some(rest) = rest.strip_prefix(':') else {
+            return rest.starts_with(',');
+        };
+        // Values run to the end of their line, except the one that wraps
+        // onto continuation lines — whose first line is a receiver, which
+        // is non-empty and passes for the right reason.
+        let value = rest
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches(',')
+            .trim();
+        !matches!(
+            value,
+            "" | "\"\""
+                | "String::new()"
+                | "String::default()"
+                | "Default::default()"
+                | "Vec::new()"
+                | "vec![]"
+        )
+    }
+
+    /// The `{ … }` at `open`, skipping braces the mask says are not code.
+    fn braced_block<'a>(src: &'a str, code: &[bool], open: usize) -> Option<&'a str> {
+        let b = src.as_bytes();
+        assert_eq!(b[open], b'{');
+        let mut depth = 0usize;
+        for i in open..b.len() {
+            if !code[i] {
+                continue;
+            }
+            match b[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&src[open..=i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The mask is load-bearing for the guard above, so it is pinned
+    /// directly: every one of these would be a false positive or a false
+    /// negative under the line-prefix heuristic it replaces.
+    #[test]
+    fn the_code_mask_excludes_strings_comments_and_raw_strings() {
+        let at = |src: &str, needle: &str| {
+            let m = code_mask(src);
+            m[src.find(needle).expect("needle must appear")]
+        };
+        assert!(at("let x = 1; UsageEvent {}", "UsageEvent"));
+        assert!(!at("let s = \"UsageEvent {\";", "UsageEvent"));
+        assert!(!at("// UsageEvent {", "UsageEvent"));
+        assert!(!at("/* a /* b */ UsageEvent */", "UsageEvent"));
+        assert!(!at("let s = r#\"UsageEvent {\"#;", "UsageEvent"));
+        // The two the heuristic got wrong: a completed string earlier on
+        // the line, and an escaped quote inside one.
+        assert!(at("let u = \"https://x\"; UsageEvent {}", "UsageEvent"));
+        assert!(at("let e = \"a\\\"b\"; UsageEvent {}", "UsageEvent"));
+        // A char literal must not open a string, and an identifier ending
+        // in `r` must not open a raw string.
+        assert!(at("let c = '\"'; UsageEvent {}", "UsageEvent"));
+        assert!(at("let var = 1; UsageEvent {}", "UsageEvent"));
     }
 }

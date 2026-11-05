@@ -307,7 +307,33 @@ fn canonical_extras(extra: &serde_json::Map<String, serde_json::Value>) -> Vec<(
 }
 
 fn canonical_json_string(value: &serde_json::Value) -> String {
-    canonicalise(value).to_string()
+    serde_json::to_string(&Canonical(value)).unwrap_or_default()
+}
+
+/// Serializes a value with every nested object's keys in sorted order —
+/// the same text as `canonicalise(value).to_string()`, written straight
+/// from the borrowed value. A content-block array can carry megabytes of
+/// base64 images, and a canonicalised clone of it would be one more copy
+/// of the request for the sake of a hash input.
+struct Canonical<'a>(&'a serde_json::Value);
+
+impl serde::Serialize for Canonical<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self.0 {
+            serde_json::Value::Object(map) => {
+                let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+                let mut out = serializer.serialize_map(Some(entries.len()))?;
+                for (k, v) in entries {
+                    out.serialize_entry(k, &Canonical(v))?;
+                }
+                out.end()
+            }
+            serde_json::Value::Array(items) => serializer.collect_seq(items.iter().map(Canonical)),
+            other => other.serialize(serializer),
+        }
+    }
 }
 
 /// Return a clone of `value` with every nested object's keys reordered
@@ -344,7 +370,8 @@ fn message_pair(m: &ChatMessage) -> (String, String) {
     // (sorted keys at every nesting level) so JSON-key-order
     // differences don't cause spurious cache misses.
     let content_repr = match m.content_blocks.as_ref() {
-        Some(blocks) => canonical_json_string(&serde_json::Value::Array(blocks.clone())),
+        Some(blocks) => serde_json::to_string(&blocks.iter().map(Canonical).collect::<Vec<_>>())
+            .unwrap_or_default(),
         None => m.content_str().to_string(),
     };
     // Message-level identity beyond the content changes what the
@@ -384,18 +411,19 @@ fn role_str(role: Role) -> &'static str {
         Role::User => "user",
         Role::Assistant => "assistant",
         Role::Tool => "tool",
+        Role::Function => "function",
     }
 }
 
-/// Convert an f32 in [0.0, 1.0]-ish range to a u32 in milli units.
+/// Convert an f64 in [0.0, 1.0]-ish range to a u32 in milli units.
 /// Saturates negatives at 0 and >65 at u32::MAX-ish; collisions on weird
 /// values are fine — the cache just doesn't help that request.
-fn quantise_milli(v: f32) -> u32 {
+fn quantise_milli(v: f64) -> u32 {
     if v.is_nan() || v.is_sign_negative() {
         return 0;
     }
     let scaled = v * 1_000.0;
-    if scaled > u32::MAX as f32 {
+    if scaled > f64::from(u32::MAX) {
         u32::MAX
     } else {
         scaled as u32
@@ -451,9 +479,26 @@ mod tests {
             "only the messages changed"
         );
     }
+
+    #[test]
+    fn canonical_serialization_matches_a_canonicalised_copy() {
+        // Written straight from the borrowed value, it must produce the
+        // exact text the canonicalised clone did — the fingerprint of every
+        // stored entry depends on it.
+        let v = serde_json::json!([
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA", "detail": "high"}},
+            {"z": [ {"b": 1, "a": {"y": null, "x": [true, 1.5, "s"]}} ], "a": "text"}
+        ]);
+        assert_eq!(canonical_json_string(&v), canonicalise(&v).to_string());
+        let blocks = v.as_array().unwrap();
+        assert_eq!(
+            serde_json::to_string(&blocks.iter().map(Canonical).collect::<Vec<_>>()).unwrap(),
+            canonicalise(&v).to_string()
+        );
+    }
     use super::*;
 
-    fn req(model: &str, messages: Vec<ChatMessage>, temp: Option<f32>) -> ChatFormat {
+    fn req(model: &str, messages: Vec<ChatMessage>, temp: Option<f64>) -> ChatFormat {
         let mut f = ChatFormat::new(model, messages);
         f.temperature = temp;
         f
@@ -476,6 +521,16 @@ mod tests {
         assert_ne!(
             CacheKey::from_request(&a).fingerprint(),
             CacheKey::from_request(&b).fingerprint(),
+        );
+    }
+
+    #[test]
+    fn developer_and_system_roles_have_distinct_fingerprints() {
+        let system = req("m", vec![ChatMessage::system("same")], None);
+        let developer = req("m", vec![ChatMessage::developer("same")], None);
+        assert_ne!(
+            CacheKey::from_request(&system).fingerprint(),
+            CacheKey::from_request(&developer).fingerprint(),
         );
     }
 
@@ -674,11 +729,11 @@ mod tests {
 
     #[test]
     fn quantise_handles_pathological_floats() {
-        assert_eq!(quantise_milli(f32::NAN), 0);
+        assert_eq!(quantise_milli(f64::NAN), 0);
         assert_eq!(quantise_milli(-1.0), 0);
         assert_eq!(quantise_milli(0.0), 0);
         assert_eq!(quantise_milli(0.5), 500);
-        assert_eq!(quantise_milli(f32::INFINITY), u32::MAX);
+        assert_eq!(quantise_milli(f64::INFINITY), u32::MAX);
     }
 
     #[test]

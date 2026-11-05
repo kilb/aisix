@@ -78,7 +78,7 @@ fn cache_lifetime(expires_in_secs: u64) -> Duration {
 /// AAD app-registration credentials for the `client_credentials`
 /// grant. Field names match the JSON shape an operator pastes
 /// directly from the Azure portal's "Certificates & secrets" view.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub(crate) struct AadCredentials {
     /// AAD tenant UUID (or vanity domain). Embedded in the token
     /// endpoint URL path.
@@ -103,6 +103,25 @@ pub(crate) struct AadCredentials {
     /// `/oauth2/v2.0/token` path itself.
     #[serde(default)]
     pub authority_host: Option<String>,
+}
+
+// Hand-written: the client secret must never print, and `authority_host` may
+// carry a configured `user:pass@`.
+impl std::fmt::Debug for AadCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AadCredentials")
+            .field("tenant_id", &self.tenant_id)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"***")
+            .field(
+                "authority_host",
+                &self
+                    .authority_host
+                    .as_deref()
+                    .map(aisix_gateway::redact_url_for_log),
+            )
+            .finish()
+    }
 }
 
 impl AadCredentials {
@@ -142,26 +161,27 @@ impl AadCredentials {
         // Optional authority_host: when present it becomes the origin
         // of the token-endpoint URL, so it must be a bare http(s)
         // origin. Mirrors the Vertex `resolve_api_base` validation
-        // (PR #392) — reject userinfo / query / fragment first (fixed
-        // message, no echo, so pasted `user:pass@host` credentials
-        // never surface in logs), then enforce the scheme.
+        // (PR #392) — reject query / fragment first (fixed message, no
+        // echo), then enforce the scheme. Userinfo is accepted and used as
+        // configured, so everything below quotes the value without it.
         if let Some(host) = self
             .authority_host
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            if host.contains('@') || host.contains('?') || host.contains('#') {
+            if host.contains('?') || host.contains('#') {
                 return Err(BridgeError::InvalidUpstreamConfig(
                     "azure aad credentials.authority_host must be a bare origin — \
-                     reject userinfo (@), query (?), fragment (#)"
+                     reject query (?), fragment (#)"
                         .into(),
                 ));
             }
             if !(host.starts_with("https://") || host.starts_with("http://")) {
+                let shown = aisix_gateway::redact_userinfo(host);
                 return Err(BridgeError::InvalidUpstreamConfig(format!(
                     "azure aad credentials.authority_host must use http:// or https:// \
-                     scheme, got {host:?}"
+                     scheme, got {shown:?}"
                 )));
             }
             // Reject an embedded path component — only `scheme://host[:port]`
@@ -171,17 +191,17 @@ impl AadCredentials {
             // `resolve_api_base` check. Backslashes are rejected too: the
             // WHATWG URL parser the HTTP client uses normalizes `\` to `/` on
             // http(s) URLs, so `host\evil` injects a path exactly like
-            // `host/evil`. `host` has no `@`/`?`/`#` here, so echoing it is
-            // safe. Audit #434 LOW-1 / #435 (+ #464 audit MEDIUM).
+            // `host/evil`. Audit #434 LOW-1 / #435 (+ #464 audit MEDIUM).
             let after_scheme = host
                 .split_once("://")
                 .map(|(_, rest)| rest)
                 .unwrap_or(host)
                 .trim_end_matches('/');
             if after_scheme.contains('/') || after_scheme.contains('\\') {
+                let shown = aisix_gateway::redact_url_for_log(host);
                 return Err(BridgeError::InvalidUpstreamConfig(format!(
                     "azure aad credentials.authority_host must be a bare origin \
-                     (scheme://host[:port]) with no path, got {host:?}"
+                     (scheme://host[:port]) with no path, got {shown:?}"
                 )));
             }
         }
@@ -323,6 +343,13 @@ impl TokenMinter {
             .send()
             .await
             .map_err(|e| {
+                // This text reaches the usage event, so the cause goes to the log alone.
+                tracing::warn!(
+                    error = %aisix_gateway::transport_error_message(&e),
+                    "azure aad token mint request failed",
+                );
+                let endpoint = aisix_gateway::redact_url_for_log(&endpoint);
+                let e = e.without_url();
                 BridgeError::Transport(format!("azure aad token mint POST {endpoint}: {e}"))
             })?;
 
@@ -330,12 +357,16 @@ impl TokenMinter {
         if !status.is_success() {
             // Read Retry-After BEFORE consuming the body.
             let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-            let body = resp.text().await.unwrap_or_default();
+            let body =
+                aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES)
+                    .await;
+            let text = String::from_utf8_lossy(body.whole()).into_owned();
+            let read_error = body.read_error;
             // Cap body to 500 chars. AAD error envelopes
             // `{error: "invalid_client", error_description: "..."}` are
             // operator-actionable; cap is defense-in-depth against a
             // mis-deployed front-door that returns an HTML error page.
-            let truncated: String = body.chars().take(500).collect();
+            let truncated: String = text.chars().take(500).collect();
             let msg = format!("azure aad token mint upstream returned HTTP {status}: {truncated}");
             // Mirror Vertex audit MEDIUM (ai-gateway#387): 5xx is
             // transient upstream — should surface UpstreamStatus
@@ -344,12 +375,14 @@ impl TokenMinter {
             // is operator-actionable, stays Config.
             return Err(if status.is_server_error() {
                 BridgeError::upstream_status_with_retry_after(status.as_u16(), msg, retry_after)
+                    .with_body_read_error(read_error)
             } else {
                 BridgeError::Config(msg)
             });
         }
         let parsed: TokenResponse = resp.json().await.map_err(|e| {
-            BridgeError::UpstreamDecode(format!("azure aad token mint response: {e}"))
+            aisix_gateway::log_body_read_causes(&e);
+            BridgeError::TokenExchangeDecode(format!("azure aad token mint response: {e}"))
         })?;
         Ok((parsed.access_token, parsed.expires_in))
     }
@@ -363,7 +396,7 @@ impl TokenMinter {
     ///   3. Default public-cloud authority `login.microsoftonline.com`.
     ///
     /// `authority_host` is validated by [`AadCredentials::validate`]
-    /// (bare http(s) origin, no userinfo / query / fragment) before
+    /// (bare http(s) origin, no query / fragment) before
     /// this runs, so the only normalisation needed here is trimming a
     /// trailing slash to avoid a `//{tenant}` double slash.
     fn resolve_token_endpoint(&self, creds: &AadCredentials) -> String {
@@ -401,7 +434,7 @@ mod tests {
 
     #[tokio::test]
     async fn mint_posts_client_credentials_grant_with_correct_scope() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let captured_body: Arc<std::sync::Mutex<Option<String>>> =
             Arc::new(std::sync::Mutex::new(None));
         let captured_for_responder = captured_body.clone();
@@ -435,9 +468,27 @@ mod tests {
         assert!(body.contains("scope=https%3A%2F%2Fcognitiveservices.azure.com%2F.default"));
     }
 
+    /// An unreadable token answer is not a model answer: nothing was
+    /// served or billed, so it must stay retryable rather than take the
+    /// never-retry rule an undecodable 2xx model response gets.
+    #[tokio::test]
+    async fn an_unreadable_token_answer_is_a_retryable_exchange_failure() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>proxy</html>"))
+            .mount(&server)
+            .await;
+        let minter = TokenMinter::new(Client::new()).with_token_endpoint_override(server.uri());
+        let err = minter.get_token(&sample_creds()).await.unwrap_err();
+        assert!(
+            matches!(err, BridgeError::TokenExchangeDecode(_)),
+            "got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn get_token_caches_within_ttl_and_only_calls_endpoint_once() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "aad.cache-hit",
@@ -461,7 +512,7 @@ mod tests {
     /// waiting on it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_get_token_mints_once_not_once_per_caller() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let mints = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = mints.clone();
         Mock::given(method("POST"))
@@ -505,7 +556,7 @@ mod tests {
     /// the identity provider.
     #[tokio::test]
     async fn a_short_lived_token_is_still_cached() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let mints = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = mints.clone();
         Mock::given(method("POST"))
@@ -537,7 +588,7 @@ mod tests {
         // a regression that keyed only by tenant_id would serve
         // app B's request app A's token (or vice versa). Pin the
         // separation explicitly.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("client_id=aaaa"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -584,7 +635,7 @@ mod tests {
         // serves the pre-rotation token for its full hour. The gateway
         // would keep authenticating with the secret the operator just
         // replaced, and report success while doing it.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("client_secret=secret-old"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -629,7 +680,7 @@ mod tests {
         // authority_host selects which AAD cloud minted the token, so a
         // public-cloud token must never be served to a sovereign-cloud
         // request that happens to share tenant_id + client_id.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "token-per-authority",
@@ -654,7 +705,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_endpoint_5xx_surfaces_as_upstream_status_with_retry_hint() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(503)
@@ -680,7 +731,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_endpoint_4xx_invalid_client_surfaces_as_config_error() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(401).set_body_string(
                 r#"{"error":"invalid_client","error_description":"AADSTS7000215: Invalid client secret provided"}"#,
@@ -700,7 +751,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_tenant_id_rejected_before_endpoint_call() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200))
             .expect(0)
@@ -727,7 +778,7 @@ mod tests {
         // A `/` in tenant_id could redirect the token POST to a path
         // the operator never authorized. validate() must catch this
         // before we interpolate into the URL.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200))
             .expect(0)
@@ -810,7 +861,7 @@ mod tests {
     /// authority_host) would not match and the mock would 404.
     #[tokio::test]
     async fn mint_via_production_authority_host_posts_to_interpolated_path() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(wiremock::matchers::path("/tenant-xyz/oauth2/v2.0/token"))
             .and(body_string_contains("grant_type=client_credentials"))
@@ -910,27 +961,119 @@ mod tests {
         }
     }
 
+    /// 项目所有者的决定：`authority_host` 里的 userinfo 照配置使用，但密码不能
+    /// 出现在任何展示出来的地方。接受这件事由下面上游的测试钉住，这里钉隐藏：
+    /// 仍被拒绝的写法不回显密码，`Debug` 也不打印它。
     #[test]
-    fn validate_rejects_authority_host_with_userinfo_without_echoing_it() {
+    fn an_authority_host_with_userinfo_is_never_displayed() {
+        let with_host = |host: &str| AadCredentials {
+            tenant_id: "t".into(),
+            client_id: "app".into(),
+            client_secret: "s3cret-value".into(),
+            authority_host: Some(host.into()),
+        };
+        for refused in [
+            "https://user:pass-9f2b@login.example.com/evil",
+            "https://user:pass-9f2b@login.example.com\\evil",
+            "https://user:pass-9f2b@login.example.com?x=1",
+            "https://user:pass-9f2b@login.example.com#frag",
+            "user:pass-9f2b@login.example.com",
+            "ftp://user:pass-9f2b@login.example.com",
+        ] {
+            let msg = with_host(refused)
+                .validate()
+                .expect_err("this shape stays refused")
+                .to_string();
+            assert!(!msg.contains("pass-9f2b"), "{refused}: {msg}");
+        }
+
+        let debug = format!(
+            "{:?}",
+            with_host("https://user:pass-9f2b@login.example.com")
+        );
+        assert!(!debug.contains("pass-9f2b"), "{debug}");
+        assert!(!debug.contains("s3cret-value"), "{debug}");
+        assert!(debug.contains("https://login.example.com/"), "{debug}");
+    }
+
+    /// A mint against a `user:pass@` authority that cannot be reached: the
+    /// `Transport` text reaches the usage event, the cause goes to the log, and
+    /// neither names the password.
+    #[tokio::test]
+    async fn a_failed_mint_against_a_userinfo_authority_hides_the_password() {
+        let closed = refused_url("");
+        let host = closed.replace("http://", "http://user:pass-9f2b@");
+        let creds = AadCredentials {
+            authority_host: Some(host),
+            ..sample_creds()
+        };
+        let minter = TokenMinter::new(Client::new());
+        let (result, logged) = capture_logs(minter.get_token(&creds)).await;
+        let Err(BridgeError::Transport(text)) = result else {
+            panic!("expected a transport failure, got {result:?}");
+        };
+        assert!(text.starts_with("azure aad token mint POST"), "{text}");
+        assert!(!text.contains("pass-9f2b"), "{text}");
+        assert!(!logged.contains("pass-9f2b"), "{logged}");
+    }
+
+    #[test]
+    fn validate_accepts_authority_host_with_userinfo() {
         let creds = AadCredentials {
             tenant_id: "t".into(),
             client_id: "app".into(),
             client_secret: "s".into(),
-            authority_host: Some("https://user:pass@evil.example.com".into()),
+            authority_host: Some("https://user:pass@login.example.com".into()),
         };
-        let err = creds.validate().err().unwrap();
-        match err {
-            BridgeError::InvalidUpstreamConfig(msg) => {
-                assert!(msg.contains("bare origin"));
-                // The pasted userinfo must NOT surface in the error.
-                assert!(!msg.contains("pass"), "error leaked userinfo: {msg}");
-                assert!(
-                    !msg.contains("evil.example.com"),
-                    "error leaked host: {msg}"
-                );
+        creds.validate().expect("userinfo is part of an opaque URL");
+    }
+
+    /// Run `f` under a capturing subscriber; returns its result and what it logged.
+    async fn capture_logs<T>(f: impl std::future::Future<Output = T>) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
             }
-            other => panic!("expected InvalidUpstreamConfig, got {other:?}"),
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // A callsite first hit where no subscriber was set has cached "disabled".
+        tracing::callsite::rebuild_interest_cache();
+        let out = f.await;
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (out, logged)
+    }
+
+    /// A loopback address nothing listens on, so a connect is refused at once.
+    fn refused_url(path: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}{path}", listener.local_addr().unwrap())
+    }
+
+    /// The `Transport` text reaches the usage event; the cause goes to the log.
+    #[tokio::test]
+    async fn a_failed_mint_logs_its_cause_and_keeps_the_error_text() {
+        let minter =
+            TokenMinter::new(Client::new()).with_token_endpoint_override(refused_url("/token"));
+        let (result, logged) = capture_logs(minter.get_token(&sample_creds())).await;
+        let Err(BridgeError::Transport(text)) = result else {
+            panic!("expected a transport failure, got {result:?}");
+        };
+        assert!(logged.to_lowercase().contains("refused"), "{logged}");
+        assert!(text.starts_with("azure aad token mint POST"), "{text}");
+        assert!(!text.to_lowercase().contains("refused"), "{text}");
+        assert!(!logged.contains("fake-secret-not-a-real-one"), "{logged}");
     }
 
     /// The doc on `cache_key` asks the next person to add new fields to the

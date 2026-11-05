@@ -1,5 +1,5 @@
-//! kind=presidio guardrail dispatcher (#52) — self-hosted Microsoft
-//! Presidio PII detection + anonymization.
+//! kind=presidio guardrail dispatcher (#52) — PII detection +
+//! anonymization by a customer-run Presidio.
 //!
 //! Two-step API (customer-run containers, no vendor secret):
 //! - `POST {analyzer_url}/analyze` `{ text, language, entities?,
@@ -7,7 +7,7 @@
 //! - `POST {anonymizer_url}/anonymize` `{ text, analyzer_results,
 //!   anonymizers }` → `{ text, items: [{ entity_type, ... }] }`
 //!
-//! Source: <https://microsoft.github.io/presidio/api-docs/api-docs.html>
+//! Source: <https://presidio.dataprivacystack.org/api-docs/api-docs.html>
 //!
 //! Decision rule (per-entity actions, same shape as `kind: "pii"`):
 //! - any detected entity whose effective action is `block` → Block;
@@ -41,6 +41,7 @@
 //! | timeout                         | true        | Bypass { "presidio_timeout" }      |
 //! | 429 Throttling                  | true        | Bypass { "presidio_throttled" }    |
 //! | 5xx / IO error                  | true        | Bypass { "presidio_5xx" }          |
+//! | 413, or spaCy's E088 in the body | true       | Bypass { "presidio_too_large" }    |
 //! | 4xx (non-429, e.g. 400/404)     | true        | Bypass { "presidio_config_error" } |
 //! | any failure                     | false       | Block { "presidio unavailable …" } |
 
@@ -53,6 +54,7 @@ use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::call_error::{CallClock, CallFailure};
 use crate::pii::PiiAction;
 use crate::{Guardrail, GuardrailVerdict, SegmentsOutcome, StreamOutputPolicy};
 
@@ -90,7 +92,7 @@ pub struct PresidioGuardrail {
 /// The anonymizer operator payload for one operator name. Presidio's
 /// `/anonymize` takes `{"anonymizers": {"DEFAULT": { "type": ... }}}`;
 /// unknown names are rejected at build time (`BuildError::InvalidValue`).
-/// Source: <https://microsoft.github.io/presidio/anonymizer/>
+/// Source: <https://presidio.dataprivacystack.org/anonymizer/>
 pub fn operator_config(operator: &str) -> Option<serde_json::Value> {
     match operator {
         // Presidio's default: replace the span with `<ENTITY_TYPE>`.
@@ -168,7 +170,10 @@ impl PresidioGuardrail {
     /// `POST {analyzer_url}/analyze` for one text. Empty/whitespace-only
     /// text short-circuits to no results (Presidio 500s on it; LiteLLM
     /// skips it the same way).
-    async fn analyze(&self, text: &str) -> Result<Vec<AnalyzerResult>, PresidioFailure> {
+    async fn analyze(
+        &self,
+        text: &str,
+    ) -> Result<Vec<AnalyzerResult>, CallFailure<PresidioFailure>> {
         if text.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -189,7 +194,7 @@ impl PresidioGuardrail {
         &self,
         text: &str,
         results: &[AnalyzerResult],
-    ) -> Result<AnonymizeResponse, PresidioFailure> {
+    ) -> Result<AnonymizeResponse, CallFailure<PresidioFailure>> {
         let url = format!("{}/anonymize", self.anonymizer_url);
         let body = AnonymizeRequest {
             text,
@@ -203,38 +208,74 @@ impl PresidioGuardrail {
         &self,
         url: &str,
         body: &B,
-    ) -> Result<T, PresidioFailure> {
+    ) -> Result<T, CallFailure<PresidioFailure>> {
+        let mut clock = CallClock::start(self.timeout);
         let future = self.client.post(url).json(body).send();
-        let resp = match tokio::time::timeout(self.timeout, future).await {
-            Err(_elapsed) => return Err(PresidioFailure::Timeout),
-            Ok(Err(_e)) => return Err(PresidioFailure::IoError),
+        let resp = match clock.within(future).await {
+            Err(_elapsed) => return Err(clock.fail(PresidioFailure::Timeout)),
+            Ok(Err(e)) => return Err(clock.fail_with(PresidioFailure::IoError, &e)),
             Ok(Ok(r)) => r,
         };
+        clock.responded(resp.status());
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(PresidioFailure::Throttled);
+            return Err(clock.fail(PresidioFailure::Throttled));
+        }
+        if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+            return Err(clock.fail(PresidioFailure::TooLarge));
         }
         if status.is_server_error() {
-            return Err(PresidioFailure::ServerError);
+            // A 5xx is normally an outage, but a Presidio-style analyzer
+            // surfaces its NLP pipeline's own length ceiling as an
+            // unhandled error here — read the body before deciding which
+            // it was, so the operator is not sent after an outage that
+            // is really a payload the deployment cannot take.
+            let Ok(response_body) = clock
+                .within(crate::read_error_body_capped(resp, &self.row_name))
+                .await
+            else {
+                return Err(clock.fail(PresidioFailure::Timeout));
+            };
+            if crate::too_large::body_says_too_large(&response_body) {
+                tracing::error!(
+                    guardrail_name = %self.row_name,
+                    http_status = status.as_u16(),
+                    response_body = %response_body,
+                    "presidio refused the payload for its size",
+                );
+                return Err(clock.fail(PresidioFailure::TooLarge));
+            }
+            return Err(clock.fail(PresidioFailure::ServerError));
         }
         if !status.is_success() {
             // 4xx other than 429 — almost always a misconfiguration
             // (bad URL path, unsupported language, malformed entity list).
-            let response_body = crate::read_error_body_capped(resp).await;
+            let Ok(response_body) = clock
+                .within(crate::read_error_body_capped(resp, &self.row_name))
+                .await
+            else {
+                return Err(clock.fail(PresidioFailure::Timeout));
+            };
             tracing::error!(
-                row = %self.row_name,
+                guardrail_name = %self.row_name,
                 http_status = status.as_u16(),
-                url = %url,
+                url = %aisix_gateway::redact_url_for_log(url),
                 response_body = %response_body,
                 "presidio returned 4xx — check analyzer_url/anonymizer_url, language, and entities configuration",
             );
-            return Err(PresidioFailure::ConfigError);
+            if crate::too_large::body_says_too_large(&response_body) {
+                return Err(clock.fail(PresidioFailure::TooLarge));
+            }
+            return Err(clock.fail(PresidioFailure::ConfigError));
         }
-        resp.json().await.map_err(|_| PresidioFailure::ServerError)
+        match clock.within(resp.json()).await {
+            Ok(r) => r.map_err(|e| clock.fail_with(PresidioFailure::ServerError, &e)),
+            Err(_) => Err(clock.fail(PresidioFailure::Timeout)),
+        }
     }
 
     /// Analyze one text and fold the entity hits into a decision.
-    async fn decide(&self, text: &str) -> Result<TextDecision, PresidioFailure> {
+    async fn decide(&self, text: &str) -> Result<TextDecision, CallFailure<PresidioFailure>> {
         let results = self.analyze(text).await?;
         if results.is_empty() {
             return Ok(TextDecision::Clean);
@@ -335,21 +376,29 @@ impl PresidioGuardrail {
         ))
     }
 
-    fn handle_failure(&self, failure: PresidioFailure, fail_open: bool) -> GuardrailVerdict {
-        let tag = failure.bypass_tag();
+    fn handle_failure(
+        &self,
+        failure: CallFailure<PresidioFailure>,
+        fail_open: bool,
+    ) -> GuardrailVerdict {
+        let tag = failure.failure.bypass_tag();
         // ConfigError is already logged at error level in post_json().
-        if !matches!(failure, PresidioFailure::ConfigError) {
+        if !matches!(failure.failure, PresidioFailure::ConfigError) {
             tracing::warn!(
-                row = %self.row_name,
-                failure = ?failure,
+                guardrail_name = %self.row_name,
+                failure = ?failure.failure,
+                http_status = failure.http_status,
                 fail_open = fail_open,
+                error = failure.error.as_deref(),
+                error_kind = failure.error_kind.map(tracing::field::display),
+                elapsed_ms = failure.elapsed_ms,
                 "presidio call failed",
             );
         }
         if fail_open {
             GuardrailVerdict::Bypass { reason: tag.into() }
         } else {
-            GuardrailVerdict::block(format!("presidio unavailable ({tag})"))
+            GuardrailVerdict::block_unavailable(format!("presidio unavailable ({tag})"), tag)
         }
     }
 }
@@ -374,6 +423,11 @@ enum PresidioFailure {
     IoError,
     ServerError,
     ConfigError,
+    /// The provider refused the payload for its size. Distinct from
+    /// `ConfigError` and `Throttled` because the operator's fix is
+    /// different: neither fixing credentials nor waiting helps — the
+    /// request has to get smaller (AISIX-Cloud#1386).
+    TooLarge,
 }
 
 impl PresidioFailure {
@@ -383,6 +437,7 @@ impl PresidioFailure {
             Self::Throttled => "presidio_throttled",
             Self::IoError | Self::ServerError => "presidio_5xx",
             Self::ConfigError => "presidio_config_error",
+            Self::TooLarge => "presidio_too_large",
         }
     }
 }
@@ -441,7 +496,7 @@ impl Guardrail for PresidioGuardrail {
         )
     }
 
-    fn enforces_input(&self) -> bool {
+    fn runs_on_input(&self) -> bool {
         matches!(
             self.hook_point,
             GuardrailHookPoint::Input | GuardrailHookPoint::Both
@@ -449,7 +504,15 @@ impl Guardrail for PresidioGuardrail {
     }
 
     fn checks_input_remotely(&self) -> bool {
-        self.enforces_input()
+        self.runs_on_input()
+    }
+
+    fn fails_closed_on_input(&self) -> bool {
+        !self.fail_open
+    }
+
+    fn fails_closed_on_output(&self) -> bool {
+        !self.output_fail_open
     }
 
     /// Masking a streamed response requires the whole response held back —
@@ -581,7 +644,7 @@ mod tests {
 
     #[tokio::test]
     async fn clean_input_allows_without_anonymizer_call() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/analyze"))
             .and(body_partial_json(json!({
@@ -601,7 +664,7 @@ mod tests {
 
     #[tokio::test]
     async fn blocking_entity_blocks() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/analyze"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([
@@ -624,7 +687,7 @@ mod tests {
     async fn maskable_blob_path_blocks() {
         // The blob path has no write-back channel, so a maskable outcome
         // maps to Block there (kind=bedrock ANONYMIZE contract).
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/analyze"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([
@@ -643,8 +706,8 @@ mod tests {
 
     #[tokio::test]
     async fn segment_path_masks_via_anonymizer() {
-        let analyzer = MockServer::start().await;
-        let anonymizer = MockServer::start().await;
+        let analyzer = MockServer::builder().start().await;
+        let anonymizer = MockServer::builder().start().await;
         // Slot 0 is clean, slot 1 carries the email.
         Mock::given(method("POST"))
             .and(path("/analyze"))
@@ -689,7 +752,7 @@ mod tests {
 
     #[tokio::test]
     async fn segment_path_block_entity_short_circuits() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/analyze"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([
@@ -707,8 +770,8 @@ mod tests {
 
     #[tokio::test]
     async fn anonymizer_failure_does_not_release_unmasked_content() {
-        let analyzer = MockServer::start().await;
-        let anonymizer = MockServer::start().await;
+        let analyzer = MockServer::builder().start().await;
+        let anonymizer = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/analyze"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([
@@ -732,7 +795,7 @@ mod tests {
     async fn empty_text_skips_analyzer() {
         // No /analyze mock mounted — a call would 404 → ConfigError → Block,
         // so Allow proves empty slots never reach the analyzer.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let g = build(&server.uri(), &server.uri(), false);
         let out = g
             .moderate_input_segments(&[String::new(), "   ".to_owned()], None)
@@ -742,7 +805,7 @@ mod tests {
 
     #[tokio::test]
     async fn five_xx_fail_open_bypasses_fail_closed_blocks() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/analyze"))
             .respond_with(ResponseTemplate::new(503))
@@ -761,7 +824,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_error_4xx_tagged_separately() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/analyze"))
             .respond_with(ResponseTemplate::new(400))
@@ -791,7 +854,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_only_hook_skips_output() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let c = cfg(&server.uri(), &server.uri());
         let g = PresidioGuardrail::new(
             "t",
@@ -805,5 +868,88 @@ mod tests {
         assert!(!g.runs_on_output());
         let out = g.moderate_output_segments(&["x".to_owned()]).await;
         assert_eq!(out, SegmentsOutcome::allow());
+    }
+
+    /// The analyzer URL is configured and may carry `user:pass@`, and this is
+    /// the one log line that names it.
+    #[tokio::test]
+    async fn a_4xx_log_line_never_shows_a_password_in_the_configured_url() {
+        use crate::call_error::testing::*;
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400))
+            .mount(&server)
+            .await;
+        let uri = server.uri().replace("http://", "http://svc:url-LEAK@");
+        let logged = capture_logs(|| async {
+            let g = build(&uri, &uri, true);
+            let _ = g.check_input(&req(PROMPT_MARKER)).await;
+        })
+        .await;
+        assert!(logged.contains("presidio returned 4xx"), "{logged}");
+        assert!(logged.contains("127.0.0.1"), "{logged}");
+        assert!(!logged.contains("url-LEAK"), "{logged}");
+    }
+
+    /// A refused connection is logged with its cause, not just `IoError`
+    /// (AISIX-Cloud#1786).
+    #[tokio::test]
+    async fn refused_connection_logs_the_underlying_error() {
+        use crate::call_error::testing::*;
+        let endpoint = refused_endpoint();
+        let logged = capture_logs(|| async {
+            let g = build(&endpoint, &endpoint, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_refusal_logged(&logged, "presidio call failed", &[]);
+    }
+
+    /// A response that does not decode is logged with where it failed, and
+    /// none of the text it quoted.
+    #[tokio::test]
+    async fn undecodable_response_logs_the_underlying_error() {
+        use crate::call_error::testing::*;
+        let server = undecodable_server("DECODE-REQ-1").await;
+        let uri = server.uri();
+        let logged = capture_logs(|| async {
+            let g = build(&uri, &uri, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_decode_logged(&logged, "presidio call failed", "ServerError");
+    }
+
+    /// A 5xx is logged with its status (AISIX-Cloud#1786).
+    #[tokio::test]
+    async fn server_error_logs_the_status() {
+        use crate::call_error::testing::*;
+        let server = status_server(503).await;
+        let uri = server.uri();
+        let logged = capture_logs(|| async {
+            let g = build(&uri, &uri, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_status_logged(&logged, "presidio call failed", 503);
+    }
+
+    /// `timeout_ms` covers the response body, not just its headers: a body
+    /// that stalls ends the call as a timeout instead of hanging it.
+    #[tokio::test]
+    async fn stalled_body_times_out() {
+        use crate::call_error::testing::*;
+        let uri = stalled_body_server(200).await;
+        let logged = capture_logs(|| async {
+            let mut g = build(&uri, &uri, true);
+            g.timeout = Duration::from_millis(200);
+            let verdict =
+                tokio::time::timeout(Duration::from_secs(5), g.check_input(&req(PROMPT_MARKER)))
+                    .await
+                    .expect("the guardrail call must end at its own timeout");
+            assert!(verdict.is_bypass());
+        })
+        .await;
+        assert_stall_logged(&logged, "presidio call failed", 200);
     }
 }

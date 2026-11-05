@@ -4,7 +4,7 @@
 //! the `aisix-proxy::ProxyState::guardrail_index` resolves the
 //! applicable chain per request.
 //!
-//! P0b added `enforcement_mode`, `mandatory`, and `direction` columns
+//! P0b added `enforcement_mode` and `direction` columns
 //! to the CP `guardrails` table. P0c wires them to the kine payload
 //! and adds the `GuardrailAttachment` row type (`/aisix/<env>/guardrail_attachments/<uuid>`).
 //! The outer `Guardrail` struct accepts but defaults the three new fields
@@ -43,6 +43,9 @@
 //!     detection-only block.
 //!   * `presidio` — self-hosted Presidio analyze→anonymize; per-entity
 //!     `mask`/`block` + selectable anonymize operator.
+//!   * `custom` — operator-supplied script run in a sandboxed engine in the
+//!     DP process; reaches a screening service that speaks its own protocol
+//!     without a separate adapter deployment. Detection-only.
 //!
 //! See `aisix-guardrails/src/keyword.rs` for the runtime semantics
 //! the snapshot is parsed into.
@@ -66,6 +69,35 @@ pub enum GuardrailHookPoint {
     Both,
 }
 
+/// Which messages of a request an input guardrail considers — its window.
+/// What the guardrail reads inside the window depends on its kind.
+///
+/// IDE and agent clients replay the whole conversation on every call, so a
+/// rule that matched once keeps matching for the rest of the session even
+/// after the offending message is long past. `LatestTurn` narrows every
+/// input hook — the block check and the masking pass alike — to the part
+/// of the conversation the model has not answered yet.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardrailInputMessages {
+    /// The window is the whole request: system, developer, user, assistant
+    /// and tool messages alike.
+    #[default]
+    All,
+    /// The window is only the messages after the last assistant message,
+    /// with system and developer messages excluded — this turn's user
+    /// messages together with the tool results answering them. That
+    /// assistant message is looked for only before the request's final
+    /// message other than a system or developer one, so a trailing
+    /// assistant prefill stays inside the current turn. For a request
+    /// carrying no assistant message, the window is the whole request
+    /// apart from its system and developer messages. Messages the model has
+    /// already replied to are neither screened nor rewritten.
+    LatestTurn,
+}
+
 /// Literal or regular-expression pattern used by a keyword guardrail.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", content = "value", rename_all = "lowercase")]
@@ -78,7 +110,6 @@ pub enum KeywordPattern {
 
 /// Config block for `kind: "keyword"`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct KeywordConfig {
     /// Blocklist patterns. An empty list is valid and allows every
     /// request, equivalent to `enabled: false`.
@@ -87,7 +118,7 @@ pub struct KeywordConfig {
 
 /// AWS credentials for a Bedrock guardrail.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BedrockAWSCredentials {
     Static {
         /// AWS access key ID for static Bedrock guardrail credentials.
@@ -97,6 +128,57 @@ pub enum BedrockAWSCredentials {
         /// Bedrock. The gateway does not log the plaintext value.
         #[schemars(length(min = 1))]
         secret_access_key: String,
+        /// AWS session token that accompanies temporary access keys. The
+        /// gateway does not log the plaintext value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(min = 1))]
+        session_token: Option<String>,
+        /// ARN of an IAM role to assume with these credentials through
+        /// `sts:AssumeRole`. The temporary credentials are refreshed before
+        /// they expire. When the credentials already belong to this role,
+        /// they are used as they are.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(min = 1))]
+        role_arn: Option<String>,
+        /// External ID the role's trust policy requires. Requires `role_arn`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(min = 1))]
+        external_id: Option<String>,
+        /// Session name for the assumed role. Requires `role_arn`. When
+        /// omitted, the gateway generates one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(min = 1))]
+        role_session_name: Option<String>,
+    },
+    /// A Bedrock API key, sent as a bearer token instead of a SigV4
+    /// signature.
+    ApiKey {
+        /// Amazon Bedrock API key. The gateway does not log the plaintext
+        /// value.
+        #[schemars(length(min = 1))]
+        api_key: String,
+    },
+    /// Credentials from the gateway's own AWS environment: environment
+    /// variables, web identity (for example IRSA on EKS), the ECS
+    /// container credentials endpoint, or the EC2 instance profile.
+    /// Temporary credentials are refreshed before they expire.
+    DefaultChain {
+        /// ARN of an IAM role to assume with these credentials through
+        /// `sts:AssumeRole`. The temporary credentials are refreshed before
+        /// they expire. When the credentials already belong to this role,
+        /// they are used as they are.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(min = 1))]
+        role_arn: Option<String>,
+        /// External ID the role's trust policy requires. Requires `role_arn`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(min = 1))]
+        external_id: Option<String>,
+        /// Session name for the assumed role. Requires `role_arn`. When
+        /// omitted, the gateway generates one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(min = 1))]
+        role_session_name: Option<String>,
     },
 }
 
@@ -122,7 +204,6 @@ pub enum BedrockLatencyMode {
 /// projection time so the DP always holds plaintext in memory. The
 /// key is never logged.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct AzureContentSafetyConfig {
     /// Azure Cognitive Services resource endpoint, e.g.
     /// `https://my-resource.cognitiveservices.azure.com`.
@@ -158,7 +239,6 @@ fn default_acs_timeout_ms() -> u32 {
 /// default. Only `api_key` is a secret (decrypted by the control plane before kine
 /// projection). Every other field travels in the clear.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct AzureContentSafetyTextModerationConfig {
     /// Azure Cognitive Services resource endpoint. The gateway appends
     /// `/contentsafety/text:analyze?api-version=2024-09-01`.
@@ -214,7 +294,14 @@ pub struct AzureContentSafetyTextModerationConfig {
     /// Chars carried between windows so a span split across a boundary is still caught.
     #[serde(default = "default_acs_window_overlap_size")]
     pub window_overlap_size: u32,
-    /// Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.
+    /// Max bytes of model-generated content held back from a streamed response
+    /// before `on_buffer_exceeded` applies: in `buffer_full` mode, and in
+    /// `window` mode wherever output is held whole (the whole stream on
+    /// `/v1/messages` and `/v1/responses`, and tool-call arguments on
+    /// `/v1/chat/completions`) and no output guardrail in the chain uses
+    /// `buffer_full`, whose rows alone then set the cap. Counts assistant
+    /// text, reasoning, and tool-call arguments; SSE and JSON framing is not
+    /// counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -282,7 +369,6 @@ fn default_acs_on_buffer_exceeded() -> String {
 /// projection. It is plaintext in DP memory only and never logged). Every other
 /// field travels in the clear.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct AliyunTextModerationConfig {
     /// Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The gateway
     /// builds the endpoint `https://green-cip.<region>.aliyuncs.com`.
@@ -325,7 +411,14 @@ pub struct AliyunTextModerationConfig {
     /// Chars carried between windows so a span split across a boundary is still caught.
     #[serde(default = "default_aliyun_window_overlap_size")]
     pub window_overlap_size: u32,
-    /// Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.
+    /// Max bytes of model-generated content held back from a streamed response
+    /// before `on_buffer_exceeded` applies: in `buffer_full` mode, and in
+    /// `window` mode wherever output is held whole (the whole stream on
+    /// `/v1/messages` and `/v1/responses`, and tool-call arguments on
+    /// `/v1/chat/completions`) and no output guardrail in the chain uses
+    /// `buffer_full`, whose rows alone then set the cap. Counts assistant
+    /// text, reasoning, and tool-call arguments; SSE and JSON framing is not
+    /// counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -361,7 +454,6 @@ fn default_aliyun_risk_level_threshold() -> String {
 /// projection. It is plaintext in DP memory only and never logged). Every
 /// other field travels in the clear.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct AliyunAiGuardrailConfig {
     /// Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The gateway
     /// builds the endpoint `https://green-cip.<region>.aliyuncs.com`.
@@ -406,7 +498,14 @@ pub struct AliyunAiGuardrailConfig {
     /// Chars carried between windows so a span split across a boundary is still caught.
     #[serde(default = "default_aliyun_window_overlap_size")]
     pub window_overlap_size: u32,
-    /// Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.
+    /// Max bytes of model-generated content held back from a streamed response
+    /// before `on_buffer_exceeded` applies: in `buffer_full` mode, and in
+    /// `window` mode wherever output is held whole (the whole stream on
+    /// `/v1/messages` and `/v1/responses`, and tool-call arguments on
+    /// `/v1/chat/completions`) and no output guardrail in the chain uses
+    /// `buffer_full`, whose rows alone then set the cap. Counts assistant
+    /// text, reasoning, and tool-call arguments; SSE and JSON framing is not
+    /// counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -423,7 +522,6 @@ fn default_aliyun_aig_service_level() -> String {
 /// detector to enable; `action` optionally overrides the guardrail-level
 /// `default_action` for this detector only.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct PiiDetectorConfig {
     /// Built-in detector to enable for this PII guardrail entry.
     #[serde(rename = "type")]
@@ -437,7 +535,6 @@ pub struct PiiDetectorConfig {
 
 /// One operator-supplied regex detector for `kind: "pii"`.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct PiiCustomPattern {
     /// Detector name surfaced in the mask token (`[<NAME>_REDACTED]`),
     /// telemetry counts, and block reasons. Never the matched value.
@@ -445,12 +542,26 @@ pub struct PiiCustomPattern {
     pub name: String,
     /// Regular expression AISIX compiles when building the guardrail chain.
     /// An invalid pattern makes AISIX log and skip the guardrail.
+    ///
+    /// When the expression declares at least one capture group, a `mask`
+    /// action rewrites only the first capture group of each match and keeps
+    /// the rest of the match unchanged. Use this to replace a value while
+    /// preserving its surrounding key or label, for example
+    /// `"version"\s*:\s*"([^"]*)"`. Without capture groups, the whole match
+    /// is rewritten.
     #[schemars(length(min = 1))]
     pub regex: String,
     /// Per-pattern action override. Falls back to the guardrail's
     /// `default_action` when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
+    /// Literal text that replaces the masked span, such as `***`. When
+    /// omitted, the span is rewritten to `[<NAME>_REDACTED]`. An empty
+    /// string removes the span. Only valid when the pattern's effective
+    /// action is `mask`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 256))]
+    pub replacement: Option<String>,
 }
 
 /// Config block for `kind: "pii"`. Built-in sensitive-data detection and
@@ -464,7 +575,6 @@ pub struct PiiCustomPattern {
 /// content-filter envelope. Matched values never appear in logs, telemetry,
 /// or error envelopes — only detector names and match counts do.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct PiiConfig {
     /// Built-in detectors to enable. The resource schema rejects unknown
     /// detector ids, so a typo cannot silently disable the policy.
@@ -482,7 +592,9 @@ pub struct PiiConfig {
     // back (the mask spans chunk boundaries), so kind=pii always uses the
     // buffer_full policy on the output hook. These knobs mirror the ACS/
     // Aliyun buffer_full parameters.
-    /// Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.
+    /// Max bytes of model-generated content held back from a streamed response
+    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
+    /// and tool-call arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -507,7 +619,6 @@ fn default_aliyun_window_overlap_size() -> u32 {
 /// `aisix-guardrails::BedrockGuardrail` from this and dispatches
 /// `ApplyGuardrail` on every governed request.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct BedrockConfig {
     /// Guardrail identifier issued by the AWS console.
     #[schemars(length(min = 1, max = 64))]
@@ -539,7 +650,6 @@ pub struct BedrockConfig {
 /// configuration is applied; the plaintext is held in memory only and is
 /// never logged.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct LakeraConfig {
     /// Lakera API key sent as a `Authorization: Bearer` header. Decrypted
     /// before projection. Plaintext is held in memory only and is not logged.
@@ -571,7 +681,9 @@ pub struct LakeraConfig {
     // Masking a streamed response requires the whole response held back
     // (a masked span can cross any chunk boundary), so kind=lakera always
     // uses the buffer_full policy on the output hook, like kind=pii.
-    /// Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.
+    /// Max bytes of model-generated content held back from a streamed response
+    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
+    /// and tool-call arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -590,7 +702,6 @@ pub struct LakeraConfig {
 /// configuration is applied; the plaintext is held in memory only and is
 /// never logged.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct OpenaiModerationConfig {
     /// OpenAI API key sent as a `Authorization: Bearer` header. Decrypted
     /// before projection. Plaintext is held in memory only and is not logged.
@@ -635,7 +746,6 @@ fn default_openai_moderation_model() -> String {
 /// `action` optionally overrides the guardrail-level `default_action` for
 /// this entity only — the same per-detector shape as `kind: "pii"`.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct PresidioEntityConfig {
     /// Presidio entity type, e.g. `EMAIL_ADDRESS`, `PERSON`, `US_SSN`.
     #[serde(rename = "type")]
@@ -647,8 +757,8 @@ pub struct PresidioEntityConfig {
     pub action: Option<String>,
 }
 
-/// Config block for `kind: "presidio"`. Calls a self-hosted Microsoft
-/// Presidio analyzer to find PII entities and, when the effective action is
+/// Config block for `kind: "presidio"`. Calls a customer-run Presidio
+/// analyzer to find PII entities and, when the effective action is
 /// `mask`, calls the anonymizer to rewrite text before traffic continues.
 /// `block` rejects with the standard 422 content-filter envelope.
 ///
@@ -657,7 +767,6 @@ pub struct PresidioEntityConfig {
 /// compliance posture, and selectable anonymize operators. No vendor secret:
 /// both URLs point at customer-run containers.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct PresidioConfig {
     /// Presidio analyzer base URL, e.g. `http://presidio-analyzer:3000`.
     /// The gateway appends `/analyze`.
@@ -704,7 +813,9 @@ pub struct PresidioConfig {
     // Masking a streamed response requires the whole response held back,
     // so kind=presidio always uses the buffer_full policy on the output
     // hook, like kind=pii.
-    /// Max bytes buffered for a streamed response before `on_buffer_exceeded` applies.
+    /// Max bytes of model-generated content held back from a streamed response
+    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
+    /// and tool-call arguments; SSE and JSON framing is not counted.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -721,8 +832,289 @@ fn default_presidio_language() -> String {
     "en".to_owned()
 }
 
+/// Config block for `kind: "semantic"`. Embedding-similarity screening
+/// against operator-supplied EXAMPLE texts: each candidate text is
+/// embedded with `embedding_model` and scored (cosine) against the
+/// `deny_examples` and `allow_examples` prototypes. A text that clears
+/// `deny_threshold` against any deny example blocks; when
+/// `allow_examples` is non-empty, a text that clears NO allow example
+/// blocks as well. Deny wins over allow.
+///
+/// The kind is direction-neutral — `hook_point` decides whether the
+/// request, the response, or both are screened, and the same example
+/// lists apply to whichever hooks run. Two directions that need
+/// DIFFERENT examples are two guardrail rows, not one row with nested
+/// per-direction blocks.
+///
+/// This guardrail calls an `embedding`-kind Model through the gateway's
+/// provider bridges, so it is available on every node but costs one
+/// upstream embedding call per screened text (example prototypes are
+/// embedded once and cached).
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
+pub struct SemanticConfig {
+    /// Alias of an `embedding`-kind Model used to embed both the
+    /// examples and the screened text. Must resolve in the same
+    /// environment as this guardrail.
+    ///
+    /// Defaulted at the TYPE level and required by the strict write
+    /// schema instead: a row the loader cannot deserialize is skipped
+    /// whole, and a screening row that vanishes is a guardrail that
+    /// stopped screening. Empty resolves to nothing, so the row degrades
+    /// per `fail_open` — fail-closed by default — rather than
+    /// disappearing.
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    pub embedding_model: String,
+    /// Resource id of the `embedding`-kind Model used to embed both the
+    /// examples and the screened text. Present, it is authoritative and
+    /// `embedding_model` is ignored: the id is resolved against the models
+    /// in the current configuration, so renaming that model keeps this row
+    /// screening with it and needs no edit here. An id resolving to no
+    /// model is an embedder that cannot be resolved, exactly as an
+    /// `embedding_model` naming no model is — the row degrades per
+    /// `fail_open`, fail-closed by default.
+    ///
+    /// Defaulted at the type level for the same reason `embedding_model`
+    /// is: the strict write schema requires one of the two, the read path
+    /// requires neither, and a screening row that fails to load is
+    /// fail-OPEN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub embedding_model_id: Option<String>,
+    /// Example texts whose meaning must be REFUSED. A screened text
+    /// scoring at or above `deny_threshold` against any of them blocks.
+    #[serde(default)]
+    #[schemars(length(max = 100))]
+    pub deny_examples: Vec<String>,
+    /// Example texts whose meaning is PERMITTED. When non-empty, a
+    /// screened text that clears none of them blocks — an allow-list
+    /// narrows traffic to the listed topics. Empty (the default) means
+    /// "no allow-list": only `deny_examples` can block.
+    #[serde(default)]
+    #[schemars(length(max = 100))]
+    pub allow_examples: Vec<String>,
+    /// Cosine-similarity threshold for `deny_examples`, in `[-1, 1]`.
+    /// Lower it to block more. Required whenever `deny_examples` is
+    /// non-empty.
+    ///
+    /// There is no portable value. Cosine scores are not comparable
+    /// across embedding models — the same pair of texts can fall on
+    /// opposite sides of a fixed threshold depending on which model
+    /// produced the vectors, and a threshold carried over from another
+    /// model under-screens without any sign that it is doing so. Measure
+    /// one against the model named in `embedding_model`, on your own
+    /// traffic: a request that emits a usage event reports what it scored
+    /// in `guardrail_scores`, including the requests this guardrail
+    /// allowed. Not every surface can produce that sample. `/a2a`,
+    /// `rerank`, `/v1/embeddings`, `/v1/images/*`, `/v1/videos`,
+    /// `/v1/audio/speech` and `/v1/messages/count_tokens` run the INPUT
+    /// hook only, so an output-hook row scores nothing on them (audio
+    /// transcription and translation do run both); `/a2a` also resolves no
+    /// model and no MCP server, so only a row attached at the
+    /// environment, API-key or team scope reaches it at all.
+    // Defaulted at the TYPE level and required by the strict write schema
+    // instead, for the reason `embedding_model` gives: rows written before
+    // the field was required carry no key at all, and a row the loader
+    // cannot deserialize is skipped whole — a screening row that vanishes
+    // is a guardrail that stopped screening, which is fail-OPEN on a
+    // security control. The default keeps the historical value rather than
+    // a lowered one, because those rows enforce it today and changing what
+    // they enforce without the operator asking would be a worse surprise;
+    // see `default_semantic_threshold`.
+    #[serde(default = "default_semantic_threshold")]
+    #[schemars(range(min = -1.0, max = 1.0))]
+    pub deny_threshold: f32,
+    /// Cosine-similarity threshold for `allow_examples`, in `[-1, 1]`.
+    /// RAISE it to block more — a text must reach it to be admitted.
+    /// Required whenever `allow_examples` is non-empty, and only then: a
+    /// row with no allow-list has nothing for this number to decide. See
+    /// `deny_threshold` for why there is no portable value.
+    #[serde(default = "default_semantic_threshold")]
+    #[schemars(range(min = -1.0, max = 1.0))]
+    pub allow_threshold: f32,
+    /// Per-call deadline for the embedding request in milliseconds.
+    #[serde(default = "default_semantic_timeout_ms")]
+    #[schemars(range(min = 1))]
+    pub timeout_ms: u64,
+    /// Cap on how many texts ONE request screens, bounding the embedding
+    /// tokens a single request can spend. The input hook screens the
+    /// MOST RECENT messages first and drops the rest: an earlier turn
+    /// was already screened as the latest message of an earlier request,
+    /// so the dropped tail is seen history rather than unread content.
+    #[serde(default = "default_semantic_max_screened_texts")]
+    #[schemars(range(min = 1, max = 64))]
+    pub max_screened_texts: u32,
+    /// Input-hook text selection. The default screens user messages
+    /// only; the alternate mode screens every message. Ignored on the
+    /// output hook.
+    #[serde(default = "default_semantic_text_source")]
+    pub text_source: String,
+
+    // --- streaming-output controls (consumed by aisix-proxy) ---
+    // A semantic judgement needs the whole text, so this kind always
+    // uses the buffer_full policy on the output hook, like
+    // kind=pii and kind=presidio.
+    /// Max bytes of model-generated content held back from a streamed response
+    /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
+    /// and tool-call arguments; SSE and JSON framing is not counted.
+    #[serde(default = "default_acs_max_buffer_bytes")]
+    #[schemars(range(min = 1))]
+    pub max_buffer_bytes: u64,
+    /// Buffer-overflow policy for streamed output when the buffer cap is hit.
+    #[serde(default = "default_acs_on_buffer_exceeded")]
+    pub on_buffer_exceeded: String,
+    /// Fail-open policy for the output hook. When disabled, an embedding
+    /// outage does not release unscreened model output.
+    #[serde(default)]
+    pub output_fail_open: bool,
+}
+
+/// Read-path only. The strict write schema requires each threshold
+/// alongside its example list, so nothing an operator saves today lands
+/// here — this exists for rows written before that requirement, which
+/// enforce 0.75 and must go on enforcing it until the control plane's
+/// backfill rewrites them. The value can go in the release that re-runs that
+/// backfill with the floor past the last control plane that accepted a
+/// populated example list without its threshold (v0.13.0; v1.0.0 requires it).
+/// The field stays defaulted, because a direction with no example list still
+/// omits its key.
+fn default_semantic_threshold() -> f32 {
+    0.75
+}
+
+fn default_semantic_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_semantic_max_screened_texts() -> u32 {
+    8
+}
+
+fn default_semantic_text_source() -> String {
+    "user_messages".to_owned()
+}
+
+/// Config block for `kind: "custom"`. Runs an operator-supplied script in a
+/// sandboxed engine inside the gateway, so a screening service that speaks
+/// its own protocol can be reached without deploying a separate adapter.
+///
+/// The script is an ES module exporting `checkInput` and/or `checkOutput`.
+/// Each receives a context object and returns a verdict:
+///
+/// ```js
+/// export async function checkInput(ctx) {
+///   const resp = await fetch("https://screening.internal/scan", {
+///     method: "POST",
+///     headers: { "content-type": "application/json" },
+///     body: JSON.stringify({ text: ctx.text }),
+///   });
+///   const result = await resp.json();
+///   return result.verdict === "deny"
+///     ? { action: "block", reason_code: "policy" }
+///     : { action: "none" };
+/// }
+/// ```
+///
+/// A script can allow, block, or rewrite content. Rewriting returns a
+/// replacement for each slot in `ctx.segments`; where the call site cannot
+/// substitute text back, a rewrite request blocks instead of releasing the
+/// original. Scripts also get signing primitives (`crypto`) and access to
+/// the environment's embedding model (`aisix.embed`), so a script can
+/// express what the built-in kinds express. Applies on input, output, or
+/// both, including streamed output.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
+pub struct CustomConfig {
+    /// The script source, as an ES module exporting `checkInput` and/or
+    /// `checkOutput`. A hook whose function the module does not export is
+    /// skipped, so a script may cover one direction only.
+    ///
+    /// Required on both the write schema and the read one, so a row that
+    /// omits it is refused rather than loaded: unlike the fields that are
+    /// write-path-only, a `custom` row with no script screens nothing
+    /// either way, and rejecting it is what puts it in `/status/config`'s
+    /// `rejected` list where an operator can see it.
+    ///
+    /// A script that is whitespace-only or does not compile passes the
+    /// schema — `minLength` counts characters, so a whitespace-only value is
+    /// non-empty — and is refused when the chain is built instead. `aisix
+    /// validate` reports that and exits non-zero; a serving gateway reports
+    /// the runtime rejection through config status (api7/aisix#1084).
+    #[serde(default)]
+    #[schemars(length(min = 1))]
+    pub script: String,
+    /// Values the script reads as `ctx.secrets.<NAME>`, for credentials the
+    /// screening service requires. Stored encrypted and decrypted before
+    /// projection; plaintext is held in memory only and is never logged.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub secrets: std::collections::BTreeMap<String, String>,
+    /// Wall-clock budget for one hook invocation, in milliseconds, covering
+    /// the script's own execution and every call it makes. `fail_open` and
+    /// `output_fail_open` govern the verdict when it elapses. Per-call
+    /// timeouts within the budget are the script's own to set.
+    #[serde(default = "default_custom_timeout_ms")]
+    #[schemars(range(min = 1, max = 300_000))]
+    pub timeout_ms: u32,
+    /// Memory ceiling for the script engine, in bytes. A script that exceeds
+    /// it is terminated and the hook's fail-open policy applies.
+    #[serde(default = "default_custom_max_memory_bytes")]
+    #[schemars(range(min = 1_048_576, max = 536_870_912u64))]
+    pub max_memory_bytes: u64,
+
+    // --- streaming-output controls (consumed by aisix-proxy build_sse_stream) ---
+    /// Streaming output moderation mode: sliding-window incremental release
+    /// or whole-response hold-back.
+    #[serde(default = "default_custom_stream_processing_mode")]
+    pub stream_processing_mode: String,
+    /// Sliding-window size in characters for window mode.
+    #[serde(default = "default_acs_window_size")]
+    #[schemars(range(min = 1, max = 10_000))]
+    pub window_size: u32,
+    /// Chars carried between windows so a span split across a boundary is still caught.
+    #[serde(default = "default_acs_window_overlap_size")]
+    pub window_overlap_size: u32,
+    /// Max bytes of model-generated content held back from a streamed response
+    /// before `on_buffer_exceeded` applies: in `buffer_full` mode, and in
+    /// `window` mode wherever output is held whole (the whole stream on
+    /// `/v1/messages` and `/v1/responses`, and tool-call arguments on
+    /// `/v1/chat/completions`) and no output guardrail in the chain uses
+    /// `buffer_full`, whose rows alone then set the cap. Counts assistant
+    /// text, reasoning, and tool-call arguments; SSE and JSON framing is not
+    /// counted.
+    #[serde(default = "default_acs_max_buffer_bytes")]
+    #[schemars(range(min = 1))]
+    pub max_buffer_bytes: u64,
+    /// Buffer-overflow policy for streamed output when the buffer cap is hit.
+    #[serde(default = "default_acs_on_buffer_exceeded")]
+    pub on_buffer_exceeded: String,
+    /// Fail-open policy for the output hook. When disabled (the default), a
+    /// script failure blocks model output instead of releasing unscanned
+    /// content. The input hook uses the top-level `fail_open` policy.
+    #[serde(default)]
+    pub output_fail_open: bool,
+}
+
+fn default_custom_timeout_ms() -> u32 {
+    5_000
+}
+
+fn default_custom_max_memory_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
+fn default_custom_stream_processing_mode() -> String {
+    "window".to_owned()
+}
+
 /// Provider discriminator. The kind drives which `*_config` block is
 /// expected. Serde's `tag = "kind"` keeps us honest at parse time.
+///
+/// The per-kind configs deliberately carry no `#[serde(deny_unknown_fields)]`:
+/// `Guardrail` flattens this enum, so a type-level guard here also applies to
+/// the etcd loader, which deserialises the same types — and a guardrail row
+/// dropped for one unknown field is a content policy that silently stops
+/// enforcing. Unknown-field strictness belongs to the write path and lives in
+/// the branch and definition closures in
+/// [`guardrail_root_schema`](crate::models::schema::guardrail_root_schema).
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GuardrailKind {
@@ -742,10 +1134,12 @@ pub enum GuardrailKind {
     /// `TextModerationPlus` action on `green-cip.<region>.aliyuncs.com`, on
     /// input and/or output, including streaming output.
     AliyunTextModeration(AliyunTextModerationConfig),
-    /// Aliyun AI Guardrails (AI 安全护栏). Policy-driven moderation via the
-    /// `MultiModalGuard` action on `green-cip.<region>.aliyuncs.com`; the
-    /// verdict follows the console-configured policy's `Suggestion`. On
-    /// input and/or output, including streaming output.
+    /// Aliyun AI Guardrails. Policy-driven moderation through the
+    /// `MultiModalGuard` action: the verdict follows the policy configured in
+    /// the provider's console. Content that policy marks for masking is
+    /// released with the provider's desensitized text in place of the
+    /// original, and blocked when no desensitized text is returned. Applies
+    /// on input and/or output, including streaming output.
     AliyunAiGuardrail(AliyunAiGuardrailConfig),
     /// Built-in sensitive-data detection and redaction inside AISIX. Built-in
     /// detectors and custom regex patterns can mask matched spans or block
@@ -762,11 +1156,23 @@ pub enum GuardrailKind {
     /// guardrail is detection-only and never rewrites content. Applies on
     /// input, output, or both, including buffered streaming output.
     OpenaiModeration(OpenaiModerationConfig),
-    /// Self-hosted Microsoft Presidio PII detection and anonymization.
+    /// PII detection and anonymization by a customer-run Presidio.
     /// Analyzer entities can mask or block per entity, and masked entities
     /// use the selected anonymize operator. Applies on input, output, or both,
     /// including buffered streaming output.
     Presidio(PresidioConfig),
+    /// Embedding-similarity screening against operator-supplied example
+    /// texts. Deny examples block on a close match; an allow-list, when
+    /// present, blocks everything that matches none of it. Calls an
+    /// `embedding`-kind Model through the gateway's provider bridges.
+    /// Detection-only — never rewrites content. Applies on input,
+    /// output, or both, including buffered streaming output.
+    Semantic(SemanticConfig),
+    /// Screening by an operator-supplied script the gateway runs in a
+    /// sandboxed engine, for a screening service that speaks its own
+    /// protocol. The script can allow, block, or rewrite content. Applies
+    /// on input, output, or both, including streaming output.
+    Custom(CustomConfig),
 }
 
 impl GuardrailKind {
@@ -786,6 +1192,8 @@ impl GuardrailKind {
             GuardrailKind::Lakera(_) => "lakera",
             GuardrailKind::OpenaiModeration(_) => "openai_moderation",
             GuardrailKind::Presidio(_) => "presidio",
+            GuardrailKind::Semantic(_) => "semantic",
+            GuardrailKind::Custom(_) => "custom",
         }
     }
 }
@@ -818,25 +1226,180 @@ pub struct AppliedGuardrail {
 /// stage a policy, watch its hit rate in the dashboard, and only then flip
 /// it to `block`.
 ///
-/// `reason` and `counts` carry detector/entity/category NAMES only — never
-/// matched content (#153 no-leak criterion).
+/// `reason` is a code-owned kind/outcome summary, never the inner guardrail's
+/// dynamic reason. An availability failure may append its bounded, code-owned
+/// failure tag. Built-in mask `counts` carry detector/entity/category names;
+/// custom masks use the fixed key `custom` and count rewritten segments. No
+/// matched content enters this structure (#153 no-leak criterion).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuardrailMonitorHit {
     /// The configured (row) name of the monitor-mode guardrail that fired.
     pub guardrail_name: String,
     /// Which side observed the hit: `input` or `output`.
     pub hook: String,
-    /// `would_block` (a Block verdict was downgraded) or `would_mask`
-    /// (maskable spans were observed but not rewritten).
+    /// `would_block` (a Block verdict was downgraded), `would_mask`
+    /// (maskable spans were observed but not rewritten), or
+    /// `would_mask_unsupported` (a mask rule matched on a surface that
+    /// cannot rewrite content, such as a passthrough route, so enforcing
+    /// the rule would forward the content unmodified too).
     pub action: String,
-    /// The suppressed Block's operator-facing reason (`would_block` only;
-    /// empty for `would_mask`).
+    /// Code-owned summary of the suppressed Block's kind and outcome
+    /// (`would_block` only; empty for both mask actions).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reason: String,
+    /// Bounded failure tag retained only until the execution metrics sink has
+    /// recorded this monitor hit. The public usage-event summary carries the
+    /// same tag in `reason`, so this internal copy must not change its shape.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub error_type: String,
     /// detector/entity name → span count the guardrail would have masked
-    /// (`would_mask` only; empty for `would_block`).
+    /// (`would_mask` and `would_mask_unsupported`; empty for
+    /// `would_block`).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub counts: std::collections::BTreeMap<String, u32>,
+}
+
+/// One ENFORCE-mode guardrail hit on this request: which configured
+/// guardrail fired, on which side, and what it actually did
+/// (AISIX-Cloud#1330 audit chain). The monitor-mode counterpart is
+/// [`GuardrailMonitorHit`]; the two never describe the same execution,
+/// so a consumer can read `action` without also checking the mode.
+///
+/// Carried on the telemetry UsageEvent so a compliance audit can answer
+/// "which policy rewrote this request, and how much did it rewrite" from
+/// the event alone. Names and counts ONLY — the matched value, the block
+/// reason, and any upstream detail are never captured (#153 / #932
+/// no-leak criterion).
+///
+/// One entry per `(guardrail_name, hook, action, error_type)`: a guardrail
+/// that masks forty string leaves of one tool result reports a single entry
+/// whose `counts` and `duration_us` are summed across those leaves.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardrailEnforcedHit {
+    /// The configured (row) name of the guardrail that fired.
+    pub guardrail_name: String,
+    /// Which side it fired on: `input` or `output`.
+    pub hook: String,
+    /// What it did:
+    ///
+    /// - `masked` — content was rewritten and the request continued.
+    /// - `blocked` — the guardrail's content policy refused the request.
+    /// - `blocked_unavailable` — the guardrail could not evaluate the
+    ///   request and its configuration refuses what it cannot check
+    ///   (`fail_open: false`). The request was
+    ///   refused because the check was unavailable, not because the
+    ///   content matched a policy.
+    /// - `blocked_buffer_exceeded` — a streamed response outgrew the
+    ///   hold-back cap (`max_buffer_bytes`) while an output row's
+    ///   `on_buffer_exceeded` was `fail_closed`, so it was refused without
+    ///   being scanned. `guardrail_name` is the row whose cap was hit —
+    ///   the smallest among the output rows — and the refusal policy is
+    ///   the chain's folded one (fail-closed when any output row is), so
+    ///   the named row may itself be `fail_open`. Raising that cap, not
+    ///   tuning the policy, is the remedy.
+    /// - `mask_unsupported` — a mask rule matched on a surface that cannot
+    ///   rewrite content (a passthrough route, a job body, a realtime
+    ///   frame, …), so the content was forwarded unmodified. Nothing was
+    ///   redacted: `redacted_entity_counts` does not count these spans.
+    pub action: String,
+    /// Why the check was unavailable, on `blocked_unavailable` only: a
+    /// short, bounded cause such as `lakera_timeout` or
+    /// `presidio_5xx`. Empty for every other action.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error_type: String,
+    /// detector/rule name → number of spans masked (`masked`), or matched
+    /// but left in place (`mask_unsupported`); empty for every refusal
+    /// action. Same key space as `redacted_entity_counts`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub counts: std::collections::BTreeMap<String, u32>,
+    /// Wall-clock time this guardrail spent on this hook, in
+    /// MICROseconds, summed over every evaluation that contributed to the
+    /// entry. Microseconds rather than milliseconds because in-process
+    /// rule evaluation is routinely sub-millisecond and would otherwise
+    /// always report zero. Saturates at `u32::MAX` (about 71 minutes).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub duration_us: u32,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+/// One similarity-screening summary from a `kind: "semantic"` guardrail
+/// execution (AISIX-Cloud#1467): what the embedding comparison actually
+/// scored, on a request it PASSED as well as on one it refused.
+///
+/// It exists because a similarity policy is untunable without its numbers.
+/// The verdict fields answer "did it fire"; nothing answered "how close was
+/// it", so an operator whose threshold was slightly too high saw a guardrail
+/// that simply never fired and had to bisect the threshold blindly. Monitor
+/// mode did not help: [`GuardrailMonitorHit`] records only a SUPPRESSED
+/// BLOCK, so a below-threshold pass produced no record at all.
+///
+/// One entry per `(guardrail_name, hook, direction)` — a SUMMARY, not one
+/// entry per screened text. A request screens up to `max_screened_texts`
+/// messages, and reporting each would make the array grow with conversation
+/// length while burying the only number that matters: the closest call.
+/// So `deny` carries the HIGHEST similarity seen across the screened texts
+/// and `allow` the LOWEST best-allow similarity, each being the text that
+/// came nearest to changing the verdict.
+///
+/// `embedding_model` is not decoration: cosine scores are not comparable
+/// across embedding models, so a score without the model that produced it
+/// cannot be read against a threshold, against another deployment, or
+/// against a value recorded before the model was switched.
+///
+/// **Indices only, never text.** `top_example_index` names the example the
+/// candidate scored highest against; neither the example text nor the
+/// screened text is ever captured here (#153 no-leak criterion). That is
+/// deliberate and not an oversight to be corrected later: this event is
+/// durable and widely readable, so an echoed example would let anyone with
+/// log access enumerate the operator's deny list, and an echoed candidate
+/// would make the telemetry a copy of user prompts. An interactive
+/// operator-facing dry-run answers with the example text; this does not.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GuardrailScore {
+    /// The configured (row) name of the guardrail that scored.
+    pub guardrail_name: String,
+    /// Which side ran: `input` or `output`. Never `both` — that is a
+    /// configuration value, not an execution.
+    pub hook: String,
+    /// Which example list was scored against:
+    ///
+    /// - `deny` — similarity to the closest `deny_examples` entry. The
+    ///   guardrail refuses at or above `threshold`.
+    /// - `allow` — similarity to the closest `allow_examples` entry,
+    ///   reported only when that list is non-empty. The guardrail refuses
+    ///   BELOW `threshold`.
+    pub direction: String,
+    /// Cosine similarity, in `[-1, 1]`. For `deny` the highest seen across
+    /// the screened texts; for `allow` the lowest best-allow value.
+    pub score: f32,
+    /// The configured threshold this direction compares against
+    /// (`deny_threshold` / `allow_threshold`), recorded alongside the score
+    /// so a stored event stays readable after the row is retuned.
+    pub threshold: f32,
+    /// `score >= threshold`, in BOTH directions — a statement about
+    /// similarity only, never about the verdict. Whether crossing the
+    /// threshold is good or bad is the direction's business: `deny` refuses
+    /// when it is `true`, `allow` refuses when it is `false`. Defining it as
+    /// "this caused the block" would invert its meaning between the two.
+    ///
+    /// Other gateways spell the equivalent flag as "passed", which reads
+    /// more naturally but only works where crossing a threshold always
+    /// means the same thing. It cannot describe an allow-list gate, whose
+    /// whole shape is that falling SHORT is the refusal. The difference is
+    /// deliberate.
+    pub matched: bool,
+    /// Zero-based index, into this direction's example list, of the
+    /// HIGHEST-SCORING example — whether or not it crossed the threshold.
+    /// On `matched: false` this is the number an operator needs: it names
+    /// which example came closest.
+    pub top_example_index: u32,
+    /// The `embedding_model` the row screened with. See the type doc: a
+    /// score is not interpretable without it.
+    pub embedding_model: String,
 }
 
 /// One guardrail member execution as observed by the chain fold
@@ -847,17 +1410,28 @@ pub struct GuardrailMonitorHit {
 pub struct GuardrailExecution<'a> {
     /// Configured (row) name of the guardrail.
     pub guardrail_name: &'a str,
-    /// The `kind` discriminator (`GuardrailKind::kind_str`). `keyword` and
-    /// `pii` run in-process; every other kind calls a remote service.
+    /// The `kind` discriminator (`GuardrailKind::kind_str`). `keyword`
+    /// and `pii` run in-process; every other kind calls a remote
+    /// service.
     pub kind: &'a str,
     /// Which side ran: `input` or `output`.
     pub phase: &'static str,
     /// Enforced outcome: `allowed` / `blocked` / `masked` / `bypassed`
-    /// (remote failure + fail-open) / `would_block` / `would_mask`
-    /// (monitor mode).
+    /// (remote failure + fail-open) / `would_block` / `would_mask` /
+    /// `would_mask_unsupported` (monitor mode; a mask rule that matched
+    /// where the content cannot be rewritten).
     pub result: &'static str,
     /// Bounded failure tag (e.g. `lakera_timeout`) when the guardrail could
-    /// not evaluate and failed open (`result = bypassed`); `None` otherwise.
+    /// not evaluate: on `result = bypassed` (it failed OPEN and the request
+    /// continued) and, since AISIX-Cloud#1365, on `result = blocked` when
+    /// it failed CLOSED and the request was refused instead. `None` for
+    /// every outcome the guardrail actually decided.
+    ///
+    /// `result` deliberately does not distinguish those two blocks — it is
+    /// a shipped metric label with alerting attached, and splitting its
+    /// value domain would silently stop an existing `result="blocked"`
+    /// alert from counting outages. `error_type != None` is the
+    /// discriminator on this side; the audit event uses a separate action.
     pub error_type: Option<&'a str>,
     /// Wall-clock time the member call took.
     pub elapsed: std::time::Duration,
@@ -868,6 +1442,20 @@ pub struct GuardrailExecution<'a> {
 /// build time, so aisix-guardrails stays free of a metrics dependency.
 pub trait GuardrailMetricsSink: Send + Sync + 'static {
     fn record_guardrail_execution(&self, exec: &GuardrailExecution<'_>);
+
+    /// Count one bypass the PROXY performed on the chain's behalf, with
+    /// no member execution to carry it: a body the gateway could not give
+    /// the guardrails at all, which a fail-open chain lets through (#1115).
+    ///
+    /// The execution-driven bypasses reach the same counter through
+    /// [`Self::record_guardrail_execution`], which is why this is a second
+    /// method rather than a synthetic execution — there is no member, no
+    /// kind and no duration to report, and inventing them would put a
+    /// phantom row in the per-execution latency histogram.
+    ///
+    /// Required rather than defaulted: a sink that silently dropped these
+    /// would under-report exactly the traffic the counter is read to find.
+    fn record_guardrail_bypass(&self, reason: &str);
 }
 
 /// Observability seam for the shared rate-limit store, mirroring
@@ -906,10 +1494,53 @@ pub struct Guardrail {
     #[serde(default)]
     pub hook_point: GuardrailHookPoint,
 
-    /// Behavior when a remote API guardrail cannot reach its upstream.
-    /// `true` allows the request and records the bypass reason in
-    /// `usage_events.guardrail_bypassed_reason`. `false` blocks with
-    /// 422. Keyword guardrails do not use this setting.
+    /// Which messages of a request this rule's input check considers — its
+    /// window. What the rule reads inside the window depends on its kind:
+    /// some kinds read only its user messages by default.
+    ///
+    /// `all` (the default) makes the window the whole request: system,
+    /// developer, user, assistant and tool messages alike. `latest_turn`
+    /// makes it only the messages after the last assistant message, with
+    /// system and developer messages excluded — the current user message
+    /// plus any tool results answering it. It exists for clients that
+    /// resend the whole conversation on every call, where a rule that
+    /// matched one earlier message would otherwise keep refusing the rest
+    /// of the session.
+    ///
+    /// A rule reads, and can rewrite, only the messages in its window:
+    /// under `latest_turn` a masking rule rewrites only the current turn,
+    /// and messages outside it reach the upstream exactly as the caller
+    /// sent them. A rule whose job is to mask the whole conversation
+    /// belongs on `all`.
+    ///
+    /// Ignored at the output hook, which always reads the whole response.
+    #[serde(default)]
+    pub input_messages: GuardrailInputMessages,
+
+    /// Behavior when this guardrail cannot complete its check. Two
+    /// causes: a remote provider that is unreachable, timing out,
+    /// throttling, or rejecting the call; and a body the gateway could
+    /// not give the guardrail at all — one that does not decode as UTF-8
+    /// or does not parse, which the proxy would otherwise refuse with
+    /// `unscannable_body`. `true` allows the request; `false` (the
+    /// default) blocks with 422.
+    ///
+    /// Both causes apply to EVERY kind: the second one is the gateway
+    /// failing to produce scannable text, which happens before any
+    /// guardrail runs and so reaches all of them. `keyword` and `pii`
+    /// never call out, so only the second can arise for them; a kind
+    /// that calls out can meet either.
+    ///
+    /// The per-hook split follows the same line. A kind that calls out
+    /// carries its own `output_fail_open` for the output hook, leaving
+    /// this field to govern the input hook. `keyword` and `pii` have no
+    /// `output_fail_open`, so this one value governs both of their hooks.
+    ///
+    /// Defaults to fail-closed so an unchecked request is never released
+    /// on the strength of a guardrail that did not run: an operator who
+    /// prefers availability over enforcement opts in explicitly. This
+    /// matches `output_fail_open` and `on_buffer_exceeded`, which have
+    /// always defaulted closed.
     #[serde(default = "default_fail_open")]
     pub fail_open: bool,
 
@@ -924,13 +1555,6 @@ pub struct Guardrail {
     /// without blocking or redacting the caller-visible response.
     #[serde(default = "default_enforcement_mode")]
     pub enforcement_mode: String,
-
-    /// Whether guardrail evaluation errors are fatal. When `true`, a remote
-    /// guardrail that cannot reach its upstream blocks the request instead of
-    /// failing open, overriding `fail_open` on the failure path. The default
-    /// `false` keeps the `fail_open` behavior.
-    #[serde(default)]
-    pub mandatory: bool,
 
     /// Attachment direction hint. Guardrail execution still follows
     /// `hook_point`.
@@ -950,7 +1574,7 @@ fn default_enabled() -> bool {
 }
 
 fn default_fail_open() -> bool {
-    true
+    false
 }
 
 fn default_enforcement_mode() -> String {
@@ -991,6 +1615,11 @@ impl Resource for Guardrail {
 /// A `Model`-scoped guardrail therefore never inspects MCP or passthrough
 /// traffic, an `McpServer`-scoped one never inspects model traffic, and a
 /// `PassthroughRoute`-scoped one inspects only the traffic of that route.
+///
+/// Scope follows the entry the caller addresses: a guardrail attached to a
+/// model runs only for requests addressed to that model. When the model is
+/// reached as a member of a routing, semantic, or ensemble group, its
+/// guardrails do not run — attach the guardrail to the group instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardrailScopeType {
@@ -1110,7 +1739,9 @@ mod tests {
         let g: Guardrail = serde_json::from_value(v).unwrap();
         assert!(g.enabled);
         assert_eq!(g.hook_point, GuardrailHookPoint::Both);
-        assert!(g.fail_open);
+        // Fail-closed by default: a guardrail that could not run must not
+        // release the request (AISIX-Cloud#1382).
+        assert!(!g.fail_open);
     }
 
     #[test]
@@ -1126,42 +1757,45 @@ mod tests {
     }
 
     #[test]
-    fn unknown_field_rejected_by_inner_kind_struct() {
-        // The outer Guardrail can't use deny_unknown_fields (see its
-        // doc comment), but the inner KeywordConfig does — and serde
-        // surfaces unknown fields from the flattened inner type at
-        // the top level. Net effect: typos are still caught.
+    fn unknown_field_is_rejected_on_write_and_kept_on_read() {
+        // The typo guard used to be `deny_unknown_fields` on the config
+        // structs, which sat in the TYPE — so it also applied to the etcd
+        // loader, which deserialises the same types, and killed the whole
+        // row. It now lives in the strict schema: `aisix validate` and the
+        // file source still refuse the typo, while a stored document keeps
+        // loading with the field ignored.
         let v = json!({
             "name": "g",
             "kind": "keyword",
             "patterns": [],
             "extra": "nope"
         });
-        let r: Result<Guardrail, _> = serde_json::from_value(v);
-        assert!(r.is_err());
+        assert!(crate::models::validate_guardrail(&v).is_err());
+        assert!(crate::models::validate_guardrail_lenient(&v).is_ok());
+        let g: Guardrail = serde_json::from_value(v).expect("the read path keeps the row");
+        assert_eq!(g.name, "g");
     }
 
     #[test]
-    fn p0c_fields_dont_trip_keyword_config_deny_unknown_fields() {
-        // `KeywordConfig` has `deny_unknown_fields`. The P0c fields
-        // (`enforcement_mode`, `mandatory`, `direction`) are declared on
-        // the outer `Guardrail` struct with `#[serde(default)]`, so serde
-        // absorbs them at the outer level before the flattened inner sees
-        // the remaining fields. This test pins that routing: if any of
-        // these fields accidentally reached `KeywordConfig`, the parse
-        // would return an unknown-field error.
+    fn p0c_fields_travel_past_the_flattened_kind() {
+        // The P0c fields (`enforcement_mode`, `direction`) are
+        // declared on the outer `Guardrail` struct with `#[serde(default)]`,
+        // so serde absorbs them at the outer level before the flattened
+        // inner kind sees the remaining fields. The strict schema owes them
+        // the same passage from the other direction: a closed kind branch
+        // lists only its own kind's fields, so the root properties are
+        // copied in (`guardrail_root_schema`) or every real document fails.
         let v = json!({
             "name": "g",
             "kind": "keyword",
             "patterns": [],
             "enforcement_mode": "monitor",
-            "mandatory": true,
             "direction": "input"
         });
-        let g: Guardrail = serde_json::from_value(v)
-            .expect("P0c fields must not trip KeywordConfig deny_unknown_fields");
+        assert!(crate::models::validate_guardrail(&v).is_ok());
+        let g: Guardrail =
+            serde_json::from_value(v).expect("outer fields must not reach the inner kind");
         assert_eq!(g.enforcement_mode, "monitor");
-        assert!(g.mandatory);
         assert_eq!(g.direction, "input");
     }
 
@@ -1190,10 +1824,14 @@ mod tests {
                     BedrockAWSCredentials::Static {
                         access_key_id,
                         secret_access_key,
+                        session_token: None,
+                        role_arn: None,
+                        ..
                     } => {
                         assert_eq!(access_key_id, "AKIAEXAMPLE");
                         assert_eq!(secret_access_key, "PLAINTEXT_FOR_TEST");
                     }
+                    other => panic!("expected static credentials, got {other:?}"),
                 }
             }
             _ => panic!("expected Bedrock variant"),
@@ -1484,7 +2122,8 @@ mod tests {
             "kind": "pii",
             "default_action": "block",
             "custom_patterns": [
-                { "name": "employee_id", "regex": "\\bEMP-\\d{6}\\b", "action": "mask" }
+                { "name": "employee_id", "regex": "\\bEMP-\\d{6}\\b", "action": "mask" },
+                { "name": "eda_version", "regex": "version: (\\S+)", "action": "mask", "replacement": "***" }
             ],
             "max_buffer_bytes": 1024,
             "on_buffer_exceeded": "fail_open"
@@ -1493,15 +2132,23 @@ mod tests {
         match g.config {
             GuardrailKind::Pii(ref c) => {
                 assert!(c.detectors.is_empty());
-                assert_eq!(c.custom_patterns.len(), 1);
+                assert_eq!(c.custom_patterns.len(), 2);
                 assert_eq!(c.custom_patterns[0].name, "employee_id");
                 assert_eq!(c.custom_patterns[0].action.as_deref(), Some("mask"));
+                assert_eq!(c.custom_patterns[0].replacement, None);
+                assert_eq!(c.custom_patterns[1].replacement.as_deref(), Some("***"));
                 assert_eq!(c.default_action, "block");
                 assert_eq!(c.max_buffer_bytes, 1024);
                 assert_eq!(c.on_buffer_exceeded, "fail_open");
             }
             _ => panic!("expected Pii variant"),
         }
+        // A row without `replacement` serialises without the key
+        // (skip_serializing_if), so older documents round-trip untouched.
+        let ser = serde_json::to_value(&g).unwrap();
+        let pats = ser["custom_patterns"].as_array().unwrap();
+        assert!(pats[0].get("replacement").is_none());
+        assert_eq!(pats[1]["replacement"], "***");
     }
 
     #[test]

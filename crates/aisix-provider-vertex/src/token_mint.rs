@@ -66,7 +66,7 @@ fn cache_lifetime(expires_in_secs: u64) -> Duration {
 /// `client_x509_cert_url`) are omitted from the struct — serde's
 /// default deserializer silently ignores them, so the operator
 /// can paste the whole SA JSON verbatim without trimming.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub(crate) struct ServiceAccountKey {
     /// Discriminator; must equal `"service_account"` for normal SA
     /// keys (vs. `"external_account"` / `"authorized_user"`). We
@@ -79,6 +79,22 @@ pub(crate) struct ServiceAccountKey {
     pub private_key: String,
     pub client_email: String,
     pub token_uri: String,
+}
+
+// Hand-written: the private key must never print, and `token_uri` may carry a
+// configured `user:pass@`.
+impl std::fmt::Debug for ServiceAccountKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceAccountKey")
+            .field("typ", &self.typ)
+            .field("private_key", &"***")
+            .field("client_email", &self.client_email)
+            .field(
+                "token_uri",
+                &aisix_gateway::redact_url_for_log(&self.token_uri),
+            )
+            .finish()
+    }
 }
 
 impl ServiceAccountKey {
@@ -281,6 +297,13 @@ impl TokenMinter {
             .send()
             .await
             .map_err(|e| {
+                // This text reaches the usage event, so the cause goes to the log alone.
+                tracing::warn!(
+                    error = %aisix_gateway::transport_error_message(&e),
+                    "vertex token mint request failed",
+                );
+                let endpoint = aisix_gateway::redact_url_for_log(&endpoint);
+                let e = e.without_url();
                 BridgeError::Transport(format!("vertex token mint POST {endpoint}: {e}"))
             })?;
 
@@ -294,8 +317,12 @@ impl TokenMinter {
             // GCP returns OAuth-shape errors `{error, error_description}`
             // — text is operator-actionable (invalid_grant etc.) and
             // does not echo the SA's private key.
-            let body = resp.text().await.unwrap_or_default();
-            let truncated: String = body.chars().take(500).collect();
+            let body =
+                aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES)
+                    .await;
+            let text = String::from_utf8_lossy(body.whole()).into_owned();
+            let read_error = body.read_error;
+            let truncated: String = text.chars().take(500).collect();
             let msg = format!("vertex token mint upstream returned HTTP {status}: {truncated}");
             // Audit MEDIUM (PR #387): classify 5xx as a transient
             // upstream failure (502 with cooldown semantics) rather
@@ -305,14 +332,15 @@ impl TokenMinter {
             // IS operator-actionable, so it stays Config.
             return Err(if status.is_server_error() {
                 BridgeError::upstream_status_with_retry_after(status.as_u16(), msg, retry_after)
+                    .with_body_read_error(read_error)
             } else {
                 BridgeError::Config(msg)
             });
         }
-        let parsed: TokenResponse = resp
-            .json()
-            .await
-            .map_err(|e| BridgeError::UpstreamDecode(format!("vertex token mint response: {e}")))?;
+        let parsed: TokenResponse = resp.json().await.map_err(|e| {
+            aisix_gateway::log_body_read_causes(&e);
+            BridgeError::TokenExchangeDecode(format!("vertex token mint response: {e}"))
+        })?;
         Ok((parsed.access_token, parsed.expires_in))
     }
 
@@ -362,7 +390,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_get_token_mints_once_not_once_per_caller() {
         let (private_pem, _) = test_key_pair();
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let mints = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = mints.clone();
         Mock::given(method("POST"))
@@ -403,7 +431,7 @@ mod tests {
     #[tokio::test]
     async fn a_short_lived_token_is_still_cached() {
         let (private_pem, _) = test_key_pair();
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let mints = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = mints.clone();
         Mock::given(method("POST"))
@@ -432,7 +460,7 @@ mod tests {
     #[tokio::test]
     async fn mint_signs_jwt_with_correct_claims_and_posts_to_token_uri() {
         let (private_pem, public_pem) = test_key_pair();
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
 
         // Capture the inbound JWT assertion so we can decode + verify
         // its claims independently using the public key.
@@ -491,7 +519,7 @@ mod tests {
         let rotated_pem = include_str!("../test-fixtures/test_sa_private_rotated.pem").to_string();
         assert_ne!(private_pem, rotated_pem, "fixture keys must differ");
 
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "ya29.per-key",
@@ -516,7 +544,7 @@ mod tests {
     #[tokio::test]
     async fn get_token_caches_within_ttl_and_only_calls_endpoint_once() {
         let (private_pem, _) = test_key_pair();
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "ya29.cache-hit",
@@ -540,7 +568,7 @@ mod tests {
         // be UpstreamStatus (502 with cooldown semantics), not
         // Config (500 operator-must-fix).
         let (private_pem, _) = test_key_pair();
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(503)
@@ -573,7 +601,7 @@ mod tests {
         // Audit MEDIUM (PR #387): 4xx remains Config — invalid_grant
         // / bad SA / clock skew are operator-actionable.
         let (private_pem, _) = test_key_pair();
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(400).set_body_string(
                 r#"{"error":"invalid_grant","error_description":"JWT iat/exp out of range"}"#,
@@ -594,7 +622,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_pem_surfaces_clear_error_before_endpoint_call() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         // Mock with .expect(0) — endpoint must NOT be called for a
         // pre-flight validation failure.
         Mock::given(method("POST"))
@@ -622,7 +650,7 @@ mod tests {
     #[tokio::test]
     async fn wrong_type_field_rejected_before_endpoint_call() {
         let (private_pem, _) = test_key_pair();
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200))
             .expect(0)
@@ -714,5 +742,75 @@ mod tests {
              a cache entry, and one gets the other's access token. Add them to \
              `cache_key`."
         );
+    }
+
+    /// Run `f` under a capturing subscriber; returns its result and what it logged.
+    async fn capture_logs<T>(f: impl std::future::Future<Output = T>) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // A callsite first hit where no subscriber was set has cached "disabled".
+        tracing::callsite::rebuild_interest_cache();
+        let out = f.await;
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (out, logged)
+    }
+
+    /// A loopback address nothing listens on, so a connect is refused at once.
+    fn refused_url(path: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}{path}", listener.local_addr().unwrap())
+    }
+
+    /// The `Transport` text reaches the usage event; the cause goes to the log.
+    #[tokio::test]
+    async fn a_failed_mint_logs_its_cause_and_keeps_the_error_text() {
+        let (private_pem, _) = test_key_pair();
+        let endpoint = refused_url("/token");
+        let minter = TokenMinter::new(Client::new()).with_token_endpoint_override(endpoint.clone());
+        let sa = sample_sa(&private_pem, &endpoint);
+        let (result, logged) = capture_logs(minter.get_token(&sa)).await;
+        let Err(BridgeError::Transport(text)) = result else {
+            panic!("expected a transport failure, got {result:?}");
+        };
+        assert!(logged.to_lowercase().contains("refused"), "{logged}");
+        assert!(text.starts_with("vertex token mint POST"), "{text}");
+        assert!(!text.to_lowercase().contains("refused"), "{text}");
+    }
+
+    /// 项目所有者的决定：配置的 URL 可以带 userinfo，但密码不能出现在任何展示
+    /// 出来的地方。这段错误文本会进 usage 事件，`Debug` 也一样不能打印它。
+    #[tokio::test]
+    async fn a_token_uri_with_userinfo_is_never_displayed() {
+        let (private_pem, _) = test_key_pair();
+        let endpoint = refused_url("/token").replace("http://", "http://user:pass-9f2b@");
+        let sa = sample_sa(&private_pem, &endpoint);
+        let debug = format!("{sa:?}");
+        assert!(!debug.contains("pass-9f2b"), "{debug}");
+        assert!(!debug.contains("BEGIN"), "{debug}");
+
+        let minter = TokenMinter::new(Client::new());
+        let (result, logged) = capture_logs(minter.get_token(&sa)).await;
+        let Err(BridgeError::Transport(text)) = result else {
+            panic!("expected a transport failure, got {result:?}");
+        };
+        assert!(text.starts_with("vertex token mint POST"), "{text}");
+        assert!(!text.contains("pass-9f2b"), "{text}");
+        assert!(!logged.contains("pass-9f2b"), "{logged}");
     }
 }

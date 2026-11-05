@@ -67,7 +67,7 @@ const MAX_RESOURCES: usize = 8192;
 const MAX_ROWS_PER_RESOURCE: usize = 1024;
 
 /// A ready-to-post endpoint URL.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum EndpointUrl {
     /// Parsed once (possibly cached); reqwest takes `Url` by value
     /// without re-parsing.
@@ -76,6 +76,22 @@ pub enum EndpointUrl {
     /// request builder produces exactly the error it always produced
     /// for a malformed `api_base`; never cached.
     Unparsed(String),
+}
+
+// Hand-written because the URL may carry a configured `user:pass@`.
+impl std::fmt::Debug for EndpointUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parsed(url) => f
+                .debug_tuple("Parsed")
+                .field(&aisix_core::redact_url_for_log(url.as_str()))
+                .finish(),
+            Self::Unparsed(raw) => f
+                .debug_tuple("Unparsed")
+                .field(&aisix_core::redact_userinfo(raw))
+                .finish(),
+        }
+    }
 }
 
 impl EndpointUrl {

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startRestUpstream,
@@ -195,26 +196,17 @@ describe("mcp openapi e2e: REST API exposed as MCP tools", () => {
     await seed.createApiKey({
       key_hash: sha256(KEY_FULL),
       allowed_models: [],
-      allowed_tools: ["*"],
+      mcp_access: { allow: ["*"] },
     });
     await seed.createApiKey({
       key_hash: sha256(KEY_SCOPED),
       allowed_models: [],
-      allowed_tools: ["erp__getitem"],
+      mcp_access: { allow: ["erp__getitem"] },
     });
 
-    // Tolerant probe (no assertions): both the key and the server must have
-    // propagated before the pinned tests run.
-    await waitConfigPropagation(async () => {
-      if ((await initialize(KEY_FULL)) !== 200) return false;
-      const r = await post(KEY_FULL, {
-        jsonrpc: "2.0",
-        id: 2,
-        method: "tools/list",
-        params: {},
-      });
-      return (r.json?.result?.tools ?? []).length === 3;
-    });
+    // The last key authenticating implies the earlier key and server landed.
+    const gate = new ProxyClient(app.proxyUrl, KEY_SCOPED);
+    await waitConfigPropagation(async () => (await gate.listModels()).status === 200);
   }, 120_000);
 
   afterAll(async () => {
@@ -303,5 +295,77 @@ describe("mcp openapi e2e: REST API exposed as MCP tools", () => {
     const allowed = await callTool(KEY_SCOPED, "erp__getitem", { id: 7 });
     expect(allowed.isError).not.toBe(true);
     expect(JSON.parse(allowed.text ?? "{}").id).toBe("7");
+  });
+
+  // A document the gateway can turn into no tool would register a server
+  // that serves nothing; it is rejected at load and reported like any other
+  // rejected row. Operation ids that collide after sanitization are not a
+  // rejection: both operations are served, one under a `_2` suffix.
+  test("an openapi server yielding no tools is rejected; colliding operationIds load", async () => {
+    if (!etcdReachable) return;
+    const etcd = new EtcdClient();
+    const badId = randomUUID();
+    const dupId = randomUUID();
+    const server = (name: string, spec: unknown) =>
+      JSON.stringify({
+        name,
+        type: "openapi",
+        url: erp!.baseUrl,
+        auth_type: "bearer",
+        secret: erp!.token,
+        spec,
+      });
+    await etcd.put(
+      `${app!.etcdPrefix}/mcp_servers/${badId}`,
+      server("empty", {
+        openapi: "3.0.0",
+        paths: {
+          "/upload": {
+            post: {
+              operationId: "upload",
+              requestBody: { content: { "multipart/form-data": {} } },
+            },
+          },
+        },
+      }),
+    );
+    await etcd.put(
+      `${app!.etcdPrefix}/mcp_servers/${dupId}`,
+      server("dup", {
+        openapi: "3.0.0",
+        paths: {
+          "/items/{id}": { get: { operationId: "items/get" } },
+          "/items": { get: { operationId: "items.get" } },
+        },
+      }),
+    );
+    try {
+      let rejected: Array<{ resource_kind: string; resource_id: string }> = [];
+      let names: string[] = [];
+      await waitConfigPropagation(async () => {
+        const res = await fetch(`${app!.metricsUrl}/status/config`);
+        rejected = ((await res.json()) as { rejected: typeof rejected }).rejected;
+        names = (await listTools(KEY_FULL)).map((t) => t.name);
+        return (
+          rejected.some((r) => r.resource_id === badId) &&
+          names.some((n) => n.startsWith("dup__"))
+        );
+      });
+      expect(rejected.find((r) => r.resource_id === badId)!.resource_kind).toBe(
+        "mcp_servers",
+      );
+      expect(rejected.some((r) => r.resource_id === dupId)).toBe(false);
+      expect(names.filter((n) => n.startsWith("dup__")).sort()).toEqual([
+        "dup__items_get",
+        "dup__items_get_2",
+      ]);
+      expect(names.some((n) => n.startsWith("empty__"))).toBe(false);
+
+      const metrics = await (await fetch(`${app!.metricsUrl}/metrics`)).text();
+      expect(metrics).toMatch(/aisix_config_rejected_resources\{kind="mcp_servers"\} 1\b/);
+    } finally {
+      await etcd.delete(`${app!.etcdPrefix}/mcp_servers/${badId}`);
+      await etcd.delete(`${app!.etcdPrefix}/mcp_servers/${dupId}`);
+    }
   });
 });

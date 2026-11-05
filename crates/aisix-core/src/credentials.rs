@@ -22,8 +22,10 @@ pub enum CredentialKind {
     /// credential), at any depth. Non-string values, such as a boolean
     /// flag, are kept.
     ProviderKey,
-    /// `api_key`, `access_key_secret` and `secret_access_key` at any depth
-    /// (the Bedrock secret sits under `aws_credentials`).
+    /// `api_key`, `access_key_secret`, `secret_access_key` and
+    /// `session_token` at any depth (the Bedrock secrets sit under
+    /// `aws_credentials`), plus every string under a custom guardrail's
+    /// `secrets`, whatever its name.
     Guardrail,
     /// `secret`.
     McpServer,
@@ -32,10 +34,18 @@ pub enum CredentialKind {
     /// Every value under `headers` (an OTLP exporter's request headers,
     /// which routinely carry a vendor auth token).
     ObservabilityExporter,
+    /// `hmac_secret`, which every caller of a shared-secret provider
+    /// authenticates with, and `login.client_secret`.
+    OidcProvider,
 }
 
 /// Guardrail fields that hold a credential wherever they appear.
-const GUARDRAIL_SECRET_KEYS: &[&str] = &["api_key", "access_key_secret", "secret_access_key"];
+const GUARDRAIL_SECRET_KEYS: &[&str] = &[
+    "api_key",
+    "access_key_secret",
+    "secret_access_key",
+    "session_token",
+];
 
 /// One credential found by [`visit_credentials`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,9 +90,25 @@ pub fn visit_credentials(
                 string_map(request, "default_body_fields", "default body field", visit);
             }
         }
-        CredentialKind::Guardrail => by_key(doc, GUARDRAIL_SECRET_KEYS, visit),
+        CredentialKind::Guardrail => {
+            // Every value under `secrets` is a credential whatever it is
+            // named, so it is walked once as a map and kept out of the by-name
+            // walk, which would otherwise visit a secret named `api_key` twice.
+            let secrets = doc.get_mut("secrets").map(Value::take);
+            by_key(doc, GUARDRAIL_SECRET_KEYS, visit);
+            if let Some(secrets) = secrets {
+                doc["secrets"] = secrets;
+                string_map(doc, "secrets", "secret", visit);
+            }
+        }
         CredentialKind::McpServer | CredentialKind::A2aAgent => top_level(doc, "secret", visit),
         CredentialKind::ObservabilityExporter => string_map(doc, "headers", "header", visit),
+        CredentialKind::OidcProvider => {
+            top_level(doc, "hmac_secret", visit);
+            if let Some(login) = doc.get_mut("login") {
+                top_level(login, "client_secret", visit);
+            }
+        }
     }
 }
 
@@ -215,6 +241,10 @@ mod tests {
             "secret",
             "access_key_secret",
             "secret_access_key",
+            "session_token",
+            "secrets",
+            "hmac_secret",
+            "client_secret",
         ];
         const NOT_SECRET: &[&str] = &[
             "api_key_header",   // the name of a header, not its value
@@ -222,10 +252,12 @@ mod tests {
             "auth_header_name", // the name of a header
             "auth_mode",
             "auth_type",
-            "aws_credentials", // container; its secret is redacted
+            "authorization_url", // where users are sent to sign in
+            "aws_credentials",   // container; its secret is redacted
             "credential_mode",
             "credential_ref", // names an environment credential
             "max_tokens",
+            "token_exchange_profile", // names a protocol
             "token_url",
         ];
         const HINTS: &[&str] = &[
@@ -274,6 +306,42 @@ mod tests {
             unclassified.is_empty(),
             "classify each as redacted (extend visit_credentials) or not secret: {unclassified:?}",
         );
+    }
+
+    #[test]
+    fn guardrail_session_token_and_every_custom_secret_are_credentials() {
+        let found = slots(
+            CredentialKind::Guardrail,
+            json!({
+                "name": "g",
+                "aws_credentials": { "access_key_id": "AKIA", "session_token": "st-1" },
+                "secrets": { "SCREENER_KEY": "sk-2", "api_key": "sk-3" },
+                "script": "kept"
+            }),
+        );
+        assert_eq!(
+            found,
+            vec![
+                ("SECRETS_API_KEY".to_string(), "sk-3".to_string()),
+                ("SECRETS_SCREENER_KEY".to_string(), "sk-2".to_string()),
+                ("session_token".to_string(), "st-1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn oidc_provider_hmac_secret_and_login_client_secret_are_credentials() {
+        let mut doc = json!({
+            "name": "corp",
+            "issuer": "https://idp.example",
+            "hmac_secret": "h-1",
+            "login": { "client_id": "gw", "client_secret": "c-2" }
+        });
+        redact_credentials(CredentialKind::OidcProvider, &mut doc);
+        assert_eq!(doc["hmac_secret"], REDACTED);
+        assert_eq!(doc["login"]["client_secret"], REDACTED);
+        assert_eq!(doc["login"]["client_id"], "gw");
+        assert_eq!(doc["issuer"], "https://idp.example");
     }
 
     #[test]

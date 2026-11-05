@@ -19,6 +19,7 @@
 //!
 //! **Stateless task addressing**: the gateway persists nothing. The
 //! caller-visible id is `base64url_nopad("<model_entry_id>:<upstream_task_id>")`
+//! (for a Model Group, the id of the target that accepted the task)
 //! — the GET routes decode it, re-resolve the Model row (and thus the
 //! ProviderKey credential) from the live snapshot, and call the
 //! provider's task endpoint. Same encode-routing-into-the-id approach as
@@ -244,7 +245,7 @@ fn map_openai_status(status: &str) -> &'static str {
 /// `size` a `WIDTHxHEIGHT` resolution. `model` is required here (the
 /// gateway has no default video model). Unknown fields (e.g.
 /// `input_reference`) are ignored in Phase 1.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct VideoCreateBody {
     pub model: String,
     pub prompt: String,
@@ -257,7 +258,7 @@ pub struct VideoCreateBody {
 /// The upstream contract types `seconds` as a string enum (`"4"`, `"8"`,
 /// `"12"`); accept a bare integer too so curl-first callers aren't
 /// punished for the obvious spelling.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum SecondsField {
     Int(u64),
@@ -998,24 +999,36 @@ fn nonempty_str(v: Option<&serde_json::Value>) -> Option<&str> {
 /// content-proxy path ([`proxy_content`]) — both must map a non-2xx upstream
 /// to a typed error rather than surfacing the raw body.
 fn parse_provider_error_message(bytes: &[u8]) -> String {
+    vendor_error_message(bytes).unwrap_or_else(|| "upstream error".to_string())
+}
+
+/// The typed error of a non-2xx: the caller reads
+/// [`parse_provider_error_message`], the row and the access log what the body
+/// actually said.
+fn provider_status_error(status: u16, bytes: &[u8]) -> aisix_gateway::BridgeError {
+    let detail =
+        vendor_error_message(bytes).unwrap_or_else(|| aisix_gateway::bounded_error_text(bytes));
+    aisix_gateway::BridgeError::upstream_status(status, parse_provider_error_message(bytes))
+        .with_telemetry_detail(&detail)
+}
+
+fn vendor_error_message(bytes: &[u8]) -> Option<String> {
     let parsed: Option<serde_json::Value> = serde_json::from_slice(bytes).ok();
-    parsed
-        .and_then(|p| {
-            let scope = if p.get("error").is_some() {
-                p.get("error").cloned().unwrap_or_default()
-            } else {
-                p
-            };
-            let code = nonempty_str(scope.get("code")).map(str::to_string);
-            let msg = nonempty_str(scope.get("message")).map(str::to_string);
-            match (code, msg) {
-                (Some(code), Some(msg)) => Some(format!("{code}: {msg}")),
-                (None, Some(msg)) => Some(msg),
-                (Some(code), None) => Some(code),
-                (None, None) => None,
-            }
-        })
-        .unwrap_or_else(|| "upstream error".to_string())
+    parsed.and_then(|p| {
+        let scope = if p.get("error").is_some() {
+            p.get("error").cloned().unwrap_or_default()
+        } else {
+            p
+        };
+        let code = nonempty_str(scope.get("code")).map(str::to_string);
+        let msg = nonempty_str(scope.get("message")).map(str::to_string);
+        match (code, msg) {
+            (Some(code), Some(msg)) => Some(format!("{code}: {msg}")),
+            (None, Some(msg)) => Some(msg),
+            (Some(code), None) => Some(code),
+            (None, None) => None,
+        }
+    })
 }
 
 // ─────────────────────── resolved dispatch target ───────────────────────
@@ -1029,20 +1042,52 @@ struct VideoTarget {
     provider_label: String,
     base_url: String,
     secret: String,
-    /// The ProviderKey's TLS override, resolved with the target so every
-    /// round-trip on this surface (submit, poll, content fetch) dials the
-    /// endpoint under the same trust settings.
-    tls: Option<aisix_core::models::provider_key::ProviderKeyTls>,
-    /// The ProviderKey's rendered `default_headers` plus the client headers
-    /// its `forward_client_headers` allowlist admits, resolved once when the
-    /// target is resolved so every round-trip on this surface (submit, poll,
-    /// content fetch) sends the same set (#1112 / #1167).
+    /// The ProviderKey's connection overrides, resolved with the target so
+    /// every round-trip on this surface (submit, poll, content fetch)
+    /// dials the endpoint the same way.
+    conn: Option<aisix_core::models::provider_key::UpstreamConnection>,
+    /// The ProviderKey's rendered `default_headers`, resolved once when the
+    /// target is resolved so every round-trip on this surface (submit,
+    /// poll, content fetch) sends the same set (#1112).
     extra_headers: Vec<(axum::http::HeaderName, axum::http::HeaderValue)>,
+    /// The client headers this ProviderKey's `forward_client_headers`
+    /// admits, resolved from the same inbound request and reused on the
+    /// same round-trips (AISIX-Cloud#1167). Kept beside `extra_headers`
+    /// because it OVERWRITES its slots while `extra_headers` merges with
+    /// skip-if-present — a forwarded credential is meant to displace the
+    /// gateway's own.
+    forwarded_client: aisix_gateway::ForwardedClientHeaders,
 }
 
 impl VideoTarget {
     fn display_name(&self) -> &str {
         &self.model_entry.value.display_name
+    }
+}
+
+/// A provider `/v1/videos` has no mapping for, and what the 501 says about it.
+struct UnsupportedProvider(String);
+
+impl UnsupportedProvider {
+    fn into_success(
+        self,
+        model_id: String,
+        applied_guardrails: Vec<AppliedGuardrail>,
+        monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+        redactions: crate::redact::RedactionCounts,
+    ) -> CreateSuccess {
+        let env = ErrorEnvelope::new(self.0.clone(), "not_implemented");
+        CreateSuccess {
+            response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
+            provider: "unknown".into(),
+            model_id,
+            provider_key_id: String::new(),
+            applied_guardrails,
+            monitor_hits,
+            redactions,
+            upstream_called: false,
+            unsupported: Some(self.0),
+        }
     }
 }
 
@@ -1056,8 +1101,8 @@ fn resolve_video_target(
     model_entry: std::sync::Arc<aisix_core::ResourceEntry<aisix_core::Model>>,
     acl_name: &str,
     client_ctx: &ClientContext,
-) -> Result<Result<VideoTarget, Response>, ProxyError> {
-    if !auth.key().can_access(acl_name) {
+) -> Result<Result<VideoTarget, UnsupportedProvider>, ProxyError> {
+    if !auth.key().can_access(snapshot, acl_name) {
         return Err(ProxyError::ModelForbidden(acl_name.to_string()));
     }
     crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
@@ -1068,11 +1113,9 @@ fn resolve_video_target(
     // GET routes by resolve_get_target). MiniMax (Files-API fetch
     // indirection) is the tracked Phase 2 follow-up.
     let Some(video_provider) = VideoProvider::from_provider(&provider) else {
-        let env = ErrorEnvelope::new(
-            format!("provider {provider:?} is not yet supported on /v1/videos"),
-            "not_implemented",
-        );
-        return Ok(Err((StatusCode::NOT_IMPLEMENTED, Json(env)).into_response()));
+        return Ok(Err(UnsupportedProvider(format!(
+            "provider {provider:?} is not yet supported on /v1/videos"
+        ))));
     };
 
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, &model_entry.value)?;
@@ -1090,35 +1133,31 @@ fn resolve_video_target(
     };
     let secret = crate::dispatch::require_api_key(&pk_entry.value, &model_entry.value)?.to_string();
 
-    let extra_headers =
-        aisix_gateway::resolve_extra_headers(&crate::dispatch::upstream_header_ctx(
-            &pk_entry.value,
-            &pk_entry.id,
-            &model_entry.value,
-            &model_entry.id,
-            client_ctx,
-        ));
+    let header_ctx = crate::dispatch::upstream_header_ctx(
+        &pk_entry.value,
+        &pk_entry.id,
+        &model_entry.value,
+        &model_entry.id,
+        client_ctx,
+    );
+    let forwarded_client = aisix_gateway::ForwardedClientHeaders::resolve(&header_ctx);
+    let extra_headers = aisix_gateway::resolve_default_headers(&header_ctx);
     Ok(Ok(VideoTarget {
         pk_id: pk_entry.id.to_string(),
-        tls: pk_entry.value.tls.clone(),
+        conn: pk_entry.value.upstream_connection(),
         provider: video_provider,
         provider_label: provider.to_ascii_lowercase(),
         base_url,
         secret,
         model_entry,
         extra_headers,
+        forwarded_client,
     }))
 }
 
 // ─────────────────────── upstream plumbing ───────────────────────
 
-/// One provider HTTP round-trip: Bearer auth (all three vendors),
-/// provider-specific submit headers, the model's E2E timeout, cooldown
-/// accounting on transport failures (parity with jobs / passthrough,
-/// #701). Non-2xx responses map to `BridgeError::UpstreamStatus`
-/// carrying the upstream `message` (4xx pass through the standard
-/// envelope; 5xx bodies are redacted by the shared renderer in
-/// error.rs).
+/// [`provider_call_once`] under the target model's retry budget.
 async fn provider_call(
     state: &ProxyState,
     target: &VideoTarget,
@@ -1127,8 +1166,87 @@ async fn provider_call(
     body: Option<&serde_json::Value>,
     request_id: &str,
 ) -> Result<serde_json::Value, ProxyError> {
-    let client = crate::http_client::client_for(target.tls.as_ref());
-    let note = |e: aisix_gateway::BridgeError| {
+    // Every /v1/videos JSON round-trip after the submit — poll, content-URL
+    // fetch — funnels through here, so wrapping this one function gives
+    // those routes a retry budget. The submit walks a Model Group's targets
+    // instead (`dispatch_create`), with the same permit.
+    let timeout =
+        crate::routing::effective_timeouts(&target.model_entry.value, None, state.default_timeouts)
+            .request;
+    crate::routing::retrying_dispatch_gated(
+        state,
+        &target.model_entry.value,
+        "/v1/videos",
+        |e| retry_permit(&method, e),
+        || {
+            let call = provider_call_once(
+                state,
+                target,
+                method.clone(),
+                url,
+                body,
+                request_id,
+                timeout,
+            );
+            async move {
+                let result = call.await;
+                note_deployment(state, target, result.as_ref().map(|_| 200));
+                result
+            }
+        },
+    )
+    .await
+    .map_err(ProxyError::Bridge)
+}
+
+/// One follow-up round-trip's `aisix_deployment_*` sample; the submit is
+/// counted by its routing loop instead.
+fn note_deployment(
+    state: &ProxyState,
+    target: &VideoTarget,
+    outcome: Result<u16, &aisix_gateway::BridgeError>,
+) {
+    let status = match outcome {
+        Ok(status) => status,
+        Err(e) if e.reached_upstream() => e.http_status(),
+        Err(_) => return,
+    };
+    crate::attempt::RoutingTelemetry::record_deployment(state, &target.model_entry.id, status);
+}
+
+/// Whether a failed round-trip may be replayed (same target or, on the
+/// submit, the next target of a Model Group).
+///
+/// The submit POST creates a PAID generation task, so a failure after the
+/// upstream returned its status (a body-read or parse failure —
+/// `UpstreamDecode`) must not be replayed: the task exists upstream, its id
+/// was in the lost body, and a retry would start a second one the caller
+/// also can't see. Send-phase transport failures stay retryable for POST
+/// too — whether the request arrived is unknowable, and the provider SDKs
+/// make the same call for their own paid generation POSTs. GETs (poll /
+/// content URL) retry everything.
+fn retry_permit(method: &reqwest::Method, e: &aisix_gateway::BridgeError) -> bool {
+    method == reqwest::Method::GET || !matches!(e, aisix_gateway::BridgeError::UpstreamDecode(_))
+}
+
+/// One provider HTTP round-trip: Bearer auth (all three vendors),
+/// provider-specific submit headers, the given E2E timeout, cooldown
+/// accounting on transport failures (parity with jobs / passthrough,
+/// #701). Non-2xx responses map to `BridgeError::UpstreamStatus`
+/// carrying the upstream `message` (4xx pass through the standard
+/// envelope; 5xx bodies are redacted by the shared renderer in
+/// error.rs). `note` stays per attempt (see rerank.rs).
+fn provider_call_once<'a>(
+    state: &'a ProxyState,
+    target: &'a VideoTarget,
+    method: reqwest::Method,
+    url: &str,
+    body: Option<&serde_json::Value>,
+    request_id: &str,
+    timeout: Option<Duration>,
+) -> impl std::future::Future<Output = Result<serde_json::Value, aisix_gateway::BridgeError>> + 'a {
+    let client = crate::http_client::client_for(target.conn.as_ref());
+    let note = move |e: aisix_gateway::BridgeError| {
         crate::cooldown::note_failure(
             &state.runtime_status,
             &target.model_entry.id,
@@ -1136,109 +1254,82 @@ async fn provider_call(
             e,
         )
     };
+    // Gateway-owned headers go into the map first; the operator /
+    // client set is merged on top and skips any name already there.
+    // `RequestBuilder::header` APPENDS on a repeat name, so building
+    // the map is what keeps a colliding operator header from putting
+    // two values of e.g. `x-aisix-request-id` on the wire.
+    let mut headers = axum::http::HeaderMap::new();
+    if let Ok(v) = header::HeaderValue::from_str(&format!("Bearer {}", target.secret)) {
+        headers.insert(header::AUTHORIZATION, v);
+    }
+    if let Ok(v) = header::HeaderValue::from_str(request_id) {
+        headers.insert(header::HeaderName::from_static("x-aisix-request-id"), v);
+    }
+    // A provider header required on every call (submit and poll) — e.g.
+    // Runway's mandatory `X-Runway-Version`. Applied unconditionally,
+    // before the submit-only body/header block below.
+    if let Some((name, value)) = target.provider.all_request_header() {
+        if let (Ok(n), Ok(v)) = (
+            name.parse::<header::HeaderName>(),
+            header::HeaderValue::from_str(value),
+        ) {
+            headers.insert(n, v);
+        }
+    }
+    if target.provider.submit_headers_async() && body.is_some() {
+        // DashScope requires the async-mode header — it rejects
+        // synchronous video-synthesis calls outright.
+        headers.insert(
+            header::HeaderName::from_static("x-dashscope-async"),
+            header::HeaderValue::from_static("enable"),
+        );
+    }
+    for (name, value) in &target.extra_headers {
+        if !headers.contains_key(name) {
+            headers.insert(name.clone(), value.clone());
+        }
+    }
+    // Last, and overwriting — see the field's doc comment.
+    target.forwarded_client.apply(&mut headers);
 
-    // Every /v1/videos JSON round-trip — submit, poll, content-URL fetch —
-    // funnels through here, so wrapping this one function gives the whole
-    // surface a retry budget. `note` stays per attempt (see rerank.rs).
-    //
-    // The submit POST creates a PAID generation task, so a failure after
-    // the upstream returned its status (a body-read or parse failure —
-    // `UpstreamDecode`) must not be replayed: the task exists upstream,
-    // its id was in the lost body, and a retry would start a second one
-    // the caller also can't see. Send-phase transport failures stay
-    // retryable for POST too — whether the request arrived is unknowable,
-    // and the provider SDKs make the same call for their own paid
-    // generation POSTs. GETs (poll / content URL) retry everything.
-    let retry_permit = |e: &aisix_gateway::BridgeError| {
-        method == reqwest::Method::GET
-            || !matches!(e, aisix_gateway::BridgeError::UpstreamDecode(_))
-    };
-    crate::routing::retrying_dispatch_gated(
-        state,
-        &target.model_entry.value,
-        "/v1/videos",
-        retry_permit,
-        || {
-            // Gateway-owned headers go into the map first; the operator /
-            // client set is merged on top and skips any name already there.
-            // `RequestBuilder::header` APPENDS on a repeat name, so building
-            // the map is what keeps a colliding operator header from putting
-            // two values of e.g. `x-aisix-request-id` on the wire.
-            let mut headers = axum::http::HeaderMap::new();
-            if let Ok(v) = header::HeaderValue::from_str(&format!("Bearer {}", target.secret)) {
-                headers.insert(header::AUTHORIZATION, v);
-            }
-            if let Ok(v) = header::HeaderValue::from_str(request_id) {
-                headers.insert(header::HeaderName::from_static("x-aisix-request-id"), v);
-            }
-            // A provider header required on every call (submit and poll) — e.g.
-            // Runway's mandatory `X-Runway-Version`. Applied unconditionally,
-            // before the submit-only body/header block below.
-            if let Some((name, value)) = target.provider.all_request_header() {
-                if let (Ok(n), Ok(v)) = (
-                    name.parse::<header::HeaderName>(),
-                    header::HeaderValue::from_str(value),
-                ) {
-                    headers.insert(n, v);
-                }
-            }
-            if target.provider.submit_headers_async() && body.is_some() {
-                // DashScope requires the async-mode header — it rejects
-                // synchronous video-synthesis calls outright.
-                headers.insert(
-                    header::HeaderName::from_static("x-dashscope-async"),
-                    header::HeaderValue::from_static("enable"),
-                );
-            }
-            for (name, value) in &target.extra_headers {
-                if !headers.contains_key(name) {
-                    headers.insert(name.clone(), value.clone());
-                }
-            }
-            let mut builder = client.request(method.clone(), url).headers(headers);
-            if let Some(b) = body {
-                builder = builder
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .json(b);
-            }
-            if let Some(d) = crate::routing::effective_timeouts(
-                &target.model_entry.value,
-                None,
-                state.default_timeouts,
-            )
-            .request
-            {
-                builder = builder.timeout(d);
-            }
-            async move {
-                let started = Instant::now();
-                let resp = builder
-                    .send()
-                    .await
-                    .map_err(|e| note(crate::dispatch::reqwest_error_to_bridge(&e, started)))?;
-                let status = resp.status().as_u16();
-                let bytes = resp
-                    .bytes()
-                    .await
-                    .map_err(|e| note(aisix_gateway::BridgeError::UpstreamDecode(e.to_string())))?;
+    let mut builder = client.request(method, url).headers(headers);
+    if let Some(b) = body {
+        builder = builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(aisix_gateway::json_body(b).expect("a serde_json::Value always serializes"));
+    }
+    if let Some(d) = timeout {
+        builder = builder.timeout(d);
+    }
+    async move {
+        let started = Instant::now();
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| note(crate::dispatch::reqwest_error_to_bridge(&e, started)))?;
+        aisix_gateway::note_upstream_response(resp.headers());
+        let status = resp.status().as_u16();
+        let is_success = (200..300).contains(&status);
+        let bytes = resp.bytes().await.map_err(|e| {
+            note(if is_success {
+                aisix_gateway::upstream_body_read_error(&e)
+            } else {
+                aisix_gateway::BridgeError::upstream_body_unread(status, &e)
+            })
+        })?;
 
-                if !(200..300).contains(&status) {
-                    let message = parse_provider_error_message(&bytes);
-                    return Err(note(aisix_gateway::BridgeError::upstream_status(
-                        status, message,
-                    )));
-                }
+        if !is_success {
+            aisix_gateway::note_upstream_error_body(&bytes);
+            return Err(note(provider_status_error(status, &bytes)));
+        }
 
-                serde_json::from_slice(&bytes).map_err(|e| {
-                    aisix_gateway::BridgeError::UpstreamDecode(format!(
-                        "invalid task response from upstream: {e}"
-                    ))
-                })
-            }
-        },
-    )
-    .await
-    .map_err(ProxyError::Bridge)
+        serde_json::from_slice(&bytes).map_err(|e| {
+            aisix_gateway::BridgeError::UpstreamDecode(format!(
+                "invalid task response from upstream: {e}"
+            ))
+        })
+    }
 }
 
 /// Poll the provider task for a decoded video id and reduce it to the
@@ -1282,7 +1373,7 @@ async fn proxy_content(
     url: &str,
     request_id: &str,
 ) -> Result<Response, ProxyError> {
-    let client = crate::http_client::client_for(target.tls.as_ref());
+    let client = crate::http_client::client_for(target.conn.as_ref());
     // Same map-then-merge shape as `provider_call` — see the comment there
     // on why the gateway-owned names cannot be appended to.
     let mut headers = axum::http::HeaderMap::new();
@@ -1307,6 +1398,9 @@ async fn proxy_content(
             headers.insert(name.clone(), value.clone());
         }
     }
+    // Last, and overwriting — see the field's doc comment.
+    target.forwarded_client.apply(&mut headers);
+
     let builder = client.get(url).headers(headers);
 
     let stream_budget =
@@ -1323,10 +1417,12 @@ async fn proxy_content(
     };
     let resp = crate::stream_timeout::send_with_deadline(builder, stream_budget, started)
         .await
+        .inspect_err(|e| note_deployment(state, target, Err(e)))
         .map_err(&note)
         .map_err(ProxyError::Bridge)?;
 
     let status = resp.status();
+    note_deployment(state, target, Ok(status.as_u16()));
     if !status.is_success() {
         // Status checked BEFORE any body is constructed: an expired /
         // not-ready content URL must surface as a typed error envelope, never
@@ -1336,18 +1432,20 @@ async fn proxy_content(
         // error body cannot hang the handler (the success path is already
         // bounded per-chunk; this closes the error branch).
         let code = status.as_u16();
-        let bytes = match stream_budget {
-            Some(d) => tokio::time::timeout(d, resp.bytes())
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or_default(),
-            None => resp.bytes().await.unwrap_or_default(),
+        let read = aisix_gateway::read_body_capped(resp, usize::MAX);
+        let body = match stream_budget {
+            Some(d) => tokio::time::timeout(d, read).await.unwrap_or_else(|_| {
+                let reason = format!("timed out after {}ms", d.as_millis());
+                aisix_gateway::warn_error_body_unread(code, &reason);
+                aisix_gateway::UpstreamErrorBody {
+                    bytes: bytes::Bytes::new(),
+                    read_error: Some(reason),
+                }
+            }),
+            None => read.await,
         };
-        let message = parse_provider_error_message(&bytes);
-        return Err(ProxyError::Bridge(note(
-            aisix_gateway::BridgeError::upstream_status(code, message),
-        )));
+        let err = provider_status_error(code, body.whole()).with_body_read_error(body.read_error);
+        return Err(ProxyError::Bridge(note(err)));
     }
 
     // Relay the upstream content headers before consuming the response into a
@@ -1436,11 +1534,46 @@ struct Telemetry<'a> {
     auth: &'a AuthenticatedKey,
     request_id: String,
     started: Instant,
+    /// The content route's proxied delivery relays an open-ended body after
+    /// this tail runs, so its access-log `duration` is measured to the end
+    /// of that relay.
+    duration_spans_body: bool,
 }
 
 impl Telemetry<'_> {
     fn finish(&self, status: u16, provider: &str, model_label: &str, error: Option<&ProxyError>) {
+        self.finish_routed(
+            status,
+            provider,
+            model_label,
+            error,
+            &crate::attempt::RoutingTelemetry::default(),
+        );
+    }
+
+    /// [`Self::finish`] for the submit, whose dispatch can fail over to
+    /// another Model Group target: the access log carries its routing
+    /// summary, the request series its `is_fallback`.
+    fn finish_routed(
+        &self,
+        status: u16,
+        provider: &str,
+        model_label: &str,
+        error: Option<&ProxyError>,
+        routing: &crate::attempt::RoutingTelemetry,
+    ) {
         let elapsed = self.started.elapsed();
+        let error_source = error.map_or_else(
+            // A direct model's unsupported-provider 501 records no attempt.
+            || {
+                if status >= 400 {
+                    aisix_obs::ErrorSource::Aisix
+                } else {
+                    crate::attempt::answered_error_source(false, routing)
+                }
+            },
+            crate::attempt::error_source,
+        );
         let (error_kind, error) = match error {
             Some(e) => {
                 let (kind, msg) = crate::attempt::access_log_error(e);
@@ -1448,13 +1581,31 @@ impl Telemetry<'_> {
             }
             None => (None, None),
         };
-        AccessLog {
+        // AISIX-Cloud#1325: this tail never took `upstream_model` or the
+        // ProviderKey pair, and its error sites pass `provider: "unknown"`.
+        // All three come off the request's attribution cell, which the
+        // dispatch filled when it selected the target — so a failed video
+        // job is attributable to the same key its successes are.
+        let snap = self.state.snapshot.load();
+        let attributed = crate::attribution::current().unwrap_or_default();
+        let last_target = crate::request_metrics::LastTarget::new(&snap, &attributed);
+        let provider = if provider == "unknown" {
+            last_target.provider()
+        } else {
+            provider
+        };
+        let log_target = crate::attribution::AccessLogTarget::current();
+        let summary = routing.access_log_summary();
+        let line = AccessLog {
             method: self.method,
             path: &self.path,
             status,
             latency: elapsed,
+            duration: elapsed,
             provider: Some(provider).filter(|p| !p.is_empty()),
             model: Some(model_label),
+            upstream_model: log_target.upstream_model(),
+            provider_key_id: log_target.provider_key_id(),
             api_key_id: Some(&self.auth.entry.id),
             prompt_tokens: None,
             completion_tokens: None,
@@ -1466,25 +1617,47 @@ impl Telemetry<'_> {
             // same job (#1289). It already reaches the caller as
             // the job's own `id`.
             provider_request_id: None,
-            served_by_model: None,
-            routing_attempt_count: None,
-            routing_fallback_count: None,
+            served_by_model: summary.served_by_model,
+            routing_attempt_count: summary.attempt_count,
+            routing_fallback_count: summary.fallback_count,
             error_kind,
             error: error.as_deref(),
+            mcp: None,
+            cache: None,
+            request_body_bytes: None,
+            response_body_bytes: None,
+        };
+        if self.duration_spans_body {
+            crate::attribution::emit_access_log_spanning_body(line, self.started);
+        } else {
+            crate::attribution::emit_access_log(line);
         }
-        .emit();
-        crate::request_metrics::record(
-            self.state,
-            self.endpoint,
-            crate::request_metrics::Caller::new(self.auth),
-            crate::request_metrics::Upstream {
-                provider,
-                model: model_label,
-                ..Default::default()
-            },
-            status,
-            elapsed,
-        );
+        let caller = crate::request_metrics::Caller::new(self.auth);
+        let upstream = crate::request_metrics::Upstream {
+            provider,
+            ..last_target.upstream(model_label, false, routing.fallback_count() > 0)
+        };
+        if self.duration_spans_body {
+            crate::request_metrics::record_spanning_body(
+                self.state,
+                self.endpoint,
+                caller,
+                upstream,
+                status,
+                error_source,
+                self.started,
+            );
+        } else {
+            crate::request_metrics::record(
+                self.state,
+                self.endpoint,
+                caller,
+                upstream,
+                status,
+                error_source,
+                elapsed,
+            );
+        }
     }
 }
 
@@ -1505,6 +1678,7 @@ pub async fn create_video(
         auth: &auth,
         request_id: client.request_id.clone(),
         started,
+        duration_spans_body: false,
     };
     let body = match body {
         Ok(Json(b)) => b,
@@ -1530,7 +1704,23 @@ pub async fn create_video(
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
 
-    match dispatch_create(&state, &snapshot, &auth, body, &client).await {
+    // See `embeddings`: filled inside `dispatch_create` so the failure
+    // branch — where a guardrail block lands — stamps the enforced hits
+    // too (AISIX-Cloud#1330 / #1024).
+    let mut audit = crate::usage_attr::GuardrailAudit::default();
+    // Every upstream attempt, filled by the dispatch (#655).
+    let mut routing = crate::attempt::RoutingTelemetry::default();
+    match dispatch_create(
+        &state,
+        &snapshot,
+        &auth,
+        body,
+        &client,
+        &mut audit,
+        &mut routing,
+    )
+    .await
+    {
         Ok(success) => {
             let status = success.response.status().as_u16();
             // Label by the RESOLVED entry's display_name, not the requested
@@ -1544,14 +1734,33 @@ pub async fn create_video(
                 .get_by_id(&success.model_id)
                 .map(|e| e.value.display_name.clone())
                 .unwrap_or_else(|| crate::usage_attr::UNRESOLVED_MODEL_LABEL.to_string());
-            telemetry.finish(status, &success.provider, &model_label, None);
+            telemetry.finish_routed(status, &success.provider, &model_label, None, &routing);
+            // One zero-token event per attempt that failed first (#655).
+            // The route's own 501 is the terminal event below.
+            let superseded = crate::usage_attr::split_route_refusal(&routing);
+            crate::usage_attr::emit_failed_attempts(
+                &state,
+                &snapshot,
+                crate::operation::VIDEO_GENERATION,
+                &client.request_id,
+                &model_name,
+                &auth.entry.id,
+                &client,
+                &success.applied_guardrails,
+                superseded,
+                false,
+                false,
+                success.monitor_hits.clone(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
+            );
             // One zero-token UsageEvent per accepted submit — visible in
             // /logs and the budget ledger like every other endpoint.
             // Per-second cost is computed control-plane-side once the
             // per-second cost schema lands (#1118 decision 2);
-            // token fields stay zero. Skipped when no upstream call
-            // happened (the 501 unsupported-provider branch).
-            if success.upstream_called {
+            // token fields stay zero. The 501 unsupported-provider branch,
+            // which made no upstream call, emits too.
+            {
                 emit_submit_usage_event(
                     &state,
                     &snapshot,
@@ -1565,6 +1774,10 @@ pub async fn create_video(
                     success.redactions.clone(),
                     status,
                     started.elapsed(),
+                    &audit,
+                    routing.attempts.last(),
+                    success.upstream_called,
+                    success.unsupported.as_deref(),
                 );
             }
             // Same window the other model-dispatch endpoints publish, so an
@@ -1590,21 +1803,56 @@ pub async fn create_video(
         Err(err) => {
             let status = err.status().as_u16();
             let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
-            telemetry.finish(status, "unknown", metric_model.as_ref(), Some(&err));
+            telemetry.finish_routed(
+                status,
+                "unknown",
+                metric_model.as_ref(),
+                Some(&err),
+                &routing,
+            );
             // #655 parity: failed submits surface in Logs as zero-token
             // events instead of vanishing.
-            crate::usage_attr::emit_error_usage_event(
+            // Per #655: one zero-token event per failed upstream attempt,
+            // the last of them terminal when every attempt failed.
+            crate::usage_attr::note_client_error(&snapshot, &err);
+            let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
+            crate::usage_attr::emit_failed_attempts(
                 &state,
                 &snapshot,
-                "videos",
-                "openai",
+                crate::operation::VIDEO_GENERATION,
                 &client.request_id,
                 &model_name,
                 &auth.entry.id,
-                status,
-                err.kind(),
                 &client,
+                &crate::usage_attr::applied_guardrails(&audit),
+                &routing.attempts,
+                failed_terminal,
+                err.is_guardrail_block(),
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
             );
+            // A failure no attempt answers for — pre-dispatch, or after the
+            // winner — is one zero-token terminal event.
+            if !failed_terminal {
+                crate::usage_attr::emit_error_usage_event(
+                    &state,
+                    &snapshot,
+                    crate::operation::VIDEO_GENERATION,
+                    "openai",
+                    &client.request_id,
+                    &model_name,
+                    &auth.entry.id,
+                    status,
+                    crate::usage_attr::EventError::of(&err),
+                    err.is_guardrail_block(),
+                    &client,
+                    crate::usage_attr::applied_guardrails(&audit),
+                    crate::usage_attr::enforced_hits(&audit),
+                    crate::usage_attr::guardrail_scores(&audit),
+                    crate::usage_attr::bypass_reason(&audit),
+                );
+            }
             err.into_response()
         }
     }
@@ -1620,9 +1868,11 @@ struct CreateSuccess {
     /// Per-entity counts of what a mask rule rewrote. Names only, never
     /// the matched values (#932).
     redactions: crate::redact::RedactionCounts,
-    /// `false` on the 501 unsupported-provider branch — no upstream call
-    /// happened, so no UsageEvent is attributed (embeddings convention).
+    /// `false` on the 501 unsupported-provider branch: no upstream call
+    /// happened, so its usage event exports no upstream span.
     upstream_called: bool,
+    /// The 501's text, which names that row's failure.
+    unsupported: Option<String>,
 }
 
 async fn dispatch_create(
@@ -1631,7 +1881,12 @@ async fn dispatch_create(
     auth: &AuthenticatedKey,
     mut body: VideoCreateBody,
     client: &ClientContext,
+    audit_out: &mut crate::usage_attr::GuardrailAudit,
+    routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<CreateSuccess, ProxyError> {
+    crate::usage_attr::note_failure_request(snapshot, || {
+        serde_json::to_string(&body).unwrap_or_default()
+    });
     let model_entry = crate::model_resolve::resolve_model(snapshot, &body.model)
         .ok_or_else(|| ProxyError::ModelNotFound(body.model.clone()))?;
     let model_id = model_entry.id.to_string();
@@ -1648,70 +1903,96 @@ async fn dispatch_create(
         ));
     }
 
-    let target = match resolve_video_target(snapshot, auth, model_entry, &body.model, client)? {
-        Ok(t) => t,
-        Err(resp) => {
-            return Ok(CreateSuccess {
-                response: resp,
-                provider: "unknown".into(),
+    // The caller-addressed entry's own gates run once, before guardrails.
+    // A direct model is also its own only target, so its provider gate
+    // (the 501 for an unmapped vendor) answers here too, before the request
+    // is screened or burns a rate-limit slot; a Model Group's targets are
+    // gated one by one in the dispatch below.
+    if model_entry.value.routing.is_none() {
+        if let Err(unsupported) =
+            resolve_video_target(snapshot, auth, model_entry.clone(), &body.model, client)?
+        {
+            return Ok(unsupported.into_success(
                 model_id,
-                provider_key_id: String::new(),
-                applied_guardrails: Vec::new(),
-                monitor_hits: Vec::new(),
-                redactions: crate::redact::RedactionCounts::new(),
-                upstream_called: false,
-            })
+                Vec::new(),
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+            ));
         }
-    };
+    } else {
+        if !auth.key().can_access(snapshot, &body.model) {
+            return Err(ProxyError::ModelForbidden(body.model.clone()));
+        }
+        crate::dispatch::check_ip_access(&model_entry.value, &client.source_ip)?;
+    }
 
     // Input guardrail chain over the prompt — same resolution as chat /
     // embeddings, run BEFORE the rate-limit reservation so a policy
     // block doesn't burn an RPM slot (#542).
     let guardrail_ctx = aisix_guardrails::RequestContext {
         passthrough_route_id: "",
-        model_id: &target.model_entry.id,
+        model_id: &model_entry.id,
         mcp_server_id: "",
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
     let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
     let applied_guardrails = resolved_chain.applied().to_vec();
+    *audit_out = resolved_chain.audit_log();
     // A check that calls a remote moderation service is admitted by the
     // key's rate limits before it runs, and a refusal keeps the slot it took
     // (see `quota::reserve_before_costly_check`).
-    let model_rl = crate::quota::ModelRateLimit::from_model(
-        &body.model,
-        &target.model_entry.id,
-        &target.model_entry.value,
-    );
+    let model_rl =
+        crate::quota::ModelRateLimit::from_model(&body.model, &model_entry.id, &model_entry.value);
     let early_reservation = crate::quota::reserve_before_costly_check(
         &resolved_chain,
         crate::quota::enforce(state, snapshot, auth, Some(&model_rl)),
     )
     .await?;
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    let mut input_capture_safe = true;
     if !resolved_chain.is_empty() {
         let chat = aisix_gateway::ChatFormat::new(
             &body.model,
             vec![aisix_gateway::ChatMessage::user(body.prompt.clone())],
         );
         let (verdict, hits) =
-            aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
+            aisix_guardrails::Guardrail::check_input_unmaskable_observed(&resolved_chain, &chat)
+                .await;
         monitor_hits.extend(hits);
+        input_capture_safe = !verdict.is_bypass();
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
+            unavailable,
         } = verdict
         {
             // Matched-pattern detail stays in ops logs only (#153).
             tracing::warn!(
+                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                 guardrail_hook = "input",
                 model = %body.model,
                 reason = %reason,
                 "guardrail blocked /v1/videos request",
             );
-            return Err(ProxyError::ContentFiltered(
-                crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
+            // The refusal's row reports the request body under full-content
+            // export: mask it there too, so a blocked row never exports what
+            // the success path would have hidden.
+            if crate::usage_attr::content_cap(snapshot).is_some() {
+                if let Some(r) = aisix_guardrails::Guardrail::redact_input_text(
+                    &resolved_chain.without_audit(),
+                    &body.prompt,
+                ) {
+                    body.prompt = r.text;
+                }
+                crate::usage_attr::note_failure_request(snapshot, || {
+                    serde_json::to_string(&body).unwrap_or_default()
+                });
+            }
+            return Err(crate::error::guardrail_block_error(
+                "request",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
             ));
         }
     }
@@ -1730,6 +2011,17 @@ async fn dispatch_create(
             crate::redact::merge_counts(&mut redactions, r.counts);
         }
     }
+    // A failure row reports the masked text, and nothing when a check failed
+    // open, as on every other prompt-bearing endpoint.
+    if !redactions.is_empty() || !input_capture_safe {
+        crate::usage_attr::note_failure_request(snapshot, || {
+            if input_capture_safe {
+                serde_json::to_string(&body).unwrap_or_default()
+            } else {
+                String::new()
+            }
+        });
+    }
 
     // Model-level rate limiting — the submit is a full typed endpoint
     // (#1118 decision 3; the #1116 shape).
@@ -1738,29 +2030,94 @@ async fn dispatch_create(
         None => crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?,
     };
 
-    let upstream_model =
-        crate::dispatch::require_upstream_model(&target.model_entry.value)?.to_string();
-    let submit_body = target.provider.submit_body(
-        &upstream_model,
-        &body.prompt,
-        seconds,
-        body.size.as_deref(),
-    )?;
-    let url = target.provider.submit_url(&target.base_url);
-
-    let result = provider_call(
+    // A Model Group walks its targets (AISIX-Cloud#1111). The video id then
+    // names the target that accepted the task, so the GET routes poll the
+    // provider that holds it; the ACL they re-run is against the name the
+    // caller addressed (the group), exactly as here.
+    enum Submitted {
+        Accepted(Box<VideoTarget>, serde_json::Value),
+        Unsupported(UnsupportedProvider),
+    }
+    *routing_out = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
+        .with_trace(client.trace.clone());
+    let dispatched = crate::routing::dispatch_with_failover(
         state,
-        &target,
-        reqwest::Method::POST,
-        &url,
-        Some(&submit_body),
-        &client.request_id,
+        snapshot,
+        auth,
+        client,
+        &body.model,
+        &model_entry,
+        routing_out,
+        |e| retry_permit(&reqwest::Method::POST, e),
+        |submitted: &Submitted| {
+            matches!(submitted, Submitted::Unsupported(_))
+                .then(|| "provider is not yet supported on /v1/videos".to_string())
+        },
+        |attempt, timeouts| {
+            let (body, revision) = (&body, model_entry.revision);
+            async move {
+                let entry = std::sync::Arc::new(aisix_core::ResourceEntry::from_arc(
+                    attempt.id,
+                    attempt.model,
+                    revision,
+                ));
+                let target = match resolve_video_target(snapshot, auth, entry, &body.model, client)?
+                {
+                    Ok(t) => t,
+                    Err(unsupported) => return Ok(Submitted::Unsupported(unsupported)),
+                };
+                let upstream_model =
+                    crate::dispatch::require_upstream_model(&target.model_entry.value)?.to_string();
+                let submit_body = target.provider.submit_body(
+                    &upstream_model,
+                    &body.prompt,
+                    seconds,
+                    body.size.as_deref(),
+                )?;
+                let url = target.provider.submit_url(&target.base_url);
+                let resp = provider_call_once(
+                    state,
+                    &target,
+                    reqwest::Method::POST,
+                    &url,
+                    Some(&submit_body),
+                    &client.request_id,
+                    timeouts.request,
+                )
+                .await
+                .map_err(ProxyError::Bridge)?;
+                Ok(Submitted::Accepted(Box::new(target), resp))
+            }
+        },
     )
     .await;
+    let mut reservation = reservation;
+    let submitted = match dispatched {
+        Ok(d) => {
+            if let Some(member) = d.member_reservation {
+                reservation.merge(member);
+            }
+            d.value
+        }
+        Err(e) => {
+            reservation.commit_tokens_no_spend(0).await;
+            return Err(e);
+        }
+    };
     // Zero tokens on the videos surface — commit releases the
     // concurrency permit and finalises RPM.
     reservation.commit_tokens_no_spend(0).await;
-    let resp = result?;
+    let (target, resp) = match submitted {
+        Submitted::Accepted(target, resp) => (*target, resp),
+        Submitted::Unsupported(unsupported) => {
+            return Ok(unsupported.into_success(
+                model_id,
+                applied_guardrails,
+                monitor_hits,
+                redactions,
+            ));
+        }
+    };
 
     state
         .health
@@ -1790,12 +2147,15 @@ async fn dispatch_create(
     Ok(CreateSuccess {
         response: Json(video).into_response(),
         provider: target.provider_label.clone(),
-        model_id,
+        // The target that accepted the task — the one pricing resolves
+        // against, which for a Model Group is not the group itself.
+        model_id: target.model_entry.id.to_string(),
         provider_key_id: target.pk_id.clone(),
         applied_guardrails,
         monitor_hits,
         redactions,
         upstream_called: true,
+        unsupported: None,
     })
 }
 
@@ -1822,19 +2182,25 @@ async fn dispatch_create(
 /// crafted ids. The submit path keeps its distinct 403/501 — there the
 /// caller already knows the model name they asked for, so there is
 /// nothing to disclose.
+///
+/// Returns the resolved target, the provider-side task id, and the model
+/// name the CALLER addressed at submit time. That last one is NOT the row's
+/// `display_name`: a wildcard row serves many caller-minted names, and the
+/// client-facing `model` echoes the one the caller used. Telemetry labels
+/// keep using `display_name` — see `usage_attr`.
 fn resolve_get_target(
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     video_id: &str,
     client_ctx: &ClientContext,
-) -> Result<(VideoTarget, String), ProxyError> {
+) -> Result<(VideoTarget, String, String), ProxyError> {
     let (entry_id, alias, task_id) =
         decode_video_id(video_id).ok_or_else(|| ProxyError::VideoNotFound(video_id.to_string()))?;
     let model_entry = crate::model_resolve::resolve_model(snapshot, &alias)
         .filter(|resolved| resolved.id == entry_id)
         .ok_or_else(|| ProxyError::VideoNotFound(video_id.to_string()))?;
     match resolve_video_target(snapshot, auth, model_entry, &alias, client_ctx) {
-        Ok(Ok(target)) => Ok((target, task_id)),
+        Ok(Ok(target)) => Ok((target, task_id, alias)),
         // Unsupported provider → uniform 404 (oracle fold, see above).
         Ok(Err(_)) => Err(ProxyError::VideoNotFound(video_id.to_string())),
         // ACL denial → uniform 404 (oracle fold, see above).
@@ -1843,6 +2209,19 @@ fn resolve_get_target(
     }
 }
 
+/// Whether `group` names a Model Group with `target` among its targets.
+fn group_routes_to(snapshot: &aisix_core::AisixSnapshot, group: &str, target: &str) -> bool {
+    snapshot.models.get_by_name(group).is_some_and(|entry| {
+        entry
+            .value
+            .routing
+            .as_ref()
+            .is_some_and(|r| r.targets.iter().any(|t| t.model_ref(snapshot) == target))
+    })
+}
+
+/// Polls a video job. Deliberately emits no usage event: polling a job is
+/// not a recorded request (see `usage_attr::emit_usage`).
 pub async fn get_video(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
@@ -1857,21 +2236,41 @@ pub async fn get_video(
         auth: &auth,
         request_id: client.request_id.clone(),
         started: Instant::now(),
+        duration_spans_body: false,
     };
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
 
     let result: Result<(Response, String, String), ProxyError> = async {
-        let (target, task_id) = resolve_get_target(&snapshot, &auth, &video_id, &client)?;
+        let (target, task_id, requested_alias) =
+            resolve_get_target(&snapshot, &auth, &video_id, &client)?;
         // Poll traffic is exempt from model-level limits BY DESIGN
         // (#1118 decision 3): a client polling a task it
         // already paid an RPM slot to submit must not starve itself.
         // Key-level layers still apply.
         let reservation = crate::quota::enforce(&state, &snapshot, &auth, None).await?;
+        crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_id)?;
         let result = poll_task(&state, &target, &task_id, &client.request_id).await;
         reservation.commit_tokens_no_spend(0).await;
         let poll = result?;
-        let video = video_object_from_poll(&video_id, target.display_name(), &poll);
+        // Echo the name the caller submitted under, not the row's own — the
+        // two differ for a wildcard row, and the submit response already
+        // echoed the caller's (`model_echo`). But that name is decoded from a
+        // CLIENT-SUPPLIED id, so echo it only when this row would actually
+        // serve it: a forged id, or one left behind by a row renamed since
+        // submit, falls back to the row's own name rather than being handed
+        // back as though the gateway had attested it. A task submitted
+        // through a Model Group is held by one of its targets, and the name
+        // the caller submitted under is the group's.
+        let echoed =
+            if crate::model_resolve::row_serves_name(&target.model_entry.value, &requested_alias)
+                || group_routes_to(&snapshot, &requested_alias, target.display_name())
+            {
+                requested_alias.as_str()
+            } else {
+                target.display_name()
+            };
+        let video = video_object_from_poll(&video_id, echoed, &poll);
         Ok((
             Json(video).into_response(),
             target.provider_label.clone(),
@@ -1897,13 +2296,15 @@ pub async fn get_video(
     }
 }
 
+/// Retrieves a finished video. Deliberately emits no usage event, like
+/// [`get_video`].
 pub async fn video_content(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     client: ClientContext,
     AisixPath(video_id): AisixPath<String>,
 ) -> Response {
-    let telemetry = Telemetry {
+    let mut telemetry = Telemetry {
         state: &state,
         method: "GET",
         path: "/v1/videos/:id/content".to_string(),
@@ -1913,18 +2314,24 @@ pub async fn video_content(
         auth: &auth,
         request_id: client.request_id.clone(),
         started: Instant::now(),
+        // Set below for the proxied delivery only: a redirect or an error
+        // envelope is not a relay, and a slow reader must not stretch its
+        // duration.
+        duration_spans_body: false,
     };
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
 
-    let result: Result<(Response, String, String), ProxyError> = async {
-        let (target, task_id) = resolve_get_target(&snapshot, &auth, &video_id, &client)?;
+    let result: Result<(Response, String, String, bool), ProxyError> = async {
+        let (target, task_id, _) = resolve_get_target(&snapshot, &auth, &video_id, &client)?;
         // Same model-layer exemption as the poll route (see get_video).
         let reservation = crate::quota::enforce(&state, &snapshot, &auth, None).await?;
+        crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_id)?;
         let result = poll_task(&state, &target, &task_id, &client.request_id).await;
         reservation.commit_tokens_no_spend(0).await;
         let poll = result?;
 
+        let mut relays_body = false;
         let response = match poll.status {
             // A completed task is delivered per the provider's content mode
             // (#1118, content-proxy design):
@@ -1966,6 +2373,7 @@ pub async fn video_content(
                         resp
                     }
                     ContentDelivery::Proxy { url } => {
+                        relays_body = true;
                         proxy_content(&state, &target, &url, &client.request_id).await?
                     }
                 }
@@ -1994,12 +2402,14 @@ pub async fn video_content(
             response,
             target.provider_label.clone(),
             target.display_name().to_string(),
+            relays_body,
         ))
     }
     .await;
 
     match result {
-        Ok((resp, provider, model_label)) => {
+        Ok((resp, provider, model_label, relays_body)) => {
+            telemetry.duration_spans_body = relays_body;
             telemetry.finish(resp.status().as_u16(), &provider, &model_label, None);
             resp
         }
@@ -2038,38 +2448,62 @@ fn emit_submit_usage_event(
     redacted_entity_counts: crate::redact::RedactionCounts,
     status_code: u16,
     elapsed: Duration,
+    // The request's enforced-guardrail audit handle (AISIX-Cloud#1330).
+    audit: &crate::usage_attr::GuardrailAudit,
+    // The attempt that answered (#655).
+    winner: Option<&crate::attempt::AttemptRecord>,
+    // Whether the submit reached an upstream; the route's own 501 did not.
+    dispatched: bool,
+    // The route's own 501, in the wording it answered with.
+    unsupported: Option<&str>,
 ) {
     let mut event = UsageEvent {
         request_id: client.request_id.clone(),
-        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         model_id: model_id.to_string(),
         api_key_id: api_key_id.to_string(),
         requested_model: requested_model.to_string(),
         status_code,
-        // Single-attempt endpoint: the attempt spans the whole request, so
-        // the upstream figure and what the caller waited for coincide.
-        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
-        downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        // Narrowed to the winning attempt's own latency below
+        // (`apply_winning_attempt`) once a failover put earlier attempts
+        // in front of it; they emitted their own events.
+        upstream_latency_ms: crate::attempt::measured_ms(elapsed),
+        downstream_latency_ms: crate::attempt::measured_ms(elapsed),
         inbound_protocol: "openai".to_string(),
         applied_guardrails: applied_guardrails.to_vec(),
         guardrail_monitor_hits,
         redacted_entity_counts,
+        guardrail_enforced_hits: crate::usage_attr::enforced_hits(audit),
+        guardrail_scores: crate::usage_attr::guardrail_scores(audit),
+        guardrail_bypassed_reason: crate::usage_attr::bypass_reason(audit),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        request_headers: client.request_headers.clone(),
         ..Default::default()
     };
-    crate::usage_attr::apply_pk_telemetry(
-        &mut event,
-        &crate::usage_attr::ResolvedPk::resolve(snap, provider_key_id),
-    );
-    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
-    state.usage_sink.try_emit("videos", event.clone());
-    let exporters = crate::usage_attr::live_exporters(state, snap);
-    state.otlp_fan_out.fan_out(
-        &event,
+    let pk = crate::usage_attr::ResolvedPk::resolve(snap, provider_key_id);
+    crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
+    crate::usage_attr::apply_winning_attempt(&mut event, winner);
+    if let Some(message) = unsupported {
+        event.error_class = "config".to_string();
+        event.error_message = message.to_string();
+    }
+    crate::usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
+    let usage_model =
+        crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
+    // Only the submission meters: the two GET routes poll and download a job
+    // this event already accounted for, so `video_generation` counts video
+    // work rather than polling traffic (AISIX-Cloud#1461).
+    crate::usage_attr::emit_usage(
+        state,
+        snap,
+        crate::operation::VIDEO_GENERATION,
+        event,
+        crate::usage_attr::usage_event_labels(&usage_model, &pk),
         None,
-        exporters.generation(),
-        exporters.iter().map(|e| &*e.value),
+        client.trace.as_ref(),
+        /* terminal */ true,
+        dispatched,
     );
 }
 
@@ -2428,11 +2862,13 @@ mod tests {
     fn cfg() -> ProxyConfig {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: Some(1_048_576),
+            request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),
+            expose_debug_headers: false,
             tls: None,
+            listeners: Vec::new(),
             thread_per_core: None,
             workers: None,
         }
@@ -2527,7 +2963,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_happy_path_returns_video_object_and_maps_upstream_wire() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(DASHSCOPE_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(pending_submit_response()))
@@ -2595,7 +3031,7 @@ mod tests {
     /// see. The `.expect(1)` is the assertion.
     #[tokio::test]
     async fn submit_decode_failure_is_not_replayed() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(DASHSCOPE_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
@@ -2624,7 +3060,7 @@ mod tests {
     /// second attempt recovers the request.
     #[tokio::test]
     async fn submit_transient_5xx_is_retried_then_succeeds() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(DASHSCOPE_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(503).set_body_string("overloaded"))
@@ -2655,9 +3091,65 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// A submit whose retry WON at the attempt level and then failed to
+    /// parse: the failed first attempt has its row, and the request's
+    /// terminal error row must follow it rather than repeat index 0 — the
+    /// control plane counts a request by its one `attempt_index = 0` row.
+    #[tokio::test]
+    async fn failure_after_a_retried_winner_keeps_one_index_zero_row() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path(DASHSCOPE_SUBMIT_PATH))
+            .respond_with(ResponseTemplate::new(503).set_body_string("overloaded"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(DASHSCOPE_SUBMIT_PATH))
+            // JSON, so the attempt itself succeeds; it names no task, so
+            // the submit fails afterwards.
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"request_id": "r-1"})),
+            )
+            .with_priority(2)
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let handle = SnapshotHandle::new(new_snap(&upstream.uri(), "alibaba", ""));
+        let app = crate::build_router(
+            crate::ProxyState::new(handle, Arc::new(Hub::new()), &cfg())
+                .without_cache()
+                .with_usage_sink(UsageSink::new(tx)),
+        );
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            post_videos(serde_json::json!({"model": "my-video", "prompt": "a city"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 2);
+
+        let mut events = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await
+        {
+            events.push(ev);
+        }
+        assert_eq!(events.len(), 2, "{events:?}");
+        let indices: Vec<u32> = events.iter().map(|e| e.attempt_index).collect();
+        assert_eq!(indices, vec![0, 1], "{events:?}");
+        assert_eq!(events[0].attempt_kind, "initial");
+        assert_eq!(events[1].status_code, 502);
+    }
+
     #[tokio::test]
     async fn poll_maps_running_to_in_progress() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path(format!("{DASHSCOPE_TASK_PATH}/task-123")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2683,7 +3175,7 @@ mod tests {
 
     #[tokio::test]
     async fn poll_failed_task_carries_error_object() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path(format!("{DASHSCOPE_TASK_PATH}/task-bad")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2713,7 +3205,7 @@ mod tests {
 
     #[tokio::test]
     async fn content_redirects_302_to_provider_url_when_completed() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path(format!("{DASHSCOPE_TASK_PATH}/task-123")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2743,7 +3235,7 @@ mod tests {
 
     #[tokio::test]
     async fn content_not_ready_returns_400_invalid_request() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path(format!("{DASHSCOPE_TASK_PATH}/task-123")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2788,9 +3280,21 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// The route's own 501 still records the request, at zero tokens.
     #[tokio::test]
     async fn unsupported_provider_returns_501_not_implemented() {
-        let app = build_app(new_snap("http://unused", "minimax", ""));
+        use aisix_obs::UsageSink;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = crate::build_router(
+            crate::ProxyState::new(
+                SnapshotHandle::new(new_snap("http://unused", "minimax", "")),
+                Arc::new(Hub::new()),
+                &cfg(),
+            )
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx)),
+        );
         let resp = tower::ServiceExt::oneshot(
             app,
             post_videos(serde_json::json!({"model": "my-video", "prompt": "hi"})),
@@ -2800,6 +3304,14 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
         let v = body_json(resp).await;
         assert_eq!(v["error"]["type"], "not_implemented");
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the 501 must emit its zero-token UsageEvent")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.status_code, 501);
+        assert_eq!(ev.error_class, "config", "{ev:?}");
+        assert_eq!(ev.error_message, v["error"]["message"], "{ev:?}");
+        assert_eq!((ev.prompt_tokens, ev.completion_tokens), (0, 0));
     }
 
     #[tokio::test]
@@ -2841,7 +3353,7 @@ mod tests {
     /// in `applied_guardrails`, and the caller's PII is in the provider's logs.
     #[tokio::test]
     async fn a_mask_rule_rewrites_the_prompt_before_it_reaches_the_provider() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(DASHSCOPE_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(pending_submit_response()))
@@ -2854,7 +3366,7 @@ mod tests {
             r#"{"name":"mask-email","enabled":true,"hook_point":"input","kind":"pii","detectors":[{"type":"email","action":"mask"}]}"#,
         )
         .unwrap();
-        snap.guardrails.insert(ResourceEntry::new("g-mask", g, 1));
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-mask", g, 1));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let app = build_app_with_sink(snap, tx);
@@ -2893,7 +3405,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_guardrail_blocks_prompt_and_upstream_is_never_called() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(DASHSCOPE_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(pending_submit_response()))
@@ -2906,7 +3418,7 @@ mod tests {
             r#"{"name":"test-block","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"BLOCKME"}]}"#,
         )
         .unwrap();
-        snap.guardrails.insert(ResourceEntry::new("g-1", g, 1));
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-1", g, 1));
 
         let app = build_app(snap);
         let resp = tower::ServiceExt::oneshot(
@@ -2925,7 +3437,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_hits_model_rpm_cap_but_polling_stays_exempt() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(DASHSCOPE_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(pending_submit_response()))
@@ -2976,7 +3488,7 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_4xx_maps_to_error_envelope() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(DASHSCOPE_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
@@ -3048,7 +3560,7 @@ mod tests {
     /// #451 cardinality failure on this route too.
     #[tokio::test]
     async fn submit_success_metric_label_is_resolved_display_name_not_alias() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(DASHSCOPE_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(pending_submit_response()))
@@ -3114,7 +3626,7 @@ mod tests {
     /// the caller's own task.
     #[tokio::test]
     async fn wildcard_alias_submit_poll_content_all_succeed() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(DASHSCOPE_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(pending_submit_response()))
@@ -3192,7 +3704,7 @@ mod tests {
     /// must not turn the poll route into a Model-table existence probe.
     #[tokio::test]
     async fn restricted_key_gets_404_on_poll_and_upstream_untouched() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path(format!("{DASHSCOPE_TASK_PATH}/task-123")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3235,7 +3747,7 @@ mod tests {
     /// is a 404, and the other Model's upstream is never contacted.
     #[tokio::test]
     async fn id_pairing_an_allowed_alias_with_another_entry_is_404() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "output": {"task_id": "task-123", "task_status": "RUNNING"}
@@ -3278,7 +3790,7 @@ mod tests {
     /// of producing `…/compatible-mode/v1/api/v1/services/…` 404s.
     #[tokio::test]
     async fn compatible_mode_api_base_reaches_native_dashscope_paths() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(DASHSCOPE_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(pending_submit_response()))
@@ -3306,7 +3818,7 @@ mod tests {
     /// not ride the Location header to the caller.
     #[tokio::test]
     async fn content_rejects_non_http_video_url_scheme() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path(format!("{DASHSCOPE_TASK_PATH}/task-123")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3333,7 +3845,7 @@ mod tests {
     /// source IP the request is rejected before any upstream contact.
     #[tokio::test]
     async fn allowed_cidrs_enforced_on_poll_route() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path(format!("{DASHSCOPE_TASK_PATH}/task-123")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3366,7 +3878,7 @@ mod tests {
     /// content 302s to that URL.
     #[tokio::test]
     async fn zhipu_submit_poll_content_journey() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(ZHIPU_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3459,7 +3971,7 @@ mod tests {
     /// content 302s to the URL.
     #[tokio::test]
     async fn ark_submit_poll_content_journey() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(ARK_TASKS_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3543,7 +4055,7 @@ mod tests {
     /// message}` through the unified error object on poll.
     #[tokio::test]
     async fn ark_failed_task_carries_error_object() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path(format!("{ARK_TASKS_PATH}/cgt-bad")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3575,7 +4087,7 @@ mod tests {
     /// fallback code.
     #[tokio::test]
     async fn zhipu_fail_status_yields_generic_error_object() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path(format!("{ZHIPU_TASK_PATH}/zt-bad")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3601,7 +4113,7 @@ mod tests {
     /// top-level shape is covered by upstream_4xx_maps_to_error_envelope).
     #[tokio::test]
     async fn zhipu_nested_error_envelope_maps_to_4xx_message() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(ZHIPU_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
@@ -3635,7 +4147,7 @@ mod tests {
     /// POST and the poll GET.
     #[tokio::test]
     async fn runway_submit_poll_content_journey_sends_version_header_on_both_legs() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(RUNWAY_SUBMIT_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3741,7 +4253,7 @@ mod tests {
     /// `failureCode` fields through the unified error object on poll.
     #[tokio::test]
     async fn runway_failed_task_carries_failure_code_and_message() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path(format!("{RUNWAY_TASK_PATH}/rw-bad")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3901,7 +4413,7 @@ mod tests {
     /// client.
     #[tokio::test]
     async fn openai_submit_poll_content_proxy_journey() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/videos"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -4018,7 +4530,7 @@ mod tests {
     /// envelope — it must NOT stream an error body back as video/mp4.
     #[tokio::test]
     async fn openai_content_proxy_upstream_403_maps_to_error_envelope() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path("/v1/videos/video_x/content"))
             .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
@@ -4061,5 +4573,51 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("download URL has expired"));
+    }
+
+    /// AISIX-Cloud#1330 / #1024: a guardrail BLOCK leaves this handler
+    /// through `Err`, so the terminal usage event is the shared
+    /// zero-token error event. That branch is the one an auditor reads —
+    /// "which policy refused this request" — and a drain wired only into
+    /// the success path misses it silently.
+    #[tokio::test]
+    async fn blocked_request_names_the_policy_on_the_usage_event() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::builder().start().await;
+        let snap = new_snap(&upstream.uri(), "alibaba", "");
+        let g: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"test-block","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"BLOCKME"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-1", g, 1));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        let handle = SnapshotHandle::new(snap);
+        let app = crate::build_router(
+            crate::ProxyState::new(handle, hub, &cfg())
+                .without_cache()
+                .with_usage_sink(UsageSink::new(tx)),
+        );
+
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            post_videos(serde_json::json!({"model": "my-video", "prompt": "please BLOCKME now"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for the refusal")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].guardrail_name, "test-block");
+        assert_eq!(ev.guardrail_enforced_hits[0].hook, "input");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "blocked");
+        let wire = serde_json::to_string(&ev).unwrap();
+        assert!(!wire.contains("BLOCKME"), "{wire}");
     }
 }

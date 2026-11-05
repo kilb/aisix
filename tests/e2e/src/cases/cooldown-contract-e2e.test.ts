@@ -98,6 +98,9 @@ describe("cooldown contract (H1) — 401 cools down despite being non-retryable"
         provider: "openai",
         model_name: "gpt-4o-mini",
         provider_key_id: failPk.id,
+        // Cooldown is opt-in — this suite's subject is what an
+        // operator who enabled it gets.
+        cooldown: { enabled: true },
       })
     ).id;
     await seed.createModel({
@@ -251,6 +254,9 @@ describe("cooldown contract (M1) — 429 cools down even when retry_on_429=false
         provider: "openai",
         model_name: "gpt-4o-mini",
         provider_key_id: rateLimitedPk.id,
+        // Cooldown is opt-in — this suite's subject is what an
+        // operator who enabled it gets.
+        cooldown: { enabled: true },
       })
     ).id;
     await seed.createModel({
@@ -406,6 +412,9 @@ describe("cooldown contract (H2) — Retry-After header from upstream drives TTL
         provider: "openai",
         model_name: "gpt-4o-mini",
         provider_key_id: upstreamPk.id,
+        // Cooldown is opt-in — this suite's subject is what an
+        // operator who enabled it gets.
+        cooldown: { enabled: true },
       })
     ).id;
     await seed.createModel({
@@ -825,6 +834,9 @@ describe("cooldown observability — a cooldown transition emits aisix_deploymen
         provider: "openai",
         model_name: "gpt-4o-mini",
         provider_key_id: failPk.id,
+        // Cooldown is opt-in — this suite's subject is what an
+        // operator who enabled it gets.
+        cooldown: { enabled: true },
       })
     ).id;
     await seed.createModel({
@@ -1022,7 +1034,7 @@ describe("cooldown observability — the state gauge follows a target back into 
         provider_key_id: flakyPk.id,
         // A 1s TTL keeps the test honest: it must observe the cooldown
         // lapsing on its own, which is what the router does in production.
-        cooldown: { default_seconds: 1 },
+        cooldown: { enabled: true, default_seconds: 1 },
       })
     ).id;
     await seed.createModel({

@@ -1,11 +1,14 @@
 //! Guard that every provider bridge validates `ProviderKey.api_base`.
 //!
-//! `api_base` decides where a ProviderKey's secret is sent. A value like
-//! `https://api.openai.com@evil.example/v1` reads as one host and resolves to
-//! another, which then receives the Authorization header. #390 added the check
-//! to the Vertex and Azure bridges and stopped there — the OpenAI-compatible
-//! and Anthropic bridges carried the gap silently until the 2026-08-19 pass,
-//! because nothing fails when a sibling is missed.
+//! `api_base` decides where a ProviderKey's secret is sent, and the bridge
+//! appends a fixed path to it, so a query or fragment in the base would swallow
+//! that path. #390 added the check to the Vertex and Azure bridges and stopped
+//! there — the OpenAI-compatible and Anthropic bridges carried the gap silently
+//! until the 2026-08-19 pass, because nothing fails when a sibling is missed.
+//!
+//! Userinfo is no longer part of this guard: the project owner decided a URL
+//! with `user:pass@` is accepted and used as configured, and its password is
+//! kept out of everything displayed.
 //!
 //! This is a source scan over the bridge crates rather than a behavioural
 //! test: a behavioural one would need a live `BridgeContext` per provider, and
@@ -24,9 +27,9 @@ const BRIDGES_RESOLVING_A_BASE: &[(&str, &str)] = &[
 ];
 
 /// Evidence that a bridge checks the shape. Either it calls the shared
-/// validator, or it carries its own userinfo rejection (Vertex and Azure
-/// predate the shared one and keep their provider-specific messages).
-const ACCEPTED_EVIDENCE: &[&str] = &["validate_api_base", "contains('@')"];
+/// validator, or it carries its own query rejection (Vertex and Azure predate
+/// the shared one and keep their provider-specific messages).
+const ACCEPTED_EVIDENCE: &[&str] = &["validate_api_base", "contains('?')"];
 
 fn crates_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -52,9 +55,9 @@ fn every_base_resolving_bridge_validates_its_api_base() {
     assert!(
         unguarded.is_empty(),
         "these bridges resolve an operator-supplied api_base without validating its \
-         shape, so a base embedding userinfo would send the ProviderKey secret to a \
-         host the config does not appear to name:\n{}\n\nCall \
-         `aisix_gateway::validate_api_base` from the base resolution.",
+         shape, so a query or fragment in the base would swallow the path the bridge \
+         appends:\n{}\n\nCall `aisix_gateway::validate_api_base` from the base \
+         resolution.",
         unguarded.join("\n"),
     );
 }

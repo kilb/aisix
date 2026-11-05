@@ -13,9 +13,12 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
-use super::{RateStore, DAY_SECS, HOUR_SECS, MINUTE_SECS, SECOND_SECS};
+use super::{
+    RateStore, DAY_SECS, DIM_RPD, DIM_RPH, DIM_RPM, DIM_RPS, DIM_TPD, DIM_TPH, DIM_TPM, HOUR_SECS,
+    MINUTE_SECS, SECOND_SECS,
+};
 use crate::clock::{Clock, SystemClock};
-use crate::error::RateLimitError;
+use crate::error::{LimitDetail, RateLimitError};
 use crate::limiter::RateLimitStatus;
 use crate::window::{FixedWindowCounter, WindowCheck};
 
@@ -191,7 +194,9 @@ impl<C: Clock> RateStore for LocalStore<C> {
         // Concurrency first — cheapest and never consumes a window slot.
         if let Some(max) = limits.concurrency {
             if s.in_flight.len() as u32 >= max {
-                return Err(RateLimitError::Concurrency);
+                return Err(RateLimitError::Concurrency {
+                    detail: LimitDetail::concurrency(u64::from(max), s.in_flight.len() as u64),
+                });
             }
         }
 
@@ -211,7 +216,7 @@ impl<C: Clock> RateStore for LocalStore<C> {
             if let Some(retry) = s.tpm.is_exceeded(now, max) {
                 return Err(RateLimitError::Tokens {
                     scope: RateLimitScope::Tokens,
-                    retry_after_secs: retry,
+                    detail: LimitDetail::window(DIM_TPM, max, s.tpm.current(now), retry),
                 });
             }
         }
@@ -219,7 +224,7 @@ impl<C: Clock> RateStore for LocalStore<C> {
             if let Some(retry) = s.tph.is_exceeded(now, max) {
                 return Err(RateLimitError::Tokens {
                     scope: RateLimitScope::Tokens,
-                    retry_after_secs: retry,
+                    detail: LimitDetail::window(DIM_TPH, max, s.tph.current(now), retry),
                 });
             }
         }
@@ -227,7 +232,7 @@ impl<C: Clock> RateStore for LocalStore<C> {
             if let Some(retry) = s.tpd.is_exceeded(now, max) {
                 return Err(RateLimitError::Tokens {
                     scope: RateLimitScope::Tokens,
-                    retry_after_secs: retry,
+                    detail: LimitDetail::window(DIM_TPD, max, s.tpd.current(now), retry),
                 });
             }
         }
@@ -238,32 +243,47 @@ impl<C: Clock> RateStore for LocalStore<C> {
         // rejects, every earlier-incremented counter is rolled back by
         // exactly the delta this call contributed — concurrent sibling
         // requests' increments survive.
+        //
+        // Each rejection first reads the refused window's own state for
+        // the 429's `x-ratelimit-*` headers. The read has to happen
+        // before the roll-backs below, and the result must be bound out
+        // of the `if let` scrutinee — an `if let` over the call itself
+        // would hold the counter borrowed across the body.
         let mut rps_incremented = false;
         if let Some(max) = limits.rps {
-            if let WindowCheck::Full { retry_after_secs } = s.rps.check_and_increment(now, 1, max) {
+            let check = s.rps.check_and_increment(now, 1, max);
+            if let WindowCheck::Full { retry_after_secs } = check {
+                let detail =
+                    LimitDetail::window(DIM_RPS, max, s.rps.current(now), retry_after_secs);
                 return Err(RateLimitError::Requests {
                     scope: RateLimitScope::Requests,
-                    retry_after_secs,
+                    detail,
                 });
             }
             rps_incremented = true;
         }
         let mut rpm_incremented = false;
         if let Some(max) = limits.rpm {
-            if let WindowCheck::Full { retry_after_secs } = s.rpm.check_and_increment(now, 1, max) {
+            let check = s.rpm.check_and_increment(now, 1, max);
+            if let WindowCheck::Full { retry_after_secs } = check {
+                let detail =
+                    LimitDetail::window(DIM_RPM, max, s.rpm.current(now), retry_after_secs);
                 if rps_incremented {
                     s.rps.decrement(now, 1);
                 }
                 return Err(RateLimitError::Requests {
                     scope: RateLimitScope::Requests,
-                    retry_after_secs,
+                    detail,
                 });
             }
             rpm_incremented = true;
         }
         let mut rph_incremented = false;
         if let Some(max) = limits.rph {
-            if let WindowCheck::Full { retry_after_secs } = s.rph.check_and_increment(now, 1, max) {
+            let check = s.rph.check_and_increment(now, 1, max);
+            if let WindowCheck::Full { retry_after_secs } = check {
+                let detail =
+                    LimitDetail::window(DIM_RPH, max, s.rph.current(now), retry_after_secs);
                 if rpm_incremented {
                     s.rpm.decrement(now, 1);
                 }
@@ -272,13 +292,16 @@ impl<C: Clock> RateStore for LocalStore<C> {
                 }
                 return Err(RateLimitError::Requests {
                     scope: RateLimitScope::Requests,
-                    retry_after_secs,
+                    detail,
                 });
             }
             rph_incremented = true;
         }
         if let Some(max) = limits.rpd {
-            if let WindowCheck::Full { retry_after_secs } = s.rpd.check_and_increment(now, 1, max) {
+            let check = s.rpd.check_and_increment(now, 1, max);
+            if let WindowCheck::Full { retry_after_secs } = check {
+                let detail =
+                    LimitDetail::window(DIM_RPD, max, s.rpd.current(now), retry_after_secs);
                 if rph_incremented {
                     s.rph.decrement(now, 1);
                 }
@@ -290,7 +313,7 @@ impl<C: Clock> RateStore for LocalStore<C> {
                 }
                 return Err(RateLimitError::Requests {
                     scope: RateLimitScope::Requests,
-                    retry_after_secs,
+                    detail,
                 });
             }
         }
@@ -374,6 +397,11 @@ impl<C: Clock> RateStore for LocalStore<C> {
         // store 落了单。
         s.consumed_micro_usd = s.consumed_micro_usd.saturating_add(tokens);
         s.last_touched = now;
+    }
+
+    /// Shrinks only when [`LocalStore::reap`] drops idle buckets.
+    fn local_key_count(&self) -> Option<u64> {
+        Some(self.states.len() as u64)
     }
 
     async fn peek(&self, key: &str, limits: &RateLimit) -> Option<RateLimitStatus> {

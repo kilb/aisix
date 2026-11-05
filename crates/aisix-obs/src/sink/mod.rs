@@ -18,6 +18,7 @@ mod manager;
 mod object_store;
 mod pipeline;
 mod record;
+mod redact;
 mod sls;
 mod truncate;
 
@@ -28,8 +29,13 @@ pub use datadog::{resolve_datadog_credential, DatadogSink};
 pub use manager::ExporterPipelines;
 pub use object_store::{build_object_store_sink, ObjectStoreSink};
 pub use pipeline::{PipelineConfig, SinkHandle, SinkPipeline, SinkStatsSnapshot};
+pub(crate) use record::is_mcp;
 pub use record::{CapturedContent, EventBatch, SinkContent, SinkRecord, SCHEMA_VERSION};
+pub use redact::ErrorRedactor;
 pub use sls::{resolve_sls_credential, AliyunSlsSink};
+pub use truncate::{omit_base64_media, omit_base64_media_in_json};
+
+use std::time::Duration;
 
 use async_trait::async_trait;
 
@@ -77,6 +83,16 @@ pub enum SinkError {
     /// throttle/429).
     #[error("transient sink error: {0}")]
     Transient(String),
+    /// Transient, and the sink said how long to wait: a `Retry-After` on a
+    /// 429 or a 503. Retrying sooner than asked is what turns a throttle
+    /// into a longer one, so the pipeline waits the stated delay instead
+    /// of its own backoff (bounded by `max_backoff` — a sink asking for
+    /// an hour does not get to stall the queue behind it that long).
+    #[error("transient sink error (retry after {retry_after:?}): {detail}")]
+    Throttled {
+        retry_after: Duration,
+        detail: String,
+    },
     /// Permanent for this batch — retrying it unchanged will fail again
     /// (auth/403, malformed payload, oversize). The pipeline stops hammering
     /// and surfaces a masked health error instead.
@@ -87,8 +103,73 @@ pub enum SinkError {
 impl SinkError {
     /// Whether the pipeline should retry this batch with backoff.
     pub fn is_transient(&self) -> bool {
-        matches!(self, SinkError::Transient(_))
+        matches!(self, SinkError::Transient(_) | SinkError::Throttled { .. })
     }
+
+    /// The delay the sink itself asked for, if it did.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            SinkError::Throttled { retry_after, .. } => Some(*retry_after),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a receiver's HTTP status is worth retrying: 5xx, 408 and 429.
+/// Every other failure status is a config / auth / payload error that the
+/// same batch meets again on retry. Shared by every HTTP-speaking sink so
+/// the family cannot drift apart again.
+pub(crate) fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
+/// The [`SinkError`] for a non-success HTTP response: [`SinkError::Throttled`]
+/// when a retryable status carried a `Retry-After`, [`SinkError::Transient`]
+/// for any other retryable status, [`SinkError::Permanent`] otherwise.
+pub(crate) fn http_status_error(
+    status: reqwest::StatusCode,
+    retry_after: Option<Duration>,
+    detail: String,
+) -> SinkError {
+    if !is_retryable_status(status) {
+        return SinkError::Permanent(detail);
+    }
+    match retry_after {
+        Some(retry_after) => SinkError::Throttled {
+            retry_after,
+            detail,
+        },
+        None => SinkError::Transient(detail),
+    }
+}
+
+/// The `Retry-After` on a throttled or overloaded response, as the HTTP
+/// spec allows it: delta-seconds, or an HTTP date to wait until.
+///
+/// Read only for 429 and 503, the two statuses where it means "come back
+/// later" rather than something about the resource. A value that is
+/// absent, unparseable or already in the past yields `None`, leaving the
+/// pipeline on its own backoff.
+pub(crate) fn retry_after_of(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<Duration> {
+    if status != reqwest::StatusCode::TOO_MANY_REQUESTS
+        && status != reqwest::StatusCode::SERVICE_UNAVAILABLE
+    {
+        return None;
+    }
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    if let Ok(secs) = raw.trim().parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let until = chrono::DateTime::parse_from_rfc2822(raw.trim()).ok()?;
+    (until.timestamp() - chrono::Utc::now().timestamp())
+        .try_into()
+        .ok()
+        .map(Duration::from_secs)
 }
 
 /// Render an error together with its full `source()` chain.
@@ -96,7 +177,7 @@ impl SinkError {
 /// `Display` on a transport error usually names only the outermost layer
 /// ("error sending request", "Error performing PUT <url>") while the
 /// actionable cause — a DNS failure, a TLS verification error — sits levels
-/// deeper. The nightly objstore smoke burned five weeks on a detail that
+/// deeper. The scheduled objstore smoke burned five weeks on a detail that
 /// ended at the request URL before anyone saw the underlying
 /// "failed to lookup address information". Layers whose text the outer
 /// message already embeds are skipped, so wrappers that interpolate their
@@ -151,6 +232,13 @@ pub trait ObservabilitySink: Send + Sync + 'static {
     /// Cheap liveness/connectivity probe for the circuit-breaker and the
     /// control-plane "test connection" affordance.
     async fn healthcheck(&self) -> SinkHealth;
+
+    /// The configured URLs and secrets the pipeline scrubs from this sink's
+    /// delivery errors before logging or reporting them. A sink configured
+    /// with a URL or a credential must declare it here.
+    fn error_redactor(&self) -> ErrorRedactor {
+        ErrorRedactor::default()
+    }
 }
 
 #[cfg(test)]
@@ -158,6 +246,45 @@ mod tests {
     use super::*;
     use crate::usage::UsageEvent;
     use std::sync::Arc;
+
+    #[test]
+    fn http_status_error_retries_only_5xx_408_429() {
+        use reqwest::StatusCode;
+        for s in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert!(
+                http_status_error(s, None, String::new()).is_transient(),
+                "{s} should be retried"
+            );
+        }
+        for s in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::METHOD_NOT_ALLOWED,
+            StatusCode::CONFLICT,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            assert!(
+                !http_status_error(s, None, String::new()).is_transient(),
+                "{s} should be permanent"
+            );
+        }
+        let throttled = http_status_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            Some(Duration::from_secs(7)),
+            String::new(),
+        );
+        assert_eq!(throttled.retry_after(), Some(Duration::from_secs(7)));
+    }
 
     /// A trivial at-least-once sink that records what it was handed —
     /// proves the trait is object-safe (`Arc<dyn ObservabilitySink>`) and
@@ -230,6 +357,69 @@ mod tests {
     fn sink_error_transience_drives_retry() {
         assert!(SinkError::Transient("429".into()).is_transient());
         assert!(!SinkError::Permanent("403".into()).is_transient());
+        // A throttle is a transient failure that came with instructions.
+        let throttled = SinkError::Throttled {
+            retry_after: Duration::from_secs(7),
+            detail: "429".into(),
+        };
+        assert!(throttled.is_transient());
+        assert_eq!(throttled.retry_after(), Some(Duration::from_secs(7)));
+        assert_eq!(SinkError::Transient("429".into()).retry_after(), None);
+    }
+
+    /// `Retry-After` is what a throttling receiver knows and our backoff
+    /// ladder does not. Read it in both forms the spec allows, and only
+    /// where it means "come back later".
+    #[test]
+    fn retry_after_is_read_on_throttle_and_overload_only() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+        use reqwest::StatusCode;
+
+        let with = |raw: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(RETRY_AFTER, HeaderValue::from_str(raw).unwrap());
+            h
+        };
+
+        assert_eq!(
+            retry_after_of(StatusCode::TOO_MANY_REQUESTS, &with("30")),
+            Some(Duration::from_secs(30)),
+            "delta-seconds",
+        );
+        let date = chrono::Utc::now() + chrono::Duration::seconds(45);
+        let parsed = retry_after_of(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &with(&date.format("%a, %d %b %Y %H:%M:%S GMT").to_string()),
+        )
+        .expect("an HTTP date is a legal Retry-After");
+        assert!(
+            parsed >= Duration::from_secs(43) && parsed <= Duration::from_secs(45),
+            "an HTTP date resolves to the wait it implies: {parsed:?}",
+        );
+
+        // A date already past means "now", never a negative wait.
+        let past = chrono::Utc::now() - chrono::Duration::seconds(60);
+        assert_eq!(
+            retry_after_of(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &with(&past.format("%a, %d %b %Y %H:%M:%S GMT").to_string()),
+            ),
+            None,
+        );
+        assert_eq!(
+            retry_after_of(StatusCode::TOO_MANY_REQUESTS, &with("whenever")),
+            None,
+            "an unparseable value leaves the pipeline on its own backoff",
+        );
+        assert_eq!(
+            retry_after_of(StatusCode::INTERNAL_SERVER_ERROR, &with("30")),
+            None,
+            "on other statuses the header is not this instruction",
+        );
+        assert_eq!(
+            retry_after_of(StatusCode::TOO_MANY_REQUESTS, &HeaderMap::new()),
+            None,
+        );
     }
 
     #[test]
@@ -264,7 +454,7 @@ mod tests {
     fn error_chain_appends_hidden_sources() {
         // The wrapper's Display names only itself — the shape reqwest and
         // object_store's retry error have, which is what buried the DNS
-        // cause of the nightly objstore failure.
+        // cause of the scheduled objstore failure.
         let e = Layered {
             text: "error sending request",
             source: Some(Box::new(Layered {

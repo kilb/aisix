@@ -2,7 +2,9 @@
 //!
 //! This endpoint is a thin passthrough to the provider's `/completions`
 //! surface. The upstream `model` field is rewritten to the provider's own
-//! model id; everything else in the request body is forwarded verbatim.
+//! model id and everything else in the request body is forwarded verbatim,
+//! `stream: true` included: a stream is relayed, or held back while an output
+//! guardrail needs to see all of it ([`stream`]).
 //!
 //! Flow:
 //! 1. [`AuthenticatedKey`] extractor — 401 if auth fails.
@@ -11,15 +13,17 @@
 //! 4. Resolve model name → `Model` in snapshot → 404 if absent.
 //! 5. Check `allowed_models` → 403 if denied.
 //! 6. Look up Bridge on Hub → 503 if not registered.
-//! 7. Call `bridge.complete(body, ctx)` → JSON response.
+//! 7. Call `bridge.complete(body, ctx)` → JSON response, or
+//!    `bridge.complete_stream(body, ctx)` → SSE.
 //! 8. Providers that don't support completions return 501.
 
 mod stream;
 
-use aisix_gateway::{BridgeError, ChatMessage, ChatResponse, FinishReason, UsageStats};
-use aisix_obs::{
-    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent, UsageLabels,
+use aisix_core::AppliedGuardrail;
+use aisix_gateway::{
+    BridgeCapability, BridgeError, ChatMessage, ChatResponse, FinishReason, UsageStats,
 };
+use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::extract::State;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -63,8 +67,7 @@ struct CompletionDispatchSuccess {
     /// UUID of the resolved Model row — required for UsageEvent
     /// `model_id`. Always populated on every success arm (including
     /// the 501 NotImplemented branch where no upstream call
-    /// happened); the emit gate is `usage.is_some()`, not this
-    /// field. Audit MEDIUM-1 on PR #426 clarified.
+    /// happened); every arm emits a usage event.
     model_id: String,
     /// Resolved ProviderKey UUID — feeds per-PK telemetry attribution
     /// (#867 parity).
@@ -72,15 +75,21 @@ struct CompletionDispatchSuccess {
     /// Provider-side model name, for the `upstream_model` metric label
     /// (#1234 parity with chat / messages / responses).
     upstream_model: String,
+    /// The guardrails attached to this request, including a request that
+    /// ends on the provider-unsupported branch after screening ran.
+    applied_guardrails: Vec<AppliedGuardrail>,
     /// Legacy-completions response object `id` (`cmpl-…`). Empty on the 501
     /// NotImplemented path (no upstream call) and when the upstream omitted
     /// it (#1289).
     provider_request_id: String,
     /// Upstream-reported token counts. `None` on the 501
     /// NotImplemented path (provider doesn't support completions)
-    /// or on a 200 with no `usage` block (rare edge). Handler
-    /// gates UsageEvent emission on this being `Some`.
+    /// or on a 200 with no `usage` block (rare edge). Those paths emit a
+    /// zero-token event.
     usage: Option<CompletionUsage>,
+    /// Whether the request reached the provider. False only for the 501
+    /// provider-unsupported branch.
+    upstream_called: bool,
     /// Per-detector PII mask counts (#932), input + output merged.
     /// Attached to the emitted UsageEvent. Empty = no redaction.
     redactions: crate::redact::RedactionCounts,
@@ -97,21 +106,32 @@ struct CompletionDispatchSuccess {
     /// ledger + /logs from under-reporting spend the provider charged for
     /// — the output analog of chat.rs's UpstreamCharge / responses.rs #543.
     guardrail_blocked: bool,
+    /// The refusal's or failed stream's own text, from
+    /// [`crate::attempt::gateway_error_message`], so the usage event names it
+    /// the way an input refusal does. Empty when nothing failed.
+    failure_message: String,
     /// Captured request/response content for content-capturing exporters
     /// (#947). `Some` only when an enabled exporter opted into
     /// `content_mode = full`; threaded to `fan_out` via the handler's emit,
     /// never to the CP sink.
     captured_content: Option<CapturedContent>,
-    /// Live streams emit usage and end-to-end latency from their terminal
-    /// callback. Buffered and non-streaming responses emit in the handler.
+    /// Live streams emit usage from their terminal callback, which also
+    /// completes the access-log line and request metrics the handler parks.
+    /// Buffered and non-streaming responses emit in the handler.
     usage_handled_by_stream: bool,
-    /// Which group member served and what the walk cost.
-    routing: crate::routing::RoutingAttribution,
 }
+
+/// What one streamed attempt hands back: the prepared stream, or the provider's
+/// refusal of the surface; the provider label and key id; and the TTFT slot.
+type CompletionStreamAttempt = (
+    Result<PreparedCompletionStream, BridgeError>,
+    String,
+    String,
+    Arc<std::sync::OnceLock<Duration>>,
+);
 
 #[derive(Default)]
 struct CompletionDispatchTelemetry {
-    applied_guardrails: Vec<aisix_core::AppliedGuardrail>,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
 }
 
@@ -124,12 +144,28 @@ struct CompletionDispatchTelemetry {
 struct CompletionUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// `prompt_tokens_details.cached_tokens` — the upstream prompt-cache
+    /// hits, already counted INSIDE `prompt_tokens` (AISIX-Cloud#1404).
+    /// Reported by this endpoint for the same providers that report it
+    /// on `/v1/chat/completions`; 0 when the upstream omits it, never
+    /// inferred.
+    cached_prompt_tokens: u32,
+    cache_write_tokens: Option<u32>,
+    modality: aisix_gateway::ModalityTokens,
+    /// `completion_tokens_details.reasoning_tokens` and `total_tokens`,
+    /// recorded exactly as `/v1/chat/completions` records them; 0 when the
+    /// upstream omits them.
+    reasoning_tokens: u32,
+    upstream_total_tokens: u32,
     /// True when any counter was filled by the local estimator because
     /// the upstream reported no usage (#1074).
     usage_estimated: bool,
     /// 本次尝试起点到上游首个字节块的耗时（见 `stamp_first_chunk`）。`Some`
     /// 当且仅当流式路径真的收到了首块；非流式恒为 `None`。
     upstream_ttft: Option<Duration>,
+    /// 调用方收到首个字节的耗时。实时转发与上游相同，扣留路径是放行的时刻；
+    /// 什么都没有交付（被拦、失败）时为 `None`。
+    downstream_ttft: Option<Duration>,
 }
 
 pub async fn completions(
@@ -165,6 +201,11 @@ pub async fn completions(
         }
     };
     let request_id = client.request_id.clone();
+    crate::span_facts::note_request(
+        &client,
+        body.as_object()
+            .map(aisix_obs::GenAiRequestParams::from_openai_completions),
+    );
     let api_key_id = auth.entry.id.clone();
     let model_name = body
         .get("model")
@@ -176,6 +217,12 @@ pub async fn completions(
     let snapshot = state.snapshot.load();
     let mut telemetry = CompletionDispatchTelemetry::default();
 
+    // See `embeddings`: the handle is filled inside `dispatch` so the
+    // failure branch — where a guardrail block lands — stamps the enforced
+    // hits too (AISIX-Cloud#1330 / #1024).
+    let mut audit = crate::usage_attr::GuardrailAudit::default();
+    // Every upstream attempt, filled by the dispatch (#655).
+    let mut routing = crate::attempt::RoutingTelemetry::default();
     match dispatch(
         &state,
         &snapshot,
@@ -184,6 +231,8 @@ pub async fn completions(
         &request_id,
         &client,
         &mut telemetry,
+        &mut audit,
+        &mut routing,
     )
     .await
     {
@@ -197,55 +246,93 @@ pub async fn completions(
             // does not support completions". Matches the convention
             // PR #404 (responses) and PR #405 (rerank) adopted.
             let status = success.response.status().as_u16();
-            emit_access_log(
-                &model_name,
-                &success.provider,
-                &api_key_id,
-                status,
-                elapsed,
-                &request_id,
-                Some(success.provider_request_id.as_str()),
-                Some(&success.routing),
-                None,
-            );
             // One ProviderKey lookup for the metric emit + the usage event
             // below (#941).
             let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
-            crate::request_metrics::record(
-                &state,
-                "/v1/completions",
-                crate::request_metrics::Caller::new(&auth),
-                crate::request_metrics::Upstream {
-                    provider: &success.provider,
-                    model: &model_name,
-                    upstream_model: &success.upstream_model,
-                    pk: pk.labels(),
-                    stream: is_stream,
-                    ..Default::default()
-                },
-                status,
-                elapsed,
-            );
-            if !success.usage_handled_by_stream {
-                let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
-                state.metrics.record_request_e2e_latency(
-                    LatencyLabels {
-                        endpoint: "/v1/completions",
-                        model: metric_model.as_ref(),
-                        provider: &success.provider,
-                        status,
-                        streaming: is_stream,
+            let request_upstream = crate::request_metrics::Upstream {
+                provider: &success.provider,
+                model: &model_name,
+                upstream_model: &success.upstream_model,
+                pk: pk.labels(),
+                stream: is_stream,
+                is_fallback: routing.fallback_count() > 0,
+            };
+            if success.usage_handled_by_stream {
+                // A live stream has no outcome yet. Park the line and the
+                // samples; its terminal usage event writes both, with that
+                // event's status and failure.
+                crate::attribution::defer_access_log(
+                    crate::attribution::PendingAccessLog::new(
+                        "POST",
+                        "/v1/completions",
+                        &request_id,
+                        &api_key_id,
+                        started,
+                    )
+                    .with_model(&success.provider, &model_name)
+                    .with_routing(&routing),
+                    crate::request_metrics::PendingRequestMetrics::at_stream_end(
+                        &state,
+                        "/v1/completions",
+                        crate::request_metrics::Caller::new(&auth),
+                        request_upstream,
+                        started,
+                    ),
+                );
+            } else {
+                emit_access_log(
+                    &model_name,
+                    &success.provider,
+                    &api_key_id,
+                    status,
+                    elapsed,
+                    &request_id,
+                    Some(success.provider_request_id.as_str()),
+                    &routing,
+                    None,
+                );
+                crate::request_metrics::record(
+                    &state,
+                    "/v1/completions",
+                    crate::request_metrics::Caller::new(&auth),
+                    request_upstream,
+                    status,
+                    // A held stream that died after generating output is
+                    // answered here, and its class says whose failure it was.
+                    if success.error_class.is_empty() {
+                        crate::attempt::answered_error_source(success.guardrail_blocked, &routing)
+                    } else {
+                        crate::attempt::error_source_of_class(&success.error_class)
                     },
                     elapsed,
                 );
             }
             // Issue #403: emit UsageEvent so the control plane's budget ledger
-            // and customer-facing /logs see /v1/completions spend.
-            // Pre-#403 the legacy completions handler dropped the
-            // event entirely. Skip emit on the 501 NotImplemented
-            // path (no upstream call) and on 200 without a usage
-            // block (rare edge) — both surface as `usage: None`.
-            if let Some(usage) = success.usage {
+            // and customer-facing /logs see /v1/completions traffic. The
+            // route's own 501 records zero tokens.
+            // One zero-token event per attempt that failed first (#655).
+            // The route's own 501 is the terminal event below.
+            let superseded = crate::usage_attr::split_route_refusal(&routing);
+            crate::usage_attr::emit_failed_attempts(
+                &state,
+                &snapshot,
+                crate::operation::COMPLETIONS,
+                &request_id,
+                &model_name,
+                &api_key_id,
+                &client,
+                &success.applied_guardrails,
+                superseded,
+                false,
+                success.guardrail_blocked,
+                success.monitor_hits.clone(),
+                success.redactions.clone(),
+                &audit,
+            );
+            // A live stream's terminal event comes from its own callback.
+            if !success.usage_handled_by_stream {
+                let no_usage = CompletionUsage::default();
+                let usage = success.usage.as_ref().unwrap_or(&no_usage);
                 emit_usage_event(
                     &state,
                     &snapshot,
@@ -256,19 +343,22 @@ pub async fn completions(
                     &api_key_id,
                     &success.provider,
                     &success.upstream_model,
+                    &success.applied_guardrails,
                     status,
                     elapsed,
-                    &usage,
+                    usage,
                     &success.provider_request_id,
-                    &success.routing,
                     &client,
                     is_stream,
                     &success.error_class,
                     success.guardrail_blocked,
-                    telemetry.applied_guardrails.clone(),
+                    &success.failure_message,
                     success.redactions.clone(),
                     success.monitor_hits.clone(),
                     success.captured_content.as_ref(),
+                    &audit,
+                    success.upstream_called,
+                    routing.attempts.last(),
                 );
             }
             // Same window /v1/chat/completions publishes, so an SDK client
@@ -292,57 +382,90 @@ pub async fn completions(
         Err(err) => {
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             emit_access_log(
                 &model_name,
-                "unknown",
+                last_target.provider(),
                 &api_key_id,
                 status,
                 elapsed,
                 &request_id,
                 None,
-                None,
+                &routing,
                 Some(&err),
             );
             let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
+            // AISIX-Cloud#1325: name the target the request died on. This
+            // branch used to emit `Upstream::default()`, so a 502 from a
+            // real provider landed on `provider="unknown"` while the same
+            // key's successes landed on the real one.
             crate::request_metrics::record(
                 &state,
                 "/v1/completions",
                 crate::request_metrics::Caller::new(&auth),
-                crate::request_metrics::Upstream {
-                    model: metric_model.as_ref(),
-                    stream: is_stream,
-                    ..Default::default()
-                },
+                last_target.upstream(
+                    metric_model.as_ref(),
+                    is_stream,
+                    routing.fallback_count() > 0,
+                ),
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
-            state.metrics.record_request_e2e_latency(
-                LatencyLabels {
-                    endpoint: "/v1/completions",
-                    model: metric_model.as_ref(),
-                    provider: "unknown",
-                    status,
-                    streaming: is_stream,
-                },
-                elapsed,
-            );
-            // Per #655 parity: surface the failed request in Logs with a
-            // zero-token event (status + error class), instead of dropping it.
-            crate::usage_attr::emit_guardrail_error_usage_event(
+            // Per #655: one zero-token event per failed upstream attempt,
+            // the last of them terminal when every attempt failed.
+            crate::usage_attr::note_client_error(&snapshot, &err);
+            let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
+            crate::usage_attr::emit_failed_attempts(
                 &state,
                 &snapshot,
-                "completions",
-                "openai",
+                crate::operation::COMPLETIONS,
                 &request_id,
                 &model_name,
                 &api_key_id,
-                status,
-                err.kind(),
                 &client,
-                matches!(&err, ProxyError::ContentFiltered(_)),
-                telemetry.applied_guardrails,
-                telemetry.monitor_hits,
+                &crate::usage_attr::applied_guardrails(&audit),
+                &routing.attempts,
+                failed_terminal,
+                err.is_guardrail_block(),
+                telemetry.monitor_hits.clone(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
             );
+            // A failure no attempt answers for — pre-dispatch, or after the
+            // winner — is surfaced as one zero-token terminal event.
+            if !failed_terminal {
+                let mut event = crate::usage_attr::build_error_usage_event(
+                    "openai",
+                    &request_id,
+                    &model_name,
+                    &api_key_id,
+                    status,
+                    crate::usage_attr::EventError::of(&err),
+                    err.is_guardrail_block(),
+                    &client,
+                    crate::usage_attr::applied_guardrails(&audit),
+                    crate::usage_attr::enforced_hits(&audit),
+                    crate::usage_attr::guardrail_scores(&audit),
+                    crate::usage_attr::bypass_reason(&audit),
+                );
+                // What a monitor-mode rule saw before the request was refused
+                // stays on the refusal's row.
+                event.guardrail_monitor_hits = telemetry.monitor_hits;
+                let pk =
+                    crate::usage_attr::ResolvedPk::resolve(&snapshot, &attributed.provider_key_id);
+                let usage_model =
+                    crate::usage_attr::usage_event_model_label(&snapshot, &model_name);
+                crate::usage_attr::emit_prepared_usage_event(
+                    &state,
+                    &snapshot,
+                    crate::operation::COMPLETIONS,
+                    event,
+                    crate::usage_attr::usage_event_labels(&usage_model, &pk),
+                    client.trace.as_ref(),
+                );
+            }
             err.into_response()
         }
     }
@@ -375,6 +498,7 @@ fn completions_prompt_uses_token_ids(body: &Value) -> bool {
         .is_some_and(|items| items.iter().any(|item| !item.is_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
@@ -383,7 +507,10 @@ async fn dispatch(
     request_id: &str,
     client_ctx: &ClientContext,
     telemetry: &mut CompletionDispatchTelemetry,
+    audit_out: &mut crate::usage_attr::GuardrailAudit,
+    routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<CompletionDispatchSuccess, ProxyError> {
+    crate::usage_attr::note_failure_request(snapshot, || body.to_string());
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())
@@ -394,7 +521,7 @@ async fn dispatch(
     let model_entry = crate::model_resolve::resolve_model(snapshot, model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.to_string()))?;
 
-    if !auth.key().can_access(model_name) {
+    if !auth.key().can_access(snapshot, model_name) {
         return Err(ProxyError::ModelForbidden(model_name.to_string()));
     }
 
@@ -415,16 +542,20 @@ async fn dispatch(
         team_id: auth.key().team_id.as_deref(),
     };
     let resolved_chain = Arc::new(state.guardrail_index.resolve(&guardrail_ctx));
-    telemetry.applied_guardrails = resolved_chain.applied().to_vec();
-    let input_guardrail_applies = telemetry
-        .applied_guardrails
-        .iter()
-        .any(|guardrail| matches!(guardrail.hook.as_str(), "input" | "both"));
-    if input_guardrail_applies && completions_prompt_uses_token_ids(&body) {
-        return Err(ProxyError::ContentFiltered(
-            "request blocked by input guardrail: token-id prompts cannot be inspected safely"
-                .to_string(),
-        ));
+    let applied_guardrails = resolved_chain.applied().to_vec();
+    *audit_out = resolved_chain.audit_log();
+    // Token ids carry no text a guardrail could read, and the gateway cannot
+    // rewrite them. Refused like any other body the chain cannot be given
+    // (see `refuses_unevaluable_input`).
+    if completions_prompt_uses_token_ids(&body) {
+        if aisix_guardrails::Guardrail::refuses_unevaluable_input(resolved_chain.as_ref()) {
+            return Err(crate::error::guardrail_block_error(
+                "request",
+                None,
+                Some(crate::error::TAG_UNSCANNABLE_BODY),
+            ));
+        }
+        resolved_chain.record_unevaluable_input_bypass(crate::error::TAG_UNSCANNABLE_BODY);
     }
     // A check that calls a remote moderation service is admitted by the
     // key's rate limits before it runs, and a refusal keeps the slot it took
@@ -452,6 +583,7 @@ async fn dispatch(
         // (#932 bedrock follow-up).
         let moderation = crate::redact::moderate_completions_request_structured(
             resolved_chain.as_ref(),
+            Some(model_name),
             verdict,
             &mut body,
             &mut input_seg_counts,
@@ -464,17 +596,36 @@ async fn dispatch(
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
+            unavailable,
         } = verdict
         {
             // Per #153 the matched-pattern detail stays in ops logs only.
             tracing::warn!(
+                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                 guardrail_hook = "input",
                 model = %model_name,
                 reason = %reason,
                 "guardrail blocked /v1/completions request",
             );
-            return Err(ProxyError::ContentFiltered(
-                crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
+            // A blocked request exports what the success path would have sent.
+            if crate::usage_attr::content_cap(snapshot).is_some() {
+                let masked = crate::redact::redact_completions_request_structured(
+                    &resolved_chain.without_audit(),
+                    &mut body,
+                );
+                // A structural field a mask cannot rewrite is still in the body.
+                crate::usage_attr::note_failure_request(snapshot, || {
+                    if masked.unrewritable_tool_key {
+                        String::new()
+                    } else {
+                        body.to_string()
+                    }
+                });
+            }
+            return Err(crate::error::guardrail_block_error(
+                "request",
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
             ));
         }
     }
@@ -484,12 +635,20 @@ async fn dispatch(
     let final_redaction =
         crate::redact::redact_completions_request_structured(resolved_chain.as_ref(), &mut body);
     if final_redaction.unrewritable_tool_key {
-        return Err(ProxyError::ContentFiltered(
-            crate::error::guardrail_block_message("request", None),
-        ));
+        crate::usage_attr::note_failure_request(snapshot, String::new);
+        return Err(crate::error::guardrail_block_error("request", None, None));
     }
     let mut redactions = final_redaction.counts;
     crate::redact::merge_counts(&mut redactions, input_seg_counts);
+    // A failure row reports the masked text, and nothing when a check failed
+    // open: the success path's capture withholds that request too.
+    crate::usage_attr::note_failure_request(snapshot, || {
+        if input_capture_safe {
+            body.to_string()
+        } else {
+            String::new()
+        }
+    });
 
     // Content capture (#947): the client-facing request body
     // (post-redaction, so masked PII stays masked in the exported content),
@@ -501,52 +660,40 @@ async fn dispatch(
             .iter()
             .map(|e| &*e.value),
     );
-    let captured_prompt = content_cap.map(|_| serde_json::to_string(&body).unwrap_or_default());
 
     let mut reservation = match early_reservation {
         Some(reservation) => reservation,
         None => crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?,
     };
 
-    // A Model Group has no provider of its own — the group walk resolves one
-    // per target, so the bridge, credential, deadlines and upstream model
-    // are all bound inside the walk rather than hoisted out of it.
+    // A Model Group has no provider of its own: refuse what cannot be
+    // dispatched before the walk, and bind every per-target input — provider,
+    // key, bridge, deadline — from the target inside it (#1111).
     crate::dispatch::require_dispatchable_entry(&model_entry.value)?;
     let is_stream = body.get("stream").and_then(Value::as_bool) == Some(true);
-    let group_entry = crate::routing::GroupEntry {
-        // A streamed dispatch returns `Ok` when the stream OPENS, so its
-        // outcome is settled from the terminal event instead.
-        defer_outcome: is_stream,
-        endpoint: "/v1/completions",
-        name: model_name,
-        id: &model_entry.id,
-        model: &model_entry.value,
-    };
+    *routing_out = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
+        .with_trace(client_ctx.trace.clone());
     // #554: the request deadline bounds a non-streaming call; the streaming
     // deadline bounds every body read. Legacy completions use a byte stream
     // but retain typed BridgeError failures, so the first read can still
     // retry / fail over and terminal telemetry can distinguish a later
     // timeout from a downstream disconnect.
-    let attempt_ctx =
-        |att: &crate::routing::GroupAttempt,
-         pk: &aisix_core::ResourceEntry<aisix_core::ProviderKey>| {
-            let mut ctx = crate::dispatch::bridge_ctx(
-                request_id,
-                &att.id,
-                Arc::clone(&att.model),
-                &pk.id,
-                Arc::clone(&pk.value),
-                Some(client_ctx),
-            );
-            if let Some(d) = if is_stream {
-                att.timeouts.stream
-            } else {
-                att.timeouts.request
-            } {
-                ctx = ctx.with_deadline(d);
-            }
-            ctx
-        };
+    let attempt_ctx = |target: &crate::routing::AttemptModel,
+                       pk: &aisix_core::ResourceEntry<aisix_core::ProviderKey>,
+                       deadline: Option<Duration>| {
+        let mut ctx = crate::dispatch::bridge_ctx(
+            request_id,
+            &target.id,
+            Arc::clone(&target.model),
+            &pk.id,
+            Arc::clone(&pk.value),
+            Some(client_ctx),
+        );
+        if let Some(d) = deadline {
+            ctx = ctx.with_deadline(d);
+        }
+        ctx
+    };
 
     if is_stream {
         let output_policy =
@@ -560,31 +707,35 @@ async fn dispatch(
             } => (max_buffer_bytes, on_exceeded_fail_open),
             _ => (aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false),
         };
-        let walk = crate::routing::dispatch_over_group(
+        let dispatched = crate::routing::dispatch_stream_with_failover(
             state,
             snapshot,
             auth,
             client_ctx,
-            group_entry,
-            |att| {
+            model_name,
+            &model_entry,
+            routing_out,
+            |_| true,
+            |(answered, ..): &CompletionStreamAttempt| {
+                answered.as_ref().err().map(ToString::to_string)
+            },
+            |target, timeouts| {
                 let body = &body;
+                let resolved_chain = &resolved_chain;
+                let attempt_ctx = &attempt_ctx;
                 async move {
-                    let provider = crate::dispatch::require_provider(&att.model)?;
-                    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, &att.model)?;
+                    let provider =
+                        crate::dispatch::require_provider(&target.model)?.to_ascii_lowercase();
+                    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, &target.model)?;
                     let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
                         .ok_or(ProxyError::ProviderUnavailable)?;
-                    let ctx = attempt_ctx(&att, &pk_entry);
-                    let facts = CompletionAttemptFacts {
-                        provider: provider.to_ascii_lowercase(),
-                        provider_key_id: pk_entry.id.to_string(),
-                        upstream_model: crate::dispatch::require_upstream_model(&att.model)?
-                            .to_string(),
-                    };
+                    crate::dispatch::require_upstream_model(&target.model)?;
+                    let ctx = attempt_ctx(&target, &pk_entry, timeouts.stream);
                     // 本次尝试的上游 TTFT，由 `stamp_first_chunk` 在首块到达时写入；
                     // 随胜出的那次尝试一起带出 walk，各分支收尾时读。
                     let upstream_ttft = Arc::new(std::sync::OnceLock::new());
                     let attempt_started = Instant::now();
-                    let prepared = if hold_back {
+                    let prepared: Result<PreparedCompletionStream, ProxyError> = if hold_back {
                         async {
                         let stream = bridge
                             .complete_stream(body, &ctx)
@@ -598,7 +749,7 @@ async fn dispatch(
                 let mut stream =
                             crate::stream_timeout::with_read_timeout_completion(
                                 stream,
-                                att.timeouts.stream,
+                                timeouts.stream,
                             );
                 let mut buffer = Vec::new();
                 let mut observed = CompletionSseAccumulator::default();
@@ -635,6 +786,10 @@ async fn dispatch(
                                 model = %model_name,
                                 max_buffer_bytes,
                                 "streaming /v1/completions output exceeded buffer cap; failing open"
+                            );
+                            aisix_guardrails::Guardrail::record_output_bypass(
+                                resolved_chain.as_ref(),
+                                crate::error::TAG_OUTPUT_BUFFER_EXCEEDED,
                             );
                             let prefix =
                                 futures::stream::iter([Ok(bytes::Bytes::from(buffer)), Ok(chunk)]);
@@ -684,7 +839,7 @@ async fn dispatch(
                             );
                             let mut stream = crate::stream_timeout::with_read_timeout_completion(
                                 stream,
-                                att.timeouts.stream,
+                                timeouts.stream,
                             );
 
                             // An explicitly configured per-model stream timeout is a
@@ -692,7 +847,7 @@ async fn dispatch(
                             // committing 200 so a TTFT timeout remains retryable. The
                             // deployment default still wraps subsequent reads, but does
                             // not add a pre-response wait to every legacy completion.
-                            if att.timeouts.stream_configured {
+                            if timeouts.stream_configured {
                                 return match stream.next().await {
                                     Some(Ok(first)) => {
                                         let prefix =
@@ -713,38 +868,75 @@ async fn dispatch(
                             })
                         }
                         .await
-                    }?;
-                    Ok((prepared, facts, upstream_ttft))
+                    };
+                    // A provider without the surface is the route's own 501,
+                    // not a failed attempt. #701: every other failure marks
+                    // the target, so the cooldown sees a flapping upstream
+                    // even when a later retry recovers the request.
+                    let prepared = match prepared {
+                        Ok(prepared) => Ok(prepared),
+                        Err(ProxyError::Bridge(
+                            e @ BridgeError::UnsupportedCapability(
+                                BridgeCapability::TextCompletions,
+                            ),
+                        )) => Err(e),
+                        Err(ProxyError::Bridge(e)) => {
+                            return Err(ProxyError::Bridge(crate::cooldown::note_failure(
+                                &state.runtime_status,
+                                &target.id,
+                                target.model.cooldown.as_ref(),
+                                e,
+                            )))
+                        }
+                        Err(other) => return Err(other),
+                    };
+                    Ok((prepared, provider, pk_entry.id.to_string(), upstream_ttft))
                 }
             },
         )
         .await;
-
-        let outcome = match walk {
-            Ok(o) => o,
-            Err(failure) => {
+        // Serialized once the upstream has answered, not before: a copy made
+        // up front would be alive for the whole upstream wait.
+        let captured_prompt = content_cap.map(|_| serde_json::to_string(&body).unwrap_or_default());
+        let crate::routing::Dispatched {
+            value: (answered, provider_label, provider_key_id, upstream_ttft),
+            target,
+            attempt_started,
+            member_reservation,
+            in_flight,
+            deferred,
+        } = match dispatched {
+            Ok(d) => d,
+            Err(e) => {
                 reservation.commit_tokens_no_spend(0).await;
-                return completion_unsupported_or_error(
-                    failure,
-                    &model_entry,
-                    redactions,
-                    monitor_hits,
-                );
+                return Err(e);
             }
         };
         // Everything below attributes to the row that SERVED — for a group
         // that is a member, not the entry the caller addressed.
-        let routing = outcome.attribution();
-        let model = std::sync::Arc::clone(&outcome.target);
-        let model_entry_id = outcome.target_id.clone();
-        if let Some(member) = outcome.member_reservation {
+        let model = Arc::clone(&target.model);
+        let model_entry_id = target.id.clone();
+        if let Some(member) = member_reservation {
             reservation.merge(member);
         }
-        let deferred = outcome.deferred;
-        let (prepared, facts, upstream_ttft) = outcome.value;
-        let provider_label = facts.provider;
-        let provider_key_id = facts.provider_key_id;
-        let upstream_model = facts.upstream_model;
+        let upstream_model = model.upstream_model().unwrap_or("unknown").to_string();
+        let prepared = match answered {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                // No upstream call → no tokens to count.
+                reservation.commit_tokens_no_spend(0).await;
+                return Ok(completion_not_implemented(
+                    &e,
+                    provider_label,
+                    model_entry_id,
+                    provider_key_id,
+                    upstream_model,
+                    applied_guardrails,
+                    redactions,
+                    monitor_hits,
+                ));
+            }
+        };
 
         match prepared {
             PreparedCompletionStream::Buffered(mut buffer) => {
@@ -768,6 +960,8 @@ async fn dispatch(
                     &output_text,
                 );
                 usage.upstream_ttft = upstream_ttft.get().copied();
+                // Nothing reached the caller before the held buffer is released.
+                usage.downstream_ttft = usage.upstream_ttft.map(|_| attempt_started.elapsed());
                 reservation
                     .commit(
                         u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens),
@@ -776,11 +970,14 @@ async fn dispatch(
                     .await;
 
                 let synth = ChatResponse {
+                    logprobs: None,
+                    more_choices: Vec::new(),
                     id: String::new(),
                     model: model_name.to_string(),
                     message: ChatMessage::assistant(output_text),
                     finish_reason: FinishReason::Stop,
                     usage: UsageStats::default(),
+                    service_tier: None,
                 };
                 let (verdict, hits) =
                     aisix_guardrails::Guardrail::check_output_non_segment_observed(
@@ -792,6 +989,7 @@ async fn dispatch(
                 let moderation = crate::redact::moderate_body(
                     resolved_chain.as_ref(),
                     crate::redact::Direction::Output,
+                    None,
                     verdict,
                     &mut redactions,
                     &mut monitor_hits,
@@ -810,35 +1008,39 @@ async fn dispatch(
                 if let aisix_guardrails::GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
+                    unavailable,
                 } = verdict
                 {
                     tracing::warn!(
+                        guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                         guardrail_hook = "output",
                         model = %model_name,
                         reason = %reason,
                         "guardrail blocked streaming /v1/completions response"
                     );
+                    let block = crate::error::guardrail_block_error(
+                        "response",
+                        guardrail_name.as_deref(),
+                        unavailable.as_deref(),
+                    );
+                    let failure_message = crate::attempt::gateway_error_message(&block);
                     return Ok(CompletionDispatchSuccess {
-                        response: ProxyError::ContentFiltered(
-                            crate::error::guardrail_block_message(
-                                "response",
-                                guardrail_name.as_deref(),
-                            ),
-                        )
-                        .into_response(),
+                        response: block.into_response(),
                         provider: provider_label,
                         model_id: model_entry_id.clone(),
                         provider_key_id: provider_key_id.clone(),
                         upstream_model,
+                        applied_guardrails,
                         provider_request_id: accumulator.provider_request_id,
                         usage: Some(usage),
+                        upstream_called: true,
                         redactions,
                         monitor_hits,
                         error_class: String::new(),
                         guardrail_blocked: true,
+                        failure_message,
                         captured_content: None,
                         usage_handled_by_stream: false,
-                        routing: routing.clone(),
                     });
                 }
 
@@ -871,15 +1073,17 @@ async fn dispatch(
                     model_id: model_entry_id.clone(),
                     provider_key_id: provider_key_id.clone(),
                     upstream_model,
+                    applied_guardrails,
                     provider_request_id: accumulator.provider_request_id,
                     usage: Some(usage),
+                    upstream_called: true,
                     redactions,
                     monitor_hits,
                     error_class: String::new(),
                     guardrail_blocked: false,
+                    failure_message: String::new(),
                     captured_content,
                     usage_handled_by_stream: false,
-                    routing: routing.clone(),
                 });
             }
             PreparedCompletionStream::BufferExceeded {
@@ -909,24 +1113,30 @@ async fn dispatch(
                         completion_spend_micro_usd(snapshot, &model_entry_id, &usage),
                     )
                     .await;
+                aisix_guardrails::Guardrail::record_output_buffer_exceeded(resolved_chain.as_ref());
+                let block = crate::error::guardrail_block_error(
+                    "response",
+                    aisix_guardrails::Guardrail::output_buffer_owner(resolved_chain.as_ref()),
+                    Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+                );
+                let failure_message = crate::attempt::gateway_error_message(&block);
                 return Ok(CompletionDispatchSuccess {
-                    response: ProxyError::ContentFiltered(
-                        "response blocked by content policy".into(),
-                    )
-                    .into_response(),
+                    response: block.into_response(),
                     provider: provider_label,
                     model_id: model_entry_id.clone(),
                     provider_key_id: provider_key_id.clone(),
                     upstream_model,
+                    applied_guardrails,
                     provider_request_id: accumulator.provider_request_id,
                     usage: Some(usage),
+                    upstream_called: true,
                     redactions,
                     monitor_hits,
                     error_class: String::new(),
                     guardrail_blocked: true,
+                    failure_message,
                     captured_content: None,
                     usage_handled_by_stream: false,
-                    routing: routing.clone(),
                 });
             }
             PreparedCompletionStream::Failed {
@@ -964,6 +1174,7 @@ async fn dispatch(
                 if let Some(deferred) = &deferred {
                     deferred.finish(state, failed.status().as_u16(), false);
                 }
+                let failure_message = crate::attempt::gateway_error_message(&failed);
                 let response = failed.into_response();
                 return Ok(CompletionDispatchSuccess {
                     response,
@@ -971,15 +1182,17 @@ async fn dispatch(
                     model_id: model_entry_id.clone(),
                     provider_key_id: provider_key_id.clone(),
                     upstream_model,
+                    applied_guardrails,
                     provider_request_id: accumulator.provider_request_id,
                     usage: Some(usage),
+                    upstream_called: true,
                     redactions,
                     monitor_hits,
                     error_class,
                     guardrail_blocked: false,
+                    failure_message,
                     captured_content: None,
                     usage_handled_by_stream: false,
-                    routing: routing.clone(),
                 });
             }
             PreparedCompletionStream::Live {
@@ -1001,7 +1214,10 @@ async fn dispatch(
                 let api_key_id = auth.entry.id.clone();
                 let provider_for_stream = provider_label.clone();
                 let provider_key_id_for_stream = provider_key_id.clone();
-                let routing_for_stream = routing.clone();
+                // The winner's own record, staged by the walk; what a failover
+                // spent before it went out on the failed attempts' own rows.
+                let winner = routing_out.attempts.last().cloned();
+                let audit_for_stream = audit_out.clone();
                 // Settles the staged winning attempt once the stream's real
                 // terminal status is known — without this the attempt never
                 // reaches the deployment counters at all.
@@ -1012,8 +1228,7 @@ async fn dispatch(
                 let captured_prompt_for_stream = captured_prompt.clone();
                 let input_redactions = redactions.clone();
                 let input_monitor_hits = monitor_hits.clone();
-                let applied_guardrails = telemetry.applied_guardrails.clone();
-                let stream_started = Instant::now();
+                let applied_for_stream = applied_guardrails.clone();
                 let output_observer =
                     aisix_guardrails::Guardrail::runs_on_output(resolved_chain.as_ref())
                         .then(|| Arc::clone(&resolved_chain));
@@ -1022,6 +1237,9 @@ async fn dispatch(
                     output_observer,
                     upstream_model.clone(),
                     move |accumulator, outcome, output_observation| {
+                        // `least_busy` counts the target until the relay ends.
+                        drop(in_flight);
+                        let mut failure_message = String::new();
                         let (terminal_status, error_class) = match outcome {
                             CompletionStreamOutcome::CleanEof => {
                                 state_for_stream
@@ -1044,7 +1262,7 @@ async fn dispatch(
                                 }
                                 let error = match failure {
                                     CompletionStreamFailure::Timeout => BridgeError::Timeout {
-                                        elapsed_ms: stream_started.elapsed().as_millis() as u64,
+                                        elapsed_ms: attempt_started.elapsed().as_millis() as u64,
                                         cause: "stream body".to_string(),
                                     },
                                     CompletionStreamFailure::Decode => BridgeError::UpstreamDecode(
@@ -1052,11 +1270,14 @@ async fn dispatch(
                                     ),
                                     CompletionStreamFailure::Other => BridgeError::StreamAborted,
                                 };
-                                let _ = crate::cooldown::note_failure(
+                                let error = crate::cooldown::note_failure(
                                     &state_for_stream.runtime_status,
                                     &model_id_for_stream,
                                     cooldown_for_stream.as_ref(),
                                     error,
+                                );
+                                failure_message = crate::attempt::gateway_error_message(
+                                    &ProxyError::Bridge(error),
                                 );
                                 (status, error_class)
                             }
@@ -1079,6 +1300,9 @@ async fn dispatch(
                             &output_text,
                         );
                         usage.upstream_ttft = upstream_ttft.get().copied();
+                        // Relayed as it arrives, so the caller's first byte is
+                        // the upstream's.
+                        usage.downstream_ttft = usage.upstream_ttft;
                         let total =
                             u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens);
                         limiter.add_tokens_post_stream_all(&post_stream_keys, total);
@@ -1107,22 +1331,8 @@ async fn dispatch(
                             &snapshot,
                             &provider_key_id_for_stream,
                         );
-                        let (metric_model, metric_upstream) =
-                            crate::usage_attr::metric_model_label_pair(
-                                &snapshot,
-                                &requested_model,
-                                &upstream_model_for_stream,
-                            );
-                        state_for_stream.metrics.record_request_e2e_latency(
-                            LatencyLabels {
-                                endpoint: "/v1/completions",
-                                model: metric_model.as_ref(),
-                                provider: &provider_for_stream,
-                                status: terminal_status,
-                                streaming: true,
-                            },
-                            stream_started.elapsed(),
-                        );
+                        // The terminal usage event also completes the access-log
+                        // line and the request metrics the handler parked.
                         emit_usage_event(
                             &state_for_stream,
                             &snapshot,
@@ -1132,20 +1342,23 @@ async fn dispatch(
                             &requested_model,
                             &api_key_id,
                             &provider_for_stream,
-                            metric_upstream.as_ref(),
+                            &upstream_model_for_stream,
+                            &applied_for_stream,
                             terminal_status,
-                            stream_started.elapsed(),
+                            attempt_started.elapsed(),
                             &usage,
                             &accumulator.provider_request_id,
-                            &routing_for_stream,
                             &client,
                             true,
                             error_class,
                             false,
-                            applied_guardrails,
+                            &failure_message,
                             input_redactions,
                             all_hits,
                             captured_content.as_ref(),
+                            &audit_for_stream,
+                            true,
+                            winner.as_ref(),
                         );
                     },
                 );
@@ -1162,64 +1375,101 @@ async fn dispatch(
                     model_id: model_entry_id.clone(),
                     provider_key_id: provider_key_id.clone(),
                     upstream_model,
+                    applied_guardrails,
                     provider_request_id: String::new(),
                     usage: None,
+                    upstream_called: true,
                     redactions,
                     monitor_hits,
                     error_class: String::new(),
                     guardrail_blocked: false,
+                    failure_message: String::new(),
                     captured_content: None,
                     usage_handled_by_stream: true,
-                    routing: routing.clone(),
                 });
             }
         }
     }
 
-    // The walk marks each failed attempt on the target's runtime status, so
-    // the cooldown / circuit-breaker sees a flapping upstream even when a
-    // later retry recovers the request.
-    let walk = crate::routing::dispatch_over_group(
+    let dispatched = crate::routing::dispatch_with_failover(
         state,
         snapshot,
         auth,
         client_ctx,
-        group_entry,
-        |att| {
+        model_name,
+        &model_entry,
+        routing_out,
+        |_| true,
+        |(answered, ..): &(Result<Value, BridgeError>, String, String)| {
+            answered.as_ref().err().map(ToString::to_string)
+        },
+        |target, timeouts| {
             let body = &body;
+            let attempt_ctx = &attempt_ctx;
             async move {
-                let provider = crate::dispatch::require_provider(&att.model)?;
-                let pk_entry = crate::dispatch::resolve_provider_key(snapshot, &att.model)?;
+                let provider =
+                    crate::dispatch::require_provider(&target.model)?.to_ascii_lowercase();
+                let pk_entry = crate::dispatch::resolve_provider_key(snapshot, &target.model)?;
                 let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
                     .ok_or(ProxyError::ProviderUnavailable)?;
-                let ctx = attempt_ctx(&att, &pk_entry);
-                let facts = CompletionAttemptFacts {
-                    provider: provider.to_ascii_lowercase(),
-                    provider_key_id: pk_entry.id.to_string(),
-                    upstream_model: crate::dispatch::require_upstream_model(&att.model)?
-                        .to_string(),
+                crate::dispatch::require_upstream_model(&target.model)?;
+                // #554: apply the configured request `timeout` as the upstream deadline.
+                let ctx = attempt_ctx(&target, &pk_entry, timeouts.request);
+                // #701: mark each failed attempt on the runtime status, so the
+                // cooldown / circuit-breaker sees flapping upstreams even when
+                // a later retry recovers the request. `note_failure` is a
+                // no-op for non-triggering categories.
+                let answered = match bridge.complete(body, &ctx).await {
+                    Ok(v) => Ok(v),
+                    Err(
+                        e @ BridgeError::UnsupportedCapability(BridgeCapability::TextCompletions),
+                    ) => Err(e),
+                    Err(e) => {
+                        return Err(ProxyError::Bridge(crate::cooldown::note_failure(
+                            &state.runtime_status,
+                            &target.id,
+                            target.model.cooldown.as_ref(),
+                            e,
+                        )))
+                    }
                 };
-                let resp_json = bridge
-                    .complete(body, &ctx)
-                    .await
-                    .map_err(ProxyError::Bridge)?;
-                Ok((resp_json, facts))
+                Ok((answered, provider, pk_entry.id.to_string()))
             }
         },
     )
     .await;
+    // Serialized once the upstream has answered, not before: a copy made
+    // up front would be alive for the whole upstream wait.
+    let captured_prompt = content_cap.map(|_| serde_json::to_string(&body).unwrap_or_default());
+    let crate::routing::Dispatched {
+        value: (answered, provider_label, pk_id),
+        target,
+        member_reservation,
+        ..
+    } = match dispatched {
+        Ok(d) => d,
+        Err(e) => {
+            reservation.commit_tokens_no_spend(0).await;
+            return Err(e);
+        }
+    };
+    // Fold the target's model-layer reservation in (#1087) so
+    // one commit bills the member's TPM/TPD too.
+    if let Some(member) = member_reservation {
+        reservation.merge(member);
+    }
+    let model = &target.model;
 
-    match walk {
-        Ok(outcome) => {
-            let routing = outcome.attribution();
-            let model_entry_id = outcome.target_id.clone();
-            if let Some(member) = outcome.member_reservation {
-                reservation.merge(member);
-            }
-            let (resp_json, facts) = outcome.value;
-            let provider_label = facts.provider;
-            let provider_key_id = facts.provider_key_id;
-            let upstream_model = facts.upstream_model;
+    let model_entry_id = target.id.clone();
+    let provider_key_id = pk_id;
+    let upstream_model = model.upstream_model().unwrap_or("unknown").to_string();
+
+    match answered {
+        Ok(resp_json) => {
+            // #701: clear any cooldown/unhealthy mark now the upstream
+            // answered — same recovery signal as rerank/audio/chat.
+            state.health.record_success(&model.display_name);
+            state.runtime_status.mark_healthy(&target.id);
             // Extract usage BEFORE moving resp_json into the Response
             // so the success struct carries typed counters rather
             // than re-parsing JSON downstream.
@@ -1237,8 +1487,14 @@ async fn dispatch(
                 let mut u = extract_completion_usage(&resp_json).unwrap_or(CompletionUsage {
                     prompt_tokens: 0,
                     completion_tokens: 0,
+                    cached_prompt_tokens: 0,
+                    cache_write_tokens: None,
+                    modality: Default::default(),
+                    reasoning_tokens: 0,
+                    upstream_total_tokens: 0,
                     usage_estimated: false,
                     upstream_ttft: None,
+                    downstream_ttft: None,
                 });
                 let est_model = upstream_model.as_str();
                 if u.prompt_tokens == 0 {
@@ -1287,11 +1543,14 @@ async fn dispatch(
             let mut output_capture_safe = true;
             if !resolved_chain.is_empty() {
                 let synth = ChatResponse {
+                    logprobs: None,
+                    more_choices: Vec::new(),
                     id: String::new(),
                     model: model_name.to_string(),
                     message: ChatMessage::assistant(completion_output_text(&resp_json)),
                     finish_reason: FinishReason::Stop,
                     usage: UsageStats::default(),
+                    service_tier: None,
                 };
                 let (verdict, hits) =
                     aisix_guardrails::Guardrail::check_output_non_segment_observed(
@@ -1303,6 +1562,7 @@ async fn dispatch(
                 let moderation = crate::redact::moderate_body(
                     resolved_chain.as_ref(),
                     crate::redact::Direction::Output,
+                    None,
                     verdict,
                     &mut redactions,
                     &mut monitor_hits,
@@ -1315,10 +1575,12 @@ async fn dispatch(
                 if let aisix_guardrails::GuardrailVerdict::Block {
                     reason,
                     guardrail_name,
+                    unavailable,
                 } = verdict
                 {
                     // Per #153 the matched-pattern detail stays in ops logs only.
                     tracing::warn!(
+                        guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                         guardrail_hook = "output",
                         model = %model_name,
                         reason = %reason,
@@ -1330,32 +1592,40 @@ async fn dispatch(
                     // recording zero tokens here would let the control plane's ledger
                     // under-report spend the customer was charged for. Same
                     // output analog as responses.rs #543 / chat.rs UpstreamCharge.
+                    let block = crate::error::guardrail_block_error(
+                        "response",
+                        guardrail_name.as_deref(),
+                        unavailable.as_deref(),
+                    );
+                    let failure_message = crate::attempt::gateway_error_message(&block);
                     return Ok(CompletionDispatchSuccess {
-                        response: ProxyError::ContentFiltered(
-                            crate::error::guardrail_block_message(
-                                "response",
-                                guardrail_name.as_deref(),
-                            ),
-                        )
-                        .into_response(),
+                        response: block.into_response(),
                         provider: provider_label,
                         model_id: model_entry_id.clone(),
                         provider_key_id: provider_key_id.clone(),
                         upstream_model: upstream_model.clone(),
+                        applied_guardrails: applied_guardrails.clone(),
                         usage,
+                        upstream_called: true,
                         provider_request_id,
                         redactions,
                         monitor_hits,
                         error_class: String::new(),
                         guardrail_blocked: true,
+                        failure_message,
                         // Blocked responses never reached the client — no
                         // content capture, matching the chat surface.
                         captured_content: None,
                         usage_handled_by_stream: false,
-                        routing: routing.clone(),
                     });
                 }
             }
+
+            // Echo the model name the caller addressed. The request half
+            // already translates the alias to the upstream id
+            // (`aisix-provider-openai::bridge::completions`), so without this
+            // the response half handed the upstream's own id straight back.
+            crate::model_echo::restamp_body(&mut resp_json, model_name);
 
             // #932: mask-action PII rules rewrite the reply text AFTER the
             // block check passes.
@@ -1380,33 +1650,50 @@ async fn dispatch(
                 model_id: model_entry_id.clone(),
                 provider_key_id: provider_key_id.clone(),
                 upstream_model: upstream_model.clone(),
+                applied_guardrails: applied_guardrails.clone(),
                 usage,
+                upstream_called: true,
                 provider_request_id,
                 redactions,
                 monitor_hits,
                 error_class: String::new(),
                 guardrail_blocked: false,
+                failure_message: String::new(),
                 captured_content,
                 usage_handled_by_stream: false,
-                routing: routing.clone(),
             })
         }
-        Err(failure) => {
-            // No upstream answer → no tokens to count; release the
-            // reservation. Cooldown / health were noted per attempt by the
-            // walker.
+        // The provider does not implement completions (`Err` carries only
+        // that refusal — every other failure left through the dispatch).
+        Err(e) => {
+            // No upstream call → no tokens to count; release the reservation.
             reservation.commit_tokens_no_spend(0).await;
-            completion_unsupported_or_error(failure, &model_entry, redactions, monitor_hits)
+            Ok(completion_not_implemented(
+                &e,
+                provider_label,
+                model_entry_id,
+                provider_key_id,
+                upstream_model,
+                applied_guardrails,
+                redactions,
+                monitor_hits,
+            ))
         }
     }
 }
 
+/// 这次 `/v1/completions` 调用的输入分桶：花费桶和用量事件的 `cost_usd` 取同一份。
+/// 这个端点只有 OpenAI 形状，缓存命中是 `prompt_tokens` 的子集，按缓存费率计价。
+fn completion_input_tokens(usage: &CompletionUsage) -> aisix_core::InputTokens {
+    crate::usage_attr::input_tokens_for_pricing(
+        u64::from(usage.prompt_tokens),
+        u64::from(usage.cached_prompt_tokens),
+        0,
+        0,
+    )
+}
+
 /// 这次 `/v1/completions` 调用要记进花费桶的量（micro-USD）。
-///
-/// 与本文件用量事件里的 `cost_usd` 取同一组入参：`CompletionUsage` 上根本
-/// 没有缓存计数器，所以整份输入按未缓存计价——不是说这个端点不受上游的
-/// prompt 缓存影响。哪天这些计数器接上来了，这里和用量事件都要改成
-/// `input_tokens_for_pricing`。
 fn completion_spend_micro_usd(
     snap: &aisix_core::AisixSnapshot,
     model_id: &str,
@@ -1415,7 +1702,7 @@ fn completion_spend_micro_usd(
     crate::usage_attr::request_spend_micro_usd(
         snap,
         model_id,
-        aisix_core::InputTokens::uncached_only(u64::from(usage.prompt_tokens)),
+        completion_input_tokens(usage),
         u64::from(usage.completion_tokens),
     )
 }
@@ -1425,9 +1712,7 @@ fn completion_spend_micro_usd(
 ///   - The `usage` block is missing entirely (non-conformant edge), or
 ///   - `usage.prompt_tokens` is missing / non-numeric (malformed)
 ///
-/// Those cases skip UsageEvent emission rather than attributing a
-/// zero-everything noise row to the api_key. The `prompt_tokens` gate
-/// distinguishes "no upstream usage at all" from a legitimate reply.
+/// The caller then estimates the counts locally (AISIX-Cloud#1074).
 ///
 /// `completion_tokens`, by contrast, defaults to 0 when absent: a 200
 /// that reports a prompt side but omits the completion side is still a
@@ -1447,12 +1732,52 @@ fn extract_completion_usage(body: &Value) -> Option<CompletionUsage> {
         .and_then(|v| v.as_u64())
         .map(crate::usage_attr::token_count)
         .unwrap_or(0);
+    let cached_prompt_tokens = usage
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .map(crate::usage_attr::token_count)
+        .unwrap_or(0);
+    let cache_write_tokens = usage
+        .pointer("/prompt_tokens_details/cache_write_tokens")
+        .and_then(Value::as_u64)
+        .map(|n| n.min(u32::MAX as u64) as u32);
+    let counter = |pointer: &str| {
+        usage
+            .pointer(pointer)
+            .and_then(Value::as_u64)
+            .map_or(0, |n| n.min(u32::MAX as u64) as u32)
+    };
     Some(CompletionUsage {
         prompt_tokens,
         completion_tokens,
+        cached_prompt_tokens,
+        cache_write_tokens,
+        modality: aisix_gateway::ModalityTokens::from_openai_details(
+            usage.get("prompt_tokens_details"),
+            usage.get("completion_tokens_details"),
+        ),
+        reasoning_tokens: counter("/completion_tokens_details/reasoning_tokens"),
+        upstream_total_tokens: counter("/total_tokens"),
         usage_estimated: false,
         // 流式调用方在算完用量后自己填上首块时刻。
         upstream_ttft: None,
+        downstream_ttft: None,
+    })
+}
+
+/// [`extract_completion_usage`] as `UsageStats`: this endpoint's own reading
+/// of a completions body, shared with passthrough routes relaying the same
+/// envelope so the two cannot record one upstream reply differently.
+pub(crate) fn completion_usage_stats(body: &Value) -> Option<UsageStats> {
+    let u = extract_completion_usage(body)?;
+    Some(UsageStats {
+        cached_prompt_tokens: u.cached_prompt_tokens,
+        cache_write_tokens: u.cache_write_tokens,
+        modality: u.modality,
+        reasoning_tokens: u.reasoning_tokens,
+        upstream_total_tokens: u.upstream_total_tokens,
+        ..UsageStats::new(u.prompt_tokens, u.completion_tokens)
     })
 }
 
@@ -1519,17 +1844,18 @@ fn emit_usage_event(
     // alongside rather than in it.
     provider: &str,
     upstream_model: &str,
+    applied_guardrails: &[AppliedGuardrail],
     status_code: u16,
     elapsed: Duration,
     usage: &CompletionUsage,
     provider_request_id: &str,
-    // Which group member served and how many attempts it took.
-    routing: &crate::routing::RoutingAttribution,
     client: &ClientContext,
     stream: bool,
     error_class: &str,
     guardrail_blocked: bool,
-    applied_guardrails: Vec<aisix_core::AppliedGuardrail>,
+    // The output refusal's or the failed stream's own text; see
+    // `CompletionDispatchSuccess`.
+    failure_message: &str,
     // Per-detector PII mask counts (#932). Empty = no redaction.
     redacted_entity_counts: crate::redact::RedactionCounts,
     // Monitor-mode guardrail observations (#562).
@@ -1537,36 +1863,39 @@ fn emit_usage_event(
     // Captured request/response content for content-capturing exporters
     // (#947). Forwarded only to `fan_out`, never to the CP sink.
     content: Option<&CapturedContent>,
+    // The request's enforced-guardrail audit handle (AISIX-Cloud#1330).
+    audit: &crate::usage_attr::GuardrailAudit,
+    dispatched: bool,
+    // The attempt that answered (#655); `None` when none was dispatched.
+    winner: Option<&crate::attempt::AttemptRecord>,
 ) {
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
-        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
         model_id: model_id.to_string(),
         api_key_id: api_key_id.to_string(),
         requested_model: requested_model.to_string(),
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
-        attempt_index: routing.attempt_index,
-        attempt_kind: routing.attempt_kind.to_string(),
-        attempt_model: routing.served_by_model.clone(),
+        cached_prompt_tokens: usage.cached_prompt_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
+        modality_tokens: usage.modality,
+        reasoning_tokens: usage.reasoning_tokens,
+        total_tokens: usage.upstream_total_tokens,
         // Priced from the dispatched row's `Model.cost` when the operator set
         // one, `0.0` otherwise — see `usage_attr::request_cost_usd`.
         cost_usd: crate::usage_attr::request_cost_usd(
             snap,
             model_id,
-            // Priced as all-fresh input because this path's `CompletionUsage`
-            // carries no cache counters at all — not because the legacy
-            // completions surface is exempt from prompt caching upstream. If
-            // those counters are ever plumbed onto this struct, switch this to
-            // `input_tokens_for_pricing` like the chat surfaces.
-            aisix_core::InputTokens::uncached_only(u64::from(usage.prompt_tokens)),
+            completion_input_tokens(usage),
             u64::from(usage.completion_tokens),
         ),
         usage_estimated: usage.usage_estimated,
-        // Single-attempt endpoint: the attempt spans the whole request, so
-        // the upstream figure and what the caller waited for coincide.
-        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
-        downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        // Narrowed to the winning attempt's own latency below
+        // (`apply_winning_attempt`) once a failover put earlier attempts
+        // in front of it; they emitted their own events.
+        upstream_latency_ms: crate::attempt::measured_ms(elapsed),
+        downstream_latency_ms: crate::attempt::measured_ms(elapsed),
         // 上游首块时刻，只有流式才有；非流式为 0，线上省略。
         upstream_ttft_ms: usage
             .upstream_ttft
@@ -1574,26 +1903,52 @@ fn emit_usage_event(
         status_code,
         provider_request_id: provider_request_id.to_string(),
         inbound_protocol: "openai".to_string(),
+        applied_guardrails: applied_guardrails.to_vec(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         error_class: error_class.to_string(),
+        request_headers: client.request_headers.clone(),
         // #911 [23]: a billed-then-output-blocked completion surfaces on the
         // dashboard's Blocked tab while still carrying its billed token counts.
         guardrail_blocked,
-        applied_guardrails,
         redacted_entity_counts,
         guardrail_monitor_hits,
+        guardrail_enforced_hits: crate::usage_attr::enforced_hits(audit),
+        guardrail_scores: crate::usage_attr::guardrail_scores(audit),
+        guardrail_bypassed_reason: crate::usage_attr::bypass_reason(audit),
         ..Default::default()
     };
     crate::usage_attr::apply_pk_telemetry(&mut event, pk);
-    crate::usage_attr::apply_jwt_identity(&mut event, client.jwt.as_ref());
-    state.usage_sink.try_emit("completions", event.clone());
-    let exporters = crate::usage_attr::live_exporters(state, snap);
-    state.otlp_fan_out.fan_out(
-        &event,
+    crate::usage_attr::apply_winning_attempt(&mut event, winner);
+    // A stream's attempt record stops at the response head; its upstream
+    // figure is the whole relay, which `elapsed` already measures from that
+    // attempt's start.
+    if stream {
+        event.upstream_latency_ms = crate::attempt::measured_ms(elapsed);
+    }
+    // An output guardrail's refusal names itself like an input refusal does,
+    // and a failed stream names its failure.
+    if guardrail_blocked {
+        event.error_class = crate::attempt::GUARDRAIL_BLOCK_CLASS.to_string();
+        event.error_message = failure_message.to_string();
+    } else if !error_class.is_empty() {
+        event.error_message = failure_message.to_string();
+    }
+    crate::usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
+    let usage_model =
+        crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
+    // Read before the event moves into the emit: the spend family bills from it.
+    let cost_usd = event.cost_usd;
+    crate::usage_attr::emit_usage(
+        state,
+        snap,
+        crate::operation::COMPLETIONS,
+        event,
+        crate::usage_attr::usage_event_labels(&usage_model, pk),
         content,
-        exporters.generation(),
-        exporters.iter().map(|e| &*e.value),
+        client.trace.as_ref(),
+        /* terminal */ true,
+        dispatched,
     );
     let owned_caller = crate::request_metrics::Caller::from_api_key_id(snap, api_key_id);
     let caller = owned_caller.as_caller();
@@ -1613,7 +1968,13 @@ fn emit_usage_event(
             input: usage.prompt_tokens,
             output: usage.completion_tokens,
             total: usage.prompt_tokens.saturating_add(usage.completion_tokens),
-            spend_usd: event.cost_usd,
+            cached: usage.cached_prompt_tokens,
+            // The legacy completions surface is OpenAI-shape only: its
+            // cache hits are the subset above, never a counter beside
+            // the prompt tokens.
+            cache_read: 0,
+            cache_creation: 0,
+            spend_usd: cost_usd,
             client_type: state.client_classifier.classify(&client.user_agent),
         },
     );
@@ -1623,103 +1984,63 @@ fn emit_usage_event(
     //
     // 按请求方点名的那一行记（路由组时是父模型），和同一个流的 e2e 直方图一致；
     // 经快照收敛成配置里的名字，调用方随手写的字符串进不了标签。
-    if usage.upstream_ttft.is_some() {
-        let (bounded_model, bounded_upstream) =
-            crate::usage_attr::metric_model_label_pair(snap, requested_model, upstream_model);
-        state.metrics.record_request_ttft(
-            LatencyLabels {
-                endpoint: "/v1/completions",
-                model: bounded_model.as_ref(),
-                provider,
-                status: status_code,
-                streaming: true,
-            },
-            usage.upstream_ttft,
-        );
-        state.metrics.record_time_to_first_token(
-            UsageLabels {
-                endpoint: "/v1/completions",
-                inbound_protocol: "openai",
-                provider,
-                model: bounded_model.as_ref(),
-                upstream_model: bounded_upstream.as_ref(),
-                provider_key_id: pk.labels().id(),
-                provider_key_name: pk.labels().name(),
-                api_key_id: caller.api_key_id,
-                team_id: caller.team_id,
-                user_id: caller.user_id,
-                user_name: caller.user_name,
-            },
-            Duration::from_millis(u64::from(event.upstream_ttft_ms)),
-        );
-    }
-}
-#[allow(clippy::too_many_arguments)]
-/// Per-target facts a Model Group resolves differently per member, so none
-/// of them can be read off the caller-addressed entry.
-struct CompletionAttemptFacts {
-    provider: String,
-    provider_key_id: String,
-    upstream_model: String,
+    crate::request_metrics::record_stream_ttft(
+        state,
+        "/v1/completions",
+        caller,
+        crate::request_metrics::Upstream {
+            provider,
+            model: requested_model,
+            upstream_model,
+            pk: pk.labels(),
+            stream,
+            ..Default::default()
+        },
+        status_code,
+        usage.upstream_ttft,
+        usage.downstream_ttft,
+    );
 }
 
-/// Render a walk that produced no answer.
-///
-/// A provider that does not implement legacy completions is a 501 rather
-/// than a 502: the request was well-formed and the gateway reached a
-/// decision without the upstream failing. Attribution goes to the row that
-/// refused — with several group members, only one of them may lack the
-/// surface.
-fn completion_unsupported_or_error(
-    failure: crate::routing::GroupFailure,
-    entry: &aisix_core::ResourceEntry<aisix_core::Model>,
+/// The route's own answer for a provider that does not implement legacy
+/// completions: a 501 rather than a 502, because the request was well-formed
+/// and the gateway reached a decision without the upstream failing.
+/// Attribution goes to the row that refused — with several group members, only
+/// one of them may lack the surface.
+#[allow(clippy::too_many_arguments)]
+fn completion_not_implemented(
+    refusal: &BridgeError,
+    provider: String,
+    model_id: String,
+    provider_key_id: String,
+    upstream_model: String,
+    applied_guardrails: Vec<AppliedGuardrail>,
     redactions: crate::redact::RedactionCounts,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
-) -> Result<CompletionDispatchSuccess, ProxyError> {
-    let msg = match &failure.err {
-        ProxyError::Bridge(BridgeError::Config(msg))
-            if msg.contains("does not support text completions")
-                || msg.contains("text completions") =>
-        {
-            msg.clone()
-        }
-        _ => return Err(failure.err),
-    };
-    let target = failure
-        .target
-        .clone()
-        .unwrap_or_else(|| std::sync::Arc::clone(&entry.value));
-    Ok(CompletionDispatchSuccess {
+) -> CompletionDispatchSuccess {
+    CompletionDispatchSuccess {
         response: (
             StatusCode::NOT_IMPLEMENTED,
-            Json(ErrorEnvelope::new(msg, "not_implemented")),
+            Json(ErrorEnvelope::new(refusal.to_string(), "not_implemented")),
         )
             .into_response(),
-        provider: target
-            .provider
-            .as_deref()
-            .unwrap_or("unknown")
-            .to_ascii_lowercase(),
-        model_id: if failure.target_id.is_empty() {
-            entry.id.to_string()
-        } else {
-            failure.target_id.clone()
-        },
-        provider_key_id: String::new(),
-        upstream_model: target.upstream_model().unwrap_or("unknown").to_string(),
-        // No upstream call → no usage to attribute. The handler gates
-        // emission on `usage.is_some()` so a 501 stays out of /logs noise
-        // (same convention as #402).
+        provider,
+        model_id,
+        provider_key_id,
+        upstream_model,
+        applied_guardrails,
+        // No upstream call → no token usage; the event records zero.
         usage: None,
+        upstream_called: false,
         provider_request_id: String::new(),
         redactions,
         monitor_hits,
         error_class: String::new(),
         guardrail_blocked: false,
+        failure_message: String::new(),
         captured_content: None,
         usage_handled_by_stream: false,
-        routing: failure.attribution(),
-    })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1732,9 +2053,7 @@ fn emit_access_log(
     request_id: &str,
     // Provider response id; `None`/empty when the call produced none.
     provider_request_id: Option<&str>,
-    // Which group member served and what the walk cost; `None` for a
-    // failed request.
-    routing: Option<&crate::routing::RoutingAttribution>,
+    routing: &crate::attempt::RoutingTelemetry,
     error: Option<&ProxyError>,
 ) {
     let (error_kind, error) = match error {
@@ -1748,28 +2067,34 @@ fn emit_access_log(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    AccessLog {
+    let target = crate::attribution::AccessLogTarget::current();
+    let summary = routing.access_log_summary();
+    crate::attribution::emit_access_log(AccessLog {
         method: "POST",
         path: "/v1/completions",
         status,
         latency,
+        duration: latency,
         provider: Some(provider),
         model: Some(model),
+        upstream_model: target.upstream_model(),
+        provider_key_id: target.provider_key_id(),
         api_key_id: Some(api_key_id),
         prompt_tokens: None,
         completion_tokens: None,
         total_tokens: None,
         request_id,
         provider_request_id: provider_request_id.filter(|s| !s.is_empty()),
-        served_by_model: routing
-            .map(|r| r.served_by_model.as_str())
-            .filter(|s| !s.is_empty()),
-        routing_attempt_count: routing.map(|r| r.attempt_count),
-        routing_fallback_count: routing.map(|r| r.fallback_count),
+        served_by_model: summary.served_by_model,
+        routing_attempt_count: summary.attempt_count,
+        routing_fallback_count: summary.fallback_count,
         error_kind,
         error: error.as_deref(),
-    }
-    .emit();
+        mcp: None,
+        cache: None,
+        request_body_bytes: None,
+        response_body_bytes: None,
+    });
 }
 
 #[cfg(test)]
@@ -1789,11 +2114,13 @@ mod tests {
     fn cfg() -> ProxyConfig {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: Some(1_048_576),
+            request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),
+            expose_debug_headers: false,
             tls: None,
+            listeners: Vec::new(),
             thread_per_core: None,
             workers: None,
         }
@@ -1910,7 +2237,7 @@ mod tests {
     /// text has already leaked.
     #[tokio::test]
     async fn output_guardrail_blocks_stream_before_release_issue_554() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = concat!(
             "data: {\"id\":\"cmpl-stream\",\"object\":\"text_completion\",",
             "\"choices\":[{\"index\":0,\"text\":\"BLOCK\",\"finish_reason\":null}]}\n\n",
@@ -1929,7 +2256,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("instruct"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let hub = Arc::new(Hub::new());
@@ -1971,7 +2298,7 @@ mod tests {
     /// intact.
     #[tokio::test]
     async fn output_guardrail_releases_clean_stream_as_sse_issue_554() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = concat!(
             "data: {\"id\":\"cmpl-clean\",\"object\":\"text_completion\",",
             "\"choices\":[{\"index\":0,\"text\":\"hello\",\"finish_reason\":null}]}\n\n",
@@ -1990,7 +2317,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("instruct"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
 
         let resp = tower::ServiceExt::oneshot(
             build_app(snap),
@@ -2019,7 +2346,7 @@ mod tests {
     /// consumption instead of being lost when the handler returns.
     #[tokio::test]
     async fn unguarded_stream_forwards_and_emits_terminal_usage() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = concat!(
             "data: {\"id\":\"cmpl-live\",\"object\":\"text_completion\",",
             "\"choices\":[{\"index\":0,\"text\":\"hello\",\"finish_reason\":null}]}\n\n",
@@ -2073,7 +2400,7 @@ mod tests {
     /// the choice channel before redaction, then release only the masked value.
     #[tokio::test]
     async fn pii_mask_reassembles_text_across_completion_frames() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = concat!(
             "data: {\"id\":\"cmpl-pii\",\"object\":\"text_completion\",",
             "\"choices\":[{\"index\":0,\"text\":\"alice@\",\"finish_reason\":null}]}\n\n",
@@ -2091,7 +2418,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("instruct"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(pii_output_guardrail(65_536));
+        crate::seed_env_scoped_guardrail(&snap, pii_output_guardrail(65_536));
         let resp = tower::ServiceExt::oneshot(
             build_app(snap),
             make_req(serde_json::json!({
@@ -2114,7 +2441,7 @@ mod tests {
     /// releasing any upstream bytes when the configured cap is exceeded.
     #[tokio::test]
     async fn output_guardrail_stream_buffer_overflow_fails_closed() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = format!(
             "data: {{\"id\":\"cmpl-large\",\"object\":\"text_completion\",\"choices\":[{{\"index\":0,\"text\":\"{}\",\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n",
             "x".repeat(256),
@@ -2128,7 +2455,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("instruct"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(pii_output_guardrail(64));
+        crate::seed_env_scoped_guardrail(&snap, pii_output_guardrail(64));
         let resp = tower::ServiceExt::oneshot(
             build_app(snap),
             make_req(serde_json::json!({
@@ -2150,7 +2477,7 @@ mod tests {
     /// byte-for-byte instead of converting the overflow into a 422.
     #[tokio::test]
     async fn output_guardrail_stream_buffer_overflow_honors_fail_open() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let sse = format!(
             "data: {{\"id\":\"cmpl-large\",\"object\":\"text_completion\",\"choices\":[{{\"index\":0,\"text\":\"{}\",\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n",
             "x".repeat(256),
@@ -2205,7 +2532,12 @@ mod tests {
         });
 
         let snap = new_snap(&format!("http://{address}"));
-        snap.models.insert(model_entry("instruct"));
+        let mut entry = model_entry("instruct");
+        Arc::make_mut(&mut entry.value).cooldown = Some(aisix_core::CooldownConfig {
+            enabled: Some(true),
+            ..Default::default()
+        });
+        snap.models.insert(entry);
         snap.apikeys.insert(apikey_entry(&["*"]));
         let (usage_tx, mut usage_rx) = tokio::sync::mpsc::channel(4);
         let hub = Arc::new(Hub::new());
@@ -2255,7 +2587,10 @@ mod tests {
             &runtime,
             "instruct",
             "m-1",
-            Some(&aisix_core::CooldownConfig::default()),
+            Some(&aisix_core::CooldownConfig {
+                enabled: Some(true),
+                ..Default::default()
+            }),
             aisix_gateway::BridgeError::Timeout {
                 elapsed_ms: 300,
                 cause: "first stream event".into(),
@@ -2277,7 +2612,7 @@ mod tests {
     /// contacted (`expect(0)`).
     #[tokio::test]
     async fn input_guardrail_blocks_prompt_returns_422() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .respond_with(
@@ -2291,7 +2626,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("instruct"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
         let app = build_app(snap);
         let body = serde_json::json!({"model": "instruct", "prompt": "please BLOCKME now"});
@@ -2313,7 +2648,7 @@ mod tests {
     /// provider call fails. The error UsageEvent must not silently discard it.
     #[tokio::test]
     async fn input_monitor_hit_survives_upstream_error() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .respond_with(ResponseTemplate::new(500).set_body_string("upstream failed"))
@@ -2323,8 +2658,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("instruct"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails
-            .insert(keyword_input_monitor_guardrail("WATCHME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_monitor_guardrail("WATCHME"));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let hub = Arc::new(Hub::new());
@@ -2343,10 +2677,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
-            .await
-            .expect("failed request must emit usage")
-            .expect("usage sink closed");
+        // One row per attempt (#655); the hit rides the request's terminal one.
+        let event = loop {
+            let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+                .await
+                .expect("failed request must emit usage")
+                .expect("usage sink closed");
+            if event.is_final_attempt {
+                break event;
+            }
+        };
         assert!(!event.guardrail_blocked);
         assert_eq!(event.applied_guardrails.len(), 1);
         assert_eq!(event.guardrail_monitor_hits.len(), 1);
@@ -2401,14 +2741,14 @@ mod tests {
 
     #[tokio::test]
     async fn model_group_fails_over_on_completions() {
-        let dead = MockServer::start().await;
+        let dead = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .respond_with(ResponseTemplate::new(503).set_body_string("overloaded"))
             .expect(1)
             .mount(&dead)
             .await;
-        let live = MockServer::start().await;
+        let live = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2436,14 +2776,14 @@ mod tests {
 
     #[tokio::test]
     async fn model_group_fails_over_on_streaming_completions() {
-        let dead = MockServer::start().await;
+        let dead = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .respond_with(ResponseTemplate::new(503).set_body_string("overloaded"))
             .expect(1)
             .mount(&dead)
             .await;
-        let live = MockServer::start().await;
+        let live = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .respond_with(
@@ -2483,7 +2823,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_guardrail_allows_benign_prompt_forwards_200() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2498,7 +2838,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("instruct"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
 
         let app = build_app(snap);
         let body = serde_json::json!({"model": "instruct", "prompt": "a fine prompt"});
@@ -2514,7 +2854,7 @@ mod tests {
 
     #[tokio::test]
     async fn happy_path_forwards_to_completions_endpoint() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2598,7 +2938,7 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_error_propagates_as_502() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .respond_with(ResponseTemplate::new(500).set_body_string("error"))
@@ -2626,7 +2966,7 @@ mod tests {
     async fn emits_usage_event_on_200_with_tokens_issue_403() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // Legacy OpenAI completions wire shape. Pin specific token
         // counts so a regression that swapped prompt/completion
         // semantics would fail here.
@@ -2690,7 +3030,7 @@ mod tests {
     async fn records_the_provider_response_id_1289() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2741,7 +3081,7 @@ mod tests {
     async fn estimates_usage_event_when_upstream_usage_block_is_empty() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let upstream_body = serde_json::json!({
             "id": "cmpl-up-1",
             "object": "text_completion",
@@ -2797,7 +3137,7 @@ mod tests {
     async fn emits_with_zero_completion_when_completion_tokens_missing() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let upstream_body = serde_json::json!({
             "id": "cmpl-up-1",
             "object": "text_completion",
@@ -2844,12 +3184,12 @@ mod tests {
     /// ONE zero-token UsageEvent so the failed request is visible in Logs
     /// (status + error class) and attributed to the api_key — instead of being
     /// dropped, as the non-chat handlers used to do. The 501 NotImplemented
-    /// path still emits nothing (no upstream call); see the test below.
+    /// path emits a zero-token event too; see the test below.
     #[tokio::test]
     async fn upstream_5xx_emits_zero_token_error_event() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .respond_with(ResponseTemplate::new(500).set_body_string("Internal"))
@@ -2888,24 +3228,36 @@ mod tests {
             !ev.error_class.is_empty(),
             "error_class must classify the failure"
         );
+        // One event per upstream attempt (#655): each of the direct
+        // model's own retries fails the same way and leaves its own row,
+        // none of them billed.
+        let mut events = vec![ev];
+        while let Ok(more) = rx.try_recv() {
+            events.push(more);
+        }
+        let hits = upstream.received_requests().await.unwrap_or_default().len();
         assert!(
-            rx.try_recv().is_err(),
-            "exactly one event per failed request"
+            hits > 1,
+            "the direct model's retry budget should replay a 5xx"
         );
+        assert_eq!(events.len(), hits, "exactly one event per upstream attempt");
+        for (i, ev) in events.iter().enumerate() {
+            assert_eq!(ev.attempt_index, i as u32);
+            assert_eq!(ev.attempt_kind, if i == 0 { "initial" } else { "retry" });
+            assert_eq!(ev.status_code, events[0].status_code);
+            assert_eq!((ev.prompt_tokens, ev.completion_tokens), (0, 0));
+            assert_eq!(ev.cost_usd, 0.0);
+        }
     }
 
-    /// Issue #403 audit MEDIUM-3: the 501 NotImplemented path
-    /// (provider doesn't support text completions) must not emit
-    /// a UsageEvent — no upstream call happened, so no usage to
-    /// attribute. Without this test, a future regression that
-    /// flipped `usage: None` → `Some(zero)` on the 501 branch
-    /// would silently emit a bogus zero event. Triggers the path
+    /// A 501 emits a zero-token event, and one reached after a mask carries
+    /// that attribution (#1083). Triggers the path
     /// by routing /v1/completions at an Anthropic-backed model;
-    /// `AnthropicBridge` doesn't override `Bridge::complete()`
-    /// so the trait default returns `BridgeError::Config(...)`
-    /// which maps to 501.
+    /// `AnthropicBridge` doesn't override `Bridge::complete()`, so the trait
+    /// default returns `UnsupportedCapability(TextCompletions)`, which maps to
+    /// 501.
     #[tokio::test]
-    async fn provider_lacking_complete_returns_501_without_emit() {
+    async fn provider_lacking_complete_emits_a_zero_token_event() {
         use aisix_obs::UsageSink;
         use aisix_provider_anthropic::AnthropicBridge;
 
@@ -2926,6 +3278,7 @@ mod tests {
         snap.provider_keys.insert(anthropic_pk_entry);
         snap.models.insert(anthropic_model_entry);
         snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, masking_input_guardrail());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
@@ -2937,7 +3290,7 @@ mod tests {
         let app = crate::build_router(state);
 
         let body = serde_json::json!({"model": "claude-instruct", "prompt": "hi"});
-        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+        let resp = tower::ServiceExt::oneshot(app.clone(), make_req(body))
             .await
             .unwrap();
         assert_eq!(
@@ -2947,14 +3300,101 @@ mod tests {
              (default Bridge::complete returns BridgeError::Config)",
         );
 
-        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
-        if let Ok(Some(ev)) = recv {
-            panic!(
-                "501 NotImplemented must not emit UsageEvent, \
-                 got prompt_tokens={}, status_code={}",
-                ev.prompt_tokens, ev.status_code,
-            );
-        }
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the 501 must emit its zero-token UsageEvent")
+            .expect("usage sink remains open");
+        assert_eq!(ev.status_code, 501);
+        assert_eq!(ev.error_class, "config", "{ev:?}");
+        assert!(ev.error_message.contains("does not support"), "{ev:?}");
+        assert_eq!((ev.prompt_tokens, ev.completion_tokens), (0, 0));
+        assert!(ev.guardrail_enforced_hits.is_empty(), "{ev:?}");
+
+        let body = serde_json::json!({
+            "model": "claude-instruct",
+            "prompt": "build version: 9.9.9"
+        });
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the masked 501 must emit its guardrail attribution")
+            .expect("usage sink remains open");
+        assert_eq!(ev.status_code, 501);
+        assert_eq!((ev.prompt_tokens, ev.completion_tokens), (0, 0));
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "masked");
+        assert_eq!(ev.applied_guardrails.len(), 1);
+    }
+
+    /// The same 501 path, but the guardrail FAILS OPEN instead of masking:
+    /// the bypass reason, which leaves no enforced hit and no score, still
+    /// lands on the unbilled event.
+    #[tokio::test]
+    async fn a_fail_open_bypass_alone_keeps_the_unbilled_event_alive() {
+        use aisix_obs::UsageSink;
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        const ANTHROPIC_PK_ID: &str = "22222222-2222-2222-2222-222222222222";
+
+        let anthropic_pk: aisix_core::ProviderKey = serde_json::from_str(
+            r#"{"display_name":"anthropic-up","secret":"sk-ant-test","provider":"anthropic","adapter":"anthropic"}"#,
+        )
+        .unwrap();
+        let anthropic_model: Model = serde_json::from_str(&format!(
+            r#"{{"display_name":"claude-instruct","provider":"anthropic","model_name":"claude-3-haiku-20240307","provider_key_id":"{ANTHROPIC_PK_ID}"}}"#
+        ))
+        .unwrap();
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(ResourceEntry::new(ANTHROPIC_PK_ID, anthropic_pk, 1));
+        snap.models
+            .insert(ResourceEntry::new("m-anthropic", anthropic_model, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        // Faults instead of deciding, input hook only.
+        let row: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
+            "name": "completions-fail-open",
+            "enabled": true,
+            "kind": "custom",
+            "hook_point": "input",
+            "fail_open": true,
+            "script": "export function checkInput() { throw new Error('x'); }",
+            "timeout_ms": 5000,
+        }))
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-open", row, 1));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = tower::ServiceExt::oneshot(
+            crate::build_router(state),
+            make_req(serde_json::json!({"model": "claude-instruct", "prompt": "hi"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("a bypassed request must not have its event suppressed")
+            .expect("usage sink remains open");
+        assert_eq!(
+            ev.guardrail_bypassed_reason, "custom_script_error",
+            "{ev:?}"
+        );
+        // The premise: nothing else on this event could have kept it alive.
+        assert!(ev.guardrail_enforced_hits.is_empty(), "{ev:?}");
+        assert!(ev.guardrail_scores.is_empty(), "{ev:?}");
+        assert!(ev.guardrail_monitor_hits.is_empty(), "{ev:?}");
+        assert_eq!((ev.prompt_tokens, ev.completion_tokens), (0, 0));
     }
 
     /// A 200 response with NO `usage` block at all (vs `usage: {}`
@@ -2966,7 +3406,7 @@ mod tests {
     async fn estimates_usage_event_when_upstream_omits_usage_block_entirely() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // No `usage` key at all — distinct from `usage: {}`.
         let upstream_body = serde_json::json!({
             "id": "cmpl-no-usage",
@@ -3021,7 +3461,7 @@ mod tests {
     async fn emits_provider_telemetry_tags_issue_867() {
         use aisix_obs::UsageSink;
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let upstream_body = serde_json::json!({
             "id": "cmpl-up-1",
             "object": "text_completion",
@@ -3072,7 +3512,7 @@ mod tests {
     /// Healthy.
     #[tokio::test]
     async fn upstream_5xx_marks_cooldown_issue_701() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/completions"))
             .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
@@ -3080,7 +3520,15 @@ mod tests {
             .await;
 
         let snap = new_snap(&upstream.uri());
-        snap.models.insert(model_entry("instruct"));
+        // Cooldown is opt-in (AISIX-Cloud#1499). The subject here is that
+        // this handler routes its failures through the cooldown
+        // chokepoint at all, so the model has to ask for cooldown.
+        let mut entry = model_entry("instruct");
+        Arc::make_mut(&mut entry.value).cooldown = Some(aisix_core::CooldownConfig {
+            enabled: Some(true),
+            ..Default::default()
+        });
+        snap.models.insert(entry);
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let hub = Arc::new(Hub::new());
@@ -3116,5 +3564,165 @@ mod tests {
         let chat = super::completions_input_to_chat("m", &body);
         let contents: Vec<_> = chat.messages.iter().map(|m| m.content.as_deref()).collect();
         assert_eq!(contents, [Some("u\ns\np1\np2")]);
+    }
+
+    /// AISIX-Cloud#1330 / #1024: a guardrail BLOCK leaves this handler
+    /// through `Err`, so the terminal usage event is the shared
+    /// zero-token error event. That branch is the one an auditor reads —
+    /// "which policy refused this request" — and a drain wired only into
+    /// the success path misses it silently.
+    #[tokio::test]
+    async fn blocked_request_names_the_policy_on_the_usage_event() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::builder().start().await;
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-completions"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let app = crate::build_router(
+            crate::ProxyState::new(handle, hub, &cfg())
+                .without_cache()
+                .with_usage_sink(UsageSink::new(tx)),
+        );
+
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            make_req(serde_json::json!({"model": "my-completions", "prompt": "please BLOCKME"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for the refusal")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].guardrail_name, "t");
+        assert_eq!(ev.guardrail_enforced_hits[0].hook, "input");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "blocked");
+        let wire = serde_json::to_string(&ev).unwrap();
+        assert!(!wire.contains("BLOCKME"), "{wire}");
+    }
+    /// A `kind: "pii"` row whose one custom pattern masks a version string
+    /// on input — the in-process rewrite this handler actually performs,
+    /// as opposed to the keyword BLOCK the sibling test drives.
+    fn masking_input_guardrail() -> ResourceEntry<aisix_core::Guardrail> {
+        let g: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"eda-mask","enabled":true,"hook_point":"input","kind":"pii","detectors":[],"custom_patterns":[{"name":"eda_version","regex":"version\\s*:\\s*(\\d+(?:\\.\\d+)+)","action":"mask","replacement":"***"}]}"#,
+        )
+        .unwrap();
+        ResourceEntry::new("g-mask", g, 1)
+    }
+
+    /// AISIX-Cloud#1330 / #1024: the SUCCESS emitter drains too.
+    ///
+    /// The sibling test drives a refusal, which leaves through the shared
+    /// error event — so on its own it would stay green if the drain were
+    /// deleted from the success path. An enforcing MASK is the case that
+    /// only the success emitter can report, and the case a masking
+    /// deployment lives on: the request is served, nothing errors, and
+    /// without the drain the /logs row is indistinguishable from one no
+    /// guardrail touched.
+    #[tokio::test]
+    async fn masked_request_names_the_policy_on_the_usage_event() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "text_completion",
+                "choices": [{"text": "ok", "index": 0, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("instruct"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, masking_input_guardrail());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let app = crate::build_router(
+            crate::ProxyState::new(handle, hub, &cfg())
+                .without_cache()
+                .with_usage_sink(UsageSink::new(tx)),
+        );
+
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            make_req(serde_json::json!({"model": "instruct", "prompt": "build version: 9.9.9 ok"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].guardrail_name, "eda-mask");
+        assert_eq!(ev.guardrail_enforced_hits[0].hook, "input");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "masked");
+        let wire = serde_json::to_string(&ev).unwrap();
+        assert!(!wire.contains("9.9.9"), "{wire}");
+    }
+
+    /// A request without `stream: true` has no stream to defer its line to
+    /// and writes it where it always did — at the handler tail. What #1571
+    /// adds here is the second figure, and on a buffered request the two are
+    /// the same number: the caller waited for the whole response, which is
+    /// the whole request.
+    #[tokio::test]
+    async fn a_buffered_request_reports_one_line_whose_duration_is_its_latency() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-abc",
+                "object": "text_completion",
+                "created": 1_700_000_000i64,
+                "model": "gpt-3.5-turbo-instruct",
+                "choices": [{"text": " is a test", "index": 0, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 4, "total_tokens": 9}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("instruct"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_app(snap);
+
+        let capture = crate::test_log::Capture::install();
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            make_req(serde_json::json!({"model": "instruct", "prompt": "Say this"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = to_bytes(resp.into_body(), 65536).await.unwrap();
+
+        let line = capture.only("a buffered request");
+        assert_eq!(line.status(), 200);
+        assert_eq!(line.field("path").as_deref(), Some("/v1/completions"));
+        assert_eq!(
+            line.num("duration_ms"),
+            line.num("downstream_latency_ms"),
+            "nothing is streamed here, so the wait and the request are the same span",
+        );
     }
 }

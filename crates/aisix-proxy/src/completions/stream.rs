@@ -80,7 +80,6 @@ pub(super) struct CompletionSseAccumulator {
     text_bytes: usize,
     frame_cap: usize,
     text_cap: usize,
-    first_frame: bool,
     pub(super) saw_done: bool,
     /// Where, in the bytes of the [`Self::push`] that found it, the `[DONE]`
     /// frame began — `0` when it began in an earlier push.
@@ -101,7 +100,6 @@ impl Default for CompletionSseAccumulator {
             text_bytes: 0,
             frame_cap: crate::messages::MAX_SSE_FRAME_BUF_BYTES,
             text_cap: crate::token_estimate::OUTPUT_ACCUMULATION_CAP,
-            first_frame: true,
             saw_done: false,
             done_frame_start: 0,
             malformed_data: false,
@@ -201,7 +199,6 @@ impl CompletionSseAccumulator {
         if self.dropping_oversized_frame {
             self.dropping_oversized_frame = false;
             self.frame_buf.clear();
-            self.first_frame = false;
             return;
         }
         let frame = std::mem::take(&mut self.frame_buf);
@@ -209,14 +206,11 @@ impl CompletionSseAccumulator {
     }
 
     fn observe_frame(&mut self, frame: &[u8]) {
-        let first_frame = self.first_frame;
-        let saw_done = crate::redact::is_sse_done_event(frame, first_frame);
-        self.first_frame = false;
-        if saw_done {
+        if crate::redact::is_sse_done_event(frame) {
             self.saw_done = true;
             return;
         }
-        let (json, malformed) = crate::redact::parse_sse_json_event(frame, first_frame);
+        let (json, malformed) = crate::redact::parse_sse_json_event(frame);
         self.malformed_data |= malformed;
         let Some(json) = json else {
             return;
@@ -279,7 +273,7 @@ impl CompletionSseAccumulator {
     /// keeping already-complete frames in their parsed text form.
     pub(super) fn finish_for_overflow_estimate(&mut self) -> String {
         let partial = if self.frame_buf.is_empty()
-            || crate::redact::parse_sse_json_event(&self.frame_buf, self.first_frame)
+            || crate::redact::parse_sse_json_event(&self.frame_buf)
                 .0
                 .is_some()
         {
@@ -379,7 +373,10 @@ pub(super) fn stamp_first_chunk(
 ) -> CompletionByteStream {
     Box::pin(upstream.inspect(move |item| {
         if matches!(item, Ok(bytes) if !bytes.is_empty()) {
-            slot.get_or_init(|| attempt_started.elapsed());
+            slot.get_or_init(|| {
+                crate::attribution::note_upstream_first_frame();
+                attempt_started.elapsed()
+            });
         }
     }))
 }
@@ -603,11 +600,14 @@ async fn observe_completion_stream_output(
         };
     }
     let mut synth = ChatResponse {
+        logprobs: None,
+        more_choices: Vec::new(),
         id: String::new(),
         model: upstream_model.to_string(),
         message: ChatMessage::assistant(text.to_string()),
         finish_reason: FinishReason::Stop,
         usage: UsageStats::default(),
+        service_tier: None,
     };
     let (verdict, mut hits) =
         aisix_guardrails::Guardrail::check_output_non_segment_observed(chain, &synth).await;
@@ -660,6 +660,7 @@ mod tests {
                     hook: "output".to_string(),
                     action: "would_block".to_string(),
                     reason: "test observation".to_string(),
+                    error_type: String::new(),
                     counts: BTreeMap::new(),
                 }],
             )

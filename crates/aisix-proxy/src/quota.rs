@@ -1,7 +1,7 @@
 //! Pre-dispatch quota gate shared by every LLM endpoint.
 //!
 //! Applies budget + multi-layer rate limiting:
-//! 1. Budget pre-check (the control plane cached decision)
+//! 1. Budget pre-check (`budget::enforce_key`, from the pushed budget documents)
 //! 2. API-key inline rate limit (`auth.entry.id`)
 //! 3. Model inline rate limit (`model:<name>`) — when the resolved Model has one
 //! 4. MCP-server rate limit (`mcp:<api_key_id>:<server>`) — on an MCP
@@ -125,6 +125,7 @@ fn condition_input<'a>(
         provider: model_rl.and_then(|m| m.provider.as_deref()),
         routing_parent_model: routing_parent.map(|p| p.entry_id),
         routing_parent_model_name: routing_parent.map(|p| p.name),
+        tags: Some(&auth.tags),
     }
 }
 
@@ -303,12 +304,15 @@ fn match_conditional_layer(
     // order never changes the bucket identity. A matched request
     // missing a split dimension is not subject to the policy (mirrors
     // `team_member` only applying to keys carrying a `user_id`).
-    let group_by = policy.group_by.as_deref().unwrap_or_default();
+    let mut group_by: Vec<&GroupByDimension> = policy
+        .group_by
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .collect();
+    group_by.sort_by_key(|dim| dim.canonical_rank());
     let mut bucket_key = format!("policy:v2:{policy_entry_id}");
-    for dim in GroupByDimension::CANONICAL_ORDER {
-        if !group_by.contains(&dim) {
-            continue;
-        }
+    for dim in group_by {
         let value = input.get_group_by(dim)?;
         bucket_key = format!("{bucket_key}:{dim}={}", escape_bucket_segment(value));
     }
@@ -413,10 +417,11 @@ fn warn_inert_dimension_once(policy_name: &str, window: &str, dimension: &str) {
 /// 对同一个（快照，模型）是恒定的 —— 真要省，该在快照构建时算成一个派生标志，
 /// 而不是在这里加缓存。目前没有测到它值得那么做。
 fn unpriced_dispatch_exists(snap: &aisix_core::AisixSnapshot, model: &aisix_core::Model) -> bool {
+    let pricing = crate::usage_attr::pricing_index(snap);
     let unpriced_by_name = |name: &str| {
         snap.models
             .get_by_name(name)
-            .is_some_and(|e| e.value.cost.is_none() && !is_virtual_parent(&e.value))
+            .is_some_and(|e| pricing.resolve(&e.value).is_none() && !is_virtual_parent(&e.value))
     };
     if let Some(routing) = model.routing.as_ref() {
         return routing.targets.iter().any(|t| unpriced_by_name(&t.model));
@@ -432,7 +437,7 @@ fn unpriced_dispatch_exists(snap: &aisix_core::AisixSnapshot, model: &aisix_core
         return unpriced_by_name(&ensemble.judge.model)
             || ensemble.panel.iter().any(|m| unpriced_by_name(&m.model));
     }
-    model.cost.is_none()
+    pricing.resolve(model).is_none()
 }
 
 /// 父级不带 `cost` 是结构使然，不是"没配价"。目标本身又是父级时不下结论——
@@ -611,12 +616,19 @@ async fn reserve_layers(
 
     // Layer 3: per-MCP-server limit carried by this key. Bucketed on
     // `mcp:<api_key_id>:<server>` so each server the key reaches counts
-    // independently — of the other servers, and of every other key.
+    // independently — of the other servers, and of every other key. The
+    // `<server>` half is whichever identity selected the limit (see
+    // `McpServerLimit`), so a rename does not silently hand the key a
+    // fresh window on a limit that was attached by id.
     if let Some(server) = mcp_server {
-        if let Some(limits) = auth.key().mcp_rate_limit(server) {
-            let rl = RateLimit::from(limits);
+        // Through the same registered-server index the tool ACL resolves
+        // against, so a key that names its limits by server id and its
+        // grants by server id sees one rename take effect at one instant.
+        let servers = state.mcp_servers.for_snapshot(snapshot);
+        if let Some(limit) = auth.key().mcp_rate_limit(&servers, server) {
+            let rl = RateLimit::from(limit.limits);
             if !rl.is_unrestricted() {
-                let key = format!("mcp:{}:{}", auth.entry.id, server);
+                let key = format!("mcp:{}:{}", auth.entry.id, limit.bucket);
                 let r = state
                     .limiter
                     .pre_commit(&key, &rl)
@@ -645,9 +657,9 @@ async fn reserve_layers(
     Ok(MultiReservation::new(reservations))
 }
 
-/// Scan the policy table once for the given phase and reserve every
+/// Select policy candidates for the given phase and reserve every
 /// applicable layer. Shared by the request gate ([`reserve_layers`])
-/// and the per-target gate ([`reserve_model_only`]) so the two scans
+/// and the per-target gate ([`reserve_model_only`]) so the two paths
 /// cannot drift (the schedules gate had to be patched into both loops
 /// once already — #1104).
 async fn reserve_policy_layers(
@@ -663,13 +675,14 @@ async fn reserve_policy_layers(
 ) -> Result<(), ProxyError> {
     // O(1) empty check before anything else: deployments with no
     // rate-limit policies (the default) skip the wall-clock read and
-    // the per-shard table scan below entirely. Covers both callers —
+    // candidate lookup below entirely. Covers both callers —
     // the request gate and the per-target gate.
     if snap.rate_limit_policies.is_empty() {
         return Ok(());
     }
     let now = chrono::Utc::now();
-    for entry in snap.rate_limit_policies.entries() {
+    let index = state.policy_index.for_table(&snap.rate_limit_policies);
+    for entry in index.candidates(input) {
         let policy = &entry.value;
         // Inside a scheduled suspension window the policy reserves
         // nothing; enforcement resumes automatically when the window
@@ -754,11 +767,9 @@ fn reject(
     layer: &'static str,
     policy: Option<(&str, &str)>,
 ) -> ProxyError {
-    state.metrics.record_ratelimit_rejection(
-        &err.scope().to_string(),
-        layer,
-        policy.map(|(id, _)| id),
-    );
+    state
+        .metrics
+        .record_ratelimit_rejection(&err.scope().to_string(), layer, policy);
     match policy {
         Some((id, name)) => ProxyError::PolicyRateLimit {
             source: err,
@@ -831,7 +842,7 @@ fn reject_spend(
     state.metrics.record_ratelimit_rejection(
         spend_scope_label(policy.window, &err),
         "policy_spend",
-        Some(policy_id),
+        Some((policy_id, policy.name.as_str())),
     );
     let retry_after_seconds = err.retry_after_secs();
     let usd = |micro: u64| format!("{:.6}", micro as f64 / 1_000_000.0);
@@ -842,7 +853,7 @@ fn reject_spend(
             .map(|team| format!("{team}:{member}")),
         _ => policy.scope_ref.clone(),
     };
-    ProxyError::BudgetExceeded(Box::new(crate::budget_reason::BudgetReason {
+    ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
         message: if matches!(err, aisix_ratelimit::RateLimitError::AllowanceExhausted) {
             // 措辞要说清「等不回来」。窗口上限的文案会让人以为再等等就好了，
             // 而这个要有人去充值。
@@ -871,6 +882,9 @@ fn reject_spend(
         // 本身去认窗口，是 store 层的改动，本任务的约束不允许。
         // 上限 + 重试时间已足够客户端处置。
         spent_usd: None,
+        // 剩余额度同样读不回来（见上面 `spent_usd` 的说明）。这个字段只喂
+        // `aisix_budget_remaining_usd`，不进响应体。
+        remaining_usd: None,
         period: policy.window.map(|w| w.as_str().to_string()),
         period_resets_at: None,
         retry_after_seconds,
@@ -883,18 +897,65 @@ fn reject_spend(
 /// identity for policy matching and optional inline limits. Pass `None`
 /// only for endpoints that don't resolve a model (e.g. passthrough).
 ///
-/// 预算不再由这里单独判定：过去这里会先问一次控制平面（HTTP `check_budget`）
-/// 再走限流，现在预算就是策略里的一层花费桶，和其余限流层一起在
-/// `reserve_layers` 里预留/提交。花费桶超限时报 `ProxyError::
-/// BudgetExceeded`（见 [`reject_spend`]），与 token/请求层的
-/// `PolicyRateLimit` 区分开。
+/// 花费上限有两个来源，都在这里生效：一是控制平面推送的预算文档，由
+/// `budget::enforce_key` 在本地判定（不发 HTTP 请求）；二是策略里的一层花费
+/// 桶（`max_spend_micro_usd`），和其余限流层一起在 `reserve_layers` 里预留/
+/// 提交。两者超限都报 `ProxyError::BudgetExceeded`（花费桶见
+/// [`reject_spend`]），与 token/请求层的 `PolicyRateLimit` 区分开。
 pub(crate) async fn enforce(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     model_rl: Option<&ModelRateLimit>,
 ) -> Result<MultiReservation, ProxyError> {
-    reserve_layers(state, snapshot, auth, model_rl, None).await
+    crate::budget::enforce_key(state, snapshot, auth)?;
+    let reserved = reserve_layers(state, snapshot, auth, model_rl, None).await;
+    refresh_remaining(state, snapshot, auth, model_rl);
+    reserved
+}
+
+/// Refresh `aisix_ratelimit_remaining_{requests,tokens}` for the caller's
+/// key from its window as this gate left it — the one point every model
+/// route reserves through. A route that resolved no model (MCP, A2A, a
+/// video poll) has no `model` to label the gauge with and leaves it alone.
+fn refresh_remaining(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    model_rl: Option<&ModelRateLimit>,
+) {
+    let Some(model_rl) = model_rl else {
+        return;
+    };
+    let key_limits = auth.key().rate_limit.clone().unwrap_or_default();
+    if key_limits.is_unrestricted() {
+        return;
+    }
+    // Off the request's path: on a shared store the peek is a round trip,
+    // and a gauge has no reason to delay the upstream call.
+    let limiter = state.limiter.clone();
+    let metrics = state.metrics.clone();
+    let api_key_id = auth.entry.id.clone();
+    let api_key_name = auth
+        .api_key_name()
+        .unwrap_or(crate::request_metrics::UNKNOWN)
+        .to_owned();
+    let model = crate::usage_attr::metric_model_label(snapshot, &model_rl.name).into_owned();
+    let refresh = async move {
+        if let Some(status) = limiter.peek(&api_key_id, &key_limits).await {
+            metrics.set_rate_limit_remaining(
+                &api_key_id,
+                &api_key_name,
+                &model,
+                status.rpm_remaining(),
+                status.tpm_remaining(),
+            );
+        }
+    };
+    tokio::spawn(tracing::Instrument::instrument(
+        refresh,
+        tracing::Span::current(),
+    ));
 }
 
 /// Take a request's rate-limit reservation BEFORE its input guardrails when
@@ -935,22 +996,41 @@ pub(crate) async fn enforce_mcp(
     auth: &AuthenticatedKey,
     mcp_server: &str,
 ) -> Result<MultiReservation, ProxyError> {
+    crate::budget::enforce_key(state, snapshot, auth)?;
     reserve_layers(state, snapshot, auth, None, Some(mcp_server)).await
 }
 
-/// Alias for [`enforce`], kept so `chat.rs`'s call site doesn't need a
-/// rename. Historically distinct because chat dispatch ran its own inline
-/// control-plane budget check before calling this; that inline check is
-/// gone (budgets are no longer decided by an HTTP call), so the bodies were
-/// byte-identical duplicates — consolidated here into one delegation
-/// instead of two copies that could drift.
+/// The budget gauge labels of `auth`, shared by every emit site so the
+/// gauge-liveness sweep (`gauge_series_is_live` in the server) can judge
+/// them against one resolution rule.
+pub(crate) fn budget_labels(auth: &AuthenticatedKey) -> aisix_obs::BudgetLabels<'_> {
+    let caller = crate::request_metrics::Caller::new(auth);
+    aisix_obs::BudgetLabels {
+        api_key_id: caller.api_key_id,
+        api_key_name: caller.api_key_name,
+        team_id: caller.team_id,
+        team_name: caller.team_name,
+        user_id: caller.user_id,
+        user_name: caller.user_name,
+    }
+}
+
+/// Rate-limit-only enforcement (no budget check). Used by `chat.rs`
+/// which handles budget separately.
+///
+/// Refreshes the remaining-quota gauges only on a rejection: `chat.rs`
+/// refreshes them itself once the request's tokens are committed.
 pub(crate) async fn enforce_rate_limit(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     model_rl: Option<&ModelRateLimit>,
 ) -> Result<MultiReservation, ProxyError> {
-    enforce(state, snapshot, auth, model_rl).await
+    let reserved = reserve_layers(state, snapshot, auth, model_rl, None).await;
+    if reserved.is_err() {
+        refresh_remaining(state, snapshot, auth, model_rl);
+    }
+    reserved
 }
 
 /// Reserve ONLY the model-scoped layers for one model, identified by its
@@ -1174,12 +1254,15 @@ mod tests {
         }))
         .unwrap();
         AuthenticatedKey {
+            anonymous: false,
             entry: std::sync::Arc::new(aisix_core::resource::ResourceEntry::new(
                 "key-entry-1",
                 key,
                 1,
             )),
             jwt: None,
+            owner: Default::default(),
+            tags: Default::default(),
         }
     }
 
@@ -1235,13 +1318,15 @@ mod tests {
             std::sync::Arc::new(aisix_gateway::Hub::new()),
             &aisix_core::ProxyConfig {
                 addr: "127.0.0.1:0".into(),
-                request_body_limit_bytes: None,
+                request_body_limit_bytes: 0,
                 tls: None,
                 real_ip: Default::default(),
                 request_id: Default::default(),
                 thread_per_core: None,
                 workers: None,
                 url_rewrites: Vec::new(),
+                expose_debug_headers: false,
+                listeners: Vec::new(),
             },
         )
     }
@@ -1254,8 +1339,11 @@ mod tests {
         }))
         .unwrap();
         AuthenticatedKey {
+            anonymous: false,
             entry: std::sync::Arc::new(aisix_core::resource::ResourceEntry::new(entry_id, key, 1)),
             jwt: None,
+            owner: Default::default(),
+            tags: Default::default(),
         }
     }
 
@@ -1281,6 +1369,94 @@ mod tests {
         )
         .expect("policy applies")
         .bucket_key
+    }
+
+    #[test]
+    fn policy_candidates_preserve_all_matching_layers() {
+        use aisix_core::{resource::ResourceEntry, snapshot::ResourceTable};
+        use serde_json::json;
+        let table = ResourceTable::new();
+        let mut id = 0;
+        let mut add = |policy| {
+            id += 1;
+            table.insert(ResourceEntry::new(format!("p{id}"), policy, 1));
+        };
+        for scope in ["api_key", "model", "team", "member", "team_member"] {
+            for value in ["selected", "parent", "other"] {
+                add(make_scoped_policy(scope, value));
+            }
+        }
+        for dim in [
+            "team",
+            "member",
+            "api_key",
+            "model",
+            "model_name",
+            "provider",
+        ] {
+            for (op, value) in [
+                ("==", json!("selected")),
+                ("~=", json!("selected")),
+                ("in", json!(["selected", "parent", "selected"])),
+                ("~~", json!("^selected$")),
+            ] {
+                for negate in [false, true] {
+                    let leaf = json!({"dimension":dim,"operator":op,"value":value,"negate":negate});
+                    let other = json!({"dimension":"member","operator":"==","value":"other"});
+                    for conditions in [
+                        json!([leaf]),
+                        json!([other, leaf]),
+                        json!([{"logic":"and","children":[leaf,other]}]),
+                        json!([{"logic":"or","children":[leaf,other]}]),
+                        json!([{"logic":"and","negate":true,"children":[leaf,other]}]),
+                        json!([{"logic":"or","negate":true,"children":[leaf,other]}]),
+                        json!([{"logic":"and","children":[{"logic":"or","children":[other]},leaf]}]),
+                    ] {
+                        add(make_conditional_policy(json!({
+                            "name":"conditional", "conditions":conditions,
+                            "group_by":["member","model"], "limits":{"rpm":10}
+                        })));
+                    }
+                }
+            }
+        }
+        add(make_conditional_policy(
+            json!({"name":"global","limits":{"rpm":10}}),
+        ));
+        let index = crate::policy_index::LivePolicyIndex::default().for_table(&table);
+        for value in [None, Some("selected"), Some("other")] {
+            for parent in [None, Some("parent"), Some("selected")] {
+                let input = ConditionInput {
+                    team: value,
+                    member: value,
+                    api_key: value,
+                    model: value,
+                    model_name: value,
+                    provider: value,
+                    routing_parent_model: parent,
+                    routing_parent_model_name: parent,
+                    tags: None,
+                };
+                for phase in [REQUEST, REQUEST_DEFERRING, PolicyPhase::ModelTarget] {
+                    let layer = |entry: &ResourceEntry<RateLimitPolicy>| {
+                        match_policy_layer(&entry.value, &entry.id, &input, phase).map(|layer| {
+                            (
+                                layer.bucket_key,
+                                serde_json::to_value(layer.limits).unwrap(),
+                            )
+                        })
+                    };
+                    let expected: Vec<_> = table
+                        .entries()
+                        .into_iter()
+                        .filter_map(|e| layer(&e))
+                        .collect();
+                    let actual: Vec<_> =
+                        index.candidates(&input).filter_map(|e| layer(e)).collect();
+                    assert_eq!(actual, expected, "input={input:?}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -1518,6 +1694,56 @@ mod tests {
             layer.bucket_key,
             "policy:v2:pol-2:team=team-1:model=model-1"
         );
+    }
+
+    #[test]
+    fn tag_conditions_and_group_by_follow_the_effective_tags() {
+        let policy = make_conditional_policy(serde_json::json!({
+            "name": "per-department",
+            "conditions": [
+                { "dimension": "tag:bg", "operator": "==", "value": "cloud" }
+            ],
+            "group_by": ["tag:department", "team"],
+            "limits": { "rpm": 20 },
+        }));
+        let mut auth = make_auth(Some("team-1"), None);
+        auth.tags = std::sync::Arc::new(
+            [
+                ("bg".to_string(), "cloud".to_string()),
+                ("department".to_string(), "r:d".to_string()),
+            ]
+            .into(),
+        );
+        let layer = match_policy_layer(
+            &policy,
+            "pol-t",
+            &condition_input(&auth, None, None),
+            REQUEST,
+        )
+        .expect("matches");
+        assert_eq!(
+            layer.bucket_key,
+            "policy:v2:pol-t:team=team-1:tag:department=r%3Ad"
+        );
+
+        // No value for a group_by tag: not subject to the policy.
+        auth.tags = std::sync::Arc::new([("bg".to_string(), "cloud".to_string())].into());
+        assert!(match_policy_layer(
+            &policy,
+            "pol-t",
+            &condition_input(&auth, None, None),
+            REQUEST
+        )
+        .is_none());
+        // No value for the condition tag: unmatched.
+        auth.tags = Default::default();
+        assert!(match_policy_layer(
+            &policy,
+            "pol-t",
+            &condition_input(&auth, None, None),
+            REQUEST
+        )
+        .is_none());
     }
 
     #[test]

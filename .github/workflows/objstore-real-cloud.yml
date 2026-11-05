@@ -6,11 +6,11 @@
 # → assert exactly one object under the prefix → re-deliver the same batch →
 # assert no duplicate key → clean up) against the actual cloud APIs. These
 # complement the emulator smoke in ci.yml's unit job, which cannot exercise real
-# S3 auth or (for GCS) the real PUT path that fake-gcs-server can't round-trip.
+# S3 auth or (for GCS) the XML API upload that fake-gcs-server does not implement.
 #
 # Gated: never runs on a normal push. Triggered manually (workflow_dispatch),
-# nightly (schedule), or on a same-repo PR labeled `objstore real cloud`. Each
-# provider's test self-skips (logged) when its secrets are absent, so an
+# on the schedule below, or on a same-repo PR labeled `objstore real cloud`.
+# Each provider's test self-skips (logged) when its secrets are absent, so an
 # unconfigured run is a green no-op.
 #
 # ── Required repository secrets ──
@@ -46,7 +46,9 @@ name: objstore-real-cloud
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 0 * * *" # 00:30 UTC (08:30 Asia/Shanghai)
+    # 00:30 UTC (08:30 Asia/Shanghai) on days 3, 6, ..., 30 of each month.
+    # Month boundaries can lengthen the interval to four or five days.
+    - cron: "30 0 3-30/3 * *"
   pull_request:
     types: [labeled, synchronize, reopened]
     branches: [main]
@@ -65,7 +67,7 @@ jobs:
     # The explicit same-repo check is defense-in-depth: plain `pull_request`
     # withholds secrets from fork PRs by GitHub default today, but this gate
     # keeps the credentials off fork-controlled code even if that default is
-    # ever flipped (mirrors docker-image.yml's `!= 'pull_request'` guard).
+    # ever flipped.
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.head.repo.full_name == github.repository &&

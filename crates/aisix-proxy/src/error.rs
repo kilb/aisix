@@ -95,10 +95,9 @@ pub struct PolicyErrorRef {
     pub name: String,
 }
 
-/// The structured budget fields that a `budget_exceeded` 429 lifts from
-/// its [`crate::budget_reason::BudgetReason`]. Flattened into `ErrorBody`.
-/// Each field is omitted when absent so a reason carrying only a human
-/// message still serializes cleanly with just that message.
+/// The structured budget fields that `budget_exceeded` 429s lift from
+/// the exhausted budget's reason. Flattened into `ErrorBody`. Each field
+/// is omitted when the reason does not carry it.
 #[derive(Debug, Serialize, Clone)]
 pub struct BudgetErrorFields {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,7 +147,7 @@ impl ErrorEnvelope {
 
     /// Attach the structured budget detail to the error block. Only
     /// the budget_exceeded path calls this.
-    pub fn with_budget(mut self, r: &crate::budget_reason::BudgetReason) -> Self {
+    pub fn with_budget(mut self, r: &crate::budget::BudgetReason) -> Self {
         self.error.budget = Some(BudgetErrorFields {
             scope: r.scope.clone(),
             scope_ref: r.scope_ref.clone(),
@@ -164,8 +163,17 @@ impl ErrorEnvelope {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
-    #[error("missing or malformed Authorization header")]
-    MissingAuth,
+    /// No usable gateway credential. Carries the credential header that
+    /// failed, so the message points at the header to fix.
+    #[error("missing or malformed {0} header")]
+    MissingAuth(&'static str),
+    /// A `header_key` passthrough route saw no gateway key in its configured
+    /// header. Named separately from [`ProxyError::MissingAuth`] because on
+    /// these routes `Authorization` deliberately carries the caller's own
+    /// upstream credential — telling the integrator to fix `Authorization`
+    /// points at exactly the wrong header.
+    #[error("missing or malformed {0} header (this route's gateway API key header)")]
+    MissingRouteAuthHeader(String),
     #[error("invalid API key")]
     InvalidApiKey,
     /// The presented key exists but its `expires_at` deadline has
@@ -195,10 +203,23 @@ pub enum ProxyError {
     #[error("JWT has expired")]
     JwtExpired,
     /// The JWT verified but does not satisfy the trust provider's
-    /// `required_scopes` / `bound_claims` requirements. 403: the
-    /// caller is authenticated, just not entitled.
+    /// `bound_claims` requirements. 403: the caller is authenticated,
+    /// just not entitled. (Scope failures are the sibling
+    /// [`Self::JwtInsufficientScope`]; both render identically.)
     #[error("JWT does not satisfy the required scopes or claims")]
     JwtClaimsRejected,
+    /// The JWT verified but its granted scopes do not cover the trust
+    /// provider's `required_scopes`. Split from
+    /// [`Self::JwtClaimsRejected`] so the active `/mcp` OAuth surface
+    /// can attach an RFC 6750 `insufficient_scope` challenge naming the
+    /// scopes this operation needs (AISIX-Cloud#1143) — a scope failure
+    /// is curable by re-consenting, a `bound_claims` policy denial is
+    /// not, so only the former may carry a challenge. Renders
+    /// byte-identically to `JwtClaimsRejected` on the wire (same 403,
+    /// `permission_denied` type, `jwt_claims_rejected` code): the `/v1`
+    /// contract is unchanged.
+    #[error("JWT does not satisfy the required scopes or claims")]
+    JwtInsufficientScope { required_scopes: Vec<String> },
     /// The JWT verified but no API key carries a `jwt_subject` equal
     /// to its identity claim. Named explicitly (not a generic invalid
     /// credential) because the fix — binding a key to the identity —
@@ -212,6 +233,17 @@ pub enum ProxyError {
     /// gateway just cannot verify it right now — retryable.
     #[error("unable to fetch the identity provider's signing keys")]
     JwksUnavailable,
+    /// The single-server MCP endpoint could not obtain an upstream token for
+    /// the caller from an `oauth2_token_exchange` server's token endpoint.
+    #[error("upstream token exchange failed: {0}")]
+    McpTokenExchange(aisix_mcp::TokenExchangeFailure),
+    /// `/mcp/{server}` has no usable upstream token for the caller of an
+    /// `oauth2_authorization_code` server.
+    #[error("{}", mcp_user_oauth_message(.failure, .server))]
+    McpUserOAuth {
+        failure: aisix_mcp::UserOAuthFailure,
+        server: String,
+    },
     #[error("model {0:?} not found")]
     ModelNotFound(String),
     /// A `/v1/videos/{video_id}` id that this gateway could not have
@@ -240,11 +272,6 @@ pub enum ProxyError {
     /// `allowed_routes` grants.
     #[error("API key is not allowed to use passthrough route {0:?}")]
     RouteForbidden(String),
-    /// A removed endpoint whose replacement exists: 410 with a fixed
-    /// migration message (the implicit `/passthrough/:provider/*rest`
-    /// tunnel, superseded by explicit passthrough routes).
-    #[error("{0}")]
-    Gone(String),
     #[error("request payload is invalid: {0}")]
     InvalidRequest(String),
     /// A non-WebSocket request reached the WebSocket-only realtime
@@ -258,6 +285,15 @@ pub enum ProxyError {
     WebSocketUpgradeRequired { status: StatusCode, detail: String },
     #[error("no bridge registered for provider")]
     ProviderUnavailable,
+    /// A semantic router could not make its routing decision — the
+    /// classifier or embedding call failed — and its failure policy is
+    /// `fail`. `reason` is a closed vocabulary; the underlying error,
+    /// which can quote the prompt, stays on the router's warn line.
+    #[error("semantic router '{router}' could not pick a route ({reason})")]
+    SemanticDecisionFailed {
+        router: String,
+        reason: crate::semantic::DecisionFailure,
+    },
     /// Every routing candidate was excluded by the runtime status layer
     /// (all in cooldown or background-unhealthy) and the routing model
     /// is configured with `when_all_unavailable: fail`. Caller-visible as
@@ -275,20 +311,43 @@ pub enum ProxyError {
     /// [`guardrail_block_message`] — generic policy wording plus the NAME
     /// of the guardrail that fired (#519 B.4b) — and emits the rich
     /// detail to `tracing` for operators.
-    #[error("{0}")]
-    ContentFiltered(String),
-    // 携带结构化的预算拒绝原因（`BudgetReason`）。预算判定不再来自控制平面的
-    // HTTP 调用，而是由本地策略（etcd 中 `RateLimitPolicy.max_spend_micro_usd`）
-    // 判定并填充这个类型——契约（`error.budget.*` 的形状）不变，只是换了填充者。
-    // Display 原样转发 message（应当已经是完整的客户句子，例如
-    // "<scope> budget '<name>' exceeded ($X/period). Resets …"）；结构化字段
-    // 通过 `with_budget` 附加到 429 的 error block 里。
+    ///
+    /// `unavailable` carries the guardrail's bounded failure tag when the
+    /// refusal was an AVAILABILITY failure on a `fail_open: false` row —
+    /// the screening service was unreachable, or an operator-supplied
+    /// script produced no usable verdict — rather than a content decision.
+    /// It is the same closed, label-safe vocabulary
+    /// `GuardrailVerdict::Block::unavailable` carries, never free text and
+    /// never matched content, so it is safe on the wire.
+    ///
+    /// Keeping the two inside ONE variant is deliberate: `status()`,
+    /// `kind()`, and the dispatch-loop predicates must not diverge between
+    /// them (a guardrail refusal is a guardrail refusal for retry,
+    /// failover and outcome-classification purposes), so the distinction
+    /// lives only where it is read by a human or branched on by an SDK —
+    /// the message and `error.code`.
+    #[error("{message}")]
+    ContentFiltered {
+        message: String,
+        unavailable: Option<String>,
+    },
+    // Carries the budget document's structured reason. Display forwards
+    // its message verbatim (it's already a complete customer sentence —
+    // "<scope> budget '<name>' exceeded ($X/period). Resets …"); the
+    // structured fields ride along in the 429 error block via
+    // `with_budget` (prd-09b §5.8).
     // Boxed: BudgetReason is ~184 bytes; inlining it would make this the
     // largest ProxyError variant and trip clippy::result_large_err across
     // every `Result<_, ProxyError>` in the hot path. The box keeps the
     // enum small (budget denial is rare, so the extra alloc is fine).
     #[error("{}", .0.message)]
-    BudgetExceeded(Box<crate::budget_reason::BudgetReason>),
+    BudgetExceeded(Box<crate::budget::BudgetReason>),
+    /// A budget applies to the request, but the environment's budget
+    /// policy is `closed` and usage has not reached the control plane for
+    /// longer than its grace period, so whether the budget still has room
+    /// cannot be known.
+    #[error("budget could not be verified: usage has not reached the control plane")]
+    BudgetUnverified,
     /// Per RFC 9110 §15.5.14, a request body that exceeds a server-
     /// imposed limit gets a `413 Content Too Large`. The caller-visible
     /// `message` is intentionally bare of the actual incoming size
@@ -316,6 +375,25 @@ pub enum ProxyError {
     Bridge(#[from] BridgeError),
 }
 
+/// Failure tags for the two refusals the PROXY itself raises on a
+/// guardrail's behalf, where no `GuardrailVerdict` exists to carry one.
+/// Same closed, label-safe vocabulary as a kind's own tag, and here for
+/// the same reason: in both cases the content was never screened, so
+/// telling the caller its content violated a policy states something that
+/// did not happen.
+///
+/// `output_buffer_exceeded` — a streamed response outgrew the hold-back
+/// cap and the row is fail-closed, so it is refused unscanned. Under
+/// `on_buffer_exceeded: fail_open` the same tag is the request's
+/// `guardrail_bypassed_reason`: there it means the output scan was skipped.
+/// `unscannable_body` — the body could not be walked, so the guardrail was
+/// never offered the content to scan.
+/// `mask_writeback_failed` — a mask verdict could not be spliced back into
+/// the body, so the request is refused rather than forwarded unmasked.
+pub(crate) const TAG_OUTPUT_BUFFER_EXCEEDED: &str = "output_buffer_exceeded";
+pub(crate) const TAG_UNSCANNABLE_BODY: &str = "unscannable_body";
+pub(crate) const TAG_MASK_WRITEBACK_FAILED: &str = "mask_writeback_failed";
+
 /// The caller-visible message for a guardrail `Block` verdict.
 ///
 /// Carries WHICH guardrail fired — `guardrail_name` is operator-assigned
@@ -327,38 +405,109 @@ pub enum ProxyError {
 /// family builds its rejection text through this helper so the wording can't
 /// drift between siblings, even where the envelope differs (422 or an SSE
 /// error event on the LLM routes; an `isError` tool result on `/mcp`).
-pub(crate) fn guardrail_block_message(side: &str, guardrail_name: Option<&str>) -> String {
-    match guardrail_name {
-        Some(name) => format!("{side} blocked by content policy (guardrail '{name}')"),
-        None => format!("{side} blocked by content policy"),
+///
+/// `unavailable` splits the sentence in two. A guardrail that REFUSED the
+/// content and a guardrail that COULD NOT EVALUATE it are the same 422 to
+/// every consumer downstream, and until this parameter existed they were
+/// also the same sentence — so an operator whose fail-closed row was
+/// broken (a screening service down, a script returning a verdict the
+/// gateway does not understand) saw their own working policy's message on
+/// every single request, with nothing in the response to suggest
+/// otherwise. AISIX-Cloud#1365 split the two on the audit event and the
+/// metric; this is the third surface, the one the caller actually reads.
+/// The tag is named in the text because it is what an operator greps for
+/// and what the dashboard shows.
+pub(crate) fn guardrail_block_message(
+    side: &str,
+    guardrail_name: Option<&str>,
+    unavailable: Option<&str>,
+) -> String {
+    match (unavailable, guardrail_name) {
+        (Some(tag), Some(name)) => {
+            format!("{side} rejected: guardrail '{name}' could not evaluate it ({tag})")
+        }
+        (Some(tag), None) => format!("{side} rejected: a guardrail could not evaluate it ({tag})"),
+        (None, Some(name)) => format!("{side} blocked by content policy (guardrail '{name}')"),
+        (None, None) => format!("{side} blocked by content policy"),
     }
+}
+
+/// [`guardrail_block_message`] wrapped in the error the LLM handlers
+/// return. The `Option<String>` sites (SSE error frames, `/mcp` tool
+/// results, hand-built JSON bodies) use the message helper directly; every
+/// site that returns a [`ProxyError`] goes through this one so the message
+/// and the `unavailable` tag can never be set from different verdicts.
+pub(crate) fn guardrail_block_error(
+    side: &str,
+    guardrail_name: Option<&str>,
+    unavailable: Option<&str>,
+) -> ProxyError {
+    ProxyError::ContentFiltered {
+        message: guardrail_block_message(side, guardrail_name, unavailable),
+        unavailable: unavailable.map(str::to_owned),
+    }
+}
+
+/// The `data:` payload of the OpenAI-shape SSE `event: error` frame that
+/// ends a streamed response an output guardrail refused. It is the buffered
+/// 422 body for the same refusal, so the two halves of an endpoint carry the
+/// same `error.type` and the same `error.code` (`guardrail_unavailable` for
+/// a fail-closed refusal, none for a policy block).
+pub(crate) fn guardrail_block_frame_payload(
+    guardrail_name: Option<&str>,
+    unavailable: Option<&str>,
+) -> String {
+    serde_json::to_string(
+        &guardrail_block_error("response", guardrail_name, unavailable).envelope(),
+    )
+    .expect("an error envelope serializes")
 }
 
 impl ProxyError {
     pub fn status(&self) -> StatusCode {
         match self {
-            ProxyError::MissingAuth
+            ProxyError::MissingRouteAuthHeader(_)
+            | ProxyError::MissingAuth(_)
             | ProxyError::InvalidApiKey
             | ProxyError::ApiKeyExpired
             | ProxyError::ApiKeyDisabled
             | ProxyError::JwtInvalid
             | ProxyError::JwtExpired
             | ProxyError::JwtIdentityUnmapped => StatusCode::UNAUTHORIZED,
-            ProxyError::JwtClaimsRejected => StatusCode::FORBIDDEN,
+            ProxyError::JwtClaimsRejected | ProxyError::JwtInsufficientScope { .. } => {
+                StatusCode::FORBIDDEN
+            }
             ProxyError::JwksUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ProxyError::McpTokenExchange(failure) => match failure {
+                aisix_mcp::TokenExchangeFailure::NoSubject
+                | aisix_mcp::TokenExchangeFailure::SubjectRejected { .. } => {
+                    StatusCode::UNAUTHORIZED
+                }
+                aisix_mcp::TokenExchangeFailure::Misconfigured => StatusCode::INTERNAL_SERVER_ERROR,
+                aisix_mcp::TokenExchangeFailure::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            },
+            ProxyError::McpUserOAuth { failure, .. } => match failure {
+                aisix_mcp::UserOAuthFailure::AuthorizationRequired => StatusCode::UNAUTHORIZED,
+                // Never a 401: an MCP client answers any 401 by opening a
+                // browser, and signing in cannot give this caller a user.
+                aisix_mcp::UserOAuthFailure::NoSubject => StatusCode::FORBIDDEN,
+                aisix_mcp::UserOAuthFailure::Misconfigured => StatusCode::INTERNAL_SERVER_ERROR,
+                aisix_mcp::UserOAuthFailure::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            },
             ProxyError::ModelForbidden(_) => StatusCode::FORBIDDEN,
             ProxyError::ModelIpRestricted(_) => StatusCode::FORBIDDEN,
             ProxyError::RouteIpRestricted(_) => StatusCode::FORBIDDEN,
             ProxyError::RouteForbidden(_) => StatusCode::FORBIDDEN,
-            ProxyError::Gone(_) => StatusCode::GONE,
             ProxyError::ModelNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::VideoNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             ProxyError::WebSocketUpgradeRequired { status, .. } => *status,
             ProxyError::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ProxyError::SemanticDecisionFailed { .. } => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::AllCandidatesUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
-            ProxyError::ContentFiltered(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            ProxyError::ContentFiltered { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             ProxyError::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
+            ProxyError::BudgetUnverified => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             ProxyError::RateLimit(_) => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::PolicyRateLimit { .. } => StatusCode::TOO_MANY_REQUESTS,
@@ -370,35 +519,77 @@ impl ProxyError {
 
     pub fn kind(&self) -> &'static str {
         match self {
-            ProxyError::MissingAuth
+            ProxyError::MissingRouteAuthHeader(_)
+            | ProxyError::MissingAuth(_)
             | ProxyError::InvalidApiKey
             | ProxyError::ApiKeyExpired
             | ProxyError::ApiKeyDisabled
             | ProxyError::JwtInvalid
             | ProxyError::JwtExpired
             | ProxyError::JwtIdentityUnmapped => "invalid_api_key",
-            ProxyError::JwtClaimsRejected => "permission_denied",
+            ProxyError::JwtClaimsRejected | ProxyError::JwtInsufficientScope { .. } => {
+                "permission_denied"
+            }
             // Auth infrastructure fault, not a credential judgment — the
             // generic server-fault family, like a 5xx from dispatch.
             ProxyError::JwksUnavailable => "api_error",
+            ProxyError::McpTokenExchange(failure) => match failure {
+                aisix_mcp::TokenExchangeFailure::NoSubject
+                | aisix_mcp::TokenExchangeFailure::SubjectRejected { .. } => "authentication_error",
+                aisix_mcp::TokenExchangeFailure::Misconfigured
+                | aisix_mcp::TokenExchangeFailure::Unavailable => "api_error",
+            },
+            ProxyError::McpUserOAuth { failure, .. } => match failure {
+                aisix_mcp::UserOAuthFailure::AuthorizationRequired => "authentication_error",
+                aisix_mcp::UserOAuthFailure::NoSubject => "permission_denied",
+                aisix_mcp::UserOAuthFailure::Misconfigured
+                | aisix_mcp::UserOAuthFailure::Unavailable => "api_error",
+            },
             ProxyError::ModelForbidden(_) => "permission_denied",
             ProxyError::ModelIpRestricted(_) => "permission_denied",
             ProxyError::RouteIpRestricted(_) => "permission_denied",
             ProxyError::RouteForbidden(_) => "permission_denied",
-            ProxyError::Gone(_) => "invalid_request_error",
             ProxyError::ModelNotFound(_) => "model_not_found",
             ProxyError::VideoNotFound(_) => "video_not_found",
             ProxyError::InvalidRequest(_) => "invalid_request_error",
             ProxyError::WebSocketUpgradeRequired { .. } => "websocket_upgrade_required",
             ProxyError::RequestTooLarge { .. } => "invalid_request_error",
             ProxyError::ProviderUnavailable => "provider_unavailable",
+            // A gateway-side dependency failed, like `JwksUnavailable`;
+            // `error.code` carries the distinction.
+            ProxyError::SemanticDecisionFailed { .. } => "api_error",
             ProxyError::AllCandidatesUnavailable { .. } => "all_candidates_unavailable",
-            ProxyError::ContentFiltered(_) => "content_filter",
+            ProxyError::ContentFiltered { .. } => "content_filter",
             ProxyError::BudgetExceeded(_) => "billing_error",
+            // A gateway-side dependency failed, like `JwksUnavailable`;
+            // `error.code` carries the distinction.
+            ProxyError::BudgetUnverified => "api_error",
             ProxyError::RateLimit(_) => "rate_limit_exceeded",
             ProxyError::PolicyRateLimit { .. } => "rate_limit_exceeded",
             ProxyError::Bridge(b) => b.error_type(),
         }
+    }
+
+    /// Whether this failure IS a guardrail refusal — the request was
+    /// stopped by the guardrail machinery rather than by an upstream, a
+    /// quota, a credential or a malformed body.
+    ///
+    /// Drives `UsageEvent::guardrail_blocked`, which is the indexed column
+    /// the dashboard's "Guardrail blocks" view and the
+    /// `guardrail_blocked=true` usage query filter on. Every failure-path
+    /// emitter reads it from here rather than re-deriving the match, so a
+    /// new handler cannot join the family with the flag silently left at
+    /// its `false` default (AISIX-Cloud#1428).
+    ///
+    /// A fail-closed refusal (`unavailable: Some(_)` — the guardrail could
+    /// not evaluate the request and its row refuses what it cannot check)
+    /// counts too: the guardrail machinery is still what stopped the
+    /// request, and hiding it from the Blocked view would leave an operator
+    /// with a 422 that nothing accounts for. Which of the two it was stays
+    /// legible on `guardrail_enforced_hits.action`
+    /// (`blocked` vs `blocked_unavailable`).
+    pub(crate) fn is_guardrail_block(&self) -> bool {
+        matches!(self, ProxyError::ContentFiltered { .. })
     }
 
     /// Seconds the client should wait before retrying. Only present for
@@ -429,16 +620,10 @@ impl ProxyError {
     pub fn envelope(&self) -> ErrorEnvelope {
         // Bridge-surface upstream errors get special handling: the
         // bridge has best-effort-parsed the upstream envelope into a
-        // structured [`UpstreamErrorView`], and for same-wire 4xx
-        // (OpenAI upstream + OpenAI client) we forward the parsed
-        // fields directly instead of wrapping them inside the
-        // gateway's generic `upstream_error` envelope.
-        //
-        // 5xx and non-JSON bodies fall back to the generic envelope —
-        // upstream internal-server-error detail (engine names, queue
-        // depth, etc.) is operator-internal and must not bleed through.
-        // Cross-wire translation (Anthropic / Bedrock / Vertex / Azure
-        // → OpenAI shape) ships in a follow-up via `error_translate`.
+        // structured [`UpstreamErrorView`], and for a 4xx we translate
+        // its fields into the client's envelope. 5xx and non-JSON bodies
+        // take the generic envelope; every one carries the upstream's own
+        // message.
         if let ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamStatus {
             status,
             message,
@@ -480,9 +665,18 @@ impl ProxyError {
                 self.kind(),
             );
         }
+        if let ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamBodyUnread {
+            decode_error,
+            ..
+        }) = self
+        {
+            let as_decode = aisix_gateway::BridgeError::UpstreamDecode(decode_error.clone());
+            return ErrorEnvelope::new(as_decode.to_string(), self.kind());
+        }
         let env = ErrorEnvelope::new(self.to_string(), self.kind());
         match self {
             ProxyError::BudgetExceeded(r) => env.with_code("budget_exceeded").with_budget(r),
+            ProxyError::BudgetUnverified => env.with_code("budget_unverified"),
             // Attribution for policy-layer 429s (#892): the
             // OpenAI envelope names the offending policy. The Anthropic
             // envelope keeps its strict {type,message} shape.
@@ -496,9 +690,6 @@ impl ProxyError {
             // ModelForbidden (#557 AC-1).
             ProxyError::ModelIpRestricted(_) => env.with_code("ip_restricted"),
             ProxyError::RouteIpRestricted(_) => env.with_code("ip_restricted"),
-            // Stable code so migration tooling can detect the removed
-            // tunnel without matching on the message text.
-            ProxyError::Gone(_) => env.with_code("endpoint_removed"),
             // Stable machine-readable codes so SDKs can branch on the
             // lifecycle reason without parsing the message, while the
             // `error.type` stays the family-wide `invalid_api_key`.
@@ -513,9 +704,40 @@ impl ProxyError {
             // (`jwt_identity_unmapped`).
             ProxyError::JwtInvalid => env.with_code("jwt_invalid"),
             ProxyError::JwtExpired => env.with_code("jwt_expired"),
-            ProxyError::JwtClaimsRejected => env.with_code("jwt_claims_rejected"),
+            ProxyError::JwtClaimsRejected | ProxyError::JwtInsufficientScope { .. } => {
+                env.with_code("jwt_claims_rejected")
+            }
             ProxyError::JwtIdentityUnmapped => env.with_code("jwt_identity_unmapped"),
             ProxyError::JwksUnavailable => env.with_code("jwks_unavailable"),
+            ProxyError::McpTokenExchange(failure) => env.with_code(match failure {
+                aisix_mcp::TokenExchangeFailure::NoSubject => "token_exchange_subject_missing",
+                aisix_mcp::TokenExchangeFailure::SubjectRejected { .. } => {
+                    "token_exchange_subject_rejected"
+                }
+                aisix_mcp::TokenExchangeFailure::Misconfigured => "token_exchange_misconfigured",
+                aisix_mcp::TokenExchangeFailure::Unavailable => "token_exchange_unavailable",
+            }),
+            ProxyError::McpUserOAuth { failure, .. } => env.with_code(match failure {
+                aisix_mcp::UserOAuthFailure::AuthorizationRequired => {
+                    "mcp_oauth_authorization_required"
+                }
+                aisix_mcp::UserOAuthFailure::NoSubject => "mcp_oauth_no_subject",
+                aisix_mcp::UserOAuthFailure::Misconfigured => "mcp_oauth_misconfigured",
+                aisix_mcp::UserOAuthFailure::Unavailable => "mcp_oauth_unavailable",
+            }),
+            ProxyError::SemanticDecisionFailed { .. } => env.with_code("semantic_routing_failed"),
+            // Same stable-code convention, for the one distinction a
+            // caller cannot make from `error.type`: `content_filter`
+            // covers both a policy refusal and a fail-closed row that
+            // could not evaluate the request. The `type` stays
+            // `content_filter` — it is a shipped contract and both really
+            // are guardrail refusals — while the code lets an SDK branch,
+            // and lets an operator's dashboard stop counting a broken
+            // script as policy volume.
+            ProxyError::ContentFiltered {
+                unavailable: Some(_),
+                ..
+            } => env.with_code("guardrail_unavailable"),
             _ => env,
         }
     }
@@ -529,49 +751,196 @@ impl ProxyError {
 /// tables so the OpenAI-shape `error.type` and `error.code` carry the
 /// retry semantics SDKs depend on.
 ///
-/// **5xx**: emit a canned `upstream returned {status}` message under
-/// `type: upstream_error`. Upstream 5xx bodies routinely embed
-/// operator-internal detail (engine names, shard ids, queue depth,
-/// ARNs in raw AWS messages) — surfacing them to the customer leaks
-/// internal taxonomy. The full upstream body remains in operator
-/// logs via tracing.
+/// **5xx and synthesised errors** (`UpstreamWire::Unknown`): the generic
+/// `upstream_error` envelope carrying the upstream's own message.
 ///
-/// **`UpstreamWire::Unknown`** (cooldown fixtures / synthesised
-/// errors): legacy generic envelope.
+/// An upstream that answers with no usable message (an empty body, or an
+/// envelope whose `message` is blank) is named by its status and reason
+/// phrase instead, so the caller never receives an empty `error.message`.
+/// Response headers are deliberately not echoed: a redirect's `Location`
+/// names a host the operator never configured.
 fn render_bridge_upstream_envelope(
     status: u16,
     message: &str,
     parsed: Option<&aisix_gateway::UpstreamErrorView>,
     wire: aisix_gateway::UpstreamWire,
 ) -> ErrorEnvelope {
+    let status_message;
+    let message = if message.trim().is_empty() {
+        status_message = upstream_status_message(status);
+        status_message.as_str()
+    } else {
+        message
+    };
     let is_4xx = (400..500).contains(&status);
     if is_4xx && !matches!(wire, aisix_gateway::UpstreamWire::Unknown) {
         return ErrorEnvelope {
             error: crate::error_translate::render_openai_envelope(parsed, wire, message),
         };
     }
-    let safe_message = if (500..600).contains(&status) {
-        // Suppress upstream `error.message` on 5xx — engine names /
-        // shard ids / ARNs commonly appear here and are not customer
-        // information.
-        format!("upstream returned {status}")
-    } else {
-        message.to_string()
+    ErrorEnvelope::new(message.to_string(), "upstream_error")
+}
+
+fn upstream_status_message(status: u16) -> String {
+    match StatusCode::from_u16(status)
+        .ok()
+        .and_then(|s| s.canonical_reason())
+    {
+        Some(reason) => format!("upstream returned {status} {reason}"),
+        None => format!("upstream returned {status}"),
+    }
+}
+
+/// Auth-failure classification attached to the response as an extension
+/// so the `/mcp` challenge middleware (`crate::mcp_auth`) can add the
+/// RFC 9728 `WWW-Authenticate` header. Classification must happen here:
+/// `IntoResponse` has no access to route or snapshot state, and only the
+/// active `/mcp` surface actually renders the header.
+#[derive(Debug, Clone)]
+pub(crate) enum AuthChallenge {
+    /// No usable credential was presented — bare `resource_metadata`.
+    MissingCredentials,
+    /// A credential was presented and rejected — `error="invalid_token"`.
+    InvalidToken,
+    /// A valid token lacks the scopes this operation requires —
+    /// `error="insufficient_scope"` plus the currently-required scopes
+    /// (SEP-2350 semantics: only what this operation needs, never an
+    /// echo of previously granted scopes).
+    InsufficientScope { required_scopes: Vec<String> },
+    /// The identity provider demands a step-up (Microsoft Entra claims
+    /// challenge) before it accepts the caller's token for an on-behalf-of
+    /// exchange — `error="insufficient_claims"` plus the provider's claims,
+    /// base64-encoded, for the client to satisfy at the provider and retry.
+    InsufficientClaims { claims: String },
+}
+
+impl ProxyError {
+    /// The challenge classification for this error, when it is an
+    /// auth failure a Bearer challenge can describe. `JwtClaimsRejected`
+    /// (`bound_claims` policy denial) deliberately maps to `None`:
+    /// re-authenticating cannot cure it, so a challenge would only send
+    /// clients into a retry loop. `JwksUnavailable` is a gateway-side
+    /// fault, not a credential judgment.
+    fn auth_challenge(&self) -> Option<AuthChallenge> {
+        match self {
+            ProxyError::MissingAuth(_) => Some(AuthChallenge::MissingCredentials),
+            ProxyError::InvalidApiKey
+            | ProxyError::ApiKeyExpired
+            | ProxyError::ApiKeyDisabled
+            | ProxyError::JwtInvalid
+            | ProxyError::JwtExpired
+            | ProxyError::JwtIdentityUnmapped => Some(AuthChallenge::InvalidToken),
+            ProxyError::JwtInsufficientScope { required_scopes } => {
+                Some(AuthChallenge::InsufficientScope {
+                    required_scopes: required_scopes.clone(),
+                })
+            }
+            // The token an on-behalf-of exchange needs is one the
+            // environment's own trust provider issues, which is exactly
+            // what the gateway's discovery document names.
+            ProxyError::McpTokenExchange(aisix_mcp::TokenExchangeFailure::SubjectRejected {
+                claims: Some(claims),
+            }) => Some(AuthChallenge::InsufficientClaims {
+                claims: claims.clone(),
+            }),
+            ProxyError::McpTokenExchange(
+                aisix_mcp::TokenExchangeFailure::NoSubject
+                | aisix_mcp::TokenExchangeFailure::SubjectRejected { claims: None },
+            ) => Some(AuthChallenge::InvalidToken),
+            _ => None,
+        }
+    }
+}
+
+impl ProxyError {
+    /// The gateway limit that refused this request, when the gateway's
+    /// OWN limiter is what refused it.
+    ///
+    /// `None` for every other 429: a budget rejection caps spend in
+    /// dollars, not requests or tokens, and an upstream 429 reports the
+    /// provider's quota, which the gateway does not know. Both would
+    /// have to invent the numbers. That makes the presence of the
+    /// `x-ratelimit-*` trio on a 429 the caller's signal that AISIX
+    /// itself rejected the request rather than relaying somebody else's
+    /// rejection.
+    fn rate_limit_detail(&self) -> Option<aisix_ratelimit::LimitDetail> {
+        match self {
+            ProxyError::RateLimit(e) => e.detail(),
+            ProxyError::PolicyRateLimit { source, .. } => source.detail(),
+            _ => None,
+        }
+    }
+}
+
+/// Write the retry / rate-limit headers both envelopes owe a rejection.
+///
+/// Shared so the OpenAI-shape and Anthropic-shape renderers cannot
+/// drift: `/v1/messages` answering a 429 without the headers
+/// `/v1/chat/completions` carries would be the same class of bug #336
+/// fixed for the body.
+///
+/// `X-RateLimit-Reset` is delta-seconds, deliberately the same number
+/// as `Retry-After` for a windowed dimension — a caller may read either
+/// one and back off identically, with no clock sync against the
+/// gateway. `X-RateLimit-Scope` is an AISIX extension naming which
+/// dimension fired; without it `x-ratelimit-limit: 100` cannot be told
+/// apart between an rpm, a tpm and a concurrency cap, whose units all
+/// differ.
+fn apply_retry_headers(
+    response: &mut Response,
+    retry_after_secs: Option<u64>,
+    detail: Option<aisix_ratelimit::LimitDetail>,
+) {
+    let headers = response.headers_mut();
+    let mut set = |name: &'static str, value: String| {
+        if let Ok(v) = HeaderValue::from_str(&value) {
+            headers.insert(name, v);
+        }
     };
-    ErrorEnvelope::new(safe_message, "upstream_error")
+    if let Some(secs) = retry_after_secs {
+        set("retry-after", secs.to_string());
+    }
+    if let Some(d) = detail {
+        set("x-ratelimit-limit", d.limit.to_string());
+        set("x-ratelimit-remaining", d.remaining.to_string());
+        set("x-ratelimit-reset", d.reset_secs.to_string());
+        set("x-ratelimit-scope", d.dimension.to_string());
+    }
+}
+
+/// The caller-facing text of [`ProxyError::McpUserOAuth`].
+fn mcp_user_oauth_message(failure: &aisix_mcp::UserOAuthFailure, server: &str) -> String {
+    match failure {
+        aisix_mcp::UserOAuthFailure::AuthorizationRequired => {
+            format!("MCP server '{server}' requires this user to sign in")
+        }
+        aisix_mcp::UserOAuthFailure::NoSubject => format!(
+            "this gateway credential has no user, so it cannot be used with MCP server \
+             '{server}', which signs in each user individually"
+        ),
+        aisix_mcp::UserOAuthFailure::Misconfigured => format!(
+            "MCP server '{server}' cannot sign in users as configured; an administrator must \
+             check its OAuth settings and the MCP authentication settings"
+        ),
+        aisix_mcp::UserOAuthFailure::Unavailable => format!(
+            "this user's upstream token for MCP server '{server}' is temporarily unavailable; \
+             try again"
+        ),
+    }
 }
 
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
+        let challenge = self.auth_challenge();
         let status = self.status();
         let retry_after = self.retry_after_secs();
+        let rate_limit_detail = self.rate_limit_detail();
         let upgrade_reject = matches!(self, ProxyError::WebSocketUpgradeRequired { .. });
         let body = self.envelope();
         let mut response = (status, Json(body)).into_response();
-        if let Some(secs) = retry_after {
-            if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
-                response.headers_mut().insert("retry-after", value);
-            }
+        apply_retry_headers(&mut response, retry_after, rate_limit_detail);
+        if let Some(challenge) = challenge {
+            response.extensions_mut().insert(challenge);
         }
         // RFC 9110: a 426 must name the protocol to switch to (§15.5.22)
         // and a 405 must list the allowed methods (§15.5.6; GET implies
@@ -618,6 +987,28 @@ struct AnthropicErrorBody {
     #[serde(rename = "type")]
     kind: String,
     message: String,
+    /// Set only on a guardrail refusal ([`anthropic_guardrail_code`]):
+    /// `type` is pinned to the SDK's closed literal, so without it a
+    /// policy block and a malformed request are the same 422.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
+}
+
+/// The Anthropic envelope's `error.code` for a guardrail refusal, shared by
+/// the HTTP 422 body and the streaming `event: error` frame of
+/// `/v1/messages` and `/v1/messages/count_tokens`.
+///
+/// `error.type` cannot carry the signal there: it stays
+/// `invalid_request_error`, because the Anthropic SDK types it as a closed
+/// literal and a `content_filter` type once failed its typed parse. The
+/// code does: `content_filter` for a policy block, and for a fail-closed
+/// refusal the same `guardrail_unavailable` the OpenAI envelope carries.
+pub(crate) fn anthropic_guardrail_code(unavailable: Option<&str>) -> &'static str {
+    if unavailable.is_some() {
+        "guardrail_unavailable"
+    } else {
+        "content_filter"
+    }
 }
 
 /// Map an HTTP status code to the Anthropic-canonical `error.type`
@@ -637,7 +1028,7 @@ struct AnthropicErrorBody {
 /// (The OpenAI envelope's inner `error.type` keeps the DP-stable
 /// strings per ai-gateway#327; that contract is unchanged on
 /// `/v1/chat/completions`.)
-fn anthropic_kind_from_status(status: StatusCode) -> &'static str {
+pub(crate) fn anthropic_kind_from_status(status: StatusCode) -> &'static str {
     match status.as_u16() {
         400 | 422 => "invalid_request_error",
         401 => "authentication_error",
@@ -659,7 +1050,8 @@ fn anthropic_kind_from_status(status: StatusCode) -> &'static str {
 
 impl ProxyError {
     /// Render this error as an Anthropic-shape `{type:"error", error:
-    /// {type, message}}` HTTP response. Used by `/v1/messages` so the
+    /// {type, message}}` HTTP response, plus `error.code` on a guardrail
+    /// refusal ([`anthropic_guardrail_code`]). Used by `/v1/messages` so the
     /// Anthropic SDK's envelope parser sees a shape the official
     /// SDK and the broader ecosystem both treat as canonical.
     ///
@@ -674,31 +1066,39 @@ impl ProxyError {
     /// follows ecosystem convention.
     ///
     /// Reuses [`Self::envelope`] for the 4xx/5xx message-classification
-    /// and upstream-message redaction logic so the two envelope
+    /// and upstream-message logic so the two envelope
     /// renderers can't drift on those rules.
     pub fn into_anthropic_response(self) -> Response {
         let status = self.status();
         let retry_after = self.retry_after_secs();
-        let kind = anthropic_kind_from_status(status).to_string();
-        // Reuse OpenAI envelope only for the SAFE-MESSAGE logic
-        // (5xx body redaction, 4xx upstream-message pass-through).
-        // The inner type is overwritten to the Anthropic-canonical
-        // string above.
-        let openai_env = self.envelope();
-        let anth_body = AnthropicErrorEnvelope {
+        let rate_limit_detail = self.rate_limit_detail();
+        let mut response = (status, Json(self.anthropic_envelope())).into_response();
+        apply_retry_headers(&mut response, retry_after, rate_limit_detail);
+        response
+    }
+
+    /// The body [`Self::into_anthropic_response`] sends.
+    pub(crate) fn anthropic_body(&self) -> String {
+        serde_json::to_string(&self.anthropic_envelope()).unwrap_or_default()
+    }
+
+    fn anthropic_envelope(&self) -> AnthropicErrorEnvelope {
+        let code = match self {
+            ProxyError::ContentFiltered { unavailable, .. } => {
+                Some(anthropic_guardrail_code(unavailable.as_deref()))
+            }
+            _ => None,
+        };
+        AnthropicErrorEnvelope {
             discriminator: "error",
             error: AnthropicErrorBody {
-                kind,
-                message: openai_env.error.message,
+                kind: anthropic_kind_from_status(self.status()).to_string(),
+                // Reuse OpenAI envelope only for the SAFE-MESSAGE logic
+                // (the upstream message, translated on a 4xx).
+                message: self.envelope().error.message,
+                code,
             },
-        };
-        let mut response = (status, Json(anth_body)).into_response();
-        if let Some(secs) = retry_after {
-            if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
-                response.headers_mut().insert("retry-after", value);
-            }
         }
-        response
     }
 }
 
@@ -738,6 +1138,17 @@ pub(crate) fn proxy_error_from_json_rejection(
         }
         JsonRejection::BytesRejection(_) => {
             ProxyError::InvalidRequest("failed to read request body".into())
+        }
+        // Valid JSON whose value does not fit the request type: name the
+        // field it failed at (`messages[0].content: ...`, `max_tokens:
+        // invalid value: integer `-1`, expected u32`) rather than leave the
+        // caller to guess.
+        JsonRejection::JsonDataError(e) => {
+            let text = e.body_text();
+            let detail = text
+                .strip_prefix("Failed to deserialize the JSON body into the target type: ")
+                .unwrap_or(&text);
+            ProxyError::InvalidRequest(format!("invalid request body: {detail}"))
         }
         _ => ProxyError::InvalidRequest("invalid JSON request body".into()),
     }
@@ -837,9 +1248,93 @@ mod tests {
 
     #[test]
     fn missing_auth_maps_to_401_invalid_api_key() {
-        let e = ProxyError::MissingAuth;
+        let e = ProxyError::MissingAuth("Authorization");
         assert_eq!(e.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(e.kind(), "invalid_api_key");
+    }
+
+    /// AISIX-Cloud#1143: the scope-failure variant split out of
+    /// `JwtClaimsRejected` must stay byte-identical on the wire — same
+    /// 403, `permission_denied` type, `jwt_claims_rejected` code and
+    /// message — so `/v1` callers cannot observe the split. The only
+    /// difference is the challenge classification for the `/mcp`
+    /// middleware.
+    #[test]
+    fn insufficient_scope_renders_identically_to_claims_rejected() {
+        let scope_err = ProxyError::JwtInsufficientScope {
+            required_scopes: vec!["mcp:tools".into()],
+        };
+        let policy_err = ProxyError::JwtClaimsRejected;
+        assert_eq!(scope_err.status(), policy_err.status());
+        assert_eq!(scope_err.kind(), policy_err.kind());
+        let a = serde_json::to_value(scope_err.envelope()).unwrap();
+        let b = serde_json::to_value(policy_err.envelope()).unwrap();
+        assert_eq!(a, b, "wire envelopes must not diverge");
+    }
+
+    #[test]
+    fn auth_challenge_classification_covers_exactly_the_curable_failures() {
+        assert!(matches!(
+            ProxyError::MissingAuth("Authorization").auth_challenge(),
+            Some(AuthChallenge::MissingCredentials)
+        ));
+        for e in [
+            ProxyError::InvalidApiKey,
+            ProxyError::ApiKeyExpired,
+            ProxyError::ApiKeyDisabled,
+            ProxyError::JwtInvalid,
+            ProxyError::JwtExpired,
+            ProxyError::JwtIdentityUnmapped,
+        ] {
+            assert!(matches!(
+                e.auth_challenge(),
+                Some(AuthChallenge::InvalidToken)
+            ));
+        }
+        let scope_err = ProxyError::JwtInsufficientScope {
+            required_scopes: vec!["mcp:tools".into()],
+        };
+        match scope_err.auth_challenge() {
+            Some(AuthChallenge::InsufficientScope { required_scopes }) => {
+                assert_eq!(required_scopes, vec!["mcp:tools".to_string()]);
+            }
+            other => panic!("expected InsufficientScope, got {other:?}"),
+        }
+        // A bound_claims policy denial is not curable by re-consenting:
+        // no challenge, ever. Same for the gateway-side JWKS fault.
+        assert!(ProxyError::JwtClaimsRejected.auth_challenge().is_none());
+        assert!(ProxyError::JwksUnavailable.auth_challenge().is_none());
+
+        use aisix_mcp::TokenExchangeFailure as F;
+        for f in [F::NoSubject, F::SubjectRejected { claims: None }] {
+            assert!(matches!(
+                ProxyError::McpTokenExchange(f).auth_challenge(),
+                Some(AuthChallenge::InvalidToken)
+            ));
+        }
+        match ProxyError::McpTokenExchange(F::SubjectRejected {
+            claims: Some("{}".into()),
+        })
+        .auth_challenge()
+        {
+            Some(AuthChallenge::InsufficientClaims { claims }) => assert_eq!(claims, "{}"),
+            other => panic!("expected InsufficientClaims, got {other:?}"),
+        }
+        for f in [F::Misconfigured, F::Unavailable] {
+            assert!(ProxyError::McpTokenExchange(f).auth_challenge().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn into_response_attaches_the_challenge_extension() {
+        let resp = ProxyError::MissingAuth("Authorization").into_response();
+        assert!(matches!(
+            resp.extensions().get::<AuthChallenge>(),
+            Some(AuthChallenge::MissingCredentials)
+        ));
+        // Non-auth errors carry no marker.
+        let resp = ProxyError::ModelNotFound("m".into()).into_response();
+        assert!(resp.extensions().get::<AuthChallenge>().is_none());
     }
 
     #[test]
@@ -983,6 +1478,56 @@ mod tests {
         json
     }
 
+    #[test]
+    fn a_guardrail_that_could_not_evaluate_does_not_claim_a_content_decision() {
+        // The whole defect in one assertion: the two refusals shared a
+        // sentence, so a broken fail-closed row looked exactly like a
+        // working policy to the caller.
+        let policy = guardrail_block_error("request", Some("my-guard"), None);
+        let broken = guardrail_block_error("request", Some("my-guard"), Some("custom_no_verdict"));
+        assert_eq!(
+            policy.to_string(),
+            "request blocked by content policy (guardrail 'my-guard')"
+        );
+        assert_ne!(policy.to_string(), broken.to_string());
+        assert!(broken.to_string().contains("could not evaluate"));
+        assert!(!broken.to_string().contains("content policy"));
+        // The tag is named so an operator can grep the message straight
+        // onto the dashboard series that carries the same value.
+        assert!(broken.to_string().contains("custom_no_verdict"));
+        // Both still name the firing row (#519 B.4b) and neither carries
+        // matched content (#153).
+        assert!(broken.to_string().contains("my-guard"));
+    }
+
+    #[test]
+    fn an_unattributed_availability_refusal_still_says_which_kind_of_refusal_it_is() {
+        let msg = guardrail_block_message("response", None, Some("output_buffer_exceeded"));
+        assert_eq!(
+            msg,
+            "response rejected: a guardrail could not evaluate it (output_buffer_exceeded)"
+        );
+    }
+
+    #[test]
+    fn the_availability_refusal_keeps_the_status_and_type_but_adds_a_machine_readable_code() {
+        let policy = guardrail_block_error("request", Some("g"), None);
+        let broken = guardrail_block_error("request", Some("g"), Some("custom_unknown_action"));
+        // Same shipped contract: an SDK branching on status or type sees
+        // no change, and an operator alert on `content_filter` keeps
+        // counting both.
+        assert_eq!(policy.status(), broken.status());
+        assert_eq!(policy.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(policy.kind(), "content_filter");
+        assert_eq!(broken.kind(), "content_filter");
+        // The code is the new discriminator.
+        assert_eq!(policy.envelope().error.code, None);
+        assert_eq!(
+            broken.envelope().error.code.as_deref(),
+            Some("guardrail_unavailable")
+        );
+    }
+
     #[tokio::test]
     async fn anthropic_envelope_404_maps_to_not_found_error() {
         let err = ProxyError::ModelNotFound("claude-x".into());
@@ -999,7 +1544,7 @@ mod tests {
 
     #[tokio::test]
     async fn anthropic_envelope_401_maps_to_authentication_error() {
-        let err = ProxyError::MissingAuth;
+        let err = ProxyError::MissingAuth("Authorization");
         let resp = err.into_anthropic_response();
         assert_anthropic_envelope(resp, StatusCode::UNAUTHORIZED, "authentication_error").await;
     }
@@ -1034,24 +1579,46 @@ mod tests {
         assert_anthropic_envelope(resp, StatusCode::PAYLOAD_TOO_LARGE, "request_too_large").await;
     }
 
+    /// Content-filter rejections share 422 with the OpenAI side, and the
+    /// Anthropic-canonical 422 is `invalid_request_error` (the SDK literal
+    /// has no content-filter type). AISIX-Cloud#726: so `error.code` is the
+    /// only field that tells a guardrail refusal from a malformed request —
+    /// and a broken fail-closed row from a policy hit.
     #[tokio::test]
-    async fn anthropic_envelope_422_content_filter_maps_to_invalid_request_error() {
-        // Content-filter rejections share 422 with the OpenAI side;
-        // Anthropic-canonical 422 maps to `invalid_request_error`
-        // (no dedicated content-filter type in the SDK literal).
-        let err = ProxyError::ContentFiltered("request blocked by content policy".into());
-        let resp = err.into_anthropic_response();
-        assert_anthropic_envelope(
-            resp,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_request_error",
-        )
+    async fn anthropic_envelope_422_content_filter_maps_to_invalid_request_error_with_a_code() {
+        async fn body(err: ProxyError) -> serde_json::Value {
+            let resp = err.into_anthropic_response();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            body_to_json(resp).await
+        }
+        let policy = body(guardrail_block_error("request", Some("gr"), None)).await;
+        assert_eq!(policy["error"]["type"], "invalid_request_error");
+        assert_eq!(policy["error"]["code"], "content_filter");
+
+        let broken = body(guardrail_block_error(
+            "request",
+            Some("gr"),
+            Some(TAG_UNSCANNABLE_BODY),
+        ))
         .await;
+        assert_eq!(broken["error"]["type"], "invalid_request_error");
+        assert_eq!(broken["error"]["code"], "guardrail_unavailable");
+        // The same code the OpenAI envelope carries for a fail-closed row.
+        assert_eq!(
+            guardrail_block_error("request", None, Some(TAG_UNSCANNABLE_BODY))
+                .envelope()
+                .error
+                .code
+                .as_deref(),
+            Some("guardrail_unavailable"),
+        );
+
+        assert!(policy["error"].get("param").is_none());
     }
 
     #[tokio::test]
     async fn anthropic_envelope_429_budget_exceeded_maps_to_rate_limit_error() {
-        let err = ProxyError::BudgetExceeded(Box::new(crate::budget_reason::BudgetReason {
+        let err = ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
             message: "ak-1".to_string(),
             ..Default::default()
         }));
@@ -1061,11 +1628,11 @@ mod tests {
 
     #[test]
     fn openai_envelope_budget_exceeded_carries_structured_fields() {
-        // prd-09b §5.8: the budget_exceeded 429 lifts the control plane's structured
+        // prd-09b §5.8: the budget_exceeded 429 lifts the budget's structured
         // reason into the error block. Pin scope / scope_ref / limit_usd /
         // spent_usd / period so a regression that drops them (the old
         // String-only variant) fails here.
-        let err = ProxyError::BudgetExceeded(Box::new(crate::budget_reason::BudgetReason {
+        let err = ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
             message: "team budget 'frontend' exceeded ($1.00/month). Resets soon.".into(),
             scope: Some("team".into()),
             scope_ref: Some("team-uuid-1".into()),
@@ -1074,6 +1641,7 @@ mod tests {
             period: Some("month".into()),
             period_resets_at: Some("2026-06-01T00:00:00Z".into()),
             retry_after_seconds: Some(259_200),
+            ..Default::default()
         }));
         // The Retry-After *header* must source the same value the body
         // carries — otherwise SDKs (which back off on the header) and
@@ -1108,7 +1676,7 @@ mod tests {
         // only. The Anthropic /v1/messages error block is the strict
         // {type, message} shape — a fully-populated reason must NOT leak
         // scope / limit_usd etc. into it.
-        let err = ProxyError::BudgetExceeded(Box::new(crate::budget_reason::BudgetReason {
+        let err = ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
             message: "team budget 'frontend' exceeded ($1.00/month). Resets soon.".into(),
             scope: Some("team".into()),
             scope_ref: Some("team-uuid-1".into()),
@@ -1117,6 +1685,7 @@ mod tests {
             period: Some("month".into()),
             period_resets_at: Some("2026-06-01T00:00:00Z".into()),
             retry_after_seconds: Some(259_200),
+            ..Default::default()
         }));
         let resp = err.into_anthropic_response();
         let json =
@@ -1152,24 +1721,157 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anthropic_envelope_bridge_5xx_maps_to_api_error_with_message_redacted() {
-        // 5xx collapse contract from ai-gateway#322/#327 — upstream
-        // body redacted, customer sees a generic 502 wrapped in the
-        // Anthropic-shape envelope with `error.type = "api_error"`
-        // (Anthropic's catch-all for upstream/server failure).
+    async fn anthropic_envelope_bridge_5xx_maps_to_api_error_with_the_upstream_message() {
+        // 5xx collapse contract from ai-gateway#322/#327: the customer
+        // sees a 502 wrapped in the Anthropic-shape envelope with
+        // `error.type = "api_error"` (Anthropic's catch-all for
+        // upstream/server failure), carrying the upstream's own message.
         let bridge_err = BridgeError::upstream_status(503, "engine internal panic");
         let err = ProxyError::Bridge(bridge_err);
         let resp = err.into_anthropic_response();
         let json = assert_anthropic_envelope(resp, StatusCode::BAD_GATEWAY, "api_error").await;
-        let msg = json["error"]["message"].as_str().unwrap_or("");
-        assert!(
-            !msg.contains("engine internal panic"),
-            "upstream 5xx body must be redacted from the Anthropic envelope, got: {msg}",
-        );
-        assert!(
-            msg.contains("503"),
-            "redacted message must still surface the upstream status, got: {msg}",
-        );
+        assert_eq!(json["error"]["message"], "engine internal panic");
+    }
+
+    /// The four headers a gateway-produced 429 owes the caller, on the
+    /// OpenAI-shape envelope. `x-ratelimit-reset` is delta-seconds and
+    /// equals `retry-after` for a windowed dimension, so a client may
+    /// back off on either without a clock shared with the gateway.
+    #[tokio::test]
+    async fn gateway_429_carries_the_standard_rate_limit_headers() {
+        let err = ProxyError::RateLimit(aisix_ratelimit::RateLimitError::Requests {
+            scope: aisix_core::RateLimitScope::Requests,
+            detail: aisix_ratelimit::LimitDetail {
+                dimension: "rpm",
+                limit: 100,
+                remaining: 0,
+                reset_secs: 43,
+            },
+        });
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let h = resp.headers();
+        assert_eq!(h.get("retry-after").unwrap(), "43");
+        assert_eq!(h.get("x-ratelimit-limit").unwrap(), "100");
+        assert_eq!(h.get("x-ratelimit-remaining").unwrap(), "0");
+        assert_eq!(h.get("x-ratelimit-reset").unwrap(), "43");
+        assert_eq!(h.get("x-ratelimit-scope").unwrap(), "rpm");
+    }
+
+    /// `/v1/messages` answers in the Anthropic envelope but owes the
+    /// same headers — the renderers share one writer precisely so this
+    /// cannot drift per endpoint.
+    #[tokio::test]
+    async fn anthropic_envelope_429_carries_the_same_rate_limit_headers() {
+        let err = ProxyError::RateLimit(aisix_ratelimit::RateLimitError::Tokens {
+            scope: aisix_core::RateLimitScope::Tokens,
+            detail: aisix_ratelimit::LimitDetail {
+                dimension: "tpm",
+                limit: 50_000,
+                remaining: 0,
+                reset_secs: 12,
+            },
+        });
+        let resp = err.into_anthropic_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let h = resp.headers();
+        assert_eq!(h.get("retry-after").unwrap(), "12");
+        assert_eq!(h.get("x-ratelimit-limit").unwrap(), "50000");
+        assert_eq!(h.get("x-ratelimit-remaining").unwrap(), "0");
+        assert_eq!(h.get("x-ratelimit-reset").unwrap(), "12");
+        assert_eq!(h.get("x-ratelimit-scope").unwrap(), "tpm");
+    }
+
+    /// A policy-layer rejection is the same rejection with an attributed
+    /// policy — it reports the policy's own limit, not a blank.
+    #[tokio::test]
+    async fn policy_429_reports_the_policy_layer_limit() {
+        let err = ProxyError::PolicyRateLimit {
+            source: aisix_ratelimit::RateLimitError::Requests {
+                scope: aisix_core::RateLimitScope::Requests,
+                detail: aisix_ratelimit::LimitDetail {
+                    dimension: "rpd",
+                    limit: 5_000,
+                    remaining: 0,
+                    reset_secs: 3_600,
+                },
+            },
+            policy_id: "pol-1".into(),
+            policy_name: "team-daily".into(),
+        };
+        let resp = err.into_response();
+        let h = resp.headers();
+        assert_eq!(h.get("x-ratelimit-limit").unwrap(), "5000");
+        assert_eq!(h.get("x-ratelimit-scope").unwrap(), "rpd");
+        assert_eq!(h.get("x-ratelimit-reset").unwrap(), "3600");
+    }
+
+    /// A concurrency cap has no window, so it reports a fixed hint —
+    /// but it DOES report all four headers. Before this contract a
+    /// concurrency 429 carried no retry hint at all, leaving a client
+    /// with nothing to back off on.
+    #[tokio::test]
+    async fn concurrency_429_carries_all_four_headers() {
+        let err = ProxyError::RateLimit(aisix_ratelimit::RateLimitError::Concurrency {
+            detail: aisix_ratelimit::LimitDetail {
+                dimension: aisix_ratelimit::CONCURRENCY_DIMENSION,
+                limit: 8,
+                remaining: 0,
+                reset_secs: aisix_ratelimit::CONCURRENCY_RETRY_AFTER_SECS,
+            },
+        });
+        let resp = err.into_response();
+        let h = resp.headers();
+        assert_eq!(h.get("retry-after").unwrap(), "60");
+        assert_eq!(h.get("x-ratelimit-limit").unwrap(), "8");
+        assert_eq!(h.get("x-ratelimit-remaining").unwrap(), "0");
+        assert_eq!(h.get("x-ratelimit-reset").unwrap(), "60");
+        assert_eq!(h.get("x-ratelimit-scope").unwrap(), "concurrency");
+    }
+
+    /// An upstream 429 is the provider's rejection, not the gateway's.
+    /// Its `Retry-After` is forwarded, but the gateway must NOT invent
+    /// `x-ratelimit-*` values for a quota it does not know — their
+    /// absence is how a caller tells the two 429s apart.
+    #[tokio::test]
+    async fn upstream_429_forwards_retry_after_but_no_gateway_ratelimit_headers() {
+        let err = ProxyError::Bridge(BridgeError::upstream_status_with_retry_after(
+            429,
+            "rate limited by provider",
+            Some(std::time::Duration::from_secs(30)),
+        ));
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let h = resp.headers();
+        assert_eq!(h.get("retry-after").unwrap(), "30");
+        assert!(h.get("x-ratelimit-limit").is_none());
+        assert!(h.get("x-ratelimit-remaining").is_none());
+        assert!(h.get("x-ratelimit-reset").is_none());
+        assert!(h.get("x-ratelimit-scope").is_none());
+    }
+
+    /// A budget rejection caps spend in dollars. It shares the 429
+    /// status but has no request/token dimension, so the trio must stay
+    /// absent rather than carry a number in the wrong unit.
+    #[tokio::test]
+    async fn budget_429_keeps_retry_after_without_rate_limit_headers() {
+        let err = ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
+            message: "budget exceeded".into(),
+            scope: None,
+            scope_ref: None,
+            limit_usd: Some("1.00".into()),
+            spent_usd: Some("2.00".into()),
+            period: None,
+            period_resets_at: None,
+            retry_after_seconds: Some(600),
+            ..Default::default()
+        }));
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let h = resp.headers();
+        assert_eq!(h.get("retry-after").unwrap(), "600");
+        assert!(h.get("x-ratelimit-limit").is_none());
+        assert!(h.get("x-ratelimit-scope").is_none());
     }
 
     #[tokio::test]

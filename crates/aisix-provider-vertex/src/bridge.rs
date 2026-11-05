@@ -26,10 +26,15 @@
 //! multi-region locations).
 
 use aisix_gateway::{
+    chat::ChatChoice,
     sse::{SseDecoder, SseEvent},
+    structured_output::{
+        apply_schema_limits, json_schema_from_response_format, response_into_fake_stream_chunks,
+        unwrap_json_tool_call, GEMINI_OPENAPI_SCHEMA_LIMITS,
+    },
     Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatDelta, ChatFormat,
     ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest, EmbeddingResponse,
-    EmbeddingUsage, EmbeddingVector, FinishReason, Role, UsageStats,
+    EmbeddingUsage, EmbeddingUsageSource, EmbeddingVector, FinishReason, Role, UsageStats,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -43,8 +48,21 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aisix_gateway::content_part::{
+    check_tool_result_parts, display_uri, parse_part, translate_user_parts, ContentPart, Media,
+    MediaKind, MediaSource,
+};
+use aisix_gateway::media_fetch::{fetch_media_urls, Encoding, FetchedMedia};
+
+use crate::gemini_tools::{
+    function_call_parts, function_response_part, gemini_2_5, gemini_3_or_newer, gemini_model_name,
+    gemini_tool_config, gemini_tools, tool_call_from_function_call, GeminiFunctionCall,
+};
 use crate::token_mint::{ServiceAccountKey, TokenMinter};
 use crate::wire;
+
+#[path = "native.rs"]
+mod native;
 
 // Claude on Vertex reuses the shared Anthropic Messages serializer +
 // response decoder (the same `wire` items the Bedrock `/invoke` path
@@ -54,8 +72,10 @@ use crate::wire;
 // Anthropic SSE, decoded by the shared `AnthropicStreamEvent` +
 // `StreamState` (the same decoder the direct Anthropic bridge uses).
 use aisix_provider_anthropic::wire::{
-    build_request as build_anthropic_request, response_into_chat_response, split_system,
-    AnthropicResponse, AnthropicStreamEvent, StreamState,
+    anthropic_needs_fetch, apply_auto_prompt_caching, build_request as build_anthropic_request,
+    response_into_chat_response, retain_cache_control_fields, split_system_with,
+    structured_output_for, AnthropicResponse, AnthropicStreamEvent, MediaUrls, StreamState,
+    StructuredOutput,
 };
 
 // Llama + the OpenAI-compatible MaaS family on Vertex use the OpenAI
@@ -64,8 +84,8 @@ use aisix_provider_anthropic::wire::{
 use aisix_provider_openai::wire::{
     build_request as build_openai_request, messages_from as openai_messages_from,
     response_into_chat_response as openai_response_into_chat_response,
-    stream_chunk_into_chat_chunk as openai_stream_chunk_into_chat_chunk, OpenAiResponse,
-    OpenAiStreamChunk,
+    stream_chunk_into_chat_chunks as openai_stream_chunk_into_chat_chunks, DeveloperRoleMode,
+    OpenAiResponse, OpenAiStreamChunk, ToolCallIndexer,
 };
 
 // Per-`ProviderKey` request/response override pipeline (#302 §5 / #339).
@@ -75,7 +95,9 @@ use aisix_provider_openai::wire::{
 // targeted keys are absent, so they are safe to call uniformly across the
 // five publisher rails (the Gemini `contents` shape simply does not match the
 // OpenAI-style top-level keys the request transforms look for).
-use aisix_gateway::{apply_request_headers, redact_userinfo, UpstreamHeaderContext};
+use aisix_gateway::{
+    apply_request_headers, redact_url_for_log, redact_userinfo, ServiceTier, UpstreamHeaderContext,
+};
 use aisix_provider_openai::overrides::{
     apply_content_list_to_string, apply_default_body_fields, apply_param_constraints,
     apply_param_renames,
@@ -125,14 +147,15 @@ impl VertexBridge {
     }
 
     /// The client this dispatch runs on: the bridge's shared one, unless
-    /// the resolved Provider Key carries its own TLS settings. The token
+    /// the resolved Provider Key carries its own connection overrides
+    /// (TLS trust settings, a name-resolution address). The token
     /// minter deliberately keeps the shared client — it talks to the
-    /// identity provider, not to the key's `api_base`, and a private CA
+    /// identity provider, not to the key's `api_base`, and an override
     /// declared for the model endpoint says nothing about that host.
     fn client_for(&self, ctx: &BridgeContext) -> Client {
         aisix_gateway::upstream_tls::client_for_provider_key(
             &self.client,
-            ctx.provider_key.tls.as_ref(),
+            ctx.provider_key.upstream_connection().as_ref(),
         )
     }
 
@@ -181,8 +204,6 @@ impl VertexBridge {
     /// the URL template, so we reject classes of input that the
     /// bridge cannot safely concatenate or that would shadow auth:
     ///   - non-`http(s)` schemes (no `file://`, `gs://`, etc.)
-    ///   - userinfo `@` (an operator embedding `user:pass@host` would
-    ///     leak credentials via logs / SSRF-style escalation)
     ///   - `?` query string (would silently merge with the streaming
     ///     `?alt=sse` the bridge appends)
     ///   - `#` fragment (no meaningful semantic for an upstream POST)
@@ -192,6 +213,9 @@ impl VertexBridge {
     /// operator sees an actionable message instead of a silent
     /// fall-through-to-canonical (which is what the original #390 bug
     /// was — exactly what we don't want to bring back).
+    ///
+    /// Userinfo (`user:pass@host`) is accepted and used as configured, so
+    /// no message here quotes the value with it.
     /// The id this request's endpoint URLs are cached under, or `""` to
     /// bypass the cache.
     ///
@@ -225,17 +249,6 @@ impl VertexBridge {
                     redact_userinfo(b)
                 )));
             }
-            if b.contains('@') {
-                // Redact userinfo before echoing the rejected value into
-                // the error string — the whole point of rejecting `@` is
-                // that operator-pasted credentials shouldn't appear in
-                // logs. Audit #392 re-audit LOW-1.
-                let redacted = redact_userinfo(b);
-                return Err(BridgeError::InvalidUpstreamConfig(format!(
-                    "vertex provider_key api_base must not embed userinfo (@); use the request's \
-                     Authorization header instead, got {redacted:?}",
-                )));
-            }
             if b.contains('?') {
                 // The value is not quoted back: a query string is where an
                 // operator pastes a key, and this error reaches the caller.
@@ -257,17 +270,17 @@ impl VertexBridge {
             // with a clear Config error. Backslashes are rejected too: the
             // WHATWG URL parser the HTTP client uses normalizes `\` to `/` on
             // http(s) URLs, so `host\evil` injects a path exactly like
-            // `host/evil`. `b` has no `@`/`?`/`#` here (rejected above), so
-            // echoing it is safe. Audit #434 LOW-1 / #435 (+ #464 audit MEDIUM).
+            // `host/evil`. Audit #434 LOW-1 / #435 (+ #464 audit MEDIUM).
             let after_scheme = b
                 .split_once("://")
                 .map(|(_, rest)| rest)
                 .unwrap_or(b)
                 .trim_end_matches('/');
             if after_scheme.contains('/') || after_scheme.contains('\\') {
+                let shown = redact_url_for_log(b);
                 return Err(BridgeError::InvalidUpstreamConfig(format!(
                     "vertex provider_key api_base must be a bare origin \
-                     (scheme://host[:port]) with no path, got {b:?}",
+                     (scheme://host[:port]) with no path, got {shown:?}",
                 )));
             }
             return Ok(b.trim_end_matches('/').to_string());
@@ -300,10 +313,7 @@ impl Default for VertexBridge {
 }
 
 fn default_client() -> Client {
-    aisix_gateway::build_client_or_default(
-        aisix_gateway::client_builder().user_agent("aisix/0.1"),
-        "vertex bridge",
-    )
+    aisix_gateway::build_client_or_default(aisix_gateway::client_builder(), "vertex bridge")
 }
 
 /// The set of Vertex publishers we dispatch to.
@@ -380,6 +390,17 @@ impl VertexPublisher {
     }
 }
 
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
 /// `ProviderKey.api_key` schema for a Vertex provider key.
 ///
 /// Convention: GCP credentials are JSON-encoded into the `secret`
@@ -434,12 +455,58 @@ impl VertexSecret {
                     .into(),
             ));
         }
-        let parsed: VertexSecret = serde_json::from_str(secret).map_err(|_e| {
-            BridgeError::InvalidUpstreamCredentials(
-                "vertex provider_key.api_key must be valid JSON: \
-                 {project, region, and either access_token or service_account_json}"
-                    .into(),
-            )
+        const SHAPE: &str = "{project, region, and either access_token or service_account_json}";
+        let value: serde_json::Value = serde_json::from_str(secret).map_err(|_e| {
+            BridgeError::InvalidUpstreamCredentials(format!(
+                "vertex provider_key.api_key must be valid JSON: {SHAPE}"
+            ))
+        })?;
+        let Some(fields) = value.as_object() else {
+            return Err(BridgeError::InvalidUpstreamCredentials(format!(
+                "vertex provider_key.api_key must be a JSON object: {SHAPE}"
+            )));
+        };
+        // Name the offending field: a type error from serde would either be
+        // too generic or quote the value, which may be secret material.
+        for (field, required) in [("project", true), ("region", true), ("access_token", false)] {
+            match fields.get(field) {
+                None if required => {
+                    return Err(BridgeError::InvalidUpstreamCredentials(format!(
+                        "vertex provider_key.api_key.{field} is missing: {SHAPE}"
+                    )));
+                }
+                None | Some(serde_json::Value::String(_)) => {}
+                Some(serde_json::Value::Null) if !required => {}
+                Some(other) => {
+                    return Err(BridgeError::InvalidUpstreamCredentials(format!(
+                        "vertex provider_key.api_key.{field} must be a string, got {}",
+                        json_type_name(other)
+                    )));
+                }
+            }
+        }
+        match fields.get("service_account_json") {
+            None | Some(serde_json::Value::Null | serde_json::Value::Object(_)) => {}
+            Some(other) => {
+                return Err(BridgeError::InvalidUpstreamCredentials(format!(
+                    "vertex provider_key.api_key.service_account_json must be a JSON \
+                     object (the contents of the service-account key file), got {}",
+                    json_type_name(other)
+                )));
+            }
+        }
+        let has_sa = fields
+            .get("service_account_json")
+            .is_some_and(serde_json::Value::is_object);
+        let parsed: VertexSecret = serde_json::from_value(value).map_err(|_e| {
+            BridgeError::InvalidUpstreamCredentials(if has_sa {
+                "vertex provider_key.api_key.service_account_json must be a \
+                 service-account key object with string fields type, private_key, \
+                 client_email and token_uri"
+                    .into()
+            } else {
+                format!("vertex provider_key.api_key must be {SHAPE}")
+            })
         })?;
         // Enforce mutual exclusion. Both-set is suspect (which one
         // wins?); neither-set is unusable. Empty-string token is a
@@ -559,37 +626,27 @@ where
     }
 }
 
-/// Map an upstream HTTP error to a customer-visible error.
-///
-/// **Audit-aware:** Vertex error envelopes (`{"error": {"code":
-/// 403, "message": "Permission denied for project foo-bar-prod"}}`)
-/// leak operator project ids. The customer-visible `message` is a
-/// canned status-keyed phrase. We *do* read the upstream's
-/// `error.status` (a gRPC canonical code such as `"RESOURCE_EXHAUSTED"`)
-/// into [`UpstreamErrorView::kind`] so the envelope-translation layer
-/// can derive an OpenAI `code` — that token is a stable taxonomy
-/// label, not operator-internal data. [`UpstreamErrorView::message`]
-/// is intentionally left `None`.
+/// Map an upstream HTTP error to a [`BridgeError::UpstreamStatus`]
+/// carrying Vertex's own error message. The upstream's `error.status` (a
+/// gRPC canonical code such as `"RESOURCE_EXHAUSTED"`) is read into
+/// [`UpstreamErrorView::kind`] so the envelope-translation layer can derive
+/// an OpenAI `code`.
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     let retry_after = aisix_gateway::parse_retry_after(resp.headers());
     let is_json = aisix_gateway::response_is_json(&resp);
-    let body =
-        aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
+    let aisix_gateway::UpstreamErrorBody {
+        bytes: body,
+        read_error,
+    } = aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
     // Skip the serde parse on non-JSON bodies (HTML / text error pages
     // from a fronting WAF or load balancer). Same guard as
     // `capture_upstream_error_http`.
     let kind = is_json.then(|| parse_vertex_error_status(&body)).flatten();
-    let message = match status.as_u16() {
-        401 | 403 => "upstream authentication failed".to_string(),
-        404 => "upstream model or endpoint not found".to_string(),
-        408 => "upstream request timeout".to_string(),
-        429 => "upstream rate limited".to_string(),
-        _ => format!("upstream returned {}", status.as_u16()),
-    };
+    let message = aisix_gateway::upstream_error_message(&body);
     let parsed = kind.as_ref().map(|_| {
         Box::new(aisix_gateway::UpstreamErrorView {
             kind: kind.clone(),
-            message: None,
+            message: (!message.is_empty()).then(|| message.clone()),
             code: None,
             param: None,
         })
@@ -600,15 +657,16 @@ async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeEr
         parsed,
         wire: aisix_gateway::UpstreamWire::Vertex,
         retry_after,
+        diagnostic: None,
     }
+    .with_body_read_error(read_error)
 }
 
 /// Extract just the `error.status` field (the gRPC canonical code) from
 /// a Vertex error body. The body shape is
 /// `{"error": {"code": int, "message": "...", "status": "...", "details": [...]}}`
 /// per <https://cloud.google.com/apis/design/errors>. Returns `None`
-/// when the body is not JSON of that shape — we intentionally do not
-/// surface `error.message` (it embeds operator project ids).
+/// when the body is not JSON of that shape.
 fn parse_vertex_error_status(body: &[u8]) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct Outer {
@@ -665,9 +723,47 @@ impl Bridge for VertexBridge {
         self.name
     }
 
+    fn wire_protocol(&self) -> &'static str {
+        aisix_core::Adapter::Vertex.wire_protocol()
+    }
+
+    fn reads_cache_markers(&self, ctx: &BridgeContext) -> bool {
+        upstream_model(ctx).is_ok_and(|id| {
+            VertexPublisher::from_upstream_id(id) == Some(VertexPublisher::Anthropic)
+        })
+    }
+
     async fn chat(
         &self,
         req: &ChatFormat,
+        ctx: &BridgeContext,
+    ) -> Result<ChatResponse, BridgeError> {
+        self.chat_cow(std::borrow::Cow::Borrowed(req), ctx).await
+    }
+
+    fn serves_anthropic_messages(&self, upstream_model: &str) -> bool {
+        native::serves_anthropic_messages(upstream_model)
+    }
+
+    async fn anthropic_messages(
+        &self,
+        body: serde_json::Value,
+        ctx: &BridgeContext,
+    ) -> Result<aisix_gateway::NativeMessages, BridgeError> {
+        self.native_messages(body, ctx).await
+    }
+
+    async fn anthropic_count_tokens(
+        &self,
+        body: serde_json::Value,
+        ctx: &BridgeContext,
+    ) -> Result<serde_json::Value, BridgeError> {
+        self.native_count_tokens(body, ctx).await
+    }
+
+    async fn chat_cow(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
         let upstream_id = upstream_model(ctx)?;
@@ -679,10 +775,23 @@ impl Bridge for VertexBridge {
             ))
         })?;
         let _ = wire::reserved_query_params();
+        // The thought signature in a tool call id is for Gemini alone.
+        let req = match publisher {
+            VertexPublisher::Google => req,
+            _ => aisix_gateway::tool_calls::chat_without_thought_signatures(req),
+        };
 
         match publisher {
-            VertexPublisher::Google => self.chat_gemini(req, ctx, upstream_id).await,
-            VertexPublisher::Anthropic => self.chat_anthropic(req, ctx, upstream_id).await,
+            VertexPublisher::Google | VertexPublisher::Anthropic => {
+                // Gemini and Claude take tools, not the legacy fields.
+                let (req, legacy) = aisix_gateway::tool_calls::legacy_functions_as_tools(req)?;
+                let resp = if publisher == VertexPublisher::Google {
+                    self.chat_gemini(req, ctx, upstream_id).await
+                } else {
+                    self.chat_anthropic(req, ctx, upstream_id).await
+                };
+                resp.map(|resp| legacy.reply(resp))
+            }
             VertexPublisher::OpenAiCompat => self.chat_openai_shim(req, ctx, upstream_id).await,
             VertexPublisher::Mistral | VertexPublisher::Ai21 => {
                 self.chat_mistral_ai21(req, ctx, upstream_id, publisher)
@@ -696,6 +805,15 @@ impl Bridge for VertexBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
+        self.chat_stream_cow(std::borrow::Cow::Borrowed(req), ctx)
+            .await
+    }
+
+    async fn chat_stream_cow(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
+        ctx: &BridgeContext,
+    ) -> Result<ChatChunkStream, BridgeError> {
         let upstream_id = upstream_model(ctx)?;
         let publisher = VertexPublisher::from_upstream_id(upstream_id).ok_or_else(|| {
             BridgeError::Config(format!(
@@ -704,7 +822,43 @@ impl Bridge for VertexBridge {
                  mistral-* / jamba-*"
             ))
         })?;
-        match publisher {
+        // The thought signature in a tool call id is for Gemini alone.
+        let req = match publisher {
+            VertexPublisher::Google => req,
+            _ => aisix_gateway::tool_calls::chat_without_thought_signatures(req),
+        };
+        // Gemini and Claude take tools, not the legacy fields.
+        let (req, legacy) = match publisher {
+            VertexPublisher::Google | VertexPublisher::Anthropic => {
+                aisix_gateway::tool_calls::legacy_functions_as_tools(req)?
+            }
+            _ => (req, Default::default()),
+        };
+        // The Claude tool route's JSON only exists once the synthetic
+        // tool call has been assembled, so it cannot be streamed as it
+        // arrives. Run the request non-streaming and fake-stream the
+        // translated result: the client sees an ordinary chunk sequence,
+        // and usage rides its own terminal chunk exactly as on a real
+        // stream. Gemini never takes that route — its structured output
+        // is native — and the OpenAI-shim publishers speak
+        // `response_format` natively.
+        if publisher == VertexPublisher::Anthropic
+            && matches!(
+                structured_output_for(&req, upstream_id),
+                StructuredOutput::Tool(_)
+            )
+        {
+            // The leg is not streaming, so it runs under the budget a
+            // non-streaming call would have got — the streaming budget
+            // this context carries bounds a chunk gap, not a completion.
+            let chunks = response_into_fake_stream_chunks(
+                self.chat_cow(req, &ctx.non_streaming_ctx()).await?,
+            );
+            return Ok(
+                legacy.reply_stream(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+            );
+        }
+        let stream = match publisher {
             VertexPublisher::Google => self.chat_gemini_stream(req, ctx, upstream_id).await,
             VertexPublisher::OpenAiCompat => {
                 self.chat_openai_shim_stream(req, ctx, upstream_id).await
@@ -714,7 +868,8 @@ impl Bridge for VertexBridge {
                 self.chat_mistral_ai21_stream(req, ctx, upstream_id, publisher)
                     .await
             }
-        }
+        };
+        stream.map(|stream| legacy.reply_stream(stream))
     }
 
     /// Native Vertex embeddings (#723): google-publisher `:predict`
@@ -728,6 +883,7 @@ impl Bridge for VertexBridge {
         req: &EmbeddingRequest,
         ctx: &BridgeContext,
     ) -> Result<EmbeddingResponse, BridgeError> {
+        req.require_text_input()?;
         let upstream_id = upstream_model(ctx)?;
         let creds = VertexSecret::parse(&ctx.provider_key.api_key)?;
         validate_url_token("project", &creds.project)?;
@@ -755,16 +911,19 @@ impl Bridge for VertexBridge {
             },
         )?;
 
-        let instances: Vec<serde_json::Value> = req
-            .input
-            .iter()
-            .map(|text| serde_json::json!({"content": text}))
-            .collect();
-        let mut body = serde_json::json!({"instances": instances});
-        if let Some(dims) = req.dimensions {
-            body["parameters"] = serde_json::json!({"outputDimensionality": dims});
-        }
-        apply_body_overrides(&mut body, ctx)?;
+        let body = {
+            let instances: Vec<serde_json::Value> = req
+                .input
+                .iter()
+                .map(|text| serde_json::json!({"content": text}))
+                .collect();
+            let mut body = serde_json::json!({"instances": instances});
+            if let Some(dims) = req.dimensions {
+                body["parameters"] = serde_json::json!({"outputDimensionality": dims});
+            }
+            apply_body_overrides(&mut body, ctx)?;
+            outbound_bytes(&body)?
+        };
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
@@ -776,10 +935,11 @@ impl Bridge for VertexBridge {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
+            aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -787,13 +947,21 @@ impl Bridge for VertexBridge {
             let parsed: VertexPredictEmbeddingsResponse = resp
                 .json()
                 .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+                .map_err(|e| aisix_gateway::upstream_body_read_error(&e))?;
 
             let mut data = Vec::with_capacity(parsed.predictions.len());
             let mut prompt_tokens: u64 = 0;
+            let mut usage_reported = !parsed.predictions.is_empty();
             for (i, p) in parsed.predictions.into_iter().enumerate() {
-                if let Some(stats) = &p.embeddings.statistics {
-                    prompt_tokens += stats.token_count;
+                if let Some(token_count) = p
+                    .embeddings
+                    .statistics
+                    .as_ref()
+                    .and_then(|stats| stats.token_count)
+                {
+                    prompt_tokens += token_count;
+                } else {
+                    usage_reported = false;
                 }
                 data.push(EmbeddingObject {
                     index: i as u32,
@@ -802,6 +970,11 @@ impl Bridge for VertexBridge {
                 });
             }
             let tokens = prompt_tokens.min(u32::MAX as u64) as u32;
+            let source = if usage_reported {
+                EmbeddingUsageSource::Reported
+            } else {
+                EmbeddingUsageSource::Unavailable
+            };
             Ok(EmbeddingResponse {
                 object: "list".to_string(),
                 model: model_echo,
@@ -809,6 +982,10 @@ impl Bridge for VertexBridge {
                 usage: EmbeddingUsage {
                     prompt_tokens: tokens,
                     total_tokens: tokens,
+                    // The upstream reports no total; the one above is the
+                    // prompt count, filled for the client.
+                    upstream_total_tokens: 0,
+                    source,
                 },
             })
         })
@@ -838,8 +1015,7 @@ struct VertexEmbeddingsPayload {
 
 #[derive(Debug, Deserialize)]
 struct VertexEmbeddingStatistics {
-    #[serde(default)]
-    token_count: u64,
+    token_count: Option<u64>,
 }
 
 impl VertexBridge {
@@ -848,7 +1024,7 @@ impl VertexBridge {
     /// <https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/gemini>.
     async fn chat_gemini(
         &self,
-        req: &ChatFormat,
+        req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatResponse, BridgeError> {
@@ -880,32 +1056,31 @@ impl VertexBridge {
             },
         )?;
 
-        let typed = build_gemini_request(req);
-        // Audit LOW-4: Gemini requires `contents` to be a non-empty
-        // array. If the caller passed system-only messages (lifted to
-        // `systemInstruction`), `contents` ends up empty and Vertex
-        // returns a generic 400. Fail fast with a clear error so the
-        // operator can fix the request shape before the round trip.
-        if typed.contents.is_empty() {
-            return Err(BridgeError::Config(
-                "vertex chat: messages must include at least one user / \
-                 assistant turn (system-only requests are not supported by Gemini)"
-                    .into(),
-            ));
-        }
-        // Serialize to JSON, then apply the per-ProviderKey override
-        // pipeline (#339). The Gemini `contents` shape does not match the
-        // OpenAI-style top-level keys the request transforms target, so
-        // renames/clamps are usually no-ops here — but default_body_fields
-        // / default_headers still apply.
-        let mut body = serde_json::to_value(&typed)
-            .map_err(|e| BridgeError::Config(format!("serialize Gemini request body: {e}")))?;
-        apply_body_overrides(&mut body, ctx)?;
+        let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, gemini_needs_fetch).await?;
+        let charged = fetched.charge(ctx);
+        let ctx = &*charged;
+        let shared_request_type = gemini_shared_request_type(&req)?;
+        let body = {
+            let typed = build_gemini_request_with(&req, upstream_id, &fetched)?;
+            // Serialize to JSON, then apply the per-ProviderKey override
+            // pipeline (#339). The Gemini `contents` shape does not match the
+            // OpenAI-style top-level keys the request transforms target, so
+            // renames/clamps are usually no-ops here — but default_body_fields
+            // / default_headers still apply.
+            let mut body = serde_json::to_value(&typed)
+                .map_err(|e| BridgeError::Config(format!("serialize Gemini request body: {e}")))?;
+            drop(typed);
+            apply_body_overrides(&mut body, ctx)?;
+            outbound_bytes(&body)?
+        };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
         // Resolve bearer: pre-minted token verbatim, or mint+cache
         // via the in-process token minter from SA JSON. Failure
         // surfaces as a Config error (operator-actionable).
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        with_shared_request_type(&mut headers, shared_request_type);
         let client = self.client_for(ctx);
         let started = Instant::now();
 
@@ -913,20 +1088,23 @@ impl VertexBridge {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
+            aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
             }
+            let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
             let parsed: GeminiGenerateContentResponse = resp
                 .json()
                 .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
-            Ok(gemini_response_into_chat_response(parsed, upstream_id))
+                .map_err(|e| aisix_gateway::upstream_body_read_error(&e))?;
+            Ok(gemini_response_into_chat_response(parsed, upstream_id)
+                .with_fallback_service_tier(header_tier))
         })
         .await
     }
@@ -956,7 +1134,7 @@ impl VertexBridge {
     /// happens at the proxy render layer, not here.
     async fn chat_anthropic(
         &self,
-        req: &ChatFormat,
+        req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatResponse, BridgeError> {
@@ -990,27 +1168,51 @@ impl VertexBridge {
         // then shape it for Vertex (strip model + stream, add the
         // Vertex `anthropic_version`). Mirrors the Bedrock `/invoke`
         // body shaping, differing only in the version string.
-        let (system, messages) =
-            split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
-        let anthropic_req = build_anthropic_request(req, upstream_id, system, messages, false);
-        let mut body_value = serde_json::to_value(&anthropic_req)
-            .map_err(|e| BridgeError::Config(format!("serialize Anthropic request body: {e}")))?;
-        // Apply the per-ProviderKey override pipeline (#339) before the
-        // Vertex-specific shaping below, so the `model`/`stream` strip keeps
-        // the final say and an override can never reintroduce a URL-borne
-        // `model` into the `:rawPredict` body.
-        apply_body_overrides(&mut body_value, ctx)?;
-        if let Some(obj) = body_value.as_object_mut() {
-            obj.remove("model");
-            obj.remove("stream");
-            obj.insert(
-                "anthropic_version".to_string(),
-                serde_json::Value::String(VERTEX_ANTHROPIC_VERSION.to_string()),
-            );
-        }
+        let synthetic_json_tool = matches!(
+            structured_output_for(&req, upstream_id),
+            StructuredOutput::Tool(_)
+        );
+        let urls = MediaUrls::Refused("Claude on Vertex AI");
+        let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, |m| {
+            anthropic_needs_fetch(m, urls)
+        })
+        .await?;
+        let charged = fetched.charge(ctx);
+        let ctx = &*charged;
+        let body_value = {
+            let (system, messages) = split_system_with(&req, urls, &fetched)
+                .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
+            let mut anthropic_req =
+                build_anthropic_request(&req, upstream_id, system, messages, false)?;
+            apply_auto_prompt_caching(&mut anthropic_req, &ctx.model);
+            let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
+                BridgeError::Config(format!("serialize Anthropic request body: {e}"))
+            })?;
+            drop(anthropic_req);
+            // Vertex AI refuses the `scope` a marker may carry on the
+            // Anthropic API.
+            retain_cache_control_fields(&mut body_value, |k| k != "scope");
+            // Apply the per-ProviderKey override pipeline (#339) before the
+            // Vertex-specific shaping below, so the `model`/`stream` strip keeps
+            // the final say and an override can never reintroduce a URL-borne
+            // `model` into the `:rawPredict` body.
+            apply_body_overrides(&mut body_value, ctx)?;
+            if let Some(obj) = body_value.as_object_mut() {
+                obj.remove("model");
+                obj.remove("stream");
+                obj.insert(
+                    "anthropic_version".to_string(),
+                    serde_json::Value::String(VERTEX_ANTHROPIC_VERSION.to_string()),
+                );
+            }
+            outbound_bytes(&body_value)?
+        };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        retain_vertex_betas(&mut headers)?;
         let client = self.client_for(ctx);
         let started = Instant::now();
 
@@ -1018,20 +1220,23 @@ impl VertexBridge {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&body_value)
+                .body(body_value)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
+            aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
             }
-            let parsed: AnthropicResponse = resp
-                .json()
-                .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
-            Ok(response_into_chat_response(parsed))
+            let parsed: AnthropicResponse =
+                aisix_provider_anthropic::wire::decode_success_body(resp).await?;
+            let mut chat = response_into_chat_response(parsed);
+            if synthetic_json_tool {
+                unwrap_json_tool_call(&mut chat);
+            }
+            Ok(chat)
         })
         .await
     }
@@ -1053,7 +1258,7 @@ impl VertexBridge {
     /// alias restore are identical to the non-stream path.
     async fn chat_anthropic_stream(
         &self,
-        req: &ChatFormat,
+        req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatChunkStream, BridgeError> {
@@ -1087,40 +1292,61 @@ impl VertexBridge {
         // with stream=true and — unlike `:rawPredict` — `stream` is KEPT
         // in the body (only `model` is stripped into the URL). Add the
         // Vertex `anthropic_version`.
-        let (system, messages) =
-            split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
-        let anthropic_req = build_anthropic_request(req, upstream_id, system, messages, true);
-        let mut body_value = serde_json::to_value(&anthropic_req)
-            .map_err(|e| BridgeError::Config(format!("serialize Anthropic request body: {e}")))?;
-        // Apply the per-ProviderKey override pipeline (#339) before the
-        // Vertex-specific shaping below (see the non-stream path). Here
-        // `stream` is intentionally KEPT in the body.
-        apply_body_overrides(&mut body_value, ctx)?;
-        if let Some(obj) = body_value.as_object_mut() {
-            obj.remove("model");
-            obj.insert(
-                "anthropic_version".to_string(),
-                serde_json::Value::String(VERTEX_ANTHROPIC_VERSION.to_string()),
-            );
-        }
+        let urls = MediaUrls::Refused("Claude on Vertex AI");
+        let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, |m| {
+            anthropic_needs_fetch(m, urls)
+        })
+        .await?;
+        let charged = fetched.charge(ctx);
+        let ctx = &*charged;
+        let body_value = {
+            let (system, messages) = split_system_with(&req, urls, &fetched)
+                .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
+            let mut anthropic_req =
+                build_anthropic_request(&req, upstream_id, system, messages, true)?;
+            apply_auto_prompt_caching(&mut anthropic_req, &ctx.model);
+            let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
+                BridgeError::Config(format!("serialize Anthropic request body: {e}"))
+            })?;
+            drop(anthropic_req);
+            // Vertex AI refuses the `scope` a marker may carry on the
+            // Anthropic API.
+            retain_cache_control_fields(&mut body_value, |k| k != "scope");
+            // Apply the per-ProviderKey override pipeline (#339) before the
+            // Vertex-specific shaping below (see the non-stream path). Here
+            // `stream` is intentionally KEPT in the body.
+            apply_body_overrides(&mut body_value, ctx)?;
+            if let Some(obj) = body_value.as_object_mut() {
+                obj.remove("model");
+                obj.insert(
+                    "anthropic_version".to_string(),
+                    serde_json::Value::String(VERTEX_ANTHROPIC_VERSION.to_string()),
+                );
+            }
+            outbound_bytes(&body_value)?
+        };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
 
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        retain_vertex_betas(&mut headers)?;
         let client = self.client_for(ctx);
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
             url.post_on(&client)
                 .headers(headers)
-                .json(&body_value)
+                .body(body_value)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)
         })
         .await?;
 
+        aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status();
         if !status.is_success() {
             return Err(map_http_error(status, resp).await);
@@ -1138,12 +1364,21 @@ impl VertexBridge {
             let mut state = StreamState::default();
             let mut byte_stream = Box::pin(byte_stream);
 
-            while let Some(item) = byte_stream.next().await {
-                let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
-                for event in decoder
-                    .feed_checked(bytes.as_ref())
-                    .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
-                {
+            loop {
+                // At EOF, `finish` flushes a last frame the upstream never
+                // terminated, and reports a frame that outgrew the bound
+                // after the last events were returned.
+                let (events, eof) = match byte_stream.next().await {
+                    Some(item) => {
+                        let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                        (decoder.feed(bytes.as_ref()).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?, false)
+                    }
+                    None => (
+                        decoder.finish().map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?.into_iter().collect(),
+                        true,
+                    ),
+                };
+                for event in events {
                     let SseEvent::Data(data) = event else { continue };
                     let parsed: AnthropicStreamEvent =
                         serde_json::from_str(&data).map_err(|e| {
@@ -1154,13 +1389,15 @@ impl VertexBridge {
                     if let AnthropicStreamEvent::Error { error } = &parsed {
                         Err(aisix_provider_anthropic::wire::stream_error_into_bridge_error(error))?;
                     }
-                    state.update(&parsed);
-                    if let Some(chunk) = state.to_chunk(&parsed) {
+                    if let Some(chunk) = state.next_chunk(&parsed) {
                         yield chunk;
                     }
                     if StreamState::is_terminal(&parsed) {
                         return;
                     }
+                }
+                if eof {
+                    break;
                 }
             }
         };
@@ -1196,7 +1433,7 @@ impl VertexBridge {
     /// <https://cloud.google.com/vertex-ai/generative-ai/docs/partner-models/llama#openai>.
     async fn chat_openai_shim(
         &self,
-        req: &ChatFormat,
+        req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatResponse, BridgeError> {
@@ -1219,14 +1456,20 @@ impl VertexBridge {
             || self.openai_shim_url(&creds, ctx.provider_key.api_base.as_deref()),
         )?;
 
-        let messages = openai_messages_from(req, false);
-        let typed = build_openai_request(req, upstream_id, &messages, false);
-        let mut body = serde_json::to_value(&typed)
-            .map_err(|e| BridgeError::Config(format!("serialize OpenAI shim request body: {e}")))?;
-        // Apply the per-ProviderKey override pipeline (#339). The shim
-        // speaks the OpenAI wire, so renames / clamps / default fields all
-        // apply directly; the model id is kept in the body.
-        apply_body_overrides(&mut body, ctx)?;
+        let body = {
+            let messages = openai_messages_from(&req, DeveloperRoleMode::MapToSystem);
+            let typed = build_openai_request(&req, upstream_id, &messages, false);
+            let mut body = serde_json::to_value(&typed).map_err(|e| {
+                BridgeError::Config(format!("serialize OpenAI shim request body: {e}"))
+            })?;
+            // Apply the per-ProviderKey override pipeline (#339). The shim
+            // speaks the OpenAI wire, so renames / clamps / default fields all
+            // apply directly; the model id is kept in the body.
+            apply_body_overrides(&mut body, ctx)?;
+            outbound_bytes(&body)?
+        };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
@@ -1237,19 +1480,20 @@ impl VertexBridge {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
+            aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
             }
-            let parsed: OpenAiResponse = resp
-                .json()
-                .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
-            Ok(openai_response_into_chat_response(parsed))
+            let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
+            let parsed: OpenAiResponse =
+                aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::Vertex)
+                    .await?;
+            Ok(openai_response_into_chat_response(parsed).with_fallback_service_tier(header_tier))
         })
         .await
     }
@@ -1261,7 +1505,7 @@ impl VertexBridge {
     /// has no `?alt=sse`-style query).
     async fn chat_openai_shim_stream(
         &self,
-        req: &ChatFormat,
+        req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatChunkStream, BridgeError> {
@@ -1280,13 +1524,19 @@ impl VertexBridge {
             || self.openai_shim_url(&creds, ctx.provider_key.api_base.as_deref()),
         )?;
 
-        let messages = openai_messages_from(req, false);
-        let typed = build_openai_request(req, upstream_id, &messages, true);
-        let mut body = serde_json::to_value(&typed)
-            .map_err(|e| BridgeError::Config(format!("serialize OpenAI shim request body: {e}")))?;
-        // Apply the per-ProviderKey override pipeline (#339); `stream: true`
-        // stays in the body.
-        apply_body_overrides(&mut body, ctx)?;
+        let body = {
+            let messages = openai_messages_from(&req, DeveloperRoleMode::MapToSystem);
+            let typed = build_openai_request(&req, upstream_id, &messages, true);
+            let mut body = serde_json::to_value(&typed).map_err(|e| {
+                BridgeError::Config(format!("serialize OpenAI shim request body: {e}"))
+            })?;
+            // Apply the per-ProviderKey override pipeline (#339); `stream: true`
+            // stays in the body.
+            apply_body_overrides(&mut body, ctx)?;
+            outbound_bytes(&body)?
+        };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
 
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
@@ -1298,27 +1548,30 @@ impl VertexBridge {
         let resp = with_deadline(ctx.deadline, started, async move {
             url.post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)
         })
         .await?;
 
+        aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status();
         if !status.is_success() {
             return Err(map_http_error(status, resp).await);
         }
 
+        let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
         let byte_stream = resp.bytes_stream();
         let stream = async_stream::try_stream! {
             let mut decoder = SseDecoder::new();
+            let mut tool_call_indexer = ToolCallIndexer::default();
             let mut byte_stream = Box::pin(byte_stream);
 
             while let Some(item) = byte_stream.next().await {
                 let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
                 for event in decoder
-                    .feed_checked(bytes.as_ref())
+                    .feed(bytes.as_ref())
                     .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
                 {
                     match event {
@@ -1327,7 +1580,9 @@ impl VertexBridge {
                                 &data,
                                 "vertex openai-shim stream chunk parse",
                             )?;
-                            yield openai_stream_chunk_into_chat_chunk(parsed);
+                            for chunk in openai_stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
+                                yield chunk.with_fallback_service_tier(&header_tier);
+                            }
                         }
                         // OpenAI shim terminates with `data: [DONE]`;
                         // stop emitting on the sentinel.
@@ -1338,14 +1593,16 @@ impl VertexBridge {
             // Flush a partial trailing chunk if the connection drops
             // without a final blank line.
             if let Some(SseEvent::Data(data)) = decoder
-                .finish_checked()
+                .finish()
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
             {
                 let parsed = parse_vertex_openai_stream_payload(
                     &data,
                     "vertex openai-shim stream tail parse",
                 )?;
-                yield openai_stream_chunk_into_chat_chunk(parsed);
+                for chunk in openai_stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
+                    yield chunk.with_fallback_service_tier(&header_tier);
+                }
             }
         };
 
@@ -1389,7 +1646,7 @@ impl VertexBridge {
     /// body POSTed to `publishers/{mistralai|ai21}/models/<model>:rawPredict`.
     async fn chat_mistral_ai21(
         &self,
-        req: &ChatFormat,
+        req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
         upstream_id: &str,
         publisher: VertexPublisher,
@@ -1430,13 +1687,18 @@ impl VertexBridge {
         // OpenAI chat-completions body — same serializer the OpenAI-shim
         // (Llama/MaaS) rail uses. The model is KEPT in the body (Mistral /
         // AI21 on Vertex expect it in both the URL and the body).
-        let messages = openai_messages_from(req, false);
-        let typed = build_openai_request(req, upstream_id, &messages, false);
-        let mut body = serde_json::to_value(&typed)
-            .map_err(|e| BridgeError::Config(format!("serialize OpenAI request body: {e}")))?;
-        // Apply the per-ProviderKey override pipeline (#339). The model id
-        // is kept in the body (Mistral / AI21 expect it in both URL + body).
-        apply_body_overrides(&mut body, ctx)?;
+        let body = {
+            let messages = openai_messages_from(&req, DeveloperRoleMode::MapToSystem);
+            let typed = build_openai_request(&req, upstream_id, &messages, false);
+            let mut body = serde_json::to_value(&typed)
+                .map_err(|e| BridgeError::Config(format!("serialize OpenAI request body: {e}")))?;
+            // Apply the per-ProviderKey override pipeline (#339). The model id
+            // is kept in the body (Mistral / AI21 expect it in both URL + body).
+            apply_body_overrides(&mut body, ctx)?;
+            outbound_bytes(&body)?
+        };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
@@ -1447,19 +1709,20 @@ impl VertexBridge {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
+            aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
             }
-            let parsed: OpenAiResponse = resp
-                .json()
-                .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
-            Ok(openai_response_into_chat_response(parsed))
+            let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
+            let parsed: OpenAiResponse =
+                aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::Vertex)
+                    .await?;
+            Ok(openai_response_into_chat_response(parsed).with_fallback_service_tier(header_tier))
         })
         .await
     }
@@ -1471,7 +1734,7 @@ impl VertexBridge {
     /// shared [`SseDecoder`] + the OpenAI stream-chunk decoder.
     async fn chat_mistral_ai21_stream(
         &self,
-        req: &ChatFormat,
+        req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
         upstream_id: &str,
         publisher: VertexPublisher,
@@ -1507,13 +1770,18 @@ impl VertexBridge {
             },
         )?;
 
-        let messages = openai_messages_from(req, false);
-        let typed = build_openai_request(req, upstream_id, &messages, true);
-        let mut body = serde_json::to_value(&typed)
-            .map_err(|e| BridgeError::Config(format!("serialize OpenAI request body: {e}")))?;
-        // Apply the per-ProviderKey override pipeline (#339); `stream: true`
-        // stays in the body (model id rides in both URL + body).
-        apply_body_overrides(&mut body, ctx)?;
+        let body = {
+            let messages = openai_messages_from(&req, DeveloperRoleMode::MapToSystem);
+            let typed = build_openai_request(&req, upstream_id, &messages, true);
+            let mut body = serde_json::to_value(&typed)
+                .map_err(|e| BridgeError::Config(format!("serialize OpenAI request body: {e}")))?;
+            // Apply the per-ProviderKey override pipeline (#339); `stream: true`
+            // stays in the body (model id rides in both URL + body).
+            apply_body_overrides(&mut body, ctx)?;
+            outbound_bytes(&body)?
+        };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
 
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
@@ -1525,27 +1793,30 @@ impl VertexBridge {
         let resp = with_deadline(ctx.deadline, started, async move {
             url.post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)
         })
         .await?;
 
+        aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status();
         if !status.is_success() {
             return Err(map_http_error(status, resp).await);
         }
 
+        let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
         let byte_stream = resp.bytes_stream();
         let stream = async_stream::try_stream! {
             let mut decoder = SseDecoder::new();
+            let mut tool_call_indexer = ToolCallIndexer::default();
             let mut byte_stream = Box::pin(byte_stream);
 
             while let Some(item) = byte_stream.next().await {
                 let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
                 for event in decoder
-                    .feed_checked(bytes.as_ref())
+                    .feed(bytes.as_ref())
                     .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
                 {
                     match event {
@@ -1554,7 +1825,9 @@ impl VertexBridge {
                                 &data,
                                 "vertex partner :streamRawPredict chunk parse",
                             )?;
-                            yield openai_stream_chunk_into_chat_chunk(parsed);
+                            for chunk in openai_stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
+                                yield chunk.with_fallback_service_tier(&header_tier);
+                            }
                         }
                         // OpenAI-compatible upstreams (Mistral / AI21)
                         // terminate with `data: [DONE]`; stop on the sentinel.
@@ -1563,14 +1836,16 @@ impl VertexBridge {
                 }
             }
             if let Some(SseEvent::Data(data)) = decoder
-                .finish_checked()
+                .finish()
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
             {
                 let parsed = parse_vertex_openai_stream_payload(
                     &data,
                     "vertex partner :streamRawPredict tail parse",
                 )?;
-                yield openai_stream_chunk_into_chat_chunk(parsed);
+                for chunk in openai_stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
+                    yield chunk.with_fallback_service_tier(&header_tier);
+                }
             }
         };
 
@@ -1597,7 +1872,7 @@ impl VertexBridge {
     /// break us.
     async fn chat_gemini_stream(
         &self,
-        req: &ChatFormat,
+        req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatChunkStream, BridgeError> {
@@ -1627,43 +1902,49 @@ impl VertexBridge {
             },
         )?;
 
-        let typed = build_gemini_request(req);
-        if typed.contents.is_empty() {
-            return Err(BridgeError::Config(
-                "vertex chat: messages must include at least one user / \
-                 assistant turn (system-only requests are not supported by Gemini)"
-                    .into(),
-            ));
-        }
-        // Serialize + apply the per-ProviderKey override pipeline (#339)
-        // before sending (see the non-stream path for the rail caveat).
-        let mut body = serde_json::to_value(&typed)
-            .map_err(|e| BridgeError::Config(format!("serialize Gemini request body: {e}")))?;
-        apply_body_overrides(&mut body, ctx)?;
+        let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, gemini_needs_fetch).await?;
+        let charged = fetched.charge(ctx);
+        let ctx = &*charged;
+        let shared_request_type = gemini_shared_request_type(&req)?;
+        let body = {
+            let typed = build_gemini_request_with(&req, upstream_id, &fetched)?;
+            // Serialize + apply the per-ProviderKey override pipeline (#339)
+            // before sending (see the non-stream path for the rail caveat).
+            let mut body = serde_json::to_value(&typed)
+                .map_err(|e| BridgeError::Config(format!("serialize Gemini request body: {e}")))?;
+            drop(typed);
+            apply_body_overrides(&mut body, ctx)?;
+            outbound_bytes(&body)?
+        };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
         // Resolve bearer (pre-minted OR minted-from-SA) BEFORE
         // entering the stream future so token-mint errors surface
         // as a direct Err return rather than being yielded mid-stream.
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        with_shared_request_type(&mut headers, shared_request_type);
         let client = self.client_for(ctx);
         let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
             url.post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)
         })
         .await?;
 
+        aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status();
         if !status.is_success() {
             return Err(map_http_error(status, resp).await);
         }
 
         let upstream_id_owned = upstream_id.to_string();
+        let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
         let byte_stream = resp.bytes_stream();
 
         // try_stream! adapts the byte stream into a Stream of
@@ -1672,13 +1953,17 @@ impl VertexBridge {
         // `aisix-provider-openai::build_chunk_stream`.
         let stream = async_stream::try_stream! {
             let mut decoder = SseDecoder::new();
-            let mut emitted_role = false;
+            // The header is the fallback; a body tier replaces it.
+            let mut state = GeminiStreamState {
+                service_tier: header_tier,
+                ..Default::default()
+            };
             let mut byte_stream = Box::pin(byte_stream);
 
             while let Some(item) = byte_stream.next().await {
                 let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
                 for event in decoder
-                    .feed_checked(bytes.as_ref())
+                    .feed(bytes.as_ref())
                     .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
                 {
                     if let SseEvent::Data(data) = event {
@@ -1687,7 +1972,7 @@ impl VertexBridge {
                             "vertex stream chunk parse",
                         )?;
                         for chunk in
-                            gemini_chunk_into_chat_chunks(parsed, &upstream_id_owned, &mut emitted_role)
+                            gemini_chunk_into_chat_chunks(parsed, &upstream_id_owned, &mut state)
                         {
                             yield chunk;
                         }
@@ -1703,7 +1988,7 @@ impl VertexBridge {
             // last chunk if the upstream connection drops without a
             // final `\n\n`.
             if let Some(SseEvent::Data(data)) = decoder
-                .finish_checked()
+                .finish()
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
             {
                 let parsed = parse_vertex_gemini_stream_payload(
@@ -1711,7 +1996,7 @@ impl VertexBridge {
                     "vertex stream tail parse",
                 )?;
                 for chunk in
-                    gemini_chunk_into_chat_chunks(parsed, &upstream_id_owned, &mut emitted_role)
+                    gemini_chunk_into_chat_chunks(parsed, &upstream_id_owned, &mut state)
                 {
                     yield chunk;
                 }
@@ -1722,107 +2007,219 @@ impl VertexBridge {
     }
 }
 
+/// What one Gemini stream remembers across its chunks.
+#[derive(Default)]
+struct GeminiStreamState {
+    /// Per choice: the assistant role chunk has gone out, and the tool
+    /// calls emitted so far — the next call's `index`.
+    choices: std::collections::BTreeMap<u32, GeminiStreamChoice>,
+    /// The last tier the stream reported, stamped on every chunk.
+    service_tier: Option<ServiceTier>,
+    /// The first `responseId` the stream reported, stamped on every chunk.
+    response_id: Option<String>,
+}
+
+#[derive(Default)]
+struct GeminiStreamChoice {
+    emitted_role: bool,
+    tool_calls: usize,
+    images: usize,
+}
+
+impl GeminiStreamState {
+    fn choice(&mut self, index: u32) -> &mut GeminiStreamChoice {
+        self.choices.entry(index).or_default()
+    }
+}
+
 /// Translate one Gemini stream chunk into the gateway's
-/// [`ChatChunk`] sequence. Returns up to TWO chunks per upstream
-/// chunk:
+/// [`ChatChunk`] sequence. Every candidate (`n > 1` streams several per
+/// frame, keyed by `index`) yields up to TWO chunks for its choice:
 ///
-/// 1. **Role chunk** (only on the first emission carrying text) —
-///    sets `delta.role = Role::Assistant` so downstream consumers
-///    know this is an assistant turn. Mirrors OpenAI's
+/// 1. **Role chunk** (only on the choice's first emission carrying text,
+///    reasoning, a tool call, an image or a finish reason) — sets `delta.role = Role::Assistant` so downstream
+///    consumers know this is an assistant turn. Mirrors OpenAI's
 ///    "first-chunk-is-role" wire convention.
-/// 2. **Content / terminal chunk** — carries the text delta and,
-///    on the final upstream chunk, the `finish_reason` +
-///    `usage` populated from `finishReason` + `usageMetadata`.
+/// 2. **Content / terminal chunk** — carries the text and reasoning deltas,
+///    `logprobs`, any `functionCall` parts as complete `tool_calls` deltas
+///    (Gemini streams each call whole, never split across chunks; each gets
+///    the next `index` of its choice), generated images as `delta.images`
+///    (numbered within their choice across the stream), and, on the final
+///    upstream chunk, the
+///    `finish_reason` populated from `finishReason`.
 ///
-/// Returns 0 chunks if the upstream chunk had no candidates AND no
-/// usage metadata (which would be an empty keep-alive — Gemini
-/// doesn't emit those today, but the no-op is the safe response).
+/// The frame's usage rides its last chunk. A frame with no candidate
+/// still reports its usage, and a blocked prompt — feedback and no
+/// candidate — finishes choice 0 as `content_filter`.
 fn gemini_chunk_into_chat_chunks(
-    raw: GeminiGenerateContentResponse,
+    mut raw: GeminiGenerateContentResponse,
     upstream_id: &str,
-    emitted_role: &mut bool,
+    state: &mut GeminiStreamState,
 ) -> Vec<ChatChunk> {
-    let first_candidate = raw.candidates.into_iter().next();
-    let (text, finish_reason_raw) = match first_candidate {
-        Some(c) => {
-            let text = c
-                .content
-                .map(|ct| {
-                    ct.parts
-                        .into_iter()
-                        .filter_map(|p| p.text)
-                        .collect::<Vec<_>>()
-                        .join("")
-                })
-                .unwrap_or_default();
-            (text, c.finish_reason)
-        }
-        None => (String::new(), None),
+    // Vertex stamps `usageMetadata` on every frame but fills the counters
+    // only on the last; the earlier ones carry `trafficType` alone. Such a
+    // frame is not a usage report: read as one, its missing
+    // `totalTokenCount` would make the whole stream's total unreported.
+    if let Some(tier) = raw
+        .usage_metadata
+        .as_ref()
+        .and_then(GeminiUsageMetadata::service_tier)
+    {
+        state.service_tier = Some(tier);
+    }
+    if state.response_id.is_none() {
+        state.response_id = raw.response_id.take().filter(|id| !id.is_empty());
+    }
+    let blocked = raw.prompt_blocked();
+    let candidates = raw.indexed_candidates();
+    let mut usage = raw
+        .usage_metadata
+        .filter(GeminiUsageMetadata::reports_counts)
+        .map(GeminiUsageMetadata::into_usage_stats);
+
+    let chunk = |choice_index: u32, delta: ChatDelta, state: &GeminiStreamState| ChatChunk {
+        choice_index,
+        logprobs: None,
+        id: state.response_id.clone().unwrap_or_default(),
+        model: upstream_id.to_string(),
+        delta,
+        finish_reason: None,
+        usage: None,
+        service_tier: state.service_tier.clone(),
+        accounting_usage: None,
     };
-    // Distinguish "no finishReason field" from "finishReason: STOP".
-    // The non-stream path collapses both to FinishReason::Stop (since
-    // ChatResponse always carries a finish_reason); on the stream
-    // path we only attach finish_reason when upstream explicitly set
-    // one, otherwise downstream consumers assume "stream still going".
-    let finish_reason = finish_reason_raw
-        .as_deref()
-        .map(|s| map_gemini_finish_reason(Some(s)));
-
-    let usage = raw.usage_metadata.map(|u| UsageStats {
-        prompt_tokens: u.prompt_token_count,
-        cached_prompt_tokens: u.cached_content_token_count,
-        completion_tokens: u
-            .candidates_token_count
-            .saturating_add(u.thoughts_token_count),
-        // Surfaced separately as well as counted: `reasoning_tokens` is
-        // defined as a subset of `completion_tokens`, which is exactly
-        // what thoughts became above, and an operator seeing a thinking
-        // model's bill wants "of which N were thinking".
-        reasoning_tokens: u.thoughts_token_count,
-        total_tokens: if u.total_token_count > 0 {
-            u.total_token_count
-        } else {
-            u.prompt_token_count
-                .saturating_add(u.candidates_token_count)
-                .saturating_add(u.thoughts_token_count)
-        },
+    let role = || ChatDelta {
+        role: Some(Role::Assistant),
         ..Default::default()
-    });
+    };
 
-    let mut chunks = Vec::with_capacity(2);
-
-    // Role-setting chunk on first content emission.
-    if !*emitted_role && !text.is_empty() {
-        *emitted_role = true;
-        chunks.push(ChatChunk {
-            id: String::new(),
-            model: upstream_id.to_string(),
-            delta: ChatDelta {
-                role: Some(Role::Assistant),
-                ..Default::default()
-            },
-            finish_reason: None,
-            usage: None,
-        });
+    let mut chunks = Vec::with_capacity(2 * candidates.len().max(1));
+    if candidates.is_empty() && (blocked || usage.is_some()) {
+        let mut terminal = chunk(0, ChatDelta::default(), state);
+        if blocked {
+            let choice = state.choice(0);
+            if !choice.emitted_role {
+                choice.emitted_role = true;
+                terminal.delta = role();
+            }
+            terminal.finish_reason = Some(FinishReason::ContentFilter);
+        }
+        terminal.usage = usage.take();
+        chunks.push(terminal);
+        return chunks;
     }
-
-    // Content / terminal chunk — emit when there's text OR a
-    // finishReason OR usage, so the terminal-state chunk lands even
-    // when its content is empty.
-    if !text.is_empty() || finish_reason.is_some() || usage.is_some() {
-        chunks.push(ChatChunk {
-            id: String::new(),
-            model: upstream_id.to_string(),
-            delta: ChatDelta {
-                content: (!text.is_empty()).then_some(text),
-                ..Default::default()
-            },
-            finish_reason,
-            usage,
+    for (index, c) in candidates {
+        let logprobs = gemini_logprobs(c.logprobs_result.as_ref());
+        let GeminiMessageParts {
+            text,
+            reasoning,
+            tool_calls,
+            images,
+        } = c.content.map(gemini_parts_into_message).unwrap_or_default();
+        // Distinguish "no finishReason field" from "finishReason: STOP".
+        // The non-stream path collapses both to FinishReason::Stop (since
+        // ChatResponse always carries a finish_reason); on the stream
+        // path we only attach finish_reason when upstream explicitly set
+        // one, otherwise downstream consumers assume "stream still going".
+        //
+        // Gemini ends a tool-calling turn with `STOP`, often on a later
+        // chunk than the calls; a choice that called tools finishes as
+        // `tool_calls`, like the non-stream response.
+        let choice = state.choice(index);
+        let finish_reason = c.finish_reason.as_deref().map(|s| {
+            if !tool_calls.is_empty() || choice.tool_calls > 0 {
+                finish_with_tool_calls(Some(s))
+            } else {
+                map_gemini_finish_reason(Some(s))
+            }
         });
+        let emit_role = !choice.emitted_role
+            && (!text.is_empty()
+                || !reasoning.is_empty()
+                || !tool_calls.is_empty()
+                || !images.is_empty()
+                || c.finish_reason.is_some());
+        if emit_role {
+            choice.emitted_role = true;
+        }
+        let tool_calls: Vec<serde_json::Value> = tool_calls
+            .into_iter()
+            .map(|mut call| {
+                call["index"] = choice.tool_calls.into();
+                choice.tool_calls += 1;
+                call
+            })
+            .collect();
+        let first_image = choice.images;
+        choice.images += images.len();
+        if emit_role {
+            chunks.push(chunk(index, role(), state));
+        }
+        // Content / terminal chunk — emit when there's text, reasoning, a
+        // tool call, an image, logprobs or a finishReason, so a thought-only frame
+        // reaches the client as it arrives and the terminal-state chunk lands
+        // even when its content is empty.
+        if !text.is_empty()
+            || !reasoning.is_empty()
+            || !tool_calls.is_empty()
+            || !images.is_empty()
+            || logprobs.is_some()
+            || finish_reason.is_some()
+        {
+            let mut extra = serde_json::Map::new();
+            if !images.is_empty() {
+                extra.insert("images".into(), openai_images(images, first_image));
+            }
+            let mut content = chunk(
+                index,
+                ChatDelta {
+                    content: (!text.is_empty()).then_some(text),
+                    reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
+                    tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                    extra,
+                    ..Default::default()
+                },
+                state,
+            );
+            content.finish_reason = finish_reason;
+            content.logprobs = logprobs;
+            chunks.push(content);
+        }
     }
-
+    if let Some(usage) = usage {
+        match chunks.last_mut() {
+            Some(last) => last.usage = Some(usage),
+            None => chunks.push(ChatChunk {
+                usage: Some(usage),
+                ..chunk(0, ChatDelta::default(), state)
+            }),
+        }
+    }
     chunks
+}
+
+/// Keep only the `anthropic-beta` values Vertex AI takes in a Claude chat
+/// request's headers — the provider key's `default_headers` or a forwarded
+/// client header — under Vertex AI's names; an unknown one is a 400 there.
+fn retain_vertex_betas(headers: &mut http::HeaderMap) -> Result<(), BridgeError> {
+    use aisix_provider_anthropic::platform::{header_betas, platform_beta, Platform};
+    let beta_header = HeaderName::from_static("anthropic-beta");
+    let wanted = header_betas(Some(headers));
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    let kept: std::collections::BTreeSet<&str> = wanted
+        .iter()
+        .filter_map(|b| platform_beta(Platform::Vertex, b))
+        .collect();
+    headers.remove(&beta_header);
+    if !kept.is_empty() {
+        let joined = kept.into_iter().collect::<Vec<_>>().join(",");
+        let value = HeaderValue::from_str(&joined)
+            .map_err(|e| BridgeError::Config(format!("anthropic-beta header: {e}")))?;
+        headers.insert(beta_header, value);
+    }
+    Ok(())
 }
 
 /// Build the outbound headers: `Authorization: Bearer <access_token>`,
@@ -1868,6 +2265,46 @@ fn build_request_headers(
     Ok(headers)
 }
 
+/// OpenAI's `service_tier` as the Vertex header that picks a PayGo tier:
+/// `flex` and `priority` are its `X-Vertex-AI-LLM-Shared-Request-Type`
+/// values, per
+/// <https://cloud.google.com/vertex-ai/generative-ai/docs/flex-paygo> and
+/// <https://cloud.google.com/vertex-ai/generative-ai/docs/priority-paygo>.
+/// Vertex has no request setting for `auto`, `default` or `scale`.
+fn gemini_shared_request_type(req: &ChatFormat) -> Result<Option<&'static str>, BridgeError> {
+    match req.extra.get("service_tier") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(tier)) => Ok(match tier.as_str() {
+            "flex" => Some("flex"),
+            "priority" => Some("priority"),
+            _ => None,
+        }),
+        Some(_) => Err(BridgeError::InvalidRequest(
+            "service_tier must be a string".into(),
+        )),
+    }
+}
+
+/// Set the tier header, unless the provider key's `default_headers` or a
+/// forwarded client header already names one.
+fn with_shared_request_type(headers: &mut HeaderMap, tier: Option<&'static str>) {
+    if let Some(tier) = tier {
+        headers
+            .entry(HeaderName::from_static(
+                "x-vertex-ai-llm-shared-request-type",
+            ))
+            .or_insert(HeaderValue::from_static(tier));
+    }
+}
+
+/// The wire bytes of an outbound body. Called where the `Value` is a
+/// temporary, so it is gone before the upstream is awaited — see
+/// [`aisix_gateway::json_body`].
+fn outbound_bytes(body: &serde_json::Value) -> Result<bytes::Bytes, BridgeError> {
+    aisix_gateway::json_body(body)
+        .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))
+}
+
 /// Apply the per-`ProviderKey` request/response override pipeline to an
 /// already-serialized outbound body, mirroring
 /// `OpenAiBridge::prepare_outbound_body` step-for-step:
@@ -1905,17 +2342,26 @@ fn apply_body_overrides(
 
 // ─── Gemini wire shapes ────────────────────────────────────────────────
 
+/// The only `responseMimeType` this bridge sets: Gemini's structured
+/// output is gated on it, and both schema fields are inert without it.
+const GEMINI_JSON_MIME_TYPE: &str = "application/json";
+
 /// Gemini's `generateContent` request body per
 /// <https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/gemini>.
 ///
 /// Note `system_instruction` is OPTIONAL and only emitted when
 /// the caller's ChatFormat has system-role turns; sending an empty
-/// one would 400 upstream. Same goes for `generation_config`.
+/// one would 400 upstream. Same goes for `generation_config`, `tools`
+/// and `tool_config`.
 #[derive(Debug, Serialize)]
 struct GeminiGenerateContentRequest {
     contents: Vec<GeminiContent>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "systemInstruction")]
     system_instruction: Option<GeminiContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "toolConfig")]
+    tool_config: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "generationConfig")]
     generation_config: Option<GeminiGenerationConfig>,
 }
@@ -1929,22 +2375,14 @@ struct GeminiContent {
     parts: Vec<GeminiPart>,
 }
 
-/// One part of a Gemini `contents` entry.
-///
-/// `inlineData` carries the bytes themselves, base64-encoded — the same
-/// encoding an OpenAI `data:` URI already uses, so the payload passes
-/// through without a decode/re-encode round trip
-/// (<https://ai.google.dev/api/generate-content>).
+/// One `parts[]` entry: a text part, or a raw part — a media part from
+/// [`gemini_media_part`], or one built by [`crate::gemini_tools`]
+/// (`functionCall` / `functionResponse`, with its `thoughtSignature`).
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum GeminiPart {
-    Text {
-        text: String,
-    },
-    #[serde(rename_all = "camelCase")]
-    InlineData {
-        inline_data: GeminiBlob,
-    },
+    Text { text: String },
+    Raw(serde_json::Value),
 }
 
 impl GeminiPart {
@@ -1953,121 +2391,544 @@ impl GeminiPart {
     }
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GeminiBlob {
-    mime_type: String,
-    /// Base64, exactly as the caller's `data:` URI carried it.
-    data: String,
-}
-
-/// Translate an OpenAI `image_url` content part into a Gemini part.
-///
-/// Only a `data:` URI maps. Gemini's other media form, `fileData.fileUri`,
-/// addresses a Google-managed URI (a Files API or Cloud Storage object) —
-/// not an arbitrary web URL — so a caller's `https://…` image has nowhere
-/// to go here. The gateway does not fetch it: downloading caller-named
-/// URLs would take on egress, latency and an SSRF surface that belong to
-/// the provider.
-///
-/// That is a real asymmetry with the Anthropic bridge, which accepts a URL
-/// natively, and it is a property of the providers rather than of this
-/// code.
-fn gemini_part_from_openai_media(part: &serde_json::Value) -> Option<GeminiPart> {
-    let url = part
-        .get("image_url")
-        .and_then(|i| i.get("url"))
-        .and_then(serde_json::Value::as_str)?;
-    let rest = url.strip_prefix("data:")?;
-    let (meta, payload) = rest.split_once(',')?;
-    let mime_type = meta.strip_suffix(";base64")?;
-    if mime_type.is_empty() || payload.is_empty() {
-        return None;
-    }
-    Some(GeminiPart::InlineData {
-        inline_data: GeminiBlob {
-            mime_type: mime_type.to_string(),
-            data: payload.to_string(),
-        },
-    })
-}
-
-/// Parts for one message: its text, plus any media the caller attached, in
-/// the order they were written — "what is in this image?" before and after
-/// the image are different prompts.
-///
-/// Degrades to a single text part when the message carries no typed
-/// blocks, which is the common case and the historical shape.
-fn gemini_parts_for(msg: &ChatMessage) -> Vec<GeminiPart> {
-    let Some(blocks) = msg.content_blocks.as_deref() else {
-        return vec![GeminiPart::text(msg.content_str())];
-    };
-    let mut parts: Vec<GeminiPart> = Vec::new();
-    for block in blocks {
-        match block.get("type").and_then(|t| t.as_str()) {
-            Some("text") => {
-                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                    if !text.trim().is_empty() {
-                        parts.push(GeminiPart::text(text));
-                    }
-                }
-            }
-            Some("image_url") => match gemini_part_from_openai_media(block) {
-                Some(part) => parts.push(part),
-                None => tracing::warn!(
-                    "dropping image part this provider cannot address on cross-provider \
-                     dispatch: the model answers without having seen it",
-                ),
-            },
-            other => tracing::debug!(
-                block_type = ?other,
-                "dropping unsupported content part on cross-provider dispatch",
-            ),
-        }
-    }
-    if parts.is_empty() {
-        parts.push(GeminiPart::text(msg.content_str()));
-    }
-    parts
-}
-
-#[derive(Debug, Serialize, Default)]
+/// Gemini's `GenerationConfig`, per
+/// <https://cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/GenerationConfig>.
+/// The caller's values go in as sent; Vertex answers for the ones it
+/// refuses.
+#[derive(Debug, Serialize, Default, PartialEq)]
 struct GeminiGenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "topP")]
-    top_p: Option<f32>,
+    top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "topK")]
+    top_k: Option<u64>,
+    /// `max_completion_tokens`, else `max_tokens`.
     #[serde(skip_serializing_if = "Option::is_none", rename = "maxOutputTokens")]
-    max_output_tokens: Option<u32>,
+    max_output_tokens: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "stopSequences")]
+    stop_sequences: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "presencePenalty")]
+    presence_penalty: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "frequencyPenalty")]
+    frequency_penalty: Option<serde_json::Value>,
+    /// OpenAI `n`.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "candidateCount")]
+    candidate_count: Option<serde_json::Value>,
+    /// OpenAI `logprobs`.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "responseLogprobs")]
+    response_logprobs: Option<serde_json::Value>,
+    /// OpenAI `top_logprobs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "thinkingConfig")]
+    thinking_config: Option<serde_json::Value>,
+    /// OpenAI `modalities`, which Gemini spells upper-case.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "responseModalities")]
+    response_modalities: Option<serde_json::Value>,
+    /// Gemini's constrained-decoding switch. `"application/json"` is the
+    /// only value this bridge sets; without it neither schema field has
+    /// any effect.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "responseMimeType")]
+    response_mime_type: Option<&'static str>,
+    /// Gemini 2 and later: a standard JSON Schema, sent as the caller
+    /// wrote it.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "responseJsonSchema")]
+    response_json_schema: Option<serde_json::Value>,
+    /// Gemini 1.x: the older OpenAPI-flavoured schema dialect. See
+    /// [`gemini_openapi_schema`].
+    #[serde(skip_serializing_if = "Option::is_none", rename = "responseSchema")]
+    response_schema: Option<serde_json::Value>,
+}
+
+/// What a caller's OpenAI `response_format` becomes in Gemini's
+/// `generationConfig`.
+///
+/// Gemini has no tool-call fallback here — the constrained decoding is
+/// native, so there is no synthetic tool to force — and no prompt
+/// injection: a model that cannot constrain its decoding is left to
+/// answer as it would have.
+#[derive(Debug, PartialEq, Eq)]
+enum GeminiJsonOutput {
+    /// No `response_format`, or `{"type":"text"}`: nothing to emit.
+    None,
+    /// `{"type":"json_object"}` — JSON, but no schema to constrain it to.
+    MimeOnly,
+    /// Gemini 2+: `responseJsonSchema`, standard JSON Schema.
+    JsonSchema(serde_json::Value),
+    /// Gemini 1.x: `responseSchema`, the OpenAPI-flavoured dialect.
+    OpenApiSchema(serde_json::Value),
+}
+
+/// Decide what `response_format` becomes for `upstream_model`.
+///
+/// Both schema fields carry the same document; which one Gemini reads it
+/// out of is a generation thing. `responseJsonSchema` takes ordinary
+/// JSON Schema and only exists from Gemini 2 onwards; `responseSchema`
+/// is the older OpenAPI-derived subset every generation accepts. An
+/// unrecognisable model name therefore falls back to `responseSchema`,
+/// the one that works everywhere.
+///
+/// A `response_format` that is not an OpenAI one — not an object, or a
+/// `type` other than `text` / `json_object` / `json_schema` — is refused.
+fn gemini_json_output(
+    req: &ChatFormat,
+    upstream_model: &str,
+) -> Result<GeminiJsonOutput, BridgeError> {
+    let response_format = match req.extra.get("response_format") {
+        None | Some(serde_json::Value::Null) => return Ok(GeminiJsonOutput::None),
+        Some(rf @ serde_json::Value::Object(_)) => rf,
+        Some(_) => {
+            return Err(BridgeError::InvalidRequest(
+                "response_format must be an object".into(),
+            ))
+        }
+    };
+    match response_format.get("type").and_then(|t| t.as_str()) {
+        Some("text") => return Ok(GeminiJsonOutput::None),
+        Some("json_object") => return Ok(GeminiJsonOutput::MimeOnly),
+        Some("json_schema") => {}
+        _ => {
+            return Err(BridgeError::InvalidRequest(
+                "response_format.type must be \"text\", \"json_object\" or \"json_schema\"".into(),
+            ))
+        }
+    }
+    let Some(schema) = json_schema_from_response_format(response_format) else {
+        return Ok(GeminiJsonOutput::None);
+    };
+    Ok(
+        if gemini_major_version(upstream_model).is_some_and(|major| major >= 2) {
+            GeminiJsonOutput::JsonSchema(schema)
+        } else {
+            GeminiJsonOutput::OpenApiSchema(gemini_openapi_schema(&schema))
+        },
+    )
+}
+
+/// OpenAI's `stop` (a string or an array of strings) as Gemini's
+/// `stopSequences`, which takes an array only.
+fn gemini_stop_sequences(req: &ChatFormat) -> Result<Option<serde_json::Value>, BridgeError> {
+    match req.extra.get("stop") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(serde_json::json!([s]))),
+        Some(serde_json::Value::Array(items)) if items.iter().all(|i| i.is_string()) => {
+            Ok(Some(serde_json::Value::Array(items.clone())))
+        }
+        Some(_) => Err(BridgeError::InvalidRequest(
+            "stop must be a string or an array of strings".into(),
+        )),
+    }
+}
+
+/// `reasoning_effort` (and a `/v1/messages` caller's exact thinking
+/// budget) as Gemini's `thinkingConfig`.
+///
+/// Gemini 3 and later take a `thinkingLevel`; `minimal` / `low` / `medium` /
+/// `high` go there as sent, and a model that lacks the level answers for
+/// it. Gemini 2.5 takes a `thinkingBudget`: the caller's exact budget when
+/// there is one, else the tier through the table Google publishes for its
+/// OpenAI-compatible endpoint
+/// (<https://ai.google.dev/gemini-api/docs/openai#thinking>: minimal and low
+/// 1,024, medium 8,192, high 24,576), and `none` as a budget of 0 on the
+/// models that can turn thinking off — 2.5 Flash and Flash-Lite, not 2.5 Pro
+/// (<https://cloud.google.com/vertex-ai/generative-ai/docs/thinking>).
+/// A tier the model has no setting for, and every tier on an older model,
+/// is dropped.
+///
+/// A caller that asked for its thoughts ([`ChatFormat::thoughts_requested`])
+/// on 2.5 or later also gets `includeThoughts`, on its own when no setting
+/// applies; Gemini returns no thought parts without it. An effort written by
+/// anyone else does not ask, so that request and its response stay as they
+/// would be with no reasoning support, and neither does a request whose
+/// effective setting turns thinking off (`none`).
+fn gemini_thinking_config(
+    req: &ChatFormat,
+    upstream_model: &str,
+) -> Result<Option<serde_json::Value>, BridgeError> {
+    let effort = match req.extra.get("reasoning_effort") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(effort)) => Some(effort.as_str()),
+        Some(_) => {
+            return Err(BridgeError::InvalidRequest(
+                "reasoning_effort must be a string".into(),
+            ))
+        }
+    };
+    let mut config = serde_json::Map::new();
+    if gemini_3_or_newer(upstream_model) {
+        let level = match effort {
+            Some("minimal") => Some("MINIMAL"),
+            Some("low") => Some("LOW"),
+            Some("medium") => Some("MEDIUM"),
+            Some("high") => Some("HIGH"),
+            _ => None,
+        };
+        if let Some(level) = level {
+            config.insert("thinkingLevel".into(), level.into());
+        }
+    } else if gemini_2_5(upstream_model) {
+        let budget = match (req.thinking_budget_tokens, effort) {
+            (Some(budget), _) => Some(budget),
+            (None, Some("minimal" | "low")) => Some(1024),
+            (None, Some("medium")) => Some(8192),
+            (None, Some("high")) => Some(24576),
+            (None, Some("none")) if !gemini_model_name(upstream_model).contains("-pro") => Some(0),
+            _ => None,
+        };
+        if let Some(budget) = budget {
+            config.insert("thinkingBudget".into(), budget.into());
+        }
+    } else {
+        return Ok(None);
+    }
+    if req.thoughts_requested && effort != Some("none") {
+        config.insert("includeThoughts".into(), true.into());
+    }
+    Ok((!config.is_empty()).then_some(serde_json::Value::Object(config)))
+}
+
+/// Read the generation off a Gemini model name: `2` from
+/// `gemini-2.5-flash`, `3` from `gemini-3-pro-preview`. The gateway
+/// holds no capability map, so the name is all there is.
+///
+/// `None` for anything that is not a `gemini-<digits>` name — including
+/// the undated experimental aliases (`gemini-exp-1206`) — which lands on
+/// the older schema field, the one every generation accepts.
+fn gemini_major_version(model: &str) -> Option<u32> {
+    let lowered = model.trim().to_ascii_lowercase();
+    // Vertex accepts both the bare id and the `models/<id>` spelling.
+    let name = lowered.rsplit('/').next().unwrap_or(&lowered);
+    let rest = name.strip_prefix("gemini")?.trim_start_matches(['-', '_']);
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// Rewrite a JSON Schema into the OpenAPI-derived dialect Gemini 1.x
+/// reads out of `responseSchema`:
+///
+///   * `type` is an upper-case OpenAPI type name (`OBJECT`, `STRING`),
+///   * members outside the `Schema` type — `additionalProperties`
+///     among them — do not exist and are rejected by name, which
+///     [`apply_schema_limits`] has already dealt with,
+///   * `propertyOrdering` fixes the order the model emits an object's
+///     members in — omitted, the order is unspecified.
+///
+/// Run after [`apply_schema_limits`], which has already removed the
+/// keywords the dialect has no member for and inlined its `$ref`s.
+///
+/// The ordering emitted is the order the properties appear in the schema
+/// as this gateway serialises it, so the request is self-consistent.
+fn gemini_openapi_schema(schema: &serde_json::Value) -> serde_json::Value {
+    let mut out = schema.clone();
+    // First narrow the schema to the dialect's vocabulary — this is
+    // also what inlines `$ref`, which the dialect has no spelling for —
+    // then rewrite what survives into the dialect's own shape.
+    apply_schema_limits(&mut out, &GEMINI_OPENAPI_SCHEMA_LIMITS);
+    rewrite_gemini_openapi_schema(&mut out);
+    out
+}
+
+fn rewrite_gemini_openapi_schema(schema: &mut serde_json::Value) {
+    let Some(obj) = schema.as_object_mut() else {
+        return;
+    };
+    match obj.get_mut("type") {
+        Some(serde_json::Value::String(ty)) => *ty = ty.to_ascii_uppercase(),
+        // A union type (`["string","null"]`, how strict mode spells an
+        // optional field) would otherwise reach the wire with lower-case
+        // names Vertex does not recognise.
+        Some(serde_json::Value::Array(types)) => {
+            for ty in types.iter_mut() {
+                if let serde_json::Value::String(ty) = ty {
+                    *ty = ty.to_ascii_uppercase();
+                }
+            }
+        }
+        _ => {}
+    }
+    if let Some(properties) = obj.get("properties").and_then(|p| p.as_object()) {
+        let ordering: Vec<serde_json::Value> =
+            properties.keys().map(|k| k.as_str().into()).collect();
+        if !ordering.is_empty() {
+            obj.insert("propertyOrdering".to_string(), ordering.into());
+        }
+    }
+    if let Some(properties) = obj.get_mut("properties").and_then(|p| p.as_object_mut()) {
+        for property in properties.values_mut() {
+            rewrite_gemini_openapi_schema(property);
+        }
+    }
+    // `items` also has the draft-07 tuple form. Gemini's `Schema.items`
+    // is a single schema, so a tuple array is a shape this dialect
+    // cannot express at all and Vertex rejects it — the same standing
+    // as an unresolvable `$ref`. The elements are still rewritten, so
+    // the two walkers agree about where schemas live and the request
+    // that goes up is the caller's own, not a half-converted one.
+    match obj.get_mut("items") {
+        Some(serde_json::Value::Array(items)) => {
+            for item in items {
+                rewrite_gemini_openapi_schema(item);
+            }
+        }
+        Some(items) => rewrite_gemini_openapi_schema(items),
+        None => {}
+    }
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if let Some(branches) = obj.get_mut(key).and_then(|b| b.as_array_mut()) {
+            for branch in branches {
+                rewrite_gemini_openapi_schema(branch);
+            }
+        }
+    }
+}
+
+/// A user turn's `parts[]`, in the caller's order: text, then media as
+/// `inlineData` (base64 in the request, or downloaded by the gateway) or
+/// `fileData` (a `gs://` or `https://` reference Gemini resolves itself).
+fn gemini_user_parts(
+    m: &ChatMessage,
+    index: usize,
+    fetched: &FetchedMedia,
+) -> Result<Vec<GeminiPart>, BridgeError> {
+    let Some(blocks) = m.content_blocks.as_deref() else {
+        return Ok(vec![GeminiPart::text(m.content_str())]);
+    };
+    translate_user_parts(blocks, index, "Gemini", GeminiPart::text, |media, _| {
+        gemini_media_part(media, fetched).map(GeminiPart::Raw)
+    })
+    .map_err(BridgeError::InvalidRequest)
+}
+
+/// An assistant turn's generated `images`, the part shape the same turn's
+/// response carried them in. Media downloads cover user turns only and are
+/// counted per use, so these never draw on them.
+fn gemini_replayed_image_parts(
+    m: &ChatMessage,
+    index: usize,
+) -> Result<Vec<GeminiPart>, BridgeError> {
+    let images = match m.extra.get("images") {
+        Some(images) if m.role == Role::Assistant && !images.is_null() => images,
+        _ => return Ok(Vec::new()),
+    };
+    let images = images.as_array().ok_or_else(|| {
+        BridgeError::InvalidRequest(format!("messages[{index}].images must be an array"))
+    })?;
+    images
+        .iter()
+        .enumerate()
+        .map(|(i, image)| {
+            let invalid = |reason: String| {
+                BridgeError::InvalidRequest(format!("messages[{index}].images[{i}]: {reason}"))
+            };
+            match parse_part(image).map_err(invalid)? {
+                ContentPart::Media(media) if media.kind == MediaKind::Image => {
+                    gemini_media_part(&media, &FetchedMedia::default())
+                        .map(GeminiPart::Raw)
+                        .map_err(invalid)
+                }
+                _ => Err(invalid("an image must be an image_url part".to_string())),
+            }
+        })
+        .collect()
+}
+
+/// Gemini reads `gs://` and `https://` URLs itself, but only with a media
+/// type; an `http://` URL, or an `https://` one whose type neither the
+/// caller nor the extension gives, is downloaded by the gateway.
+fn gemini_needs_fetch(media: &Media<'_>) -> bool {
+    match &media.source {
+        MediaSource::Inline { .. } => false,
+        MediaSource::Uri { mime_type, .. } => match media.source.scheme().as_deref() {
+            Some("http") => true,
+            Some("https") => mime_type.is_none(),
+            _ => false,
+        },
+    }
+}
+
+/// One media part on the Gemini wire: a URL the gateway downloaded goes up
+/// as `inlineData`; a `gs://` or `https://` URL as `fileData` for Gemini
+/// to read, which needs the media type — the caller's `format` or the
+/// URL's extension.
+fn gemini_media_part(
+    media: &Media<'_>,
+    fetched: &FetchedMedia,
+) -> Result<serde_json::Value, String> {
+    if let MediaSource::Uri { uri, .. } = &media.source {
+        if let Some(download) = fetched.take(uri) {
+            return Ok(serde_json::json!({
+                "inlineData": {
+                    "mimeType": download.mime_type,
+                    "data": download.data.into_base64(),
+                }
+            }));
+        }
+    }
+    match &media.source {
+        MediaSource::Inline { mime_type, data } => Ok(serde_json::json!({
+            "inlineData": {"mimeType": mime_type, "data": data}
+        })),
+        MediaSource::Uri { uri, mime_type, .. } => {
+            match media.source.scheme().as_deref() {
+                Some("gs" | "https") => {}
+                _ => {
+                    return Err(format!(
+                        "Gemini models read only gs:// and https:// URLs, and the gateway did \
+                         not download {}; send the content inline as a base64 data: URL",
+                        display_uri(uri)
+                    ));
+                }
+            }
+            let mime_type = mime_type.as_deref().ok_or_else(|| {
+                format!(
+                    "the media type of {} cannot be told from its extension; \
+                     set it in image_url.format (or file.format), for example \"image/png\"",
+                    display_uri(uri)
+                )
+            })?;
+            Ok(serde_json::json!({
+                "fileData": {"mimeType": mime_type, "fileUri": uri}
+            }))
+        }
+    }
+}
+
+#[cfg(test)]
+fn build_gemini_request(
+    req: &ChatFormat,
+    upstream_model: &str,
+) -> Result<GeminiGenerateContentRequest, BridgeError> {
+    build_gemini_request_with(req, upstream_model, &FetchedMedia::default())
 }
 
 /// Translate the gateway's [`ChatFormat`] into Gemini's
 /// `generateContent` body.
 ///
 /// Translation rules:
-/// - System messages → top-level `systemInstruction` (concatenated
-///   with `\n\n` if multiple). They do NOT appear in `contents`.
+/// - System and developer messages → top-level `systemInstruction`
+///   (concatenated with `\n\n` if multiple). They do NOT appear in
+///   `contents`.
 /// - User messages → `{"role":"user","parts":[{"text":...}]}`
 /// - Assistant messages → `{"role":"model","parts":[{"text":...}]}`
 ///   (Gemini uses `"model"` not `"assistant"`)
-/// - Tool messages: out of scope for D5.2.a; treated as user text
-///   (preserves conversation history without 400ing the upstream)
-/// - `temperature`, `top_p`, `max_tokens` → `generationConfig.*`
-fn build_gemini_request(req: &ChatFormat) -> GeminiGenerateContentRequest {
+/// - Assistant `tool_calls` → `functionCall` parts after the turn's
+///   text (if it has any); consecutive tool results → ONE `user` turn of
+///   `functionResponse` parts, as Gemini pairs a turn's calls with the
+///   next turn's responses — see [`crate::gemini_tools`]
+/// - `tools` → `tools[].functionDeclarations`, `tool_choice` →
+///   `toolConfig.functionCallingConfig` (the legacy `functions` /
+///   `function_call` arrive here already rewritten as tools, by
+///   [`aisix_gateway::tool_calls::legacy_functions_as_tools`])
+/// - Assistant `images` → `inlineData` (or `fileData`) parts after the
+///   turn's text, without a thought signature
+/// - `temperature`, `top_p`, `top_k`, `max_completion_tokens` /
+///   `max_tokens`, `stop`, `seed`, the penalties, `n`, `logprobs` /
+///   `top_logprobs`, `modalities` and `reasoning_effort` → their
+///   `generationConfig` slots (see [`GeminiGenerationConfig`], [`gemini_thinking_config`])
+/// - `response_format` → `generationConfig.responseMimeType` plus the
+///   schema field this model's generation reads — see
+///   [`gemini_json_output`]. Every other `extra` field has no slot in this
+///   body and is dropped.
+///
+/// Fails (400) on a value OpenAI's own contract forbids, naming the field,
+/// and on what this translation cannot express: a hosted tool, a tool
+/// result with no call to answer, or call arguments that are not JSON.
+///
+/// `fetched` holds the media URLs the gateway downloaded for Gemini.
+fn build_gemini_request_with(
+    req: &ChatFormat,
+    upstream_model: &str,
+    fetched: &FetchedMedia,
+) -> Result<GeminiGenerateContentRequest, BridgeError> {
     let mut system_parts: Vec<String> = Vec::new();
     let mut contents: Vec<GeminiContent> = Vec::new();
-    for m in &req.messages {
+    let mut tool_responses: Vec<GeminiPart> = Vec::new();
+    let mut prior_tool_calls: Vec<&serde_json::Value> = Vec::new();
+    for (index, m) in req.messages.iter().enumerate() {
+        let replayed_images = gemini_replayed_image_parts(m, index)?;
+        // `generateContent` has no slot for replayed reasoning; a turn that
+        // holds only that would become an empty `model` turn.
+        if m.is_reasoning_only() && replayed_images.is_empty() {
+            continue;
+        }
+        if matches!(m.role, Role::User | Role::Assistant) && !tool_responses.is_empty() {
+            contents.push(GeminiContent {
+                role: "user",
+                parts: std::mem::take(&mut tool_responses),
+            });
+        }
         match m.role {
             Role::System | Role::Developer => system_parts.push(m.content_str().to_string()),
-            Role::User | Role::Tool => contents.push(GeminiContent {
+            Role::User => contents.push(GeminiContent {
                 role: "user",
-                parts: gemini_parts_for(m),
+                parts: gemini_user_parts(m, index, fetched)?,
             }),
-            Role::Assistant => contents.push(GeminiContent {
-                role: "model",
-                parts: gemini_parts_for(m),
-            }),
+            Role::Tool | Role::Function => {
+                check_tool_result_parts(m, index).map_err(BridgeError::InvalidRequest)?;
+                tool_responses.push(GeminiPart::Raw(function_response_part(
+                    m,
+                    &prior_tool_calls,
+                )?))
+            }
+            Role::Assistant => {
+                let tool_calls = m
+                    .extra
+                    .get("tool_calls")
+                    .and_then(serde_json::Value::as_array)
+                    .filter(|calls| !calls.is_empty());
+                let parts = match tool_calls {
+                    None if replayed_images.is_empty() => {
+                        vec![GeminiPart::text(m.content_str())]
+                    }
+                    None => m
+                        .text()
+                        .filter(|text| !text.is_empty())
+                        .map(GeminiPart::text)
+                        .into_iter()
+                        .chain(replayed_images)
+                        .collect(),
+                    Some(calls) => {
+                        prior_tool_calls.extend(calls);
+                        // A pure tool-call turn has `content: null` and
+                        // no text part.
+                        m.text()
+                            .filter(|text| !text.is_empty())
+                            .map(GeminiPart::text)
+                            .into_iter()
+                            .chain(replayed_images)
+                            .chain(
+                                function_call_parts(calls, upstream_model)?
+                                    .into_iter()
+                                    .map(GeminiPart::Raw),
+                            )
+                            .collect()
+                    }
+                };
+                contents.push(GeminiContent {
+                    role: "model",
+                    parts,
+                });
+            }
         }
+    }
+    if !tool_responses.is_empty() {
+        contents.push(GeminiContent {
+            role: "user",
+            parts: tool_responses,
+        });
+    }
+    // Gemini rejects an empty `contents`, which is what a request holding
+    // only system / developer turns leaves once they are lifted into
+    // `systemInstruction`. A single blank user turn lets the model answer
+    // the instructions alone.
+    if contents.is_empty() {
+        contents.push(GeminiContent {
+            role: "user",
+            parts: vec![GeminiPart::text(" ")],
+        });
     }
     let system_instruction = if system_parts.is_empty() {
         None
@@ -2077,20 +2938,69 @@ fn build_gemini_request(req: &ChatFormat) -> GeminiGenerateContentRequest {
             parts: vec![GeminiPart::text(system_parts.join("\n\n"))],
         })
     };
-    let generation_config =
-        if req.temperature.is_some() || req.top_p.is_some() || req.max_tokens.is_some() {
-            Some(GeminiGenerationConfig {
-                temperature: req.temperature,
-                top_p: req.top_p,
-                max_output_tokens: req.max_tokens,
-            })
-        } else {
-            None
+    let tools = match req.extra.get("tools") {
+        Some(tools) => gemini_tools(tools, upstream_model)?,
+        None => None,
+    };
+    // Checked even when no tool is sent, so an illegal choice is refused
+    // the same way on every request. A calling mode with nothing to call
+    // is meaningless; the choice is dropped with the (absent) tools.
+    let tool_config = match req.extra.get("tool_choice") {
+        Some(choice) => gemini_tool_config(choice)?,
+        None => None,
+    }
+    .filter(|_| tools.is_some());
+    let (response_mime_type, response_json_schema, response_schema) =
+        match gemini_json_output(req, upstream_model)? {
+            GeminiJsonOutput::None => (None, None, None),
+            GeminiJsonOutput::MimeOnly => (Some(GEMINI_JSON_MIME_TYPE), None, None),
+            GeminiJsonOutput::JsonSchema(schema) => {
+                (Some(GEMINI_JSON_MIME_TYPE), Some(schema), None)
+            }
+            GeminiJsonOutput::OpenApiSchema(schema) => {
+                (Some(GEMINI_JSON_MIME_TYPE), None, Some(schema))
+            }
         };
-    GeminiGenerateContentRequest {
+    let extra = |key: &str| req.extra.get(key).filter(|v| !v.is_null()).cloned();
+    let config = GeminiGenerationConfig {
+        temperature: req.temperature,
+        top_p: req.top_p,
+        top_k: req.top_k,
+        max_output_tokens: extra("max_completion_tokens")
+            .or_else(|| req.max_tokens.map(Into::into)),
+        stop_sequences: gemini_stop_sequences(req)?,
+        seed: extra("seed"),
+        presence_penalty: extra("presence_penalty"),
+        frequency_penalty: extra("frequency_penalty"),
+        candidate_count: extra("n"),
+        response_logprobs: extra("logprobs"),
+        logprobs: extra("top_logprobs"),
+        thinking_config: gemini_thinking_config(req, upstream_model)?,
+        response_modalities: extra("modalities").map(gemini_response_modalities),
+        response_mime_type,
+        response_json_schema,
+        response_schema,
+    };
+    let generation_config = (config != GeminiGenerationConfig::default()).then_some(config);
+    Ok(GeminiGenerateContentRequest {
         contents,
         system_instruction,
+        tools,
+        tool_config,
         generation_config,
+    })
+}
+
+fn gemini_response_modalities(modalities: serde_json::Value) -> serde_json::Value {
+    match modalities {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .map(|item| match item {
+                serde_json::Value::String(s) => s.to_ascii_uppercase().into(),
+                other => other,
+            })
+            .collect(),
+        other => other,
     }
 }
 
@@ -2101,13 +3011,94 @@ struct GeminiGenerateContentResponse {
     candidates: Vec<GeminiCandidate>,
     #[serde(default, rename = "usageMetadata")]
     usage_metadata: Option<GeminiUsageMetadata>,
+    /// Set, with no candidates, when the prompt itself was blocked.
+    #[serde(default, rename = "promptFeedback")]
+    prompt_feedback: Option<GeminiPromptFeedback>,
+    #[serde(default, rename = "responseId")]
+    response_id: Option<String>,
+}
+
+impl GeminiGenerateContentResponse {
+    fn prompt_blocked(&self) -> bool {
+        self.prompt_feedback
+            .as_ref()
+            .is_some_and(|f| f.block_reason.is_some())
+    }
+
+    /// The candidates keyed by their `index`, in choice order.
+    fn indexed_candidates(&mut self) -> Vec<(u32, GeminiCandidate)> {
+        // Proto3 JSON omits a zero `index`, so where any candidate names
+        // one, an unnamed candidate is choice 0.
+        let indexed = self.candidates.iter().any(|c| c.index.is_some());
+        let mut candidates: Vec<(u32, GeminiCandidate)> = std::mem::take(&mut self.candidates)
+            .into_iter()
+            .enumerate()
+            .map(|(position, c)| {
+                let fallback = if indexed { 0 } else { position as u32 };
+                (c.index.unwrap_or(fallback), c)
+            })
+            .collect();
+        candidates.sort_by_key(|(index, _)| *index);
+        candidates
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiPromptFeedback {
+    #[serde(default, rename = "blockReason")]
+    block_reason: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct GeminiCandidate {
+    #[serde(default)]
+    index: Option<u32>,
     content: Option<GeminiResponseContent>,
     #[serde(default, rename = "finishReason")]
     finish_reason: Option<String>,
+    #[serde(default, rename = "logprobsResult")]
+    logprobs_result: Option<serde_json::Value>,
+}
+
+/// Gemini's `logprobsResult` in OpenAI's `logprobs` shape: one `content`
+/// entry per chosen token, carrying that position's top candidates.
+fn gemini_logprobs(result: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    fn entry(candidate: &serde_json::Value) -> serde_json::Value {
+        let token = candidate
+            .get("token")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        serde_json::json!({
+            "token": token,
+            // Proto3 JSON omits a zero float: a certain token has no
+            // `logProbability`.
+            "logprob": candidate.get("logProbability").cloned().unwrap_or(0.0.into()),
+            "bytes": token.as_bytes(),
+        })
+    }
+    let result = result?;
+    let chosen = result.get("chosenCandidates")?.as_array()?;
+    let top = result
+        .get("topCandidates")
+        .and_then(serde_json::Value::as_array);
+    let content: Vec<serde_json::Value> = chosen
+        .iter()
+        .enumerate()
+        .map(|(i, candidate)| {
+            let mut out = entry(candidate);
+            let top_logprobs: Vec<serde_json::Value> = top
+                .and_then(|top| top.get(i))
+                .and_then(|t| t.get("candidates"))
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(entry)
+                .collect();
+            out["top_logprobs"] = top_logprobs.into();
+            out
+        })
+        .collect();
+    Some(serde_json::json!({ "content": content }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2121,85 +3112,297 @@ struct GeminiResponseContent {
 struct GeminiResponsePart {
     #[serde(default)]
     text: Option<String>,
+    #[serde(default, rename = "functionCall")]
+    function_call: Option<GeminiFunctionCall>,
+    #[serde(default, rename = "inlineData")]
+    inline_data: Option<GeminiInlineData>,
+    #[serde(default, rename = "thoughtSignature")]
+    thought_signature: Option<String>,
+    #[serde(default)]
+    thought: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiInlineData {
+    #[serde(default, rename = "mimeType")]
+    mime_type: String,
+    #[serde(default)]
+    data: String,
+}
+
+#[derive(Debug, Default)]
+struct GeminiMessageParts {
+    text: String,
+    reasoning: String,
+    tool_calls: Vec<serde_json::Value>,
+    images: Vec<GeminiInlineData>,
+}
+
+/// A candidate's parts → the turn's text, its reasoning (`thought: true`
+/// text parts, as sent), its OpenAI-shape `tool_calls` (no `index`) and its
+/// generated images (interim `thought: true` ones included), each in part
+/// order.
+fn gemini_parts_into_message(content: GeminiResponseContent) -> GeminiMessageParts {
+    let mut out = GeminiMessageParts::default();
+    for part in content.parts {
+        if let Some(t) = part.text {
+            if part.thought {
+                out.reasoning.push_str(&t);
+            } else {
+                out.text.push_str(&t);
+            }
+        }
+        if let Some(call) = part.function_call {
+            out.tool_calls.push(tool_call_from_function_call(
+                &call,
+                part.thought_signature.as_deref(),
+            ));
+        }
+        if let Some(inline) = part.inline_data {
+            if inline.mime_type.starts_with("image/") {
+                out.images.push(inline);
+            }
+        }
+    }
+    out
+}
+
+/// Generated images as the `images` field of an OpenAI-shape message or
+/// delta, numbered from `first` — their position within the response.
+fn openai_images(images: Vec<GeminiInlineData>, first: usize) -> serde_json::Value {
+    images
+        .into_iter()
+        .zip(first..)
+        .map(|(image, index)| {
+            serde_json::json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{};base64,{}", image.mime_type, image.data),
+                    "detail": "auto",
+                },
+                "index": index,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct GeminiUsageMetadata {
     #[serde(default, rename = "promptTokenCount")]
     prompt_token_count: u32,
-    /// Cached portion of the prompt. INSIDE `promptTokenCount` — the API
-    /// reference states the prompt count is "still the total effective prompt
-    /// size" when cached content is set. Subset semantics, so it maps to
-    /// `cached_prompt_tokens`, which pricing subtracts before charging the
-    /// fresh rate.
-    #[serde(default, rename = "cachedContentTokenCount")]
-    cached_content_token_count: u32,
     #[serde(default, rename = "candidatesTokenCount")]
     candidates_token_count: u32,
-    /// Thinking tokens. OUTSIDE `candidatesTokenCount` — the reference defines
-    /// `totalTokenCount` as prompt + thoughts + candidates. They are generated
-    /// output and billed as output, so they are added to `completion_tokens`
-    /// rather than reported beside them.
-    #[serde(default, rename = "thoughtsTokenCount")]
-    thoughts_token_count: u32,
     #[serde(default, rename = "totalTokenCount")]
     total_token_count: u32,
+    /// Context-cache hits, which Gemini reports as a SUBSET of
+    /// `promptTokenCount` — the OpenAI accounting shape, so it maps onto
+    /// `UsageStats::cached_prompt_tokens` and must not be added to the
+    /// prompt total (AISIX-Cloud#1404).
+    #[serde(default, rename = "cachedContentTokenCount")]
+    cached_content_token_count: u32,
+    /// Thinking tokens. Gemini bills these as output but reports them
+    /// in their own counter, and — depending on model version — either
+    /// inside `candidatesTokenCount` or beside it. OpenAI accounting has
+    /// no third bucket: reasoning is a SUBSET of `completion_tokens`.
+    /// See [`GeminiUsageMetadata::into_usage_stats`].
+    #[serde(default, rename = "thoughtsTokenCount")]
+    thoughts_token_count: u32,
+    /// Tokens fed back to the model from tool results — INPUT that
+    /// `promptTokenCount` does not include. It is also a term in
+    /// Gemini's own `totalTokenCount` identity, which is what decides
+    /// whether `candidatesTokenCount` already contains the thoughts; a
+    /// version of this code that assumed the term away would
+    /// double-count thinking tokens on tool-calling turns.
+    #[serde(default, rename = "toolUsePromptTokenCount")]
+    tool_use_prompt_token_count: u32,
+    /// Per-modality breakdowns, `[{modality, tokenCount}]`.
+    #[serde(default, rename = "promptTokensDetails")]
+    prompt_tokens_details: Option<serde_json::Value>,
+    #[serde(default, rename = "candidatesTokensDetails")]
+    candidates_tokens_details: Option<serde_json::Value>,
+    /// The tier that served the request. Raw, so an unexpected type cannot
+    /// fail the decode.
+    #[serde(default, rename = "serviceTier")]
+    service_tier: Option<serde_json::Value>,
 }
 
-/// Translate Gemini's response into the gateway's [`ChatResponse`].
+impl GeminiUsageMetadata {
+    fn service_tier(&self) -> Option<ServiceTier> {
+        aisix_gateway::chat::gemini_usage_service_tier(
+            self.service_tier
+                .as_ref()
+                .and_then(serde_json::Value::as_str),
+        )
+    }
+
+    fn reports_counts(&self) -> bool {
+        self.prompt_token_count > 0
+            || self.candidates_token_count > 0
+            || self.total_token_count > 0
+            || self.cached_content_token_count > 0
+            || self.thoughts_token_count > 0
+            || self.tool_use_prompt_token_count > 0
+    }
+
+    /// Project Gemini's counters onto [`UsageStats`]' OpenAI accounting
+    /// shape. Shared by the streaming and non-streaming decoders so the
+    /// two cannot report a different completion total for the same call.
+    ///
+    /// `thoughtsTokenCount` is the subtle one. Gemini changed its mind
+    /// about whether `candidatesTokenCount` includes it, so neither
+    /// answer can be hard-coded; `totalTokenCount` settles it, exactly
+    /// as LiteLLM's adapter decides the same question. Left unmapped
+    /// (the pre-fix behaviour) a thinking model reported
+    /// `reasoning_tokens: 0` and a `completion_tokens` short of what
+    /// Google billed, which every client-facing protocol then inherited
+    /// (AISIX-Cloud#1447).
+    fn into_usage_stats(self) -> UsageStats {
+        // Gemini's identity is
+        //   total = prompt + candidates + toolUsePrompt + thoughts
+        // so `candidates` still summing to the total means it has
+        // already absorbed the thoughts, and adding them again would
+        // bill the thinking twice.
+        let prompt_tokens = self
+            .prompt_token_count
+            .saturating_add(self.tool_use_prompt_token_count);
+        //
+        // `thoughts <= candidates` is part of the test, not a safety
+        // clamp: "the candidates already contain the thoughts" cannot be
+        // true of a count smaller than the thoughts it supposedly
+        // contains. A streaming frame mid-thinking hits exactly that —
+        // thoughts accrue while `candidatesTokenCount` is still 0, and a
+        // `totalTokenCount` that has not caught up satisfies the sum. On
+        // the inclusive reading that frame yields
+        // `reasoning_tokens > completion_tokens`, which cp-api rejects
+        // outright, dropping the request from Logs and billing with only
+        // a warning. Reading it as exclusive is also simply correct.
+        let candidates_inclusive = self.total_token_count > 0
+            && prompt_tokens.saturating_add(self.candidates_token_count) == self.total_token_count
+            && self.thoughts_token_count <= self.candidates_token_count;
+        //
+        // The fold is client-facing accounting only. The UsageEvent records
+        // Gemini's own counters — `candidatesTokenCount` as the completion
+        // and `totalTokenCount` as the total — by subtracting
+        // `reasoning_folded_into_completion` back out; cp-api reads the
+        // total identity itself.
+        let reasoning_folded_into_completion = if candidates_inclusive {
+            0
+        } else {
+            self.thoughts_token_count
+        };
+        let completion_tokens = self
+            .candidates_token_count
+            .saturating_add(reasoning_folded_into_completion);
+        UsageStats {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+            cached_prompt_tokens: self.cached_content_token_count,
+            reasoning_tokens: self.thoughts_token_count,
+            upstream_total_tokens: self.total_token_count,
+            reasoning_folded_into_completion,
+            modality: aisix_gateway::ModalityTokens::from_gemini_details(
+                self.prompt_tokens_details.as_ref(),
+                self.candidates_tokens_details.as_ref(),
+            ),
+            ..Default::default()
+        }
+    }
+}
+
+/// Translate Gemini's response into the gateway's [`ChatResponse`]: the
+/// first candidate is the message, every other one a further choice.
 fn gemini_response_into_chat_response(
-    raw: GeminiGenerateContentResponse,
+    mut raw: GeminiGenerateContentResponse,
     upstream_id: &str,
 ) -> ChatResponse {
-    let first = raw.candidates.into_iter().next();
-    let (message, finish) = match first {
-        Some(c) => {
-            let text: String = c
-                .content
-                .map(|ct| {
-                    ct.parts
-                        .into_iter()
-                        .filter_map(|p| p.text)
-                        .collect::<Vec<_>>()
-                        .join("")
-                })
-                .unwrap_or_default();
-            (
-                ChatMessage::assistant(text),
-                map_gemini_finish_reason(c.finish_reason.as_deref()),
-            )
+    let mut choices = raw
+        .indexed_candidates()
+        .into_iter()
+        .map(|(index, c)| gemini_candidate_into_choice(index, c))
+        .peekable();
+    let first = choices.next_if(|c| c.index == 0).unwrap_or_else(|| {
+        // A blocked prompt is answered with feedback and no candidate.
+        let mut message = ChatMessage::assistant("");
+        let finish_reason = if raw.prompt_blocked() {
+            message.content = None;
+            FinishReason::ContentFilter
+        } else {
+            FinishReason::Stop
+        };
+        ChatChoice {
+            index: 0,
+            message,
+            finish_reason,
+            logprobs: None,
         }
-        None => (ChatMessage::assistant(""), FinishReason::Stop),
-    };
+    });
+    let more_choices = choices.collect();
+    let service_tier = raw
+        .usage_metadata
+        .as_ref()
+        .and_then(GeminiUsageMetadata::service_tier);
     let usage = raw
         .usage_metadata
-        .map(|u| UsageStats {
-            prompt_tokens: u.prompt_token_count,
-            cached_prompt_tokens: u.cached_content_token_count,
-            completion_tokens: u
-                .candidates_token_count
-                .saturating_add(u.thoughts_token_count),
-            // Surfaced separately as well as counted: `reasoning_tokens` is
-            // defined as a subset of `completion_tokens`, which is exactly
-            // what thoughts became above, and an operator seeing a thinking
-            // model's bill wants "of which N were thinking".
-            reasoning_tokens: u.thoughts_token_count,
-            total_tokens: if u.total_token_count > 0 {
-                u.total_token_count
-            } else {
-                u.prompt_token_count
-                    .saturating_add(u.candidates_token_count)
-                    .saturating_add(u.thoughts_token_count)
-            },
-            ..Default::default()
-        })
+        .map(GeminiUsageMetadata::into_usage_stats)
         .unwrap_or_default();
     ChatResponse {
-        id: String::new(), // Gemini doesn't return a request id in the body
+        logprobs: first.logprobs,
+        more_choices,
+        id: raw.response_id.unwrap_or_default(),
         model: upstream_id.to_string(),
-        message,
-        finish_reason: finish,
+        message: first.message,
+        finish_reason: first.finish_reason,
         usage,
+        service_tier,
+    }
+}
+
+fn gemini_candidate_into_choice(index: u32, c: GeminiCandidate) -> ChatChoice {
+    let logprobs = gemini_logprobs(c.logprobs_result.as_ref());
+    let GeminiMessageParts {
+        text,
+        reasoning,
+        tool_calls,
+        images,
+    } = c.content.map(gemini_parts_into_message).unwrap_or_default();
+    let mut message = ChatMessage::assistant(text);
+    if !images.is_empty() {
+        message
+            .extra
+            .insert("images".into(), openai_images(images, 0));
+    }
+    if !reasoning.is_empty() {
+        message
+            .extra
+            .insert("reasoning_content".into(), reasoning.into());
+    }
+    let finish_reason = if tool_calls.is_empty() {
+        map_gemini_finish_reason(c.finish_reason.as_deref())
+    } else {
+        if message.content.as_deref() == Some("") {
+            message.content = None;
+        }
+        message
+            .extra
+            .insert("tool_calls".into(), serde_json::Value::Array(tool_calls));
+        finish_with_tool_calls(c.finish_reason.as_deref())
+    };
+    ChatChoice {
+        index,
+        message,
+        finish_reason,
+        logprobs,
+    }
+}
+
+/// The finish reason of a turn that called tools. Gemini reports `STOP`
+/// for one, which the OpenAI shape spells `tool_calls`; a turn cut short
+/// by the token limit or a block keeps saying so.
+fn finish_with_tool_calls(reason: Option<&str>) -> FinishReason {
+    match reason {
+        None | Some("STOP") => FinishReason::ToolCalls,
+        other => map_gemini_finish_reason(other),
     }
 }
 
@@ -2209,7 +3412,8 @@ fn gemini_response_into_chat_response(
 /// - `STOP` → `FinishReason::Stop`
 /// - `MAX_TOKENS` → `FinishReason::Length`
 /// - `SAFETY` / `RECITATION` / `BLOCKLIST` / `PROHIBITED_CONTENT` /
-///   `SPII` / `IMAGE_SAFETY` / `LANGUAGE` → `FinishReason::ContentFilter`
+///   `SPII` / `IMAGE_SAFETY` / `IMAGE_PROHIBITED_CONTENT` / `IMAGE_RECITATION`
+///   / `IMAGE_OTHER` / `NO_IMAGE` / `LANGUAGE` → `FinishReason::ContentFilter`
 /// - `MALFORMED_FUNCTION_CALL` / `UNEXPECTED_TOOL_CALL` / `OTHER` /
 ///   `FINISH_REASON_UNSPECIFIED` / unknown → `FinishReason::Stop`
 ///
@@ -2227,6 +3431,10 @@ fn map_gemini_finish_reason(reason: Option<&str>) -> FinishReason {
         | Some("PROHIBITED_CONTENT")
         | Some("SPII")
         | Some("IMAGE_SAFETY")
+        | Some("IMAGE_PROHIBITED_CONTENT")
+        | Some("IMAGE_RECITATION")
+        | Some("IMAGE_OTHER")
+        | Some("NO_IMAGE")
         | Some("LANGUAGE") => FinishReason::ContentFilter,
         _ => FinishReason::Stop,
     }
@@ -2235,6 +3443,15 @@ fn map_gemini_finish_reason(reason: Option<&str>) -> FinishReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl GeminiPart {
+        fn as_text(&self) -> &str {
+            match self {
+                GeminiPart::Text { text } => text,
+                GeminiPart::Raw(v) => panic!("not a text part: {v}"),
+            }
+        }
+    }
 
     // ─── Publisher resolution (preserved from skeleton) ──────────────
 
@@ -2400,6 +3617,36 @@ mod tests {
     }
 
     #[test]
+    fn non_regional_locations_resolve_to_their_own_host() {
+        let bridge = VertexBridge::new();
+        assert_eq!(
+            bridge.resolve_api_base("global", None).unwrap(),
+            "https://aiplatform.googleapis.com",
+        );
+        assert_eq!(
+            bridge.resolve_api_base("us", None).unwrap(),
+            "https://aiplatform.us.rep.googleapis.com",
+        );
+        assert_eq!(
+            bridge.resolve_api_base("eu", None).unwrap(),
+            "https://aiplatform.eu.rep.googleapis.com",
+        );
+        let creds =
+            VertexSecret::parse(r#"{"access_token":"t","project":"my-proj","region":"global"}"#)
+                .unwrap();
+        assert_eq!(
+            bridge.openai_shim_url(&creds, None).unwrap(),
+            "https://aiplatform.googleapis.com/v1/projects/my-proj/locations/global/endpoints/openapi/chat/completions",
+        );
+        assert_eq!(
+            bridge
+                .partner_rawpredict_url(&creds, None, "publishers/mistralai", "mistral-medium-3", "rawPredict")
+                .unwrap(),
+            "https://aiplatform.googleapis.com/v1/projects/my-proj/locations/global/publishers/mistralai/models/mistral-medium-3:rawPredict",
+        );
+    }
+
+    #[test]
     fn resolve_api_base_cfg_test_override_takes_precedence_over_ctx() {
         // The test-only `with_api_base_override` seam shadows
         // `ctx_api_base` so existing tests that pin against a
@@ -2415,9 +3662,9 @@ mod tests {
     //
     // The operator-supplied api_base is interpolated directly into
     // `format!("{base}/v1/projects/...")`. The bridge rejects classes
-    // of input that would either escalate (userinfo `@`) or silently
-    // corrupt the URL stitching (`?` / `#`). Mirrors the Azure-OpenAI
-    // sibling fix (#391) which rejects the same shapes.
+    // of input that would silently corrupt the URL stitching (`?` / `#`).
+    // Mirrors the Azure-OpenAI sibling fix (#391) which rejects the same
+    // shapes.
 
     #[test]
     fn resolve_api_base_rejects_non_http_scheme() {
@@ -2450,38 +3697,95 @@ mod tests {
     }
 
     #[test]
-    fn resolve_api_base_rejects_embedded_userinfo() {
+    fn resolve_api_base_passes_userinfo_through_verbatim() {
         let bridge = VertexBridge::new();
-        // userinfo (`user:pass@host`) is rejected because:
-        //   1. it would leak credentials via access-log URLs;
-        //   2. the bridge writes its own Authorization header from
-        //      the SA-minted Bearer; userinfo would either shadow it
-        //      or get sent to a non-Google host.
-        let err = bridge
+        let resolved = bridge
             .resolve_api_base("us-central1", Some("https://user:secret@proxy.internal"))
-            .err()
             .unwrap();
-        match err {
-            BridgeError::InvalidUpstreamConfig(msg) => {
-                assert!(msg.contains("userinfo") || msg.contains("@"));
-                // Defense-in-depth: the error message MUST NOT echo
-                // the original userinfo back into log output (re-audit
-                // LOW-1). The redactor replaces `user:secret` with `***` so
-                // an operator-supplied credential doesn't propagate into
-                // operational telemetry. (Marker was `<redacted>` while this
-                // bridge carried its own copy; it uses the shared
-                // `aisix_gateway::redact_userinfo` now, so the whole
-                // workspace redacts identically.)
-                assert!(
-                    !msg.contains("user:secret"),
-                    "error message leaked operator-supplied userinfo: {msg}"
-                );
-                assert!(
-                    msg.contains("***@"),
-                    "error message should redact userinfo: {msg}"
-                );
-            }
-            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
+        assert!(
+            resolved.starts_with("https://user:secret@proxy.internal"),
+            "{resolved}"
+        );
+    }
+
+    /// 项目所有者的决定：`api_base` 里的 userinfo 照配置使用，但密码不能出现在
+    /// 任何展示出来的地方。接受这件事由上面上游的测试钉住，这里钉隐藏：仍被拒绝
+    /// 的写法不回显它。
+    #[test]
+    fn a_refused_userinfo_api_base_never_shows_the_password() {
+        let bridge = VertexBridge::new();
+        for base in [
+            "https://user:secret@proxy.internal/evil",
+            "https://user:secret@proxy.internal\\evil",
+            "https://user:secret@proxy.internal?x=1",
+            "https://user:secret@proxy.internal#frag",
+            "ftp://user:secret@proxy.internal",
+            "user:secret@proxy.internal",
+        ] {
+            let err = bridge
+                .resolve_api_base("us-central1", Some(base))
+                .err()
+                .unwrap_or_else(|| panic!("{base} stays refused"));
+            let BridgeError::InvalidUpstreamConfig(msg) = err else {
+                panic!("expected InvalidUpstreamConfig for {base}, got {err:?}");
+            };
+            assert!(
+                !msg.contains("secret"),
+                "error message leaked operator-supplied userinfo: {msg}"
+            );
+        }
+    }
+
+    /// A request on a userinfo base goes out, and when the upstream cannot be
+    /// reached the error — which reaches the usage event and the logs — does
+    /// not name the password.
+    #[tokio::test]
+    async fn a_userinfo_api_base_reaches_the_upstream_and_failures_hide_the_password() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(CapturingResponder::default())
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bridge = VertexBridge::new();
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        let base = server.uri().replace("http://", "http://user:secret-9f2b@");
+        let ctx = BridgeContext::new(
+            "req",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_secret_and_api_base(valid_secret_json(), &base),
+        );
+        bridge
+            .chat(&req, &ctx)
+            .await
+            .expect("the request reaches the upstream");
+        // reqwest turns the userinfo into a Basic header, and the bridge's own
+        // header map then replaces it: the upstream sees the bearer token, once.
+        let received = server.received_requests().await.unwrap_or_default();
+        let authorization: Vec<_> = received[0]
+            .headers
+            .get_all("authorization")
+            .iter()
+            .collect();
+        assert_eq!(authorization, ["Bearer ya29.test"]);
+        drop(server);
+
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let base = format!("http://user:secret-9f2b@127.0.0.1:{closed}");
+        let ctx = BridgeContext::new(
+            "req",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_secret_and_api_base(valid_secret_json(), &base),
+        );
+        let err = bridge
+            .chat(&req, &ctx)
+            .await
+            .expect_err("nothing listens there");
+        for rendered in [err.to_string(), format!("{err:?}")] {
+            assert!(!rendered.contains("secret-9f2b"), "{rendered}");
         }
     }
 
@@ -2503,7 +3807,7 @@ mod tests {
         for base in [
             // No scheme — the branch the old helper did not cover.
             "user:sk-live-9f2b1e@vertex.example/v1",
-            // With a scheme, caught by the userinfo branch.
+            // With a scheme, caught by the no-path branch.
             "https://user:sk-live-9f2b1e@vertex.example/v1",
         ] {
             let err = bridge
@@ -2682,6 +3986,34 @@ mod tests {
                 assert!(msg.contains("api_key is empty"));
             }
             other => panic!("expected InvalidUpstreamCredentials, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vertex_secret_names_a_mistyped_field() {
+        let cases = [
+            (
+                r#"{"project":"p","region":"r","service_account_json":"{\"type\":\"service_account\"}"}"#,
+                "service_account_json must be a JSON object",
+            ),
+            (
+                r#"{"project":7,"region":"r","access_token":"t"}"#,
+                "project must be a string",
+            ),
+            (r#"{"project":"p","access_token":"t"}"#, "region is missing"),
+            (
+                r#"{"project":"p","region":"r","service_account_json":{"type":"service_account"}}"#,
+                "service_account_json must be a service-account key object",
+            ),
+        ];
+        for (secret, want) in cases {
+            match VertexSecret::parse(secret).unwrap_err() {
+                BridgeError::InvalidUpstreamCredentials(msg) => {
+                    assert!(msg.contains(want), "{secret}: {msg}");
+                    assert!(!msg.contains("must be valid JSON"), "{secret}: {msg}");
+                }
+                other => panic!("expected InvalidUpstreamCredentials, got {other:?}"),
+            }
         }
     }
 
@@ -2887,7 +4219,7 @@ mod tests {
             serde_json::json!({"type": "text", "text": "this?"}),
         ]);
         let req = ChatFormat::new("my-gemini", vec![msg]);
-        let body = build_gemini_request(&req);
+        let body = build_gemini_request(&req, "gemini-2.0-flash").unwrap();
         let wire = serde_json::to_value(&body).unwrap();
         let parts = wire["contents"][0]["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 3);
@@ -2904,12 +4236,11 @@ mod tests {
         );
     }
 
-    /// Gemini addresses media by Google-managed URI, not by arbitrary web
-    /// URL, so an `https://` image has nowhere to go — and the gateway will
-    /// not fetch it on the caller's behalf. The turn keeps its text rather
-    /// than failing.
+    /// An `https://` image reaches Gemini as a `fileData` part beside the
+    /// turn's text, never left out: a dropped image is a question the model
+    /// answers blind.
     #[test]
-    fn a_remote_image_url_cannot_be_addressed_and_leaves_the_text_intact() {
+    fn a_remote_image_url_reaches_gemini_beside_the_text() {
         let mut msg = ChatMessage::user("describe");
         msg.content_blocks = Some(vec![
             serde_json::json!({"type": "text", "text": "describe"}),
@@ -2917,10 +4248,15 @@ mod tests {
                                "image_url": {"url": "https://x.example/cat.png"}}),
         ]);
         let req = ChatFormat::new("my-gemini", vec![msg]);
-        let wire = serde_json::to_value(build_gemini_request(&req)).unwrap();
+        let wire =
+            serde_json::to_value(build_gemini_request(&req, "gemini-2.0-flash").unwrap()).unwrap();
         let parts = wire["contents"][0]["parts"].as_array().unwrap();
-        assert_eq!(parts.len(), 1);
+        assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["text"], "describe");
+        assert_eq!(
+            parts[1]["fileData"],
+            serde_json::json!({"mimeType": "image/png", "fileUri": "https://x.example/cat.png"})
+        );
     }
 
     /// A message with no typed blocks keeps the historical single-text-part
@@ -2928,28 +4264,21 @@ mod tests {
     #[test]
     fn a_plain_message_still_serializes_as_one_text_part() {
         let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
-        let wire = serde_json::to_value(build_gemini_request(&req)).unwrap();
+        let wire =
+            serde_json::to_value(build_gemini_request(&req, "gemini-2.0-flash").unwrap()).unwrap();
         assert_eq!(
             wire["contents"][0]["parts"],
             serde_json::json!([{"text": "hi"}])
         );
     }
 
-    /// Text of a part, for assertions that predate multimodal parts.
-    fn part_text(part: &GeminiPart) -> &str {
-        match part {
-            GeminiPart::Text { text } => text,
-            GeminiPart::InlineData { .. } => panic!("expected a text part, got inline data"),
-        }
-    }
-
     #[test]
     fn build_gemini_request_translates_user_turn() {
         let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
-        let body = build_gemini_request(&req);
+        let body = build_gemini_request(&req, "gemini-2.0-flash").unwrap();
         assert_eq!(body.contents.len(), 1);
         assert_eq!(body.contents[0].role, "user");
-        assert_eq!(part_text(&body.contents[0].parts[0]), "hi");
+        assert_eq!(body.contents[0].parts[0].as_text(), "hi");
         assert!(body.system_instruction.is_none());
         assert!(body.generation_config.is_none());
     }
@@ -2963,11 +4292,66 @@ mod tests {
                 ChatMessage::assistant("hello back"),
             ],
         );
-        let body = build_gemini_request(&req);
+        let body = build_gemini_request(&req, "gemini-2.0-flash").unwrap();
         assert_eq!(body.contents.len(), 2);
         assert_eq!(body.contents[0].role, "user");
         // Gemini uses `model`, NOT `assistant`.
         assert_eq!(body.contents[1].role, "model");
+    }
+
+    /// A replayed turn that holds only `reasoning_content` is skipped
+    /// rather than sent as an empty `model` turn.
+    #[test]
+    fn build_gemini_request_skips_a_reasoning_only_assistant_turn() {
+        let reasoning_only: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant", "content": null, "reasoning_content": "thinking",
+        }))
+        .unwrap();
+        let req = ChatFormat::new(
+            "my-gemini",
+            vec![
+                ChatMessage::user("q1"),
+                reasoning_only,
+                ChatMessage::user("q2"),
+                ChatMessage::assistant("a"),
+            ],
+        );
+        let body = build_gemini_request(&req, "gemini-2.0-flash").unwrap();
+        let roles: Vec<&str> = body.contents.iter().map(|c| c.role).collect();
+        assert_eq!(roles, ["user", "user", "model"]);
+        assert!(body
+            .contents
+            .iter()
+            .all(|c| !c.parts[0].as_text().is_empty()));
+    }
+
+    /// The same skip for a turn whose only payload is reasoning content
+    /// parts (Mistral `thinking`, Databricks `reasoning`).
+    #[test]
+    fn build_gemini_request_skips_a_reasoning_parts_only_assistant_turn() {
+        for parts in [
+            serde_json::json!([{"type": "thinking", "thinking": [{"type": "text", "text": "t"}]}]),
+            serde_json::json!([{"type": "thinking", "thinking": "t", "signature": "s"}]),
+            serde_json::json!([{"type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "t", "signature": "s"}]}]),
+        ] {
+            let reasoning_only: ChatMessage = serde_json::from_value(serde_json::json!({
+                "role": "assistant", "content": parts,
+            }))
+            .unwrap();
+            let req = ChatFormat::new(
+                "my-gemini",
+                vec![
+                    ChatMessage::user("q1"),
+                    reasoning_only,
+                    ChatMessage::user("q2"),
+                    ChatMessage::assistant("a"),
+                ],
+            );
+            let body = build_gemini_request(&req, "gemini-2.0-flash").unwrap();
+            let roles: Vec<&str> = body.contents.iter().map(|c| c.role).collect();
+            assert_eq!(roles, ["user", "user", "model"], "{parts}");
+        }
     }
 
     #[test]
@@ -2979,13 +4363,28 @@ mod tests {
                 ChatMessage::user("hi"),
             ],
         );
-        let body = build_gemini_request(&req);
+        let body = build_gemini_request(&req, "gemini-2.0-flash").unwrap();
         // System NOT in contents[].
         assert_eq!(body.contents.len(), 1);
         assert_eq!(body.contents[0].role, "user");
         // System lifted to systemInstruction.
         let sys = body.system_instruction.as_ref().unwrap();
-        assert_eq!(part_text(&sys.parts[0]), "you are helpful");
+        assert_eq!(sys.parts[0].as_text(), "you are helpful");
+    }
+
+    #[test]
+    fn build_gemini_request_lifts_developer_to_system_instruction() {
+        let req = ChatFormat::new(
+            "my-gemini",
+            vec![
+                ChatMessage::developer("follow application instructions"),
+                ChatMessage::user("hi"),
+            ],
+        );
+        let body = build_gemini_request(&req, "gemini-2.0-flash").unwrap();
+        assert_eq!(body.contents.len(), 1);
+        let sys = body.system_instruction.as_ref().unwrap();
+        assert_eq!(sys.parts[0].as_text(), "follow application instructions");
     }
 
     #[test]
@@ -2998,9 +4397,9 @@ mod tests {
                 ChatMessage::user("hi"),
             ],
         );
-        let body = build_gemini_request(&req);
+        let body = build_gemini_request(&req, "gemini-2.0-flash").unwrap();
         let sys = body.system_instruction.as_ref().unwrap();
-        assert_eq!(part_text(&sys.parts[0]), "rule 1\n\nrule 2");
+        assert_eq!(sys.parts[0].as_text(), "rule 1\n\nrule 2");
     }
 
     #[test]
@@ -3009,11 +4408,557 @@ mod tests {
         req.temperature = Some(0.7);
         req.top_p = Some(0.9);
         req.max_tokens = Some(100);
-        let body = build_gemini_request(&req);
+        let body = build_gemini_request(&req, "gemini-2.0-flash").unwrap();
         let gc = body.generation_config.as_ref().unwrap();
         assert_eq!(gc.temperature, Some(0.7));
         assert_eq!(gc.top_p, Some(0.9));
-        assert_eq!(gc.max_output_tokens, Some(100));
+        assert_eq!(gc.max_output_tokens, Some(100.into()));
+    }
+
+    fn gemini_body(extra: serde_json::Value, model: &str) -> serde_json::Value {
+        let mut req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        req.extra = extra.as_object().unwrap().clone();
+        serde_json::to_value(build_gemini_request(&req, model).unwrap()).unwrap()
+    }
+
+    fn gemini_refusal(extra: serde_json::Value) -> String {
+        let mut req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        req.extra = extra.as_object().unwrap().clone();
+        match build_gemini_request(&req, "gemini-2.5-flash") {
+            Err(BridgeError::InvalidRequest(m)) => m,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn openai_sampling_fields_reach_their_generation_config_slots() {
+        let body = gemini_body(
+            serde_json::json!({
+                "max_tokens": 10, "max_completion_tokens": 20, "stop": "END", "seed": 7,
+                "presence_penalty": 0.5, "frequency_penalty": -0.25, "n": 2,
+                "logprobs": true, "top_logprobs": 3, "top_k": 9,
+            }),
+            "gemini-2.5-flash",
+        );
+        assert_eq!(
+            body["generationConfig"],
+            serde_json::json!({
+                "maxOutputTokens": 20, "stopSequences": ["END"], "seed": 7,
+                "presencePenalty": 0.5, "frequencyPenalty": -0.25, "candidateCount": 2,
+                "responseLogprobs": true, "logprobs": 3,
+            })
+        );
+        assert_eq!(
+            gemini_body(serde_json::json!({"stop": ["a", "b"]}), "gemini-2.5-flash")
+                ["generationConfig"]["stopSequences"],
+            serde_json::json!(["a", "b"])
+        );
+        // `top_k` reaches Gemini from a `/v1/messages` caller.
+        let mut req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        req.top_k = Some(40);
+        let body =
+            serde_json::to_value(build_gemini_request(&req, "gemini-2.5-flash").unwrap()).unwrap();
+        assert_eq!(body["generationConfig"], serde_json::json!({"topK": 40}));
+    }
+
+    #[test]
+    fn reasoning_effort_becomes_each_generation_s_thinking_setting() {
+        let asking = |effort: &str, model: &str, thoughts_requested: bool| {
+            let mut req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+            req.extra
+                .insert("reasoning_effort".into(), serde_json::json!(effort));
+            req.thoughts_requested = thoughts_requested;
+            serde_json::to_value(build_gemini_request(&req, model).unwrap())
+                .unwrap()
+                .pointer("/generationConfig/thinkingConfig")
+                .cloned()
+        };
+        let thinking = |effort: &str, model: &str| asking(effort, model, true);
+        for (effort, level) in [
+            ("minimal", "MINIMAL"),
+            ("low", "LOW"),
+            ("medium", "MEDIUM"),
+            ("high", "HIGH"),
+        ] {
+            assert_eq!(
+                thinking(effort, "gemini-3-flash-preview"),
+                Some(serde_json::json!({"thinkingLevel": level, "includeThoughts": true}))
+            );
+        }
+        assert_eq!(thinking("none", "gemini-3-pro-preview"), None);
+        // A tier with no setting still asked for thinking.
+        assert_eq!(
+            thinking("max", "gemini-3-pro-preview"),
+            Some(serde_json::json!({"includeThoughts": true}))
+        );
+        assert_eq!(
+            thinking("max", "gemini-2.5-flash"),
+            Some(serde_json::json!({"includeThoughts": true}))
+        );
+        for (effort, budget) in [
+            ("minimal", 1024),
+            ("low", 1024),
+            ("medium", 8192),
+            ("high", 24576),
+        ] {
+            assert_eq!(
+                thinking(effort, "gemini-2.5-pro"),
+                Some(serde_json::json!({"thinkingBudget": budget, "includeThoughts": true}))
+            );
+        }
+        assert_eq!(
+            thinking("none", "gemini-2.5-flash"),
+            Some(serde_json::json!({"thinkingBudget": 0}))
+        );
+        assert_eq!(
+            thinking("none", "gemini-2.5-flash-lite"),
+            Some(serde_json::json!({"thinkingBudget": 0}))
+        );
+        // 2.5 Pro cannot turn thinking off.
+        assert_eq!(thinking("none", "gemini-2.5-pro"), None);
+        assert_eq!(thinking("high", "gemini-2.0-flash"), None);
+        // An effort the caller did not send sets the depth and asks for nothing.
+        assert_eq!(
+            asking("high", "gemini-3-flash-preview", false),
+            Some(serde_json::json!({"thinkingLevel": "HIGH"}))
+        );
+        assert_eq!(
+            asking("high", "gemini-2.5-flash", false),
+            Some(serde_json::json!({"thinkingBudget": 24576}))
+        );
+        // A caller that sent nothing gets no thinking setting at all.
+        for model in ["gemini-2.5-flash", "gemini-3-flash-preview"] {
+            assert_eq!(
+                gemini_body(serde_json::json!({}), model)
+                    .pointer("/generationConfig/thinkingConfig"),
+                None
+            );
+        }
+
+        // A `/v1/messages` caller's exact budget wins over its bucketed tier.
+        let mut req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        req.extra
+            .insert("reasoning_effort".into(), serde_json::json!("medium"));
+        req.thoughts_requested = true;
+        req.thinking_budget_tokens = Some(3000);
+        let body =
+            serde_json::to_value(build_gemini_request(&req, "gemini-2.5-flash").unwrap()).unwrap();
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"],
+            serde_json::json!({"thinkingBudget": 3000, "includeThoughts": true})
+        );
+    }
+
+    #[test]
+    fn values_openai_forbids_are_refused_naming_the_field() {
+        assert_eq!(
+            gemini_refusal(serde_json::json!({"stop": 3})),
+            "stop must be a string or an array of strings"
+        );
+        assert_eq!(
+            gemini_refusal(serde_json::json!({"reasoning_effort": 1})),
+            "reasoning_effort must be a string"
+        );
+        assert_eq!(
+            gemini_refusal(serde_json::json!({"response_format": "json"})),
+            "response_format must be an object"
+        );
+        assert_eq!(
+            gemini_refusal(serde_json::json!({"response_format": {"type": "yaml"}})),
+            "response_format.type must be \"text\", \"json_object\" or \"json_schema\""
+        );
+        assert_eq!(
+            gemini_refusal(serde_json::json!({"tools": {"type": "function"}})),
+            "tools must be an array"
+        );
+        // Refused even with no tools to choose from.
+        assert!(gemini_refusal(serde_json::json!({"tool_choice": false}))
+            .starts_with("tool_choice must be"));
+        let mut req = ChatFormat::new("m", vec![]);
+        req.extra
+            .insert("service_tier".into(), serde_json::json!(1));
+        assert!(matches!(
+            gemini_shared_request_type(&req),
+            Err(BridgeError::InvalidRequest(m)) if m == "service_tier must be a string"
+        ));
+    }
+
+    #[test]
+    fn service_tier_flex_and_priority_pick_the_paygo_header() {
+        let tier = |t: serde_json::Value| {
+            let mut req = ChatFormat::new("m", vec![]);
+            req.extra.insert("service_tier".into(), t);
+            gemini_shared_request_type(&req).unwrap()
+        };
+        assert_eq!(tier(serde_json::json!("flex")), Some("flex"));
+        assert_eq!(tier(serde_json::json!("priority")), Some("priority"));
+        for none in ["auto", "default", "scale"] {
+            assert_eq!(tier(serde_json::json!(none)), None);
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-vertex-ai-llm-shared-request-type",
+            HeaderValue::from_static("priority"),
+        );
+        with_shared_request_type(&mut headers, Some("flex"));
+        assert_eq!(headers["x-vertex-ai-llm-shared-request-type"], "priority");
+    }
+
+    #[test]
+    fn a_blocked_prompt_finishes_as_content_filter() {
+        let raw: GeminiGenerateContentResponse = serde_json::from_value(serde_json::json!({
+            "promptFeedback": {"blockReason": "PROHIBITED_CONTENT"},
+            "usageMetadata": {"promptTokenCount": 8, "totalTokenCount": 8},
+        }))
+        .unwrap();
+        let resp = gemini_response_into_chat_response(raw, "gemini-2.5-flash");
+        assert_eq!(resp.finish_reason, FinishReason::ContentFilter);
+        assert_eq!(resp.message.content, None);
+        assert_eq!(resp.usage.prompt_tokens, 8);
+
+        let raw: GeminiGenerateContentResponse = serde_json::from_value(serde_json::json!({
+            "promptFeedback": {"blockReason": "SAFETY"},
+            "usageMetadata": {"promptTokenCount": 8, "totalTokenCount": 8},
+        }))
+        .unwrap();
+        let chunks =
+            gemini_chunk_into_chat_chunks(raw, "gemini-2.5-flash", &mut Default::default());
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].delta.role, Some(Role::Assistant));
+        assert_eq!(chunks[0].finish_reason, Some(FinishReason::ContentFilter));
+        assert!(chunks[0].usage.is_some());
+    }
+
+    fn logprobs_result(token: &str) -> serde_json::Value {
+        serde_json::json!({
+            "chosenCandidates": [{"token": token, "logProbability": -0.5}],
+            "topCandidates": [{"candidates": [
+                {"token": token, "logProbability": -0.5},
+                {"token": "x", "logProbability": -2.0}
+            ]}]
+        })
+    }
+
+    fn openai_logprobs(token: &str) -> serde_json::Value {
+        serde_json::json!({"content": [{
+            "token": token, "logprob": -0.5, "bytes": token.as_bytes(),
+            "top_logprobs": [
+                {"token": token, "logprob": -0.5, "bytes": token.as_bytes()},
+                {"token": "x", "logprob": -2.0, "bytes": [120]}
+            ]
+        }]})
+    }
+
+    #[test]
+    fn every_candidate_comes_back_as_a_choice_with_its_logprobs() {
+        let raw: GeminiGenerateContentResponse = serde_json::from_value(serde_json::json!({
+            "candidates": [
+                {"index": 1, "content": {"parts": [{"text": "B"}]}, "finishReason": "MAX_TOKENS",
+                 "logprobsResult": logprobs_result("B")},
+                {"content": {"parts": [{"text": "A"}]}, "finishReason": "STOP",
+                 "logprobsResult": logprobs_result("A")}
+            ],
+            "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 2, "totalTokenCount": 5},
+        }))
+        .unwrap();
+        let resp = gemini_response_into_chat_response(raw, "gemini-2.5-flash");
+        assert_eq!(resp.message.content.as_deref(), Some("A"));
+        assert_eq!(resp.finish_reason, FinishReason::Stop);
+        assert_eq!(resp.logprobs, Some(openai_logprobs("A")));
+        assert_eq!(resp.more_choices.len(), 1);
+        assert_eq!(resp.more_choices[0].index, 1);
+        assert_eq!(resp.more_choices[0].message.content.as_deref(), Some("B"));
+        assert_eq!(resp.more_choices[0].finish_reason, FinishReason::Length);
+        assert_eq!(resp.more_choices[0].logprobs, Some(openai_logprobs("B")));
+    }
+
+    #[test]
+    fn a_certain_token_and_a_missing_first_candidate_keep_their_place() {
+        let raw: GeminiGenerateContentResponse = serde_json::from_value(serde_json::json!({
+            "candidates": [{"index": 1, "content": {"parts": [{"text": "B"}]}, "finishReason": "STOP",
+                            "logprobsResult": {"chosenCandidates": [{"token": "B"}]}}],
+        }))
+        .unwrap();
+        let resp = gemini_response_into_chat_response(raw, "gemini-2.5-flash");
+        assert_eq!(resp.message.content.as_deref(), Some(""));
+        assert_eq!(resp.more_choices.len(), 1);
+        assert_eq!(resp.more_choices[0].index, 1);
+        // Proto3 JSON omits a zero `logProbability`.
+        assert_eq!(
+            resp.more_choices[0].logprobs.as_ref().unwrap()["content"][0]["logprob"],
+            0.0
+        );
+    }
+
+    #[test]
+    fn a_stream_keys_every_candidate_by_its_choice() {
+        let mut state = GeminiStreamState::default();
+        let frame = |v: serde_json::Value| serde_json::from_value(v).unwrap();
+        let first = gemini_chunk_into_chat_chunks(
+            frame(serde_json::json!({"candidates": [
+                {"index": 0, "content": {"parts": [{"text": "A"}]}, "logprobsResult": logprobs_result("A")},
+                {"index": 1, "content": {"parts": [{"text": "B"}]}}
+            ]})),
+            "gemini-2.5-flash",
+            &mut state,
+        );
+        let shape: Vec<(u32, Option<Role>, Option<String>)> = first
+            .iter()
+            .map(|c| (c.choice_index, c.delta.role, c.delta.content.clone()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (0, Some(Role::Assistant), None),
+                (0, None, Some("A".into())),
+                (1, Some(Role::Assistant), None),
+                (1, None, Some("B".into())),
+            ]
+        );
+        assert_eq!(first[1].logprobs, Some(openai_logprobs("A")));
+        let last = gemini_chunk_into_chat_chunks(
+            frame(serde_json::json!({
+                "candidates": [
+                    {"index": 0, "finishReason": "STOP"},
+                    {"index": 1, "finishReason": "STOP"}
+                ],
+                "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 2, "totalTokenCount": 5}
+            })),
+            "gemini-2.5-flash",
+            &mut state,
+        );
+        assert_eq!(last.len(), 2);
+        assert_eq!(
+            last.iter().map(|c| c.choice_index).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(last
+            .iter()
+            .all(|c| c.finish_reason == Some(FinishReason::Stop)));
+        assert!(last[0].usage.is_none() && last[1].usage.is_some());
+    }
+
+    // ─── Gemini structured outputs ─────────────────────────────────────
+
+    fn gemini_request_with_response_format(response_format: serde_json::Value) -> ChatFormat {
+        let mut req = ChatFormat::new("my-gemini", vec![ChatMessage::user("who are you")]);
+        req.extra.insert("response_format".into(), response_format);
+        req
+    }
+
+    fn json_schema_format(schema: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {"name": "answer", "schema": schema, "strict": true},
+        })
+    }
+
+    fn person_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "pet": {"type": "object", "properties": {"kind": {"type": "string"}}},
+            },
+            "required": ["name"],
+            "additionalProperties": false,
+        })
+    }
+
+    #[test]
+    fn gemini_generation_gate_reads_the_major_off_the_model_name() {
+        for (name, major) in [
+            ("gemini-2.0-flash", Some(2)),
+            ("gemini-2.5-flash", Some(2)),
+            ("gemini-2.5-pro-preview-05-06", Some(2)),
+            ("gemini-3-pro-preview", Some(3)),
+            ("gemini-3", Some(3)),
+            ("gemini-10-ultra", Some(10)),
+            ("GEMINI-2.5-FLASH", Some(2)),
+            ("models/gemini-2.5-flash", Some(2)),
+            ("gemini-1.5-pro", Some(1)),
+            ("gemini-1.0-pro-002", Some(1)),
+            // Not a `gemini-<digits>` name: no generation to read.
+            ("gemini-exp-1206", None),
+            ("gemini", None),
+            ("text-embedding-005", None),
+            ("claude-sonnet-4-5", None),
+        ] {
+            assert_eq!(gemini_major_version(name), major, "{name}");
+        }
+    }
+
+    #[test]
+    fn gemini_2_and_later_carry_the_schema_in_response_json_schema() {
+        let req = gemini_request_with_response_format(json_schema_format(person_schema()));
+        let body = build_gemini_request(&req, "gemini-2.5-flash").unwrap();
+        let gc = body.generation_config.as_ref().unwrap();
+        assert_eq!(gc.response_mime_type, Some("application/json"));
+        // Standard JSON Schema, forwarded as the caller wrote it.
+        assert_eq!(gc.response_json_schema.as_ref(), Some(&person_schema()));
+        assert!(gc.response_schema.is_none());
+    }
+
+    #[test]
+    fn gemini_1_x_carries_the_schema_in_the_openapi_dialect() {
+        let req = gemini_request_with_response_format(json_schema_format(person_schema()));
+        let body = build_gemini_request(&req, "gemini-1.5-pro").unwrap();
+        let gc = body.generation_config.as_ref().unwrap();
+        assert_eq!(gc.response_mime_type, Some("application/json"));
+        assert!(gc.response_json_schema.is_none());
+        let schema = gc.response_schema.as_ref().unwrap();
+        // Upper-case OpenAPI type names, no `additionalProperties`
+        // (Gemini rejects it), and an explicit member ordering.
+        assert_eq!(schema["type"], "OBJECT");
+        assert_eq!(schema["properties"]["name"]["type"], "STRING");
+        assert_eq!(schema["properties"]["pet"]["type"], "OBJECT");
+        assert_eq!(
+            schema["properties"]["pet"]["properties"]["kind"]["type"],
+            "STRING"
+        );
+        assert!(schema.get("additionalProperties").is_none());
+        assert_eq!(
+            schema["propertyOrdering"],
+            serde_json::json!(["name", "pet"])
+        );
+        assert_eq!(
+            schema["properties"]["pet"]["propertyOrdering"],
+            serde_json::json!(["kind"])
+        );
+        // `required` is the caller's own statement on both dialects.
+        assert_eq!(schema["required"], serde_json::json!(["name"]));
+    }
+
+    #[test]
+    fn gemini_openapi_dialect_reaches_arrays_and_branches() {
+        let req = gemini_request_with_response_format(json_schema_format(serde_json::json!({
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"id": {"type": "integer"}},
+                "additionalProperties": false,
+            },
+            "anyOf": [{"type": "string"}],
+        })));
+        let body = build_gemini_request(&req, "gemini-1.5-flash").unwrap();
+        let schema = body.generation_config.unwrap().response_schema.unwrap();
+        assert_eq!(schema["type"], "ARRAY");
+        assert_eq!(schema["items"]["type"], "OBJECT");
+        assert_eq!(schema["items"]["properties"]["id"]["type"], "INTEGER");
+        assert!(schema["items"].get("additionalProperties").is_none());
+        assert_eq!(schema["anyOf"][0]["type"], "STRING");
+    }
+
+    #[test]
+    fn gemini_property_ordering_matches_the_schema_as_it_goes_on_the_wire() {
+        // `propertyOrdering` is only useful if it names the properties
+        // in the order the request itself presents them; a list that
+        // disagrees with the accompanying `properties` object would fix
+        // an order the schema does not show.
+        let req = gemini_request_with_response_format(json_schema_format(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "zeta": {"type": "string"},
+                "alpha": {"type": "string"},
+                "mid": {"type": "string"},
+            },
+        })));
+        let body =
+            serde_json::to_value(build_gemini_request(&req, "gemini-1.5-pro").unwrap()).unwrap();
+        let schema = &body["generationConfig"]["responseSchema"];
+        let on_the_wire: Vec<&str> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let ordering: Vec<&str> = schema["propertyOrdering"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(ordering, on_the_wire);
+    }
+
+    #[test]
+    fn gemini_openapi_dialect_inlines_definitions_and_uppercases_union_types() {
+        // The dialect is an OpenAPI `Schema` object: it rejects members
+        // by name, so `$defs` cannot ride along and `$ref` has no
+        // spelling. The definitions are inlined and the blocks removed
+        // before the dialect rewrite, so what `$ref` pointed at gets the
+        // same upper-casing as everything else.
+        let req = gemini_request_with_response_format(json_schema_format(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pet": {"$ref": "#/$defs/Pet"},
+                "nickname": {"type": ["string", "null"]},
+            },
+            "$defs": {
+                "Pet": {
+                    "type": "object",
+                    "properties": {"kind": {"type": "string"}},
+                    "additionalProperties": false,
+                },
+            },
+        })));
+        let schema = build_gemini_request(&req, "gemini-1.5-pro")
+            .unwrap()
+            .generation_config
+            .unwrap()
+            .response_schema
+            .unwrap();
+        assert!(schema.get("$defs").is_none(), "{schema}");
+        let pet = &schema["properties"]["pet"];
+        assert!(pet.get("$ref").is_none(), "{schema}");
+        assert_eq!(pet["type"], "OBJECT");
+        assert_eq!(pet["properties"]["kind"]["type"], "STRING");
+        assert!(pet.get("additionalProperties").is_none());
+        assert_eq!(
+            schema["properties"]["nickname"]["type"],
+            serde_json::json!(["STRING", "NULL"])
+        );
+    }
+
+    #[test]
+    fn gemini_json_object_asks_for_json_without_a_schema() {
+        for model in ["gemini-2.5-flash", "gemini-1.5-pro"] {
+            let req =
+                gemini_request_with_response_format(serde_json::json!({"type": "json_object"}));
+            let gc = build_gemini_request(&req, model)
+                .unwrap()
+                .generation_config
+                .unwrap();
+            assert_eq!(gc.response_mime_type, Some("application/json"));
+            assert!(gc.response_json_schema.is_none());
+            assert!(gc.response_schema.is_none());
+        }
+    }
+
+    #[test]
+    fn gemini_response_format_text_emits_no_generation_config_at_all() {
+        let req = gemini_request_with_response_format(serde_json::json!({"type": "text"}));
+        assert!(build_gemini_request(&req, "gemini-2.5-flash")
+            .unwrap()
+            .generation_config
+            .is_none());
+    }
+
+    #[test]
+    fn gemini_response_format_never_reaches_the_wire_verbatim() {
+        // It has no top-level Gemini counterpart; forwarding it 400s.
+        let req = gemini_request_with_response_format(json_schema_format(person_schema()));
+        let body =
+            serde_json::to_value(build_gemini_request(&req, "gemini-2.5-flash").unwrap()).unwrap();
+        assert!(body.get("response_format").is_none());
+        assert_eq!(
+            body["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert_eq!(
+            body["generationConfig"]["responseJsonSchema"],
+            person_schema()
+        );
     }
 
     // ─── Gemini response translation ───────────────────────────────────
@@ -3040,8 +4985,8 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let mut emitted_role = false;
-        let chunks = gemini_chunk_into_chat_chunks(raw, "gemini-2.5-pro", &mut emitted_role);
+        let mut state = GeminiStreamState::default();
+        let chunks = gemini_chunk_into_chat_chunks(raw, "gemini-2.5-pro", &mut state);
 
         let usage = chunks
             .iter()
@@ -3157,6 +5102,53 @@ mod tests {
         assert_eq!(chat.usage.total_tokens, 6);
     }
 
+    /// AISIX-Cloud#1404: Gemini reports context-cache hits in
+    /// `cachedContentTokenCount`, which is a SUBSET of
+    /// `promptTokenCount` — the OpenAI accounting shape. It therefore
+    /// maps onto `cached_prompt_tokens` and must NOT be added to the
+    /// prompt or total counts, which already contain it.
+    #[test]
+    fn gemini_response_maps_cached_content_tokens_as_a_prompt_subset() {
+        let raw: GeminiGenerateContentResponse = serde_json::from_str(
+            r#"{
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "hello"}]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 100,
+                    "candidatesTokenCount": 10,
+                    "totalTokenCount": 110,
+                    "cachedContentTokenCount": 80
+                }
+            }"#,
+        )
+        .unwrap();
+        let chat = gemini_response_into_chat_response(raw, "gemini-1.5-pro");
+        assert_eq!(chat.usage.cached_prompt_tokens, 80);
+        assert_eq!(chat.usage.prompt_tokens, 100);
+        assert_eq!(chat.usage.total_tokens, 110);
+        // The Anthropic-shape counters stay empty: Gemini reports no
+        // cache tokens outside its prompt count.
+        assert_eq!(chat.usage.cache_read_tokens, 0);
+        assert_eq!(chat.usage.cache_creation_tokens, 0);
+    }
+
+    /// An upstream that omits the field reports no cache hit, rather
+    /// than one inferred from the prompt size.
+    #[test]
+    fn gemini_response_without_cached_content_reports_no_cache_hit() {
+        let raw: GeminiGenerateContentResponse = serde_json::from_str(
+            r#"{
+                "candidates": [{"content": {"parts": [{"text": "hi"}]}, "finishReason": "STOP"}],
+                "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 1, "totalTokenCount": 6}
+            }"#,
+        )
+        .unwrap();
+        let chat = gemini_response_into_chat_response(raw, "gemini-1.5-pro");
+        assert_eq!(chat.usage.cached_prompt_tokens, 0);
+    }
+
     #[test]
     fn gemini_response_maps_max_tokens_finish_reason() {
         let raw: GeminiGenerateContentResponse = serde_json::from_str(
@@ -3203,6 +5195,144 @@ mod tests {
         .unwrap();
         let chat = gemini_response_into_chat_response(raw, "gemini-1.5-pro");
         assert_eq!(chat.usage.total_tokens, 0);
+    }
+
+    fn gemini_usage(json: &str) -> UsageStats {
+        serde_json::from_str::<GeminiUsageMetadata>(json)
+            .unwrap()
+            .into_usage_stats()
+    }
+
+    /// A thinking model whose `candidatesTokenCount` EXCLUDES the
+    /// thoughts: `totalTokenCount` is the giveaway (100 + 20 != 150).
+    /// Google bills thoughts as output, and OpenAI accounting has no
+    /// third bucket, so they fold into `completion_tokens` with
+    /// `reasoning_tokens` naming the subset. Left unmapped they vanished
+    /// from every client-facing protocol (AISIX-Cloud#1447).
+    #[test]
+    fn gemini_thoughts_fold_into_completion_when_reported_beside_candidates() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":20,
+                "thoughtsTokenCount":30,"totalTokenCount":150}"#,
+        );
+        assert_eq!(u.prompt_tokens, 100);
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.reasoning_tokens, 30);
+        assert_eq!(u.total_tokens, 150, "matches Gemini's own totalTokenCount");
+        assert_eq!(u.openai_total_tokens(), 150);
+        // The recorded event keeps Gemini's own counters.
+        assert_eq!(u.upstream_total_tokens, 150);
+        assert_eq!(u.reasoning_folded_into_completion, 30);
+        assert_eq!(
+            aisix_gateway::chat::recorded_completion_tokens(
+                u.prompt_tokens,
+                u.completion_tokens,
+                u.reasoning_tokens,
+                u.reasoning_folded_into_completion,
+                u.upstream_total_tokens
+            ),
+            20
+        );
+    }
+
+    /// Without `totalTokenCount` there is nothing to say the candidates
+    /// already hold the thoughts, so the client-facing fold stays as it
+    /// was — and the recorded total stays unreported rather than becoming
+    /// a sum computed here.
+    #[test]
+    fn gemini_missing_total_folds_for_clients_and_records_no_total() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":20,"thoughtsTokenCount":30}"#,
+        );
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.total_tokens, 150);
+        assert_eq!(u.upstream_total_tokens, 0);
+        assert_eq!(u.reasoning_folded_into_completion, 30);
+    }
+
+    /// Other Gemini versions already count thoughts INSIDE
+    /// `candidatesTokenCount` — here 50 covers both, and
+    /// `100 + 50 == 150` says so. Adding them again would bill the
+    /// thinking twice, so the total settles which reading applies.
+    #[test]
+    fn gemini_thoughts_are_not_double_counted_when_already_inclusive() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":50,
+                "thoughtsTokenCount":30,"totalTokenCount":150}"#,
+        );
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.reasoning_tokens, 30);
+        assert_eq!(u.total_tokens, 150);
+        assert_eq!(u.reasoning_folded_into_completion, 0);
+        assert_eq!(u.upstream_total_tokens, 150);
+    }
+
+    /// Tool-result tokens are INPUT that `promptTokenCount` excludes, so
+    /// they join the prompt — and they are a term in the identity that
+    /// decides inclusiveness. Here `100 + 20 + 15 + 30 == 165`, so the
+    /// candidates are exclusive and the thoughts fold in.
+    #[test]
+    fn gemini_tool_use_prompt_tokens_join_the_input() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":20,"toolUsePromptTokenCount":15,
+                "thoughtsTokenCount":30,"totalTokenCount":165}"#,
+        );
+        assert_eq!(u.prompt_tokens, 115);
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.total_tokens, 165, "matches Gemini's own totalTokenCount");
+    }
+
+    /// The same reading with INCLUSIVE candidates: `100 + 50 + 15 == 165`
+    /// leaves nothing for the thoughts, so they are already inside the
+    /// 50. Judging inclusiveness without the tool-use term would read
+    /// this as exclusive and bill the 30 thinking tokens twice — the
+    /// reason that term is mapped at all while this bridge sends no
+    /// tools.
+    #[test]
+    fn gemini_tool_use_tokens_do_not_break_the_inclusive_reading() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":50,"toolUsePromptTokenCount":15,
+                "thoughtsTokenCount":30,"totalTokenCount":165}"#,
+        );
+        assert_eq!(u.prompt_tokens, 115);
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.total_tokens, 165);
+    }
+
+    /// `reasoning_tokens` is a SUBSET of `completion_tokens` in OpenAI
+    /// accounting, and cp-api enforces that by REJECTING an event that
+    /// violates it — the request then leaves no row in Logs and is never
+    /// billed. A thinking frame that has accrued thoughts before any
+    /// visible output is the shape that produces it, so pin that it
+    /// stays consistent.
+    #[test]
+    fn gemini_thinking_frame_never_reports_more_reasoning_than_output() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":0,
+                "thoughtsTokenCount":50,"totalTokenCount":100}"#,
+        );
+        assert!(
+            u.reasoning_tokens <= u.completion_tokens,
+            "reasoning {} > completion {} would be dropped by cp-api",
+            u.reasoning_tokens,
+            u.completion_tokens
+        );
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.reasoning_tokens, 50);
+    }
+
+    /// Context-cache hits stay the OpenAI shape: a SUBSET of the prompt,
+    /// never added on top of it.
+    #[test]
+    fn gemini_cached_content_stays_a_subset_of_the_prompt() {
+        let u = gemini_usage(
+            r#"{"promptTokenCount":100,"candidatesTokenCount":20,
+                "cachedContentTokenCount":70,"totalTokenCount":120}"#,
+        );
+        assert_eq!(u.openai_prompt_tokens(), 100);
+        assert_eq!(u.openai_cached_tokens(), 70);
+        assert_eq!(u.anthropic_input_tokens(), 30);
+        assert_eq!(u.anthropic_cache_read_input_tokens(), 70);
     }
 
     // ─── Pre-dispatch validation ───────────────────────────────────────
@@ -3351,7 +5481,7 @@ mod tests {
 
     // ─── Dispatch end-to-end against wiremock via api_base override ──
 
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{header, method, path, path_regex};
     use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTemplate};
 
     #[derive(Clone, Default)]
@@ -3385,7 +5515,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_gemini_dispatches_to_generate_content_url() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -3436,7 +5566,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_anthropic_dispatches_to_raw_predict_url_with_messages_body() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingAnthropicResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -3497,6 +5627,132 @@ mod tests {
             obj.contains_key("max_tokens"),
             "max_tokens is required by the Anthropic Messages wire: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn vertex_claude_carries_the_schema_in_output_config_on_a_4_5_family() {
+        // Claude on Vertex speaks the Anthropic Messages wire, so a
+        // caller's `response_format` becomes whatever the shared
+        // serializer makes of it — the native control here, since the
+        // Vertex model id IS the Claude name (`@date`, not `-date`).
+        let server = MockServer::builder().start().await;
+        let responder = CapturingAnthropicResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/v1/projects/.+:rawPredict$"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("claude-sonnet-4-5@20250929"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = gemini_request_with_response_format(json_schema_format(person_schema()));
+        let _ = bridge.chat(&req, &ctx).await.unwrap();
+
+        let body = responder.captured_body.lock().unwrap().clone().unwrap();
+        assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(
+            body["output_config"]["format"]["schema"]["additionalProperties"],
+            false
+        );
+        assert!(body.get("response_format").is_none(), "body={body}");
+        assert!(body.get("tools").is_none(), "body={body}");
+    }
+
+    #[tokio::test]
+    async fn a_small_stream_budget_does_not_cut_the_fake_stream_leg() {
+        // On a streaming dispatch the deadline is the streaming budget,
+        // which bounds a chunk gap rather than a whole completion. The
+        // Claude tool route's upstream leg is not streaming, so it runs
+        // under the end-to-end budget carried beside it.
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/v1/projects/.+:rawPredict$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(250))
+                    .set_body_json(serde_json::json!({
+                        "id": "msg_json",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-3-5-sonnet",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "toolu_json",
+                            "name": "json_tool_call",
+                            "input": {"name": "Ada"},
+                        }],
+                        "stop_reason": "tool_use",
+                        "usage": {"input_tokens": 3, "output_tokens": 5},
+                    })),
+            )
+            .mount(&server)
+            .await;
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("claude-3-5-sonnet-v2@20241022"),
+            sample_pk_with_secret(valid_secret_json()),
+        )
+        .with_deadline(std::time::Duration::from_millis(50))
+        .with_non_streaming_deadline(Some(std::time::Duration::from_secs(30)));
+
+        let mut req = gemini_request_with_response_format(json_schema_format(person_schema()));
+        req.stream = Some(true);
+        let stream = bridge
+            .chat_stream(&req, &ctx)
+            .await
+            .expect("the fake-stream leg must not be cut by the chunk-gap budget");
+        let chunks: Vec<ChatChunk> = futures::StreamExt::collect::<Vec<_>>(stream)
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            chunks[1].delta.content.as_deref(),
+            Some(r#"{"name":"Ada"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn vertex_claude_synthetic_tool_reply_comes_back_as_json_content() {
+        // An older Claude family takes the tool route, and the call it
+        // makes is the answer — the client must not be handed a tool
+        // call it never offered.
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/v1/projects/.+:rawPredict$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_json",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-3-5-sonnet",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_json",
+                    "name": "json_tool_call",
+                    "input": {"name": "Ada"},
+                }],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 3, "output_tokens": 5},
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("claude-3-5-sonnet-v2@20241022"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = gemini_request_with_response_format(json_schema_format(person_schema()));
+        let chat = bridge.chat(&req, &ctx).await.unwrap();
+        assert_eq!(chat.message.content.as_deref(), Some(r#"{"name":"Ada"}"#));
+        assert!(!chat.message.extra.contains_key("tool_calls"));
+        assert_eq!(chat.finish_reason, FinishReason::Stop);
     }
 
     /// Capturing responder that returns a native Anthropic SSE stream
@@ -3564,7 +5820,7 @@ mod tests {
     /// and surface a terminal finish_reason.
     #[tokio::test]
     async fn chat_anthropic_stream_dispatches_to_stream_raw_predict_keeping_stream_in_body() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingAnthropicStreamResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -3669,7 +5925,7 @@ mod tests {
     /// stripped — opposite of the Gemini/Anthropic publisher paths).
     #[tokio::test]
     async fn chat_openai_shim_dispatches_to_openapi_endpoint_with_model_in_body() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingOpenAiResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -3688,7 +5944,13 @@ mod tests {
             sample_model_with("meta/llama-3.3-70b-instruct-maas"),
             sample_pk_with_secret(valid_secret_json()),
         );
-        let req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
+        let req = ChatFormat::new(
+            "my-llama",
+            vec![
+                ChatMessage::developer("Follow application instructions"),
+                ChatMessage::user("hi"),
+            ],
+        );
         let chat = bridge.chat(&req, &ctx).await.unwrap();
 
         // Customer-visible response decoded from the OpenAI envelope.
@@ -3710,11 +5972,13 @@ mod tests {
             Some("meta/llama-3.3-70b-instruct-maas"),
             "openapi shim keys off the body `model` field (kept, not stripped): {body}"
         );
-        assert!(
-            obj.get("messages")
-                .and_then(|v| v.as_array())
-                .is_some_and(|m| !m.is_empty()),
-            "messages array must carry the user turn: {body}"
+        assert_eq!(
+            obj.get("messages"),
+            Some(&serde_json::json!([
+                {"role": "system", "content": "Follow application instructions"},
+                {"role": "user", "content": "hi"}
+            ])),
+            "the compatible shim must receive developer instructions as system: {body}"
         );
     }
 
@@ -3776,7 +6040,7 @@ mod tests {
     /// matches the upstream stream and surface a terminal finish_reason.
     #[tokio::test]
     async fn chat_openai_shim_stream_dispatches_to_openapi_endpoint_with_stream_in_body() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingOpenAiStreamResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -3795,7 +6059,13 @@ mod tests {
             sample_model_with("meta/llama-3.3-70b-instruct-maas"),
             sample_pk_with_secret(valid_secret_json()),
         );
-        let req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
+        let req = ChatFormat::new(
+            "my-llama",
+            vec![
+                ChatMessage::developer("Follow application instructions"),
+                ChatMessage::user("hi"),
+            ],
+        );
         let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
 
         let mut content = String::new();
@@ -3835,6 +6105,14 @@ mod tests {
             Some("meta/llama-3.3-70b-instruct-maas"),
             "model id stays in the body (never the URL) on the stream path: {body}"
         );
+        assert_eq!(
+            obj.get("messages"),
+            Some(&serde_json::json!([
+                {"role": "system", "content": "Follow application instructions"},
+                {"role": "user", "content": "hi"}
+            ])),
+            "the streaming compatible shim maps developer instructions to system: {body}"
+        );
     }
 
     /// D5.4 — Mistral on Vertex dispatches through the partner
@@ -3845,7 +6123,7 @@ mod tests {
     /// Bearer, and that the model is ALSO kept in the body.
     #[tokio::test]
     async fn chat_mistral_dispatches_to_rawpredict_with_model_in_url_and_body() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingOpenAiResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -3898,7 +6176,7 @@ mod tests {
     /// segment from Mistral) with the same OpenAI-shape body.
     #[tokio::test]
     async fn chat_ai21_dispatches_to_rawpredict_under_ai21_publisher_segment() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingOpenAiResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -3940,7 +6218,7 @@ mod tests {
     /// only in the publisher URL segment pinned by the non-stream tests).
     #[tokio::test]
     async fn chat_mistral_stream_dispatches_to_streamrawpredict_with_stream_in_body() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingOpenAiStreamResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -4002,7 +6280,7 @@ mod tests {
     /// (not only transitively via the `url_segment()` unit test).
     #[tokio::test]
     async fn chat_ai21_stream_dispatches_to_streamrawpredict_under_ai21_segment() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingOpenAiStreamResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -4074,7 +6352,7 @@ mod tests {
     /// surface the bug.
     #[tokio::test]
     async fn chat_gemini_honors_provider_key_api_base_in_production_path() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -4109,7 +6387,7 @@ mod tests {
     /// land on its own path every time.
     #[tokio::test]
     async fn url_cache_holds_a_row_per_upstream_model() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         for model in ["gemini-1.5-pro", "gemini-2.0-flash"] {
             Mock::given(method("POST"))
                 .and(path(format!(
@@ -4152,8 +6430,8 @@ mod tests {
                 .mount(server)
                 .await;
         }
-        let first = MockServer::start().await;
-        let second = MockServer::start().await;
+        let first = MockServer::builder().start().await;
+        let second = MockServer::builder().start().await;
         mount(&first).await;
         mount(&second).await;
 
@@ -4177,7 +6455,7 @@ mod tests {
     /// still produce a single-slash URL after concatenation.
     #[tokio::test]
     async fn chat_gemini_trims_trailing_slash_on_provider_key_api_base() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -4205,7 +6483,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_gemini_body_uses_gemini_wire_shape() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .respond_with(responder.clone())
@@ -4247,7 +6525,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_gemini_lifts_system_to_top_level_system_instruction() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .respond_with(responder.clone())
@@ -4293,7 +6571,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_gemini_uses_model_role_for_assistant_turns() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .respond_with(responder.clone())
@@ -4339,7 +6617,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_gemini_authorization_header_carries_pre_minted_bearer() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .respond_with(responder.clone())
@@ -4368,10 +6646,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_gemini_maps_4xx_to_canned_message_not_body_echo() {
-        // Audit-aware: Vertex 4xx error envelopes leak operator project
-        // ids. Must redact to canned phrase.
-        let server = MockServer::start().await;
+    async fn chat_gemini_maps_4xx_to_the_upstream_message() {
+        // The caller receives Vertex's own error message.
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
                 "error": {
@@ -4399,24 +6676,13 @@ mod tests {
                 ..
             } => {
                 assert_eq!(status, 403);
-                assert!(
-                    !message.contains("my-proj-prod-123")
-                        && !message.contains("Permission denied on project"),
-                    "upstream body must not leak project id; got message={message:?}"
+                assert_eq!(
+                    message,
+                    "Permission denied on project my-proj-prod-123 for resource gemini-1.5-pro"
                 );
-                // Audit fix (PR #323 MEDIUM-2): pin the wire tag so a
-                // refactor that breaks the cross-wire translation
-                // pipeline fails this test loudly. parsed.message
-                // must stay None for operator-taxonomy redaction.
                 assert_eq!(wire, aisix_gateway::UpstreamWire::Vertex);
-                if let Some(view) = parsed {
-                    assert!(
-                        view.message.is_none(),
-                        "vertex must NOT surface upstream message (project ids leak); \
-                         got {:?}",
-                        view.message
-                    );
-                }
+                // No gRPC `status` in this body, so there is no view.
+                assert!(parsed.is_none());
             }
             other => panic!("expected UpstreamStatus, got {other:?}"),
         }
@@ -4428,7 +6694,7 @@ mod tests {
     /// `capture_upstream_error_http`.
     #[tokio::test]
     async fn chat_gemini_non_json_body_skips_envelope_parse() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(403).set_body_raw(
                 b"<html><body>403 Forbidden</body></html>".as_slice(),
@@ -4463,7 +6729,7 @@ mod tests {
     /// (operator project ids leak otherwise).
     #[tokio::test]
     async fn chat_gemini_429_populates_parsed_kind_from_grpc_status() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
                 "error": {
@@ -4493,13 +6759,10 @@ mod tests {
             } => {
                 assert_eq!(status, 429);
                 assert_eq!(wire, aisix_gateway::UpstreamWire::Vertex);
-                assert!(
-                    !message.contains("my-secret-proj"),
-                    "must not leak project id; got {message:?}"
-                );
+                assert_eq!(message, "Quota exceeded for project my-secret-proj");
                 let parsed = parsed.expect("status field parsed into view");
                 assert_eq!(parsed.kind.as_deref(), Some("RESOURCE_EXHAUSTED"));
-                assert!(parsed.message.is_none());
+                assert_eq!(parsed.message.as_deref(), Some(message.as_str()));
             }
             other => panic!("expected UpstreamStatus, got {other:?}"),
         }
@@ -4510,7 +6773,7 @@ mod tests {
         // A malicious secret that injects `/` into the project field
         // must be rejected before URL stitching — otherwise the
         // attacker could redirect to a different path.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let bridge = VertexBridge::new().with_api_base_override(server.uri());
         let evil_secret =
             r#"{"access_token":"ya29","project":"my-proj/../admin","region":"us-central1"}"#;
@@ -4584,48 +6847,30 @@ mod tests {
         }
     }
 
-    /// Audit LOW-4: system-only messages produce empty `contents[]`
-    /// (system lifted to top-level). Gemini's schema requires
-    /// `contents` to be non-empty; the bridge must fail fast with a
-    /// clear error instead of letting Vertex 400 with a generic
-    /// "upstream returned 400" surface.
-    #[tokio::test]
-    async fn chat_gemini_with_system_only_messages_fails_fast() {
-        let server = MockServer::start().await;
-        // The mock is set up but should NOT be called — the bridge
-        // must reject before dispatch. expect(0) catches a regression
-        // where the request leaks through.
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0)
-            .mount(&server)
-            .await;
-
-        let bridge = VertexBridge::new().with_api_base_override(server.uri());
-        let ctx = BridgeContext::new(
-            "req-1",
-            sample_model_with("gemini-1.5-pro"),
-            sample_pk_with_secret(valid_secret_json()),
-        );
+    /// A system-only request leaves `contents` empty once the system turn
+    /// moves to `systemInstruction`; Gemini rejects that, so one blank user
+    /// turn is sent in its place.
+    #[test]
+    fn system_only_request_sends_one_blank_user_turn() {
         let req = ChatFormat::new(
             "my-gemini",
             vec![ChatMessage::system("only system, no user")],
         );
-        let err = bridge.chat(&req, &ctx).await.unwrap_err();
-        match err {
-            BridgeError::Config(msg) => {
-                assert!(
-                    msg.contains("at least one user") && msg.contains("system-only"),
-                    "must explain system-only is not supported; got {msg}"
-                );
-            }
-            other => panic!("expected Config error, got {other:?}"),
-        }
+        let body =
+            serde_json::to_value(build_gemini_request(&req, "gemini-2.5-flash").unwrap()).unwrap();
+        assert_eq!(
+            body["contents"],
+            serde_json::json!([{"role": "user", "parts": [{"text": " "}]}])
+        );
+        assert_eq!(
+            body["systemInstruction"]["parts"][0]["text"],
+            "only system, no user"
+        );
     }
 
     #[tokio::test]
     async fn chat_gemini_response_with_max_tokens_finish_reason_maps_to_length() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "candidates": [{
@@ -4704,7 +6949,7 @@ mod tests {
         // trips. A regression that dropped `?alt=sse` would land here
         // — Vertex would return chunked JSON array instead of SSE,
         // breaking the decoder.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(
                 "/v1/projects/my-proj/locations/us-central1/publishers/google/models/gemini-1.5-pro:streamGenerateContent",
@@ -4743,7 +6988,7 @@ mod tests {
     /// without the test-only `with_api_base_override` seam.
     #[tokio::test]
     async fn chat_gemini_stream_honors_provider_key_api_base_in_production_path() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(
                 "/v1/projects/my-proj/locations/us-central1/publishers/google/models/gemini-1.5-pro:streamGenerateContent",
@@ -4779,7 +7024,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_gemini_stream_first_chunk_is_role_then_content() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -4840,7 +7085,7 @@ mod tests {
         // Sanity: body has multiple chunks separated by \n\n.
         assert!(body.matches("\n\n").count() >= 3);
 
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -4892,7 +7137,7 @@ mod tests {
             .unwrap()
         );
 
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -4926,7 +7171,7 @@ mod tests {
         // returns Err from chat_stream rather than yielding an Err
         // chunk). This matches the non-stream path and is what
         // DP-side error handling expects.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
                 "error": {
@@ -4960,7 +7205,7 @@ mod tests {
         // decode the `data:` payload as a different shape) should
         // surface as UpstreamDecode, not panic or skip the chunk.
         let body = "data: this is not valid JSON\n\n".to_string();
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -5001,7 +7246,7 @@ mod tests {
         let body = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hel\"}]}}]}\n\n\
 data: {\"error\":{\"code\":503,\"message\":\"The service is currently unavailable.\",\"status\":\"UNAVAILABLE\"}}\n\n"
             .to_string();
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -5052,7 +7297,7 @@ data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_d
 event: error\n\
 data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n"
             .to_string();
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -5089,6 +7334,47 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
         assert!(saw_in_band, "expected typed in-band error");
     }
 
+    /// A last frame the upstream never terminated is still read, as on the
+    /// native Anthropic bridge.
+    #[tokio::test]
+    async fn chat_anthropic_stream_reads_an_unterminated_last_frame() {
+        let body = "event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}"
+            .to_string();
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("claude-3-5-sonnet-v2@20241022"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+        let chunks: Vec<_> = bridge
+            .chat_stream(&req, &ctx)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            chunks.last().and_then(|c| c.finish_reason.clone()),
+            Some(aisix_gateway::FinishReason::Stop)
+        );
+    }
+
     /// The OpenAI-shim rail probes the same envelope shape.
     #[test]
     fn parse_vertex_openai_stream_payload_captures_error_frame() {
@@ -5117,7 +7403,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
         // the request URI included `?alt=sse`. Without that query,
         // Vertex emits a chunked JSON array, not SSE — which would
         // make every downstream stream consumer fail to decode.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let captured: std::sync::Arc<std::sync::Mutex<Option<String>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let captured_for_responder = captured.clone();
@@ -5189,8 +7475,8 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
     async fn chat_gemini_sa_path_mints_token_and_forwards_as_bearer() {
         // Two wiremock servers: one for GCP OAuth token endpoint,
         // one for Vertex AI Gemini chat.
-        let oauth_server = MockServer::start().await;
-        let vertex_server = MockServer::start().await;
+        let oauth_server = MockServer::builder().start().await;
+        let vertex_server = MockServer::builder().start().await;
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -5275,7 +7561,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
 
     #[tokio::test]
     async fn gemini_request_applies_default_body_fields() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -5317,7 +7603,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
 
     #[tokio::test]
     async fn gemini_request_applies_default_headers() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -5358,7 +7644,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
         // names `authorization` must NEVER clobber the minted Vertex OAuth
         // Bearer. A non-reserved companion header still applies, proving the
         // block was processed rather than skipped wholesale.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -5403,7 +7689,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
 
     #[tokio::test]
     async fn openai_shim_request_applies_param_renames() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingOpenAiResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -5445,7 +7731,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
 
     #[tokio::test]
     async fn openai_shim_request_applies_param_constraints() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingOpenAiResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -5487,7 +7773,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
         // `default_body_fields` block can never reintroduce a URL-borne
         // `model` into the `:rawPredict` body — while a genuine extra field
         // still lands.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingAnthropicResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -5551,7 +7837,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
         // Regression guard for the STREAMING body-build path: it serializes
         // the body separately from the non-stream path, so it needs its own
         // proof that the override pipeline reaches the wire.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingOpenAiStreamResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -5598,7 +7884,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
     async fn mistral_request_applies_default_body_fields_and_keeps_model_in_body() {
         // Regression guard for the partner `:rawPredict` URL builder rail,
         // which is a distinct code path from the openapi shim.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingOpenAiResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -5645,7 +7931,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
         // The `content_list_to_string` branch is gated on the *response*
         // override block, so it needs a PK with a `response` section and a
         // multi-block message to observe the array -> string flatten.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingOpenAiResponder::default();
         Mock::given(method("POST"))
             .and(path(
@@ -5694,7 +7980,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
         use wiremock::matchers::{method as wm_method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .and(wm_path(
                 "/v1/projects/my-proj/locations/us-central1/publishers/google/models/text-embedding-005:predict",
@@ -5715,11 +8001,15 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             sample_pk_with_secret(valid_secret_json()),
         );
         let req = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
             model: "customer-facing-name".into(),
             input: vec!["hello".into(), "world".into()],
             input_was_single: false,
             encoding_format: None,
             dimensions: None,
+            input_type: None,
+            embedding_types: None,
         };
         let resp = bridge.embed(&req, &ctx).await.expect("embed dispatch");
         assert_eq!(resp.object, "list");
@@ -5734,6 +8024,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             resp.usage.prompt_tokens, 5,
             "token_count sums across predictions"
         );
+        assert_eq!(resp.usage.source, EmbeddingUsageSource::Reported);
 
         // Upstream body: one instance per input, in order, plus the
         // OAuth bearer from the PK secret.
@@ -5758,11 +8049,52 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
     }
 
     #[tokio::test]
+    async fn embed_marks_missing_usage_unavailable() {
+        use wiremock::matchers::{method as wm_method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::builder().start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/google/models/text-embedding-005:predict",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "predictions": [{"embeddings": {"values": [0.1, 0.2]}}]
+            })))
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("text-embedding-005"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
+            model: "customer-facing-name".into(),
+            input: vec!["hello".into()],
+            input_was_single: true,
+            encoding_format: None,
+            dimensions: None,
+            input_type: None,
+            embedding_types: None,
+        };
+
+        let resp = bridge.embed(&req, &ctx).await.expect("embed dispatch");
+        assert_eq!(resp.data.len(), 1);
+        assert_eq!(resp.usage.prompt_tokens, 0);
+        assert_eq!(resp.usage.total_tokens, 0);
+        assert_eq!(resp.usage.source, EmbeddingUsageSource::Unavailable);
+    }
+
+    #[tokio::test]
     async fn embed_forwards_output_dimensionality() {
         use wiremock::matchers::method as wm_method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(wm_method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "predictions": [
@@ -5779,15 +8111,202 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             sample_pk_with_secret(valid_secret_json()),
         );
         let req = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
             model: "customer-facing-name".into(),
             input: vec!["hello".into()],
             input_was_single: true,
             encoding_format: None,
             dimensions: Some(256),
+            input_type: None,
+            embedding_types: None,
         };
         bridge.embed(&req, &ctx).await.expect("embed dispatch");
         let received = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
         assert_eq!(body["parameters"]["outputDimensionality"], 256);
+    }
+
+    fn tool_round_trip_request() -> ChatFormat {
+        serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather in Paris and Rome?"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_a__thought__SIGA", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}},
+                    {"id": "call_b", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{\"city\":\"Rome\"}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_a__thought__SIGA", "content": "sunny"},
+                {"role": "tool", "tool_call_id": "call_b", "content": "{\"temp\":21}"},
+                {"role": "user", "content": "thanks"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "get_weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}],
+            "tool_choice": "required"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn build_gemini_request_translates_a_tool_round_trip() {
+        let body = serde_json::to_value(
+            build_gemini_request(&tool_round_trip_request(), "gemini-2.5-flash").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["contents"],
+            serde_json::json!([
+                {"role": "user", "parts": [{"text": "weather in Paris and Rome?"}]},
+                {"role": "model", "parts": [
+                    {"functionCall": {"id": "call_a", "name": "get_weather", "args": {"city": "Paris"}},
+                     "thoughtSignature": "SIGA"},
+                    {"functionCall": {"id": "call_b", "name": "get_weather", "args": {"city": "Rome"}}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"id": "call_a", "name": "get_weather", "response": {"content": "sunny"}}},
+                    {"functionResponse": {"id": "call_b", "name": "get_weather", "response": {"temp": 21}}}
+                ]},
+                {"role": "user", "parts": [{"text": "thanks"}]}
+            ])
+        );
+        assert_eq!(
+            body["tools"],
+            serde_json::json!([{"functionDeclarations": [{"name": "get_weather",
+                "parametersJsonSchema": {"type": "object", "properties": {"city": {"type": "string"}}}}]}])
+        );
+        assert_eq!(
+            body["toolConfig"],
+            serde_json::json!({"functionCallingConfig": {"mode": "ANY"}})
+        );
+    }
+
+    #[test]
+    fn gemini_usage_metadata_reports_the_served_tier() {
+        let tier = |t: serde_json::Value| {
+            gemini_response_into_chat_response(
+                function_call_response(serde_json::json!({
+                    "candidates": [{"content": {"role": "model", "parts": [{"text": "hi"}]},
+                                    "finishReason": "STOP"}],
+                    "usageMetadata": {"promptTokenCount": 1, "serviceTier": t}
+                })),
+                "gemini-2.5-flash",
+            )
+            .service_tier
+        };
+        assert_eq!(
+            tier("priority".into()),
+            Some(ServiceTier::Native("priority".into()))
+        );
+        assert_eq!(tier("unspecified".into()), None);
+        assert_eq!(tier("SERVICE_TIER_UNSPECIFIED".into()), None);
+        assert_eq!(tier("".into()), None);
+        assert_eq!(tier(3.into()), None);
+
+        // Streamed: a frame carrying only the tier still sets it, and every
+        // chunk after carries it.
+        let mut state = GeminiStreamState {
+            service_tier: Some(ServiceTier::Native("standard".into())),
+            ..Default::default()
+        };
+        let chunks = gemini_chunk_into_chat_chunks(
+            function_call_response(serde_json::json!({
+                "candidates": [{"content": {"role": "model", "parts": [{"text": "hi"}]}}],
+                "usageMetadata": {"serviceTier": "flex"}
+            })),
+            "gemini-2.5-flash",
+            &mut state,
+        );
+        assert!(!chunks.is_empty());
+        for c in &chunks {
+            assert_eq!(c.service_tier, Some(ServiceTier::Native("flex".into())));
+        }
+    }
+
+    fn function_call_response(json: serde_json::Value) -> GeminiGenerateContentResponse {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn gemini_function_calls_come_back_as_tool_calls() {
+        let resp = gemini_response_into_chat_response(
+            function_call_response(serde_json::json!({
+                "candidates": [{"content": {"role": "model", "parts": [
+                    {"functionCall": {"name": "get_weather", "args": {"city": "Paris"}},
+                     "thoughtSignature": "SIG"},
+                    {"functionCall": {"name": "get_weather", "args": {"city": "Rome"}}}
+                ]}, "finishReason": "STOP"}]
+            })),
+            "gemini-2.5-flash",
+        );
+        assert_eq!(resp.finish_reason, FinishReason::ToolCalls);
+        assert_eq!(resp.message.content, None);
+        let calls = resp.message.extra["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0]["id"].as_str().unwrap().ends_with("__thought__SIG"));
+        assert_ne!(calls[0]["id"], calls[1]["id"]);
+        assert_eq!(calls[1]["function"]["arguments"], "{\"city\":\"Rome\"}");
+    }
+
+    #[test]
+    fn streamed_function_calls_get_their_own_index_and_end_as_tool_calls() {
+        let mut state = GeminiStreamState::default();
+        let mut chunks = gemini_chunk_into_chat_chunks(
+            function_call_response(serde_json::json!({"candidates": [{"content": {"parts": [
+                {"functionCall": {"name": "get_weather", "args": {"city": "Paris"}}}]}}]})),
+            "gemini-2.5-flash",
+            &mut state,
+        );
+        chunks.extend(gemini_chunk_into_chat_chunks(
+            function_call_response(serde_json::json!({"candidates": [{"content": {"parts": [
+                {"functionCall": {"name": "get_weather", "args": {"city": "Rome"}}}]}}]})),
+            "gemini-2.5-flash",
+            &mut state,
+        ));
+        chunks.extend(gemini_chunk_into_chat_chunks(
+            function_call_response(serde_json::json!({"candidates": [{"content": {"parts": [
+                {"text": ""}]}, "finishReason": "STOP"}]})),
+            "gemini-2.5-flash",
+            &mut state,
+        ));
+        assert_eq!(chunks[0].delta.role, Some(Role::Assistant));
+        let indices: Vec<_> = chunks
+            .iter()
+            .flat_map(|c| c.delta.tool_calls.iter().flatten())
+            .map(|tc| tc["index"].clone())
+            .collect();
+        assert_eq!(indices, [serde_json::json!(0), serde_json::json!(1)]);
+        assert_eq!(
+            chunks.last().unwrap().finish_reason,
+            Some(FinishReason::ToolCalls)
+        );
+    }
+
+    #[test]
+    fn a_tool_choice_without_tools_sends_no_tool_config() {
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("hi")]);
+        req.extra
+            .insert("tool_choice".into(), serde_json::json!("required"));
+        let body = build_gemini_request(&req, "gemini-2.5-flash").unwrap();
+        assert!(body.tool_config.is_none() && body.tools.is_none());
+    }
+
+    #[test]
+    fn a_tool_calling_turn_cut_short_keeps_its_reason() {
+        let finish = |reason: &str| {
+            gemini_response_into_chat_response(
+                function_call_response(serde_json::json!({
+                    "candidates": [{"content": {"parts": [
+                        {"functionCall": {"name": "f", "args": {}}}]}, "finishReason": reason}]
+                })),
+                "gemini-2.5-flash",
+            )
+            .finish_reason
+        };
+        assert_eq!(finish("STOP"), FinishReason::ToolCalls);
+        assert_eq!(finish("MAX_TOKENS"), FinishReason::Length);
+        assert_eq!(finish("SAFETY"), FinishReason::ContentFilter);
+        assert_eq!(finish("MALFORMED_FUNCTION_CALL"), FinishReason::Stop);
     }
 }

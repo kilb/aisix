@@ -14,8 +14,11 @@
 //!
 //! Cheap to clone: every field is either an `Arc` or a small Copy scalar.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use aisix_cache::{Cache, MemoryCache, MemorySemanticCache, SemanticCacheStore};
 use aisix_core::models::CacheBackend;
+use aisix_core::models::{LiveMcpServerIndex, LivePricingIndex};
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, ProxyConfig};
 use aisix_gateway::Hub;
@@ -38,6 +41,14 @@ use crate::routing::RoutingRegistry;
 /// caching for its requests (`cache_status = disabled`) — never a
 /// silent fallback to node-local memory, which would lie about the
 /// sharing semantics the operator picked.
+/// The write-once home of the `backend: redis` semantic store.
+///
+/// A `OnceLock` rather than a swap cell because that is the whole
+/// contract: the vector-search question is answered once, against the
+/// first live connection, and the answer never changes for the life of
+/// the process.
+pub type SemanticRedisCell = std::sync::OnceLock<Arc<dyn SemanticCacheStore>>;
+
 #[derive(Clone)]
 pub struct CacheBackends {
     memory: Arc<dyn Cache>,
@@ -46,21 +57,50 @@ pub struct CacheBackends {
     /// built — in-process, no config needed, zero cost until a policy
     /// with a `semantic` block matches a request.
     semantic_memory: Arc<dyn SemanticCacheStore>,
-    /// Semantic (L2) store for `backend: redis` policies. Wired by the
-    /// bootstrap only when `cache.redis` is configured, is not cluster
-    /// mode, AND the server passed the vector-search capability probe —
-    /// so its absence here IS the degradation signal.
-    semantic_redis: Option<Arc<dyn SemanticCacheStore>>,
+    /// Semantic (L2) store for `backend: redis` policies. Wired only
+    /// when `cache.redis` is configured, is not cluster mode, AND the
+    /// server passed the vector-search capability probe — so its absence
+    /// here IS the degradation signal, and a policy that asks for
+    /// semantic matching is told once and then served exact-only with no
+    /// embedding call and no Redis round trip.
+    ///
+    /// Swappable because the probe can only run against a live
+    /// connection, and `cache.redis` may be unreachable when the gateway
+    /// starts: the answer is then not "no vector search" but "not asked
+    /// yet", and the background attach fills it in when it gets there.
+    /// It is written once, by that attach, and never cleared.
+    semantic_redis: Arc<SemanticRedisCell>,
     /// Policy ids already warned about an unavailable redis backend,
     /// so the gate logs once per policy instead of once per request.
     redis_warned: Arc<DashSet<String>>,
     /// Policy ids already warned about the redis semantic layer being
-    /// unavailable (same warn-once discipline as `redis_warned`).
+    /// unavailable (same warn-once discipline as `redis_warned`). The
+    /// line has to name both reasons the cell can be empty, because
+    /// warn-once means it is never corrected: a store published by the
+    /// background attach simply stops the gate reaching this branch.
     semantic_redis_warned: Arc<DashSet<String>>,
     /// Policy ids already warned about a stable semantic config error
     /// (missing / non-embedding `embedding_model`). The per-request
     /// metric keeps counting; only the log line is deduplicated.
     semantic_resolve_warned: Arc<DashSet<String>>,
+    /// Set while the redis cache is failing, so the gate reports an
+    /// outage once rather than once per request. Re-armed by the next
+    /// success, so a second outage is reported again.
+    ///
+    /// A cache Redis can now be unreachable from boot and stay that way
+    /// (the connection attaches in the background instead of the process
+    /// exiting), and every cached-policy request produces both a read and
+    /// a write failure — so an unthrottled line is two per request for as
+    /// long as the outage lasts, which buries every other line in the
+    /// log. How hard and how long it is failing is
+    /// `aisix_redis_failures_total{operation}`; the log says that it
+    /// started.
+    ///
+    /// Two latches, not one: the exact-KV and vector-search halves fail
+    /// and recover independently, and only one of them costs an
+    /// embedding call.
+    exact_degraded: Arc<AtomicBool>,
+    semantic_degraded: Arc<AtomicBool>,
 }
 
 impl CacheBackends {
@@ -69,18 +109,68 @@ impl CacheBackends {
             memory,
             redis,
             semantic_memory: Arc::new(MemorySemanticCache::new()),
-            semantic_redis: None,
+            semantic_redis: Arc::new(SemanticRedisCell::new()),
             redis_warned: Arc::new(DashSet::new()),
             semantic_redis_warned: Arc::new(DashSet::new()),
             semantic_resolve_warned: Arc::new(DashSet::new()),
+            exact_degraded: Arc::new(AtomicBool::new(false)),
+            semantic_degraded: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Entries held by the in-process exact-match response cache.
+    pub fn response_cache_entries(&self) -> u64 {
+        self.memory.local_entry_count().unwrap_or(0)
+    }
+
+    /// Entries held by the in-process semantic cache.
+    pub fn semantic_cache_entries(&self) -> u64 {
+        self.semantic_memory.local_entry_count().unwrap_or(0)
+    }
+
+    /// True the first time the exact-KV cache fails in an outage, false
+    /// for the rest of it — the caller logs only when it is true.
+    pub fn note_exact_failure(&self) -> bool {
+        !self.exact_degraded.swap(true, Ordering::Relaxed)
+    }
+
+    /// Re-arm [`Self::note_exact_failure`] after a successful operation.
+    ///
+    /// Read before write: this runs on every cache MISS, the commonest
+    /// branch there is, and an unconditional store is a cross-core line
+    /// invalidation per request under thread-per-core serving. The
+    /// healthy path only ever reads.
+    pub fn note_exact_success(&self) {
+        if self.exact_degraded.load(Ordering::Relaxed) {
+            self.exact_degraded.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// [`Self::note_exact_failure`] for the vector-search half.
+    pub fn note_semantic_failure(&self) -> bool {
+        !self.semantic_degraded.swap(true, Ordering::Relaxed)
+    }
+
+    /// Re-arm [`Self::note_semantic_failure`]. Read before write, for
+    /// the reason on [`Self::note_exact_success`].
+    pub fn note_semantic_success(&self) {
+        if self.semantic_degraded.load(Ordering::Relaxed) {
+            self.semantic_degraded.store(false, Ordering::Relaxed);
         }
     }
 
     /// Attach the shared semantic store for `backend: redis` policies.
-    /// The bootstrap calls this only after the capability probe passed.
-    pub fn with_semantic_redis(mut self, store: Arc<dyn SemanticCacheStore>) -> Self {
-        self.semantic_redis = Some(store);
+    /// Callers reach this only after the capability probe passed.
+    pub fn with_semantic_redis(self, store: Arc<dyn SemanticCacheStore>) -> Self {
+        let _ = self.semantic_redis.set(store);
         self
+    }
+
+    /// The cell [`Self::with_semantic_redis`] writes, for a bootstrap
+    /// that has to attach the store later than it builds the backends —
+    /// a `cache.redis` that was unreachable at startup.
+    pub fn semantic_redis_cell(&self) -> Arc<SemanticRedisCell> {
+        Arc::clone(&self.semantic_redis)
     }
 
     /// True the FIRST time `policy_id` reports a stable semantic config
@@ -139,16 +229,19 @@ impl CacheBackends {
         match backend {
             CacheBackend::Memory => Some(&self.semantic_memory),
             CacheBackend::Redis => {
-                let store = self.semantic_redis.as_ref();
+                let store = self.semantic_redis.get();
                 if store.is_none() && self.semantic_redis_warned.insert(policy_id.to_string()) {
                     tracing::warn!(
                         target: "aisix::cache",
                         policy_id = %policy_id,
                         policy_name = %policy_name,
                         "cache policy configures semantic matching on backend=redis but \
-                         the configured cache.redis has no vector-search support \
-                         (requires Redis 8+ or the search module; cluster mode is not \
-                         supported yet); requests fall back to exact matching only"
+                         no vector-search store is available: either the configured \
+                         cache.redis has no vector-search support (requires Redis 8+ or \
+                         the search module; cluster mode is not supported yet), or it \
+                         was unreachable at startup and has not been probed yet — a \
+                         background attach publishes the store if the probe then \
+                         passes. Requests fall back to exact matching only"
                     );
                 }
                 store
@@ -201,18 +294,38 @@ pub struct ProxyStateInner {
     pub snapshot: SnapshotHandle<AisixSnapshot>,
     pub hub: Arc<Hub>,
     pub limiter: Arc<Limiter>,
+    pub(crate) policy_index: Arc<crate::policy_index::LivePolicyIndex>,
+    pub(crate) jwt_bindings: Arc<crate::jwt_index::LiveJwtBindings>,
     pub metrics: Arc<Metrics>,
     pub cache: Option<CacheBackends>,
     pub routing: Arc<RoutingRegistry>,
     /// Per-instance cache of semantic-router example embeddings, populated
-    /// lazily on first use and reused across requests so semantic routing
-    /// costs one embedding call (the prompt) in steady state.
+    /// lazily on first use and reused across requests so a steady-state
+    /// logical embedding batch contains only the prompt.
     pub semantic_cache: Arc<crate::semantic::SemanticVectorCache>,
     /// Per-request guardrail index. Resolves the applicable chain from
     /// attachment scope + priority on each request. Rebuilds lazily
     /// when the snapshot version changes. Default is an empty index
     /// (no-op); the server bootstrap wires a live handle at startup.
     pub guardrail_index: Arc<LiveGuardrailIndex>,
+    /// Prices by `pricing_key`, derived from the two pricing tables and
+    /// rebuilt only when one of them changes. Every reader of a model's
+    /// price goes through it — `least_cost` ranking and the `cost_usd` on
+    /// the usage events — so ranking and billing cannot disagree about
+    /// what a model costs.
+    pub pricing: Arc<LivePricingIndex>,
+    /// Registered MCP servers by name → resource id, rebuilt only when the
+    /// `mcp_servers` table changes. Both MCP gates that a key can address by
+    /// server id read it — the tool ACL and the per-server rate limit — so
+    /// the two resolve a rename at the same instant.
+    pub mcp_servers: Arc<LiveMcpServerIndex>,
+    /// Per-user tokens of `oauth2_authorization_code` MCP servers.
+    /// [`ProxyState::with_mcp_oauth_store`] picks where they are kept; until
+    /// then, this process alone.
+    pub(crate) mcp_oauth: Arc<aisix_mcp::UserOAuthManager>,
+    /// The `budgets` documents indexed for the per-request budget gate,
+    /// rebuilt only when that table changes.
+    pub(crate) budgets: Arc<crate::budget::LiveBudgetIndex>,
     /// Per-model health tracker. Updated on every upstream call outcome;
     /// read by `GET /admin/v1/health`.
     pub health: Arc<HealthTracker>,
@@ -233,8 +346,8 @@ pub struct ProxyStateInner {
     /// `reqwest::Client` connection pool. Always present (the
     /// no-exporters case = empty snapshot table = no spawned tasks).
     pub otlp_fan_out: OtlpHttpFanOut,
-    /// `None` and `Some(0)` are unlimited; `Some(n)` applies `n` globally.
-    pub request_body_limit_bytes: Option<usize>,
+    /// `0` is unlimited; `n` applies `n` globally.
+    pub request_body_limit_bytes: usize,
     /// Pre-parsed `proxy.real_ip` config for resolving the downstream
     /// client IP on each request (#492). Default = trust nothing → the
     /// logged source IP is the immediate TCP peer.
@@ -246,6 +359,9 @@ pub struct ProxyStateInner {
     /// Boot-compiled `proxy.url_rewrites` rules, applied in order to every
     /// request before routing (first match wins). Empty = layer no-ops.
     pub url_rewrites: Arc<[crate::rewrite::CompiledRewrite]>,
+    /// `proxy.expose_debug_headers`: whether chat completions carry the
+    /// `x-aisix-call-id` / `-served-by` / `-route` / `-cache*` headers.
+    pub expose_debug_headers: bool,
     /// Config-freshness probe for `GET /readyz`: returns the time since the
     /// config source last applied a snapshot (`None` = never applied). Every
     /// constructor installs a fail-closed probe; server bootstrap must replace
@@ -291,9 +407,6 @@ impl std::ops::DerefMut for ProxyState {
 #[cfg(test)]
 const TEST_RATE_LIMIT_CLOCK_SECS: u64 = 1_763_000_000;
 
-/// `metrics` is `Some` only on the bootstrap constructor, which is what puts
-/// each exporter's drops and hard delivery failures on the Prometheus scrape;
-/// the lightweight constructors leave the pipelines counting internally.
 /// Reclaim runtime state for config rows the snapshot no longer carries.
 ///
 /// Health counters, per-target runtime status and round-robin cursors are all
@@ -318,9 +431,11 @@ fn reconcile_runtime_state(
     });
 }
 
+/// `metrics` is what puts each exporter's drops and hard delivery failures on
+/// the Prometheus scrape.
 fn live_exporter_fan_out(
     snapshot: &SnapshotHandle<AisixSnapshot>,
-    metrics: Option<Arc<Metrics>>,
+    metrics: Metrics,
 ) -> OtlpHttpFanOut {
     let fan_out = OtlpHttpFanOut::with_metrics(metrics);
     let reconciler = fan_out.clone();
@@ -331,19 +446,49 @@ fn live_exporter_fan_out(
     fan_out
 }
 
+/// The embedding dispatcher `kind: "semantic"` guardrail rows compile
+/// against. Free function rather than a method because the three
+/// `ProxyState` constructors need it before `self` exists.
+fn guardrail_embedder_slot(
+    hub: &Arc<Hub>,
+    snapshot: &SnapshotHandle<AisixSnapshot>,
+    cache: &Arc<crate::semantic::SemanticVectorCache>,
+) -> aisix_guardrails::GuardrailEmbedderSlot {
+    aisix_guardrails::GuardrailEmbedderSlot::new(Arc::new(
+        crate::guardrail_embedder::ProxyGuardrailEmbedder::new(
+            Arc::clone(hub),
+            snapshot.clone(),
+            Arc::clone(cache),
+        ),
+    ))
+}
+
+impl ProxyState {
+    /// This state's embedding dispatcher, for callers that rebuild the
+    /// guardrail index and must not drop the embedder while doing so.
+    pub fn guardrail_embedder(&self) -> aisix_guardrails::GuardrailEmbedderSlot {
+        guardrail_embedder_slot(&self.hub, &self.snapshot, &self.semantic_cache)
+    }
+}
+
 impl ProxyState {
     /// Resolve the configured body cap. The path is retained at call sites so
     /// a future explicit per-endpoint mode can be added without another
     /// handler sweep; omission remains unlimited for backwards compatibility.
     pub(crate) fn request_body_limit_for(&self, _path: &str) -> usize {
-        self.request_body_limit_bytes.unwrap_or(0)
+        self.request_body_limit_bytes
     }
 
     pub fn new(snapshot: SnapshotHandle<AisixSnapshot>, hub: Arc<Hub>, cfg: &ProxyConfig) -> Self {
         let metrics = Arc::new(Metrics::new(false));
-        let guardrail_index =
-            LiveGuardrailIndex::new_with_sink(snapshot.clone(), None, Some(metrics.clone()));
-        let otlp_fan_out = live_exporter_fan_out(&snapshot, None);
+        let semantic_cache = Arc::new(crate::semantic::SemanticVectorCache::default());
+        let guardrail_index = LiveGuardrailIndex::new_with_sink(
+            snapshot.clone(),
+            None,
+            Some(metrics.clone()),
+            guardrail_embedder_slot(&hub, &snapshot, &semantic_cache),
+        );
+        let otlp_fan_out = live_exporter_fan_out(&snapshot, (*metrics).clone());
         // Unit tests get a frozen rate-limit clock: on the wall clock, any
         // "the next request 429s" assertion silently races the fixed-window
         // minute boundary — a test that straddles :00 lands its two requests
@@ -363,11 +508,19 @@ impl ProxyState {
             snapshot,
             hub,
             limiter,
+            policy_index: Arc::new(crate::policy_index::LivePolicyIndex::default()),
+            jwt_bindings: Arc::new(crate::jwt_index::LiveJwtBindings::default()),
             metrics,
             cache: Some(CacheBackends::memory_only()),
             routing: Arc::new(RoutingRegistry::new()),
-            semantic_cache: Arc::new(crate::semantic::SemanticVectorCache::default()),
+            semantic_cache,
             guardrail_index,
+            pricing: Arc::new(LivePricingIndex::new()),
+            mcp_servers: Arc::new(LiveMcpServerIndex::new()),
+            mcp_oauth: Arc::new(aisix_mcp::UserOAuthManager::new(Arc::new(
+                aisix_mcp::MemoryStore::default(),
+            ))),
+            budgets: Arc::new(crate::budget::LiveBudgetIndex::default()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
             config_apply_age: Some(Arc::new(|| None)),
@@ -382,6 +535,7 @@ impl ProxyState {
                 .unwrap_or_default()
                 .into(),
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
+            expose_debug_headers: cfg.expose_debug_headers,
             billed_batches: Arc::new(dashmap::DashMap::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
@@ -398,18 +552,31 @@ impl ProxyState {
         cfg: &ProxyConfig,
     ) -> Self {
         let metrics = Arc::new(Metrics::new(false));
-        let guardrail_index =
-            LiveGuardrailIndex::new_with_sink(snapshot.clone(), None, Some(metrics.clone()));
-        let otlp_fan_out = live_exporter_fan_out(&snapshot, None);
+        let semantic_cache = Arc::new(crate::semantic::SemanticVectorCache::default());
+        let guardrail_index = LiveGuardrailIndex::new_with_sink(
+            snapshot.clone(),
+            None,
+            Some(metrics.clone()),
+            guardrail_embedder_slot(&hub, &snapshot, &semantic_cache),
+        );
+        let otlp_fan_out = live_exporter_fan_out(&snapshot, (*metrics).clone());
         Self::from_inner(ProxyStateInner {
             snapshot,
             hub,
             limiter,
+            policy_index: Arc::new(crate::policy_index::LivePolicyIndex::default()),
+            jwt_bindings: Arc::new(crate::jwt_index::LiveJwtBindings::default()),
             metrics,
             cache: Some(CacheBackends::memory_only()),
             routing: Arc::new(RoutingRegistry::new()),
-            semantic_cache: Arc::new(crate::semantic::SemanticVectorCache::default()),
+            semantic_cache,
             guardrail_index,
+            pricing: Arc::new(LivePricingIndex::new()),
+            mcp_servers: Arc::new(LiveMcpServerIndex::new()),
+            mcp_oauth: Arc::new(aisix_mcp::UserOAuthManager::new(Arc::new(
+                aisix_mcp::MemoryStore::default(),
+            ))),
+            budgets: Arc::new(crate::budget::LiveBudgetIndex::default()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
             config_apply_age: Some(Arc::new(|| None)),
@@ -424,6 +591,7 @@ impl ProxyState {
                 .unwrap_or_default()
                 .into(),
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
+            expose_debug_headers: cfg.expose_debug_headers,
             billed_batches: Arc::new(dashmap::DashMap::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
@@ -442,9 +610,14 @@ impl ProxyState {
         cache: Option<CacheBackends>,
         cfg: &ProxyConfig,
     ) -> Self {
-        let guardrail_index =
-            LiveGuardrailIndex::new_with_sink(snapshot.clone(), None, Some(metrics.clone()));
-        let otlp_fan_out = live_exporter_fan_out(&snapshot, Some(metrics.clone()));
+        let semantic_cache = Arc::new(crate::semantic::SemanticVectorCache::default());
+        let guardrail_index = LiveGuardrailIndex::new_with_sink(
+            snapshot.clone(),
+            None,
+            Some(metrics.clone()),
+            guardrail_embedder_slot(&hub, &snapshot, &semantic_cache),
+        );
+        let otlp_fan_out = live_exporter_fan_out(&snapshot, (*metrics).clone());
         // The bootstrap constructor is the one place the tracker gets a
         // metrics sink + snapshot handle, so cooldown transitions emit
         // `aisix_deployment_*`. Clone both before they are moved into the
@@ -471,11 +644,19 @@ impl ProxyState {
             snapshot,
             hub,
             limiter,
+            policy_index: Arc::new(crate::policy_index::LivePolicyIndex::default()),
+            jwt_bindings: Arc::new(crate::jwt_index::LiveJwtBindings::default()),
             metrics,
             cache,
             routing,
-            semantic_cache: Arc::new(crate::semantic::SemanticVectorCache::default()),
+            semantic_cache,
             guardrail_index,
+            pricing: Arc::new(LivePricingIndex::new()),
+            mcp_servers: Arc::new(LiveMcpServerIndex::new()),
+            mcp_oauth: Arc::new(aisix_mcp::UserOAuthManager::new(Arc::new(
+                aisix_mcp::MemoryStore::default(),
+            ))),
+            budgets: Arc::new(crate::budget::LiveBudgetIndex::default()),
             health,
             livez: Arc::new(LivezState::new()),
             config_apply_age: Some(Arc::new(|| None)),
@@ -490,6 +671,7 @@ impl ProxyState {
                 .unwrap_or_default()
                 .into(),
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
+            expose_debug_headers: cfg.expose_debug_headers,
             billed_batches: Arc::new(dashmap::DashMap::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
@@ -545,6 +727,13 @@ impl ProxyState {
         self
     }
 
+    /// Keep per-user MCP tokens in `store` rather than in this process.
+    pub fn with_mcp_oauth_store(mut self, store: Arc<dyn aisix_mcp::SharedStore>) -> Self {
+        Arc::make_mut(&mut self.inner).mcp_oauth =
+            Arc::new(aisix_mcp::UserOAuthManager::new(store));
+        self
+    }
+
     /// Attach a CP-side usage telemetry sink. Default is `disabled()`;
     /// the server bootstrap calls this in managed mode after spawning
     /// the sender worker.
@@ -552,7 +741,6 @@ impl ProxyState {
         Arc::make_mut(&mut self.inner).usage_sink = sink;
         self
     }
-
     /// Wire the config-freshness probe used by `GET /readyz` (#591). The
     /// closure returns the time since the etcd watch last applied config.
     pub fn with_config_apply_age(
@@ -603,6 +791,38 @@ mod tests {
             "an entry past its window must be reclaimed, not kept forever"
         );
     }
+
+    // The re-arm is the only direction of this latch that can cause
+    // SILENCE — a latch stuck set means the NEXT outage reports at debug
+    // and nobody hears about it — and it has already been got wrong once
+    // (a semantic HIT did not re-arm). Without this test, deleting the
+    // re-arm leaves every other test green.
+    #[test]
+    fn a_second_outage_is_reported_again() {
+        let b = super::CacheBackends::memory_only();
+        assert!(b.note_exact_failure(), "the first failure reports");
+        assert!(!b.note_exact_failure(), "the rest of the outage is quiet");
+        b.note_exact_success();
+        assert!(b.note_exact_failure(), "a later outage must report again");
+    }
+
+    // The two halves fail and recover independently — one connection is
+    // exact-KV and the other is vector search — so neither latch may
+    // speak for the other.
+    #[test]
+    fn the_two_cache_halves_latch_independently() {
+        let b = super::CacheBackends::memory_only();
+        assert!(b.note_exact_failure());
+        assert!(
+            b.note_semantic_failure(),
+            "the exact half's outage must not silence the semantic one"
+        );
+        b.note_exact_success();
+        assert!(
+            !b.note_semantic_failure(),
+            "and recovering the exact half must not re-arm the semantic one"
+        );
+    }
     use super::{remember_billed_batch, ProxyState};
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;
@@ -611,7 +831,7 @@ mod tests {
     use aisix_obs::UsageEvent;
     use std::sync::Arc;
 
-    fn test_state_with_limit(request_body_limit_bytes: Option<usize>) -> ProxyState {
+    fn test_state_with_limit(request_body_limit_bytes: usize) -> ProxyState {
         ProxyState::new(
             SnapshotHandle::new(AisixSnapshot::new()),
             Arc::new(Hub::new()),
@@ -619,17 +839,19 @@ mod tests {
                 addr: "127.0.0.1:0".into(),
                 request_body_limit_bytes,
                 tls: None,
+                listeners: Vec::new(),
                 real_ip: Default::default(),
                 request_id: Default::default(),
                 thread_per_core: None,
                 workers: None,
                 url_rewrites: Vec::new(),
+                expose_debug_headers: false,
             },
         )
     }
 
     fn test_state() -> ProxyState {
-        test_state_with_limit(Some(1_048_576))
+        test_state_with_limit(1_048_576)
     }
 
     #[test]
@@ -653,14 +875,20 @@ mod tests {
 
     #[test]
     fn omitted_body_limit_preserves_unlimited_compatibility() {
-        let omitted = test_state_with_limit(None);
+        let omitted: ProxyConfig =
+            serde_json::from_value(serde_json::json!({"addr": "127.0.0.1:0"})).unwrap();
+        let omitted = ProxyState::new(
+            SnapshotHandle::new(AisixSnapshot::new()),
+            Arc::new(Hub::new()),
+            &omitted,
+        );
         assert_eq!(omitted.request_body_limit_for("/v1/messages"), 0);
         assert_eq!(omitted.request_body_limit_for("/v1/files"), 0);
 
-        let explicit = test_state_with_limit(Some(7));
+        let explicit = test_state_with_limit(7);
         assert_eq!(explicit.request_body_limit_for("/v1/files"), 7);
         assert_eq!(explicit.request_body_limit_for("/v1/messages"), 7);
-        let unlimited = test_state_with_limit(Some(0));
+        let unlimited = test_state_with_limit(0);
         assert_eq!(unlimited.request_body_limit_for("/v1/messages"), 0);
     }
 
@@ -708,19 +936,23 @@ mod tests {
             Arc::new(Hub::new()),
             &ProxyConfig {
                 addr: "127.0.0.1:0".into(),
-                request_body_limit_bytes: None,
+                request_body_limit_bytes: 0,
                 tls: None,
+                listeners: Vec::new(),
                 real_ip: Default::default(),
                 request_id: Default::default(),
                 thread_per_core: None,
                 workers: None,
                 url_rewrites: Vec::new(),
+                expose_debug_headers: false,
             },
         );
         let view = handle.load_versioned();
         let exporters = view.snapshot.observability_exporters.entries();
         state.otlp_fan_out.fan_out(
             &UsageEvent::default(),
+            None,
+            None,
             None,
             view.version,
             exporters.iter().map(|entry| &*entry.value),
@@ -738,6 +970,8 @@ mod tests {
         // instead of recreating the revoked pipeline.
         state.otlp_fan_out.fan_out(
             &UsageEvent::default(),
+            None,
+            None,
             None,
             view.version,
             exporters.iter().map(|entry| &*entry.value),

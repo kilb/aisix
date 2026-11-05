@@ -28,6 +28,17 @@ use std::sync::Arc;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// Heap profiling is on from the first allocation, so a profile can be taken
+// from a gateway that is already misbehaving, and the automatic dump near
+// the memory limit has something to write. One allocation in every 2 MiB
+// (2^21 bytes) on average is sampled with its stack. jemalloc reads this
+// symbol at startup and then `_RJEM_MALLOC_CONF`, which overrides it — an
+// operator turns sampling off with `_RJEM_MALLOC_CONF=prof_active:false`.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[export_name = "_rjem_malloc_conf"]
+pub static MALLOC_CONF: Option<&'static u8> =
+    Some(&b"prof:true,prof_active:true,lg_prof_sample:21\0"[0]);
+
 // jemalloc parks freed pages as "dirty" and only advances their decay clock
 // on later allocator activity in the same arena, so after a burst of
 // large-payload traffic an idle gateway keeps its peak RSS indefinitely
@@ -61,22 +72,24 @@ fn enable_jemalloc_background_thread() -> Result<bool, tikv_jemalloc_ctl::Error>
 }
 
 mod cert_bundle;
+mod dp_store;
 mod export;
 mod heartbeat;
 mod managed_bundle;
+mod proxy_protocol;
 mod telemetry;
 
 use aisix_admin::{AdminState, ConfigStore, EtcdConfigStore, FileManagedStore};
-use aisix_cache::{Cache, MemoryCache, RedisCache};
+use aisix_cache::{Cache, MemoryCache};
 use aisix_core::models::Adapter;
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{
     AisixSnapshot, CacheBackend, Config, ConfigStatus, EtcdConfig, EtcdTlsConfig, RateLimitBackend,
     SourceKind,
 };
-use aisix_etcd::{EtcdConfigProvider, SnapshotCache, Supervisor};
+use aisix_etcd::{EtcdConfigProvider, SnapshotCache, Supervisor, WatchedPrefix};
 use aisix_gateway::{Hub, UpstreamHttpConfig};
-use aisix_obs::{init_tracing, install_otlp_tracer, Metrics};
+use aisix_obs::{init_tracing, Metrics};
 use aisix_provider_anthropic::AnthropicBridge;
 use aisix_provider_azure_openai::AzureOpenAiBridge;
 use aisix_provider_bedrock::BedrockBridge;
@@ -93,8 +106,8 @@ use tokio::sync::watch;
 #[derive(Debug, Parser)]
 #[command(
     name = "aisix",
-    version = aisix_core::BUILD_VERSION,
-    about = "aisix AI Gateway",
+    version = aisix_core::BUILD_VERSION.as_str(),
+    about = "AISIX gateway",
     subcommand_negates_reqs = true
 )]
 struct Cli {
@@ -153,6 +166,15 @@ enum CliCommand {
 /// keep a config reload from stalling behind a telemetry flush without
 /// taking a core back from the workers.
 const CONTROL_RUNTIME_THREADS: usize = 2;
+
+/// How long the exit waits for the log queue to reach its sink.
+///
+/// Its own constant rather than `shutdown.min_drain_secs`: that knob
+/// sizes the CONNECTION drain against a load balancer's detection
+/// latency, `0` is a legal and used value for it (the e2e harness sets
+/// exactly that), and a zero-length flush would drop the shutdown log
+/// every time.
+const LOG_FLUSH_DEADLINE: Duration = Duration::from_secs(5);
 
 fn main() -> anyhow::Result<()> {
     // Install the process-level rustls CryptoProvider before anything
@@ -219,43 +241,246 @@ async fn async_main(cfg: Config) -> anyhow::Result<()> {
     // `register_hangup`). Failure is reported on stderr.
     let hangup = register_hangup();
 
-    // Step 3: tracing + optional OTLP export.
+    // Step 3: process logging. Trace export is not wired here — it is an
+    // `observability_exporters` entry (kind = otlp_http) resolved from the
+    // live resource snapshot, not a boot-time pipeline.
     init_tracing(&cfg.observability).map_err(|e| anyhow::anyhow!("tracing init failed: {e}"))?;
-    let _otlp = install_otlp_tracer(&cfg.observability)
-        .map_err(|e| anyhow::anyhow!("otlp init failed: {e}"))?;
+
+    // Keys that name no setting, and setting values that do nothing. Warned
+    // about only now, because the subscriber above is what makes a warning
+    // visible at all. An ignored key is reported whatever the log level: it
+    // is a misspelled setting as often as a retired one, and that is
+    // visible nowhere else — so when the level filters WARN out, it goes
+    // straight to stderr instead.
+    let warn_enabled = tracing::enabled!(tracing::Level::WARN);
+    for ignored in cfg.ignored_keys() {
+        if warn_enabled {
+            tracing::warn!("{ignored}");
+        } else {
+            eprintln!("WARN {ignored}");
+        }
+    }
+    for retired in cfg.observability.retired_settings() {
+        tracing::warn!("{retired}");
+    }
+
+    // `AISIX_*` variables that name no setting. Same reason for the
+    // placement: the load that dropped them ran before the subscriber.
+    for ignored in Config::ignored_env_overrides() {
+        tracing::warn!("{ignored}");
+    }
 
     // After tracing so the enable outcome is observable in the logs; the
     // returned outcome is already logged inside.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     let _ = enable_jemalloc_background_thread();
+    aisix_obs::memory::register_runtime("control", tokio::runtime::Handle::current());
 
-    // Before any bridge builds its `reqwest::Client` — the connection
-    // pools are constructed once and can't be reconfigured afterwards.
-    aisix_gateway::upstream_http::init(upstream_http_config(&cfg.upstream)?)
-        .map_err(|e| anyhow::anyhow!("upstream TLS init failed: {e}"))?;
-
-    run(cfg, hangup).await
+    // Everything from here on is inside the drained scope, because
+    // everything from here on can log and then fail: `?` would otherwise
+    // return with those lines still queued for a writer thread nobody is
+    // going to flush, and a boot that fails is precisely when the log is
+    // the only thing an operator has. The flush result is discarded on
+    // purpose — see `shutdown_logging`, there is nowhere left to report a
+    // sink that is not taking bytes.
+    let outcome = async {
+        // Before any bridge builds its `reqwest::Client` — the connection
+        // pools are constructed once and can't be reconfigured afterwards.
+        aisix_gateway::upstream_http::init(upstream_http_config(&cfg.upstream)?)
+            .map_err(|e| anyhow::anyhow!("upstream TLS init failed: {e}"))?;
+        aisix_gateway::ssrf::init(&cfg.outbound.ssrf_protection)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        aisix_gateway::media_fetch::init(
+            &cfg.upstream.media_fetch,
+            cfg.proxy.request_body_limit_bytes,
+        );
+        aisix_provider_bedrock::init_mantle_endpoint(cfg.upstream.bedrock.mantle_endpoint.clone());
+        run(cfg, hangup).await
+    }
+    .await;
+    let _ = aisix_obs::shutdown_logging(LOG_FLUSH_DEADLINE);
+    outcome
 }
 
 /// `aisix validate --resources <file>`: run the identical file-source
 /// pipeline (read → interpolate → desugar → canonical schema validation
 /// → typed decode → cross-reference checks) that boot and SIGHUP reload
-/// use, without booting any listener. Exit 0 on success; on failure the
+/// use, without booting any listener, then check that every enabled
+/// guardrail row actually builds. Exit 0 on success; on failure the
 /// aggregated error report (every problem, with kind / entry / field
 /// context) goes to stderr and the process exits non-zero.
 fn run_validate(resources: &Path) -> anyhow::Result<()> {
-    match aisix_core::filesource::load_resources_file(resources, 1) {
-        Ok(snapshot) => {
-            println!(
-                "OK: {} loaded {} resource(s)",
-                resources.display(),
-                snapshot.total_entries(),
-            );
-            Ok(())
-        }
+    let snapshot = match aisix_core::filesource::load_resources_file(resources, 1) {
+        Ok(snapshot) => snapshot,
         Err(report) => {
             eprintln!("{report}");
             std::process::exit(1);
+        }
+    };
+    // Loading only proves the file parses. A guardrail row whose config
+    // does not build — an invalid regex, an unknown detector, a
+    // `kind: custom` script with a syntax error — is dropped from the
+    // chain while the gateway keeps serving. Runtime status reports that
+    // rejection, but this command still needs to fail synchronously rather
+    // than validate a file whose screening rule cannot run.
+    let unbuildable = aisix_guardrails::unbuildable_guardrail_rows(&snapshot.guardrails, None);
+    if !unbuildable.is_empty() {
+        eprintln!(
+            "resources file {}: {} guardrail(s) load but cannot run:",
+            resources.display(),
+            unbuildable.len(),
+        );
+        for row in &unbuildable {
+            eprintln!("  - guardrails ({:?}): {}", row.name, row.reason);
+        }
+        std::process::exit(1);
+    }
+    // An enabled guardrail nothing attaches is inert — a scope target can be
+    // deleted, so this is legitimate rather than malformed, and the exit code
+    // stays 0. But `validate` is the one place an operator looks BEFORE
+    // deploying, and the runtime WARN they would otherwise have to notice in
+    // a log is the only other signal: the row loads, the resource count
+    // includes it, and no request ever mentions it.
+    let unattached = aisix_guardrails::unattached_guardrail_names(
+        &snapshot.guardrails,
+        &snapshot.guardrail_attachments,
+    );
+    if !unattached.is_empty() {
+        eprintln!(
+            "resources file {}: {} enabled guardrail(s) have no attachment and inspect no traffic:",
+            resources.display(),
+            unattached.len(),
+        );
+        for name in &unattached {
+            eprintln!(
+                "  - guardrails ({name:?}): add a guardrail_attachments entry to put it in force"
+            );
+        }
+    }
+    // Operations whose ids collide after tool-name sanitization load and
+    // stay callable under a `_2` / `_3` … suffix, so this is not an error —
+    // but the suffixed names are not the ones the spec's author wrote.
+    for (name, duplicates) in openapi_tool_name_collisions(&snapshot.mcp_servers) {
+        eprintln!(
+            "resources file {}: warning: mcp_servers ({name:?}): operations share a tool name \
+             after sanitization and are served with a _2, _3 … suffix: {}",
+            resources.display(),
+            duplicates.join(", "),
+        );
+    }
+    println!(
+        "OK: {} loaded {} resource(s)",
+        resources.display(),
+        snapshot.total_entries(),
+    );
+    Ok(())
+}
+
+/// `(server name, colliding base tool names)` for each `type: openapi`
+/// server whose operations collide after tool-name sanitization.
+fn openapi_tool_name_collisions(
+    servers: &aisix_core::ResourceTable<aisix_core::McpServer>,
+) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = servers
+        .entries()
+        .into_iter()
+        .filter(|e| e.value.server_type == aisix_core::McpServerType::Openapi)
+        .filter_map(|e| {
+            let spec = e.value.spec.as_ref()?;
+            let duplicates = aisix_core::mcp_openapi::generate(spec).ok()?.duplicates;
+            (!duplicates.is_empty()).then(|| (e.value.name.clone(), duplicates))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Is this gauge label set still describing something the configuration
+/// contains?
+///
+/// The retirement sweep asks this per series: `Gone` when the api key no
+/// longer exists, `Stale` when it exists but the series no longer matches
+/// it (see `Metrics::retire_stale_gauges`). Two rules keep
+/// it from retiring live data:
+///
+/// Absence has to be POSITIVE: only a label this can resolve, and whose
+/// resource is genuinely gone, counts as dead. Anything undecidable stays
+/// live, because a wrongly retired gauge hides real state — a worse outcome
+/// than the stale sample retirement exists to clean up.
+///
+/// Both families are therefore judged on `api_key_id` alone, which is the
+/// one label here that is an id the snapshot can be asked about:
+///
+/// - The budget family additionally compares the whole member triple and
+///   every selected name label. A bare existence check would call BOTH
+///   label sets live after a rebind or a rename and leave the pre-change
+///   sample frozen under the same `api_key_id`, which is the case it exists
+///   to catch. The values are resolved from the api-key row and the team /
+///   member documents exactly as the emitter resolves them
+///   (`aisix_core::KeyOwnerNames`), so the comparison is exact. The
+///   rate-limit family compares its selected `api_key_name` the same way.
+/// - The rate-limit family's `model` is checked because the emit site
+///   collapses it to the configured set first (`usage_attr::
+///   metric_model_label`): an exact model name, a wildcard ROW name like
+///   `openai/*`, or the `unresolved` placeholder. All three are decidable
+///   — the first two resolve by name, the third is a placeholder. Were the
+///   raw caller string still reaching the label, this check would retire
+///   live series every sweep, because a wildcard alias serves concrete
+///   names that are in no `models` row.
+fn gauge_series_is_live(
+    snap: &AisixSnapshot,
+    series: aisix_obs::LiveGaugeSeries<'_>,
+) -> aisix_obs::GaugeLiveness {
+    use aisix_obs::GaugeLiveness::{Gone, Live, Stale};
+    let judge = |matches: bool| if matches { Live } else { Stale };
+    const UNKNOWN: &str = "unknown";
+    // What `metric_model_label` emits when nothing resolved. It names no
+    // row, so it is a placeholder like `unknown` and must never be retired.
+    // Taken from the emitter's own constant rather than spelled again here:
+    // the two drifting apart would silently start retiring live series.
+    const UNRESOLVED: &str = aisix_proxy::UNRESOLVED_MODEL_LABEL;
+    // A name label the series' selection does not keep is `None` and is
+    // not judged: that series does not carry it.
+    let name_matches = |label: Option<&str>, current: Option<&str>| {
+        label.is_none_or(|label| current.unwrap_or(UNKNOWN) == label)
+    };
+    match series {
+        aisix_obs::LiveGaugeSeries::Budget {
+            api_key_id,
+            team_id,
+            user_id,
+            user_name,
+            api_key_name,
+            team_name,
+        } => {
+            let Some(entry) = snap.apikeys.get_by_id(api_key_id) else {
+                return Gone;
+            };
+            let key = &entry.value;
+            // The resolution the emitter uses (`quota::budget_labels`).
+            let owner = aisix_core::KeyOwnerNames::resolve(snap, key);
+            judge(
+                key.team_id.as_deref().unwrap_or(UNKNOWN) == team_id
+                    && key.user_id.as_deref().unwrap_or(UNKNOWN) == user_id
+                    && owner.user_name(key).unwrap_or(UNKNOWN) == user_name
+                    && name_matches(api_key_name, key.telemetry_name())
+                    && name_matches(team_name, owner.team_name()),
+            )
+        }
+        aisix_obs::LiveGaugeSeries::RatelimitRemaining {
+            api_key_id,
+            model,
+            api_key_name,
+        } => {
+            let Some(entry) = snap.apikeys.get_by_id(api_key_id) else {
+                return Gone;
+            };
+            judge(
+                name_matches(api_key_name, entry.value.telemetry_name())
+                    && (model == UNKNOWN
+                        || model == UNRESOLVED
+                        || snap.models.get_by_name(model).is_some()),
+            )
         }
     }
 }
@@ -470,9 +695,12 @@ fn select_managed_boot_path(bundle_on_disk: bool, bundle_provided: bool) -> Mana
 /// it can never drop a bucket whose daily window is still open.
 const RATE_LIMIT_BUCKET_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60 + 300);
 
-async fn run_metrics_upkeep<F>(mut cancel: watch::Receiver<bool>, period: Duration, upkeep: F)
+/// Run `job` every `period` until cancelled. Three callers: the metrics
+/// upkeep sweep, the rate-limit bucket reaper and the inert-guardrail sweep.
+async fn run_periodic<F, Fut>(mut cancel: watch::Receiver<bool>, period: Duration, job: F)
 where
-    F: Fn(),
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = ()>,
 {
     let mut interval = tokio::time::interval(period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -481,7 +709,7 @@ where
             break;
         }
         tokio::select! {
-            _ = interval.tick() => upkeep(),
+            _ = interval.tick() => job().await,
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() {
                     break;
@@ -564,7 +792,7 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
             tracing::info!(
                 dp_id = %p.dp_id,
                 env_id = %p.env_id,
-                etcd = %etcd_url,
+                etcd = %aisix_core::redact_url_for_log(&etcd_url),
                 "provisioned with dashboard-issued cert bundle",
             );
             cfg.etcd.endpoints = vec![etcd_url];
@@ -595,7 +823,7 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
                     )
                 })?;
             Some(heartbeat::HeartbeatConfig::sanitised(
-                format!("{}/dp/heartbeat", cp_base.trim_end_matches('/')),
+                heartbeat::heartbeat_url(cp_base),
                 p.dp_id,
                 std::time::Duration::from_secs(cfg.managed.heartbeat_interval_secs),
                 heartbeat::MtlsBundle {
@@ -622,7 +850,10 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
             // from config.managed.yaml survives into the etcd dial,
             // causing the stale-endpoint bug (#289).
             let etcd_url = derive_cp_etcd_url(&cfg.managed)?;
-            tracing::info!(etcd = %etcd_url, "managed mode: etcd endpoint for subsequent boot");
+            tracing::info!(
+                etcd = %aisix_core::redact_url_for_log(&etcd_url),
+                "managed mode: etcd endpoint for subsequent boot",
+            );
             cfg.etcd.endpoints = vec![etcd_url];
             cfg.etcd.tls = Some(EtcdTlsConfig {
                 ca_cert_file: managed_bundle::ca_cert_path(&cfg.managed.mtls_dir)
@@ -666,11 +897,25 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
     };
 
     let (cancel_tx, cancel_rx) = watch::channel(false);
+    // Flipped when the drain STARTS, where `cancel` is flipped when it
+    // ends. Only a listener reads it, and only to hand an HTTP/2
+    // downstream its GOAWAY without closing the listener under traffic
+    // a balancer is still routing here (AISIX-Cloud#1395).
+    let (retire_tx, retire_rx) = watch::channel(false);
+    let shutdown = ShutdownWatch {
+        retire: retire_rx.clone(),
+        cancel: cancel_rx.clone(),
+    };
 
     // Steps 4-6: the resource source — either the standalone resources
     // file (`resources_file` in config) or etcd + watch supervisor.
     // Config validation already guaranteed exactly one is selected.
     let file_source_path = cfg.resources_file.clone().map(PathBuf::from);
+    // The supervisor is built before `Metrics` is — and an apply reports
+    // its cost by calling into `Metrics`, which owns the recorder. The
+    // slot closes that gap: applies before the registry exists (the boot
+    // load) report into nothing, every later one lands.
+    let metrics_slot: Arc<std::sync::OnceLock<Arc<Metrics>>> = Arc::new(std::sync::OnceLock::new());
     let (snapshot_handle, supervisor, watch_task, admin_client, config_status) =
         if let Some(path) = &file_source_path {
             // FILE MODE: load once at boot, fail fast with the aggregated
@@ -722,20 +967,47 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
             // (env_id populated from the register response above), bare
             // `<prefix>` in self-hosted dev where env_id is empty.
             let etcd_prefix = cfg.etcd.effective_prefix();
+            // The shared pricing catalog, watched alongside the
+            // environment's own prefix and folded into the same snapshot.
+            // A control plane that does not grant read access to it is
+            // tolerated: the supervisor serves without prices rather than
+            // without configuration.
+            let global_prefix = cfg.etcd.global_prefix();
+            // Only a refusal ends the boot here: an etcd that cannot be
+            // reached leaves the connection pending and the supervisor
+            // dials it again, so the gateway waits for its source instead
+            // of exiting on it. See `EtcdConfigProvider::connect`.
             let provider = Arc::new(
-                EtcdConfigProvider::connect_with_policy(
+                EtcdConfigProvider::connect(
                     &cfg.etcd.endpoints,
                     etcd_prefix.clone(),
                     connect_options.clone(),
-                    etcd_connect_policy(&cfg.etcd),
+                    cfg.etcd.request_timeout(),
+                    cfg.etcd.dial_budget(),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("etcd connect failed: {e}"))?,
             );
-            // Separate client for the admin read surface — only needed when
-            // the admin listener is bound. We could share a single underlying
-            // connection via `Client::clone()` but keeping two is cleaner:
-            // admin reads and the watch stream don't contend on the same mutex.
+            // Its own connection, for the same reason the admin surface
+            // has one: the catalog's range read and watch never queue
+            // behind the environment's, and a refusal on one channel does
+            // not disturb the other.
+            let global_provider = Arc::new(
+                EtcdConfigProvider::connect(
+                    &cfg.etcd.endpoints,
+                    global_prefix.clone(),
+                    connect_options.clone(),
+                    cfg.etcd.request_timeout(),
+                    cfg.etcd.dial_budget(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("etcd connect failed: {e}"))?,
+            );
+            // Separate connection for the admin read surface — only needed
+            // when the admin listener is bound. It could share the config
+            // provider's, but keeping two means an admin read and the watch
+            // stream never queue behind the same connect, and neither can
+            // stall the other's channel.
             // Skipped whenever the admin listener is not bound — managed mode,
             // or `admin.enabled = false` — so admin-off doesn't pay for (or
             // fail boot on) a connection it immediately drops; `/status/models`
@@ -744,26 +1016,35 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
                 None
             } else {
                 Some((
-                    etcd_client::Client::connect(&cfg.etcd.endpoints, connect_options.clone())
-                        .await
-                        .map_err(|e| anyhow::anyhow!("etcd admin client connect failed: {e}"))?,
+                    Arc::new(aisix_etcd::LazyEtcdClient::new(
+                        cfg.etcd.endpoints.clone(),
+                        connect_options.clone(),
+                        cfg.etcd.dial_budget(),
+                    )),
                     etcd_prefix.clone(),
+                    cfg.etcd.request_timeout(),
                 ))
             };
-            // Snapshot cache: persist to disk so the DP can serve traffic
-            // from the last-known config across CP outages and restarts.
-            // Managed mode defaults to /var/lib/aisix/config_cache.json;
-            // self-hosted etcd mode enables it only when the operator sets
-            // a path explicitly; "" disables it in either mode.
+            // Disk recovery is opt-in in both managed and self-hosted modes.
             let snapshot_cache = match cfg.managed.effective_snapshot_cache_path() {
                 Some(path) => SnapshotCache::new(path),
                 None => SnapshotCache::disabled(),
             };
-            let supervisor = Arc::new(Supervisor::with_cache(
-                provider,
-                etcd_prefix,
-                snapshot_cache,
-            ));
+            let observed = Arc::clone(&metrics_slot);
+            let supervisor = Arc::new(
+                Supervisor::with_sources(
+                    vec![
+                        (WatchedPrefix::environment(etcd_prefix), provider),
+                        (WatchedPrefix::global(global_prefix), global_provider),
+                    ],
+                    snapshot_cache,
+                )
+                .with_apply_observer(Arc::new(move |trigger, events, elapsed| {
+                    if let Some(metrics) = observed.get() {
+                        metrics.record_config_apply(trigger, events, elapsed);
+                    }
+                })),
+            );
             // Seed the snapshot from disk before the etcd cycle starts so the
             // proxy is ready to serve from cached config the moment the watch
             // task takes its first iteration.
@@ -787,72 +1068,82 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
     // + same cp_base URL host. We derive the
     // /dp/telemetry URL from the /dp/heartbeat URL by swapping the
     // path suffix so the two stay in lock-step on cp_base changes.
-    let telemetry_cfg = heartbeat_cfg.as_ref().map(|h| {
-        telemetry::TelemetryConfig::new(
-            h.url.replace("/dp/heartbeat", "/dp/telemetry"),
-            h.mtls.clone(),
-        )
-    });
-    let (usage_sink, telemetry_task) = match telemetry_cfg {
-        Some(cfg) => {
-            let (sink, handle) = telemetry::spawn(cfg, cancel_rx.clone());
-            (sink, Some(handle))
-        }
-        None => (aisix_obs::UsageSink::disabled(), None),
-    };
-
+    let telemetry_cfg = heartbeat_cfg
+        .as_ref()
+        .map(|h| telemetry::TelemetryConfig::new(telemetry_url(&h.url), h.mtls.clone()));
     // Steps 7-8: build Hub, shared components, then routers.
     let hub = Arc::new(build_hub());
     // env_id is resolved by now (managed provisioning / sidecar restore
     // above); it becomes the constant `env_id` label on the SLO latency
     // histograms. Standalone DPs leave it empty → "unknown".
-    // #1226: operator bucket overrides. Validation errors are
+    // AISIX-Cloud#1226: operator bucket overrides. Validation errors are
     // boot-fatal — a silently ignored override would leave the deployment
     // reading quantiles off bucket edges it did not choose.
     let histogram_buckets =
         aisix_obs::HistogramBuckets::from_config(&cfg.observability.metrics.buckets)
             .map_err(|e| anyhow::anyhow!(e))?;
-    let metrics = Arc::new(Metrics::new_with_buckets(
-        &cfg.etcd.env_id,
-        &histogram_buckets,
-    ));
-
-    // 花费预算的可见性。控制平面下发的 `/dp/budget_check` 已在本次发布
-    // 中删除，改由 RateLimitPolicy 上的 `max_spend_micro_usd` 本地执行。
-    // 托管模式下升级上来的部署，如果没人写过这个字段，花费就是完全不设
-    // 上限的 —— 而且这种状态在指标上和「还没有流量」一模一样，只看拒绝
-    // 计数分辨不出来。
+    let metrics = Arc::new(
+        Metrics::new_with_labels(
+            &cfg.etcd.env_id,
+            &histogram_buckets,
+            &cfg.observability.metrics.labels,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?,
+    );
+    let _ = metrics_slot.set(metrics.clone());
+    // Spawned here rather than beside the heartbeat worker above because it
+    // needs `Metrics`: a usage batch it gives up on is counted against
+    // `aisix_usage_event_drops_total`, the same counter the queue's own
+    // drops land on.
     //
-    // 两者都挂在 `subscribe` 上，而不是在这里对快照采样一次：托管模式
-    // 强制走 etcd（`resources_file` 与之互斥），而 etcd 分支是先
+    // It stops on its own signal rather than `cancel`, flipped once the
+    // proxy has finished serving: see `telemetry::stop_after`.
+    let (usage_stop_tx, usage_stop_rx) = watch::channel(false);
+    let (usage_sink, telemetry_task) = match telemetry_cfg {
+        Some(cfg) => {
+            let (sink, handle) = telemetry::spawn(cfg, (*metrics).clone(), usage_stop_rx);
+            (sink, Some(handle))
+        }
+        None => (aisix_obs::UsageSink::disabled(), None),
+    };
+
+    // 花费上限的可见性。托管部署的上限有两个来源：控制平面下发的 `budgets`
+    // 文档（`budget::enforce_key`）和 RateLimitPolicy 上的 `max_spend_micro_usd`
+    // （`quota::reject_spend`）。两边都没配时花费就是完全不设上限的 —— 而且这种
+    // 状态在指标上和「还没有流量」一模一样，只看拒绝计数分辨不出来。
+    //
+    // 两者都挂在 `subscribe_after_publish` 上，而不是在这里对快照采样一次：
+    // 托管模式强制走 etcd（`resources_file` 与之互斥），而 etcd 分支是先
     // `restore_from_cache()` 再把 watch 任务 spawn 出去的，所以执行到这一
     // 行时快照可能还是空的。在这里采样会让每个冷启动的托管部署都收到一条
     // 必然误报的「没配预算」告警，而误报是训练运维忽略告警最快的办法。
     //
     // 闩锁只在**载入到内容之后**的第一个快照上判定：空快照代表"还什么都
-    // 不知道"，不是"确认没有预算"。gauge 则每次发布都跟着走，删掉最后一条
-    // 预算策略后会归零。
+    // 不知道"，不是"确认没有预算"。gauge 则每次发布都跟着走，删掉最后一个
+    // 上限后会归零。
     {
         let metrics = metrics.clone();
         let managed = heartbeat_cfg.is_some();
         let warned = std::sync::atomic::AtomicBool::new(false);
-        snapshot_handle.subscribe(move |view| {
-            let configured = count_spend_policies(&view.snapshot);
+        snapshot_handle.subscribe_after_publish(move |view| {
+            let configured = count_spend_ceilings(&view.snapshot);
             metrics.set_budget_policies_configured(configured);
             if spend_is_uncapped(managed, configured, view.snapshot.total_entries())
                 && !warned.swap(true, std::sync::atomic::Ordering::Relaxed)
             {
                 tracing::warn!(
-                    "managed mode is enabled but no RateLimitPolicy carries \
-                     `max_spend_micro_usd`: control-plane budget enforcement \
-                     was removed in this release and no local spend ceiling is \
-                     configured — spend is UNCAPPED. Set `max_spend_micro_usd` \
-                     on a RateLimitPolicy to restore a ceiling.",
+                    "managed mode is enabled but no `budgets` document applies and no \
+                     RateLimitPolicy carries `max_spend_micro_usd`: no spend ceiling is \
+                     configured — spend is UNCAPPED. Create a hard-stop budget, or set \
+                     `max_spend_micro_usd` on a RateLimitPolicy, to restore a ceiling.",
                 );
             }
         });
     }
 
+    // Built before the stores below because each Redis-backed store takes
+    // the handle: their failures are fail-open by design, so the counter
+    // is the only place the degradation shows (#1060).
     // Rate-limit backend (#798). Default `memory` keeps per-process
     // counters; `redis` shares them across every replica so a cluster
     // enforces one global window instead of one-per-replica. The
@@ -871,12 +1162,50 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
                 backend = "redis",
                 "connecting shared rate-limit backend"
             );
-            // No URL in the message: redis URLs carry credentials.
-            let store = RedisStore::connect(redis_cfg)
+            aisix_redis::warn_on_credential_shadowing(redis_cfg);
+            // A Redis that is unreachable HERE does not stop the boot: the
+            // listeners must bind whether or not the shared counters are
+            // reachable, and the store degrades to per-replica counting
+            // and re-attaches on its own.
+            let (store, degraded) = RedisStore::connect_or_attach_later(redis_cfg)
                 .await
                 .map_err(|e| {
                     anyhow::anyhow!("redis rate-limit connect failed (ratelimit.redis): {e}")
-                })?
+                })?;
+            if let Some(e) = degraded {
+                // Host and port only, never the configured URL: redis URLs
+                // carry credentials. `error` is as specific as the driver
+                // allows: it passes a refused `SELECT` through with the
+                // server's own text, but replaces a refused AUTH with a
+                // fixed "Password authentication failed", so the WARN can
+                // promise the refusal and not always which setting.
+                let reason = aisix_redis::failure_reason(&e);
+                let endpoint = aisix_redis::endpoint_label(redis_cfg);
+                if reason == "refused" {
+                    tracing::warn!(
+                        target: "aisix::ratelimit",
+                        backend = "redis",
+                        %endpoint,
+                        %reason,
+                        error = %e,
+                        "shared rate-limit backend REFUSED the configured connection \
+                         settings at startup; serving with per-replica in-memory counting \
+                         (cluster limits not enforced) and retrying in the background"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "aisix::ratelimit",
+                        backend = "redis",
+                        %endpoint,
+                        %reason,
+                        error = %e,
+                        "shared rate-limit backend unreachable at startup; serving with \
+                         per-replica in-memory counting (cluster limits not enforced) and \
+                         attaching the shared backend in the background"
+                    );
+                }
+            }
+            let store = store
                 .with_conc_ttl(cfg.ratelimit.concurrency_ttl_secs)
                 .with_env_namespace(&cfg.etcd.env_id)
                 // Failing open to per-replica counting is the event to alert
@@ -888,10 +1217,30 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
     });
     let metrics_upkeep_task = {
         let metrics = metrics.clone();
-        tokio::spawn(run_metrics_upkeep(
+        let snapshot = snapshot_handle.clone();
+        tokio::spawn(run_periodic(
             cancel_rx.clone(),
             Duration::from_secs(5),
-            move || metrics.run_upkeep(),
+            move || {
+                let metrics = metrics.clone();
+                let snapshot = snapshot.clone();
+                async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        metrics.run_upkeep();
+                        // Retire the gauge series whose key is gone. These families
+                        // are written only from the request (or health-check) path,
+                        // and the recorder registers no idle timeout, so a deleted
+                        // or rebound api key leaves a sample frozen at its last
+                        // value while still claiming to describe the present.
+                        let snap = snapshot.load();
+                        metrics.retire_stale_gauges(|series| gauge_series_is_live(&snap, series));
+                    })
+                    .await;
+                    if let Err(error) = result {
+                        tracing::error!(%error, "metrics upkeep task failed");
+                    }
+                }
+            },
         ))
     };
     // Rate-limit buckets are keyed by configuration (api key × model ×
@@ -901,10 +1250,13 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
     // longer than that has already rolled and carries nothing worth keeping.
     let ratelimit_upkeep_task = {
         let limiter = limiter.clone();
-        tokio::spawn(run_metrics_upkeep(
+        tokio::spawn(run_periodic(
             cancel_rx.clone(),
             Duration::from_secs(300),
-            move || limiter.reap(RATE_LIMIT_BUCKET_IDLE_TTL),
+            move || {
+                limiter.reap(RATE_LIMIT_BUCKET_IDLE_TTL);
+                std::future::ready(())
+            },
         ))
     };
     // Cache backends (#519 B.8). The memory cache is always built
@@ -918,98 +1270,138 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
     if cfg.cache.backend == CacheBackend::Redis && cfg.cache.redis.is_none() {
         anyhow::bail!("cache.backend = redis but cache.redis missing");
     }
-    let redis_cache: Option<Arc<dyn Cache>> = match cfg.cache.redis.as_ref() {
-        Some(redis_cfg) => {
-            tracing::info!(target: "aisix::cache", backend = "redis", "connecting cache backend");
-            let redis = RedisCache::connect(redis_cfg)
-                .await
-                .map_err(|e| {
-                    // Deliberately no URL in the message: redis URLs carry
-                    // credentials (redis://user:pass@host) and this error
-                    // lands in logs that may ship to centralized sinks.
-                    anyhow::anyhow!("redis cache connect failed (cache.redis): {e}")
-                })?
-                .with_env_namespace(&cfg.etcd.env_id);
-            Some(Arc::new(redis) as Arc<dyn Cache>)
+    // ONE failure policy for the whole cache subsystem. The exact-KV and
+    // vector-search stores below open separate connections to the same
+    // `cache.redis` — deliberately, so they do not serialize on one
+    // pipeline — but a single chat request touches both twice (lookup,
+    // lookup, write, write). A breaker per connection therefore let one
+    // request pay the command budget four times over while Redis was
+    // black-holed; sharing the policy makes the first failure
+    // short-circuit the rest of the request. The rate-limit store reads
+    // a different config block and keeps its own.
+    //
+    // The config and its policy travel as one value so the two stores
+    // cannot be built from the same block under different policies —
+    // which is the whole defect, and it reads as ordinary wiring.
+    let cache_redis = cfg
+        .cache
+        .redis
+        .as_ref()
+        .map(|c| (c, aisix_cache::FailurePolicy::new(c)));
+    // A Redis that is unreachable HERE does not stop the boot either.
+    // The cache's whole failure contract is already a miss — every
+    // operation on both stores fails open to one — and a RUNNING gateway
+    // rides out an unbounded cache-Redis outage that way, so a boot that
+    // exited instead was the odd one out. It also took down precisely the
+    // deployment this release is fixing: `config.example.yaml` says the
+    // rate limiter may point at the same Redis as the cache, and with
+    // both blocks on one unreachable server the limiter degraded
+    // correctly and then the cache killed the process anyway.
+    let exact_slot = aisix_redis::ConnSlot::empty();
+    if let Some(redis_cfg) = cache_redis.as_ref() {
+        aisix_redis::warn_on_credential_shadowing(redis_cfg.0);
+    }
+    let redis_cache: Option<Arc<dyn Cache>> = cache_redis.as_ref().map(|_| {
+        Arc::new(
+            aisix_cache::RedisCache::with_slot(exact_slot.clone())
+                .with_env_namespace(&cfg.etcd.env_id)
+                .with_metrics((*metrics).clone()),
+        ) as Arc<dyn Cache>
+    });
+    let cache_backends = CacheBackends::new(Arc::new(MemoryCache::with_defaults()), redis_cache);
+    if let Some((redis_cfg, policy)) = &cache_redis {
+        tracing::info!(target: "aisix::cache", backend = "redis", "connecting cache backend");
+        // Cluster mode has no vector search yet, so nothing is ever
+        // published into the semantic cell there.
+        let semantic_cell = (redis_cfg.mode != aisix_core::RedisMode::Cluster)
+            .then(|| cache_backends.semantic_redis_cell());
+        if semantic_cell.is_none() {
+            tracing::warn!(
+                target: "aisix::cache",
+                "cache.redis is in cluster mode; semantic matching on backend=redis \
+                 policies is not supported yet and stays exact-only"
+            );
         }
-        None => None,
-    };
-    // Shared semantic (L2) store for `backend: redis` policies. Wired
-    // only when the server passes the vector-search probe — a plain
-    // Redis 6/7 (or cluster mode, unsupported yet) degrades those
-    // policies to exact-only, loudly, HERE at boot rather than
-    // silently per request.
-    let semantic_redis: Option<Arc<dyn aisix_cache::SemanticCacheStore>> =
-        match cfg.cache.redis.as_ref() {
-            Some(redis_cfg) if redis_cfg.mode == aisix_core::RedisMode::Cluster => {
+        match attach_cache_backends(
+            &exact_slot,
+            semantic_cell.as_deref(),
+            redis_cfg,
+            policy,
+            &cfg.etcd.env_id,
+            &metrics,
+        )
+        .await
+        {
+            Ok(CacheAttach::Settled) => {}
+            // The exact half is up, so `backend: redis` policies are
+            // being served — but the vector-search question has not been
+            // answered, and dropping it here would mean exact-only for
+            // the life of the process on a server that may well support
+            // it. A task carries on asking.
+            Ok(CacheAttach::SemanticPending) => {
                 tracing::warn!(
                     target: "aisix::cache",
-                    "cache.redis is in cluster mode; semantic matching on backend=redis \
-                     policies is not supported yet and stays exact-only"
+                    backend = "redis",
+                    endpoint = %aisix_redis::endpoint_label(redis_cfg),
+                    "cache.redis connected but the vector-search probe did not \
+                     complete; semantic matching on backend=redis policies stays \
+                     exact-only until it does, and is retried in the background"
                 );
-                None
+                spawn_cache_attach(
+                    exact_slot.clone(),
+                    semantic_cell,
+                    (*redis_cfg).clone(),
+                    policy.clone(),
+                    cfg.etcd.env_id.clone(),
+                    (*metrics).clone(),
+                );
             }
-            Some(redis_cfg) => {
-                // Degrade (never abort) on any failure here: the exact
-                // redis cache above is the load-bearing connection; the
-                // semantic store is an optimization layer.
-                match aisix_cache::RedisSemanticCache::connect(redis_cfg).await {
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "aisix::cache",
-                            error = %e,
-                            "redis semantic cache connect failed; semantic matching \
-                             on backend=redis policies stays exact-only"
-                        );
-                        None
-                    }
-                    Ok(store) => {
-                        let store = store.with_env_namespace(&cfg.etcd.env_id);
-                        match store.probe().await {
-                            Ok(()) => {
-                                match store.sweep_empty_indexes().await {
-                                    Ok(dropped) if dropped > 0 => {
-                                        tracing::info!(
-                                            target: "aisix::cache",
-                                            dropped,
-                                            "reclaimed empty semantic-cache indexes"
-                                        );
-                                    }
-                                    Ok(_) => {}
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            target: "aisix::cache",
-                                            error = %e,
-                                            "semantic-cache index sweep failed; continuing"
-                                        );
-                                    }
-                                }
-                                tracing::info!(
-                                    target: "aisix::cache",
-                                    "cache.redis supports vector search; semantic matching \
-                                     enabled for backend=redis policies"
-                                );
-                                Some(Arc::new(store) as Arc<dyn aisix_cache::SemanticCacheStore>)
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: "aisix::cache",
-                                    error = %e,
-                                    "cache.redis has no vector-search support; semantic matching \
-                                     on backend=redis policies stays exact-only"
-                                );
-                                None
-                            }
-                        }
-                    }
+            // A config the process rejected by ITSELF is still fatal:
+            // retrying a typo'd `ca_file` forever would leave the gateway
+            // healthy and permanently uncached, which is worse than the
+            // boot failure it replaced. A server that answered and
+            // refused is degraded around instead — it can be corrected
+            // server-side while this gateway keeps serving.
+            Err(e) if aisix_redis::is_boot_fatal(&e) => {
+                anyhow::bail!("redis cache connect failed (cache.redis): {e}");
+            }
+            Err(e) => {
+                // `error` is as specific as the driver allows — see the
+                // rate-limit site above.
+                let reason = aisix_redis::failure_reason(&e);
+                let endpoint = aisix_redis::endpoint_label(redis_cfg);
+                if reason == "refused" {
+                    tracing::warn!(
+                        target: "aisix::cache",
+                        backend = "redis",
+                        %endpoint,
+                        %reason,
+                        error = %e,
+                        "cache backend REFUSED the configured connection settings at \
+                         startup; serving with backend=redis cache policies treated as \
+                         misses and retrying in the background"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "aisix::cache",
+                        backend = "redis",
+                        %endpoint,
+                        %reason,
+                        error = %e,
+                        "cache backend unreachable at startup; serving with backend=redis \
+                         cache policies treated as misses and attaching in the background"
+                    );
                 }
+                spawn_cache_attach(
+                    exact_slot.clone(),
+                    semantic_cell,
+                    (*redis_cfg).clone(),
+                    policy.clone(),
+                    cfg.etcd.env_id.clone(),
+                    (*metrics).clone(),
+                );
             }
-            None => None,
-        };
-    let mut cache_backends =
-        CacheBackends::new(Arc::new(MemoryCache::with_defaults()), redis_cache);
-    if let Some(store) = semantic_redis {
-        cache_backends = cache_backends.with_semantic_redis(store);
+        }
     }
     let cache = Some(cache_backends);
 
@@ -1025,6 +1417,18 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
     // so a real DP scrape surfaces UsageEvent throughput without
     // needing the control plane or an OTLP receiver in the loop.
     proxy_state = proxy_state.with_usage_sink(usage_sink.with_metrics((*metrics).clone()));
+    // With no dp-manager, per-user MCP tokens stay in this process and do not
+    // survive a restart.
+    if let Some(h) = heartbeat_cfg.as_ref() {
+        proxy_state = proxy_state.with_mcp_oauth_store(Arc::new(dp_store::DpManagerStore::new(
+            dpmgr_origin(&h.url),
+            &h.mtls,
+        )));
+    }
+    // OTLP exports report the configured service name as `service.name`.
+    proxy_state
+        .otlp_fan_out
+        .set_service_name(&cfg.observability.service_name);
     // #1045: operator UA→client_type rules. Compile errors are
     // boot-fatal — a dropped rule would silently misattribute traffic.
     let client_classifier =
@@ -1048,15 +1452,19 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
     // doesn't accidentally redirect Bedrock calls into thin air.
     let bedrock_endpoint_url = cfg.bedrock_endpoint_url.clone().filter(|s| !s.is_empty());
     let guardrail_metrics_sink = proxy_state.metrics.clone();
-    proxy_state =
-        proxy_state.with_guardrail_index(aisix_guardrails::LiveGuardrailIndex::new_with_sink(
+    let guardrail_embedder = proxy_state.guardrail_embedder();
+    proxy_state = proxy_state.with_guardrail_index(
+        aisix_guardrails::LiveGuardrailIndex::new_with_sink_and_status(
             snapshot_handle.clone(),
             bedrock_endpoint_url,
             Some(guardrail_metrics_sink),
-        ));
+            guardrail_embedder,
+            Some(config_status.clone()),
+        ),
+    );
     // Heartbeat worker — spawned after proxy_state exists so it can read
     // the exporter fan-out's delivery counters. Each tick reports:
-    //   - rejected_resources: the supervisor's loader rejections (#115)
+    //   - rejected_resources: loader + runtime-build rejections (#115, #1084)
     //   - applied_revision: the highest etcd revision the supervisor has
     //     applied, so the control plane can show "propagating…" until the DP catches
     //     up with a kine write (#519 B.3)
@@ -1071,9 +1479,9 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
         let supervisor = supervisor
             .as_ref()
             .expect("managed mode implies the etcd resource source (validated at boot)");
-        let supervisor_for_heartbeat = Arc::clone(supervisor);
+        let config_status_for_rejections = config_status.clone();
         h = h.with_rejection_fetcher(Arc::new(move || {
-            supervisor_for_heartbeat.recent_rejections()
+            config_status_for_rejections.rejection_snapshots()
         }));
         let watch_status = supervisor.watch_status();
         h = h.with_applied_revision_fetcher(Arc::new(move || watch_status.snapshot().revision));
@@ -1089,6 +1497,42 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
         h = h.with_exporter_health_fetcher(Arc::new(move || fan_out.exporter_stats()));
         heartbeat::spawn(h, cancel_rx.clone())
     });
+
+    // Name the guardrails that are attached to nothing, on a timer.
+    //
+    // On a timer rather than from the index build, because the thing being
+    // reported does not coincide with a configuration change. A build
+    // happens only when the snapshot version moves, so a notice emitted
+    // from one is delivered only if somebody writes something — and the two
+    // cases that matter most are the ones where nobody does: a scope target
+    // deleted out from under a rule that was screening traffic yesterday,
+    // and a gateway restarted onto standing configuration.
+    //
+    // Nor is it gated on a readiness flag. `ConfigStatus::is_ready` means
+    // "a load has been applied", which `Supervisor::restore_from_cache`
+    // satisfies before the watch task has reached etcd at all — a one-shot
+    // report behind that gate reads the CACHED generation and never looks
+    // again, so it goes quiet exactly when the cache is the stale thing
+    // (someone changed an attachment while this gateway was down). A sweep
+    // that keeps running converges either way. It may still name a row
+    // that live etcd has attached, during a long outage: that is not a
+    // false alarm, because the gateway is serving the cached generation at
+    // that moment and in it the rule really does inspect nothing.
+    {
+        let sweep_snapshot = snapshot_handle.clone();
+        tokio::spawn(run_periodic(
+            cancel_rx.clone(),
+            aisix_guardrails::UNATTACHED_SWEEP_INTERVAL,
+            move || {
+                let snap = sweep_snapshot.load();
+                aisix_guardrails::sweep_unattached_guardrails(
+                    &snap.guardrails,
+                    &snap.guardrail_attachments,
+                );
+                std::future::ready(())
+            },
+        ));
+    }
 
     // Clone shared trackers before consuming proxy_state in build_router.
     let health_tracker = proxy_state.health.clone();
@@ -1112,6 +1556,14 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
         // config as always freshly applied.
         None => proxy_state.with_config_apply_age(Arc::new(|| Some(std::time::Duration::ZERO))),
     };
+    register_memory_probes(&metrics, &proxy_state);
+    aisix_obs::heap_profile::spawn_auto_dump(
+        &cfg.observability.heap_profiling.auto_dump,
+        (*metrics).clone(),
+    );
+    // The same parsed list `proxy.real_ip` judges forwarded headers by, so
+    // the two trust decisions cannot drift apart.
+    let proxy_protocol_trust: ProxyProtocolTrust = proxy_state.real_ip.trusted.clone().into();
     let proxy_router = aisix_proxy::build_router(proxy_state);
 
     let background_check_task = tokio::spawn(async move {
@@ -1143,14 +1595,18 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
     // Admin router + listener are only built in standalone mode.
     // In managed mode (`cfg.managed.enabled = true`) the DP reads
     // configuration exclusively from etcd; exposing the admin surface
-    // or the Playground would bypass the AISIX Cloud control plane.
+    // or the Playground would bypass the connected control plane.
     //
     // Which store backs the admin surface depends on the resource
     // source: etcd standalone reads the etcd store; file mode reads a
     // view of the file-loaded snapshot. The admin resource surface is
     // read-only — writes were removed with the Admin API write path.
     let admin_store: Option<Arc<dyn ConfigStore>> = match (admin_client, &file_source_path) {
-        (Some((client, prefix)), _) => Some(Arc::new(EtcdConfigStore::new(client, prefix))),
+        (Some((client, prefix, request_timeout)), _) => Some(Arc::new(EtcdConfigStore::new(
+            client,
+            prefix,
+            request_timeout,
+        ))),
         (None, Some(_)) if !cfg.managed.is_managed() => {
             Some(Arc::new(FileManagedStore::new(snapshot_handle.clone())))
         }
@@ -1197,8 +1653,9 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
             admin_router,
             admin_tls,
             downstream_idle_timeout,
-            cancel_rx.clone(),
+            shutdown.clone(),
             "admin",
+            None,
             None,
         )))
     } else {
@@ -1243,8 +1700,9 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
                 metrics_router,
                 None,
                 downstream_idle_timeout,
-                cancel_rx.clone(),
+                shutdown.clone(),
                 "metrics",
+                None,
                 None,
             )))
         } else {
@@ -1252,28 +1710,152 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
         }
     };
 
-    // Step 9: bind + serve the proxy (always). Admin is handled above.
-    let proxy_addr: std::net::SocketAddr = cfg.proxy.addr.parse()?;
-    let proxy_tls = cfg.proxy.tls.clone();
+    // Diagnostics listener (`GET /debug/pprof/heap`), loopback by default.
+    // Unlike the metrics listener a bind failure is not fatal: a second
+    // gateway on the same host network would otherwise refuse to start
+    // over a port it may never use.
+    let debug = &cfg.observability.debug;
+    if debug.enabled {
+        let debug_addr: std::net::SocketAddr = debug.addr.parse()?;
+        if !debug_addr.ip().is_loopback() {
+            tracing::warn!(
+                addr = %debug_addr,
+                "observability.debug.addr is not a loopback address; GET /debug/pprof/heap \
+                 is unauthenticated and costs seconds of CPU per request — restrict access \
+                 at the network layer"
+            );
+        }
+        match std::net::TcpListener::bind(debug_addr) {
+            Ok(probe) => {
+                drop(probe);
+                let router = aisix_admin::debug_router(
+                    metrics.clone(),
+                    aisix_obs::heap_profile::scratch_dir(
+                        &cfg.observability.heap_profiling.auto_dump,
+                    ),
+                );
+                let shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = serve_http(
+                        debug_addr,
+                        router,
+                        None,
+                        downstream_idle_timeout,
+                        shutdown,
+                        "debug",
+                        None,
+                        None,
+                    )
+                    .await
+                    {
+                        tracing::error!(%error, "debug listener stopped");
+                    }
+                });
+            }
+            Err(error) => tracing::error!(
+                %error,
+                addr = %debug_addr,
+                "debug listener bind failed; heap profiles are unavailable over HTTP"
+            ),
+        }
+    }
+
+    // Step 9: bind + serve the proxy, once a configuration has been
+    // applied. Admin is handled above.
+    // `proxy.listeners`, when set, IS the listener set; `proxy.addr` +
+    // `proxy.tls` are the one-listener shorthand. Resolved in one place in
+    // aisix-core so the bind path and the validation cannot disagree.
+    if !cfg.proxy.listeners.is_empty() {
+        tracing::info!(
+            addr = %cfg.proxy.addr,
+            "proxy.addr is ignored because proxy.listeners is set — \
+             proxy.listeners is the complete set of proxy listeners",
+        );
+    }
+    let shorthand = cfg.proxy.listeners.is_empty();
+    let mut proxy_binds: Vec<ListenerBind> = Vec::new();
+    for (i, listener) in cfg.proxy.resolved_listeners().into_iter().enumerate() {
+        proxy_binds.push(ListenerBind {
+            addr: listener.addr.parse()?,
+            tls: listener.tls,
+            tls_field: if shorthand {
+                "proxy.tls".to_string()
+            } else {
+                format!("proxy.listeners[{i}].tls")
+            },
+        });
+    }
     let proxy_workers = cfg
         .proxy
         .thread_per_core_enabled()
         .then(|| cfg.proxy.worker_threads());
-    let proxy_serve = serve_http(
-        proxy_addr,
-        proxy_router,
-        proxy_tls,
-        downstream_idle_timeout,
-        cancel_rx.clone(),
-        "proxy",
-        proxy_workers,
-    );
+    // Only the proxy listeners' connections are counted for the drain: it is
+    // about client traffic, and folding the platform's probes into the number
+    // would report a connection nobody is waiting on.
+    // The gate can defer the real bind indefinitely, so the two failures that
+    // used to surface AT the bind are probed here instead — per listener: an
+    // address that is unusable, and certificate material that cannot be
+    // loaded. Without this a typo'd cert path or an occupied port stops being
+    // a boot failure and becomes an exit at an arbitrary later moment — or
+    // never, on a gateway still waiting for its first configuration. Same
+    // pattern, and the same benign re-bind gap, as the metrics listener's
+    // probe above.
+    for bind in &proxy_binds {
+        let addr = &bind.addr;
+        std::net::TcpListener::bind(addr)
+            .map_err(|e| anyhow::anyhow!("proxy listener bind {addr} failed: {e}"))?;
+        if let Some(tls) = bind.tls.as_ref() {
+            downstream_tls_acceptor(tls, &bind.tls_field).await?;
+        }
+    }
+    let proxy_addrs = proxy_binds
+        .iter()
+        .map(|bind| bind.addr.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let proxy_drain = livez_state.clone();
+    let gate_status = config_status.clone();
+    let mut gate_cancel = cancel_rx.clone();
+    let mut gate_retire = retire_rx.clone();
+    // The gate wraps the call rather than living inside `serve_http`, which
+    // both listener modes enter: `serve_http_tpc` branches off before the
+    // single-listener bind, so a gate placed further in would not cover the
+    // thread-per-core `SO_REUSEPORT` path. Left lazy so the shutdown
+    // coordinator below is spawned before the wait begins.
+    let proxy_serve = async move {
+        if !await_first_config(
+            &gate_status,
+            &mut gate_cancel,
+            &mut gate_retire,
+            &proxy_addrs,
+        )
+        .await
+        {
+            return Ok(());
+        }
+        serve_listeners(
+            proxy_binds,
+            proxy_router,
+            downstream_idle_timeout,
+            shutdown,
+            "proxy",
+            proxy_workers,
+            Some(proxy_drain),
+            Some(proxy_protocol_trust),
+        )
+        .await
+    };
 
     // Step 10: shutdown coordinator. Whichever of (signal, proxy, admin)
     // completes first triggers the rest.
-    let signal_task = tokio::spawn(wait_for_signal(cancel_tx.clone(), livez_state));
+    let signal_task = tokio::spawn(wait_for_signal(
+        cancel_tx.clone(),
+        retire_tx,
+        livez_state,
+        Duration::from_secs(cfg.shutdown.min_drain_secs),
+    ));
 
-    proxy_serve
+    telemetry::stop_after(proxy_serve, &usage_stop_tx)
         .await
         .map_err(|e| anyhow::anyhow!("proxy serve error: {e}"))?;
     if let Some(handle) = admin_serve_handle {
@@ -1308,6 +1890,65 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
     Ok(())
 }
 
+/// Report each in-process store's size on the Prometheus scrape. Every
+/// reading here is O(1) or bounded by configuration, never by traffic.
+fn register_memory_probes(metrics: &aisix_obs::Metrics, state: &ProxyState) {
+    use aisix_obs::memory::ComponentReading;
+    fn entries(n: u64) -> ComponentReading {
+        ComponentReading {
+            entries: Some(n),
+            bytes: None,
+        }
+    }
+    let probes = metrics.memory_probes();
+
+    let usage = state.usage_sink.clone();
+    probes.register_component("usage_event_queue", move || entries(usage.queued()));
+    let fan_out = state.otlp_fan_out.clone();
+    probes.register_exporter_queues(move || fan_out.exporter_queue_depths());
+    probes.register_component("log_queue", || {
+        let (lines, bytes) = aisix_obs::log_queue_depth();
+        ComponentReading {
+            entries: Some(lines),
+            bytes: Some(bytes),
+        }
+    });
+    if let Some(cache) = state.cache.clone() {
+        let response = cache.clone();
+        probes.register_component("response_cache", move || {
+            entries(response.response_cache_entries())
+        });
+        probes.register_component("semantic_cache", move || {
+            entries(cache.semantic_cache_entries())
+        });
+    }
+    let vectors = state.semantic_cache.clone();
+    probes.register_component("route_embedding_cache", move || {
+        entries(vectors.entry_count())
+    });
+    let limiter = state.limiter.clone();
+    probes.register_component("ratelimit_local_keys", move || {
+        entries(limiter.local_key_count())
+    });
+    probes.register_component("snapshot_pending_reclaim", || {
+        entries(aisix_core::snapshot::pending_reclaim() as u64)
+    });
+    probes.register_component("upstream_clients", || {
+        entries(aisix_gateway::upstream_tls::provider_key_client_count())
+    });
+    probes.register_component("in_flight_request_bodies", || {
+        let (bodies, bytes) = aisix_proxy::in_flight_request_bodies();
+        ComponentReading {
+            entries: Some(bodies as u64),
+            bytes: Some(bytes as u64),
+        }
+    });
+    probes.register_component("guardrail_holdback", || ComponentReading {
+        entries: None,
+        bytes: Some(aisix_proxy::holdback_bytes() as u64),
+    });
+}
+
 /// Build the etcd-client `ConnectOptions` from `cfg.etcd`, wiring in
 /// the mTLS bundle when `cfg.etcd.tls` is present.
 ///
@@ -1330,47 +1971,6 @@ fn build_etcd_connect_options(etcd: &EtcdConfig) -> anyhow::Result<Option<Connec
     build_etcd_connect_options_with_extra_ca(etcd, None)
 }
 
-/// HTTP/2 keepalive on the etcd channel: ping every interval, drop the
-/// connection if a ping goes unanswered for the timeout.
-///
-/// This is the one that mattered. `ConnectOptions::new()` sets
-/// `keep_alive: None` — no pings at all — while `keep_alive_while_idle` is
-/// already `true`, so the setting that was missing is the one that does the
-/// work. Against an endpoint that accepts the TCP connection and then never
-/// speaks gRPC, the first `load_all` on the boot path DID NOT RETURN AT ALL
-/// (measured: the 45s guard in the test fires; with these bounds it errors in
-/// ~15s). The watch is the same shape and worse, because it is idle between
-/// config changes by design: a peer that stops answering leaves the stream
-/// open and silent, config quietly goes stale, and nothing errors.
-///
-/// A dead peer is noticed in about 15s. 10s stays clear of etcd's default
-/// `--grpc-keepalive-min-time` of 5s, so the server will not answer these
-/// pings with GOAWAY — while a stream is open. On a connection with none,
-/// etcd counts every ping as a strike (`PermitWithoutStream` is hard-coded
-/// false) and sends GOAWAY `too_many_pings` after three, so pings are limited
-/// to connections carrying the watch or a request in flight, which are the
-/// two cases above.
-///
-/// Deliberately NOT `with_timeout`: etcd-client turns that into
-/// `Endpoint::timeout`, a tonic CHANNEL-level deadline applied to every
-/// request INCLUDING the streaming watch, which would tear the config watch
-/// down on a fixed schedule.
-const ETCD_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
-const ETCD_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The connect policy boot uses, in one place so a test can drive the same
-/// one. Without this the wiring is what rots: the provider can honour
-/// `etcd.request_timeout_ms` perfectly while the boot call quietly stops
-/// passing it, and nothing anywhere fails.
-fn etcd_connect_policy(etcd: &EtcdConfig) -> aisix_etcd::ConnectPolicy {
-    aisix_etcd::ConnectPolicy {
-        // `etcd.request_timeout_ms` — accepted, defaulted and documented
-        // since this config struct existed, and read by nothing until now.
-        request_timeout: Some(etcd.request_timeout()),
-        ..Default::default()
-    }
-}
-
 fn build_etcd_connect_options_with_extra_ca(
     etcd: &EtcdConfig,
     extra_ca_pem: Option<&[u8]>,
@@ -1382,13 +1982,24 @@ fn build_etcd_connect_options_with_extra_ca(
     // Note that `Client::connect` proves nothing on its own: etcd-client
     // builds a `balance_channel` and, with no auth configured, sends no
     // request, so it returns `Ok` against an endpoint that is not etcd at all.
-    // The bounds below are what the FIRST READ and the watch rely on.
+    // What the FIRST READ and the watch rely on is the keepalive
+    // `LazyEtcdClient::new` puts on every connection, and
+    // `etcd.request_timeout_ms` when it is set. Deliberately NOT
+    // `with_timeout`: etcd-client turns that into `Endpoint::timeout`, a tonic
+    // CHANNEL-level deadline applied to every request INCLUDING the streaming
+    // watch, which would tear the config watch down on a fixed schedule.
     // 只在有活跃 stream 时 ping：etcd 把空闲连接上的 ping 记过，攒够三次就回
     // GOAWAY `too_many_pings` 断开（见 `build_connect_options_pings_only_while_a_stream_is_open`）。
-    let mut options = ConnectOptions::new()
-        .with_connect_timeout(etcd.dial_timeout())
-        .with_keep_alive(ETCD_KEEPALIVE_INTERVAL, ETCD_KEEPALIVE_TIMEOUT)
-        .with_keep_alive_while_idle(false);
+    let mut options = ConnectOptions::new().with_keep_alive_while_idle(false);
+
+    // `with_connect_timeout` bounds establishing the channel only; it is
+    // not a deadline on the calls made over it (that is
+    // `etcd.request_timeout_ms`, applied per call). Per ATTEMPT, so the
+    // per-endpoint value rather than `dial_budget`, which is what bounds
+    // the whole dial one level up.
+    if let Some(dial) = etcd.dial_timeout() {
+        options = options.with_connect_timeout(dial);
+    }
 
     if let (Some(user), Some(env_key)) = (etcd.user.as_ref(), etcd.password_env.as_ref()) {
         let pw = std::env::var(env_key).map_err(|_| {
@@ -1435,6 +2046,227 @@ fn build_etcd_connect_options_with_extra_ca(
     Ok(Some(options))
 }
 
+/// How often a gateway that started without its cache backend re-states
+/// that `backend: redis` policies are being served as misses. Same
+/// reasoning, and same interval, as the rate limiter's: a Redis that is
+/// merely late says nothing beyond the boot WARN, while a permanent
+/// misconfiguration stays greppable in any retained log window.
+const CACHE_DEGRADED_REMINDER: Duration = Duration::from_secs(300);
+
+/// How far [`attach_cache_backends`] got.
+///
+/// The two connections do not settle together, and the difference is
+/// what tells the retry loop whether to stop. A semantic connection that
+/// failed, or a probe that never reached an answer, leaves the question
+/// open — and giving up on it would mean exact-only for the life of the
+/// process on a server that may well do vector search.
+enum CacheAttach {
+    /// Both halves are settled: the exact connection is up, and the
+    /// vector-search question has a final answer — published, or
+    /// answered no by a server that answered.
+    Settled,
+    /// The exact connection is up; the vector-search question is still
+    /// open. Keep asking.
+    SemanticPending,
+}
+
+/// Connect the cache subsystem and publish what it got.
+///
+/// The exact-KV connection is what the subsystem IS: failing it fails
+/// this call, and the caller decides whether that is a boot warning or a
+/// retry that has not landed yet. The vector-search half never fails
+/// this call — it reports through [`CacheAttach`] instead, because its
+/// failure is not the subsystem's.
+///
+/// The semantic store is BUILT here rather than handed in, because the
+/// question it answers — does this server do vector search at all — can
+/// only be asked of a live connection. Publishing it is the yes; leaving
+/// the cell empty is the no, and that is the same "no" a `cache.redis`
+/// without the search module has always produced: the gate reports it
+/// once per policy and then serves exact-only, with no embedding call
+/// and no Redis round trip per request. A store published with a dead
+/// connection would instead charge an embedding call for every semantic
+/// lookup for the life of the process, which is why nothing is published
+/// until the probe has passed.
+///
+/// Re-entrant: the retry loop calls it again for the half that has not
+/// settled, and neither half is re-dialled once it has.
+async fn attach_cache_backends(
+    exact: &aisix_redis::ConnSlot,
+    semantic: Option<&aisix_proxy::SemanticRedisCell>,
+    cfg: &aisix_core::RedisConnConfig,
+    policy: &aisix_cache::FailurePolicy,
+    env_id: &str,
+    metrics: &Metrics,
+) -> Result<CacheAttach, aisix_redis::ConnectError> {
+    if !exact.is_attached() {
+        exact.attach(aisix_redis::connect_bounded(cfg, policy).await?);
+    }
+    let Some(cell) = semantic else {
+        return Ok(CacheAttach::Settled);
+    };
+    if cell.get().is_some() {
+        return Ok(CacheAttach::Settled);
+    }
+    // Its own connection — same policy, so the two share one cool-off,
+    // but separate so they do not serialize on one pipeline.
+    let conn = match aisix_redis::connect_bounded(cfg, policy).await {
+        Ok(conn) => conn,
+        Err(e) => {
+            // Not settled: the exact connection landing a moment earlier
+            // says the server is there, so this is a blip — a connection
+            // limit, a restart between the two dials — and the answer is
+            // still unknown rather than no.
+            tracing::debug!(
+                target: "aisix::cache",
+                error = %e,
+                "redis semantic cache connect failed; retrying"
+            );
+            return Ok(CacheAttach::SemanticPending);
+        }
+    };
+    let store = aisix_cache::RedisSemanticCache::from_conn(conn)
+        .with_env_namespace(env_id)
+        .with_metrics(metrics.clone());
+    match store.probe_outcome().await {
+        aisix_cache::ProbeOutcome::Inconclusive(e) => {
+            // The probe did not reach an answer. Recording "no vector
+            // search" on that would be recording a timeout as a server
+            // capability, for the life of the process.
+            tracing::debug!(
+                target: "aisix::cache",
+                error = %e,
+                "vector-search probe did not complete; retrying"
+            );
+            return Ok(CacheAttach::SemanticPending);
+        }
+        aisix_cache::ProbeOutcome::Unsupported(e) => {
+            tracing::warn!(
+                target: "aisix::cache",
+                error = %e,
+                "cache.redis has no vector-search support; semantic matching \
+                 on backend=redis policies stays exact-only"
+            );
+            return Ok(CacheAttach::Settled);
+        }
+        aisix_cache::ProbeOutcome::Supported => {}
+    }
+    match store.sweep_empty_indexes().await {
+        Ok(dropped) if dropped > 0 => {
+            tracing::info!(target: "aisix::cache", dropped, "reclaimed empty semantic-cache indexes");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                target: "aisix::cache",
+                error = %e,
+                "semantic-cache index sweep failed; continuing"
+            );
+        }
+    }
+    let _ = cell.set(Arc::new(store) as Arc<dyn aisix_cache::SemanticCacheStore>);
+    tracing::info!(
+        target: "aisix::cache",
+        "cache.redis supports vector search; semantic matching \
+         enabled for backend=redis policies"
+    );
+    Ok(CacheAttach::Settled)
+}
+
+/// Keep trying the cache backend until both halves settle, then stop.
+///
+/// Same cadence and same reasoning as the rate limiter's attach task: one
+/// attempt per configured budget, off the request path, so the
+/// node-reboot case — Redis coming up seconds after the gateway —
+/// recovers in seconds.
+///
+/// It does NOT stop as soon as the exact connection lands. The semantic
+/// half is a second connection and a capability question, and either can
+/// miss for a transient reason; giving up on the first attempt would
+/// leave every semantic policy exact-only for the life of the process on
+/// a server that does support vector search.
+fn spawn_cache_attach(
+    exact: aisix_redis::ConnSlot,
+    semantic: Option<Arc<aisix_proxy::SemanticRedisCell>>,
+    cfg: aisix_core::RedisConnConfig,
+    policy: aisix_cache::FailurePolicy,
+    env_id: String,
+    metrics: Metrics,
+) {
+    tokio::spawn(async move {
+        let retry = Duration::from_secs(cfg.timeout_secs.max(1));
+        let endpoint = aisix_redis::endpoint_label(&cfg);
+        let mut last_reminder = std::time::Instant::now();
+        let mut announced = false;
+        loop {
+            tokio::time::sleep(retry).await;
+            match attach_cache_backends(
+                &exact,
+                semantic.as_deref(),
+                &cfg,
+                &policy,
+                &env_id,
+                &metrics,
+            )
+            .await
+            {
+                Ok(settled) => {
+                    // Announced on the first round that gets the exact
+                    // connection up, not on every subsequent semantic
+                    // retry: that is when `backend: redis` policies start
+                    // being served again.
+                    if !announced {
+                        announced = true;
+                        tracing::info!(
+                            target: "aisix::cache",
+                            %endpoint,
+                            "cache backend attached; backend=redis policies are served again"
+                        );
+                    }
+                    if matches!(settled, CacheAttach::Settled) {
+                        return;
+                    }
+                }
+                Err(e) if last_reminder.elapsed() >= CACHE_DEGRADED_REMINDER => {
+                    last_reminder = std::time::Instant::now();
+                    // Same `reason` the boot line carried, so the two read
+                    // as one story and one filter finds both.
+                    let reason = aisix_redis::failure_reason(&e);
+                    if reason == "refused" {
+                        tracing::warn!(
+                            target: "aisix::cache",
+                            %endpoint,
+                            %reason,
+                            error = %e,
+                            "cache backend is still REFUSING the configured connection \
+                             settings; every backend=redis cache policy is being served \
+                             as a miss"
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: "aisix::cache",
+                            %endpoint,
+                            %reason,
+                            error = %e,
+                            "cache backend still unreachable; every backend=redis cache \
+                             policy is being served as a miss"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        target: "aisix::cache",
+                        %endpoint,
+                        error = %e,
+                        retry_secs = retry.as_secs(),
+                        "cache backend still unreachable; serving misses"
+                    );
+                }
+            }
+        }
+    });
+}
+
 /// Extract the host portion of a URL-like endpoint (`http://host:2379`,
 /// `https://host:2379`, or bare `host:2379`) for use as the TLS SNI.
 /// Per-endpoint DNS probe logged at info / warn. Not part of the
@@ -1442,11 +2274,14 @@ fn build_etcd_connect_options_with_extra_ca(
 /// for why this exists.
 async fn probe_etcd_dns(endpoints: &[String]) {
     for raw in endpoints {
+        // `redact_userinfo` because an endpoint may be a bare `host:port`,
+        // which is not a URL `redact_url_for_log` could say anything about.
+        let shown = aisix_core::redact_userinfo(raw);
         let (host, port) = match parse_host_port(raw) {
             Ok(hp) => hp,
             Err(err) => {
                 tracing::warn!(
-                    endpoint = %raw,
+                    endpoint = %shown,
                     error = %err,
                     "etcd endpoint parse failed; skipping DNS probe",
                 );
@@ -1457,7 +2292,7 @@ async fn probe_etcd_dns(endpoints: &[String]) {
             Ok(iter) => {
                 let addrs: Vec<String> = iter.map(|a| a.to_string()).collect();
                 tracing::info!(
-                    endpoint = %raw,
+                    endpoint = %shown,
                     host = %host,
                     port,
                     addrs = ?addrs,
@@ -1476,7 +2311,7 @@ async fn probe_etcd_dns(endpoints: &[String]) {
                     cur = src.source();
                 }
                 tracing::warn!(
-                    endpoint = %raw,
+                    endpoint = %shown,
                     host = %host,
                     port,
                     error = %chain,
@@ -1488,42 +2323,73 @@ async fn probe_etcd_dns(endpoints: &[String]) {
     }
 }
 
-/// Shared endpoint → (host, port) splitter. Mirrors the logic in
-/// [`default_domain_from_endpoint`] plus a port parse.
-fn parse_host_port(endpoint: &str) -> anyhow::Result<(String, u16)> {
+/// The `host[:port]` of an endpoint: scheme and userinfo removed. An endpoint
+/// may carry userinfo (`managed.cp_base_url` becomes one), and its password is
+/// neither a host to resolve nor a name to present over TLS. The last `@`,
+/// because a password can hold one.
+fn endpoint_authority(endpoint: &str) -> &str {
     let without_scheme = endpoint
         .split_once("://")
         .map(|(_, rest)| rest)
         .unwrap_or(endpoint);
-    let (host, port) = match without_scheme.rsplit_once(':') {
+    without_scheme
+        .rsplit_once('@')
+        .map_or(without_scheme, |(_, authority)| authority)
+}
+
+/// Shared endpoint → (host, port) splitter. Mirrors the logic in
+/// [`default_domain_from_endpoint`] plus a port parse.
+fn parse_host_port(endpoint: &str) -> anyhow::Result<(String, u16)> {
+    let authority = endpoint_authority(endpoint);
+    let shown = aisix_core::redact_userinfo(endpoint);
+    let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => (
             h.trim_matches(|c| c == '[' || c == ']'),
             p.parse::<u16>()
-                .map_err(|e| anyhow::anyhow!("invalid port {p:?} in {endpoint:?}: {e}"))?,
+                .map_err(|e| anyhow::anyhow!("invalid port {p:?} in {shown:?}: {e}"))?,
         ),
         // No explicit port — default to the etcd v3 port.
-        None => (without_scheme.trim_matches(|c| c == '[' || c == ']'), 2379),
+        None => (authority.trim_matches(|c| c == '[' || c == ']'), 2379),
     };
     if host.is_empty() {
-        anyhow::bail!("endpoint {endpoint:?} has no host");
+        anyhow::bail!("endpoint {shown:?} has no host");
     }
     Ok((host.to_string(), port))
 }
 
 fn default_domain_from_endpoint(endpoint: &str) -> anyhow::Result<String> {
-    let without_scheme = endpoint
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(endpoint);
-    let host = without_scheme
+    let authority = endpoint_authority(endpoint);
+    let host = authority
         .rsplit_once(':')
         .map(|(h, _)| h)
-        .unwrap_or(without_scheme)
+        .unwrap_or(authority)
         .trim_matches(|c| c == '[' || c == ']'); // strip IPv6 brackets
     if host.is_empty() {
-        anyhow::bail!("cannot derive TLS domain_name from endpoint {endpoint:?}");
+        let shown = aisix_core::redact_userinfo(endpoint);
+        anyhow::bail!("cannot derive TLS domain_name from endpoint {shown:?}");
     }
     Ok(host.to_string())
+}
+
+/// The dpmgr origin: the heartbeat URL with its path stripped back off.
+fn dpmgr_origin(heartbeat_url: &str) -> &str {
+    heartbeat_url
+        .strip_suffix(heartbeat::HEARTBEAT_PATH)
+        .unwrap_or(heartbeat_url)
+}
+
+/// Telemetry URL, derived from the heartbeat URL by swapping the path
+/// suffix so the two stay in lock-step on a `cp_base_url` change.
+///
+/// Built on `dpmgr_origin` rather than a `replace`: a replace rewrites
+/// every occurrence, and a base that itself ends in `/dp/heartbeat`
+/// would then yield `…/dp/telemetry/dp/telemetry`.
+fn telemetry_url(heartbeat_url: &str) -> String {
+    format!(
+        "{}{}",
+        dpmgr_origin(heartbeat_url),
+        telemetry::TELEMETRY_PATH
+    )
 }
 
 /// Derive the etcd endpoint from `managed.cp_base_url` or
@@ -1585,7 +2451,7 @@ fn load_heartbeat_config_from_disk(
     if dp_id.is_empty() {
         anyhow::bail!("dp_id file {} is empty", managed.dp_id_file);
     }
-    let url = format!("{}/dp/heartbeat", base.trim_end_matches('/'));
+    let url = heartbeat::heartbeat_url(base);
     Ok(heartbeat::HeartbeatConfig::sanitised(
         url,
         dp_id,
@@ -1697,122 +2563,905 @@ fn background_check_interval(snapshot: &aisix_core::AisixSnapshot) -> std::time:
     std::time::Duration::from_secs(min_interval.max(1))
 }
 
-/// Set on every connection the gateway accepts from a client.
+/// The two moments a listener has to tell apart during a shutdown.
 ///
-/// Nagle's algorithm holds a small segment back until the previous one
-/// has been acknowledged. A short buffered answer leaves in a single
-/// segment and never notices — which is why this is invisible in the
-/// throughput benchmark — but a streamed one writes a frame at a time,
-/// and a frame that lands while an earlier one is still unacknowledged
-/// waits out the client's delayed ACK (up to 40ms on Linux) before it
-/// leaves the box. HTTP/2 control frames and the WebSocket surfaces run
-/// on the same accepted socket and inherit the option.
+/// `retire` flips when the drain STARTS (SIGTERM): open connections are
+/// told to stop taking new work while the listener KEEPS accepting,
+/// because a balancer only learns about the `/readyz` 503 on its next
+/// probe and refusing everything it routes in between is the failure a
+/// graceful shutdown exists to avoid. `cancel` flips when the drain is
+/// OVER: stop accepting, and close what is left.
 ///
-/// `axum_server` accepts with the option off, and the gateway had never
-/// turned it on. reqwest already sets it on the upstream side.
-///
-/// A `set_nodelay` failure fails that connection: on Linux the option
-/// carries no socket-state precondition and cannot fail, and elsewhere
-/// it reports a peer that has already gone away — a connection that was
-/// not answerable regardless.
-const DOWNSTREAM_NODELAY: axum_server::accept::NoDelayAcceptor =
-    axum_server::accept::NoDelayAcceptor;
+/// The two must stay separate signals. Collapsing them into one is the
+/// same as having no HTTP/2 retirement signal at all, because the only
+/// way to retire a connection would be to close the listener with it
+/// (AISIX-Cloud#1395).
+#[derive(Clone)]
+struct ShutdownWatch {
+    retire: watch::Receiver<bool>,
+    cancel: watch::Receiver<bool>,
+}
 
-/// Completes when the process receives SIGINT or SIGTERM (best-effort on
-/// Windows — Ctrl+C only) OR when another part of the system has already
-/// flipped the cancel channel.
-/// Serve `router` on `addr`, choosing HTTPS when `tls` is configured and
-/// plain HTTP otherwise. Both variants honour the shared `cancel` watch for
-/// graceful shutdown so the proxy/admin surfaces stop in lockstep with the
-/// rest of the process. Wired for #473: `proxy.tls` / `admin.tls` were
-/// parsed but never reached the listener, so the documented config silently
-/// served plain HTTP.
+impl ShutdownWatch {
+    /// Resolves once `rx` is true — immediately when it was already true
+    /// before this connection was accepted, which is the case for every
+    /// connection accepted during a drain. `Receiver::changed` would
+    /// wait for the NEXT flip and so never return for those.
+    ///
+    /// A dropped sender resolves too: the process is going away, and
+    /// "retire now" is the safe reading of that.
+    async fn signalled(rx: &mut watch::Receiver<bool>) {
+        let _ = rx.wait_for(|flag| *flag).await;
+    }
+
+    /// Whichever comes first. `cancel` belongs here because it can flip
+    /// without `retire` ever flipping: a failure elsewhere in the
+    /// process cancels it without a drain.
+    async fn retire_or_cancel(&mut self) {
+        tokio::select! {
+            _ = Self::signalled(&mut self.retire) => {}
+            _ = Self::signalled(&mut self.cancel) => {}
+        }
+    }
+
+    async fn cancelled(&mut self) {
+        Self::signalled(&mut self.cancel).await;
+    }
+}
+
+/// Which HTTP version an accepted connection settled on.
 ///
-/// Both variants run on `axum_server` rather than `axum::serve` because
-/// only the former exposes the hyper connection builder, which is where
-/// `downstream.idle_timeout_secs` has to be applied (#1126).
+/// The gateway decides this itself rather than leaving it to
+/// `hyper_util`'s auto builder, because the version decides which
+/// retirement signal the connection can be handed and the auto
+/// connection does not report which version it negotiated. Its
+/// `graceful_shutdown` is version-blind, and on an HTTP/1.1 connection
+/// it means "close as soon as idle" — the server-initiated close of a
+/// pooled connection that #1394 ruled out.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Downstream {
+    Http1,
+    Http2,
+}
+
+/// Holds a connection's slot in [`LivezState::open_connections`] for as
+/// long as the connection's task runs.
+///
+/// The count is what separates work the gateway had already taken on
+/// from traffic still being routed at it during a drain: a pooled
+/// connection sitting idle carries no in-flight request, so a count that
+/// stays up while `in_flight` falls is how an operator sees that the
+/// balancer has not stopped routing here yet (#1394).
+struct ConnectionGuard(std::sync::Arc<aisix_proxy::LivezState>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.connection_closed();
+    }
+}
+
+/// Replays the bytes the version sniff had to consume, so hyper still
+/// sees the connection from byte zero.
+struct Rewind<I> {
+    prefix: Vec<u8>,
+    replayed: usize,
+    inner: I,
+}
+
+impl<I> Rewind<I> {
+    fn new(prefix: Vec<u8>, inner: I) -> Self {
+        Self {
+            prefix,
+            replayed: 0,
+            inner,
+        }
+    }
+}
+
+impl<I: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Rewind<I> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let me = &mut *self;
+        if me.replayed < me.prefix.len() && buf.remaining() > 0 {
+            let n = (me.prefix.len() - me.replayed).min(buf.remaining());
+            buf.put_slice(&me.prefix[me.replayed..me.replayed + n]);
+            me.replayed += n;
+            if me.replayed == me.prefix.len() {
+                // Held for the connection's lifetime otherwise.
+                me.prefix = Vec::new();
+                me.replayed = 0;
+            }
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut me.inner).poll_read(cx, buf)
+    }
+}
+
+impl<I: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Rewind<I> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+/// Read enough of a plaintext connection to tell HTTP/2 from HTTP/1.1,
+/// and hand back a stream that still starts at byte zero.
+///
+/// Four bytes settle it: RFC 9113 §3.4 reserves the `PRI` method for the
+/// client connection preface precisely so that no HTTP/1 request can
+/// begin with it. `hyper_util` reads the same bytes one layer down and
+/// keeps the answer to itself.
+///
+/// A TLS listener never reaches here — ALPN has already answered.
+async fn sniff_downstream_version<I: tokio::io::AsyncRead + Unpin>(
+    mut stream: I,
+    first_bytes_timeout: Option<Duration>,
+) -> std::io::Result<(Downstream, Rewind<I>)> {
+    use tokio::io::AsyncReadExt;
+
+    const PREFACE_HEAD: &[u8] = b"PRI ";
+
+    let mut head = [0u8; PREFACE_HEAD.len()];
+    let mut filled = 0;
+    let read = async {
+        while filled < head.len() {
+            match stream.read(&mut head[filled..]).await? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    };
+
+    match first_bytes_timeout {
+        // The same window `downstream.idle_timeout_secs` gives a request
+        // head, applied here because this read happens BEFORE hyper has
+        // a connection to arm its own timer on. hyper's version read has
+        // no timer of its own, so without this a peer that connects and
+        // then says nothing holds its slot until the platform reclaims
+        // the socket (#1126).
+        Some(d) => tokio::time::timeout(d, read).await.map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "downstream opened a connection and sent nothing",
+            )
+        })??,
+        None => read.await?,
+    }
+
+    let version = if head[..filled] == *PREFACE_HEAD {
+        Downstream::Http2
+    } else {
+        Downstream::Http1
+    };
+    Ok((version, Rewind::new(head[..filled].to_vec(), stream)))
+}
+
+/// A dual-stack (`[::]`) listener reports an IPv4 client as
+/// `::ffff:a.b.c.d`, which no IPv4 CIDR contains. Every consumer of the
+/// connection's peer — `trusted_proxies`, `allowed_cidrs`, source
+/// allowlists, hash routing, the reported client address — reads it
+/// through `ConnectInfo`, so it is normalised once, here.
+fn canonical_peer(peer: std::net::SocketAddr) -> std::net::SocketAddr {
+    std::net::SocketAddr::new(peer.ip().to_canonical(), peer.port())
+}
+
+/// The peers allowed to open a proxy-listener connection with a PROXY
+/// header: `proxy.real_ip.trusted_proxies`. Only the proxy listeners carry
+/// one; the admin, metrics and debug listeners never read a header.
+type ProxyProtocolTrust = std::sync::Arc<[ipnet::IpNet]>;
+
+/// Read the PROXY header a connection may open with, bounded by the same
+/// first-bytes window as the version sniff. Returns the peer to attribute
+/// the connection to and the stream positioned at the byte after the
+/// header, or `None` once the connection has been refused and logged.
+async fn read_proxy_header(
+    mut stream: tokio::net::TcpStream,
+    socket_peer: std::net::SocketAddr,
+    trusted: &[ipnet::IpNet],
+    timeout: Option<Duration>,
+    label: &'static str,
+) -> Option<(std::net::SocketAddr, Rewind<tokio::net::TcpStream>)> {
+    let read = proxy_protocol::read(&mut stream, socket_peer, trusted, timeout).await;
+    match read {
+        Ok((peer, replay)) => Some((peer, Rewind::new(replay, stream))),
+        Err(proxy_protocol::Refused::Untrusted) => {
+            tracing::warn!(
+                label,
+                peer = %socket_peer,
+                "PROXY protocol header from a peer outside proxy.real_ip.trusted_proxies; \
+                 closing the connection"
+            );
+            None
+        }
+        Err(proxy_protocol::Refused::Malformed(reason)) => {
+            tracing::warn!(
+                label,
+                peer = %socket_peer,
+                reason,
+                "malformed PROXY protocol header; closing the connection"
+            );
+            None
+        }
+        Err(proxy_protocol::Refused::Io(e)) => {
+            tracing::debug!(label, error = %e, "reading the connection's first bytes failed");
+            None
+        }
+    }
+}
+
+/// How often the boot path repeats the "still waiting for a configuration"
+/// line while the proxy listener is held closed.
+const FIRST_CONFIG_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Hold the boot path until the gateway has applied a configuration, so the
+/// proxy listener never binds on an instance that has nothing to serve. A
+/// platform that reads "the TCP port accepts" as "this instance is ready"
+/// otherwise routes client traffic to a gateway whose first configuration
+/// read is still in flight, and every request is rejected as an unknown API
+/// key.
+///
+/// The paths that already hold a configuration pay nothing: file mode loads
+/// synchronously and boot-fatally before this point, and an etcd boot seeded
+/// from the on-disk snapshot cache has applied that snapshot before the watch
+/// task is spawned. A cold etcd boot is the only one that waits, and it waits
+/// indefinitely — the watch supervisor owns the retry loop and its backoff,
+/// and `/status/ready` on the metrics listener answers 503 throughout.
+///
+/// Returns `false` once shutdown has started, in which case the proxy listener
+/// is never bound at all. `retire` is what SIGTERM flips; `cancel` only follows
+/// after the drain window, so waiting on `cancel` alone would let a
+/// configuration landing mid-drain open a fresh listener on an instance that is
+/// already terminating.
+async fn await_first_config(
+    config_status: &ConfigStatus,
+    cancel: &mut watch::Receiver<bool>,
+    retire: &mut watch::Receiver<bool>,
+    proxy_addr: &str,
+) -> bool {
+    if config_status.is_ready() {
+        return true;
+    }
+    tracing::info!(
+        addr = %proxy_addr,
+        "waiting for the first configuration before binding the proxy listener",
+    );
+    let applied = config_status.wait_until_applied();
+    tokio::pin!(applied);
+    // First tick one interval in, not immediately: a cold etcd boot reaches
+    // this a few milliseconds before its first `load_all` returns, and a
+    // warning that fires on every healthy boot is one operators learn to
+    // filter out. The INFO line above already records that the wait started.
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + FIRST_CONFIG_WAIT_LOG_INTERVAL,
+        FIRST_CONFIG_WAIT_LOG_INTERVAL,
+    );
+    loop {
+        // `biased` so a configuration arriving in the same wakeup as a
+        // shutdown signal cannot win the race and open a listener the
+        // shutdown coordinator is already tearing down.
+        tokio::select! {
+            biased;
+            _ = retire.wait_for(|draining| *draining) => {
+                tracing::info!(
+                    addr = %proxy_addr,
+                    "shutdown started before the first configuration was applied — \
+                     proxy listener never bound",
+                );
+                return false;
+            }
+            _ = cancel.wait_for(|cancelled| *cancelled) => {
+                tracing::info!(
+                    addr = %proxy_addr,
+                    "cancelled before the first configuration was applied — \
+                     proxy listener never bound",
+                );
+                return false;
+            }
+            _ = &mut applied => {
+                tracing::info!(
+                    addr = %proxy_addr,
+                    "first configuration applied — binding the proxy listener",
+                );
+                return true;
+            }
+            _ = ticker.tick() => {
+                tracing::warn!(
+                    addr = %proxy_addr,
+                    "proxy listener still not bound: no configuration has been applied yet",
+                );
+            }
+        }
+    }
+}
+
+/// Serve `router` on `addr`, choosing HTTPS when `tls` is configured and
+/// plain HTTP otherwise. Wired for #473: `proxy.tls` / `admin.tls` were
+/// parsed but never reached the listener, so the documented config
+/// silently served plain HTTP.
+///
+/// The gateway runs its own accept loop rather than `axum::serve` or
+/// `axum_server`. Two things it has to do are not reachable through
+/// either: applying `downstream.idle_timeout_secs` needs the hyper
+/// connection builder (#1126), which `axum::serve` does not
+/// expose; and retiring a connection WITHOUT closing the listener needs
+/// the connection future (#1395), which `axum_server` owns
+/// internally and only retires together with the listener.
+#[allow(clippy::too_many_arguments)]
 async fn serve_http(
     addr: std::net::SocketAddr,
     router: axum::Router,
     tls: Option<aisix_core::TlsConfig>,
     idle_timeout: Option<Duration>,
-    cancel: watch::Receiver<bool>,
+    shutdown: ShutdownWatch,
     label: &'static str,
     workers: Option<usize>,
+    drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
+) -> anyhow::Result<()> {
+    serve_listeners(
+        vec![ListenerBind {
+            addr,
+            tls,
+            tls_field: format!("{label}.tls"),
+        }],
+        router,
+        idle_timeout,
+        shutdown,
+        label,
+        workers,
+        drain,
+        None,
+    )
+    .await
+}
+
+/// One listener to bind: its address, its optional TLS material, and the
+/// configuration path that material was written at.
+struct ListenerBind {
+    addr: std::net::SocketAddr,
+    tls: Option<aisix_core::TlsConfig>,
+    tls_field: String,
+}
+
+/// Serve `router` on every listener in `binds`, each with its own
+/// optional TLS, until the drain ends.
+///
+/// One router and one application state across the set, so which port a
+/// request arrived on changes nothing but the scheme — that is what lets
+/// a deployment answer HTTPS and plaintext HTTP at the same time
+/// (`proxy.listeners`, AISIX-Cloud#1662). The admin and metrics surfaces
+/// pass a single element through [`serve_http`].
+#[allow(clippy::too_many_arguments)]
+async fn serve_listeners(
+    binds: Vec<ListenerBind>,
+    router: axum::Router,
+    idle_timeout: Option<Duration>,
+    shutdown: ShutdownWatch,
+    label: &'static str,
+    workers: Option<usize>,
+    drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
+    proxy_protocol: Option<ProxyProtocolTrust>,
 ) -> anyhow::Result<()> {
     // Resolved before binding so a bad cert path still fails with the
     // same error it always did, before a port is taken.
-    let tls_config = match tls {
-        Some(tls) => Some(
-            axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_file, &tls.key_file)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "{label}.tls: failed to load cert_file={:?} / key_file={:?}: {e}",
-                        tls.cert_file,
-                        tls.key_file
-                    )
-                })?,
-        ),
-        None => None,
-    };
+    let mut resolved = Vec::with_capacity(binds.len());
+    for bind in binds {
+        let tls = match bind.tls {
+            Some(tls) => Some(downstream_tls_acceptor(&tls, &bind.tls_field).await?),
+            None => None,
+        };
+        resolved.push((bind.addr, tls));
+    }
 
     // Thread-per-core serving is the proxy's; the admin and metrics
     // surfaces are control traffic and keep their single listener.
     if let Some(workers) = workers {
         return serve_http_tpc(
-            addr,
+            resolved,
             router,
-            tls_config,
             idle_timeout,
-            cancel,
+            shutdown,
             label,
             workers,
+            drain,
+            proxy_protocol,
         )
         .await;
     }
 
-    let listener = std::net::TcpListener::bind(addr)
-        .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?;
-    listener.set_nonblocking(true)?;
-
-    let handle = axum_server::Handle::new();
-    tokio::spawn({
-        let handle = handle.clone();
-        async move {
-            shutdown_signal(cancel, label).await;
-            // `None` = drain without a deadline: an in-flight LLM stream
-            // can run for minutes, and the platform (k8s
-            // terminationGracePeriodSeconds, systemd TimeoutStopSec)
-            // already caps how long that may take. Idle connections are
-            // closed immediately either way.
-            handle.graceful_shutdown(None);
+    // Bound before any of them starts accepting, so a bind failure on the
+    // second listener still aborts startup rather than leaving the gateway
+    // serving on fewer ports than it reported.
+    let mut listeners = Vec::with_capacity(resolved.len());
+    for (addr, tls) in resolved {
+        let listener = std::net::TcpListener::bind(addr)
+            .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?;
+        match tls {
+            None => tracing::info!(%addr, label, "aisix listening (http)"),
+            Some(_) => tracing::info!(%addr, label, "aisix listening (https)"),
         }
-    });
+        listeners.push((listener, tls));
+    }
 
-    // ConnectInfo<SocketAddr> exposes the TCP peer to the proxy's real-ip
-    // resolver (#492). Harmless for the admin listener, which ignores it.
-    let make_service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    // Each listener runs the same accept loop the single one always did,
+    // on its own task — the shape the admin listener has had all along.
+    let mut serving = tokio::task::JoinSet::new();
+    for (listener, tls) in listeners {
+        serving.spawn(accept_loop(
+            listener,
+            router.clone(),
+            tls,
+            idle_timeout,
+            shutdown.clone(),
+            label,
+            drain.clone(),
+            proxy_protocol.clone(),
+        ));
+    }
+    join_listeners(serving, label).await
+}
 
-    match tls_config {
-        None => {
-            tracing::info!(%addr, label, "aisix listening (http)");
-            let mut server = axum_server::from_tcp(listener)
-                .acceptor(DOWNSTREAM_NODELAY)
-                .handle(handle);
-            apply_idle_timeout(server.http_builder(), idle_timeout);
-            server.serve(make_service).await?;
-        }
-        Some(tls_config) => {
-            tracing::info!(%addr, label, "aisix listening (https)");
-            let mut server = axum_server::from_tcp_rustls(listener, tls_config)
-                .map(|tls| tls.acceptor(DOWNSTREAM_NODELAY))
-                .handle(handle);
-            apply_idle_timeout(server.http_builder(), idle_timeout);
-            server.serve(make_service).await?;
+/// Wait for every listener task, surfacing the FIRST failure rather than
+/// the first task in order.
+///
+/// A listener that fails on its own — a panic, or an accept loop that
+/// returns `Err` — has to bring the process down, exactly as it did when
+/// there was one. Awaiting the handles in order would hold that failure
+/// until the listener ahead of it finished, which is at shutdown: the
+/// gateway would go on answering `/livez` while one of its ports had
+/// silently stopped accepting.
+async fn join_listeners(
+    mut serving: tokio::task::JoinSet<anyhow::Result<()>>,
+    label: &'static str,
+) -> anyhow::Result<()> {
+    while let Some(joined) = serving.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(anyhow::anyhow!("{label} listener task join error: {e}")),
         }
     }
     Ok(())
+}
+
+/// Build the downstream TLS acceptor from the configured PEM files.
+///
+/// `field` is the configuration path the material came from —
+/// `proxy.listeners[1].tls` rather than a generic `proxy.tls`, so a cert
+/// that will not load names the field the operator actually wrote.
+///
+/// ALPN offers `h2` ahead of `http/1.1`, which is what the gateway has
+/// always advertised — a downstream that prefers HTTP/2 has to keep
+/// getting it. (#535/#536 guard the dp-manager's REST *clients* against
+/// negotiating h2; this is the server side, and it does offer it.)
+async fn downstream_tls_acceptor(
+    tls: &aisix_core::TlsConfig,
+    field: &str,
+) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
+    let failed = |e: String| {
+        anyhow::anyhow!(
+            "{field}: failed to load cert_file={:?} / key_file={:?}: {e}",
+            tls.cert_file,
+            tls.key_file,
+        )
+    };
+
+    let cert_pem = tokio::fs::read(&tls.cert_file)
+        .await
+        .map_err(|e| failed(e.to_string()))?;
+    let key_pem = tokio::fs::read(&tls.key_file)
+        .await
+        .map_err(|e| failed(e.to_string()))?;
+
+    let certs = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| failed(e.to_string()))?;
+    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+        .map_err(|e| failed(e.to_string()))?
+        .ok_or_else(|| failed("no private key in key_file".to_string()))?;
+
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| failed(e.to_string()))?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config)))
+}
+
+/// Accept and serve on `listener` until the drain ends, then wait for
+/// the connections still open to finish.
+///
+/// The single accept path for every listener the gateway binds — both
+/// serving modes, TLS and plaintext, proxy and control surfaces. The
+/// per-listener differences are all parameters, so a rule proved on one
+/// listener holds on all of them.
+#[allow(clippy::too_many_arguments)]
+async fn accept_loop(
+    listener: std::net::TcpListener,
+    router: axum::Router,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    idle_timeout: Option<Duration>,
+    mut shutdown: ShutdownWatch,
+    label: &'static str,
+    drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
+    proxy_protocol: Option<ProxyProtocolTrust>,
+) -> anyhow::Result<()> {
+    listener.set_nonblocking(true)?;
+    let listener = tokio::net::TcpListener::from_std(listener)?;
+
+    // The scheme this listener serves, for the SERVER span's `url.scheme`.
+    let router = router.layer(axum::Extension(aisix_proxy::DownstreamScheme(
+        if tls.is_some() { "https" } else { "http" },
+    )));
+
+    // ConnectInfo<SocketAddr> exposes the TCP peer — or the client a
+    // trusted PROXY header names — to the proxy's real-ip resolver (#492).
+    // Harmless for the admin listener, which ignores it.
+    let make_service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+
+    // Close an accepted HTTP/1.1 connection that sits idle for
+    // `idle_timeout`. hyper arms this timer only when it is waiting for a
+    // request head, and it only waits for one once the previous response
+    // has been fully written (`Conn::can_read_head` requires the read
+    // half to be back at `Init`, which `try_keep_alive` reaches only when
+    // reading *and* writing are done). So a slow model or a long SSE
+    // stream is never interrupted — the timer covers exactly the
+    // between-requests window.
+    //
+    // hyper defaults this to 30s but drops the default unless a timer is
+    // installed, and axum does not install one — which is why the gateway
+    // held idle connections forever before AISIX-Cloud#1126.
+    //
+    // HTTP/2 has no equivalent knob in hyper; h2 connections are
+    // unaffected. `sniff_downstream_version` covers the one window that
+    // precedes either builder.
+    let mut http1 = hyper::server::conn::http1::Builder::new();
+    if let Some(d) = idle_timeout {
+        http1
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(d);
+    }
+    let http2 = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+
+    // Every connection task holds a clone of the sender; the receiver
+    // below completes once the last one is dropped. Cheaper than keeping
+    // join handles, and it cannot leak one for a connection that already
+    // ended.
+    let (alive, mut all_connections_ended) = tokio::sync::mpsc::channel::<()>(1);
+
+    loop {
+        let accepted = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                tracing::info!(label, "shutdown signal observed — stopping listener");
+                break;
+            }
+            accepted = listener.accept() => accepted,
+        };
+
+        let (stream, peer) = match accepted {
+            Ok((stream, peer)) => (stream, canonical_peer(peer)),
+            // Transient: fd exhaustion, or a peer that vanished between
+            // the SYN and the accept. Backing off keeps a listener that
+            // cannot accept from spinning a core.
+            Err(e) => {
+                tracing::debug!(label, error = %e, "accept failed");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+
+        // Nagle's algorithm holds a small segment back until the previous
+        // one has been acknowledged. A short buffered answer leaves in a
+        // single segment and never notices — which is why this is
+        // invisible in the throughput benchmark — but a streamed one
+        // writes a frame at a time, and a frame that lands while an
+        // earlier one is still unacknowledged waits out the client's
+        // delayed ACK (up to 40ms on Linux) before it leaves the box.
+        // HTTP/2 control frames and the WebSocket surfaces run on the
+        // same accepted socket and inherit the option. reqwest already
+        // sets it on the upstream side.
+        //
+        // A failure fails that connection: on Linux the option carries no
+        // socket-state precondition and cannot fail, and elsewhere it
+        // reports a peer that has already gone away — a connection that
+        // was not answerable regardless.
+        if let Err(e) = stream.set_nodelay(true) {
+            tracing::debug!(label, error = %e, "TCP_NODELAY failed; dropping connection");
+            continue;
+        }
+
+        // Accepting is the only place either fact is observable, and
+        // during a drain they are what separates work the gateway had
+        // already taken on from traffic still being routed at it
+        // (AISIX-Cloud#1394).
+        //
+        // Neither can tell a client apart from the platform, though:
+        // `/livez` and `/readyz` are served on the proxy listener too,
+        // and the probes keep arriving throughout the drain, each on its
+        // own connection. So the count includes them and the accept line
+        // does not claim to know who connected — the arrival line in
+        // `record_request_telemetry` knows the path and is where that
+        // judgement is made. This line covers what the arrival line
+        // cannot: a connection opened and never used.
+        //
+        // `drain` is `None` for the admin and metrics listeners, which
+        // are control surfaces nothing routes client traffic to.
+        let counted = drain.as_ref().map(|drain| {
+            drain.connection_opened();
+            if drain.is_shutting_down() {
+                tracing::info!(
+                    peer = %peer,
+                    open_connections = drain.open_connections(),
+                    "accepted a new downstream connection while draining"
+                );
+            }
+            ConnectionGuard(drain.clone())
+        });
+
+        let alive = alive.clone();
+        let shutdown = shutdown.clone();
+        let http1 = http1.clone();
+        let http2 = http2.clone();
+        let tls = tls.clone();
+        let make_service = make_service.clone();
+        let proxy_protocol = proxy_protocol.clone();
+        tokio::spawn(async move {
+            let _alive = alive;
+            let _counted = counted;
+            // The PROXY header, the TLS handshake and the version read all
+            // wait on the peer, so they belong to the connection's own
+            // task: a client that stalls in any must not hold up the
+            // accept loop.
+            // One first-bytes window covers the PROXY header and the
+            // version sniff together, not one each.
+            let first_bytes_deadline = idle_timeout.map(|d| tokio::time::Instant::now() + d);
+            let (peer, stream) = match proxy_protocol {
+                None => (peer, Rewind::new(Vec::new(), stream)),
+                Some(trusted) => {
+                    match read_proxy_header(stream, peer, &trusted, idle_timeout, label).await {
+                        Some((peer, stream)) => (canonical_peer(peer), stream),
+                        None => return,
+                    }
+                }
+            };
+            // `SocketAddr` is `Connected` both for a bare peer address and
+            // for axum's own `IncomingStream`, so the target type has to be
+            // named or the make-service call is ambiguous.
+            let service = match tower::ServiceExt::<std::net::SocketAddr>::oneshot(
+                make_service,
+                peer,
+            )
+            .await
+            {
+                Ok(service) => service,
+                Err(never) => match never {},
+            };
+            match tls {
+                Some(tls) => match tls.accept(stream).await {
+                    Ok(stream) => {
+                        let version = match stream.get_ref().1.alpn_protocol() {
+                            Some(proto) if proto == b"h2" => Downstream::Http2,
+                            _ => Downstream::Http1,
+                        };
+                        serve_connection(stream, version, service, &http1, &http2, shutdown, label)
+                            .await;
+                    }
+                    Err(e) => tracing::debug!(label, error = %e, "TLS handshake failed"),
+                },
+                None => match sniff_downstream_version(
+                    stream,
+                    first_bytes_deadline
+                        .map(|at| at.saturating_duration_since(tokio::time::Instant::now())),
+                )
+                .await
+                {
+                    Ok((version, stream)) => {
+                        serve_connection(stream, version, service, &http1, &http2, shutdown, label)
+                            .await;
+                    }
+                    Err(e) => {
+                        tracing::debug!(label, error = %e, "reading the request preface failed")
+                    }
+                },
+            }
+        });
+    }
+
+    // Refuse connections immediately rather than letting the ones the
+    // kernel already queued hang: tokio accepts into that queue whether
+    // or not this loop is still reading from it.
+    drop(listener);
+
+    // The drain has already run every in-flight request to completion, so
+    // what is left here is idle pooled connections, which end as soon as
+    // `serve_connection` hands them the cancel signal, and connections that
+    // have not sent a request yet, which are served first and so are held
+    // for up to `downstream.idle_timeout_secs` (unbounded when it is 0; a
+    // TLS handshake that stalls is not bounded by it either).
+    drop(alive);
+    let _ = all_connections_ended.recv().await;
+    // A connection that upgraded ends its task at the 101, but its session
+    // is still in flight (a Realtime WebSocket holds a drain guard until
+    // it closes). The drain's own wait is over by now, so this one is what
+    // keeps the listener — and in thread-per-core mode the worker runtime
+    // the session runs on — up until such a session opened after the
+    // drain ended has finished.
+    if let Some(drain) = drain {
+        while drain.in_flight() > 0 {
+            tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+        }
+    }
+    Ok(())
+}
+
+/// Serve one accepted connection to completion, giving it the retirement
+/// signal its protocol can actually carry.
+///
+/// The two versions are dispatched here rather than left to
+/// `hyper_util`'s auto builder because they retire at different moments,
+/// and the difference is a deliberate one:
+///
+/// * **HTTP/2 is retired when the drain STARTS**, with GOAWAY. hyper
+///   sends RFC 9113 §6.8's two-phase form — an advisory
+///   `GOAWAY(2^31-1)`, a PING, then a second GOAWAY naming the last
+///   stream it actually processed. The peer finishes the streams it had
+///   already dispatched and opens no new ones, and nothing closes until
+///   they are done, so there is no race with a request in flight. It is
+///   the only in-band retirement signal h2 has: RFC 9113 §8.2.2 forbids
+///   `Connection: close`, and before this the gateway had no way to send
+///   one during a drain (AISIX-Cloud#1395).
+/// * **HTTP/1.1 is retired in band**, by `Connection: close` on the
+///   responses served during the drain
+///   (`aisix_proxy::retire_connection`), and hears nothing here until
+///   the drain ENDS. hyper retires an h1 connection by disabling
+///   keep-alive, which closes an IDLE one at once — a server-initiated
+///   close of a pooled connection, where a client dispatching onto it in
+///   that same instant loses the request. AISIX-Cloud#1394 ruled that
+///   out: a long connection is the client's to close, and the server's
+///   job is only to say so.
+async fn serve_connection<I, S>(
+    io: I,
+    version: Downstream,
+    service: S,
+    http1: &hyper::server::conn::http1::Builder,
+    http2: &hyper::server::conn::http2::Builder<hyper_util::rt::TokioExecutor>,
+    mut shutdown: ShutdownWatch,
+    label: &'static str,
+) where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tower::Service<
+            axum::http::Request<hyper::body::Incoming>,
+            Response = axum::http::Response<axum::body::Body>,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+{
+    let io = hyper_util::rt::TokioIo::new(io);
+    let service = hyper_util::service::TowerToHyperService::new(service);
+
+    let served = match version {
+        Downstream::Http1 => {
+            // `with_upgrades` keeps the WebSocket surfaces (`/v1/realtime`)
+            // working: hyper cannot upgrade a connection it does not own.
+            // hyper retires an h1 connection that has not read a request
+            // yet by closing it on the spot, and on a TLS connection — or
+            // a plaintext one whose request is still arriving — nothing
+            // has been read at the moment the drain ends. That client is
+            // owed an answer like any other (AISIX-Cloud#1394), so a
+            // connection is retired only between requests, once it has
+            // answered one: the request that arrives is served with
+            // `Connection: close`, and a connection that never sends one
+            // is bounded by `downstream.idle_timeout_secs` exactly as the
+            // version sniff bounds a plaintext one. A pooled connection
+            // idle when the drain ends is retired then, as before.
+            //
+            // Waiting for the answer is also what keeps an upgrade intact:
+            // retiring a connection while its upgrade handler runs makes
+            // hyper stamp `Connection: close` over the 101's `Connection:
+            // upgrade`, which a WebSocket client rejects (RFC 6455 §4.1).
+            // A 101 does not make the connection retirable — it is no
+            // longer HTTP once upgraded.
+            let (retirable_tx, mut retirable) = watch::channel(false);
+            let retirable_tx = std::sync::Arc::new(retirable_tx);
+            let service = hyper::service::service_fn(move |req| {
+                retirable_tx.send_if_modified(|r| std::mem::replace(r, false));
+                let call = hyper::service::Service::call(&service, req);
+                let retirable_tx = retirable_tx.clone();
+                async move {
+                    let response = call.await;
+                    if let Ok(response) = &response {
+                        if response.status() != axum::http::StatusCode::SWITCHING_PROTOCOLS {
+                            retirable_tx.send_if_modified(|r| !std::mem::replace(r, true));
+                        }
+                    }
+                    response
+                }
+            });
+            let conn = http1.serve_connection(io, service).with_upgrades();
+            tokio::pin!(conn);
+            let mut retired = false;
+            loop {
+                tokio::select! {
+                    // A pooled connection whose next request is already
+                    // buffered reads it before it can be retired.
+                    biased;
+                    served = conn.as_mut() => break served.map_err(|e| e.to_string()),
+                    _ = async {
+                        shutdown.cancelled().await;
+                        let _ = retirable.wait_for(|r| *r).await;
+                    }, if !retired => {
+                        conn.as_mut().graceful_shutdown();
+                        retired = true;
+                    }
+                }
+            }
+        }
+        Downstream::Http2 => {
+            // Needs h2 >= 0.4.14. A peer that answers our GOAWAY with one
+            // of its own — Node's HTTP/2 client does, on any graceful
+            // GOAWAY — sends `last_stream_id: 0`, because a client's
+            // last-stream-id speaks only for server-PUSHED streams.
+            // Before hyperium/h2#886 the server applied it to every
+            // stream in the store, so the reciprocal frame reset each
+            // request still running on the connection: the drain would
+            // kill exactly the in-flight work it exists to protect.
+            // Pinned by the `graceful-drain-h2` e2e spec, which fails
+            // against 0.4.13.
+            let conn = http2.serve_connection(io, service);
+            tokio::pin!(conn);
+            let mut retired = false;
+            loop {
+                tokio::select! {
+                    served = conn.as_mut() => break served.map_err(|e| e.to_string()),
+                    _ = shutdown.retire_or_cancel(), if !retired => {
+                        conn.as_mut().graceful_shutdown();
+                        retired = true;
+                    }
+                }
+            }
+        }
+    };
+
+    if let Err(e) = served {
+        // A downstream that hangs up mid-request lands here, which is
+        // ordinary traffic rather than a fault.
+        tracing::debug!(label, error = %e, "downstream connection ended");
+    }
 }
 
 /// Serve from `workers` independent threads, each with its own runtime
@@ -1831,14 +3480,16 @@ async fn serve_http(
 /// 4-tuple. That spreads evenly across many client connections and
 /// unevenly across few, which is why the mode is documented as a
 /// throughput setting rather than a latency one.
+#[allow(clippy::too_many_arguments)]
 async fn serve_http_tpc(
-    addr: std::net::SocketAddr,
+    binds: Vec<(std::net::SocketAddr, Option<tokio_rustls::TlsAcceptor>)>,
     router: axum::Router,
-    tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
     idle_timeout: Option<Duration>,
-    cancel: watch::Receiver<bool>,
+    shutdown: ShutdownWatch,
     label: &'static str,
     workers: usize,
+    drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
+    proxy_protocol: Option<ProxyProtocolTrust>,
 ) -> anyhow::Result<()> {
     // An address someone else already holds has to stay a loud boot
     // failure. Every socket on a `SO_REUSEPORT` address has to set the
@@ -1847,30 +3498,48 @@ async fn serve_http_tpc(
     // sockets below deliberately give up, since they must co-bind with
     // each other. Without this a second gateway would start silently
     // and split traffic with the first.
-    drop(
-        std::net::TcpListener::bind(addr)
-            .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?,
-    );
+    for (addr, _) in &binds {
+        drop(
+            std::net::TcpListener::bind(addr)
+                .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?,
+        );
+    }
 
     // Every listener is bound before any worker spawns, so a bind
     // failure — fd exhaustion on the last socket included — aborts
     // startup before a single connection is accepted, exactly as the
-    // single listener does.
-    let mut listeners = Vec::with_capacity(workers);
+    // single listener does. A worker gets one socket per configured
+    // address, so the worker count is the thread count whatever the
+    // listener set is, and the kernel still spreads each address's
+    // connections across the workers.
+    let mut per_worker: Vec<Vec<WorkerListener>> = Vec::with_capacity(workers);
     for _ in 0..workers {
-        let listener = bind_reuseport_listener(addr)
-            .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?;
-        listener.set_nonblocking(true)?;
-        listeners.push(listener);
+        let mut mine = Vec::with_capacity(binds.len());
+        for (addr, tls) in &binds {
+            let listener = bind_reuseport_listener(*addr)
+                .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?;
+            mine.push(WorkerListener {
+                addr: *addr,
+                listener,
+                tls: tls.clone(),
+            });
+        }
+        per_worker.push(mine);
     }
 
     // One slot per worker so no worker blocks reporting its exit.
     let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel::<anyhow::Result<()>>(workers);
-    for (worker, listener) in listeners.into_iter().enumerate() {
+    let all_served = std::sync::Arc::new(tokio::sync::Barrier::new(workers));
+    for (worker, listeners) in per_worker.into_iter().enumerate() {
         let router = router.clone();
-        let cancel = cancel.clone();
-        let tls_config = tls_config.clone();
+        let shutdown = shutdown.clone();
         let exit_tx = exit_tx.clone();
+        let all_served = all_served.clone();
+        // Every worker raises and lowers the same process-wide count, so
+        // the drain heartbeat reports the listener as a whole rather than
+        // whichever worker happened to accept.
+        let drain = drain.clone();
+        let proxy_protocol = proxy_protocol.clone();
         std::thread::Builder::new()
             // Names the mode in `ps -T` / `top -H`: `tpc-N` here,
             // tokio's own `tokio-rt-worker` on the shared runtime.
@@ -1882,14 +3551,15 @@ async fn serve_http_tpc(
                     outcome: None,
                 };
                 exit.outcome = Some(run_tpc_worker(
-                    addr,
-                    listener,
+                    listeners,
                     router,
-                    tls_config,
                     idle_timeout,
-                    cancel,
+                    shutdown,
                     label,
                     worker,
+                    drain,
+                    proxy_protocol,
+                    all_served,
                 ));
             })?;
     }
@@ -1898,14 +3568,16 @@ async fn serve_http_tpc(
     drop(exit_tx);
 
     // A graceful shutdown ends the workers together, but each drains its
-    // own connections on its own clock — an idle worker returns at once
-    // while a sibling may hold an in-flight stream for minutes. Wait for
-    // every worker, so the fastest drain cannot end the process under
-    // the slowest. Everything else stays immediately fatal: an accept
-    // loop failing, a panic unwinding, or a worker stopping without a
-    // shutdown signal has to bring the process down rather than leave it
-    // serving on fewer listeners than it reported binding.
-    let shutdown_seen = cancel;
+    // own connections on its own clock — an idle worker is done at once
+    // while a sibling may hold an in-flight stream for minutes. A done
+    // worker waits for the slowest before it drops its runtime (see
+    // `run_tpc_worker`), and this waits for every worker, so the fastest
+    // drain cannot end the process under the slowest. Everything else
+    // stays immediately fatal: an accept loop failing, a panic unwinding,
+    // or a worker stopping without a shutdown signal has to bring the
+    // process down rather than leave it serving on fewer listeners than
+    // it reported binding.
+    let shutdown_seen = shutdown.cancel;
     tokio::task::spawn_blocking(move || {
         for _ in 0..workers {
             match exit_rx.recv() {
@@ -1947,58 +3619,84 @@ impl Drop for WorkerExit {
 }
 
 /// One thread-per-core worker: its own current-thread runtime, its own
-/// listener, its own upstream connection pool.
+/// listener, its own upstream connection pool for Provider Keys without
+/// a connection override. Every other client pool is process-wide, so an
+/// upstream connection this runtime drives may be serving a sibling's
+/// request — which is why the runtime outlives its own drain.
 #[allow(clippy::too_many_arguments)]
 fn run_tpc_worker(
-    addr: std::net::SocketAddr,
-    listener: std::net::TcpListener,
+    listeners: Vec<WorkerListener>,
     router: axum::Router,
-    tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
     idle_timeout: Option<Duration>,
-    cancel: watch::Receiver<bool>,
+    shutdown: ShutdownWatch,
     label: &'static str,
     worker: usize,
+    drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
+    proxy_protocol: Option<ProxyProtocolTrust>,
+    all_served: std::sync::Arc<tokio::sync::Barrier>,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    aisix_obs::memory::register_runtime(format!("tpc-{worker}"), rt.handle().clone());
     // Every dispatch from this thread now uses this thread's pool, so an
     // upstream response is read by the same runtime that is waiting for
     // it. Marked inside the worker because the marker is per thread.
     aisix_gateway::upstream_tls::mark_worker_thread();
     rt.block_on(async move {
-        let handle = axum_server::Handle::new();
-        tokio::spawn({
-            let handle = handle.clone();
-            async move {
-                shutdown_signal(cancel, label).await;
-                // `None` = drain without a deadline, as on the shared
-                // runtime: an in-flight LLM stream can run for minutes.
-                handle.graceful_shutdown(None);
+        // This worker's share of every configured listener, accepted
+        // concurrently on its own runtime.
+        let mut serving = tokio::task::JoinSet::new();
+        for WorkerListener {
+            addr,
+            listener,
+            tls,
+        } in listeners
+        {
+            match tls {
+                None => {
+                    tracing::info!(%addr, label, worker, "aisix listening (http, thread-per-core)")
+                }
+                Some(_) => {
+                    tracing::info!(%addr, label, worker, "aisix listening (https, thread-per-core)")
+                }
             }
-        });
-
-        let make_service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
-        match tls_config {
-            None => {
-                tracing::info!(%addr, label, worker, "aisix listening (http, thread-per-core)");
-                let mut server = axum_server::from_tcp(listener)
-                    .acceptor(DOWNSTREAM_NODELAY)
-                    .handle(handle);
-                apply_idle_timeout(server.http_builder(), idle_timeout);
-                server.serve(make_service).await?;
-            }
-            Some(tls_config) => {
-                tracing::info!(%addr, label, worker, "aisix listening (https, thread-per-core)");
-                let mut server = axum_server::from_tcp_rustls(listener, tls_config)
-                    .map(|tls| tls.acceptor(DOWNSTREAM_NODELAY))
-                    .handle(handle);
-                apply_idle_timeout(server.http_builder(), idle_timeout);
-                server.serve(make_service).await?;
-            }
+            serving.spawn(accept_loop(
+                listener,
+                router.clone(),
+                tls,
+                idle_timeout,
+                shutdown.clone(),
+                label,
+                drain.clone(),
+                proxy_protocol.clone(),
+            ));
         }
-        Ok(())
+        let served = join_listeners(serving, label).await;
+        // An upstream connection is driven by a task on the runtime of
+        // the worker that opened it, and every process-wide client pool
+        // (Provider Key overrides, the shared fallback, guardrail, MCP,
+        // ...) hands that connection to whichever worker checks it out
+        // next. Dropping this runtime would kill those tasks under a
+        // sibling's request still in flight on them, which then fails
+        // as "dispatch task is gone" and is retried — a duplicate
+        // upstream call. So a drained worker keeps polling its runtime
+        // until every worker has finished serving, and only then lets it
+        // drop. A failure skips the wait: it ends the process anyway, and
+        // a worker that stopped without a shutdown signal must be
+        // reported rather than parked.
+        if served.is_ok() && *shutdown.cancel.borrow() {
+            all_served.wait().await;
+        }
+        served
     })
+}
+
+/// One thread-per-core worker's share of one configured listener.
+struct WorkerListener {
+    addr: std::net::SocketAddr,
+    listener: std::net::TcpListener,
+    tls: Option<tokio_rustls::TlsAcceptor>,
 }
 
 /// A listener that shares `addr` with the other workers' listeners.
@@ -2034,47 +3732,20 @@ fn bind_reuseport_listener(addr: std::net::SocketAddr) -> std::io::Result<std::n
     }
 }
 
-/// Close an accepted HTTP/1.1 connection that sits idle for `idle_timeout`.
-///
-/// hyper arms this timer only when it is waiting for a request head, and
-/// it only waits for one once the previous response has been fully written
-/// (`Conn::can_read_head` requires the read half to be back at `Init`,
-/// which `try_keep_alive` reaches only when reading *and* writing are
-/// done). So a slow model or a long SSE stream is never interrupted — the
-/// timer covers exactly the between-requests window.
-///
-/// hyper defaults this to 30s but drops the default unless a timer is
-/// installed, and neither axum nor axum_server installs one — which is why
-/// the gateway held idle connections forever before this.
-///
-/// HTTP/2 has no equivalent knob in hyper; h2 connections are unaffected.
-fn apply_idle_timeout(
-    builder: &mut hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor>,
-    idle_timeout: Option<Duration>,
-) {
-    if let Some(d) = idle_timeout {
-        builder
-            .http1()
-            .timer(hyper_util::rt::TokioTimer::new())
-            .header_read_timeout(d);
-    }
-}
+/// How often the drain loop re-reads the in-flight count once the
+/// minimum window has elapsed.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-async fn shutdown_signal(mut cancel: watch::Receiver<bool>, label: &'static str) {
-    loop {
-        if *cancel.borrow() {
-            tracing::info!(label, "shutdown signal observed — stopping listener");
-            return;
-        }
-        if cancel.changed().await.is_err() {
-            return;
-        }
-    }
-}
+/// How often the drain loop reports that it is still waiting, so a drain
+/// that never finishes is visible in the logs rather than looking like a
+/// hung process.
+const DRAIN_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 async fn wait_for_signal(
     cancel_tx: watch::Sender<bool>,
+    retire_tx: watch::Sender<bool>,
     livez_state: std::sync::Arc<aisix_proxy::LivezState>,
+    min_drain: Duration,
 ) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -2098,19 +3769,73 @@ async fn wait_for_signal(
         _ = term => tracing::info!("received SIGTERM"),
     }
 
+    // `/readyz` answers 503 from here on. Everything below decides when
+    // it is safe to stop accepting, which is deliberately NOT the same
+    // moment: a balancer only learns about the 503 on its next health
+    // check, and closing the listener before then refuses every
+    // connection it routes in between.
     livez_state.mark_shutting_down();
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    // Retirement rides the same moment. An HTTP/1.1 connection is
+    // retired in band, on the next response it carries; an HTTP/2 one
+    // has no such header (RFC 9113 §8.2.2) and gets its GOAWAY here,
+    // which asks the peer to finish the streams it has and open no new
+    // ones without closing anything (AISIX-Cloud#1395).
+    let _ = retire_tx.send(true);
+    tracing::info!(
+        min_drain_secs = min_drain.as_secs(),
+        in_flight = livez_state.in_flight(),
+        open_connections = livez_state.open_connections(),
+        "draining — /readyz now reports 503, still accepting new connections"
+    );
+
+    if !min_drain.is_zero() {
+        tokio::time::sleep(min_drain).await;
+    }
+
+    // The window is a minimum, not a deadline. A balancer slower than
+    // configured is still routing traffic here, and that traffic is
+    // exactly what the in-flight count shows — so keep serving until it
+    // reaches zero, at which point closing the listener cannot interrupt
+    // anything. Unbounded on purpose: an inference call or an SSE stream
+    // may run for minutes, and the platform (Kubernetes
+    // `terminationGracePeriodSeconds`, systemd `TimeoutStopSec`) is the
+    // one hard bound.
+    let mut last_log = std::time::Instant::now();
+    loop {
+        let in_flight = livez_state.in_flight();
+        if in_flight == 0 {
+            break;
+        }
+        if last_log.elapsed() >= DRAIN_LOG_INTERVAL {
+            // The open-connection count next to it separates the two
+            // reasons a drain does not end: requests this gateway already
+            // took on, versus a load balancer still routing here — only
+            // the second of which is a balancer problem
+            // (AISIX-Cloud#1394).
+            tracing::info!(
+                in_flight,
+                open_connections = livez_state.open_connections(),
+                "still draining in-flight requests"
+            );
+            last_log = std::time::Instant::now();
+        }
+        tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+    }
+
+    tracing::info!("drain complete — closing listeners");
     let _ = cancel_tx.send(true);
 }
 
-/// 快照里配了花费上限的 RateLimitPolicy 条数。
-fn count_spend_policies(snapshot: &AisixSnapshot) -> usize {
-    snapshot
-        .rate_limit_policies
-        .entries()
-        .iter()
-        .filter(|entry| entry.value.max_spend_micro_usd.is_some())
-        .count()
+/// 快照里生效的花费上限条数：控制平面下发的 `budgets` 文档（只有硬上限才有
+/// 文档），加上配了 `max_spend_micro_usd` 的 RateLimitPolicy。
+fn count_spend_ceilings(snapshot: &AisixSnapshot) -> usize {
+    snapshot.budgets.len()
+        + snapshot
+            .rate_limit_policies
+            .entries()
+            .iter()
+            .filter(|entry| entry.value.max_spend_micro_usd.is_some())
+            .count()
 }
 
 /// 该不该就「花费完全不设上限」发告警。
@@ -2146,6 +3871,39 @@ mod tests {
         );
     }
 
+    /// 托管部署的上限也可能只来自 `budgets` 文档。没算上它们的话，每个这样的
+    /// 部署都会读到 0 并收到一条误报的「花费不设上限」告警。
+    #[test]
+    fn budget_documents_and_spend_policies_both_count_as_ceilings() {
+        use aisix_core::resource::ResourceEntry;
+        let snap = aisix_core::AisixSnapshot::new();
+        assert_eq!(super::count_spend_ceilings(&snap), 0);
+
+        let requests_only: aisix_core::RateLimitPolicy =
+            serde_json::from_value(serde_json::json!({
+                "name": "requests-only", "scope": "api_key", "scope_ref": "k",
+                "window": "day", "max_requests": 10,
+            }))
+            .unwrap();
+        snap.rate_limit_policies
+            .insert(ResourceEntry::new("p-1", requests_only, 1));
+        assert_eq!(super::count_spend_ceilings(&snap), 0);
+
+        let budget: aisix_core::models::Budget =
+            serde_json::from_value(serde_json::json!({"scope": "org", "period": "month"})).unwrap();
+        snap.budgets.insert(ResourceEntry::new("b-1", budget, 1));
+        assert_eq!(super::count_spend_ceilings(&snap), 1);
+
+        let spend: aisix_core::RateLimitPolicy = serde_json::from_value(serde_json::json!({
+            "name": "spend", "scope": "api_key", "scope_ref": "k",
+            "window": "day", "max_spend_micro_usd": 1000,
+        }))
+        .unwrap();
+        snap.rate_limit_policies
+            .insert(ResourceEntry::new("p-2", spend, 1));
+        assert_eq!(super::count_spend_ceilings(&snap), 2);
+    }
+
     use super::*;
     use clap::Parser;
 
@@ -2163,20 +3921,194 @@ mod tests {
         );
     }
 
+    fn live(snap: &AisixSnapshot, series: aisix_obs::LiveGaugeSeries<'_>) -> bool {
+        gauge_series_is_live(snap, series) == aisix_obs::GaugeLiveness::Live
+    }
+
+    fn snapshot_with_key(
+        id: &str,
+        team: Option<&str>,
+        user: Option<&str>,
+        name: Option<&str>,
+    ) -> AisixSnapshot {
+        let key: aisix_core::ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": "h",
+            "allowed_models": [],
+            "team_id": team,
+            "user_id": user,
+            "user_name": name,
+        }))
+        .unwrap();
+        let snap = AisixSnapshot::new();
+        snap.apikeys
+            .insert(aisix_core::resource::ResourceEntry::new(id, key, 1));
+        snap
+    }
+
+    /// The case the sweep exists for: the api key is gone, so its budget
+    /// label set describes nothing and must be reported dead.
+    #[test]
+    fn a_deleted_key_is_not_live() {
+        let snap = AisixSnapshot::new();
+        assert!(!live(
+            &snap,
+            aisix_obs::LiveGaugeSeries::Budget {
+                api_key_id: "ak-gone",
+                team_id: "t",
+                user_id: "u",
+                user_name: "alice",
+                api_key_name: None,
+                team_name: None,
+            }
+        ));
+    }
+
+    /// A bare "does the key exist" check would call BOTH label sets live
+    /// after a rebind and leave the pre-rebind sample frozen forever. The
+    /// whole member triple has to match.
+    #[test]
+    fn a_rebound_key_leaves_only_its_current_label_set_live() {
+        let snap = snapshot_with_key("ak-1", Some("team-new"), Some("u"), Some("alice"));
+        let at = |team, user, name| aisix_obs::LiveGaugeSeries::Budget {
+            api_key_id: "ak-1",
+            team_id: team,
+            user_id: user,
+            user_name: name,
+            api_key_name: None,
+            team_name: None,
+        };
+        assert!(live(&snap, at("team-new", "u", "alice")));
+        assert!(!live(&snap, at("team-old", "u", "alice")));
+        assert!(!live(&snap, at("team-new", "u-old", "alice")));
+        // A rename strands the old name under the same id, same as a rebind.
+        assert!(!live(&snap, at("team-new", "u", "Alice Before")));
+    }
+
+    /// An unbound key projects `unknown` for the member triple; that IS its
+    /// current label set, so it must stay live.
+    #[test]
+    fn an_unbound_key_is_live_under_its_placeholders() {
+        let snap = snapshot_with_key("ak-1", None, None, None);
+        assert!(live(
+            &snap,
+            aisix_obs::LiveGaugeSeries::Budget {
+                api_key_id: "ak-1",
+                team_id: "unknown",
+                user_id: "unknown",
+                user_name: "unknown",
+                api_key_name: Some("unknown"),
+                team_name: Some("unknown"),
+            }
+        ));
+    }
+
+    /// The name labels are judged against the same resolution the emitter
+    /// uses: the key's display name, the team's `teams` document, and the
+    /// member's `users` document ahead of the key's own `user_name`. A name
+    /// the series' selection does not keep (`None`) is not judged at all.
+    #[test]
+    fn name_labels_are_judged_against_the_resolved_names() {
+        let snap = AisixSnapshot::new();
+        let key: aisix_core::ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": "h",
+            "allowed_models": [],
+            "display_name": "Billing key",
+            "team_id": "t-1",
+            "user_id": "u-1",
+            "user_name": "inline name",
+        }))
+        .unwrap();
+        snap.apikeys
+            .insert(aisix_core::resource::ResourceEntry::new("ak-1", key, 1));
+        let team: aisix_core::Team =
+            serde_json::from_value(serde_json::json!({"name": "Platform"})).unwrap();
+        snap.teams
+            .insert(aisix_core::resource::ResourceEntry::new("t-1", team, 1));
+        let user: aisix_core::User =
+            serde_json::from_value(serde_json::json!({"name": "Alice"})).unwrap();
+        snap.users
+            .insert(aisix_core::resource::ResourceEntry::new("u-1", user, 1));
+        let at = |user_name, api_key_name, team_name| aisix_obs::LiveGaugeSeries::Budget {
+            api_key_id: "ak-1",
+            team_id: "t-1",
+            user_id: "u-1",
+            user_name,
+            api_key_name,
+            team_name,
+        };
+        assert!(live(
+            &snap,
+            at("Alice", Some("Billing key"), Some("Platform"))
+        ));
+        // The users document wins over the key's inline name.
+        assert!(!live(&snap, at("inline name", None, None)));
+        assert!(!live(&snap, at("Alice", Some("Old key name"), None)));
+        assert!(!live(&snap, at("Alice", None, Some("Old team"))));
+        assert!(live(&snap, at("Alice", None, None)));
+        let remaining = |api_key_name| aisix_obs::LiveGaugeSeries::RatelimitRemaining {
+            api_key_id: "ak-1",
+            model: "unknown",
+            api_key_name,
+        };
+        assert!(live(&snap, remaining(Some("Billing key"))));
+        assert!(!live(&snap, remaining(Some("Old key name"))));
+        assert!(live(&snap, remaining(None)));
+        // A renamed key is stale — watched on, since a name can come back —
+        // and a deleted one is gone.
+        assert_eq!(
+            gauge_series_is_live(&snap, at("Alice", Some("Old key name"), None)),
+            aisix_obs::GaugeLiveness::Stale
+        );
+        snap.apikeys.remove("ak-1");
+        assert_eq!(
+            gauge_series_is_live(&snap, at("Alice", None, None)),
+            aisix_obs::GaugeLiveness::Gone
+        );
+    }
+
+    /// The rate-limit family is judged on BOTH halves of its key, which is
+    /// only safe because the emit site collapses the caller's model string
+    /// to the configured set first. A wildcard alias serves concrete names
+    /// that are in no `models` row, so if the raw string still reached the
+    /// label this check would retire live series on every sweep.
+    #[test]
+    fn rate_limit_remaining_is_judged_on_both_halves_of_its_key() {
+        let snap = snapshot_with_key("ak-1", None, None, None);
+        let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "openai/*",
+            "provider": "openai",
+            "model_name": "gpt-4o-mini",
+        }))
+        .unwrap();
+        snap.models
+            .insert(aisix_core::resource::ResourceEntry::new("m-1", model, 1));
+        let at = |key, model| aisix_obs::LiveGaugeSeries::RatelimitRemaining {
+            api_key_id: key,
+            model,
+            api_key_name: None,
+        };
+        // The wildcard ROW name is what the emit site stamps for every
+        // concrete name that row serves, and it resolves.
+        assert!(live(&snap, at("ak-1", "openai/*")));
+        // Placeholders name no row, so they are never retired.
+        assert!(live(&snap, at("ak-1", "unresolved")));
+        assert!(live(&snap, at("ak-1", "unknown")));
+        // Either half going away retires the series.
+        assert!(!live(&snap, at("ak-gone", "openai/*")));
+        assert!(!live(&snap, at("ak-1", "deleted-model")));
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn metrics_upkeep_runs_periodically_and_stops_on_cancel() {
+    async fn a_periodic_job_runs_on_its_period_and_stops_on_cancel() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = calls.clone();
-        let task = tokio::spawn(run_metrics_upkeep(
-            cancel_rx,
-            Duration::from_secs(5),
-            move || {
-                observed.fetch_add(1, Ordering::SeqCst);
-            },
-        ));
+        let task = tokio::spawn(run_periodic(cancel_rx, Duration::from_secs(5), move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(())
+        }));
 
         tokio::task::yield_now().await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -2271,6 +4203,33 @@ models:
     }
 
     #[test]
+    fn validate_reports_colliding_openapi_tool_names_without_failing() {
+        use std::io::Write as _;
+        let mut f = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        f.write_all(
+            br#"
+_format_version: "1"
+mcp_servers:
+  - name: erp
+    type: openapi
+    url: https://erp.test
+    spec: {"paths": {"/a": {"get": {"operationId": "foo/list"}}, "/b": {"get": {"operationId": "foo.list"}}}}
+  - name: clean
+    type: openapi
+    url: https://clean.test
+    spec: {"paths": {"/a": {"get": {"operationId": "one"}}, "/b": {"get": {"operationId": "two"}}}}
+"#,
+        )
+        .unwrap();
+        run_validate(f.path()).unwrap();
+        let snapshot = aisix_core::filesource::load_resources_file(f.path(), 1).unwrap();
+        assert_eq!(
+            openapi_tool_name_collisions(&snapshot.mcp_servers),
+            vec![("erp".to_string(), vec!["foo_list".to_string()])]
+        );
+    }
+
+    #[test]
     fn default_domain_strips_scheme_port_and_brackets() {
         // Plain hostnames.
         assert_eq!(
@@ -2314,8 +4273,8 @@ models:
             env_id: String::new(),
             user: None,
             password_env: None,
-            dial_timeout_ms: 5000,
-            request_timeout_ms: 5000,
+            dial_timeout_ms: None,
+            request_timeout_ms: None,
             tls: None,
         };
         let opts = build_etcd_connect_options(&etcd).unwrap();
@@ -2342,8 +4301,8 @@ models:
             env_id: String::new(),
             user: None,
             password_env: None,
-            dial_timeout_ms: 5000,
-            request_timeout_ms: 5000,
+            dial_timeout_ms: Some(5000),
+            request_timeout_ms: Some(5000),
             tls: None,
         };
         let opts = build_etcd_connect_options(&etcd)
@@ -2365,8 +4324,8 @@ models:
             env_id: String::new(),
             user: None,
             password_env: None,
-            dial_timeout_ms: 5000,
-            request_timeout_ms: 5000,
+            dial_timeout_ms: None,
+            request_timeout_ms: None,
             tls: Some(aisix_core::EtcdTlsConfig {
                 ca_cert_file: "/definitely/does/not/exist/ca.crt".into(),
                 client_cert_file: "/tmp/c.crt".into(),
@@ -2402,6 +4361,37 @@ models:
         let (h, p) = parse_host_port("etcd.aisix.cloud:2379").unwrap();
         assert_eq!(h, "etcd.aisix.cloud");
         assert_eq!(p, 2379);
+    }
+
+    /// `managed.cp_base_url` becomes the etcd endpoint verbatim, so a URL with
+    /// userinfo lands here. The real host must be what gets resolved and
+    /// presented over TLS, and the password must not reach the error text.
+    #[test]
+    fn an_endpoint_with_userinfo_splits_on_its_real_host_and_hides_the_password() {
+        for endpoint in [
+            "https://user:hunter2@etcd.example.com:7943",
+            "user:hunter2@etcd.example.com:7943",
+        ] {
+            assert_eq!(
+                parse_host_port(endpoint).unwrap(),
+                ("etcd.example.com".to_string(), 7943),
+            );
+            assert_eq!(
+                default_domain_from_endpoint(endpoint).unwrap(),
+                "etcd.example.com",
+            );
+        }
+        assert_eq!(
+            parse_host_port("https://user:hunter2@etcd.example.com").unwrap(),
+            ("etcd.example.com".to_string(), 2379),
+        );
+        for err in [
+            parse_host_port("https://user:hunter2@host:abc").unwrap_err(),
+            parse_host_port("https://user:hunter2@:7943").unwrap_err(),
+            default_domain_from_endpoint("https://user:hunter2@:7943").unwrap_err(),
+        ] {
+            assert!(!err.to_string().contains("hunter2"), "{err}");
+        }
     }
 
     #[test]
@@ -2478,6 +4468,116 @@ models:
         );
     }
 
+    /// All three consumers of `managed.cp_base_url` must read the same
+    /// origin. Before AISIX-Cloud#1643 only the etcd dial attached a
+    /// scheme of its own, so a bare `host:port` connected to etcd — the
+    /// console showed the gateway healthy — while heartbeat and telemetry
+    /// each concatenated a path onto a value reqwest cannot parse.
+    #[test]
+    fn managed_urls_agree_on_a_scheme_less_cp_base_url() {
+        let file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+managed:
+  enabled: true
+  cp_base_url: "dpm.example.com:7944"
+"#,
+        )
+        .unwrap();
+        let cfg = aisix_core::Config::load_from_path(Some(file.path())).unwrap();
+        let base = cfg.managed.cp_base_url.as_deref().unwrap();
+
+        let hb = heartbeat::heartbeat_url(base);
+        assert_eq!(hb, "https://dpm.example.com:7944/dp/heartbeat");
+        assert_eq!(
+            telemetry_url(&hb),
+            "https://dpm.example.com:7944/dp/telemetry"
+        );
+        assert_eq!(dpmgr_origin(&hb), "https://dpm.example.com:7944");
+        assert_eq!(
+            derive_cp_etcd_url(&cfg.managed).unwrap(),
+            "https://dpm.example.com:7944"
+        );
+    }
+
+    /// `cp_etcd_endpoint` is the field with the opposite convention:
+    /// `derive_cp_etcd_url` prepends `https://` itself, so an operator
+    /// who writes one — the natural mistake now that the neighbouring
+    /// field takes a scheme — used to get
+    /// `https://https://etcd.example.com:7943`, a dial the supervisor
+    /// retries forever while the proxy listener never binds.
+    #[test]
+    fn managed_etcd_url_survives_a_scheme_on_the_endpoint() {
+        let file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+managed:
+  enabled: true
+  cp_base_url: "dpm.example.com:7944"
+  cp_etcd_endpoint: "https://etcd.example.com:7943"
+"#,
+        )
+        .unwrap();
+        let cfg = aisix_core::Config::load_from_path(Some(file.path())).unwrap();
+        assert_eq!(
+            derive_cp_etcd_url(&cfg.managed).unwrap(),
+            "https://etcd.example.com:7943"
+        );
+    }
+
+    /// A trailing slash on the base must not double up in the derived
+    /// paths — normalisation deliberately leaves it in place and the
+    /// call sites own the trimming.
+    #[test]
+    fn managed_urls_tolerate_a_trailing_slash_on_the_base() {
+        let hb = heartbeat::heartbeat_url("https://dpm.example.com:7944/");
+        assert_eq!(hb, "https://dpm.example.com:7944/dp/heartbeat");
+        assert_eq!(dpmgr_origin(&hb), "https://dpm.example.com:7944");
+    }
+
+    /// A base carrying a path is accepted (the shipped managed example
+    /// uses one), and the three derivations must still agree on it. The
+    /// telemetry URL is the one that can drift: derived by rewriting
+    /// every `/dp/heartbeat` it finds, a base ending in that path would
+    /// have produced `…/dp/telemetry/dp/telemetry` while `dpmgr_origin`
+    /// returned the origin untouched.
+    #[test]
+    fn managed_urls_agree_on_a_base_carrying_a_path() {
+        let hb = heartbeat::heartbeat_url("https://cp.example.com/api");
+        assert_eq!(hb, "https://cp.example.com/api/dp/heartbeat");
+        assert_eq!(
+            telemetry_url(&hb),
+            "https://cp.example.com/api/dp/telemetry"
+        );
+        assert_eq!(dpmgr_origin(&hb), "https://cp.example.com/api");
+
+        let hb = heartbeat::heartbeat_url("https://cp.example.com/dp/heartbeat");
+        assert_eq!(hb, "https://cp.example.com/dp/heartbeat/dp/heartbeat");
+        assert_eq!(
+            telemetry_url(&hb),
+            "https://cp.example.com/dp/heartbeat/dp/telemetry"
+        );
+        assert_eq!(dpmgr_origin(&hb), "https://cp.example.com/dp/heartbeat");
+    }
+
     #[test]
     fn derive_etcd_url_errors_without_base_url() {
         let m = managed_with_urls(None, None);
@@ -2490,6 +4590,93 @@ models:
         let m = managed_with_urls(Some(""), None);
         let err = derive_cp_etcd_url(&m).unwrap_err();
         assert!(err.to_string().contains("cp_base_url"), "unexpected: {err}");
+    }
+
+    /// The `upstream_protocol` metric label (AISIX-Cloud#1403) MUST
+    /// agree with the bridge `build_hub()` actually dispatches to.
+    ///
+    /// `aisix_gateway::upstream_protocol` is a pure function of the
+    /// ProviderKey row — it has to be, because the metric emit path
+    /// resolves the row once per request and has no Hub in hand. That
+    /// makes it a SECOND copy of `Hub::dispatch_two_tier`'s rule, and
+    /// this test is what keeps the copy honest: it sweeps the REGISTERED
+    /// specialized vendors (so a third one cannot be added without being
+    /// covered) crossed with every `Adapter` variant plus the absent
+    /// adapter, and asserts the label equals the dispatched bridge's own
+    /// `wire_protocol()`.
+    ///
+    /// A mismatch is not a cosmetic label bug: it puts one ProviderKey's
+    /// traffic under a protocol it never spoke, which is exactly the
+    /// misattribution the label was added to remove.
+    #[test]
+    fn upstream_protocol_label_matches_dispatched_bridge() {
+        let hub = build_hub();
+        let mut vendors = hub.specialized_vendors();
+        // A vendor with no specialized registration, to exercise the
+        // family tier the long-tail catalog resolves through.
+        vendors.push("some-long-tail-vendor".to_string());
+
+        let adapters: Vec<Option<aisix_core::Adapter>> = std::iter::once(None)
+            .chain(aisix_core::Adapter::ALL.into_iter().map(Some))
+            .collect();
+
+        for vendor in &vendors {
+            for adapter in &adapters {
+                let adapter_field = match adapter {
+                    Some(a) => format!(r#","adapter":"{}""#, a.wire_protocol()),
+                    None => String::new(),
+                };
+                let pk: aisix_core::ProviderKey = serde_json::from_str(&format!(
+                    r#"{{"display_name":"pk","secret":"k","provider":"{vendor}"{adapter_field}}}"#
+                ))
+                .unwrap();
+                let dispatched = hub
+                    .dispatch_two_tier(&pk)
+                    .map(|b| b.wire_protocol())
+                    .unwrap_or(aisix_gateway::UPSTREAM_PROTOCOL_UNKNOWN);
+                assert_eq!(
+                    aisix_gateway::upstream_protocol(&pk),
+                    dispatched,
+                    "provider={vendor:?} adapter={adapter:?}: the upstream_protocol \
+                     label disagrees with the bridge dispatch selects",
+                );
+            }
+        }
+    }
+
+    /// A vendor with no specialized bridge and no `adapter` reaches no
+    /// bridge at all, so its protocol is genuinely unknown rather than a
+    /// guess at the most common wire shape. Pinned separately because
+    /// the sweep above would still pass if BOTH sides defaulted to
+    /// `"openai"`.
+    #[test]
+    fn upstream_protocol_is_unknown_without_a_resolvable_bridge() {
+        let pk: aisix_core::ProviderKey = serde_json::from_str(
+            r#"{"display_name":"pk","secret":"k","provider":"some-long-tail-vendor"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            aisix_gateway::upstream_protocol(&pk),
+            "unknown",
+            "an unresolvable ProviderKey must not be labelled with a guessed protocol",
+        );
+        assert!(build_hub().dispatch_two_tier(&pk).is_none());
+    }
+
+    /// The canonical `provider: "openai"` / `provider: "anthropic"` keys
+    /// cp-api writes reach a SPECIALIZED bridge, so their protocol comes
+    /// from the vendor tier — reading `pk.adapter` alone would report
+    /// `unknown` for a key that omits it.
+    #[test]
+    fn upstream_protocol_reads_the_specialized_tier_before_the_adapter() {
+        for (vendor, want) in [("openai", "openai"), ("anthropic", "anthropic")] {
+            let pk: aisix_core::ProviderKey = serde_json::from_str(&format!(
+                r#"{{"display_name":"pk","secret":"k","provider":"{vendor}"}}"#
+            ))
+            .unwrap();
+            assert!(pk.adapter.is_none());
+            assert_eq!(aisix_gateway::upstream_protocol(&pk), want);
+        }
     }
 
     /// `build_hub()` must NOT register `cohere` as a specialized chat
@@ -2622,14 +4809,146 @@ models:
         );
     }
 
-    /// The acceptor has to leave `TCP_NODELAY` set on the socket the
-    /// gateway will write responses to. Asserted against a real accepted
-    /// connection, including that the option is off beforehand — the
-    /// default this exists to change.
-    #[tokio::test]
-    async fn the_downstream_acceptor_sets_tcp_nodelay() {
-        use axum_server::accept::Accept;
+    /// One accept path, and it has to keep setting `TCP_NODELAY`.
+    ///
+    /// This stays a source probe because the option is invisible from
+    /// outside: a listener wired without it serves correctly, benchmarks
+    /// identically, and only pays the delayed-ACK tax on streamed
+    /// responses. One accept path is what makes that cheap to guard, so
+    /// the invariant is that there is still only one — a second would be
+    /// a second place to forget the option, the connection count and the
+    /// version sniff.
+    #[test]
+    fn the_gateway_has_one_accept_path_and_it_sets_tcp_nodelay() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .expect("production half");
 
+        let sites: Vec<usize> = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains("listener.accept()"))
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(
+            sites.len(),
+            1,
+            "expected exactly one accept site, found {}. A second one is a \
+             second place TCP_NODELAY, the connection count and the version \
+             sniff can be forgotten; fold it into `accept_loop` instead",
+            sites.len(),
+        );
+
+        let armed: Vec<usize> = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains("set_nodelay(true)"))
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(
+            armed.len(),
+            1,
+            "expected exactly one TCP_NODELAY site, found {}",
+            armed.len(),
+        );
+        assert!(
+            sites[0] < armed[0],
+            "TCP_NODELAY must be set on the socket this accept produced",
+        );
+
+        // And on the accept path itself, not inside the connection task:
+        // a socket handed off before the option is set would serve a
+        // request or two with Nagle still on.
+        let lines: Vec<&str> = production.lines().collect();
+        let between = lines[sites[0]..armed[0]].join(" ");
+        assert!(
+            !between.contains("tokio::spawn("),
+            "TCP_NODELAY must be set before the connection is handed to a task",
+        );
+    }
+
+    /// The preface decides, and the bytes it consumed have to come back.
+    /// A sniff that swallowed them would leave hyper reading an HTTP/2
+    /// connection that starts four bytes in.
+    #[tokio::test]
+    async fn sniffing_recognises_the_http2_preface_and_replays_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        client.write_all(PREFACE).await.expect("write preface");
+        let (accepted, _peer) = listener.accept().await.expect("accept");
+
+        let (version, mut stream) = sniff_downstream_version(accepted, None)
+            .await
+            .expect("sniff");
+        assert_eq!(version, Downstream::Http2);
+
+        let mut seen = vec![0u8; PREFACE.len()];
+        stream
+            .read_exact(&mut seen)
+            .await
+            .expect("replayed preface");
+        assert_eq!(
+            seen, PREFACE,
+            "hyper must still see the connection from byte zero"
+        );
+    }
+
+    /// The HTTP/1.1 side of the same contract.
+    #[tokio::test]
+    async fn sniffing_falls_back_to_http1_and_replays_what_it_read() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const HEAD: &[u8] = b"GET /livez HTTP/1.1\r\n\r\n";
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        client.write_all(HEAD).await.expect("write head");
+        let (accepted, _peer) = listener.accept().await.expect("accept");
+
+        let (version, mut stream) = sniff_downstream_version(accepted, None)
+            .await
+            .expect("sniff");
+        assert_eq!(version, Downstream::Http1);
+
+        let mut seen = vec![0u8; HEAD.len()];
+        stream.read_exact(&mut seen).await.expect("replayed head");
+        assert_eq!(seen, HEAD);
+    }
+
+    /// A peer that opens a connection and closes it without speaking
+    /// must not be read as HTTP/2, and must not hang the task.
+    #[tokio::test]
+    async fn sniffing_treats_an_empty_connection_as_http1() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (accepted, _peer) = listener.accept().await.expect("accept");
+        drop(client);
+
+        let (version, _stream) = sniff_downstream_version(accepted, None)
+            .await
+            .expect("sniff");
+        assert_eq!(version, Downstream::Http1);
+    }
+
+    /// A peer that connects and then says nothing holds a connection
+    /// slot. hyper's own version read has no timer, so this is the one
+    /// place the configured idle timeout can bound it
+    /// (AISIX-Cloud#1126).
+    #[tokio::test]
+    async fn sniffing_gives_up_on_a_peer_that_sends_nothing() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind");
@@ -2637,80 +4956,428 @@ models:
         let _client = tokio::net::TcpStream::connect(addr).await.expect("connect");
         let (accepted, _peer) = listener.accept().await.expect("accept");
 
-        assert!(
-            !accepted.nodelay().expect("read nodelay"),
-            "a plain accepted socket is expected to have Nagle on; if the \
-             platform default changed, this test no longer proves anything",
-        );
-        let (accepted, ()) = DOWNSTREAM_NODELAY
-            .accept(accepted, ())
-            .await
-            .expect("accept");
-        assert!(accepted.nodelay().expect("read nodelay"));
+        let err = match sniff_downstream_version(accepted, Some(Duration::from_millis(50))).await {
+            Ok(_) => panic!("a silent peer must not be waited on forever"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     }
 
-    /// Four listeners are served — HTTP and HTTPS, on the shared runtime
-    /// and on each thread-per-core worker — and a fifth is one config
-    /// surface away. A listener wired without the acceptor fails in the
-    /// way nothing catches: it serves correctly, benchmarks identically,
-    /// and only pays the delayed-ACK tax on streamed responses.
-    ///
-    /// The TLS sites also have to wire it with `map`, not `acceptor`:
-    /// `Server::acceptor` *replaces* the acceptor, so
-    /// `from_tcp_rustls(..).acceptor(DOWNSTREAM_NODELAY)` compiles, drops
-    /// the rustls acceptor, and serves plaintext on the TLS port — while
-    /// satisfying a check that only looks for the constant's name.
-    #[test]
-    fn every_listener_sets_tcp_nodelay() {
-        let src = include_str!("main.rs");
-        let production = src
-            .split("\n#[cfg(test)]\nmod ")
-            .next()
-            .expect("production half");
-        // Spelled out at the call site rather than imported, so this
-        // probe sees every listener. (`use axum_server::…` in production
-        // would hide one from it.)
-        assert!(
-            !production.contains("use axum_server::"),
-            "importing the listener constructor hides the site from this \
-             check; call it as `axum_server::from_tcp…` instead",
-        );
-        let lines: Vec<&str> = production.lines().collect();
+    /// The replay has to survive a reader that takes fewer bytes than
+    /// are buffered — hyper reads into whatever buffer it has.
+    #[tokio::test]
+    async fn rewind_replays_across_short_reads() {
+        use tokio::io::AsyncReadExt;
 
-        let mut sites = 0;
-        let mut offenders = Vec::new();
-        for (n, line) in lines.iter().enumerate() {
-            if !(line.contains("axum_server::from_tcp") || line.contains("axum_server::bind")) {
-                continue;
+        let (mut client, server) = tokio::io::duplex(64);
+        tokio::io::AsyncWriteExt::write_all(&mut client, b"XYZ")
+            .await
+            .expect("write tail");
+        drop(client);
+
+        let mut stream = Rewind::new(b"PRI ".to_vec(), server);
+        let mut all = Vec::new();
+        let mut one = [0u8; 1];
+        while stream.read(&mut one).await.expect("read") == 1 {
+            all.push(one[0]);
+        }
+        assert_eq!(all, b"PRI XYZ");
+    }
+
+    /// A listener running the real `accept_loop`, plus the two levers a
+    /// shutdown pulls: `retire` at the start of the drain, `cancel` at
+    /// the end.
+    struct DrainHarness {
+        addr: std::net::SocketAddr,
+        retire: watch::Sender<bool>,
+        cancel: watch::Sender<bool>,
+        serving: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    async fn drain_harness() -> DrainHarness {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let (retire, retire_rx) = watch::channel(false);
+        let (cancel, cancel_rx) = watch::channel(false);
+        let router = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "ok" }))
+            .route(
+                "/slow",
+                axum::routing::get(|| async {
+                    tokio::time::sleep(Duration::from_millis(1_500)).await;
+                    "ok"
+                }),
+            )
+            .route(
+                "/upgrade-slow",
+                axum::routing::get(|| async {
+                    // An upgrade handler that awaits before answering, as
+                    // `/v1/realtime` does whenever authentication has to
+                    // go out (a JWKS fetch).
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    axum::http::Response::builder()
+                        .status(axum::http::StatusCode::SWITCHING_PROTOCOLS)
+                        .header("connection", "upgrade")
+                        .header("upgrade", "websocket")
+                        .body(axum::body::Body::empty())
+                        .expect("101")
+                }),
+            );
+        let serving = tokio::spawn(accept_loop(
+            listener,
+            router,
+            None,
+            None,
+            ShutdownWatch {
+                retire: retire_rx,
+                cancel: cancel_rx,
+            },
+            "test",
+            None,
+            None,
+        ));
+        DrainHarness {
+            addr,
+            retire,
+            cancel,
+            serving,
+        }
+    }
+
+    async fn get_ok<B>(sender: &mut hyper::client::conn::http1::SendRequest<B>) -> hyper::Result<()>
+    where
+        B: hyper::body::Body + Default + Send + 'static + Unpin,
+        B::Data: Send,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        use http_body_util::BodyExt;
+        let response = sender
+            .send_request(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(B::default())
+                    .expect("request"),
+            )
+            .await?;
+        assert_eq!(response.status(), 200);
+        // An HTTP/1.1 connection cannot carry the next request until the
+        // previous body is read off it.
+        response.into_body().collect().await?;
+        Ok(())
+    }
+
+    /// A connection accepted before the drain ended that asks to upgrade
+    /// afterwards gets its 101 with `Connection: upgrade` intact. Retiring
+    /// it while the handler is still running would make hyper stamp
+    /// `Connection: close` over it, and a WebSocket client rejects that.
+    #[tokio::test]
+    async fn an_upgrade_after_the_drain_ended_keeps_connection_upgrade() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let harness = drain_harness().await;
+        let mut tcp = tokio::net::TcpStream::connect(harness.addr)
+            .await
+            .expect("connect");
+        // Accepted before the listener closes, or the kernel resets it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        harness.retire.send(true).expect("retire");
+        harness.cancel.send(true).expect("cancel");
+        tcp.write_all(
+            b"GET /upgrade-slow HTTP/1.1\r\nhost: 127.0.0.1\r\n\
+              connection: upgrade\r\nupgrade: websocket\r\n\r\n",
+        )
+        .await
+        .expect("write");
+
+        let mut head = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = tokio::time::timeout(Duration::from_secs(5), tcp.read(&mut buf))
+                .await
+                .expect("response head in time")
+                .expect("read");
+            assert!(n > 0, "closed before a response head: {head:?}");
+            head.extend_from_slice(&buf[..n]);
+        }
+        let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 101"), "{head}");
+        assert!(head.contains("\r\nconnection: upgrade\r\n"), "{head}");
+        drop(tcp);
+        harness.serving.await.expect("join").expect("serve");
+    }
+
+    /// The same, on a pooled connection that has already served a request
+    /// and asks to upgrade while the drain ends: it is not idle, so it is
+    /// not retired under the running upgrade handler.
+    #[tokio::test]
+    async fn an_upgrade_on_a_pooled_connection_keeps_connection_upgrade_when_the_drain_ends() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn read_head(tcp: &mut tokio::net::TcpStream) -> String {
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                let n = tokio::time::timeout(Duration::from_secs(5), tcp.read(&mut byte))
+                    .await
+                    .expect("response head in time")
+                    .expect("read");
+                assert!(n > 0, "closed before a response head: {head:?}");
+                head.push(byte[0]);
             }
-            sites += 1;
-            // The acceptor is wired in the same statement, which the
-            // formatter keeps within the next two lines.
-            let statement = lines[n..(n + 3).min(lines.len())].join(" ");
-            if !statement.contains("DOWNSTREAM_NODELAY") {
-                offenders.push(format!("main.rs:{}: no TCP_NODELAY acceptor", n + 1));
-            } else if line.contains("_rustls") && !statement.contains(".map(") {
-                offenders.push(format!(
-                    "main.rs:{}: TLS listener must slot the acceptor under rustls with \
-                     `.map(|tls| tls.acceptor(DOWNSTREAM_NODELAY))`; `.acceptor(..)` \
-                     replaces the rustls acceptor and serves plaintext",
-                    n + 1
-                ));
-            }
+            String::from_utf8_lossy(&head).to_ascii_lowercase()
         }
 
-        assert!(
-            sites >= 4,
-            "found {sites} listener construction sites, expected at least 4 — \
-             the probe no longer matches the code and this test proves nothing. \
-             If the listeners were deliberately consolidated, lower this count \
-             on purpose",
+        let harness = drain_harness().await;
+        let mut tcp = tokio::net::TcpStream::connect(harness.addr)
+            .await
+            .expect("connect");
+        tcp.write_all(b"GET / HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n")
+            .await
+            .expect("write");
+        let first = read_head(&mut tcp).await;
+        assert!(first.starts_with("http/1.1 200"), "{first}");
+        let mut body = [0u8; 2];
+        tcp.read_exact(&mut body).await.expect("body");
+
+        tcp.write_all(
+            b"GET /upgrade-slow HTTP/1.1\r\nhost: 127.0.0.1\r\n\
+              connection: upgrade\r\nupgrade: websocket\r\n\r\n",
+        )
+        .await
+        .expect("write");
+        // The handler is now running; the drain ends under it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        harness.retire.send(true).expect("retire");
+        harness.cancel.send(true).expect("cancel");
+
+        let head = read_head(&mut tcp).await;
+        assert!(head.starts_with("http/1.1 101"), "{head}");
+        assert!(head.contains("\r\nconnection: upgrade\r\n"), "{head}");
+        drop(tcp);
+        harness.serving.await.expect("join").expect("serve");
+    }
+
+    /// The whole of AISIX-Cloud#1395: an HTTP/2 downstream is told to
+    /// retire when the drain STARTS, not when the listener finally
+    /// closes. Asserted against a real hyper client, because GOAWAY is
+    /// only observable as a peer: the connection future resolves once
+    /// the frame lands and the streams it permits are done.
+    #[tokio::test]
+    async fn an_http2_downstream_is_retired_when_the_drain_starts() {
+        use http_body_util::BodyExt;
+
+        let harness = drain_harness().await;
+        let tcp = tokio::net::TcpStream::connect(harness.addr)
+            .await
+            .expect("connect");
+        let (mut sender, conn) = hyper::client::conn::http2::handshake::<_, _, axum::body::Body>(
+            hyper_util::rt::TokioExecutor::new(),
+            hyper_util::rt::TokioIo::new(tcp),
+        )
+        .await
+        .expect("h2 handshake");
+        let driving = tokio::spawn(conn);
+
+        let response = sender
+            .send_request(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("first request");
+        assert_eq!(response.status(), 200);
+        response.into_body().collect().await.expect("body");
+
+        // A stream still running when the drain starts. GOAWAY asks the
+        // peer to open no NEW streams; RFC 9113 §6.8's second frame names
+        // this one as processed, so it has to be answered, not reset.
+        let slow = sender
+            .send_request(
+                axum::http::Request::builder()
+                    .uri("/slow")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await;
+
+        // The drain starts. The listener is NOT closed; the only thing
+        // that can reach this peer is a frame.
+        harness.retire.send(true).expect("retire");
+
+        let slow = slow.expect("in-flight response head");
+        assert_eq!(slow.status(), 200);
+        assert_eq!(
+            slow.into_body()
+                .collect()
+                .await
+                .expect("in-flight body")
+                .to_bytes(),
+            "ok".as_bytes(),
+            "GOAWAY must not cut off a stream it named as processed",
         );
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), driving)
+            .await
+            .expect("the h2 connection must end after GOAWAY, not hang until the listener closes")
+            .expect("join");
         assert!(
-            offenders.is_empty(),
-            "these listeners accept connections with Nagle left on, which \
-             delays streamed response frames; wire `DOWNSTREAM_NODELAY`:\n{}",
-            offenders.join("\n"),
+            ended.is_ok(),
+            "GOAWAY should end the connection cleanly, not error it: {ended:?}",
+        );
+
+        harness.cancel.send(true).expect("cancel");
+        let _ = tokio::time::timeout(Duration::from_secs(5), harness.serving).await;
+    }
+
+    /// The other half of the same decision. An HTTP/1.1 connection is
+    /// retired in band, by `Connection: close` on the responses it
+    /// carries — never by the server closing it. Disabling keep-alive
+    /// here would close an idle pooled connection, and a client
+    /// dispatching onto it in that instant loses the request
+    /// (AISIX-Cloud#1394).
+    #[tokio::test]
+    async fn an_http1_downstream_is_not_closed_when_the_drain_starts() {
+        let harness = drain_harness().await;
+        let tcp = tokio::net::TcpStream::connect(harness.addr)
+            .await
+            .expect("connect");
+        let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, axum::body::Body>(
+            hyper_util::rt::TokioIo::new(tcp),
+        )
+        .await
+        .expect("h1 handshake");
+        let driving = tokio::spawn(conn);
+
+        get_ok(&mut sender).await.expect("first request");
+
+        harness.retire.send(true).expect("retire");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        get_ok(&mut sender)
+            .await
+            .expect("the connection must still serve after the drain starts");
+        assert!(
+            !driving.is_finished(),
+            "h1 connection was closed by the server"
+        );
+
+        harness.cancel.send(true).expect("cancel");
+        let _ = tokio::time::timeout(Duration::from_secs(5), harness.serving).await;
+    }
+
+    /// Retiring connections must not take the listener with it. A
+    /// balancer only learns about the `/readyz` 503 on its next probe,
+    /// and everything it routes here in between still has to be served.
+    #[tokio::test]
+    async fn the_listener_keeps_accepting_after_the_drain_starts() {
+        let harness = drain_harness().await;
+        harness.retire.send(true).expect("retire");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let tcp = tokio::net::TcpStream::connect(harness.addr)
+            .await
+            .expect("a connection opened during the drain must be accepted");
+        let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, axum::body::Body>(
+            hyper_util::rt::TokioIo::new(tcp),
+        )
+        .await
+        .expect("h1 handshake");
+        let _driving = tokio::spawn(conn);
+        get_ok(&mut sender)
+            .await
+            .expect("a request arriving during the drain must be served");
+
+        harness.cancel.send(true).expect("cancel");
+        let _ = tokio::time::timeout(Duration::from_secs(5), harness.serving).await;
+    }
+
+    /// The listener staying open is only worth something if what it
+    /// accepts is actually served. A connection opened during the drain
+    /// is retired the moment it is accepted, because `retire` is already
+    /// true — so this asks the question that matters: does its FIRST
+    /// request still get an answer, or did retiring it refuse exactly
+    /// the traffic the open listener exists to take?
+    ///
+    /// RFC 9113 §6.8's two-phase form is what makes the answer yes. The
+    /// advisory `GOAWAY(2^31-1)` goes out first and explicitly allows
+    /// in-flight stream creation; the settled GOAWAY that bounds it only
+    /// follows a PING round trip. The request lands inside that window
+    /// and is one of the streams the second frame names as processed.
+    #[tokio::test]
+    async fn an_http2_connection_opened_during_the_drain_still_serves_its_request() {
+        use http_body_util::BodyExt;
+
+        let harness = drain_harness().await;
+        harness.retire.send(true).expect("retire");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let tcp = tokio::net::TcpStream::connect(harness.addr)
+            .await
+            .expect("a connection opened during the drain must be accepted");
+        let (mut sender, conn) = hyper::client::conn::http2::handshake::<_, _, axum::body::Body>(
+            hyper_util::rt::TokioExecutor::new(),
+            hyper_util::rt::TokioIo::new(tcp),
+        )
+        .await
+        .expect("h2 handshake");
+        let _driving = tokio::spawn(conn);
+
+        let response = sender
+            .send_request(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("a request arriving during the drain must be served");
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes(),
+            "ok".as_bytes(),
+        );
+
+        harness.cancel.send(true).expect("cancel");
+        let _ = tokio::time::timeout(Duration::from_secs(5), harness.serving).await;
+    }
+
+    /// And the end of the drain does close it, and does return — an
+    /// accept loop that outlived its cancel would hold the process up
+    /// until the platform killed it.
+    #[tokio::test]
+    async fn the_listener_stops_accepting_when_the_drain_ends() {
+        let harness = drain_harness().await;
+        let tcp = tokio::net::TcpStream::connect(harness.addr)
+            .await
+            .expect("connect");
+        let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, axum::body::Body>(
+            hyper_util::rt::TokioIo::new(tcp),
+        )
+        .await
+        .expect("h1 handshake");
+        let _driving = tokio::spawn(conn);
+        get_ok(&mut sender).await.expect("first request");
+
+        harness.cancel.send(true).expect("cancel");
+        let served = tokio::time::timeout(Duration::from_secs(5), harness.serving)
+            .await
+            .expect("accept_loop must return once the drain ends")
+            .expect("join");
+        assert!(served.is_ok(), "{served:?}");
+
+        assert!(
+            tokio::net::TcpStream::connect(harness.addr)
+                .await
+                .and_then(|s| s.peer_addr())
+                .is_err(),
+            "the listener must be closed once the drain has ended",
         );
     }
 
@@ -2740,6 +5407,7 @@ models:
 
         let cfg = aisix_core::config::EtcdConfig {
             endpoints: vec![format!("http://127.0.0.1:{port}")],
+            request_timeout_ms: Some(5000),
             ..Default::default()
         };
         let options = super::build_etcd_connect_options_with_extra_ca(&cfg, None)
@@ -2750,17 +5418,14 @@ models:
              that gap is half of what this guards"
         );
 
-        let provider = aisix_etcd::EtcdConfigProvider::connect_with_policy(
+        // The call boot makes, with the bounds boot passes: the point is that
+        // whatever boot passes is what is being measured.
+        let provider = aisix_etcd::EtcdConfigProvider::connect(
             &cfg.endpoints,
             "/aisix-test",
             options,
-            // Boot's own policy, with only the retry ladder shortened: the
-            // point is that whatever boot passes is what is being measured.
-            aisix_etcd::ConnectPolicy {
-                interval: std::time::Duration::from_millis(1),
-                attempts: 1,
-                ..super::etcd_connect_policy(&cfg)
-            },
+            cfg.request_timeout(),
+            cfg.dial_budget(),
         )
         .await
         .expect("the lazy connect reports success without reaching the endpoint");
@@ -2783,14 +5448,112 @@ models:
             result.is_err(),
             "an endpoint that never speaks gRPC must not yield a snapshot"
         );
-        // `etcd.request_timeout_ms` defaults to 5s and is what should end
-        // this. Ceiling set well above it but well below the ~15s the
-        // keepalive alone would take, so losing the request bound and falling
-        // back to the slower net still fails here.
+        // `etcd.request_timeout_ms` is 5s here and is what should end this.
+        // Ceiling set well above it but well below the ~20s the keepalive
+        // alone would take, so losing the request bound and falling back to
+        // the slower net still fails here.
         assert!(
             elapsed < std::time::Duration::from_secs(10),
             "the read took {elapsed:?} — `etcd.request_timeout_ms` is not \
              bounding it"
         );
+    }
+
+    /// The same silent endpoint on the shipped defaults, which set no request
+    /// bound: a range read scales with the configuration, so the default leaves
+    /// it unbounded. The keepalive every etcd connection carries is then all
+    /// that ends the read, and it must.
+    #[tokio::test]
+    async fn a_first_read_from_a_silent_etcd_fails_on_the_default_config_too() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+        let port = listener.local_addr().expect("read back the port").port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept() {
+                held.push(sock);
+            }
+        });
+
+        let cfg = aisix_core::config::EtcdConfig {
+            endpoints: vec![format!("http://127.0.0.1:{port}")],
+            ..Default::default()
+        };
+        assert_eq!(cfg.request_timeout(), None);
+        let provider = aisix_etcd::EtcdConfigProvider::connect(
+            &cfg.endpoints,
+            "/aisix-test",
+            super::build_etcd_connect_options_with_extra_ca(&cfg, None)
+                .expect("building options must not fail for a plain endpoint"),
+            cfg.request_timeout(),
+            cfg.dial_budget(),
+        )
+        .await
+        .expect("the lazy connect reports success without reaching the endpoint");
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            aisix_etcd::ConfigProvider::load_all(&provider),
+        )
+        .await
+        .expect("the first read from a silent etcd never returned");
+        assert!(
+            outcome.is_err(),
+            "an endpoint that never speaks gRPC must not yield a snapshot"
+        );
+    }
+
+    /// The count is what tells an operator during a drain whether the
+    /// balancer has stopped routing here. Nothing else checks that the
+    /// slot comes back: every drain assertion is "at least one", so a
+    /// guard that outlived its connection would keep them all green
+    /// while the number climbed for the life of the process.
+    #[tokio::test]
+    async fn an_accepted_connection_holds_a_slot_until_its_task_ends() {
+        let livez = std::sync::Arc::new(aisix_proxy::LivezState::new());
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let (_retire, retire_rx) = watch::channel(false);
+        let (cancel, cancel_rx) = watch::channel(false);
+        let router = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let serving = tokio::spawn(accept_loop(
+            listener,
+            router,
+            None,
+            None,
+            ShutdownWatch {
+                retire: retire_rx,
+                cancel: cancel_rx,
+            },
+            "test",
+            Some(livez.clone()),
+            None,
+        ));
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, axum::body::Body>(
+            hyper_util::rt::TokioIo::new(tcp),
+        )
+        .await
+        .expect("h1 handshake");
+        let driving = tokio::spawn(conn);
+        get_ok(&mut sender).await.expect("first request");
+        assert_eq!(livez.open_connections(), 1);
+
+        drop(sender);
+        let _ = driving.await;
+        for _ in 0..50 {
+            if livez.open_connections() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            livez.open_connections(),
+            0,
+            "the slot must go back when the connection's task ends",
+        );
+
+        cancel.send(true).expect("cancel");
+        let _ = tokio::time::timeout(Duration::from_secs(5), serving).await;
     }
 }

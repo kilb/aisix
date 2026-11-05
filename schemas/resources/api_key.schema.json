@@ -1,64 +1,89 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "mcp_rate_limits_by_id": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "mcp_rate_limits_by_id"
+        ]
+      },
+      "then": {
+        "required": [
+          "mcp_rate_limits"
+        ]
+      }
+    }
+  ],
   "definitions": {
     "McpAccess": {
       "additionalProperties": false,
-      "description": "Policy-driven MCP access configuration on an API key. When present, this block supersedes the key's `allowed_tools` list: the allow side of the key's effective grant is computed from the applicable MCP access policies and `mode`, and `allowed_tools` is not consulted.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "deny_ids": {
+                "type": "array"
+              }
+            },
+            "required": [
+              "deny_ids"
+            ]
+          },
+          "then": {
+            "required": [
+              "deny"
+            ]
+          }
+        }
+      ],
+      "description": "The API key's own layer of the MCP tool ACL, the same `allow`/`deny` shape an MCP access policy carries. Present means the key constrains its grant; omitted means the key adds no constraint of its own and takes whatever the environment and team layers leave.",
       "properties": {
         "allow": {
-          "description": "Namespaced `<server>__<tool>` patterns intersected with the inherited grant when `mode` is `restrict`, using the same `*` glob matching as `allowed_tools`. Ignored for the other modes.",
+          "default": [],
+          "description": "Namespaced `<server>__<tool>` patterns this key allows, intersected with the environment and team layers. Same `*` glob matching a policy's `allow` uses; an empty list leaves the key no MCP access, and `[\"*\"]` narrows nothing (useful with `deny` alone).\n\nRequired on the write path and defaulted by the runtime loader, for the reason given on [`McpPolicy::allow`]. Read only when `allow_ids` is absent; ignored entirely when it is present.",
           "items": {
             "type": "string"
           },
           "type": "array"
+        },
+        "allow_ids": {
+          "description": "This key's allow side written by MCP server resource id instead of by server name, so renaming a server does not change what the key may reach. Present — including as an empty array — it is authoritative and `allow` is ignored; an empty array therefore allows nothing. Absent or `null`, the key falls back to `allow`.\n\nIt cannot express \"every server\": each entry names one server exactly and `server_id` is never a glob, so an enumeration of the servers registered today silently fails to cover one registered tomorrow. To allow (or deny) every server, present and future, leave this absent and use the name form's `\"*\"`.",
+          "items": {
+            "$ref": "#/definitions/McpToolRef"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "deny": {
-          "description": "Namespaced `<server>__<tool>` patterns subtracted from the key's effective grant, using the same `*` glob matching as `allow`.",
+          "description": "Namespaced `<server>__<tool>` patterns subtracted from this key's effective grant, using the same `*` glob matching as `allow`. Read only when `deny_ids` is absent.",
           "items": {
             "type": "string"
           },
           "type": "array"
         },
-        "mode": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/McpAccessMode"
-            }
-          ],
-          "description": "How the key combines with the applicable policies: `inherit`, `restrict`, or `deny`."
+        "deny_ids": {
+          "description": "This key's deny side written by MCP server resource id instead of by server name. Present — including as an empty array — it is authoritative and `deny` is ignored; an empty array subtracts nothing. Absent or `null`, the key falls back to `deny`.\n\nIt cannot express \"every server\": each entry names one server exactly and `server_id` is never a glob, so an enumeration of the servers registered today silently fails to cover one registered tomorrow. To allow (or deny) every server, present and future, leave this absent and use the name form's `\"*\"`.",
+          "items": {
+            "$ref": "#/definitions/McpToolRef"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
         }
       },
       "required": [
-        "mode"
+        "allow"
       ],
       "type": "object"
-    },
-    "McpAccessMode": {
-      "description": "How an API key combines with the applicable MCP access policies: `inherit`, `restrict`, or `deny`.",
-      "oneOf": [
-        {
-          "description": "The key uses the inherited grant unchanged: its team's enabled policy when one exists, otherwise the environment-default policy.",
-          "enum": [
-            "inherit"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "The key uses the intersection of the inherited grant and its own `allow` patterns — a restriction can only narrow what the policies grant, never widen it.",
-          "enum": [
-            "restrict"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "The key has no MCP tool access at all.",
-          "enum": [
-            "deny"
-          ],
-          "type": "string"
-        }
-      ]
     },
     "McpRateLimit": {
       "additionalProperties": false,
@@ -110,6 +135,27 @@
           ]
         }
       },
+      "type": "object"
+    },
+    "McpToolRef": {
+      "additionalProperties": false,
+      "description": "One tool on one MCP server, the server named by its resource id and the tool by name.\n\nThe tool half is matched with the same `*` glob rule the name form uses, so `tool: \"*\"` is the id spelling of `<server>__*`. The server half is an exact id: it is compared against the id of the server the addressed tool actually belongs to, never glob-matched, so a server whose *name* happens to contain a `*` cannot widen a grant.\n\nBoth halves are required on the WRITE path and defaulted by the runtime loader — the strict schemas add them to this definition's `required`, the types do not. An entry these were required of at the type level would fail to deserialize, and the loader skips a row it cannot deserialize whole: one malformed entry in one `allow_ids` array would stop the entire `api_key` from authenticating any traffic at all, not merely lose it MCP access. Defaulted, the malformed entry matches nothing instead — an empty `server_id` names no registered server, and an empty `tool` glob covers no tool name the gateway exposes.",
+      "properties": {
+        "server_id": {
+          "description": "Resource id of the registered MCP server (`mcp_servers/<id>`) this entry refers to. An id matching no registered server refers to nothing: the entry never matches, and the other entries are unaffected.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "tool": {
+          "description": "Tool on that server, matched as a `*` glob against the bare tool name — the part after the `<server>__` namespace prefix. `\"*\"` covers every tool the server exposes.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "server_id",
+        "tool"
+      ],
       "type": "object"
     },
     "RateLimit": {
@@ -193,7 +239,17 @@
   },
   "properties": {
     "allowed_agents": {
-      "description": "A2A agents this key may reach, named by their registered names. Entries are matched as `*` globs, mirroring `allowed_tools`: `\"*\"` grants every agent and an entry without a `*` matches one agent exactly. When omitted, set to `null`, or set to an empty list, the key has no A2A agent access — access is granted explicitly.",
+      "description": "A2A agents this key may reach, named by their registered names. Entries are matched as `*` globs, mirroring `allowed_models`: `\"*\"` grants every agent and an entry without a `*` matches one agent exactly. When omitted, set to `null`, or set to an empty list, the key has no A2A agent access — access is granted explicitly.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "allowed_model_ids": {
+      "description": "Models this key may use, named by resource id rather than by name, so renaming a model does not change what this key may reach. Present — including as an empty array — it is authoritative and `allowed_models` is ignored; each id is resolved against the current models in the snapshot and the resolved name is matched with the same `*` glob rule. An id naming a wildcard model therefore grants every name that model's pattern covers — including a name an exact-match model of its own serves, which is how the name form behaves too. An id matching no model grants nothing.\n\nSet to `null` it means the same as omitted: the key falls back to `allowed_models`. A producer must therefore write `[]`, never `null`, for a key that is meant to grant no model — the two are opposite grants, and an empty list is the one that is authoritative.",
       "items": {
         "type": "string"
       },
@@ -203,24 +259,15 @@
       ]
     },
     "allowed_models": {
-      "description": "Model identifiers this key may use. Entries are matched as `*` globs: `\"*\"` grants every model, `\"openai/*\"` grants every model name under that prefix, and an entry without a `*` matches one model exactly. An empty array denies access to every model.",
+      "default": [],
+      "description": "Model names this key may use, matched as `*` globs: `\"*\"` grants every model, `\"openai/*\"` grants every model name under that prefix, and an entry without a `*` matches one model exactly. An empty array denies access to every model. Read only when `allowed_model_ids` is absent; ignored entirely when it is present. When both are omitted the key may use no model — model access is granted explicitly.",
       "items": {
         "type": "string"
       },
       "type": "array"
     },
     "allowed_routes": {
-      "description": "Passthrough routes this key may use, named by their registered names. Entries are matched as `*` globs, mirroring `allowed_tools`: `\"*\"` grants every route and an entry without a `*` matches one route exactly. When omitted, set to `null`, or set to an empty list, the key may use no passthrough route — access is granted explicitly.",
-      "items": {
-        "type": "string"
-      },
-      "type": [
-        "array",
-        "null"
-      ]
-    },
-    "allowed_tools": {
-      "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names (the form the gateway exposes). Entries are matched as `*` globs, mirroring `allowed_models`: `\"*\"` grants every tool and `\"<server>__*\"` grants every tool on one server (e.g. `\"github__*\"`); an entry without a `*` matches one tool exactly. When omitted, set to `null`, or set to an empty list, the key has no MCP tool access — access is granted explicitly.",
+      "description": "Passthrough routes this key may use, named by their registered names. Entries are matched as `*` globs, mirroring `allowed_models`: `\"*\"` grants every route and an entry without a `*` matches one route exactly. When omitted, set to `null`, or set to an empty list, the key may use no passthrough route — access is granted explicitly.",
       "items": {
         "type": "string"
       },
@@ -234,7 +281,7 @@
       "type": "boolean"
     },
     "display_name": {
-      "description": "Operator-facing label for this key, as shown in the dashboard. Read only by the `${request.api_key.name}` header template (#1112); never used for authentication or routing.",
+      "description": "Operator-facing label for this key, as shown in the dashboard. Read by the `${request.api_key.name}` header template (#1112) and as the `api_key_name` metric label; never used for authentication or routing.",
       "type": [
         "string",
         "null"
@@ -278,13 +325,23 @@
           "type": "null"
         }
       ],
-      "description": "Policy-driven MCP access for this key. When present, it supersedes `allowed_tools`: the key's grant is computed from the environment's and its team's MCP access policies according to `mode` (`inherit`, `restrict`, or `deny`), and `allowed_tools` is not consulted. When omitted, the key keeps the explicit `allowed_tools` behavior — with policy `deny` patterns still subtracted, since deny applies to every key the policy covers."
+      "description": "This key's own layer of the MCP tool ACL, as namespaced `<server>__<tool>` glob patterns, or as `allow_ids` / `deny_ids` entries naming the server by resource id. It is intersected with the environment and team MCP access policies: every present layer must allow a tool and no layer may deny it. When omitted the key adds no constraint of its own — but with no layer present anywhere the grant is empty, so MCP access is always granted explicitly."
     },
     "mcp_rate_limits": {
       "additionalProperties": {
         "$ref": "#/definitions/McpRateLimit"
       },
-      "description": "Per-MCP-server limits for this key, keyed by the registered MCP server name — the `<server>` half of the `<server>__<tool>` names the gateway exposes. A `tools/call` is metered against the entry for the server it targets **and** the key's own `rate_limit`, each in its own counter, so a burst against one server never consumes another's budget. A server with no entry here is bounded by `rate_limit` alone. Only tool calls are metered; the `initialize` / `tools/list` handshake is not.",
+      "description": "Per-MCP-server limits for this key, keyed by the registered MCP server name — the `<server>` half of the `<server>__<tool>` names the gateway exposes. A `tools/call` is metered against the entry for the server it targets **and** the key's own `rate_limit`, each in its own counter, so a burst against one server never consumes another's budget. A server with no entry here is bounded by `rate_limit` alone. Only tool calls are metered; the `initialize` / `tools/list` handshake is not.\n\nRead only when `mcp_rate_limits_by_id` is absent; ignored entirely when it is present.",
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "mcp_rate_limits_by_id": {
+      "additionalProperties": {
+        "$ref": "#/definitions/McpRateLimit"
+      },
+      "description": "The same per-server limits, keyed by the MCP server's resource id (`mcp_servers/<id>`) rather than by its name, so renaming a server does not detach the limit that was set for it.\n\nPresent — including as an empty object — it is authoritative and `mcp_rate_limits` is ignored; an empty object therefore leaves every server bounded by `rate_limit` alone. A key naming no registered server imposes nothing, and the other entries are unaffected. Set to `null` it means the same as omitted: the key falls back to `mcp_rate_limits`.\n\nEach key names one server exactly; there is no \"every server\" key, which is the same as today — a server with no entry is bounded by `rate_limit` alone.",
       "type": [
         "object",
         "null"
@@ -300,6 +357,19 @@
         }
       ],
       "description": "Request, token, and concurrency limits for this key."
+    },
+    "tags": {
+      "additionalProperties": {
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "description": "Cost-attribution tags, as tag key to tag value — for example `{\"department\": \"rnd\", \"subsidiary\": \"emea\"}`. Every request this key authenticates is attributed to one value per tag key, resolved when the request is made with the nearest setting winning: this key's own value, else the value in the `tags` of the team `team_id` names, else the value in the `tags` of the member `user_id` names. Different keys combine, so a request can carry tags from all three. A request authenticated by a JWT takes the value its identity provider's `tag_claims` reads from the verified token ahead of all three; nothing else in a request sets a tag. Keys match `^[a-z][a-z0-9_]{0,62}$`, values are 1 to 128 characters, and at most 32 entries are allowed. Omitted or empty means the key adds no tags of its own.",
+      "maxProperties": 32,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]{0,62}$"
+      },
+      "type": "object"
     },
     "team_id": {
       "description": "Team this API key belongs to. Used for matching team-scope rate limit policies.",
@@ -318,7 +388,7 @@
       ]
     },
     "user_name": {
-      "description": "Readable display name of the owning member. Used only for telemetry labels alongside `user_id`; never used for authentication or routing. When omitted, telemetry reports the user name as `\"unknown\"`.",
+      "description": "Readable display name of the owning member. Used only for telemetry labels alongside `user_id`; never used for authentication or routing. Read only when no `users` document exists for `user_id`; when one does, its name is used instead. When neither provides a name, telemetry reports the user name as `\"unknown\"`.",
       "type": [
         "string",
         "null"
@@ -326,7 +396,6 @@
     }
   },
   "required": [
-    "allowed_models",
     "key_hash"
   ],
   "title": "ApiKey",

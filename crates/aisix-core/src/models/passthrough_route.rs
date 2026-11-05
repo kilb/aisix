@@ -23,11 +23,23 @@ pub struct PassthroughRoute {
     pub name: String,
 
     /// Gateway path prefix this route serves, e.g. `/passthrough/openai`.
-    /// The prefix is stripped before the remainder is joined to the target
-    /// URL. Must start with `/` and must not claim a reserved gateway
-    /// namespace (`/v1`, `/mcp`, `/a2a`, health probes). At least one of
-    /// `path_prefix` / `hosts` is required; when both are set the request
-    /// must satisfy both.
+    /// Must start with `/`.
+    ///
+    /// How the prefix is treated depends on the target shape: a
+    /// `target_url` route MOUNTS at the prefix, so it is stripped before
+    /// the remainder is joined to the target base; a `preserve_host` route
+    /// MIRRORS an upstream that owns its own path space, so the prefix only
+    /// selects which requests the route claims and the complete path is
+    /// forwarded unchanged.
+    ///
+    /// A route WITHOUT `hosts` must not claim a
+    /// reserved gateway namespace (`/v1`, `/mcp`, `/a2a`, health probes) —
+    /// the typed routes would shadow it. A route WITH `hosts` may use any
+    /// prefix: host-matched requests dispatch ahead of the typed routes,
+    /// which is what lets a forward proxy relay an upstream's own
+    /// namespace (e.g. Copilot's `/mcp/...` on its chat host).
+    /// At least one of `path_prefix` / `hosts` is required; when both are
+    /// set the request must satisfy both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(regex(pattern = "^/"), length(min = 1))]
     pub path_prefix: Option<String>,
@@ -101,17 +113,6 @@ pub struct PassthroughRoute {
     #[schemars(length(min = 1))]
     pub provider_key_id: Option<String>,
 
-    /// Body-shape hint for auditing, guardrails and usage extraction.
-    /// Parsing is best-effort: a body that does not match the declared
-    /// shape degrades to `raw` handling, it is never rejected for shape.
-    #[serde(default)]
-    pub protocol: PassthroughProtocol,
-
-    /// Relay `text/event-stream` upstream responses incrementally. When
-    /// `false` streaming responses are fully buffered like any other body.
-    #[serde(default = "default_true")]
-    pub streaming: bool,
-
     /// Optional header carrying the end-user identity injected by the
     /// upstream network device (e.g. `x-aisix-user`). Its value is recorded
     /// on the usage event for per-employee audit attribution and stripped
@@ -123,12 +124,69 @@ pub struct PassthroughRoute {
     #[schemars(regex(pattern = "^[!#$%&'*+.^_`|~0-9a-z-]+$"), length(min = 1))]
     pub identity_header: Option<String>,
 
-    /// Maximum time, in milliseconds, for a non-streaming upstream
-    /// exchange. On a streaming route it bounds the response-header phase
-    /// and any non-SSE body read, but never a healthy SSE relay (which
-    /// ends with the upstream stream or the client hanging up). When
-    /// omitted, the gateway default request timeout applies to
-    /// non-streaming exchanges only.
+    /// Inbound client headers forwarded to the upstream even when this
+    /// route would otherwise strip them, as `*` glob patterns
+    /// matched case-insensitively against the header name
+    /// (`"authorization"`, `"x-trace-*"`). Empty — the default — overrides
+    /// no stripping.
+    ///
+    /// A header the caller sends more than once is forwarded with every
+    /// value preserved.
+    ///
+    /// A route forwards the caller's headers by default, so this field
+    /// only matters for the ones it removes, and `credential_mode` decides
+    /// which credentials those are. The credential slots are
+    /// `authorization`, `proxy-authorization`, `x-api-key`, `api-key`,
+    /// `x-goog-api-key`, `cookie`, and the AWS SigV4 trio
+    /// `x-amz-security-token` / `x-amz-date` / `x-amz-content-sha256`.
+    ///
+    /// Under `credential_mode: inject` the route removes every credential
+    /// slot, whatever the ProviderKey's `strip_headers` lists and whatever
+    /// the `auth_mode`, and removes the rest of `strip_headers` as well.
+    /// Naming the slot the route injects into (`x-api-key` for an Anthropic
+    /// ProviderKey, `authorization` otherwise) puts the caller's value on
+    /// the upstream request in place of the injected one, never both —
+    /// which is what lets an internal service that already authorizes on
+    /// the end user's `Authorization` keep doing so unchanged. Any other
+    /// named slot rides beside the injected credential.
+    ///
+    /// Under `credential_mode: forward_client` the caller's credentials are
+    /// relayed without any pattern. The route removes only
+    /// `proxy-authorization`, its own `identity_header`, and the slot the
+    /// gateway consumed to authenticate the caller: `authorization` and
+    /// `x-api-key` under `auth_mode: gateway_key`, unless the caller sent
+    /// its gateway key in `x-aisix-api-key`, and `auth_header_name` under
+    /// `header_key`.
+    ///
+    /// Among the headers a route removes, a credential slot and
+    /// `traceparent` / `tracestate` come back only when a pattern names
+    /// them exactly. A glob such as `"*"` or `"x-*"` is a statement about
+    /// the operator's own headers, not consent to hand a third party the
+    /// caller's credential or to graft the caller's trace onto that party's
+    /// telemetry, so a broad pattern overrides the rest of the strip set
+    /// and leaves those alone.
+    ///
+    /// This route's own `auth_header_name` and `identity_header` are read
+    /// the same way. Both are slots this route chose rather than ones the
+    /// gateway owns — under `auth_mode: header_key` the first carries the
+    /// gateway credential the caller authenticated with, and the second
+    /// carries an end-user identity this route records and strips — so a
+    /// glob does not sweep either, and a pattern that names one in full
+    /// forwards it.
+    ///
+    /// Headers whose forwarding would break the exchange rather than
+    /// change who it comes from are stripped whatever the patterns say:
+    /// `host`, `content-length`, the hop-by-hop headers that describe the
+    /// caller's own connection, and the gateway's `x-aisix-*` namespace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forward_client_headers: Vec<String>,
+
+    /// Maximum time, in milliseconds, for the upstream exchange. Bounds
+    /// the response-header phase and any non-SSE body read. For SSE it
+    /// bounds the wait for the first byte and every later no-byte gap, but
+    /// not the total duration of a healthy relay (which ends with the
+    /// upstream stream or the client hanging up). When omitted, the gateway
+    /// default request timeout applies the same way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub timeout_ms: Option<u64>,
@@ -170,33 +228,18 @@ pub enum PassthroughAuthMode {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum PassthroughCredentialMode {
-    /// Strip inbound credential headers and inject the configured
-    /// ProviderKey's secret (the legacy tunnel's behavior, now explicit).
+    /// Strip every inbound credential slot and inject the configured
+    /// ProviderKey's secret. `forward_client_headers` puts back a slot it
+    /// names exactly.
     #[default]
     Inject,
-    /// Forward the caller's own `Authorization` (and other credential
-    /// headers) verbatim — bring-your-own-credential. Gateway side-channel
-    /// headers are still stripped so the gateway credential never leaks
-    /// upstream.
+    /// Forward the caller's own credential headers verbatim —
+    /// bring-your-own-credential. The slot the gateway consumed to
+    /// authenticate the caller is stripped by default so the gateway
+    /// credential stays home, unless `forward_client_headers` names that
+    /// slot exactly. To send its own `Authorization` under `auth_mode:
+    /// gateway_key`, a caller carries its gateway key in `x-aisix-api-key`.
     ForwardClient,
-}
-
-/// Body-shape hint for a passthrough route.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum PassthroughProtocol {
-    /// No parsing: bodies are opaque byte blobs (guardrails scan them as
-    /// one lossy-UTF-8 text).
-    #[default]
-    Raw,
-    /// OpenAI-compatible chat envelope (`messages`, streamed
-    /// `choices[].delta.content`, final-chunk / response `usage`).
-    OpenaiChat,
-    /// OpenAI-compatible legacy completions / FIM envelope (`prompt` [+
-    /// `suffix`], streamed `choices[].text`, `usage`).
-    OpenaiCompletions,
 }
 
 impl Resource for PassthroughRoute {
@@ -221,22 +264,7 @@ impl PassthroughRoute {
         let Some(hosts) = &self.hosts else {
             return false;
         };
-        hosts.iter().any(|pattern| {
-            let p = pattern.to_ascii_lowercase();
-            if let Some(suffix) = p.strip_prefix("*.") {
-                match host.strip_suffix(suffix) {
-                    // `label.` + suffix, with exactly one label consumed.
-                    Some(head) => {
-                        head.ends_with('.')
-                            && !head[..head.len() - 1].is_empty()
-                            && !head[..head.len() - 1].contains('.')
-                    }
-                    None => false,
-                }
-            } else {
-                p == host
-            }
-        })
+        crate::host::matches(hosts, host)
     }
 }
 
@@ -286,16 +314,28 @@ pub fn passthrough_route_coupling() -> Value {
                 "type": "array", "minItems": 1,
                 "items": {
                     "type": "string", "minLength": 1,
-                    "pattern": "^(\\*\\.)?([A-Za-z0-9-]+\\.)+[A-Za-z0-9-]+$|^[A-Za-z0-9-]+$"
+                    "pattern": crate::host::HOST_PATTERN
                 }
             } } }
         },
-        // path_prefix must not claim a reserved gateway namespace. The
-        // proxy's typed routes always win over the fallback matcher anyway;
-        // this rule keeps a shadowed-by-construction route from being
-        // configured at all.
+        // A path-only route must not claim a reserved gateway namespace:
+        // the proxy's typed routes win over the fallback matcher, so such a
+        // route is shadowed by construction and better rejected outright.
+        //
+        // A route that ALSO matches on `hosts` is exempt, and deliberately
+        // so: host-matched requests are dispatched by the host middleware
+        // wrapping the whole router, ahead of the typed routes, so the
+        // prefix is reachable. Forward-proxy deployments need this — an
+        // upstream owns its own path space, and GitHub Copilot's CLI
+        // reaches its MCP server at `/mcp/readonly` on the same host it
+        // uses for chat inference. Requiring `hosts` keeps the exemption
+        // narrow: it cannot be used to shadow the gateway's own endpoints
+        // for ordinary (host-less) traffic.
         {
-            "if": { "required": ["path_prefix"] },
+            "if": {
+                "required": ["path_prefix"],
+                "not": { "required": ["hosts"] }
+            },
             "then": { "properties": { "path_prefix": {
                 "not": { "pattern": "^/(v1|mcp|a2a|admin|livez|readyz|metrics)(/|$)" }
             } } }
@@ -353,8 +393,14 @@ pub fn passthrough_route_coupling() -> Value {
         },
         {
             "if": { "required": ["identity_header"] },
+            // Presence, not value, for the same reason as the caller-JWT
+            // slot below: the property declares itself nullable and no
+            // mode requires it, so an explicit null means "not
+            // configured" rather than a document worth dropping the
+            // route over. The coupled fields above are the opposite
+            // case and keep their type pin.
             "then": { "properties": { "identity_header": {
-                "type": "string", "not": { "enum": FORBIDDEN_HEADER_SLOTS }
+                "not": { "enum": FORBIDDEN_HEADER_SLOTS }
             } } }
         },
         // auth_mode couplings. The mode-required companions are pinned to
@@ -378,6 +424,30 @@ pub fn passthrough_route_coupling() -> Value {
                     }
                 }
             }
+        },
+        // Cross-mode leftovers are configuration errors, not ignored
+        // fields: a companion outside its mode is never consulted, so a
+        // row carrying one is rejected rather than half-honored. The CP
+        // enforces the identical rule on create and patch.
+        {
+            "title": "auth_header_name only in header_key mode",
+            "if": {
+                "anyOf": [
+                    { "title": "auth_mode omitted (defaults to gateway_key)", "not": { "required": ["auth_mode"] } },
+                    { "title": "auth_mode: gateway_key or anonymous", "properties": { "auth_mode": { "enum": ["gateway_key", "anonymous"] } }, "required": ["auth_mode"] }
+                ]
+            },
+            "then": { "not": { "required": ["auth_header_name"] } }
+        },
+        {
+            "title": "anonymous_key_id only in anonymous mode",
+            "if": {
+                "anyOf": [
+                    { "title": "auth_mode omitted (defaults to gateway_key)", "not": { "required": ["auth_mode"] } },
+                    { "title": "auth_mode: gateway_key or header_key", "properties": { "auth_mode": { "enum": ["gateway_key", "header_key"] } }, "required": ["auth_mode"] }
+                ]
+            },
+            "then": { "not": { "required": ["anonymous_key_id"] } }
         },
         // credential_mode couplings: inject needs a real ProviderKey id; a
         // forward_client route carrying one is a configuration error, not
@@ -418,12 +488,38 @@ mod tests {
     }
 
     #[test]
+    fn the_client_header_forward_is_a_free_list_of_patterns() {
+        use crate::models::schema::{
+            validate_passthrough_route, validate_passthrough_route_lenient,
+        };
+
+        let with = |patterns: serde_json::Value| {
+            let mut v = json!({
+                "name": "system-server",
+                "path_prefix": "/passthrough/system",
+                "target_url": "https://erp.internal",
+                "provider_key_id": "11111111-1111-1111-1111-111111111111"
+            });
+            v["forward_client_headers"] = patterns;
+            v
+        };
+
+        // Naming the credential slot the gateway consumed is the point of
+        // the field, not an oversight, so the schema does not second-guess
+        // it — the runtime decides what is deliverable.
+        validate_passthrough_route(&with(json!(["authorization", "x-trace-*", "*"])))
+            .expect("credential slots and globs are both accepted");
+        validate_passthrough_route(&with(json!([])))
+            .expect("an empty list is the default, spelled out");
+        validate_passthrough_route_lenient(&with(json!(["authorization"])))
+            .expect("the read path must not cost the route over a pattern");
+    }
+
+    #[test]
     fn minimal_route_defaults() {
         let r = minimal();
         assert_eq!(r.auth_mode, PassthroughAuthMode::GatewayKey);
         assert_eq!(r.credential_mode, PassthroughCredentialMode::Inject);
-        assert_eq!(r.protocol, PassthroughProtocol::Raw);
-        assert!(r.streaming);
         assert!(r.enabled);
         assert!(!r.preserve_host);
     }
@@ -514,6 +610,125 @@ mod coupling_tests {
             "source_cidrs": ["10.0.0.0/8"]
         });
         assert!(validate_passthrough_route(&doc).is_err());
+    }
+
+    #[test]
+    fn explicit_null_on_an_optional_header_slot_clears_it() {
+        // The opposite of the coupled fields above: no mode requires
+        // these, they declare themselves nullable, and `null` is how a
+        // resources.yaml author writes "not set" — a bare key parses to
+        // it. Rejecting that costs the whole route on the lenient read
+        // path, over a value the author meant to leave empty.
+        let field = "identity_header";
+        let mut doc = base();
+        doc[field] = json!(null);
+        validate_passthrough_route(&doc)
+            .unwrap_or_else(|e| panic!("strict must accept null {field}: {e}"));
+        validate_passthrough_route_lenient(&doc)
+            .unwrap_or_else(|e| panic!("lenient must accept null {field}: {e}"));
+
+        // Relaxing the type did not relax the rule the branch exists for.
+        let mut doc = base();
+        doc[field] = json!("authorization");
+        assert!(
+            validate_passthrough_route(&doc).is_err(),
+            "a credential slot is still refused as an identity header"
+        );
+    }
+
+    #[test]
+    fn reserved_prefix_is_rejected_only_without_hosts() {
+        // A host-less route on a gateway namespace is shadowed by the typed
+        // routes, so it stays rejected…
+        let mut doc = base();
+        for p in [
+            "/mcp",
+            "/mcp/readonly",
+            "/v1/chat/completions",
+            "/a2a",
+            "/metrics",
+        ] {
+            doc["path_prefix"] = json!(p);
+            assert!(
+                validate_passthrough_route(&doc).is_err(),
+                "host-less route on {p} must stay rejected"
+            );
+        }
+        // …but the same prefix WITH a host allowlist is exactly the
+        // forward-proxy shape (Copilot CLI's MCP server sits at /mcp on the
+        // same host as chat) and host dispatch runs before the typed routes.
+        let doc = json!({
+            "name": "copilot-cli-mcp",
+            "hosts": ["api.business.githubcopilot.com"],
+            "path_prefix": "/mcp",
+            "preserve_host": true,
+            "auth_mode": "header_key",
+            "auth_header_name": "x-aisix-api-key",
+            "credential_mode": "forward_client"
+        });
+        assert!(
+            validate_passthrough_route(&doc).is_ok(),
+            "host-matched route on /mcp must be accepted: {:?}",
+            validate_passthrough_route(&doc)
+        );
+        assert!(validate_passthrough_route_lenient(&doc).is_ok());
+    }
+
+    #[test]
+    fn removed_protocol_and_streaming_fields_are_unknown() {
+        // The pre-0.10.0 dev cycle carried `protocol` / `streaming` route
+        // fields; both were removed before the kind ever shipped (the
+        // envelope is now detected per request, SSE always relays
+        // incrementally). The strict write path rejects them like any
+        // unknown field; the lenient etcd path tolerates-and-strips.
+        for (field, value) in [
+            ("protocol", json!("openai_responses")),
+            ("streaming", json!(false)),
+        ] {
+            let mut doc = base();
+            doc[field] = value;
+            assert!(
+                validate_passthrough_route(&doc).is_err(),
+                "strict must reject unknown field {field}"
+            );
+            assert!(
+                validate_passthrough_route_lenient(&doc).is_ok(),
+                "lenient must tolerate unknown field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_mode_leftover_companions_are_rejected() {
+        // A companion outside its mode is never consulted at runtime, so
+        // both validators refuse the row instead of half-honoring it.
+        // auth_header_name without header_key (auth_mode absent = gateway_key).
+        let mut doc = base();
+        doc["auth_header_name"] = json!("x-aisix-api-key");
+        assert!(validate_passthrough_route(&doc).is_err());
+        assert!(validate_passthrough_route_lenient(&doc).is_err());
+        // anonymous_key_id on an explicit header_key route.
+        let doc = json!({
+            "name": "r", "path_prefix": "/p",
+            "target_url": "https://u.example", "provider_key_id": "pk",
+            "auth_mode": "header_key", "auth_header_name": "x-aisix-api-key",
+            "anonymous_key_id": "ak-1"
+        });
+        assert!(validate_passthrough_route(&doc).is_err());
+        // auth_header_name on an anonymous route.
+        let doc = json!({
+            "name": "r", "path_prefix": "/p",
+            "target_url": "https://u.example", "provider_key_id": "pk",
+            "auth_mode": "anonymous", "anonymous_key_id": "ak-1",
+            "source_cidrs": ["10.0.0.0/8"],
+            "auth_header_name": "x-aisix-api-key"
+        });
+        assert!(validate_passthrough_route(&doc).is_err());
+        // source_cidrs is deliberately NOT mode-coupled: an extra IP
+        // allowlist is honored on every mode.
+        let mut doc = base();
+        doc["source_cidrs"] = json!(["10.0.0.0/8"]);
+        assert!(validate_passthrough_route(&doc).is_ok());
     }
 
     #[test]

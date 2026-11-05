@@ -53,6 +53,7 @@ use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha1::Sha1;
 
+use crate::call_error::{CallClock, CallFailure};
 use crate::{Guardrail, GuardrailVerdict, StreamOutputPolicy};
 
 type HmacSha1 = Hmac<Sha1>;
@@ -64,7 +65,9 @@ const SERVICE_OUTPUT: &str = "llm_response_moderation";
 
 /// Per-call content cap (chars). Aliyun caps `llm_query_moderation` at
 /// 2 000 and `llm_response_moderation` at 5 000; 2 000 is the safe shared
-/// bound and matches the default streaming window.
+/// bound and matches the default streaming window. It bounds one CALL,
+/// not one check — longer text goes out in several calls, never clipped
+/// (see [`plan_pieces`]).
 const MAX_CONTENT_CHARS: usize = 2_000;
 
 /// Chars shared by consecutive pieces of one check, so a phrase that
@@ -80,6 +83,11 @@ pub(crate) const MAX_CALLS_PER_CHECK: usize = 16;
 
 /// How many of one check's calls are in flight at once.
 pub(crate) const CONCURRENT_CALLS: usize = 4;
+
+/// Failure tag of a check whose must-cover part does not fit the call
+/// budget. Not an outage, so `fail_open` does not apply; it still is not a
+/// policy hit, and the tag is what tells an operator the two apart.
+pub(crate) const TAG_TOO_LARGE: &str = "aliyun_too_large";
 
 /// The pieces one check sends, each at most the per-call cap.
 #[derive(Debug, PartialEq, Eq)]
@@ -223,15 +231,18 @@ impl AliyunTextModerationGuardrail {
         let ranges = match plan_pieces(text, must_cover_from, MAX_CONTENT_CHARS) {
             PiecePlan::TooLong => {
                 tracing::info!(
-                    row = %self.row_name,
+                    guardrail_name = %self.row_name,
                     service,
                     chars = text[must_cover_from..].chars().count(),
                     "aliyun text moderation: content too long to moderate; blocking",
                 );
-                return GuardrailVerdict::block(format!(
-                    "aliyun text moderation: content too long to moderate (row: {})",
-                    self.row_name
-                ));
+                return GuardrailVerdict::block_unavailable(
+                    format!(
+                        "aliyun text moderation: content too long to moderate (row: {})",
+                        self.row_name
+                    ),
+                    TAG_TOO_LARGE,
+                );
             }
             PiecePlan::Pieces {
                 ranges,
@@ -239,7 +250,7 @@ impl AliyunTextModerationGuardrail {
             } => {
                 if unchecked_bytes > 0 {
                     tracing::info!(
-                        row = %self.row_name,
+                        guardrail_name = %self.row_name,
                         service,
                         unchecked_chars = text[..unchecked_bytes].chars().count(),
                         "aliyun text moderation: earlier conversation beyond the call \
@@ -291,7 +302,7 @@ impl AliyunTextModerationGuardrail {
                 // request, so it stays at debug.
                 if blocked {
                     tracing::info!(
-                        row = %self.row_name,
+                        guardrail_name = %self.row_name,
                         service,
                         aliyun_request_id = %diag.request_id,
                         aliyun_code = %diag.code,
@@ -301,7 +312,7 @@ impl AliyunTextModerationGuardrail {
                     );
                 } else {
                     tracing::debug!(
-                        row = %self.row_name,
+                        guardrail_name = %self.row_name,
                         service,
                         aliyun_request_id = %diag.request_id,
                         aliyun_code = %diag.code,
@@ -336,7 +347,10 @@ impl AliyunTextModerationGuardrail {
         service: &str,
         content: &str,
         session_id: Option<&str>,
-    ) -> (Result<String, AliyunFailure>, AliyunDiagnostics) {
+    ) -> (
+        Result<String, CallFailure<AliyunFailure>>,
+        AliyunDiagnostics,
+    ) {
         let mut svc_params = serde_json::Map::new();
         svc_params.insert(
             "content".into(),
@@ -388,6 +402,7 @@ impl AliyunTextModerationGuardrail {
         body.push_str("&Signature=");
         body.push_str(&percent_encode(&signature));
 
+        let mut clock = CallClock::start(self.timeout);
         let future = self
             .client
             .post(format!("{}/", self.endpoint))
@@ -399,11 +414,22 @@ impl AliyunTextModerationGuardrail {
         // No response means no diagnostics to report: an id Aliyun never
         // sent can't be invented. `request_id` stays empty and the failure
         // bucket carries the whole story.
-        let resp = match tokio::time::timeout(self.timeout, future).await {
-            Err(_elapsed) => return (Err(AliyunFailure::Timeout), AliyunDiagnostics::default()),
-            Ok(Err(_e)) => return (Err(AliyunFailure::IoError), AliyunDiagnostics::default()),
+        let resp = match clock.within(future).await {
+            Err(_elapsed) => {
+                return (
+                    Err(clock.fail(AliyunFailure::Timeout)),
+                    AliyunDiagnostics::default(),
+                )
+            }
+            Ok(Err(e)) => {
+                return (
+                    Err(clock.fail_with(AliyunFailure::IoError, &e)),
+                    AliyunDiagnostics::default(),
+                )
+            }
             Ok(Ok(r)) => r,
         };
+        clock.responded(resp.status());
 
         // Read the id off the headers up front: it survives every path
         // below, including the ones where the body is unusable.
@@ -411,10 +437,10 @@ impl AliyunTextModerationGuardrail {
 
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return (Err(AliyunFailure::Throttled), diag);
+            return (Err(clock.fail(AliyunFailure::Throttled)), diag);
         }
         if status.is_server_error() {
-            return (Err(AliyunFailure::ServerError), diag);
+            return (Err(clock.fail(AliyunFailure::ServerError)), diag);
         }
         if !status.is_success() {
             // Report the provider's error CODE (e.g. `InvalidAccessKeyId.NotFound`)
@@ -432,22 +458,36 @@ impl AliyunTextModerationGuardrail {
             // The body is still read (capped) rather than skipped, since the code
             // lives in it; it is just never logged verbatim.
             let mut resp = resp;
-            let response_body =
-                crate::read_body_capped(&mut resp, MAX_ERROR_BODY_PARSE_BYTES).await;
+            let Ok(response_body) = clock
+                .within(crate::read_body_capped(
+                    &mut resp,
+                    MAX_ERROR_BODY_PARSE_BYTES,
+                    &self.row_name,
+                ))
+                .await
+            else {
+                return (Err(clock.fail(AliyunFailure::Timeout)), diag);
+            };
             diag.code = extract_error_code(&response_body);
             tracing::error!(
-                row = %self.row_name,
+                guardrail_name = %self.row_name,
                 aliyun_request_id = %diag.request_id,
                 http_status = status.as_u16(),
                 aliyun_code = %diag.code,
                 "aliyun TextModerationPlus returned 4xx — check region/access keys configuration",
             );
-            return (Err(AliyunFailure::ConfigError), diag);
+            return (Err(clock.fail(AliyunFailure::ConfigError)), diag);
         }
 
-        let body: AliyunResponse = match resp.json().await {
-            Ok(b) => b,
-            Err(_) => return (Err(AliyunFailure::MalformedResponse), diag),
+        let body: AliyunResponse = match clock.within(resp.json()).await {
+            Ok(Ok(b)) => b,
+            Err(_) => return (Err(clock.fail(AliyunFailure::Timeout)), diag),
+            Ok(Err(e)) => {
+                return (
+                    Err(clock.fail_with(AliyunFailure::MalformedResponse, &e)),
+                    diag,
+                )
+            }
         };
         diag.absorb_body(&body);
 
@@ -461,7 +501,7 @@ impl AliyunTextModerationGuardrail {
             }),
             408 | 401 | 403 | 400 => {
                 tracing::error!(
-                    row = %self.row_name,
+                    guardrail_name = %self.row_name,
                     aliyun_request_id = %diag.request_id,
                     aliyun_code = %diag.code,
                     aliyun_message = %diag.message_field(),
@@ -469,40 +509,48 @@ impl AliyunTextModerationGuardrail {
                 );
                 Err(AliyunFailure::ConfigError)
             }
-            _ => {
+            code => {
+                let (failure, meaning) = classify_body_error_code(code);
                 tracing::warn!(
-                    row = %self.row_name,
+                    guardrail_name = %self.row_name,
                     aliyun_request_id = %diag.request_id,
                     aliyun_code = %diag.code,
                     aliyun_message = %diag.message_field(),
-                    "aliyun TextModerationPlus non-200 Code",
+                    "aliyun TextModerationPlus non-200 Code: {meaning}",
                 );
-                Err(AliyunFailure::ServerError)
+                Err(failure)
             }
         };
-        (outcome, diag)
+        (outcome.map_err(|f| clock.fail(f)), diag)
     }
 
     fn handle_failure(
         &self,
-        failure: AliyunFailure,
+        failure: CallFailure<AliyunFailure>,
         diag: &AliyunDiagnostics,
         fail_open: bool,
     ) -> GuardrailVerdict {
-        let tag = failure.bypass_tag();
-        if !matches!(failure, AliyunFailure::ConfigError) {
+        let tag = failure.failure.bypass_tag();
+        if !matches!(failure.failure, AliyunFailure::ConfigError) {
             tracing::warn!(
-                row = %self.row_name,
+                guardrail_name = %self.row_name,
                 aliyun_request_id = %diag.request_id,
-                failure = ?failure,
+                failure = ?failure.failure,
+                http_status = failure.http_status,
                 fail_open,
+                error = failure.error.as_deref(),
+                error_kind = failure.error_kind.map(tracing::field::display),
+                elapsed_ms = failure.elapsed_ms,
                 "aliyun text moderation call failed",
             );
         }
         if fail_open {
             GuardrailVerdict::Bypass { reason: tag.into() }
         } else {
-            GuardrailVerdict::block(format!("aliyun text moderation unavailable ({tag})"))
+            GuardrailVerdict::block_unavailable(
+                format!("aliyun text moderation unavailable ({tag})"),
+                tag,
+            )
         }
     }
 }
@@ -648,6 +696,32 @@ impl AliyunFailure {
     }
 }
 
+/// Classify a non-success body `Code` that is not a configuration error,
+/// returning the failure bucket and a log-ready meaning.
+///
+/// Aliyun's RPC API reports throttling and its own timeouts as HTTP 200
+/// with a body `Code`, not as an HTTP status, so these never reach the
+/// HTTP-429 / transport-timeout arms. Both MultiModalGuard and
+/// TextModerationPlus document the same table:
+/// <https://help.aliyun.com/zh/document_detail/2937221.html>,
+/// <https://help.aliyun.com/zh/document_detail/2671445.html>.
+///
+/// 581 shares `aliyun_timeout` with our own `timeout_ms` elapsing; the
+/// meaning string is what tells the two apart in the log.
+pub(crate) fn classify_body_error_code(code: i32) -> (AliyunFailure, &'static str) {
+    match code {
+        588 => (
+            AliyunFailure::Throttled,
+            "request rate exceeded the Aliyun quota (Code 588 EXCEED_QUOTA)",
+        ),
+        581 => (
+            AliyunFailure::Timeout,
+            "Aliyun-side request timeout (Code 581 TIMEOUT)",
+        ),
+        _ => (AliyunFailure::ServerError, "unrecognised non-200 Code"),
+    }
+}
+
 /// The `x-acs-request-id` response header. Every Alibaba Cloud OpenAPI
 /// response carries it — verified against the live `green-cip` endpoint on
 /// 2xx, on a JSON business error, and on 400/404 responses whose body is
@@ -781,7 +855,7 @@ impl Guardrail for AliyunTextModerationGuardrail {
         )
     }
 
-    fn enforces_input(&self) -> bool {
+    fn runs_on_input(&self) -> bool {
         matches!(
             self.hook_point,
             GuardrailHookPoint::Input | GuardrailHookPoint::Both
@@ -789,7 +863,15 @@ impl Guardrail for AliyunTextModerationGuardrail {
     }
 
     fn checks_input_remotely(&self) -> bool {
-        self.enforces_input()
+        self.runs_on_input()
+    }
+
+    fn fails_closed_on_input(&self) -> bool {
+        !self.fail_open
+    }
+
+    fn fails_closed_on_output(&self) -> bool {
+        !self.output_fail_open
     }
 
     fn stream_output_policy(&self) -> StreamOutputPolicy {
@@ -802,6 +884,8 @@ impl Guardrail for AliyunTextModerationGuardrail {
             _ => StreamOutputPolicy::Window {
                 size_chars: self.window_size as usize,
                 overlap_chars: self.window_overlap_size as usize,
+                max_buffer_bytes: self.max_buffer_bytes as usize,
+                on_exceeded_fail_open: self.on_buffer_exceeded == "fail_open",
             },
         }
     }
@@ -911,11 +995,14 @@ mod tests {
 
     fn resp(content: &str) -> ChatResponse {
         ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "stream-req-1".into(),
             model: "m".into(),
             message: ChatMessage::assistant(content),
             finish_reason: FinishReason::Stop,
             usage: UsageStats::new(0, 0),
+            service_tier: None,
         }
     }
 
@@ -1091,7 +1178,7 @@ mod tests {
 
     #[tokio::test]
     async fn clean_input_returns_allow_and_signs_request() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/"))
             // proves the signed form body carries Action + Service + Signature
@@ -1107,9 +1194,100 @@ mod tests {
         assert_eq!(g.check_input(&req("hello")).await, GuardrailVerdict::Allow);
     }
 
+    // --- per-call cap: split, never clip (AISIX-Cloud#1381) ---------------
+
+    /// The bug this replaced: the text is assembled oldest-message-first,
+    /// so clipping to `MAX_CONTENT_CHARS` meant the newest turn — the one
+    /// actually being screened — was never submitted. Aliyun answered
+    /// `none` for the benign history and the request was released clean.
+    #[tokio::test]
+    async fn risk_past_the_cap_in_the_newest_message_still_blocks() {
+        let server = MockServer::builder().start().await;
+        // The benign history: every call whose content lacks the marker
+        // comes back clean.
+        Mock::given(method("POST"))
+            .and(body_string_contains("RISKMARKER"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(risk_body("high")))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(risk_body("none")))
+            .mount(&server)
+            .await;
+
+        let history = "benign ".repeat(MAX_CONTENT_CHARS); // far past one call
+        let newest = "RISKMARKER";
+        let req = ChatFormat::new(
+            "m",
+            vec![ChatMessage::user(&history), ChatMessage::user(newest)],
+        );
+
+        let g = build(&server.uri(), "high", true);
+        assert!(
+            g.check_input(&req).await.is_block(),
+            "the newest message sits past the per-call cap; it must still be scanned",
+        );
+    }
+
+    /// The output side of the same clip (`check_output` shares `moderate`).
+    #[tokio::test]
+    async fn risk_past_the_cap_in_the_output_tail_still_blocks() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("RISKMARKER"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(risk_body("high")))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(risk_body("none")))
+            .mount(&server)
+            .await;
+
+        let long = format!("{}RISKMARKER", "benign ".repeat(MAX_CONTENT_CHARS));
+        let g = build(&server.uri(), "high", true);
+        assert!(
+            g.check_output(&resp(&long)).await.is_block(),
+            "a response tail past the per-call cap must still be scanned",
+        );
+    }
+
+    /// Coverage is what matters, but the cost shape matters too: content
+    /// that fits stays exactly one call, and content that does not costs
+    /// one call per chunk rather than silently dropping the remainder.
+    #[tokio::test]
+    async fn content_within_the_cap_is_still_a_single_call() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(risk_body("none")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let g = build(&server.uri(), "high", true);
+        assert_eq!(
+            g.check_input(&req("short and clean")).await,
+            GuardrailVerdict::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn content_over_the_cap_costs_one_call_per_chunk() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(risk_body("none")))
+            // 3 chunks' worth of whitespace-free text, cut with the
+            // overlap between pieces → 4 calls, and the `expect` fails the
+            // test if the tail was dropped instead.
+            .expect(4)
+            .mount(&server)
+            .await;
+        let g = build(&server.uri(), "high", true);
+        let text = "x".repeat(MAX_CONTENT_CHARS * 3);
+        assert_eq!(g.check_input(&req(&text)).await, GuardrailVerdict::Allow);
+    }
+
     #[tokio::test]
     async fn high_risk_input_blocks_at_high_threshold() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(risk_body("high")))
             .mount(&server)
@@ -1120,7 +1298,7 @@ mod tests {
 
     #[tokio::test]
     async fn medium_risk_allowed_at_high_threshold_blocked_at_medium() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(risk_body("medium")))
             .mount(&server)
@@ -1135,7 +1313,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_sends_session_id() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("Service=llm_response_moderation"))
             // sessionId is JSON-encoded inside ServiceParameters, percent-encoded
@@ -1149,13 +1327,38 @@ mod tests {
         assert_eq!(g.check_output(&resp("ok")).await, GuardrailVerdict::Allow);
     }
 
+    /// Aliyun reports quota throttling and its own timeout as HTTP 200 +
+    /// body `Code`, never as HTTP 429 / a transport timeout.
+    #[tokio::test]
+    async fn body_code_588_and_581_classify_as_throttled_and_timeout() {
+        for (code, want) in [
+            (588, "aliyun_throttled"),
+            (581, "aliyun_timeout"),
+            (500, "aliyun_5xx"),
+        ] {
+            let server = MockServer::builder().start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({ "Code": code, "Message": "x", "RequestId": "r" })),
+                )
+                .mount(&server)
+                .await;
+            let g = build(&server.uri(), "high", true);
+            match g.check_input(&req("x")).await {
+                GuardrailVerdict::Bypass { reason } => assert_eq!(reason, want, "Code {code}"),
+                other => panic!("Code {code}: expected Bypass({want}), got {other:?}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn pieces_of_one_long_reply_are_each_moderated_on_their_own() {
         // With a sessionId Aliyun joins the session's pieces and moderates
         // only as much of the join as one call may hold, so the later
         // pieces of one long reply might never be judged. Each piece must
         // stand alone: no session on a multi-piece check.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("sessionId"))
             .respond_with(ResponseTemplate::new(200).set_body_json(risk_body("none")))
@@ -1174,7 +1377,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_5xx_fail_open_true_returns_bypass() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
@@ -1188,7 +1391,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_5xx_fails_closed_by_default() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
@@ -1203,7 +1406,7 @@ mod tests {
 
     #[tokio::test]
     async fn app_level_403_code_is_config_error_block_when_fail_closed() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -1304,7 +1507,7 @@ mod tests {
         //    with a body naming the cause. Without the code the operator only
         //    sees a bare status (#1030 follow-up).
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(ResponseTemplate::new(404).set_body_json(json!({
                     "Code": "InvalidAccessKeyId.NotFound",
@@ -1331,7 +1534,7 @@ mod tests {
         //    the caller's prompt — plus the AccessKey id. Body copied from a
         //    live green-cip response. Only `Code` may survive into a log (#153).
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             let string_to_sign = "POST&%2F&AccessKeyId%3DLTAI_LEAKED_KEY_ID%26Action%3D\
                  TextModerationPlus%26ServiceParameters%3D%257B%2522content%2522%253A\
                  %2520%2522CANARY_CALLER_PROMPT%2522%257D%26Version%3D2022-03-02";
@@ -1377,7 +1580,7 @@ mod tests {
         //     parse nothing, and report no code for the single most common
         //     misconfiguration.
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             // Mirrors the live shape: RequestId, then the huge Message, then Code.
             let echo = "%2522%E4%25BD%25A0".repeat(2_000);
             Mock::given(method("POST"))
@@ -1411,7 +1614,7 @@ mod tests {
         // 2b. An unparseable 4xx body yields no code rather than a raw echo: an
         //     unrecognized body is exactly the one we can't vouch for.
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             let filler = "X".repeat(crate::MAX_ERROR_BODY_LOG_BYTES + 4_000);
             Mock::given(method("POST"))
                 .respond_with(
@@ -1438,7 +1641,7 @@ mod tests {
         // 3. HTTP 200 but an app-level error Code — the Message carries the
         //    reason (e.g. an access key lacking llm_response_moderation).
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                     "Code": 403,
@@ -1472,7 +1675,7 @@ mod tests {
         //    RiskWords/RiskPositions must not reach the log even though the
         //    provider sent them.
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(
                     ResponseTemplate::new(200)
@@ -1518,7 +1721,7 @@ mod tests {
         //    retrievable for a request nobody blocked, without spending a
         //    default-level line on every request.
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(
                     ResponseTemplate::new(200)
@@ -1545,7 +1748,7 @@ mod tests {
         //    "we forgot to log it", an empty one as "Aliyun never answered" —
         //    and the failure bucket must survive.
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(
                     ResponseTemplate::new(200)
@@ -1572,7 +1775,7 @@ mod tests {
         //    there rather than from the body — and the failure type must say
         //    "malformed", not "5xx".
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(
                     ResponseTemplate::new(200)
@@ -1605,7 +1808,7 @@ mod tests {
         // 5. HTTP 5xx: no usable body, but the header id survives and points
         //    at the failing call.
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(
                     ResponseTemplate::new(500).insert_header("x-acs-request-id", "SERVER-ERR-1"),
@@ -1628,7 +1831,7 @@ mod tests {
         // 6. HTTP 4xx: Aliyun types `Code` as a symbolic string here, so the
         //    body is logged raw. The id must come from the header regardless.
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(
                     ResponseTemplate::new(404)
@@ -1658,7 +1861,7 @@ mod tests {
         //    is present in the body here even without the header, so a server
         //    that omits the header still yields one.
         {
-            let server = MockServer::start().await;
+            let server = MockServer::builder().start().await;
             Mock::given(method("POST"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                     "Code": 400,
@@ -1691,7 +1894,9 @@ mod tests {
             g.stream_output_policy(),
             StreamOutputPolicy::Window {
                 size_chars: 2_000,
-                overlap_chars: 128
+                overlap_chars: 128,
+                max_buffer_bytes: 262_144,
+                on_exceeded_fail_open: false,
             }
         );
         let mut g2 = build("http://unused", "high", true);
@@ -1784,5 +1989,80 @@ mod tests {
             !risky_diag.labels.is_empty(),
             "a risky prompt must report at least one Label, got {risky_diag:?}"
         );
+    }
+
+    /// A refused connection is logged with its cause, not just `IoError`
+    /// (AISIX-Cloud#1786).
+    #[tokio::test]
+    async fn refused_connection_logs_the_underlying_error() {
+        use crate::call_error::testing::*;
+        let endpoint = refused_endpoint();
+        let logged = capture_logs(|| async {
+            let g = build(&endpoint, "high", true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_refusal_logged(
+            &logged,
+            "aliyun text moderation call failed",
+            &["test-secret", "LTAI_TEST"],
+        );
+    }
+
+    /// A response that does not decode is logged with where it failed, and
+    /// none of the text it quoted.
+    #[tokio::test]
+    async fn undecodable_response_logs_the_underlying_error() {
+        use crate::call_error::testing::*;
+        let server = undecodable_server("DECODE-REQ-1").await;
+        let uri = server.uri();
+        let logged = capture_logs(|| async {
+            let g = build(&uri, "high", true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_decode_logged(
+            &logged,
+            "aliyun text moderation call failed",
+            "MalformedResponse",
+        );
+        assert!(
+            failure_line(&logged, "aliyun text moderation call failed")
+                .contains("aliyun_request_id=DECODE-REQ-1"),
+            "the id Aliyun sent survives a decode failure; got: {logged}"
+        );
+    }
+
+    /// A 5xx is logged with its status (AISIX-Cloud#1786).
+    #[tokio::test]
+    async fn server_error_logs_the_status() {
+        use crate::call_error::testing::*;
+        let server = status_server(503).await;
+        let uri = server.uri();
+        let logged = capture_logs(|| async {
+            let g = build(&uri, "high", true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_status_logged(&logged, "aliyun text moderation call failed", 503);
+    }
+
+    /// `timeout_ms` covers the response body, not just its headers: a body
+    /// that stalls ends the call as a timeout instead of hanging it.
+    #[tokio::test]
+    async fn stalled_body_times_out() {
+        use crate::call_error::testing::*;
+        let uri = stalled_body_server(200).await;
+        let logged = capture_logs(|| async {
+            let mut g = build(&uri, "high", true);
+            g.timeout = Duration::from_millis(200);
+            let verdict =
+                tokio::time::timeout(Duration::from_secs(5), g.check_input(&req(PROMPT_MARKER)))
+                    .await
+                    .expect("the guardrail call must end at its own timeout");
+            assert!(verdict.is_bypass());
+        })
+        .await;
+        assert_stall_logged(&logged, "aliyun text moderation call failed", 200);
     }
 }

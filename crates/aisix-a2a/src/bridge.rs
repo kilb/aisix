@@ -32,6 +32,7 @@ use aisix_core::{A2aAgent, A2aAuthType, A2aProtocolVersion};
 use aisix_gateway::redact_url_for_log;
 use async_trait::async_trait;
 use futures::StreamExt;
+use http::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 
 use crate::error::A2aError;
@@ -62,9 +63,10 @@ const SSE_CONTENT_TYPE: &str = "text/event-stream";
 
 /// Hard cap on a SINGLE buffered SSE event. A stream has no total size — a task
 /// may push updates for hours — so the cap is per event: it bounds how much an
-/// upstream can accumulate without ever emitting a newline, which is the only
-/// way a streaming reader can be made to grow without limit.
-const MAX_SSE_EVENT_BYTES: usize = 16 * 1024 * 1024;
+/// upstream can accumulate without ever emitting the blank line that ends an
+/// event, which is the only way a streaming reader can be made to grow without
+/// limit.
+const MAX_SSE_EVENT_BYTES: usize = aisix_gateway::sse::MAX_SSE_FRAME_BYTES;
 
 /// Hard cap on an upstream response body the gateway will buffer. A registered
 /// agent is semi-trusted, but a compromised or misbehaving one must not be able
@@ -94,6 +96,43 @@ fn shared_client() -> reqwest::Client {
         .clone()
 }
 
+/// Hand a refused call's body to the request's full-content exports. The
+/// caller is sent the status only, so nothing else needs it read.
+async fn read_error_body_for_export(resp: reqwest::Response) {
+    if aisix_gateway::wants_upstream_error_body() {
+        aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
+    }
+}
+
+/// Log the cause chain of an upstream transport failure. The text of an
+/// [`A2aError`] is what the caller and the usage event are given, so it stays
+/// reqwest's top-level message and the cause stops here.
+fn log_transport_causes(err: &reqwest::Error) {
+    tracing::warn!(
+        error = %aisix_gateway::transport_error_message(err),
+        "A2A upstream transport failure",
+    );
+}
+
+/// Convert reqwest failures without ever retaining the request URL. Reqwest's
+/// default Display includes it, including path/query values that may contain
+/// tenant secrets in rows written before URL validation was tightened.
+fn connect_error(err: reqwest::Error) -> A2aError {
+    let err = err.without_url();
+    log_transport_causes(&err);
+    if err.is_timeout() {
+        A2aError::Connect("upstream request timed out".to_string())
+    } else {
+        A2aError::Connect(err.to_string())
+    }
+}
+
+fn read_error(err: reqwest::Error) -> A2aError {
+    let err = err.without_url();
+    log_transport_causes(&err);
+    A2aError::Request(err.to_string())
+}
+
 /// Read an upstream response body, refusing anything larger than
 /// [`MAX_UPSTREAM_BODY_BYTES`]. An honestly-declared oversized `Content-Length`
 /// is rejected up front; a lying or absent length (including a never-ending
@@ -110,7 +149,7 @@ async fn read_capped(resp: reqwest::Response) -> Result<Vec<u8>, A2aError> {
     let mut stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(response_body_error)?;
+        let chunk = chunk.map_err(read_error)?;
         if buf.len() + chunk.len() > MAX_UPSTREAM_BODY_BYTES {
             return Err(A2aError::Request(
                 "upstream response exceeded size cap".to_string(),
@@ -119,22 +158,6 @@ async fn read_capped(resp: reqwest::Response) -> Result<Vec<u8>, A2aError> {
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
-}
-
-/// Convert reqwest failures without ever retaining the request URL. Reqwest's
-/// default Display includes it, including path/query values that may contain
-/// tenant secrets in rows written before URL validation was tightened.
-fn connect_error(error: reqwest::Error) -> A2aError {
-    let detail = if error.is_timeout() {
-        "upstream request timed out"
-    } else {
-        "upstream connection failed"
-    };
-    A2aError::Connect(detail.to_string())
-}
-
-fn response_body_error(_error: reqwest::Error) -> A2aError {
-    A2aError::Request("upstream response body failed".to_string())
 }
 
 /// How the gateway authenticates to an upstream A2A agent. The credential is
@@ -228,6 +251,34 @@ fn warn_cleartext_credential(agent: &A2aAgent) {
     }
 }
 
+/// Header slots the A2A protocol itself owns on this hop.
+///
+/// `a2a-version` is the gateway's OWN announcement of the wire version the
+/// agent is pinned to in `protocol_version`, and the agent reads it to pick
+/// the envelope shape it answers in. A caller's copy relayed alongside would
+/// let the caller override that pin — the agent would answer in a format the
+/// operator did not configure, or refuse the call outright — so it is refused
+/// however broad the pattern is.
+pub const A2A_PROTOCOL_HEADERS: &[&str] = &["a2a-version"];
+
+/// The inbound client headers `agent` forwards out of `client_headers`.
+///
+/// `None` — a gateway operation with no calling request behind it — forwards
+/// nothing.
+pub fn forwarded_client_headers(
+    agent: &A2aAgent,
+    client_headers: Option<&http::HeaderMap>,
+) -> Vec<(HeaderName, HeaderValue)> {
+    let Some(client) = client_headers else {
+        return Vec::new();
+    };
+    aisix_core::resolve_forwarded_client_headers(
+        &agent.forward_client_headers,
+        client,
+        A2A_PROTOCOL_HEADERS,
+    )
+}
+
 /// Build an [`A2aUpstream`] from a registered [`A2aAgent`] resource.
 pub fn upstream_from_a2a_agent(agent: &A2aAgent) -> A2aUpstream {
     warn_cleartext_credential(agent);
@@ -300,12 +351,34 @@ pub struct HttpBridge {
     /// is one cache lookup per request in place of one `Url` parse.
     endpoint: aisix_gateway::url_cache::EndpointUrl,
     client: reqwest::Client,
+    /// Inbound client headers this agent's `forward_client_headers` admits,
+    /// resolved per request against the calling client's own request. Empty
+    /// when the agent configures none, or when nothing the caller sent
+    /// matched.
+    ///
+    /// Independent of the upstream's `auth`, which stays the gateway's own
+    /// credential — except when both name the same header, where the
+    /// forwarded value wins and the gateway's is not sent at all.
+    forwarded_client_headers: Vec<(HeaderName, HeaderValue)>,
 }
 
+// Manual so a forwarded value — which may be the caller's own credential —
+// cannot leak through `Debug`, and so the gateway-held credential keeps the
+// redaction `A2aUpstream`'s own impl gives it.
 impl std::fmt::Debug for HttpBridge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpBridge")
             .field("upstream", &self.upstream)
+            .field(
+                // Names only: the slot stays diagnosable, the value never
+                // prints.
+                "forwarded_client_headers",
+                &self
+                    .forwarded_client_headers
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -319,20 +392,47 @@ impl HttpBridge {
             endpoint: aisix_gateway::url_cache::cached_url(&upstream.url),
             upstream,
             client: shared_client(),
+            forwarded_client_headers: Vec::new(),
         }
     }
 
-    /// Apply the gateway-held upstream credential and announce the wire version
-    /// this agent is pinned to. Both belong on every outgoing request: the
-    /// credential because the gateway is the one holding it, the version
-    /// because an agent that receives no `A2A-Version` must assume `0.3`.
+    /// Deliver the client headers this agent forwards, as already resolved
+    /// against the inbound request by [`forwarded_client_headers`].
+    pub fn with_forwarded_client_headers(
+        mut self,
+        forwarded: Vec<(HeaderName, HeaderValue)>,
+    ) -> Self {
+        self.forwarded_client_headers = forwarded;
+        self
+    }
+
+    /// Apply the gateway-held upstream credential, announce the wire version
+    /// this agent is pinned to, and deliver the forwarded client headers. All
+    /// three belong on every outgoing request: the credential because the
+    /// gateway is the one holding it, the version because an agent that
+    /// receives no `A2A-Version` must assume `0.3`, and the forward because it
+    /// is configured per agent rather than per operation.
+    ///
+    /// The gateway credential and the forward can name the same slot: an
+    /// operator who lists `authorization` in `forward_client_headers` is
+    /// choosing the caller's own credential over the gateway's, and the agent
+    /// must receive exactly one of them. `reqwest`'s `header` APPENDS, so
+    /// suppressing the gateway's is the only way to keep a single value on the
+    /// wire — the claimed set is read before anything fills a slot, so the
+    /// suppression and the delivery cannot disagree.
     fn prepare(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let forwarded = &self.forwarded_client_headers;
+        let claims = |name: &str| forwarded.iter().any(|(n, _)| n.as_str() == name);
         let req = req.header(VERSION_HEADER, self.upstream.protocol_version.as_wire_str());
-        match &self.upstream.auth {
+        let req = match &self.upstream.auth {
             A2aAuth::None => req,
-            A2aAuth::Bearer(token) => req.bearer_auth(token),
-            A2aAuth::ApiKey(key) => req.header(API_KEY_HEADER, key),
-        }
+            A2aAuth::Bearer(token) if !claims("authorization") => req.bearer_auth(token),
+            A2aAuth::ApiKey(key) if !claims(API_KEY_HEADER) => req.header(API_KEY_HEADER, key),
+            A2aAuth::Bearer(_) | A2aAuth::ApiKey(_) => req,
+        };
+        forwarded.iter().fold(req, |req, (name, value)| {
+            req.header(name.clone(), value.clone())
+        })
     }
 
     /// Candidate agent-card URIs, most specific first: each well-known path
@@ -454,13 +554,13 @@ impl A2aBridge for HttpBridge {
             .send()
             .await
             .map_err(connect_error)?;
+        aisix_gateway::note_upstream_response(resp.headers());
         if !resp.status().is_success() {
             // Surface the upstream STATUS only — never proxy the upstream error
             // body verbatim to the caller, which could leak upstream internals.
-            return Err(A2aError::Request(format!(
-                "upstream returned HTTP {}",
-                resp.status().as_u16()
-            )));
+            let status = resp.status().as_u16();
+            read_error_body_for_export(resp).await;
+            return Err(A2aError::UpstreamStatus(status));
         }
         let bytes = read_capped(resp).await?;
         serde_json::from_slice::<serde_json::Value>(&bytes)
@@ -493,14 +593,16 @@ impl A2aBridge for HttpBridge {
         .await
         .map_err(|_| A2aError::Connect("timed out opening the upstream stream".to_string()))?
         .map_err(connect_error)?;
+        aisix_gateway::note_upstream_response(resp.headers());
 
         if !resp.status().is_success() {
             // Status only — never proxy the upstream's error body, same as
-            // `send`.
-            return Err(A2aError::Request(format!(
-                "upstream returned HTTP {}",
-                resp.status().as_u16()
-            )));
+            // `send`. Bounded here: `send`'s request timeout has no twin on a
+            // stream, and a stalled error body must not hold the caller's answer.
+            let status = resp.status().as_u16();
+            let _ =
+                tokio::time::timeout(self.upstream.timeout, read_error_body_for_export(resp)).await;
+            return Err(A2aError::UpstreamStatus(status));
         }
 
         // A JSON-RPC error is delivered at HTTP 200 with an `error` member, so
@@ -532,39 +634,40 @@ impl A2aBridge for HttpBridge {
     }
 }
 
-/// Parse an upstream SSE body into the JSON-RPC envelope of each `data:` field.
+/// Parse an upstream SSE body into one JSON-RPC envelope per event.
 ///
-/// Deliberately minimal: A2A carries one JSON-RPC envelope per `data:` line, so
-/// `event:` / `id:` / `retry:` fields and comments are metadata this gateway has
-/// no use for and passes over. A `data:` line that is not JSON ends the stream
-/// with an error rather than being skipped — a caller that silently dropped
-/// events would report a truncated task as a complete one.
+/// Join an event's `data:` fields with newlines before parsing, as specified by
+/// https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation.
+/// Metadata and comments are ignored. Malformed JSON fails the stream once the
+/// event ends, rather than silently reporting a truncated task as complete.
 fn sse_events(resp: reqwest::Response) -> impl futures::Stream<Item = A2aEvent> + Send {
     async_stream::stream! {
         let mut bytes = resp.bytes_stream();
-        let mut pending: Vec<u8> = Vec::new();
+        // Bound the whole event, including multiple data lines, rather than a
+        // network chunk that may contain many small events.
+        let mut frames = aisix_gateway::sse::SseFrameSplitter::new(MAX_SSE_EVENT_BYTES);
         loop {
             let chunk = match bytes.next().await {
                 Some(Ok(chunk)) => chunk,
-                Some(Err(error)) => {
-                    yield Err(response_body_error(error));
+                Some(Err(e)) => {
+                    yield Err(read_error(e));
                     return;
                 }
                 None => break,
             };
-            pending.extend_from_slice(&chunk);
-            // A single event is bounded even though the stream is not: an
-            // upstream that never emits a newline must not grow this buffer
-            // without limit.
-            if pending.len() > MAX_SSE_EVENT_BYTES {
-                yield Err(A2aError::Request(
-                    "upstream SSE event exceeded size cap".to_string(),
-                ));
-                return;
-            }
-            while let Some(newline) = pending.iter().position(|b| *b == b'\n') {
-                let line: Vec<u8> = pending.drain(..=newline).collect();
-                match parse_sse_data_line(&line) {
+            frames.push(&chunk);
+            loop {
+                let frame = match frames.next_frame() {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => break,
+                    Err(_) => {
+                        yield Err(A2aError::Request(
+                            "upstream SSE event exceeded size cap".to_string(),
+                        ));
+                        return;
+                    }
+                };
+                match parse_sse_frame(&frame) {
                     Ok(Some(event)) => yield Ok(event),
                     Ok(None) => {}
                     Err(e) => {
@@ -575,11 +678,9 @@ fn sse_events(resp: reqwest::Response) -> impl futures::Stream<Item = A2aEvent> 
             }
         }
         // A body that ends without its final newline still carries an event —
-        // and if that last line is malformed it fails the stream like any
-        // other. Swallowing the error here would make a truncated task read as
-        // a clean end, which is the exact failure the per-line rule exists to
-        // prevent.
-        match parse_sse_data_line(&pending) {
+        // preserve that compatibility, but parse all of its data fields together.
+        // A malformed trailing event must still fail rather than end quietly.
+        match parse_sse_frame(&frames.take_rest()) {
             Ok(Some(event)) => yield Ok(event),
             Ok(None) => {}
             Err(e) => yield Err(e),
@@ -587,15 +688,18 @@ fn sse_events(resp: reqwest::Response) -> impl futures::Stream<Item = A2aEvent> 
     }
 }
 
-/// Extract the JSON-RPC envelope from one SSE line, or `None` when the line
-/// carries no `data:` field.
-fn parse_sse_data_line(line: &[u8]) -> Result<Option<serde_json::Value>, A2aError> {
-    let text = std::str::from_utf8(line)
+/// Extract the JSON-RPC envelope from an SSE event's joined data fields.
+fn parse_sse_frame(frame: &[u8]) -> Result<Option<serde_json::Value>, A2aError> {
+    // Strict: an event that is not valid UTF-8 fails the stream rather than
+    // being read around.
+    std::str::from_utf8(frame)
         .map_err(|_| A2aError::Request("upstream SSE event was not valid UTF-8".to_string()))?;
-    let Some(payload) = text.trim_end_matches(['\r', '\n']).strip_prefix("data:") else {
+    let Some(data) = aisix_gateway::sse::parse_frame(frame).data else {
         return Ok(None);
     };
-    let payload = payload.trim();
+    let payload = std::str::from_utf8(&data)
+        .map_err(|_| A2aError::Request("upstream SSE event was not valid UTF-8".to_string()))?
+        .trim();
     if payload.is_empty() {
         return Ok(None);
     }
@@ -792,7 +896,7 @@ mod tests {
 
     #[test]
     fn sse_lines_yield_only_data_payloads() {
-        let event = |line: &str| parse_sse_data_line(line.as_bytes()).unwrap();
+        let event = |line: &str| parse_sse_frame(line.as_bytes()).unwrap();
 
         assert_eq!(
             event("data: {\"jsonrpc\":\"2.0\",\"id\":1}\n").unwrap()["id"],
@@ -812,15 +916,38 @@ mod tests {
     }
 
     #[test]
+    fn sse_frame_joins_data_fields_before_parsing() {
+        for newline in ["\n", "\r\n", "\r"] {
+            let frame = [
+                "data: {\"jsonrpc\":\"2.0\",",
+                ": keep-alive",
+                "event: status-update",
+                "data",
+                "data:\"result\":{\"final\":true}}",
+                "",
+                "",
+            ]
+            .join(newline);
+            assert_eq!(
+                parse_sse_frame(frame.as_bytes()).unwrap().unwrap(),
+                serde_json::json!({"jsonrpc": "2.0", "result": {"final": true}})
+            );
+        }
+        // Joining without the required newline would silently turn invalid
+        // JSON into a different, valid string.
+        assert!(parse_sse_frame(b"data: {\"text\":\"hel\ndata: lo\"}\n\n").is_err());
+    }
+
+    #[test]
     fn a_data_line_that_is_not_json_is_an_error_not_a_skip() {
         // Silently dropping it would let a truncated task read as a complete
         // one, which is worse than failing the stream.
-        let err = parse_sse_data_line(b"data: not-json\n").unwrap_err();
+        let err = parse_sse_frame(b"data: not-json\n").unwrap_err();
         assert!(
             matches!(err, A2aError::Request(ref m) if m.contains("malformed JSON-RPC event")),
             "got {err:?}"
         );
-        assert!(parse_sse_data_line(b"data: \xff\xfe\n").is_err());
+        assert!(parse_sse_frame(b"data: \xff\xfe\n").is_err());
     }
 
     #[test]
@@ -845,5 +972,77 @@ mod tests {
         let back = serde_json::to_value(&card).unwrap();
         assert_eq!(back["version"], "2.1.0");
         assert_eq!(back["skills"][0]["id"], "s1");
+    }
+
+    /// Run `f` under a capturing subscriber; returns its result and what it logged.
+    async fn capture_logs<T>(f: impl std::future::Future<Output = T>) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // A callsite first hit where no subscriber was set has cached "disabled".
+        tracing::callsite::rebuild_interest_cache();
+        let out = f.await;
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (out, logged)
+    }
+
+    /// A loopback address nothing listens on, so a connect is refused at once.
+    fn refused_url(path: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}{path}", listener.local_addr().unwrap())
+    }
+
+    /// The text of an `A2aError` is what the caller and the usage event are
+    /// given, so the transport cause reaches the log and nothing else.
+    #[tokio::test]
+    async fn a_transport_failure_logs_its_cause_and_keeps_the_error_text() {
+        let bridge = bridge_at(&refused_url("/a2a"));
+        let (result, logged) = capture_logs(bridge.send(&serde_json::json!({}))).await;
+        let err = result.expect_err("nothing listens");
+        assert!(logged.to_lowercase().contains("refused"), "{logged}");
+        let text = err.to_string();
+        assert!(text.contains("error sending request"), "{text}");
+        assert!(!text.to_lowercase().contains("refused"), "{text}");
+    }
+
+    /// Answers one request with a `200` whose body stops short of its length.
+    async fn cut_short_url(path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = sock.read(&mut request).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nshort")
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}{path}")
+    }
+
+    /// As for a failed send: the read's cause stays out of the error's text.
+    #[tokio::test]
+    async fn a_failed_body_read_logs_its_cause_and_keeps_the_error_text() {
+        let bridge = bridge_at(&cut_short_url("/a2a").await);
+        let (result, logged) = capture_logs(bridge.send(&serde_json::json!({}))).await;
+        let text = result.expect_err("the body is cut short").to_string();
+        assert!(logged.contains("end of file"), "{logged}");
+        assert!(!text.contains("end of file"), "{text}");
     }
 }

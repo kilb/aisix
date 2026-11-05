@@ -24,10 +24,15 @@ aisix-mcp = { path = "../aisix-mcp" }
 # renames, constraints, default body fields, default headers) takes
 # effect on outbound `/v1/messages` requests — without this the
 # override pipeline silently no-ops on the Anthropic path (#335 /
-# #337). These two crates are the only provider crates the proxy
-# depends on directly — others stay behind the Bridge trait.
+# #337). These two crates, plus the Azure one below (used for its
+# credential only), are the only provider crates the proxy depends on
+# directly — others stay behind the Bridge trait.
 aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
 aisix-provider-openai = { path = "../aisix-provider-openai" }
+# `/v1/systemone` and `/v1/decisions` call Microsoft Foundry directly and
+# authenticate with an Azure key exactly as the Azure bridge does
+# (`resolve_credential`), including the Entra ID client-credentials shape.
+aisix-provider-azure-openai = { path = "../aisix-provider-azure-openai" }
 aisix-obs = { path = "../aisix-obs" }
 aisix-ratelimit = { path = "../aisix-ratelimit" }
 aisix-cache = { path = "../aisix-cache" }
@@ -48,7 +53,7 @@ http-body-util.workspace = true
 bytes.workspace = true
 regex.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 # Token-estimation fallback for usage telemetry (token_estimate.rs).
 tiktoken-rs.workspace = true
 futures.workspace = true
@@ -56,10 +61,12 @@ tokio-tungstenite.workspace = true
 async-trait.workspace = true
 async-stream = "0.3"
 dashmap.workspace = true
+arc-swap.workspace = true
 base64.workspace = true
 # Scheme validation of provider-supplied redirect targets on
 # `GET /v1/videos/:id/content` (already in the tree via reqwest).
 url.workspace = true
+percent-encoding.workspace = true
 # Per-request weighted-random target selection in `routing::weighted_pick`.
 # `thread_rng()` gives proper per-request entropy that converges to the
 # configured weights over a finite sample (fix for #197 — the prior
@@ -89,3 +96,6 @@ tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 wiremock.workspace = true
 # Captures the auth-denial log lines so their per-request fields are pinned.
 tracing-subscriber.workspace = true
+# The budget-gate boundary test loads a real `aisix_core::Config` from
+# a file so it exercises `managed.cp_base_url` normalisation.
+tempfile.workspace = true

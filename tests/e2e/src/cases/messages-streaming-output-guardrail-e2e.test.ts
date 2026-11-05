@@ -15,7 +15,7 @@ import {
 // blocked response is signalled with a terminal `error` event (mirroring
 // /v1/chat/completions and the common streaming-guardrail pattern). We stream
 // Anthropic SSE whose text_delta carries a forbidden token and require
-// the response to end with a content_filter error event.
+// the response to end with an Anthropic-shape `error` event.
 
 const CALLER = "sk-msgstream-gr-caller";
 const HASH = createHash("sha256").update(CALLER).digest("hex");
@@ -138,7 +138,7 @@ describe("streaming /v1/messages output guardrail (#448)", () => {
       }),
     });
 
-  test("a forbidden streamed response ends with a content_filter error event", async (ctx) => {
+  test("a forbidden streamed response ends with an anthropic-shape error event", async (ctx) => {
     if (!etcdReachable || !app || !upstream) {
       ctx.skip();
       return;
@@ -157,12 +157,18 @@ describe("streaming /v1/messages output guardrail (#448)", () => {
     for (const event of STREAM_EVENTS) {
       expect(body, "hold-back keeps every upstream frame off the wire").not.toContain(event);
     }
+    expect(body, "hold-back keeps the matched content off the wire").not.toContain(FORBIDDEN);
     const blockedFrames = parseSseFrames(body);
     expect(blockedFrames).toHaveLength(1);
-    expect(blockedFrames[0]?.event).toBe("error");
+    expect(blockedFrames[0]?.event, "stream must end with an SSE error event").toBe("error");
+    // The terminal frame carries `error.type = "invalid_request_error"` —
+    // the same value the HTTP 422 half of this endpoint renders. Anthropic's
+    // `error.type` is a closed enum with no `content_filter` member, so the
+    // two halves had been disagreeing and the SDK's typed parse rejected the
+    // streaming one. The refusal is named by `error.code` instead (#726).
     expect(JSON.parse(blockedFrames[0]!.data)).toMatchObject({
       type: "error",
-      error: { type: "content_filter" },
+      error: { type: "invalid_request_error", code: "content_filter" },
     });
 
     const cleanMarker = `clean-stream-${randomUUID()}`;

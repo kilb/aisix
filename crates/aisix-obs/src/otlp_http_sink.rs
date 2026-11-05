@@ -16,8 +16,11 @@
 //!    enqueues one OTLP span record into it. The pipeline batches, retries
 //!    transient failures with backoff, and drops-with-metric under
 //!    backpressure — all off the request hot path. Spans are encoded per
-//!    OpenTelemetry's GenAI semantic conventions
-//!    (<https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/gen-ai-spans.md>).
+//!    OpenTelemetry's GenAI semantic conventions as released in
+//!    semantic-conventions v1.41.1
+//!    (<https://github.com/open-telemetry/semantic-conventions/blob/v1.41.1/docs/gen-ai/gen-ai-spans.md>),
+//!    the SERVER span per the HTTP server span conventions of the same
+//!    release.
 //!
 //! ## Per-exporter knobs (#519 B.2)
 //!
@@ -28,10 +31,12 @@
 //!   attempt span of one request shares the `request_id`, a trace is
 //!   exported whole or not at all — consistently across retries/fallbacks.
 //! - **`content_mode` / `content_max_bytes`** — same opt-in content capture
-//!   the SLS / Datadog sinks use ([`content_record`]); under `full` the span
-//!   carries `gen_ai.prompt` / `gen_ai.completion` (plus
-//!   `aisix.content_truncated` when cut) — the same keys the Datadog sink
-//!   ships the captured content under. Defaults to `metadata_only`, where
+//!   the SLS / Datadog sinks use ([`content_record`]); under `full` a
+//!   complete message exchange is carried as the conventions' structured
+//!   `gen_ai.input.messages` / `gen_ai.output.messages` /
+//!   `gen_ai.system_instructions` / `gen_ai.tool.definitions`, and anything
+//!   else as `aisix.content.prompt` / `aisix.content.response` (plus
+//!   `aisix.content_truncated` when cut). Defaults to `metadata_only`, where
 //!   the record never carries content fields, so it cannot leak.
 //!
 //! ## What's intentionally NOT here yet
@@ -45,28 +50,36 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aisix_core::models::{
-    AliyunSlsConfig, DatadogConfig, ExporterKind, ObjectStoreConfig, ObservabilityExporter,
-    OtlpHttpConfig, SlsContentMode,
+    AisixSnapshot, AliyunSlsConfig, DatadogConfig, ExporterKind, ObjectStoreConfig,
+    ObservabilityExporter, OtlpHttpConfig, SlsContentMode,
 };
+use aisix_core::snapshot::SnapshotHandle;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::metrics::Metrics;
+use crate::sink::is_mcp;
 use crate::sink::{
     build_object_store_sink, resolve_datadog_credential, resolve_sls_credential, AliyunSlsSink,
-    BatchUnit, CapturedContent, DatadogSink, EventBatch, ExporterPipelines, IdempotencyMarker,
-    IdempotencyScheme, ObservabilitySink, OrderingScope, PipelineConfig, SinkAck, SinkCapabilities,
-    SinkContent, SinkError, SinkHealth, SinkRecord, SinkResult, SinkStatsSnapshot,
+    BatchUnit, CapturedContent, DatadogSink, ErrorRedactor, EventBatch, ExporterPipelines,
+    IdempotencyMarker, IdempotencyScheme, ObservabilitySink, OrderingScope, PipelineConfig,
+    SinkAck, SinkCapabilities, SinkContent, SinkError, SinkHealth, SinkRecord, SinkResult,
+    SinkStatsSnapshot,
 };
-use crate::usage::UsageEvent;
+use crate::usage::{GatewayEmbeddingCall, UsageEvent};
 
 /// Wall-clock duration of an OTLP/HTTP POST before we abandon it.
 /// Tight on purpose — we never want a slow exporter to backlog tokio
 /// tasks for a wedged user receiver.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `User-Agent` header so vendor receivers can attribute traces back
-/// to AISIX in their own analytics. Not a contract; informational.
-const USER_AGENT: &str = concat!("aisix-dp/", env!("CARGO_PKG_VERSION"));
+/// `service.name` until the gateway's configured
+/// `observability.service_name` is handed over — the same default that key
+/// has.
+const DEFAULT_SERVICE_NAME: &str = "aisix";
+
+/// The gateway's status for a caller that closed the request (nginx's 499).
+const CLIENT_CLOSED_REQUEST: u16 = 499;
 
 /// Fans usage events out to every configured observability exporter — any
 /// [`ExporterKind`], dispatched per kind to the matching
@@ -95,6 +108,9 @@ struct FanOutInner {
     /// an older in-flight request cannot recreate a deleted exporter after a
     /// newer request observed the revocation.
     reconciled_generation: parking_lot::Mutex<u64>,
+    /// The resource `service.name` every OTLP export carries, once
+    /// [`OtlpHttpFanOut::set_service_name`] hands it over.
+    service_name: std::sync::OnceLock<String>,
 }
 
 /// Delivery tuning for otlp exporter pipelines. A short flush keeps a
@@ -109,14 +125,18 @@ fn exporter_pipeline_config() -> PipelineConfig {
 
 impl OtlpHttpFanOut {
     pub fn new() -> Self {
-        Self::with_metrics(None)
+        Self::build(None)
     }
 
-    /// Like [`OtlpHttpFanOut::new`], publishing per-exporter drop and
-    /// delivery-failure counters to `metrics`. The server bootstrap passes
-    /// the process handle so telemetry loss is visible on `/metrics`; tests
-    /// pass `None`.
-    pub fn with_metrics(metrics: Option<Arc<crate::Metrics>>) -> Self {
+    /// As [`Self::new`], emitting the per-exporter fan-out drop and
+    /// failure counters on `metrics`. Without it the fan-out still runs
+    /// and still accounts drops in [`SinkStatsSnapshot`] — but nothing
+    /// reaches `GET /metrics`, which is the gap #1060 names.
+    pub fn with_metrics(metrics: Metrics) -> Self {
+        Self::build(Some(metrics))
+    }
+
+    fn build(metrics: Option<Metrics>) -> Self {
         // Was `.expect("reqwest::Client default config is valid")`, on the
         // premise that only illegal TLS roots can fail the build. This is not
         // the default config — `client_builder()` applies the DEPLOYMENT's
@@ -126,22 +146,30 @@ impl OtlpHttpFanOut {
         let client = aisix_gateway::build_client_or_default(
             aisix_gateway::client_builder()
                 .timeout(REQUEST_TIMEOUT)
-                .user_agent(USER_AGENT),
+                .user_agent(format!("aisix-dp/{}", &*aisix_core::BUILD_VERSION)),
             "otlp http exporter",
         );
         Self {
             inner: Arc::new(FanOutInner {
                 exporters: {
-                    let pipelines = ExporterPipelines::new(exporter_pipeline_config());
+                    let p = ExporterPipelines::new(exporter_pipeline_config());
                     match metrics {
-                        Some(m) => pipelines.with_metrics(m),
-                        None => pipelines,
+                        Some(m) => p.with_metrics(m),
+                        None => p,
                     }
                 },
                 client,
                 reconciled_generation: parking_lot::Mutex::new(0),
+                service_name: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// Name the service OTLP exports report as `service.name` — the
+    /// gateway's `observability.service_name`. Called once at boot, before
+    /// any exporter pipeline starts; a later call is ignored.
+    pub fn set_service_name(&self, name: &str) {
+        let _ = self.inner.service_name.set(name.to_string());
     }
 
     /// Fan one event out to every enabled exporter, dispatched per kind and
@@ -156,10 +184,24 @@ impl OtlpHttpFanOut {
     /// `content_mode = full`; every other exporter — and the CP telemetry
     /// path, which is not in this loop — receives the shared metadata-only
     /// record, so prompt/response can never leak there.
+    ///
+    /// `trace` is the event's span snapshot (AISIX-Cloud#1279) — ids and
+    /// boundaries frozen at emission time by the request's trace bundle.
+    /// It rides every record unchanged (`SinkRecord::trace` is
+    /// serde-skipped, so only the OTLP encoder reads it), which is what
+    /// makes span ids byte-identical across delivery retries and across
+    /// exporters. `None` (a caller predating the bundle, or a synthetic
+    /// event) falls back to the legacy single-span encoding.
+    ///
+    /// `facts` are the event's export-only span facts — request parameters,
+    /// the dispatched upstream, the inbound HTTP request — which never join
+    /// the usage-event wire.
     pub fn fan_out<'a, I>(
         &self,
         event: &UsageEvent,
         content: Option<&CapturedContent>,
+        trace: Option<&crate::trace::TraceEmission>,
+        facts: Option<&Arc<crate::genai::SpanFacts>>,
         snapshot_generation: u64,
         exporters: I,
     ) where
@@ -182,6 +224,17 @@ impl OtlpHttpFanOut {
         // queue, and sink on the first request that observes the change.
         self.reconcile_pipelines(&desired);
 
+        let settled;
+        let event = match event.settled_cache_creation_ttl() {
+            ttl if ttl == event.cache_creation_ttl => event,
+            ttl => {
+                settled = UsageEvent {
+                    cache_creation_ttl: ttl,
+                    ..event.clone()
+                };
+                &settled
+            }
+        };
         // The shared metadata-only record, built once on first sighting and
         // reused by every exporter that does not capture content.
         let mut metadata_record: Option<Arc<SinkRecord>> = None;
@@ -212,11 +265,19 @@ impl OtlpHttpFanOut {
                     let name = exp.name.clone();
                     let endpoint = cfg.endpoint.clone();
                     let headers = cfg.headers.clone();
+                    let service_name = self
+                        .inner
+                        .service_name
+                        .get()
+                        .cloned()
+                        .unwrap_or_else(|| DEFAULT_SERVICE_NAME.to_string());
                     self.inner
                         .exporters
                         .get_or_create(&exp.name, fingerprint, move || {
-                            Arc::new(OtlpSink::new(name, endpoint, headers, client))
-                                as Arc<dyn ObservabilitySink>
+                            Arc::new(
+                                OtlpSink::new(name, endpoint, headers, client)
+                                    .with_service_name(service_name),
+                            ) as Arc<dyn ObservabilitySink>
                         })
                 }
                 ExporterKind::AliyunSls(cfg) => {
@@ -288,12 +349,41 @@ impl OtlpHttpFanOut {
             // A content-bearing record for an SLS exporter that opted into
             // full capture (and only when the handler captured content); the
             // shared metadata-only record for everyone else.
-            let record = content_record(&exp.kind, event, content).unwrap_or_else(|| {
-                Arc::clone(
-                    metadata_record
-                        .get_or_insert_with(|| Arc::new(SinkRecord::metadata_only(event.clone()))),
-                )
-            });
+            // Each exporter sees only the headers in its own lists, so one
+            // that selects any gets a record of its own.
+            let selects_headers =
+                !exp.request_headers.is_empty() || !exp.upstream_response_headers.is_empty();
+            let record = content_record(&exp.kind, event, content, trace, facts)
+                .map(|record| {
+                    if selects_headers {
+                        Arc::new(Arc::unwrap_or_clone(record).with_exporter_headers(
+                            &exp.request_headers,
+                            &exp.upstream_response_headers,
+                        ))
+                    } else {
+                        record
+                    }
+                })
+                .unwrap_or_else(|| {
+                    if selects_headers {
+                        return Arc::new(
+                            SinkRecord::metadata_only(event.clone())
+                                .with_trace(trace.cloned())
+                                .with_facts(facts.cloned())
+                                .with_exporter_headers(
+                                    &exp.request_headers,
+                                    &exp.upstream_response_headers,
+                                ),
+                        );
+                    }
+                    Arc::clone(metadata_record.get_or_insert_with(|| {
+                        Arc::new(
+                            SinkRecord::metadata_only(event.clone())
+                                .with_trace(trace.cloned())
+                                .with_facts(facts.cloned()),
+                        )
+                    }))
+                });
             handle.try_enqueue(record);
         }
     }
@@ -327,6 +417,43 @@ impl OtlpHttpFanOut {
         self.inner.exporters.reconcile(desired);
     }
 
+    /// Stop the pipeline of every exporter that was deleted, disabled or
+    /// reconfigured, each time a snapshot is published, until `cancel` fires.
+    /// Without it the pipeline — task, client, queue — outlives its exporter
+    /// for the life of the process (#954).
+    ///
+    /// Driven by the publish rather than by traffic or a timer: a deleted
+    /// exporter is by definition one no request will touch again. It keys
+    /// on the exporter table's generation, so a write to any other
+    /// collection costs one comparison. Stopping only touches the worker's
+    /// task handle, wherever it runs — under `proxy.thread_per_core` a
+    /// pipeline lives on the worker runtime whose request first saw the
+    /// exporter, not on the runtime running this loop.
+    pub async fn reap_on_config_change(
+        self,
+        snapshot: SnapshotHandle<AisixSnapshot>,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let mut published = snapshot.subscribe();
+        let mut reaped = None;
+        loop {
+            if *cancel.borrow() {
+                return;
+            }
+            let view = snapshot.load_versioned();
+            let generation = view.snapshot.observability_exporters.generation();
+            if reaped != Some(generation) {
+                let exporters = view.snapshot.observability_exporters.entries();
+                self.reconcile(view.version, exporters.iter().map(|e| &*e.value));
+                reaped = Some(generation);
+            }
+            tokio::select! {
+                changed = published.changed() => if changed.is_err() { return },
+                changed = cancel.changed() => if changed.is_err() { return },
+            }
+        }
+    }
+
     /// Per-exporter delivery counters, keyed by exporter name. Read by the
     /// managed-mode heartbeat to report `exporter_health` to the control plane
     /// (#519 D.2). Counters are per-pipeline: a reconfigured exporter gets
@@ -334,6 +461,11 @@ impl OtlpHttpFanOut {
     /// them as resettable.
     pub fn exporter_stats(&self) -> std::collections::HashMap<String, SinkStatsSnapshot> {
         self.inner.exporters.stats()
+    }
+
+    /// Records queued per exporter, keyed by exporter name.
+    pub fn exporter_queue_depths(&self) -> Vec<(String, u64)> {
+        self.inner.exporters.queue_depths()
     }
 
     /// Drain every exporter pipeline at graceful shutdown.
@@ -469,6 +601,8 @@ fn content_record(
     kind: &ExporterKind,
     event: &UsageEvent,
     content: Option<&CapturedContent>,
+    trace: Option<&crate::trace::TraceEmission>,
+    facts: Option<&Arc<crate::genai::SpanFacts>>,
 ) -> Option<Arc<SinkRecord>> {
     // The exporters that opt into full content capture share the
     // `SlsContentMode` model; pull each one's (mode, cap). Any other kind
@@ -485,8 +619,14 @@ fn content_record(
     let captured = content?;
     let mut sc = SinkContent::capture(&captured.prompt, &captured.response, max_bytes as usize);
     sc.truncated = sc.truncated || captured.truncated;
+    sc.prompt_truncated = sc.prompt_truncated || captured.prompt_truncated;
+    sc.response_truncated = sc.response_truncated || captured.response_truncated;
+    sc.output = captured.output.clone();
     Some(Arc::new(
-        SinkRecord::metadata_only(event.clone()).with_content(sc),
+        SinkRecord::metadata_only(event.clone())
+            .with_content(sc)
+            .with_trace(trace.cloned())
+            .with_facts(facts.cloned()),
     ))
 }
 
@@ -568,6 +708,7 @@ pub struct OtlpSink {
     endpoint: String,
     headers: BTreeMap<String, String>,
     client: reqwest::Client,
+    service_name: String,
 }
 
 impl OtlpSink {
@@ -584,7 +725,14 @@ impl OtlpSink {
             endpoint: endpoint.into(),
             headers,
             client,
+            service_name: DEFAULT_SERVICE_NAME.to_string(),
         }
+    }
+
+    /// The resource `service.name` this sink's exports report.
+    pub fn with_service_name(mut self, service_name: String) -> Self {
+        self.service_name = service_name;
+        self
     }
 }
 
@@ -611,14 +759,14 @@ impl ObservabilitySink for OtlpSink {
         if batch.is_empty() {
             return Ok(SinkAck::default());
         }
-        // One export request carrying every record's span — one POST, one
+        // One export request carrying every record's spans — one POST, one
         // atomic retry unit (vs. the per-event fan-out's N spawns).
         let spans: Vec<Value> = batch
             .records
             .iter()
-            .map(|record| build_otlp_span(record, &self.name))
+            .flat_map(|record| build_otlp_spans(record, &self.name))
             .collect();
-        let body = otlp_export_request(spans);
+        let body = otlp_export_request(spans, &self.service_name);
         let bytes = serde_json::to_vec(&body)
             .map_err(|e| SinkError::Permanent(format!("otlp encode: {e}")))?;
 
@@ -640,6 +788,7 @@ impl ObservabilitySink for OtlpSink {
                         ..SinkAck::default()
                     });
                 }
+                let retry_after = crate::sink::retry_after_of(status, resp.headers());
                 let text = resp.text().await.unwrap_or_default();
                 let detail = format!(
                     "HTTP {}: {}",
@@ -648,20 +797,13 @@ impl ObservabilitySink for OtlpSink {
                 );
                 // 5xx / 408 / 429 are worth retrying; other 4xx are
                 // config/auth/payload errors that will fail identically.
-                if status.is_server_error()
-                    || status == reqwest::StatusCode::REQUEST_TIMEOUT
-                    || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                {
-                    Err(SinkError::Transient(detail))
-                } else {
-                    Err(SinkError::Permanent(detail))
-                }
+                Err(crate::sink::http_status_error(status, retry_after, detail))
             }
             // Connect / DNS / timeout — transient by nature. reqwest's
             // Display hides the cause in `source()` — chain it.
             Err(e) => Err(SinkError::Transient(format!(
                 "POST {}: {}",
-                self.endpoint,
+                aisix_gateway::redact_url_for_log(&self.endpoint),
                 crate::sink::error_chain(&e)
             ))),
         }
@@ -674,25 +816,33 @@ impl ObservabilitySink for OtlpSink {
         // `SinkStats::last_error`.
         SinkHealth::healthy()
     }
+
+    fn error_redactor(&self) -> ErrorRedactor {
+        self.headers
+            .values()
+            .fold(ErrorRedactor::default().url(&self.endpoint), |r, value| {
+                // A receiver may quote only the credential of `<scheme> <credential>`.
+                let credential = value.trim().rsplit_once(' ').map_or("", |(_, c)| c).trim();
+                // Only an auth-shaped value splits; `team a` must not make
+                // every `a` in the error a secret.
+                let credential = if credential.len() >= 8 {
+                    credential
+                } else {
+                    ""
+                };
+                r.secret(value).secret(credential)
+            })
+    }
 }
 
-/// Build the single OTLP span object for one sink record. Attribute names
-/// match the OpenTelemetry GenAI semantic conventions:
-/// <https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/gen-ai-spans.md>.
+/// Encode a record without a trace snapshot as one CLIENT span: a caller that
+/// predates the request trace bundle, or a usage row with no live request
+/// behind it (the background batch-completion accounting).
 ///
-/// Per-attribute encoding:
-/// - String / int values use the canonical `{"stringValue": ...}` /
-///   `{"intValue": "..."}` (string-encoded int per OTLP/JSON spec).
-/// - Trace ID + span ID are random 16-byte / 8-byte hex values.
-/// - Timestamps are nanos-since-epoch, OTLP's required unit.
-///
-/// When the record carries captured content (this exporter's
-/// `content_mode = full`, see [`content_record`]) the span additionally
-/// carries `gen_ai.prompt` / `gen_ai.completion` — the same prompt /
-/// assembled response the Datadog sink ships under those keys — plus
-/// `aisix.content_truncated` when either field was cut to the exporter's
-/// `content_max_bytes`. Metadata-only records never carry content, so the
-/// default span shape is unchanged.
+/// Attribute names follow the OpenTelemetry GenAI semantic conventions
+/// (semantic-conventions v1.41.1, `docs/gen-ai/gen-ai-spans.md`). Being the
+/// only span, it also carries the inbound-request attributes a SERVER span
+/// would otherwise hold.
 fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
     let event = &record.usage;
     let trace_id = random_trace_id();
@@ -706,26 +856,386 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
     // The span represents this ATTEMPT, so its duration is the
     // attempt-scoped upstream latency (the request-scoped
     // `downstream_latency_ms` rides along as an attribute instead).
-    // Latency landed in milliseconds; widen + multiply.
     let latency_nanos = (event.upstream_latency_ms as u128).saturating_mul(1_000_000);
     let start_unix_nano = end_unix_nano.saturating_sub(latency_nanos);
 
-    // Status: OK (1) for 2xx, ERROR (2) otherwise.
-    let status_code = if (200..300).contains(&event.status_code) {
-        1
-    } else {
-        2
-    };
+    let mut attributes = event_attributes(record, exporter_name);
+    merge_attributes(&mut attributes, inbound_request_attributes(record));
+    let error = client_error_type(event);
+    if let Some(error_type) = &error {
+        attributes.push(attr_string("error.type", error_type));
+    }
+    let mut span = json!({
+        "traceId": trace_id,
+        "spanId":  span_id,
+        "name":    operation_span_name(record),
+        // SPAN_KIND_CLIENT: the gateway is the client of a remote model,
+        // agent or MCP server.
+        "kind":    3,
+        "startTimeUnixNano": start_unix_nano.to_string(),
+        "endTimeUnixNano":   end_unix_nano.to_string(),
+        "attributes": attributes,
+    });
+    if error.is_some() {
+        span["status"] = json!({ "code": STATUS_ERROR });
+    }
+    span
+}
 
+/// OTLP `Status.code` for a failed operation. A successful one leaves the
+/// status unset, which the recording-errors convention requires.
+const STATUS_ERROR: i64 = 2;
+
+/// Encode one sink record into its OTLP span set.
+///
+/// A record carrying a [`crate::trace::TraceEmission`] (AISIX-Cloud#1279)
+/// yields the request's span hierarchy — SERVER → logical CLIENT → attempt
+/// CLIENT — with ids and nanosecond boundaries frozen at emission time, so
+/// a delivery retry re-encodes byte-identical spans and every exporter
+/// agrees on the trace. A record without one falls back to the single span
+/// of [`build_otlp_span`].
+///
+/// Which span says what:
+///
+/// - The **carrier** (the attempt span when present, else the logical span,
+///   else SERVER) is the GenAI operation span: it alone carries the
+///   `gen_ai.*` attributes, the usage and the captured content, so a backend
+///   that turns GenAI spans into model calls counts each attempt once.
+/// - The **SERVER** span follows the HTTP server conventions: its name is
+///   `{method} {route}`, it carries the inbound request's attributes, and a
+///   4xx leaves its status unset.
+/// - A **logical** span that is not the carrier groups the attempts and
+///   carries only the joining `aisix.*` keys — no `gen_ai.*`, which would
+///   make it read as a second model call.
+fn build_otlp_spans(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
+    use crate::trace::SpanRole;
+
+    let Some(trace) = &record.trace else {
+        return vec![build_otlp_span(record, exporter_name)];
+    };
+    let event = &record.usage;
+    let trace_id = trace.trace_id.to_hex();
+    let carrier = trace.carrier_role();
+    let operation_name = operation_span_name(record);
+    trace
+        .spans
+        .iter()
+        .map(|span| {
+            let is_carrier = Some(span.role) == carrier;
+            let (name, kind, mut attributes, error) = match span.role {
+                SpanRole::Server => {
+                    let mut attributes = server_attributes(record, exporter_name);
+                    if is_carrier {
+                        // A cache hit, a refusal or a pre-dispatch error:
+                        // the request's only span, so it carries the event.
+                        let mut merged = event_attributes(record, exporter_name);
+                        merge_attributes(&mut merged, attributes);
+                        attributes = merged;
+                    }
+                    (
+                        server_span_name(record),
+                        2,
+                        attributes,
+                        server_error_type(event),
+                    )
+                }
+                SpanRole::Logical | SpanRole::Attempt => {
+                    let attributes = if is_carrier {
+                        event_attributes(record, exporter_name)
+                    } else {
+                        joining_attributes(event, exporter_name)
+                    };
+                    (
+                        operation_name.clone(),
+                        3,
+                        attributes,
+                        client_error_type(event),
+                    )
+                }
+            };
+            if let Some(error_type) = &error {
+                attributes.push(attr_string("error.type", error_type));
+            }
+            let mut json = json!({
+                "traceId": trace_id,
+                "spanId": span.span_id.to_hex(),
+                "name": name,
+                "kind": kind,
+                "startTimeUnixNano": span.start_unix_nano.to_string(),
+                "endTimeUnixNano": span.end_unix_nano.to_string(),
+                "attributes": attributes,
+                "flags": span_flags(span, trace),
+            });
+            if error.is_some() {
+                json["status"] = json!({ "code": STATUS_ERROR });
+            }
+            if let Some(parent) = span.parent_span_id {
+                json["parentSpanId"] = Value::String(parent.to_hex());
+            }
+            // The caller's tracestate belongs to the propagated context;
+            // it rides the SERVER span, the one that continues it.
+            if span.role == SpanRole::Server {
+                if let Some(state) = &trace.tracestate {
+                    json["traceState"] = Value::String(state.clone());
+                }
+            }
+            json
+        })
+        .collect()
+}
+
+/// OTLP span `flags` (uint32): the low byte is the span's W3C trace-flags
+/// — always `sampled`, since encoding IS the export decision, plus the
+/// inbound octet's `random` bit (0x02) on a SERVER span continuing a
+/// remote trace — and `HAS_IS_REMOTE` (bit 8) on every span, with
+/// `IS_REMOTE` (bit 9) on a SERVER span whose parent arrived over the
+/// wire in `traceparent`.
+fn span_flags(span: &crate::trace::SpanEmit, trace: &crate::trace::TraceEmission) -> u32 {
+    const SAMPLED: u32 = 0x01;
+    const W3C_RANDOM: u32 = 0x02;
+    const HAS_IS_REMOTE: u32 = 0x100;
+    const IS_REMOTE: u32 = 0x200;
+    let remote = span.role == crate::trace::SpanRole::Server
+        && span.parent_span_id.is_some()
+        && trace.remote_flags.is_some();
+    let mut flags = SAMPLED | HAS_IS_REMOTE;
+    if remote {
+        flags |= IS_REMOTE;
+        // The random bit describes the trace id, which the remote parent
+        // minted — preserve its claim; never invent it for local roots.
+        flags |= u32::from(trace.remote_flags.unwrap_or(0)) & W3C_RANDOM;
+    }
+    flags
+}
+
+/// `error.type` of a CLIENT span, or `None` when the operation did not
+/// fail. Any status outside 1xx–3xx is a failure, except 499: a caller
+/// that hung up cancelled the call on purpose, which the conventions say
+/// not to record as an error.
+fn client_error_type(event: &UsageEvent) -> Option<String> {
+    let status = event.status_code;
+    if status < 400 || status == CLIENT_CLOSED_REQUEST {
+        return None;
+    }
+    Some(error_type_value(event))
+}
+
+/// `error.type` of the SERVER span: only a 5xx is the server's own failure;
+/// a 4xx leaves a SERVER span's status unset (HTTP span status rules).
+fn server_error_type(event: &UsageEvent) -> Option<String> {
+    (event.status_code >= 500).then(|| error_type_value(event))
+}
+
+/// The gateway's own bounded error class when it named one, else the
+/// status code as a string — both values the conventions allow.
+fn error_type_value(event: &UsageEvent) -> String {
+    if event.error_class.is_empty() {
+        event.status_code.to_string()
+    } else {
+        event.error_class.clone()
+    }
+}
+
+/// `gen_ai.operation.name` for this event: the conventions' value where one
+/// applies, else the gateway's own operation, verbatim. `None` only for an
+/// event that carries no operation at all.
+fn genai_operation_name(event: &UsageEvent) -> Option<&str> {
+    if is_a2a(event) {
+        return Some("invoke_agent");
+    }
+    if is_mcp(event) {
+        return Some("execute_tool");
+    }
+    match event.operation.as_str() {
+        "chat" | "messages" | "responses" => Some("chat"),
+        "completions" => Some("text_completion"),
+        "embeddings" => Some("embeddings"),
+        "" => None,
+        other => Some(other),
+    }
+}
+
+fn is_a2a(event: &UsageEvent) -> bool {
+    event.operation == "a2a" || event.inbound_protocol == "a2a"
+}
+
+/// The JSON-RPC method of every MCP call the gateway records: usage is
+/// emitted for tool calls only.
+const MCP_TOOL_CALL_METHOD: &str = "tools/call";
+
+/// Longest target this will append to a span name.
+///
+/// An A2A agent name is a registered resource, but an MCP tool name is the
+/// caller's own `tools/call` `params.name` and is recorded before the tool is
+/// known to exist — including on the quota-rejection path, which emits without
+/// ever contacting an upstream. A trace backend indexes span names and most
+/// derive RED metrics from them, so the one field a caller picks freely is
+/// bounded before it gets there.
+const MAX_SPAN_NAME_TARGET: usize = 64;
+
+/// The name of the GenAI operation span (and of a logical span grouping its
+/// attempts): `{operation} {target}`, where the target is the model the
+/// request was made to, the agent invoked, or the passthrough route, and
+/// MCP's own `{mcp.method.name} {gen_ai.tool.name}`. A target that is absent
+/// or outside [`MAX_SPAN_NAME_TARGET`] leaves the bare operation, which the
+/// conventions name as the fallback.
+fn operation_span_name(record: &SinkRecord) -> String {
+    let event = &record.usage;
+    let (operation, target) = if is_mcp(event) {
+        (MCP_TOOL_CALL_METHOD, event.mcp_tool_name.as_str())
+    } else if is_a2a(event) {
+        ("invoke_agent", event.a2a_agent_name.as_str())
+    } else {
+        let operation = genai_operation_name(event).unwrap_or("unknown");
+        let target = if event.inbound_protocol == "passthrough" {
+            event.passthrough_route_name.as_str()
+        } else {
+            upstream(record)
+                .filter(|u| !u.request_model_caller_named)
+                .map_or("", |u| u.request_model.as_str())
+        };
+        (operation, target)
+    };
+    if target.is_empty() || target.len() > MAX_SPAN_NAME_TARGET {
+        operation.to_string()
+    } else {
+        format!("{operation} {target}")
+    }
+}
+
+fn server_span_name(record: &SinkRecord) -> String {
+    match record.facts.as_ref().and_then(|f| f.http.as_ref()) {
+        Some(http) => http.span_name(),
+        None => "HTTP".to_string(),
+    }
+}
+
+fn upstream(record: &SinkRecord) -> Option<&crate::genai::UpstreamFacts> {
+    record.facts.as_ref().and_then(|f| f.upstream.as_ref())
+}
+
+/// Append `extra`, skipping any key `attributes` already carries.
+fn merge_attributes(attributes: &mut Vec<Value>, extra: Vec<Value>) {
+    for attr in extra {
+        let key = attr["key"].as_str().unwrap_or_default();
+        if !attributes.iter().any(|a| a["key"] == key) {
+            attributes.push(attr);
+        }
+    }
+}
+
+/// The keys every span of a request shares, so a backend can group them.
+fn joining_attributes(event: &UsageEvent, exporter_name: &str) -> Vec<Value> {
     let mut attributes = vec![
-        attr_string("gen_ai.system", "aisix"),
-        attr_string("gen_ai.operation.name", operation_name(event)),
+        attr_string("aisix.exporter_name", exporter_name),
+        attr_string("aisix.request_id", &event.request_id),
     ];
-    // The model alias the client sent (`model` field) — a Model-Group
-    // name for routed requests (#790). Semconv key for the
-    // requested (vs response) model.
+    if !event.operation.is_empty() {
+        attributes.push(attr_string("aisix.operation", &event.operation));
+    }
+    attributes
+}
+
+/// What the caller's HTTP request looked like, under the HTTP and client
+/// conventions' names: the resolved caller address, its `User-Agent`, and
+/// the operator-selected request headers.
+fn inbound_request_attributes(record: &SinkRecord) -> Vec<Value> {
+    let event = &record.usage;
+    let mut attributes = Vec::new();
+    if !event.client_source_ip.is_empty() {
+        attributes.push(attr_string("client.address", &event.client_source_ip));
+    }
+    if !event.client_user_agent.is_empty() {
+        attributes.push(attr_string("user_agent.original", &event.client_user_agent));
+    }
+    // `http.request.header.<lowercase name>` is a string array; one element
+    // here, because repeated occurrences were already joined into one value.
+    for (name, value) in &record.request_headers {
+        attributes.push(attr_string_array(
+            &format!("http.request.header.{name}"),
+            std::slice::from_ref(value),
+        ));
+    }
+    attributes
+}
+
+/// The SERVER span's attributes: the HTTP server convention's request
+/// shape, the response status, the inbound-request attributes, and the
+/// joining keys.
+fn server_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
+    let event = &record.usage;
+    let mut attributes = Vec::new();
+    if let Some(http) = record.facts.as_ref().and_then(|f| f.http.as_ref()) {
+        attributes.push(attr_string("http.request.method", http.method));
+        if let Some(original) = &http.method_original {
+            attributes.push(attr_string("http.request.method_original", original));
+        }
+        attributes.push(attr_string("url.path", &http.path));
+        if let Some(scheme) = http.scheme {
+            attributes.push(attr_string("url.scheme", scheme));
+        }
+        if let Some(route) = http.route {
+            attributes.push(attr_string("http.route", route));
+        }
+        if let Some(query) = &http.query {
+            attributes.push(attr_string("url.query", query));
+        }
+    }
+    attributes.push(attr_int(
+        "http.response.status_code",
+        event.status_code as i64,
+    ));
+    attributes.extend(inbound_request_attributes(record));
+    attributes.extend(joining_attributes(event, exporter_name));
+    attributes
+}
+
+/// The GenAI operation span's attributes: the event's full attribute set,
+/// plus captured content when the record carries it.
+fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
+    let event = &record.usage;
+    let facts = record.facts.as_deref();
+    let upstream = facts.and_then(|f| f.upstream.as_ref());
+    let mcp = is_mcp(event);
+    let a2a = is_a2a(event);
+    let operation = genai_operation_name(event);
+
+    let mut attributes = Vec::new();
+    if let Some(operation) = operation {
+        attributes.push(attr_string("gen_ai.operation.name", operation));
+    }
+    // The gateway's own, finer reading of the same thing. The convention's
+    // value collapses chat, messages and responses onto `chat`, which
+    // cannot separate them (#1461).
+    if !event.operation.is_empty() {
+        attributes.push(attr_string("aisix.operation", &event.operation));
+    }
+    if mcp {
+        attributes.push(attr_string("mcp.method.name", MCP_TOOL_CALL_METHOD));
+    }
+    if let Some(upstream) = upstream {
+        if !upstream.provider_name.is_empty() {
+            attributes.push(attr_string("gen_ai.provider.name", &upstream.provider_name));
+        }
+        // The model name sent to the upstream — not the alias the caller
+        // addressed, which is `aisix.requested_model`.
+        if !upstream.request_model.is_empty() {
+            attributes.push(attr_string("gen_ai.request.model", &upstream.request_model));
+        }
+        if !upstream.server_address.is_empty() {
+            attributes.push(attr_string("server.address", &upstream.server_address));
+            if let Some(port) = upstream.server_port {
+                attributes.push(attr_int("server.port", i64::from(port)));
+            }
+        }
+    }
+    // The model alias the client sent (`model` field) — a Model-Group name
+    // for routed requests (#790).
     if !event.requested_model.is_empty() {
-        attributes.push(attr_string("gen_ai.request.model", &event.requested_model));
+        attributes.push(attr_string("aisix.requested_model", &event.requested_model));
+    }
+    if let Some(params) = facts.and_then(|f| f.request.as_deref()) {
+        push_request_params(&mut attributes, params, upstream);
     }
     if !event.provider_model_version.is_empty() {
         attributes.push(attr_string(
@@ -745,14 +1255,17 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
             std::slice::from_ref(&event.finish_reason),
         ));
     }
-    attributes.push(attr_int(
-        "gen_ai.usage.input_tokens",
-        event.prompt_tokens as i64,
-    ));
-    attributes.push(attr_int(
-        "gen_ai.usage.output_tokens",
-        event.completion_tokens as i64,
-    ));
+    // Measured from this attempt's dispatch to the upstream's first
+    // streamed frame — the convention's definition, in seconds.
+    if event.upstream_ttft_ms > 0 {
+        attributes.push(attr_double(
+            "gen_ai.response.time_to_first_chunk",
+            f64::from(event.upstream_ttft_ms) / 1000.0,
+        ));
+    }
+    if !mcp {
+        push_usage(&mut attributes, event, operation);
+    }
     attributes.push(attr_int(
         "http.response.status_code",
         event.status_code as i64,
@@ -762,8 +1275,37 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
         // spans back to the AISIX api_key dashboard.
         attributes.push(attr_string("aisix.api_key_id", &event.api_key_id));
     }
+    if !event.api_key_name.is_empty() {
+        attributes.push(attr_string("aisix.api_key_name", &event.api_key_name));
+    }
+    // The org member behind the credential (AISIX-Cloud#1389). Exported
+    // beside the key rather than derived from it downstream: a member can
+    // hold several keys, and a key can be rebound to someone else.
+    if !event.user_id.is_empty() {
+        attributes.push(attr_string("aisix.user_id", &event.user_id));
+    }
+    if !event.team_id.is_empty() {
+        attributes.push(attr_string("aisix.team_id", &event.team_id));
+    }
+    // The request's effective cost-attribution tags, one attribute per tag
+    // key — the same `aisix.tags.<key>` path the Datadog log's nested
+    // `aisix.tags` object facets on.
+    for (key, value) in &event.tags {
+        attributes.push(attr_string(&format!("aisix.tags.{key}"), value));
+    }
     if !event.model_id.is_empty() {
         attributes.push(attr_string("aisix.model_id", &event.model_id));
+    }
+    if !event.requested_model_id.is_empty() {
+        attributes.push(attr_string(
+            "aisix.requested_model_id",
+            &event.requested_model_id,
+        ));
+    }
+    // The tier the upstream served on. `openai.request.service_tier`
+    // beside it is what the request asked for, which can differ.
+    if let Some(tier) = &event.service_tier {
+        attributes.push(attr_string("aisix.service_tier", tier));
     }
     // Duration cost basis (#457): only the duration-billed audio models
     // carry it, so it stays off every other span.
@@ -790,11 +1332,27 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
             event.downstream_latency_ms as i64,
         ));
     }
+    if let Some(overhead) = event.gateway_overhead_ms {
+        attributes.push(attr_int("aisix.gateway_overhead_ms", i64::from(overhead)));
+    }
+    if let Some(tpot) = event.upstream_tpot_ms {
+        attributes.push(attr_double("aisix.upstream_tpot_ms", tpot));
+    }
+    // `http.response.header.<lowercase name>`, a string array like its
+    // request twin: this attempt's upstream response, as the exporter
+    // selected it.
+    for (name, value) in &record.upstream_response_headers {
+        attributes.push(attr_string_array(
+            &format!("http.response.header.{name}"),
+            std::slice::from_ref(value),
+        ));
+    }
     // Per-attempt telemetry (#655). `request_id` is the trace/group key; a
     // failover request emits one span per attempt sharing it, ordered by
     // `aisix.attempt_index`. The OTLP encoder is an explicit allowlist, so
     // these are added here alongside the wire fields.
     attributes.push(attr_int("aisix.attempt_index", event.attempt_index as i64));
+    attributes.push(attr_bool("aisix.is_final_attempt", event.is_final_attempt));
     if !event.attempt_kind.is_empty() {
         attributes.push(attr_string("aisix.attempt_kind", &event.attempt_kind));
     }
@@ -807,19 +1365,34 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
     if !event.error_message.is_empty() {
         attributes.push(attr_string("aisix.error_message", &event.error_message));
     }
-    // Downstream client attribution (#492). Custom attrs so exporters
-    // can slice by source IP / client type; the OTLP encoder is an
-    // explicit allowlist, so new UsageEvent fields must be added here.
-    if !event.client_source_ip.is_empty() {
-        attributes.push(attr_string(
-            "aisix.client_source_ip",
-            &event.client_source_ip,
+    // Gateway-owned semantic embeddings are child work of this request, not
+    // attempts for its client-selected model. OTLP attributes cannot carry a
+    // nested object, so retain the bounded audit trail as a JSON string and
+    // expose the number of calls omitted from that string separately. The
+    // encoder is an allowlist: without this explicit projection OTLP loses
+    // the audit fields that SLS and other sink records retain.
+    let (gateway_calls, export_dropped) =
+        gateway_embedding_calls_attribute(&event.gateway_embedding_calls);
+    if let Some(calls) = gateway_calls {
+        attributes.push(calls);
+    }
+    let gateway_calls_dropped = event
+        .gateway_embedding_calls_dropped
+        .saturating_add(export_dropped);
+    if gateway_calls_dropped > 0 {
+        attributes.push(attr_int(
+            "aisix.gateway_embedding_calls_dropped",
+            i64::from(gateway_calls_dropped),
         ));
     }
-    if !event.client_user_agent.is_empty() {
-        attributes.push(attr_string(
-            "aisix.client_user_agent",
-            &event.client_user_agent,
+    // End-user identity a passthrough route's `identity_header` extracted —
+    // the per-employee attribution of the forward-proxy scenario. Not gated
+    // on the protocol so a future handler that learns to populate it exports
+    // it without touching this sink.
+    if !event.client_identity.is_empty() {
+        attributes.push(attr_string_capped(
+            "aisix.client_identity",
+            &event.client_identity,
         ));
     }
     // JWT identity attribution (#564): who the request ran as
@@ -842,130 +1415,251 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
     // tool call in a trace backend indistinguishable from an LLM request —
     // with the agent, the method and the task it touched recorded nowhere at
     // all (#1215).
-    match event.inbound_protocol.as_str() {
-        "a2a" => {
-            if !event.a2a_agent_name.is_empty() {
-                attributes.push(attr_string("gen_ai.agent.name", &event.a2a_agent_name));
-            }
-            // An A2A context ties a multi-turn exchange's tasks together —
-            // exactly what semconv means by a conversation id.
-            if !event.a2a_context_id.is_empty() {
-                attributes.push(attr_string_capped(
-                    "gen_ai.conversation.id",
-                    &event.a2a_context_id,
-                ));
-            }
-            for (key, value) in [
-                ("aisix.a2a.method", &event.a2a_method),
-                ("aisix.a2a.operation", &event.a2a_operation),
-                ("aisix.a2a.protocol_version", &event.a2a_protocol_version),
-                ("aisix.a2a.task_id", &event.a2a_task_id),
-                ("aisix.a2a.task_state", &event.a2a_task_state),
-            ] {
-                if !value.is_empty() {
-                    attributes.push(attr_string_capped(key, value));
-                }
-            }
-            if event.a2a_stream_event_count > 0 {
-                attributes.push(attr_int(
-                    "aisix.a2a.stream_event_count",
-                    i64::from(event.a2a_stream_event_count),
-                ));
+    if a2a {
+        if !event.a2a_agent_name.is_empty() {
+            attributes.push(attr_string("gen_ai.agent.name", &event.a2a_agent_name));
+        }
+        // An A2A context ties a multi-turn exchange's tasks together —
+        // exactly what semconv means by a conversation id.
+        if !event.a2a_context_id.is_empty() {
+            attributes.push(attr_string_capped(
+                "gen_ai.conversation.id",
+                &event.a2a_context_id,
+            ));
+        }
+        for (key, value) in [
+            ("aisix.a2a.method", &event.a2a_method),
+            ("aisix.a2a.operation", &event.a2a_operation),
+            ("aisix.a2a.protocol_version", &event.a2a_protocol_version),
+            ("aisix.a2a.task_id", &event.a2a_task_id),
+            ("aisix.a2a.task_state", &event.a2a_task_state),
+        ] {
+            if !value.is_empty() {
+                attributes.push(attr_string_capped(key, value));
             }
         }
-        "mcp" => {
-            if !event.mcp_tool_name.is_empty() {
-                attributes.push(attr_string_capped("gen_ai.tool.name", &event.mcp_tool_name));
-            }
-            if !event.mcp_server_name.is_empty() {
-                attributes.push(attr_string("aisix.mcp.server_name", &event.mcp_server_name));
-            }
+        if event.a2a_stream_event_count > 0 {
+            attributes.push(attr_int(
+                "aisix.a2a.stream_event_count",
+                i64::from(event.a2a_stream_event_count),
+            ));
         }
-        _ => {}
+    } else if mcp {
+        if !event.mcp_tool_name.is_empty() {
+            attributes.push(attr_string_capped("gen_ai.tool.name", &event.mcp_tool_name));
+        }
+        if !event.mcp_server_name.is_empty() {
+            attributes.push(attr_string("aisix.mcp.server_name", &event.mcp_server_name));
+        }
+    } else if event.inbound_protocol == "passthrough" && !event.passthrough_route_name.is_empty() {
+        attributes.push(attr_string(
+            "aisix.passthrough.route_name",
+            &event.passthrough_route_name,
+        ));
     }
-    // Opt-in captured content (#519 B.2) — present ONLY on a record built by
-    // [`content_record`] for a `content_mode = full` exporter. Keys match the
-    // Datadog sink's flattened content fields, so one query vocabulary works
-    // across both backends.
     if let Some(content) = &record.content {
-        attributes.push(attr_string("gen_ai.prompt", &content.prompt));
-        attributes.push(attr_string("gen_ai.completion", &content.response));
-        if content.truncated {
-            attributes.push(attr_bool("aisix.content_truncated", true));
+        push_content(&mut attributes, event, content);
+    }
+    attributes
+}
+
+/// The request parameters the inference conventions list, as the caller
+/// sent them.
+fn push_request_params(
+    attributes: &mut Vec<Value>,
+    params: &crate::genai::GenAiRequestParams,
+    upstream: Option<&crate::genai::UpstreamFacts>,
+) {
+    if let Some(v) = params.max_tokens {
+        attributes.push(attr_int("gen_ai.request.max_tokens", v));
+    }
+    for (key, value) in [
+        ("gen_ai.request.temperature", params.temperature),
+        ("gen_ai.request.top_p", params.top_p),
+        ("gen_ai.request.top_k", params.top_k),
+        ("gen_ai.request.frequency_penalty", params.frequency_penalty),
+        ("gen_ai.request.presence_penalty", params.presence_penalty),
+    ] {
+        if let Some(v) = value {
+            attributes.push(attr_double(key, v));
         }
     }
-
-    json!({
-        "traceId": trace_id,
-        "spanId":  span_id,
-        "name":    span_name(event),
-        // SPAN_KIND_CLIENT for all three: the gateway is the client of a
-        // remote LLM, agent or MCP server. The conventions name INTERNAL for
-        // a tool executed in-process, which is not what this span describes.
-        "kind":    3,
-        "startTimeUnixNano": start_unix_nano.to_string(),
-        "endTimeUnixNano":   end_unix_nano.to_string(),
-        "attributes": attributes,
-        "status": { "code": status_code },
-    })
-}
-
-/// The OpenTelemetry GenAI operation this event describes.
-///
-/// The gateway fronts three kinds of upstream, and only one of them is a model
-/// inference. `invoke_agent` and `execute_tool` are the semconv's own
-/// well-known values for the other two, so an A2A or MCP span lands in the
-/// same bucket a trace backend already understands.
-fn operation_name(event: &UsageEvent) -> &'static str {
-    match event.inbound_protocol.as_str() {
-        "a2a" => "invoke_agent",
-        "mcp" => "execute_tool",
-        _ => "chat",
+    if !params.stop_sequences.is_empty() {
+        attributes.push(attr_string_array(
+            "gen_ai.request.stop_sequences",
+            &params.stop_sequences,
+        ));
+    }
+    if let Some(v) = params.seed {
+        attributes.push(attr_int("gen_ai.request.seed", v));
+    }
+    if let Some(v) = params.choice_count {
+        attributes.push(attr_int("gen_ai.request.choice.count", v));
+    }
+    // Set if and only if the request streamed.
+    if params.stream {
+        attributes.push(attr_bool("gen_ai.request.stream", true));
+    }
+    if let Some(v) = params.output_type {
+        attributes.push(attr_string("gen_ai.output.type", v));
+    }
+    if !params.encoding_formats.is_empty() {
+        attributes.push(attr_string_array(
+            "gen_ai.request.encoding_formats",
+            &params.encoding_formats,
+        ));
+    }
+    if let Some(v) = params.embedding_dimensions {
+        attributes.push(attr_int("gen_ai.embeddings.dimension.count", v));
+    }
+    // Provider-specific attributes belong only on that provider's spans.
+    if let Some(tier) = &params.openai_service_tier {
+        if upstream.is_some_and(|u| u.provider_name == "openai") {
+            attributes.push(attr_string("openai.request.service_tier", tier));
+        }
     }
 }
 
-/// Longest target this will append to a span name.
-///
-/// An A2A agent name is a registered resource, but an MCP tool name is the
-/// caller's own `tools/call` `params.name` and is recorded before the tool is
-/// known to exist — including on the quota-rejection path, which emits without
-/// ever contacting an upstream. A trace backend indexes span names and most
-/// derive RED metrics from them, so the one field a caller picks freely is
-/// bounded before it gets there.
-const MAX_SPAN_NAME_TARGET: usize = 64;
+/// The usage counters, under the conventions' accounting: input includes
+/// every cached token and output includes reasoning, whatever shape the
+/// upstream reported them in. The cache and reasoning breakdowns appear only
+/// when the upstream reported them. An embeddings span has no output.
+fn push_usage(attributes: &mut Vec<Value>, event: &UsageEvent, operation: Option<&str>) {
+    attributes.push(attr_int(
+        "gen_ai.usage.input_tokens",
+        i64::from(event.genai_input_tokens()),
+    ));
+    let cache_read = event.genai_cache_read_input_tokens();
+    if cache_read > 0 {
+        attributes.push(attr_int(
+            "gen_ai.usage.cache_read.input_tokens",
+            i64::from(cache_read),
+        ));
+    }
+    if let Some(creation) = event.genai_cache_creation_input_tokens() {
+        attributes.push(attr_int(
+            "gen_ai.usage.cache_creation.input_tokens",
+            i64::from(creation),
+        ));
+    }
+    // The conventions define no per-lifetime split of cache writes.
+    for (key, value) in [
+        (
+            "aisix.cache_creation_5m_tokens",
+            event.cache_creation_ttl.cache_creation_5m_tokens,
+        ),
+        (
+            "aisix.cache_creation_1h_tokens",
+            event.cache_creation_ttl.cache_creation_1h_tokens,
+        ),
+    ] {
+        if let Some(v) = value {
+            attributes.push(attr_int(key, i64::from(v)));
+        }
+    }
+    // Modality breakdowns, as the upstream reported them (each a subset of
+    // its side's total). Named after the GenAI conventions' development
+    // registry, which defines them beyond the v1.41 release.
+    for (key, value) in [
+        (
+            "gen_ai.usage.audio.input_tokens",
+            event.modality_tokens.prompt_audio_tokens,
+        ),
+        (
+            "gen_ai.usage.image.input_tokens",
+            event.modality_tokens.prompt_image_tokens,
+        ),
+    ] {
+        if let Some(v) = value {
+            attributes.push(attr_int(key, i64::from(v)));
+        }
+    }
+    if operation == Some("embeddings") {
+        return;
+    }
+    attributes.push(attr_int(
+        "gen_ai.usage.output_tokens",
+        i64::from(event.genai_output_tokens()),
+    ));
+    if event.reasoning_tokens > 0 {
+        attributes.push(attr_int(
+            "gen_ai.usage.reasoning.output_tokens",
+            i64::from(event.reasoning_tokens),
+        ));
+    }
+    for (key, value) in [
+        (
+            "gen_ai.usage.audio.output_tokens",
+            event.modality_tokens.completion_audio_tokens,
+        ),
+        (
+            "gen_ai.usage.image.output_tokens",
+            event.modality_tokens.completion_image_tokens,
+        ),
+    ] {
+        if let Some(v) = value {
+            attributes.push(attr_int(key, i64::from(v)));
+        }
+    }
+}
 
-/// The span's name: `{operation} {target}` where the target is low-cardinality
-/// and known, per the semconv's naming rule for agent and tool spans. LLM
-/// traffic keeps the name it has always had.
+/// Captured content (`content_mode = full`).
 ///
-/// A target that is absent or outside [`MAX_SPAN_NAME_TARGET`] leaves the bare
-/// operation, which the conventions name as the fallback for exactly this
-/// case. The raw value is still on the span as an attribute either way.
-fn span_name(event: &UsageEvent) -> String {
-    let operation = operation_name(event);
-    let target = match event.inbound_protocol.as_str() {
-        "a2a" => &event.a2a_agent_name,
-        "mcp" => &event.mcp_tool_name,
-        _ => return "chat.completions".to_string(),
-    };
-    if target.is_empty() || target.len() > MAX_SPAN_NAME_TARGET {
-        operation.to_string()
-    } else {
-        format!("{operation} {target}")
+/// A message-shaped payload whose capture is complete becomes the
+/// conventions' structured attributes, each held to the exporter's
+/// per-field cap. Everything else — a non-message payload (embedding input,
+/// images, audio, jobs, agent text), content the capture cap cut, or content
+/// that does not convert — stays under `aisix.content.prompt` /
+/// `aisix.content.response`, with `aisix.content_truncated` when cut, so a
+/// `gen_ai.*` content attribute is never malformed or partial.
+fn push_content(attributes: &mut Vec<Value>, event: &UsageEvent, content: &SinkContent) {
+    let enc = content.encode(event);
+    for (key, value) in [
+        ("gen_ai.tool.call.arguments", enc.tool_call_arguments),
+        ("gen_ai.tool.call.result", enc.tool_call_result),
+        (
+            "gen_ai.input.messages",
+            enc.structured.input_messages.as_deref(),
+        ),
+        (
+            "gen_ai.system_instructions",
+            enc.structured.system_instructions.as_deref(),
+        ),
+        (
+            "gen_ai.tool.definitions",
+            enc.structured.tool_definitions.as_deref(),
+        ),
+        (
+            "gen_ai.output.messages",
+            enc.structured.output_messages.as_deref(),
+        ),
+        ("aisix.content.prompt", enc.raw_prompt),
+        ("aisix.content.response", enc.raw_response),
+    ] {
+        if let Some(value) = value {
+            attributes.push(attr_string(key, value));
+        }
+    }
+    if content.truncated {
+        attributes.push(attr_bool("aisix.content_truncated", true));
     }
 }
 
 /// Wrap one or more spans into an OTLP/HTTP-JSON `ExportTraceServiceRequest`.
-fn otlp_export_request(spans: Vec<Value>) -> Value {
+/// `service.name` is the gateway's configured `observability.service_name`;
+/// the service and instrumentation-scope versions are the build's.
+fn otlp_export_request(spans: Vec<Value>, service_name: &str) -> Value {
+    let version = &*aisix_core::BUILD_VERSION;
     json!({
         "resourceSpans": [{
             "resource": {
                 "attributes": [
-                    attr_string("service.name", "aisix-dp"),
+                    attr_string("service.name", service_name),
+                    attr_string("service.version", version),
                 ],
             },
             "scopeSpans": [{
-                "scope": { "name": "aisix-obs.otlp_http_sink" },
+                "scope": { "name": "aisix-obs.otlp_http_sink", "version": version },
                 "spans": spans,
             }],
         }],
@@ -979,7 +1673,10 @@ fn otlp_export_request(spans: Vec<Value>) -> Value {
 #[cfg(test)]
 fn build_otlp_traces_payload(event: &UsageEvent, exporter_name: &str) -> Value {
     let record = SinkRecord::metadata_only(event.clone());
-    otlp_export_request(vec![build_otlp_span(&record, exporter_name)])
+    otlp_export_request(
+        vec![build_otlp_span(&record, exporter_name)],
+        DEFAULT_SERVICE_NAME,
+    )
 }
 
 fn attr_string(key: &str, value: &str) -> Value {
@@ -998,14 +1695,118 @@ fn attr_string(key: &str, value: &str) -> Value {
 /// value is a delivery problem as much as a storage one.
 const MAX_PROTOCOL_ATTR_BYTES: usize = 256;
 
-/// [`attr_string`] for a value a caller controls, cut to
-/// [`MAX_PROTOCOL_ATTR_BYTES`] on a UTF-8 boundary.
-fn attr_string_capped(key: &str, value: &str) -> Value {
-    let mut end = MAX_PROTOCOL_ATTR_BYTES.min(value.len());
+/// Bound the serialized child-work audit on an OTLP span. The source ledger
+/// retains at most 64 calls, but exporter input is public enough that the
+/// encoder also protects itself from a synthetic or malformed `UsageEvent`.
+///
+/// The value is JSON rather than a semconv array because these child calls
+/// have several scalar fields and OTLP attributes have one homogeneous value.
+const MAX_GATEWAY_EMBEDDING_CALLS_ATTR_BYTES: usize = 32 * 1024;
+const MAX_GATEWAY_EMBEDDING_CALLS_ATTR_ITEMS: usize = 64;
+const MAX_GATEWAY_EMBEDDING_MODEL_ID_ATTR_BYTES: usize = 128;
+
+#[derive(serde::Serialize)]
+struct OtlpGatewayEmbeddingCall<'a> {
+    count: u32,
+    purpose: crate::usage::GatewayEmbeddingPurpose,
+    embedding_model_id: &'a str,
+    prompt_tokens: u32,
+    total_tokens: u32,
+    usage_source: crate::usage::GatewayEmbeddingUsageSource,
+    latency_ms: u32,
+    outcome: crate::usage::GatewayEmbeddingOutcome,
+}
+
+/// Encode the retained ordered prefix as valid JSON inside one bounded OTLP
+/// string attribute. `dropped` includes both calls the request ledger omitted
+/// and calls this exporter cannot fit, so a trace never silently looks
+/// complete after either cap applies.
+fn gateway_embedding_calls_attribute(calls: &[GatewayEmbeddingCall]) -> (Option<Value>, u32) {
+    let mut encoded = String::from("[");
+    let mut retained = 0usize;
+    let mut dropped = 0u32;
+
+    for (index, call) in calls.iter().enumerate() {
+        if index == MAX_GATEWAY_EMBEDDING_CALLS_ATTR_ITEMS {
+            dropped = dropped.saturating_add(usize_to_u32(calls.len().saturating_sub(index)));
+            break;
+        }
+        let item = serde_json::to_string(&OtlpGatewayEmbeddingCall {
+            count: call.count,
+            purpose: call.purpose,
+            embedding_model_id: gateway_embedding_model_id(&call.embedding_model_id),
+            prompt_tokens: call.prompt_tokens,
+            total_tokens: call.total_tokens,
+            usage_source: call.usage_source,
+            latency_ms: call.latency_ms,
+            outcome: call.outcome,
+        })
+        // Serializing these scalar fields into an owned String cannot fail.
+        .expect("gateway embedding audit is JSON-serializable");
+        let separator = usize::from(retained > 0);
+        if encoded
+            .len()
+            .saturating_add(separator)
+            .saturating_add(item.len())
+            .saturating_add(1)
+            > MAX_GATEWAY_EMBEDDING_CALLS_ATTR_BYTES
+        {
+            // Preserve an ordered prefix, like the request ledger does, and
+            // make every omitted suffix visible through the count attribute.
+            dropped = dropped.saturating_add(usize_to_u32(calls.len().saturating_sub(index)));
+            break;
+        }
+        if retained > 0 {
+            encoded.push(',');
+        }
+        encoded.push_str(&item);
+        retained += 1;
+    }
+    if retained == 0 {
+        return (None, dropped);
+    }
+    encoded.push(']');
+    debug_assert!(encoded.len() <= MAX_GATEWAY_EMBEDDING_CALLS_ATTR_BYTES);
+    (
+        Some(attr_string("aisix.gateway_embedding_calls", &encoded)),
+        dropped,
+    )
+}
+
+fn usize_to_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+/// Return an OTLP-safe embedding resource ID, or `unknown`.
+///
+/// Gateway embedding audit records can originate outside the proxy, so the
+/// exporter treats this as its own final boundary. Reject rather than truncate
+/// an unsafe value: keeping a prefix could still export its contents.
+fn gateway_embedding_model_id(value: &str) -> &str {
+    if !value.is_empty()
+        && value.len() <= MAX_GATEWAY_EMBEDDING_MODEL_ID_ATTR_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        value
+    } else {
+        "unknown"
+    }
+}
+
+fn capped_utf8(value: &str, max_bytes: usize) -> &str {
+    let mut end = max_bytes.min(value.len());
     while end > 0 && !value.is_char_boundary(end) {
         end -= 1;
     }
-    attr_string(key, &value[..end])
+    &value[..end]
+}
+
+/// [`attr_string`] for a value a caller controls, cut to
+/// [`MAX_PROTOCOL_ATTR_BYTES`] on a UTF-8 boundary.
+fn attr_string_capped(key: &str, value: &str) -> Value {
+    attr_string(key, capped_utf8(value, MAX_PROTOCOL_ATTR_BYTES))
 }
 
 fn attr_int(key: &str, value: i64) -> Value {
@@ -1167,6 +1968,7 @@ mod tests {
             provider_model_version: "gpt-4o-2024-08-06".into(),
             finish_reason: "stop".into(),
             cost_usd: 0.001,
+            operation: "image_generation".into(),
             ..Default::default()
         }
     }
@@ -1195,6 +1997,521 @@ mod tests {
             content_mode,
             content_max_bytes: max_bytes,
         })
+    }
+
+    /// A three-attempt failover bundle with a remote parent, for the
+    /// hierarchy-encoding assertions (AISIX-Cloud#1279).
+    fn hierarchy_record() -> SinkRecord {
+        let (trace_id, parent_span_id, flags) = crate::trace::parse_traceparent(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        )
+        .unwrap();
+        let bundle =
+            crate::trace::RequestTraceBundle::new(Some(crate::trace::RemoteTraceContext {
+                trace_id,
+                parent_span_id,
+                flags,
+                tracestate: Some("vendor=x".into()),
+            }));
+        bundle.start_attempt(0);
+        bundle.end_attempt(0);
+        bundle.start_attempt(1);
+        bundle.end_attempt(1);
+        let mut event = sample_event();
+        event.attempt_index = 1;
+        SinkRecord::metadata_only(event).with_trace(Some(bundle.emission(true, 1, 250, true)))
+    }
+
+    /// The hierarchy contract (AISIX-Cloud#1279): a terminal record with a
+    /// remote parent encodes SERVER (kind 2, parented to the inbound
+    /// traceparent, carrying traceState) → logical CLIENT → attempt
+    /// CLIENT, all under the caller's trace id, with the event's full
+    /// attribute set on the attempt span only.
+    #[test]
+    fn hierarchy_record_encodes_server_logical_attempt_spans() {
+        let record = hierarchy_record();
+        let spans = build_otlp_spans(&record, "exp-1");
+        assert_eq!(spans.len(), 3);
+
+        for span in &spans {
+            assert_eq!(span["traceId"], "4bf92f3577b34da6a3ce929d0e0e4736");
+        }
+        let server = &spans[0];
+        let logical = &spans[1];
+        let attempt = &spans[2];
+        assert_eq!(server["kind"], 2);
+        assert_eq!(server["parentSpanId"], "00f067aa0ba902b7");
+        assert_eq!(server["traceState"], "vendor=x");
+        // SAMPLED | HAS_IS_REMOTE | IS_REMOTE.
+        assert_eq!(server["flags"], 0x301);
+
+        assert_eq!(logical["kind"], 3);
+        assert_eq!(logical["parentSpanId"], server["spanId"]);
+        assert_eq!(logical["flags"], 0x101);
+        assert!(logical.get("traceState").is_none());
+
+        assert_eq!(attempt["kind"], 3);
+        assert_eq!(attempt["parentSpanId"], logical["spanId"]);
+
+        // The event's full attribute set rides the attempt span; the
+        // structural spans carry only the joining keys.
+        let keys = |span: &Value| -> Vec<String> {
+            span["attributes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["key"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert!(keys(attempt).contains(&"gen_ai.response.id".to_string()));
+        assert!(!keys(server).contains(&"gen_ai.response.id".to_string()));
+        assert!(keys(server).contains(&"aisix.request_id".to_string()));
+        // The request's kind is one of the joining keys, on every level:
+        // a trace backend filters a whole trace by it at the SERVER root,
+        // which reading it off the attempt span alone would not allow
+        // (AISIX-Cloud#1461).
+        let operation_of = |span: &Value| -> String {
+            span["attributes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["key"] == "aisix.operation")
+                .expect("aisix.operation must be present")["value"]["stringValue"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        for span in [server, logical, attempt] {
+            assert_eq!(operation_of(span), "image_generation");
+        }
+
+        // Timestamps bracket: server ⊇ logical ⊇ attempt.
+        let nanos =
+            |span: &Value, key: &str| -> u128 { span[key].as_str().unwrap().parse().unwrap() };
+        assert!(nanos(server, "startTimeUnixNano") <= nanos(logical, "startTimeUnixNano"));
+        assert!(nanos(logical, "endTimeUnixNano") <= nanos(server, "endTimeUnixNano"));
+        assert!(nanos(logical, "startTimeUnixNano") <= nanos(attempt, "startTimeUnixNano"));
+        assert!(nanos(attempt, "endTimeUnixNano") <= nanos(logical, "endTimeUnixNano"));
+    }
+
+    fn attr<'a>(span: &'a Value, key: &str) -> Option<&'a Value> {
+        span["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["key"] == key)
+            .map(|a| &a["value"])
+    }
+
+    fn hierarchy_with(event: UsageEvent, facts: crate::genai::SpanFacts) -> Vec<Value> {
+        let bundle = crate::trace::RequestTraceBundle::new(None);
+        bundle.start_attempt(0);
+        bundle.end_attempt(0);
+        let record = SinkRecord::metadata_only(event)
+            .with_trace(Some(bundle.emission(true, 0, 10, true)))
+            .with_facts(Some(Arc::new(facts)));
+        build_otlp_spans(&record, "exp-1")
+    }
+
+    fn chat_facts() -> crate::genai::SpanFacts {
+        crate::genai::SpanFacts {
+            http: Some(Arc::new(crate::genai::HttpServerFacts::new(
+                "POST",
+                "/v1/chat/completions",
+                Some("/v1/chat/completions"),
+                Some("https"),
+            ))),
+            request: None,
+            upstream: Some(crate::genai::UpstreamFacts {
+                provider_name: "anthropic".into(),
+                request_model: "claude-sonnet-4-5".into(),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// SERVER follows the HTTP server conventions, the GenAI attributes ride
+    /// the attempt alone, and a logical span grouping attempts carries none
+    /// of them — a backend that maps `gen_ai.operation.name` / a model
+    /// attribute to a model call would otherwise count it twice.
+    #[test]
+    fn only_the_carrier_span_reads_as_a_genai_operation() {
+        let mut event = sample_event();
+        event.operation = "chat".into();
+        event.client_source_ip = "203.0.113.7".into();
+        let spans = hierarchy_with(event, chat_facts());
+        let (server, logical, attempt) = (&spans[0], &spans[1], &spans[2]);
+
+        assert_eq!(server["name"], "POST /v1/chat/completions");
+        assert_eq!(
+            attr(server, "http.request.method").unwrap()["stringValue"],
+            "POST"
+        );
+        assert_eq!(
+            attr(server, "url.path").unwrap()["stringValue"],
+            "/v1/chat/completions"
+        );
+        assert_eq!(attr(server, "url.scheme").unwrap()["stringValue"], "https");
+        assert_eq!(
+            attr(server, "http.route").unwrap()["stringValue"],
+            "/v1/chat/completions"
+        );
+        assert_eq!(
+            attr(server, "client.address").unwrap()["stringValue"],
+            "203.0.113.7"
+        );
+        assert!(attr(attempt, "client.address").is_none());
+
+        assert_eq!(attempt["name"], "chat claude-sonnet-4-5");
+        assert_eq!(logical["name"], "chat claude-sonnet-4-5");
+        for key in [
+            "gen_ai.operation.name",
+            "gen_ai.request.model",
+            "gen_ai.provider.name",
+        ] {
+            assert!(attr(attempt, key).is_some(), "{key} on the attempt");
+            assert!(attr(logical, key).is_none(), "{key} on the logical span");
+            assert!(attr(server, key).is_none(), "{key} on the SERVER span");
+        }
+        for span in &spans {
+            assert!(span.get("status").is_none(), "success leaves status unset");
+        }
+    }
+
+    /// A 4xx is the CLIENT spans' error but not the SERVER span's; a 5xx is
+    /// both; a caller's own hang-up (499) is neither.
+    #[test]
+    fn error_status_follows_the_span_kind() {
+        let status_of = |status: u16, class: &str| {
+            let mut event = sample_event();
+            event.operation = "chat".into();
+            event.status_code = status;
+            event.error_class = class.into();
+            hierarchy_with(event, chat_facts())
+        };
+        let spans = status_of(429, "rate_limit_exceeded");
+        assert!(spans[0].get("status").is_none());
+        assert!(attr(&spans[0], "error.type").is_none());
+        for client in &spans[1..] {
+            assert_eq!(client["status"]["code"], STATUS_ERROR);
+            assert_eq!(
+                attr(client, "error.type").unwrap()["stringValue"],
+                "rate_limit_exceeded"
+            );
+        }
+        let spans = status_of(502, "");
+        for span in &spans {
+            assert_eq!(span["status"]["code"], STATUS_ERROR);
+            assert_eq!(attr(span, "error.type").unwrap()["stringValue"], "502");
+        }
+        let spans = status_of(499, "client_disconnected");
+        for span in &spans {
+            assert!(span.get("status").is_none());
+            assert!(attr(span, "error.type").is_none());
+        }
+    }
+
+    /// `gen_ai.usage.input_tokens` includes every cached token whichever
+    /// shape the upstream reported it in, with the cache breakdown beside it.
+    #[test]
+    fn usage_follows_the_conventions_accounting() {
+        let usage = |event: UsageEvent| build_otlp_span(&SinkRecord::metadata_only(event), "x");
+        let anthropic = usage(UsageEvent {
+            prompt_tokens: 10,
+            cache_read_tokens: 300,
+            cache_creation_tokens: 40,
+            cache_creation_ttl: aisix_gateway::CacheCreationTtl {
+                cache_creation_5m_tokens: Some(0),
+                cache_creation_1h_tokens: Some(40),
+            },
+            completion_tokens: 5,
+            ..sample_event()
+        });
+        assert_eq!(
+            attr(&anthropic, "aisix.cache_creation_5m_tokens").unwrap()["intValue"],
+            "0"
+        );
+        assert_eq!(
+            attr(&anthropic, "aisix.cache_creation_1h_tokens").unwrap()["intValue"],
+            "40"
+        );
+        assert_eq!(
+            attr(&anthropic, "gen_ai.usage.input_tokens").unwrap()["intValue"],
+            "350"
+        );
+        assert_eq!(
+            attr(&anthropic, "gen_ai.usage.cache_read.input_tokens").unwrap()["intValue"],
+            "300"
+        );
+        assert_eq!(
+            attr(&anthropic, "gen_ai.usage.cache_creation.input_tokens").unwrap()["intValue"],
+            "40"
+        );
+
+        let openai = usage(UsageEvent {
+            prompt_tokens: 120,
+            cached_prompt_tokens: 100,
+            cache_write_tokens: Some(20),
+            completion_tokens: 30,
+            reasoning_tokens: 12,
+            ..sample_event()
+        });
+        assert_eq!(
+            attr(&openai, "gen_ai.usage.input_tokens").unwrap()["intValue"],
+            "120"
+        );
+        assert_eq!(
+            attr(&openai, "gen_ai.usage.cache_read.input_tokens").unwrap()["intValue"],
+            "100"
+        );
+        assert_eq!(
+            attr(&openai, "gen_ai.usage.cache_creation.input_tokens").unwrap()["intValue"],
+            "20"
+        );
+        assert_eq!(
+            attr(&openai, "gen_ai.usage.reasoning.output_tokens").unwrap()["intValue"],
+            "12"
+        );
+
+        let plain = usage(sample_event());
+        assert!(attr(&plain, "gen_ai.usage.cache_read.input_tokens").is_none());
+        assert!(attr(&plain, "gen_ai.usage.cache_creation.input_tokens").is_none());
+        assert!(attr(&plain, "aisix.cache_creation_5m_tokens").is_none());
+        assert!(attr(&plain, "aisix.cache_creation_1h_tokens").is_none());
+    }
+
+    /// A complete chat capture becomes the conventions' structured content;
+    /// a cut one stays raw under `aisix.content.*`.
+    #[test]
+    fn chat_content_is_structured_unless_the_capture_was_cut() {
+        let mut event = sample_event();
+        event.operation = "chat".into();
+        let prompt =
+            json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}).to_string();
+        let record = |cap: u32| {
+            content_record(
+                &otlp_kind(SlsContentMode::Full, cap),
+                &event,
+                Some(&CapturedContent {
+                    prompt: prompt.clone(),
+                    response: "hello there".into(),
+                    truncated: false,
+                    prompt_truncated: false,
+                    response_truncated: false,
+                    output: None,
+                }),
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let span = build_otlp_span(&record(4096), "x");
+        assert_eq!(
+            attr(&span, "gen_ai.input.messages").unwrap()["stringValue"],
+            r#"[{"parts":[{"content":"hi","type":"text"}],"role":"user"}]"#
+        );
+        assert_eq!(
+            attr(&span, "gen_ai.output.messages").unwrap()["stringValue"],
+            r#"[{"finish_reason":"stop","parts":[{"content":"hello there","type":"text"}],"role":"assistant"}]"#
+        );
+        assert!(attr(&span, "aisix.content.prompt").is_none());
+
+        // Only the answer cut: the prompt is still reported structured.
+        let long_answer = content_record(
+            &otlp_kind(SlsContentMode::Full, 2 * prompt.len() as u32),
+            &event,
+            Some(&CapturedContent::new(
+                &prompt,
+                &"x".repeat(4 * prompt.len()),
+                8192,
+            )),
+            None,
+            None,
+        )
+        .unwrap();
+        let half = build_otlp_span(&long_answer, "x");
+        assert!(attr(&half, "gen_ai.input.messages").is_some());
+        assert!(attr(&half, "gen_ai.output.messages").is_none());
+        assert!(attr(&half, "aisix.content.response").is_some());
+        assert!(attr(&half, "aisix.content.prompt").is_none());
+
+        let cut = build_otlp_span(&record(8), "x");
+        assert!(attr(&cut, "gen_ai.input.messages").is_none());
+        assert!(attr(&cut, "gen_ai.output.messages").is_none());
+        assert!(attr(&cut, "aisix.content.prompt").is_some());
+        assert_eq!(
+            attr(&cut, "aisix.content_truncated").unwrap()["boolValue"],
+            true
+        );
+    }
+
+    /// Captured parts become the output message in order — reasoning, text,
+    /// tool call with parsed arguments.
+    #[test]
+    fn structured_output_parts_become_the_output_message() {
+        let mut event = sample_event();
+        event.operation = "chat".into();
+        let prompt =
+            json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}).to_string();
+        let body = json!({"choices": [{"index": 0, "message": {
+            "role": "assistant",
+            "reasoning_content": "think",
+            "content": "hello",
+            "tool_calls": [{"id": "c1", "type": "function",
+                "function": {"name": "f", "arguments": "{\"a\":1}"}}],
+        }}]});
+        let content = |cap: usize| {
+            CapturedContent::new(&prompt, "hello", 4096).with_output(Some(
+                crate::output::OutputCollector::from_body(
+                    crate::output::OutputWire::OpenAiChat,
+                    cap,
+                    &body,
+                ),
+            ))
+        };
+        let span = |captured: CapturedContent| {
+            let record = content_record(
+                &otlp_kind(SlsContentMode::Full, 4096),
+                &event,
+                Some(&captured),
+                None,
+                None,
+            )
+            .unwrap();
+            build_otlp_span(&record, "x")
+        };
+        let whole = span(content(4096));
+        let output: Value = serde_json::from_str(
+            attr(&whole, "gen_ai.output.messages").unwrap()["stringValue"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            output[0]["parts"],
+            json!([
+                {"type": "reasoning", "content": "think"},
+                {"type": "text", "content": "hello"},
+                {"type": "tool_call", "id": "c1", "name": "f", "arguments": {"a": 1}},
+            ])
+        );
+        assert_eq!(output[0]["finish_reason"], "stop");
+        assert!(attr(&whole, "aisix.content.response").is_none());
+
+        // Parts the cap cut are not reported partially: the flat text
+        // stands in, exactly as before parts were captured.
+        let cut = span(content(6));
+        assert_eq!(
+            attr(&cut, "gen_ai.output.messages").unwrap()["stringValue"],
+            r#"[{"finish_reason":"stop","parts":[{"content":"hello","type":"text"}],"role":"assistant"}]"#
+        );
+    }
+
+    /// The per-request latency breakdown, the key's name, team and tags,
+    /// TPOT and the modality counts each ride the operation span; absent
+    /// ones stay off.
+    #[test]
+    fn span_carries_key_identity_tags_overhead_tpot_and_modality_counts() {
+        let mut ev = sample_event();
+        ev.api_key_name = "team-a-key".into();
+        ev.team_id = "team-1".into();
+        ev.tags = [
+            ("department".to_string(), "rnd".to_string()),
+            ("bg".to_string(), "cloud".to_string()),
+        ]
+        .into();
+        ev.gateway_overhead_ms = Some(7);
+        ev.upstream_tpot_ms = Some(12.5);
+        ev.modality_tokens = aisix_gateway::ModalityTokens {
+            prompt_audio_tokens: Some(30),
+            prompt_image_tokens: Some(0),
+            completion_audio_tokens: Some(40),
+            completion_image_tokens: None,
+        };
+        let body = build_otlp_traces_payload(&ev, "x");
+        let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(
+            attr(span, "aisix.api_key_name").unwrap()["stringValue"],
+            "team-a-key"
+        );
+        assert_eq!(
+            attr(span, "aisix.team_id").unwrap()["stringValue"],
+            "team-1"
+        );
+        assert_eq!(
+            attr(span, "aisix.tags.department").unwrap()["stringValue"],
+            "rnd"
+        );
+        assert_eq!(attr(span, "aisix.tags.bg").unwrap()["stringValue"], "cloud");
+        assert_eq!(
+            attr(span, "aisix.gateway_overhead_ms").unwrap()["intValue"],
+            "7"
+        );
+        assert_eq!(
+            attr(span, "aisix.upstream_tpot_ms").unwrap()["doubleValue"],
+            12.5
+        );
+        assert_eq!(
+            attr(span, "gen_ai.usage.audio.input_tokens").unwrap()["intValue"],
+            "30"
+        );
+        assert_eq!(
+            attr(span, "gen_ai.usage.image.input_tokens").unwrap()["intValue"],
+            "0"
+        );
+        assert_eq!(
+            attr(span, "gen_ai.usage.audio.output_tokens").unwrap()["intValue"],
+            "40"
+        );
+        assert!(attr(span, "gen_ai.usage.image.output_tokens").is_none());
+
+        let bare = build_otlp_traces_payload(&sample_event(), "x").to_string();
+        for key in [
+            "aisix.api_key_name",
+            "aisix.team_id",
+            "aisix.tags.",
+            "aisix.gateway_overhead_ms",
+            "aisix.upstream_tpot_ms",
+            "gen_ai.usage.audio.",
+            "gen_ai.usage.image.",
+        ] {
+            assert!(!bare.contains(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn export_resource_names_the_service_and_build() {
+        let body = otlp_export_request(vec![], "edge-gw");
+        let resource = &body["resourceSpans"][0]["resource"]["attributes"];
+        assert_eq!(resource[0]["key"], "service.name");
+        assert_eq!(resource[0]["value"]["stringValue"], "edge-gw");
+        assert_eq!(resource[1]["key"], "service.version");
+        assert_eq!(
+            body["resourceSpans"][0]["scopeSpans"][0]["scope"]["version"],
+            aisix_core::BUILD_VERSION.as_str()
+        );
+    }
+
+    /// The regenerate-per-retry defect this PR removes: encoding the same
+    /// record twice — what the delivery retry loop does — must produce
+    /// byte-identical ids and timestamps.
+    #[test]
+    fn re_encoding_a_trace_record_is_byte_identical() {
+        let record = hierarchy_record();
+        let a = build_otlp_spans(&record, "exp-1");
+        let b = build_otlp_spans(&record, "exp-1");
+        assert_eq!(a, b);
+    }
+
+    /// A record without a trace snapshot (a synthetic event, or a caller
+    /// predating the bundle) keeps the legacy single-span shape.
+    #[test]
+    fn traceless_record_falls_back_to_the_legacy_single_span() {
+        let record = SinkRecord::metadata_only(sample_event());
+        let spans = build_otlp_spans(&record, "exp-1");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0]["kind"], 3);
+        assert!(spans[0].get("parentSpanId").is_none());
     }
 
     fn otlp_kind(content_mode: SlsContentMode, max_bytes: u32) -> ExporterKind {
@@ -1266,12 +2583,15 @@ mod tests {
             prompt: "the prompt".into(),
             response: "the response".into(),
             truncated: false,
+            prompt_truncated: false,
+            response_truncated: false,
+            output: None,
         };
 
         // otlp on its default (metadata_only) never carries content, even
         // when content was captured.
         let otlp = otlp_kind(SlsContentMode::MetadataOnly, 1024);
-        assert!(content_record(&otlp, &event, Some(&captured)).is_none());
+        assert!(content_record(&otlp, &event, Some(&captured), None, None).is_none());
 
         // object_store never carries content either — content_record gates on
         // the AliyunSls variant, so any other kind gets metadata-only even when
@@ -1287,19 +2607,19 @@ mod tests {
         }))
         .unwrap()
         .kind;
-        assert!(content_record(&objstore, &event, Some(&captured)).is_none());
+        assert!(content_record(&objstore, &event, Some(&captured), None, None).is_none());
 
         // sls metadata_only → no content.
         let meta = sls_kind(SlsContentMode::MetadataOnly, 1024);
-        assert!(content_record(&meta, &event, Some(&captured)).is_none());
+        assert!(content_record(&meta, &event, Some(&captured), None, None).is_none());
 
         // sls full but nothing captured → falls back to metadata.
         let full = sls_kind(SlsContentMode::Full, 1024);
-        assert!(content_record(&full, &event, None).is_none());
+        assert!(content_record(&full, &event, None, None, None).is_none());
 
         // sls full + captured content → a content-bearing record that still
         // carries the metadata.
-        let rec = content_record(&full, &event, Some(&captured))
+        let rec = content_record(&full, &event, Some(&captured), None, None)
             .expect("full-capture sls with content yields a content record");
         let c = rec.content.as_ref().expect("content attached");
         assert_eq!(c.prompt, "the prompt");
@@ -1312,8 +2632,18 @@ mod tests {
             prompt: "a".repeat(500),
             response: "ok".into(),
             truncated: false,
+            prompt_truncated: false,
+            response_truncated: false,
+            output: None,
         };
-        let rec = content_record(&sls_kind(SlsContentMode::Full, 16), &event, Some(&big)).unwrap();
+        let rec = content_record(
+            &sls_kind(SlsContentMode::Full, 16),
+            &event,
+            Some(&big),
+            None,
+            None,
+        )
+        .unwrap();
         let c = rec.content.as_ref().unwrap();
         assert_eq!(c.prompt.len(), 16);
         assert!(c.truncated, "oversize content must flag truncated");
@@ -1324,8 +2654,11 @@ mod tests {
             prompt: "short".into(),
             response: "short".into(),
             truncated: true,
+            prompt_truncated: true,
+            response_truncated: false,
+            output: None,
         };
-        let rec = content_record(&full, &event, Some(&pre)).unwrap();
+        let rec = content_record(&full, &event, Some(&pre), None, None).unwrap();
         assert!(
             rec.content.as_ref().unwrap().truncated,
             "source truncation must propagate"
@@ -1335,31 +2668,44 @@ mod tests {
         // full + captured content → a content-bearing record (same shared
         // `SlsContentMode` plumbing).
         let dd_meta = datadog_kind(SlsContentMode::MetadataOnly, 1024);
-        assert!(content_record(&dd_meta, &event, Some(&captured)).is_none());
+        assert!(content_record(&dd_meta, &event, Some(&captured), None, None).is_none());
         let dd_full = datadog_kind(SlsContentMode::Full, 1024);
-        assert!(content_record(&dd_full, &event, None).is_none());
-        let rec = content_record(&dd_full, &event, Some(&captured))
+        assert!(content_record(&dd_full, &event, None, None, None).is_none());
+        let rec = content_record(&dd_full, &event, Some(&captured), None, None)
             .expect("full-capture datadog with content yields a content record");
         let c = rec.content.as_ref().expect("content attached");
         assert_eq!(c.prompt, "the prompt");
         assert_eq!(c.response, "the response");
         // Per-exporter cap truncates a datadog record too.
-        let rec =
-            content_record(&datadog_kind(SlsContentMode::Full, 16), &event, Some(&big)).unwrap();
+        let rec = content_record(
+            &datadog_kind(SlsContentMode::Full, 16),
+            &event,
+            Some(&big),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(rec.content.as_ref().unwrap().prompt.len(), 16);
         assert!(rec.content.as_ref().unwrap().truncated);
 
         // otlp_http behaves identically (#519 B.2): full + captured content →
         // a content-bearing record; full with nothing captured → metadata.
         let otlp_full = otlp_kind(SlsContentMode::Full, 1024);
-        assert!(content_record(&otlp_full, &event, None).is_none());
-        let rec = content_record(&otlp_full, &event, Some(&captured))
+        assert!(content_record(&otlp_full, &event, None, None, None).is_none());
+        let rec = content_record(&otlp_full, &event, Some(&captured), None, None)
             .expect("full-capture otlp with content yields a content record");
         let c = rec.content.as_ref().expect("content attached");
         assert_eq!(c.prompt, "the prompt");
         assert_eq!(c.response, "the response");
         // Per-exporter cap truncates an otlp record too.
-        let rec = content_record(&otlp_kind(SlsContentMode::Full, 16), &event, Some(&big)).unwrap();
+        let rec = content_record(
+            &otlp_kind(SlsContentMode::Full, 16),
+            &event,
+            Some(&big),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(rec.content.as_ref().unwrap().prompt.len(), 16);
         assert!(rec.content.as_ref().unwrap().truncated);
     }
@@ -1381,30 +2727,43 @@ mod tests {
         assert!(!keys.contains(&"gen_ai.completion"));
         assert!(!keys.contains(&"aisix.content_truncated"));
 
-        // Content-bearing record (content_mode = full): prompt + completion
-        // ride the span under the Datadog sink's key names.
+        // Content-bearing record (content_mode = full) of a payload that is
+        // not a message list (the sample is an image generation): it rides
+        // the bounded `aisix.content.*` keys, never a `gen_ai.*` message.
         let captured = CapturedContent {
             prompt: "what is 2+2?".into(),
             response: "4".into(),
             truncated: false,
+            prompt_truncated: false,
+            response_truncated: false,
+            output: None,
         };
         let rec = content_record(
             &otlp_kind(SlsContentMode::Full, 1024),
             &event,
             Some(&captured),
+            None,
+            None,
         )
         .unwrap();
         let span = build_otlp_span(&rec, "x");
         let attrs = span["attributes"].as_array().unwrap();
         let find = |k: &str| attrs.iter().find(|a| a["key"] == k);
         assert_eq!(
-            find("gen_ai.prompt").expect("prompt attr")["value"]["stringValue"],
+            find("aisix.content.prompt").expect("prompt attr")["value"]["stringValue"],
             "what is 2+2?"
         );
         assert_eq!(
-            find("gen_ai.completion").expect("completion attr")["value"]["stringValue"],
+            find("aisix.content.response").expect("response attr")["value"]["stringValue"],
             "4"
         );
+        for retired in [
+            "gen_ai.prompt",
+            "gen_ai.completion",
+            "gen_ai.input.messages",
+        ] {
+            assert!(find(retired).is_none(), "{retired} must not be emitted");
+        }
         // Nothing was truncated → no flag.
         assert!(find("aisix.content_truncated").is_none());
 
@@ -1413,8 +2772,18 @@ mod tests {
             prompt: "a".repeat(500),
             response: "ok".into(),
             truncated: false,
+            prompt_truncated: false,
+            response_truncated: false,
+            output: None,
         };
-        let rec = content_record(&otlp_kind(SlsContentMode::Full, 16), &event, Some(&big)).unwrap();
+        let rec = content_record(
+            &otlp_kind(SlsContentMode::Full, 16),
+            &event,
+            Some(&big),
+            None,
+            None,
+        )
+        .unwrap();
         let span = build_otlp_span(&rec, "x");
         let attrs = span["attributes"].as_array().unwrap();
         let flag = attrs
@@ -1629,18 +2998,73 @@ mod tests {
         );
     }
 
+    /// GenAI `output_tokens` includes reasoning. A record that counts its
+    /// reasoning beside the completion (Gemini thoughts) exports the sum;
+    /// one that counts it inside (OpenAI) exports the completion as is.
+    #[test]
+    fn output_tokens_include_reasoning_counted_beside_the_completion() {
+        let output = |event: UsageEvent| {
+            let body = build_otlp_traces_payload(&event, "test-exp");
+            let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+                .as_array()
+                .unwrap()
+                .clone();
+            attrs
+                .iter()
+                .find(|a| a["key"] == "gen_ai.usage.output_tokens")
+                .expect("output tokens exported")["value"]["intValue"]
+                .clone()
+        };
+        let gemini = UsageEvent {
+            prompt_tokens: 100,
+            completion_tokens: 20,
+            reasoning_tokens: 30,
+            total_tokens: 150,
+            ..sample_event()
+        };
+        assert_eq!(output(gemini), serde_json::json!("50"));
+        let openai = UsageEvent {
+            prompt_tokens: 40,
+            completion_tokens: 25,
+            reasoning_tokens: 10,
+            total_tokens: 65,
+            ..sample_event()
+        };
+        assert_eq!(output(openai), serde_json::json!("25"));
+    }
+
     #[test]
     fn payload_carries_genai_semconv_attributes() {
         let body = build_otlp_traces_payload(&sample_event(), "test-exp");
         let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
-        assert_eq!(span["name"], "chat.completions");
-        assert_eq!(span["status"]["code"], 1);
-        // Attribute set must include the GenAI required + recommended fields
-        // we promised the user.
+        // An operation the conventions have no value for is named by the
+        // gateway's own; no upstream was resolved, so there is no target.
+        assert_eq!(span["name"], "image_generation");
+        // Success leaves the status unset.
+        assert!(span.get("status").is_none());
         let attrs = span["attributes"].as_array().unwrap();
         let keys: Vec<&str> = attrs.iter().map(|a| a["key"].as_str().unwrap()).collect();
-        assert!(keys.contains(&"gen_ai.system"));
-        assert!(keys.contains(&"gen_ai.operation.name"));
+        assert!(
+            !keys.contains(&"gen_ai.system"),
+            "replaced by gen_ai.provider.name"
+        );
+        assert!(!keys.contains(&"error.type"));
+        assert_eq!(
+            attrs
+                .iter()
+                .find(|a| a["key"] == "gen_ai.operation.name")
+                .unwrap()["value"]["stringValue"],
+            "image_generation"
+        );
+        // The semconv value collapses every OpenAI-shaped route onto `chat`;
+        // this is the one that says which endpoint (AISIX-Cloud#1461), so the
+        // VALUE is what has to be checked — the key alone would be satisfied
+        // by an empty attribute.
+        let operation = attrs
+            .iter()
+            .find(|a| a["key"] == "aisix.operation")
+            .expect("aisix.operation must be present");
+        assert_eq!(operation["value"]["stringValue"], "image_generation");
         assert!(keys.contains(&"gen_ai.response.model"));
         assert!(keys.contains(&"gen_ai.response.id"));
         assert!(keys.contains(&"gen_ai.usage.input_tokens"));
@@ -1688,6 +3112,45 @@ mod tests {
     }
 
     #[test]
+    fn a_passthrough_relay_exports_route_and_identity_not_a_chat_span() {
+        // The passthrough handler emits usage events with
+        // `inbound_protocol = "passthrough"`; without the explicit branch a
+        // Copilot relay exported as a bare `chat.completions` span with the
+        // route and the device-injected end-user identity recorded nowhere.
+        let mut ev = sample_event();
+        ev.inbound_protocol = "passthrough".into();
+        ev.operation = "passthrough".into();
+        ev.passthrough_route_name = "copilot-chat".into();
+        ev.client_identity = "alice@example.com".into();
+
+        let body = build_otlp_traces_payload(&ev, "test-exp");
+        let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(span["name"], "passthrough copilot-chat");
+        let attrs = span["attributes"].as_array().unwrap();
+        let find = |k: &str| attrs.iter().find(|a| a["key"] == k);
+        let string_at = |k: &str| find(k).unwrap()["value"]["stringValue"].clone();
+        assert_eq!(string_at("gen_ai.operation.name"), "passthrough");
+        assert_eq!(string_at("aisix.passthrough.route_name"), "copilot-chat");
+        assert_eq!(string_at("aisix.client_identity"), "alice@example.com");
+    }
+
+    #[test]
+    fn client_identity_exports_without_a_protocol_gate() {
+        // The identity attribute must not depend on the passthrough branch:
+        // any handler that populates the field gets it exported.
+        let mut ev = sample_event();
+        ev.client_identity = "bob@example.com".into();
+        let body = build_otlp_traces_payload(&ev, "test-exp");
+        let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        let attrs = span["attributes"].as_array().unwrap();
+        let id = attrs
+            .iter()
+            .find(|a| a["key"] == "aisix.client_identity")
+            .unwrap();
+        assert_eq!(id["value"]["stringValue"], "bob@example.com");
+    }
+
+    #[test]
     fn a_streamed_a2a_call_carries_its_event_count() {
         // A unary call has no count, and exporting a zero would read as "the
         // stream carried nothing" rather than "there was no stream".
@@ -1729,7 +3192,8 @@ mod tests {
 
         let body = build_otlp_traces_payload(&ev, "test-exp");
         let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
-        assert_eq!(span["name"], "execute_tool create_issue");
+        // MCP's own naming: `{mcp.method.name} {gen_ai.tool.name}`.
+        assert_eq!(span["name"], "tools/call create_issue");
         let attrs = span["attributes"].as_array().unwrap();
         let find = |k: &str| attrs.iter().find(|a| a["key"] == k);
         assert_eq!(
@@ -1744,6 +3208,12 @@ mod tests {
             find("aisix.mcp.server_name").unwrap()["value"]["stringValue"],
             "github"
         );
+        assert_eq!(
+            find("mcp.method.name").unwrap()["value"]["stringValue"],
+            "tools/call"
+        );
+        // A tool call has no token usage to report.
+        assert!(find("gen_ai.usage.input_tokens").is_none());
     }
 
     #[test]
@@ -1759,7 +3229,7 @@ mod tests {
 
         let body = build_otlp_traces_payload(&ev, "test-exp");
         let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
-        assert_eq!(span["name"], "execute_tool");
+        assert_eq!(span["name"], "tools/call");
         let attrs = span["attributes"].as_array().unwrap();
         let tool = attrs
             .iter()
@@ -1807,24 +3277,104 @@ mod tests {
         );
     }
 
+    /// A wildcard row's upstream model is the caller's own substitution, so
+    /// it stays out of the span name (unbounded cardinality) but is still
+    /// the request-model attribute.
     #[test]
-    fn llm_traffic_keeps_its_chat_span_shape() {
-        // The protocol switch must not move LLM spans: dashboards and saved
-        // trace queries are written against these two values.
-        for protocol in ["", "openai", "anthropic"] {
+    fn a_caller_named_upstream_model_stays_out_of_the_span_name() {
+        let mut ev = sample_event();
+        ev.operation = "chat".into();
+        let record =
+            SinkRecord::metadata_only(ev).with_facts(Some(Arc::new(crate::genai::SpanFacts {
+                upstream: Some(crate::genai::UpstreamFacts {
+                    request_model: "anything-the-caller-sent".into(),
+                    request_model_caller_named: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })));
+        let span = build_otlp_span(&record, "x");
+        assert_eq!(span["name"], "chat");
+        assert_eq!(
+            attr(&span, "gen_ai.request.model").unwrap()["stringValue"],
+            "anything-the-caller-sent"
+        );
+    }
+
+    #[test]
+    fn requested_model_id_rides_beside_model_id() {
+        // A group request: the addressed group and the dispatched target are
+        // two ids, and a span must carry both so it stays joinable to the
+        // group across a rename.
+        let mut ev = sample_event();
+        ev.requested_model = "smart-group".into();
+        ev.requested_model_id = "group-uuid".into();
+        let span = build_otlp_span(&SinkRecord::metadata_only(ev), "x");
+        assert_eq!(
+            attr(&span, "aisix.requested_model_id").unwrap()["stringValue"],
+            "group-uuid"
+        );
+        assert_eq!(
+            attr(&span, "aisix.model_id").unwrap()["stringValue"],
+            "mod-uuid"
+        );
+
+        // Nothing resolved: no blank attribute, the same as `aisix.model_id`.
+        let span = build_otlp_span(&SinkRecord::metadata_only(UsageEvent::default()), "x");
+        assert!(attr(&span, "aisix.requested_model_id").is_none());
+        assert!(attr(&span, "aisix.model_id").is_none());
+    }
+
+    #[test]
+    fn served_service_tier_is_its_own_attribute() {
+        let mut ev = sample_event();
+        ev.service_tier = Some("priority".into());
+        let span = build_otlp_span(&SinkRecord::metadata_only(ev), "x");
+        assert_eq!(
+            attr(&span, "aisix.service_tier").unwrap()["stringValue"],
+            "priority"
+        );
+
+        let span = build_otlp_span(&SinkRecord::metadata_only(sample_event()), "x");
+        assert!(attr(&span, "aisix.service_tier").is_none());
+    }
+
+    #[test]
+    fn inference_spans_are_named_by_operation_and_requested_model() {
+        // Every chat-shaped route maps onto the conventions' `chat`, the
+        // legacy completions route onto `text_completion` and embeddings onto
+        // `embeddings`; the span is named after the model the request was
+        // made to, not the caller's alias.
+        for (operation, genai) in [
+            ("chat", "chat"),
+            ("messages", "chat"),
+            ("responses", "chat"),
+            ("completions", "text_completion"),
+            ("embeddings", "embeddings"),
+            ("rerank", "rerank"),
+        ] {
             let mut ev = sample_event();
-            ev.inbound_protocol = protocol.into();
-            let body = build_otlp_traces_payload(&ev, "test-exp");
-            let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
-            assert_eq!(span["name"], "chat.completions", "protocol={protocol:?}");
+            ev.operation = operation.into();
+            ev.requested_model = "my-alias".into();
+            let record =
+                SinkRecord::metadata_only(ev).with_facts(Some(Arc::new(crate::genai::SpanFacts {
+                    upstream: Some(crate::genai::UpstreamFacts {
+                        provider_name: "openai".into(),
+                        request_model: "gpt-4o".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })));
+            let span = build_otlp_span(&record, "test-exp");
+            assert_eq!(span["name"], format!("{genai} gpt-4o"), "{operation}");
             let attrs = span["attributes"].as_array().unwrap();
-            assert_eq!(
-                attrs
-                    .iter()
-                    .find(|a| a["key"] == "gen_ai.operation.name")
-                    .unwrap()["value"]["stringValue"],
-                "chat"
-            );
+            let string_at = |k: &str| {
+                attrs.iter().find(|a| a["key"] == k).unwrap()["value"]["stringValue"].clone()
+            };
+            assert_eq!(string_at("gen_ai.operation.name"), genai);
+            assert_eq!(string_at("gen_ai.request.model"), "gpt-4o");
+            assert_eq!(string_at("aisix.requested_model"), "my-alias");
+            assert_eq!(string_at("gen_ai.provider.name"), "openai");
         }
     }
 
@@ -1835,6 +3385,7 @@ mod tests {
         ev.attempt_index = 1;
         ev.attempt_kind = "fallback".into();
         ev.attempt_model = "secondary".into();
+        ev.is_final_attempt = true;
         ev.error_class = "upstream_status".into();
         ev.error_message = "upstream returned 502".into();
         let body = build_otlp_traces_payload(&ev, "test-exp");
@@ -1845,6 +3396,10 @@ mod tests {
         assert_eq!(
             find("aisix.attempt_index").unwrap()["value"]["intValue"],
             "1"
+        );
+        assert_eq!(
+            find("aisix.is_final_attempt").unwrap()["value"]["boolValue"],
+            true
         );
         assert_eq!(
             find("aisix.attempt_kind").unwrap()["value"]["stringValue"],
@@ -1880,6 +3435,118 @@ mod tests {
     }
 
     #[test]
+    fn payload_carries_a_bounded_gateway_embedding_child_audit() {
+        let mut event = sample_event();
+        // These belong only to the parent event. The child-audit schema has
+        // no text, provider-error, or credential fields, so they must never
+        // cross into its serialized OTLP attribute.
+        event.error_message = "provider-error-sentinel".into();
+        event.api_key_id = "credential-sentinel".into();
+        event.requested_model = "caller-text-sentinel".into();
+        // One more than the OTLP resource-ID cap, with an unsafe multibyte
+        // value: both caps must remain visible without exporting the input.
+        event.gateway_embedding_calls = (0..=MAX_GATEWAY_EMBEDDING_CALLS_ATTR_ITEMS)
+            .map(|index| GatewayEmbeddingCall {
+                count: 1,
+                purpose: crate::usage::GatewayEmbeddingPurpose::SemanticRoute,
+                embedding_model_id: format!("{}-{index}", "情".repeat(100)),
+                prompt_tokens: index as u32,
+                total_tokens: index as u32 + 1,
+                usage_source: crate::usage::GatewayEmbeddingUsageSource::Reported,
+                latency_ms: index as u32 + 2,
+                outcome: crate::usage::GatewayEmbeddingOutcome::Succeeded,
+            })
+            .collect();
+        event.gateway_embedding_calls_dropped = 7;
+
+        let body = build_otlp_traces_payload(&event, "test-exp");
+        let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .unwrap();
+        let find = |key: &str| attrs.iter().find(|attr| attr["key"] == key);
+        let encoded = find("aisix.gateway_embedding_calls")
+            .expect("child audit is in the OTLP allowlist")["value"]["stringValue"]
+            .as_str()
+            .expect("child audit is serialized JSON");
+        assert!(encoded.len() <= MAX_GATEWAY_EMBEDDING_CALLS_ATTR_BYTES);
+        let calls: Vec<Value> =
+            serde_json::from_str(encoded).expect("the bounded child audit remains valid JSON");
+        assert_eq!(calls.len(), MAX_GATEWAY_EMBEDDING_CALLS_ATTR_ITEMS);
+        for sentinel in [
+            "provider-error-sentinel",
+            "credential-sentinel",
+            "caller-text-sentinel",
+        ] {
+            assert!(
+                !encoded.contains(sentinel),
+                "parent-only sentinel leaked into child audit: {sentinel}"
+            );
+        }
+        assert_eq!(calls[0]["purpose"], "semantic_route");
+        let model_id = calls[0]["embedding_model_id"].as_str().unwrap();
+        assert_eq!(model_id, "unknown");
+        assert!(!encoded.contains('情'));
+        assert_eq!(
+            find("aisix.gateway_embedding_calls_dropped")
+                .expect("ledger and exporter truncation are both visible")["value"]["intValue"],
+            "8",
+        );
+    }
+
+    #[test]
+    fn gateway_embedding_audit_ids_are_sanitized_at_the_otlp_boundary() {
+        let unsafe_ids = [
+            ("chinese-leak-", "chinese-leak-情".to_owned()),
+            ("control-leak-", "control-leak-\u{1b}[31m".to_owned()),
+            ("at-leak-", "at-leak@example".to_owned()),
+            (
+                "long-leak-",
+                format!(
+                    "long-leak-{}",
+                    "a".repeat(MAX_GATEWAY_EMBEDDING_MODEL_ID_ATTR_BYTES)
+                ),
+            ),
+        ];
+        let mut audit_calls = vec![GatewayEmbeddingCall {
+            count: 1,
+            purpose: crate::usage::GatewayEmbeddingPurpose::SemanticRoute,
+            embedding_model_id: "embed_model-01".into(),
+            prompt_tokens: 0,
+            total_tokens: 0,
+            usage_source: crate::usage::GatewayEmbeddingUsageSource::Unavailable,
+            latency_ms: 0,
+            outcome: crate::usage::GatewayEmbeddingOutcome::Failed,
+        }];
+        audit_calls.extend(unsafe_ids.iter().map(|(_, id)| GatewayEmbeddingCall {
+            count: 1,
+            purpose: crate::usage::GatewayEmbeddingPurpose::SemanticRoute,
+            embedding_model_id: id.clone(),
+            prompt_tokens: 0,
+            total_tokens: 0,
+            usage_source: crate::usage::GatewayEmbeddingUsageSource::Unavailable,
+            latency_ms: 0,
+            outcome: crate::usage::GatewayEmbeddingOutcome::Failed,
+        }));
+
+        let (attribute, dropped) = gateway_embedding_calls_attribute(&audit_calls);
+        assert_eq!(dropped, 0);
+        let attribute = attribute.expect("audit attribute is retained");
+        let encoded = attribute["value"]["stringValue"]
+            .as_str()
+            .expect("audit attribute is JSON text");
+        let calls: Vec<Value> =
+            serde_json::from_str(encoded).expect("audit attribute remains valid JSON");
+        assert_eq!(calls[0]["embedding_model_id"], "embed_model-01");
+        for (call, (prefix, _)) in calls.iter().skip(1).zip(unsafe_ids.iter()) {
+            assert_eq!(call["embedding_model_id"], "unknown");
+            assert!(
+                !encoded.contains(prefix),
+                "unsafe embedding resource ID prefix leaked into OTLP JSON: {prefix}"
+            );
+        }
+    }
+
+    #[test]
     fn payload_carries_client_attribution_when_present() {
         let mut ev = sample_event();
         ev.client_source_ip = "203.0.113.7".into();
@@ -1888,16 +3555,69 @@ mod tests {
         let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
             .as_array()
             .unwrap();
-        let ip = attrs.iter().find(|a| a["key"] == "aisix.client_source_ip");
-        let ua = attrs.iter().find(|a| a["key"] == "aisix.client_user_agent");
+        // Under the client / user-agent conventions' names, replacing the
+        // former `aisix.client_*` keys.
+        let ip = attrs.iter().find(|a| a["key"] == "client.address");
+        let ua = attrs.iter().find(|a| a["key"] == "user_agent.original");
         assert_eq!(
-            ip.expect("client_source_ip attr")["value"]["stringValue"],
+            ip.expect("client.address attr")["value"]["stringValue"],
             "203.0.113.7"
         );
         assert_eq!(
-            ua.expect("client_user_agent attr")["value"]["stringValue"],
+            ua.expect("user_agent.original attr")["value"]["stringValue"],
             "codex-cli/1.2"
         );
+        assert!(!body.to_string().contains("aisix.client_source_ip"));
+        assert!(!body.to_string().contains("aisix.client_user_agent"));
+    }
+
+    /// Each exporter reports only the names in its own lists: the record
+    /// built for an exporter selecting `x-sub-user` drops `x-department`
+    /// although the request carried it, and response headers ride the
+    /// span under `http.response.header.<name>`.
+    #[test]
+    fn payload_carries_the_exporters_own_headers_as_semconv_string_arrays() {
+        let mut ev = sample_event();
+        ev.request_headers = [
+            ("x-sub-user".to_string(), "alice".to_string()),
+            ("x-department".to_string(), "eng, ops".to_string()),
+        ]
+        .into();
+        ev.upstream_response_headers = [
+            ("x-upstream-region".to_string(), "us-east".to_string()),
+            ("x-other".to_string(), "unselected".to_string()),
+        ]
+        .into();
+        let record = SinkRecord::metadata_only(ev).with_exporter_headers(
+            &["x-sub-user".to_string(), "x-department".to_string()],
+            &["x-upstream-region".to_string()],
+        );
+        let body = otlp_export_request(
+            vec![build_otlp_span(&record, "test-exp")],
+            DEFAULT_SERVICE_NAME,
+        );
+        let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .unwrap();
+        assert!(!body.to_string().contains("x-other"));
+        for (key, value) in [
+            ("http.request.header.x-sub-user", "alice"),
+            ("http.request.header.x-department", "eng, ops"),
+            ("http.response.header.x-upstream-region", "us-east"),
+        ] {
+            let attr = attrs
+                .iter()
+                .find(|a| a["key"] == key)
+                .unwrap_or_else(|| panic!("{key} attr missing"));
+            assert_eq!(
+                attr["value"],
+                json!({"arrayValue": {"values": [{"stringValue": value}]}}),
+            );
+        }
+        let mut unselected = sample_event();
+        unselected.request_headers = [("x-sub-user".to_string(), "alice".to_string())].into();
+        let none = build_otlp_traces_payload(&unselected, "x");
+        assert!(!none.to_string().contains("http.request.header."));
     }
 
     #[test]
@@ -1907,8 +3627,8 @@ mod tests {
             .as_array()
             .unwrap();
         let keys: Vec<&str> = attrs.iter().map(|a| a["key"].as_str().unwrap()).collect();
-        assert!(!keys.contains(&"aisix.client_source_ip"));
-        assert!(!keys.contains(&"aisix.client_user_agent"));
+        assert!(!keys.contains(&"client.address"));
+        assert!(!keys.contains(&"user_agent.original"));
     }
 
     #[test]
@@ -1938,7 +3658,7 @@ mod tests {
 
     #[tokio::test]
     async fn otlp_sink_posts_one_request_with_all_spans() {
-        let server = wiremock::MockServer::start().await;
+        let server = wiremock::MockServer::builder().start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/traces"))
             .respond_with(wiremock::ResponseTemplate::new(200))
@@ -1948,7 +3668,7 @@ mod tests {
             "test-exp",
             format!("{}/v1/traces", server.uri()),
             BTreeMap::new(),
-            otlp_test_client(),
+            OtlpHttpFanOut::new().inner.client.clone(),
         );
 
         let ack = sink
@@ -1959,6 +3679,10 @@ mod tests {
 
         let reqs = server.received_requests().await.unwrap();
         assert_eq!(reqs.len(), 1, "one batched request, not three spawns");
+        assert_eq!(
+            reqs[0].headers["user-agent"],
+            format!("aisix-dp/{}", &*aisix_core::BUILD_VERSION)
+        );
         let body: Value = serde_json::from_slice(&reqs[0].body).unwrap();
         let spans = body["resourceSpans"][0]["scopeSpans"][0]["spans"]
             .as_array()
@@ -1968,7 +3692,7 @@ mod tests {
 
     #[tokio::test]
     async fn otlp_sink_classifies_5xx_as_transient() {
-        let server = wiremock::MockServer::start().await;
+        let server = wiremock::MockServer::builder().start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(wiremock::ResponseTemplate::new(503))
             .mount(&server)
@@ -1983,7 +3707,7 @@ mod tests {
 
     #[tokio::test]
     async fn otlp_sink_classifies_4xx_as_permanent() {
-        let server = wiremock::MockServer::start().await;
+        let server = wiremock::MockServer::builder().start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(wiremock::ResponseTemplate::new(400))
             .mount(&server)
@@ -1994,6 +3718,87 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!err.is_transient(), "4xx must be permanent: {err}");
+    }
+
+    /// The `last_error` a pipeline records for `sink`'s first failed
+    /// delivery — the text the warn log and the heartbeat carry too.
+    async fn first_last_error(sink: OtlpSink) -> String {
+        let (handle, worker) = crate::sink::SinkPipeline::new(
+            Arc::new(sink),
+            PipelineConfig {
+                flush_interval: Duration::from_millis(20),
+                ..PipelineConfig::default()
+            },
+        );
+        let (cancel_tx, cancel) = tokio::sync::watch::channel(false);
+        let run = tokio::spawn(worker.run(cancel));
+        assert!(handle.try_enqueue(Arc::new(SinkRecord::metadata_only(sample_event()))));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let last = loop {
+            if let Some(e) = handle.stats().last_error {
+                break e;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no delivery error recorded"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        cancel_tx.send(true).unwrap();
+        run.abort();
+        last
+    }
+
+    /// A configured endpoint may carry `user:pass@`, and the headers carry
+    /// the receiver's credential. Neither may reach `last_error` — neither
+    /// through the transport error that names the endpoint, nor through a
+    /// receiver that echoes the credential back in its error body.
+    #[tokio::test]
+    async fn otlp_delivery_errors_carry_no_configured_credential() {
+        let headers = BTreeMap::from([(
+            "authorization".to_string(),
+            "Bearer otlp-header-token".to_string(),
+        )]);
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let unreachable = first_last_error(OtlpSink::new(
+            "e",
+            format!("http://otlp-user:otlp-pass@127.0.0.1:{closed}/v1/traces"),
+            headers.clone(),
+            otlp_test_client(),
+        ))
+        .await;
+        assert!(
+            unreachable.contains(&format!("POST http://127.0.0.1:{closed}/")),
+            "the endpoint stays diagnosable: {unreachable}"
+        );
+
+        let server = wiremock::MockServer::builder().start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(401)
+                    .set_body_string("rejected token otlp-header-token"),
+            )
+            .mount(&server)
+            .await;
+        let echoed = first_last_error(OtlpSink::new(
+            "e",
+            server
+                .uri()
+                .replace("http://", "http://otlp-user:otlp-pass@"),
+            headers,
+            otlp_test_client(),
+        ))
+        .await;
+        assert!(echoed.contains("HTTP 401"), "{echoed}");
+
+        for last in [unreachable, echoed] {
+            for secret in ["otlp-user", "otlp-pass", "otlp-header-token"] {
+                assert!(!last.contains(secret), "{secret} leaked into: {last}");
+            }
+        }
     }
 
     #[test]
@@ -2051,7 +3856,7 @@ mod tests {
         // can't easily count spawned tasks, but if the call returned
         // and the test process didn't hang, we're good.
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, 0, std::iter::empty());
+        f.fan_out(&sample_event(), None, None, None, 0, std::iter::empty());
     }
 
     #[test]
@@ -2065,26 +3870,33 @@ mod tests {
         let mut exp = sample_exporter();
         exp.enabled = false;
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, 0, std::iter::once(&exp));
+        f.fan_out(&sample_event(), None, None, None, 0, std::iter::once(&exp));
     }
 
     #[tokio::test]
     async fn fan_out_reaps_pipelines_absent_from_the_live_exporter_set() {
         let exp = sample_exporter();
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, 1, std::iter::once(&exp));
+        f.fan_out(&sample_event(), None, None, None, 1, std::iter::once(&exp));
         assert!(f.exporter_stats().contains_key(&exp.name));
 
-        f.fan_out(&sample_event(), None, 2, std::iter::empty());
+        f.fan_out(&sample_event(), None, None, None, 2, std::iter::empty());
         assert!(
             f.exporter_stats().is_empty(),
             "a deleted exporter must not retain its task, queue, and client"
         );
 
-        f.fan_out(&sample_event(), None, 3, std::iter::once(&exp));
+        f.fan_out(&sample_event(), None, None, None, 3, std::iter::once(&exp));
         let mut disabled = exp.clone();
         disabled.enabled = false;
-        f.fan_out(&sample_event(), None, 4, std::iter::once(&disabled));
+        f.fan_out(
+            &sample_event(),
+            None,
+            None,
+            None,
+            4,
+            std::iter::once(&disabled),
+        );
         assert!(
             f.exporter_stats().is_empty(),
             "a disabled exporter must release an already-running pipeline"
@@ -2094,8 +3906,8 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_reconfiguration_revokes_the_old_queued_destination() {
-        let old_server = wiremock::MockServer::start().await;
-        let new_server = wiremock::MockServer::start().await;
+        let old_server = wiremock::MockServer::builder().start().await;
+        let new_server = wiremock::MockServer::builder().start().await;
         for server in [&old_server, &new_server] {
             wiremock::Mock::given(wiremock::matchers::method("POST"))
                 .and(wiremock::matchers::path("/v1/traces"))
@@ -2119,7 +3931,7 @@ mod tests {
         cfg.endpoint = format!("{}/v1/traces", new_server.uri());
 
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, 1, std::iter::once(&old));
+        f.fan_out(&sample_event(), None, None, None, 1, std::iter::once(&old));
         f.reconcile(2, std::iter::once(&new));
         assert!(
             f.exporter_stats().is_empty(),
@@ -2132,7 +3944,7 @@ mod tests {
             "the old queued event must not reach the revoked destination",
         );
 
-        f.fan_out(&sample_event(), None, 2, std::iter::once(&new));
+        f.fan_out(&sample_event(), None, None, None, 2, std::iter::once(&new));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if !new_server.received_requests().await.unwrap().is_empty() {
@@ -2151,13 +3963,13 @@ mod tests {
     async fn stale_generation_cannot_recreate_a_removed_exporter() {
         let exp = sample_exporter();
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, 7, std::iter::once(&exp));
+        f.fan_out(&sample_event(), None, None, None, 7, std::iter::once(&exp));
         assert!(f.exporter_stats().contains_key(&exp.name));
 
-        f.fan_out(&sample_event(), None, 8, std::iter::empty());
+        f.fan_out(&sample_event(), None, None, None, 8, std::iter::empty());
         assert!(f.exporter_stats().is_empty());
 
-        f.fan_out(&sample_event(), None, 7, std::iter::once(&exp));
+        f.fan_out(&sample_event(), None, None, None, 7, std::iter::once(&exp));
         assert!(
             f.exporter_stats().is_empty(),
             "an older in-flight request recreated a revoked exporter"
@@ -2171,8 +3983,8 @@ mod tests {
         // `control` with the rate absent (= 1.0). One event must reach the
         // control's receiver while the rate-0 exporter enqueues nothing —
         // its pipeline is never even created.
-        let zero_srv = wiremock::MockServer::start().await;
-        let ctrl_srv = wiremock::MockServer::start().await;
+        let zero_srv = wiremock::MockServer::builder().start().await;
+        let ctrl_srv = wiremock::MockServer::builder().start().await;
         for srv in [&zero_srv, &ctrl_srv] {
             wiremock::Mock::given(wiremock::matchers::method("POST"))
                 .respond_with(wiremock::ResponseTemplate::new(200))
@@ -2195,7 +4007,7 @@ mod tests {
         let control = mk("control", &ctrl_srv.uri(), None);
 
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, 1, [&zero, &control]);
+        f.fan_out(&sample_event(), None, None, None, 1, [&zero, &control]);
 
         // The control's span lands after the 1s flush…
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2224,7 +4036,7 @@ mod tests {
     async fn fan_out_delivers_a_span_to_a_real_receiver() {
         // The new fan-out enqueues into a per-exporter pipeline (1s flush);
         // a single request's span lands at the receiver after the flush.
-        let server = wiremock::MockServer::start().await;
+        let server = wiremock::MockServer::builder().start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/traces"))
             .respond_with(wiremock::ResponseTemplate::new(200))
@@ -2240,7 +4052,7 @@ mod tests {
         .unwrap();
 
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, 1, std::iter::once(&exp));
+        f.fan_out(&sample_event(), None, None, None, 1, std::iter::once(&exp));
 
         // Poll for the batched POST (flush_interval is 1s).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2254,6 +4066,97 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+        f.shutdown().await;
+    }
+
+    /// #954: publishing a snapshot that deletes one exporter and disables
+    /// another drops both from the delivery-health report — the view the
+    /// managed-mode heartbeat sends the control plane — with no traffic in
+    /// between, while the exporter that is still configured keeps its
+    /// pipeline.
+    #[tokio::test]
+    async fn config_publish_reaps_deleted_and_disabled_exporters() {
+        let receiver = wiremock::MockServer::builder().start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&receiver)
+            .await;
+        let endpoint = format!("{}/v1/traces", receiver.uri());
+        let exporter = |name: &str, enabled: bool| -> ObservabilityExporter {
+            serde_json::from_value(serde_json::json!({
+                "name": name,
+                "enabled": enabled,
+                "kind": "otlp_http",
+                "endpoint": endpoint,
+            }))
+            .unwrap()
+        };
+        let snapshot_with = |rows: &[(&str, bool)]| {
+            let snap = AisixSnapshot::new();
+            for (name, enabled) in rows {
+                snap.observability_exporters
+                    .insert(aisix_core::ResourceEntry::new(
+                        format!("id-{name}"),
+                        exporter(name, *enabled),
+                        1,
+                    ));
+            }
+            snap
+        };
+        let handle = SnapshotHandle::new(snapshot_with(&[
+            ("keep", true),
+            ("gone", true),
+            ("off", true),
+        ]));
+        let f = OtlpHttpFanOut::new();
+        let view = handle.load_versioned();
+        let generation = view.version;
+        let live = view.snapshot.observability_exporters.entries();
+        f.fan_out(
+            &sample_event(),
+            None,
+            None,
+            None,
+            generation,
+            live.iter().map(|e| &*e.value),
+        );
+        let mut names: Vec<_> = f.exporter_stats().into_keys().collect();
+        names.sort();
+        assert_eq!(names, ["gone", "keep", "off"]);
+
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let reaper = tokio::spawn(f.clone().reap_on_config_change(handle.clone(), cancel_rx));
+        handle.store(snapshot_with(&[("keep", true), ("off", false)]));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while f.exporter_stats().len() != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "deleted/disabled exporters still reported: {:?}",
+                f.exporter_stats().keys().collect::<Vec<_>>()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(f.exporter_stats().contains_key("keep"));
+
+        // A request that loaded the snapshot before the publish emits after
+        // the reap: the removed exporters' pipelines stay stopped.
+        f.fan_out(
+            &sample_event(),
+            None,
+            None,
+            None,
+            generation,
+            live.iter().map(|e| &*e.value),
+        );
+        assert_eq!(
+            f.exporter_stats().into_keys().collect::<Vec<_>>(),
+            ["keep"],
+            "a stale snapshot restarted a reaped pipeline"
+        );
+
+        cancel_tx.send(true).unwrap();
+        reaper.await.unwrap();
         f.shutdown().await;
     }
 }

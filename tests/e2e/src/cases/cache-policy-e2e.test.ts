@@ -3,6 +3,7 @@ import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -44,7 +45,7 @@ describe("cache policy e2e: identical request hits cache", () => {
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
-    app = await spawnApp();
+    app = await spawnApp({ exposeDebugHeaders: true });
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const pk = await seed.createProviderKey({
@@ -73,7 +74,8 @@ describe("cache policy e2e: identical request hits cache", () => {
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["cache-e2e"],
     });
-
+    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
   });
 
   afterAll(async () => {
@@ -92,22 +94,6 @@ describe("cache policy e2e: identical request hits cache", () => {
       baseURL: `${app.proxyUrl}/v1`,
     });
 
-    // Wait for the snapshot to carry the Model + ProviderKey + ApiKey
-    // + CachePolicy. The probe uses a distinct message so it doesn't
-    // pollute the cache fingerprint we're about to test against.
-    await waitConfigPropagation(async () => {
-      try {
-        await client.chat.completions.create({
-          model: "cache-e2e",
-          messages: [{ role: "user", content: "ready-probe" }],
-        });
-        return true;
-      } catch {
-        return false;
-      }
-    });
-
-    // Baseline includes the probe (and any retries during propagation).
     const baseline = upstream.receivedRequests.length;
 
     // First call with a fresh fingerprint — cache miss, upstream hit.

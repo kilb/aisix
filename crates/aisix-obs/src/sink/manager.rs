@@ -24,6 +24,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use super::{ObservabilitySink, PipelineConfig, SinkHandle, SinkPipeline, SinkStatsSnapshot};
+use crate::metrics::Metrics;
 
 /// One running pipeline plus the bookkeeping needed to stop/rebuild it.
 struct Running {
@@ -43,7 +44,7 @@ pub struct ExporterPipelines {
     /// Handed to every pipeline this manager starts, so telemetry drops and
     /// hard delivery failures reach the Prometheus scrape and not only the
     /// heartbeat. `None` in tests and standalone construction.
-    metrics: Option<Arc<crate::Metrics>>,
+    metrics: Option<Metrics>,
 }
 
 impl ExporterPipelines {
@@ -57,8 +58,9 @@ impl ExporterPipelines {
         }
     }
 
-    /// Publish every pipeline's drop / failure counters to `metrics`.
-    pub fn with_metrics(mut self, metrics: Arc<crate::Metrics>) -> Self {
+    /// Emit the fan-out drop/failure counters on `metrics`. Every
+    /// pipeline this manager starts inherits the handle.
+    pub fn with_metrics(mut self, metrics: Metrics) -> Self {
         self.metrics = Some(metrics);
         self
     }
@@ -99,7 +101,7 @@ impl ExporterPipelines {
         }
         let sink = build();
         let (handle, pipeline) =
-            SinkPipeline::new_with_metrics(sink, self.cfg.clone(), self.metrics.clone());
+            SinkPipeline::with_metrics(sink, self.cfg.clone(), self.metrics.clone());
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let worker = tokio::spawn(pipeline.run(cancel_rx));
         running.insert(
@@ -139,6 +141,16 @@ impl ExporterPipelines {
             .lock()
             .iter()
             .map(|(key, pipeline)| (key.clone(), pipeline.handle.stats()))
+            .collect()
+    }
+
+    /// Records waiting in each running pipeline's queue, keyed by exporter
+    /// name. A pipeline stopped by a config change has discarded its queue.
+    pub fn queue_depths(&self) -> Vec<(String, u64)> {
+        self.running
+            .lock()
+            .iter()
+            .map(|(key, pipeline)| (key.clone(), pipeline.handle.queued()))
             .collect()
     }
 

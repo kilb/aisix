@@ -14,7 +14,9 @@ use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 use regex::Regex;
 
-use crate::{Guardrail, GuardrailVerdict};
+use aisix_core::models::GuardrailMonitorHit;
+
+use crate::{Guardrail, GuardrailVerdict, ScanSegment};
 
 #[derive(Debug, Clone)]
 pub enum KeywordRule {
@@ -65,6 +67,13 @@ pub struct KeywordBlocklist {
     pub check_input_enabled: bool,
     /// Apply on output content.
     pub check_output_enabled: bool,
+    /// The row's `fail_open`, governing BOTH hooks — see
+    /// `fails_closed_on_output`. A local rule never calls out, so it has
+    /// no provider outage to survive; but it still cannot evaluate a body
+    /// the gateway could not decode, and this says what the operator
+    /// wants done about that. Defaults to the row default (fail-closed);
+    /// `with_fail_open` is how the snapshot build sets it.
+    fail_open: bool,
 }
 
 impl KeywordBlocklist {
@@ -73,7 +82,15 @@ impl KeywordBlocklist {
             rules,
             check_input_enabled: true,
             check_output_enabled: true,
+            fail_open: false,
         }
+    }
+
+    /// Apply the row's `fail_open` policy. This kind has no per-hook
+    /// split, so the one value governs both.
+    pub fn with_fail_open(mut self, fail_open: bool) -> Self {
+        self.fail_open = fail_open;
+        self
     }
 
     pub fn input_only(rules: Vec<KeywordRule>) -> Self {
@@ -81,6 +98,7 @@ impl KeywordBlocklist {
             rules,
             check_input_enabled: true,
             check_output_enabled: false,
+            fail_open: false,
         }
     }
 
@@ -89,6 +107,7 @@ impl KeywordBlocklist {
             rules,
             check_input_enabled: false,
             check_output_enabled: true,
+            fail_open: false,
         }
     }
 
@@ -120,13 +139,25 @@ impl Guardrail for KeywordBlocklist {
         self.check_output_enabled
     }
 
-    fn enforces_input(&self) -> bool {
+    fn runs_on_input(&self) -> bool {
         self.check_input_enabled
     }
 
     // Local rules: checking costs no remote call.
     fn checks_input_remotely(&self) -> bool {
         false
+    }
+
+    fn fails_closed_on_input(&self) -> bool {
+        !self.fail_open
+    }
+
+    /// This kind has no `output_fail_open` of its own — the remote kinds
+    /// split the policy per hook because only they can have a provider
+    /// fail on one side. Here the row-level `fail_open` is the only policy
+    /// the operator can express, so it governs both hooks.
+    fn fails_closed_on_output(&self) -> bool {
+        !self.fail_open
     }
 
     async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
@@ -149,6 +180,35 @@ impl Guardrail for KeywordBlocklist {
             }
             None => GuardrailVerdict::Allow,
         }
+    }
+
+    fn checks_local_segments(&self) -> bool {
+        true
+    }
+
+    /// Each segment on its own: `^`/`$` anchor to one slot, and no rule
+    /// matches across two of them. A key or tool name blocks like any
+    /// other text — this kind never rewrites.
+    fn check_local_segments(
+        &self,
+        segments: &[ScanSegment],
+        input: bool,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let (enabled, side) = if input {
+            (self.check_input_enabled, "input")
+        } else {
+            (self.check_output_enabled, "output")
+        };
+        if !enabled {
+            return (GuardrailVerdict::Allow, Vec::new());
+        }
+        let verdict = segments
+            .iter()
+            .find_map(|seg| self.first_match(&seg.text))
+            .map_or(GuardrailVerdict::Allow, |rule| {
+                GuardrailVerdict::block(format!("{side} blocked by {}", rule.description()))
+            });
+        (verdict, Vec::new())
     }
 
     async fn check_output(&self, resp: &ChatResponse) -> GuardrailVerdict {
@@ -185,11 +245,14 @@ mod tests {
 
     fn resp(content: &str) -> ChatResponse {
         ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "r".into(),
             model: "m".into(),
             message: ChatMessage::assistant(content),
             finish_reason: FinishReason::Stop,
             usage: UsageStats::new(0, 0),
+            service_tier: None,
         }
     }
 
@@ -363,11 +426,14 @@ mod tests {
             }]),
         );
         let r = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "r".into(),
             model: "m".into(),
             message: msg,
             finish_reason: FinishReason::Stop,
             usage: UsageStats::new(0, 0),
+            service_tier: None,
         };
         assert!(g.check_output(&r).await.is_block());
     }

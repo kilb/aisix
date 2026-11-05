@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { createServer, type Server, type Socket } from "node:net";
 import { WebSocket } from "undici";
 import {
   WebSocket as WsClient,
@@ -9,10 +10,13 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   agentClaims,
   EtcdClient,
+  metricDelta,
+  scrapeMetrics,
   SeedClient,
   spawnApp,
   startMockIdp,
   waitConfigPropagation,
+  waitForLogLine,
   type MockIdp,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -34,15 +38,37 @@ import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 //      key or the gateway alias.
 //   4. Auth failure rejects the HTTP upgrade (native client fires
 //      an error/close, never `open`).
+//   5. The `openai-beta: realtime=v1` opt-in is CLIENT-driven: forwarded
+//      upstream only when the caller asked for it. Sending it
+//      unconditionally made OpenAI's GA endpoint kill the session with
+//      `beta_api_shape_disabled`.
+//   6. The upstream dial is bounded by `upstream.connect_timeout_ms`,
+//      and the failure it produces is COUNTED. Only this layer can show
+//      either: the setting travels from the config file through the real
+//      binary into the one outbound stack that is not reqwest, and the
+//      counters are read off the real scrape.
 
 const CALLER_PLAINTEXT = "sk-realtime-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
 
+/**
+ * `upstream.connect_timeout_ms` for this file's gateway. Well under the
+ * shipped 5s default so the black-hole case below stays quick, and far
+ * above anything a loopback dial needs, so no other case notices it.
+ */
+const CONNECT_TIMEOUT_MS = 1_500;
+
 interface RealtimeUpstream {
   port: number;
-  handshakes: { url: string; authorization: string }[];
+  handshakes: {
+    url: string;
+    authorization: string;
+    openaiBeta?: string;
+    /** Every header of the upstream handshake, for the forwarding case. */
+    headers: Record<string, string>;
+  }[];
   frames: string[];
   close(): Promise<void>;
 }
@@ -57,6 +83,13 @@ async function startRealtimeUpstream(): Promise<RealtimeUpstream> {
     handshakes.push({
       url: req.url ?? "",
       authorization: (req.headers.authorization as string) ?? "",
+      openaiBeta: req.headers["openai-beta"] as string | undefined,
+      headers: Object.fromEntries(
+        Object.entries(req.headers).map(([k, v]) => [
+          k.toLowerCase(),
+          Array.isArray(v) ? v.join(",") : String(v ?? ""),
+        ]),
+      ),
     });
     socket.on("message", (data) => {
       frames.push(data.toString());
@@ -88,10 +121,76 @@ async function startRealtimeUpstream(): Promise<RealtimeUpstream> {
   };
 }
 
+/**
+ * An upstream that accepts the session and then drops the connection
+ * without a close frame on the first client event — a session the upstream
+ * cut off mid-flight.
+ */
+async function startDroppingUpstream(): Promise<{
+  port: number;
+  /** Client events the upstream received before dropping the session. */
+  received: string[];
+  close(): Promise<void>;
+}> {
+  const received: string[] = [];
+  const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  wss.on("connection", (socket: WsSocket) => {
+    socket.on("message", (data) => {
+      received.push(data.toString());
+      socket.terminate();
+    });
+  });
+  await new Promise<void>((resolve) => wss.on("listening", resolve));
+  const addr = wss.address();
+  if (addr === null || typeof addr === "string") throw new Error("no port");
+  return {
+    port: addr.port,
+    received,
+    close: () =>
+      new Promise<void>((resolve, reject) =>
+        wss.close((e) => (e ? reject(e) : resolve())),
+      ),
+  };
+}
+
+/**
+ * An upstream that completes the TCP connect and then says nothing —
+ * the handshake never gets a response and the socket is never closed.
+ *
+ * A deterministic stand-in for a black-holed endpoint: an unroutable
+ * address depends on what the CI network does with it (a prompt ICMP
+ * unreachable would end the dial without the budget ever being read),
+ * whereas a socket that is accepted and held hangs identically
+ * everywhere.
+ */
+function startSilentUpstream(): Promise<{
+  port: number;
+  close(): Promise<void>;
+}> {
+  const held: Socket[] = [];
+  const server: Server = createServer((sock) => held.push(sock));
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      if (addr === null || typeof addr === "string") throw new Error("no port");
+      resolve({
+        port: addr.port,
+        close: () =>
+          new Promise<void>((done) => {
+            for (const sock of held) sock.destroy();
+            server.close(() => done());
+          }),
+      });
+    });
+  });
+}
+
 describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
   let app: SpawnedApp | undefined;
   let seed: SeedClient | undefined;
   let upstream: RealtimeUpstream | undefined;
+  let silent: { port: number; close(): Promise<void> } | undefined;
+  let dropping: Awaited<ReturnType<typeof startDroppingUpstream>> | undefined;
   let idp: MockIdp | undefined;
   let otlp: MockOtlp | undefined;
   let restrictedKey: { id: string } | undefined;
@@ -103,9 +202,14 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     if (!etcdReachable) return;
 
     // The access log emits at `info` (asserted by the #932 case below).
-    app = await spawnApp({ logLevel: "info" });
+    app = await spawnApp({
+      logLevel: "info",
+      extra: { upstream: { connect_timeout_ms: CONNECT_TIMEOUT_MS } },
+    });
     seed = new SeedClient(etcd, app.etcdPrefix);
     upstream = await startRealtimeUpstream();
+    silent = await startSilentUpstream();
+    dropping = await startDroppingUpstream();
     idp = await startMockIdp();
     otlp = await startMockOtlp();
 
@@ -123,6 +227,52 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
       provider: "openai",
       model_name: "gpt-realtime-mock",
       provider_key_id: pk.id,
+    });
+
+    // A second upstream binding on the SAME mock server whose ProviderKey
+    // opts into forwarding. `/v1/realtime` builds its handshake by hand
+    // rather than through the shared pipeline, so this is the only layer
+    // that proves the setting survives a real binary + etcd propagation.
+    const fwdPk = await seed.createProviderKey({
+      display_name: "realtime-e2e-fwd-pk",
+      secret: "sk-upstream-realtime",
+      api_base: `http://127.0.0.1:${upstream.port}/v1`,
+      request: {
+        forward_client_headers: ["x-user-jwt", "sec-websocket-protocol"],
+      },
+    });
+    await seed.createModel({
+      display_name: "realtime-e2e-fwd-model",
+      provider: "openai",
+      model_name: "gpt-realtime-mock",
+      provider_key_id: fwdPk.id,
+    });
+
+    // A model whose upstream accepts the connection and then answers
+    // nothing — the subject of the connect-budget case below.
+    const silentPk = await seed.createProviderKey({
+      display_name: "realtime-e2e-silent-pk",
+      secret: "sk-upstream-realtime",
+      api_base: `http://127.0.0.1:${silent.port}/v1`,
+    });
+    await seed.createModel({
+      display_name: "realtime-e2e-silent-model",
+      provider: "openai",
+      model_name: "gpt-realtime-mock",
+      provider_key_id: silentPk.id,
+    });
+
+    // A model whose upstream drops the session on its first event.
+    const droppingPk = await seed.createProviderKey({
+      display_name: "realtime-e2e-drop-pk",
+      secret: "sk-upstream-realtime",
+      api_base: `http://127.0.0.1:${dropping.port}/v1`,
+    });
+    await seed.createModel({
+      display_name: "realtime-e2e-drop-model",
+      provider: "openai",
+      model_name: "gpt-realtime-mock",
+      provider_key_id: droppingPk.id,
     });
 
     // JWT identity resolving (via a claim mapping) to a key that may NOT
@@ -181,6 +331,8 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
   afterAll(async () => {
     await app?.exit();
     await upstream?.close();
+    await silent?.close();
+    await dropping?.close();
     await idp?.close();
     await otlp?.close();
   });
@@ -234,6 +386,141 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     );
     expect(upstream.handshakes[0].url).toContain("model=gpt-realtime-mock");
     expect(upstream.handshakes[0].url).not.toContain(CALLER_PLAINTEXT);
+    // This client offered `openai-beta.realtime-v1`, so the opt-in is
+    // forwarded upstream in the header form.
+    expect(upstream.handshakes[0].openaiBeta).toBe("realtime=v1");
+
+    ws.close();
+
+    // The session's line is written when it closes. A WebSocket carries no
+    // HTTP request or response body, so the line reports neither size.
+    const sessionLine = await waitForLogLine(
+      app,
+      (l) =>
+        l.includes("proxy request completed") &&
+        l.includes('path="/v1/realtime"') &&
+        l.includes('requested_model="realtime-e2e-model"') &&
+        l.includes("status_code=200"),
+      "the realtime session's access-log line",
+    );
+    expect(sessionLine).not.toContain("request_body_bytes");
+    expect(sessionLine).not.toContain("response_body_bytes");
+    // The session's one `response.done` reported 9 in / 4 out, and the line
+    // carries the session's totals like its usage event does.
+    expect(sessionLine).toContain("prompt_tokens=9");
+    expect(sessionLine).toContain("completion_tokens=4");
+    expect(sessionLine).toContain("total_tokens=13");
+  });
+
+  test("a caller that did not opt in gets NO openai-beta header upstream", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    // The regression: the gateway used to send `openai-beta: realtime=v1`
+    // on every upstream dial. OpenAI's GA /v1/realtime answers that with
+    // `beta_api_shape_disabled` and closes the session before the client
+    // can send anything, so a plain GA caller must dial clean.
+    const before = upstream.handshakes.length;
+    const wsUrl = `${app.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=realtime-e2e-model`;
+    // `ws` sets headers: a server-side caller with no beta opt-in.
+    const c = new WsClient(wsUrl, {
+      headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+    });
+    const relayed = await new Promise<string>((resolve, reject) => {
+      c.on("open", () => c.send(JSON.stringify({ type: "session.update" })));
+      c.on("message", (d) => resolve(d.toString()));
+      c.on("unexpected-response", (_q, res) =>
+        reject(new Error(`upgrade refused: ${res.statusCode}`)),
+      );
+      c.on("error", (e) => reject(e));
+    });
+    expect(JSON.parse(relayed).type).toBe("response.done");
+    c.terminate();
+
+    const hs = upstream.handshakes[before];
+    expect(hs).toBeDefined();
+    expect(hs.openaiBeta).toBeUndefined();
+  });
+
+  test("x-aisix-api-key authenticates the session ahead of Authorization", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    const wsUrl = `${app.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=realtime-e2e-model`;
+    const dial = (headers: Record<string, string>) =>
+      new Promise<number | string>((resolve) => {
+        const c = new WsClient(wsUrl, { headers });
+        c.on("open", () => c.send(JSON.stringify({ type: "session.update" })));
+        c.on("message", (d) => {
+          resolve(JSON.parse(d.toString()).type as string);
+          c.terminate();
+        });
+        c.on("unexpected-response", (_q, res) => resolve(res.statusCode ?? 0));
+        c.on("error", () => resolve("error"));
+      });
+    // The gateway key in its dedicated header; Authorization carries a
+    // token meant for someone else and is not read for gateway auth.
+    expect(
+      await dial({
+        "x-aisix-api-key": CALLER_PLAINTEXT,
+        authorization: "Bearer not-a-gateway-key",
+      }),
+    ).toBe("response.done");
+    // Present, so it is the only credential read: a wrong value is refused
+    // even beside a valid Authorization.
+    expect(
+      await dial({
+        "x-aisix-api-key": "sk-not-a-key",
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+      }),
+    ).toBe(401);
+  });
+
+  test("forward_client_headers reaches the upstream handshake, minus the browser credential", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    const mark = upstream.handshakes.length;
+
+    // A server-side client, so headers can be set. The subprotocol list
+    // still carries the caller's own gateway key — the browser flow's
+    // credential channel — and the ProviderKey names
+    // `sec-websocket-protocol` EXACTLY, which on every other face would
+    // be consent. This face refuses it outright.
+    const wsUrl = `${app.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=realtime-e2e-fwd-model`;
+    const ws = new WsClient(wsUrl, [
+      "realtime",
+      `openai-insecure-api-key.${CALLER_PLAINTEXT}`,
+    ], {
+      headers: { "x-user-jwt": "caller.jwt.value" },
+    });
+    await new Promise<void>((resolve, reject) => {
+      ws.on("open", () => resolve());
+      ws.on("error", (e: Error) => reject(e));
+    });
+    // The gateway accepts the client upgrade before it dials upstream, so
+    // `open` alone proves nothing about the upstream handshake. Driving
+    // one frame and awaiting the answer is what forces it.
+    const answered = new Promise<string>((resolve) => {
+      ws.on("message", (data: Buffer) => resolve(data.toString()));
+    });
+    ws.send(JSON.stringify({ type: "session.update", session: {} }));
+    expect(JSON.parse(await answered).type).toBe("response.done");
+
+    const seen = upstream.handshakes.slice(mark);
+    expect(seen.length, "the upstream handshake must have happened").toBe(1);
+    expect(seen[0].headers["x-user-jwt"]).toBe("caller.jwt.value");
+    // Named exactly and still refused: relaying it would hand the
+    // provider the caller's own AISIX key, and would override the
+    // subprotocol the gateway negotiates.
+    expect(seen[0].headers["sec-websocket-protocol"] ?? "").not.toContain(
+      CALLER_PLAINTEXT,
+    );
+    // The gateway's own credential still authenticates the session.
+    expect(seen[0].authorization).toBe("Bearer sk-upstream-realtime");
 
     ws.close();
   });
@@ -295,8 +582,12 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     let span;
     const deadline = Date.now() + 10_000;
     while (Date.now() < deadline) {
+      // Attempt carrier only — the AISIX-Cloud#1279 hierarchy also ships
+      // structural spans sharing the request id without usage attributes.
       span = otlp.spans.find(
-        (s) => s.attributes["aisix.request_id"] === refusal.requestId,
+        (s) =>
+          s.attributes["aisix.request_id"] === refusal.requestId &&
+          s.attributes["aisix.attempt_index"] !== undefined,
       );
       if (span) break;
       await new Promise((r) => setTimeout(r, 100));
@@ -315,16 +606,139 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     // Third surface of the same fix: the refusal's access-log line must
     // name the caller (the realtime access log carried no api_key_id on
     // any path before #932).
-    const logLine = app
-      .output()
-      .split("\n")
-      .find(
-        (l) =>
-          l.includes("proxy request completed") &&
-          l.includes(refusal.requestId),
-      );
-    expect(logLine, "access log line for the refusal").toBeTruthy();
+    const logLine = await waitForLogLine(
+      app,
+      (l) =>
+        l.includes("proxy request completed") && l.includes(refusal.requestId),
+      "the access-log line for the refusal",
+    );
     expect(logLine).toContain(restrictedKey.id);
+  });
+
+  test("a session the upstream cut off names the failure on its usage event and its line alike", async (ctx) => {
+    if (!etcdReachable || !app || !otlp || !dropping) {
+      ctx.skip();
+      return;
+    }
+    const before = dropping.received.length;
+    const wsUrl = `${app.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=realtime-e2e-drop-model`;
+    const c = new WsClient(wsUrl, {
+      headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+    });
+    let requestId = "";
+    c.on("upgrade", (res) => {
+      requestId = String(res.headers["x-aisix-request-id"] ?? "");
+    });
+    await new Promise<void>((resolve, reject) => {
+      c.on("open", () => {
+        c.send(JSON.stringify({ type: "session.update", session: { instructions: "hi" } }));
+      });
+      c.on("close", () => resolve());
+      c.on("error", (e) => reject(e));
+    });
+    expect(requestId).not.toBe("");
+    // The session was open and relaying when the upstream dropped it — not
+    // a dial that failed, which names a transport failure too.
+    expect(dropping.received.length).toBe(before + 1);
+
+    const line = await waitForLogLine(
+      app,
+      (l) => l.includes("proxy request completed") && l.includes(`request_id="${requestId}"`),
+      "the cut-off session's access-log line",
+      10_000,
+    );
+    const lineClass = /\berror_class="?([^"\s]+)"?/.exec(line)?.[1];
+    expect(lineClass, line).toBeTruthy();
+
+    let span;
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      span = otlp.spans.find(
+        (s) =>
+          s.attributes["aisix.request_id"] === requestId &&
+          s.attributes["aisix.attempt_index"] !== undefined,
+      );
+      if (span) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(span, `no usage span for request_id=${requestId}`).toBeTruthy();
+    // The row the control plane stores names the same failure the line does.
+    expect(span!.attributes["aisix.error_class"]).toBe(lineClass);
+  });
+
+  test("an unanswered upstream dial ends at upstream.connect_timeout_ms", async (ctx) => {
+    if (!etcdReachable || !app || !silent) {
+      ctx.skip();
+      return;
+    }
+    // The client upgrade succeeds — the gateway dials upstream only
+    // afterwards — so the failure arrives as the session's own error
+    // frame plus a 1011 close, the same pair any unreachable upstream
+    // produces. Unbudgeted, none of it ever arrives: the dial sat on an
+    // accepted-but-silent socket indefinitely, while every other route
+    // gave up at `connect_timeout_ms`.
+    const wsUrl = `${app.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=realtime-e2e-silent-model`;
+    const before = await scrapeMetrics(app.metricsUrl);
+    const c = new WsClient(wsUrl, {
+      headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+    });
+    const started = Date.now();
+    const ended = await new Promise<{ frame?: string; code: number }>(
+      (resolve, reject) => {
+        let frame: string | undefined;
+        const giveUp = setTimeout(() => {
+          c.terminate();
+          reject(new Error("the gateway never gave up on the dial"));
+        }, 20_000);
+        c.on("message", (d: Buffer) => {
+          frame = d.toString();
+        });
+        c.on("close", (code: number) => {
+          clearTimeout(giveUp);
+          resolve({ frame, code });
+        });
+        c.on("unexpected-response", (_q, res) =>
+          reject(new Error(`upgrade refused: ${res.statusCode}`)),
+        );
+        c.on("error", (e: Error) => reject(e));
+      },
+    );
+    const elapsed = Date.now() - started;
+
+    expect(ended.code).toBe(1011);
+    expect(JSON.parse(ended.frame ?? "{}").error?.type).toBe("upstream_error");
+    // Lower bound too: a session that ended for any reason OTHER than
+    // the budget would not have waited for it.
+    expect(elapsed).toBeGreaterThanOrEqual(CONNECT_TIMEOUT_MS - 500);
+    expect(elapsed).toBeLessThan(CONNECT_TIMEOUT_MS + 4_000);
+
+    // …and the request exists in the metrics, not only in the access log.
+    // A black-holed realtime upstream now fails promptly and repeatedly,
+    // so a session missing from these counters is a request-rate and
+    // error-rate alert that never fires.
+    //
+    // Polled, not scraped once: the session runs on a detached upgrade
+    // task that records AFTER it has written the close frame this test
+    // resolved on, so a single scrape races that task and would flake
+    // exactly like the regression it pins.
+    await expect
+      .poll(
+        async () => {
+          const after = await scrapeMetrics(app!.metricsUrl);
+          return {
+            legacy: metricDelta(before, after, "aisix_requests_total", {
+              model: "realtime-e2e-silent-model",
+              status: "502",
+            }),
+            proxy: metricDelta(before, after, "aisix_proxy_requests_total", {
+              endpoint: "/v1/realtime",
+              status: "502",
+            }),
+          };
+        },
+        { timeout: 5_000 },
+      )
+      .toEqual({ legacy: 1, proxy: 1 });
   });
 
   test("bad credentials reject the upgrade handshake", async (ctx) => {

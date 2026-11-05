@@ -29,9 +29,10 @@
 //! to its own I/O worker and returns; the shared counters converge shortly
 //! after, not synchronously.
 
+use std::time::Duration;
+
 use aisix_core::RateLimit;
 use async_trait::async_trait;
-use std::time::Duration;
 
 use crate::error::RateLimitError;
 use crate::limiter::RateLimitStatus;
@@ -43,6 +44,33 @@ pub(crate) const SECOND_SECS: u64 = 1;
 pub(crate) const MINUTE_SECS: u64 = 60;
 pub(crate) const HOUR_SECS: u64 = 60 * 60;
 pub(crate) const DAY_SECS: u64 = 24 * 60 * 60;
+
+/// Dimension names. Both stores name the same window identically —
+/// they are the Redis key segment AND the `x-ratelimit-scope` value a
+/// 429 reports, so a client cannot be told `rpm` by one backend and
+/// `RPM` by the other.
+pub(crate) const DIM_RPS: &str = "rps";
+pub(crate) const DIM_RPM: &str = "rpm";
+pub(crate) const DIM_RPH: &str = "rph";
+pub(crate) const DIM_RPD: &str = "rpd";
+pub(crate) const DIM_TPM: &str = "tpm";
+pub(crate) const DIM_TPH: &str = "tph";
+pub(crate) const DIM_TPD: &str = "tpd";
+
+/// Result of trying to renew a distributed streaming concurrency lease.
+///
+/// Only [`StreamLeaseRefresh::Missing`] is definitive: the member was no
+/// longer present in the shared semaphore. The passthrough SSE relay uses
+/// that signal to end an already-headed response rather than continue outside
+/// its configured concurrency limit. `Unavailable` includes backends that
+/// cannot report an outcome and Redis transport failures; those retain the
+/// rate limiter's established fail-open behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamLeaseRefresh {
+    Renewed,
+    Missing,
+    Unavailable,
+}
 
 /// A windowed request/token dimension active on a [`RateLimit`]:
 /// `(name, window_secs, limit)`. Shared by both stores so the Redis key
@@ -56,10 +84,10 @@ pub(crate) struct Dim {
 /// Request-count dimensions (rps/rpm/rph/rpd) that carry a limit.
 pub(crate) fn request_dims(limits: &RateLimit) -> Vec<Dim> {
     [
-        ("rps", SECOND_SECS, limits.rps),
-        ("rpm", MINUTE_SECS, limits.rpm),
-        ("rph", HOUR_SECS, limits.rph),
-        ("rpd", DAY_SECS, limits.rpd),
+        (DIM_RPS, SECOND_SECS, limits.rps),
+        (DIM_RPM, MINUTE_SECS, limits.rpm),
+        (DIM_RPH, HOUR_SECS, limits.rph),
+        (DIM_RPD, DAY_SECS, limits.rpd),
     ]
     .into_iter()
     .filter_map(|(name, window_secs, limit)| {
@@ -83,9 +111,9 @@ pub(crate) fn request_dims(limits: &RateLimit) -> Vec<Dim> {
 /// `quota::warn_inert_dimension_once`) rather than half-honoured.
 pub(crate) fn token_dims(limits: &RateLimit) -> Vec<Dim> {
     [
-        ("tpm", MINUTE_SECS, limits.tpm),
-        ("tph", HOUR_SECS, limits.tph),
-        ("tpd", DAY_SECS, limits.tpd),
+        (DIM_TPM, MINUTE_SECS, limits.tpm),
+        (DIM_TPH, HOUR_SECS, limits.tph),
+        (DIM_TPD, DAY_SECS, limits.tpd),
     ]
     .into_iter()
     .filter_map(|(name, window_secs, limit)| {
@@ -124,17 +152,6 @@ pub trait RateStore: Send + Sync + 'static {
     /// when no tpd limit is configured (it simply expires unread).
     async fn commit(&self, key: &str, tokens: u64, member: &str);
 
-    /// How often an active distributed concurrency lease must be renewed.
-    /// Local stores return `None` because their slots do not expire.
-    fn concurrency_lease_renewal_interval(&self) -> Option<Duration> {
-        None
-    }
-
-    /// Refresh one active concurrency lease. Implementations must not create
-    /// a lease whose `member` no longer exists: release and renewal can race
-    /// on different connections when a request completes.
-    async fn renew_concurrency_lease(&self, _key: &str, _member: &str) {}
-
     /// Release the concurrency slot held by `member` without recording
     /// tokens. Sync so it can run from `Drop`; the Redis impl spawns a
     /// detached release (the concurrency set self-heals via TTL pruning
@@ -170,6 +187,26 @@ pub trait RateStore: Send + Sync + 'static {
     /// hold no in-process state.
     fn reap(&self, _idle_for: std::time::Duration) {}
 
+    /// How often a live streaming reservation should renew its distributed
+    /// concurrency lease. Local counters have no lease, so they opt out.
+    fn stream_lease_refresh_interval(&self) -> Option<Duration> {
+        None
+    }
+
+    /// Refresh a live streaming reservation's distributed concurrency lease.
+    /// Implementations must never recreate a member that has already been
+    /// released: a final refresh racing with stream teardown must be a no-op.
+    async fn refresh_stream_lease(&self, _key: &str, _member: &str) {}
+
+    /// Refresh a streaming lease while reporting whether its member still
+    /// exists. This preserves the legacy [`RateStore::refresh_stream_lease`]
+    /// hook for external stores: an implementation that only provides that
+    /// hook remains fail-open because it cannot prove that its member vanished.
+    async fn refresh_stream_lease_outcome(&self, key: &str, member: &str) -> StreamLeaseRefresh {
+        self.refresh_stream_lease(key, member).await;
+        StreamLeaseRefresh::Unavailable
+    }
+
     /// Read-only snapshot for the `x-ratelimit-*` headers. Returns `None`
     /// when there is nothing meaningful to report for the bucket.
     async fn peek(&self, key: &str, limits: &RateLimit) -> Option<RateLimitStatus>;
@@ -190,4 +227,10 @@ pub trait RateStore: Send + Sync + 'static {
     /// whenever a process that has forgotten the batch sees it completed
     /// again.
     async fn claim_once(&self, key: &str, ttl: Duration) -> bool;
+
+    /// Keys this process holds counters for; `None` for a shared store
+    /// whose counters live elsewhere.
+    fn local_key_count(&self) -> Option<u64> {
+        None
+    }
 }

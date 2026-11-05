@@ -40,6 +40,8 @@ const MODEL_DISPATCH_HANDLERS: &[&str] = &[
     "audio.rs",
     "videos.rs",
     "count_tokens.rs",
+    "images_edits.rs",
+    "decisions.rs",
 ];
 
 /// Per-request mechanisms every one of those handlers must carry, with what
@@ -120,6 +122,8 @@ fn a_handler_that_checks_caller_text_also_masks_it() {
         "redact::redact_",
         "moderate_body",
         "moderate_structured_body",
+        // The multipart surfaces' shared rewrite of their `prompt` fields.
+        "mask_prompt_fields",
     ];
 
     let mut missing: Vec<String> = Vec::new();
@@ -174,20 +178,13 @@ fn a_handler_that_masks_also_records_that_it_masked() {
         "redact::redact_",
         "moderate_body(",
         "moderate_structured_body(",
+        "mask_prompt_fields(",
     ];
     const REPORTS_THE_COUNTS: &[&str] = &["redacted_entity_counts", "redactions"];
-
-    /// `/v1/messages/count_tokens` emits no UsageEvent at all (see
-    /// `count_tokens.rs`), so it has nowhere to put the counts. Listed by
-    /// name so a handler that DOES emit one cannot inherit the exemption.
-    const NO_USAGE_EVENT: &[&str] = &["count_tokens.rs"];
 
     let dir = handlers_dir();
     let mut unaudited: Vec<String> = Vec::new();
     for handler in MODEL_DISPATCH_HANDLERS {
-        if NO_USAGE_EVENT.contains(handler) {
-            continue;
-        }
         let src = std::fs::read_to_string(dir.join(handler)).expect("handler is readable");
         if !APPLIES_MASKS.iter().any(|m| src.contains(m)) {
             continue;
@@ -205,16 +202,6 @@ fn a_handler_that_masks_also_records_that_it_masked() {
          rule did. Carry the counts into `redacted_entity_counts`.",
         unaudited.join("\n"),
     );
-
-    // The exemption rots like every other list here.
-    for handler in NO_USAGE_EVENT {
-        let src = std::fs::read_to_string(dir.join(handler)).expect("handler is readable");
-        assert!(
-            !src.contains("UsageEvent {"),
-            "NO_USAGE_EVENT lists `{handler}`, which now builds a UsageEvent — \
-             drop the exemption and carry the counts into it"
-        );
-    }
 }
 
 /// A cache HIT is client-visible output, so it must run the output chain
@@ -367,13 +354,20 @@ fn the_handler_list_matches_what_is_on_disk() {
     }
 
     /// Resolves a Model but is not one of these, with the reason.
-    const NOT_A_RESPONSE_HANDLER: &[(&str, &str)] = &[(
-        "realtime.rs",
-        "answers with a WebSocket upgrade, not a response an SDK reads: the \
-         shared mechanisms here are about shaping that response (rate-limit \
-         headers, cache-hit guarding, a mask over caller text in a body it \
-         does not have).",
-    )];
+    const NOT_A_RESPONSE_HANDLER: &[(&str, &str)] = &[
+        (
+            "realtime.rs",
+            "answers with a WebSocket upgrade, not a response an SDK reads: the \
+             shared mechanisms here are about shaping that response (rate-limit \
+             headers, cache-hit guarding, a mask over caller text in a body it \
+             does not have).",
+        ),
+        (
+            "request_metrics.rs",
+            "resolves a name only to choose a metric label for a request that \
+             already ended; it dispatches nothing and answers nothing.",
+        ),
+    ];
 
     let mut unlisted: Vec<String> = Vec::new();
     let mut resolvers = 0usize;

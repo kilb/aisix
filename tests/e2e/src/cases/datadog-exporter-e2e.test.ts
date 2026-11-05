@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { gunzipSync } from "node:zlib";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
@@ -247,6 +248,15 @@ describe("datadog exporter e2e (#688): DP delivers a gzip JSON intake to Datadog
         // Default privacy posture: operational metadata only, never content.
         content_mode: "metadata_only",
       });
+      // A second exporter on the OTLP wire, to pin that the public
+      // trace_id both sinks carry names the SAME trace (AISIX-Cloud#1279).
+      const otlp: MockOtlp = await startMockOtlp();
+      await seed.createObservabilityExporter({
+        name: "mock-datadog-otlp-side",
+        enabled: true,
+        kind: "otlp_http",
+        endpoint: otlp.url,
+      });
       await seedRouting(seed, upstream, "datadog-exporter-model");
 
       await waitConfigPropagation(async () => {
@@ -298,6 +308,29 @@ describe("datadog exporter e2e (#688): DP delivers a gzip JSON intake to Datadog
 
       // The API key must appear ONLY in the header — never anywhere in the body.
       expect(intake.bodyText.includes(DD_API_KEY)).toBe(false);
+
+      // The public trace_id (AISIX-Cloud#1279): present on the log wire as
+      // 32 lowercase hex, and EQUAL to the trace the OTLP exporter shipped
+      // for the same request — the correlation contract the control
+      // plane's {trace_id} link template depends on.
+      const logTraceId = log["aisix.trace_id"];
+      expect(logTraceId).toMatch(/^[0-9a-f]{32}$/);
+      const requestId = log["aisix.request_id"];
+      const deadline = Date.now() + 10_000;
+      while (
+        Date.now() < deadline &&
+        !otlp.spans.some((s) => s.attributes["aisix.request_id"] === requestId)
+      ) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      const spans = otlp.spans.filter(
+        (s) => s.attributes["aisix.request_id"] === requestId,
+      );
+      expect(spans.length).toBeGreaterThan(0);
+      for (const span of spans) {
+        expect(span.traceId).toBe(logTraceId);
+      }
+      await otlp.close();
       // Metadata-only posture: no captured prompt / response fields at all.
       expect(log["gen_ai.prompt"]).toBeUndefined();
       expect(log["gen_ai.completion"]).toBeUndefined();
@@ -306,7 +339,7 @@ describe("datadog exporter e2e (#688): DP delivers a gzip JSON intake to Datadog
   );
 
   test(
-    "content_mode=full ships gen_ai.prompt/completion; metadata_only ships neither",
+    "content_mode=full ships the structured gen_ai input/output messages; metadata_only ships neither",
     async (ctx) => {
       if (!etcdReachable || !upstream || !dd) {
         ctx.skip();
@@ -372,17 +405,37 @@ describe("datadog exporter e2e (#688): DP delivers a gzip JSON intake to Datadog
         const metaIntake = await waitForIntake(ddMeta);
 
         const fullLog = asRecord(fullIntake.logs[0]);
-        // Full capture carries both the prompt and the assembled response.
-        expect(fullLog["gen_ai.prompt"]).toBeTypeOf("string");
-        expect(fullLog["gen_ai.completion"]).toBeTypeOf("string");
+        // Full capture carries the request and the assembled response as
+        // the GenAI conventions' messages, nested, and no flat text.
+        expect(fullLog["gen_ai.input.messages"]).toEqual([
+          {
+            role: "user",
+            parts: [{ type: "text", content: `please remember the token ${PROMPT_TOKEN}` }],
+          },
+        ]);
+        expect(fullLog["gen_ai.output.messages"]).toEqual([
+          {
+            role: "assistant",
+            finish_reason: "stop",
+            parts: [{ type: "text", content: `sure, ${RESPONSE_TOKEN} noted` }],
+          },
+        ]);
+        expect(fullLog["gen_ai.prompt"]).toBeUndefined();
+        expect(fullLog["gen_ai.completion"]).toBeUndefined();
         expect(fullIntake.bodyText).toContain(PROMPT_TOKEN);
         expect(fullIntake.bodyText).toContain(RESPONSE_TOKEN);
 
         // Metadata-only carries NEITHER the prompt nor the response — content
         // gating holds end-to-end through the real binary.
         const metaLog = asRecord(metaIntake.logs[0]);
-        expect(metaLog["gen_ai.prompt"]).toBeUndefined();
-        expect(metaLog["gen_ai.completion"]).toBeUndefined();
+        for (const field of [
+          "gen_ai.prompt",
+          "gen_ai.completion",
+          "gen_ai.input.messages",
+          "gen_ai.output.messages",
+        ]) {
+          expect(metaLog[field]).toBeUndefined();
+        }
         expect(metaIntake.bodyText).not.toContain(PROMPT_TOKEN);
         expect(metaIntake.bodyText).not.toContain(RESPONSE_TOKEN);
       } finally {

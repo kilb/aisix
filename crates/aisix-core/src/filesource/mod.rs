@@ -2,9 +2,10 @@
 //! config.yaml).
 //!
 //! Loads every dynamic resource — provider keys, models, API keys,
-//! guardrails, MCP servers, A2A agents, cache policies, observability
-//! exporters, rate-limit policies — from one YAML file instead of etcd,
-//! so a single container can run fully declaratively.
+//! guardrails and their attachments, MCP servers, A2A agents, cache
+//! policies, observability exporters, rate-limit policies — from one YAML
+//! file instead of etcd, so a single container can run fully
+//! declaratively.
 //!
 //! Pipeline (identical for boot, SIGHUP reload, and `aisix validate`):
 //!
@@ -22,8 +23,8 @@
 //! per-entry and across entries.)
 //!
 //! File format v1 (`_format_version: "1"`, mandatory):
-//! - nine top-level collection keys, each a sequence of maps, named by
-//!   the plural resource kind; unknown top-level keys are load errors.
+//! - fourteen top-level collection keys, each a sequence of maps, named
+//!   by the plural resource kind; unknown top-level keys are load errors.
 //! - after desugaring, every entry must be exactly a canonical resource
 //!   document (`schemas/resources/*.schema.json`) — the file source
 //!   never relaxes the canonical schemas.
@@ -31,6 +32,12 @@
 //!   (UUIDv5 of `"<kind>/<identity>"`, see
 //!   [`desugar::FILE_RESOURCE_NAMESPACE`]) and identities must be
 //!   unique per kind.
+//! - cross-collection references are written as the identity the target
+//!   collection is keyed by, and desugaring rewrites them to derived ids
+//!   — including a guardrail attachment's `guardrail_id` and `scope_id`.
+//!   A guardrail with no attachment is not an error: its scope target may
+//!   simply be gone, and a guardrail's scope is its attachments and
+//!   nothing else, so it governs nothing until something attaches it.
 
 mod desugar;
 mod status;
@@ -46,9 +53,10 @@ use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::models::{
     validate_a2a_agent, validate_apikey, validate_cache_policy, validate_claim_mapping,
-    validate_guardrail, validate_mcp_server, validate_model, validate_observability_exporter,
-    validate_oidc_provider, validate_passthrough_route, validate_provider_key,
-    validate_rate_limit_policy, A2aAgent, ApiKey, CachePolicy, ClaimMapping, Guardrail, McpServer,
+    validate_guardrail, validate_guardrail_attachment, validate_mcp_auth_settings,
+    validate_mcp_server, validate_model, validate_observability_exporter, validate_oidc_provider,
+    validate_passthrough_route, validate_provider_key, validate_rate_limit_policy, A2aAgent,
+    ApiKey, CachePolicy, ClaimMapping, Guardrail, GuardrailAttachment, McpAuthSettings, McpServer,
     Model, ObservabilityExporter, OidcProvider, PassthroughRoute, ProviderKey, RateLimitPolicy,
     SchemaError,
 };
@@ -103,19 +111,10 @@ impl std::error::Error for FileSourceErrors {}
 /// change semantics without silently misreading old gateways' files.
 const SUPPORTED_FORMAT_VERSION: &str = "1";
 
-/// True when a URL embeds credentials that must not sit in a public JWKS
-/// endpoint: userinfo (`user:pass@host`) or a credential-bearing query
-/// parameter. String-scanned rather than URL-parsed to avoid pulling a
-/// URL crate into `aisix-core`.
+/// True when a URL embeds a credential-bearing query parameter, which must
+/// not sit in a public JWKS endpoint. String-scanned rather than
+/// URL-parsed to avoid pulling a URL crate into `aisix-core`.
 pub(crate) fn url_has_credentials(url: &str) -> bool {
-    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
-    // Authority ends at the first '/', '?', or '#'.
-    let authority_end = after_scheme
-        .find(['/', '?', '#'])
-        .unwrap_or(after_scheme.len());
-    if after_scheme[..authority_end].contains('@') {
-        return true;
-    }
     if let Some((_, query)) = url.split_once('?') {
         let query = query.split('#').next().unwrap_or(query);
         for pair in query.split('&') {
@@ -131,12 +130,13 @@ pub(crate) fn url_has_credentials(url: &str) -> bool {
     false
 }
 
-/// Fixed processing order for the twelve resource collections.
-const KINDS: [(&str, IdentityField); 12] = [
+/// Fixed processing order for the fourteen resource collections.
+const KINDS: [(&str, IdentityField); 14] = [
     ("provider_keys", IdentityField::DisplayName),
     ("models", IdentityField::DisplayName),
     ("api_keys", IdentityField::DisplayName),
     ("guardrails", IdentityField::Name),
+    ("guardrail_attachments", IdentityField::AttachmentTriple),
     ("mcp_servers", IdentityField::NameOrDisplayName),
     ("a2a_agents", IdentityField::NameOrDisplayName),
     ("cache_policies", IdentityField::Name),
@@ -145,7 +145,234 @@ const KINDS: [(&str, IdentityField); 12] = [
     ("oidc_providers", IdentityField::Name),
     ("claim_mappings", IdentityField::Name),
     ("passthrough_routes", IdentityField::NameOrDisplayName),
+    // Singleton: the fixed identity makes a second entry a duplicate
+    // at pass 1, enforcing at-most-one row per file.
+    (
+        "mcp_auth_settings",
+        IdentityField::Fixed("mcp_auth_settings"),
+    ),
 ];
+
+/// One id-form model reference a document can carry: the field, the
+/// name-form field that replaces it, and how an operator should spell that
+/// name form.
+///
+/// `hint` is not decoration. It is the same as `name_field` for every
+/// reference whose name form takes a bare model name, and differs for the
+/// one that does not: a cache policy's model scope is written into the
+/// free-form `applies_to`, where a bare name parses as no discriminator at
+/// all and the policy silently WIDENS to every request instead of failing.
+/// An error message that told an operator to "use `applies_to`" would be
+/// walking them into that.
+pub struct ModelRefIdField {
+    pub field: &'static str,
+    pub name_field: &'static str,
+    pub hint: &'static str,
+}
+
+const fn pair(field: &'static str, name_field: &'static str) -> ModelRefIdField {
+    ModelRefIdField {
+        field,
+        name_field,
+        hint: name_field,
+    }
+}
+
+/// The id-form model references a document of `kind` can carry.
+///
+/// A projected document may point at a Model by resource id instead of by
+/// display name, which is what makes a reference survive a rename of the
+/// model. The list is public because two consumers must agree on it: the
+/// resources file refuses the id form (see [`load_from_str`]) and `aisix
+/// export` rewrites it back to the name form, and a field one of them
+/// knows about and the other does not is a silent round-trip loss.
+pub fn model_ref_id_fields(kind: &str) -> &'static [ModelRefIdField] {
+    const API_KEYS: [ModelRefIdField; 1] = [pair("allowed_model_ids", "allowed_models")];
+    const MODELS: [ModelRefIdField; 4] = [
+        pair("model_id", "model"),
+        pair("target_id", "target"),
+        pair("embedding_model_id", "embedding_model"),
+        pair("default_id", "default"),
+    ];
+    const CACHE_POLICIES: [ModelRefIdField; 2] = [
+        ModelRefIdField {
+            field: "applies_to_model_id",
+            name_field: "applies_to",
+            hint: "applies_to: \"model:<name>\"",
+        },
+        pair("embedding_model_id", "embedding_model"),
+    ];
+    const GUARDRAILS: [ModelRefIdField; 1] = [pair("embedding_model_id", "embedding_model")];
+    match kind {
+        "api_keys" => &API_KEYS,
+        "models" => &MODELS,
+        "cache_policies" => &CACHE_POLICIES,
+        "guardrails" => &GUARDRAILS,
+        _ => &[],
+    }
+}
+
+/// One id-form MCP server reference a document can carry: where it sits,
+/// the field, and the name-form field that replaces it.
+///
+/// The name form spells the server as the `<server>` half of a namespaced
+/// `<server>__<tool>` pattern (an ACL side), as a map key (the per-server
+/// rate limits), or as a bare entry in a list (the anonymous ceiling);
+/// either way the file names the server, and the id form is what a file
+/// cannot express.
+pub struct McpRefIdField {
+    /// Object path from the document root to the object carrying `field`.
+    pub path: &'static [&'static str],
+    pub field: &'static str,
+    pub name_field: &'static str,
+}
+
+impl McpRefIdField {
+    /// Dotted path an operator sees in the error, e.g. `mcp_access.allow_ids`.
+    fn display_path(&self) -> String {
+        let mut out = String::new();
+        for segment in self.path {
+            out.push_str(segment);
+            out.push('.');
+        }
+        out.push_str(self.field);
+        out
+    }
+}
+
+/// The id-form MCP server references a document of `kind` can carry.
+///
+/// Same contract as [`model_ref_id_fields`], for the other reference that
+/// has an id spelling: the resources file refuses it (see [`load_from_str`])
+/// and `aisix export` rewrites it back to the name form, and a field one of
+/// them knows about and the other does not is a silent round-trip loss.
+///
+/// `mcp_policies` is deliberately absent — the file source carries no such
+/// collection, so there is no document of that kind for a file to reject.
+pub fn mcp_ref_id_fields(kind: &str) -> &'static [McpRefIdField] {
+    const MCP_AUTH_SETTINGS: [McpRefIdField; 1] = [McpRefIdField {
+        path: &["anonymous"],
+        field: "server_ids",
+        name_field: "servers",
+    }];
+    const API_KEYS: [McpRefIdField; 3] = [
+        McpRefIdField {
+            path: &[],
+            field: "mcp_rate_limits_by_id",
+            name_field: "mcp_rate_limits",
+        },
+        McpRefIdField {
+            path: &["mcp_access"],
+            field: "allow_ids",
+            name_field: "allow",
+        },
+        McpRefIdField {
+            path: &["mcp_access"],
+            field: "deny_ids",
+            name_field: "deny",
+        },
+    ];
+    match kind {
+        "api_keys" => &API_KEYS,
+        "mcp_auth_settings" => &MCP_AUTH_SETTINGS,
+        _ => &[],
+    }
+}
+
+/// The first id-form MCP reference `doc` carries, if any.
+fn mcp_ref_id_field(kind: &str, doc: &Value) -> Option<&'static McpRefIdField> {
+    mcp_ref_id_fields(kind).iter().find(|f| {
+        let mut node = doc;
+        for segment in f.path {
+            match node.get(segment) {
+                Some(next) => node = next,
+                None => return false,
+            }
+        }
+        node.get(f.field).is_some()
+    })
+}
+
+/// Call `f` on every object in `doc` that may carry one of
+/// [`model_ref_id_fields`]'s fields, for a document of `kind`.
+///
+/// Addressed by path rather than by walking the whole document for the
+/// field names: `secrets` and `headers` on a guardrail are operator-keyed
+/// maps, so a blind walk would treat a secret named `model_id` as a model
+/// reference and rewrite it. Extend this when a new nesting site gains a
+/// model reference.
+pub fn for_each_model_ref_node(
+    kind: &str,
+    doc: &mut Value,
+    f: &mut dyn FnMut(&mut serde_json::Map<String, Value>),
+) {
+    let Some(root) = doc.as_object_mut() else {
+        return;
+    };
+    let objects_in =
+        |node: &mut Value, key: &str, f: &mut dyn FnMut(&mut serde_json::Map<String, Value>)| {
+            if let Some(Value::Array(items)) = node.get_mut(key) {
+                for item in items {
+                    if let Some(obj) = item.as_object_mut() {
+                        f(obj);
+                    }
+                }
+            }
+        };
+    match kind {
+        // The key's grant list is a root field; a guardrail's kind config
+        // is `#[serde(flatten)]`ed onto the root, so its embedder is too.
+        "api_keys" | "guardrails" => f(root),
+        "cache_policies" => {
+            f(root);
+            if let Some(Value::Object(semantic)) = root.get_mut("semantic") {
+                f(semantic);
+            }
+        }
+        "models" => {
+            if let Some(routing) = root.get_mut("routing") {
+                objects_in(routing, "targets", f);
+            }
+            if let Some(ensemble) = root.get_mut("ensemble") {
+                objects_in(ensemble, "panel", f);
+                if let Some(Value::Object(judge)) = ensemble.get_mut("judge") {
+                    f(judge);
+                }
+            }
+            if let Some(semantic) = root.get_mut("semantic") {
+                objects_in(semantic, "routes", f);
+                if let Some(Value::Object(on_failure)) = semantic.get_mut("on_embedding_failure") {
+                    f(on_failure);
+                }
+                if let Some(Value::Object(on_failure)) = semantic
+                    .get_mut("classifier")
+                    .and_then(|c| c.get_mut("on_failure"))
+                {
+                    f(on_failure);
+                }
+                if let Some(semantic) = semantic.as_object_mut() {
+                    f(semantic);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The first id-form model reference `doc` carries.
+fn model_ref_id_field(kind: &str, doc: &mut Value) -> Option<&'static ModelRefIdField> {
+    let fields = model_ref_id_fields(kind);
+    if fields.is_empty() {
+        return None;
+    }
+    let mut found = None;
+    for_each_model_ref_node(kind, doc, &mut |node| {
+        if found.is_none() {
+            found = fields.iter().find(|f| node.contains_key(f.field));
+        }
+    });
+    found
+}
 
 /// Load `path` into a fresh [`AisixSnapshot`], resolving `${VAR}`
 /// interpolation against the current process environment. `revision` is
@@ -224,6 +451,23 @@ pub fn load_from_str(
             )));
             continue;
         };
+        // Named ahead of the generic unknown-key error: `pricing` is a
+        // real collection the gateway loads from etcd, so "unknown
+        // top-level key" would read as a typo rather than as the answer
+        // it is. Pricing documents are a control-plane projection —
+        // shared across environments and keyed by control-plane id — and
+        // a file that declared its own could not be the same document any
+        // other environment reads. Set `cost` on the model instead.
+        if key == "pricing" {
+            errors.push(file_error(
+                "the resources file does not accept a `pricing` collection — pricing \
+                 documents are written by the control plane and shared across \
+                 environments, which a file cannot express; set `cost` on each model \
+                 instead"
+                    .to_string(),
+            ));
+            continue;
+        }
         if key != "_format_version" && !KINDS.iter().any(|(k, _)| k == key) {
             let known: Vec<&str> = KINDS.iter().map(|(k, _)| *k).collect();
             errors.push(file_error(format!(
@@ -343,6 +587,7 @@ pub fn load_from_str(
     let mut apikeys: Vec<(String, String, ApiKey)> = Vec::new();
     let mut provider_keys: Vec<(String, String, ProviderKey)> = Vec::new();
     let mut guardrails: Vec<(String, String, Guardrail)> = Vec::new();
+    let mut guardrail_attachments: Vec<(String, String, GuardrailAttachment)> = Vec::new();
     let mut mcp_servers: Vec<(String, String, McpServer)> = Vec::new();
     let mut a2a_agents: Vec<(String, String, A2aAgent)> = Vec::new();
     let mut cache_policies: Vec<(String, String, CachePolicy)> = Vec::new();
@@ -351,6 +596,7 @@ pub fn load_from_str(
     let mut oidc_providers: Vec<(String, String, OidcProvider)> = Vec::new();
     let mut claim_mappings: Vec<(String, String, ClaimMapping)> = Vec::new();
     let mut passthrough_routes: Vec<(String, String, PassthroughRoute)> = Vec::new();
+    let mut mcp_auth_settings: Vec<(String, String, McpAuthSettings)> = Vec::new();
 
     for mut entry in prepared {
         let id = derive_id(entry.kind, &entry.identity);
@@ -371,6 +617,63 @@ pub fn load_from_str(
             continue;
         }
 
+        // `pricing_key` is the same class of control-plane projection as
+        // the model-reference id spellings below: it names a pricing
+        // document a file has no way to declare, so a file that carried
+        // it would leave the model with no price at all — silently, and
+        // with `cost` the only thing that could have supplied one.
+        if entry.kind == "models" && entry.doc.get("pricing_key").is_some() {
+            errors.push(LoadError {
+                scope,
+                message: "the resources file does not accept `pricing_key` — it names a \
+                          pricing document written by the control plane, which a file \
+                          cannot declare; set the price inline with `cost`"
+                    .into(),
+            });
+            continue;
+        }
+
+        // Every model reference has an id spelling that names the model by
+        // the id the control plane assigned it. A file's ids are derived
+        // from its entry names, so no id a file can carry ever resolves:
+        // accepting one would make the reference point at nothing —
+        // silently, and with the name spelling ignored on top. The file
+        // rejects the id spelling instead, wherever it appears. (The etcd
+        // path is the opposite: there an id that resolves to no model
+        // degrades that one reference and must never fail the row, because
+        // a rejected api_key stops authenticating entirely.)
+        if let Some(reference) = model_ref_id_field(entry.kind, &mut entry.doc) {
+            let (field, hint) = (reference.field, reference.hint);
+            errors.push(LoadError {
+                scope,
+                message: format!(
+                    "the resources file does not accept `{field}` — it names a model by \
+                     control-plane id, which a file cannot resolve; name the model with \
+                     `{hint}` instead"
+                ),
+            });
+            continue;
+        }
+
+        // The same rule for the other reference with an id spelling: an
+        // MCP server named by the id the control plane assigned it. A file
+        // registers its servers by name and derives their ids from those
+        // names, so an id a file carries resolves to nothing — the grant
+        // would silently cover no tool, or the limit bind to no server,
+        // with the name spelling ignored on top.
+        if let Some(reference) = mcp_ref_id_field(entry.kind, &entry.doc) {
+            let (path, name_field) = (reference.display_path(), reference.name_field);
+            errors.push(LoadError {
+                scope,
+                message: format!(
+                    "the resources file does not accept `{path}` — it names an MCP server by \
+                     control-plane id, which a file cannot resolve; name the server with \
+                     `{name_field}` instead"
+                ),
+            });
+            continue;
+        }
+
         let sugar_result = match entry.kind {
             "models" => desugar::desugar_model(&mut entry.doc, &identity_maps),
             "api_keys" => desugar::desugar_api_key(&mut entry.doc, env),
@@ -378,6 +681,9 @@ pub fn load_from_str(
                 desugar::desugar_rate_limit_policy(&mut entry.doc, &identity_maps)
             }
             "claim_mappings" => desugar::desugar_claim_mapping(&mut entry.doc, &identity_maps),
+            "guardrail_attachments" => {
+                desugar::desugar_guardrail_attachment(&mut entry.doc, &identity_maps)
+            }
             "passthrough_routes" => {
                 desugar::desugar_passthrough_route(&mut entry.doc, &identity_maps)
             }
@@ -409,9 +715,27 @@ pub fn load_from_str(
                     guardrails.push((id, scope, t));
                 }
             }
+            "guardrail_attachments" => {
+                if let Some(t) = finish(
+                    &scope,
+                    &entry.doc,
+                    validate_guardrail_attachment,
+                    &mut errors,
+                ) {
+                    guardrail_attachments.push((id, scope, t));
+                }
+            }
             "mcp_servers" => {
-                if let Some(t) = finish(&scope, &entry.doc, validate_mcp_server, &mut errors) {
-                    mcp_servers.push((id, scope, t));
+                if let Some(t) =
+                    finish::<McpServer>(&scope, &entry.doc, validate_mcp_server, &mut errors)
+                {
+                    // An OpenAPI document that yields no tool is beyond the
+                    // schema — a load error like any schema failure.
+                    if let Err(message) = t.validate_semantics() {
+                        errors.push(LoadError { scope, message });
+                    } else {
+                        mcp_servers.push((id, scope, t));
+                    }
                 }
             }
             "a2a_agents" => {
@@ -459,13 +783,28 @@ pub fn load_from_str(
                 }
             }
             "oidc_providers" => {
-                if let Some(t) = finish(&scope, &entry.doc, validate_oidc_provider, &mut errors) {
-                    oidc_providers.push((id, scope, t));
+                if let Some(t) =
+                    finish::<OidcProvider>(&scope, &entry.doc, validate_oidc_provider, &mut errors)
+                {
+                    // Mode-dependent field coupling and the shared-secret
+                    // length floor are beyond the schema — a failing
+                    // entry is a load error like any schema failure.
+                    if let Err(message) = t.validate_semantics() {
+                        errors.push(LoadError { scope, message });
+                    } else {
+                        oidc_providers.push((id, scope, t));
+                    }
                 }
             }
             "claim_mappings" => {
                 if let Some(t) = finish(&scope, &entry.doc, validate_claim_mapping, &mut errors) {
                     claim_mappings.push((id, scope, t));
+                }
+            }
+            "mcp_auth_settings" => {
+                if let Some(t) = finish(&scope, &entry.doc, validate_mcp_auth_settings, &mut errors)
+                {
+                    mcp_auth_settings.push((id, scope, t));
                 }
             }
             other => unreachable!("kind {other} is not in KINDS"),
@@ -515,7 +854,9 @@ pub fn load_from_str(
             check_model_ref(scope, "ensemble judge", &ensemble.judge.model);
         }
         if let Some(semantic) = &model.semantic {
-            check_model_ref(scope, "semantic embedding_model", &semantic.embedding_model);
+            if semantic.classifier.is_none() {
+                check_model_ref(scope, "semantic embedding_model", &semantic.embedding_model);
+            }
             check_model_ref(scope, "semantic default", &semantic.default);
             for route in &semantic.routes {
                 check_model_ref(
@@ -524,10 +865,15 @@ pub fn load_from_str(
                     &route.target,
                 );
             }
-            if let crate::models::OnEmbeddingFailure::Target { target } =
+            if let crate::models::OnEmbeddingFailure::Target { target, .. } =
                 &semantic.on_embedding_failure
             {
                 check_model_ref(scope, "semantic on_embedding_failure target", target);
+            }
+            if let Some(crate::models::OnEmbeddingFailure::Target { target, .. }) =
+                semantic.classifier.as_ref().map(|c| &c.on_failure)
+            {
+                check_model_ref(scope, "semantic classifier on_failure target", target);
             }
         }
     }
@@ -619,13 +965,18 @@ pub fn load_from_str(
         if !provider.enabled {
             continue;
         }
-        if let Some(first) = seen_issuers.insert(provider.issuer.as_str(), scope.as_str()) {
+        // Providers that pin no issuer (only possible in shared-secret
+        // mode) are not ambiguous with each other: a token reaches them
+        // by trial in name order, not by issuer, which is a total order.
+        let Some(issuer) = provider.issuer.as_deref() else {
+            continue;
+        };
+        if let Some(first) = seen_issuers.insert(issuer, scope.as_str()) {
             errors.push(LoadError {
                 scope: scope.clone(),
                 message: format!(
-                    "duplicate enabled OIDC issuer {:?}: already used by {first} — every \
-                     enabled provider must have a distinct issuer",
-                    provider.issuer
+                    "duplicate enabled OIDC issuer {issuer:?}: already used by {first} — every \
+                     enabled provider must have a distinct issuer"
                 ),
             });
         }
@@ -675,12 +1026,12 @@ pub fn load_from_str(
         }
     }
 
-    // A JWKS/discovery URL must never carry embedded credentials
-    // (`user:pass@host` or a credential query): JWKS material is public,
+    // A JWKS/discovery URL must never carry a credential query: JWKS
+    // material is public,
     // credentials there would only leak (e.g. through a snapshot export).
     for (_, scope, provider) in &oidc_providers {
         for (field, url) in [
-            ("issuer", Some(&provider.issuer)),
+            ("issuer", provider.issuer.as_ref()),
             ("jwks_uri", provider.jwks_uri.as_ref()),
         ] {
             if let Some(url) = url {
@@ -688,12 +1039,29 @@ pub fn load_from_str(
                     errors.push(LoadError {
                         scope: scope.clone(),
                         message: format!(
-                            "OIDC provider {field} must not embed credentials (user info or a \
-                             token query parameter) — JWKS endpoints are public"
+                            "OIDC provider {field} must not embed credentials (a token query \
+                             parameter) — JWKS endpoints are public"
                         ),
                     });
                 }
             }
+        }
+    }
+
+    // Same rule for the MCP OAuth resource URL: it is published verbatim
+    // on the unauthenticated protected-resource-metadata endpoint, so an
+    // embedded credential would be world-readable.
+    for (_, scope, settings) in &mcp_auth_settings {
+        let Some(resource_url) = settings.resource_url.as_deref() else {
+            continue;
+        };
+        if url_has_credentials(resource_url) {
+            errors.push(LoadError {
+                scope: scope.clone(),
+                message: "mcp_auth_settings resource_url must not embed credentials (a token \
+                          query parameter) — protected resource metadata is public"
+                    .into(),
+            });
         }
     }
 
@@ -714,6 +1082,19 @@ pub fn load_from_str(
                     message: format!(
                         "provider_key_id {pk_id:?} does not match any provider key \
                          defined in this file — reference it by name with \
+                         `provider_key` instead"
+                    ),
+                });
+            }
+        }
+        let classifier = model.semantic.as_ref().and_then(|s| s.classifier.as_ref());
+        if let Some(pk_id) = classifier.map(|c| c.provider_key_id.as_str()) {
+            if !pk_ids.contains(pk_id) {
+                errors.push(LoadError {
+                    scope: scope.clone(),
+                    message: format!(
+                        "semantic classifier provider_key_id {pk_id:?} does not match any \
+                         provider key defined in this file — reference it by name with \
                          `provider_key` instead"
                     ),
                 });
@@ -741,6 +1122,11 @@ pub fn load_from_str(
     for (id, _, v) in guardrails {
         snapshot
             .guardrails
+            .insert(ResourceEntry::new(id, v, revision));
+    }
+    for (id, _, v) in guardrail_attachments {
+        snapshot
+            .guardrail_attachments
             .insert(ResourceEntry::new(id, v, revision));
     }
     for (id, _, v) in mcp_servers {
@@ -781,6 +1167,11 @@ pub fn load_from_str(
     for (id, _, v) in passthrough_routes {
         snapshot
             .passthrough_routes
+            .insert(ResourceEntry::new(id, v, revision));
+    }
+    for (id, _, v) in mcp_auth_settings {
+        snapshot
+            .mcp_auth_settings
             .insert(ResourceEntry::new(id, v, revision));
     }
     Ok(snapshot)

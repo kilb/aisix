@@ -10,6 +10,7 @@
 //! `x-forwarded-for`) is walked to find the originating address. With no
 //! trusted proxies configured (the default) the peer is always logged.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
@@ -61,7 +62,9 @@ pub fn resolve_client_ip(
     // A no-op for genuine IPv6. Forwarded entries are canonicalized where
     // they are parsed, in `parse_forwarded_token`.
     let peer = peer.to_canonical();
-    let is_trusted = |ip: &IpAddr| trusted.iter().any(|n| n.contains(ip));
+    // An IPv4 address written in its IPv4-mapped IPv6 form is the same
+    // address, and an IPv4 CIDR has to match it.
+    let is_trusted = |ip: &IpAddr| trusted.iter().any(|n| n.contains(&ip.to_canonical()));
     // nginx only rewrites $remote_addr when the connection itself comes
     // from a trusted proxy. An untrusted peer IS the client.
     if !is_trusted(&peer) {
@@ -127,11 +130,6 @@ fn parse_forwarded_token(tok: &str) -> Option<IpAddr> {
 /// tags never reach the upstream request body.
 pub const ROUTING_TAGS_HEADER: &str = "x-aisix-routing-tags";
 
-/// Header carrying the stability key for sticky (A/B / canary) weighted
-/// routing. When present, a request consistently maps to the same weighted
-/// target; absent, the caller's API key is used as the key instead.
-pub const ROUTING_KEY_HEADER: &str = "x-aisix-routing-key";
-
 /// Per-request client attribution. Resolved once via the extractor and
 /// threaded into the usage event by each handler's emit fn.
 #[derive(Debug, Clone, Default)]
@@ -141,9 +139,6 @@ pub struct ClientContext {
     /// Routing tags from [`ROUTING_TAGS_HEADER`], used to select among a
     /// routing model's tagged targets. Empty when the header is absent.
     pub routing_tags: Vec<String>,
-    /// Stability key from [`ROUTING_KEY_HEADER`] for sticky weighted routing.
-    /// `None` when the header is absent (the caller's API key is used instead).
-    pub routing_key: Option<String>,
     /// Per-request correlation id, resolved from the [`RequestId`] the
     /// `ensure_request_id` middleware stamped into the request extensions.
     /// Handlers use it for both the usage event and the response header, so
@@ -168,6 +163,78 @@ pub struct ClientContext {
     /// extractor; `None` when the request authenticated with the key's
     /// plaintext.
     pub jwt: Option<Arc<crate::auth::JwtIdentity>>,
+    /// The request's trace identity (AISIX-Cloud#1279), minted by
+    /// `ensure_request_id` beside the [`RequestId`]. Handlers thread it
+    /// into their attempt telemetry and usage-event emission so every
+    /// exported span of the request shares one trace. `None` only when
+    /// the middleware isn't in the chain (a handler unit test with a
+    /// bare router) — emission then falls back to the legacy flat span.
+    pub trace: Option<Arc<aisix_obs::RequestTraceBundle>>,
+    /// The operator-selected request headers every usage event of this
+    /// request records ([`capture_request_headers`]).
+    pub request_headers: BTreeMap<String, String>,
+    /// The inbound body's byte count, read at dispatch time (the handler
+    /// has the whole body by then). `None` outside the body-limit layer.
+    pub(crate) inbound_body: Option<crate::request_body_account::InboundBody>,
+}
+
+/// The values of the request headers any enabled exporter of this snapshot
+/// lists in its `request_headers`, for `UsageEvent::request_headers`.
+///
+/// Every emitter takes the map from here — through [`ClientContext`], or
+/// directly on `/mcp` and `/a2a`, which build none — so all events of one
+/// request carry the same values; each exporter then keeps only its own
+/// names (`OtlpHttpFanOut::fan_out`). Value rules:
+/// [`aisix_gateway::capture_header_values`]. Reading a header here never
+/// changes what is forwarded upstream.
+pub(crate) fn capture_request_headers(
+    headers: &HeaderMap,
+    snap: &aisix_core::AisixSnapshot,
+) -> BTreeMap<String, String> {
+    let names = exported_header_names(snap, false);
+    if names.is_empty() {
+        return BTreeMap::new();
+    }
+    aisix_gateway::capture_header_values(headers, &names)
+}
+
+/// The union of one header list across the snapshot's enabled exporters
+/// (`response` picks `upstream_response_headers`), keeping only names the
+/// write path admits: a lowercase token, never a credential slot, and never
+/// `set-cookie` on the response side. A stored row may predate a tightening
+/// of those rules, and it still loads (the read schema leaves them out), so
+/// this is where they hold.
+pub(crate) fn exported_header_names(
+    snap: &aisix_core::AisixSnapshot,
+    response: bool,
+) -> Vec<String> {
+    let admitted = |name: &&String| {
+        !name.is_empty()
+            && name.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || b"!#$%&'*+.^_`|~-".contains(&b)
+            })
+            && !aisix_core::forwarded_headers::CREDENTIAL_SLOT_HEADERS.contains(&name.as_str())
+            && name.as_str() != aisix_core::forwarded_headers::GATEWAY_CREDENTIAL_HEADER
+            && (!response || name.as_str() != "set-cookie")
+    };
+    let mut names: Vec<String> = snap
+        .observability_exporters
+        .entries()
+        .iter()
+        .filter(|e| e.value.enabled)
+        .flat_map(|e| {
+            if response {
+                e.value.upstream_response_headers.iter()
+            } else {
+                e.value.request_headers.iter()
+            }
+        })
+        .filter(admitted)
+        .cloned()
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 /// Resolve the caller's address from the peer plus the trusted-proxy
@@ -217,37 +284,60 @@ where
             .map(parse_routing_tags)
             .unwrap_or_default();
 
-        let routing_key = parts
-            .headers
-            .get(ROUTING_KEY_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
-
         let request_id = parts
             .extensions
             .get::<crate::request_id::RequestId>()
             .map(|r| r.0.clone())
             .unwrap_or_else(crate::request_id::new_request_id);
 
-        Ok(ClientContext {
+        let api_key = parts
+            .extensions
+            .get::<Arc<aisix_core::ResourceEntry<aisix_core::ApiKey>>>();
+
+        let ctx = ClientContext {
             source_ip,
             user_agent,
             routing_tags,
-            routing_key,
             request_id,
             headers: Arc::new(parts.headers.clone()),
-            caller: parts
-                .extensions
-                .get::<Arc<aisix_core::ResourceEntry<aisix_core::ApiKey>>>()
-                .map(|e| aisix_gateway::CallerIdentity::from_entry(e))
+            caller: api_key
+                .map(|e| {
+                    let owner = parts.extensions.get::<aisix_core::KeyOwnerNames>();
+                    let tags = parts
+                        .extensions
+                        .get::<crate::auth::EffectiveTags>()
+                        .map(|t| std::sync::Arc::clone(&t.0))
+                        .unwrap_or_default();
+                    aisix_gateway::CallerIdentity::from_entry(
+                        e,
+                        owner.unwrap_or(&Default::default()),
+                        tags,
+                    )
+                })
                 .unwrap_or_default(),
             jwt: parts
                 .extensions
                 .get::<Arc<crate::auth::JwtIdentity>>()
                 .cloned(),
-        })
+            trace: parts
+                .extensions
+                .get::<Arc<aisix_obs::RequestTraceBundle>>()
+                .cloned(),
+            request_headers: capture_request_headers(&parts.headers, &proxy_state.snapshot.load()),
+            inbound_body: parts
+                .extensions
+                .get::<crate::request_body_account::InboundBody>()
+                .cloned(),
+        };
+        // Hand the caller to the request's attribution cell as well
+        // (AISIX-Cloud#1571). This extractor is the one place every
+        // client-facing handler resolves who is calling, so it is also the
+        // one place that can hand it to the cancel guard — which emits the
+        // request's usage events when the handler future is dropped before
+        // it can. The api_key id comes from the same extension the `caller`
+        // above does, so the two cannot disagree.
+        crate::attribution::note_client(&ctx, api_key.map(|e| e.id.as_str()).unwrap_or_default());
+        Ok(ctx)
     }
 }
 
@@ -260,8 +350,76 @@ fn parse_routing_tags(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether `source_ip` — as resolved by the real-ip chain above, never a
+/// raw caller-supplied header — falls inside one of `cidrs`.
+///
+/// An unparseable source IP is OUT: callers gate access on this, so a
+/// peer address the proxy could not resolve must not pass an allowlist.
+/// An unparseable CIDR entry is skipped rather than opening the list.
+/// An EMPTY list is also out — "allowlist everything" has to be spelled
+/// by the caller (passthrough routes treat an unset list as
+/// unrestricted; the MCP anonymous block requires a non-empty one), so
+/// this primitive never has to guess which of the two an empty list means.
+pub(crate) fn ip_in_cidrs(source_ip: &str, cidrs: &[String]) -> bool {
+    let Ok(ip) = source_ip.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    // Same canonicalization `Model::ip_allowed` applies: a dual-stack
+    // listener reports an IPv4 client as `::ffff:a.b.c.d`, which no IPv4
+    // CIDR contains. A no-op for genuine IPv6. This gate is the whole
+    // boundary for an anonymous route, so it must not depend on which
+    // address family the listener happened to bind.
+    let ip = ip.to_canonical();
+    // An entry that does not parse is skipped, which narrows the allowlist
+    // rather than widening it. `validate_passthrough_route` rejects that
+    // shape on the write path, so this only tolerates rows stored by an
+    // older build.
+    cidrs
+        .iter()
+        .filter_map(|cidr| cidr.parse::<ipnet::IpNet>().ok())
+        .any(|net| net.contains(&ip))
+}
+
 #[cfg(test)]
 mod tests {
+    /// A stored exporter may name a header the write path refuses; the
+    /// capture drops it rather than recording a credential.
+    #[test]
+    fn exported_header_names_drop_what_the_write_path_refuses() {
+        let snap = aisix_core::AisixSnapshot::new();
+        let exporter: aisix_core::ObservabilityExporter =
+            serde_json::from_value(serde_json::json!({
+                "name": "x", "kind": "otlp_http", "endpoint": "https://x",
+                "request_headers": ["x-sub-user", "authorization", "x-aisix-api-key", "X-Upper", "x-sub-user"],
+                "upstream_response_headers": ["x-region", "set-cookie", "x-api-key"],
+            }))
+            .unwrap();
+        snap.observability_exporters
+            .insert(aisix_core::ResourceEntry::new("e1", exporter, 1));
+        assert_eq!(
+            exported_header_names(&snap, false),
+            vec!["x-sub-user".to_string()]
+        );
+        assert_eq!(
+            exported_header_names(&snap, true),
+            vec!["x-region".to_string()]
+        );
+    }
+
+    #[test]
+    fn cidr_match_is_closed_on_bad_input() {
+        let cidrs = vec!["10.0.0.0/8".to_string(), "2001:db8::/32".to_string()];
+        assert!(super::ip_in_cidrs("10.1.2.3", &cidrs));
+        assert!(super::ip_in_cidrs("2001:db8::5", &cidrs));
+        assert!(!super::ip_in_cidrs("192.0.2.1", &cidrs));
+        // Unresolvable source, empty list, and a malformed entry all
+        // fail closed rather than passing the allowlist.
+        assert!(!super::ip_in_cidrs("", &cidrs));
+        assert!(!super::ip_in_cidrs("not-an-ip", &cidrs));
+        assert!(!super::ip_in_cidrs("10.1.2.3", &[]));
+        assert!(!super::ip_in_cidrs("10.1.2.3", &["nonsense".to_string()]));
+    }
+
     use super::*;
 
     fn nets(cidrs: &[&str]) -> Vec<IpNet> {
@@ -318,6 +476,17 @@ mod tests {
         let fwd = [ip("1.2.3.4")];
         let trusted = nets(&["10.0.0.0/8"]);
         assert_eq!(resolve_client_ip(peer, &fwd, &trusted, true), peer);
+    }
+
+    #[test]
+    fn an_ipv4_mapped_forwarded_entry_matches_an_ipv4_cidr() {
+        let peer = ip("10.0.0.1");
+        let fwd = [ip("203.0.113.7"), ip("::ffff:10.0.0.2")];
+        let trusted = nets(&["10.0.0.0/8"]);
+        assert_eq!(
+            resolve_client_ip(peer, &fwd, &trusted, true),
+            ip("203.0.113.7")
+        );
     }
 
     #[test]

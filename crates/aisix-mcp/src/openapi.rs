@@ -17,12 +17,16 @@
 //!
 //! The spec is read from the resource snapshot (shared, never re-fetched at
 //! runtime): the control plane validates and materializes it at write time, so
-//! the tool set only changes when the resource does.
+//! the tool set only changes when the resource does. The generation itself is
+//! [`aisix_core::mcp_openapi`], shared with the resource loaders, which reject
+//! a document it yields no tools from.
 
-use std::collections::HashSet;
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use aisix_core::mcp_openapi::{generate, GeneratedTool};
+use aisix_core::snapshot::ResourceTable;
 use aisix_core::{McpAuthType, McpServer, ResourceEntry};
 use async_trait::async_trait;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
@@ -34,19 +38,6 @@ use crate::error::McpError;
 /// Header the API key is sent under for `auth_type: api_key` when the
 /// resource sets no `api_key_header`.
 pub const DEFAULT_API_KEY_HEADER: &str = "x-api-key";
-
-/// Tool names must survive every major LLM provider's `^[a-zA-Z0-9_-]+$`
-/// name check; 128 is the most restrictive cap (mirrors LiteLLM).
-const TOOL_NAME_MAX_LEN: usize = 128;
-
-/// HTTP methods that map to tools, in generation order.
-const METHODS: [&str; 5] = ["get", "post", "put", "delete", "patch"];
-
-/// `$ref` inlining bounds, per operation: a cyclic or pathologically nested
-/// schema degrades to `{}` (schema "anything") instead of recursing forever
-/// or exploding the inlined size.
-const MAX_REF_DEPTH: usize = 16;
-const MAX_REF_EXPANSIONS: usize = 256;
 
 /// Everything except RFC 3986 unreserved characters is percent-encoded when a
 /// path parameter value is substituted into the URL template.
@@ -94,27 +85,19 @@ fn http_client() -> &'static reqwest::Client {
     })
 }
 
-/// One OpenAPI operation, resolved into a callable tool.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct GeneratedTool {
-    pub name: String,
-    pub description: String,
-    pub input_schema: Value,
-    /// Lowercase HTTP method.
-    pub method: String,
-    /// The path template as written in the spec, e.g. `/items/{id}`.
-    pub path: String,
-    pub path_params: Vec<String>,
-    pub query_params: Vec<String>,
-    pub has_body: bool,
-}
-
 /// [`McpBridge`] over an OpenAPI-backed `mcp_server` resource. Holds the
 /// snapshot entry (`Arc`, shared with the snapshot) so the spec is never
 /// deep-cloned per request.
 pub struct OpenApiBridge {
     entry: Arc<ResourceEntry<McpServer>>,
     timeout: Duration,
+    /// Inbound client headers this server's `forward_client_headers`
+    /// admits, resolved per request against the calling agent's own
+    /// request and delivered to the REST API behind these tools.
+    forwarded_client_headers: Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>,
+    /// The calling agent's own credentials, read by `oauth_delegate` and
+    /// `oauth2_token_exchange`.
+    caller: crate::bridge::CallerCredentials,
 }
 
 impl OpenApiBridge {
@@ -124,18 +107,81 @@ impl OpenApiBridge {
             .timeout_ms
             .map(Duration::from_millis)
             .unwrap_or(crate::bridge::DEFAULT_UPSTREAM_TIMEOUT);
-        Self { entry, timeout }
+        Self {
+            entry,
+            timeout,
+            forwarded_client_headers: Vec::new(),
+            caller: crate::bridge::CallerCredentials::default(),
+        }
+    }
+
+    /// Deliver the calling agent's own credentials for the auth types that
+    /// act for the caller.
+    pub fn with_caller_credentials(mut self, caller: crate::bridge::CallerCredentials) -> Self {
+        self.caller = caller;
+        self
+    }
+
+    fn token_exchange(&self) -> crate::token_exchange::TokenExchangeAuth {
+        crate::token_exchange::TokenExchangeAuth {
+            config: crate::bridge::token_exchange_config(self.server()),
+            subject: self
+                .caller
+                .subject_token
+                .clone()
+                .map(crate::token_exchange::SubjectToken),
+        }
+    }
+
+    /// Deliver the client headers this server forwards, as already
+    /// resolved against the inbound request.
+    pub fn with_forwarded_client_headers(
+        mut self,
+        forwarded: Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>,
+    ) -> Self {
+        self.forwarded_client_headers = forwarded;
+        self
     }
 
     fn server(&self) -> &McpServer {
         &self.entry.value
     }
 
-    fn tools(&self) -> Result<Vec<GeneratedTool>, McpError> {
+    /// This server's tool set, generated once per row version.
+    ///
+    /// The aggregating `/mcp` endpoint builds a bridge per enabled server
+    /// per request, and both `tools/list` and `tools/call` ask for the
+    /// tools — so without this every call walked every registered
+    /// server's whole OpenAPI document, resolving `$ref`s and building a
+    /// JSON Schema per operation (AISIX-Cloud#1542).
+    fn tools(&self) -> Result<Arc<Vec<GeneratedTool>>, McpError> {
         let spec = self.server().spec.as_ref().ok_or_else(|| {
             McpError::Request("openapi server has no spec configured".to_string())
         })?;
-        generate_tools(spec)
+        // Row identity is the snapshot's `Arc`: a copy-on-write publish
+        // shares rows it did not change, so the same allocation means the
+        // same spec. The cache keeps its own `Arc`, so the address cannot
+        // be recycled underneath it.
+        if let Some(hit) = lookup_tools(&self.entry) {
+            return Ok(hit);
+        }
+        // Generated with the lock RELEASED. One lock serves every
+        // registered server, so holding it across the spec walk would
+        // make one server's miss block every other server's hit — and a
+        // write that replaces one row makes the aggregating endpoint's
+        // concurrent requests all miss at once. The cost is that a race
+        // may generate the same tool set twice; the second insert simply
+        // replaces the first, and both are equal.
+        let tools = Arc::new(generate_tools(spec)?);
+        let mut cache = tool_cache();
+        cache.by_id.insert(
+            self.entry.id.clone(),
+            CachedTools {
+                row: Arc::clone(&self.entry),
+                tools: Arc::clone(&tools),
+            },
+        );
+        Ok(tools)
     }
 
     /// Inject the gateway-held credential for this server. For `oauth2` this
@@ -143,24 +189,62 @@ impl OpenApiBridge {
     async fn apply_auth(
         &self,
         request: reqwest::RequestBuilder,
+        deadline: tokio::time::Instant,
     ) -> Result<reqwest::RequestBuilder, McpError> {
         let server = self.server();
-        Ok(match server.auth_type {
+        // A forwarded client header wins the slot it names:
+        // `RequestBuilder::header` appends, so filling a slot twice would
+        // put two credentials on the wire and let the REST API pick
+        // between them.
+        //
+        // The claimed set is read before anything fills a slot, so
+        // suppressing the server credential and delivering the forwarded
+        // value cannot disagree.
+        let forwarded = &self.forwarded_client_headers;
+        let claims = |name: &str| forwarded.iter().any(|(n, _)| n.as_str() == name);
+        let api_key_header = server
+            .api_key_header
+            .as_deref()
+            .filter(|h| !h.is_empty())
+            .unwrap_or(DEFAULT_API_KEY_HEADER);
+        let request = match server.auth_type {
             McpAuthType::None => request,
+            McpAuthType::Bearer if claims("authorization") => request,
             McpAuthType::Bearer => request.bearer_auth(server.secret.as_deref().unwrap_or("")),
+            McpAuthType::ApiKey if claims(api_key_header.to_ascii_lowercase().as_str()) => request,
             McpAuthType::ApiKey => {
-                let header = server
-                    .api_key_header
-                    .as_deref()
-                    .filter(|h| !h.is_empty())
-                    .unwrap_or(DEFAULT_API_KEY_HEADER);
-                request.header(header, server.secret.as_deref().unwrap_or(""))
+                request.header(api_key_header, server.secret.as_deref().unwrap_or(""))
             }
+            McpAuthType::OAuth2 if claims("authorization") => request,
             McpAuthType::OAuth2 => {
-                let token = crate::oauth::get_or_fetch(&self.oauth_config()).await?;
+                let token = tokio::time::timeout_at(
+                    deadline,
+                    crate::oauth::get_or_fetch(&self.oauth_config()),
+                )
+                .await
+                .map_err(|_| tool_call_timed_out())??;
                 request.bearer_auth(token)
             }
-        })
+            McpAuthType::OauthDelegate if claims("authorization") => request,
+            McpAuthType::OauthDelegate => match &self.caller.delegated_authorization {
+                Some(value) => {
+                    let mut value = value.clone();
+                    value.set_sensitive(true);
+                    request.header(reqwest::header::AUTHORIZATION, value)
+                }
+                None => request,
+            },
+            McpAuthType::OAuth2TokenExchange if claims("authorization") => request,
+            McpAuthType::OAuth2TokenExchange => {
+                request.bearer_auth(self.token_exchange().token(deadline).await?)
+            }
+            // `type: mcp` only; a row combining it with `type: openapi` fails
+            // both schemas and never gets here.
+            McpAuthType::OAuth2AuthorizationCode => request,
+        };
+        Ok(forwarded.iter().fold(request, |req, (name, value)| {
+            req.header(name.clone(), value.clone())
+        }))
     }
 
     fn oauth_config(&self) -> OAuthClientConfig {
@@ -173,10 +257,15 @@ impl OpenApiBridge {
         }
     }
 
+    /// Run one tool call. Every step that waits on the network is bounded
+    /// by `deadline` on its own, rather than the call as a whole, so a token
+    /// exchange that runs out of it is reported as the identity provider
+    /// being unavailable.
     async fn execute(
         &self,
         tool: &GeneratedTool,
         arguments: &Value,
+        deadline: tokio::time::Instant,
     ) -> Result<McpToolResult, McpError> {
         let args = match arguments {
             Value::Object(map) => map.clone(),
@@ -198,53 +287,80 @@ impl OpenApiBridge {
         let method = reqwest::Method::from_bytes(tool.method.to_uppercase().as_bytes())
             .map_err(|_| McpError::Request(format!("unsupported HTTP method {}", tool.method)))?;
 
-        let mut request = http_client().request(method, url);
-        request = self.apply_auth(request).await?;
-
         let query = build_query_pairs(tool, &args);
-        if !query.is_empty() {
-            request = request.query(&query);
-        }
-
-        if tool.has_body {
-            if let Some(body) = coerce_body(args.get("body")) {
-                request = request.json(&body);
+        let body = if tool.has_body {
+            coerce_body(args.get("body"))
+        } else {
+            None
+        };
+        // An exchanged token the REST API rejects is dropped and exchanged
+        // afresh, once.
+        let attempts = if self.server().auth_type == McpAuthType::OAuth2TokenExchange {
+            2
+        } else {
+            1
+        };
+        let mut attempt = 0;
+        let response = loop {
+            attempt += 1;
+            let mut request = http_client().request(method.clone(), url.clone());
+            request = match self.apply_auth(request, deadline).await {
+                Ok(request) => request,
+                // The REST API already rejected the previous token.
+                Err(error) if attempt > 1 => return Err(error.after_upstream_contact()),
+                Err(error) => return Err(error),
+            };
+            if !query.is_empty() {
+                request = request.query(&query);
             }
-        }
+            if let Some(body) = &body {
+                request = request.json(body);
+            }
 
-        // The error text (which names the request URL: the
-        // operator-configured base URL plus the agent's query arguments) is
-        // logged server-side by the gateway and never returned to the agent;
-        // the URL is reduced to its origin, and sanitizing bounds the text
-        // and strips log-injection vectors.
-        let response = request.send().await.map_err(|e| {
-            McpError::Request(format!(
-                "HTTP request failed: {}",
-                crate::bridge::sanitize_error_message(&crate::bridge::redact_request_url(
-                    e.to_string(),
-                    e.url().map(|u| u.as_str())
-                ))
-            ))
-        })?;
+            // The error text is logged server-side by the gateway and never
+            // returned to the agent; sanitizing bounds it and strips
+            // log-injection vectors. Only the URL's origin stays: past it are
+            // the operator's base path and the tool's arguments, and a long
+            // one would push the cause past the bound.
+            let response = tokio::time::timeout_at(deadline, request.send())
+                .await
+                .map_err(|_| tool_call_timed_out())?
+                .map_err(|e| {
+                    McpError::Request(format!(
+                        "HTTP request failed: {}",
+                        crate::bridge::sanitize_error_message(
+                            &crate::bridge::transport_failure_text(e)
+                        )
+                    ))
+                })?;
+            if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+                break response;
+            }
+            // Mirrors the connect-time posture in `bridge.rs`: a 401 against a
+            // minted or exchanged token means it was revoked early — drop the
+            // cache entry so the next call re-mints instead of replaying it.
+            match self.server().auth_type {
+                McpAuthType::OAuth2 => crate::oauth::invalidate(&self.oauth_config()),
+                McpAuthType::OAuth2TokenExchange => self.token_exchange().invalidate(),
+                _ => {}
+            }
+            if attempt >= attempts {
+                break response;
+            }
+        };
 
         let status = response.status();
-        // Mirrors the connect-time posture in `bridge.rs`: a 401 against a
-        // minted token means it was revoked early — drop the cache entry so
-        // the next call re-mints instead of replaying it.
-        if status == reqwest::StatusCode::UNAUTHORIZED
-            && self.server().auth_type == McpAuthType::OAuth2
-        {
-            crate::oauth::invalidate(&self.oauth_config());
-        }
-        let body = response.text().await.map_err(|e| {
-            McpError::Request(format!(
-                "failed to read response: {}",
-                crate::bridge::sanitize_error_message(&crate::bridge::redact_request_url(
-                    e.to_string(),
-                    e.url().map(|u| u.as_str())
+        let body = tokio::time::timeout_at(deadline, response.text())
+            .await
+            .map_err(|_| tool_call_timed_out())?
+            .map_err(|e| {
+                McpError::Request(format!(
+                    "failed to read response: {}",
+                    crate::bridge::sanitize_error_message(&crate::bridge::transport_failure_text(
+                        e
+                    ))
                 ))
-            ))
-        })?;
+            })?;
 
         if status.is_success() {
             Ok(McpToolResult {
@@ -258,6 +374,10 @@ impl OpenApiBridge {
     }
 }
 
+fn tool_call_timed_out() -> McpError {
+    McpError::Request("tool call timed out".to_string())
+}
+
 /// A tool-level error result (`isError: true` with a text message) — the
 /// agent-visible failure shape for bad arguments and non-2xx responses.
 fn tool_error(text: String) -> McpToolResult {
@@ -268,16 +388,62 @@ fn tool_error(text: String) -> McpToolResult {
     }
 }
 
+/// Tool sets generated from `type: openapi` rows, keyed by the row's
+/// etcd id and shared across every per-request bridge in the process.
+static TOOL_CACHE: OnceLock<Mutex<ToolCache>> = OnceLock::new();
+
+#[derive(Default)]
+struct ToolCache {
+    /// The `mcp_servers` table generation the map was last swept against.
+    swept: Option<u64>,
+    by_id: HashMap<String, CachedTools>,
+}
+
+struct CachedTools {
+    row: Arc<ResourceEntry<McpServer>>,
+    tools: Arc<Vec<GeneratedTool>>,
+}
+
+/// The cached tool set for `entry`, if this exact row version has one.
+/// Holds the lock only long enough to read it.
+fn lookup_tools(entry: &Arc<ResourceEntry<McpServer>>) -> Option<Arc<Vec<GeneratedTool>>> {
+    let cache = tool_cache();
+    let cached = cache.by_id.get(&entry.id)?;
+    Arc::ptr_eq(&cached.row, entry).then(|| Arc::clone(&cached.tools))
+}
+
+fn tool_cache() -> std::sync::MutexGuard<'static, ToolCache> {
+    TOOL_CACHE
+        .get_or_init(|| Mutex::new(ToolCache::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Forget cached tool sets for servers the snapshot no longer carries.
+///
+/// Called where a snapshot is in hand — the bridge itself only ever sees
+/// its own row. Cheap when nothing changed: a create/delete moves the
+/// `mcp_servers` generation and nothing else does.
+pub(crate) fn sweep_tool_cache(servers: &ResourceTable<McpServer>) {
+    let generation = servers.generation();
+    let mut cache = tool_cache();
+    if cache.swept == Some(generation) {
+        return;
+    }
+    cache.by_id.retain(|id, _| servers.get_by_id(id).is_some());
+    cache.swept = Some(generation);
+}
+
 #[async_trait]
 impl McpBridge for OpenApiBridge {
     async fn list_tools(&self) -> Result<Vec<McpTool>, McpError> {
         Ok(self
             .tools()?
-            .into_iter()
+            .iter()
             .map(|t| McpTool {
-                name: t.name,
-                description: Some(t.description),
-                input_schema: t.input_schema,
+                name: t.name.clone(),
+                description: Some(t.description.clone()),
+                input_schema: t.input_schema.clone(),
             })
             .collect())
     }
@@ -288,422 +454,38 @@ impl McpBridge for OpenApiBridge {
             .iter()
             .find(|t| t.name == name)
             .ok_or_else(|| McpError::Request(format!("unknown tool '{name}'")))?;
-        tokio::time::timeout(self.timeout, self.execute(tool, &arguments))
+        self.execute(tool, &arguments, tokio::time::Instant::now() + self.timeout)
             .await
-            .map_err(|_| McpError::Request("tool call timed out".to_string()))?
     }
-}
 
-/// Map an `operationId` (or fallback) to a provider-safe tool name:
-/// lowercase, any character outside `[a-zA-Z0-9_-]` replaced with `_`,
-/// capped at [`TOOL_NAME_MAX_LEN`]. Mirrors LiteLLM's sanitizer.
-fn sanitize_tool_name(raw: &str) -> String {
-    raw.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .take(TOOL_NAME_MAX_LEN)
-        .collect()
-}
-
-/// Strictly validate an OpenAPI document for `type: openapi` registration,
-/// returning the generated tool names on success.
-///
-/// This is the write-path (Admin API / control plane) contract: a document
-/// with no usable `paths`, zero generatable operations, or post-sanitization
-/// tool-name collisions is rejected with a message naming the problem —
-/// unlike [`generate_tools`], whose runtime posture is to degrade.
-pub fn validate_spec(spec: &Value) -> Result<Vec<String>, McpError> {
-    let generation = generate(spec)?;
-    if !generation.duplicates.is_empty() {
-        return Err(McpError::Request(format!(
-            "duplicate tool names after operationId sanitization: {} — make the \
-             operationIds distinct under lowercase [a-z0-9_-]",
-            generation.duplicates.join(", ")
-        )));
-    }
-    if generation.tools.is_empty() {
-        let mut message =
-            "spec has no operations that can become tools (methods get/post/put/delete/patch)"
-                .to_string();
-        if !generation.skipped.is_empty() {
-            message.push_str(&format!(
-                "; skipped operations without an application/json request body: {}",
-                generation.skipped.join(", ")
-            ));
+    async fn preflight_auth(&self) -> Result<(), McpError> {
+        let claimed = self
+            .forwarded_client_headers
+            .iter()
+            .any(|(name, _)| name == reqwest::header::AUTHORIZATION);
+        if self.server().auth_type == McpAuthType::OAuth2TokenExchange && !claimed {
+            self.token_exchange()
+                .token(tokio::time::Instant::now() + self.timeout)
+                .await?;
         }
-        return Err(McpError::Request(message));
+        Ok(())
     }
-    Ok(generation.tools.into_iter().map(|t| t.name).collect())
 }
 
-/// Generate the tool set from an OpenAPI 3.x document.
-///
-/// Anomalies inside a single operation (a request body without an
-/// `application/json` variant, an unresolvable parameter ref) skip or degrade
-/// that operation only; the error path is reserved for a document that has no
-/// usable `paths` object at all. Name collisions after sanitization are
-/// disambiguated with `_2` / `_3` … suffixes — the write path rejects them
-/// via [`validate_spec`], so this only defends rows written past it.
+/// Generate the tool set from an OpenAPI 3.x document — the same walk the
+/// loaders judge a spec by ([`aisix_core::mcp_openapi::generate`]), so a
+/// row that loaded always yields at least one tool here. Name collisions
+/// after sanitization are disambiguated with `_2` / `_3` … suffixes and
+/// every tool stays callable.
 pub(crate) fn generate_tools(spec: &Value) -> Result<Vec<GeneratedTool>, McpError> {
-    Ok(generate(spec)?.tools)
-}
-
-/// Outcome of walking a spec: the tools plus the anomalies the strict write
-/// path reports (and the runtime path merely logs).
-struct Generation {
-    tools: Vec<GeneratedTool>,
-    /// Base names that collided after sanitization (each listed once).
-    duplicates: Vec<String>,
-    /// `<METHOD> <path>` of operations skipped for an unsupported body.
-    skipped: Vec<String>,
-}
-
-fn generate(spec: &Value) -> Result<Generation, McpError> {
-    let paths = spec
-        .get("paths")
-        .and_then(Value::as_object)
-        .ok_or_else(|| McpError::Request("openapi spec has no `paths` object".to_string()))?;
-
-    let components = spec.get("components").cloned().unwrap_or(Value::Null);
-    let mut used_names: HashSet<String> = HashSet::new();
-    let mut tools = Vec::new();
-    let mut duplicates: Vec<String> = Vec::new();
-    let mut skipped: Vec<String> = Vec::new();
-
-    for (path, path_item) in paths {
-        let Some(path_item) = path_item.as_object() else {
-            continue;
-        };
-        for method in METHODS {
-            let Some(operation) = path_item.get(method).and_then(Value::as_object) else {
-                continue;
-            };
-
-            let mut resolver = RefResolver::new(spec);
-            let params = merged_parameters(path_item, operation, &components, &mut resolver);
-
-            // A request body we cannot express (no JSON variant) skips the
-            // operation: a tool missing its body argument would mislead the
-            // agent into calls that cannot succeed.
-            let request_body = operation
-                .get("requestBody")
-                .map(|rb| resolver.resolve(rb, 0));
-            let body_schema = match &request_body {
-                Some(rb) => match json_body_schema(rb, &mut resolver) {
-                    BodyOutcome::Schema(schema) => Some(schema),
-                    BodyOutcome::None => None,
-                    BodyOutcome::Unsupported => {
-                        tracing::debug!(
-                            path = %path,
-                            method = %method,
-                            "skipping operation: request body has no application/json content"
-                        );
-                        skipped.push(format!("{} {}", method.to_uppercase(), path));
-                        continue;
-                    }
-                },
-                None => None,
-            };
-
-            let raw_name = operation
-                .get("operationId")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("{method}_{path}"));
-            let base_name = sanitize_tool_name(&raw_name);
-
-            // Disambiguate names that collide after sanitization so every
-            // tool stays reachable (`foo/list` and `foo.list` both map to
-            // `foo_list`).
-            let mut name = base_name.clone();
-            let mut n = 1;
-            while !used_names.insert(name.clone()) {
-                if n == 1 && !duplicates.contains(&base_name) {
-                    duplicates.push(base_name.clone());
-                }
-                n += 1;
-                let suffix = format!("_{n}");
-                let keep = TOOL_NAME_MAX_LEN - suffix.len();
-                name = base_name.chars().take(keep).collect::<String>() + &suffix;
-            }
-
-            let description = operation
-                .get("summary")
-                .or_else(|| operation.get("description"))
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("{} {}", method.to_uppercase(), path));
-
-            let mut properties = Map::new();
-            let mut required = Vec::new();
-            let mut path_params = Vec::new();
-            let mut query_params = Vec::new();
-
-            for param in &params {
-                let Some(param_name) = param.get("name").and_then(Value::as_str) else {
-                    continue;
-                };
-                let location = param.get("in").and_then(Value::as_str).unwrap_or("");
-                match location {
-                    "path" => path_params.push(param_name.to_string()),
-                    "query" => query_params.push(param_name.to_string()),
-                    // header/cookie parameters are not exposed to the agent:
-                    // upstream headers are the gateway's to set, not the
-                    // caller's.
-                    _ => continue,
-                }
-
-                let mut schema = match param.get("schema") {
-                    Some(s) => resolver.resolve(s, 0),
-                    None => Value::Null,
-                };
-                if !schema.is_object() || schema.as_object().is_some_and(Map::is_empty) {
-                    schema = json!({ "type": "string" });
-                }
-                if let Some(desc) = param.get("description").and_then(Value::as_str) {
-                    schema
-                        .as_object_mut()
-                        .expect("schema coerced to object above")
-                        .insert("description".to_string(), json!(desc));
-                }
-                properties.insert(param_name.to_string(), schema);
-
-                if param.get("required").and_then(Value::as_bool) == Some(true) {
-                    required.push(param_name.to_string());
-                }
-            }
-
-            let has_body = if let Some(mut schema) = body_schema {
-                // A non-object or degraded-to-`{}` schema still gets an
-                // object hint, mirroring the string default on parameters.
-                if !schema.is_object() || schema.as_object().is_some_and(Map::is_empty) {
-                    schema = json!({ "type": "object" });
-                }
-                if let Some(desc) = request_body
-                    .as_ref()
-                    .and_then(|rb| rb.get("description"))
-                    .and_then(Value::as_str)
-                {
-                    schema
-                        .as_object_mut()
-                        .expect("schema coerced to object above")
-                        .insert("description".to_string(), json!(desc));
-                }
-                properties.insert("body".to_string(), schema);
-                if request_body
-                    .as_ref()
-                    .and_then(|rb| rb.get("required"))
-                    .and_then(Value::as_bool)
-                    == Some(true)
-                {
-                    required.push("body".to_string());
-                }
-                true
-            } else {
-                false
-            };
-
-            tools.push(GeneratedTool {
-                name,
-                description,
-                input_schema: json!({
-                    "type": "object",
-                    "properties": properties,
-                    "required": required,
-                }),
-                method: method.to_string(),
-                path: path.clone(),
-                path_params,
-                query_params,
-                has_body,
-            });
-        }
+    let generation = generate(spec).map_err(McpError::Request)?;
+    for skipped in &generation.skipped {
+        tracing::debug!(
+            operation = %skipped,
+            "skipping operation: request body has no application/json content"
+        );
     }
-
-    Ok(Generation {
-        tools,
-        duplicates,
-        skipped,
-    })
-}
-
-/// How an operation's `requestBody` maps onto the tool schema.
-enum BodyOutcome {
-    /// `application/json` variant found; its (resolved) schema.
-    Schema(Value),
-    /// The body object carries no `content` at all — treat as body-less.
-    None,
-    /// A body exists but has no JSON variant (multipart upload, form data…).
-    Unsupported,
-}
-
-fn json_body_schema(request_body: &Value, resolver: &mut RefResolver<'_>) -> BodyOutcome {
-    let Some(content) = request_body.get("content").and_then(Value::as_object) else {
-        return BodyOutcome::None;
-    };
-    if content.is_empty() {
-        return BodyOutcome::None;
-    }
-    // Accept `application/json` plus parameterized variants like
-    // `application/json; charset=utf-8` or `application/problem+json`.
-    let json_variant = content.iter().find(|(mime, _)| {
-        let mime = mime.split(';').next().unwrap_or("").trim();
-        mime.eq_ignore_ascii_case("application/json")
-            || (mime.starts_with("application/") && mime.ends_with("+json"))
-    });
-    match json_variant {
-        Some((_, media)) => {
-            let schema = media
-                .get("schema")
-                .map(|s| resolver.resolve(s, 0))
-                .unwrap_or_else(|| json!({ "type": "object" }));
-            BodyOutcome::Schema(schema)
-        }
-        None => BodyOutcome::Unsupported,
-    }
-}
-
-/// Merge path-level and operation-level parameters (operation wins on the
-/// same `(name, in)` pair), resolving `#/components/parameters/*` refs and
-/// dropping unresolvable entries.
-fn merged_parameters(
-    path_item: &Map<String, Value>,
-    operation: &Map<String, Value>,
-    components: &Value,
-    resolver: &mut RefResolver<'_>,
-) -> Vec<Value> {
-    let resolve_list = |raw: Option<&Value>, resolver: &mut RefResolver<'_>| -> Vec<Value> {
-        raw.and_then(Value::as_array)
-            .map(|list| {
-                list.iter()
-                    .filter_map(|p| {
-                        let resolved = resolve_parameter(p, components, resolver)?;
-                        resolved.get("name")?.as_str()?;
-                        Some(resolved)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-
-    let path_level = resolve_list(path_item.get("parameters"), resolver);
-    let op_level = resolve_list(operation.get("parameters"), resolver);
-
-    let op_keys: HashSet<(String, String)> = op_level.iter().map(param_key).collect();
-    let mut merged: Vec<Value> = path_level
-        .into_iter()
-        .filter(|p| !op_keys.contains(&param_key(p)))
-        .collect();
-    merged.extend(op_level);
-    merged
-}
-
-fn param_key(param: &Value) -> (String, String) {
-    (
-        param
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        param
-            .get("in")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-    )
-}
-
-/// Resolve one parameter entry, following a `#/components/parameters/<name>`
-/// ref if present. Returns `None` for unresolvable refs so callers drop the
-/// entry instead of keeping a nameless stub.
-fn resolve_parameter(
-    param: &Value,
-    components: &Value,
-    resolver: &mut RefResolver<'_>,
-) -> Option<Value> {
-    let Some(reference) = param.get("$ref").and_then(Value::as_str) else {
-        return Some(param.clone());
-    };
-    let target_name = reference.strip_prefix("#/components/parameters/")?;
-    let target = components.get("parameters")?.get(target_name)?;
-    Some(resolver.resolve(target, 0))
-}
-
-/// Bounded local-`$ref` inliner.
-///
-/// Replaces `{"$ref": "#/..."}` nodes with their (recursively resolved)
-/// targets; sibling keys next to `$ref` overlay the resolved target (the
-/// OpenAPI 3.1 `summary`/`description` pattern). External refs, missing
-/// targets, cycles past [`MAX_REF_DEPTH`], and documents spending more than
-/// [`MAX_REF_EXPANSIONS`] lookups degrade the node to `{}` — schema
-/// "anything" — rather than failing the operation.
-struct RefResolver<'a> {
-    root: &'a Value,
-    expansions: usize,
-}
-
-impl<'a> RefResolver<'a> {
-    fn new(root: &'a Value) -> Self {
-        Self {
-            root,
-            expansions: 0,
-        }
-    }
-
-    fn resolve(&mut self, node: &Value, depth: usize) -> Value {
-        match node {
-            Value::Object(map) => {
-                if let Some(reference) = map.get("$ref").and_then(Value::as_str) {
-                    let resolved = self.resolve_ref(reference, depth);
-                    // Sibling keys overlay the resolved target.
-                    if map.len() > 1 {
-                        let mut base = match resolved {
-                            Value::Object(m) => m,
-                            _ => Map::new(),
-                        };
-                        for (k, v) in map {
-                            if k != "$ref" {
-                                base.insert(k.clone(), self.resolve(v, depth));
-                            }
-                        }
-                        return Value::Object(base);
-                    }
-                    return resolved;
-                }
-                Value::Object(
-                    map.iter()
-                        .map(|(k, v)| (k.clone(), self.resolve(v, depth)))
-                        .collect(),
-                )
-            }
-            Value::Array(items) => {
-                Value::Array(items.iter().map(|v| self.resolve(v, depth)).collect())
-            }
-            other => other.clone(),
-        }
-    }
-
-    fn resolve_ref(&mut self, reference: &str, depth: usize) -> Value {
-        if depth >= MAX_REF_DEPTH || self.expansions >= MAX_REF_EXPANSIONS {
-            return json!({});
-        }
-        let Some(pointer) = reference.strip_prefix('#') else {
-            // External refs are not fetched at runtime by design.
-            return json!({});
-        };
-        self.expansions += 1;
-        match self.root.pointer(pointer) {
-            Some(target) => self.resolve(target, depth + 1),
-            None => json!({}),
-        }
-    }
+    Ok(generation.tools)
 }
 
 /// Substitute path parameters into the template and join with the base URL.
@@ -818,15 +600,63 @@ mod tests {
             .unwrap_or_else(|| panic!("tool {name} not generated"))
     }
 
+    fn openapi_server(id: &str, path: &str) -> Arc<ResourceEntry<McpServer>> {
+        let server: McpServer = serde_json::from_value(json!({
+            "name": format!("srv-{id}"),
+            "type": "openapi",
+            "url": "http://127.0.0.1:1/",
+            "spec": {
+                "openapi": "3.0.0",
+                "paths": { path: { "get": { "operationId": "listItems" } } }
+            }
+        }))
+        .expect("test mcp_server");
+        Arc::new(ResourceEntry::new(id, server, 1))
+    }
+
+    fn server_table(entries: &[Arc<ResourceEntry<McpServer>>]) -> ResourceTable<McpServer> {
+        let table = ResourceTable::new();
+        for e in entries {
+            table.insert_arc(Arc::clone(e));
+        }
+        table
+    }
+
+    /// The aggregating `/mcp` endpoint builds a bridge per enabled server
+    /// per REQUEST, and both `tools/list` and `tools/call` ask for the
+    /// tool set — so regenerating it from the spec each time made one
+    /// call cost a walk of every registered document (AISIX-Cloud#1542).
+    // Uses ids of its own: `TOOL_CACHE` is process-wide, and
+    // `sweep_tool_cache` with a table that does not carry a row evicts it.
+    // A second test in THIS crate's lib-test binary that reaches the cache
+    // (anything going through `McpGateway::from_snapshot*`) would have to
+    // coordinate with this one; today there is none.
     #[test]
-    fn sanitizes_operation_ids_like_litellm() {
-        // GitHub-style tag-namespaced ids gain `_` for `/`; uppercase folds.
-        assert_eq!(
-            sanitize_tool_name("actions/Download-Job.Logs"),
-            "actions_download-job_logs"
+    fn tool_generation_is_cached_per_row_and_evicted_with_it() {
+        let row = openapi_server("cache-row-1", "/items");
+        let table = server_table(&[Arc::clone(&row)]);
+        sweep_tool_cache(&table);
+
+        // Two bridges, as two requests would build them.
+        let first = OpenApiBridge::new(Arc::clone(&row)).tools().unwrap();
+        let second = OpenApiBridge::new(Arc::clone(&row)).tools().unwrap();
+        assert!(Arc::ptr_eq(&first, &second), "the tool set was regenerated");
+        assert_eq!(first[0].name, "listitems");
+
+        // A rewritten row is a different `Arc`: regenerate.
+        let rewritten = openapi_server("cache-row-1", "/things");
+        let after_write = OpenApiBridge::new(Arc::clone(&rewritten)).tools().unwrap();
+        assert!(!Arc::ptr_eq(&first, &after_write));
+        assert_eq!(after_write[0].path, "/things");
+
+        // Deleting the row evicts it, so the map cannot grow under
+        // create/delete churn.
+        sweep_tool_cache(&server_table(&[]));
+        let after_delete = OpenApiBridge::new(Arc::clone(&rewritten)).tools().unwrap();
+        assert!(
+            !Arc::ptr_eq(&after_write, &after_delete),
+            "the deleted row was still cached",
         );
-        let long = "x".repeat(200);
-        assert_eq!(sanitize_tool_name(&long).len(), TOOL_NAME_MAX_LEN);
     }
 
     #[test]
@@ -1126,40 +956,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_spec_rejects_duplicates_and_empty_specs() {
-        // Collision: strict validation names the colliding base name.
-        let dup = json!({
-            "paths": {
-                "/a": { "get": { "operationId": "foo/list" } },
-                "/b": { "get": { "operationId": "foo.list" } }
-            }
-        });
-        let err = validate_spec(&dup).unwrap_err().to_string();
-        assert!(err.contains("duplicate tool names"), "{err}");
-        assert!(err.contains("foo_list"), "{err}");
-
-        // No paths at all.
-        assert!(validate_spec(&json!({ "openapi": "3.0.0" })).is_err());
-
-        // Paths but nothing generatable — the skipped multipart op is named.
-        let only_multipart = json!({
-            "paths": { "/upload": { "post": {
-                "operationId": "up",
-                "requestBody": { "content": { "multipart/form-data": {} } }
-            } } }
-        });
-        let err = validate_spec(&only_multipart).unwrap_err().to_string();
-        assert!(err.contains("no operations"), "{err}");
-        assert!(err.contains("POST /upload"), "{err}");
-
-        // Healthy spec: returns the generated names.
-        let ok = json!({
-            "paths": { "/items": { "get": { "operationId": "listItems" } } }
-        });
-        assert_eq!(validate_spec(&ok).unwrap(), vec!["listitems"]);
-    }
-
-    #[test]
     fn coerce_body_matches_litellm_semantics() {
         assert_eq!(coerce_body(Some(&json!({"a": 1}))), Some(json!({"a": 1})));
         assert_eq!(
@@ -1208,5 +1004,77 @@ mod tests {
             assert!(!err.contains(secret), "error leaked {secret}: {err}");
         }
         assert!(err.contains(&format!("http://127.0.0.1:{port}/")), "{err}");
+    }
+
+    /// What this text becomes is the gateway's `upstream tools/call failed`
+    /// warn line. A tool's arguments can land in the URL, so the URL stays out
+    /// and a long one cannot push the cause past the bound.
+    #[tokio::test]
+    async fn a_failed_call_names_its_cause_and_not_the_arguments() {
+        let server: McpServer = serde_json::from_value(json!({
+            "name": "srv-transport-cause",
+            "type": "openapi",
+            "url": "http://127.0.0.1:1/",
+            "spec": {
+                "openapi": "3.0.0",
+                "paths": { "/items": { "get": {
+                    "operationId": "searchItems",
+                    "parameters": [
+                        { "name": "q", "in": "query", "schema": { "type": "string" } }
+                    ]
+                } } }
+            }
+        }))
+        .expect("test mcp_server");
+        let bridge = OpenApiBridge::new(Arc::new(ResourceEntry::new(
+            "transport-cause-row",
+            server,
+            1,
+        )));
+        let name = bridge.tools().unwrap()[0].name.clone();
+        let err = bridge
+            .call_tool(&name, json!({ "q": "secret-arg".repeat(100) }))
+            .await
+            .expect_err("nothing listens on port 1");
+        let text = err.to_string();
+        assert!(text.to_lowercase().contains("refused"), "{text}");
+        assert!(!text.contains("secret-arg"), "{text}");
+    }
+
+    /// Answers one request with a `200` whose body stops short of its length.
+    async fn cut_short_url(path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = sock.read(&mut request).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nshort")
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}{path}")
+    }
+
+    #[tokio::test]
+    async fn a_cut_short_body_names_its_cause() {
+        let server: McpServer = serde_json::from_value(json!({
+            "name": "srv-cut-short",
+            "type": "openapi",
+            "url": cut_short_url("/").await,
+            "spec": {
+                "openapi": "3.0.0",
+                "paths": { "/items": { "get": { "operationId": "listItems" } } }
+            }
+        }))
+        .expect("test mcp_server");
+        let bridge = OpenApiBridge::new(Arc::new(ResourceEntry::new("cut-short-row", server, 1)));
+        let name = bridge.tools().unwrap()[0].name.clone();
+        let err = bridge
+            .call_tool(&name, json!({}))
+            .await
+            .expect_err("the body is cut short");
+        assert!(err.to_string().contains("end of file"), "{err}");
     }
 }

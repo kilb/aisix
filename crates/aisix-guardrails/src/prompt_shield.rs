@@ -50,6 +50,8 @@ use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::call_error::{CallClock, CallFailure};
+use crate::chunk::chunk_text;
 use crate::{Guardrail, GuardrailVerdict};
 
 /// Maximum characters per Prompt Shield API call. Azure CS enforces a
@@ -141,13 +143,14 @@ impl PromptShieldGuardrail {
     /// POST to the Prompt Shield endpoint. Returns `Ok(true)` if any
     /// attack was detected, `Ok(false)` if the request is clean, `Err`
     /// if the call failed.
-    async fn call_api(&self, user_prompt: &str) -> Result<bool, AcsFailure> {
+    async fn call_api(&self, user_prompt: &str) -> Result<bool, CallFailure<AcsFailure>> {
         let url = format!("{}{}", self.endpoint, SHIELD_PATH);
         let body = ShieldRequest {
             user_prompt,
             documents: &[],
         };
 
+        let mut clock = CallClock::start(self.timeout);
         let future = self
             .client
             .post(&url)
@@ -156,18 +159,19 @@ impl PromptShieldGuardrail {
             .json(&body)
             .send();
 
-        let resp = match tokio::time::timeout(self.timeout, future).await {
-            Err(_elapsed) => return Err(AcsFailure::Timeout),
-            Ok(Err(_e)) => return Err(AcsFailure::IoError),
+        let resp = match clock.within(future).await {
+            Err(_elapsed) => return Err(clock.fail(AcsFailure::Timeout)),
+            Ok(Err(e)) => return Err(clock.fail_with(AcsFailure::IoError, &e)),
             Ok(Ok(r)) => r,
         };
+        clock.responded(resp.status());
 
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(AcsFailure::Throttled);
+            return Err(clock.fail(AcsFailure::Throttled));
         }
         if status.is_server_error() {
-            return Err(AcsFailure::ServerError);
+            return Err(clock.fail(AcsFailure::ServerError));
         }
         if !status.is_success() {
             // 4xx other than 429 — almost always a misconfiguration.
@@ -175,39 +179,58 @@ impl PromptShieldGuardrail {
             // silently bypasses the guardrail on every request until
             // the operator notices. A persistent error-level log is
             // the only signal they get.
-            let response_body = crate::read_error_body_capped(resp).await;
+            let Ok(response_body) = clock
+                .within(crate::read_error_body_capped(resp, &self.row_name))
+                .await
+            else {
+                return Err(clock.fail(AcsFailure::Timeout));
+            };
             tracing::error!(
-                row = %self.row_name,
+                guardrail_name = %self.row_name,
                 http_status = status.as_u16(),
                 response_body = %response_body,
                 "azure content safety returned 4xx — check endpoint and api_key configuration",
             );
-            return Err(AcsFailure::ConfigError);
+            return Err(clock.fail(AcsFailure::ConfigError));
         }
 
-        let parsed: ShieldResponse = resp.json().await.map_err(|_| AcsFailure::ServerError)?;
+        let parsed: ShieldResponse = match clock.within(resp.json()).await {
+            Ok(r) => r.map_err(|e| clock.fail_with(AcsFailure::ServerError, &e))?,
+            Err(_) => return Err(clock.fail(AcsFailure::Timeout)),
+        };
         let attacked = parsed.user_prompt_analysis.attack_detected
             || parsed.documents_analysis.iter().any(|d| d.attack_detected);
         Ok(attacked)
     }
 
-    fn handle_failure(&self, failure: AcsFailure, fail_open: bool) -> GuardrailVerdict {
-        let tag = failure.bypass_tag();
+    fn handle_failure(
+        &self,
+        failure: CallFailure<AcsFailure>,
+        fail_open: bool,
+    ) -> GuardrailVerdict {
+        let tag = failure.failure.bypass_tag();
         // ConfigError is already logged at error level in call_api(); skip
         // the generic warn here so operators see exactly one log line per
         // event and alert rules don't fire twice for the same failure.
-        if !matches!(failure, AcsFailure::ConfigError) {
+        if !matches!(failure.failure, AcsFailure::ConfigError) {
             tracing::warn!(
-                row = %self.row_name,
-                failure = ?failure,
+                guardrail_name = %self.row_name,
+                failure = ?failure.failure,
+                http_status = failure.http_status,
                 fail_open = fail_open,
+                error = failure.error.as_deref(),
+                error_kind = failure.error_kind.map(tracing::field::display),
+                elapsed_ms = failure.elapsed_ms,
                 "azure content safety call failed",
             );
         }
         if fail_open {
             GuardrailVerdict::Bypass { reason: tag.into() }
         } else {
-            GuardrailVerdict::block(format!("azure content safety unavailable ({tag})"))
+            GuardrailVerdict::block_unavailable(
+                format!("azure content safety unavailable ({tag})"),
+                tag,
+            )
         }
     }
 }
@@ -279,7 +302,7 @@ impl Guardrail for PromptShieldGuardrail {
         )
     }
 
-    fn enforces_input(&self) -> bool {
+    fn runs_on_input(&self) -> bool {
         matches!(
             self.hook_point,
             GuardrailHookPoint::Input | GuardrailHookPoint::Both
@@ -287,7 +310,15 @@ impl Guardrail for PromptShieldGuardrail {
     }
 
     fn checks_input_remotely(&self) -> bool {
-        self.enforces_input()
+        self.runs_on_input()
+    }
+
+    fn fails_closed_on_input(&self) -> bool {
+        !self.fail_open
+    }
+
+    fn fails_closed_on_output(&self) -> bool {
+        !self.output_fail_open
     }
 
     fn name(&self) -> &'static str {
@@ -339,50 +370,6 @@ fn collect_input_text(req: &ChatFormat) -> String {
         .join("\n")
 }
 
-/// Split `text` into chunks of at most `max_chars` characters, breaking
-/// on whitespace boundaries. A single word that exceeds `max_chars` is
-/// hard-truncated to that limit (avoids infinite loops on pathological
-/// inputs; such strings are rejected by the Azure CS API anyway).
-fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
-    if text.is_empty() {
-        return vec![];
-    }
-    if text.chars().count() <= max_chars {
-        return vec![text.to_owned()];
-    }
-    let mut chunks: Vec<String> = Vec::new();
-    let mut current = String::with_capacity(max_chars);
-    for word in text.split_whitespace() {
-        let word_chars = word.chars().count();
-        let sep = if current.is_empty() { 0usize } else { 1 };
-        if current.chars().count() + sep + word_chars > max_chars {
-            if !current.is_empty() {
-                chunks.push(std::mem::take(&mut current));
-            }
-            if word_chars > max_chars {
-                // Single word longer than the limit — split it into
-                // max_chars-sized pieces so the ENTIRE token is evaluated.
-                // Truncating to the first max_chars (the previous behavior)
-                // let the trailing part of an oversized whitespace-free
-                // input reach the model unscanned (#448).
-                let word_chars_vec: Vec<char> = word.chars().collect();
-                for piece in word_chars_vec.chunks(max_chars) {
-                    chunks.push(piece.iter().collect());
-                }
-                continue;
-            }
-        }
-        if !current.is_empty() {
-            current.push(' ');
-        }
-        current.push_str(word);
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -428,11 +415,14 @@ mod tests {
 
     fn resp(content: &str) -> ChatResponse {
         ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "r".into(),
             model: "m".into(),
             message: ChatMessage::assistant(content),
             finish_reason: FinishReason::Stop,
             usage: UsageStats::new(0, 0),
+            service_tier: None,
         }
     }
 
@@ -527,7 +517,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_fail_open_true_returns_bypass() {
         let g = build("http://unused", true);
-        let v = g.handle_failure(AcsFailure::Timeout, g.fail_open);
+        let v = g.handle_failure(CallFailure::bare(AcsFailure::Timeout), g.fail_open);
         match v {
             GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "azure_cs_timeout"),
             other => panic!("expected Bypass, got {other:?}"),
@@ -537,14 +527,14 @@ mod tests {
     #[tokio::test]
     async fn timeout_fail_open_false_returns_block() {
         let g = build("http://unused", false);
-        let v = g.handle_failure(AcsFailure::Timeout, g.fail_open);
+        let v = g.handle_failure(CallFailure::bare(AcsFailure::Timeout), g.fail_open);
         assert!(v.is_block(), "expected Block, got {v:?}");
     }
 
     #[tokio::test]
     async fn throttled_fail_open_true_returns_bypass_throttled() {
         let g = build("http://unused", true);
-        let v = g.handle_failure(AcsFailure::Throttled, g.fail_open);
+        let v = g.handle_failure(CallFailure::bare(AcsFailure::Throttled), g.fail_open);
         match v {
             GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "azure_cs_throttled"),
             other => panic!("expected Bypass, got {other:?}"),
@@ -561,10 +551,10 @@ mod tests {
         assert!(!g.output_fail_open, "output must default fail-closed");
         // Input policy bypasses, output policy blocks.
         assert!(g
-            .handle_failure(AcsFailure::Timeout, g.fail_open)
+            .handle_failure(CallFailure::bare(AcsFailure::Timeout), g.fail_open)
             .is_bypass());
         assert!(g
-            .handle_failure(AcsFailure::Timeout, g.output_fail_open)
+            .handle_failure(CallFailure::bare(AcsFailure::Timeout), g.output_fail_open)
             .is_block());
     }
 
@@ -575,7 +565,7 @@ mod tests {
     /// can't come from an unmatched-route 404 (which would also block).
     #[tokio::test]
     async fn output_5xx_fails_closed_by_default() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .and(query_param("api-version", "2024-09-01"))
@@ -597,7 +587,7 @@ mod tests {
     /// `output_fail_open`, not the input policy.
     #[tokio::test]
     async fn output_fail_open_true_bypasses_on_output() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .and(query_param("api-version", "2024-09-01"))
@@ -622,7 +612,7 @@ mod tests {
     async fn output_only_row_skips_input_check() {
         // No mock mounted — if check_input reached the HTTP layer, it would
         // time out quickly; Allow proves the hook-point guard fired first.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let mut g = build(&server.uri(), true);
         g.hook_point = GuardrailHookPoint::Output;
 
@@ -636,7 +626,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_only_row_skips_output_check() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let mut g = build(&server.uri(), true);
         g.hook_point = GuardrailHookPoint::Input;
 
@@ -661,7 +651,7 @@ mod tests {
     ///   (a version bump in SHIELD_PATH would otherwise silently pass all tests)
     #[tokio::test]
     async fn clean_input_returns_allow_and_sends_auth_header() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .and(query_param("api-version", "2024-09-01"))
@@ -687,7 +677,7 @@ mod tests {
     /// API returns `attackDetected=true` → Block verdict.
     #[tokio::test]
     async fn attack_detected_returns_block() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -707,7 +697,7 @@ mod tests {
     /// HTTP 500 + fail_open=true → Bypass tagged `azure_cs_5xx`.
     #[tokio::test]
     async fn http_5xx_fail_open_true_returns_bypass() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .respond_with(ResponseTemplate::new(500))
@@ -725,7 +715,7 @@ mod tests {
     /// HTTP 500 + fail_open=false → Block.
     #[tokio::test]
     async fn http_5xx_fail_open_false_returns_block() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .respond_with(ResponseTemplate::new(500))
@@ -740,7 +730,7 @@ mod tests {
     /// HTTP 429 → `azure_cs_throttled`.
     #[tokio::test]
     async fn http_429_fail_open_true_returns_bypass_throttled() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .respond_with(ResponseTemplate::new(429))
@@ -759,7 +749,7 @@ mod tests {
     /// `azure_cs_config_error` (NOT `azure_cs_5xx`).
     #[tokio::test]
     async fn http_401_fail_open_true_returns_bypass_config_error() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .respond_with(ResponseTemplate::new(401))
@@ -779,7 +769,7 @@ mod tests {
     /// HTTP 401 + fail_open=false → Block (same as other failures).
     #[tokio::test]
     async fn http_401_fail_open_false_returns_block() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .respond_with(ResponseTemplate::new(401))
@@ -794,7 +784,7 @@ mod tests {
     /// `timeout=100ms` + wiremock delayed 800ms → Bypass tagged `azure_cs_timeout`.
     #[tokio::test]
     async fn call_timeout_fail_open_true_returns_bypass_timeout() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .respond_with(
@@ -822,7 +812,7 @@ mod tests {
     /// `attackDetected=true` the overall verdict is Block.
     #[tokio::test]
     async fn long_prompt_splits_and_blocks_on_attack() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         // Respond with attackDetected=true for all calls.
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
@@ -843,7 +833,7 @@ mod tests {
     /// Long clean prompt: all chunks return clean → Allow overall.
     #[tokio::test]
     async fn long_clean_prompt_returns_allow() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -862,7 +852,7 @@ mod tests {
     /// Output check: response content with attack → Block.
     #[tokio::test]
     async fn attack_in_output_returns_block() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -881,10 +871,76 @@ mod tests {
     #[tokio::test]
     async fn empty_input_skips_api_call() {
         // No mock mounted — if the API were called it would fail immediately.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let g = build(&server.uri(), true);
         let empty_req = ChatFormat::new("m", vec![ChatMessage::user("")]);
         let v = g.check_input(&empty_req).await;
         assert_eq!(v, GuardrailVerdict::Allow, "empty input must not call API");
+    }
+
+    /// A refused connection is logged with its cause, not just `IoError`
+    /// (AISIX-Cloud#1786).
+    #[tokio::test]
+    async fn refused_connection_logs_the_underlying_error() {
+        use crate::call_error::testing::*;
+        let endpoint = refused_endpoint();
+        let logged = capture_logs(|| async {
+            let g = build(&endpoint, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_refusal_logged(
+            &logged,
+            "azure content safety call failed",
+            &["test-key-abc"],
+        );
+    }
+
+    /// A response that does not decode is logged with where it failed, and
+    /// none of the text it quoted.
+    #[tokio::test]
+    async fn undecodable_response_logs_the_underlying_error() {
+        use crate::call_error::testing::*;
+        let server = undecodable_server("DECODE-REQ-1").await;
+        let uri = server.uri();
+        let logged = capture_logs(|| async {
+            let g = build(&uri, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_decode_logged(&logged, "azure content safety call failed", "ServerError");
+    }
+
+    /// A 5xx is logged with its status (AISIX-Cloud#1786).
+    #[tokio::test]
+    async fn server_error_logs_the_status() {
+        use crate::call_error::testing::*;
+        let server = status_server(503).await;
+        let uri = server.uri();
+        let logged = capture_logs(|| async {
+            let g = build(&uri, true);
+            assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
+        })
+        .await;
+        assert_status_logged(&logged, "azure content safety call failed", 503);
+    }
+
+    /// `timeout_ms` covers the response body, not just its headers: a body
+    /// that stalls ends the call as a timeout instead of hanging it.
+    #[tokio::test]
+    async fn stalled_body_times_out() {
+        use crate::call_error::testing::*;
+        let uri = stalled_body_server(200).await;
+        let logged = capture_logs(|| async {
+            let mut g = build(&uri, true);
+            g.timeout = Duration::from_millis(200);
+            let verdict =
+                tokio::time::timeout(Duration::from_secs(5), g.check_input(&req(PROMPT_MARKER)))
+                    .await
+                    .expect("the guardrail call must end at its own timeout");
+            assert!(verdict.is_bypass());
+        })
+        .await;
+        assert_stall_logged(&logged, "azure content safety call failed", 200);
     }
 }

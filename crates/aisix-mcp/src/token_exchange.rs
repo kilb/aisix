@@ -1,0 +1,452 @@
+//! OAuth token exchange on behalf of the caller (`auth_type:
+//! oauth2_token_exchange`).
+//!
+//! The gateway trades the caller's own bearer token (the *subject*, which it
+//! verified itself through a JWT trust provider on the same request) for an
+//! access token issued for the upstream server, and presents that token
+//! upstream. The subject never leaves the gateway except towards the token
+//! endpoint.
+//!
+//! Exchanged tokens are cached process-globally, keyed on a digest of the
+//! subject token, the whole exchange configuration and the server, so two
+//! callers can never share an entry, and reused until shortly before their
+//! reported expiry. [`invalidate`] drops an entry when the upstream rejects
+//! the token. Concurrent misses on one key share a single exchange.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+use aisix_core::McpTokenExchangeProfile;
+use futures::future::{BoxFuture, FutureExt, Shared};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+
+use crate::error::{McpError, TokenExchangeFailure};
+use crate::token_cache::{token_lifetime, TokenCache};
+
+/// RFC 7523 JWT bearer grant, which Microsoft Entra ID's On-Behalf-Of flow
+/// is built on.
+const JWT_BEARER_GRANT: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
+
+/// RFC 6749 §5.2 error codes that blame the gateway's own client
+/// registration or configuration rather than the caller's token, so a
+/// fresh caller sign-in cannot fix them.
+const GATEWAY_FAULT_ERRORS: &[&str] = &[
+    "invalid_client",
+    "unauthorized_client",
+    "unsupported_grant_type",
+    "invalid_target",
+    "invalid_scope",
+];
+
+/// RFC 8693 token types that are not an access token, which the gateway
+/// must not present upstream as a bearer even if the endpoint labels it so.
+const NON_ACCESS_TOKEN_TYPES: &[&str] = &[
+    "urn:ietf:params:oauth:token-type:refresh_token",
+    "urn:ietf:params:oauth:token-type:id_token",
+    "urn:ietf:params:oauth:token-type:saml1",
+    "urn:ietf:params:oauth:token-type:saml2",
+];
+
+/// Ceiling on cached exchanged tokens. Entries are per caller token, so
+/// unlike the client-credentials cache this one grows with traffic; past
+/// the ceiling, expired entries are purged first and then the ones closest
+/// to expiry.
+const MAX_CACHED_TOKENS: usize = 10_000;
+
+/// Exchange parameters for one upstream server.
+#[derive(Clone)]
+pub struct TokenExchangeConfig {
+    /// `None` only on a row the write path would have refused; it fails
+    /// as misconfigured rather than guess a protocol.
+    pub profile: Option<McpTokenExchangeProfile>,
+    /// Token endpoint URL (non-secret).
+    pub token_url: String,
+    /// The gateway's OAuth client identifier (non-secret).
+    pub client_id: String,
+    /// The gateway's OAuth client secret. Redacted from `Debug`.
+    pub client_secret: String,
+    /// Scopes requested for the upstream token, joined with spaces.
+    pub scopes: Vec<String>,
+    /// Identifies the upstream server the exchanged token is for, folded
+    /// into the cache key.
+    pub server: String,
+}
+
+impl std::fmt::Debug for TokenExchangeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenExchangeConfig")
+            .field("profile", &self.profile)
+            .field(
+                "token_url",
+                &aisix_gateway::redact_url_for_log(&self.token_url),
+            )
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"***redacted***")
+            .field("scopes", &self.scopes)
+            // The server's name only: what follows it is the server's URL, which
+            // may carry a credential of its own.
+            .field(
+                "server",
+                &self.server.split('\x1f').next().unwrap_or_default(),
+            )
+            .finish()
+    }
+}
+
+fn cache() -> &'static TokenCache {
+    static CACHE: OnceLock<TokenCache> = OnceLock::new();
+    CACHE.get_or_init(|| TokenCache::new(Some(MAX_CACHED_TOKENS)))
+}
+
+/// One exchange in progress, awaited by every concurrent miss on its key.
+/// Its outcome — token or failure — goes to all of them; it leaves the map
+/// when it completes, so a failure is never served to a later request.
+type Flight = Shared<BoxFuture<'static, Result<String, TokenExchangeFailure>>>;
+
+fn inflight() -> &'static Mutex<HashMap<String, Flight>> {
+    static INFLIGHT: OnceLock<Mutex<HashMap<String, Flight>>> = OnceLock::new();
+    INFLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// SHA-256 over every input that shapes the exchanged token, each
+/// length-prefixed so no field value can shift a boundary. Nothing secret
+/// is held in the key itself.
+fn cache_key(cfg: &TokenExchangeConfig, subject: &str) -> String {
+    let profile = match cfg.profile {
+        Some(McpTokenExchangeProfile::EntraObo) => "entra_obo",
+        None => "",
+    };
+    let scopes = cfg.scopes.join(" ");
+    let mut hasher = Sha256::new();
+    for part in [
+        subject,
+        profile,
+        cfg.token_url.as_str(),
+        cfg.client_id.as_str(),
+        cfg.client_secret.as_str(),
+        scopes.as_str(),
+        cfg.server.as_str(),
+    ] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// The upstream access token for `subject` under `cfg`, from the cache or
+/// a fresh exchange. `None` subject — the caller was not authenticated
+/// through a JWT trust provider — fails without contacting anyone.
+pub(crate) async fn get_or_exchange(
+    cfg: &TokenExchangeConfig,
+    subject: Option<&str>,
+) -> Result<String, McpError> {
+    let Some(subject) = subject else {
+        return Err(TokenExchangeFailure::NoSubject.into());
+    };
+    if cfg.profile.is_none()
+        || cfg.token_url.is_empty()
+        || cfg.client_id.is_empty()
+        || cfg.client_secret.is_empty()
+        || cfg.scopes.is_empty()
+    {
+        return Err(TokenExchangeFailure::Misconfigured.into());
+    }
+    let key = cache_key(cfg, subject);
+    if let Some(token) = cache().get(&key) {
+        return Ok(token);
+    }
+    let flight = inflight()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(key.clone())
+        .or_insert_with(|| start_flight(key, cfg.clone(), subject.to_owned()))
+        .clone();
+    flight.await.map_err(McpError::from)
+}
+
+/// The exchange behind one [`Flight`], spawned so that it finishes and
+/// leaves the in-flight map even when every waiter goes away (a client
+/// disconnect, an upstream connect timeout) — otherwise the abandoned
+/// flight would stay in the map and be resumed, stale, by a later request.
+fn start_flight(key: String, cfg: TokenExchangeConfig, subject: String) -> Flight {
+    let task = tokio::spawn(async move {
+        // A flight that finished between this caller's cache miss and its
+        // lookup in the in-flight map has already cached the token.
+        let outcome = match cache().get(&key) {
+            Some(token) => Ok(token),
+            None => exchange(&cfg, &subject).await.map(|(token, lifetime)| {
+                cache().insert(key.clone(), &token, lifetime);
+                token
+            }),
+        };
+        inflight()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key);
+        outcome
+    });
+    async move { task.await.unwrap_or(Err(TokenExchangeFailure::Unavailable)) }
+        .boxed()
+        .shared()
+}
+
+/// Drop the cached token for `(cfg, subject)` so the next call exchanges
+/// again — called when the upstream rejects the token.
+pub(crate) fn invalidate(cfg: &TokenExchangeConfig, subject: Option<&str>) {
+    let Some(subject) = subject else { return };
+    cache().remove(&cache_key(cfg, subject));
+}
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    token_type: Option<String>,
+    #[serde(default)]
+    issued_token_type: Option<String>,
+    #[serde(default)]
+    expires_in: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct ErrorResponse {
+    #[serde(default)]
+    error: Option<String>,
+    /// Microsoft Entra's claims challenge (Conditional Access step-up,
+    /// continuous access evaluation): what the caller must satisfy at the
+    /// identity provider before its token is accepted.
+    #[serde(default)]
+    claims: Option<serde_json::Value>,
+}
+
+/// POST the exchange and classify the outcome.
+///
+/// The form carries the client secret and the caller's token, so neither
+/// the form nor the endpoint's error body is ever logged or echoed; only
+/// the status and the RFC 6749 `error` code are.
+async fn exchange(
+    cfg: &TokenExchangeConfig,
+    subject: &str,
+) -> Result<(String, Duration), TokenExchangeFailure> {
+    let scope = cfg.scopes.join(" ");
+    let form: Vec<(&str, &str)> = match cfg.profile {
+        None => return Err(TokenExchangeFailure::Misconfigured),
+        Some(McpTokenExchangeProfile::EntraObo) => vec![
+            ("grant_type", JWT_BEARER_GRANT),
+            ("assertion", subject),
+            ("scope", scope.as_str()),
+            ("requested_token_use", "on_behalf_of"),
+            ("client_id", cfg.client_id.as_str()),
+            ("client_secret", cfg.client_secret.as_str()),
+        ],
+    };
+    let response = match crate::oauth::http_client()
+        .post(&cfg.token_url)
+        .header(http::header::ACCEPT, "application/json")
+        .form(&form)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            tracing::warn!(
+                server = %cfg.server,
+                error = %crate::bridge::sanitize_error_message(&aisix_gateway::transport_error_message(&e.without_url())),
+                "upstream token exchange request failed"
+            );
+            return Err(TokenExchangeFailure::Unavailable);
+        }
+    };
+    let status = response.status();
+    // Throttling and a request timeout say nothing about the caller's
+    // token: the same token can succeed on a retry.
+    let transient = matches!(
+        status,
+        http::StatusCode::TOO_MANY_REQUESTS | http::StatusCode::REQUEST_TIMEOUT
+    );
+    if status.is_client_error() && !transient {
+        let body = response.json::<ErrorResponse>().await.ok();
+        let (code, claims) = match body {
+            Some(body) => (
+                body.error,
+                body.claims.and_then(|claims| match claims {
+                    serde_json::Value::String(claims) if !claims.is_empty() => Some(claims),
+                    _ => None,
+                }),
+            ),
+            None => (None, None),
+        };
+        let gateway_fault = code
+            .as_deref()
+            .is_some_and(|code| GATEWAY_FAULT_ERRORS.contains(&code));
+        // Only a code from the fixed list above is logged verbatim; any
+        // other value is caller-influenced IdP text.
+        tracing::warn!(
+            server = %cfg.server,
+            status = status.as_u16(),
+            error = code.as_deref().filter(|_| gateway_fault).unwrap_or("-"),
+            step_up = claims.is_some(),
+            "upstream token exchange rejected"
+        );
+        return Err(if gateway_fault {
+            TokenExchangeFailure::Misconfigured
+        } else {
+            TokenExchangeFailure::SubjectRejected { claims }
+        });
+    }
+    if !status.is_success() {
+        tracing::warn!(
+            server = %cfg.server,
+            status = status.as_u16(),
+            "upstream token exchange failed"
+        );
+        return Err(TokenExchangeFailure::Unavailable);
+    }
+    let unusable = |reason: &str| {
+        tracing::warn!(server = %cfg.server, "upstream token exchange returned {reason}");
+        TokenExchangeFailure::Unavailable
+    };
+    let token = match response.json::<TokenResponse>().await {
+        Ok(token) => token,
+        Err(e) => {
+            aisix_gateway::log_body_read_causes(&e);
+            return Err(unusable("a malformed token response"));
+        }
+    };
+    let Some(access_token) = token.access_token.filter(|t| !t.is_empty()) else {
+        return Err(unusable("no access_token"));
+    };
+    // Presented upstream as a bearer token, so a declared non-bearer type
+    // or a non-access issued type must not be forwarded as one.
+    if token
+        .token_type
+        .as_deref()
+        .is_some_and(|t| !t.trim().eq_ignore_ascii_case("bearer"))
+    {
+        return Err(unusable("a non-bearer token_type"));
+    }
+    if token
+        .issued_token_type
+        .as_deref()
+        .is_some_and(|t| NON_ACCESS_TOKEN_TYPES.contains(&t))
+    {
+        return Err(unusable("a token that is not an access token"));
+    }
+    let lifetime = token_lifetime(token.expires_in.as_ref().and_then(expires_in_secs));
+    Ok((access_token, lifetime))
+}
+
+/// `expires_in` as seconds. Entra ID returns it as a number; some
+/// endpoints send a numeric string.
+fn expires_in_secs(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// Shared handle used by the bridges: the config plus the caller's subject.
+#[derive(Clone, Debug)]
+pub struct TokenExchangeAuth {
+    pub config: TokenExchangeConfig,
+    pub subject: Option<SubjectToken>,
+}
+
+/// The caller's verified bearer token. Never printed.
+#[derive(Clone)]
+pub struct SubjectToken(pub Arc<str>);
+
+impl std::fmt::Debug for SubjectToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SubjectToken(***redacted***)")
+    }
+}
+
+impl TokenExchangeAuth {
+    fn subject(&self) -> Option<&str> {
+        self.subject.as_ref().map(|s| &*s.0)
+    }
+
+    /// The upstream token, or [`TokenExchangeFailure::Unavailable`] once
+    /// `deadline` — the server's per-operation deadline — passes. A waiter
+    /// that gives up leaves a shared exchange running for the others.
+    pub(crate) async fn token(&self, deadline: tokio::time::Instant) -> Result<String, McpError> {
+        match tokio::time::timeout_at(deadline, get_or_exchange(&self.config, self.subject())).await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                tracing::warn!(
+                    server = %self.config.server,
+                    "upstream token exchange timed out"
+                );
+                Err(TokenExchangeFailure::Unavailable.into())
+            }
+        }
+    }
+
+    pub(crate) fn invalidate(&self) {
+        invalidate(&self.config, self.subject());
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_logs {
+    /// Run `f` under a capturing subscriber; returns its result and what it logged.
+    pub(crate) async fn capture_logs<T>(f: impl std::future::Future<Output = T>) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // A callsite first hit where no subscriber was set has cached "disabled".
+        tracing::callsite::rebuild_interest_cache();
+        let out = f.await;
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (out, logged)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_logs::capture_logs;
+    use super::*;
+
+    /// A loopback address nothing listens on, so a connect is refused at once.
+    fn refused_url(path: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}{path}", listener.local_addr().unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_failed_exchange_logs_its_cause_and_no_credential() {
+        let cfg = TokenExchangeConfig {
+            profile: Some(McpTokenExchangeProfile::EntraObo),
+            token_url: refused_url("/token"),
+            client_id: "cid".into(),
+            client_secret: "obo-secret-LEAK".into(),
+            scopes: vec!["api://x/.default".into()],
+            server: "s".into(),
+        };
+        let (result, logged) = capture_logs(exchange(&cfg, "subject-LEAK")).await;
+        assert!(matches!(result, Err(TokenExchangeFailure::Unavailable)));
+        assert!(logged.to_lowercase().contains("refused"), "{logged}");
+        assert!(!logged.contains("LEAK"), "{logged}");
+    }
+}

@@ -25,6 +25,8 @@ use std::time::Duration;
 use crate::chat::{ChatChunk, ChatFormat, ChatResponse, EmbeddingRequest, EmbeddingResponse};
 use crate::upstream_headers::{CallerIdentity, UpstreamHeaderContext};
 
+pub use aisix_core::redact_userinfo;
+
 /// Maximum number of bytes read from an upstream error response body
 /// before attempting JSON envelope parse. Bounds memory and parser cost
 /// when an upstream returns something pathological (an HTML error page
@@ -88,7 +90,7 @@ pub struct UpstreamErrorView {
 /// and resolved both the target Model AND its referenced ProviderKey
 /// from the [`aisix_core::AisixSnapshot`]. Bridges read from it but
 /// do not mutate it.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BridgeContext {
     /// Correlation id propagated into traces and error envelopes.
     pub request_id: String,
@@ -100,7 +102,25 @@ pub struct BridgeContext {
     pub provider_key: std::sync::Arc<ProviderKey>,
     /// Deadline for the entire upstream call. Bridges are expected to
     /// honour this by cancelling any in-flight HTTP request.
+    ///
+    /// On a streaming dispatch this is the **streaming** budget, which
+    /// bounds the connect phase and the gap between chunks rather than
+    /// the whole completion. A bridge that answers a streaming request
+    /// with a non-streaming upstream leg must use
+    /// [`non_streaming_deadline`](Self::non_streaming_deadline) instead.
     pub deadline: Option<Duration>,
+    /// The end-to-end budget for a non-streaming upstream call, carried
+    /// alongside `deadline` on streaming dispatches.
+    ///
+    /// A structured-output request on the synthetic-tool route cannot be
+    /// streamed — the JSON only exists once the tool call is complete —
+    /// so those bridges run the upstream leg non-streaming and render
+    /// the result as chunks. Measured against the streaming budget, a
+    /// completion that takes longer than one chunk gap is supposed to
+    /// would be cut off; this is the budget that call is actually
+    /// entitled to. `None` on a non-streaming dispatch, where `deadline`
+    /// already is it.
+    pub non_streaming_deadline: Option<Duration>,
     /// The authenticated caller, for `${request.api_key.*}` header
     /// templates. Default (all-empty) on calls with no caller behind
     /// them — a background job poll, an internal embedding lookup.
@@ -117,6 +137,40 @@ pub struct BridgeContext {
     /// unpopulated field outside tests.
     pub model_id: String,
     pub provider_key_id: String,
+    /// Size of the caller's inbound request body, which media the gateway
+    /// downloads for the request counts against together with
+    /// `proxy.request_body_limit_bytes`. `0` on caller-less calls.
+    pub inbound_body_bytes: usize,
+}
+
+/// Print the context without its credentials.
+///
+/// Two of these fields reach live secrets: `provider_key` carries the
+/// gateway's own upstream `api_key`, and `client_headers` the caller's
+/// own. A derived `Debug` would put both in any log line that ever
+/// formats a context, so the type names them instead of quoting them.
+impl std::fmt::Debug for BridgeContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BridgeContext")
+            .field("request_id", &self.request_id)
+            .field("model", &self.model.display_name)
+            .field("provider_key", &self.provider_key.display_name)
+            .field("deadline", &self.deadline)
+            .field("caller", &self.caller)
+            // Names only: the inbound map holds the caller's own
+            // `Authorization`, and nothing marks a header sensitive on
+            // the way in.
+            .field(
+                "client_headers",
+                &self
+                    .client_headers
+                    .as_ref()
+                    .map(|h| h.keys().map(|k| k.as_str()).collect::<Vec<_>>()),
+            )
+            .field("model_id", &self.model_id)
+            .field("provider_key_id", &self.provider_key_id)
+            .finish()
+    }
 }
 
 impl BridgeContext {
@@ -130,16 +184,44 @@ impl BridgeContext {
             model,
             provider_key,
             deadline: None,
+            non_streaming_deadline: None,
             caller: CallerIdentity::default(),
             client_headers: None,
             model_id: String::new(),
             provider_key_id: String::new(),
+            inbound_body_bytes: 0,
         }
+    }
+
+    pub fn with_inbound_body_bytes(mut self, bytes: usize) -> Self {
+        self.inbound_body_bytes = bytes;
+        self
     }
 
     pub fn with_deadline(mut self, deadline: Duration) -> Self {
         self.deadline = Some(deadline);
         self
+    }
+
+    /// Record the end-to-end budget a non-streaming call would have got,
+    /// for the streaming dispatches whose `deadline` is the smaller
+    /// streaming budget. See
+    /// [`non_streaming_deadline`](Self::non_streaming_deadline).
+    pub fn with_non_streaming_deadline(mut self, deadline: Option<Duration>) -> Self {
+        self.non_streaming_deadline = deadline;
+        self
+    }
+
+    /// The deadline an upstream leg that is *not* streaming should run
+    /// under, whichever kind of dispatch this context came from.
+    pub fn non_streaming_ctx(&self) -> Self {
+        let mut ctx = self.clone();
+        // The result is a non-streaming context, which carries its budget
+        // in `deadline` alone.
+        if let Some(deadline) = ctx.non_streaming_deadline.take() {
+            ctx.deadline = Some(deadline);
+        }
+        ctx
     }
 
     /// Attach the caller identity and inbound headers the outbound-header
@@ -185,6 +267,9 @@ impl BridgeContext {
                 provider_key_name: Some(&self.provider_key.display_name),
             },
             client_headers: self.client_headers.as_deref(),
+            // A Bridge speaks HTTP to its upstream and owns no header
+            // name the shared lists do not already cover.
+            surface_blocked: &[],
         }
     }
 }
@@ -196,6 +281,45 @@ fn timeout_cause_suffix(cause: &str) -> String {
         String::new()
     } else {
         format!(": {cause}")
+    }
+}
+
+/// A non-chat operation a Bridge may or may not implement.
+///
+/// The value domain is closed on purpose: it names exactly the three
+/// [`Bridge`] methods that ship a default implementation, and it is what
+/// [`BridgeError::UnsupportedCapability`] carries. Before it existed the
+/// proxy decided the 501 by searching the error's message text for a
+/// phrase, so rewording the sentence below would have silently turned a
+/// 501 into a 500 with nothing to catch it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeCapability {
+    /// [`Bridge::embed`] — `/v1/embeddings`.
+    Embeddings,
+    /// [`Bridge::complete`] — `/v1/completions`.
+    TextCompletions,
+    /// [`Bridge::generate_image`] — `/v1/images/generations`.
+    ImageGeneration,
+    /// [`Bridge::anthropic_messages`] and [`Bridge::anthropic_count_tokens`]
+    /// — `/v1/messages` served on the platform's own Claude routes.
+    AnthropicMessages,
+}
+
+impl BridgeCapability {
+    /// The words the client-facing message names this capability by.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Embeddings => "embeddings",
+            Self::TextCompletions => "text completions",
+            Self::ImageGeneration => "image generation",
+            Self::AnthropicMessages => "Anthropic messages",
+        }
+    }
+}
+
+impl std::fmt::Display for BridgeCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -227,7 +351,11 @@ pub enum BridgeError {
     /// the structured fields and [`wire`] to produce a client-shape
     /// envelope; `message` is kept around for logs and as a
     /// last-resort fallback if a parsed field is missing.
-    #[error("upstream returned HTTP {status}: {message}")]
+    ///
+    /// `message` also decides the client's envelope (blank falls back to the
+    /// status and reason phrase), so what logs and telemetry say beyond it
+    /// lives in the error's `Display` and never in this field.
+    #[error("{}", upstream_status_display(*.status, .message, .diagnostic.as_deref()))]
     UpstreamStatus {
         status: u16,
         message: String,
@@ -237,9 +365,33 @@ pub enum BridgeError {
         parsed: Option<Box<UpstreamErrorView>>,
         wire: UpstreamWire,
         retry_after: Option<Duration>,
+        /// What `Display` says instead of the `message` wording, when the
+        /// caller's text is not the diagnosis. See
+        /// [`with_body_read_error`](Self::with_body_read_error) and
+        /// [`with_telemetry_detail`](Self::with_telemetry_detail).
+        diagnostic: Option<String>,
     },
+    /// A non-2xx whose body could not be read, on a route that reports that
+    /// to its caller as [`UpstreamDecode`](Self::UpstreamDecode): the same
+    /// status, type, class and retry decisions, the same text to the caller
+    /// (`decode_error`), and only `Display` saying what happened.
+    #[error("upstream returned HTTP {status}: failed to read response body: {reason}")]
+    UpstreamBodyUnread {
+        status: u16,
+        decode_error: String,
+        reason: String,
+    },
+    /// A 2xx model answer the gateway could not read. Never retried,
+    /// failed over or counted toward cooldown: the upstream already served
+    /// — and billed — the call.
     #[error("upstream returned an unparseable body: {0}")]
     UpstreamDecode(String),
+    /// A 2xx from a credential token exchange (Azure AAD, Vertex service
+    /// account) the gateway could not read. Nothing was served or billed,
+    /// so unlike [`UpstreamDecode`](Self::UpstreamDecode) it is retried and
+    /// counts toward cooldown like a transport fault.
+    #[error("upstream returned an unparseable body: {0}")]
+    TokenExchangeDecode(String),
     /// A provider-reported error carried *inside* a 2xx streaming
     /// response body — an OpenAI-family `data: {"error":{...}}` frame,
     /// an Anthropic `event: error` frame, a Gemini in-stream error
@@ -252,7 +404,7 @@ pub enum BridgeError {
     /// [`UpstreamDecode`](Self::UpstreamDecode) keeps the provider's
     /// own error type/message intact instead of surfacing a serde
     /// parse failure (#1222 scenario 3).
-    #[error("upstream reported an in-band stream error: {message}")]
+    #[error("{}", in_band_display(.message, .parsed.as_deref()))]
     UpstreamInBand {
         status: Option<u16>,
         message: String,
@@ -263,15 +415,55 @@ pub enum BridgeError {
     },
     #[error("bridge is misconfigured: {0}")]
     Config(String),
+    /// The provider's bridge does not implement this operation at all —
+    /// the [`Bridge`] default impl answered, so no request was built and no
+    /// upstream was contacted.
+    ///
+    /// Static per adapter: the same provider will answer the same way for
+    /// every request, which is why it is the one failure that must not
+    /// spend a retry ([`crate::BridgeError`] consumers in the proxy's
+    /// `routing::is_retryable`).
+    ///
+    /// It carries the SAME status, error type and telemetry class as
+    /// [`Config`](Self::Config), which it was spelled as until #1093 — the
+    /// point of the variant is that a status decision no longer reads the
+    /// message text, not that any response changed.
+    #[error("this provider does not support {0}")]
+    UnsupportedCapability(BridgeCapability),
     /// Customer-fixable upstream config — the admin's ProviderKey/Model
-    /// is set up wrong (missing api_base, missing model_name) or the
-    /// caller's request is malformed (e.g. split_system shape). Maps to
+    /// is set up wrong (missing api_base, missing model_name). A request
+    /// shape the bridge cannot translate is [`InvalidRequest`] instead,
+    /// whose message does not blame the upstream config. Maps to
     /// 400, not 500: it's the caller's mistake, retrying won't help, and
     /// a 5xx wrongly tells SDKs/monitoring it's a server fault (#367).
     /// Contrast [`Config`], reserved for errors *we* cause
     /// (serialization, our generated request_id) which stays 500.
     #[error("invalid upstream configuration: {0}")]
     InvalidUpstreamConfig(String),
+    /// The caller's request asks for something this provider's bridge
+    /// cannot translate (a request field, tool type, or history shape).
+    /// Same 400 `invalid_request_error` and non-retryable handling as
+    /// [`InvalidUpstreamConfig`], but the message is the sentence itself
+    /// rather than one prefixed as an upstream misconfiguration, so the
+    /// caller is pointed at the request instead of the ProviderKey/Model,
+    /// and the telemetry class is `invalid_request_error`, the one every
+    /// refusal of the caller's request records, not `invalid_config`.
+    #[error("{0}")]
+    InvalidRequest(String),
+    /// The request outgrew `proxy.request_body_limit_bytes` once the media
+    /// the gateway downloaded for it is counted with its inbound body.
+    /// The same 413 an over-limit inbound body gets; never retried, and
+    /// raised before the upstream is contacted. The message counts both
+    /// parts, since the inbound body alone is under the limit.
+    #[error(
+        "the request body ({inbound_bytes} bytes) plus downloaded media ({downloaded_bytes} \
+         bytes) exceeds the {limit_bytes}-byte request_body_limit_bytes limit"
+    )]
+    RequestTooLarge {
+        limit_bytes: usize,
+        inbound_bytes: usize,
+        downloaded_bytes: u64,
+    },
     /// Customer-fixable upstream *credential* problem — the admin's
     /// ProviderKey secret/credential is missing, empty, or malformed
     /// (empty secret, api key with invalid HTTP-header bytes, unparseable
@@ -299,6 +491,7 @@ impl BridgeError {
             parsed: None,
             wire: UpstreamWire::Unknown,
             retry_after: None,
+            diagnostic: None,
         }
     }
 
@@ -315,8 +508,121 @@ impl BridgeError {
             parsed: None,
             wire: UpstreamWire::Unknown,
             retry_after,
+            diagnostic: None,
         }
     }
+
+    /// Have `Display` name the read failure behind this `UpstreamStatus`. What
+    /// the caller is sent stays whatever `message` says: the caller's answer
+    /// does not depend on how far the body got.
+    pub fn with_body_read_error(mut self, reason: Option<String>) -> Self {
+        if let (
+            Self::UpstreamStatus {
+                status, diagnostic, ..
+            },
+            Some(reason),
+        ) = (&mut self, reason)
+        {
+            *diagnostic = Some(format!(
+                "upstream returned HTTP {status}: failed to read response body: {reason}"
+            ));
+        }
+        self
+    }
+
+    /// Have `Display` report `detail` as this `UpstreamStatus`'s message, for
+    /// a route whose caller is sent other text than what the upstream said.
+    pub fn with_telemetry_detail(mut self, detail: &str) -> Self {
+        if let Self::UpstreamStatus {
+            status, diagnostic, ..
+        } = &mut self
+        {
+            *diagnostic = Some(upstream_status_display(*status, detail, None));
+        }
+        self
+    }
+
+    /// The [`UpstreamBodyUnread`](Self::UpstreamBodyUnread) of a failed read.
+    pub fn upstream_body_unread(status: u16, err: &reqwest::Error) -> Self {
+        let reason = crate::upstream_http::transport_error_message(err);
+        crate::response_tap::warn_error_body_unread(status, &reason);
+        Self::UpstreamBodyUnread {
+            status,
+            decode_error: err.to_string(),
+            reason,
+        }
+    }
+
+    /// The text of an error frame ending a stream. Written out rather than
+    /// taken from `Display`, which is free to say more than the caller is told.
+    pub fn stream_frame_message(&self) -> String {
+        match self {
+            Self::UpstreamStatus {
+                status, message, ..
+            } => format!("upstream returned HTTP {status}: {message}"),
+            Self::UpstreamInBand { message, .. } => {
+                format!("{IN_BAND_STREAM_ERROR}: {message}")
+            }
+            other => other.to_string(),
+        }
+    }
+}
+
+fn upstream_status_display(status: u16, message: &str, diagnostic: Option<&str>) -> String {
+    match diagnostic {
+        Some(diagnostic) => diagnostic.to_string(),
+        None if message.chars().all(|c| c.is_control() || c.is_whitespace()) => {
+            format!("upstream returned HTTP {status} with no error detail in the response")
+        }
+        None => format!("upstream returned HTTP {status}: {message}"),
+    }
+}
+
+const IN_BAND_STREAM_ERROR: &str = "upstream reported an in-band stream error";
+
+fn in_band_display(message: &str, parsed: Option<&UpstreamErrorView>) -> String {
+    if !message.chars().all(|c| c.is_control() || c.is_whitespace()) {
+        return format!("{IN_BAND_STREAM_ERROR}: {message}");
+    }
+    let named = parsed.and_then(|p| p.code.as_deref().or(p.kind.as_deref()));
+    match named {
+        Some(name) => format!("{IN_BAND_STREAM_ERROR} with no message: {name}"),
+        None => format!("{IN_BAND_STREAM_ERROR} with no message"),
+    }
+}
+
+/// A non-JSON-aware route's error message: the body text as sent, bounded.
+pub fn bounded_error_text(body: &[u8]) -> String {
+    String::from_utf8_lossy(body).chars().take(1024).collect()
+}
+
+/// Read a non-2xx answer a proxy route holds itself into an `UpstreamStatus`
+/// with no parsed envelope, `message` deriving its text from the body. A body
+/// that could not be read whole gives `message` nothing: these routes answer
+/// such a failure with the status fallback, not with a fragment.
+pub async fn upstream_status_from_response(
+    resp: reqwest::Response,
+    limit: usize,
+    message: impl FnOnce(&[u8]) -> String,
+) -> BridgeError {
+    upstream_status_from_response_with_deadline(resp, limit, None, message).await
+}
+
+/// [`upstream_status_from_response`] with the read under
+/// [`read_body_capped_with_deadline`]'s deadline, for the routes that wait on
+/// the error body within a request budget of their own.
+pub async fn upstream_status_from_response_with_deadline(
+    resp: reqwest::Response,
+    limit: usize,
+    deadline: Option<Duration>,
+    message: impl FnOnce(&[u8]) -> String,
+) -> BridgeError {
+    let status = resp.status().as_u16();
+    let retry_after = parse_retry_after(resp.headers());
+    let body = read_body_capped_with_deadline(resp, limit, deadline).await;
+    let text = message(body.whole());
+    BridgeError::upstream_status_with_retry_after(status, text, retry_after)
+        .with_body_read_error(body.read_error)
 }
 
 /// Parse the `Retry-After` response header into a Duration.
@@ -361,7 +667,10 @@ pub async fn capture_upstream_error_http(
     parse: impl FnOnce(&[u8]) -> Option<UpstreamErrorView>,
 ) -> BridgeError {
     let retry_after = parse_retry_after(resp.headers());
-    let body = read_body_capped(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
+    let UpstreamErrorBody {
+        bytes: body,
+        read_error,
+    } = read_body_capped(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
     // Parse the error envelope opportunistically, regardless of the
     // upstream's Content-Type (#543). OpenAI's 401 `invalid_api_key`
     // path (and edge / proxy layers fronting some upstreams) return the
@@ -398,15 +707,55 @@ pub async fn capture_upstream_error_http(
         parsed: parsed.map(Box::new),
         wire,
         retry_after,
+        diagnostic: None,
+    }
+    .with_body_read_error(read_error)
+}
+
+/// The human-readable message of an upstream error body: `error.message`
+/// (the OpenAI / Google / Azure envelope), a top-level `message` (AWS), a
+/// bare-string `error`, or else the body text itself — truncated at
+/// [`MAX_UPSTREAM_ERROR_MESSAGE_BYTES`]. The caller receives it as the
+/// upstream wrote it.
+pub fn upstream_error_message(body: &[u8]) -> String {
+    let parsed: Option<serde_json::Value> = serde_json::from_slice(body).ok();
+    let text = |v: Option<&serde_json::Value>| v.and_then(|m| m.as_str()).map(str::to_string);
+    let message = parsed.as_ref().and_then(|v| {
+        text(v.get("error").and_then(|e| e.get("message")))
+            .or_else(|| text(v.get("message")))
+            .or_else(|| text(v.get("error")))
+    });
+    let message = message.unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
+    truncate_lossy(&message, MAX_UPSTREAM_ERROR_MESSAGE_BYTES)
+}
+
+/// Whether a top-level `error` value reports a failure: a non-empty
+/// string, or an object with a non-empty `message` or a non-null `code`.
+/// `null`, `{}`, `""` and an object carrying neither field do not — some
+/// OpenAI-compatible servers send an empty `error` beside a successful
+/// answer. The one rule every in-band probe applies, whether or not the
+/// payload also carries `choices`.
+pub fn in_band_error_reported(error: &serde_json::Value) -> bool {
+    match error {
+        serde_json::Value::String(s) => !s.is_empty(),
+        serde_json::Value::Object(obj) => {
+            let message = match obj.get("message") {
+                None | Some(serde_json::Value::Null) => false,
+                Some(serde_json::Value::String(s)) => !s.is_empty(),
+                Some(_) => true,
+            };
+            message || obj.get("code").is_some_and(|c| !c.is_null())
+        }
+        _ => false,
     }
 }
 
-/// Probe one SSE `data:` payload for a provider in-band error envelope
-/// (`{"error": {...}}` or `{"error": "..."}`) and capture it as a
-/// [`BridgeError::UpstreamInBand`]. Returns `None` when the payload is
-/// not an error envelope — callers fall back to their decode-error
-/// path, so a genuinely malformed frame still surfaces as
-/// [`BridgeError::UpstreamDecode`].
+/// Probe one SSE `data:` payload, or a whole 2xx body, for a provider
+/// in-band error envelope (`{"error": {...}}` or `{"error": "..."}`) and
+/// capture it as a [`BridgeError::UpstreamInBand`]. Returns `None` when the
+/// payload carries no `error` that [`in_band_error_reported`] accepts —
+/// callers fall back to their decode path, so a genuinely malformed frame
+/// still surfaces as [`BridgeError::UpstreamDecode`].
 ///
 /// Field handling is tolerant across the OpenAI-compatible family and
 /// Google's error shape:
@@ -414,64 +763,100 @@ pub async fn capture_upstream_error_http(
 ///   `kind`; absent that, Google's `error.status` gRPC token
 ///   (`UNAVAILABLE`, `RESOURCE_EXHAUSTED`, …) does, so the per-wire
 ///   translation tables in `error_translate` apply either way.
-/// - `error.code` may be a JSON number (Google) or a string (OpenAI).
-///   A numeric value in 400..=599 — either form — becomes the embedded
-///   `status`; a non-numeric string stays in the view's `code`.
-/// - a bare-string `error` value becomes the message (LiteLLM accepts
-///   this form from OpenAI-compatible aggregators; so do we).
+/// - `error.code` may be a JSON number (Google, OpenRouter) or a string
+///   (OpenAI). A numeric value in 400..=599 — either form — becomes the
+///   embedded `status`; a non-numeric string stays in the view's `code`.
+/// - a bare-string `error` value becomes the message (OpenAI-compatible
+///   aggregators send this form).
 ///
 /// All captured strings are truncated at
 /// [`MAX_UPSTREAM_ERROR_MESSAGE_BYTES`], same as
 /// [`capture_upstream_error_http`].
 pub fn capture_in_band_error(payload: &str, wire: UpstreamWire) -> Option<BridgeError> {
-    #[derive(serde::Deserialize)]
-    struct Outer {
-        error: ErrorField,
-    }
-    #[derive(serde::Deserialize)]
-    #[serde(untagged)]
-    enum ErrorField {
-        Obj(Inner),
-        Str(String),
-    }
-    #[derive(serde::Deserialize)]
-    struct Inner {
-        message: Option<String>,
-        #[serde(rename = "type")]
-        kind: Option<String>,
-        code: Option<serde_json::Value>,
-        param: Option<String>,
-        status: Option<String>,
-    }
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    capture_in_band_error_value(&value, wire)
+}
 
+/// [`capture_in_band_error`] over a whole 2xx response body. The parse is
+/// skipped unless the body mentions an `"error"` key, so a success body
+/// costs one substring scan.
+pub fn in_band_error_in_body(body: &[u8], wire: UpstreamWire) -> Option<BridgeError> {
+    capture_in_band_error_value(&in_band_error_body(body)?, wire)
+}
+
+/// The parsed 2xx body, when its top-level `error` reports a failure by
+/// [`in_band_error_reported`] — for a caller that reads the envelope with
+/// its own wire's taxonomy. The parse is skipped unless the body mentions
+/// an `"error"` key.
+pub fn in_band_error_body(body: &[u8]) -> Option<serde_json::Value> {
+    const KEY: &[u8] = b"\"error\"";
+    if !body.windows(KEY.len()).any(|w| w == KEY) {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    value
+        .get("error")
+        .is_some_and(in_band_error_reported)
+        .then_some(value)
+}
+
+/// Read a 2xx body and decode it as the success shape `T`, unless it
+/// reports an in-band error ([`in_band_error_in_body`]), which is returned
+/// instead. A body that is neither is [`BridgeError::UpstreamDecode`].
+pub async fn decode_success_body<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+    wire: UpstreamWire,
+) -> Result<T, BridgeError> {
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| crate::upstream_http::upstream_body_read_error(&e))?;
+    if let Some(err) = in_band_error_in_body(&body, wire) {
+        return Err(err);
+    }
+    serde_json::from_slice(&body).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
+}
+
+/// [`capture_in_band_error`] over an already-parsed payload.
+pub fn capture_in_band_error_value(
+    value: &serde_json::Value,
+    wire: UpstreamWire,
+) -> Option<BridgeError> {
+    let error = value.get("error")?;
+    if !in_band_error_reported(error) {
+        return None;
+    }
     let cap = MAX_UPSTREAM_ERROR_MESSAGE_BYTES;
-    let outer: Outer = serde_json::from_str(payload).ok()?;
-    let (status, message, parsed) = match outer.error {
-        ErrorField::Str(s) => (None, truncate_lossy(&s, cap), None),
-        ErrorField::Obj(inner) => {
-            let numeric_status = match &inner.code {
+    let text = |v: Option<&serde_json::Value>| match v {
+        Some(serde_json::Value::String(s)) => Some(truncate_lossy(s, cap)),
+        _ => None,
+    };
+    let (status, message, parsed) = match error {
+        serde_json::Value::String(s) => (None, truncate_lossy(s, cap), None),
+        inner => {
+            let code = inner.get("code");
+            let numeric_status = match code {
                 Some(serde_json::Value::Number(n)) => n.as_u64(),
                 Some(serde_json::Value::String(s)) => s.parse::<u64>().ok(),
                 _ => None,
             }
             .and_then(|n| u16::try_from(n).ok())
             .filter(|n| (400..=599).contains(n));
-            let code_str = match &inner.code {
-                Some(serde_json::Value::String(s)) if numeric_status.is_none() => {
-                    Some(truncate_lossy(s, cap))
-                }
-                _ => None,
+            let message = match inner.get("message") {
+                Some(serde_json::Value::String(s)) => Some(truncate_lossy(s, cap)),
+                Some(serde_json::Value::Null) | None => None,
+                Some(other) => Some(truncate_lossy(&other.to_string(), cap)),
             };
             let view = UpstreamErrorView {
-                kind: inner.kind.or(inner.status).map(|k| truncate_lossy(&k, cap)),
-                message: inner.message.as_deref().map(|m| truncate_lossy(m, cap)),
-                code: code_str,
-                param: inner.param.map(|p| truncate_lossy(&p, cap)),
+                kind: text(inner.get("type")).or_else(|| text(inner.get("status"))),
+                message,
+                code: text(code).filter(|_| numeric_status.is_none()),
+                param: text(inner.get("param")),
             };
             let message = view
                 .message
                 .clone()
-                .unwrap_or_else(|| truncate_lossy(payload, cap));
+                .unwrap_or_else(|| truncate_lossy(&error.to_string(), cap));
             (numeric_status, message, Some(Box::new(view)))
         }
     };
@@ -483,59 +868,86 @@ pub fn capture_in_band_error(payload: &str, wire: UpstreamWire) -> Option<Bridge
     })
 }
 
-/// Read the response body, stopping after `limit` bytes. Used to bound
-/// upstream-error parsing cost regardless of `Content-Length`. Errors
-/// during read surface as an empty buffer — the caller falls through
-/// to a parse-failure path and emits the generic `upstream_error`
-/// envelope, which matches the pre-fix behaviour for that edge.
+/// An upstream error response's body as far as it could be read.
+pub struct UpstreamErrorBody {
+    pub bytes: bytes::Bytes,
+    /// Why reading stopped early, `None` when the body arrived whole.
+    pub read_error: Option<String>,
+}
+
+impl UpstreamErrorBody {
+    /// The bytes if the body arrived whole, nothing otherwise.
+    pub fn whole(&self) -> &[u8] {
+        if self.read_error.is_some() {
+            &[]
+        } else {
+            &self.bytes
+        }
+    }
+}
+
+/// Read an upstream error response's body, keeping at most `limit` bytes.
+/// Used to bound upstream-error parsing cost regardless of `Content-Length`.
+/// THE read of every non-2xx upstream body: it hands the bytes to the request's
+/// full-content exports ([`crate::response_tap::note_upstream_error_body`])
+/// and logs a failed read.
 ///
 /// Public so non-OpenAI / non-Anthropic bridges (Vertex, Azure) can
 /// enforce the same cap when they need a custom parse path (e.g.
 /// extracting only `kind` from the upstream envelope while suppressing
 /// the `message` for operator-taxonomy redaction).
-pub async fn read_body_capped(resp: reqwest::Response, limit: usize) -> bytes::Bytes {
-    read_body_capped_with_deadline(resp, limit, None)
-        .await
-        .unwrap_or_default()
+pub async fn read_body_capped(resp: reqwest::Response, limit: usize) -> UpstreamErrorBody {
+    read_body_capped_with_deadline(resp, limit, None).await
 }
 
-/// Bounded upstream-error body reader with an optional whole-drain deadline.
-/// It stops once `limit` bytes are retained; dropping the response may forfeit
-/// keep-alive, but avoids letting an error body slow-drip forever after its
-/// diagnostic prefix is already complete.
+/// [`read_body_capped`] with an optional deadline over the whole read. A
+/// deadline that elapses ends the read like a failed one: `read_error` says so
+/// and the bytes that had arrived are kept.
+///
+/// The read stops once `limit` bytes are retained. Dropping the response may
+/// forfeit keep-alive, but avoids letting an error body slow-drip forever
+/// after its diagnostic prefix is already complete.
 pub async fn read_body_capped_with_deadline(
     resp: reqwest::Response,
     limit: usize,
-    deadline: Option<std::time::Duration>,
-) -> Result<bytes::Bytes, BridgeError> {
+    deadline: Option<Duration>,
+) -> UpstreamErrorBody {
     use futures::StreamExt;
-    let read = async move {
-        let mut buf = bytes::BytesMut::with_capacity(limit.min(16 * 1024));
+    let status = resp.status().as_u16();
+    let mut buf = bytes::BytesMut::with_capacity(limit.min(16 * 1024));
+    let read = async {
         let mut stream = resp.bytes_stream();
         while buf.len() < limit {
             let Some(chunk) = stream.next().await else {
                 break;
             };
-            let chunk = chunk.map_err(|e| {
-                BridgeError::Transport(crate::upstream_http::transport_error_message(&e))
-            })?;
-            let remaining = limit - buf.len();
-            let take = chunk.len().min(remaining);
-            buf.extend_from_slice(&chunk[..take]);
+            match chunk {
+                Ok(chunk) => {
+                    let take = chunk.len().min(limit - buf.len());
+                    buf.extend_from_slice(&chunk[..take]);
+                }
+                Err(e) => return Some(crate::upstream_http::transport_error_message(&e)),
+            }
         }
-        Ok::<_, BridgeError>(buf.freeze())
+        None
     };
-    match deadline {
-        Some(duration) => {
-            tokio::time::timeout(duration, read)
-                .await
-                .map_err(|_| BridgeError::Timeout {
-                    elapsed_ms: duration.as_millis().min(u128::from(u64::MAX)) as u64,
-                    cause: "upstream error body".to_string(),
-                })?
-        }
+    let read_error = match deadline {
+        Some(duration) => tokio::time::timeout(duration, read)
+            .await
+            .unwrap_or_else(|_| {
+                Some(format!(
+                    "timed out after {}ms",
+                    duration.as_millis().min(u128::from(u64::MAX))
+                ))
+            }),
         None => read.await,
+    };
+    if let Some(reason) = &read_error {
+        crate::response_tap::warn_error_body_unread(status, reason);
     }
+    let bytes = buf.freeze();
+    crate::response_tap::note_upstream_error_body(&bytes);
+    UpstreamErrorBody { bytes, read_error }
 }
 
 /// Content-Type token starts with `application/json` (RFC 7231 §3.1.1.1
@@ -592,7 +1004,9 @@ impl BridgeError {
                     502
                 }
             }
-            BridgeError::UpstreamDecode(_) => 502,
+            BridgeError::UpstreamDecode(_)
+            | BridgeError::UpstreamBodyUnread { .. }
+            | BridgeError::TokenExchangeDecode(_) => 502,
             // Same forwarding rule as UpstreamStatus: an embedded 4xx is
             // the provider's judgment of the request and passes through;
             // 5xx / unknown collapse to 502.
@@ -600,8 +1014,16 @@ impl BridgeError {
                 Some(s) if (400..500).contains(s) => *s,
                 _ => 502,
             },
-            BridgeError::Config(_) => 500,
-            BridgeError::InvalidUpstreamConfig(_) => 400,
+            // Same 500 as `Config`, which this variant was spelled as
+            // before it was typed. The three routes that turn it into a
+            // 501 build that response inline (they answer it as a dispatch
+            // success, not through `ProxyError`), and the other two callers
+            // of the `embed` default — the semantic router and the guardrail
+            // embedder — surface it through this table. Mapping it to 501
+            // here would change what those two return.
+            BridgeError::Config(_) | BridgeError::UnsupportedCapability(_) => 500,
+            BridgeError::InvalidUpstreamConfig(_) | BridgeError::InvalidRequest(_) => 400,
+            BridgeError::RequestTooLarge { .. } => 413,
             BridgeError::InvalidUpstreamCredentials(_) => 401,
             BridgeError::Transport(_) => 502,
             BridgeError::StreamAborted => 502,
@@ -612,7 +1034,7 @@ impl BridgeError {
     /// error was raised.
     ///
     /// Gates the `aisix_deployment_*` families, which read as **upstream
-    /// health** for one deployment target. The three config/credential
+    /// health** for one deployment target. The config/credential/request
     /// variants are raised while the request is still being assembled — an
     /// empty or unusable `api_key`, a missing `model_name`/`api_base`, a
     /// body that would not serialize, a `split_system` shape the provider
@@ -631,11 +1053,16 @@ impl BridgeError {
             BridgeError::Timeout { .. }
             | BridgeError::UpstreamStatus { .. }
             | BridgeError::UpstreamDecode(_)
+            | BridgeError::UpstreamBodyUnread { .. }
+            | BridgeError::TokenExchangeDecode(_)
             | BridgeError::UpstreamInBand { .. }
             | BridgeError::Transport(_)
             | BridgeError::StreamAborted => true,
             BridgeError::Config(_)
+            | BridgeError::UnsupportedCapability(_)
             | BridgeError::InvalidUpstreamConfig(_)
+            | BridgeError::InvalidRequest(_)
+            | BridgeError::RequestTooLarge { .. }
             | BridgeError::InvalidUpstreamCredentials(_) => false,
         }
     }
@@ -645,10 +1072,14 @@ impl BridgeError {
         match self {
             BridgeError::Timeout { .. } => "timeout",
             BridgeError::UpstreamStatus { .. } => "upstream_error",
-            BridgeError::UpstreamDecode(_) => "upstream_decode_error",
+            BridgeError::UpstreamDecode(_)
+            | BridgeError::UpstreamBodyUnread { .. }
+            | BridgeError::TokenExchangeDecode(_) => "upstream_decode_error",
             BridgeError::UpstreamInBand { .. } => "upstream_in_band_error",
-            BridgeError::Config(_) => "config_error",
-            BridgeError::InvalidUpstreamConfig(_) => "invalid_request_error",
+            BridgeError::Config(_) | BridgeError::UnsupportedCapability(_) => "config_error",
+            BridgeError::InvalidUpstreamConfig(_)
+            | BridgeError::InvalidRequest(_)
+            | BridgeError::RequestTooLarge { .. } => "invalid_request_error",
             BridgeError::InvalidUpstreamCredentials(_) => "authentication_error",
             BridgeError::Transport(_) => "transport_error",
             BridgeError::StreamAborted => "stream_aborted",
@@ -666,6 +1097,18 @@ pub type ChatChunkStream = BoxStream<'static, Result<ChatChunk, BridgeError>>;
 /// guardrail hold-back.
 pub type CompletionByteStream = BoxStream<'static, Result<bytes::Bytes, BridgeError>>;
 
+/// What a platform answered an Anthropic Messages request with, in the
+/// Anthropic Messages wire itself.
+pub enum NativeMessages {
+    /// The Messages response object.
+    Json(serde_json::Value),
+    /// Anthropic SSE frames (`event:` + `data:` + blank line), each item
+    /// one or more whole frames. A failure inside the committed stream
+    /// arrives as an Anthropic `error` frame; an `Err` item is a transport
+    /// failure the bridge could not express as one.
+    Stream(BoxStream<'static, Result<bytes::Bytes, BridgeError>>),
+}
+
 /// The provider-agnostic chat operation. Implementors live in the
 /// individual `aisix-provider-*` crates.
 #[async_trait]
@@ -673,6 +1116,34 @@ pub trait Bridge: Send + Sync + 'static {
     /// Human-readable name used in logs and metrics labels. Stable across
     /// upgrades so dashboards don't break.
     fn name(&self) -> &'static str;
+
+    /// The upstream API protocol this bridge speaks on the wire, as the
+    /// bounded `upstream_protocol` metric label value
+    /// (AISIX-Cloud#1403).
+    ///
+    /// NOT [`Bridge::name`]: a bridge names itself after the vendor
+    /// family it serves, which for Bedrock varies per model family
+    /// (`"anthropic"`, `"meta"`, …) while the wire shape stays
+    /// `"bedrock"` throughout.
+    ///
+    /// The default is [`crate::hub::UPSTREAM_PROTOCOL_UNKNOWN`] so a
+    /// stub bridge in a test does not have to answer. Every bridge
+    /// reachable from `build_hub()` overrides it, which
+    /// `upstream_protocol_label_matches_dispatched_bridge` pins.
+    fn wire_protocol(&self) -> &'static str {
+        crate::hub::UPSTREAM_PROTOCOL_UNKNOWN
+    }
+
+    /// Whether the upstream `ctx` dispatches to reads `cache_control`
+    /// prompt-cache markers carried in the [`ChatFormat`] — on content
+    /// parts, on a `role:"tool"` message, on `tool_calls[]` entries and on
+    /// tool definitions. A translation from a protocol whose markers the
+    /// chat form does not carry by default (Anthropic Messages) keeps them
+    /// only when this is true; everywhere else they would reach an upstream
+    /// that rejects or ignores them. The default is `false`.
+    fn reads_cache_markers(&self, _ctx: &BridgeContext) -> bool {
+        false
+    }
 
     /// Non-streaming call: one request, one response.
     async fn chat(
@@ -688,16 +1159,40 @@ pub trait Bridge: Send + Sync + 'static {
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError>;
 
+    /// [`Bridge::chat`] for a caller that can hand over a request it will
+    /// not reuse — a per-attempt translation or rewrite. An owned request
+    /// is dropped as soon as the upstream body is built, so it is not
+    /// alive for the upstream wait next to the body. Every production
+    /// bridge overrides this; the default only borrows.
+    async fn chat_cow(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
+        ctx: &BridgeContext,
+    ) -> Result<ChatResponse, BridgeError> {
+        self.chat(&req, ctx).await
+    }
+
+    /// [`Bridge::chat_stream`] with the same ownership contract as
+    /// [`Bridge::chat_cow`].
+    async fn chat_stream_cow(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
+        ctx: &BridgeContext,
+    ) -> Result<ChatChunkStream, BridgeError> {
+        self.chat_stream(&req, ctx).await
+    }
+
     /// Embedding call: text(s) → float vectors. Providers that do not
-    /// support embeddings return [`BridgeError::Config`] with a clear
-    /// message so the proxy can surface a 501 rather than a 502.
+    /// support embeddings keep the default, which returns
+    /// [`BridgeError::UnsupportedCapability`] so `/v1/embeddings` can
+    /// surface a 501 rather than a 502.
     async fn embed(
         &self,
         _req: &EmbeddingRequest,
         _ctx: &BridgeContext,
     ) -> Result<EmbeddingResponse, BridgeError> {
-        Err(BridgeError::Config(
-            "this provider does not support embeddings".into(),
+        Err(BridgeError::UnsupportedCapability(
+            BridgeCapability::Embeddings,
         ))
     }
 
@@ -709,14 +1204,16 @@ pub trait Bridge: Send + Sync + 'static {
     /// between providers are the caller's responsibility.
     ///
     /// Providers that do not expose a `/completions` endpoint should keep
-    /// the default, which returns a 501-mapped [`BridgeError::Config`].
+    /// the default, which returns
+    /// [`BridgeError::UnsupportedCapability`] — the value `/v1/completions`
+    /// turns into a 501.
     async fn complete(
         &self,
         _body: &serde_json::Value,
         _ctx: &BridgeContext,
     ) -> Result<serde_json::Value, BridgeError> {
-        Err(BridgeError::Config(
-            "this provider does not support text completions".into(),
+        Err(BridgeError::UnsupportedCapability(
+            BridgeCapability::TextCompletions,
         ))
     }
 
@@ -728,8 +1225,8 @@ pub trait Bridge: Send + Sync + 'static {
         _body: &serde_json::Value,
         _ctx: &BridgeContext,
     ) -> Result<CompletionByteStream, BridgeError> {
-        Err(BridgeError::Config(
-            "this provider does not support streaming text completions".into(),
+        Err(BridgeError::UnsupportedCapability(
+            BridgeCapability::TextCompletions,
         ))
     }
 
@@ -740,70 +1237,67 @@ pub trait Bridge: Send + Sync + 'static {
     /// body JSON is returned as-is from the upstream.
     ///
     /// Providers that do not expose an image generation endpoint should keep
-    /// the default, which returns a 501-mapped [`BridgeError::Config`].
+    /// the default, which returns
+    /// [`BridgeError::UnsupportedCapability`] — the value
+    /// `/v1/images/generations` turns into a 501.
     async fn generate_image(
         &self,
         _body: &serde_json::Value,
         _ctx: &BridgeContext,
     ) -> Result<serde_json::Value, BridgeError> {
-        Err(BridgeError::Config(
-            "this provider does not support image generation".into(),
+        Err(BridgeError::UnsupportedCapability(
+            BridgeCapability::ImageGeneration,
+        ))
+    }
+
+    /// Whether `upstream_model` is a Claude model this platform serves on
+    /// its own Anthropic Messages routes, so `/v1/messages` reaches it
+    /// through [`Bridge::anthropic_messages`] rather than the chat
+    /// translation.
+    fn serves_anthropic_messages(&self, _upstream_model: &str) -> bool {
+        false
+    }
+
+    /// An Anthropic Messages body sent to the platform's own Claude route
+    /// and answered in the same wire. `body` is the caller's request with
+    /// the gateway's own rewrites applied; the bridge adapts it to what the
+    /// platform accepts. `body.stream` picks the streaming route.
+    async fn anthropic_messages(
+        &self,
+        _body: serde_json::Value,
+        _ctx: &BridgeContext,
+    ) -> Result<NativeMessages, BridgeError> {
+        Err(BridgeError::UnsupportedCapability(
+            BridgeCapability::AnthropicMessages,
+        ))
+    }
+
+    /// `/v1/messages/count_tokens` on the platform's own token-counting
+    /// API, answered as Anthropic's `{"input_tokens": N}`.
+    async fn anthropic_count_tokens(
+        &self,
+        _body: serde_json::Value,
+        _ctx: &BridgeContext,
+    ) -> Result<serde_json::Value, BridgeError> {
+        Err(BridgeError::UnsupportedCapability(
+            BridgeCapability::AnthropicMessages,
         ))
     }
 }
 
-/// Replace any `userinfo@` prefix in an authority with `***@` before the value
-/// goes into an error a CALLER will read.
+/// Reject a `ProviderKey.api_base` shape the bridge cannot build a request from.
 ///
-/// THE implementation, for the same reason `cidr_allows` is: a redaction
-/// copied per provider drifts. Vertex grew its own and applied it to one of
-/// its four echo branches; Azure grew none and printed the whole value in the
-/// branch that says the value embeds userinfo. This one also covers the
-/// scheme-less shape — Vertex's returned the input untouched without a
-/// `://`, which is precisely the case that reaches the no-scheme branch.
+/// A query or fragment on the base is refused: the bridge appends a fixed path
+/// suffix, and a `?` or `#` in the base makes that suffix land inside the query
+/// string instead of the path.
 ///
-/// `InvalidUpstreamConfig` renders as a 400 with the message in the body, so
-/// anything echoed here reaches whoever made the request. The rule below —
-/// "report the scheme-stripped prefix, never the whole value, an embedded
-/// credential is exactly what may be in there" — is the reason, and the
-/// no-scheme branch was the one place still printing the raw string: an
-/// `api_base` written as `user:pass@host/v1`, with the scheme simply
-/// forgotten, does not reach the userinfo check below. It fails here first,
-/// and used to be quoted back in full.
-pub fn redact_userinfo(value: &str) -> std::borrow::Cow<'_, str> {
-    // 只有出现在任何 `/` `?` `#` `@` 之前的 `://` 才是 scheme 分隔符；query 里的
-    // `https://` 不算，否则 authority 会被认到它后面，前面的 userinfo 原样放过。
-    let after_scheme = match value.find("://") {
-        Some(i) if !value[..i].contains(['/', '?', '#', '@']) => i + 3,
-        _ => 0,
-    };
-    // The last `@` anywhere after the scheme: a password may itself hold a
-    // raw `/`, `?` or `#`, and ending the authority at the first of those
-    // would leave the rest of the password in the message. A path or query
-    // holding an `@` is over-redacted, which is harmless in a message.
-    match value[after_scheme..].rfind('@') {
-        Some(at) => std::borrow::Cow::Owned(format!(
-            "{}***@{}",
-            &value[..after_scheme],
-            &value[after_scheme + at + 1..]
-        )),
-        None => std::borrow::Cow::Borrowed(value),
-    }
-}
-
-/// Reject a `ProviderKey.api_base` shape that would send the key's secret
-/// somewhere other than where the config appears to say.
-///
-/// `https://api.openai.com@evil.example/v1` reads like OpenAI to a human and
-/// resolves to `evil.example`, which then receives the Authorization header —
-/// which is why userinfo is refused outright. A query or fragment on the base
-/// is refused for the same family of reasons: the bridge appends a fixed path
-/// suffix, and a `?` or `#` in the base makes that suffix land inside the
-/// query string instead of the path.
+/// Userinfo is accepted and used as configured, by the project owner's decision,
+/// and its password is kept out of everything displayed. So
+/// `https://api.openai.com@evil.example/v1` is taken at its word and goes to
+/// `evil.example`, with the key: the operator configured that value.
 ///
 /// Vertex and Azure each grew this check locally (#390); the OpenAI-compatible
-/// and Anthropic bridges did not, so it lives here now and every bridge calls
-/// the same one.
+/// and Anthropic bridges did not, so it lives here now for those two.
 pub fn validate_api_base(provider: &str, base: &str) -> Result<(), BridgeError> {
     let Some(rest) = base
         .strip_prefix("https://")
@@ -816,13 +1310,8 @@ pub fn validate_api_base(provider: &str, base: &str) -> Result<(), BridgeError> 
     };
     // Everything below reports the SCHEME-STRIPPED prefix, never the whole
     // value: an embedded credential is exactly what may be in there.
-    let host_part = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if host_part.contains('@') {
-        return Err(BridgeError::InvalidUpstreamConfig(format!(
-            "{provider} provider_key api_base must not embed userinfo (@); put the \
-             credential in `provider_key.api_key` instead"
-        )));
-    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_part = authority.rsplit('@').next().unwrap_or(authority);
     if host_part.is_empty() {
         let shown = redact_userinfo(base);
         return Err(BridgeError::InvalidUpstreamConfig(format!(
@@ -846,7 +1335,7 @@ mod tests {
     fn validate_api_base_messages_carry_no_source_indentation() {
         for base in [
             "ftp://host/v1",
-            "https://user:pw@host/v1",
+            "https://user:pw@/v1",
             "https:///v1",
             "https://host/v1?x=1",
         ] {
@@ -882,24 +1371,29 @@ mod tests {
         assert_eq!(shown, "https://***@res.openai.azure.com/v1");
     }
 
-    /// `api_base` decides where the ProviderKey's secret is sent, so a shape
-    /// that reads like one host and resolves to another has to be refused
-    /// rather than normalised.
+    /// Userinfo is accepted as configured (project owner's decision); what the
+    /// bridge cannot append its path to is still refused.
     #[test]
-    fn validate_api_base_refuses_credential_redirecting_shapes() {
+    fn validate_api_base_accepts_userinfo_and_refuses_shapes_that_break_the_path() {
         validate_api_base("openai", "https://api.openai.com/v1").unwrap();
         validate_api_base("openai", "http://127.0.0.1:8080/v1").unwrap();
+        validate_api_base("openai", "https://user:pw@proxy.example/v1").unwrap();
+        validate_api_base("anthropic", "https://user@proxy.example").unwrap();
 
-        // Reads as OpenAI, resolves to evil.example — which would then
-        // receive the Authorization header.
-        let err = validate_api_base("openai", "https://api.openai.com@evil.example/v1")
-            .expect_err("userinfo must be refused");
-        assert!(format!("{err}").contains("userinfo"), "{err}");
-        // The rejection must not echo the value back: it may carry a secret.
-        assert!(
-            !format!("{err}").contains("evil.example"),
-            "the error must not repeat a base that may embed a credential: {err}"
-        );
+        // Userinfo and nothing else is still no host.
+        let err = validate_api_base("openai", "https://user:s3cret@/v1")
+            .expect_err("no host behind the userinfo");
+        assert!(!format!("{err}").contains("s3cret"), "{err}");
+
+        // A refused base never shows its password, whichever check refused it.
+        for refused in [
+            "https://user:s3cret@proxy.example/v1?x=1",
+            "https://user:s3cret@proxy.example/v1#frag",
+            "ftp://user:s3cret@proxy.example/v1",
+        ] {
+            let err = validate_api_base("openai", refused).expect_err(refused);
+            assert!(!format!("{err}").contains("s3cret"), "{err}");
+        }
 
         for bad in [
             "ftp://api.openai.com/v1",
@@ -915,6 +1409,194 @@ mod tests {
         }
     }
     use super::*;
+
+    /// An in-band error with an empty message says so where telemetry reads
+    /// it; the stream's error frame keeps what the caller has always been sent.
+    #[test]
+    fn a_blank_in_band_message_is_named_without_changing_the_callers_frame() {
+        let in_band = |payload: serde_json::Value| {
+            capture_in_band_error_value(&payload, UpstreamWire::OpenAI).unwrap()
+        };
+        let with_code =
+            in_band(serde_json::json!({"error": {"message": "", "code": "overloaded"}}));
+        assert_eq!(
+            with_code.to_string(),
+            "upstream reported an in-band stream error with no message: overloaded"
+        );
+        assert_eq!(
+            with_code.stream_frame_message(),
+            "upstream reported an in-band stream error: "
+        );
+        let bare = BridgeError::UpstreamInBand {
+            status: None,
+            message: " \n".into(),
+            parsed: None,
+            wire: UpstreamWire::OpenAI,
+        };
+        assert_eq!(
+            bare.to_string(),
+            "upstream reported an in-band stream error with no message"
+        );
+        let named = in_band(serde_json::json!({"error": {"message": "boom"}}));
+        assert_eq!(
+            named.to_string(),
+            "upstream reported an in-band stream error: boom"
+        );
+        assert_eq!(named.stream_frame_message(), named.to_string());
+    }
+
+    /// The wording of a blank message is the error's `Display`, and its
+    /// `message` stays blank for the client's status fallback.
+    #[test]
+    fn upstream_status_display_names_what_a_blank_message_means() {
+        for blank in ["", " \n", "\u{1}\u{2028}"] {
+            let err = BridgeError::upstream_status(404, blank);
+            assert_eq!(
+                err.to_string(),
+                "upstream returned HTTP 404 with no error detail in the response"
+            );
+        }
+        let err = BridgeError::upstream_status(502, "fragment")
+            .with_body_read_error(Some("connection reset".into()));
+        assert_eq!(
+            err.to_string(),
+            "upstream returned HTTP 502: failed to read response body: connection reset"
+        );
+        // The caller's text is untouched by the diagnosis.
+        let BridgeError::UpstreamStatus { message, .. } = err else {
+            unreachable!()
+        };
+        assert_eq!(message, "fragment");
+        assert_eq!(
+            BridgeError::upstream_status(502, "upstream error")
+                .with_telemetry_detail("real detail")
+                .to_string(),
+            "upstream returned HTTP 502: real detail"
+        );
+        assert_eq!(
+            BridgeError::upstream_status(502, "upstream error")
+                .with_telemetry_detail("")
+                .to_string(),
+            "upstream returned HTTP 502 with no error detail in the response"
+        );
+        // An error frame keeps the plain wording whatever `Display` says.
+        assert_eq!(
+            BridgeError::upstream_status(500, "").stream_frame_message(),
+            "upstream returned HTTP 500: "
+        );
+        assert_eq!(
+            BridgeError::upstream_status(400, "bad param").to_string(),
+            "upstream returned HTTP 400: bad param"
+        );
+    }
+    use crate::chat::{
+        ChatFormat, ChatMessage, ChatResponse, EmbeddingRequest, FinishReason, UsageStats,
+    };
+
+    /// A Bridge that implements only what the trait requires, so the three
+    /// optional operations fall through to their defaults — the shape every
+    /// provider that does not speak embeddings / text completions / image
+    /// generation actually has.
+    struct ChatOnlyBridge;
+
+    #[async_trait::async_trait]
+    impl Bridge for ChatOnlyBridge {
+        fn name(&self) -> &'static str {
+            "chat-only"
+        }
+        async fn chat(
+            &self,
+            _req: &ChatFormat,
+            _ctx: &BridgeContext,
+        ) -> Result<ChatResponse, BridgeError> {
+            Ok(ChatResponse {
+                logprobs: None,
+                more_choices: Vec::new(),
+                id: String::new(),
+                model: String::new(),
+                message: ChatMessage::assistant(String::new()),
+                finish_reason: FinishReason::Stop,
+                usage: UsageStats::default(),
+                service_tier: None,
+            })
+        }
+        async fn chat_stream(
+            &self,
+            _req: &ChatFormat,
+            _ctx: &BridgeContext,
+        ) -> Result<ChatChunkStream, BridgeError> {
+            unreachable!("not exercised")
+        }
+    }
+
+    /// The three defaults name their capability in a typed field rather
+    /// than only in prose. Before #1093 the proxy read the sentence to
+    /// decide the status, so rewording it would have moved a 501 to a 500
+    /// with nothing to catch it — and this test would not have existed to
+    /// notice, because the message was the contract.
+    ///
+    /// The `Display` text is asserted too, because the three routes render
+    /// it into the client-facing 501 envelope.
+    #[tokio::test]
+    async fn the_optional_operations_default_to_a_typed_capability_gap() {
+        let b = ChatOnlyBridge;
+        let ctx = BridgeContext::new(
+            "req-1",
+            std::sync::Arc::new(
+                serde_json::from_str::<Model>(
+                    r#"{"display_name":"m","provider":"anthropic","model_name":"claude","provider_key_id":"pk"}"#,
+                )
+                .unwrap(),
+            ),
+            std::sync::Arc::new(
+                serde_json::from_str::<ProviderKey>(r#"{"display_name":"pk","secret":"s"}"#).unwrap(),
+            ),
+        );
+        let embed_req = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
+            model: "m".into(),
+            input: vec!["hello".into()],
+            input_was_single: true,
+            encoding_format: None,
+            dimensions: None,
+            input_type: None,
+            embedding_types: None,
+        };
+
+        let cases: Vec<(BridgeError, BridgeCapability, &str)> = vec![
+            (
+                b.embed(&embed_req, &ctx).await.unwrap_err(),
+                BridgeCapability::Embeddings,
+                "this provider does not support embeddings",
+            ),
+            (
+                b.complete(&serde_json::json!({}), &ctx).await.unwrap_err(),
+                BridgeCapability::TextCompletions,
+                "this provider does not support text completions",
+            ),
+            (
+                b.generate_image(&serde_json::json!({}), &ctx)
+                    .await
+                    .unwrap_err(),
+                BridgeCapability::ImageGeneration,
+                "this provider does not support image generation",
+            ),
+        ];
+
+        for (err, capability, message) in cases {
+            assert!(
+                matches!(err, BridgeError::UnsupportedCapability(c) if c == capability),
+                "expected {capability:?}, got {err}"
+            );
+            assert_eq!(err.to_string(), message);
+            // The response shape the two non-route callers see is unchanged:
+            // this stays exactly what `Config` reported.
+            assert_eq!(err.http_status(), 500);
+            assert_eq!(err.error_type(), "config_error");
+            assert!(!err.reached_upstream());
+        }
+    }
 
     #[test]
     fn in_band_probe_parses_openai_string_code_envelope() {
@@ -1010,6 +1692,34 @@ mod tests {
             e,
             BridgeError::UpstreamInBand { status: None, .. }
         ));
+    }
+
+    #[test]
+    fn in_band_probe_ignores_an_error_that_reports_nothing() {
+        for payload in [
+            r#"{"error":null}"#,
+            r#"{"error":{}}"#,
+            r#"{"error":""}"#,
+            r#"{"error":{"message":"","code":null,"type":"x"}}"#,
+            r#"{"id":"c","choices":[{"index":0}],"error":{}}"#,
+        ] {
+            assert!(
+                capture_in_band_error(payload, UpstreamWire::OpenAI).is_none(),
+                "{payload}"
+            );
+            assert!(in_band_error_in_body(payload.as_bytes(), UpstreamWire::OpenAI).is_none());
+        }
+        // A code alone, or a message beside answers, still reports one.
+        for payload in [
+            r#"{"error":{"code":502}}"#,
+            r#"{"id":"c","choices":[],"error":{"code":502,"message":"down"}}"#,
+            r#"{"choices":[{"index":0}],"error":{"message":"down"}}"#,
+        ] {
+            assert!(
+                in_band_error_in_body(payload.as_bytes(), UpstreamWire::OpenAI).is_some(),
+                "{payload}"
+            );
+        }
     }
 
     #[test]
@@ -1186,6 +1896,50 @@ mod tests {
     }
 
     #[test]
+    fn debugging_a_context_names_its_credentials_without_quoting_them() {
+        let pk = sample_provider_key();
+        let api_key = pk.api_key.clone();
+        assert!(!api_key.is_empty(), "the sample must carry a real secret");
+
+        let mut inbound = HeaderMap::new();
+        inbound.insert(
+            http::header::AUTHORIZATION,
+            "Bearer header.payload.signature".parse().expect("header"),
+        );
+
+        let ctx = BridgeContext::new(
+            "req-1",
+            std::sync::Arc::new(sample_model()),
+            std::sync::Arc::new(pk),
+        )
+        .with_client(
+            CallerIdentity::default(),
+            Some(std::sync::Arc::new(inbound)),
+        );
+
+        // The credential is really on the context: without this the
+        // assertions below would pass on an empty one.
+        assert_eq!(
+            ctx.client_headers.as_ref().expect("headers")[http::header::AUTHORIZATION],
+            "Bearer header.payload.signature"
+        );
+
+        let printed = format!("{ctx:?}");
+        assert!(
+            printed.contains("req-1") && printed.contains("authorization"),
+            "the non-secret fields, header names included, still print: {printed}"
+        );
+        assert!(
+            !printed.contains("header.payload.signature"),
+            "the caller's token must not print: {printed}"
+        );
+        assert!(
+            !printed.contains(&api_key),
+            "the provider key's own secret must not print either: {printed}"
+        );
+    }
+
+    #[test]
     fn context_defaults_no_deadline_with_helper_setter() {
         let m = std::sync::Arc::new(sample_model());
         let pk = std::sync::Arc::new(sample_provider_key());
@@ -1222,10 +1976,8 @@ mod tests {
     /// CALLER, so an `api_base` quoted back into it must not carry the
     /// operator's credential.
     ///
-    /// The userinfo check in `validate_api_base` refuses
-    /// `https://user:pass@host` without quoting it — but only a value that
-    /// HAS a scheme gets that far. Written without one, the same string fails
-    /// the scheme branch first, which used to echo it whole.
+    /// `https://user:pass@host` is accepted, but written without a scheme the
+    /// same string fails the scheme branch, which used to echo it whole.
     #[test]
     fn a_rejected_api_base_never_quotes_the_credential_back() {
         for base in [

@@ -13,15 +13,38 @@
 //! (`/messages/count_tokens`), the absence of streaming, and the tiny
 //! `{"input_tokens": <int>}` response, which is forwarded verbatim.
 //!
-//! Guardrails: this surface is intentionally **exempt** from
-//! content-moderation guardrails (#545). It is a pre-flight sizing
-//! call — no content reaches a model and the response is only an integer
-//! token count, never generated content — so there is nothing for a
-//! content-moderation hook to moderate on either side, and the same
-//! `messages` payload is scanned when the caller issues the actual
-//! `/v1/messages` request. Dedicated DLP kinds (`pii` and `presidio`) are the
-//! exception: the endpoint does forward messages to the provider, so they run
-//! on input and can block or mask sensitive data before egress (#555).
+//! Guardrails: the **input** hook runs here, exactly as on `/v1/messages`;
+//! the **output** hook does not (#555, revising #545).
+//!
+//! The two halves are asymmetric because the endpoint is. The response is
+//! `{"input_tokens": <int>}` — the provider generated nothing, so an output
+//! guardrail has no content to moderate and running one would be theatre.
+//! The REQUEST is a different matter: this route ships the caller's entire
+//! `system` + `messages` + `tools` payload to the provider, which is
+//! precisely the transmission a PII / DLP / data-exfiltration guardrail
+//! exists to govern. The original exemption argued the same payload gets
+//! scanned when the caller issues the real `/v1/messages` call — but nothing
+//! obliges a caller to ever issue it. `count_tokens` on its own is a
+//! complete egress channel, and an operator's input policy was silently not
+//! applied to it.
+//!
+//! Mask-action rules rewrite the body here too, before it is forwarded. That
+//! also keeps the answer honest: `/v1/messages` masks the same spans, so the
+//! count now describes the body the gateway would really send.
+//!
+//! Telemetry: this route is NOT metered and still emits a terminal
+//! `UsageEvent` on every outcome, with `prompt_tokens`/`completion_tokens`
+//! at zero. Those are two different questions, and the route answered only
+//! the first: it generates nothing, so there is nothing to bill — but it
+//! does forward the caller's whole payload to a real upstream, so every
+//! question Logs exists to answer (did this request happen, which key sent
+//! it, how long did it take, did a guardrail refuse it) had no row to read.
+//! A refusal was the sharp end: `/v1/messages/count_tokens` can be blocked
+//! by an input guardrail, and a refusal that emits no event is a 422 the
+//! caller definitely saw and the "Guardrail blocks" view cannot find
+//! (AISIX-Cloud#1435, the same failure mode as AISIX-Cloud#1428).
+//! `guardrail_coverage`'s census asserts the reporting half over the
+//! surfaces it reads out of the router, so this cannot regress quietly.
 //!
 //! Scope: Anthropic-backed models only. `count_tokens` has no upstream
 //! equivalent for OpenAI/Gemini/DeepSeek, so a non-Anthropic Model is
@@ -47,9 +70,6 @@ use axum::Json;
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
-use crate::attempt::{
-    attempt_error_from_proxy, attempt_reached_upstream, ms_since, AttemptRecord, RoutingTelemetry,
-};
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
@@ -104,19 +124,26 @@ pub async fn count_tokens(
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
 
-    match dispatch(&state, &snapshot, &auth, &mut body, &request_id, &client).await {
+    // Filled inside `dispatch`, so the failure branch — where a guardrail
+    // block lands — stamps the enforced hits too (AISIX-Cloud#1330 / #1024).
+    let mut screening = InputScreening::default();
+    // Every upstream attempt, filled by the dispatch (#655).
+    let mut routing = crate::attempt::RoutingTelemetry::default();
+    match dispatch(
+        &state,
+        &snapshot,
+        &auth,
+        &mut body,
+        &request_id,
+        &client,
+        &mut screening,
+        &mut routing,
+    )
+    .await
+    {
         Ok(success) => {
             let elapsed = started.elapsed();
             let status = success.response.status().as_u16();
-            emit_access_log(
-                &model_name,
-                &success.provider,
-                &api_key_id,
-                status,
-                elapsed,
-                &request_id,
-                None,
-            );
             // One ProviderKey lookup per completion (#941).
             let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
             crate::request_metrics::record(
@@ -128,10 +155,60 @@ pub async fn count_tokens(
                     model: &model_name,
                     upstream_model: &success.upstream_model,
                     pk: pk.labels(),
+                    is_fallback: routing.fallback_count() > 0,
                     ..Default::default()
                 },
                 status,
+                crate::attempt::answered_error_source(false, &routing),
                 elapsed,
+            );
+            // One zero-token event per attempt that failed first (#655);
+            // the winner's is the terminal one below.
+            crate::usage_attr::emit_failed_attempts_as(
+                &state,
+                &snapshot,
+                crate::operation::COUNT_TOKENS,
+                "anthropic",
+                &request_id,
+                &model_name,
+                &api_key_id,
+                &client,
+                &screening.applied,
+                &routing.attempts,
+                false,
+                false,
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &screening.audit,
+            );
+            emit_usage_event(
+                &state,
+                &snapshot,
+                &pk,
+                &request_id,
+                &success.model_id,
+                &model_name,
+                &api_key_id,
+                status,
+                success.upstream_elapsed,
+                elapsed,
+                &client,
+                &screening,
+                routing.winner(),
+            );
+            // After the event: the count's id comes off the provider's
+            // response head, which the event took.
+            let provider_request_id = crate::attribution::terminal_provider_request_id();
+            emit_access_log(
+                &model_name,
+                &success.provider,
+                &api_key_id,
+                status,
+                elapsed,
+                &request_id,
+                Some(&provider_request_id),
+                None,
+                &routing,
             );
             // Same window the other model-dispatch endpoints publish, so an
             // SDK client here can schedule back-off from real numbers.
@@ -153,27 +230,78 @@ pub async fn count_tokens(
         Err(err) => {
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             emit_access_log(
                 &model_name,
-                "unknown",
+                last_target.provider(),
                 &api_key_id,
                 status,
                 elapsed,
                 &request_id,
+                None,
                 Some(&err),
+                &routing,
             );
             let metric_model = crate::usage_attr::metric_model_label(&snapshot, &model_name);
+            // AISIX-Cloud#1325: name the target the request died on. This
+            // branch used to emit `Upstream::default()`, so a 502 from a
+            // real provider landed on `provider="unknown"` while the same
+            // key's successes landed on the real one.
             crate::request_metrics::record(
                 &state,
                 "/v1/messages/count_tokens",
                 crate::request_metrics::Caller::new(&auth),
-                crate::request_metrics::Upstream {
-                    model: metric_model.as_ref(),
-                    ..Default::default()
-                },
+                last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
+            // Per #655: one zero-token event per failed upstream attempt,
+            // the last of them terminal when every attempt failed.
+            crate::usage_attr::note_client_error_body(&snapshot, || err.anthropic_body());
+            let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
+            crate::usage_attr::emit_failed_attempts_as(
+                &state,
+                &snapshot,
+                crate::operation::COUNT_TOKENS,
+                "anthropic",
+                &request_id,
+                &model_name,
+                &api_key_id,
+                &client,
+                &screening.applied,
+                &routing.attempts,
+                failed_terminal,
+                err.is_guardrail_block(),
+                screening.monitor_hits.clone(),
+                screening.redactions.clone(),
+                &screening.audit,
+            );
+            // A failed count_tokens is a request the operator has to be
+            // able to find, and a guardrail refusal is the one that must
+            // carry the flag the "Guardrail blocks" view filters on. A
+            // failure no attempt answers for — pre-dispatch — is this one
+            // zero-token terminal event.
+            if !failed_terminal {
+                crate::usage_attr::emit_error_usage_event(
+                    &state,
+                    &snapshot,
+                    crate::operation::COUNT_TOKENS,
+                    "anthropic",
+                    &request_id,
+                    &model_name,
+                    &api_key_id,
+                    status,
+                    crate::usage_attr::EventError::of(&err),
+                    err.is_guardrail_block(),
+                    &client,
+                    crate::usage_attr::applied_guardrails(&screening.audit),
+                    crate::usage_attr::enforced_hits(&screening.audit),
+                    crate::usage_attr::guardrail_scores(&screening.audit),
+                    crate::usage_attr::bypass_reason(&screening.audit),
+                );
+            }
             // Anthropic-shape envelope (#336) — count_tokens callers are
             // the Anthropic SDK, not OpenAI-compatible clients.
             err.into_anthropic_response()
@@ -181,17 +309,211 @@ pub async fn count_tokens(
     }
 }
 
-/// What the winning attempt resolved. `/v1/messages/count_tokens` emits no
-/// UsageEvent, so the only consumer is the request-metric label set — which
-/// still has to match what chat / messages / responses report
-/// (#1234).
+/// What the input hook produced, for the terminal `UsageEvent` to carry.
+///
+/// An out-param rather than part of [`CountTokensSuccess`] because the
+/// failure branch needs it too — a guardrail refusal IS the error, so the
+/// error event is the one that must not drop the audit.
+#[derive(Default)]
+struct InputScreening {
+    /// The request's ENFORCE-mode audit handle (AISIX-Cloud#1330).
+    audit: crate::usage_attr::GuardrailAudit,
+    /// The `{kind, hook}` set of guardrails that governed the request
+    /// (#379 parity) — surfaced on the event so Logs can show them.
+    applied: Vec<aisix_core::AppliedGuardrail>,
+    /// Monitor-mode observations (AISIX-Cloud#562).
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    /// Per-detector PII mask counts (#932/#696). Empty = no redaction.
+    redactions: crate::redact::RedactionCounts,
+    /// The chain left this body unsafe to export: nothing masked it, or what
+    /// it refused is still in it. The failure row reports no request body.
+    capture_unsafe: bool,
+}
+
+impl InputScreening {
+    /// Keep the body off every failure row of this request, including the
+    /// note `dispatch` took before the chain ran: the latest note is the one
+    /// reported.
+    fn withhold_request_body(&mut self, snapshot: &aisix_core::AisixSnapshot) {
+        self.capture_unsafe = true;
+        crate::usage_attr::note_failure_request(snapshot, String::new);
+    }
+}
+
+/// Run the resolved input guardrail chain over the Anthropic-shaped body,
+/// blocking before dispatch and writing mask-action rewrites back into
+/// `body` (which is what `count_tokens_to_target` forwards upstream).
+///
+/// Returns the rate-limit reservation when the chain calls a remote service:
+/// such a check is admitted by the key's limits before it runs, and a refusal
+/// keeps the slot it took (see `quota::reserve_before_costly_check`).
+///
+/// Deliberately mirrors `messages::dispatch_inner`'s block rather than
+/// sharing a helper with it: that one threads the same telemetry through a
+/// retrying per-attempt emitter, and this route has a single terminal
+/// event. Keeping the shapes parallel is what the `guardrail_coverage`
+/// census asserts.
+#[allow(clippy::too_many_arguments)]
+async fn screen_input(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    model_entry_id: &str,
+    model_name: &str,
+    model_rl: &crate::quota::ModelRateLimit,
+    body: &mut Value,
+    screening: &mut InputScreening,
+) -> Result<Option<aisix_ratelimit::MultiReservation>, ProxyError> {
+    let chain = state
+        .guardrail_index
+        .resolve(&aisix_guardrails::RequestContext {
+            passthrough_route_id: "",
+            model_id: model_entry_id,
+            mcp_server_id: "",
+            api_key_id: &auth.entry.id,
+            team_id: auth.key().team_id.as_deref(),
+        });
+    screening.applied = chain.applied().to_vec();
+    screening.audit = chain.audit_log();
+    if chain.is_empty() {
+        return Ok(None);
+    }
+    // Fail closed on a body the scanner cannot read — see the same arm in
+    // `messages.rs`. Only when some guardrail would both read the request
+    // and refuse when it cannot evaluate it.
+    let chat = match crate::redact::anthropic_request_for_inspection(body) {
+        Ok(chat) => chat,
+        Err(err) => {
+            if !aisix_guardrails::Guardrail::refuses_unevaluable_input(&chain) {
+                tracing::debug!(
+                    guardrail_hook = "input",
+                    model = %model_name,
+                    error = ?err,
+                    "cannot scan /v1/messages/count_tokens body for guardrails; \
+                     nothing attached both reads the request and fails closed",
+                );
+                // See the same arm in `messages.rs`: unscreened is a
+                // bypass, under the tag the fail-closed direction uses.
+                chain.record_unevaluable_input_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+                if aisix_guardrails::Guardrail::runs_on_input(&chain) {
+                    screening.withhold_request_body(snapshot);
+                }
+                return Ok(None);
+            }
+            tracing::warn!(
+                guardrail_hook = "input",
+                model = %model_name,
+                error = ?err,
+                "cannot scan /v1/messages/count_tokens body for guardrails; blocking",
+            );
+            screening.withhold_request_body(snapshot);
+            return Err(crate::error::guardrail_block_error(
+                "request",
+                None,
+                Some(crate::error::TAG_UNSCANNABLE_BODY),
+            ));
+        }
+    };
+    // Taken once the body could be inspected: one that cannot never reaches
+    // the service.
+    let reservation = crate::quota::reserve_before_costly_check(
+        &chain,
+        crate::quota::enforce(state, snapshot, auth, Some(model_rl)),
+    )
+    .await?;
+    let (verdict, monitor_hits) =
+        aisix_guardrails::Guardrail::check_input_non_segment_observed(&chain, &chat).await;
+    screening.monitor_hits = monitor_hits;
+    // Same scan-only submission as `/v1/messages` — the two routes screen
+    // the same body with the same chain and must reach the same verdict.
+    let moderation = crate::redact::moderate_anthropic_request(
+        &chain,
+        Some(chat.model.as_str()),
+        verdict,
+        body,
+        &mut screening.redactions,
+        // The segment pass's monitor-mode observations belong on the same
+        // event as the non-segment ones above. A throwaway `Vec` here made
+        // this route report fewer monitor hits than `/v1/messages` for an
+        // identical body and chain — and the scan-only channel feeds this
+        // pass more text, so the gap would have widened.
+        &mut screening.monitor_hits,
+    )
+    .await;
+    if let aisix_guardrails::GuardrailVerdict::Block {
+        reason,
+        guardrail_name,
+        unavailable,
+    } = moderation.verdict
+    {
+        tracing::warn!(
+            guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
+            guardrail_hook = "input",
+            model = %model_name,
+            reason = %reason,
+            "guardrail blocked /v1/messages/count_tokens request",
+        );
+        // A blocked request exports what the success path would have sent.
+        // Only a key the mask cannot rename withholds it.
+        if crate::usage_attr::content_cap(snapshot).is_some() {
+            let redaction = crate::redact::redact_anthropic_request(&chain.without_audit(), body);
+            if redaction.unrewritable_tool_key {
+                screening.withhold_request_body(snapshot);
+            } else {
+                crate::usage_attr::note_failure_request(snapshot, || body.to_string());
+            }
+        }
+        return Err(crate::error::guardrail_block_error(
+            "request",
+            guardrail_name.as_deref(),
+            unavailable.as_deref(),
+        ));
+    }
+    // A check that failed open, or a rewrite that could not complete, leaves a
+    // forwarded body nothing vouched for.
+    if !moderation.capture_safe {
+        screening.withhold_request_body(snapshot);
+    }
+    // Mask-action rules rewrite the body that is about to be forwarded.
+    // Merged, not discarded: `/v1/messages` merges the same pass into the
+    // counts its event reports (#932), and the two routes screen the same
+    // body with the same chain — a mask this side under-reported would
+    // read as the sibling route masking more of the same payload.
+    let redaction = crate::redact::redact_anthropic_request(&chain, body);
+    if redaction.unrewritable_tool_key {
+        tracing::warn!(
+            guardrail_hook = "input",
+            model = %model_name,
+            "guardrail rejected /v1/messages/count_tokens because a sensitive tool object key cannot be safely rewritten",
+        );
+        screening.withhold_request_body(snapshot);
+        return Err(crate::error::guardrail_block_error("request", None, None));
+    }
+    crate::redact::merge_counts(&mut screening.redactions, redaction.counts);
+    Ok(reservation)
+}
+
+/// What the winning attempt resolved, for the request-metric label set —
+/// which has to match what chat / messages / responses report
+/// (AISIX-Cloud#1234) — and for the terminal `UsageEvent`.
 struct CountTokensSuccess {
     response: Response,
     provider: String,
     upstream_model: String,
     provider_key_id: String,
+    /// The DISPATCHED target's Model row id: a group resolves to one of
+    /// its members, and `UsageEvent::model_id` records that target while
+    /// `requested_model` keeps the alias the caller addressed.
+    model_id: String,
+    /// How long the WINNING attempt took. Not the handler's own elapsed:
+    /// this route fails over across a group's Anthropic targets and
+    /// retries within one, so on a group the two diverge by every attempt
+    /// that lost — and `upstream_latency_ms` is attempt-scoped everywhere
+    /// else in Logs (`downstream_latency_ms` is the request-scoped one).
+    upstream_elapsed: Duration,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
@@ -199,7 +521,10 @@ async fn dispatch(
     body: &mut Value,
     request_id: &str,
     client: &ClientContext,
+    screening: &mut InputScreening,
+    routing: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<CountTokensSuccess, ProxyError> {
+    crate::usage_attr::note_failure_request(snapshot, || body.to_string());
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())
@@ -209,82 +534,33 @@ async fn dispatch(
     let model_entry = crate::model_resolve::resolve_model(snapshot, &model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
 
-    if !auth.key().can_access(&model_name) {
+    if !auth.key().can_access(snapshot, &model_name) {
         return Err(ProxyError::ModelForbidden(model_name.clone()));
     }
 
     // Client-IP allowlist gate (#557): reject before quota / upstream.
     crate::dispatch::check_ip_access(&model_entry.value, &client.source_ip)?;
 
-    // #555: count_tokens remains exempt from content moderation, but it does
-    // send the prompt to a third party. Run only dedicated DLP kinds and apply
-    // their masks before any quota reservation or upstream attempt.
-    let guardrail_ctx = aisix_guardrails::RequestContext {
-        passthrough_route_id: "",
-        model_id: &model_entry.id,
-        mcp_server_id: "",
-        api_key_id: &auth.entry.id,
-        team_id: auth.key().team_id.as_deref(),
-    };
-    let dlp_chain = state.guardrail_index.resolve(&guardrail_ctx).dlp_only();
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let mut early_reservation = None;
-    if !dlp_chain.is_empty() {
-        let chat = crate::redact::anthropic_request_for_inspection(body).map_err(|_| {
-            ProxyError::InvalidRequest(
-                "request could not be inspected by the configured data-loss prevention policy"
-                    .to_string(),
-            )
-        })?;
-        // A check that calls a remote moderation service is admitted by the
-        // key's rate limits before it runs, and a refusal keeps the slot it
-        // took (see `quota::reserve_before_costly_check`). Taken once the
-        // body could be inspected: one that cannot never reaches the service.
-        early_reservation = crate::quota::reserve_before_costly_check(
-            &dlp_chain,
-            crate::quota::enforce(state, snapshot, auth, Some(&model_rl)),
-        )
-        .await?;
-        let (verdict, _) =
-            aisix_guardrails::Guardrail::check_input_non_segment_observed(&dlp_chain, &chat).await;
-        let mut redactions = crate::redact::RedactionCounts::new();
-        let mut monitor_hits = Vec::new();
-        let moderation = crate::redact::moderate_anthropic_request(
-            &dlp_chain,
-            verdict,
-            body,
-            &mut redactions,
-            &mut monitor_hits,
-        )
-        .await;
-        let verdict = moderation.verdict;
-        if let aisix_guardrails::GuardrailVerdict::Block {
-            reason,
-            guardrail_name,
-        } = verdict
-        {
-            tracing::warn!(
-                guardrail_hook = "input",
-                model = %model_name,
-                reason = %reason,
-                "DLP guardrail blocked /v1/messages/count_tokens request",
-            );
-            return Err(ProxyError::ContentFiltered(
-                crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
-            ));
-        }
-        let redaction = crate::redact::redact_anthropic_request(&dlp_chain, body);
-        if redaction.unrewritable_tool_key {
-            tracing::warn!(
-                guardrail_hook = "input",
-                model = %model_name,
-                "DLP guardrail rejected /v1/messages/count_tokens because a sensitive tool object key cannot be safely rewritten",
-            );
-            return Err(ProxyError::ContentFiltered(
-                crate::error::guardrail_block_message("request", None),
-            ));
-        }
+    // Input guardrails (#555). Same chain, same order and same ordering
+    // rationale as the `/v1/messages` sibling: before the reservation, so a
+    // content-policy refusal doesn't burn an RPM slot — unless the chain calls
+    // a remote service, which reserves first. See the module doc for why the
+    // input hook applies here and the output hook does not.
+    let early_reservation = screen_input(
+        state,
+        snapshot,
+        auth,
+        &model_entry.id,
+        &model_name,
+        &model_rl,
+        body,
+        screening,
+    )
+    .await?;
+    if !screening.capture_unsafe {
+        crate::usage_attr::note_failure_request(snapshot, || body.to_string());
     }
 
     let _reservation = match early_reservation {
@@ -295,22 +571,22 @@ async fn dispatch(
     // Resolve the attempt list (routing-aware). count_tokens is
     // Anthropic-only, so we attempt the group's Anthropic targets in
     // order; a direct model resolves to itself (#471).
+    let budget_gate = crate::budget::gate(state, snapshot);
     let attempt_models = crate::routing::resolve_attempt_models(
         &state.routing,
         &state.runtime_status,
+        &state.pricing,
         snapshot,
         &model_name,
         &model_entry.id,
         &model_entry.value,
         crate::routing::RoutingRequest {
             tags: &client.routing_tags,
-            stability_key: Some(
-                client
-                    .routing_key
-                    .as_deref()
-                    .unwrap_or(auth.entry.id.as_str()),
-            ),
+            headers: Some(&client.headers),
+            api_key_id: auth.entry.id.as_str(),
             source_ip: &client.source_ip,
+            context_origin: None,
+            budget: Some(&budget_gate),
         },
     )?;
     let retry_on_429 = model_entry
@@ -335,25 +611,33 @@ async fn dispatch(
     // pre-dispatch 4xx); if this endpoint ever grows semantic support,
     // widen this flag or the deferred policies are silently skipped.
     let is_routing_request = model_entry.value.routing.is_some();
-    let mut routing = RoutingTelemetry::for_request(&model_entry.value.display_name);
+    *routing = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
+        .with_trace(client.trace.clone());
     let mut last_err: Option<ProxyError> = None;
     let mut any_anthropic = false;
     for (target_idx, target) in attempt_models.iter().enumerate() {
         // count_tokens has no upstream equivalent outside the Anthropic
         // protocol; skip foreign targets in a mixed group rather than
         // dispatching to an upstream that would 404.
-        if !crate::dispatch::speaks_anthropic(snapshot, &target.model) {
+        if !counts_anthropic_tokens(state, snapshot, &target.model) {
             continue;
         }
         any_anthropic = true;
+        let pk_id = crate::dispatch::resolve_provider_key(snapshot, &target.model)
+            .map(|e| e.id.clone())
+            .unwrap_or_default();
+        // The routing target's name on the attempt record; empty for a
+        // direct model, whose `model_id` already identifies it.
         let target_model = if is_routing_request {
             target.model.display_name.clone()
         } else {
             String::new()
         };
-        let pk_id = crate::dispatch::resolve_provider_key(snapshot, &target.model)
-            .map(|entry| entry.id.clone())
-            .unwrap_or_default();
+        let attempt_target = crate::attempt::AttemptTarget {
+            display_name: &target.model.display_name,
+            target_model: &target_model,
+            model_id: &target.id,
+        };
         // Reserve THIS target's own model rate-limit layers before
         // dispatching to it (#1087); over-limit → skip it and
         // try the remaining targets. Like the handler-level `_reservation` it is
@@ -375,19 +659,21 @@ async fn dispatch(
         {
             Ok(r) => r,
             Err(e) => {
-                let (idx, kind) = routing.begin_attempt(&target.model.display_name);
+                // An attempt that never reached an upstream, recorded so
+                // the failover it forced is visible.
+                let (index, kind) = routing.begin_attempt(attempt_target);
                 routing.record(
                     state,
-                    AttemptRecord {
-                        index: idx,
+                    crate::attempt::AttemptRecord {
+                        index,
                         kind,
                         target_model: target_model.clone(),
                         target_model_id: target.id.clone(),
                         provider_key_id: pk_id.clone(),
                         status: 429,
                         success: false,
-                        error_class: e.kind().to_string(),
-                        error_message: String::new(),
+                        error_class: "rate_limit_exceeded".to_string(),
+                        error_message: e.to_string(),
                         latency_ms: 0,
                         dispatched: false,
                     },
@@ -408,7 +694,7 @@ async fn dispatch(
         // target that can actually serve the request.
         let has_usable_fallback = attempt_models[target_idx + 1..]
             .iter()
-            .any(|t| crate::dispatch::speaks_anthropic(snapshot, &t.model));
+            .any(|t| counts_anthropic_tokens(state, snapshot, &t.model));
         let budget = crate::routing::effective_retries(
             &target.model,
             crate::routing::group_retries_of(&model_entry.value),
@@ -423,7 +709,7 @@ async fn dispatch(
                 });
                 tokio::time::sleep(crate::routing::retry_backoff(attempt_idx as u32, hint)).await;
             }
-            let (idx, kind) = routing.begin_attempt(&target.model.display_name);
+            let (index, kind) = routing.begin_attempt(attempt_target);
             let attempt_started = Instant::now();
             match count_tokens_to_target(
                 state,
@@ -444,39 +730,28 @@ async fn dispatch(
                 Ok(success) => {
                     routing.record(
                         state,
-                        AttemptRecord {
-                            index: idx,
+                        crate::attempt::AttemptRecord {
+                            index,
                             kind,
                             target_model: target_model.clone(),
                             target_model_id: target.id.clone(),
                             provider_key_id: success.provider_key_id.clone(),
-                            status: 200,
+                            status: success.response.status().as_u16(),
                             success: true,
                             error_class: String::new(),
                             error_message: String::new(),
-                            latency_ms: ms_since(attempt_started),
+                            latency_ms: crate::attempt::ms_since(attempt_started),
                             dispatched: true,
                         },
                     );
                     return Ok(success);
                 }
                 Err(e) => {
-                    let retryable = matches!(
-                        &e,
-                        ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
-                    );
-                    // See `RetryBudget::covers`: a default budget skips
-                    // same-target retries for timeouts; fail-over is
-                    // unaffected (the outer loop still moves on).
-                    let budget_covers = match &e {
-                        ProxyError::Bridge(be) => budget.covers(be),
-                        _ => true,
-                    };
-                    let (error_class, error_message) = attempt_error_from_proxy(&e);
+                    let (error_class, error_message) = crate::attempt::attempt_error_from_proxy(&e);
                     routing.record(
                         state,
-                        AttemptRecord {
-                            index: idx,
+                        crate::attempt::AttemptRecord {
+                            index,
                             kind,
                             target_model: target_model.clone(),
                             target_model_id: target.id.clone(),
@@ -485,11 +760,45 @@ async fn dispatch(
                             success: false,
                             error_class,
                             error_message,
-                            latency_ms: ms_since(attempt_started),
-                            dispatched: attempt_reached_upstream(&e),
+                            latency_ms: crate::attempt::ms_since(attempt_started),
+                            dispatched: crate::attempt::attempt_reached_upstream(&e),
                         },
                     );
+                    let retryable = matches!(
+                        &e,
+                        ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429, fallback_statuses)
+                    );
+                    crate::routing::log_attempt_failure(
+                        request_id,
+                        &target.model.display_name,
+                        attempt_idx + 1,
+                        &e,
+                        retryable,
+                        fallback_statuses,
+                    );
+                    // See `RetryBudget::covers`: a default budget skips
+                    // same-target retries for timeouts; fail-over is
+                    // unaffected (the outer loop still moves on).
+                    let budget_covers = match &e {
+                        ProxyError::Bridge(be) => budget.covers(be),
+                        _ => true,
+                    };
                     last_err = Some(e);
+                    // A platform's token-counting API serves fewer models and
+                    // regions than its Messages route, so a refusal there moves
+                    // on to the group's next target rather than ending the
+                    // request a target behind it could have answered.
+                    if !retryable
+                        && has_usable_fallback
+                        && crate::dispatch::anthropic_platform_bridge(
+                            &state.hub,
+                            snapshot,
+                            &target.model,
+                        )
+                        .is_some()
+                    {
+                        break;
+                    }
                     if !retryable {
                         return Err(last_err.unwrap_or(ProxyError::ProviderUnavailable));
                     }
@@ -507,15 +816,29 @@ async fn dispatch(
     if !any_anthropic {
         return Err(ProxyError::InvalidRequest(format!(
             "model `{model_name}` is not backed by an Anthropic-protocol upstream; \
-             /v1/messages/count_tokens requires a model whose provider key uses \
-             the anthropic adapter"
+             /v1/messages/count_tokens requires a provider key that either uses \
+             the anthropic adapter or declares `apis.messages`, or a Claude model \
+             on Amazon Bedrock or Vertex AI"
         )));
     }
     Err(last_err.unwrap_or(ProxyError::ProviderUnavailable))
 }
 
-/// Dispatch one concrete Anthropic target's count_tokens passthrough to
-/// `{api_base}/v1/messages/count_tokens`. The caller has already confirmed
+/// Whether a target answers this route: an Anthropic-protocol upstream, or
+/// Claude on a platform with a token-counting API of its own.
+fn counts_anthropic_tokens(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    model: &aisix_core::Model,
+) -> bool {
+    crate::dispatch::speaks_anthropic(snapshot, model)
+        || crate::dispatch::anthropic_platform_bridge(&state.hub, snapshot, model).is_some()
+}
+
+/// Dispatch one concrete target's count_tokens passthrough. The route is
+/// a sub-route of `/v1/messages` and rides the same declaration, so it
+/// resolves against that surface's own base when the Provider Key names
+/// one and against `api_base` otherwise. The caller has already confirmed
 /// the target speaks the Anthropic protocol (`dispatch::speaks_anthropic`).
 #[allow(clippy::too_many_arguments)]
 async fn count_tokens_to_target(
@@ -530,39 +853,104 @@ async fn count_tokens_to_target(
     request_id: &str,
     client: &ClientContext,
 ) -> Result<CountTokensSuccess, ProxyError> {
-    let mut body = body.clone();
+    let attempt_started = Instant::now();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
-    let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
-
-    // Rewrite the `model` field to the upstream value, exactly as the
-    // /v1/messages passthrough does — the caller speaks the gateway's
-    // display name; the upstream expects its own id.
-    if let Some(m) = body.get_mut("model") {
-        *m = Value::String(upstream_model.clone());
+    if let Some(bridge) = crate::dispatch::anthropic_platform_bridge(&state.hub, snapshot, model) {
+        return platform_count_tokens(
+            state,
+            bridge,
+            body,
+            model,
+            model_id,
+            timeouts,
+            &pk_entry,
+            upstream_model,
+            request_id,
+            client,
+            attempt_started,
+        )
+        .await;
     }
+    let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
+    // Only the outbound wire bytes outlive this block — see
+    // `crate::util::outbound_json`.
+    let body = {
+        // Same billing-attribution strip as `/v1/messages` (see
+        // `messages::dispatch_to_target`). This route only ever dispatches to
+        // an Anthropic-protocol upstream, but that includes third-party ones,
+        // and the count it returns must be the count for the body the sibling
+        // route would actually send — which, for Anthropic's own API, is also
+        // without unsigned thinking blocks.
+        let body = if crate::dispatch::is_first_party_anthropic(snapshot, model) {
+            aisix_provider_anthropic::strip_unsigned_thinking_blocks(body)
+        } else {
+            aisix_provider_anthropic::strip_billing_header_attribution(body)
+        };
+        // This route dispatches only to Anthropic-protocol upstreams, which
+        // read the mapped effort (or, on a family that rejects it, the
+        // thinking budget) themselves, so the mapping outcome the
+        // cross-provider bridge needs has no consumer here.
+        let (mapped, _) =
+            crate::effort_mapping::anthropic_native_request(body.as_ref(), model, false);
+        let body = match mapped {
+            std::borrow::Cow::Owned(mapped) => std::borrow::Cow::Owned(mapped),
+            std::borrow::Cow::Borrowed(_) => body,
+        };
+        let only_model_renamed = match &body {
+            std::borrow::Cow::Borrowed(body) => {
+                crate::util::model_only_fields(body, &pk_entry.value, Some("messages"))
+            }
+            _ => None,
+        };
+        if let Some(fields) = only_model_renamed {
+            crate::util::outbound_json(&crate::util::ModelRenamed {
+                fields,
+                model: &upstream_model,
+            })?
+        } else {
+            let mut body = body.into_owned();
 
-    // Apply the PK's `request.*` override block to the outbound body,
-    // identically to the /v1/messages passthrough — count_tokens shares
-    // the same Anthropic ProviderKey, so operator-configured renames /
-    // constraints / defaults must reach this sibling route too. Apply
-    // order matches §5: renames → constraints → defaults; each is a
-    // no-op when its configured map is empty.
-    if let Some(r) = pk_entry.value.request.as_ref() {
-        aisix_provider_openai::overrides::validate_content_safe_request_overrides(r).map_err(
-            |message| {
-                ProxyError::Bridge(aisix_gateway::BridgeError::InvalidUpstreamConfig(message))
-            },
-        )?;
-        aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
-        if let Some(constraints) = &r.param_constraints {
-            aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);
+            // Rewrite the `model` field to the upstream value, exactly as the
+            // /v1/messages passthrough does — the caller speaks the gateway's
+            // display name; the upstream expects its own id.
+            if let Some(m) = body.get_mut("model") {
+                *m = Value::String(upstream_model.clone());
+            }
+            // A Gemini thought signature riding in a tool id is for Gemini only.
+            if let Some(messages) = body.get_mut("messages") {
+                aisix_gateway::tool_calls::strip_thought_signatures_in_body(messages);
+            }
+
+            // Apply the PK's `request.*` override block to the outbound body,
+            // identically to the /v1/messages passthrough — count_tokens shares
+            // the same Anthropic ProviderKey, so operator-configured renames /
+            // constraints / defaults must reach this sibling route too. Apply
+            // order matches §5: renames → constraints → defaults; each is a
+            // no-op when its configured map is empty.
+            if let Some(r) = pk_entry.value.request.as_ref() {
+                aisix_provider_openai::overrides::validate_content_safe_request_overrides(r)
+                    .map_err(|message| {
+                        ProxyError::Bridge(aisix_gateway::BridgeError::InvalidUpstreamConfig(
+                            message,
+                        ))
+                    })?;
+                aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
+                if let Some(constraints) = &r.param_constraints {
+                    aisix_provider_openai::overrides::apply_param_constraints(
+                        &mut body,
+                        constraints,
+                    );
+                }
+                aisix_provider_openai::overrides::apply_default_body_fields(
+                    &mut body,
+                    &r.default_body_fields,
+                );
+            }
+
+            crate::util::outbound_json(&body)?
         }
-        aisix_provider_openai::overrides::apply_default_body_fields(
-            &mut body,
-            &r.default_body_fields,
-        );
-    }
+    };
 
     // `build_anthropic_url` tolerates an api_base with or without `/v1` (the
     // Anthropic dashboard placeholder and copy-pasted full URLs both
@@ -570,9 +958,16 @@ async fn count_tokens_to_target(
     let url = aisix_gateway::url_cache::cached_endpoint_url(
         &pk_entry.id,
         "proxy/messages/count_tokens",
-        &[pk_entry.value.api_base.as_deref().unwrap_or("")],
+        // Every resolve_base_url_for input (#1017) via the shared constructor.
+        &crate::dispatch::pk_surface_url_fingerprint(
+            &pk_entry.value,
+            aisix_core::ApiSurface::Messages,
+        ),
         || {
-            let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
+            let base = crate::dispatch::resolve_base_url_for(
+                &pk_entry.value,
+                aisix_core::ApiSurface::Messages,
+            )?;
             Ok::<_, crate::error::ProxyError>(crate::dispatch::build_anthropic_url(
                 &base,
                 "/messages/count_tokens",
@@ -621,45 +1016,34 @@ async fn count_tokens_to_target(
             client,
         ),
     );
+    crate::messages::forward_client_anthropic_beta(&mut headers, client);
 
-    let client = crate::http_client::client_for(pk_entry.value.tls.as_ref());
-    let mut req = url.post_on(&client).headers(headers).json(&body);
+    let client = crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
+    let mut req = url.post_on(&client).headers(headers).body(body);
     // #554: count_tokens is non-streaming; apply the E2E request timeout.
     if let Some(d) = timeouts.request {
         req = req.timeout(d);
     }
     let send_started = Instant::now();
-    let upstream_resp = req.send().await.map_err(|e| {
-        let err = crate::dispatch::reqwest_error_to_bridge(&e, send_started);
-        state.health.record_failure(&model.display_name);
-        let err = crate::cooldown::note_failure(
-            &state.runtime_status,
-            model_id,
-            model.cooldown.as_ref(),
-            err,
-        );
-        ProxyError::Bridge(err)
-    })?;
+    let upstream_resp = req
+        .send()
+        .await
+        .map_err(|e| {
+            state.health.record_failure(&model.display_name);
+            crate::cooldown::note_failure(
+                &state.runtime_status,
+                model_id,
+                model.cooldown.as_ref(),
+                crate::dispatch::reqwest_error_to_bridge(&e, send_started),
+            )
+        })
+        .map_err(ProxyError::Bridge)?;
+    aisix_gateway::note_upstream_response(upstream_resp.headers());
 
     let status = upstream_resp.status();
 
     if !status.is_success() {
-        let status_u16 = status.as_u16();
-        let retry_after = aisix_gateway::parse_retry_after(upstream_resp.headers());
-        let message = aisix_gateway::read_body_capped_with_deadline(
-            upstream_resp,
-            aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES,
-            timeouts.request,
-        )
-        .await
-        .unwrap_or_default();
-        let message = String::from_utf8_lossy(&message);
-        let truncated = crate::util::truncate_on_char_boundary(&message, 1024);
-        let err = aisix_gateway::BridgeError::upstream_status_with_retry_after(
-            status_u16,
-            truncated,
-            retry_after,
-        );
+        let err = aisix_provider_anthropic::map_http_error(status, upstream_resp).await;
         if status.is_server_error() {
             state.health.record_failure(&model.display_name);
         }
@@ -677,16 +1061,26 @@ async fn count_tokens_to_target(
         .bytes()
         .await
         .map_err(|e| {
-            let err = aisix_gateway::BridgeError::UpstreamDecode(e.to_string());
             state.health.record_failure(&model.display_name);
             crate::cooldown::note_failure(
                 &state.runtime_status,
                 model_id,
                 model.cooldown.as_ref(),
-                err,
+                aisix_gateway::upstream_body_read_error(&e),
             )
         })
         .map_err(ProxyError::Bridge)?;
+    if let Some(err) = aisix_gateway::in_band_error_body(&body_bytes)
+        .as_ref()
+        .and_then(aisix_provider_anthropic::wire::body_in_band_error)
+    {
+        return Err(ProxyError::Bridge(crate::cooldown::note_failure(
+            &state.runtime_status,
+            model_id,
+            model.cooldown.as_ref(),
+            err,
+        )));
+    }
 
     state.health.record_success(&model.display_name);
     state.runtime_status.mark_healthy(model_id);
@@ -708,13 +1102,175 @@ async fn count_tokens_to_target(
 
     Ok(CountTokensSuccess {
         response: resp,
-        // The loop above only ever dispatches Anthropic targets.
-        provider: "anthropic".to_string(),
+        // The target model's own vendor id, as every other endpoint
+        // labels it. This used to read "anthropic" on the grounds that
+        // the loop only dispatches Anthropic targets — true of the wire,
+        // never of the vendor: a `byo` + `adapter: anthropic` key already
+        // reported `byo` on /v1/chat/completions, and a Provider Key that
+        // declares `apis.messages` brings any vendor down this path.
+        provider: model
+            .provider
+            .as_deref()
+            .unwrap_or("unknown")
+            .to_ascii_lowercase(),
         upstream_model,
         provider_key_id: pk_entry.id.to_string(),
+        model_id: model_id.to_string(),
+        upstream_elapsed: attempt_started.elapsed(),
     })
 }
 
+/// count_tokens for Claude on a platform, on the platform's own
+/// token-counting API, with the same body rewrites `/v1/messages` gives
+/// that target.
+#[allow(clippy::too_many_arguments)]
+async fn platform_count_tokens(
+    state: &ProxyState,
+    bridge: std::sync::Arc<dyn aisix_gateway::Bridge>,
+    body: &Value,
+    model: &aisix_core::Model,
+    model_id: &str,
+    timeouts: crate::routing::TimeoutBudget,
+    pk_entry: &aisix_core::resource::ResourceEntry<aisix_core::ProviderKey>,
+    upstream_model: String,
+    request_id: &str,
+    client: &ClientContext,
+    attempt_started: Instant,
+) -> Result<CountTokensSuccess, ProxyError> {
+    let stripped = aisix_provider_anthropic::strip_billing_header_attribution(body);
+    let stripped =
+        aisix_provider_anthropic::strip_unsigned_thinking_blocks(stripped.as_ref()).into_owned();
+    let (mapped, _) = crate::effort_mapping::anthropic_native_request(&stripped, model, false);
+    let mut outbound = mapped.into_owned();
+    if let Some(messages) = outbound.get_mut("messages") {
+        aisix_gateway::tool_calls::strip_thought_signatures_in_body(messages);
+    }
+    let mut ctx = crate::dispatch::bridge_ctx(
+        request_id,
+        model_id,
+        std::sync::Arc::new(model.clone()),
+        &pk_entry.id,
+        std::sync::Arc::clone(&pk_entry.value),
+        Some(client),
+    );
+    if let Some(d) = timeouts.request {
+        ctx = ctx.with_deadline(d);
+    }
+    let counted = bridge
+        .anthropic_count_tokens(outbound, &ctx)
+        .await
+        .map_err(|be| {
+            if be.http_status() >= 500 {
+                state.health.record_failure(&model.display_name);
+            }
+            crate::cooldown::note_failure(
+                &state.runtime_status,
+                model_id,
+                model.cooldown.as_ref(),
+                be,
+            )
+        })
+        .map_err(ProxyError::Bridge)?;
+    state.health.record_success(&model.display_name);
+    state.runtime_status.mark_healthy(model_id);
+    let mut resp = axum::response::IntoResponse::into_response(axum::Json(counted));
+    if let Ok(hv) = HeaderValue::from_str(request_id) {
+        resp.headers_mut()
+            .insert(HeaderName::from_static("x-aisix-request-id"), hv);
+    }
+    Ok(CountTokensSuccess {
+        response: resp,
+        provider: model
+            .provider
+            .as_deref()
+            .unwrap_or("unknown")
+            .to_ascii_lowercase(),
+        upstream_model,
+        provider_key_id: pk_entry.id.to_string(),
+        model_id: model_id.to_string(),
+        upstream_elapsed: attempt_started.elapsed(),
+    })
+}
+
+/// The terminal `UsageEvent` for a served count_tokens.
+///
+/// Token counters stay at zero, deliberately: the `{"input_tokens": N}` the
+/// caller gets back is a MEASUREMENT of a prompt, not tokens any upstream
+/// consumed or billed. Copying it into `prompt_tokens` would put spend on
+/// a request that cost nothing and double-count the prompt once the caller
+/// goes on to issue the real `/v1/messages` call.
+///
+/// No `request_metrics::record_usage` call for the same reason — the
+/// `aisix_llm_*_tokens_total` families count consumed tokens, and this
+/// route consumes none. The request families already carry the call
+/// (`request_metrics::record`, above), and `aisix_usage_events_emitted_total`
+/// counts this event under `handler="count_tokens"`.
+#[allow(clippy::too_many_arguments)]
+fn emit_usage_event(
+    state: &ProxyState,
+    snap: &aisix_core::AisixSnapshot,
+    pk: &crate::usage_attr::ResolvedPk<'_>,
+    request_id: &str,
+    model_id: &str,
+    requested_model: &str,
+    api_key_id: &str,
+    status_code: u16,
+    // Attempt-scoped, from the winning attempt; see `CountTokensSuccess`.
+    upstream_elapsed: Duration,
+    // Request-scoped: what the caller actually waited for, guardrails and
+    // any lost attempts included.
+    elapsed: Duration,
+    client: &ClientContext,
+    screening: &InputScreening,
+    // The attempt that answered, which this event describes (#655).
+    winner: Option<&crate::attempt::AttemptRecord>,
+) {
+    let mut event = aisix_obs::UsageEvent {
+        request_id: request_id.to_string(),
+        occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
+        model_id: model_id.to_string(),
+        api_key_id: api_key_id.to_string(),
+        requested_model: requested_model.to_string(),
+        upstream_latency_ms: crate::attempt::measured_ms(upstream_elapsed),
+        downstream_latency_ms: crate::attempt::measured_ms(elapsed),
+        status_code,
+        inbound_protocol: "anthropic".to_string(),
+        applied_guardrails: screening.applied.clone(),
+        client_source_ip: client.source_ip.clone(),
+        client_user_agent: client.user_agent.clone(),
+        request_headers: client.request_headers.clone(),
+        redacted_entity_counts: screening.redactions.clone(),
+        guardrail_monitor_hits: screening.monitor_hits.clone(),
+        guardrail_enforced_hits: crate::usage_attr::enforced_hits(&screening.audit),
+        guardrail_scores: crate::usage_attr::guardrail_scores(&screening.audit),
+        guardrail_bypassed_reason: crate::usage_attr::bypass_reason(&screening.audit),
+        ..Default::default()
+    };
+    if let Some(w) = winner {
+        event.attempt_index = w.index;
+        event.attempt_kind = w.kind.to_string();
+        event.attempt_model = w.target_model.clone();
+    }
+    crate::usage_attr::apply_pk_telemetry(&mut event, pk);
+    crate::usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
+    let usage_model =
+        crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
+    crate::usage_attr::emit_usage(
+        state,
+        snap,
+        crate::operation::COUNT_TOKENS,
+        event,
+        crate::usage_attr::usage_event_labels(&usage_model, pk),
+        // Content capture (#700) is not wired for a counted request; a failed
+        // one reports its body through `failure_row_content`.
+        None,
+        client.trace.as_ref(),
+        /* terminal */ true,
+        /* dispatched */ true,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_access_log(
     model: &str,
     provider: &str,
@@ -722,8 +1278,11 @@ fn emit_access_log(
     status: u16,
     elapsed: Duration,
     request_id: &str,
+    provider_request_id: Option<&str>,
     error: Option<&ProxyError>,
+    routing: &crate::attempt::RoutingTelemetry,
 ) {
+    let summary = routing.access_log_summary();
     let (error_kind, error) = match error {
         Some(e) => {
             let (kind, msg) = crate::attempt::access_log_error(e);
@@ -731,28 +1290,33 @@ fn emit_access_log(
         }
         None => (None, None),
     };
-    AccessLog {
+    let target = crate::attribution::AccessLogTarget::current();
+    crate::attribution::emit_access_log(AccessLog {
         method: "POST",
         path: "/v1/messages/count_tokens",
         status,
         latency: elapsed,
+        duration: elapsed,
         provider: Some(provider),
         model: Some(model),
+        upstream_model: target.upstream_model(),
+        provider_key_id: target.provider_key_id(),
         api_key_id: Some(api_key_id),
         prompt_tokens: None,
         completion_tokens: None,
         total_tokens: None,
         request_id,
-        // No provider response id: count_tokens returns only the token
-        // estimate, and no upstream response object (#1289).
-        provider_request_id: None,
-        served_by_model: None,
-        routing_attempt_count: None,
-        routing_fallback_count: None,
+        provider_request_id: provider_request_id.filter(|s| !s.is_empty()),
+        served_by_model: summary.served_by_model,
+        routing_attempt_count: summary.attempt_count,
+        routing_fallback_count: summary.fallback_count,
         error_kind,
         error: error.as_deref(),
-    }
-    .emit();
+        mcp: None,
+        cache: None,
+        request_body_bytes: None,
+        response_body_bytes: None,
+    });
 }
 
 #[cfg(test)]
@@ -771,11 +1335,13 @@ mod tests {
     fn cfg() -> ProxyConfig {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: Some(1_048_576),
+            request_body_limit_bytes: 1_048_576,
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),
+            expose_debug_headers: false,
             tls: None,
+            listeners: Vec::new(),
             thread_per_core: None,
             workers: None,
         }
@@ -865,7 +1431,7 @@ mod tests {
     /// dedicated DLP guardrail must mask sensitive input before that egress.
     #[tokio::test]
     async fn pii_dlp_masks_messages_before_count_tokens_egress() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages/count_tokens"))
             .respond_with(
@@ -878,7 +1444,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(anthropic_model("claude-haiku"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(pii_mask_guardrail());
+        crate::seed_env_scoped_guardrail(&snap, pii_mask_guardrail());
 
         let resp = build_app(snap)
             .oneshot(make_req(serde_json::json!({
@@ -900,7 +1466,7 @@ mod tests {
     /// the provider count endpoint is called and retain Anthropic's envelope.
     #[tokio::test]
     async fn pii_dlp_blocks_count_tokens_before_egress() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages/count_tokens"))
             .respond_with(
@@ -913,7 +1479,7 @@ mod tests {
         let snap = new_snap(&upstream.uri());
         snap.models.insert(anthropic_model("claude-haiku"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails.insert(pii_block_guardrail());
+        crate::seed_env_scoped_guardrail(&snap, pii_block_guardrail());
 
         let resp = build_app(snap)
             .oneshot(make_req(serde_json::json!({
@@ -933,25 +1499,25 @@ mod tests {
             .contains("alice@example.com"));
     }
 
-    /// #555 preserves #545's explicit policy: generation/content moderation
-    /// does not run on a sizing-only endpoint. Only dedicated DLP kinds apply.
+    /// Upstream #555 revised #545: the input hook runs here whole, because this
+    /// route is a complete egress channel for the prompt. The fork pinned the
+    /// opposite (moderation exempt, DLP kinds only); same scenario, new verdict.
     #[tokio::test]
-    async fn content_moderation_guardrail_remains_exempt_on_count_tokens() {
-        let upstream = MockServer::start().await;
+    async fn content_moderation_guardrail_refuses_count_tokens_before_egress() {
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages/count_tokens"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens": 3})),
             )
-            .expect(1)
+            .expect(0)
             .mount(&upstream)
             .await;
 
         let snap = new_snap(&upstream.uri());
         snap.models.insert(anthropic_model("claude-haiku"));
         snap.apikeys.insert(apikey_entry(&["*"]));
-        snap.guardrails
-            .insert(keyword_input_guardrail("MODERATION_BLOCK"));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("MODERATION_BLOCK"));
 
         let resp = build_app(snap)
             .oneshot(make_req(serde_json::json!({
@@ -960,7 +1526,333 @@ mod tests {
             })))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// AISIX-Cloud#1435: the served request leaves a row, and that row
+    /// carries what the guardrail chain did to the body.
+    ///
+    /// The mask count is the part worth pinning. `/v1/messages` merges the
+    /// post-block-check masking pass into the counts its event reports
+    /// (#932), and this route screens the same body with the same chain —
+    /// so a mask counted on one and not the other reads as the sibling
+    /// route masking more of the same payload. It is also invisible from
+    /// the audit side: the enforced hit carries its own copy, so a reader
+    /// checking only that would see the mask recorded while the field
+    /// cp-api persists stayed empty. The upstream answers
+    /// `input_tokens: 42`, which must NOT become spend: it measures a
+    /// prompt, it does not consume one.
+    #[tokio::test]
+    async fn a_served_request_emits_a_zero_token_row_carrying_the_mask_it_applied() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens": 42})),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(anthropic_model("ct-mask"));
+        snap.apikeys.insert(apikey_entry(&["ct-mask"]));
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{
+                "name": "eda-mask",
+                "kind": "pii",
+                "hook_point": "input",
+                "detectors": [],
+                "custom_patterns": [
+                    {"name": "eda_version", "regex": "version\\s*:\\s*(\\d+(?:\\.\\d+)+)", "action": "mask", "replacement": "***"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-mask", row, 1));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized(
+            "anthropic",
+            Arc::new(aisix_provider_anthropic::AnthropicBridge::new()),
+        );
+        let handle = SnapshotHandle::new(snap);
+        let index = aisix_guardrails::LiveGuardrailIndex::new(handle.clone(), None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = crate::build_router(
+            crate::ProxyState::new(handle, hub, &cfg())
+                .without_cache()
+                .with_guardrail_index(index)
+                .with_usage_sink(UsageSink::new(tx)),
+        );
+
+        let res = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "ct-mask",
+                "messages": [{ "role": "user", "content": "version: 9.9.9" }],
+            })))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("count_tokens must emit a usage event")
+            .expect("channel open");
+        assert_eq!(event.status_code, 200);
+        assert_eq!(event.inbound_protocol, "anthropic");
+        assert_eq!(event.requested_model, "ct-mask");
+        assert_eq!(event.prompt_tokens, 0);
+        assert_eq!(event.completion_tokens, 0);
+        assert_eq!(
+            event.redacted_entity_counts.get("eda_version").copied(),
+            Some(1),
+            "the mask this route applied is missing from its own row: {event:?}",
+        );
+    }
+
+    /// Same gate as `/v1/messages`: a body the scan parser rejects is
+    /// refused only when a guardrail would have read it. An output-hook-only
+    /// row resolves into the chain but never sees the request, so the body
+    /// goes upstream. Fails on `a456ab71` with 422.
+    #[tokio::test]
+    async fn unparseable_body_with_an_output_only_guardrail_is_forwarded() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens": 7})),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(anthropic_model("ct-out"));
+        snap.apikeys.insert(apikey_entry(&["ct-out"]));
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{"name":"out-only","kind":"keyword","hook_point":"output","patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-out", row, 1));
+
+        // The premise, asserted rather than assumed: the seeded row IS in
+        // the chain this request resolves, and it is not an input-side
+        // one. Without this the forwarding assertion below is the same
+        // observation as the no-guardrail case, and would pass just as
+        // well if the row had never been indexed at all.
+        let probe =
+            aisix_guardrails::LiveGuardrailIndex::new(SnapshotHandle::new(snap.clone()), None)
+                .resolve(&aisix_guardrails::RequestContext {
+                    passthrough_route_id: "",
+                    model_id: "",
+                    mcp_server_id: "",
+                    api_key_id: "",
+                    team_id: None,
+                });
+        assert!(!probe.is_empty(), "the seeded row must reach the chain");
+        assert!(
+            !aisix_guardrails::Guardrail::runs_on_input(&probe),
+            "and it must be output-side only"
+        );
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized(
+            "anthropic",
+            Arc::new(aisix_provider_anthropic::AnthropicBridge::new()),
+        );
+        let handle = SnapshotHandle::new(snap);
+        let index = aisix_guardrails::LiveGuardrailIndex::new(handle.clone(), None);
+        let app = crate::build_router(
+            crate::ProxyState::new(handle, hub, &cfg())
+                .without_cache()
+                .with_guardrail_index(index),
+        );
+
+        // No `messages` key: the scan parser rejects it.
+        let res = app
+            .oneshot(make_req(serde_json::json!({ "model": "ct-out" })))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// `fail_open: true` opts the row out of the refusal — same grounds as
+    /// `/v1/messages`. Fails on `8955d6ab` with 422.
+    #[tokio::test]
+    async fn unparseable_body_with_a_fail_open_guardrail_is_forwarded() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens": 7})),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(anthropic_model("ct-open"));
+        snap.apikeys.insert(apikey_entry(&["ct-open"]));
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{"name":"in-open","kind":"keyword","hook_point":"input","fail_open":true,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-open", row, 1));
+
+        // Premise: the row IS in the chain and DOES read the request; it
+        // simply must not refuse. Without this, a row that never arrived
+        // would forward for an entirely different reason.
+        let probe =
+            aisix_guardrails::LiveGuardrailIndex::new(SnapshotHandle::new(snap.clone()), None)
+                .resolve(&aisix_guardrails::RequestContext {
+                    passthrough_route_id: "",
+                    model_id: "",
+                    mcp_server_id: "",
+                    api_key_id: "",
+                    team_id: None,
+                });
+        assert!(aisix_guardrails::Guardrail::runs_on_input(&probe));
+        assert!(!aisix_guardrails::Guardrail::refuses_unevaluable_input(
+            &probe
+        ));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized(
+            "anthropic",
+            Arc::new(aisix_provider_anthropic::AnthropicBridge::new()),
+        );
+        let handle = SnapshotHandle::new(snap);
+        let index = aisix_guardrails::LiveGuardrailIndex::new(handle.clone(), None);
+        let app = crate::build_router(
+            crate::ProxyState::new(handle, hub, &cfg())
+                .without_cache()
+                .with_guardrail_index(index),
+        );
+
+        let res = app
+            .oneshot(make_req(serde_json::json!({ "model": "ct-open" })))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// The forwarding above is a fail-open BYPASS, and an operator has to
+    /// be able to find it: the request reached the provider with nothing
+    /// screening it, and its usage row otherwise reads exactly like a
+    /// screened one. The tag matches what the fail-CLOSED direction puts in
+    /// its refusal envelope, so one unscannable body reads the same
+    /// whichever way the chain is configured.
+    #[tokio::test]
+    async fn a_forwarded_unparseable_body_records_the_bypass_on_its_usage_event() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens": 7})),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(anthropic_model("ct-open"));
+        snap.apikeys.insert(apikey_entry(&["ct-open"]));
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{"name":"in-open","kind":"keyword","hook_point":"input","fail_open":true,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-open", row, 1));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized(
+            "anthropic",
+            Arc::new(aisix_provider_anthropic::AnthropicBridge::new()),
+        );
+        let handle = SnapshotHandle::new(snap);
+        let index = aisix_guardrails::LiveGuardrailIndex::new(handle.clone(), None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = crate::build_router(
+            crate::ProxyState::new(handle, hub, &cfg())
+                .without_cache()
+                .with_guardrail_index(index)
+                .with_usage_sink(UsageSink::new(tx)),
+        );
+
+        // No `messages` — the scan parser rejects it, which is what makes
+        // the body unscannable.
+        let res = app
+            .oneshot(make_req(serde_json::json!({ "model": "ct-open" })))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("count_tokens must emit a usage event")
+            .expect("channel open");
+        assert_eq!(
+            event.guardrail_bypassed_reason,
+            crate::error::TAG_UNSCANNABLE_BODY,
+            "{event:?}",
+        );
+    }
+
+    /// The same body with an INPUT-hook row keeps the fail-closed refusal.
+    #[tokio::test]
+    async fn unparseable_body_with_an_input_guardrail_is_refused() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"input_tokens": 7})),
+            )
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(anthropic_model("ct-in"));
+        snap.apikeys.insert(apikey_entry(&["ct-in"]));
+        let row: aisix_core::models::Guardrail = serde_json::from_str(
+            r#"{"name":"in-only","kind":"keyword","hook_point":"input","patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-in", row, 1));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized(
+            "anthropic",
+            Arc::new(aisix_provider_anthropic::AnthropicBridge::new()),
+        );
+        let handle = SnapshotHandle::new(snap);
+        let index = aisix_guardrails::LiveGuardrailIndex::new(handle.clone(), None);
+        let app = crate::build_router(
+            crate::ProxyState::new(handle, hub, &cfg())
+                .without_cache()
+                .with_guardrail_index(index),
+        );
+
+        let res = app
+            .oneshot(make_req(serde_json::json!({ "model": "ct-in" })))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = axum::body::to_bytes(res.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(crate::error::TAG_UNSCANNABLE_BODY),
+            "{v}"
+        );
     }
 
     /// Mixed group [anthropic, openai]: the openai target is `continue`d
@@ -971,7 +1863,7 @@ mod tests {
     /// on the first transient 502.
     #[tokio::test]
     async fn mixed_group_spends_the_default_budget_on_the_only_anthropic_target() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages/count_tokens"))
             .respond_with(ResponseTemplate::new(502).set_body_string("upstream down"))
@@ -1129,7 +2021,7 @@ mod tests {
         let big_body = format!("{}€", "a".repeat(1023));
         assert!(!big_body.is_char_boundary(1024), "test setup invariant");
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages/count_tokens"))
             .respond_with(ResponseTemplate::new(500).set_body_string(big_body))
@@ -1161,7 +2053,7 @@ mod tests {
     /// `{"input_tokens": <n>}` body verbatim.
     #[tokio::test]
     async fn happy_path_forwards_to_anthropic_count_tokens() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages/count_tokens"))
             .and(header("x-api-key", "sk-ant-test"))
@@ -1207,7 +2099,7 @@ mod tests {
     /// `/v1/messages` happily served the same model.
     #[tokio::test]
     async fn byo_model_on_the_anthropic_adapter_is_served() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages/count_tokens"))
             .and(header("x-api-key", "sk-byo"))
@@ -1276,7 +2168,7 @@ mod tests {
     /// block injecting `anthropic-beta` must reach the upstream request.
     #[tokio::test]
     async fn applies_default_headers_anthropic_beta() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages/count_tokens"))
             .and(header("anthropic-beta", "token-counting-2024-11-01"))
@@ -1315,7 +2207,7 @@ mod tests {
     /// count_tokens request, exactly as on /v1/messages.
     #[tokio::test]
     async fn applies_param_renames() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages/count_tokens"))
             .and(wiremock::matchers::body_partial_json(
@@ -1358,7 +2250,7 @@ mod tests {
     /// reserved blacklist in `apply_request_headers` protects it.
     #[tokio::test]
     async fn default_headers_cannot_overwrite_x_api_key() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // Mock only 200s when x-api-key is the PK secret, NOT the value
         // the operator tried to smuggle via default_headers.
         Mock::given(method("POST"))

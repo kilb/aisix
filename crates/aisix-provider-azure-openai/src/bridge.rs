@@ -30,21 +30,29 @@ use reqwest::{header, Client, StatusCode};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
+use aisix_provider_openai::close_strict_response_format_schema;
 use aisix_provider_openai::overrides::{
     apply_content_list_to_string, apply_default_body_fields, apply_param_constraints,
     apply_param_renames, apply_stream_done_marker_policy, extract_reasoning_field,
     validate_content_safe_request_overrides, StreamDoneOutcome,
 };
+use aisix_provider_openai::reasoning::{is_reasoning_model, ReasoningFamily};
 use aisix_provider_openai::wire::{
     build_request, embed_request_body, embed_response_into, messages_from,
-    response_into_chat_response, stream_chunk_into_chat_chunk, OpenAiEmbedResponse, OpenAiResponse,
-    OpenAiStreamChunk,
+    response_into_chat_response, stream_chunk_into_chat_chunks, DeveloperRoleMode,
+    OpenAiEmbedResponse, OpenAiResponse, OpenAiStreamChunk, ToolCallIndexer,
 };
 
 use crate::aad_token_mint::TokenMinter;
 use crate::wire;
 
 use std::sync::Arc;
+
+/// The bridge pins Azure API version `2024-10-21`, whose request-message
+/// union does not define `developer`. Azure documents developer instructions
+/// as functionally equivalent to system instructions, so both chat paths map
+/// them to the supported `system` wire role.
+const AZURE_DEVELOPER_ROLE_MODE: DeveloperRoleMode = DeveloperRoleMode::MapToSystem;
 
 /// Family Bridge for Azure OpenAI Service.
 pub struct AzureOpenAiBridge {
@@ -92,14 +100,15 @@ impl AzureOpenAiBridge {
     }
 
     /// The client this dispatch runs on: the bridge's shared one, unless
-    /// the resolved Provider Key carries its own TLS settings. The token
+    /// the resolved Provider Key carries its own connection overrides
+    /// (TLS trust settings, a name-resolution address). The token
     /// minter deliberately keeps the shared client — it talks to the
-    /// identity provider, not to the key's `api_base`, and a private CA
+    /// identity provider, not to the key's `api_base`, and an override
     /// declared for the model endpoint says nothing about that host.
     fn client_for(&self, ctx: &BridgeContext) -> Client {
         aisix_gateway::upstream_tls::client_for_provider_key(
             &self.client,
-            ctx.provider_key.tls.as_ref(),
+            ctx.provider_key.upstream_connection().as_ref(),
         )
     }
 
@@ -203,10 +212,7 @@ impl Default for AzureOpenAiBridge {
 }
 
 fn default_client() -> Client {
-    aisix_gateway::build_client_or_default(
-        aisix_gateway::client_builder().user_agent("aisix/0.1"),
-        "azure-openai bridge",
-    )
+    aisix_gateway::build_client_or_default(aisix_gateway::client_builder(), "azure-openai bridge")
 }
 
 /// Parsed Azure upstream reference resolved from a provider_key's
@@ -230,9 +236,9 @@ fn default_client() -> Client {
 /// additions don't break downstream crates. External callers should
 /// always go through [`Self::resolve`]; in-crate tests can use
 /// `..Default::default()`-style struct-literal completion (no
-/// `Default` impl is offered yet, but the `Debug` derive lets test
-/// failures dump the full shape).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Default` impl is offered yet, but the `Debug` impl lets test
+/// failures dump the shape).
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct AzureUpstreamRef {
     pub resource: String,
@@ -265,7 +271,30 @@ pub struct AzureUpstreamRef {
     /// preserved verbatim. The bridge appends `/openai/deployments/<d>/...`
     /// to whatever the operator supplied, including any internal
     /// prefix.
+    ///
+    /// **Userinfo**: `https://user:pass@host` is accepted and used as
+    /// configured. The value is therefore never displayed as it stands —
+    /// the `Debug` impl below reduces it to its origin.
     pub upstream_override: Option<String>,
+}
+
+// Hand-written so a password in the override URL cannot reach a log through
+// `{:?}`.
+impl std::fmt::Debug for AzureUpstreamRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AzureUpstreamRef")
+            .field("resource", &self.resource)
+            .field("deployment", &self.deployment)
+            .field("api_version", &self.api_version)
+            .field(
+                "upstream_override",
+                &self
+                    .upstream_override
+                    .as_deref()
+                    .map(aisix_gateway::redact_url_for_log),
+            )
+            .finish()
+    }
 }
 
 impl AzureUpstreamRef {
@@ -302,39 +331,25 @@ impl AzureUpstreamRef {
             ));
         }
 
-        // userinfo（`user:pass@host`）在任何写法下都拒绝，而且要在下面按写法
-        // 分流之前拒：canonical 主机与裸资源名会把整段值交给
-        // `validate_url_token`，它的报错原样回显 —— 那是调用方读得到的 400，
-        // 而这条检查触发时值里恰好带着凭据。运维应走 api-key / AAD，不能把
-        // 凭据嵌进 URL。
-        let post_scheme = base
-            .strip_prefix("https://")
-            .or_else(|| base.strip_prefix("http://"))
-            .unwrap_or(base);
-        if post_scheme.contains('@') {
-            let shown = aisix_gateway::redact_userinfo(base);
-            return Err(BridgeError::InvalidUpstreamConfig(format!(
-                "azure api_base {shown:?} must not embed userinfo (@); use the \
-                 api-key / AAD credentials in `provider_key.api_key` instead"
-            )));
-        }
-
         if let Some(rest) = base
             .strip_prefix("https://")
             .or_else(|| base.strip_prefix("http://"))
         {
             // Canonical form: split off the leading host segment
             // before the first `.`. If the remainder of the host is
-            // `openai.azure.com`, extract the resource as today.
-            // Otherwise fall through to the verbatim-override path.
+            // `openai.azure.com` and the segment is a resource name,
+            // extract the resource as today. Otherwise (another host, or
+            // a URL whose authority carries more than a resource name)
+            // fall through to the verbatim-override path.
             if let Some((host_resource, host_tail)) = rest.split_once('.') {
                 let host_tail_trimmed = host_tail.trim_end_matches('/');
                 let host_tail_core = host_tail_trimmed
                     .split_once('/')
                     .map(|(host, _path)| host)
                     .unwrap_or(host_tail_trimmed);
-                if host_tail_core == "openai.azure.com" {
-                    validate_url_token("resource name", host_resource)?;
+                if host_tail_core == "openai.azure.com"
+                    && validate_url_token("resource name", host_resource).is_ok()
+                {
                     return Ok(Self {
                         resource: host_resource.to_string(),
                         deployment: deployment.to_string(),
@@ -347,10 +362,9 @@ impl AzureUpstreamRef {
             // Verbatim-override branch — corporate proxy / private
             // endpoint / mock service. Defence-in-depth checks mirror
             // the Vertex sibling fix (#390): reject query and fragment
-            // (userinfo is refused above, for every shape) because each
-            // opens an injection / api-version-downgrade vector. Scheme
-            // is already constrained to `http://` or `https://` by the
-            // outer `strip_prefix` chain.
+            // because each opens an injection / api-version-downgrade
+            // vector. Scheme is already constrained to `http://` or
+            // `https://` by the outer `strip_prefix` chain.
             // The value is not quoted back: a query string is where an
             // operator pastes a key (`?subscription-key=…`), and this error
             // reaches the caller.
@@ -445,8 +459,11 @@ fn validate_url_token(name: &str, value: &str) -> Result<(), BridgeError> {
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
+        // 这条报错是调用方读得到的 400。裸资源名这一支的值没有 scheme，算不上
+        // URL，`user:pass@res` 会一路走到这里，所以回显前要去掉 userinfo。
+        let shown = aisix_gateway::redact_userinfo(value);
         return Err(BridgeError::InvalidUpstreamConfig(format!(
-            "azure {name} {value:?} contains URL-control characters — \
+            "azure {name} {shown:?} contains URL-control characters — \
              must match [A-Za-z0-9_-]+ (no spaces, slashes, dots, query params, or hash)"
         )));
     }
@@ -502,6 +519,34 @@ impl AzureSecret {
     }
 }
 
+/// The credential a request built outside the bridge sends to an Azure
+/// endpoint, resolved from the Provider Key secret exactly as the bridge
+/// resolves it: a verbatim key goes out as the `api-key` header, the JSON
+/// client-credentials shape as an Entra ID bearer token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AzureCredential {
+    ApiKey(String),
+    Bearer(String),
+}
+
+/// Process-wide token cache for the callers of [`resolve_credential`].
+/// Kept apart from each bridge's own minter; both key their cache by the
+/// whole credential, so sharing would only save a mint per process.
+static SHARED_TOKEN_MINTER: std::sync::LazyLock<TokenMinter> =
+    std::sync::LazyLock::new(|| TokenMinter::new(default_client()));
+
+/// Resolve an Azure Provider Key secret into the credential to send, minting
+/// (or reusing a cached) Entra ID token for the client-credentials shape.
+pub async fn resolve_credential(secret: &str) -> Result<AzureCredential, BridgeError> {
+    match AzureSecret::parse(secret)? {
+        AzureSecret::ApiKey(key) => Ok(AzureCredential::ApiKey(key)),
+        AzureSecret::Aad(creds) => SHARED_TOKEN_MINTER
+            .get_token(&creds)
+            .await
+            .map(AzureCredential::Bearer),
+    }
+}
+
 /// Resolved per-request auth header pair the bridge writes onto the
 /// outbound request. Exactly ONE of `api_key` / `bearer_token` is
 /// `Some`; the other is `None`.
@@ -521,19 +566,11 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
         .ok_or_else(|| BridgeError::InvalidUpstreamConfig("model.model_name missing".into()))
 }
 
-/// Map an Azure HTTP error response to a customer-visible
-/// [`BridgeError::UpstreamStatus`].
+/// Map an Azure HTTP error response to a [`BridgeError::UpstreamStatus`]
+/// carrying Azure's own error message.
 ///
-/// **Audit M1 — sensitive-info redaction:** Azure error envelopes
-/// (`{"error": {"code": "...", "message": "..."}}`) often include the
-/// operator-defined deployment id (e.g. "The API deployment for this
-/// resource does not exist.") or the resource hostname. The
-/// customer-visible `message` stays a canned phrase. We do read
-/// `error.code` into [`UpstreamErrorView::kind`] — these are a small
-/// closed set of Azure-defined tokens (`DeploymentNotFound`,
-/// `content_filter`, …), stable taxonomy rather than operator data —
-/// so the envelope-translation layer can derive an OpenAI `code`.
-/// [`UpstreamErrorView::message`] stays `None`.
+/// `error.code` is read into [`UpstreamErrorView::kind`] so the
+/// envelope-translation layer can derive an OpenAI `code`.
 ///
 /// Azure-specific quirk: content-policy violations nest under
 /// `error.inner_error.code` *or* `error.innererror.code` (Azure emits
@@ -544,21 +581,15 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     let retry_after = aisix_gateway::parse_retry_after(resp.headers());
     let is_json = aisix_gateway::response_is_json(&resp);
-    let body =
-        aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
+    let aisix_gateway::UpstreamErrorBody {
+        bytes: body,
+        read_error,
+    } = aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
     // Skip the serde parse on non-JSON bodies (HTML error page from a
     // load-balancer / front door). Same guard as
     // `capture_upstream_error_http`.
     let kind = is_json.then(|| parse_azure_error_code(&body)).flatten();
-    let message = match status.as_u16() {
-        401 | 403 => "upstream authentication failed".to_string(),
-        404 => "upstream deployment or model not found".to_string(),
-        408 => "upstream request timeout".to_string(),
-        409 => "upstream conflict".to_string(),
-        413 => "upstream request entity too large".to_string(),
-        429 => "upstream rate limited".to_string(),
-        _ => format!("upstream returned {}", status.as_u16()),
-    };
+    let message = aisix_gateway::upstream_error_message(&body);
     // Azure's envelope only has a single `error.code` field (no
     // separate `type`). Downstream OpenAI clients expect both
     // `error.type` AND `error.code` — populate both `kind` and `code`
@@ -569,7 +600,7 @@ async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeEr
     let parsed = kind.as_ref().map(|k| {
         Box::new(aisix_gateway::UpstreamErrorView {
             kind: Some(k.clone()),
-            message: None,
+            message: (!message.is_empty()).then(|| message.clone()),
             code: Some(k.clone()),
             param: None,
         })
@@ -580,7 +611,9 @@ async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeEr
         parsed,
         wire: aisix_gateway::UpstreamWire::AzureOpenAI,
         retry_after,
+        diagnostic: None,
     }
+    .with_body_read_error(read_error)
 }
 
 /// Extract the Azure error code from the envelope, applying the
@@ -641,18 +674,35 @@ where
 /// transforms before sending. Mirrors `OpenAiBridge::prepare_outbound_body`.
 fn prepare_outbound_body<T: serde::Serialize>(
     typed: &T,
+    gateway_strict_schema: bool,
+    reasoning_model: bool,
     request: Option<&RequestOverrides>,
     response: Option<&ResponseOverrides>,
 ) -> Result<Value, BridgeError> {
     let mut body = serde_json::to_value(typed)
         .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?;
+    // Azure serves the OpenAI wire, so it owes the same strict-mode
+    // schema closing the OpenAI edge applies — one function, not a
+    // second copy, because these two bodies have to stay identical.
+    close_strict_response_format_schema(&mut body, gateway_strict_schema);
+    // Before `param_renames`, so an operator's explicit rename wins.
+    if reasoning_model {
+        aisix_provider_openai::reasoning::apply_reasoning_token_cap(&mut body);
+    }
     if let Some(r) = request {
         validate_content_safe_request_overrides(r).map_err(BridgeError::Config)?;
         apply_param_renames(&mut body, &r.param_renames);
         if let Some(constraints) = &r.param_constraints {
             apply_param_constraints(&mut body, constraints);
         }
+        // A default `max_tokens` fills a cap the caller did not send, so a
+        // reasoning model needs it converted as well; a `max_tokens` already
+        // present here was put back by the operator's own rename and stays.
+        let had_max_tokens = body.get("max_tokens").is_some();
         apply_default_body_fields(&mut body, &r.default_body_fields);
+        if reasoning_model && !had_max_tokens {
+            aisix_provider_openai::reasoning::apply_reasoning_token_cap(&mut body);
+        }
     }
     if response.is_some_and(|r| r.content_list_to_string) {
         apply_content_list_to_string(&mut body);
@@ -673,13 +723,15 @@ fn prepare_outbound_body<T: serde::Serialize>(
 ///
 /// In both branches the bridge also sets `Content-Type: application/json`,
 /// `x-aisix-request-id: <ctx.request_id>`, and (for streaming)
-/// `Accept: text/event-stream`. Bridge-owned headers are inserted
-/// before `apply_request_headers` so the reserved-headers list in
-/// `aisix-gateway::upstream_headers` (which already covers `api-key`,
-/// `authorization`, `x-api-key`, plus proxy-auth / session headers)
-/// cannot overwrite them. Defense in depth: the reserved-list blocks
-/// even before the skip-if-present guard inside
-/// `apply_request_headers`.
+/// `Accept: text/event-stream`. Bridge-owned headers are inserted before
+/// `apply_request_headers`, which is what stops a `default_headers` entry
+/// displacing them — that merge is skip-if-present. Note this bridge fills
+/// exactly ONE credential slot per auth mode, so the OTHER slot is not
+/// bridge-owned and operator config reaches it: on `api-key` auth an
+/// `authorization` entry is honoured, which is how an Azure-shaped
+/// upstream behind its own bearer-authenticated hop is reached. A
+/// forwarded client header displaces even the filled slot, deliberately —
+/// see `apply_request_headers`.
 fn build_request_headers(
     auth: &AzureAuth,
     request_id: &str,
@@ -741,11 +793,24 @@ impl Bridge for AzureOpenAiBridge {
         self.name
     }
 
+    fn wire_protocol(&self) -> &'static str {
+        aisix_core::Adapter::AzureOpenai.wire_protocol()
+    }
+
     async fn chat(
         &self,
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
+        self.chat_cow(std::borrow::Cow::Borrowed(req), ctx).await
+    }
+
+    async fn chat_cow(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
+        ctx: &BridgeContext,
+    ) -> Result<ChatResponse, BridgeError> {
+        let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
         let deployment = upstream_model(ctx)?;
         let upstream = AzureUpstreamRef::resolve(deployment, ctx.provider_key.api_base.as_deref())?;
         // Keep reserved-config helpers reachable from the public surface
@@ -762,16 +827,20 @@ impl Bridge for AzureOpenAiBridge {
         // body's `model` field is ignored by Azure (or echoed back).
         // We still set it to the deployment name for log-trace clarity
         // and to mirror the upstream OpenAI SDK convention.
-        // `system`, not `developer`: the pinned api-version predates the
-        // `developer` role, and Azure treats `system` as developer
-        // instructions on the reasoning models.
-        let messages = messages_from(req, false);
-        let typed = build_request(req, deployment, &messages, false);
-        let body = prepare_outbound_body(
-            &typed,
-            ctx.provider_key.request.as_ref(),
-            ctx.provider_key.response.as_ref(),
-        )?;
+        let body = {
+            let messages = messages_from(&req, AZURE_DEVELOPER_ROLE_MODE);
+            let typed = build_request(&req, deployment, &messages, false);
+            aisix_gateway::json_body(&prepare_outbound_body(
+                &typed,
+                req.gateway_strict_schema,
+                is_reasoning_model(ReasoningFamily::AzureOpenai, deployment),
+                ctx.provider_key.request.as_ref(),
+                ctx.provider_key.response.as_ref(),
+            )?)
+            .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?
+        };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
         let headers = build_request_headers(&auth, &ctx.request_id, false, &ctx.header_ctx())?;
         let url = self.resolve_url(ctx, &upstream);
         let client = self.client_for(ctx);
@@ -781,11 +850,12 @@ impl Bridge for AzureOpenAiBridge {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
+            aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -796,10 +866,9 @@ impl Bridge for AzureOpenAiBridge {
             // `#[serde(default)]` on optional fields and does NOT set
             // `deny_unknown_fields`, so the extension fields pass
             // through transparently without breaking deserialization.
-            let parsed: OpenAiResponse = resp
-                .json()
-                .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+            let parsed: OpenAiResponse =
+                aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::AzureOpenAI)
+                    .await?;
             Ok(response_into_chat_response(parsed))
         })
         .await
@@ -810,6 +879,16 @@ impl Bridge for AzureOpenAiBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
+        self.chat_stream_cow(std::borrow::Cow::Borrowed(req), ctx)
+            .await
+    }
+
+    async fn chat_stream_cow(
+        &self,
+        req: std::borrow::Cow<'_, ChatFormat>,
+        ctx: &BridgeContext,
+    ) -> Result<ChatChunkStream, BridgeError> {
+        let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
         let deployment = upstream_model(ctx)?;
         let upstream = AzureUpstreamRef::resolve(deployment, ctx.provider_key.api_base.as_deref())?;
         let _ = wire::reserved_query_params();
@@ -817,16 +896,20 @@ impl Bridge for AzureOpenAiBridge {
 
         // See chat() — resolve auth before the request future.
         let auth = self.resolve_auth(ctx).await?;
-        // `system`, not `developer`: the pinned api-version predates the
-        // `developer` role, and Azure treats `system` as developer
-        // instructions on the reasoning models.
-        let messages = messages_from(req, false);
-        let typed = build_request(req, deployment, &messages, true);
-        let body = prepare_outbound_body(
-            &typed,
-            ctx.provider_key.request.as_ref(),
-            ctx.provider_key.response.as_ref(),
-        )?;
+        let body = {
+            let messages = messages_from(&req, AZURE_DEVELOPER_ROLE_MODE);
+            let typed = build_request(&req, deployment, &messages, true);
+            aisix_gateway::json_body(&prepare_outbound_body(
+                &typed,
+                req.gateway_strict_schema,
+                is_reasoning_model(ReasoningFamily::AzureOpenai, deployment),
+                ctx.provider_key.request.as_ref(),
+                ctx.provider_key.response.as_ref(),
+            )?)
+            .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?
+        };
+        // The owned request is not needed past its wire bytes.
+        drop(req);
         let headers = build_request_headers(&auth, &ctx.request_id, true, &ctx.header_ctx())?;
         let url = self.resolve_url(ctx, &upstream);
         let client = self.client_for(ctx);
@@ -835,13 +918,14 @@ impl Bridge for AzureOpenAiBridge {
         let resp = with_deadline(ctx.deadline, started, async move {
             url.post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)
         })
         .await?;
 
+        aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status();
         if !status.is_success() {
             return Err(map_http_error(status, resp).await);
@@ -904,11 +988,14 @@ impl Bridge for AzureOpenAiBridge {
         // The deployment is the model as far as Azure is concerned; the
         // body's `model` is ignored, and is set to the deployment name for
         // log-trace clarity, matching `chat()`.
-        let body = prepare_outbound_body(
+        let body = aisix_gateway::json_body(&prepare_outbound_body(
             &embed_request_body(req, deployment),
+            false,
+            false,
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
-        )?;
+        )?)
+        .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?;
         let headers = build_request_headers(&auth, &ctx.request_id, false, &ctx.header_ctx())?;
         let url = self.resolve_route_url(ctx, &upstream, "azure/embeddings", || {
             upstream.embeddings_url()
@@ -920,20 +1007,20 @@ impl Bridge for AzureOpenAiBridge {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&body)
+                .body(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
+            aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
             }
 
-            let parsed: OpenAiEmbedResponse = resp
-                .json()
-                .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+            let parsed: OpenAiEmbedResponse =
+                aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::AzureOpenAI)
+                    .await?;
             Ok(embed_response_into(parsed))
         })
         .await
@@ -953,15 +1040,20 @@ impl Bridge for AzureOpenAiBridge {
         // Azure reads the deployment from the URL and ignores the body's
         // `model`; it is set to the deployment name for log-trace clarity,
         // matching `chat()` and `embed()`.
-        let mut outbound = body.clone();
-        if let Some(obj) = outbound.as_object_mut() {
-            obj.insert("model".to_string(), Value::String(deployment.to_string()));
-        }
-        let outbound = prepare_outbound_body(
-            &outbound,
-            ctx.provider_key.request.as_ref(),
-            ctx.provider_key.response.as_ref(),
-        )?;
+        let outbound = {
+            let mut outbound = body.clone();
+            if let Some(obj) = outbound.as_object_mut() {
+                obj.insert("model".to_string(), Value::String(deployment.to_string()));
+            }
+            aisix_gateway::json_body(&prepare_outbound_body(
+                &outbound,
+                false,
+                false,
+                ctx.provider_key.request.as_ref(),
+                ctx.provider_key.response.as_ref(),
+            )?)
+            .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?
+        };
         let headers = build_request_headers(&auth, &ctx.request_id, false, &ctx.header_ctx())?;
         let url = self.resolve_route_url(ctx, &upstream, "azure/images", || upstream.images_url());
         let client = self.client_for(ctx);
@@ -971,19 +1063,18 @@ impl Bridge for AzureOpenAiBridge {
             let resp = url
                 .post_on(&client)
                 .headers(headers)
-                .json(&outbound)
+                .body(outbound)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
+            aisix_gateway::note_upstream_response(resp.headers());
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
             }
 
-            resp.json::<Value>()
-                .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
+            aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::AzureOpenAI).await
         })
         .await
     }
@@ -1002,6 +1093,7 @@ where
 {
     async_stream::try_stream! {
         let mut decoder = SseDecoder::new();
+        let mut tool_call_indexer = ToolCallIndexer::default();
         let mut stream = Box::pin(byte_stream);
         let mut done_marker_seen = false;
         'outer: loop {
@@ -1025,7 +1117,7 @@ where
             let Some(next) = next else { break 'outer; };
             let chunk = next.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
             for event in decoder
-                .feed_checked(chunk.as_ref())
+                .feed(chunk.as_ref())
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
             {
                 match event {
@@ -1035,13 +1127,15 @@ where
                     }
                     SseEvent::Data(payload) => {
                         let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
-                        yield stream_chunk_into_chat_chunk(parsed);
+                        for chunk in stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
+                            yield chunk;
+                        }
                     }
                 }
             }
         }
         match decoder
-            .finish_checked()
+            .finish()
             .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
         {
             Some(SseEvent::Done) => {
@@ -1049,7 +1143,9 @@ where
             }
             Some(SseEvent::Data(payload)) => {
                 let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
-                yield stream_chunk_into_chat_chunk(parsed);
+                for chunk in stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
+                    yield chunk;
+                }
             }
             None => {}
         }
@@ -1103,6 +1199,78 @@ fn parse_stream_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Azure serves the OpenAI wire, so an Anthropic-shaped
+    /// `/v1/messages` request translated onto an Azure deployment must
+    /// arrive with exactly the schema the OpenAI edge would send. Azure
+    /// keeps its own copy of the outbound-body pipeline, which is
+    /// precisely how it came to be missing the strict-mode closing.
+    #[test]
+    fn a_translated_messages_request_reaches_azure_byte_for_byte_as_before() {
+        use aisix_gateway::{ChatFormat, ChatMessage};
+        use aisix_provider_anthropic::wire::translate_extras_to_openai_shape;
+
+        let mut extra = serde_json::json!({
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "days": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {"high": {"type": "number"}},
+                                },
+                            },
+                        },
+                    },
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let gateway_strict =
+            translate_extras_to_openai_shape(&mut extra, aisix_core::MappedEffort::AsWritten);
+        assert!(gateway_strict);
+
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("weather?")]);
+        req.extra = extra;
+        let messages = messages_from(&req, AZURE_DEVELOPER_ROLE_MODE);
+        let typed = build_request(&req, "ci-chat", &messages, false);
+        let body = prepare_outbound_body(&typed, gateway_strict, false, None, None).unwrap();
+
+        assert_eq!(
+            body["response_format"],
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "structured_output",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["city", "days"],
+                        "properties": {
+                            "city": {"type": "string"},
+                            "days": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["high"],
+                                    "properties": {"high": {"type": "number"}},
+                                },
+                            },
+                        },
+                    },
+                },
+            })
+        );
+    }
 
     /// #1222 scenario 3: an in-band `data: {"error":{...}}`
     /// frame inside the committed 200 stream surfaces as the typed
@@ -1328,20 +1496,19 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rejects_override_with_userinfo() {
-        // PR #392 audit MEDIUM-defence: an operator embedding
-        // user:pass@host in the override URL would leak via logs and
-        // bypass the api-key / AAD auth path that the bridge owns.
-        let err = AzureUpstreamRef::resolve("dep", Some("https://user:pass@proxy.acme.internal"))
-            .unwrap_err();
-        match err {
-            BridgeError::InvalidUpstreamConfig(msg) => {
-                assert!(
-                    msg.contains("userinfo"),
-                    "must call out the userinfo rejection; got {msg}"
-                );
-            }
-            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
+    fn resolve_passes_userinfo_through_verbatim() {
+        for (base, expected) in [
+            (
+                "https://user:pw@proxy.acme.internal/",
+                "https://user:pw@proxy.acme.internal",
+            ),
+            (
+                "https://user:pw@acme.openai.azure.com",
+                "https://user:pw@acme.openai.azure.com",
+            ),
+        ] {
+            let r = AzureUpstreamRef::resolve("dep", Some(base)).unwrap();
+            assert_eq!(r.upstream_override.as_deref(), Some(expected), "{base}");
         }
     }
 
@@ -1492,6 +1659,14 @@ mod tests {
         }
     }
 
+    /// Test helper: build an [`AzureAuth`] for the AAD-bearer branch.
+    fn bearer_auth(token: &str) -> AzureAuth {
+        AzureAuth {
+            api_key: None,
+            bearer_token: Some(token.to_string()),
+        }
+    }
+
     fn mock_chat_url(mock_uri: &str, deployment: &str) -> String {
         format!(
             "{}/openai/deployments/{}/chat/completions?api-version=2024-10-21",
@@ -1524,7 +1699,7 @@ mod tests {
     /// `AzureUpstreamRef::resolve`'s verbatim-override branch.
     #[tokio::test]
     async fn url_cache_holds_a_row_per_deployment() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         for deployment in ["gpt4o-prod", "gpt4o-mini"] {
             Mock::given(method("POST"))
                 .and(path(format!(
@@ -1567,8 +1742,8 @@ mod tests {
                 .mount(server)
                 .await;
         }
-        let first = MockServer::start().await;
-        let second = MockServer::start().await;
+        let first = MockServer::builder().start().await;
+        let second = MockServer::builder().start().await;
         mount(&first).await;
         mount(&second).await;
 
@@ -1622,16 +1797,17 @@ mod tests {
     }
 
     #[test]
-    fn build_request_headers_default_headers_cannot_override_api_key() {
-        // Defense in depth: even if an operator's RequestOverrides
-        // includes `default_headers.api-key`, the apply pipeline's
-        // reserved-headers list must block it. Otherwise an org admin
-        // who set up a Provider Key could exfil API traffic through
-        // any header rewrite.
+    fn default_headers_cannot_displace_the_slot_this_bridge_filled() {
+        // `default_headers` is a fallback, never an override: the bridge
+        // fills its credential slot first, so an entry of the same name is
+        // declined. The OTHER slot is a different question — this bridge
+        // does not fill `authorization` under `api-key` auth, so an
+        // operator entry reaches it, which is how an Azure-shaped upstream
+        // behind its own bearer-authenticated hop is reached.
         use std::collections::HashMap;
         let mut default_headers = HashMap::new();
-        default_headers.insert("api-key".to_string(), "ATTACKER-KEY".to_string());
-        default_headers.insert("authorization".to_string(), "Bearer ATTACKER".to_string());
+        default_headers.insert("api-key".to_string(), "OVERRIDE-KEY".to_string());
+        default_headers.insert("authorization".to_string(), "Bearer hop-token".to_string());
         let request_overrides = RequestOverrides {
             default_headers,
             ..Default::default()
@@ -1646,12 +1822,26 @@ mod tests {
         assert_eq!(
             headers.get("api-key").unwrap(),
             "legit-key",
-            "reserved-headers list must prevent api-key override"
+            "the bridge filled this slot first, so the entry is declined"
         );
-        assert!(
-            !headers.contains_key("authorization"),
-            "Authorization must not be set at all for Azure"
+        assert_eq!(
+            headers.get("authorization").unwrap(),
+            "Bearer hop-token",
+            "a slot no auth mode fills is the operator's to set"
         );
+
+        // AAD auth fills `authorization` instead, and then it is the
+        // declined one — the rule is which slot the bridge filled, not
+        // which name it is.
+        let headers = build_request_headers(
+            &bearer_auth("aad-token"),
+            "req-1",
+            false,
+            &UpstreamHeaderContext::from_overrides(Some(&request_overrides)),
+        )
+        .unwrap();
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer aad-token");
+        assert_eq!(headers.get("api-key").unwrap(), "OVERRIDE-KEY");
     }
 
     #[test]
@@ -1719,7 +1909,7 @@ mod tests {
     /// deployment. Same route family as chat and embeddings.
     #[tokio::test]
     async fn generate_image_uses_the_deployment_images_route() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default().with_response(
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "created": 0,
@@ -1844,7 +2034,7 @@ mod tests {
     /// could not serve `/v1/embeddings` at all.
     #[tokio::test]
     async fn embed_dispatch_uses_the_deployment_embeddings_route() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default().with_response(
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "object": "list",
@@ -1878,6 +2068,10 @@ mod tests {
             input_was_single: true,
             encoding_format: None,
             dimensions: None,
+            input_type: None,
+            embedding_types: None,
+            token_input: None,
+            extra: Default::default(),
         };
         let out = bridge.embed(&req, &ctx).await.unwrap();
         assert_eq!(out.data.len(), 1);
@@ -1905,7 +2099,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_dispatch_sends_api_key_header_and_deployment_url() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         // Mock asserts: POST + path with deployment + api-version
         // query + api-key header carrying the literal secret.
         let responder = CapturingResponder::default().with_response(
@@ -1956,7 +2150,7 @@ mod tests {
         // Audit M4: assert the full body shape, not just the `model`
         // field — `messages` array present, `stream: false` for
         // non-streaming, content matches the request.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
@@ -1968,7 +2162,13 @@ mod tests {
         let bridge =
             AzureOpenAiBridge::new().with_url_override(mock_chat_url(&server.uri(), "gpt4o-prod"));
         let ctx = canonical_test_ctx();
-        let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
+        let req = ChatFormat::new(
+            "my-azure-gpt4",
+            vec![
+                ChatMessage::developer("follow application instructions"),
+                ChatMessage::user("hi"),
+            ],
+        );
         bridge.chat(&req, &ctx).await.unwrap();
 
         let body = responder.captured_body.lock().unwrap().clone().unwrap();
@@ -1978,13 +2178,22 @@ mod tests {
             "body.model must = deployment name; got body={body}"
         );
         let messages = body.get("messages").and_then(|v| v.as_array()).unwrap();
-        assert_eq!(messages.len(), 1, "exactly one message; got body={body}");
+        assert_eq!(messages.len(), 2, "exactly two messages; got body={body}");
         assert_eq!(
             messages[0].get("role").and_then(|v| v.as_str()),
-            Some("user")
+            Some("system"),
+            "Azure API version 2024-10-21 receives developer instructions as system"
         );
         assert_eq!(
             messages[0].get("content").and_then(|v| v.as_str()),
+            Some("follow application instructions")
+        );
+        assert_eq!(
+            messages[1].get("role").and_then(|v| v.as_str()),
+            Some("user")
+        );
+        assert_eq!(
+            messages[1].get("content").and_then(|v| v.as_str()),
             Some("hi")
         );
         assert_eq!(
@@ -2000,7 +2209,7 @@ mod tests {
         // and `content_filter_results` blocks. The reused OpenAi
         // wire parsers must not blow up on these extension fields —
         // they don't set `deny_unknown_fields`, so serde discards.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2042,7 +2251,7 @@ mod tests {
     async fn chat_applies_param_renames_to_outbound_body() {
         // Audit M2: assert the renamed key carries the original VALUE,
         // not just that the key swap happened.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let responder = CapturingResponder::default();
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
@@ -2075,12 +2284,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_maps_upstream_400_to_canned_message_not_body_echo() {
-        // Audit M1: the upstream error body may contain operator-
-        // internal identifiers (deployment name, resource hostname).
-        // The bridge must map to a canned status-keyed phrase and NOT
-        // echo the upstream body verbatim.
-        let server = MockServer::start().await;
+    async fn chat_maps_upstream_400_to_the_upstream_message() {
+        // The caller receives Azure's own error text.
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
             .respond_with(ResponseTemplate::new(400).set_body_string(
@@ -2099,9 +2305,9 @@ mod tests {
                 status, message, ..
             } => {
                 assert_eq!(status, 400);
-                assert!(
-                    !message.contains("gpt4o-prod") && !message.contains("acme-west"),
-                    "upstream body must not echo into the customer-visible error; got message={message:?}"
+                assert_eq!(
+                    message,
+                    "The API deployment for 'gpt4o-prod' does not exist on resource 'acme-west'"
                 );
             }
             other => panic!("expected UpstreamStatus, got {other:?}"),
@@ -2109,8 +2315,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_maps_404_to_deployment_not_found_canned_message() {
-        let server = MockServer::start().await;
+    async fn chat_maps_404_to_the_upstream_message() {
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
             .respond_with(ResponseTemplate::new(404).set_body_string("operator-internal: foo-bar"))
@@ -2127,22 +2333,15 @@ mod tests {
                 status, message, ..
             } => {
                 assert_eq!(status, 404);
-                assert!(
-                    message.contains("deployment or model not found"),
-                    "404 must surface as deployment-not-found canned message; got {message:?}"
-                );
-                assert!(
-                    !message.contains("foo-bar"),
-                    "upstream body must not leak; got {message:?}"
-                );
+                assert_eq!(message, "operator-internal: foo-bar");
             }
             other => panic!("expected UpstreamStatus, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn chat_maps_429_with_retry_after_and_canned_message() {
-        let server = MockServer::start().await;
+    async fn chat_maps_429_with_retry_after_and_the_upstream_message() {
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
             .respond_with(
@@ -2167,9 +2366,9 @@ mod tests {
             } => {
                 assert_eq!(status, 429);
                 assert_eq!(retry_after, Some(std::time::Duration::from_secs(30)));
-                assert!(
-                    !message.contains("gpt4o-prod"),
-                    "upstream body must not leak; got {message:?}"
+                assert_eq!(
+                    message,
+                    "rate limited — quota for deployment gpt4o-prod exceeded"
                 );
             }
             other => panic!("expected UpstreamStatus with retry_after, got {other:?}"),
@@ -2185,7 +2384,7 @@ mod tests {
     /// is exactly the SDK-retry-logic break that issue #322 calls out.
     #[tokio::test]
     async fn chat_429_preserves_openai_compatible_code_for_sdk_retry() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
             .respond_with(ResponseTemplate::new(429).set_body_raw(
@@ -2220,7 +2419,7 @@ mod tests {
     /// `capture_upstream_error_http`.
     #[tokio::test]
     async fn chat_400_non_json_body_skips_envelope_parse() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
             .respond_with(ResponseTemplate::new(400).set_body_raw(
@@ -2251,7 +2450,7 @@ mod tests {
     /// recognised by the parser.
     #[tokio::test]
     async fn chat_400_with_innererror_smushed_casing_also_lifts_kind() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
             .respond_with(ResponseTemplate::new(400).set_body_raw(
@@ -2282,7 +2481,7 @@ mod tests {
     /// `parsed.message` stays `None` (deployment id leak).
     #[tokio::test]
     async fn chat_400_with_inner_error_responsible_ai_lifts_kind() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
             .respond_with(ResponseTemplate::new(400).set_body_raw(
@@ -2307,7 +2506,7 @@ mod tests {
                 assert_eq!(wire, aisix_gateway::UpstreamWire::AzureOpenAI);
                 let parsed = parsed.expect("inner_error parsed");
                 assert_eq!(parsed.kind.as_deref(), Some("ResponsibleAIPolicyViolation"));
-                assert!(parsed.message.is_none());
+                assert_eq!(parsed.message.as_deref(), Some("blocked"));
             }
             other => panic!("expected UpstreamStatus, got {other:?}"),
         }
@@ -2348,7 +2547,7 @@ mod tests {
     /// Azure every time.
     #[tokio::test]
     async fn chat_ignores_req_model_and_uses_ctx_model_name() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2379,7 +2578,7 @@ mod tests {
         // (top-level) and `content_filter_results` (per-choice) — the
         // reused OpenAiStreamChunk parsers must tolerate both without
         // breaking deserialization.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let sse_body = concat!(
             // chunk 1 — top-level prompt_filter_results + empty choices (Azure prelude)
             "data: {\"id\":\"x\",\"model\":\"gpt4o-prod\",\"prompt_filter_results\":[{\"prompt_index\":0,\"content_filter_results\":{\"hate\":{\"filtered\":false,\"severity\":\"safe\"}}}],\"choices\":[]}\n\n",
@@ -2389,14 +2588,15 @@ mod tests {
             "data: {\"id\":\"x\",\"model\":\"gpt4o-prod\",\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":\"stop\"}]}\n\n",
             "data: [DONE]\n\n",
         );
+        let responder = CapturingResponder::default().with_response(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_body),
+        );
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
             .and(header("accept", "text/event-stream"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_string(sse_body),
-            )
+            .respond_with(responder.clone())
             .expect(1)
             .mount(&server)
             .await;
@@ -2404,7 +2604,13 @@ mod tests {
         let bridge =
             AzureOpenAiBridge::new().with_url_override(mock_chat_url(&server.uri(), "gpt4o-prod"));
         let ctx = canonical_test_ctx();
-        let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
+        let req = ChatFormat::new(
+            "my-azure-gpt4",
+            vec![
+                ChatMessage::developer("follow application instructions"),
+                ChatMessage::user("hi"),
+            ],
+        );
         let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
         let mut chunks = Vec::new();
         while let Some(item) = stream.next().await {
@@ -2430,6 +2636,15 @@ mod tests {
             last.finish_reason.is_some(),
             "last chunk must carry finish_reason"
         );
+        let body = responder.captured_body.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            body.get("messages"),
+            Some(&serde_json::json!([
+                {"role": "system", "content": "follow application instructions"},
+                {"role": "user", "content": "hi"}
+            ])),
+            "streaming Azure requests map developer instructions to system: {body}"
+        );
     }
 
     #[tokio::test]
@@ -2437,7 +2652,7 @@ mod tests {
         // Audit H2: a slow / hanging stream body must not wedge after
         // headers arrive. The bridge enforces the deadline on each
         // per-chunk wait, not just on the initial POST.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         // 1s delay before the SSE body is emitted. With a 200ms
         // deadline, the bridge should surface a Timeout from the
         // per-chunk wait — the headers arrive instantly (mock
@@ -2718,7 +2933,7 @@ mod tests {
         // End-to-end pin: AAD JSON secret → token mint via wiremock
         // AAD endpoint → chat POST to Azure OpenAI endpoint carrying
         // Authorization: Bearer <minted-token> (NOT api-key:).
-        let aad_server = MockServer::start().await;
+        let aad_server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/oauth2/v2.0/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2730,7 +2945,7 @@ mod tests {
             .mount(&aad_server)
             .await;
 
-        let azure_server = MockServer::start().await;
+        let azure_server = MockServer::builder().start().await;
         let captured_headers: std::sync::Arc<std::sync::Mutex<Option<http::HeaderMap>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let captured_for_responder = captured_headers.clone();
@@ -2785,7 +3000,7 @@ mod tests {
     async fn chat_with_aad_secret_caches_minted_token_across_calls() {
         // Three back-to-back chats with the same AAD secret must
         // share the cache slot — only one token-mint trip.
-        let aad_server = MockServer::start().await;
+        let aad_server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/oauth2/v2.0/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2797,7 +3012,7 @@ mod tests {
             .mount(&aad_server)
             .await;
 
-        let azure_server = MockServer::start().await;
+        let azure_server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "x", "object": "chat.completion", "created": 1700000000_i64,
@@ -2828,7 +3043,7 @@ mod tests {
     async fn chat_with_aad_secret_aad_4xx_surfaces_before_azure_call() {
         // AAD 401 bubbles out as Config (operator-actionable) without
         // ever calling the Azure OpenAI endpoint.
-        let aad_server = MockServer::start().await;
+        let aad_server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(401).set_body_string(
                 r#"{"error":"invalid_client","error_description":"AADSTS7000215"}"#,
@@ -2836,7 +3051,7 @@ mod tests {
             .mount(&aad_server)
             .await;
 
-        let azure_server = MockServer::start().await;
+        let azure_server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200))
             .expect(0) // must NOT be called
@@ -2869,7 +3084,7 @@ mod tests {
     /// audit-aigw-387 on the Vertex SA OAuth side.
     #[tokio::test]
     async fn chat_stream_with_aad_secret_sets_authorization_bearer_header() {
-        let aad_server = MockServer::start().await;
+        let aad_server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/oauth2/v2.0/token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2881,7 +3096,7 @@ mod tests {
             .mount(&aad_server)
             .await;
 
-        let azure_server = MockServer::start().await;
+        let azure_server = MockServer::builder().start().await;
         let captured_headers: std::sync::Arc<std::sync::Mutex<Option<http::HeaderMap>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let captured_for_responder = captured_headers.clone();
@@ -2928,43 +3143,91 @@ mod tests {
         );
     }
 
-    /// `InvalidUpstreamConfig` renders as a 400 whose message the CALLER
-    /// reads, and this branch fires precisely because the value carries a
-    /// credential — so quoting it whole handed over the thing the check
-    /// exists to protect. Vertex's sibling check has redacted since #392;
-    /// this one printed the raw base.
+    /// 项目所有者的决定：`api_base` 里的 userinfo 照配置使用，但密码不能出现在
+    /// 任何展示出来的地方。`Debug` 是其中之一，而 override 字段恰好原样存着它。
     #[test]
-    fn a_rejected_azure_api_base_never_quotes_the_credential_back() {
-        let err =
-            AzureUpstreamRef::resolve("dep", Some("https://user:sk-live-9f2b1e@azure.example"))
-                .expect_err("userinfo in api_base is refused");
-        let msg = err.to_string();
-        assert!(
-            !msg.contains("sk-live-9f2b1e"),
-            "the rejection quotes the credential back: {msg}"
-        );
-        assert!(
-            msg.contains("azure.example") && msg.contains("***@"),
-            "the host should survive so the message stays useful: {msg}"
-        );
-    }
-    /// 同一条规则对每种 api_base 写法都成立。canonical 主机与无 scheme 的裸资源名
-    /// 在 userinfo 检查之前就交给了 `validate_url_token`，而它把原值整段回显；
-    /// query 里带 `://` 的写法则让脱敏函数把 scheme 认错位置，原样放行。
-    #[test]
-    fn every_api_base_shape_keeps_the_credential_out_of_the_rejection() {
+    fn an_accepted_userinfo_base_keeps_the_password_out_of_debug() {
         for base in [
+            "https://user:sk-live-9f2b1e@azure.example",
             "https://user:sk-live-9f2b1e@myres.openai.azure.com",
+        ] {
+            let upstream = AzureUpstreamRef::resolve("dep", Some(base))
+                .unwrap_or_else(|e| panic!("{base} is accepted: {e}"));
+            assert!(
+                upstream
+                    .chat_completions_url()
+                    .contains("user:sk-live-9f2b1e@"),
+                "the URL is used as configured"
+            );
+            let debug = format!("{upstream:?}");
+            assert!(!debug.contains("sk-live-9f2b1e"), "{debug}");
+            assert!(debug.contains("https://"), "{debug}");
+        }
+    }
+
+    /// `InvalidUpstreamConfig` renders as a 400 whose message the CALLER
+    /// reads, so a shape that is still refused must not quote the credential
+    /// it carries. A canonical host and a scheme-less resource name are handed
+    /// to `validate_url_token`, whose message echoes the value, and a `://`
+    /// inside a query must not fool the redaction about where the scheme ends.
+    #[test]
+    fn every_refused_api_base_shape_keeps_the_credential_out_of_the_rejection() {
+        for base in [
             "user:sk-live-9f2b1e@myres",
             "user:sk-live-9f2b1e@myres/x?next=https://y",
+            "https://user:sk-live-9f2b1e@azure.example?api-version=1",
+            "https://user:sk-live-9f2b1e@azure.example#frag",
         ] {
-            let err = AzureUpstreamRef::resolve("dep", Some(base))
-                .expect_err("userinfo in api_base is refused");
+            let err =
+                AzureUpstreamRef::resolve("dep", Some(base)).expect_err("this shape stays refused");
             let msg = err.to_string();
             assert!(
                 !msg.contains("sk-live-9f2b1e"),
                 "{base}: the rejection quotes the credential back: {msg}"
             );
+        }
+    }
+
+    /// A request on a userinfo base goes out, and when the upstream cannot be
+    /// reached the error — which reaches the usage event and the logs — does
+    /// not name the password. reqwest turns the userinfo into a Basic header.
+    #[tokio::test]
+    async fn a_userinfo_base_reaches_the_upstream_and_failures_hide_the_password() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(CapturingResponder::default())
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bridge = AzureOpenAiBridge::new();
+        let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
+        let base = server
+            .uri()
+            .replace("http://", "http://user:sk-live-9f2b1e@");
+        let ctx = BridgeContext::new("req", sample_model(), sample_pk(Some(&base)));
+        bridge
+            .chat(&req, &ctx)
+            .await
+            .expect("the request reaches the upstream");
+        let received = server.received_requests().await.unwrap_or_default();
+        assert!(
+            received[0].headers.contains_key("authorization"),
+            "the HTTP client turns the userinfo into a header"
+        );
+        drop(server);
+
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let base = format!("http://user:sk-live-9f2b1e@127.0.0.1:{closed}");
+        let ctx = BridgeContext::new("req", sample_model(), sample_pk(Some(&base)));
+        let err = bridge
+            .chat(&req, &ctx)
+            .await
+            .expect_err("nothing listens there");
+        for rendered in [err.to_string(), format!("{err:?}")] {
+            assert!(!rendered.contains("sk-live-9f2b1e"), "{rendered}");
         }
     }
 }

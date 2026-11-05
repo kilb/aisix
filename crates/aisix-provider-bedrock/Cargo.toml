@@ -9,6 +9,7 @@ authors.workspace = true
 description = "aisix: AWS Bedrock runtime provider bridge (skeleton — multi-publisher dispatch)"
 
 [dependencies]
+tracing.workspace = true
 aisix-core = { path = "../aisix-core" }
 aisix-gateway = { path = "../aisix-gateway", features = ["aws"] }
 # Reuse Anthropic Messages request/response wire types for the
@@ -24,11 +25,12 @@ aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
 # adapter applies the same wire transforms cp-api configures (#302 §5 / #340).
 aisix-provider-openai = { path = "../aisix-provider-openai" }
 async-stream = "0.3"
+bytes.workspace = true
+base64.workspace = true
 async-trait.workspace = true
 serde.workspace = true
-serde_json.workspace = true
-base64.workspace = true
-tracing.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+uuid.workspace = true
 tokio.workspace = true
 http.workspace = true
 # AWS SDK: handles SigV4 + retries + binary event-stream framing.
@@ -36,6 +38,9 @@ http.workspace = true
 aws-config.workspace = true
 aws-sdk-bedrockruntime.workspace = true
 aws-credential-types.workspace = true
+aws-sigv4.workspace = true
+reqwest.workspace = true
+futures.workspace = true
 aws-smithy-async.workspace = true
 aws-smithy-runtime-api.workspace = true
 aws-smithy-types.workspace = true

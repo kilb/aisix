@@ -1,6 +1,6 @@
 //! `*` wildcard matching, shared by the access lists (API-key
-//! `allowed_models` / `allowed_tools` / `allowed_agents` / `allowed_routes`,
-//! MCP policy allow and deny, forwarded client headers) and the proxy's
+//! `allowed_models` / `allowed_agents` / `allowed_routes`, the MCP tool ACL
+//! layers' allow and deny, forwarded client headers) and the proxy's
 //! wildcard model resolution (`provider/*` aliases).
 //!
 //! [`wildcard_matches`] accepts any number of `*`, each matching any run of

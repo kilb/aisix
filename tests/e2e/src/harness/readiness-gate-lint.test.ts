@@ -117,6 +117,10 @@ describe("readiness gates imply what the spec then asserts", () => {
       "guardrail-monitor-mode-e2e.test.ts",
       "guardrail-monitor-provider-failure-e2e.test.ts",
       "guardrail-monitor-telemetry-e2e.test.ts",
+      // The anonymous settings row names the principal key's id, so it has to
+      // follow that key; the gate requires an anonymous tool listing, which
+      // only that row allows.
+      "mcp-anonymous-access-e2e.test.ts",
       "model-kind-dead-knobs-e2e.test.ts",
       "provider-key-tls-e2e.test.ts",
       "responses-streaming-monitor-guardrail-e2e.test.ts",

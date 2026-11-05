@@ -16,11 +16,29 @@
 //! business types in `models::AisixSnapshot`. This crate provides the
 //! primitive only.
 
+mod reclaim;
+
 use crate::resource::{Resource, ResourceEntry};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Retired configuration snapshots still held by an in-flight reader and
+/// so not yet freed.
+pub fn pending_reclaim() -> usize {
+    reclaim::pending()
+}
+
+/// Process-wide source of [`ResourceTable::generation`] stamps.
+///
+/// One counter for every table of every snapshot, so a stamp is unique
+/// across kinds and across rebuilds. That is what lets a derived cache
+/// compare two generations for equality and conclude "same rows": a
+/// table rebuilt from scratch (resync, cache restore) takes fresh stamps
+/// rather than replaying the previous snapshot's, so it can never
+/// coincide with the value a cache is holding.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Per-kind table with primary id-index and secondary name-index.
 ///
@@ -28,8 +46,9 @@ use std::sync::{Arc, Mutex};
 /// duplicate storage — the name map just holds ids.
 #[derive(Debug)]
 pub struct ResourceTable<T: Resource> {
-    by_id: DashMap<String, Arc<ResourceEntry<T>>>,
-    by_name: DashMap<String, String>,
+    // Index strings are immutable and shared across copy-on-write snapshots.
+    by_id: DashMap<Arc<str>, Arc<ResourceEntry<T>>>,
+    by_name: DashMap<Arc<str>, Arc<str>>,
     /// Ids of the entries whose name carries a `*`, maintained alongside
     /// `by_name` so it cannot drift from it.
     ///
@@ -39,18 +58,24 @@ pub struct ResourceTable<T: Resource> {
     /// on the metric-label path, which every endpoint reaches. Requests
     /// naming a model that resolves to nothing paid the same full scan
     /// before landing on the sentinel.
-    wildcards: DashMap<String, Arc<ResourceEntry<T>>>,
+    wildcards: DashMap<Arc<str>, Arc<ResourceEntry<T>>>,
     /// Cached entry count, maintained by [`ResourceTable::insert`] /
     /// [`ResourceTable::remove`]. DashMap's own `len()` / `is_empty()`
     /// visit every shard (a CAS pair per shard), so per-request
     /// emptiness checks on the hot path go through this counter
     /// instead — one relaxed load, O(1) regardless of shard count.
     count: AtomicUsize,
+    /// Stamp bumped on every mutation of THIS table and carried across
+    /// [`Clone`]. See [`ResourceTable::generation`].
+    generation: AtomicU64,
 }
 
-/// Manual impl: `AtomicUsize` is not `Clone`. The count is re-seeded
+/// Manual impl: the atomics are not `Clone`. The count is re-seeded
 /// from the cloned map's length, which the etcd watch supervisor's
-/// clone-then-mutate update cycle relies on being exact.
+/// clone-then-mutate update cycle relies on being exact. The generation
+/// is COPIED, not re-stamped: a clone holds the same rows, so a cache
+/// keyed on it must not be invalidated by the copy-on-write cycle that
+/// publishes an unrelated table's change.
 impl<T: Resource> Clone for ResourceTable<T> {
     fn clone(&self) -> Self {
         let by_id = self.by_id.clone();
@@ -60,6 +85,7 @@ impl<T: Resource> Clone for ResourceTable<T> {
             by_name: self.by_name.clone(),
             wildcards: self.wildcards.clone(),
             count,
+            generation: AtomicU64::new(self.generation.load(Ordering::Acquire)),
         }
     }
 }
@@ -71,6 +97,10 @@ impl<T: Resource> Default for ResourceTable<T> {
             by_name: DashMap::new(),
             wildcards: DashMap::new(),
             count: AtomicUsize::new(0),
+            // Empty and never mutated: an unconfigured kind keeps
+            // generation 0 forever, so two empty tables compare equal
+            // and no consumer rebuilds anything for them.
+            generation: AtomicU64::new(0),
         }
     }
 }
@@ -88,19 +118,54 @@ impl<T: Resource> ResourceTable<T> {
         self.len() == 0
     }
 
+    /// Invalidation key for anything DERIVED from this table's rows.
+    ///
+    /// Monotonic and unique process-wide: it changes whenever this table
+    /// is mutated and is carried unchanged across [`Clone`], so a cache
+    /// that keys on it rebuilds when — and only when — the rows it reads
+    /// actually changed.
+    ///
+    /// **Key derived caches on this, never on
+    /// [`SnapshotHandle::version`].** The snapshot version moves on every
+    /// published write of any kind, so keying on it makes an API-key edit
+    /// invalidate (say) the guardrail index, which is rebuilt
+    /// synchronously on the next request that resolves one. That is the
+    /// shape of AISIX-Cloud#1542. The snapshot version remains the right
+    /// tool for "has ANY configuration changed", such as an install guard
+    /// that must not publish an older build over a newer one.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Stamped AFTER the mutation lands, and released, so a reader that
+    /// observes a new generation also observes the rows behind it.
+    fn bump_generation(&self) {
+        self.generation.store(
+            NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
+            Ordering::Release,
+        );
+    }
+
     /// Insert or replace an entry, updating both indices.
     ///
     /// If an entry with the same id already exists, the old name index entry
     /// is removed first (handles rename on update).
     pub fn insert(&self, entry: ResourceEntry<T>) {
-        let id = entry.id.clone();
-        let name = entry.value.name().to_string();
+        self.insert_arc(Arc::new(entry));
+    }
 
-        if let Some(old) = self.by_id.get(&id) {
-            let old_name = old.value.name().to_string();
-            if old_name != name {
+    /// [`ResourceTable::insert`] for an entry already behind an `Arc` —
+    /// the copy-on-write path, where the new table shares the previous
+    /// snapshot's rows instead of deep-copying every payload.
+    pub fn insert_arc(&self, entry: Arc<ResourceEntry<T>>) {
+        let id: Arc<str> = Arc::from(entry.id.as_str());
+        let name: Arc<str> = Arc::from(entry.value.name());
+
+        if let Some(old) = self.by_id.get(id.as_ref()) {
+            let old_name = old.value.name();
+            if old_name != name.as_ref() {
                 // Only clear the old mapping if it still points at us.
-                self.by_name.remove_if(&old_name, |_, v| v == &id);
+                self.by_name.remove_if(old_name, |_, v| v == &id);
             }
         }
 
@@ -111,16 +176,16 @@ impl<T: Resource> ResourceTable<T> {
         // one redundant full scan, but can never skip an entry that is
         // already visible in the map.
         self.count.fetch_add(1, Ordering::Relaxed);
-        let entry = Arc::new(entry);
         if name.contains('*') {
             self.wildcards.insert(id.clone(), Arc::clone(&entry));
         } else {
             // A rename off a wildcard name must not leave the old row behind.
-            self.wildcards.remove(&id);
+            self.wildcards.remove(id.as_ref());
         }
         if self.by_id.insert(id, entry).is_some() {
             self.count.fetch_sub(1, Ordering::Relaxed);
         }
+        self.bump_generation();
     }
 
     /// Remove by id; also removes the matching name index entry.
@@ -128,8 +193,9 @@ impl<T: Resource> ResourceTable<T> {
         let (_, entry) = self.by_id.remove(id)?;
         self.wildcards.remove(id);
         self.count.fetch_sub(1, Ordering::Relaxed);
-        let name = entry.value.name().to_string();
-        self.by_name.remove_if(&name, |_, v| v == id);
+        let name = entry.value.name();
+        self.by_name.remove_if(name, |_, v| v.as_ref() == id);
+        self.bump_generation();
         Some(entry)
     }
 
@@ -138,6 +204,8 @@ impl<T: Resource> ResourceTable<T> {
     }
 
     pub fn get_by_name(&self, name: &str) -> Option<Arc<ResourceEntry<T>>> {
+        // Release the name shard before taking the id shard, since updates
+        // acquire them in the opposite order.
         let id = self.by_name.get(name)?.clone();
         self.get_by_id(&id)
     }
@@ -148,7 +216,7 @@ impl<T: Resource> ResourceTable<T> {
     pub fn name_conflicts(&self, name: &str, self_id: Option<&str>) -> bool {
         match self.by_name.get(name) {
             Some(existing_id) => match self_id {
-                Some(me) => existing_id.as_str() != me,
+                Some(me) => existing_id.as_ref() != me,
                 None => true,
             },
             None => false,
@@ -173,6 +241,22 @@ impl<T: Resource> ResourceTable<T> {
             return Vec::new();
         }
         self.by_id.iter().map(|kv| kv.value().clone()).collect()
+    }
+
+    /// Collect only matching rows without cloning handles for the rest of the
+    /// table. The predicate runs under a shard guard and must not reenter it.
+    pub fn matching_entries(
+        &self,
+        pred: impl Fn(&ResourceEntry<T>) -> bool,
+    ) -> Vec<Arc<ResourceEntry<T>>> {
+        if self.is_empty() {
+            return Vec::new();
+        }
+        self.by_id
+            .iter()
+            .filter(|kv| pred(kv.value()))
+            .map(|kv| kv.value().clone())
+            .collect()
     }
 
     /// True when any entry satisfies `pred`, without materialising the
@@ -216,6 +300,9 @@ impl<T: Resource> ResourceTable<T> {
 /// `SnapshotHandle<S>` is the type actually stored in axum state — consumers
 /// call [`SnapshotHandle::load`] on every request to get the current `Arc<S>`
 /// without any locking.
+/// Replaced snapshots are retained until their readers finish, then destroyed
+/// on a shared reclamation thread. The bounded retirement queue can apply
+/// backpressure to writers; readers never use that queue.
 ///
 /// The manual `Clone` impl deliberately does *not* require `S: Clone` — the
 /// handle only clones its inner `Arc`, the `S` is never duplicated.
@@ -223,6 +310,10 @@ impl<T: Resource> ResourceTable<T> {
 pub struct SnapshotHandle<S> {
     inner: Arc<ArcSwap<PublishedSnapshot<S>>>,
     listeners: Arc<SnapshotListeners<S>>,
+    /// Carries the version of every published snapshot, for consumers that
+    /// must act when configuration changes rather than when a request
+    /// happens to arrive. See [`Self::subscribe`].
+    published: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
 type SnapshotListener<S> = dyn Fn(SnapshotView<S>) + Send + Sync + 'static;
@@ -277,11 +368,12 @@ impl<S> Clone for SnapshotHandle<S> {
         Self {
             inner: Arc::clone(&self.inner),
             listeners: Arc::clone(&self.listeners),
+            published: Arc::clone(&self.published),
         }
     }
 }
 
-impl<S> SnapshotHandle<S> {
+impl<S: Send + Sync + 'static> SnapshotHandle<S> {
     pub fn new(initial: S) -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(PublishedSnapshot {
@@ -293,7 +385,18 @@ impl<S> SnapshotHandle<S> {
                 before_publish_callbacks: Mutex::new(Vec::new()),
                 callbacks: Mutex::new(Vec::new()),
             }),
+            published: Arc::new(tokio::sync::watch::channel(0).0),
         }
+    }
+
+    /// Wakes on every `store` / `rcu`, carrying the new
+    /// [`version`](Self::version). For work that must follow a
+    /// configuration change even when no request arrives — tearing down
+    /// what a deleted resource left running. A slow subscriber sees only
+    /// the latest version, so it must re-read the snapshot rather than
+    /// count wakes.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.published.subscribe()
     }
 
     /// Atomic load. Cheap (one Acquire load).
@@ -313,6 +416,13 @@ impl<S> SnapshotHandle<S> {
     /// Monotonic version counter. Incremented on every `store` / `rcu`.
     /// Consumers that also need the corresponding snapshot must use
     /// [`Self::load_versioned`] instead of a separate `version` + `load` pair.
+    ///
+    /// This answers "has ANY configuration changed", which is almost
+    /// never the question a cache of something DERIVED from the snapshot
+    /// is asking. Key those on [`ResourceTable::generation`] of the
+    /// tables they read instead: one API-key edit moves this counter, and
+    /// a cache keyed on it is then rebuilt on the request path of every
+    /// worker thread for a write it does not read (#1542).
     pub fn version(&self) -> u64 {
         self.inner.load().version
     }
@@ -322,7 +432,10 @@ impl<S> SnapshotHandle<S> {
     /// publication. It runs after the atomic swap and must not block or call
     /// `store`/`rcu` recursively. This is for revocation-sensitive derived
     /// state that cannot wait for request traffic to notice a new snapshot.
-    pub fn subscribe(&self, listener: impl Fn(SnapshotView<S>) + Send + Sync + 'static) {
+    pub fn subscribe_after_publish(
+        &self,
+        listener: impl Fn(SnapshotView<S>) + Send + Sync + 'static,
+    ) {
         let listener: Arc<SnapshotListener<S>> = Arc::new(listener);
         let _publication = self.listeners.publication.lock().unwrap();
         self.listeners
@@ -340,7 +453,7 @@ impl<S> SnapshotHandle<S> {
     ///
     /// Use this only for revocation-sensitive derived state: once generation
     /// N is observable, the callback has already revoked anything removed by
-    /// N. Ordinary observers should use [`Self::subscribe`].
+    /// N. Ordinary observers should use [`Self::subscribe_after_publish`].
     pub fn subscribe_before_publish(
         &self,
         listener: impl Fn(SnapshotView<S>) + Send + Sync + 'static,
@@ -373,8 +486,17 @@ impl<S> SnapshotHandle<S> {
             snapshot: Arc::clone(&published.snapshot),
         };
         Self::notify(&self.listeners.before_publish_callbacks, view.clone());
-        self.inner.store(published);
+        let previous = self.inner.swap(published);
+        self.published.send_replace(view.version);
         Self::notify(&self.listeners.callbacks, view);
+        // Retire the snapshot itself, not the publication wrapping it. A
+        // reader's `load` holds a clone of the inner `Arc`, which outlives the
+        // wrapper, so waiting on the wrapper alone would let that reader run
+        // the destructor on its request worker. Holding the inner `Arc` here
+        // keeps the reclaimer the last owner whichever reader finishes last.
+        let retired = Arc::clone(&previous.snapshot);
+        drop(previous);
+        reclaim::retire(retired);
     }
 
     /// Atomic store. Called by the etcd watch supervisor after building a
@@ -593,7 +715,7 @@ mod tests {
         let handle: SnapshotHandle<u64> = SnapshotHandle::new(3);
         let observed = Arc::new(Mutex::new(Vec::new()));
         let observed_for_listener = Arc::clone(&observed);
-        handle.subscribe(move |view| {
+        handle.subscribe_after_publish(move |view| {
             observed_for_listener
                 .lock()
                 .unwrap()
@@ -622,7 +744,7 @@ mod tests {
             let listener_observed = Arc::clone(&observed);
             let listener_release = Arc::clone(&release_initial_rx);
             scope.spawn(move || {
-                subscriber.subscribe(move |view| {
+                subscriber.subscribe_after_publish(move |view| {
                     listener_observed
                         .lock()
                         .unwrap()
@@ -700,6 +822,25 @@ mod tests {
         let published = handle.load_versioned();
         assert_eq!(published.version, 1);
         assert_eq!(*published.snapshot, 1);
+    }
+
+    /// The watch channel and the listeners share one publication path, so a
+    /// woken subscriber must find the snapshot it was woken for already loadable.
+    #[test]
+    fn watch_subscriber_tracks_store_and_rcu_with_the_snapshot_visible() {
+        let handle: SnapshotHandle<u64> = SnapshotHandle::new(0);
+        let published = handle.subscribe();
+        assert_eq!(*published.borrow(), 0);
+
+        handle.store(5);
+        assert_eq!(*published.borrow(), 1);
+        assert_eq!(*handle.load(), 5);
+
+        handle.rcu(|value| value + 1);
+        assert_eq!(*published.borrow(), 2);
+        let view = handle.load_versioned();
+        assert_eq!(view.version, 2);
+        assert_eq!(*view.snapshot, 6);
     }
 
     #[test]

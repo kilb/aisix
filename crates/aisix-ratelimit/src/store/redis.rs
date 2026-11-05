@@ -11,14 +11,13 @@
 //! Cluster slot, keeping the per-bucket Lua atomic):
 //! - `aisix:rl:{<bucket>}:<rps|rpm|rph|rpd|tpm|tph|tpd>:<window_start>` — plain
 //!   `INCR`/`GET` counters, `EXPIRE = window + grace`.
-//! - `aisix:rl:{<bucket>}:conc` — a ZSET (`member → score=server_time_ms`)
-//!   acting as a
-//!   crash-safe distributed semaphore: acquire prunes entries older than
-//!   `conc_ttl` then counts, so a slot leaked by a crashed/hung replica is
-//!   reclaimed within `conc_ttl`. (LiteLLM's latest tracks parallel
-//!   requests as a window-TTL counter; we use a ZSET with a request-
-//!   lifetime ttl because our streaming requests can outlive a 60s window
-//!   — the same reason `StreamConcurrencyGuard`/#450 exists.)
+//! - `aisix:rl:{<bucket>}:conc` — a ZSET (`member → last-refresh time`) acting
+//!   as a crash-safe distributed semaphore: acquire prunes stale entries then
+//!   counts, so a slot leaked by a crashed/hung replica is reclaimed after its
+//!   `conc_ttl` (with at most one extra second for rolling-upgrade safety).
+//!   Live streams renew their member while their `StreamConcurrencyGuard`
+//!   exists, so a deliberately long SSE response is not mistaken for a
+//!   crashed replica.
 //!
 //! `now` is read from `redis.call('TIME')` inside every script so window
 //! boundaries are identical across replicas regardless of host clock skew.
@@ -46,15 +45,15 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use aisix_core::{RateLimit, RedisConnConfig};
-use aisix_redis::RedisConn;
+use aisix_redis::{ConnSlot, FailurePolicy};
 use async_trait::async_trait;
+use dashmap::DashMap;
 use redis::Script;
 
-use super::{local::LocalStore, token_dims, Dim, RateStore};
-use crate::error::RateLimitError;
+use super::{local::LocalStore, token_dims, Dim, RateStore, StreamLeaseRefresh};
+use crate::error::{LimitDetail, RateLimitError};
 use crate::limiter::RateLimitStatus;
 
 /// Default key namespace, kept distinct from `aisix:cache` so the same
@@ -67,9 +66,6 @@ pub const DEFAULT_CONC_TTL_SECS: u64 = 300;
 /// Extra seconds added to each window counter's TTL so a counter doesn't
 /// expire a hair before its window mathematically closes.
 pub const DEFAULT_GRACE_SECS: u64 = 5;
-/// Post-stream accounting runs from synchronous stream-finalization callbacks.
-/// Bound Redis work so a half-open server cannot pin the worker's own runtime.
-const POST_STREAM_REDIS_TIMEOUT: Duration = Duration::from_secs(1);
 /// Depth of the post-stream accounting queue.
 ///
 /// Bounded on purpose. Token accounting is after-the-fact billing and must
@@ -79,17 +75,36 @@ const POST_STREAM_REDIS_TIMEOUT: Duration = Duration::from_secs(1);
 /// which runs on the serving thread, and in thread-per-core mode that thread
 /// is the whole core's event loop.
 const POST_STREAM_QUEUE_DEPTH: usize = 8192;
-/// How long `connect` waits for the accounting worker to report its Redis
-/// connection. Boot-time only — no request path ever waits on this.
-const POST_STREAM_WORKER_READY_TIMEOUT: Duration = Duration::from_millis(1_250);
+/// How often a gateway that started without its shared backend re-states
+/// that it is still counting per replica. Long enough that a Redis which
+/// is merely late says nothing beyond the boot WARN, short enough that a
+/// permanent misconfiguration is greppable in any retained log window.
+const DEGRADED_REMINDER: std::time::Duration = std::time::Duration::from_secs(300);
 
 // Result codes returned by the acquire script's first element.
+/// Dimension name reported when the script names an index this build
+/// no longer knows — only reachable if the script and the caller ever
+/// disagree on the dimension list, which they cannot today (both come
+/// from the same `request_dims` / `token_dims` call).
+const UNKNOWN_DIMENSION: &str = "unknown";
+
 const CODE_OK: i64 = 0;
 const CODE_CONCURRENCY: i64 = 1;
 const CODE_TOKENS: i64 = 2;
 const CODE_REQUESTS: i64 = 3;
 /// 累计发放额用尽。没有 retry_after —— 它不会自己回来。
 const CODE_ALLOWANCE: i64 = 4;
+
+/// What this process knows about one live concurrency member. A Redis command
+/// can fail after the server applies its Lua mutation but before the client
+/// receives a reply, so "not confirmed" is not always the same as "local
+/// only".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeaseOwnership {
+    ConfirmedRedis,
+    LocalOnly,
+    Unknown,
+}
 
 /// Atomic per-bucket acquire: concurrency gate + token check-only +
 /// request check-and-increment, all-or-nothing. See module docs for the
@@ -99,22 +114,35 @@ local prefix = ARGV[1]
 local member = ARGV[2]
 local conc_max = tonumber(ARGV[3])
 local conc_ttl = tonumber(ARGV[4])
-local grace = tonumber(ARGV[5])
+local conc_key_ttl = tonumber(ARGV[5])
+local grace = tonumber(ARGV[6])
 -- granted 追加在**所有**可变长参数之后（见脚本末尾的 idx），不能插在这里：
--- 插在中间会把 idx = 6 起的那串请求/token 三元组整体错位。
+-- 插在中间会把 idx = 7 起的那串请求/token 三元组整体错位。
 local t = redis.call('TIME')
 local now = tonumber(t[1])
-local now_ms = now * 1000 + math.floor(tonumber(t[2]) / 1000)
+-- Keep the score in seconds so rolling upgrades still understand existing
+-- integer-second members, but retain Redis TIME's sub-second precision for
+-- a live lease.
+local conc_now = now + tonumber(t[2]) / 1000000
+-- Old nodes wrote integer-second scores. Prune at a whole-second boundary so
+-- a new node cannot mistake an old member acquired late in that second for a
+-- stale member; the safe cost is at most one extra second of retention.
+local conc_prune_before = math.floor(conc_now) - conc_ttl
 
 local conc_key = prefix .. ':conc'
 if conc_max >= 0 then
-  redis.call('ZREMRANGEBYSCORE', conc_key, 0, now_ms - conc_ttl * 1000)
-  if redis.call('ZCARD', conc_key) >= conc_max then
-    return {1, 0}
+  redis.call('ZREMRANGEBYSCORE', conc_key, 0, '(' .. conc_prune_before)
+  -- 合并 upstream 之前本仓库的分数是毫秒（约 1.7e12），落不进上面按秒算的范围，
+  -- 崩溃副本留下的旧成员就永远占着一个并发位。按毫秒再清一遍；秒制分数要到公元
+  -- 5138 年才到 1e11，碰不到新格式的成员。
+  redis.call('ZREMRANGEBYSCORE', conc_key, 100000000000, conc_prune_before * 1000)
+  local in_flight = redis.call('ZCARD', conc_key)
+  if in_flight >= conc_max then
+    return {1, 0, 0, conc_max, in_flight}
   end
 end
 
-local idx = 6
+local idx = 7
 local nreq = tonumber(ARGV[idx]); idx = idx + 1
 local req = {}
 for i = 1, nreq do
@@ -143,9 +171,11 @@ for i = 1, ntok do
   local name, window, limit = tok[i][1], tok[i][2], tok[i][3]
   local ws = now - (now % window)
   local cur = tonumber(redis.call('GET', prefix .. ':' .. name .. ':' .. ws) or '0')
+  -- `>=`, matching the local backend: a token window whose committed
+  -- usage has reached the cap is spent, not still admissible (#950).
   if cur >= limit then
     local retry = window - (now - ws); if retry < 1 then retry = 1 end
-    return {2, retry}
+    return {2, retry, i, limit, cur}
   end
 end
 
@@ -155,7 +185,7 @@ for i = 1, nreq do
   local cur = tonumber(redis.call('GET', prefix .. ':' .. name .. ':' .. ws) or '0')
   if cur + 1 > limit then
     local retry = window - (now - ws); if retry < 1 then retry = 1 end
-    return {3, retry}
+    return {3, retry, i, limit, cur}
   end
 end
 
@@ -168,10 +198,28 @@ for i = 1, nreq do
   end
 end
 if conc_max >= 0 then
-  redis.call('ZADD', conc_key, now_ms, member)
-  redis.call('EXPIRE', conc_key, conc_ttl)
+  redis.call('ZADD', conc_key, conc_now, member)
+  redis.call('EXPIRE', conc_key, conc_key_ttl)
 end
-return {0, 0}
+return {0, 0, 0, 0, 0}
+"#;
+
+/// Refresh one live streaming member's concurrency lease. The member must
+/// already exist: refresh racing stream teardown must not resurrect a member
+/// after `release` removed it. ARGV: prefix, member, conc_key_ttl.
+const REFRESH_CONCURRENCY_LUA: &str = r#"
+local prefix = ARGV[1]
+local member = ARGV[2]
+local conc_key_ttl = tonumber(ARGV[3])
+local conc_key = prefix .. ':conc'
+if not redis.call('ZSCORE', conc_key, member) then
+  return 0
+end
+local t = redis.call('TIME')
+local conc_now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+redis.call('ZADD', conc_key, 'XX', conc_now, member)
+redis.call('EXPIRE', conc_key, conc_key_ttl)
+return 1
 "#;
 
 /// Post-deduct: add `tokens` to the tpm/tph/tpd windows AND release the
@@ -198,26 +246,6 @@ if tokens > 0 then
   redis.call('INCRBY', prefix .. ':consumed', tokens)
 end
 redis.call('ZREM', prefix .. ':conc', member)
-return 1
-"#;
-
-/// Refresh an existing concurrency member without recreating one that a
-/// racing completion already released. ARGV: prefix, member, conc_ttl.
-const RENEW_CONCURRENCY_LUA: &str = r#"
-local prefix = ARGV[1]
-local member = ARGV[2]
-local conc_ttl = tonumber(ARGV[3])
-local conc_key = prefix .. ':conc'
-if not redis.call('ZSCORE', conc_key, member) then
-  return 0
-end
-local t = redis.call('TIME')
-local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
--- XX is a second, command-level guarantee that a future refactor cannot
--- recreate a member already removed by commit/release. The enclosing Lua
--- script is atomic, so the ZSCORE result cannot change before this update.
-redis.call('ZADD', conc_key, 'XX', now_ms, member)
-redis.call('EXPIRE', conc_key, conc_ttl)
 return 1
 "#;
 
@@ -253,26 +281,38 @@ local prefix = ARGV[1]
 local conc_ttl = tonumber(ARGV[2])
 local t = redis.call('TIME')
 local now = tonumber(t[1])
-local now_ms = now * 1000 + math.floor(tonumber(t[2]) / 1000)
+local conc_now = now + tonumber(t[2]) / 1000000
+-- See ACQUIRE_LUA: use the same conservative boundary so header reads do not
+-- prune a live member while a rolling upgrade is in progress.
+local conc_prune_before = math.floor(conc_now) - conc_ttl
 local ws = now - (now % 60)
 local rpm = tonumber(redis.call('GET', prefix .. ':rpm:' .. ws) or '0')
 local tpm = tonumber(redis.call('GET', prefix .. ':tpm:' .. ws) or '0')
-redis.call('ZREMRANGEBYSCORE', prefix .. ':conc', 0, now_ms - conc_ttl * 1000)
+redis.call('ZREMRANGEBYSCORE', prefix .. ':conc', 0, '(' .. conc_prune_before)
+-- See ACQUIRE_LUA: the millisecond scores written before this format.
+redis.call('ZREMRANGEBYSCORE', prefix .. ':conc', 100000000000, conc_prune_before * 1000)
 local inflight = redis.call('ZCARD', prefix .. ':conc')
 return {rpm, tpm, inflight, 60 - (now % 60)}
 "#;
 
 pub struct RedisStore {
-    conn: RedisConn,
+    conn: ConnSlot,
     post_stream_tx: tokio::sync::mpsc::Sender<PostStreamTokenAdd>,
     prefix: String,
     conc_ttl: u64,
     grace: u64,
     /// Per-process fallback used when Redis is unreachable (fail-open).
     local: Arc<LocalStore>,
+    /// Per-reservation ownership provenance for stream lease refreshes.
+    /// Only a `ConfirmedRedis` member may turn a healthy ZSET miss into a
+    /// terminal signal; a timeout after dispatch is deliberately `Unknown`.
+    lease_members: DashMap<(String, String), LeaseOwnership>,
     /// One-shot guard so the degradation warning is logged once, not per
-    /// request, while Redis stays down.
-    degraded_logged: AtomicBool,
+    /// request, while Redis stays down. Shared with the boot attach task,
+    /// which starts it already set (the boot WARN said it) and clears it
+    /// on attach so the NEXT outage still warns even if no store
+    /// operation succeeded in between.
+    degraded_logged: Arc<AtomicBool>,
     shed_logged: AtomicBool,
     /// Optional observability seam. Failing open to per-replica counting is
     /// the event an operator alerts on, and until this existed the store
@@ -284,6 +324,8 @@ pub struct RedisStore {
 struct PostStreamTokenAdd {
     prefix: String,
     tokens: u64,
+    /// 随命令带上：worker 在 `with_metrics` 之前就已经起来了。
+    metrics: Option<Arc<dyn aisix_core::RateLimitMetricsSink>>,
 }
 
 /// What happened to one update offered to the accounting queue.
@@ -321,7 +363,65 @@ impl RedisStore {
     /// [`aisix_redis::connect`].
     pub async fn connect(cfg: &RedisConnConfig) -> Result<Self, redis::RedisError> {
         let conn = aisix_redis::connect(cfg).await?;
-        let post_stream_tx = spawn_post_stream_worker(cfg.clone(), DEFAULT_GRACE_SECS)?;
+        Self::with_slot(ConnSlot::filled(conn), Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Connect for the boot path: bounded by `ratelimit.redis.timeout_secs`
+    /// and never fatal.
+    ///
+    /// The gateway must bind its listeners whether or not Redis is up —
+    /// the node-reboot case has Redis coming up *after* the gateway, and
+    /// a gateway that refuses to serve until its
+    /// rate-limit counters are shareable trades an availability outage for
+    /// an accuracy one. So a connection that does not land inside the
+    /// budget leaves the store in its ordinary degraded state (per-replica
+    /// in-memory counting) and a background task attaches the shared
+    /// backend the moment Redis answers. The returned error is the boot
+    /// diagnostic, not a failure: it is `Some` exactly when the store
+    /// started degraded.
+    ///
+    /// Note what this does NOT do: fall back to the `memory` backend. That
+    /// would be permanent, and the operator asked for cluster-wide
+    /// counting.
+    ///
+    /// The outer `Err` is the one failure that is still fatal: a config
+    /// the driver can never use, which no amount of retrying fixes and
+    /// which the operator needs told loudly rather than degraded around.
+    /// A process that cannot start the accounting worker's thread ends up
+    /// here too: without it spend never reaches the shared counters.
+    pub async fn connect_or_attach_later(
+        cfg: &RedisConnConfig,
+    ) -> Result<(Self, Option<redis::RedisError>), redis::RedisError> {
+        let policy = FailurePolicy::new(cfg);
+        match aisix_redis::connect_bounded(cfg, &policy).await {
+            Ok(conn) => Ok((
+                Self::with_slot(ConnSlot::filled(conn), Arc::new(AtomicBool::new(false)))?,
+                None,
+            )),
+            // Only configuration the process rejected by itself. A
+            // server that answered and refused is degraded around like
+            // an outage: it can be corrected on the server side while
+            // this gateway keeps serving, and the re-attach below picks
+            // that up without a restart.
+            Err(e) if aisix_redis::is_boot_fatal(&e) => Err(e),
+            Err(e) => {
+                let slot = ConnSlot::empty();
+                // Already "logged": the caller WARNs this failure itself,
+                // naming the endpoint, so the first degraded request must
+                // not repeat it.
+                let degraded_logged = Arc::new(AtomicBool::new(true));
+                let store = Self::with_slot(slot.clone(), Arc::clone(&degraded_logged))?;
+                spawn_attach(slot, degraded_logged, cfg.clone(), policy);
+                Ok((store, Some(e)))
+            }
+        }
+    }
+
+    fn with_slot(
+        conn: ConnSlot,
+        degraded_logged: Arc<AtomicBool>,
+    ) -> Result<Self, redis::RedisError> {
+        let post_stream_tx = spawn_post_stream_worker(conn.clone(), DEFAULT_GRACE_SECS)?;
         Ok(Self {
             conn,
             post_stream_tx,
@@ -329,10 +429,18 @@ impl RedisStore {
             conc_ttl: DEFAULT_CONC_TTL_SECS,
             grace: DEFAULT_GRACE_SECS,
             local: Arc::new(LocalStore::new()),
-            degraded_logged: AtomicBool::new(false),
+            lease_members: DashMap::new(),
+            degraded_logged,
             shed_logged: AtomicBool::new(false),
             metrics: None,
         })
+    }
+
+    /// Publish this store's degradations to `metrics`. Wired by the server
+    /// bootstrap; absent in tests.
+    pub fn with_metrics(mut self, metrics: Arc<dyn aisix_core::RateLimitMetricsSink>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     pub fn with_conc_ttl(mut self, secs: u64) -> Self {
@@ -388,19 +496,15 @@ impl RedisStore {
         }
     }
 
-    /// Publish this store's degradations to `metrics`. Wired by the server
-    /// bootstrap; absent in tests.
-    pub fn with_metrics(mut self, metrics: Arc<dyn aisix_core::RateLimitMetricsSink>) -> Self {
-        self.metrics = Some(metrics);
-        self
+    /// Count the failure and log the fail-open transition once per
+    /// outage. Every failed operation counts; only the first logs.
+    fn note_failure(&self, op: &str, err: &redis::RedisError) {
+        record_failure(&self.metrics, op);
+        self.warn_degraded(op, err);
     }
 
+    /// Log the fail-open transition once per outage.
     fn warn_degraded(&self, op: &str, err: &redis::RedisError) {
-        // Counted on every failure, not once per outage: the warn below is
-        // deduplicated for log volume, but a rate needs every sample.
-        if let Some(m) = &self.metrics {
-            m.record_redis_failure(op);
-        }
         if !self.degraded_logged.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 target: "aisix::ratelimit",
@@ -428,8 +532,15 @@ fn post_stream_worker_error(detail: impl Into<String>) -> redis::RedisError {
     ))
 }
 
+/// Start the store-owned accounting worker.
+///
+/// The serving path only offers to its queue; the Redis I/O runs on this
+/// thread's own runtime. It works through the store's own connection slot, so
+/// a backend attached after boot serves accounting and the request path in
+/// one step, and one outage trips one breaker. Each command is bounded by that
+/// connection's command budget.
 fn spawn_post_stream_worker(
-    cfg: RedisConnConfig,
+    conn: ConnSlot,
     grace: u64,
 ) -> Result<tokio::sync::mpsc::Sender<PostStreamTokenAdd>, redis::RedisError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -437,75 +548,45 @@ fn spawn_post_stream_worker(
         .build()
         .map_err(|err| post_stream_worker_error(err.to_string()))?;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<PostStreamTokenAdd>(POST_STREAM_QUEUE_DEPTH);
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("aisix-ratelimit-commit".to_string())
         .spawn(move || {
             runtime.block_on(async move {
-                let conn = match tokio::time::timeout(
-                    POST_STREAM_REDIS_TIMEOUT,
-                    aisix_redis::connect(&cfg),
-                )
-                .await
-                {
-                    Ok(Ok(conn)) => {
-                        let _ = ready_tx.send(Ok(()));
-                        conn
-                    }
-                    Ok(Err(err)) => {
-                        let _ = ready_tx.send(Err(err));
-                        return;
-                    }
-                    Err(_) => {
-                        let _ = ready_tx.send(Err(post_stream_worker_error(
-                            "Redis post-stream worker connection timed out",
-                        )));
-                        return;
-                    }
-                };
+                // 启动时没连上的 store 每笔记账都会失败，可能持续几个小时：
+                // 计数每笔都记，日志一轮故障只打一条。
+                let warned = Arc::new(AtomicBool::new(false));
                 while let Some(command) = rx.recv().await {
                     let conn = conn.clone();
+                    let warned = Arc::clone(&warned);
                     tokio::spawn(async move {
-                        let result = match tokio::time::timeout(
-                            POST_STREAM_REDIS_TIMEOUT,
-                            add_tokens_remote(&conn, &command.prefix, command.tokens, grace),
-                        )
-                        .await
-                        {
-                            Ok(result) => result,
-                            Err(_) => {
-                                conn.note_error().await;
-                                Err(post_stream_worker_error(
-                                    "Redis post-stream token update timed out",
-                                ))
-                            }
-                        };
+                        let result =
+                            add_tokens_remote(&conn, &command.prefix, command.tokens, grace).await;
                         // Nobody is waiting on this: report it here or it is
                         // invisible.
-                        if let Err(err) = result {
-                            tracing::warn!(
-                                target: "aisix::ratelimit",
-                                error = %err,
-                                "post-stream token accounting failed; the local counter still \
-                                 reflects it but this replica's Redis total does not"
-                            );
+                        match result {
+                            Ok(()) => warned.store(false, Ordering::Relaxed),
+                            Err(err) => {
+                                record_failure(&command.metrics, "add_tokens");
+                                if !warned.swap(true, Ordering::Relaxed) {
+                                    tracing::warn!(
+                                        target: "aisix::ratelimit",
+                                        error = %err,
+                                        "post-stream token accounting failed; the local counter \
+                                         still reflects it but this replica's Redis total does not"
+                                    );
+                                }
+                            }
                         }
                     });
                 }
             });
         })
         .map_err(|err| post_stream_worker_error(err.to_string()))?;
-    match ready_rx
-        .recv_timeout(POST_STREAM_WORKER_READY_TIMEOUT)
-        .unwrap_or_else(|err| Err(post_stream_worker_error(err.to_string())))
-    {
-        Ok(()) => Ok(tx),
-        Err(err) => Err(err),
-    }
+    Ok(tx)
 }
 
 async fn add_tokens_remote(
-    conn: &RedisConn,
+    conn: &ConnSlot,
     prefix: &str,
     tokens: u64,
     grace: u64,
@@ -524,6 +605,111 @@ async fn add_tokens_remote(
             conn.note_error().await;
             Err(err)
         }
+    }
+}
+
+/// Keep trying the shared backend until it answers, then attach it.
+///
+/// The cadence is the configured budget, not the breaker's cool-off
+/// window: the reason the request-path prober waits a whole window is
+/// that a probe against a still-dead Redis costs a caller its budget,
+/// and nothing here is billed to a caller. What it buys instead is the
+/// case this exists for — Redis coming up seconds after the gateway on a
+/// node reboot — recovering in seconds rather than half a minute.
+///
+/// One attempt per iteration, and `connect_bounded` bounds each one, so
+/// an unreachable Redis costs one connect attempt per sleep-plus-budget
+/// for as long as the outage lasts.
+///
+/// A permanent misconfiguration — a wrong host, a dead Redis, an
+/// unreachable subnet — used to announce itself by killing the boot. Now
+/// it is a gateway with a healthy `/livez` that quietly never enforces a
+/// cluster-wide limit, and the only other trace is
+/// `aisix_redis_failures_total`, which moves only while rate-limited
+/// traffic actually arrives. So the retry re-states it at WARN on
+/// [`DEGRADED_REMINDER`], leaving the individual attempts at debug.
+fn spawn_attach(
+    slot: ConnSlot,
+    degraded_logged: Arc<AtomicBool>,
+    cfg: RedisConnConfig,
+    policy: FailurePolicy,
+) {
+    tokio::spawn(async move {
+        let retry = std::time::Duration::from_secs(cfg.timeout_secs.max(1));
+        let endpoint = aisix_redis::endpoint_label(&cfg);
+        let mut last_reminder = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(retry).await;
+            match aisix_redis::connect_bounded(&cfg, &policy).await {
+                Ok(conn) => {
+                    slot.attach(conn);
+                    // Re-arm the store's one-shot degradation warning:
+                    // it was set at boot so the first degraded request
+                    // would not repeat the boot WARN, and a LATER outage
+                    // has to be able to warn again even if no store
+                    // operation succeeded in between (which is what
+                    // `mark_ok` would otherwise be relied on for).
+                    degraded_logged.store(false, Ordering::Relaxed);
+                    tracing::info!(
+                        target: "aisix::ratelimit",
+                        %endpoint,
+                        "shared rate-limit backend attached; cluster-wide counting resumes"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    if last_reminder.elapsed() >= DEGRADED_REMINDER {
+                        last_reminder = std::time::Instant::now();
+                        // Same `reason` the boot line carried, so the two
+                        // read as one story and one filter finds both. A
+                        // server that answers and refuses is not an
+                        // outage, and saying "unreachable" about it sends
+                        // the operator to the network.
+                        let reason = aisix_redis::failure_reason(&e);
+                        if reason == "refused" {
+                            tracing::warn!(
+                                target: "aisix::ratelimit",
+                                %endpoint,
+                                %reason,
+                                error = %e,
+                                "shared rate-limit backend is still REFUSING the configured \
+                                 connection settings; cluster-wide rate limits are NOT \
+                                 enforced and counting stays per-replica"
+                            );
+                        } else {
+                            tracing::warn!(
+                                target: "aisix::ratelimit",
+                                %endpoint,
+                                %reason,
+                                error = %e,
+                                "shared rate-limit backend still unreachable; cluster-wide \
+                                 rate limits are NOT enforced and counting stays per-replica"
+                            );
+                        }
+                    } else {
+                        tracing::debug!(
+                            target: "aisix::ratelimit",
+                            %endpoint,
+                            error = %e,
+                            retry_secs = retry.as_secs(),
+                            "shared rate-limit backend still unreachable; per-replica \
+                             counting continues"
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Bump `aisix_redis_failures_total` for one failed rate-limit store
+/// operation. The sink is told the store call; `Metrics`' implementation of
+/// it qualifies the label (`ratelimit_acquire`), because a deployment points
+/// the limiter and the caches at the same Redis, and a bare `acquire` could
+/// have come from either.
+fn record_failure(metrics: &Option<Arc<dyn aisix_core::RateLimitMetricsSink>>, op: &str) {
+    if let Some(m) = metrics {
+        m.record_redis_failure(op);
     }
 }
 
@@ -550,6 +736,9 @@ impl RateStore for RedisStore {
             member.to_string(),
             limits.concurrency.map(i64::from).unwrap_or(-1).to_string(),
             self.conc_ttl.to_string(),
+            // Pruning retains a pre-upgrade integer-second member through its
+            // boundary, so the key must survive for the same extra second.
+            self.conc_ttl.saturating_add(1).to_string(),
             self.grace.to_string(),
         ];
         push_dims(&mut args, &super::request_dims(limits));
@@ -574,8 +763,15 @@ impl RateStore for RedisStore {
         let mut conn = match self.conn.acquire().await {
             Ok(c) => c,
             Err(e) => {
-                self.warn_degraded("acquire", &e);
-                return self.local.acquire(key, limits, member).await;
+                self.note_failure("acquire", &e);
+                let acquired = self.local.acquire(key, limits, member).await;
+                if acquired.is_ok() && limits.concurrency.is_some() {
+                    self.lease_members.insert(
+                        (key.to_string(), member.to_string()),
+                        LeaseOwnership::LocalOnly,
+                    );
+                }
+                return acquired;
             }
         };
         match invocation.invoke_async::<Vec<i64>>(&mut conn).await {
@@ -586,35 +782,77 @@ impl RateStore for RedisStore {
                 self.local.note_allowance(key, limits);
                 let code = reply.first().copied().unwrap_or(CODE_OK);
                 let retry = reply.get(1).copied().unwrap_or(0).max(0) as u64;
+                // The script reports which dimension refused as its
+                // 1-based index into the same `request_dims` /
+                // `token_dims` vectors this call pushed into ARGV, so
+                // the name never has to cross the wire.
+                let refused = |dims: &[super::Dim]| {
+                    let idx = reply.get(2).copied().unwrap_or(0);
+                    let name = usize::try_from(idx)
+                        .ok()
+                        .and_then(|i| i.checked_sub(1))
+                        .and_then(|i| dims.get(i))
+                        .map(|d| d.name)
+                        .unwrap_or(UNKNOWN_DIMENSION);
+                    let limit = reply.get(3).copied().unwrap_or(0).max(0) as u64;
+                    let used = reply.get(4).copied().unwrap_or(0).max(0) as u64;
+                    LimitDetail::window(name, limit, used, retry)
+                };
                 match code {
-                    CODE_OK => Ok(()),
-                    CODE_CONCURRENCY => Err(RateLimitError::Concurrency),
+                    CODE_OK => {
+                        if limits.concurrency.is_some() {
+                            self.lease_members.insert(
+                                (key.to_string(), member.to_string()),
+                                LeaseOwnership::ConfirmedRedis,
+                            );
+                        }
+                        Ok(())
+                    }
+                    CODE_CONCURRENCY => {
+                        let limit = reply.get(3).copied().unwrap_or(0).max(0) as u64;
+                        let in_flight = reply.get(4).copied().unwrap_or(0).max(0) as u64;
+                        Err(RateLimitError::Concurrency {
+                            detail: LimitDetail::concurrency(limit, in_flight),
+                        })
+                    }
                     CODE_TOKENS => Err(RateLimitError::Tokens {
                         scope: aisix_core::RateLimitScope::Tokens,
-                        retry_after_secs: retry,
+                        detail: refused(&token_dims(limits)),
                     }),
                     CODE_REQUESTS => Err(RateLimitError::Requests {
                         scope: aisix_core::RateLimitScope::Requests,
-                        retry_after_secs: retry,
+                        detail: refused(&super::request_dims(limits)),
                     }),
                     CODE_ALLOWANCE => Err(RateLimitError::AllowanceExhausted),
                     _ => Ok(()),
                 }
             }
             Err(e) => {
-                self.warn_degraded("acquire", &e);
+                self.note_failure("acquire", &e);
                 self.conn.note_error().await;
-                self.local.acquire(key, limits, member).await
+                let acquired = self.local.acquire(key, limits, member).await;
+                if acquired.is_ok() && limits.concurrency.is_some() {
+                    // A reply can be lost after Redis has already applied the
+                    // Lua acquire. Probe on refresh rather than assuming the
+                    // local fallback was the only reservation.
+                    self.lease_members.insert(
+                        (key.to_string(), member.to_string()),
+                        LeaseOwnership::Unknown,
+                    );
+                }
+                acquired
             }
         }
     }
 
     async fn commit(&self, key: &str, tokens: u64, member: &str) {
+        self.lease_members
+            .remove(&(key.to_string(), member.to_string()));
         let prefix = self.bucket_prefix(key);
         let mut conn = match self.conn.acquire().await {
             Ok(c) => c,
             Err(e) => {
-                self.warn_degraded("commit", &e);
+                self.note_failure("commit", &e);
                 return self.local.commit(key, tokens, member).await;
             }
         };
@@ -639,55 +877,32 @@ impl RateStore for RedisStore {
                 self.local.release(key, member);
             }
             Err(e) => {
-                self.warn_degraded("commit", &e);
+                self.note_failure("commit", &e);
                 self.conn.note_error().await;
                 self.local.commit(key, tokens, member).await;
             }
         }
     }
 
-    fn concurrency_lease_renewal_interval(&self) -> Option<Duration> {
-        let millis = self.conc_ttl.saturating_mul(1_000) / 3;
-        Some(Duration::from_millis(millis.max(100)))
-    }
-
-    async fn renew_concurrency_lease(&self, key: &str, member: &str) {
-        let prefix = self.bucket_prefix(key);
-        let mut conn = match self.conn.acquire().await {
-            Ok(c) => c,
-            Err(e) => {
-                self.warn_degraded("renew_concurrency_lease", &e);
-                return;
-            }
-        };
-        let res: Result<i64, redis::RedisError> = Script::new(RENEW_CONCURRENCY_LUA)
-            .key(&prefix)
-            .arg(&prefix)
-            .arg(member)
-            .arg(self.conc_ttl)
-            .invoke_async(&mut conn)
-            .await;
-        match res {
-            Ok(_) => self.mark_ok(),
-            Err(e) => {
-                self.warn_degraded("renew_concurrency_lease", &e);
-                self.conn.note_error().await;
-            }
-        }
-    }
-
     fn release(&self, key: &str, member: &str) {
+        self.lease_members
+            .remove(&(key.to_string(), member.to_string()));
         // Drop the local slot first (a cheap no-op when the bucket was
         // never acquired locally); covers the degraded-acquire case.
         self.local.release(key, member);
         let conc_key = format!("{}:conc", self.bucket_prefix(key));
         let conn = self.conn.clone();
         let member = member.to_string();
+        let metrics = self.metrics.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 // ZREM's first arg is the key, so Redis Cluster routes it.
-                let Ok(mut c) = conn.acquire().await else {
-                    return;
+                let mut c = match conn.acquire().await {
+                    Ok(c) => c,
+                    Err(_) => {
+                        record_failure(&metrics, "release");
+                        return;
+                    }
                 };
                 let res: Result<(), redis::RedisError> = redis::cmd("ZREM")
                     .arg(&conc_key)
@@ -695,6 +910,10 @@ impl RateStore for RedisStore {
                     .query_async(&mut c)
                     .await;
                 if res.is_err() {
+                    // The detached tasks are the only Redis failures with
+                    // no log at all — nothing awaits them, so the counter
+                    // is their only trace.
+                    record_failure(&metrics, "release");
                     conn.note_error().await;
                 }
             });
@@ -731,6 +950,7 @@ impl RateStore for RedisStore {
                 PostStreamTokenAdd {
                     prefix: self.bucket_prefix(key),
                     tokens,
+                    metrics: self.metrics.clone(),
                 },
             ) == Enqueued::Dropped
             {
@@ -742,6 +962,87 @@ impl RateStore for RedisStore {
         }
     }
 
+    fn stream_lease_refresh_interval(&self) -> Option<std::time::Duration> {
+        let millis = self
+            .conc_ttl
+            .saturating_mul(1_000)
+            .saturating_div(3)
+            .clamp(100, 60_000);
+        Some(std::time::Duration::from_millis(millis))
+    }
+
+    async fn refresh_stream_lease(&self, key: &str, member: &str) {
+        let _ = self.refresh_stream_lease_outcome(key, member).await;
+    }
+
+    async fn refresh_stream_lease_outcome(&self, key: &str, member: &str) -> StreamLeaseRefresh {
+        let ownership = self
+            .lease_members
+            .get(&(key.to_string(), member.to_string()))
+            .map(|entry| *entry);
+        let Some(ownership) = ownership else {
+            // The member was already released, or this store never admitted
+            // it. It is not a live shared lease that can be conclusively lost.
+            return StreamLeaseRefresh::Unavailable;
+        };
+        if matches!(ownership, LeaseOwnership::LocalOnly) {
+            // `conn.acquire` failed before a command could be dispatched.
+            // This member exists solely in the local fail-open fallback.
+            return StreamLeaseRefresh::Unavailable;
+        }
+        let prefix = self.bucket_prefix(key);
+        let mut conn = match self.conn.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                self.note_failure("refresh", &e);
+                // A post-dispatch I/O failure opens the shared Redis breaker.
+                // While it short-circuits, Unknown stays fail-open; only a
+                // later successful refresh can promote it to confirmed Redis
+                // ownership.
+                return StreamLeaseRefresh::Unavailable;
+            }
+        };
+        let res: Result<i64, redis::RedisError> = Script::new(REFRESH_CONCURRENCY_LUA)
+            .key(&prefix)
+            .arg(&prefix)
+            .arg(member)
+            .arg(self.conc_ttl.saturating_add(1))
+            .invoke_async(&mut conn)
+            .await;
+        match res {
+            Ok(1) => {
+                self.mark_ok();
+                if matches!(ownership, LeaseOwnership::Unknown) {
+                    self.lease_members.insert(
+                        (key.to_string(), member.to_string()),
+                        LeaseOwnership::ConfirmedRedis,
+                    );
+                }
+                StreamLeaseRefresh::Renewed
+            }
+            Ok(0) => {
+                // Redis did answer: the member itself is gone. This is not a
+                // backend outage, so clear any prior degradation marker while
+                // returning the definitive loss to the stream hold.
+                self.mark_ok();
+                if matches!(ownership, LeaseOwnership::ConfirmedRedis) {
+                    StreamLeaseRefresh::Missing
+                } else {
+                    // A command may have failed before Redis ever saw it, so
+                    // an Unknown member's absence is fail-open, not proof of
+                    // an externally released live lease.
+                    StreamLeaseRefresh::Unavailable
+                }
+            }
+            Ok(_) => StreamLeaseRefresh::Unavailable,
+            Err(e) => {
+                self.note_failure("refresh", &e);
+                self.conn.note_error().await;
+                StreamLeaseRefresh::Unavailable
+            }
+        }
+    }
+
     async fn peek(&self, key: &str, limits: &RateLimit) -> Option<RateLimitStatus> {
         if limits.is_unrestricted() {
             return None;
@@ -750,7 +1051,7 @@ impl RateStore for RedisStore {
         let mut conn = match self.conn.acquire().await {
             Ok(c) => c,
             Err(e) => {
-                self.warn_degraded("peek", &e);
+                self.note_failure("peek", &e);
                 return self.local.peek(key, limits).await;
             }
         };
@@ -775,7 +1076,7 @@ impl RateStore for RedisStore {
                 })
             }
             Err(e) => {
-                self.warn_degraded("peek", &e);
+                self.note_failure("peek", &e);
                 self.conn.note_error().await;
                 self.local.peek(key, limits).await
             }
@@ -798,7 +1099,7 @@ impl RateStore for RedisStore {
         let mut conn = match self.conn.acquire().await {
             Ok(c) => c,
             Err(e) => {
-                self.warn_degraded("claim_once", &e);
+                self.note_failure("claim_once", &e);
                 return self.local.claim_once(key, ttl).await;
             }
         };
@@ -817,7 +1118,7 @@ impl RateStore for RedisStore {
                 reply.is_some()
             }
             Err(e) => {
-                self.warn_degraded("claim_once", &e);
+                self.note_failure("claim_once", &e);
                 self.local.claim_once(key, ttl).await
             }
         }
@@ -827,11 +1128,13 @@ impl RateStore for RedisStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn add(prefix: &str) -> PostStreamTokenAdd {
         PostStreamTokenAdd {
             prefix: prefix.to_string(),
             tokens: 10,
+            metrics: None,
         }
     }
 

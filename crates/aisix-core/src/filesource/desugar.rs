@@ -64,6 +64,17 @@ pub(crate) enum IdentityField {
     /// `name`, with `display_name` accepted as the alternative spelling
     /// (mcp_servers, a2a_agents — mirroring their schemas).
     NameOrDisplayName,
+    /// A fixed constant — the kind is a per-file singleton
+    /// (mcp_auth_settings) whose entries carry no identity field of
+    /// their own. Every entry shares the constant, so a second entry
+    /// trips the pass-1 duplicate check.
+    Fixed(&'static str),
+    /// The `(guardrail_id, scope_type, scope_id)` triple
+    /// (guardrail_attachments). An attachment has no name of its own,
+    /// and that triple is exactly what the control plane makes unique,
+    /// so it is the file's identity too — attaching the same guardrail
+    /// to the same target twice is a pass-1 duplicate.
+    AttachmentTriple,
 }
 
 impl IdentityField {
@@ -73,6 +84,8 @@ impl IdentityField {
             Self::DisplayName => "display_name",
             Self::Name => "name",
             Self::NameOrDisplayName => "name (or display_name)",
+            Self::Fixed(_) => "the singleton identity",
+            Self::AttachmentTriple => "guardrail_id + scope_type (+ scope_id)",
         }
     }
 
@@ -89,6 +102,19 @@ impl IdentityField {
             Self::DisplayName => field("display_name"),
             Self::Name => field("name"),
             Self::NameOrDisplayName => field("name").or_else(|| field("display_name")),
+            Self::Fixed(v) => Some(v.to_string()),
+            // Composed from the file-level names, before desugaring
+            // rewrites them to derived ids, so the identity a duplicate
+            // is reported against is what the operator actually wrote.
+            // `-` stands in for an absent scope_id (scope_type: env),
+            // which cannot collide with a resolved name because the
+            // triple always carries the scope_type as well.
+            Self::AttachmentTriple => {
+                let guardrail = field("guardrail_id")?;
+                let scope_type = field("scope_type")?;
+                let scope = field("scope_id").unwrap_or_else(|| "-".to_string());
+                Some(format!("{guardrail}/{scope_type}/{scope}"))
+            }
         }
     }
 }
@@ -109,24 +135,41 @@ fn known_names(maps: &IdentityMaps, kind: &str) -> String {
     }
 }
 
-/// `models[].provider_key` (name) → `provider_key_id` (derived id).
+/// `models[].provider_key` (name) → `provider_key_id` (derived id), and
+/// the same sugar on a semantic router's `classifier`, which references its
+/// Provider Key exactly the way a model does.
 pub(crate) fn desugar_model(doc: &mut Value, maps: &IdentityMaps) -> Result<(), String> {
-    let obj = match doc.as_object_mut() {
-        Some(o) => o,
-        None => return Ok(()), // non-object entries error upstream
+    let Some(obj) = doc.as_object_mut() else {
+        return Ok(()); // non-object entries error upstream
     };
+    desugar_provider_key_ref(obj, maps, "")?;
+    if let Some(Value::Object(classifier)) = obj
+        .get_mut("semantic")
+        .and_then(|s| s.get_mut("classifier"))
+    {
+        desugar_provider_key_ref(classifier, maps, "semantic.classifier.")?;
+    }
+    Ok(())
+}
+
+fn desugar_provider_key_ref(
+    obj: &mut serde_json::Map<String, Value>,
+    maps: &IdentityMaps,
+    at: &str,
+) -> Result<(), String> {
     let Some(name_value) = obj.get("provider_key") else {
         return Ok(());
     };
     let Some(name) = name_value.as_str() else {
-        return Err("`provider_key` must be a string (a provider key display_name)".into());
+        return Err(format!(
+            "`{at}provider_key` must be a string (a provider key display_name)"
+        ));
     };
     if obj.contains_key("provider_key_id") {
-        return Err(
-            "`provider_key` (a name reference) and `provider_key_id` are mutually \
+        return Err(format!(
+            "`{at}provider_key` (a name reference) and `{at}provider_key_id` are mutually \
              exclusive — set exactly one"
-                .into(),
-        );
+        ));
     }
     let resolved = maps
         .get("provider_keys")
@@ -134,7 +177,7 @@ pub(crate) fn desugar_model(doc: &mut Value, maps: &IdentityMaps) -> Result<(), 
         .cloned()
         .ok_or_else(|| {
             format!(
-                "`provider_key` references unknown provider key {name:?} ({})",
+                "`{at}provider_key` references unknown provider key {name:?} ({})",
                 known_names(maps, "provider_keys")
             )
         })?;
@@ -169,7 +212,7 @@ pub(crate) fn desugar_passthrough_route(
         };
         let Some(name) = name_value.as_str() else {
             return Err(format!(
-                "`{name_field}` must be a string (a {noun} display_name)"
+                "`{name_field}` must be a string (the {noun}'s display_name)"
             ));
         };
         if obj.contains_key(id_field) {
@@ -328,6 +371,49 @@ pub(crate) fn desugar_rate_limit_policy(
     Ok(())
 }
 
+/// Resolve a guardrail attachment's two references from file-level names
+/// to derived ids: `guardrail_id` against the guardrails, and `scope_id`
+/// against whichever collection `scope_type` names.
+///
+/// `team` is absent from the scope table on purpose, and its `scope_id` is
+/// carried through verbatim rather than resolved: there is no teams
+/// collection to name, but `api_keys[].team_id` IS a file field and
+/// `IndexEntry::applies_to` compares the two ids as bare strings — so a
+/// team-scoped attachment does resolve standalone, against whatever id the
+/// operator wrote on both sides. Same treatment a team-scoped rate-limit
+/// policy's `scope_ref` already gets.
+pub(crate) fn desugar_guardrail_attachment(
+    doc: &mut Value,
+    maps: &IdentityMaps,
+) -> Result<(), String> {
+    let obj = match doc.as_object_mut() {
+        Some(o) => o,
+        None => return Ok(()),
+    };
+    if let Some(name) = obj.get("guardrail_id").and_then(Value::as_str) {
+        let resolved =
+            resolve_entity_name(maps, "guardrails", "guardrail", name, "`guardrail_id`")?;
+        obj.insert("guardrail_id".into(), Value::String(resolved));
+    }
+
+    let scope_kind = match obj.get("scope_type").and_then(Value::as_str) {
+        Some("model") => ("models", "model"),
+        Some("mcp_server") => ("mcp_servers", "MCP server"),
+        Some("api_key") => ("api_keys", "api key"),
+        Some("passthrough_route") => ("passthrough_routes", "passthrough route"),
+        // `env` carries no scope_id; `team` has no file collection.
+        _ => return Ok(()),
+    };
+    let Some(name) = obj.get("scope_id").and_then(Value::as_str) else {
+        // Missing / non-string scope_id: canonical validation reports it.
+        return Ok(());
+    };
+    let (kind, label) = scope_kind;
+    let resolved = resolve_entity_name(maps, kind, label, name, "`scope_id`")?;
+    obj.insert("scope_id".into(), Value::String(resolved));
+    Ok(())
+}
+
 fn resolve_entity_name(
     maps: &IdentityMaps,
     kind: &str,
@@ -455,6 +541,33 @@ mod tests {
     }
 
     #[test]
+    fn classifier_provider_key_name_resolves_like_a_model_s() {
+        let maps = maps_with("provider_keys", &["ts"]);
+        let mut doc = json!({
+            "display_name": "r",
+            "semantic": {"classifier": {"type": "jev", "provider_key": "ts"}}
+        });
+        desugar_model(&mut doc, &maps).unwrap();
+        let classifier = &doc["semantic"]["classifier"];
+        assert!(classifier.get("provider_key").is_none());
+        assert_eq!(
+            classifier["provider_key_id"],
+            json!(derive_id("provider_keys", "ts"))
+        );
+
+        let mut unknown = json!({"semantic": {"classifier": {"provider_key": "nope"}}});
+        let err = desugar_model(&mut unknown, &maps).unwrap_err();
+        assert!(err.contains("semantic.classifier.provider_key"), "{err}");
+        assert!(err.contains("\"nope\""), "{err}");
+
+        let mut both = json!({"semantic": {"classifier": {
+            "provider_key": "ts", "provider_key_id": "x"
+        }}});
+        let err = desugar_model(&mut both, &maps).unwrap_err();
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
     fn model_provider_key_unknown_name_lists_defined_keys() {
         let maps = maps_with("provider_keys", &["a-key", "b-key"]);
         let mut doc = json!({"display_name": "m", "provider_key": "nope"});
@@ -462,6 +575,19 @@ mod tests {
         assert!(err.contains("\"nope\""), "unexpected: {err}");
         assert!(err.contains("a-key"), "unexpected: {err}");
         assert!(err.contains("b-key"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn passthrough_route_non_string_name_reads_correctly_for_each_noun() {
+        let maps = IdentityMaps::new();
+        for (field, expected) in [
+            ("provider_key", "(the provider key's display_name)"),
+            ("anonymous_key", "(the api key's display_name)"),
+        ] {
+            let mut doc = json!({ field: 1 });
+            let err = desugar_passthrough_route(&mut doc, &maps).unwrap_err();
+            assert!(err.contains(expected), "unexpected: {err}");
+        }
     }
 
     #[test]

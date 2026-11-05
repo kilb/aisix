@@ -17,7 +17,7 @@ use dashmap::DashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, RoutingStrategy};
@@ -33,6 +33,20 @@ static TEXT_PLAIN_UTF8: HeaderValue = HeaderValue::from_static("text/plain; char
 #[derive(Debug, Default)]
 pub struct LivezState {
     shutting_down: AtomicBool,
+    /// Requests currently being served on the proxy listener, raised and
+    /// lowered by the telemetry middleware's RAII guard. Read by the
+    /// shutdown coordinator to decide when closing the listener can no
+    /// longer interrupt anything, and reported on the drain heartbeat so
+    /// an operator can watch the tail empty; a streaming response keeps
+    /// its slot for as long as bytes may still flow.
+    in_flight: AtomicUsize,
+    /// Downstream connections currently open on the proxy listener,
+    /// raised and lowered by the acceptor's RAII guard. Distinct from
+    /// `in_flight` and not derivable from it: a pooled connection sitting
+    /// idle carries no request, and during a drain a count that stays up
+    /// while `in_flight` falls is what tells an operator the load
+    /// balancer has not stopped routing here yet (AISIX-Cloud#1394).
+    connections: AtomicUsize,
 }
 
 impl LivezState {
@@ -42,6 +56,50 @@ impl LivezState {
 
     pub fn mark_shutting_down(&self) {
         self.shutting_down.store(true, Ordering::Relaxed);
+    }
+
+    /// Raise the in-flight count. Pair with [`Self::leave`]; the proxy
+    /// does that through a `Drop` guard so a cancelled request still
+    /// lowers the count it raised.
+    pub fn enter(&self) {
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Lower the in-flight count, saturating at zero so an unpaired
+    /// decrement cannot wrap the counter and wedge the drain.
+    pub fn leave(&self) {
+        let _ = self
+            .in_flight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
+    }
+
+    /// Requests in flight right now.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Raise the open-connection count. Pair with
+    /// [`Self::connection_closed`]; the acceptor does that through a
+    /// `Drop` guard carried by the accepted stream.
+    pub fn connection_opened(&self) {
+        self.connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Lower the open-connection count, saturating at zero for the same
+    /// reason [`Self::leave`] does.
+    pub fn connection_closed(&self) {
+        let _ = self
+            .connections
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
+    }
+
+    /// Downstream connections open right now.
+    pub fn open_connections(&self) -> usize {
+        self.connections.load(Ordering::Relaxed)
     }
 
     fn shutdown_check(&self) -> Result<(), &'static str> {
@@ -85,46 +143,40 @@ pub fn config_readiness_block(last_apply_age: Option<Duration>) -> Option<&'stat
     }
 }
 
-pub fn livez_response(livez: &LivezState, verbose: bool) -> Response {
-    let mut body = String::new();
-    let mut failed = false;
-
-    body.push_str("[+]ping ok\n");
-    match livez.shutdown_check() {
-        Ok(()) => body.push_str("[+]shutdown ok\n"),
-        Err(_) => {
-            failed = true;
-            body.push_str("[-]shutdown failed: reason withheld\n");
-        }
-    }
-
+/// `GET /livez` — process liveness: should this instance be RESTARTED?
+///
+/// Answering at all is the check. The listener is bound and the runtime
+/// is servicing requests, which is the whole of what a liveness probe
+/// decides, so this never fails.
+///
+/// A draining instance answers `200` like any other. Draining is
+/// deliberate work, not a fault: an instance that has been told to shut
+/// down is finishing the requests it already accepted, and restarting it
+/// kills exactly those. That is what a failing liveness probe asks a
+/// platform to do, which is why "stop sending traffic here" belongs on
+/// [`readyz_response`] instead — the two questions are what separates
+/// the endpoints, and answering both with the drain state collapses them
+/// into one.
+///
+/// The platform is not the only caller that matters: the gateway also
+/// runs as a single container under docker or systemd, where a
+/// supervisor watching this endpoint would restart a healthy draining
+/// process mid-flight.
+///
+/// [`LivezState`] is deliberately not a parameter. The drain state is the
+/// one thing this answer must not depend on, and not taking it is a
+/// stronger guarantee than a comment saying so.
+pub fn livez_response(verbose: bool) -> Response {
     let headers = [
         (CONTENT_TYPE, TEXT_PLAIN_UTF8.clone()),
         (X_CONTENT_TYPE_OPTIONS.clone(), NOSNIFF.clone()),
     ];
 
-    if failed {
-        // Graceful shutdown is an expected drain, not an internal error —
-        // 503 so Kubernetes stops routing without treating it as a crash
-        // loop (#591).
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            headers,
-            format!("{body}livez check failed"),
-        )
-            .into_response();
-    }
-
     if !verbose {
         return (StatusCode::OK, headers, "ok").into_response();
     }
 
-    (
-        StatusCode::OK,
-        headers,
-        format!("{body}livez check passed\n"),
-    )
-        .into_response()
+    (StatusCode::OK, headers, "[+]ping ok\nlivez check passed\n").into_response()
 }
 
 /// `GET /readyz` — readiness (traffic eligibility), distinct from `/livez`
@@ -236,15 +288,6 @@ struct RuntimeEntry {
     last_checked_at: Option<SystemTime>,
     last_check_status: Option<u16>,
     status_reason: Option<String>,
-    /// Exponentially-weighted moving average of recent observed upstream
-    /// latency in milliseconds. `None` until the first sample. Drives the
-    /// `least_latency` routing strategy; independent of health/cooldown.
-    latency_ewma_ms: Option<f64>,
-    /// Number of requests currently in flight to this target. Held in an
-    /// `Arc` so an [`InFlightGuard`] can decrement it after the DashMap lock
-    /// is released (and for the streaming path, after the handler returns).
-    /// Drives the `least_busy` routing strategy.
-    in_flight: Arc<AtomicUsize>,
     /// Last value published to the `aisix_deployment_state` gauge for this
     /// target, so [`ModelRuntimeStatusTracker::sync_deployment_state`] can
     /// skip a write when nothing changed. `None` = never published.
@@ -381,15 +424,28 @@ impl Entry {
 /// byte-identical behavior. Only when none holds do the trackers take the
 /// cheap read-first paths — writes whose consumers provably don't exist.
 ///
-/// The predicate set is recomputed at most once per snapshot generation
-/// (packed with the generation into one atomic so the pair can never be
-/// observed torn). The generation and table contents come from one atomic
-/// snapshot publication.
+/// Two tiers, both packed with their key into one atomic so a pair can
+/// never be observed torn. The hot tier is keyed on the snapshot version:
+/// one relaxed load answers "nothing has changed at all". When that
+/// misses, the `models` table generation answers "nothing THIS reads has
+/// changed" — a write to any other resource kind then costs one snapshot
+/// load and restamps the hot tier rather than rescanning every model.
+/// Before #1542 the version was the only key, so every API-key
+/// edit rescanned the whole model table on the next request.
+///
+/// The version, the generation and the table contents all come from one
+/// atomic snapshot publication.
 #[derive(Debug)]
 pub struct BookkeepingFlags {
     snapshot: SnapshotHandle<AisixSnapshot>,
     /// `(snapshot version << 3) | predicate bits`, or [`UNCOMPUTED`].
     packed: AtomicU64,
+    /// `(models table generation << 3) | predicate bits`, or
+    /// [`UNCOMPUTED`].
+    packed_by_generation: AtomicU64,
+    /// Walks of the model table. The observable behind "an unrelated
+    /// configuration write does not rescan every model".
+    scans: AtomicU64,
 }
 
 const FLAG_LEAST_BUSY: u64 = 1;
@@ -403,6 +459,8 @@ impl BookkeepingFlags {
         Arc::new(Self {
             snapshot,
             packed: AtomicU64::new(UNCOMPUTED),
+            packed_by_generation: AtomicU64::new(UNCOMPUTED),
+            scans: AtomicU64::new(0),
         })
     }
 
@@ -412,12 +470,30 @@ impl BookkeepingFlags {
         self.bits() != 0
     }
 
+    /// Model-table walks run so far.
+    #[cfg(test)]
+    fn scans(&self) -> u64 {
+        self.scans.load(Ordering::Relaxed)
+    }
+
     fn bits(&self) -> u64 {
         let view = self.snapshot.load_versioned();
         let packed = self.packed.load(Ordering::Relaxed);
         if packed != UNCOMPUTED && packed >> 3 == view.version {
             return packed & FLAG_BITS;
         }
+        let generation = view.snapshot.models.generation();
+        let by_generation = self.packed_by_generation.load(Ordering::Relaxed);
+        if by_generation != UNCOMPUTED && by_generation >> 3 == generation {
+            // Some other table moved. The predicates read `models` only,
+            // so the answer stands — restamp it under the new version so
+            // the next call takes the one-load path again.
+            let bits = by_generation & FLAG_BITS;
+            self.packed
+                .store((view.version << 3) | bits, Ordering::Relaxed);
+            return bits;
+        }
+        self.scans.fetch_add(1, Ordering::Relaxed);
         let mut bits = 0;
         for entry in view.snapshot.models.entries() {
             let m = &entry.value;
@@ -432,6 +508,8 @@ impl BookkeepingFlags {
                 bits |= FLAG_HEALTH_CHECKS;
             }
         }
+        self.packed_by_generation
+            .store((generation << 3) | bits, Ordering::Relaxed);
         self.packed
             .store((view.version << 3) | bits, Ordering::Relaxed);
         bits
@@ -454,6 +532,14 @@ pub struct HealthTracker {
 /// jitter, roughly matching LiteLLM's last-10-samples moving average.
 const LATENCY_EWMA_ALPHA: f64 = 0.3;
 
+/// Minimum gap between two `routing candidate excluded` lines for the same
+/// (target, reason). The exclusion happens on the per-request routing path,
+/// so an unthrottled line would be one log per request for as long as a
+/// target stays out of rotation — on a busy gateway that is a flood, and a
+/// flood is what gets a diagnostic turned off before the incident that
+/// needs it.
+const EXCLUSION_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
 #[derive(Default, Debug)]
 pub struct ModelRuntimeStatusTracker {
     entries: DashMap<String, RuntimeEntry>,
@@ -474,6 +560,31 @@ pub struct ModelRuntimeStatusTracker {
     /// every method runs its historical write path. See
     /// [`BookkeepingFlags`].
     flags: Option<Arc<BookkeepingFlags>>,
+    /// When the last `routing candidate excluded` line was written, per
+    /// (routing group, target, reason). See
+    /// [`ModelRuntimeStatusTracker::should_log_exclusion`] for why the
+    /// group is part of the key and not just the target.
+    ///
+    /// Bounded by the configured groups times their members times the two
+    /// reasons; entries for a group or target the operator has since
+    /// deleted are never revisited and cost one key each.
+    exclusion_log: DashMap<(String, String, &'static str), Instant>,
+    /// Requests currently in flight to each target, driving the
+    /// `least_busy` strategy. Each counter sits in an `Arc` so an
+    /// [`InFlightGuard`] can decrement it after the map lock is released
+    /// (and for a streamed body, after the handler returns).
+    ///
+    /// Kept apart from `entries` on purpose: an entry's existence decides
+    /// whether a first success publishes `aisix_deployment_state`, so
+    /// counting a request must not create one. See
+    /// [`ModelRuntimeStatusTracker::count_in_flight`].
+    in_flight: DashMap<String, Arc<AtomicUsize>>,
+    /// Exponentially-weighted moving average of each target's observed
+    /// upstream latency in milliseconds, driving the `least_latency`
+    /// strategy. Kept apart from `entries` for the same reason as
+    /// `in_flight`: measuring a target must not create the entry a first
+    /// success publishes `aisix_deployment_state` from.
+    latency_ewma_ms: DashMap<String, f64>,
 }
 
 /// RAII guard that decrements a target's in-flight counter when dropped.
@@ -580,13 +691,15 @@ impl HealthTracker {
 
 impl ModelRuntimeStatusTracker {
     /// Drop runtime state for target ids the snapshot no longer carries.
-    /// A target with a live in-flight count is kept: the count is released by
-    /// a guard's `Drop`, and releasing into an entry that no longer exists
-    /// would leave the next routing decision reading a fresh zero.
+    /// A target with a live in-flight count keeps its counter: the count is
+    /// released by a guard's `Drop`, and releasing into a counter the map no
+    /// longer holds would leave the next routing decision reading a fresh
+    /// zero.
     pub fn retain_configured(&self, is_configured: &dyn Fn(&str) -> bool) {
-        self.entries.retain(|id, entry| {
-            entry.in_flight.load(std::sync::atomic::Ordering::Relaxed) > 0 || is_configured(id)
-        });
+        self.entries.retain(|id, _| is_configured(id));
+        self.in_flight
+            .retain(|id, count| count.load(Ordering::Relaxed) > 0 || is_configured(id));
+        self.latency_ewma_ms.retain(|id, _| is_configured(id));
     }
 
     pub fn new() -> Self {
@@ -608,11 +721,56 @@ impl ModelRuntimeStatusTracker {
             metrics: Some(metrics),
             snapshot: Some(snapshot),
             flags: Some(flags),
+            exclusion_log: DashMap::new(),
+            in_flight: DashMap::new(),
+            latency_ewma_ms: DashMap::new(),
         }
     }
 
     fn bookkeeping_active(&self) -> bool {
         self.flags.as_ref().is_none_or(|f| f.any_active())
+    }
+
+    /// Rate gate for the `routing candidate excluded` line: true at most
+    /// once per [`EXCLUSION_LOG_INTERVAL`] for a given (routing group,
+    /// target, reason).
+    ///
+    /// The **group** is in the key because the line names one, and the
+    /// operator reads it per group. One direct model is routinely a
+    /// target of several groups; keyed on the target alone, a busy group
+    /// would win the window almost every time it opened and a quiet group
+    /// sharing that target would print nothing at all — leaving exactly
+    /// the "one attempt, no explanation" trace this line exists to
+    /// remove. It also decides `candidates`, which differs per group.
+    ///
+    /// A change of reason logs immediately rather than waiting out the
+    /// previous window, so a target that goes from cooling to
+    /// background-unhealthy is not hidden behind the cooling line. Only
+    /// excluded candidates reach here, so the steady state of a healthy
+    /// group takes no write lock at all.
+    pub(crate) fn should_log_exclusion(
+        &self,
+        virtual_name: &str,
+        model_id: &str,
+        reason: &'static str,
+    ) -> bool {
+        let key = (virtual_name.to_string(), model_id.to_string(), reason);
+        // Decide and update under one guard. A get() guard held by a match
+        // scrutinee would survive into insert() and deadlock on expiration.
+        match self.exclusion_log.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let now = Instant::now();
+                if now.duration_since(*entry.get()) < EXCLUSION_LOG_INTERVAL {
+                    return false;
+                }
+                entry.insert(now);
+                true
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(Instant::now());
+                true
+            }
+        }
     }
 
     pub fn mark_cooldown(&self, model_id: &str, ttl: Duration, reason: impl Into<String>) {
@@ -708,21 +866,23 @@ impl ModelRuntimeStatusTracker {
     /// tuple across all four or an operator cannot join "this deployment is
     /// cooled down" to "this deployment is failing".
     pub(crate) fn record_deployment_attempt(&self, model_id: &str, outcome: RequestOutcome) {
-        self.with_deployment_labels(model_id, |metrics, labels| {
+        self.with_deployment_labels(model_id, true, |metrics, labels| {
             metrics.record_deployment_request(labels, outcome);
         });
     }
 
     /// Bump `aisix_deployment_cooled_down_total` for `model_id`.
     fn record_cooldown(&self, model_id: &str) {
-        self.with_deployment_labels(model_id, |metrics, labels| {
+        self.with_deployment_labels(model_id, true, |metrics, labels| {
             metrics.record_deployment_cooldown(labels);
         });
     }
 
     /// Set the `aisix_deployment_state` gauge for `model_id`.
     fn emit_deployment_state(&self, model_id: &str, state: DeploymentState) {
-        self.with_deployment_labels(model_id, |metrics, labels| {
+        // The state gauge carries no `provider_key_name` (see
+        // `DeploymentLabels`), so it skips resolving one.
+        self.with_deployment_labels(model_id, false, |metrics, labels| {
             metrics.set_deployment_state(labels, state);
         });
     }
@@ -734,31 +894,46 @@ impl ModelRuntimeStatusTracker {
     fn with_deployment_labels(
         &self,
         model_id: &str,
+        with_provider_key_name: bool,
         f: impl FnOnce(&Metrics, DeploymentLabels<'_>),
     ) {
         let Some(metrics) = self.metrics.as_ref() else {
             return;
         };
-        let (provider, model, upstream_model, provider_key_id) = self
+        let (provider, model, upstream_model, provider_key_id, provider_key_name) = self
             .snapshot
             .as_ref()
             .and_then(|handle| {
                 let snap = handle.load();
                 let entry = snap.models.get_by_id(model_id)?;
                 let m = &entry.value;
+                let provider_key_id = m
+                    .provider_key_id
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+                // The same resolution the request families use, so the
+                // two name one key alike.
+                let provider_key_name = if with_provider_key_name {
+                    crate::usage_attr::ResolvedPk::resolve(&snap, &provider_key_id)
+                        .labels()
+                        .name()
+                        .to_string()
+                } else {
+                    "unknown".to_string()
+                };
                 Some((
                     m.provider.clone().unwrap_or_else(|| "unknown".to_string()),
                     m.display_name.clone(),
                     m.upstream_model().unwrap_or("unknown").to_string(),
-                    m.provider_key_id
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string()),
+                    provider_key_id,
+                    provider_key_name,
                 ))
             })
             .unwrap_or_else(|| {
                 (
                     "unknown".to_string(),
                     model_id.to_string(),
+                    "unknown".to_string(),
                     "unknown".to_string(),
                     "unknown".to_string(),
                 )
@@ -770,6 +945,7 @@ impl ModelRuntimeStatusTracker {
                 model: &model,
                 upstream_model: &upstream_model,
                 provider_key_id: &provider_key_id,
+                provider_key_name: &provider_key_name,
             },
         );
     }
@@ -836,28 +1012,39 @@ impl ModelRuntimeStatusTracker {
             return;
         }
         let sample = f64::from(latency_ms);
-        self.entries
+        self.latency_ewma_ms
             .entry(model_id.to_string())
-            .and_modify(|entry| {
-                entry.latency_ewma_ms = Some(match entry.latency_ewma_ms {
-                    Some(prev) => LATENCY_EWMA_ALPHA * sample + (1.0 - LATENCY_EWMA_ALPHA) * prev,
-                    None => sample,
-                });
+            .and_modify(|prev| {
+                *prev = LATENCY_EWMA_ALPHA * sample + (1.0 - LATENCY_EWMA_ALPHA) * *prev;
             })
-            .or_insert_with(|| RuntimeEntry {
-                latency_ewma_ms: Some(sample),
-                ..RuntimeEntry::default()
-            });
+            .or_insert(sample);
     }
 
     /// Current latency EWMA (ms) for `model_id`, or `None` if never sampled.
     pub fn latency_ewma_ms(&self, model_id: &str) -> Option<f64> {
-        self.entries.get(model_id).and_then(|e| e.latency_ewma_ms)
+        self.latency_ewma_ms.get(model_id).map(|v| *v)
     }
 
     /// Mark one request as in flight to `model_id` and return a guard that
     /// decrements the count when dropped. Drives the `least_busy` strategy.
+    ///
+    /// Also creates the target's runtime entry, which `mark_healthy`'s
+    /// first-success Healthy publish keys off: chat, messages and responses
+    /// publish `aisix_deployment_state` for their targets that way. The
+    /// single-attempt handlers count through [`Self::count_in_flight`],
+    /// which leaves the entry alone, so their targets publish only what
+    /// they already did. Steady state downgrades to a read-guard existence
+    /// check.
     pub fn begin_in_flight(&self, model_id: &str) -> InFlightGuard {
+        if self.entries.get(model_id).is_none() {
+            self.entries.entry(model_id.to_string()).or_default();
+        }
+        self.count_in_flight(model_id)
+    }
+
+    /// Count one request as in flight to `model_id` until the returned
+    /// guard drops, without creating the target's runtime entry.
+    pub fn count_in_flight(&self, model_id: &str) -> InFlightGuard {
         // The counter's only reader is `least_busy` target ordering; with
         // no such strategy configured, hand out a no-op guard instead of
         // paying the counter RMWs and guard refcount per request. When
@@ -865,25 +1052,13 @@ impl ModelRuntimeStatusTracker {
         // requests; requests already in flight hold no-op guards, so the
         // count transiently underreads until they drain — the same
         // cold-start the counter has on process start.
-        //
-        // The ENTRY-CREATION side effect is preserved: `mark_healthy`'s
-        // first-success Healthy publish keys off the entry this method
-        // creates, and only the endpoints that call begin_in_flight may
-        // publish that series (the single-attempt handlers never do).
-        // Steady state downgrades to a read-guard existence check.
         if !self.bookkeeping_active() {
-            if self.entries.get(model_id).is_none() {
-                self.entries.entry(model_id.to_string()).or_default();
-            }
             return InFlightGuard { counter: None };
         }
-        let counter = Arc::clone(
-            &self
-                .entries
-                .entry(model_id.to_string())
-                .or_default()
-                .in_flight,
-        );
+        let counter = match self.in_flight.get(model_id) {
+            Some(c) => Arc::clone(&c),
+            None => Arc::clone(&self.in_flight.entry(model_id.to_string()).or_default()),
+        };
         counter.fetch_add(1, Ordering::Relaxed);
         InFlightGuard {
             counter: Some(counter),
@@ -892,9 +1067,9 @@ impl ModelRuntimeStatusTracker {
 
     /// Current in-flight request count for `model_id`.
     pub fn in_flight(&self, model_id: &str) -> usize {
-        self.entries
+        self.in_flight
             .get(model_id)
-            .map(|e| e.in_flight.load(Ordering::Relaxed))
+            .map(|c| c.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
 
@@ -974,6 +1149,42 @@ mod tests {
             "a target still holding a permit must not be reclaimed"
         );
         assert_eq!(t.in_flight("idle-target"), 0);
+    }
+
+    fn an_api_key() -> aisix_core::ApiKey {
+        serde_json::from_str(r#"{"key_hash":"abc","allowed_models":["vg"]}"#).expect("test key")
+    }
+
+    #[test]
+    fn a_write_to_an_unrelated_table_does_not_rescan_the_models() {
+        // The predicates read `models` and nothing else, but they used to
+        // be keyed on the snapshot version, which moves on every
+        // published write of any kind — so a bulk API-key edit rescanned
+        // the whole model table on the next request (#1542).
+        let handle =
+            SnapshotHandle::new(snapshot_with(Some(model_json(Some("least_busy"), false))));
+        let flags = BookkeepingFlags::new(handle.clone());
+        assert!(flags.any_active());
+        assert_eq!(flags.scans(), 1);
+
+        for i in 0..5 {
+            let next = handle.load().as_ref().clone();
+            next.apikeys.insert(aisix_core::ResourceEntry::new(
+                format!("k-{i}"),
+                an_api_key(),
+                1,
+            ));
+            handle.store(next);
+            assert!(flags.any_active(), "the answer must not change");
+        }
+        assert_eq!(flags.scans(), 1, "the model table was walked again");
+
+        // A write that DOES touch models rescans.
+        let next = handle.load().as_ref().clone();
+        next.models.remove("m-1");
+        handle.store(next);
+        assert!(!flags.any_active());
+        assert_eq!(flags.scans(), 2);
     }
 
     #[test]
@@ -1069,6 +1280,7 @@ mod tests {
             metrics: None,
             snapshot: None,
             flags: Some(flags),
+            ..Default::default()
         };
         (handle, t)
     }
@@ -1078,7 +1290,7 @@ mod tests {
         for (model, expect) in [
             (None, false),
             (Some(model_json(Some("round_robin"), false)), false),
-            (Some(model_json(Some("weighted"), false)), false),
+            (Some(model_json(Some("consistent_hash"), false)), false),
             (Some(model_json(Some("failover"), false)), false),
             // least_cost ranks by static configured cost, not runtime
             // bookkeeping — it must NOT activate the write paths.
@@ -1160,6 +1372,38 @@ mod tests {
         );
     }
 
+    /// The single-attempt handlers count their requests for `least_busy`
+    /// through `count_in_flight`, which must not create the entry a first
+    /// success would publish `aisix_deployment_state` from — whether or
+    /// not bookkeeping is active.
+    #[test]
+    fn count_in_flight_counts_without_creating_an_entry() {
+        let active = ModelRuntimeStatusTracker::new();
+        let g = active.count_in_flight("single-shot-target");
+        assert_eq!(active.in_flight("single-shot-target"), 1);
+        active.mark_healthy("single-shot-target");
+        assert!(active.entries.get("single-shot-target").is_none());
+        drop(g);
+        assert_eq!(active.in_flight("single-shot-target"), 0);
+
+        let (_handle, inactive) = inactive_tracker();
+        drop(inactive.count_in_flight("single-shot-target"));
+        inactive.mark_healthy("single-shot-target");
+        assert!(inactive.entries.get("single-shot-target").is_none());
+    }
+
+    /// `dispatch_with_failover` feeds `least_latency` through
+    /// `record_latency`, which must not create the entry a first success
+    /// would publish `aisix_deployment_state` from either.
+    #[test]
+    fn record_latency_measures_without_creating_an_entry() {
+        let t = ModelRuntimeStatusTracker::new();
+        t.record_latency("single-shot-target", 50);
+        assert_eq!(t.latency_ewma_ms("single-shot-target"), Some(50.0));
+        t.mark_healthy("single-shot-target");
+        assert!(t.entries.get("single-shot-target").is_none());
+    }
+
     #[test]
     fn inactive_mark_healthy_still_recovers_cooldown_early() {
         let (_handle, t) = inactive_tracker();
@@ -1198,8 +1442,7 @@ mod tests {
 
     #[tokio::test]
     async fn livez_default_success_is_plain_ok() {
-        let state = LivezState::new();
-        let resp = livez_response(&state, false);
+        let resp = livez_response(false);
 
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
@@ -1208,28 +1451,56 @@ mod tests {
 
     #[tokio::test]
     async fn livez_verbose_success_lists_checks() {
-        let state = LivezState::new();
-        let resp = livez_response(&state, true);
+        let resp = livez_response(true);
 
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         let text = std::str::from_utf8(&body).unwrap();
         assert!(text.contains("[+]ping ok"));
-        assert!(text.contains("[+]shutdown ok"));
         assert!(text.contains("livez check passed"));
     }
 
+    /// A draining instance is healthy and must not be restarted:
+    /// restarting it kills the in-flight requests the drain exists to
+    /// finish. Liveness therefore stays `200` throughout, and it is
+    /// `/readyz` that withdraws the instance from traffic — the test
+    /// below pins the other half.
     #[tokio::test]
-    async fn livez_failure_returns_503_with_reason_withheld() {
+    async fn livez_stays_ok_while_draining() {
         let state = LivezState::new();
         state.mark_shutting_down();
-        let resp = livez_response(&state, false);
 
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
-        let text = std::str::from_utf8(&body).unwrap();
-        assert!(text.contains("[-]shutdown failed: reason withheld"));
-        assert!(text.contains("livez check failed"));
+        let resp = livez_response(false);
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let readyz = readyz_response(&state, None, false);
+        assert_eq!(
+            readyz.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the drain has to be visible somewhere, and readiness is where",
+        );
+    }
+
+    /// The count has to survive an unpaired decrement: it is reported on
+    /// the drain heartbeat, and a wrapped counter would report billions of
+    /// open connections at exactly the moment an operator is reading the
+    /// line to decide whether traffic is still arriving.
+    #[test]
+    fn open_connections_saturates_at_zero() {
+        let state = LivezState::new();
+        assert_eq!(state.open_connections(), 0);
+
+        state.connection_closed();
+        assert_eq!(state.open_connections(), 0);
+
+        state.connection_opened();
+        state.connection_opened();
+        assert_eq!(state.open_connections(), 2);
+
+        state.connection_closed();
+        state.connection_closed();
+        state.connection_closed();
+        assert_eq!(state.open_connections(), 0);
     }
 
     #[test]
@@ -1479,6 +1750,102 @@ mod tests {
         assert_eq!(s.status, RuntimeStatus::Healthy);
         assert_eq!(s.last_check_status, Some(429));
         assert_eq!(s.status_reason.as_deref(), Some("ignored_transient_error"));
+    }
+
+    #[test]
+    fn exclusion_log_gate_throttles_a_repeat_and_lets_a_new_reason_through() {
+        // The gate is what keeps the `routing candidate excluded` WARN
+        // off the per-request hot path. Its two obligations: never write
+        // the same (target, reason) twice inside the window, and never
+        // let the window hide a target whose reason has changed.
+        let t = ModelRuntimeStatusTracker::new();
+        assert!(t.should_log_exclusion("g-1", "m-1", "cooling"));
+        assert!(!t.should_log_exclusion("g-1", "m-1", "cooling"));
+        assert!(t.should_log_exclusion("g-1", "m-1", "unhealthy"));
+        assert!(!t.should_log_exclusion("g-1", "m-1", "unhealthy"));
+        // Throttling is per target, not global.
+        assert!(t.should_log_exclusion("g-1", "m-2", "cooling"));
+        // …and per routing group: a second group that shares `m-1` still
+        // gets its own line, because it has its own `candidates` count and
+        // its own operator reading it.
+        assert!(t.should_log_exclusion("g-2", "m-1", "cooling"));
+        assert!(!t.should_log_exclusion("g-2", "m-1", "cooling"));
+    }
+
+    #[test]
+    fn exclusion_log_gate_does_not_extend_the_window_when_suppressed() {
+        let t = ModelRuntimeStatusTracker::new();
+        let key = ("g-1".to_string(), "m-1".to_string(), "cooling");
+        let logged_at = Instant::now() - EXCLUSION_LOG_INTERVAL / 2;
+        t.exclusion_log.insert(key.clone(), logged_at);
+
+        for _ in 0..8 {
+            assert!(!t.should_log_exclusion("g-1", "m-1", "cooling"));
+            // Busy traffic must not postpone the next log indefinitely.
+            assert_eq!(*t.exclusion_log.get(&key).unwrap(), logged_at);
+        }
+    }
+
+    #[test]
+    fn exclusion_log_gate_reopens_after_the_interval_without_blocking() {
+        let t = Arc::new(ModelRuntimeStatusTracker::new());
+        t.exclusion_log.insert(
+            ("g-1".to_string(), "m-1".to_string(), "cooling"),
+            Instant::now() - EXCLUSION_LOG_INTERVAL,
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let reopened = t.should_log_exclusion("g-1", "m-1", "cooling");
+            let repeated = t.should_log_exclusion("g-1", "m-1", "cooling");
+            tx.send((reopened, repeated)).unwrap();
+        });
+        // A synchronous lock deadlock cannot be bounded by a Tokio timeout
+        // on the same worker. Keep the watchdog on the test thread.
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("exclusion logging blocked after its throttle expired"),
+            (true, false),
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn exclusion_log_gate_allows_one_concurrent_writer_per_window() {
+        for expired in [false, true] {
+            let t = Arc::new(ModelRuntimeStatusTracker::new());
+            if expired {
+                t.exclusion_log.insert(
+                    ("g-1".to_string(), "m-1".to_string(), "cooling"),
+                    Instant::now() - EXCLUSION_LOG_INTERVAL,
+                );
+            }
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    let t = t.clone();
+                    let barrier = barrier.clone();
+                    let tx = tx.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        tx.send(t.should_log_exclusion("g-1", "m-1", "cooling"))
+                            .unwrap();
+                    })
+                })
+                .collect();
+            let allowed = (0..8)
+                .map(|_| {
+                    usize::from(
+                        rx.recv_timeout(Duration::from_secs(2))
+                            .expect("concurrent exclusion logging blocked"),
+                    )
+                })
+                .sum::<usize>();
+            assert_eq!(allowed, 1, "expired={expired}");
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        }
     }
 
     #[test]

@@ -28,34 +28,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
-use aisix_etcd::loader::{PartialCompatEntry, RejectedEntry};
+use aisix_core::{redact_url_for_log, ConfigRejectionSnapshot};
+use aisix_etcd::loader::PartialCompatEntry;
 use aisix_obs::SinkStatsSnapshot;
 use anyhow::{anyhow, Context};
 use serde::Serialize;
 use tokio::sync::watch;
-
-/// Build identity reported to the control plane (heartbeat `version` field + HTTP
-/// User-Agent). The base version is [`aisix_core::BUILD_VERSION`] —
-/// release builds are stamped from the git tag, local builds fall back
-/// to the crate version. CI additionally stamps `AISIX_BUILD_SHA` — the
-/// same short git sha that tags the container image — so the wire
-/// carries `0.4.0+sha-103d3ec` and an operator can match a DP node
-/// directly to its image. The control plane persists this into
-/// `control plane_nodes.dp_version`, replacing the `"pending"` placeholder it
-/// wrote at install-command time.
-pub static BUILD_VERSION: LazyLock<String> = LazyLock::new(|| {
-    format_build_version(aisix_core::BUILD_VERSION, option_env!("AISIX_BUILD_SHA"))
-});
-
-fn format_build_version(pkg_version: &str, build_sha: Option<&str>) -> String {
-    match build_sha {
-        Some(sha) if !sha.is_empty() => format!("{pkg_version}+sha-{sha}"),
-        _ => pkg_version.to_string(),
-    }
-}
 
 /// Cheap clonable callback the heartbeat invokes once per tick to pull
 /// the supervisor's most recent loader rejections. Returning a clone
@@ -65,7 +45,7 @@ fn format_build_version(pkg_version: &str, build_sha: Option<&str>) -> String {
 /// Pre-fix the loader logged a warning and silently moved on. Customers
 /// who saved an invalid resource in the dashboard saw "Saved" but the
 /// DP dropped the row — no signal back. See issue #115.
-pub type RejectionFetcher = Arc<dyn Fn() -> Vec<RejectedEntry> + Send + Sync>;
+pub type RejectionFetcher = Arc<dyn Fn() -> Vec<ConfigRejectionSnapshot> + Send + Sync>;
 
 /// Per-tick source of the highest etcd/kine revision the watch
 /// supervisor has applied to its snapshot (`WatchStatus.revision`).
@@ -122,6 +102,20 @@ pub struct MtlsBundle {
     pub extra_ca_pem: Option<Vec<u8>>,
 }
 
+/// Path the DP POSTs a heartbeat to, under `managed.cp_base_url`. The
+/// telemetry worker derives its URL by swapping it for `/dp/telemetry`.
+pub const HEARTBEAT_PATH: &str = "/dp/heartbeat";
+
+/// Build the heartbeat URL from `managed.cp_base_url`.
+///
+/// Both managed boot paths (fresh provision, persisted bundle) derive
+/// it here so they cannot drift, and so a test can exercise the same
+/// derivation the binary uses. The base already carries a scheme —
+/// `aisix_core::Config` normalises it at load.
+pub fn heartbeat_url(cp_base: &str) -> String {
+    format!("{}{HEARTBEAT_PATH}", cp_base.trim_end_matches('/'))
+}
+
 /// Configuration captured at register time. `url`, `dp_id`, `interval`
 /// come from the register response (or are synthesised on bundle-on-disk
 /// boots); `mtls` points at the persisted bundle.
@@ -167,7 +161,7 @@ pub struct HeartbeatConfig {
 impl std::fmt::Debug for HeartbeatConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HeartbeatConfig")
-            .field("url", &self.url)
+            .field("url", &redact_url_for_log(&self.url))
             .field("dp_id", &self.dp_id)
             .field("instance_id", &self.instance_id)
             .field("hostname", &self.hostname)
@@ -273,7 +267,7 @@ async fn run(cfg: HeartbeatConfig, cancel: &mut watch::Receiver<bool>) {
     let client = match build_client(&cfg.mtls) {
         Ok(c) => Arc::new(c),
         Err(e) => {
-            tracing::error!(error = %e, "heartbeat: build mTLS reqwest client failed; disabled");
+            tracing::error!(error = %format_args!("{e:#}"), "heartbeat: build mTLS reqwest client failed; disabled");
             return;
         }
     };
@@ -285,7 +279,7 @@ async fn run(cfg: HeartbeatConfig, cancel: &mut watch::Receiver<bool>) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     tracing::info!(
-        url = %cfg.url,
+        url = %redact_url_for_log(&cfg.url),
         dp_id = %cfg.dp_id,
         instance_id = %cfg.instance_id,
         hostname = %cfg.hostname,
@@ -299,7 +293,7 @@ async fn run(cfg: HeartbeatConfig, cancel: &mut watch::Receiver<bool>) {
                 let uptime = started.elapsed().as_secs() as i64;
                 match send(&client, &cfg, uptime).await {
                     Ok(()) => tracing::debug!("heartbeat ok"),
-                    Err(e) => tracing::warn!(error = %e, "heartbeat failed"),
+                    Err(e) => tracing::warn!(error = %format_args!("{e:#}"), "heartbeat failed"),
                 }
             }
             _ = cancel.changed() => {
@@ -323,9 +317,10 @@ struct HeartbeatBody<'a> {
     hostname: &'a str,
     uptime_seconds: i64,
     version: &'a str,
-    /// Guardrail `kind` discriminators compiled into this binary
-    /// (#519 B.6). Always present so the control plane can hide / flag kinds the
-    /// DP can't serve (e.g. a build without the `bedrock` feature).
+    /// Guardrail `kind` discriminators this node can serve (#519 B.6).
+    /// Always present so the control plane can hide / flag kinds the
+    /// DP can't serve. Fixed at compile time — a build without the `bedrock`
+    /// feature does not advertise `bedrock`.
     supported_guardrail_kinds: &'static [&'static str],
     /// Highest etcd/kine revision the watch supervisor has applied
     /// (#519 B.3). `0` = snapshot not loaded yet. The control plane compares this
@@ -402,15 +397,15 @@ impl ExporterHealthWire {
 }
 
 /// On-the-wire shape for one rejection. Kept as a separate type from
-/// `aisix_etcd::loader::RejectedEntry` so the loader's internal
-/// representation can evolve without forcing a wire bump. The two
-/// converge today; `kind` is serialised as a string ("bad_key",
+/// [`ConfigRejectionSnapshot`] so the status subsystem's internal
+/// representation can evolve without forcing a wire bump. `kind` is
+/// serialised as a string ("bad_key",
 /// "non_json", "schema_failed", "parse_failed", "unknown_kind") so
 /// the control plane can match without depending on Rust enum repr.
 #[derive(Debug, Serialize)]
 struct RejectedResourceWire {
     key: String,
-    kind: &'static str,
+    kind: String,
     error: String,
     timestamp_unix_secs: u64,
     /// Unix seconds since when this key has been serving its last known
@@ -423,11 +418,11 @@ struct RejectedResourceWire {
     stale_serving_since_unix_secs: Option<u64>,
 }
 
-impl From<&RejectedEntry> for RejectedResourceWire {
-    fn from(r: &RejectedEntry) -> Self {
+impl From<&ConfigRejectionSnapshot> for RejectedResourceWire {
+    fn from(r: &ConfigRejectionSnapshot) -> Self {
         Self {
             key: r.key.clone(),
-            kind: r.kind.as_str(),
+            kind: r.kind.clone(),
             error: r.error.clone(),
             timestamp_unix_secs: r.timestamp_unix_secs,
             stale_serving_since_unix_secs: r.stale_serving_since_unix_secs,
@@ -469,13 +464,25 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
         .as_ref()
         .map(|fetcher| fetcher())
         .unwrap_or(0);
-    let config_hash = cfg
-        .config_hash_fetcher
-        .as_ref()
-        .and_then(|fetcher| fetcher())
-        // Defensive clamp — the hash is 64 hex chars, but the CP column
-        // caps at 128 so never send more.
-        .map(|h| h.chars().take(CONFIG_HASH_MAX_CHARS).collect::<String>());
+    // Off the runtime's own threads: the configuration status computes
+    // this digest when something reports it rather than on every apply,
+    // so the first heartbeat after an apply walks the whole
+    // configuration on a background-priority thread.
+    let config_hash = match cfg.config_hash_fetcher.clone() {
+        Some(fetcher) => match tokio::task::spawn_blocking(move || fetcher()).await {
+            Ok(hash) => hash,
+            Err(error) => {
+                // Silently omitting it would repeat every cycle with
+                // nothing to read.
+                tracing::error!(%error, "reading the applied config hash failed");
+                None
+            }
+        },
+        None => None,
+    }
+    // Defensive clamp — the hash is 64 hex chars, but the CP column
+    // caps at 128 so never send more.
+    .map(|h| h.chars().take(CONFIG_HASH_MAX_CHARS).collect::<String>());
     let mut exporter_health: Vec<ExporterHealthWire> = cfg
         .exporter_health_fetcher
         .as_ref()
@@ -504,7 +511,7 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
             instance_id: &cfg.instance_id,
             hostname: &cfg.hostname,
             uptime_seconds: uptime,
-            version: &BUILD_VERSION,
+            version: &aisix_core::HEARTBEAT_VERSION,
             supported_guardrail_kinds: aisix_guardrails::supported_kinds(),
             applied_revision,
             config_hash,
@@ -514,14 +521,15 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
         })
         .send()
         .await
-        .with_context(|| format!("POST {}", cfg.url))?;
+        .map_err(reqwest::Error::without_url)
+        .with_context(|| format!("POST {}", redact_url_for_log(&cfg.url)))?;
 
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         return Err(anyhow!(
             "heartbeat {} returned {} — {}",
-            cfg.url,
+            redact_url_for_log(&cfg.url),
             status,
             body.trim().chars().take(200).collect::<String>()
         ));
@@ -529,7 +537,12 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
     Ok(())
 }
 
-fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
+/// Build a reqwest client wired up with the on-disk mTLS bundle: the
+/// CA from the control plane as a trust root, plus the DP's client cert + key as
+/// the presenting identity. Files are read here (not at config-load
+/// time) so an unreadable/rotated bundle surfaces an actionable error
+/// at the same place every other heartbeat error does.
+pub(crate) fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
     let ca_pem = std::fs::read(&mtls.ca_cert_path)
         .with_context(|| format!("read {}", mtls.ca_cert_path.display()))?;
     let cert_pem = std::fs::read(&mtls.client_cert_path)
@@ -555,7 +568,7 @@ fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
 
     let mut builder = aisix_gateway::client_builder()
         .timeout(Duration::from_secs(10))
-        .user_agent(format!("aisix-dp/{}", &*BUILD_VERSION))
+        .user_agent(format!("aisix-dp/{}", &*aisix_core::BUILD_VERSION))
         .identity(identity)
         .add_root_certificate(ca)
         // Pin HTTP/1.1 for the control plane REST calls. The control plane
@@ -589,20 +602,6 @@ mod tests {
     use std::path::Path;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    /// The reported version must correlate a DP node with its container
-    /// image: CI stamps the image-tag sha, local builds stay bare.
-    #[test]
-    fn build_version_appends_stamped_image_sha() {
-        assert_eq!(
-            format_build_version("0.1.0", Some("103d3ec")),
-            "0.1.0+sha-103d3ec"
-        );
-        assert_eq!(format_build_version("0.1.0", None), "0.1.0");
-        // An empty stamp (e.g. `AISIX_BUILD_SHA=` in a misconfigured CI
-        // env) must not produce a dangling "0.1.0+sha-".
-        assert_eq!(format_build_version("0.1.0", Some("")), "0.1.0");
-    }
 
     /// Bundle on disk used by the build_client test: generates a real
     /// self-signed CA + leaf so reqwest's PEM parser actually accepts
@@ -653,6 +652,68 @@ mod tests {
         )
     }
 
+    /// A scheme-less `managed.cp_base_url` used to produce
+    /// `127.0.0.1:7944/dp/heartbeat`, which reqwest rejects when the
+    /// request is BUILT — so the beat never left the process and the
+    /// only symptom was one WARN per interval, while etcd (which
+    /// attaches its own scheme) stayed connected and the console showed
+    /// the gateway healthy (AISIX-Cloud#1643).
+    ///
+    /// The probe is the error kind: a builder error means no request was
+    /// ever formed, while any transport error means one was and only the
+    /// exchange failed. A peer that accepts and hangs up is what makes
+    /// the two distinguishable without standing up a control plane.
+    #[tokio::test]
+    async fn heartbeat_request_is_built_from_a_scheme_less_cp_base_url() {
+        // The listener is HELD for the whole test and answers by
+        // closing the connection immediately. Binding a port and
+        // dropping it would leave a window in which another process on
+        // a busy CI box takes it, and the probe below needs the peer's
+        // behaviour to be deterministic, not merely likely.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
+        let file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            format!(
+                r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+managed:
+  enabled: true
+  cp_base_url: "127.0.0.1:{port}"
+"#
+            ),
+        )
+        .unwrap();
+        let loaded = aisix_core::Config::load_from_path(Some(file.path())).unwrap();
+        let url = heartbeat_url(loaded.managed.cp_base_url.as_deref().unwrap());
+        assert_eq!(url, format!("https://127.0.0.1:{port}/dp/heartbeat"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_bundle(url, write_test_bundle(dir.path()));
+        let err = send(&plain_client(), &cfg, 0).await.unwrap_err();
+        let source = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<reqwest::Error>())
+            .unwrap_or_else(|| panic!("expected a reqwest failure, got: {err:#}"));
+        assert!(
+            !source.is_builder(),
+            "the heartbeat request was never built: {source}"
+        );
+    }
+
     fn plain_client() -> reqwest::Client {
         // Plain HTTP client used by the wiremock-based send tests.
         // We don't want to drag the wiremock test through TLS termination
@@ -666,7 +727,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_omits_authorization_header_and_posts_body() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/heartbeat"))
             .and(body_string_contains("\"dp_id\":\"dp_test_node_42\""))
@@ -705,7 +766,7 @@ mod tests {
     /// per-exporter delivery health (sorted by name).
     #[tokio::test]
     async fn send_includes_guardrail_kinds_revision_and_exporter_health() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/heartbeat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -742,21 +803,14 @@ mod tests {
         let received = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
 
-        // B.6 — exact compiled-in kinds under default features.
+        // B.6 — the compiled-in kinds reach the wire verbatim, in order.
+        // Compared against the crate that owns the list rather than a copy
+        // of it: a second hand-written list here would only freeze whatever
+        // the first one says. What the list must CONTAIN is pinned against
+        // the schema vocabulary in `aisix_guardrails`.
         assert_eq!(
             body["supported_guardrail_kinds"],
-            serde_json::json!([
-                "keyword",
-                "pii",
-                "azure_content_safety",
-                "azure_content_safety_text_moderation",
-                "aliyun_text_moderation",
-                "aliyun_ai_guardrail",
-                "bedrock",
-                "lakera",
-                "openai_moderation",
-                "presidio",
-            ]),
+            serde_json::json!(aisix_guardrails::supported_kinds()),
         );
 
         // B.3 — the fetched applied revision.
@@ -793,7 +847,7 @@ mod tests {
     /// serving omits the field (historical body shape).
     #[tokio::test]
     async fn send_includes_stale_serving_since_on_rejections() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/heartbeat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -807,16 +861,16 @@ mod tests {
         let cfg = cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls)
             .with_rejection_fetcher(Arc::new(|| {
                 vec![
-                    RejectedEntry {
+                    ConfigRejectionSnapshot {
                         key: "/aisix/models/stale-served".into(),
-                        kind: aisix_etcd::loader::RejectionKind::SchemaFailed,
+                        kind: "schema_failed".into(),
                         error: "schema validation failed".into(),
                         timestamp_unix_secs: 1_770_000_100,
                         stale_serving_since_unix_secs: Some(1_770_000_000),
                     },
-                    RejectedEntry {
+                    ConfigRejectionSnapshot {
                         key: "/aisix/models/never-loaded".into(),
-                        kind: aisix_etcd::loader::RejectionKind::SchemaFailed,
+                        kind: "schema_failed".into(),
                         error: "schema validation failed".into(),
                         timestamp_unix_secs: 1_770_000_100,
                         stale_serving_since_unix_secs: None,
@@ -841,7 +895,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_includes_partially_compatible_resources_when_wired() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/heartbeat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -876,7 +930,7 @@ mod tests {
     /// serialize: revision 0 and an empty exporter_health array.
     #[tokio::test]
     async fn send_defaults_new_fields_without_fetchers() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/heartbeat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -918,7 +972,7 @@ mod tests {
     /// is clamped to 128 chars (the control plane ingestion contract).
     #[tokio::test]
     async fn send_includes_and_clamps_config_hash() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/heartbeat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -958,7 +1012,7 @@ mod tests {
     /// same, and the legacy body shape is preserved.
     #[tokio::test]
     async fn send_omits_config_hash_when_fetcher_yields_none() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/heartbeat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -986,7 +1040,7 @@ mod tests {
     /// presenting the same cert bundle (k8s replicas).
     #[tokio::test]
     async fn send_includes_per_boot_instance_identity() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/heartbeat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1029,7 +1083,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_propagates_non_success_body() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/heartbeat"))
             .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
@@ -1060,7 +1114,7 @@ mod tests {
         // Bundle is real but the tick uses plain HTTP wiremock — the
         // mTLS client builder still has to succeed for `run` to enter
         // its loop, which is what this test exercises.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/dp/heartbeat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
@@ -1180,5 +1234,68 @@ mod tests {
             extra_ca_pem: None,
         };
         build_client(&mtls).expect("build_client must tolerate PEM without trailing newline");
+    }
+
+    #[tokio::test]
+    async fn a_failed_heartbeat_logs_its_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/dp/heartbeat", listener.local_addr().unwrap());
+        drop(listener);
+        let cfg = cfg_with_bundle(url, write_test_bundle(dir.path()));
+        let (_keep, mut cancel) = watch::channel(false);
+        // The first tick fires at once; `run` never returns on its own.
+        let (_, logged) = crate::dp_store::test_logs::capture_logs(tokio::time::timeout(
+            Duration::from_secs(3),
+            run(cfg, &mut cancel),
+        ))
+        .await;
+        assert!(logged.contains("heartbeat failed"), "{logged}");
+        assert!(logged.to_lowercase().contains("refused"), "{logged}");
+    }
+
+    /// `managed.cp_base_url` may carry a password. It is used as configured
+    /// and displayed nowhere: not in `Debug`, the startup line, or the failure
+    /// logged on every tick.
+    #[tokio::test]
+    async fn a_password_in_the_url_reaches_no_log_line_and_no_debug_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://user:hunter2@{}/dp/heartbeat",
+            listener.local_addr().unwrap()
+        );
+        drop(listener);
+        let cfg = cfg_with_bundle(url, write_test_bundle(dir.path()));
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains("hunter2"), "{debug}");
+        let (_keep, mut cancel) = watch::channel(false);
+        let (_, logged) = crate::dp_store::test_logs::capture_logs(tokio::time::timeout(
+            Duration::from_secs(3),
+            run(cfg, &mut cancel),
+        ))
+        .await;
+        assert!(logged.contains("heartbeat started"), "{logged}");
+        assert!(logged.contains("heartbeat failed"), "{logged}");
+        assert!(!logged.contains("hunter2"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_heartbeat_does_not_quote_the_password() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!(
+            "{}/dp/heartbeat",
+            server.uri().replacen("http://", "http://user:hunter2@", 1)
+        );
+        let cfg = cfg_with_bundle(url, write_test_bundle(dir.path()));
+        let err = send(&plain_client(), &cfg, 7).await.unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("503"), "{text}");
+        assert!(!text.contains("hunter2"), "{text}");
     }
 }

@@ -26,13 +26,18 @@
 use aisix_core::models::{
     validate_a2a_agent_lenient, validate_a2a_agent_url, validate_apikey_lenient,
     validate_cache_policy_lenient, validate_claim_mapping_lenient,
-    validate_guardrail_attachment_lenient, validate_guardrail_lenient, validate_mcp_policy_lenient,
-    validate_mcp_server_lenient, validate_model_lenient, validate_observability_exporter_lenient,
+    validate_guardrail_attachment_lenient, validate_guardrail_lenient,
+    validate_mcp_auth_settings_lenient, validate_mcp_policy_lenient, validate_mcp_server_lenient,
+    validate_model_lenient, validate_observability_exporter_lenient,
     validate_oidc_provider_lenient, validate_passthrough_route_lenient,
     validate_provider_key_lenient, validate_rate_limit_policy_lenient, A2aAgent, ApiKey,
-    CachePolicy, ClaimMapping, Guardrail, GuardrailAttachment, McpPolicy, McpServer, Model,
-    ObservabilityExporter, OidcProvider, PassthroughRoute, ProviderKey, RateLimitPolicy,
-    SchemaError,
+    CachePolicy, ClaimMapping, Guardrail, GuardrailAttachment, McpAuthSettings, McpPolicy,
+    McpServer, Model, ObservabilityExporter, OidcProvider, PassthroughRoute, ProviderKey,
+    RateLimitPolicy, SchemaError,
+};
+use aisix_core::models::{
+    validate_budget_lenient, validate_budget_policy_lenient, validate_pricing_lenient,
+    validate_team_lenient, validate_user_lenient, Budget, BudgetPolicy, Pricing, Team, User,
 };
 use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
@@ -40,7 +45,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::key::{self, ResourceKey};
+use crate::key::{PrefixScope, PrefixSet, ScopedKey};
 use crate::provider::RawEntry;
 
 /// Why the loader skipped an entry. Surfaced in [`RejectedEntry`] so
@@ -127,8 +132,8 @@ pub struct PartialCompatEntry {
     pub kind: String,
     /// Dotted path of the ignored field inside the document
     /// (e.g. `quota_profile` or `rate_limit.burst`). Array indices are
-    /// normalized to `[]` (`routing.targets[].priority`) so the entry
-    /// count is bounded by the document shape, not the data volume.
+    /// normalized to a `[]` segment (`routing.targets.[].priority`) so the
+    /// entry count is bounded by the document shape, not the data volume.
     pub field: String,
     /// Number of rows of this kind carrying this unknown field in the
     /// build.
@@ -202,14 +207,15 @@ pub struct BuildStats {
 }
 
 /// Build a fresh snapshot from raw entries. Never fails — bad rows are
-/// counted in [`BuildStats`] and skipped. The prefix lets us strip it
-/// before key parsing.
-pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, BuildStats) {
+/// counted in [`BuildStats`] and skipped. The prefix set both strips the
+/// prefix before key parsing and decides which prefix a key came from,
+/// which is what selects the table a `pricing` row lands in.
+pub fn build_snapshot(prefixes: &PrefixSet, entries: &[RawEntry]) -> (AisixSnapshot, BuildStats) {
     let snapshot = AisixSnapshot::new();
     let mut stats = BuildStats::default();
 
     for raw in entries {
-        let parsed = match key::parse(prefix, &raw.key) {
+        let parsed = match prefixes.resolve(&raw.key) {
             Ok(k) => k,
             Err(err) => {
                 tracing::warn!(key = %raw.key, error = %err, "skipping etcd entry with bad key");
@@ -236,6 +242,45 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                 continue;
             }
         };
+
+        // The shared catalog carries prices and nothing else. Anything
+        // else written there is refused outright rather than loaded into
+        // the environment's tables: the global prefix is written by a
+        // different authority, and every other kind is environment-scoped
+        // by definition.
+        //
+        // This reports `UnknownKind`, which since #1207 the status handle
+        // treats as forward compatibility: the row lands in `unknown_kinds[]`
+        // and does NOT flip `aisix_config_last_reload_successful`, even when
+        // the kind is one this build knows perfectly well and is merely
+        // misplaced. Deliberate, and the divergence it creates is bounded:
+        // the control plane's own filter only suppresses a kind no released
+        // gateway reads (`dpfloor.UnreadByEveryRelease`), so a misplaced
+        // KNOWN kind is still stored and shown red on the environment
+        // overview — an operator learns about it there, from the plane that
+        // wrote it. Splitting the two apart here would need a new rejection
+        // reason on the heartbeat wire, whose vocabulary the control plane
+        // pins in a closed enum, and only the control plane writes this
+        // prefix (today: `pricing` alone), so the case needs a projection
+        // bug or a hand-written key to occur at all.
+        if parsed.scope == PrefixScope::Global && parsed.kind != "pricing" {
+            tracing::warn!(
+                key = %raw.key,
+                kind = %parsed.kind,
+                "rejecting etcd entry: the global prefix carries `pricing` documents only",
+            );
+            stats.unknown_kind += 1;
+            stats.rejections.push(RejectedEntry::new(
+                raw.key.clone(),
+                RejectionKind::UnknownKind,
+                format!(
+                    "kind {:?} is not accepted under the global prefix, which carries \
+                     `pricing` documents only",
+                    parsed.kind
+                ),
+            ));
+            continue;
+        }
 
         match parsed.kind {
             "models" => {
@@ -369,12 +414,15 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                 }
             }
             "mcp_servers" => {
-                if let Some(entry) = validate_and_parse::<McpServer>(
+                // An OpenAPI document that yields no tool would register a
+                // server serving nothing — rejected like a schema failure.
+                if let Some(entry) = validate_and_parse_with_semantics::<McpServer>(
                     &raw.key,
                     raw.revision,
                     parsed,
                     &value,
                     validate_mcp_server_lenient,
+                    |s| s.validate_semantics(),
                     &mut stats,
                 ) {
                     snapshot.mcp_servers.insert(entry);
@@ -427,12 +475,20 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                 }
             }
             "oidc_providers" => {
-                if let Some(entry) = validate_and_parse::<OidcProvider>(
+                // Which fields a provider requires depends on its
+                // verification mode, which the schema cannot express
+                // (`issuer`/`audiences` for JWKS mode, no `jwks_uri` and
+                // a 32-byte floor for HMAC mode) — the semantic hook
+                // rejects such rows the same way a schema failure is
+                // rejected, so a provider that could not verify anything
+                // never enters the snapshot.
+                if let Some(entry) = validate_and_parse_with_semantics::<OidcProvider>(
                     &raw.key,
                     raw.revision,
                     parsed,
                     &value,
                     validate_oidc_provider_lenient,
+                    |p| p.validate_semantics(),
                     &mut stats,
                 ) {
                     snapshot.oidc_providers.insert(entry);
@@ -448,6 +504,84 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     &mut stats,
                 ) {
                     snapshot.claim_mappings.insert(entry);
+                }
+            }
+            "mcp_auth_settings" => {
+                if let Some(entry) = validate_and_parse::<McpAuthSettings>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_mcp_auth_settings_lenient,
+                    &mut stats,
+                ) {
+                    snapshot.mcp_auth_settings.insert(entry);
+                }
+            }
+            "teams" => {
+                if let Some(entry) = validate_and_parse::<Team>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_team_lenient,
+                    &mut stats,
+                ) {
+                    snapshot.teams.insert(entry);
+                }
+            }
+            "users" => {
+                if let Some(entry) = validate_and_parse::<User>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_user_lenient,
+                    &mut stats,
+                ) {
+                    snapshot.users.insert(entry);
+                }
+            }
+            "budgets" => {
+                if let Some(entry) = validate_and_parse::<Budget>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_budget_lenient,
+                    &mut stats,
+                ) {
+                    snapshot.budgets.insert(entry);
+                }
+            }
+            "budget_policy" => {
+                if let Some(entry) = validate_and_parse::<BudgetPolicy>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_budget_policy_lenient,
+                    &mut stats,
+                ) {
+                    snapshot.budget_policy.insert(entry);
+                }
+            }
+            "pricing" => {
+                if let Some(entry) = validate_and_parse::<Pricing>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_pricing_lenient,
+                    &mut stats,
+                ) {
+                    // Which table follows from the prefix, not the kind:
+                    // an environment document overrides the catalog entry
+                    // carrying the same `key`.
+                    match parsed.scope {
+                        PrefixScope::Environment => snapshot.pricing.insert(entry),
+                        PrefixScope::Global => snapshot.global_pricing.insert(entry),
+                    }
                 }
             }
             other => {
@@ -469,7 +603,7 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
 fn validate_and_parse<T>(
     key: &str,
     revision: i64,
-    parsed: ResourceKey<'_>,
+    parsed: ScopedKey<'_>,
     value: &Value,
     validate: fn(&Value) -> Result<(), SchemaError>,
     stats: &mut BuildStats,
@@ -490,7 +624,7 @@ where
 fn validate_and_parse_with_semantics<T>(
     key: &str,
     revision: i64,
-    parsed: ResourceKey<'_>,
+    parsed: ScopedKey<'_>,
     value: &Value,
     validate: fn(&Value) -> Result<(), SchemaError>,
     semantic: fn(&T) -> Result<(), String>,
@@ -529,9 +663,20 @@ where
                 return None;
             }
             stats.accepted += 1;
+            // `serde_ignored` is blind inside serde-buffered content, which
+            // for some kinds is the whole config subtree; those take their
+            // unknown-field paths off the schema instead.
+            if let Some(resource) = schema_reported_resource(parsed.kind) {
+                ignored.extend(
+                    aisix_core::models::unknown_field_paths(resource, value)
+                        .iter()
+                        .map(|path| normalize_ignored_path(path)),
+                );
+            }
             if !ignored.is_empty() {
                 // YELLOW: loaded, but fields this build does not know were
-                // ignored — typically written by a newer control plane.
+                // ignored. Which side is ahead is not knowable here — see
+                // `warn_partial_compat_deduped`.
                 ignored.sort_unstable();
                 ignored.dedup();
                 // A single document can carry an arbitrary number of
@@ -565,6 +710,25 @@ where
             ));
             None
         }
+    }
+}
+
+/// The schema resource name behind an etcd row kind, for the kinds whose
+/// unknown fields `serde_ignored` cannot see: `guardrails` and
+/// `observability_exporters` deserialise their entire config through a
+/// `#[serde(flatten)]`ed tagged enum, `models` and `rate_limit_policies`
+/// through untagged variants (`OnEmbeddingFailure`, `ConditionNode`). Serde
+/// buffers all of it, so the ignored-field callback never fires there and
+/// the row would load silently. Every other kind is fully covered by
+/// `serde_ignored`; the two sources overlap harmlessly, since the paths are
+/// normalized the same way and deduped.
+fn schema_reported_resource(row_kind: &str) -> Option<&'static str> {
+    match row_kind {
+        "guardrails" => Some("guardrail"),
+        "observability_exporters" => Some("observability_exporter"),
+        "models" => Some("model"),
+        "rate_limit_policies" => Some("rate_limit_policy"),
+        _ => None,
     }
 }
 
@@ -626,6 +790,21 @@ fn merge_partial_compat_fields(stats: &mut BuildStats, key: &str, kind: &str, fi
 /// combinations keep logging (never silently dropped) but are no longer
 /// remembered, so a pathological fleet re-logs on each resync instead
 /// of growing memory without bound.
+///
+/// The message names what this build knows and stops there. It used to
+/// add "likely written by a newer control plane", which is wrong exactly
+/// half the time and wrong in the situation that produces most of these
+/// lines: an UPGRADE, where the new data plane meets rows an OLDER
+/// control plane wrote with a field this build has since dropped
+/// (AISIX-Cloud#1435 saw `ignored_fields=mandatory` reported that way).
+/// A misdirected diagnostic on the one path where unknown fields are
+/// expected sends the reader looking at the wrong side of the fleet.
+///
+/// The direction is not merely unreported, it is unobservable from here:
+/// a retired field leaves no trace in this build — no tombstone, no
+/// "must not exist" list — so "unknown" cannot be split into "added
+/// since" and "removed since". Naming the field and its consequence is
+/// the whole of what this side can say.
 fn warn_partial_compat_deduped(key: &str, kind: &str, fields: &[String]) {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
@@ -649,8 +828,9 @@ fn warn_partial_compat_deduped(key: &str, kind: &str, fields: &[String]) {
         key = %key,
         kind = %kind,
         ignored_fields = %entry.1,
-        "row loaded with unknown fields ignored (partially compatible; \
-         likely written by a newer control plane)"
+        "row loaded with unknown fields ignored (partially compatible); this \
+         build does not define them, so whatever they configure is not \
+         enforced here"
     );
     if warned.len() < MAX_REMEMBERED {
         warned.insert(entry);
@@ -660,6 +840,21 @@ fn warn_partial_compat_deduped(key: &str, kind: &str, fields: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The environment prefix alone — what every case below that says
+    /// nothing about scopes is built on.
+    fn env_prefixes() -> PrefixSet {
+        PrefixSet::single("/aisix")
+    }
+
+    /// Environment `/aisix/<env>/` plus the shared catalog
+    /// `/aisix/global/`, the shape a managed gateway watches.
+    fn scoped_prefixes() -> PrefixSet {
+        PrefixSet::new(vec![
+            crate::key::WatchedPrefix::environment("/aisix/env-1/"),
+            crate::key::WatchedPrefix::global("/aisix/global/"),
+        ])
+    }
 
     fn raw(key: &str, value: &[u8], rev: i64) -> RawEntry {
         RawEntry {
@@ -687,7 +882,7 @@ mod tests {
             raw("/aisix/models/m-1", VALID_MODEL, 2),
             raw("/aisix/api_keys/k-1", VALID_APIKEY, 3),
         ];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
 
         assert_eq!(stats.accepted, 2);
         assert_eq!(snap.models.len(), 1);
@@ -709,7 +904,7 @@ mod tests {
             raw("/aisix/models/bad", b"not-json", 1),
             raw("/aisix/models/good", VALID_MODEL, 2),
         ];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.parse_rejected, 1);
         assert_eq!(stats.accepted, 1);
         assert_eq!(snap.models.len(), 1);
@@ -725,15 +920,101 @@ mod tests {
             br#"{"display_name":"","provider":"openai","model_name":"large","provider_key_id":"pk-1"}"#,
             1,
         )];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.schema_rejected, 1);
         assert_eq!(stats.accepted, 0);
+    }
+
+    const PRICE: &[u8] = br#"{"key":"openai/gpt-4o","input_per_1k":0.005,"output_per_1k":0.015}"#;
+
+    #[test]
+    fn a_pricing_document_lands_in_the_table_its_prefix_selects() {
+        let entries = vec![
+            raw("/aisix/env-1/pricing/env-p", PRICE, 1),
+            raw("/aisix/global/pricing/global-p", PRICE, 2),
+        ];
+        let (snap, stats) = build_snapshot(&scoped_prefixes(), &entries);
+        assert_eq!(stats.accepted, 2);
+        assert!(stats.rejections.is_empty(), "{:?}", stats.rejections);
+        // Two tables, not one: the whole point of the split is that an
+        // environment document can win over the catalog document carrying
+        // the same `key`.
+        assert_eq!(snap.pricing.len(), 1);
+        assert_eq!(snap.global_pricing.len(), 1);
+        assert!(snap.pricing.get_by_id("env-p").is_some());
+        assert!(snap.global_pricing.get_by_id("global-p").is_some());
+        // Indexed by `key`, which is what `pricing_key` resolves through.
+        assert_eq!(
+            snap.global_pricing.get_by_name("openai/gpt-4o").unwrap().id,
+            "global-p"
+        );
+    }
+
+    #[test]
+    fn the_global_prefix_refuses_every_kind_but_pricing() {
+        // A well-formed model document — it would load without complaint
+        // under the environment prefix. Written under the global one it
+        // must not reach the snapshot at all: that prefix is written by a
+        // different authority, and every other kind is environment-scoped.
+        let model = br#"{"display_name":"m","provider":"openai","model_name":"gpt-4o","provider_key_id":"11111111-1111-1111-1111-111111111111"}"#;
+        let entries = vec![
+            raw("/aisix/global/models/smuggled", model, 1),
+            raw("/aisix/global/api_keys/smuggled-key", br#"{"key_hash":"91ed2dbc407561556f3e7be98ba0bd2a57986d6a868c482d867d19c6d40d201c"}"#, 2),
+            raw("/aisix/global/pricing/ok", PRICE, 3),
+        ];
+        let (snap, stats) = build_snapshot(&scoped_prefixes(), &entries);
+        assert_eq!(snap.models.len(), 0);
+        assert_eq!(snap.apikeys.len(), 0);
+        assert_eq!(snap.global_pricing.len(), 1);
+        assert_eq!(stats.accepted, 1);
+        assert_eq!(stats.unknown_kind, 2);
+        assert_eq!(stats.rejections.len(), 2);
+        for r in &stats.rejections {
+            assert_eq!(r.kind, RejectionKind::UnknownKind);
+            assert!(
+                r.error.contains("global prefix"),
+                "rejection should say why, got {:?}",
+                r.error
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_kinds_still_load_under_the_environment_prefix() {
+        // The mirror of the case above: the gate is scoped to the global
+        // prefix and must not have narrowed the environment's kinds.
+        let model = br#"{"display_name":"m","provider":"openai","model_name":"gpt-4o","provider_key_id":"11111111-1111-1111-1111-111111111111"}"#;
+        let entries = vec![raw("/aisix/env-1/models/m-1", model, 1)];
+        let (snap, stats) = build_snapshot(&scoped_prefixes(), &entries);
+        assert_eq!(stats.accepted, 1);
+        assert_eq!(snap.models.len(), 1);
+    }
+
+    #[test]
+    fn a_pricing_document_missing_a_price_is_rejected() {
+        // All three fields ARE the document; a row missing one prices
+        // nothing, so the read path refuses it rather than defaulting.
+        let entries = vec![
+            raw(
+                "/aisix/global/pricing/no-out",
+                br#"{"key":"k","input_per_1k":1.0}"#,
+                1,
+            ),
+            raw(
+                "/aisix/global/pricing/no-key",
+                br#"{"input_per_1k":1.0,"output_per_1k":2.0}"#,
+                2,
+            ),
+        ];
+        let (snap, stats) = build_snapshot(&scoped_prefixes(), &entries);
+        assert_eq!(snap.global_pricing.len(), 0);
+        assert_eq!(stats.schema_rejected, 2);
     }
 
     #[test]
     fn unknown_kinds_are_skipped() {
         let entries = vec![raw("/aisix/unknown_kind/x-1", b"{}", 1)];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.unknown_kind, 1);
         assert!(snap.models.is_empty());
         assert!(snap.apikeys.is_empty());
@@ -742,7 +1023,7 @@ mod tests {
     #[test]
     fn bad_key_shape_is_counted_separately() {
         let entries = vec![raw("/other/models/a", VALID_MODEL, 1)];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.key_rejected, 1);
     }
 
@@ -756,7 +1037,7 @@ mod tests {
     #[test]
     fn rejection_records_bad_key_with_kind_and_error_message() {
         let entries = vec![raw("/wrong/models/x", VALID_MODEL, 1)];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.rejections.len(), 1);
         assert_eq!(stats.rejections[0].kind, RejectionKind::BadKey);
         assert_eq!(stats.rejections[0].key, "/wrong/models/x");
@@ -766,7 +1047,7 @@ mod tests {
     #[test]
     fn rejection_records_non_json_payload() {
         let entries = vec![raw("/aisix/models/m1", b"not-json", 1)];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.rejections.len(), 1);
         assert_eq!(stats.rejections[0].kind, RejectionKind::NonJson);
     }
@@ -778,7 +1059,7 @@ mod tests {
             br#"{"display_name":"","provider":"openai","model_name":"l","provider_key_id":"pk"}"#,
             1,
         )];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.rejections.len(), 1);
         assert_eq!(stats.rejections[0].kind, RejectionKind::SchemaFailed);
     }
@@ -786,7 +1067,7 @@ mod tests {
     #[test]
     fn rejection_records_unknown_kind() {
         let entries = vec![raw("/aisix/unknown_kind/x-1", b"{}", 1)];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.rejections.len(), 1);
         assert_eq!(stats.rejections[0].kind, RejectionKind::UnknownKind);
     }
@@ -794,7 +1075,7 @@ mod tests {
     #[test]
     fn happy_entries_have_no_rejections() {
         let entries = vec![raw("/aisix/models/m-1", VALID_MODEL, 1)];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert!(stats.rejections.is_empty());
     }
 
@@ -817,7 +1098,7 @@ mod tests {
     #[test]
     fn provider_key_happy_path_accepts() {
         let entries = vec![raw("/aisix/provider_keys/pk-1", VALID_PROVIDER_KEY, 1)];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1);
         assert_eq!(snap.provider_keys.len(), 1);
         assert!(stats.rejections.is_empty());
@@ -840,7 +1121,7 @@ mod tests {
             br#"{"display_name":"bedrock-pk","secret":"x","provider":"amazon-bedrock","aws_region":"us-east-1"}"#,
             1,
         )];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
         assert!(stats.rejections.is_empty());
         assert!(snap.provider_keys.get_by_id("pk-bedrock").is_some());
@@ -865,7 +1146,7 @@ mod tests {
             br#"{"display_name":"vertex-pk","secret":"x","provider":"google-vertex","gcp_project":"my-proj","gcp_region":"us-central1"}"#,
             1,
         )];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
         assert!(snap.provider_keys.get_by_id("pk-vertex").is_some());
         assert_eq!(
@@ -896,7 +1177,7 @@ mod tests {
             br#"{"display_name":"azure-pk","secret":"x","provider":"azure","azure_resource_name":"my-azure","api_version":"2024-02-01"}"#,
             1,
         )];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
         assert!(snap.provider_keys.get_by_id("pk-azure").is_some());
         assert_eq!(
@@ -936,7 +1217,7 @@ mod tests {
             }"#,
             1,
         )];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
 
         // YELLOW: the row loads and serves with the unknown field ignored.
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
@@ -969,7 +1250,7 @@ mod tests {
             }"#,
             1,
         )];
-        let (snapshot, stats) = build_snapshot("/aisix", &entries);
+        let (snapshot, stats) = build_snapshot(&env_prefixes(), &entries);
 
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
         assert!(stats.rejections.is_empty());
@@ -993,6 +1274,110 @@ mod tests {
     }
 
     #[test]
+    fn guardrail_unknown_field_inside_a_nested_config_object_loads_and_is_reported() {
+        // The shape that used to take the whole row down: a control plane
+        // one release ahead adds an optional field inside a nested guardrail
+        // config object (this is what `custom_patterns[].replacement` did to
+        // a 0.10.0 data plane). The row must load with the field ignored —
+        // a skipped guardrail row is a content policy that silently stops
+        // enforcing — and the field must still be named in the report,
+        // which `serde_ignored` cannot do inside the flattened tagged kind.
+        let entries = vec![raw(
+            "/aisix/guardrails/g-forward",
+            br#"{
+                "name": "redact-versions",
+                "kind": "pii",
+                "custom_patterns": [{
+                    "name": "eda_version",
+                    "regex": "version\\s*:\\s*(\\d+)",
+                    "action": "mask",
+                    "future_knob": "from-a-newer-cp"
+                }]
+            }"#,
+            1,
+        )];
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
+
+        assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
+        assert!(stats.rejections.is_empty());
+        assert_eq!(snap.guardrails.len(), 1);
+        let entry = snap.guardrails.get_by_id("g-forward").unwrap();
+        assert_eq!(entry.value.name, "redact-versions");
+
+        assert_eq!(
+            stats.partially_compatible,
+            vec![PartialCompatEntry {
+                kind: "guardrails".into(),
+                field: "custom_patterns.[].future_knob".into(),
+                count: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn observability_exporter_unknown_field_loads_and_is_reported() {
+        // Same shape one resource over: the exporter kind block is
+        // flattened and tagged too, so its closure lived on the read path
+        // and its report was impossible. An exporter that stops exporting
+        // is a fleet going dark on telemetry for the length of the window.
+        let entries = vec![raw(
+            "/aisix/observability_exporters/o-forward",
+            br#"{
+                "name": "otlp",
+                "kind": "otlp_http",
+                "endpoint": "https://otel.example/v1/traces",
+                "future_knob": true
+            }"#,
+            1,
+        )];
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
+
+        assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
+        assert_eq!(snap.observability_exporters.len(), 1);
+        assert_eq!(
+            stats.partially_compatible,
+            vec![PartialCompatEntry {
+                kind: "observability_exporters".into(),
+                field: "future_knob".into(),
+                count: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn api_key_retired_mcp_access_mode_selector_is_an_unknown_field() {
+        // `mcp_access.mode` is no longer consumed by the typed struct, so a
+        // document a pre-0.10.0 control plane wrote takes the ordinary
+        // unknown-field path: the api_key row still LOADS — a skipped row
+        // would stop the key authenticating every kind of traffic, not just
+        // MCP — with its own half read and the retired selector reported
+        // through the partial-compat channel.
+        let entries = vec![raw(
+            "/aisix/api_keys/k-tombstone",
+            br#"{
+                "key_hash": "1460db1b6902f8b1fc2a40d9381a24d0fd22c3bc1b2c6f999c521da73776fbe0",
+                "allowed_models": ["m"],
+                "mcp_access": {"mode": "deny", "allow": ["github__*"], "deny": ["x__y"]}
+            }"#,
+            1,
+        )];
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
+        assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
+        assert_eq!(
+            stats.partially_compatible,
+            vec![PartialCompatEntry {
+                kind: "api_keys".into(),
+                field: "mcp_access.mode".into(),
+                count: 1,
+            }]
+        );
+        let entry = snap.apikeys.get_by_id("k-tombstone").unwrap();
+        let access = entry.value.mcp_access.as_ref().unwrap();
+        assert_eq!(access.allow, vec!["github__*"]);
+        assert_eq!(access.deny, vec!["x__y"]);
+    }
+
+    #[test]
     fn nested_unknown_field_reports_dotted_path() {
         let entries = vec![raw(
             "/aisix/api_keys/k-nested",
@@ -1003,7 +1388,7 @@ mod tests {
             }"#,
             1,
         )];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
         assert_eq!(
             stats.partially_compatible,
@@ -1024,7 +1409,7 @@ mod tests {
             br#"{"display_name":"r","routing":{"strategy":"quantum","targets":[{"model":"a"}]}}"#,
             1,
         )];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 0);
         assert_eq!(stats.schema_rejected, 1);
         assert_eq!(stats.rejections[0].kind, RejectionKind::SchemaFailed);
@@ -1042,7 +1427,7 @@ mod tests {
             raw("/aisix/api_keys/k-1", doc, 1),
             raw("/aisix/api_keys/k-2", doc, 2),
         ];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 2);
         assert_eq!(
             stats.partially_compatible,
@@ -1078,7 +1463,7 @@ mod tests {
             }"#,
             1,
         )];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
         assert_eq!(snap.guardrail_attachments.len(), 1);
         assert!(
@@ -1102,7 +1487,7 @@ mod tests {
             }"#,
             1,
         )];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
         let m = snap.models.get_by_name("grp").expect("row loaded");
         assert!(m.value.retries.is_none(), "dead knob stripped from struct");
@@ -1127,7 +1512,7 @@ mod tests {
             }"#,
             1,
         )];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
         let rows: Vec<_> = stats
             .partial_rows
@@ -1164,7 +1549,7 @@ mod tests {
             doc.to_string().as_bytes(),
             1,
         )];
-        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        let (_snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1);
         let fields = &stats.partial_rows[0].fields;
         assert_eq!(fields.len(), 65, "64 fields + the truncation sentinel");
@@ -1175,7 +1560,7 @@ mod tests {
     //
     // provider_key `secret`→`api_key` and mcp_server / a2a_agent
     // `display_name`→`name`: documents written under the former names
-    // (existing etcd data, current control-plane writes) and documents
+    // (existing etcd data a control plane left before 1.8.0) and documents
     // written under the canonical names must BOTH pass this loader's
     // schema gate and serde parse. A regression here silently drops
     // resources from the snapshot in managed mode.
@@ -1194,7 +1579,7 @@ mod tests {
                 2,
             ),
         ];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 2, "rejections: {:?}", stats.rejections);
         assert_eq!(snap.provider_keys.len(), 2);
         // Both spellings land on the same typed field.
@@ -1222,7 +1607,7 @@ mod tests {
                 2,
             ),
         ];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.schema_rejected, 0);
         assert_eq!(stats.parse_rejected, 1);
         assert_eq!(stats.accepted, 1);
@@ -1256,7 +1641,7 @@ mod tests {
                 4,
             ),
         ];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 4, "rejections: {:?}", stats.rejections);
         // The name index is fed by the renamed field for both spellings.
         assert!(snap.mcp_servers.get_by_name("gh-former").is_some());
@@ -1273,7 +1658,7 @@ mod tests {
             raw("/aisix/models/m-2", VALID_MODEL, 3), // same name -> update in place
             raw("/aisix/api_keys/k-1", VALID_APIKEY, 4),
         ];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 3);
         assert_eq!(stats.parse_rejected, 1);
         // m-1 and m-2 share the same name; the second insert rebinds the
@@ -1297,7 +1682,7 @@ mod tests {
             VALID_RATE_LIMIT_POLICY,
             5,
         )];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1);
         assert_eq!(snap.rate_limit_policies.len(), 1);
         let entry = snap.rate_limit_policies.get_by_id("rlp-1").unwrap();
@@ -1328,7 +1713,7 @@ mod tests {
             }"#,
             6,
         )];
-        let (snap, stats) = build_snapshot("/aisix", &entries);
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1);
         let entry = snap.rate_limit_policies.get_by_id("rlp-2").unwrap();
         assert!(entry.value.is_conditional());
@@ -1355,7 +1740,7 @@ mod tests {
             }"#,
             7,
         );
-        let (snap, stats) = build_snapshot("/aisix", std::slice::from_ref(&bad));
+        let (snap, stats) = build_snapshot(&env_prefixes(), std::slice::from_ref(&bad));
         assert_eq!(stats.accepted, 0);
         assert_eq!(stats.schema_rejected, 1);
         assert_eq!(snap.rate_limit_policies.len(), 0);
@@ -1367,5 +1752,203 @@ mod tests {
         assert_eq!(rej.key, "/aisix/rate_limit_policies/rlp-bad");
         assert_eq!(rej.kind, RejectionKind::SchemaFailed);
         assert!(rej.error.contains("does not compile"), "{}", rej.error);
+    }
+
+    #[test]
+    fn an_openapi_mcp_server_serving_no_tools_is_rejected_and_collisions_still_load() {
+        // AISIX-Cloud#1272: an OpenAPI document the gateway turns into zero
+        // tools, and a header name no HTTP request can carry, are rejected
+        // like a schema failure. Colliding operationIds are not: the runtime
+        // suffixes them and every tool stays callable.
+        let server = |name: &str, extra: &str| {
+            format!(
+                r#"{{"name":"{name}","type":"openapi","url":"https://api.test",
+                    "auth_type":"api_key","secret":"s"{extra}}}"#
+            )
+        };
+        let entries = vec![
+            raw(
+                "/aisix/mcp_servers/no-paths",
+                server("no-paths", r#","spec":{"openapi":"3.0.0"}"#).as_bytes(),
+                1,
+            ),
+            raw(
+                "/aisix/mcp_servers/multipart-only",
+                server(
+                    "multipart-only",
+                    r#","spec":{"openapi":"3.0.0","paths":{"/upload":{"post":{
+                        "operationId":"up",
+                        "requestBody":{"content":{"multipart/form-data":{}}}}}}}"#,
+                )
+                .as_bytes(),
+                2,
+            ),
+            raw(
+                "/aisix/mcp_servers/bad-header",
+                server(
+                    "bad-header",
+                    r#","api_key_header":"X Key","spec":{"paths":{"/a":{"get":{}}}}"#,
+                )
+                .as_bytes(),
+                3,
+            ),
+            raw(
+                "/aisix/mcp_servers/collisions",
+                server(
+                    "collisions",
+                    r#","spec":{"paths":{
+                        "/a":{"get":{"operationId":"foo/list"}},
+                        "/b":{"get":{"operationId":"foo.list"}}}}"#,
+                )
+                .as_bytes(),
+                4,
+            ),
+        ];
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
+        assert_eq!(stats.accepted, 1, "{:?}", stats.rejections);
+        assert_eq!(stats.schema_rejected, 3);
+        assert!(snap.mcp_servers.get_by_id("collisions").is_some());
+        assert_eq!(snap.mcp_servers.len(), 1);
+
+        let reason = |key: &str| {
+            stats
+                .rejections
+                .iter()
+                .find(|r| r.key == key)
+                .map(|r| (r.kind, r.error.as_str()))
+                .unwrap_or_else(|| panic!("{key} not rejected: {:?}", stats.rejections))
+        };
+        let (kind, err) = reason("/aisix/mcp_servers/no-paths");
+        assert_eq!(kind, RejectionKind::SchemaFailed);
+        assert!(err.contains("no `paths` object"), "{err}");
+        let (_, err) = reason("/aisix/mcp_servers/multipart-only");
+        assert!(err.contains("no operations that can become tools"), "{err}");
+        assert!(err.contains("POST /upload"), "{err}");
+        reason("/aisix/mcp_servers/bad-header");
+    }
+
+    #[test]
+    fn budget_documents_load_by_their_key_id() {
+        let entries = vec![
+            raw(
+                "/aisix/budgets/b-1",
+                br#"{"scope":"api_key","scope_ref":"k-1","period":"month","exhausted":{"reason":{"message":"m"}}}"#,
+                1,
+            ),
+            raw(
+                "/aisix/budget_policy/env-1",
+                br#"{"fail_mode":"closed","closed_grace_seconds":120}"#,
+                2,
+            ),
+            // A scope this build does not know drops the row.
+            raw("/aisix/budgets/b-2", br#"{"scope":"project","scope_ref":"p","period":"day"}"#, 3),
+        ];
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
+        assert_eq!(stats.accepted, 2, "{:?}", stats.rejections);
+        assert_eq!(stats.unknown_kind, 0);
+        assert!(snap.budgets.get_by_id("b-1").is_some());
+        assert!(snap.budgets.get_by_id("b-2").is_none());
+        assert_eq!(
+            snap.budget_policy
+                .get_by_id("env-1")
+                .unwrap()
+                .value
+                .closed_grace_seconds,
+            120
+        );
+    }
+
+    #[test]
+    fn team_and_user_documents_load_by_their_key_id() {
+        let entries = vec![
+            raw("/aisix/teams/team-1", br#"{"name":"Platform"}"#, 1),
+            raw("/aisix/users/user-1", br#"{"name":"Alice"}"#, 2),
+            // An unknown field is tolerated on read, like every kind.
+            raw("/aisix/users/user-2", br#"{"name":"Bob","email":"b@x"}"#, 3),
+            // `name` is the document; without it the row is rejected.
+            raw("/aisix/teams/team-2", br#"{}"#, 4),
+        ];
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
+        assert_eq!(stats.accepted, 3, "{:?}", stats.rejections);
+        assert_eq!(
+            snap.teams.get_by_id("team-1").unwrap().value.name,
+            "Platform"
+        );
+        assert_eq!(snap.users.get_by_id("user-1").unwrap().value.name, "Alice");
+        assert!(snap.users.get_by_id("user-2").is_some());
+        assert!(snap.teams.get_by_id("team-2").is_none());
+    }
+
+    #[test]
+    fn semantically_invalid_oidc_providers_are_rejected_and_the_valid_rows_still_load() {
+        // Each of the three mode rules the JSON Schema cannot express,
+        // alongside one row of each mode that is fine. A rejected
+        // provider must not enter the snapshot — one that could not
+        // verify anything would otherwise sit there claiming an issuer.
+        let secret = "shared-secret-that-is-long-enough-32";
+        let entries = vec![
+            raw(
+                "/aisix/oidc_providers/ok-jwks",
+                br#"{"name":"ok-jwks","issuer":"https://idp.test","audiences":["aisix"]}"#,
+                1,
+            ),
+            raw(
+                "/aisix/oidc_providers/ok-hmac",
+                format!(r#"{{"name":"ok-hmac","hmac_secret":"{secret}"}}"#).as_bytes(),
+                2,
+            ),
+            raw(
+                "/aisix/oidc_providers/bad-hmac-with-jwks-uri",
+                format!(
+                    r#"{{"name":"bad-1","hmac_secret":"{secret}","jwks_uri":"https://x/jwks"}}"#
+                )
+                .as_bytes(),
+                3,
+            ),
+            raw(
+                "/aisix/oidc_providers/bad-jwks-no-issuer",
+                br#"{"name":"bad-2","audiences":["aisix"]}"#,
+                4,
+            ),
+            raw(
+                "/aisix/oidc_providers/bad-jwks-no-audiences",
+                br#"{"name":"bad-3","issuer":"https://idp.test"}"#,
+                5,
+            ),
+            raw(
+                "/aisix/oidc_providers/bad-short-secret",
+                br#"{"name":"bad-4","hmac_secret":"too-short"}"#,
+                6,
+            ),
+        ];
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
+        assert_eq!(stats.accepted, 2);
+        assert_eq!(stats.schema_rejected, 4);
+        assert_eq!(snap.oidc_providers.len(), 2);
+        assert!(snap.oidc_providers.get_by_id("ok-jwks").is_some());
+        assert!(snap.oidc_providers.get_by_id("ok-hmac").is_some());
+
+        let reasons: Vec<&str> = stats.rejections.iter().map(|r| r.error.as_str()).collect();
+        for expected in [
+            "`jwks_uri` must be absent",
+            "`issuer` is required",
+            "`audiences` is required",
+            "at least 32 bytes",
+        ] {
+            assert!(
+                reasons.iter().any(|r| r.contains(expected)),
+                "no rejection mentioned {expected:?}: {reasons:?}"
+            );
+        }
+        // The rejection message is surfaced on /status/config and in the
+        // control plane's rejected-resources view; it must never carry
+        // the secret that made the row invalid.
+        assert!(
+            !reasons.iter().any(|r| r.contains("too-short")),
+            "a rejection must not echo the secret: {reasons:?}"
+        );
+        for r in &stats.rejections {
+            assert_eq!(r.kind, RejectionKind::SchemaFailed);
+        }
     }
 }

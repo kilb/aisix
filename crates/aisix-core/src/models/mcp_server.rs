@@ -5,8 +5,8 @@
 //! document whose operations the gateway itself exposes as tools
 //! (`type: openapi`). Either way the tools are aggregated into the gateway's
 //! own MCP endpoint under the namespace `<name>__<tool>`, and tool calls are
-//! routed back to the source. The upstream credential is held by the gateway
-//! and is never exposed to the calling client.
+//! routed back to the source. A gateway-held upstream credential is never
+//! exposed to the calling client.
 //!
 //! etcd path: `{prefix}/mcp_servers/{uuid}`. Secondary index on `name`.
 
@@ -14,6 +14,29 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::resource::Resource;
+
+/// The WRITE-path pattern for [`McpServer::name`]: the read pattern
+/// (`^(?:[^_]|_[^_])*$`, on the field itself) with `*` additionally
+/// excluded from both alternatives.
+///
+/// A name is pasted into the `<server>__<tool>` glob patterns that every
+/// name-form MCP grant, deny and anonymous ceiling is written as, and a
+/// `*` in it makes those patterns **wider than written** — which is why the
+/// name, rather than any one call site, is what gets fixed:
+///
+/// - where the tool half is a literal, a deny of `gh*__read` on a server
+///   called `gh*` also matches `ghost__read`: `crate::wildcard` anchors the
+///   `*` between the prefix `gh` and the suffix `__read`, and `ghost__read`
+///   satisfies both.
+/// - where the tool half is itself `*` — the shape the anonymous ceiling
+///   always builds — `gh*__*` admits every tool of every server whose name
+///   starts with `gh`, because `wildcard_matches` honours every `*`.
+///
+/// New names may not carry one; stored rows that already do keep loading,
+/// because the lenient read schema is left on the looser pattern
+/// (`aisix-etcd`'s loader skips a row it cannot validate, and skipping the
+/// row is a strictly worse outcome than a name that globs).
+pub const NAME_PATTERN_STRICT: &str = r"^(?:[^_*]|_[^_*])*$";
 
 // `Eq` is deliberately absent: `spec` holds a `serde_json::Value`, which is
 // only `PartialEq` (JSON numbers are floats).
@@ -32,7 +55,10 @@ pub struct McpServer {
     // (see `aisix_mcp::gateway`). So the name must contain no `__` AND must not
     // end in `_`: `gh_` + `x` and `gh` + `_x` both serialize to `gh___x`, and the
     // split resolves the former to the non-existent server `gh`. The pattern
-    // below rejects both shapes on every configuration path.
+    // below rejects both shapes on every configuration path; the WRITE path
+    // additionally rejects a `*` (`NAME_PATTERN_STRICT`, whose doc has the two
+    // ways such a name breaks the patterns built from it), which stays out of
+    // the read pattern so a row that already carries one keeps loading.
     #[schemars(regex(pattern = "^(?:[^_]|_[^_])*$"), length(min = 1))]
     pub name: String,
 
@@ -51,7 +77,8 @@ pub struct McpServer {
 
     /// The OpenAPI 3.x document (as a JSON object) whose operations become
     /// this server's tools. Required when `type` is `openapi`; ignored
-    /// otherwise.
+    /// otherwise. A document with no operation that can become a tool is
+    /// rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<serde_json::Value>,
 
@@ -67,9 +94,11 @@ pub struct McpServer {
     #[serde(default)]
     pub transport: McpTransport,
 
-    /// How the gateway authenticates to the upstream server. The credential is
-    /// held by the gateway and is never forwarded from or exposed to the calling
-    /// client.
+    /// How the gateway authenticates to the upstream server. A gateway-held
+    /// credential (`bearer`, `api_key`, `oauth2`, `oauth2_token_exchange`,
+    /// `oauth2_authorization_code`) is never exposed to the calling client.
+    /// `oauth_delegate` holds none: the caller's own upstream token is relayed
+    /// instead.
     #[serde(default)]
     pub auth_type: McpAuthType,
 
@@ -78,7 +107,9 @@ pub struct McpServer {
     /// `Authorization: Bearer <secret>`), the API key when `auth_type` is
     /// `api_key` (sent as `x-api-key: <secret>`, or under `api_key_header`
     /// for `type: openapi`), or the OAuth client secret when `auth_type` is
-    /// `oauth2`. Leave unset when `auth_type` is `none`.
+    /// `oauth2`, `oauth2_token_exchange`, or `oauth2_authorization_code` with
+    /// a `client_id` that has one. Leave unset when `auth_type` is `none` or
+    /// `oauth_delegate`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
 
@@ -88,22 +119,50 @@ pub struct McpServer {
     // `mcp_server_credential_coupling`. That keeps the resource flat (no oneOf
     // restructuring) while giving the published schema and every runtime
     // validator one shared definition.
-    /// OAuth client identifier used for the OAuth 2.0 client credentials
-    /// grant. Required when `auth_type` is `oauth2`; ignored otherwise.
+    /// OAuth client identifier the gateway authenticates to `token_url` with.
+    /// Required when `auth_type` is `oauth2` or `oauth2_token_exchange`. For
+    /// `oauth2_authorization_code` it is optional: when omitted, the gateway
+    /// registers itself once with the authorization server as a public client.
+    /// Ignored otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
 
-    /// OAuth token endpoint URL where the gateway exchanges the client
-    /// credentials for an access token, such as
-    /// `https://auth.example.com/oauth/token`. Required when `auth_type` is
-    /// `oauth2`; ignored otherwise.
+    /// OAuth token endpoint URL where the gateway obtains the upstream access
+    /// token, such as `https://auth.example.com/oauth/token`. Required when
+    /// `auth_type` is `oauth2` or `oauth2_token_exchange`. For
+    /// `oauth2_authorization_code` it is optional: when omitted, it is
+    /// discovered from the upstream server. Ignored otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_url: Option<String>,
 
+    /// OAuth authorization endpoint URL that users are sent to when signing
+    /// in, such as `https://auth.example.com/oauth/authorize`. Used when
+    /// `auth_type` is `oauth2_authorization_code`; when omitted, it is
+    /// discovered from the upstream server. Ignored otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_url: Option<String>,
+
+    /// OAuth dynamic client registration endpoint URL. Used when `auth_type`
+    /// is `oauth2_authorization_code` and `client_id` is omitted; when this is
+    /// omitted too, it is discovered from the upstream server. Ignored
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_url: Option<String>,
+
     /// OAuth scopes to request. Joined with spaces into the `scope` parameter
-    /// of the token request. Only used when `auth_type` is `oauth2`.
+    /// of the token request. Used when `auth_type` is `oauth2` (optional) or
+    /// `oauth2_token_exchange` (required, at least one — for `entra_obo` the
+    /// target API's scope, such as `api://<app-id>/.default`). For
+    /// `oauth2_authorization_code` they are requested when signing in unless
+    /// the MCP client asks for its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scopes: Option<Vec<String>>,
+
+    /// Token exchange protocol used when `auth_type` is
+    /// `oauth2_token_exchange`. Required for that `auth_type`; ignored
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_exchange_profile: Option<McpTokenExchangeProfile>,
 
     /// MCP protocol revision the gateway uses when connecting to this
     /// upstream server. When omitted, the gateway opens the session with the
@@ -117,6 +176,48 @@ pub struct McpServer {
     /// `type: openapi`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<McpProtocolVersion>,
+
+    /// Inbound client headers forwarded to this server, as `*`
+    /// glob patterns matched case-insensitively against the header name
+    /// (`"x-trace-*"`, `"authorization"`). Empty — the default — forwards
+    /// nothing. Applies to both `type: mcp` and `type: openapi`, so a REST
+    /// API exposed here as tools receives them on every tool call.
+    ///
+    /// A header the caller sends more than once is forwarded with its
+    /// first value only; the upstream receives one well-formed header
+    /// rather than a list this gateway never interpreted. An HTTP/2
+    /// caller may split `cookie` across several header fields, and only
+    /// the first of them is forwarded.
+    ///
+    /// A header named here reaches the server whatever the gateway would
+    /// otherwise do with it. Naming the credential slot `auth_type` would
+    /// fill — `authorization` for `bearer` and `oauth2`, `api_key_header`
+    /// for `api_key` — hands the server the caller's own credential in
+    /// place of the gateway's, never both. `oauth_delegate`,
+    /// `oauth2_token_exchange` and `oauth2_authorization_code` own
+    /// `authorization` themselves, so naming it on such a server has no
+    /// effect. That is what lets an internal
+    /// server that already authorizes on the end user's `Authorization`
+    /// keep doing so unchanged. A server that validates the `aud` claim
+    /// will reject a token minted for the gateway.
+    ///
+    /// A credential slot, and `traceparent` / `tracestate`, are forwarded
+    /// only when a pattern names them exactly — a glob such as `"*"` or
+    /// `"x-*"` is a statement about the operator's own headers, not
+    /// consent to hand a third party the caller's credential or to graft
+    /// the caller's trace onto that party's telemetry.
+    ///
+    /// Headers whose forwarding would break the exchange rather than
+    /// change who it comes from are never forwarded whatever the patterns
+    /// say: `host`, the hop-by-hop headers that describe the caller's own
+    /// connection, the gateway's `x-aisix-*` namespace, the headers
+    /// describing a body this gateway re-serializes (`content-type`,
+    /// `content-length`, `accept`), and the MCP session slots
+    /// (`mcp-session-id`, `mcp-protocol-version`, `last-event-id`), which
+    /// name the caller's session with this gateway and which an upstream
+    /// MCP server refuses outright when they carry a foreign value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forward_client_headers: Vec<String>,
 
     /// Maximum time, in milliseconds, to wait for a single upstream operation
     /// (establishing the session, listing tools, or calling a tool). Must be at
@@ -210,6 +311,50 @@ pub enum McpAuthType {
     /// until shortly before their reported expiry.
     #[serde(rename = "oauth2")]
     OAuth2,
+    /// Delegated OAuth: the gateway holds no upstream credential and relays
+    /// the caller's own `Authorization` header to the server unchanged. An
+    /// `Authorization` the caller authenticated to the gateway with is never
+    /// relayed, so a caller that needs both sends its gateway API key in
+    /// `x-aisix-api-key` and its upstream token in `Authorization`. With no
+    /// upstream token the server is called without credentials and its own
+    /// response decides.
+    OauthDelegate,
+    /// OAuth token exchange on behalf of the caller: the gateway exchanges
+    /// the caller's bearer token for an access token to this server at
+    /// `token_url`, authenticating with `client_id` and the client secret in
+    /// `secret` and requesting `scopes`, and sends the result as
+    /// `Authorization: Bearer <access_token>`. `token_exchange_profile`
+    /// selects the exchange protocol. Only a token the gateway itself
+    /// verified through a JWT trust provider on the same request is
+    /// exchanged; for a caller authenticated any other way there is nothing
+    /// to exchange, and the single-server endpoint `/mcp/{name}` answers
+    /// `401`. The caller's token never reaches the server. Exchanged tokens
+    /// are cached per caller token until shortly before their reported
+    /// expiry.
+    #[serde(rename = "oauth2_token_exchange")]
+    OAuth2TokenExchange,
+    /// Per-user OAuth 2.0 authorization code flow with PKCE, for `type: mcp`
+    /// only. Each user signs in to the upstream authorization server once; the
+    /// gateway keeps the resulting tokens and sends that user's access token
+    /// as `Authorization: Bearer <access_token>`, refreshing it when needed.
+    /// A caller whose gateway credential has no user cannot use such a server.
+    /// The upstream tokens never reach the MCP client, and the client's own
+    /// `Authorization` header is never sent to the server. The public address
+    /// of the sign-in endpoints comes from `resource_url` in the MCP
+    /// authentication settings. A client with no gateway credential can
+    /// connect when a trust provider in the environment has `login`.
+    #[serde(rename = "oauth2_authorization_code")]
+    OAuth2AuthorizationCode,
+}
+
+/// Token exchange protocol for `auth_type: oauth2_token_exchange`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTokenExchangeProfile {
+    /// Microsoft Entra ID On-Behalf-Of flow: a `jwt-bearer` grant carrying the
+    /// caller's token as `assertion` with `requested_token_use=on_behalf_of`.
+    /// The caller's token must be issued for the gateway's `client_id`.
+    EntraObo,
 }
 
 impl McpServer {
@@ -239,6 +384,22 @@ impl Resource for McpServer {
 
     fn kind() -> &'static str {
         "mcp_servers"
+    }
+}
+
+impl McpServer {
+    /// Requirements the JSON Schema cannot express, run by every load path
+    /// after deserialization: a `type: openapi` document must yield at least
+    /// one tool. A row that fails is rejected exactly like a schema failure,
+    /// because the gateway would register the server and serve nothing
+    /// from it.
+    pub fn validate_semantics(&self) -> Result<(), String> {
+        match (&self.server_type, &self.spec) {
+            (McpServerType::Openapi, Some(spec)) => {
+                crate::mcp_openapi::check_spec_yields_tools(spec)
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -272,6 +433,37 @@ pub fn mcp_server_credential_coupling() -> Value {
                     "token_url": { "type": "string", "minLength": 1 }
                 }
             }
+        },
+        // The exchange carries the caller's token to `token_url` and needs
+        // the target in `scope`: no field may be left for the IdP to guess.
+        {
+            "if": {
+                "properties": { "auth_type": { "const": "oauth2_token_exchange" } },
+                "required": ["auth_type"]
+            },
+            "then": {
+                "required": ["secret", "client_id", "token_url", "scopes", "token_exchange_profile"],
+                "properties": {
+                    "secret": { "type": "string", "minLength": 1 },
+                    "client_id": { "type": "string", "minLength": 1 },
+                    "token_url": { "type": "string", "minLength": 1 },
+                    "scopes": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": { "type": "string", "minLength": 1 }
+                    },
+                    "token_exchange_profile": { "type": "string" }
+                }
+            }
+        },
+        // The per-user flow relays an MCP client's sign-in; a REST API behind
+        // `type: openapi` has no such client.
+        {
+            "if": {
+                "properties": { "auth_type": { "const": "oauth2_authorization_code" } },
+                "required": ["auth_type"]
+            },
+            "then": { "properties": { "type": { "const": "mcp" } } }
         },
         // Note on diagnosability: expressing "not a Swagger 2.0 document" as a
         // schema constraint costs the targeted hint the write path used to emit
@@ -345,6 +537,65 @@ pub fn mcp_server_credential_coupling() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_client_header_forward_is_a_free_list_of_patterns() {
+        use crate::models::schema::{validate_mcp_server, validate_mcp_server_lenient};
+
+        let with = |patterns: Value| {
+            let mut v = json!({"name": "erp", "url": "https://erp.internal/mcp"});
+            v["forward_client_headers"] = patterns;
+            v
+        };
+
+        // Credential slots are the point of the field, not an oversight:
+        // the runtime decides what is deliverable, so the schema does not
+        // second-guess an operator naming one.
+        validate_mcp_server(&with(json!(["authorization", "x-trace-*", "*"])))
+            .expect("credential slots and globs are both accepted");
+        validate_mcp_server(&with(json!([]))).expect("an empty list is the default, spelled out");
+        validate_mcp_server_lenient(&with(json!(["authorization"])))
+            .expect("the read path must not cost the row over a pattern");
+    }
+
+    #[test]
+    fn the_per_user_flow_needs_no_field_but_is_for_mcp_servers_only() {
+        use crate::models::schema::{validate_mcp_server, validate_mcp_server_lenient};
+
+        let minimal = json!({
+            "name": "erp",
+            "url": "https://erp.internal/mcp",
+            "auth_type": "oauth2_authorization_code",
+        });
+        validate_mcp_server(&minimal).expect("every OAuth field is optional");
+        validate_mcp_server_lenient(&minimal).expect("and it loads");
+
+        let server: McpServer = serde_json::from_value(json!({
+            "name": "erp",
+            "url": "https://erp.internal/mcp",
+            "auth_type": "oauth2_authorization_code",
+            "client_id": "c",
+            "secret": "s",
+            "authorization_url": "https://idp.example/authorize",
+            "token_url": "https://idp.example/token",
+            "registration_url": "https://idp.example/register",
+            "scopes": ["read"],
+        }))
+        .unwrap();
+        assert_eq!(server.auth_type, McpAuthType::OAuth2AuthorizationCode);
+        validate_mcp_server(&serde_json::to_value(&server).unwrap())
+            .expect("a full configuration round-trips through the strict schema");
+
+        let openapi = json!({
+            "name": "erp",
+            "url": "https://erp.internal/api",
+            "type": "openapi",
+            "spec": {"openapi": "3.0.0", "paths": {"/a": {"get": {"operationId": "list_a"}}}},
+            "auth_type": "oauth2_authorization_code",
+        });
+        validate_mcp_server(&openapi).expect_err("no sign-in without an MCP client");
+        validate_mcp_server_lenient(&openapi).expect_err("nor on the read path");
+    }
 
     #[test]
     fn schema_pins_each_mcp_obligation_individually() {
@@ -516,6 +767,50 @@ mod tests {
         });
         crate::models::schema::validate_mcp_server(&complete)
             .expect("a complete oauth2 credential set must be accepted");
+
+        // oauth_delegate holds no credential of its own.
+        let delegate = json!({"name": "s", "url": "https://x/mcp", "auth_type": "oauth_delegate"});
+        crate::models::schema::validate_mcp_server(&delegate)
+            .expect("oauth_delegate needs no gateway-held credential");
+    }
+
+    #[test]
+    fn token_exchange_requires_its_whole_configuration() {
+        use crate::models::schema::{validate_mcp_server, validate_mcp_server_lenient};
+        let complete = json!({
+            "name": "s", "url": "https://x/mcp", "auth_type": "oauth2_token_exchange",
+            "secret": "cs", "client_id": "cid",
+            "token_url": "https://login.example.com/tenant/oauth2/v2.0/token",
+            "scopes": ["api://upstream/.default"],
+            "token_exchange_profile": "entra_obo"
+        });
+        validate_mcp_server(&complete).expect("a complete exchange configuration");
+        let s: McpServer = serde_json::from_value(complete.clone()).unwrap();
+        assert_eq!(s.auth_type, McpAuthType::OAuth2TokenExchange);
+        assert_eq!(
+            s.token_exchange_profile,
+            Some(McpTokenExchangeProfile::EntraObo)
+        );
+
+        for field in [
+            "secret",
+            "client_id",
+            "token_url",
+            "scopes",
+            "token_exchange_profile",
+        ] {
+            let mut doc = complete.clone();
+            doc.as_object_mut().unwrap().remove(field);
+            validate_mcp_server(&doc).expect_err(&format!("{field} is required"));
+        }
+        let mut empty_scopes = complete.clone();
+        empty_scopes["scopes"] = json!([]);
+        validate_mcp_server(&empty_scopes).expect_err("at least one scope");
+        let mut generic = complete.clone();
+        generic["token_exchange_profile"] = json!("rfc8693");
+        validate_mcp_server(&generic).expect_err("entra_obo is the only profile");
+        validate_mcp_server_lenient(&generic)
+            .expect_err("an unknown profile is not loadable either");
     }
 
     #[test]
@@ -672,7 +967,11 @@ mod tests {
             client_id: None,
             token_url: None,
             scopes: None,
+            token_exchange_profile: None,
+            authorization_url: None,
+            registration_url: None,
             protocol_version: None,
+            forward_client_headers: Vec::new(),
             timeout_ms: None,
             enabled: true,
             allowed_cidrs: None,

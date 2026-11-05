@@ -22,10 +22,15 @@
 mod aliyun;
 #[cfg(feature = "aliyun-text-moderation")]
 mod aliyun_ai_guardrail;
+mod audit;
 #[cfg(feature = "bedrock")]
 mod bedrock;
 mod build;
+mod call_error;
 mod chain;
+#[cfg(any(feature = "azure-content-safety", feature = "aliyun-text-moderation"))]
+mod chunk;
+mod custom;
 mod index;
 mod keyword;
 #[cfg(feature = "lakera")]
@@ -37,11 +42,13 @@ mod pii;
 mod presidio;
 #[cfg(feature = "azure-content-safety")]
 mod prompt_shield;
+mod semantic;
 #[cfg(feature = "azure-content-safety")]
 mod text_moderation;
+mod too_large;
 
 use aisix_core::models::GuardrailMonitorHit;
-use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse};
+use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse, Role};
 use async_trait::async_trait;
 
 /// Max bytes of an upstream guardrail-provider error body to echo into a log
@@ -77,31 +84,40 @@ pub(crate) fn truncate_error_body_for_log(body: &str) -> &str {
     feature = "openai-moderation",
     feature = "presidio",
 ))]
-pub(crate) async fn read_error_body_capped(mut resp: reqwest::Response) -> String {
-    truncate_error_body_for_log(&read_body_capped(&mut resp, MAX_ERROR_BODY_LOG_BYTES).await)
+pub(crate) async fn read_error_body_capped(mut resp: reqwest::Response, row: &str) -> String {
+    truncate_error_body_for_log(&read_body_capped(&mut resp, MAX_ERROR_BODY_LOG_BYTES, row).await)
         .to_owned()
 }
 
 /// Read at most `cap` bytes of a response body, chunk by chunk, giving up on
-/// the first read error.
+/// the first read error. The error is logged rather than returned: callers
+/// carry on with the bytes read so far.
 ///
 /// Split out from [`read_error_body_capped`] because a caller that PARSES the
 /// body needs a different budget from one that logs a snippet of it: a snippet
 /// can stop anywhere, whereas a truncated body may simply not contain the field
 /// being looked for. See `aliyun::MAX_ERROR_BODY_PARSE_BYTES`.
-#[cfg(any(
-    feature = "azure-content-safety",
-    feature = "aliyun-text-moderation",
-    feature = "lakera",
-    feature = "openai-moderation",
-    feature = "presidio",
-))]
-pub(crate) async fn read_body_capped(resp: &mut reqwest::Response, cap: usize) -> String {
+pub(crate) async fn read_body_capped(
+    resp: &mut reqwest::Response,
+    cap: usize,
+    row: &str,
+) -> String {
     let mut buf: Vec<u8> = Vec::new();
     while buf.len() < cap {
         match resp.chunk().await {
             Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
-            Ok(None) | Err(_) => break,
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!(
+                    guardrail_name = %row,
+                    http_status = resp.status().as_u16(),
+                    error = call_error::error_chain(&e).as_str(),
+                    error_kind = %call_error::error_kind(&e),
+                    bytes_read = buf.len(),
+                    "guardrail response body read failed",
+                );
+                break;
+            }
         }
     }
     String::from_utf8_lossy(&buf).into_owned()
@@ -123,10 +139,26 @@ pub(crate) async fn read_body_capped(resp: &mut reqwest::Response, cap: usize) -
 ///     payload is serialized so neither a function name nor an argument
 ///     can hide a banned token, matching `ChatResponse::guardrail_output_text`
 ///     and `redact_chat_format`, which already cover this surface.
+///   * `extra["reasoning_content"]` — an assistant turn's reasoning
+///     replayed in history. It is the canonical slot every vendor
+///     spelling is normalised onto, and it travels upstream verbatim
+///     through `extra` like `tool_calls` do, so a payload parked there
+///     reaches the model unread otherwise. Reasoning the model GENERATES
+///     is a different question and stays out of the output scope — this
+///     helper only ever sees REQUEST messages (`check_input`); the output
+///     collectors read `ChatResponse::guardrail_output_text`.
+///   * reasoning content parts (`aisix_gateway::chat::reasoning_part_slots`)
+///     — the same replayed reasoning written into `content` instead of the
+///     slot, read IN ADDITION to the slot so a benign one cannot hide the
+///     other.
 ///
 /// Non-text content blocks (image/audio) are out of scope — multimodal
-/// moderation is a separate feature. Every guardrail's input/output
-/// collector goes through this so the families can't drift.
+/// moderation is a separate feature. Every blob-check guardrail's input
+/// collector goes through this so the families can't drift, and
+/// `redact_chat_format` masks exactly this list — the two must stay in
+/// lockstep or a Mask rule reports a hit on text it then forwards
+/// unmasked. The local kinds (`keyword`, `pii`) read that walker instead of
+/// this blob wherever a call site walks the body (#1027).
 pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
     let mut parts: Vec<String> = Vec::new();
     let content = m.content_str();
@@ -142,26 +174,108 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
                 .map(str::to_string),
         );
     }
-    for tool_payload in [m.extra.get("tool_calls"), m.extra.get("function_call")]
-        .into_iter()
-        .flatten()
-    {
-        if !tool_payload.is_null() {
-            parts.push(tool_payload.to_string());
+    if let Some(tool_calls) = m.extra.get("tool_calls") {
+        if !tool_calls.is_null() {
+            parts.push(aisix_gateway::tool_calls::tool_calls_scan_text(tool_calls));
         }
     }
+    // Legacy Chat `function_call`: same exposure as `tool_calls`, and it has
+    // no call id for the scan text to leave out.
+    if let Some(function_call) = m.extra.get("function_call") {
+        if !function_call.is_null() {
+            parts.push(function_call.to_string());
+        }
+    }
+    if let Some(reasoning) = m.extra.get("reasoning_content").and_then(|v| v.as_str()) {
+        if !reasoning.is_empty() {
+            parts.push(reasoning.to_string());
+        }
+    }
+    parts.extend(
+        m.content_blocks
+            .iter()
+            .flatten()
+            .flat_map(aisix_gateway::chat::reasoning_part_slots)
+            .filter(|slot| !slot.text.is_empty())
+            .map(|slot| slot.text.to_string()),
+    );
     parts.join("\n")
 }
 
-/// The guardrail `kind` discriminators compiled into this binary.
+/// The messages a `input_messages: latest_turn` guardrail may read: every
+/// message after the last assistant one, with system and developer
+/// messages dropped.
 ///
-/// Every non-keyword kind sits behind a cargo feature (see `build.rs`'s
-/// `BuildError::FeatureDisabled` arms); a DP built without one silently
-/// rejects rows of that kind while the dashboard still offers it
-/// (#519 B.6). The heartbeat reports this list so the control plane can hide /
-/// flag kinds the connected DP can't serve. Strings MUST stay equal to
-/// the serde `kind` tags in `aisix_core::models::GuardrailKind`
-/// (`GuardrailKind::kind_str`).
+/// IDE and agent clients replay the whole conversation on every call, so a
+/// rule that matched one message keeps matching for the rest of the
+/// session. The window is the part the model has not answered yet — this
+/// turn's user message together with the tool results answering it
+/// (`Role::Tool` on the OpenAI wire, an Anthropic `tool_result` block, a
+/// Responses `function_call_output` item). A request with no assistant
+/// message narrows to every non-system message.
+///
+/// A TRAILING assistant message does not close the window. It is a
+/// prefill — text the caller wrote for the model to continue, not a turn
+/// the model has answered — so it belongs to the current turn and is
+/// scanned with it. Treating it as a boundary would empty the window and
+/// hand every caller a one-line bypass: append a dummy assistant message
+/// and a `latest_turn` rule goes quiet. Anthropic's documented
+/// assistant-prefill feature reaches the same shape by accident.
+///
+/// "Trailing" is measured against the last NON-SYSTEM message, not the
+/// last message. System messages are outside the window wherever they
+/// sit, so an assistant message followed only by system ones has still
+/// answered nothing — and reading it as a boundary would leave a window
+/// holding system messages alone, which is to say an empty one. Appending
+/// a system message after the prefill would otherwise reopen the same
+/// bypass.
+///
+/// This is the CHECK pass's half of the rule. The masking walkers in
+/// `aisix-proxy::redact` apply the same rule to each wire shape directly,
+/// because their slots are raw JSON with no `ChatFormat` to index against;
+/// the e2e cases pin both halves per protocol.
+pub fn latest_turn_view(req: &ChatFormat) -> ChatFormat {
+    let answered = req
+        .messages
+        .iter()
+        .rposition(|m| !m.role.is_instruction())
+        .unwrap_or(0);
+    let start = req.messages[..answered]
+        .iter()
+        .rposition(|m| m.role == Role::Assistant)
+        .map_or(0, |i| i + 1);
+    let mut view = req.clone();
+    view.messages = req.messages[start..]
+        .iter()
+        .filter(|m| !m.role.is_instruction())
+        .cloned()
+        .collect();
+    view
+}
+
+/// The guardrail `kind` discriminators compiled into this binary whose
+/// availability is decided at COMPILE time.
+///
+/// This is the DP's capability advertisement: the heartbeat forwards it as
+/// `supported_guardrail_kinds`, the control plane unions it across the connected
+/// data planes, and the dashboard disables any kind absent from that union. So a
+/// kind missing here is not a cosmetic gap — the kind becomes unreachable in
+/// the UI and an operator asking "can this DP run that rule" is answered
+/// "no" for something the DP runs perfectly well.
+///
+/// The list therefore covers the WHOLE `GuardrailKind` vocabulary, minus only
+/// the kinds whose cargo feature is off in this build (see `build.rs`'s
+/// `BuildError::FeatureDisabled` arms): a DP built without one silently
+/// rejects rows of that kind, so advertising it would be the mirror-image
+/// lie (#519 B.6). `keyword`, `pii`, `semantic` and `custom` have no feature
+/// gate and are always present.
+///
+/// Strings MUST stay equal to the serde `kind` tags in
+/// `aisix_core::models::GuardrailKind` (`GuardrailKind::kind_str`);
+/// `supported_kinds_advertises_every_schema_kind_this_build_can_run` pins
+/// both halves against the schema `schemars` derives from that enum, so a
+/// newly added kind fails the test until it is either advertised here or
+/// declared feature-gated.
 pub fn supported_kinds() -> &'static [&'static str] {
     &[
         "keyword",
@@ -182,18 +296,176 @@ pub fn supported_kinds() -> &'static [&'static str] {
         "openai_moderation",
         #[cfg(feature = "presidio")]
         "presidio",
+        // No cargo feature and no on-disk asset: the embedding call goes
+        // out over the provider bridges every build already has.
+        "semantic",
+        // No cargo feature either: the script engine is an unconditional
+        // dependency, so every build can run a custom guardrail.
+        "custom",
     ]
+}
+
+/// Why a guardrail embedding dispatch produced no vector.
+///
+/// A closed vocabulary on purpose: the tag rides a `Bypass` reason and
+/// the `unavailable` field of a `Block`, both of which reach metric
+/// labels and the error envelope, so it must never carry free text or
+/// screened content (#153).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedFailure {
+    /// The alias names no `embedding`-kind Model in this environment, or
+    /// the model has no usable provider credential.
+    Unresolved,
+    /// The embedding call did not answer inside the configured deadline.
+    Timeout,
+    /// The embedding call reached the provider and failed there, or
+    /// answered with an unusable vector.
+    Upstream,
+}
+
+/// A failed guardrail embedding call: the bounded [`EmbedFailure`] plus,
+/// when the dispatch produced one, the underlying error for the operator
+/// log. `error` goes to the log line only — never to a verdict, a tag or a
+/// metric label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbedError {
+    pub failure: EmbedFailure,
+    /// What went wrong, for the log line. It must never carry text derived
+    /// from an upstream response, which can quote the screened input: an
+    /// embedder keeps only a status or a decode position for those, and
+    /// the [`error_chain`] for everything else. `None`
+    /// when the failure is ours, not the provider's (an unresolved alias,
+    /// a vector count that does not match).
+    pub error: Option<String>,
+    /// The embedding model as the gateway's other logs name a model: its
+    /// current display name when the reference resolved, else the id or
+    /// alias as configured. For the log line only. `None` when the
+    /// embedder never got as far as resolving it.
+    pub model: Option<String>,
+}
+
+impl From<EmbedFailure> for EmbedError {
+    fn from(failure: EmbedFailure) -> Self {
+        Self {
+            failure,
+            error: None,
+            model: None,
+        }
+    }
+}
+
+impl EmbedFailure {
+    /// The bounded tag used in verdict reasons and metric labels.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EmbedFailure::Unresolved => "semantic_embed_unresolved",
+            EmbedFailure::Timeout => "semantic_embed_timeout",
+            EmbedFailure::Upstream => "semantic_embed_upstream",
+        }
+    }
+}
+
+/// Embeds text through the gateway's own provider bridges, for
+/// `kind: "semantic"`.
+///
+/// The dispatch this needs is the one semantic ROUTING already performs
+/// (`aisix_proxy::semantic::embed_texts`), but that lives a layer up: it
+/// needs the provider hub and the model snapshot, and holding a
+/// `ProxyState` from here would close a reference cycle through the
+/// chain cache `ProxyState` itself owns. So the proxy injects an
+/// implementation through [`GuardrailEmbedderSlot`], and the
+/// implementation keeps only the hub plus a snapshot handle.
+#[async_trait]
+pub trait GuardrailEmbedder: Send + Sync + 'static {
+    /// Embed `texts` with the `embedding`-kind Model the row names,
+    /// returning one vector per input, in input order.
+    ///
+    /// The model is named by alias, by resource id, or by both. `model_id`
+    /// decides whenever it is `Some` and `model_alias` is then ignored, so
+    /// a row that names its embedder by id keeps working after that model
+    /// is renamed. Neither spelling resolving to an `embedding`-kind Model
+    /// is [`EmbedFailure::Unresolved`] — an id naming nothing behaves as a
+    /// dangling alias does, and the row degrades per its `fail_open`.
+    ///
+    /// `cacheable` marks CONFIG-derived text — the example prototypes,
+    /// which are fixed per row and worth memoising process-wide so a
+    /// chain rebuild does not re-embed them. Request-derived text passes
+    /// `false`: its cardinality is unbounded and caching it would grow
+    /// without limit.
+    async fn embed(
+        &self,
+        model_alias: &str,
+        model_id: Option<&str>,
+        texts: &[String],
+        cacheable: bool,
+        timeout: std::time::Duration,
+    ) -> Result<Embedded, EmbedError>;
+}
+
+/// One embedding call's result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Embedded {
+    /// Current display name of the `embedding`-kind Model that produced
+    /// these vectors.
+    ///
+    /// Returned rather than taken from the row's config because a score is
+    /// unreadable without the model that produced it, and the row's own
+    /// `embedding_model` is not reliably that model: under an id-form
+    /// reference it is ignored, may be stale after a rename, and may be
+    /// absent entirely.
+    pub model: String,
+    /// One vector per input, in input order.
+    pub vectors: Vec<Vec<f32>>,
+}
+
+/// The process-wide guardrail embedder, passed to the chain builders.
+/// Always constructible — a caller that has no dispatch to offer passes
+/// [`GuardrailEmbedderSlot::none`] and every `kind: "semantic"` row is
+/// skipped with a warning (`BuildError::EmbedderUnavailable`).
+#[derive(Clone, Default)]
+pub struct GuardrailEmbedderSlot {
+    embedder: Option<std::sync::Arc<dyn GuardrailEmbedder>>,
+}
+
+impl GuardrailEmbedderSlot {
+    /// No embedder: `semantic` rows cannot be served.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// An embedder: `semantic` rows compile against it.
+    pub fn new(embedder: std::sync::Arc<dyn GuardrailEmbedder>) -> Self {
+        Self {
+            embedder: Some(embedder),
+        }
+    }
+
+    pub(crate) fn get(&self) -> Option<&std::sync::Arc<dyn GuardrailEmbedder>> {
+        self.embedder.as_ref()
+    }
+}
+
+impl std::fmt::Debug for GuardrailEmbedderSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuardrailEmbedderSlot")
+            .field("present", &self.embedder.is_some())
+            .finish()
+    }
 }
 
 #[cfg(feature = "aliyun-text-moderation")]
 pub use aliyun::AliyunTextModerationGuardrail;
 #[cfg(feature = "aliyun-text-moderation")]
 pub use aliyun_ai_guardrail::AliyunAiGuardrail;
+pub use audit::GuardrailAuditLog;
 #[cfg(feature = "bedrock")]
 pub use bedrock::BedrockGuardrail;
 pub use build::{
-    build_chain_from_snapshot, build_index_from_snapshot, LiveGuardrailChain, LiveGuardrailIndex,
+    build_chain_from_snapshot, build_index_from_snapshot, sweep_unattached_guardrails,
+    unattached_guardrail_names, unbuildable_guardrail_rows, LiveGuardrailChain, LiveGuardrailIndex,
+    UnbuildableGuardrailRow, UNATTACHED_SWEEP_INTERVAL,
 };
+pub use call_error::error_chain;
 pub use chain::GuardrailChain;
 pub use index::{GuardrailIndex, RequestContext};
 pub use keyword::{KeywordBlocklist, KeywordRule};
@@ -206,6 +478,7 @@ pub use pii::{builtin_rule, PiiAction, PiiGuardrail, PiiRule, BUILTIN_DETECTORS}
 pub use presidio::PresidioGuardrail;
 #[cfg(feature = "azure-content-safety")]
 pub use prompt_shield::PromptShieldGuardrail;
+pub use semantic::SemanticGuardrail;
 #[cfg(feature = "azure-content-safety")]
 pub use text_moderation::TextModerationGuardrail;
 
@@ -233,10 +506,46 @@ pub enum GuardrailVerdict {
         /// `None` when the verdict came from a bare guardrail outside a
         /// chain.
         guardrail_name: Option<String>,
+        /// Set when this block is an AVAILABILITY failure rather than a
+        /// content decision: a remote guardrail with `fail_open: false`
+        /// that could not reach its upstream blocks
+        /// instead of bypassing, and the two are otherwise
+        /// indistinguishable to every consumer downstream
+        /// (AISIX-Cloud#1365).
+        ///
+        /// Carries the same bounded per-kind failure tag a `Bypass` puts
+        /// in its reason (e.g. `lakera_timeout`) — a closed vocabulary,
+        /// never free text and never matched content, so it is safe on a
+        /// metric label and on the wire (#153).
+        unavailable: Option<String>,
     },
     Bypass {
         reason: String,
     },
+}
+
+/// Clamp a failure tag to the shape a metric label and an audit field can
+/// safely carry: lowercase alphanumerics and underscores, at most 64 bytes.
+///
+/// Every producer already passes a `bypass_tag()` constant, so this is a
+/// no-op today. It is here because the TYPE cannot say so: the tag is a
+/// `String` — a decorator can forward whatever reason the inner
+/// guardrail's `Bypass` carried — it lands on an unsanitized Prometheus
+/// label, and it reaches the usage event that #153 forbids putting content
+/// on. A future guardrail that returns a free-text bypass reason would
+/// otherwise mint one metric series per distinct string.
+pub(crate) fn bounded_failure_tag(tag: &str) -> String {
+    let cleaned: String = tag
+        .chars()
+        .map(|c| c.to_ascii_lowercase())
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        "unknown".to_owned()
+    } else {
+        cleaned
+    }
 }
 
 impl GuardrailVerdict {
@@ -247,6 +556,35 @@ impl GuardrailVerdict {
         GuardrailVerdict::Block {
             reason: reason.into(),
             guardrail_name: None,
+            unavailable: None,
+        }
+    }
+
+    /// `Block` for a fail-CLOSED AVAILABILITY failure (AISIX-Cloud#1365):
+    /// the guardrail could not evaluate, and its configuration says an
+    /// un-evaluated request is refused rather than let through.
+    ///
+    /// `tag` is the guardrail kind's bounded failure tag — the same value
+    /// the fail-OPEN branch puts in `Bypass::reason`, so one outage reads
+    /// the same whichever way the row is configured.
+    pub fn block_unavailable(reason: impl Into<String>, tag: impl Into<String>) -> Self {
+        GuardrailVerdict::Block {
+            reason: reason.into(),
+            guardrail_name: None,
+            unavailable: Some(bounded_failure_tag(&tag.into())),
+        }
+    }
+
+    /// The bounded failure tag when this verdict is a fail-closed
+    /// availability block; `None` for a content decision and for every
+    /// non-block verdict.
+    pub fn unavailable_tag(&self) -> Option<&str> {
+        match self {
+            GuardrailVerdict::Block {
+                unavailable: Some(tag),
+                ..
+            } => Some(tag.as_str()),
+            _ => None,
         }
     }
 
@@ -299,14 +637,21 @@ pub enum StreamOutputPolicy {
     EndOfStreamCheck,
     /// Sliding window: release a window of content only after it scans
     /// clean; `overlap_chars` is carried between windows so a span split
-    /// across a boundary is still caught.
+    /// across a boundary is still caught. A relay that cannot release by
+    /// window holds the whole response instead, under `max_buffer_bytes`
+    /// and `on_exceeded_fail_open` exactly as [`Self::BufferFull`] does.
     Window {
         size_chars: usize,
         overlap_chars: usize,
+        max_buffer_bytes: usize,
+        on_exceeded_fail_open: bool,
     },
     /// Hold the whole response; scan once; release all or block.
-    /// `max_buffer_bytes` caps the hold; `on_exceeded_fail_open` decides
-    /// release-vs-block when the cap is exceeded.
+    /// `max_buffer_bytes` caps the model-generated content held (assistant
+    /// text + reasoning + tool-call arguments, never the SSE/JSON framing);
+    /// `on_exceeded_fail_open` decides what happens past the cap: release
+    /// what is held unscanned and stream the rest without an output scan,
+    /// or block.
     BufferFull {
         max_buffer_bytes: usize,
         on_exceeded_fail_open: bool,
@@ -320,6 +665,45 @@ impl StreamOutputPolicy {
         !matches!(self, StreamOutputPolicy::EndOfStreamCheck)
     }
 
+    /// The cap on held content and the overflow policy past it, for a relay
+    /// that holds the whole response; `None` when the policy holds nothing.
+    pub fn hold_cap(&self) -> Option<(usize, bool)> {
+        match *self {
+            StreamOutputPolicy::EndOfStreamCheck => None,
+            StreamOutputPolicy::Window {
+                max_buffer_bytes,
+                on_exceeded_fail_open,
+                ..
+            }
+            | StreamOutputPolicy::BufferFull {
+                max_buffer_bytes,
+                on_exceeded_fail_open,
+            } => Some((max_buffer_bytes, on_exceeded_fail_open)),
+        }
+    }
+
+    /// Fold `other`'s hold cap into `self`: the smaller cap, and fail-closed
+    /// unless both fail open.
+    fn with_cap_of(mut self, other: &Self) -> Self {
+        let Some((cap_b, open_b)) = other.hold_cap() else {
+            return self;
+        };
+        if let StreamOutputPolicy::Window {
+            max_buffer_bytes,
+            on_exceeded_fail_open,
+            ..
+        }
+        | StreamOutputPolicy::BufferFull {
+            max_buffer_bytes,
+            on_exceeded_fail_open,
+        } = &mut self
+        {
+            *max_buffer_bytes = (*max_buffer_bytes).min(cap_b);
+            *on_exceeded_fail_open = *on_exceeded_fail_open && open_b;
+        }
+        self
+    }
+
     /// Coarse strictness rank: more hold-back = higher.
     fn rank(&self) -> u8 {
         match self {
@@ -331,48 +715,44 @@ impl StreamOutputPolicy {
 
     /// Pick the stricter of two policies (used to fold a chain into one).
     /// Higher rank wins; ties break toward the tighter parameters
-    /// (smaller window, smaller buffer cap).
+    /// (smaller window). The hold cap folds within the winning rank only:
+    /// the smaller cap, and fail-closed unless every member of that rank
+    /// fails open. A `buffer_full` member therefore sets the chain's cap on
+    /// its own, and a `window` member's cap binds only a chain whose holding
+    /// members are all `window`.
     pub fn stricter(self, other: Self) -> Self {
         use StreamOutputPolicy::*;
-        match self.rank().cmp(&other.rank()) {
-            std::cmp::Ordering::Less => other,
-            std::cmp::Ordering::Greater => self,
-            std::cmp::Ordering::Equal => match (self, other) {
+        let winner = match self.rank().cmp(&other.rank()) {
+            std::cmp::Ordering::Less => return other,
+            std::cmp::Ordering::Greater => return self,
+            std::cmp::Ordering::Equal => match (&self, &other) {
                 (
                     Window {
                         size_chars: a,
                         overlap_chars: oa,
+                        ..
                     },
                     Window {
                         size_chars: b,
                         overlap_chars: ob,
+                        ..
                     },
                 ) => Window {
-                    size_chars: a.min(b),
-                    overlap_chars: oa.max(ob),
+                    size_chars: (*a).min(*b),
+                    overlap_chars: (*oa).max(*ob),
+                    max_buffer_bytes: usize::MAX,
+                    on_exceeded_fail_open: true,
                 },
-                (
-                    BufferFull {
-                        max_buffer_bytes: a,
-                        on_exceeded_fail_open: fa,
-                    },
-                    BufferFull {
-                        max_buffer_bytes: b,
-                        on_exceeded_fail_open: fb,
-                    },
-                ) => BufferFull {
-                    max_buffer_bytes: a.min(b),
-                    // fail-closed is stricter than fail-open.
-                    on_exceeded_fail_open: fa && fb,
-                },
-                (s, _) => s,
+                _ => self.clone(),
             },
-        }
+        };
+        winner.with_cap_of(&self).with_cap_of(&other)
     }
 }
 
 /// Default whole-response hold-back cap for output guardrails that don't
-/// configure their own streaming policy (keyword, prompt shield, bedrock).
+/// configure their own streaming policy (keyword, prompt shield, bedrock,
+/// OpenAI moderation), measured like a configured `max_buffer_bytes`.
 /// Matches the Azure text-moderation buffer-mode default.
 pub const DEFAULT_STREAM_OUTPUT_BUFFER_BYTES: usize = 262_144;
 
@@ -447,6 +827,40 @@ impl SegmentsOutcome {
     }
 }
 
+/// What enforcement can do with one [`ScanSegment`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentRole {
+    /// A slot the mask pass rewrites in place.
+    Rewritable,
+    /// Judged but forwarded byte-identical, and a mask hit is forwarded
+    /// with it: a signed reasoning block (#1104), a tool name, a frame the
+    /// gateway never releases, or a body with no maskable slot.
+    ScanOnly,
+    /// An object key of a structured payload (tool arguments, tool
+    /// results, `structuredContent`). A key cannot be rewritten without
+    /// changing the payload's contract, so a mask hit on one blocks.
+    Label,
+    /// A rewritable slot restating text another slot already carries — a
+    /// Responses stream's aggregate events repeat its deltas. Rewritten
+    /// and judged like [`Self::Rewritable`], counted once, as the mask
+    /// pass counts it.
+    Echo,
+}
+
+/// One slot of a request or response, as the wire walker that enforces a
+/// mask enumerates it. The local kinds (`keyword`, `pii`) judge each
+/// segment on its own, so a block, a monitor-mode `would_mask` and an
+/// enforced mask all see the same text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanSegment {
+    pub text: String,
+    pub role: SegmentRole,
+    /// Request side only: whether the slot sits inside the latest-turn
+    /// window (see [`Guardrail::redact_input_text_in_turn`]). Always
+    /// `true` on the response side.
+    pub in_latest_turn: bool,
+}
+
 /// Pluggable content-policy hook. Production wires `Arc<dyn Guardrail>`
 /// in `ProxyState`; tests construct in-memory chains directly.
 #[async_trait]
@@ -486,6 +900,30 @@ pub trait Guardrail: Send + Sync + 'static {
         }
     }
 
+    /// Record that a held-back stream outgrew the effective
+    /// [`StreamOutputPolicy::BufferFull`] cap under a fail-closed policy and
+    /// was refused (#1029). The refusal happens in the proxy's relay loop,
+    /// where no member returns a verdict, so without this the usage event
+    /// says a guardrail blocked and names none. Only [`GuardrailChain`]
+    /// knows which row set the cap and holds the request's audit log, so
+    /// the default is a no-op.
+    fn record_output_buffer_exceeded(&self) {}
+
+    /// Record that the proxy let held-back output through WITHOUT an output
+    /// scan, as a fail-open bypass under `reason` — a stream that outgrew
+    /// the cap under `on_buffer_exceeded: fail_open`. No member ran, so no
+    /// fold can report it. Only [`GuardrailChain`] carries the receivers
+    /// ([`GuardrailChain::record_bypass`]), so the default is a no-op.
+    fn record_output_bypass(&self, _reason: &str) {}
+
+    /// The configured name of the row whose `max_buffer_bytes` is the cap
+    /// [`Self::stream_output_policy`] folded to — the row an operator
+    /// raises when held-back output outgrows it. Only [`GuardrailChain`]
+    /// folds members, so the default is `None`.
+    fn output_buffer_owner(&self) -> Option<&str> {
+        None
+    }
+
     /// Whether this guardrail actually inspects the OUTPUT hook. Drives
     /// whether its `stream_output_policy` participates in the streamed-output
     /// hold-back fold (#466): an input-only guardrail must NOT force output
@@ -493,18 +931,36 @@ pub trait Guardrail: Send + Sync + 'static {
     /// for it is pure latency with no security benefit. Default: `true`
     /// (assume output-relevant, secure-leaning); input-only impls override
     /// to gate on their hook.
+    ///
+    /// [`GuardrailChain`] also skips a member outright — no check call, no
+    /// execution record — on a hook this (or [`Self::runs_on_input`])
+    /// answers `false` for, so it must agree exactly with the hook gate
+    /// inside the kind's own checks: a hook it wrongly denies is a hook the
+    /// guardrail silently stops enforcing.
     fn runs_on_output(&self) -> bool {
+        true
+    }
+
+    /// Whether this guardrail actually inspects the INPUT hook — the mirror
+    /// of [`Self::runs_on_output`]. Callers use it to decide whether a
+    /// request-side decision is one this guardrail has any say in: a
+    /// proxy-raised refusal of a body the scanner cannot read is only
+    /// justified when something would have read it, so an output-only
+    /// attachment must not cause a request to be refused (#1113 / #1114).
+    /// Default: `true` (assume input-relevant, secure-leaning); impls that
+    /// carry a hook point override to gate on it.
+    fn runs_on_input(&self) -> bool {
         true
     }
 
     /// Whether this guardrail can refuse or rewrite REQUEST content: it is
     /// attached on the input hook and enforces rather than only observing
-    /// (monitor mode). A call site that refuses request content it cannot
-    /// read asks this, so that an output-only or monitor-mode guardrail never
-    /// causes such a refusal. Default: `true` (secure-leaning); impls with a
-    /// hook override to gate on it.
+    /// (monitor mode). The A2A call sites that refuse request content they
+    /// cannot read ask this, so that an output-only or monitor-mode guardrail
+    /// never causes such a refusal. Follows [`Self::runs_on_input`]; only the
+    /// monitor decorator answers differently.
     fn enforces_input(&self) -> bool {
-        true
+        self.runs_on_input()
     }
 
     /// Whether checking a request calls a remote service — a moderation API
@@ -517,6 +973,37 @@ pub trait Guardrail: Send + Sync + 'static {
         true
     }
 
+    /// Whether an evaluation this guardrail cannot perform on the INPUT
+    /// hook is a refusal rather than a pass — the row's `fail_open`,
+    /// inverted. Default `true` (fail-closed), matching the row default.
+    fn fails_closed_on_input(&self) -> bool {
+        true
+    }
+
+    /// Output-hook counterpart, governed by the kind's own
+    /// `output_fail_open` where it has one. A kind with no configurable
+    /// output policy keeps the fail-closed default.
+    fn fails_closed_on_output(&self) -> bool {
+        true
+    }
+
+    /// Whether this guardrail turns a REQUEST the gateway could not give
+    /// it into a refusal: it reads the request, and its input failure
+    /// policy is fail-closed. This is the gate on the `unscannable_body`
+    /// refusals the proxy raises on the chain's behalf — a guardrail that
+    /// would not have read the body cannot be the reason it is refused,
+    /// and neither can one whose operator asked for `fail_open: true`,
+    /// since the refusal reports itself as `guardrail_unavailable` and
+    /// that is precisely what the setting governs.
+    fn refuses_unevaluable_input(&self) -> bool {
+        self.runs_on_input() && self.fails_closed_on_input()
+    }
+
+    /// Response-side counterpart of [`Self::refuses_unevaluable_input`].
+    fn refuses_unevaluable_output(&self) -> bool {
+        self.runs_on_output() && self.fails_closed_on_output()
+    }
+
     // --- redaction (#932) -------------------------------------------------
     //
     // Redaction is a separate, synchronous, text→text capability rather
@@ -526,6 +1013,27 @@ pub trait Guardrail: Send + Sync + 'static {
     // streamed channel) so the caller controls which wire fields are
     // rewritten and structure is preserved. Callers run the check first
     // (Block wins over Mask), then apply the redactor to each field.
+
+    // --- similarity scores (AISIX-Cloud#1467) ------------------------------
+
+    /// Bind this guardrail to one request's score log, returning the bound
+    /// instance. `None` (the default, and every kind but `semantic`) means
+    /// "nothing to bind" and the caller keeps sharing the index's instance.
+    ///
+    /// Scores need a per-request destination, and a leaf guardrail cannot
+    /// hold one: the index hands the SAME `Arc<dyn Guardrail>` to every
+    /// request. Rather than widening the eight check methods with a sink
+    /// argument — the proxy calls those on the chain, so each would have to
+    /// grow a parameter its ~40 call sites do not have — the chain rebinds
+    /// its members once, when its audit log is attached. Decorators forward
+    /// the bind so an `enforcement_mode: monitor` row still scores: monitor
+    /// mode is precisely where an operator is tuning a threshold.
+    fn bind_score_log(
+        &self,
+        _log: &std::sync::Arc<crate::GuardrailAuditLog>,
+    ) -> Option<std::sync::Arc<dyn Guardrail>> {
+        None
+    }
 
     /// `true` when this guardrail can rewrite REQUEST text. Cheap probe so
     /// call sites skip walking the body when nothing would change.
@@ -547,6 +1055,23 @@ pub trait Guardrail: Send + Sync + 'static {
     /// Rewrite one response-side text field, masking sensitive spans.
     fn redact_output_text(&self, _text: &str) -> Option<Redaction> {
         None
+    }
+
+    /// [`Self::redact_input_text`], told whether the text sits inside the
+    /// latest-turn window — `false` for a system message and for anything
+    /// the model has already replied to.
+    ///
+    /// Only [`GuardrailChain`] overrides this: it drops the members
+    /// configured `input_messages: latest_turn` for out-of-window text, so
+    /// a mask rule on that setting rewrites the current turn and leaves the
+    /// replayed history byte-identical. A leaf guardrail has no window of
+    /// its own — the setting belongs to the chain member, not the kind —
+    /// so the default ignores the flag and every caller that has no window
+    /// to report (the whole response side, and the single-input endpoints)
+    /// keeps using [`Self::redact_input_text`] directly.
+    fn redact_input_text_in_turn(&self, text: &str, in_latest_turn: bool) -> Option<Redaction> {
+        let _ = in_latest_turn;
+        self.redact_input_text(text)
     }
 
     // --- remote segment moderation (#932 bedrock follow-up) ---------------
@@ -588,30 +1113,120 @@ pub trait Guardrail: Send + Sync + 'static {
         SegmentsOutcome::allow()
     }
 
+    /// [`Self::moderate_input_segments`] told which model the request
+    /// addressed — the name the caller put in the request, the same value
+    /// the check pass sees as `ChatFormat::model`. Only a kind that exposes
+    /// the model to its policy (`custom`, as `ctx.model`) overrides it.
+    async fn moderate_input_segments_for_model(
+        &self,
+        texts: &[String],
+        newest_from: Option<usize>,
+        model: Option<&str>,
+    ) -> SegmentsOutcome {
+        let _ = model;
+        self.moderate_input_segments(texts, newest_from).await
+    }
+
     /// Moderate the response's text segments in one remote call.
     async fn moderate_output_segments(&self, _texts: &[String]) -> SegmentsOutcome {
         SegmentsOutcome::allow()
     }
 
-    /// `check_input` minus segment-moderating members — used by call
-    /// sites that ALSO run [`Self::moderate_input_segments`], so a
-    /// segment member isn't consulted twice (and billed twice). For a
-    /// leaf guardrail this is all-or-nothing: a segment moderator
-    /// answers via the segment pass (Allow here), anything else answers
-    /// via its normal check. [`GuardrailChain`] overrides with a
-    /// member-filtered fold.
+    /// [`Self::moderate_input_segments`] with one window flag per text, in
+    /// the same order (see [`Self::redact_input_text_in_turn`]).
+    ///
+    /// Only [`GuardrailChain`] overrides it: a `latest_turn` member is
+    /// offered the in-window subset and its masked replies are mapped back
+    /// onto the original positions, so the slots it never saw keep the
+    /// caller's text. The per-kind segment hooks are untouched by the
+    /// setting — a kind never learns its own window.
+    async fn moderate_input_segments_in_turn(
+        &self,
+        texts: &[String],
+        in_latest_turn: &[bool],
+        newest_from: Option<usize>,
+        model: Option<&str>,
+    ) -> SegmentsOutcome {
+        let _ = in_latest_turn;
+        self.moderate_input_segments_for_model(texts, newest_from, model)
+            .await
+    }
+
+    // --- local segment checks (#1027) ---------------------------------------
+    //
+    // The in-process kinds (`keyword`, `pii`) judge the same slots the mask
+    // pass rewrites, one at a time, instead of one joined blob. Call sites
+    // that walk a wire body collect those slots with the mask walker itself
+    // and hand them here; `check_*_non_segment` skips these members so they
+    // are consulted once per hook.
+
+    /// `true` when this guardrail judges per-segment via
+    /// [`Self::check_local_segments`] at call sites that walk a body.
+    fn checks_local_segments(&self) -> bool {
+        false
+    }
+
+    /// Judge the segments of one hook (`input` selects the side), each on
+    /// its own. Returns the verdict plus any monitor-mode observations.
+    fn check_local_segments(
+        &self,
+        _segments: &[ScanSegment],
+        _input: bool,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        (GuardrailVerdict::Allow, Vec::new())
+    }
+
+    /// Walker hook: a slot the walker judges but never rewrites — an object
+    /// key, a tool name. Only a segment collector records it; every other
+    /// guardrail ignores it.
+    fn observe_unrewritable(&self, _text: &str, _role: SegmentRole, _in_latest_turn: bool) {}
+
+    /// [`Self::redact_output_text`] for a slot that restates another one
+    /// (see [`SegmentRole::Echo`]). Only a segment collector tells the two
+    /// apart.
+    fn redact_output_echo(&self, text: &str) -> Option<Redaction> {
+        self.redact_output_text(text)
+    }
+
+    /// [`Self::check_output_observed`] minus the local-segment members,
+    /// for a call site with no held body to walk: it builds the segments
+    /// itself and runs [`Self::check_local_segments`] alongside. Every
+    /// other member answers exactly as the plain fold would.
+    async fn check_output_non_local_observed(
+        &self,
+        resp: &ChatResponse,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        if self.checks_local_segments() {
+            (GuardrailVerdict::Allow, Vec::new())
+        } else {
+            self.check_output_observed(resp).await
+        }
+    }
+
+    /// Whether this guardrail answers through a segment pass rather than
+    /// the `check_*_non_segment` folds.
+    fn judged_by_segments(&self) -> bool {
+        self.moderates_segments() || self.checks_local_segments()
+    }
+
+    /// `check_input` minus segment-moderating and local-segment members —
+    /// used by call sites that ALSO run [`Self::moderate_input_segments`]
+    /// and [`Self::check_local_segments`], so a member isn't consulted
+    /// twice (and billed twice). For a leaf guardrail this is
+    /// all-or-nothing. [`GuardrailChain`] overrides with a member-filtered
+    /// fold.
     async fn check_input_non_segment(&self, req: &ChatFormat) -> GuardrailVerdict {
-        if self.moderates_segments() {
+        if self.judged_by_segments() {
             GuardrailVerdict::Allow
         } else {
             self.check_input(req).await
         }
     }
 
-    /// `check_output` minus segment-moderating members (see
+    /// `check_output` minus segment-judged members (see
     /// [`Self::check_input_non_segment`]).
     async fn check_output_non_segment(&self, resp: &ChatResponse) -> GuardrailVerdict {
-        if self.moderates_segments() {
+        if self.judged_by_segments() {
             GuardrailVerdict::Allow
         } else {
             self.check_output(resp).await
@@ -644,12 +1259,33 @@ pub trait Guardrail: Send + Sync + 'static {
         (self.check_output(resp).await, Vec::new())
     }
 
+    /// [`Self::check_input_observed`] for a call site that has no channel
+    /// to write a mask back (a passthrough body, a job body, a realtime
+    /// frame, …): the request is forwarded unmodified, so a mask rule that
+    /// matches is reported as `mask_unsupported` / `would_mask_unsupported`
+    /// rather than as a mask. Only the chain and the monitor decorator
+    /// override it.
+    async fn check_input_unmaskable_observed(
+        &self,
+        req: &ChatFormat,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        self.check_input_observed(req).await
+    }
+
+    /// [`Self::check_input_unmaskable_observed`] for the response side.
+    async fn check_output_unmaskable_observed(
+        &self,
+        resp: &ChatResponse,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        self.check_output_observed(resp).await
+    }
+
     /// [`Self::check_input_non_segment`] plus any monitor-mode observations.
     async fn check_input_non_segment_observed(
         &self,
         req: &ChatFormat,
     ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
-        if self.moderates_segments() {
+        if self.judged_by_segments() {
             (GuardrailVerdict::Allow, Vec::new())
         } else {
             self.check_input_observed(req).await
@@ -661,7 +1297,7 @@ pub trait Guardrail: Send + Sync + 'static {
         &self,
         resp: &ChatResponse,
     ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
-        if self.moderates_segments() {
+        if self.judged_by_segments() {
             (GuardrailVerdict::Allow, Vec::new())
         } else {
             self.check_output_observed(resp).await
@@ -710,6 +1346,42 @@ pub(crate) fn keep_callsites_enabled() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A body cut short by the peer is logged with its cause, and the bytes
+    /// that did arrive are still handed back.
+    #[tokio::test]
+    async fn body_read_error_is_logged() {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = [0u8; 4096];
+            let _ = std::io::Read::read(&mut sock, &mut req);
+            // Promise 100 bytes, send 7, hang up.
+            sock.write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 100\r\n\r\npartial")
+                .unwrap();
+        });
+        let logged = crate::call_error::testing::capture_logs(|| async {
+            let mut resp = reqwest::get(format!("http://{addr}/")).await.unwrap();
+            assert_eq!(read_body_capped(&mut resp, 1024, "row-x").await, "partial");
+        })
+        .await;
+        server.join().unwrap();
+        let line = crate::call_error::testing::failure_line(
+            &logged,
+            "guardrail response body read failed",
+        );
+        assert!(line.contains("guardrail_name=row-x"), "{line}");
+        assert!(line.contains("http_status=403"), "{line}");
+        assert!(line.contains("error_kind=decode"), "{line}");
+        assert!(
+            line.contains("end of file before message length reached"),
+            "{line}"
+        );
+        assert!(line.contains("bytes_read=7"), "{line}");
+    }
+    use std::collections::BTreeSet;
 
     #[test]
     fn truncate_error_body_short_passes_through() {
@@ -803,6 +1475,57 @@ mod tests {
         );
     }
 
+    /// Same bypass class again, via `extra["reasoning_content"]`: an
+    /// assistant turn's replayed reasoning is caller-supplied text that the
+    /// bridges forward upstream verbatim, so parking a payload there must
+    /// not be a way past a deny-list the same text trips in `content`.
+    /// The same replayed reasoning written as content parts — Mistral's
+    /// `thinking` and Databricks' `reasoning` — is scanned too, signed or
+    /// not, and beside a benign `reasoning_content` rather than instead of
+    /// it.
+    #[test]
+    fn message_scan_text_scans_replayed_reasoning_parts() {
+        let msg: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "reasoning_content": "benign slot",
+            "content": [
+                {"type": "thinking", "thinking": [{"type": "text", "text": "mistral payload"}]},
+                {"type": "thinking", "thinking": "anthropic payload", "signature": "sig"},
+                {"type": "reasoning", "summary": [
+                    {"type": "summary_text", "text": "databricks payload", "signature": "sig"}
+                ]},
+                {"type": "text", "text": "answer"}
+            ]
+        }))
+        .unwrap();
+        let scanned = message_scan_text(&msg);
+        for want in [
+            "benign slot",
+            "mistral payload",
+            "anthropic payload",
+            "databricks payload",
+            "answer",
+        ] {
+            assert!(scanned.contains(want), "missing {want:?} in {scanned:?}");
+        }
+    }
+
+    #[test]
+    fn message_scan_text_scans_replayed_reasoning_content() {
+        let msg: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": "nothing to see",
+            "reasoning_content": "hidden reasoning payload"
+        }))
+        .unwrap();
+        let scanned = message_scan_text(&msg);
+        assert!(
+            scanned.contains("hidden reasoning payload"),
+            "scan must cover replayed reasoning_content, got {scanned:?}",
+        );
+        assert!(scanned.contains("nothing to see"));
+    }
+
     #[test]
     fn message_scan_text_scans_tool_call_payload() {
         // Same bypass class via `extra["tool_calls"]`: history-replay tool
@@ -869,41 +1592,147 @@ mod tests {
         ));
     }
 
-    /// Pins `supported_kinds()` under the default feature set (all
-    /// features on): exact contents, and every string round-trips
-    /// through the config parser to the matching
-    /// `GuardrailKind::kind_str` — so the heartbeat-reported list can
-    /// never drift from the wire `kind` discriminators (#519 B.6).
-    #[cfg(all(
-        feature = "bedrock",
-        feature = "azure-content-safety",
-        feature = "aliyun-text-moderation",
-        feature = "lakera",
-        feature = "openai-moderation",
-        feature = "presidio"
-    ))]
     #[test]
-    fn supported_kinds_matches_kind_str_under_default_features() {
+    fn hold_cap_folds_within_the_winning_rank() {
+        let window = |cap, open| StreamOutputPolicy::Window {
+            size_chars: 100,
+            overlap_chars: 10,
+            max_buffer_bytes: cap,
+            on_exceeded_fail_open: open,
+        };
+        let full = |cap, open| StreamOutputPolicy::BufferFull {
+            max_buffer_bytes: cap,
+            on_exceeded_fail_open: open,
+        };
+        assert_eq!(window(500, true).hold_cap(), Some((500, true)));
+        assert_eq!(StreamOutputPolicy::EndOfStreamCheck.hold_cap(), None);
+        // An all-window chain folds its rows' caps.
         assert_eq!(
-            supported_kinds(),
-            &[
-                "keyword",
-                "pii",
-                "azure_content_safety",
-                "azure_content_safety_text_moderation",
-                "aliyun_text_moderation",
-                "aliyun_ai_guardrail",
-                "bedrock",
-                "lakera",
-                "openai_moderation",
-                "presidio",
-            ],
+            window(500, true).stricter(window(900, true)).hold_cap(),
+            Some((500, true)),
         );
-        for kind in supported_kinds() {
-            // Minimal valid config per kind; parse failure or a
-            // kind_str mismatch means the heartbeat list drifted from
-            // the schema's serde tags.
-            let config = match *kind {
+        assert_eq!(
+            window(900, false).stricter(window(500, true)).hold_cap(),
+            Some((500, false)),
+        );
+        // A buffer_full member sets the cap alone: a window row's tighter
+        // cap or fail-closed policy does not bind it, in either order.
+        let mixed = full(900, true).stricter(window(500, false));
+        assert_eq!(mixed, full(900, true));
+        assert_eq!(
+            window(500, false).stricter(full(900, true)),
+            full(900, true)
+        );
+        assert_eq!(
+            window(100, false)
+                .stricter(window(200, false))
+                .stricter(full(900, true))
+                .stricter(full(700, true))
+                .stricter(window(50, false))
+                .stricter(StreamOutputPolicy::EndOfStreamCheck)
+                .hold_cap(),
+            Some((700, true)),
+        );
+    }
+
+    /// Every top-level guardrail `kind` in the resource vocabulary, read out
+    /// of the schema `schemars` DERIVES from `GuardrailKind`.
+    ///
+    /// Derived rather than restated on purpose. The predecessor of this
+    /// helper was a hand-written list, which froze the bug it was meant to
+    /// catch: `custom` shipped without ever reaching `supported_kinds()`, the
+    /// list was written to match, and the test passed all the way into a
+    /// release candidate. A variant added to the enum lands in this set with
+    /// nobody editing this file, so the assertions below fail until the new
+    /// kind is either advertised or declared feature-gated.
+    ///
+    /// Only the top-level `oneOf` is read: the tagged sub-enums nested inside
+    /// a kind (`literal`/`regex` keyword patterns, the `static` credential
+    /// and `serial`/`timed` latency modes of `bedrock`) live under
+    /// `definitions` and are not selectable provider kinds.
+    fn schema_kind_vocabulary() -> BTreeSet<String> {
+        aisix_core::models::schema::guardrail_root_schema(true)["oneOf"]
+            .as_array()
+            .expect("the guardrail root schema is a `oneOf` over the kinds")
+            .iter()
+            .map(|branch| {
+                branch["properties"]["kind"]["enum"][0]
+                    .as_str()
+                    .expect("each branch pins exactly one kind")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// The kinds this build deliberately keeps OUT of the advertisement
+    /// because their cargo feature is off — the only legitimate reason for
+    /// a schema kind to be absent. Under the default feature set this is
+    /// empty and every kind must be advertised.
+    fn feature_disabled_kinds() -> BTreeSet<&'static str> {
+        #[allow(unused_mut)]
+        let mut disabled = BTreeSet::new();
+        #[cfg(not(feature = "azure-content-safety"))]
+        {
+            disabled.insert("azure_content_safety");
+            disabled.insert("azure_content_safety_text_moderation");
+        }
+        #[cfg(not(feature = "aliyun-text-moderation"))]
+        {
+            disabled.insert("aliyun_text_moderation");
+            disabled.insert("aliyun_ai_guardrail");
+        }
+        #[cfg(not(feature = "bedrock"))]
+        disabled.insert("bedrock");
+        #[cfg(not(feature = "lakera"))]
+        disabled.insert("lakera");
+        #[cfg(not(feature = "openai-moderation"))]
+        disabled.insert("openai_moderation");
+        #[cfg(not(feature = "presidio"))]
+        disabled.insert("presidio");
+        disabled
+    }
+
+    /// The capability advertisement must equal "every kind in the schema
+    /// vocabulary that this build can actually run" — in BOTH directions, and
+    /// under any feature set. Under-advertising makes a working kind
+    /// unreachable from the dashboard (which disables anything absent from
+    /// the union the connected DPs report); over-advertising offers an
+    /// operator a kind whose rows this binary drops on load.
+    #[test]
+    fn supported_kinds_advertises_every_schema_kind_this_build_can_run() {
+        let vocabulary = schema_kind_vocabulary();
+        let disabled = feature_disabled_kinds();
+        let expected: BTreeSet<&str> = vocabulary
+            .iter()
+            .map(String::as_str)
+            .filter(|kind| !disabled.contains(kind))
+            .collect();
+
+        let advertised: BTreeSet<&str> = supported_kinds().iter().copied().collect();
+        assert_eq!(
+            advertised.len(),
+            supported_kinds().len(),
+            "supported_kinds() repeats a kind: {:?}",
+            supported_kinds(),
+        );
+        assert_eq!(
+            advertised, expected,
+            "supported_kinds() drifted from the guardrail schema vocabulary; \
+             a kind this build runs must be advertised, and one it cannot \
+             must be listed in feature_disabled_kinds()",
+        );
+    }
+
+    /// Every kind in the vocabulary parses from a minimal config and reports
+    /// itself under the same discriminator, so the advertised strings, the
+    /// serde tags and `GuardrailKind::kind_str` (three hand-written surfaces
+    /// over one vocabulary) cannot drift apart. Feature-independent: parsing
+    /// lives in `aisix-core`, which compiles every kind regardless of this
+    /// crate's features.
+    #[test]
+    fn every_schema_kind_round_trips_to_its_kind_str() {
+        for kind in schema_kind_vocabulary() {
+            let config = match kind.as_str() {
                 "keyword" => serde_json::json!({
                     "kind": "keyword",
                     "patterns": [{"kind": "literal", "value": "x"}],
@@ -950,16 +1779,27 @@ mod tests {
                     "kind": "openai_moderation",
                     "api_key": "sk",
                 }),
+                "semantic" => serde_json::json!({
+                    "kind": "semantic",
+                    "embedding_model": "embed-1",
+                    "deny_examples": ["x"],
+                }),
                 "presidio" => serde_json::json!({
                     "kind": "presidio",
                     "analyzer_url": "http://analyzer:3000",
                     "anonymizer_url": "http://anonymizer:3000",
                 }),
-                other => panic!("no parse fixture for kind {other:?}"),
+                "custom" => serde_json::json!({
+                    "kind": "custom",
+                    "script": "export function on_input() { return { action: 'allow' }; }",
+                }),
+                other => panic!(
+                    "guardrail kind {other:?} joined the schema vocabulary with no parse fixture"
+                ),
             };
             let parsed: aisix_core::models::GuardrailKind = serde_json::from_value(config)
                 .unwrap_or_else(|e| panic!("kind {kind:?} failed to parse: {e}"));
-            assert_eq!(parsed.kind_str(), *kind);
+            assert_eq!(parsed.kind_str(), kind);
         }
     }
 
@@ -972,7 +1812,46 @@ mod tests {
             GuardrailVerdict::Block {
                 reason: "x".into(),
                 guardrail_name: None,
+                unavailable: None,
             },
+        );
+        // A plain content block carries no cause; a fail-closed one does,
+        // and that is the only difference a consumer can see
+        // (AISIX-Cloud#1365).
+        assert_eq!(GuardrailVerdict::block("x").unavailable_tag(), None);
+        assert!(GuardrailVerdict::block_unavailable("x", "lakera_timeout").is_block());
+        assert_eq!(
+            GuardrailVerdict::block_unavailable("x", "lakera_timeout").unavailable_tag(),
+            Some("lakera_timeout"),
+        );
+        assert_eq!(GuardrailVerdict::Allow.unavailable_tag(), None);
+        // The tag reaches an unsanitized Prometheus label and the usage
+        // event, so it is clamped at construction rather than trusted:
+        // every producer passes a `bypass_tag()` constant today, but the
+        // field's TYPE is `String` and cannot say so.
+        assert_eq!(
+            GuardrailVerdict::block_unavailable("x", "presidio_5xx").unavailable_tag(),
+            Some("presidio_5xx"),
+            "a real tag must survive the clamp unchanged",
+        );
+        assert_eq!(
+            GuardrailVerdict::block_unavailable("x", "Lakera Timeout: 500ms!").unavailable_tag(),
+            Some("lakeratimeout500ms"),
+        );
+        assert_eq!(
+            GuardrailVerdict::block_unavailable("x", "!!!").unavailable_tag(),
+            Some("unknown"),
+        );
+        assert_eq!(
+            GuardrailVerdict::block_unavailable("x", "a".repeat(200))
+                .unavailable_tag()
+                .map(str::len),
+            Some(64),
+            "an unbounded tag must not mint an unbounded metric series",
+        );
+        assert_eq!(
+            GuardrailVerdict::Bypass { reason: "y".into() }.unavailable_tag(),
+            None,
         );
         assert!(!GuardrailVerdict::Allow.is_bypass());
         assert!(GuardrailVerdict::Bypass { reason: "y".into() }.is_bypass());

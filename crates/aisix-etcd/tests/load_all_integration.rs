@@ -100,10 +100,9 @@ async fn a_prefix_larger_than_one_request_budget_still_loads() {
         &[proxy],
         prefix.clone(),
         None,
-        ConnectPolicy {
-            request_timeout: Some(Duration::from_secs(1)),
-            ..ConnectPolicy::default()
-        },
+        Some(Duration::from_secs(1)),
+        None,
+        ConnectPolicy::default(),
     )
     .await
     .expect("connect through the proxy");
@@ -149,10 +148,9 @@ async fn every_page_reads_the_first_pages_revision() {
         &[proxy],
         prefix.clone(),
         None,
-        ConnectPolicy {
-            request_timeout: Some(Duration::from_secs(1)),
-            ..ConnectPolicy::default()
-        },
+        Some(Duration::from_secs(1)),
+        None,
+        ConnectPolicy::default(),
     )
     .await
     .expect("connect through the proxy");
@@ -225,10 +223,9 @@ async fn a_compaction_between_pages_restarts_the_load_at_a_fresh_revision() {
         &[proxy],
         prefix.clone(),
         None,
-        ConnectPolicy {
-            request_timeout: Some(Duration::from_secs(1)),
-            ..ConnectPolicy::default()
-        },
+        Some(Duration::from_secs(1)),
+        None,
+        ConnectPolicy::default(),
     )
     .await
     .expect("connect through the proxy");
@@ -291,10 +288,9 @@ async fn a_load_compacted_on_every_attempt_gives_up() {
         &[proxy],
         prefix.clone(),
         None,
-        ConnectPolicy {
-            request_timeout: Some(Duration::from_secs(1)),
-            ..ConnectPolicy::default()
-        },
+        Some(Duration::from_secs(1)),
+        None,
+        ConnectPolicy::default(),
     )
     .await
     .expect("connect through the proxy");

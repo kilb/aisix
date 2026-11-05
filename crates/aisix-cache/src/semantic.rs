@@ -82,6 +82,12 @@ pub trait SemanticCacheStore: Send + Sync + 'static {
         ttl: Duration,
         max_entries: u32,
     ) -> Result<(), CacheError>;
+
+    /// Entries held in this process, for an in-process store; `None` for
+    /// a shared backend whose contents live elsewhere.
+    fn local_entry_count(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Scale `v` to unit length, so the scan below is a dot product instead of a
@@ -89,13 +95,16 @@ pub trait SemanticCacheStore: Send + Sync + 'static {
 /// changes once per lookup, so recomputing both norms inside every comparison
 /// is pure repeated work.
 ///
-/// A zero-magnitude vector is returned unchanged (all zeros). It then dots to
-/// `0.0` against anything, which is exactly the degenerate answer the cosine
-/// form produced — and never `NaN`, which would poison the max-tracking scan.
+/// A vector with no usable magnitude — all zeros, or one whose norm overflows
+/// f32 or is `NaN` — comes back as all zeros. It then dots to `0.0` against
+/// anything, which is the degenerate fold that can never match (see the trait
+/// docs). Handing the raw values back instead would let a poisoned embedding
+/// dot to a huge "similarity" against a unit vector and beat every real
+/// candidate.
 fn unit_vector(v: &[f32]) -> Vec<f32> {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm == 0.0 || !norm.is_finite() {
-        return v.to_vec();
+        return vec![0.0; v.len()];
     }
     v.iter().map(|x| x / norm).collect()
 }
@@ -150,6 +159,12 @@ impl MemorySemanticCache {
 
 #[async_trait]
 impl SemanticCacheStore for MemorySemanticCache {
+    /// A walk over the policies, not the entries: bounded by how many
+    /// semantic policies are configured.
+    fn local_entry_count(&self) -> Option<u64> {
+        Some(self.policies.iter().map(|p| p.entries.len() as u64).sum())
+    }
+
     async fn lookup(
         &self,
         policy_id: &str,
@@ -169,31 +184,31 @@ impl SemanticCacheStore for MemorySemanticCache {
         let now = Instant::now();
         // Once per lookup, not once per candidate.
         let query = unit_vector(embedding);
-        let mut best: Option<SemanticHit> = None;
         // The shard read guard is deliberately held across the scan: DashMap
         // read guards do not block other readers, so this only contends with
         // `store`, which runs on upstream misses. Copying the candidates out
         // first would trade that for one atomic refcount bump per entry on
         // every lookup — the more frequent operation.
-        for entry in &policy.entries {
-            if entry.scope_fp != scope_fp || entry.expires_at <= now {
-                continue;
-            }
+        let mut best: Option<(&SemanticEntry, f32)> = None;
+        for entry in policy
+            .entries
+            .iter()
+            .filter(|entry| entry.scope_fp == scope_fp && entry.expires_at > now)
+        {
             let similarity = unit_similarity(&query, &entry.embedding);
-            // `> 0.0` (not just `>= threshold`): 0.0 is the degenerate
-            // fold — see the trait docs.
-            if similarity >= threshold
-                && similarity > 0.0
-                && best.as_ref().is_none_or(|b| similarity > b.similarity)
-            {
-                best = Some(SemanticHit {
-                    response: entry.response.clone(),
-                    similarity,
-                    expires_at: entry.expires_at,
-                });
+            if best.is_none_or(|(_, current)| similarity > current) {
+                best = Some((entry, similarity));
             }
         }
-        Ok(best)
+        Ok(best.and_then(|(entry, similarity)| {
+            // `> 0.0` (not just `>= threshold`): 0.0 is the degenerate
+            // fold — see the trait docs.
+            (similarity >= threshold && similarity > 0.0).then(|| SemanticHit {
+                response: entry.response.clone(),
+                similarity,
+                expires_at: entry.expires_at,
+            })
+        }))
     }
 
     async fn store(
@@ -203,10 +218,12 @@ impl SemanticCacheStore for MemorySemanticCache {
         scope_fp: &str,
         exact_key: &str,
         embedding: Vec<f32>,
-        response: ChatResponse,
+        mut response: ChatResponse,
         ttl: Duration,
         max_entries: u32,
     ) -> Result<(), CacheError> {
+        // Same as a serialized entry: a hit was served by no upstream.
+        response.service_tier = None;
         let now = Instant::now();
         // Opportunistic reclamation of OTHER policies' storage: a policy
         // that was deleted (or just went idle) never runs its own store
@@ -314,11 +331,14 @@ mod tests {
 
     fn resp(text: &str) -> ChatResponse {
         ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "cmpl-1".into(),
             model: "m".into(),
             message: ChatMessage::assistant(text),
             finish_reason: FinishReason::Stop,
             usage: UsageStats::new(2, 3),
+            service_tier: None,
         }
     }
 
@@ -619,5 +639,42 @@ mod tests {
         assert_eq!(similarity(&[1.0, 2.0, 3.0], &[1.0, 2.0]), 0.0);
         assert!((similarity(&[1.0, 1.0], &[5.0, 5.0]) - 1.0).abs() < 1e-6);
         assert!(!similarity(&[0.0], &[0.0]).is_nan());
+    }
+
+    /// 分量大到平方后溢出 f32 的向量，余弦给出 `NaN` 或 `0.0`，都不会命中。
+    /// 预先归一化不能把它变成一个巨大的「相似度」：那样它会赢过所有真实候选。
+    #[tokio::test]
+    async fn an_embedding_that_overflows_never_beats_a_real_candidate() {
+        let store = MemorySemanticCache::new();
+        store
+            .store("p", 0, "fp", "real", vec![1.0, 0.0], resp("real"), TTL, 100)
+            .await
+            .unwrap();
+        store
+            .store(
+                "p",
+                0,
+                "fp",
+                "poisoned",
+                vec![f32::MAX, 0.0],
+                resp("poisoned"),
+                TTL,
+                100,
+            )
+            .await
+            .unwrap();
+        let hit = store
+            .lookup("p", 0, "fp", &[1.0, 0.0], 0.5)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.response.message.content_str(), "real");
+
+        // 查询向量本身溢出时，同样是未命中，而不是挑一个候选返回。
+        assert!(store
+            .lookup("p", 0, "fp", &[f32::MAX, 0.0], 0.0)
+            .await
+            .unwrap()
+            .is_none());
     }
 }

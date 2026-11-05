@@ -1,0 +1,1803 @@
+//! `POST /v1/images/edits` — multipart image editing (AISIX-Cloud#1360).
+//!
+//! The editing models (`gpt-image-1`/`gpt-image-2`) take the source
+//! image(s), an optional mask, the prompt and every tuning parameter in
+//! one `multipart/form-data` body, so this route follows the audio
+//! transcription shape — drain the form, resolve `model`, swap in the
+//! upstream model id, rebuild the form and forward it — not the JSON
+//! bridge dispatch `/v1/images/generations` uses.
+//!
+//! Flow:
+//! 1. [`AuthenticatedKey`] extractor — 401 if auth fails.
+//! 2. Drain every multipart field into memory (the snapshot is loaded
+//!    only afterwards — #941 audit M2: a multi-second upload must not
+//!    pin config resolved before it began).
+//! 3. Resolve `model` → Model row → 404; `allowed_models` → 403;
+//!    client-IP allowlist → 403.
+//! 4. Input guardrails scan every `prompt` field (#545 parity with
+//!    generations; the image bytes are not scannable text). Mask-action
+//!    PII rules rewrite the prompt fields in place (#932/#696).
+//! 5. Key-level + model-level rate limits reserve capacity (#542: after
+//!    the guardrail check so a content block doesn't burn an RPM slot,
+//!    unless the check calls a remote service, see
+//!    `quota::reserve_before_costly_check`).
+//! 6. Only the `openai` provider is dispatched — the documented
+//!    `/v1/images/edits` route + form shape is OpenAI's (#168 parallel);
+//!    anything else is rejected 400 at the gateway boundary.
+//! 7. The form is rebuilt verbatim minus the `model` swap — unknown
+//!    fields (`n`, `size`, `quality`, `background`, `input_fidelity`,
+//!    repeated `image[]` parts, `mask`) forward untouched, so new
+//!    upstream parameters need no gateway release.
+//! 8. The JSON response passes the output chain, as generations' does (a
+//!    `revised_prompt` is model text), and relays back; the `usage` token
+//!    block (gpt-image-*) feeds the UsageEvent + TPM/TPD commit exactly like
+//!    generations (#911 [21]).
+//!
+//! `stream=true` (partial-image SSE) is rejected 400 for now: buffering
+//! a stream the caller asked to watch grow is silent degradation, and
+//! the live-relay plumbing (#998) is a follow-up, not a Phase 1 rider.
+
+use aisix_core::AppliedGuardrail;
+use aisix_obs::{content_capture_cap, CapturedContent};
+use axum::body::Bytes;
+use axum::extract::{Multipart, State};
+use axum::http::header;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use reqwest::multipart;
+use serde_json::Value;
+use std::time::Instant;
+
+use crate::auth::AuthenticatedKey;
+use crate::client_ip::ClientContext;
+use crate::error::ProxyError;
+use crate::state::ProxyState;
+
+const ENDPOINT: &str = "/v1/images/edits";
+
+/// Per-request payload from a successful dispatch — the same shape the
+/// generations handler consumes, minus `upstream_called` (this route has
+/// no 501 half-success: every `Ok` came back from the upstream).
+struct EditsDispatchSuccess {
+    response: Response,
+    model_name: String,
+    provider: String,
+    model_id: String,
+    provider_key_id: String,
+    upstream_model: String,
+    applied_guardrails: Vec<AppliedGuardrail>,
+    /// The upstream `usage` block (gpt-image-*). `None` still emits a
+    /// zero-token event so the request is visible + attributed.
+    usage: Option<aisix_gateway::UsageStats>,
+    redactions: crate::redact::RedactionCounts,
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    /// The output chain refused an answer the upstream already billed.
+    guardrail_blocked: bool,
+    captured_content: Option<CapturedContent>,
+}
+
+pub async fn image_edits(
+    State(state): State<ProxyState>,
+    auth: AuthenticatedKey,
+    client: ClientContext,
+    multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
+) -> Response {
+    let started = Instant::now();
+    let request_id = client.request_id.clone();
+    let api_key_id = auth.entry.id.clone();
+
+    // Same silent class as the body-extractor rejections #863 collected: a
+    // non-multipart content-type answered axum's bare 400 with no access
+    // log, metrics, or envelope.
+    let multipart = match multipart {
+        Ok(multipart) => multipart,
+        Err(_) => {
+            return crate::reject::reject_before_dispatch(
+                &state,
+                "POST",
+                ENDPOINT,
+                &request_id,
+                Some(&api_key_id),
+                started,
+                crate::reject::Envelope::OpenAi,
+                ProxyError::InvalidRequest("invalid multipart form data".into()),
+            );
+        }
+    };
+
+    // Loaded by `dispatch` AFTER the upload is drained, then reused by
+    // the emits below (#941) — see the note on audio's multipart_dispatch.
+    let mut snapshot = None;
+
+    // See `embeddings`: filled inside `dispatch` so the failure branch —
+    // where a guardrail block lands — stamps the enforced hits too
+    // (AISIX-Cloud#1330 / #1024).
+    let mut audit = crate::usage_attr::GuardrailAudit::default();
+    // Every upstream attempt, filled by the dispatch (#655).
+    let mut routing = crate::attempt::RoutingTelemetry::default();
+
+    match dispatch(
+        &state,
+        &mut snapshot,
+        &auth,
+        multipart,
+        &request_id,
+        &client,
+        &mut audit,
+        &mut routing,
+    )
+    .await
+    {
+        Ok(success) => {
+            let snapshot = snapshot.unwrap_or_else(|| state.snapshot.load());
+            let elapsed = started.elapsed();
+            let status = success.response.status().as_u16();
+            crate::images::emit_access_log(
+                ENDPOINT,
+                &success.model_name,
+                &success.provider,
+                &api_key_id,
+                status,
+                elapsed,
+                &request_id,
+                &routing,
+                None,
+            );
+            // One ProviderKey lookup for both terminal emits (#941).
+            let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
+            crate::request_metrics::record(
+                &state,
+                ENDPOINT,
+                crate::request_metrics::Caller::new(&auth),
+                crate::request_metrics::Upstream {
+                    provider: &success.provider,
+                    model: &success.model_name,
+                    upstream_model: &success.upstream_model,
+                    pk: pk.labels(),
+                    is_fallback: routing.fallback_count() > 0,
+                    ..Default::default()
+                },
+                status,
+                crate::attempt::answered_error_source(false, &routing),
+                elapsed,
+            );
+            // One zero-token event per attempt that failed before the
+            // winner (#655).
+            crate::usage_attr::emit_failed_attempts(
+                &state,
+                &snapshot,
+                crate::operation::IMAGE_EDIT,
+                &request_id,
+                &success.model_name,
+                &api_key_id,
+                &client,
+                &success.applied_guardrails,
+                &routing.attempts,
+                /* terminal_last */ false,
+                false,
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
+            );
+            crate::images::emit_usage_event(
+                &state,
+                &snapshot,
+                &pk,
+                ENDPOINT,
+                crate::operation::IMAGE_EDIT,
+                &request_id,
+                &success.model_id,
+                &success.model_name,
+                &api_key_id,
+                &success.provider,
+                &success.upstream_model,
+                &success.applied_guardrails,
+                status,
+                elapsed,
+                success.usage.as_ref().unwrap_or(&Default::default()),
+                &client,
+                success.redactions.clone(),
+                success.monitor_hits.clone(),
+                success.guardrail_blocked,
+                success.captured_content.as_ref(),
+                &audit,
+                true,
+                routing.winner(),
+            );
+            // Same window /v1/images/generations publishes, so an SDK client
+            // can schedule back-off from real numbers.
+            let mut response = success.response;
+            let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
+            crate::request_metrics::publish_rate_limit_window(
+                &state.metrics,
+                &state.limiter,
+                &snapshot,
+                &api_key_id,
+                &rl_limits,
+                &success.model_name,
+                &success.upstream_model,
+                &mut response,
+            )
+            .await;
+            response
+        }
+        Err(err) => {
+            // The dispatch can fail before it ever loaded one (a
+            // malformed form), so fall back rather than assume.
+            let snapshot = snapshot.unwrap_or_else(|| state.snapshot.load());
+            let status = err.status().as_u16();
+            let elapsed = started.elapsed();
+            let attributed = crate::attribution::current().unwrap_or_default();
+            let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
+            crate::images::emit_access_log(
+                ENDPOINT,
+                Some(attributed.requested_model.as_str())
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or("unknown"),
+                last_target.provider(),
+                &api_key_id,
+                status,
+                elapsed,
+                &request_id,
+                &routing,
+                Some(&err),
+            );
+            // AISIX-Cloud#1325: the form is parsed inside the dispatch that
+            // failed, so this branch never sees the model — the request's
+            // attribution cell recorded the target it selected.
+            let metric_model =
+                crate::request_metrics::LastTarget::requested_model(&snapshot, &attributed);
+            crate::request_metrics::record(
+                &state,
+                ENDPOINT,
+                crate::request_metrics::Caller::new(&auth),
+                last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
+                status,
+                crate::attempt::error_source(&err),
+                elapsed,
+            );
+            // Per #655 parity: surface the failed request in Logs. The
+            // attribution cell carries the requested model for every
+            // failure past model resolution (a guardrail 422, a provider
+            // 400); earlier failures leave it empty — status + error
+            // class still identify those.
+            // Per #655: one zero-token event per failed upstream attempt,
+            // the last of them terminal when every attempt failed.
+            crate::usage_attr::note_client_error(&snapshot, &err);
+            let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
+            crate::usage_attr::emit_failed_attempts(
+                &state,
+                &snapshot,
+                crate::operation::IMAGE_EDIT,
+                &request_id,
+                &attributed.requested_model,
+                &api_key_id,
+                &client,
+                &crate::usage_attr::applied_guardrails(&audit),
+                &routing.attempts,
+                failed_terminal,
+                err.is_guardrail_block(),
+                Vec::new(),
+                crate::redact::RedactionCounts::new(),
+                &audit,
+            );
+            // A failure no attempt answers for — pre-dispatch, or after the
+            // winner — is one zero-token terminal event.
+            if !failed_terminal {
+                crate::usage_attr::emit_error_usage_event(
+                    &state,
+                    &snapshot,
+                    crate::operation::IMAGE_EDIT,
+                    "openai",
+                    &request_id,
+                    &attributed.requested_model,
+                    &api_key_id,
+                    status,
+                    crate::usage_attr::EventError::of(&err),
+                    err.is_guardrail_block(),
+                    &client,
+                    crate::usage_attr::applied_guardrails(&audit),
+                    crate::usage_attr::enforced_hits(&audit),
+                    crate::usage_attr::guardrail_scores(&audit),
+                    crate::usage_attr::bypass_reason(&audit),
+                );
+            }
+            err.into_response()
+        }
+    }
+}
+
+/// A multipart request as content capture represents it. See the capture site.
+fn captured_edit_fields(fields: &[(String, Option<String>, Option<String>, Bytes)]) -> String {
+    use sha2::Digest;
+    let mut obj = serde_json::Map::new();
+    // Appends on a repeated name (multipart allows repeats and all are
+    // forwarded) so no field disappears from the export. The filename is
+    // deliberately NOT captured — it is user-controlled text that skips
+    // the redaction path; the checksum alone represents the file.
+    let mut push = |key: String, value: String| match obj.get_mut(&key) {
+        Some(Value::String(existing)) => {
+            existing.push('\n');
+            existing.push_str(&value);
+        }
+        _ => {
+            obj.insert(key, Value::String(value));
+        }
+    };
+    for (name, _, _, data) in fields {
+        // `image` / `mask` are the file slots; represent them by
+        // checksum even when the bytes happen to be valid UTF-8 (an
+        // SVG source, say) — the capture is an audit trail, not an
+        // asset store. Name-based, not content-type-based: browsers
+        // and SDKs stamp `text/plain` on ordinary text fields, and
+        // hashing a `prompt` for that would erase the very text the
+        // capture exists to audit (same rule as audio's `file`).
+        let is_binary_slot = name == "image" || name == "mask";
+        match std::str::from_utf8(data) {
+            Ok(text) if !is_binary_slot => {
+                push(name.clone(), text.to_string());
+            }
+            _ => {
+                push(
+                    format!("{name}_sha256"),
+                    format!("{:x}", sha2::Sha256::digest(data)),
+                );
+            }
+        }
+    }
+    serde_json::to_string(&Value::Object(obj)).unwrap_or_default()
+}
+
+/// Collect all multipart fields, resolve the model, swap in the upstream
+/// model id, then rebuild and forward the multipart form. See audio's
+/// `multipart_dispatch` for the pattern this follows (minus streaming).
+#[allow(clippy::too_many_arguments)]
+async fn dispatch(
+    state: &ProxyState,
+    // Out-param: the snapshot is loaded HERE, once the upload has been
+    // drained, and handed back so the handler's terminal emits read the
+    // same one (#941 audit M2).
+    snapshot_out: &mut Option<std::sync::Arc<aisix_core::AisixSnapshot>>,
+    auth: &AuthenticatedKey,
+    mut multipart: Multipart,
+    request_id: &str,
+    client_ctx: &ClientContext,
+    audit_out: &mut crate::usage_attr::GuardrailAudit,
+    routing_out: &mut crate::attempt::RoutingTelemetry,
+) -> Result<EditsDispatchSuccess, ProxyError> {
+    // Collect all fields first so we can find `model` before building the
+    // outgoing reqwest multipart.
+    let mut fields: Vec<(String, Option<String>, Option<String>, Bytes)> = Vec::new();
+
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        crate::error::proxy_error_from_multipart(
+            e,
+            state.request_body_limit_bytes,
+            "multipart read error",
+        )
+    })? {
+        let name = field.name().unwrap_or("").to_string();
+        let file_name = field.file_name().map(|s| s.to_string());
+        let content_type = field.content_type().map(|s| s.to_string());
+        let data = field.bytes().await.map_err(|e| {
+            crate::error::proxy_error_from_multipart(
+                e,
+                state.request_body_limit_bytes,
+                "multipart field read error",
+            )
+        })?;
+        fields.push((name, file_name, content_type, data));
+    }
+
+    let model_name = fields
+        .iter()
+        .find(|(name, ..)| name == "model")
+        .and_then(|(.., data)| std::str::from_utf8(data).ok())
+        .map(|s| s.trim().to_string())
+        .ok_or_else(|| ProxyError::InvalidRequest("`model` field missing from form".into()))?;
+
+    let snapshot = &**snapshot_out.insert(state.snapshot.load());
+    crate::usage_attr::note_failure_request(snapshot, || captured_edit_fields(&fields));
+    let model_entry = crate::model_resolve::resolve_model(snapshot, &model_name)
+        .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
+
+    if !auth.key().can_access(snapshot, &model_name) {
+        return Err(ProxyError::ModelForbidden(model_name.clone()));
+    }
+
+    // Client-IP allowlist gate (#557): reject before guardrails / upstream.
+    crate::dispatch::check_ip_access(&model_entry.value, &client_ctx.source_ip)?;
+
+    // Partial-image SSE (`stream=true`) is not relayed yet — reject
+    // rather than buffer a stream the caller asked to watch grow (see
+    // the module doc). Rejected AFTER model resolution so an unknown
+    // model still answers 404 (matching the JSON endpoints' precedence)
+    // and the error carries the attribution `resolve_model` recorded,
+    // BEFORE any quota reservation.
+    if fields.iter().any(|(name, _, _, data)| {
+        name == "stream" && std::str::from_utf8(data).map(str::trim) == Ok("true")
+    }) {
+        return Err(ProxyError::InvalidRequest(
+            "`stream` is not supported on /v1/images/edits".into(),
+        ));
+    }
+
+    // #1016: a `prompt` part that is not valid UTF-8 would be skipped by
+    // the guardrail scan below yet forwarded verbatim — reject it before
+    // the guardrail pass instead of leaving that asymmetry.
+    crate::dispatch::require_utf8_prompt_fields(&fields)?;
+
+    // #545 parity with generations: the `prompt` form field is caller text
+    // forwarded verbatim to the provider — scan it (input hook, before the
+    // reservation per #542) and mask it (#932). The image in the response is
+    // not scannable text; its `revised_prompt` is, and passes the output hook
+    // below.
+    let guardrail_ctx = aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
+        model_id: &model_entry.id,
+        mcp_server_id: "",
+        api_key_id: &auth.entry.id,
+        team_id: auth.key().team_id.as_deref(),
+    };
+    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    let applied_guardrails = resolved_chain.applied().to_vec();
+    *audit_out = resolved_chain.audit_log();
+    // A check that calls a remote moderation service is admitted by the
+    // key's rate limits before it runs, and a refusal keeps the slot it took
+    // (see `quota::reserve_before_costly_check`).
+    let model_rl =
+        crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
+    let early_reservation = crate::quota::reserve_before_costly_check(
+        &resolved_chain,
+        crate::quota::enforce(state, snapshot, auth, Some(&model_rl)),
+    )
+    .await?;
+    let mut redactions = crate::redact::RedactionCounts::new();
+    let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
+    let mut input_capture_safe = true;
+    if !resolved_chain.is_empty() {
+        // EVERY `prompt` field: multipart allows repeated names and the form
+        // is rebuilt with all of them, so all are scanned — an empty first
+        // field must not skip a later one. All are new content, so they are
+        // one newest message (see `newest_content_for_inspection`).
+        let chat = crate::redact::newest_content_for_inspection(
+            &model_name,
+            fields
+                .iter()
+                .filter(|(name, ..)| name == "prompt")
+                .filter_map(|(.., data)| std::str::from_utf8(data).ok()),
+        );
+        // The chain runs whether or not a `prompt` part was supplied.
+        // Gating on "we found text" made the check a text matcher's
+        // privilege: a guardrail that decides about the CALL — a policy
+        // script, an unconditional block scoped to this model — never
+        // fired on the ordinary shape of this endpoint (an edit with no `prompt` part),
+        // so an operator's rule silently allowed exactly the requests
+        // that carry nothing to match.
+        {
+            let (verdict, hits) =
+                aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
+            monitor_hits.extend(hits);
+            input_capture_safe = !verdict.is_bypass();
+            if let aisix_guardrails::GuardrailVerdict::Block {
+                reason,
+                guardrail_name,
+                unavailable,
+            } = verdict
+            {
+                // Per #153 the matched-pattern detail stays in ops logs only.
+                tracing::warn!(
+                    guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
+                    guardrail_hook = "input",
+                    model = %model_name,
+                    reason = %reason,
+                    "guardrail blocked /v1/images/edits request (prompt field)",
+                );
+                // A blocked request exports what the success path would have sent.
+                if crate::usage_attr::content_cap(snapshot).is_some() {
+                    crate::dispatch::mask_prompt_fields(
+                        &resolved_chain.without_audit(),
+                        &mut fields,
+                        &mut crate::redact::RedactionCounts::new(),
+                    );
+                    crate::usage_attr::note_failure_request(snapshot, || {
+                        captured_edit_fields(&fields)
+                    });
+                }
+                return Err(crate::error::guardrail_block_error(
+                    "request",
+                    guardrail_name.as_deref(),
+                    unavailable.as_deref(),
+                ));
+            }
+        }
+        crate::dispatch::mask_prompt_fields(&resolved_chain, &mut fields, &mut redactions);
+    }
+
+    // Content capture (#700): the image/mask bytes are NOT captured — a
+    // binary field is represented by its sha256, text fields verbatim
+    // POST-redaction (the audio convention); the response side is the
+    // image JSON with its base64 replaced (the generations convention).
+    let content_cap = content_capture_cap(
+        snapshot
+            .observability_exporters
+            .entries()
+            .iter()
+            .map(|e| &*e.value),
+    );
+    let captured_prompt = content_cap.map(|_| captured_edit_fields(&fields));
+    if let Some(prompt) = &captured_prompt {
+        // Nothing when a check failed open: the success path's capture
+        // withholds that request too.
+        crate::usage_attr::note_failure_request(snapshot, || {
+            if input_capture_safe {
+                prompt.clone()
+            } else {
+                String::new()
+            }
+        });
+    }
+
+    let reservation = match early_reservation {
+        Some(reservation) => reservation,
+        None => crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?,
+    };
+
+    // A Model Group walks its targets (AISIX-Cloud#1111); every per-target
+    // input — provider gate, key, URL, upstream id, deadline — comes from
+    // the target.
+    crate::dispatch::require_dispatchable_entry(&model_entry.value)?;
+    *routing_out = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
+        .with_trace(client_ctx.trace.clone());
+    let dispatched = crate::routing::dispatch_with_failover(
+        state,
+        snapshot,
+        auth,
+        client_ctx,
+        &model_name,
+        &model_entry,
+        routing_out,
+        |_| true,
+        |_| None,
+        |target, timeouts| {
+            let (model_name, fields) = (&model_name, &fields);
+            async move {
+                let model = &target.model;
+
+                // Per #168's reasoning on generations: only OpenAI's API documents
+                // the `/v1/images/edits` route + form shape. Routing another provider
+                // here would dispatch to an upstream that 404s — reject explicitly at
+                // the gateway boundary instead. Cross-provider editing wires
+                // (Gemini / Vertex / BFL) are the AISIX-Cloud#1360 Phase 2 follow-up.
+                if model.provider.as_deref() != Some("openai") {
+                    return Err(ProxyError::InvalidRequest(format!(
+                        "{} is not an OpenAI provider; \
+                         /v1/images/edits requires OpenAI",
+                        crate::routing::refused_model_label(model_name)
+                    )));
+                }
+
+                let provider = crate::dispatch::require_provider(model)?.to_string();
+                let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
+                let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
+                let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
+
+                let url = aisix_gateway::url_cache::cached_endpoint_url(
+                    &pk_entry.id,
+                    "proxy/images/edits",
+                    // Every resolve_base_url input, via the shared constructor
+                    // (#1017), plus the endpoint path.
+                    &{
+                        let [base, vendor, adapter] =
+                            crate::dispatch::pk_url_fingerprint(&pk_entry.value);
+                        [base, vendor, adapter, "/images/edits"]
+                    },
+                    || {
+                        let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
+                        Ok::<_, crate::error::ProxyError>(crate::dispatch::build_openai_url(
+                            &base,
+                            "/images/edits",
+                        ))
+                    },
+                )?;
+                let provider_label = provider.to_ascii_lowercase();
+
+                // Rebuild the multipart form with `model` rewritten. A `multipart::Form`
+                // is single-use (sending consumes it), so this is a closure: each retry
+                // attempt below builds a fresh one. That is only possible because every
+                // part is built over an in-memory `Bytes`.
+                let build_form = || {
+                    let mut form = multipart::Form::new();
+                    for (name, file_name, content_type, data) in fields {
+                        let field_data = if name == "model" {
+                            Bytes::copy_from_slice(upstream_model.as_bytes())
+                        } else {
+                            data.clone()
+                        };
+
+                        // Over the refcounted `Bytes` itself: `Part::bytes` would
+                        // copy each file into a `Vec` that the form holds for the
+                        // whole upstream wait, next to the request's own copy.
+                        let len = field_data.len() as u64;
+                        let new_part =
+                            || multipart::Part::stream_with_length(field_data.clone(), len);
+                        let mut part = if let Some(ct) = content_type {
+                            new_part().mime_str(ct).unwrap_or_else(|_| new_part())
+                        } else {
+                            new_part()
+                        };
+                        if let Some(fname) = file_name {
+                            part = part.file_name(fname.clone());
+                        }
+                        form = form.part(name.clone(), part);
+                    }
+                    form
+                };
+
+                // Headers built explicitly so the PK's `request.default_headers` and
+                // `request.forward_client_headers` apply (AISIX-Cloud#867). The body is
+                // a multipart form, so JSON body-field overrides don't apply — only
+                // headers do. Content-Type is left to `.multipart()` (it sets the
+                // boundary). Reserved auth headers are protected by
+                // `apply_request_headers`.
+                let mut headers = axum::http::HeaderMap::new();
+                let auth_hv =
+                    header::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
+                        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+                            "api key contains invalid header chars: {e}"
+                        )))
+                    })?;
+                headers.insert(header::AUTHORIZATION, auth_hv);
+                let rid_hv = header::HeaderValue::from_str(request_id).map_err(|e| {
+                    ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+                        "request_id contains invalid header chars: {e}"
+                    )))
+                })?;
+                headers.insert(
+                    header::HeaderName::from_static("x-aisix-request-id"),
+                    rid_hv,
+                );
+                aisix_gateway::apply_request_headers(
+                    &mut headers,
+                    &crate::dispatch::upstream_header_ctx(
+                        &pk_entry.value,
+                        &pk_entry.id,
+                        model,
+                        &target.id,
+                        client_ctx,
+                    ),
+                );
+
+                let client =
+                    crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
+                let tracker = &state.runtime_status;
+                let model_id: &str = &target.id;
+                let cooldown_cfg = model.cooldown.as_ref();
+                // #554/#911: the per-model E2E request timeout bounds the whole
+                // buffered exchange, like the other direct-upstream paths.
+                let request_budget = timeouts.request;
+                let resp_json = match {
+                    let mut req = url
+                        .clone()
+                        .post_on(&client)
+                        .headers(headers.clone())
+                        .multipart(build_form());
+                    if let Some(d) = request_budget {
+                        req = req.timeout(d);
+                    }
+                    async move {
+                        // `reqwest_error_to_bridge`: an elapsed `timeout` must surface
+                        // as `BridgeError::Timeout`, not transport — the distinction
+                        // decides whether the default retry budget covers it.
+                        let send_started = Instant::now();
+                        let resp = req.send().await.map_err(|e| {
+                            crate::cooldown::note_failure(
+                                tracker,
+                                model_id,
+                                cooldown_cfg,
+                                crate::dispatch::reqwest_error_to_bridge(&e, send_started),
+                            )
+                        })?;
+                        aisix_gateway::note_upstream_response(resp.headers());
+                        let status = resp.status();
+                        if !status.is_success() {
+                            return Err(crate::cooldown::note_failure(
+                                tracker,
+                                model_id,
+                                cooldown_cfg,
+                                aisix_gateway::upstream_status_from_response(
+                                    resp,
+                                    aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES,
+                                    aisix_gateway::bounded_error_text,
+                                )
+                                .await,
+                            ));
+                        }
+                        let body_bytes = resp.bytes().await.map_err(|e| {
+                            crate::cooldown::note_failure(
+                                tracker,
+                                model_id,
+                                cooldown_cfg,
+                                aisix_gateway::upstream_body_read_error(&e),
+                            )
+                        })?;
+                        // The edits response is a JSON object (`{created,
+                        // data, usage?}`) on every documented success; a
+                        // body that doesn't parse is a failed answer that
+                        // was still served, so it is neither retried nor
+                        // failed over.
+                        if let Some(err) = aisix_gateway::in_band_error_in_body(
+                            &body_bytes,
+                            aisix_gateway::UpstreamWire::OpenAI,
+                        ) {
+                            return Err(crate::cooldown::note_failure(
+                                tracker,
+                                model_id,
+                                cooldown_cfg,
+                                err,
+                            ));
+                        }
+                        serde_json::from_slice::<Value>(&body_bytes).map_err(|e| {
+                            crate::cooldown::note_failure(
+                                tracker,
+                                model_id,
+                                cooldown_cfg,
+                                aisix_gateway::BridgeError::UpstreamDecode(format!(
+                                    "image edits response is not JSON: {e}"
+                                )),
+                            )
+                        })
+                    }
+                }
+                .await
+                {
+                    Ok(v) => v,
+                    Err(err) => return Err(ProxyError::Bridge(err)),
+                };
+                Ok((
+                    resp_json,
+                    provider_label,
+                    pk_entry.id.to_string(),
+                    upstream_model,
+                ))
+            }
+        },
+    )
+    .await;
+    let crate::routing::Dispatched {
+        value: (mut resp_json, provider_label, pk_id, upstream_model),
+        target,
+        member_reservation,
+        ..
+    } = match dispatched {
+        Ok(d) => d,
+        Err(e) => {
+            reservation.commit_tokens_no_spend(0).await;
+            return Err(e);
+        }
+    };
+    // Fold the target's model-layer reservation in (AISIX-Cloud#1087) so
+    // one commit bills the member's TPM/TPD too.
+    let mut reservation = reservation;
+    if let Some(member) = member_reservation {
+        reservation.merge(member);
+    }
+
+    state.health.record_success(&target.model.display_name);
+    state.runtime_status.mark_healthy(&target.id);
+
+    // #911 [21]: commit the actual token cost so TPM/TPD is enforced.
+    let usage = crate::images::image_usage_stats(&resp_json);
+    let total_tokens = usage.as_ref().map_or(0, |u| {
+        u64::from(u.prompt_tokens) + u64::from(u.completion_tokens)
+    });
+    // Priced from the dispatched row, the same inputs as the usage event's
+    // `cost_usd`, with every input token fresh: this surface has no prompt
+    // cache. Spend layers read this, so `commit_tokens_no_spend` here would
+    // let a key spend past its ceiling on image edits.
+    let spend = usage.as_ref().map_or(0, |u| {
+        crate::usage_attr::request_spend_micro_usd(
+            snapshot,
+            &target.id,
+            aisix_core::InputTokens::uncached_only(u64::from(u.prompt_tokens)),
+            u64::from(u.completion_tokens),
+        )
+    });
+    reservation.commit(total_tokens, spend).await;
+
+    let review = crate::images::review_image_output(
+        &resolved_chain,
+        &model_name,
+        &mut resp_json,
+        &mut redactions,
+        &mut monitor_hits,
+    )
+    .await;
+
+    let captured_content = match (&captured_prompt, content_cap) {
+        (Some(prompt), Some(cap)) if input_capture_safe && review.capture_safe => {
+            Some(CapturedContent::new(
+                prompt,
+                &crate::images::captured_image_response(&resp_json),
+                cap as usize,
+            ))
+        }
+        _ => None,
+    };
+
+    let guardrail_blocked = review.refusal.is_some();
+    Ok(EditsDispatchSuccess {
+        response: match review.refusal {
+            Some(refusal) => refusal.into_response(),
+            None => Json(resp_json).into_response(),
+        },
+        model_name,
+        provider: provider_label,
+        model_id: target.id.clone(),
+        provider_key_id: pk_id,
+        upstream_model,
+        applied_guardrails,
+        usage,
+        redactions,
+        monitor_hits,
+        guardrail_blocked,
+        captured_content,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use aisix_core::resource::ResourceEntry;
+    use aisix_core::snapshot::SnapshotHandle;
+    use aisix_core::{AisixSnapshot, ApiKey, Model, ProxyConfig};
+    use aisix_gateway::Hub;
+    use aisix_provider_openai::OpenAiBridge;
+    use axum::body::to_bytes;
+    use axum::http::{Request, StatusCode};
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn cfg() -> ProxyConfig {
+        ProxyConfig {
+            addr: "127.0.0.1:0".into(),
+            request_body_limit_bytes: 1_048_576,
+            real_ip: Default::default(),
+            request_id: Default::default(),
+            url_rewrites: Vec::new(),
+            expose_debug_headers: false,
+            tls: None,
+            listeners: Vec::new(),
+            thread_per_core: None,
+            workers: None,
+        }
+    }
+
+    const PK_ID: &str = "11111111-1111-1111-1111-111111111111";
+
+    fn model_entry(name: &str) -> ResourceEntry<Model> {
+        let json = format!(
+            r#"{{
+                "display_name": "{name}",
+                "provider": "openai",
+                "model_name": "gpt-image-2",
+                "provider_key_id": "{PK_ID}"
+            }}"#
+        );
+        let m: Model = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("m-1", m, 1)
+    }
+
+    fn anthropic_model_entry(name: &str) -> ResourceEntry<Model> {
+        let json = format!(
+            r#"{{
+                "display_name": "{name}",
+                "provider": "anthropic",
+                "model_name": "claude-3-5-haiku-20241022",
+                "provider_key_id": "{PK_ID}"
+            }}"#
+        );
+        let m: Model = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("m-1", m, 1)
+    }
+
+    fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json = format!(
+            r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(PK_ID, pk, 1)
+    }
+
+    fn new_snap(api_base: &str) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(provider_key_entry(api_base));
+        snap
+    }
+
+    fn apikey_entry(allowed: &[&str]) -> ResourceEntry<ApiKey> {
+        let json = format!(
+            r#"{{"key_hash": "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891", "allowed_models": {}}}"#,
+            serde_json::to_string(&allowed).unwrap()
+        );
+        let k: ApiKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("k-1", k, 1)
+    }
+
+    fn build_app(snap: AisixSnapshot) -> axum::Router {
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache())
+    }
+
+    fn build_app_with_sink(
+        snap: AisixSnapshot,
+        tx: tokio::sync::mpsc::Sender<aisix_obs::UsageEvent>,
+    ) -> axum::Router {
+        use aisix_obs::UsageSink;
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        crate::build_router(state)
+    }
+
+    fn keyword_input_guardrail(literal: &str) -> ResourceEntry<aisix_core::Guardrail> {
+        let json = format!(
+            r#"{{"name":"t","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{{"kind":"literal","value":"{literal}"}}]}}"#
+        );
+        let g: aisix_core::Guardrail = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("g-1", g, 1)
+    }
+
+    /// A minimal edits form: `model`, `prompt`, and a fake PNG `image`
+    /// file part — the shape the OpenAI SDK sends.
+    fn edits_multipart(model: &str, prompt: &str) -> (String, axum::body::Body) {
+        let body = format!(
+            "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n{prompt}\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"size\"\r\n\r\n1024x1024\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"image\"; filename=\"a.png\"\r\n\
+             Content-Type: image/png\r\n\r\nPNGFAKEBYTES\r\n--b--\r\n"
+        );
+        (
+            "multipart/form-data; boundary=b".to_string(),
+            axum::body::Body::from(body),
+        )
+    }
+
+    fn make_req(model: &str, prompt: &str) -> Request<axum::body::Body> {
+        let (ct, body) = edits_multipart(model, prompt);
+        Request::builder()
+            .method("POST")
+            .uri("/v1/images/edits")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap()
+    }
+
+    fn upstream_response() -> serde_json::Value {
+        serde_json::json!({
+            "created": 1_700_000_000i64,
+            "data": [{"b64_json": "aGVsbG8="}],
+            "usage": {
+                "input_tokens": 50,
+                "output_tokens": 1056,
+                "total_tokens": 1106
+            }
+        })
+    }
+
+    /// Happy path: the form forwards with the alias swapped for the
+    /// upstream model id, image bytes and unknown fields intact, and the
+    /// upstream JSON relays back.
+    #[tokio::test]
+    async fn happy_path_rebuilds_form_and_relays_json() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .and(wiremock::matchers::body_string_contains("gpt-image-2"))
+            .and(wiremock::matchers::body_string_contains("PNGFAKEBYTES"))
+            .and(wiremock::matchers::body_string_contains("1024x1024"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("img-edit-prod"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, make_req("img-edit-prod", "add a hat"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["data"][0]["b64_json"].is_string());
+    }
+
+    /// The headline rebuild contract: repeated `image` parts and the
+    /// `mask` part all survive the drain → rebuild round-trip with their
+    /// bytes and filenames intact. A rebuild that dedups by field name
+    /// (the shape a map-keyed rebuild would take) or drops the mask
+    /// fails here.
+    #[tokio::test]
+    async fn repeated_image_and_mask_parts_forward_intact() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .and(wiremock::matchers::body_string_contains("IMAGE-ONE-BYTES"))
+            .and(wiremock::matchers::body_string_contains("IMAGE-TWO-BYTES"))
+            .and(wiremock::matchers::body_string_contains("MASK-BYTES"))
+            .and(wiremock::matchers::body_string_contains("first.png"))
+            .and(wiremock::matchers::body_string_contains("second.png"))
+            .and(wiremock::matchers::body_string_contains("mask.png"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("img-edit-prod"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let body = "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nimg-edit-prod\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\ncombine them\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"image\"; filename=\"first.png\"\r\n\
+             Content-Type: image/png\r\n\r\nIMAGE-ONE-BYTES\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"image\"; filename=\"second.png\"\r\n\
+             Content-Type: image/png\r\n\r\nIMAGE-TWO-BYTES\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"mask\"; filename=\"mask.png\"\r\n\
+             Content-Type: image/png\r\n\r\nMASK-BYTES\r\n--b--\r\n";
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/images/edits")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "multipart/form-data; boundary=b")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A 2xx whose body is not JSON was still served — and billed — by the
+    /// upstream, so a Model Group answers 502 rather than running the edit
+    /// again on its next target.
+    #[tokio::test]
+    async fn a_non_json_2xx_is_not_failed_over() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .and(wiremock::matchers::body_string_contains("garbage-upstream"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>not json</html>"))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .and(wiremock::matchers::body_string_contains("gpt-image-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        let garbage: Model = serde_json::from_str(&format!(
+            r#"{{"display_name":"edit-garbage","provider":"openai","model_name":"garbage-upstream","provider_key_id":"{PK_ID}"}}"#
+        ))
+        .unwrap();
+        snap.models
+            .insert(ResourceEntry::new("m-garbage", garbage, 1));
+        let mut ok = model_entry("edit-ok");
+        ok.id = "m-ok".into();
+        snap.models.insert(ok);
+        let group: Model = serde_json::from_str(
+            r#"{"display_name":"edit-group","routing":{"strategy":"failover","targets":[{"model":"edit-garbage"},{"model":"edit-ok"}],"retries":0,"max_fallbacks":1}}"#,
+        )
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-group", group, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, make_req("edit-group", "add a hat"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// The alias must NOT reach the upstream — the form's `model` field
+    /// is rewritten to the Model row's upstream name.
+    #[tokio::test]
+    async fn alias_never_reaches_upstream() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .and(wiremock::matchers::body_string_contains("img-edit-prod"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("img-edit-prod"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, make_req("img-edit-prod", "add a hat"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// gpt-image usage block → UsageEvent with those tokens (#407 parity).
+    #[tokio::test]
+    async fn emits_usage_event_with_tokens() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("img-edit-prod"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let resp = tower::ServiceExt::oneshot(app, make_req("img-edit-prod", "add a hat"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.prompt_tokens, 50);
+        assert_eq!(ev.completion_tokens, 1056);
+        assert_eq!(ev.requested_model, "img-edit-prod");
+        assert_eq!(ev.inbound_protocol, "openai");
+    }
+
+    /// #545 parity: a configured input guardrail fires on the `prompt`
+    /// form field — 422 content_filter, upstream never contacted.
+    #[tokio::test]
+    async fn input_guardrail_blocks_prompt_returns_422() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("img-edit-prod"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, make_req("img-edit-prod", "please BLOCKME now"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+        assert!(!v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("BLOCKME"));
+    }
+
+    /// #1016: a `prompt` part that is not valid UTF-8 is rejected 400
+    /// before the guardrail pass — pre-fix the scan silently skipped it
+    /// while the rebuilt form forwarded the bytes verbatim, and on this
+    /// route the input scan is the ONLY control (the response is an
+    /// image, no output hook). Upstream must never be contacted.
+    #[tokio::test]
+    async fn non_utf8_prompt_rejected_400_before_guardrail_and_upstream() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("img-edit-prod"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
+
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(
+            b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nimg-edit-prod\r\n",
+        );
+        body.extend_from_slice(b"--b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n");
+        body.extend_from_slice(&[0xFF]);
+        body.extend_from_slice(b"BLOCKME\r\n");
+        body.extend_from_slice(
+            b"--b\r\nContent-Disposition: form-data; name=\"image\"; filename=\"a.png\"\r\n\
+             Content-Type: image/png\r\n\r\nPNGFAKEBYTES\r\n--b--\r\n",
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/images/edits")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "multipart/form-data; boundary=b")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert!(v["error"]["message"].as_str().unwrap().contains("UTF-8"));
+    }
+
+    /// #1016: the reject sits AFTER model resolution — an unknown model
+    /// with an invalid prompt still answers 404, keeping the JSON
+    /// endpoints' status precedence.
+    #[tokio::test]
+    async fn non_utf8_prompt_unknown_model_still_404() {
+        let snap = new_snap("http://unused");
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(
+            b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nnope\r\n",
+        );
+        body.extend_from_slice(b"--b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n");
+        body.extend_from_slice(&[0xFF]);
+        body.extend_from_slice(b"x\r\n--b--\r\n");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/images/edits")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "multipart/form-data; boundary=b")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// #168 parallel: a non-OpenAI Model is rejected 400 at the gateway
+    /// boundary rather than dispatched to an upstream that would 404.
+    #[tokio::test]
+    async fn non_openai_provider_returns_400_invalid_request() {
+        let snap = new_snap("https://api.anthropic.com");
+        snap.models.insert(anthropic_model_entry("claude-img"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, make_req("claude-img", "add a hat"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("requires OpenAI"));
+    }
+
+    /// A Model Group whose first target is not OpenAI ends the request with
+    /// the same 400, naming only the group, without trying the next one:
+    /// every target of a group must serve the endpoint, and a refusal must
+    /// not tell a caller which members the group holds.
+    #[tokio::test]
+    async fn a_group_with_a_non_openai_target_names_only_the_group_in_the_400() {
+        let snap = new_snap("http://unused");
+        snap.models.insert(anthropic_model_entry("claude-img"));
+        let mut ok = model_entry("edit-ok");
+        ok.id = "m-ok".into();
+        snap.models.insert(ok);
+        let group: Model = serde_json::from_str(
+            r#"{"display_name":"mixed-group","routing":{"strategy":"failover","targets":[{"model":"claude-img"},{"model":"edit-ok"}]}}"#,
+        )
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-group", group, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, make_req("mixed-group", "add a hat"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["error"]["message"],
+            "request payload is invalid: model `mixed-group` \
+             is not an OpenAI provider; /v1/images/edits requires OpenAI"
+        );
+    }
+
+    /// `stream=true` (partial-image SSE) is not relayed yet — explicit
+    /// 400, not a silently buffered stream.
+    #[tokio::test]
+    async fn stream_true_rejected_400() {
+        let snap = new_snap("http://unused");
+        snap.models.insert(model_entry("img-edit-prod"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let body = "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nimg-edit-prod\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"stream\"\r\n\r\ntrue\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nhi\r\n--b--\r\n";
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/images/edits")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "multipart/form-data; boundary=b")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["error"]["message"].as_str().unwrap().contains("stream"));
+    }
+
+    #[tokio::test]
+    async fn missing_model_field_returns_400() {
+        let snap = new_snap("http://unused");
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let body = "--b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nhi\r\n--b--\r\n";
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/images/edits")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "multipart/form-data; boundary=b")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn non_multipart_content_type_returns_envelope_400() {
+        let snap = new_snap("http://unused");
+        snap.models.insert(model_entry("img-edit-prod"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/images/edits")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"model":"img-edit-prod"}"#))
+            .unwrap();
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_returns_401() {
+        let snap = new_snap("http://unused");
+        snap.models.insert(model_entry("img-edit-prod"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (ct, body) = edits_multipart("img-edit-prod", "hi");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/images/edits")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn forbidden_model_returns_403() {
+        let snap = new_snap("http://unused");
+        snap.models.insert(model_entry("img-edit-prod"));
+        snap.apikeys.insert(apikey_entry(&["other-model"]));
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, make_req("img-edit-prod", "hi"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn unknown_model_returns_404() {
+        let snap = new_snap("http://unused");
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, make_req("nope", "hi"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn upstream_error_propagates_as_502() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("server error"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("img-edit-prod"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(app, make_req("img-edit-prod", "hi"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// AISIX-Cloud#1330 / #1024: a guardrail BLOCK leaves this handler
+    /// through `Err`, so the terminal usage event is the shared
+    /// zero-token error event. That branch is the one an auditor reads —
+    /// "which policy refused this request" — and a drain wired only into
+    /// the success path misses it silently.
+    #[tokio::test]
+    async fn blocked_request_names_the_policy_on_the_usage_event() {
+        let upstream = MockServer::builder().start().await;
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-image"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+
+        let resp = tower::ServiceExt::oneshot(app, make_req("my-image", "please BLOCKME"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for the refusal")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].guardrail_name, "t");
+        assert_eq!(ev.guardrail_enforced_hits[0].hook, "input");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "blocked");
+        let wire = serde_json::to_string(&ev).unwrap();
+        assert!(!wire.contains("BLOCKME"), "{wire}");
+    }
+    /// The surface's money wiring. Every token this edit reports is priced off
+    /// the dispatched row, on the event and on the counter the portal bills
+    /// from, and the caller sees the window it spent.
+    #[tokio::test]
+    async fn a_priced_edit_reaches_the_spend_metric_and_reports_the_window() {
+        use aisix_obs::UsageSink;
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        let model: Model = serde_json::from_str(&format!(
+            r#"{{"display_name":"img-priced","provider":"openai","model_name":"gpt-image-2",
+                "provider_key_id":"{PK_ID}","cost":{{"input_per_1k":2.5,"output_per_1k":10.0}}}}"#
+        ))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-1", model, 1));
+        let key: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891",
+                "allowed_models":["*"],"rate_limit":{"rpm":10}}"#,
+        )
+        .unwrap();
+        snap.apikeys.insert(ResourceEntry::new("k-1", key, 1));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state.clone());
+        let resp = tower::ServiceExt::oneshot(app, make_req("img-priced", "add a hat"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()
+                .contains_key("x-ratelimit-remaining-requests"),
+            "{:?}",
+            resp.headers()
+        );
+
+        // 50 input at 2.5 and 1056 output at 10.0 per thousand.
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert!((ev.cost_usd - 10.685).abs() < 1e-9, "{}", ev.cost_usd);
+        let scrape = state.metrics.render();
+        assert!(
+            scrape.lines().any(|line| {
+                line.starts_with("aisix_llm_spend_micro_usd_total{") && line.ends_with(" 10685000")
+            }),
+            "{scrape}"
+        );
+    }
+
+    /// Generations and edits answer in one shape, so a mask rule rewrites a
+    /// `revised_prompt` here too before the caller reads it.
+    #[tokio::test]
+    async fn an_output_mask_rewrites_the_revised_prompt_of_an_edit() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "created": 1_700_000_000i64,
+                "data": [{"b64_json": "aGVsbG8=", "revised_prompt": "hat on alice@example.com"}]
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("img-edit-prod"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let g: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"pii-output","enabled":true,"hook_point":"output","kind":"pii","detectors":[{"type":"email","action":"mask"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-out", g, 1));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let resp = tower::ServiceExt::oneshot(app, make_req("img-edit-prod", "add a hat"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(!text.contains("alice@example.com"), "{text}");
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.redacted_entity_counts.get("email"), Some(&1));
+        assert!(!ev.guardrail_blocked);
+    }
+
+    /// An output block answers 422 with what the upstream already billed on
+    /// the event, marked blocked.
+    #[tokio::test]
+    async fn an_output_block_on_an_edit_keeps_the_billed_usage() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "created": 1_700_000_000i64,
+                "data": [{"b64_json": "aGVsbG8=", "revised_prompt": "please BLOCKME"}],
+                "usage": {"input_tokens": 50, "output_tokens": 1056, "total_tokens": 1106}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("img-edit-prod"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let g: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"kw-out","enabled":true,"hook_point":"output","fail_open":false,"kind":"keyword","patterns":[{"kind":"literal","value":"BLOCKME"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-out", g, 1));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let resp = tower::ServiceExt::oneshot(app, make_req("img-edit-prod", "add a hat"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("BLOCKME"));
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert!(ev.guardrail_blocked);
+        assert_eq!(ev.prompt_tokens, 50);
+        assert_eq!(ev.completion_tokens, 1056);
+    }
+
+    /// A check that calls a remote moderation service takes the key's slot
+    /// before it runs: a key at its limit never reaches the service.
+    #[tokio::test]
+    async fn a_remote_check_is_admitted_by_the_rate_limit_before_it_runs() {
+        let moderation = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"results": [{"flagged": false, "categories": {}}]}),
+            ))
+            .expect(1)
+            .mount(&moderation)
+            .await;
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("img-edit-prod"));
+        let key: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891",
+                "allowed_models":["*"],"rate_limit":{"rpm":1}}"#,
+        )
+        .unwrap();
+        snap.apikeys.insert(ResourceEntry::new("k-1", key, 1));
+        let g: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
+            "name": "remote",
+            "enabled": true,
+            "hook_point": "input",
+            "kind": "openai_moderation",
+            "endpoint": moderation.uri(),
+            "api_key": "sk-moderation",
+        }))
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-remote", g, 1));
+
+        let app = build_app(snap);
+        let first = tower::ServiceExt::oneshot(app.clone(), make_req("img-edit-prod", "add a hat"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = tower::ServiceExt::oneshot(app, make_req("img-edit-prod", "add a hat"))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// Repeated `prompt` parts are all new content: one newest message, so a
+    /// guardrail that bounds how much it sends cannot read an earlier part as
+    /// older history and skip it.
+    #[tokio::test]
+    async fn repeated_prompt_parts_reach_the_check_as_one_newest_message() {
+        let moderation = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"results": [{"flagged": false, "categories": {}}]}),
+            ))
+            .mount(&moderation)
+            .await;
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("img-edit-prod"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let g: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
+            "name": "remote",
+            "enabled": true,
+            "hook_point": "input",
+            "kind": "openai_moderation",
+            "endpoint": moderation.uri(),
+            "api_key": "sk-moderation",
+        }))
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-remote", g, 1));
+
+        let body = "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nimg-edit-prod\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nFIRSTPART\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nSECONDPART\r\n--b--\r\n";
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/images/edits")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "multipart/form-data; boundary=b")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(build_app(snap), req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let calls = moderation.received_requests().await.unwrap();
+        assert_eq!(calls.len(), 1, "one check, not one per part");
+        let sent = String::from_utf8_lossy(&calls[0].body);
+        assert!(sent.contains("FIRSTPART\\nSECONDPART"), "{sent}");
+    }
+
+    /// A `kind: "pii"` row whose one custom pattern masks a version string
+    /// on input — the in-process rewrite this handler actually performs,
+    /// as opposed to the keyword BLOCK the sibling test drives.
+    fn masking_input_guardrail() -> ResourceEntry<aisix_core::Guardrail> {
+        let g: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"eda-mask","enabled":true,"hook_point":"input","kind":"pii","detectors":[],"custom_patterns":[{"name":"eda_version","regex":"version\\s*:\\s*(\\d+(?:\\.\\d+)+)","action":"mask","replacement":"***"}]}"#,
+        )
+        .unwrap();
+        ResourceEntry::new("g-mask", g, 1)
+    }
+
+    /// AISIX-Cloud#1330 / #1024: the SUCCESS emitter drains too.
+    ///
+    /// The sibling test drives a refusal, which leaves through the shared
+    /// error event — so on its own it would stay green if the drain were
+    /// deleted from the success path. An enforcing MASK is the case that
+    /// only the success emitter can report, and the case a masking
+    /// deployment lives on: the request is served, nothing errors, and
+    /// without the drain the /logs row is indistinguishable from one no
+    /// guardrail touched.
+    #[tokio::test]
+    async fn masked_request_names_the_policy_on_the_usage_event() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-image"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, masking_input_guardrail());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+
+        let resp = tower::ServiceExt::oneshot(app, make_req("my-image", "draw version: 9.9.9 ok"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.guardrail_enforced_hits.len(), 1, "{ev:?}");
+        assert_eq!(ev.guardrail_enforced_hits[0].guardrail_name, "eda-mask");
+        assert_eq!(ev.guardrail_enforced_hits[0].hook, "input");
+        assert_eq!(ev.guardrail_enforced_hits[0].action, "masked");
+        let wire = serde_json::to_string(&ev).unwrap();
+        assert!(!wire.contains("9.9.9"), "{wire}");
+    }
+}

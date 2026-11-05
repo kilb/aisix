@@ -18,6 +18,14 @@ export interface OpenAiUpstreamOptions {
   streamEvents?: string[];
   /** Exact SSE transport chunks, for standards/framing edge cases. */
   rawSseChunks?: string[];
+  /**
+   * Complete SSE frames written VERBATIM, terminators included. Unlike
+   * `streamEvents` (which the mock wraps in `data: …\n\n`) this lets a spec
+   * reproduce a server that labels its frames — e.g. the `event: token_usage`
+   * frame an IDE agent backend reports its token counts on. Takes precedence
+   * over `streamEvents` when both are set.
+   */
+  rawStreamFrames?: string[];
   /** Inserted before the response is written (delays status + headers). */
   responseDelayMs?: number;
   /**
@@ -39,8 +47,18 @@ export interface OpenAiUpstreamOptions {
   sseLineEnding?: "\n" | "\r\n";
   /** Status code to return (default 200). */
   status?: number;
-  /** Body to return when `status` >= 400. */
+  /** Body to return when `status` >= 300. */
   errorBody?: unknown;
+  /**
+   * Error body written VERBATIM instead of JSON-encoding `errorBody` — an
+   * empty string reproduces an upstream that answers with no body at all.
+   */
+  rawErrorBody?: string | Buffer;
+  /**
+   * Error body chunks written verbatim after headers. Together with
+   * `eventDelayMs`, this models a non-2xx SSE response whose EOF is delayed.
+   */
+  rawErrorBodyChunks?: Array<string | Buffer>;
   /**
    * Content-Type for the error body (default `application/json`). Lets
    * tests reproduce upstreams / edge layers that return a JSON error
@@ -58,7 +76,15 @@ export interface OpenAiUpstreamOptions {
    * gateway streams provider bytes back and injected the provider bearer on
    * the content GET.
    */
-  rawBody?: string;
+  rawBody?: string | Buffer;
+  /**
+   * `rawBody` split into chunks written one at a time, `eventDelayMs`
+   * apart, so a spec can tell a relayed body from a buffered one: an
+   * upstream that trickles its bytes is only visibly trickling
+   * downstream if the gateway forwards them as they arrive. Takes
+   * precedence over `rawBody`; no Content-Length is sent.
+   */
+  rawBodyChunks?: Array<string | Buffer>;
   /** Content-Type for `rawBody` (default `application/octet-stream`). */
   rawContentType?: string;
   /** Per-request response script; used in order before static opts. */
@@ -83,6 +109,8 @@ export interface OpenAiUpstreamStep {
   streamEvents?: string[];
   /** See `OpenAiUpstreamOptions.rawSseChunks`. */
   rawSseChunks?: string[];
+  /** See `OpenAiUpstreamOptions.rawStreamFrames`. */
+  rawStreamFrames?: string[];
   responseDelayMs?: number;
   /** See `OpenAiUpstreamOptions.responseGate`. */
   responseGate?: Promise<void>;
@@ -93,13 +121,19 @@ export interface OpenAiUpstreamStep {
   sseLineEnding?: "\n" | "\r\n";
   status?: number;
   errorBody?: unknown;
+  /** See `OpenAiUpstreamOptions.rawErrorBody`. */
+  rawErrorBody?: string | Buffer;
+  /** See `OpenAiUpstreamOptions.rawErrorBodyChunks`. */
+  rawErrorBodyChunks?: Array<string | Buffer>;
   /** Content-Type for the error body (default `application/json`). See #543. */
   errorContentType?: string;
   disconnectAfterEvents?: number;
   /** Extra response headers, same semantics as on the top-level options. */
   responseHeaders?: Record<string, string>;
   /** Raw (non-JSON) 200 body — see `OpenAiUpstreamOptions.rawBody`. */
-  rawBody?: string;
+  rawBody?: string | Buffer;
+  /** See `OpenAiUpstreamOptions.rawBodyChunks`. */
+  rawBodyChunks?: Array<string | Buffer>;
   /** Per-path 200 bodies — see `OpenAiUpstreamOptions.pathBodies`. */
   pathBodies?: Record<string, unknown>;
   /** Content-Type for `rawBody` (default `application/octet-stream`). */
@@ -109,6 +143,13 @@ export interface OpenAiUpstreamStep {
 export interface OpenAiUpstream {
   baseUrl: string;
   receivedRequests: ReceivedRequest[];
+  /**
+   * Indexes into `receivedRequests` whose connection the GATEWAY closed
+   * before this mock had finished its response — what an upstream observes
+   * when the gateway abandons a call (a client that hung up, a timeout).
+   * A mock-initiated drop (`disconnectAfterEvents`) is not listed.
+   */
+  closedByPeer: number[];
   close(): Promise<void>;
 }
 
@@ -116,6 +157,13 @@ export interface ReceivedRequest {
   method: string;
   path: string;
   headers: Record<string, string>;
+  /**
+   * Header names as they arrived, one entry per occurrence and in wire
+   * order. `headers` collapses a repeated name (node keeps only the first
+   * `authorization`), so an assertion that a slot carries EXACTLY ONE
+   * value — the shape a doubled credential breaks — has to count here.
+   */
+  headerNames: string[];
   body: string;
 }
 
@@ -130,6 +178,7 @@ export async function startOpenAiUpstream(
   opts: OpenAiUpstreamOptions = {},
 ): Promise<OpenAiUpstream> {
   const received: ReceivedRequest[] = [];
+  const closedByPeer: number[] = [];
   let requestIndex = 0;
 
   const handler = (
@@ -142,6 +191,15 @@ export async function startOpenAiUpstream(
     // Swallow it so a deliberately-slow mock can't surface as an unhandled
     // exception that fails the run.
     res.on("error", () => {});
+    // Indexed once the request body has been read, below; a connection that
+    // closes before that never reached `receivedRequests` at all.
+    let index: number | undefined;
+    let selfClosed = false;
+    res.on("close", () => {
+      if (index !== undefined && !selfClosed && !res.writableFinished) {
+        closedByPeer.push(index);
+      }
+    });
     let raw = "";
     req.on("data", (c: Buffer) => (raw += c.toString("utf8")));
     req.on("end", async () => {
@@ -155,8 +213,12 @@ export async function startOpenAiUpstream(
             Array.isArray(v) ? v.join(",") : (v ?? ""),
           ]),
         ),
+        headerNames: req.rawHeaders
+          .filter((_, i) => i % 2 === 0)
+          .map((n) => n.toLowerCase()),
         body: raw,
       });
+      index = received.length - 1;
 
       if (step.responseGate) await step.responseGate;
       if (step.responseDelayMs) await sleep(step.responseDelayMs);
@@ -170,8 +232,28 @@ export async function startOpenAiUpstream(
       }
 
       const status = step.status ?? 200;
-      if (status >= 400) {
+      if (status >= 300) {
         res.statusCode = status;
+        if (step.rawErrorBodyChunks !== undefined) {
+          if (!res.hasHeader("content-type")) {
+            res.setHeader(
+              "content-type",
+              step.errorContentType ?? opts.errorContentType ?? "application/json",
+            );
+          }
+          res.flushHeaders();
+          for (const chunk of step.rawErrorBodyChunks) {
+            if (res.writableEnded || res.destroyed) return;
+            res.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+            if (step.eventDelayMs) await sleep(step.eventDelayMs);
+          }
+          if (!res.writableEnded && !res.destroyed) res.end();
+          return;
+        }
+        if (step.rawErrorBody !== undefined) {
+          res.end(step.rawErrorBody);
+          return;
+        }
         res.setHeader(
           "content-type",
           step.errorContentType ?? opts.errorContentType ?? "application/json",
@@ -181,6 +263,22 @@ export async function startOpenAiUpstream(
             step.errorBody ?? { error: { message: "mock error" } },
           ),
         );
+        return;
+      }
+
+      if (step.rawBodyChunks !== undefined) {
+        res.statusCode = 200;
+        res.setHeader(
+          "content-type",
+          step.rawContentType ?? "application/octet-stream",
+        );
+        res.flushHeaders();
+        for (const chunk of step.rawBodyChunks) {
+          if (res.writableEnded || res.destroyed) return;
+          res.write(Buffer.from(chunk));
+          if (step.eventDelayMs) await sleep(step.eventDelayMs);
+        }
+        if (!res.writableEnded && !res.destroyed) res.end();
         return;
       }
 
@@ -196,7 +294,8 @@ export async function startOpenAiUpstream(
         return;
       }
 
-      const isStream = !!step.streamEvents || !!step.rawSseChunks;
+      const isStream =
+        !!step.streamEvents || !!step.rawSseChunks || !!step.rawStreamFrames;
       if (isStream) {
         res.statusCode = 200;
         res.setHeader("content-type", "text/event-stream");
@@ -206,17 +305,10 @@ export async function startOpenAiUpstream(
         // first token (TTFT timeout) independently of the headers (#554).
         res.flushHeaders();
         if (step.firstEventDelayMs) await sleep(step.firstEventDelayMs);
-        const rawChunks = step.rawSseChunks;
-        if (rawChunks) {
-          for (const chunk of rawChunks) {
-            if (res.writableEnded || res.destroyed) return;
-            res.write(chunk);
-            if (step.eventDelayMs) await sleep(step.eventDelayMs);
-          }
-          if (!res.writableEnded && !res.destroyed) res.end();
-          return;
-        }
-        const events = step.streamEvents ?? [];
+        // Verbatim frames carry their own `event:`/`data:` lines and
+        // terminators; `streamEvents` are payloads the mock wraps.
+        const raw = step.rawStreamFrames ?? step.rawSseChunks;
+        const events = raw ?? step.streamEvents ?? [];
         const lineEnding = step.sseLineEnding ?? opts.sseLineEnding ?? "\n";
         for (let i = 0; i < events.length; i++) {
           // The gateway may have abandoned a stalled stream (#554 read
@@ -227,10 +319,11 @@ export async function startOpenAiUpstream(
             step.disconnectAfterEvents !== undefined &&
             i >= step.disconnectAfterEvents
           ) {
+            selfClosed = true;
             res.destroy();
             return;
           }
-          res.write(`data: ${events[i]}${lineEnding}${lineEnding}`);
+          res.write(raw ? events[i] : `data: ${events[i]}${lineEnding}${lineEnding}`);
           if (step.eventDelayMs) await sleep(step.eventDelayMs);
         }
         if (!res.writableEnded && !res.destroyed) res.end();
@@ -278,6 +371,11 @@ export async function startOpenAiUpstream(
   const server: Server = opts.tls
     ? createTlsServer({ key: opts.tls.key, cert: opts.tls.cert }, handler)
     : createServer(handler);
+  // Node's default closes an idle connection after a few seconds, which a test
+  // pausing that long races against the gateway reusing it from its pool: the
+  // request dies with "connection closed before message completed".
+  server.keepAliveTimeout = 120_000;
+  server.headersTimeout = 125_000;
 
   const port = await pickFreePort();
   await new Promise<void>((resolve) =>
@@ -288,6 +386,7 @@ export async function startOpenAiUpstream(
   return {
     baseUrl,
     receivedRequests: received,
+    closedByPeer,
     async close() {
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));

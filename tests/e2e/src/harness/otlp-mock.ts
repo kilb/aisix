@@ -11,11 +11,55 @@ import { createServer, type Server } from "node:http";
 export interface CapturedSpan {
   name: string;
   attributes: Record<string, string | number | boolean>;
+  /** 32-hex W3C trace id; empty when the body omitted it. */
+  traceId: string;
+  /** 16-hex span id; empty when the body omitted it. */
+  spanId: string;
+  /** 16-hex parent span id; empty for a root span. */
+  parentSpanId: string;
+  /** OTLP SpanKind (2 = SERVER, 3 = CLIENT); 0 when omitted. */
+  kind: number;
+  /** OTLP span flags (uint32); 0 when omitted. */
+  flags: number;
+  /** W3C tracestate carried on the span; empty when absent. */
+  traceState: string;
+  /** Nanosecond boundaries, as strings (OTLP/JSON int64 encoding). */
+  startTimeUnixNano: string;
+  endTimeUnixNano: string;
+  /** 0-based index of the POST this span arrived in (delivery-retry tests). */
+  postIndex: number;
+  /** OTLP `Status.code` (1 = OK, 2 = ERROR); 0 when unset or omitted. */
+  statusCode: number;
+  /** The export's resource attributes, flattened like `attributes`. */
+  resource: Record<string, string | number | boolean>;
+  /** The instrumentation scope the span was exported under. */
+  scope: { name: string; version: string };
+}
+
+export interface MockOtlpOptions {
+  /**
+   * Respond to the first N POSTs with 503 (their spans are still recorded),
+   * then accept. Models a transiently failing receiver so a test can assert
+   * the sink's delivery retry re-sends byte-identical spans.
+   */
+  failFirst?: number;
+  /**
+   * Status to answer those first N POSTs with. 503 (the default) is a
+   * transient refusal the sink retries; a 4xx such as 400 is permanent, so
+   * the batch is dropped on its first attempt rather than after the
+   * pipeline's retry budget — which is minutes, and not something a test
+   * can wait out.
+   */
+  failStatus?: number;
+  /** Loopback address to listen on; `127.0.0.1` by default. */
+  host?: string;
 }
 
 export interface MockOtlp {
   url: string;
   spans: CapturedSpan[];
+  /** Number of POSTs received so far (including ones answered 503). */
+  posts: number;
   /**
    * Bodies this receiver could not parse, empty on a healthy run. Without it a
    * malformed export and a never-sent one look identical: both end as "no
@@ -40,32 +84,76 @@ function anyValue(value: Record<string, unknown>): string | number | boolean {
   return "";
 }
 
-export async function startMockOtlp(): Promise<MockOtlp> {
+export async function startMockOtlp(
+  options: MockOtlpOptions = {},
+): Promise<MockOtlp> {
   const spans: CapturedSpan[] = [];
   const parseFailures: string[] = [];
+  const state = {
+    posts: 0,
+    failuresLeft: options.failFirst ?? 0,
+    failStatus: options.failStatus ?? 503,
+  };
   const server: Server = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("end", () => {
+      const postIndex = state.posts;
+      state.posts += 1;
       try {
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
           resourceSpans?: {
+            resource?: {
+              attributes?: { key: string; value: Record<string, unknown> }[];
+            };
             scopeSpans?: {
+              scope?: { name?: string; version?: string };
               spans?: {
                 name: string;
+                traceId?: string;
+                spanId?: string;
+                parentSpanId?: string;
+                kind?: number;
+                flags?: number;
+                traceState?: string;
+                startTimeUnixNano?: string;
+                endTimeUnixNano?: string;
                 attributes?: { key: string; value: Record<string, unknown> }[];
+                status?: { code?: number };
               }[];
             }[];
           }[];
         };
         for (const resource of body.resourceSpans ?? []) {
+          const resourceAttributes: Record<string, string | number | boolean> = {};
+          for (const attr of resource.resource?.attributes ?? []) {
+            resourceAttributes[attr.key] = anyValue(attr.value);
+          }
           for (const scope of resource.scopeSpans ?? []) {
             for (const span of scope.spans ?? []) {
               const attributes: Record<string, string | number | boolean> = {};
               for (const attr of span.attributes ?? []) {
                 attributes[attr.key] = anyValue(attr.value);
               }
-              spans.push({ name: span.name, attributes });
+              spans.push({
+                name: span.name,
+                attributes,
+                traceId: span.traceId ?? "",
+                spanId: span.spanId ?? "",
+                parentSpanId: span.parentSpanId ?? "",
+                kind: span.kind ?? 0,
+                flags: span.flags ?? 0,
+                traceState: span.traceState ?? "",
+                startTimeUnixNano: span.startTimeUnixNano ?? "0",
+                endTimeUnixNano: span.endTimeUnixNano ?? "0",
+                postIndex,
+                statusCode: span.status?.code ?? 0,
+                resource: resourceAttributes,
+                scope: {
+                  name: scope.scope?.name ?? "",
+                  version: scope.scope?.version ?? "",
+                },
+              });
             }
           }
         }
@@ -75,18 +163,28 @@ export async function startMockOtlp(): Promise<MockOtlp> {
         // test as an indistinguishable "no span arrived".
         parseFailures.push(String(err));
       }
+      if (state.failuresLeft > 0) {
+        state.failuresLeft -= 1;
+        res.writeHead(state.failStatus, { "content-type": "application/json" });
+        res.end("{}");
+        return;
+      }
       res.writeHead(200, { "content-type": "application/json" });
       res.end("{}");
     });
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const host = options.host ?? "127.0.0.1";
+  await new Promise<void>((resolve) => server.listen(0, host, resolve));
   const address = server.address();
   if (address === null || typeof address === "string") {
     throw new Error("otlp mock: no listen address");
   }
   return {
-    url: `http://127.0.0.1:${address.port}/v1/traces`,
+    url: `http://${host}:${address.port}/v1/traces`,
     spans,
+    get posts() {
+      return state.posts;
+    },
     parseFailures,
     close: () => new Promise((resolve) => server.close(() => resolve())),
   };

@@ -27,8 +27,8 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 use super::{
-    BatchUnit, EventBatch, IdempotencyMarker, IdempotencyScheme, ObservabilitySink, OrderingScope,
-    SinkAck, SinkCapabilities, SinkError, SinkHealth, SinkRecord, SinkResult,
+    BatchUnit, ErrorRedactor, EventBatch, IdempotencyMarker, IdempotencyScheme, ObservabilitySink,
+    OrderingScope, SinkAck, SinkCapabilities, SinkError, SinkHealth, SinkRecord, SinkResult,
 };
 
 /// `DD-API-KEY`: Datadog's API-key header. The resolved key rides here and
@@ -152,13 +152,12 @@ impl ObservabilitySink for DatadogSink {
             .await
         {
             Ok(resp) => resp,
-            // Connect / DNS / timeout — transient by nature. The endpoint URL
-            // carries no secret, so it is safe in the error detail. reqwest's
+            // Connect / DNS / timeout — transient by nature. reqwest's
             // Display hides the cause in `source()` — chain it.
             Err(e) => {
                 return Err(SinkError::Transient(format!(
                     "datadog: POST {}: {}",
-                    self.endpoint_url,
+                    aisix_gateway::redact_url_for_log(&self.endpoint_url),
                     super::error_chain(&e)
                 )))
             }
@@ -172,16 +171,12 @@ impl ObservabilitySink for DatadogSink {
             });
         }
 
+        let retry_after = super::retry_after_of(status, resp.headers());
         let body = resp.text().await.unwrap_or_default();
         let detail = parse_datadog_error(status, &body);
-        // 429 (rate limit) and 5xx (502/503/504, transient server faults) are
-        // worth retrying; other 4xx (400 malformed / 401/403 auth / 413 too
-        // large) are config/auth/payload errors that fail identically on retry.
-        if is_transient_status(status) {
-            Err(SinkError::Transient(detail))
-        } else {
-            Err(SinkError::Permanent(detail))
-        }
+        // 408 / 429 / 5xx are retried; other 4xx (400 malformed / 401/403
+        // auth / 413 too large) fail identically on retry.
+        Err(super::http_status_error(status, retry_after, detail))
     }
 
     async fn healthcheck(&self) -> SinkHealth {
@@ -190,6 +185,12 @@ impl ObservabilitySink for DatadogSink {
         // reports healthy and its delivery errors surface via
         // `SinkStats::last_error`. (Mirrors the SLS / OTLP sinks.)
         SinkHealth::healthy()
+    }
+
+    fn error_redactor(&self) -> ErrorRedactor {
+        ErrorRedactor::default()
+            .url(&self.endpoint_url)
+            .secret(&self.api_key)
     }
 }
 
@@ -201,9 +202,9 @@ impl DatadogSink {
     /// schema and inherits the exact `skip_serializing_if` emptiness rules the
     /// the control plane wire uses (empty strings / zero counters are omitted). Field
     /// names are remapped to the OTel GenAI semconv where one exists
-    /// (`gen_ai.system`, `gen_ai.request.model` / `gen_ai.response.model`,
+    /// (`gen_ai.response.model`, `gen_ai.response.id`,
     /// `gen_ai.usage.input_tokens` / `gen_ai.usage.output_tokens`, …) so a
-    /// Datadog log and an OTLP span carry the same keys; the remainder land
+    /// Datadog log and an OTLP span agree on them; the remainder land
     /// under an `aisix.` prefix. The Datadog reserved attributes (`ddsource`,
     /// `ddtags`, `service`, `message`) are set as siblings.
     fn to_log(&self, record: &SinkRecord) -> Value {
@@ -228,12 +229,60 @@ impl DatadogSink {
                 obj.insert(map_field_name(&key), rendered);
             }
         }
+        // The headers this exporter selected ride beside the usage fields,
+        // under the same key the usage map gives every other field.
+        for (key, headers) in [
+            ("request_headers", &record.request_headers),
+            (
+                "upstream_response_headers",
+                &record.upstream_response_headers,
+            ),
+        ] {
+            if !headers.is_empty() {
+                obj.insert(map_field_name(key), json!(headers));
+            }
+        }
+        // The GenAI input count includes every cached token, which an
+        // Anthropic-shape record keeps beside `prompt_tokens`; the output
+        // count includes reasoning, which the record's own
+        // `completion_tokens` may not (see `UsageEvent::genai_input_tokens`
+        // / `genai_output_tokens`).
+        obj.insert(
+            "gen_ai.usage.input_tokens".into(),
+            json!(record.usage.genai_input_tokens()),
+        );
+        obj.insert(
+            "gen_ai.usage.output_tokens".into(),
+            json!(record.usage.genai_output_tokens()),
+        );
 
-        // Opt-in captured content as flat, queryable fields. Absent on the
+        // Opt-in captured content: the GenAI conventions' structured
+        // messages as nested JSON, and a side that could not be structured
+        // as flat `gen_ai.prompt` / `gen_ai.completion` text. Absent on the
         // default metadata-only path, so prompts never leak there.
         if let Some(content) = &record.content {
-            obj.insert("gen_ai.prompt".into(), json!(content.prompt));
-            obj.insert("gen_ai.completion".into(), json!(content.response));
+            let enc = content.encode(&record.usage);
+            for (key, value) in [
+                ("gen_ai.input.messages", &enc.structured.input_messages),
+                (
+                    "gen_ai.system_instructions",
+                    &enc.structured.system_instructions,
+                ),
+                ("gen_ai.tool.definitions", &enc.structured.tool_definitions),
+                ("gen_ai.output.messages", &enc.structured.output_messages),
+            ] {
+                if let Some(parsed) = value.as_deref().and_then(|v| serde_json::from_str(v).ok()) {
+                    obj.insert(key.into(), parsed);
+                }
+            }
+            for (key, value) in [
+                ("gen_ai.prompt", enc.flat_prompt()),
+                ("gen_ai.completion", enc.flat_response()),
+            ] {
+                if let Some(value) = value {
+                    obj.insert(key.into(), json!(value));
+                }
+            }
             if content.truncated {
                 obj.insert("content_truncated".into(), json!(true));
             }
@@ -317,16 +366,6 @@ fn parse_datadog_error(status: reqwest::StatusCode, body: &str) -> String {
     truncate(&format!("HTTP {status}: {body}"))
 }
 
-/// Whether a Datadog intake HTTP status means "retry with backoff".
-///
-/// Datadog returns `429 Too Many Requests` on rate-limit and `5xx`
-/// (`502`/`503`/`504`) on transient server faults; both are retried. Other
-/// `4xx` (`400` malformed payload, `401`/`403` bad API key, `413` payload too
-/// large) are permanent — a retry of the same batch fails identically.
-fn is_transient_status(status: reqwest::StatusCode) -> bool {
-    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-}
-
 /// gzip a byte slice (RFC 1952). Permanent on the rare encode failure.
 fn gzip(data: &[u8]) -> Result<Vec<u8>, SinkError> {
     let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -373,11 +412,12 @@ fn is_loopback_site(site: &str) -> bool {
 /// is upper-cased with non-alphanumerics folded to `_`, then read from
 /// `DD_CRED_<REF>_API_KEY`. The prefix is deliberately NOT `AISIX_`: that
 /// namespace is owned by the config loader (`Environment::with_prefix("AISIX")`),
-/// so an `AISIX_`-named secret would be reinterpreted as a config override.
+/// which reads such a name as a configuration override or warns about it on
+/// every boot.
 /// Returns `None` when the key is unset or blank — the caller then lets the
 /// misconfiguration surface as a delivery-health auth error rather than POST
 /// with an empty key. (Mirrors `resolve_sls_credential` /
-/// `resolve_object_store_credential`.)
+/// `resolve_object_store_credential_with`.)
 pub fn resolve_datadog_credential(credential_ref: &str) -> Option<String> {
     resolve_datadog_credential_with(credential_ref, |key| std::env::var(key).ok())
 }
@@ -408,8 +448,7 @@ fn resolve_datadog_credential_with(
 #[cfg(test)]
 mod tests {
     use super::{
-        intake_url_for, is_transient_status, parse_datadog_error, resolve_datadog_credential_with,
-        DatadogSink,
+        intake_url_for, parse_datadog_error, resolve_datadog_credential_with, DatadogSink,
     };
     use crate::sink::{EventBatch, IdempotencyMarker, ObservabilitySink, SinkContent, SinkRecord};
     use crate::usage::UsageEvent;
@@ -459,9 +498,73 @@ mod tests {
         EventBatch::new(records.into_iter().map(Arc::new).collect())
     }
 
+    /// Datadog's GenAI output count includes reasoning counted beside the
+    /// completion, as the OTLP span's does; the reasoning and total counters
+    /// ride along under their `aisix.` keys.
+    #[tokio::test]
+    async fn output_tokens_include_reasoning_counted_beside_the_completion() {
+        let server = MockServer::builder().start().await;
+        let sink = sink_for(&server, &[]);
+        let log = |event: UsageEvent| sink.to_log(&SinkRecord::metadata_only(event));
+
+        let gemini = log(UsageEvent {
+            prompt_tokens: 100,
+            completion_tokens: 20,
+            reasoning_tokens: 30,
+            total_tokens: 150,
+            ..UsageEvent::default()
+        });
+        assert_eq!(gemini["gen_ai.usage.output_tokens"], 50);
+        assert_eq!(gemini["aisix.reasoning_tokens"], 30);
+        assert_eq!(gemini["aisix.total_tokens"], 150);
+
+        let openai = log(UsageEvent {
+            prompt_tokens: 40,
+            completion_tokens: 25,
+            reasoning_tokens: 10,
+            total_tokens: 65,
+            ..UsageEvent::default()
+        });
+        assert_eq!(openai["gen_ai.usage.output_tokens"], 25);
+    }
+
+    /// The GenAI input count includes cached tokens in either accounting
+    /// shape; the raw cache counters keep their `aisix.` keys.
+    #[tokio::test]
+    async fn input_tokens_include_cache_in_either_accounting_shape() {
+        let server = MockServer::builder().start().await;
+        let sink = sink_for(&server, &[]);
+        let log = |event: UsageEvent| sink.to_log(&SinkRecord::metadata_only(event));
+
+        let anthropic = log(UsageEvent {
+            prompt_tokens: 10,
+            cache_read_tokens: 300,
+            cache_creation_tokens: 40,
+            cache_creation_ttl: aisix_gateway::CacheCreationTtl {
+                cache_creation_5m_tokens: Some(10),
+                cache_creation_1h_tokens: Some(30),
+            },
+            ..UsageEvent::default()
+        });
+        assert_eq!(anthropic["gen_ai.usage.input_tokens"], 350);
+        assert_eq!(anthropic["aisix.cache_read_tokens"], 300);
+        assert_eq!(anthropic["aisix.cache_creation_tokens"], 40);
+        assert_eq!(anthropic["aisix.cache_creation_5m_tokens"], 10);
+        assert_eq!(anthropic["aisix.cache_creation_1h_tokens"], 30);
+
+        let openai = log(UsageEvent {
+            prompt_tokens: 120,
+            cached_prompt_tokens: 100,
+            ..UsageEvent::default()
+        });
+        assert_eq!(openai["gen_ai.usage.input_tokens"], 120);
+        assert!(openai.get("aisix.cache_creation_5m_tokens").is_none());
+        assert!(openai.get("aisix.cache_creation_1h_tokens").is_none());
+    }
+
     #[tokio::test]
     async fn appends_batch_posts_gzipped_json_with_api_key_header() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(ResponseTemplate::new(202))
@@ -473,12 +576,15 @@ mod tests {
             request_id: "req-42".into(),
             occurred_at: "2026-05-01T12:00:00Z".into(),
             model_id: "gpt-4o".into(),
+            requested_model_id: "group-uuid".into(),
+            service_tier: Some("flex".into()),
             status_code: 200,
             prompt_tokens: 5,
             completion_tokens: 7,
             upstream_latency_ms: 123,
             provider_model_version: "gpt-4o-2024-08-06".into(),
             finish_reason: "stop".into(),
+            operation: "image_generation".into(),
             ..UsageEvent::default()
         };
         let ack = sink
@@ -525,7 +631,15 @@ mod tests {
         // AISIX custom dimensions under the `aisix.` prefix.
         assert_eq!(log["aisix.request_id"], "req-42");
         assert_eq!(log["aisix.model_id"], "gpt-4o");
+        // The addressed entry's id rides beside the dispatched target's.
+        assert_eq!(log["aisix.requested_model_id"], "group-uuid");
+        assert_eq!(log["aisix.service_tier"], "flex");
         assert_eq!(log["aisix.upstream_latency_ms"], 123);
+        // The request's kind, under the `aisix.` prefix every field without a
+        // semconv key takes (AISIX-Cloud#1461). Datadog is the sink where a
+        // consumer would otherwise have only `gen_ai.operation.name`, which
+        // this encoder does not emit at all.
+        assert_eq!(log["aisix.operation"], "image_generation");
 
         // The API key must NEVER appear in the body anywhere.
         let body_text = serde_json::to_string(&logs).unwrap();
@@ -539,9 +653,99 @@ mod tests {
         assert!(log.get("gen_ai.prompt").is_none());
     }
 
+    /// The exporter's selected headers ride beside the usage fields, and a
+    /// complete chat capture is reported as the GenAI conventions'
+    /// structured messages, nested, with no flat prompt/completion.
     #[tokio::test]
-    async fn full_content_record_emits_prompt_and_response() {
-        let server = MockServer::start().await;
+    async fn selected_headers_ride_the_log_and_content_is_structured() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+
+        let sink = sink_for(&server, &[]);
+        let output = crate::output::OutputCollector::from_body(
+            crate::output::OutputWire::OpenAiChat,
+            4096,
+            &serde_json::json!({"choices": [{"index": 0, "message": {
+                "reasoning_content": "pondering", "content": "4"}}]}),
+        );
+        let record = SinkRecord::metadata_only(UsageEvent {
+            request_id: "req-headers".into(),
+            status_code: 200,
+            operation: "chat".into(),
+            finish_reason: "stop".into(),
+            api_key_name: "key-a".into(),
+            team_id: "team-1".into(),
+            tags: [
+                ("department".to_string(), "rnd".to_string()),
+                ("bg".to_string(), "cloud".to_string()),
+            ]
+            .into(),
+            request_headers: [
+                ("x-sub-user".to_string(), "alice".to_string()),
+                ("x-department".to_string(), "eng".to_string()),
+            ]
+            .into(),
+            upstream_response_headers: [("x-upstream-id".to_string(), "u-1".to_string())].into(),
+            ..UsageEvent::default()
+        })
+        .with_exporter_headers(&["x-sub-user".to_string()], &["x-upstream-id".to_string()])
+        .with_content(SinkContent {
+            prompt: r#"{"model":"m","messages":[{"role":"user","content":"what is 2+2?"}]}"#.into(),
+            response: "4".into(),
+            truncated: false,
+            prompt_truncated: false,
+            response_truncated: false,
+            max_bytes: None,
+            output: Some(output),
+        });
+        sink.append_batch(&batch_of(vec![record]), &IdempotencyMarker::None)
+            .await
+            .expect("delivery succeeds");
+
+        let requests = server.received_requests().await.unwrap();
+        let logs = decode_logs(&requests[0]);
+        let log = &logs[0];
+        assert_eq!(
+            log["aisix.request_headers"],
+            serde_json::json!({"x-sub-user": "alice"})
+        );
+        assert_eq!(
+            log["aisix.upstream_response_headers"],
+            serde_json::json!({"x-upstream-id": "u-1"})
+        );
+        assert_eq!(log["aisix.api_key_name"], "key-a");
+        assert_eq!(log["aisix.team_id"], "team-1");
+        assert_eq!(
+            log["aisix.tags"],
+            serde_json::json!({"department": "rnd", "bg": "cloud"})
+        );
+        assert_eq!(
+            log["gen_ai.input.messages"],
+            serde_json::json!([{"role": "user",
+                "parts": [{"type": "text", "content": "what is 2+2?"}]}])
+        );
+        assert_eq!(
+            log["gen_ai.output.messages"],
+            serde_json::json!([{"role": "assistant", "finish_reason": "stop", "parts": [
+                {"type": "reasoning", "content": "pondering"},
+                {"type": "text", "content": "4"},
+            ]}])
+        );
+        assert!(log.get("gen_ai.prompt").is_none());
+        assert!(log.get("gen_ai.completion").is_none());
+        assert!(log.get("content_truncated").is_none());
+        assert!(!String::from_utf8_lossy(&requests[0].body).contains("x-department"));
+    }
+
+    /// A side the cap cut stays flat text with the truncated marker; the
+    /// other side is still structured.
+    #[tokio::test]
+    async fn truncated_side_falls_back_to_flat_text() {
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(ResponseTemplate::new(202))
@@ -552,12 +756,18 @@ mod tests {
         let record = SinkRecord::metadata_only(UsageEvent {
             request_id: "req-content".into(),
             status_code: 200,
+            operation: "chat".into(),
+            finish_reason: "stop".into(),
             ..UsageEvent::default()
         })
         .with_content(SinkContent {
-            prompt: "what is 2+2?".into(),
+            prompt: r#"{"messages":[{"role":"user","content":"what is"#.into(),
             response: "4".into(),
             truncated: true,
+            prompt_truncated: true,
+            response_truncated: false,
+            max_bytes: None,
+            output: None,
         });
         sink.append_batch(&batch_of(vec![record]), &IdempotencyMarker::None)
             .await
@@ -566,8 +776,17 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         let logs = decode_logs(&requests[0]);
         let log = &logs[0];
-        assert_eq!(log["gen_ai.prompt"], "what is 2+2?");
-        assert_eq!(log["gen_ai.completion"], "4");
+        assert_eq!(
+            log["gen_ai.prompt"],
+            r#"{"messages":[{"role":"user","content":"what is"#
+        );
+        assert!(log.get("gen_ai.input.messages").is_none());
+        assert_eq!(
+            log["gen_ai.output.messages"],
+            serde_json::json!([{"role": "assistant", "finish_reason": "stop",
+                "parts": [{"type": "text", "content": "4"}]}])
+        );
+        assert!(log.get("gen_ai.completion").is_none());
         assert_eq!(log["content_truncated"], true);
         // ddtags is omitted entirely when no tags are configured.
         assert!(log.get("ddtags").is_none(), "empty ddtags must be omitted");
@@ -575,7 +794,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_error_is_transient() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(
@@ -598,7 +817,7 @@ mod tests {
     async fn rate_limited_429_is_transient() {
         // Datadog signals back-pressure with 429; a log sink must back off and
         // retry, not drop the batch.
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(
@@ -619,7 +838,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_error_403_is_permanent() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path(POST_PATH))
             .respond_with(ResponseTemplate::new(403).set_body_string(r#"{"errors":["Forbidden"]}"#))
@@ -636,25 +855,25 @@ mod tests {
         assert!(!err.is_transient(), "auth error must not be retried: {err}");
     }
 
-    #[test]
-    fn transient_status_classification() {
-        use reqwest::StatusCode;
-        for s in [
-            StatusCode::TOO_MANY_REQUESTS,
-            StatusCode::BAD_GATEWAY,
-            StatusCode::SERVICE_UNAVAILABLE,
-            StatusCode::GATEWAY_TIMEOUT,
-        ] {
-            assert!(is_transient_status(s), "{s} should be transient");
-        }
-        for s in [
-            StatusCode::BAD_REQUEST,
-            StatusCode::UNAUTHORIZED,
-            StatusCode::FORBIDDEN,
-            StatusCode::PAYLOAD_TOO_LARGE,
-        ] {
-            assert!(!is_transient_status(s), "{s} should be permanent");
-        }
+    #[tokio::test]
+    async fn request_timeout_408_is_retried() {
+        // The intake timing out on its side says nothing about the batch —
+        // retry it, as every other HTTP sink does.
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(ResponseTemplate::new(408))
+            .mount(&server)
+            .await;
+
+        let err = sink_for(&server, &[])
+            .append_batch(
+                &batch_of(vec![SinkRecord::metadata_only(UsageEvent::default())]),
+                &IdempotencyMarker::None,
+            )
+            .await
+            .expect_err("408 fails this attempt");
+        assert!(err.is_transient(), "408 must be retried: {err}");
     }
 
     #[test]

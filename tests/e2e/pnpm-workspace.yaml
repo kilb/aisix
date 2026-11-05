@@ -1,11 +1,5 @@
-# pnpm 10+ does not run a dependency's install scripts unless it is named
-# here. esbuild (via vitest) links its platform binary in that script, and
-# pnpm 9 ran it by default — so keeping it enabled preserves the behavior
-# this harness has always had. Without the entry `pnpm install` fails with
-# ERR_PNPM_IGNORED_BUILDS.
-#
-# This file MUST NOT be committed while CI still installs with pnpm 9: a
-# workspace manifest without a `packages:` key fails that version outright
-# ("packages field missing or empty").
-allowBuilds:
-  esbuild: true
+overrides:
+  # GHSA-mrhx-c7xc-m3w5: every zod 3.x is affected and only 4.6.6+ is patched.
+  # @modelcontextprotocol/sdk accepts zod 4; openai 4.x declares an optional
+  # zod ^3 peer that only its unused `openai/helpers/zod` entry imports.
+  zod: ^4.6.6

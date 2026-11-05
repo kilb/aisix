@@ -7,10 +7,47 @@ etcd:
   prefix: "/aisix"
   # user: "aisix"
   # password_env: "AISIX_ETCD_PASSWORD"
-  dial_timeout_ms: 5000
-  request_timeout_ms: 5000
+  # Optional bounds on etcd I/O. `0` means unbounded on either key — the
+  # same reading a model's `timeout: 0` gets. (A model's
+  # `stream_timeout: 0` is the odd one out: it falls back to the next
+  # level of a resolution chain these flat startup settings do not have.)
+  #
+  # `dial_timeout_ms` bounds a dial: the TCP connect, the TLS handshake
+  # after it, and the authentication exchange when `user` is set. The
+  # value reaches the connector as its per-TCP-connect bound, and the
+  # whole dial — handshake and authentication included — gets it once per
+  # configured endpoint, `dial_timeout_ms x max(1, endpoints)`. The extra
+  # budget is headroom for a cluster with unreachable members, which is
+  # what a multi-endpoint list is for; the client offers no per-endpoint
+  # bound to set instead. What you plan around is the window in which no
+  # listener is bound, and boot dials two providers one after the other,
+  # so against a wholly unreachable cluster that window is
+  # `dial_timeout_ms x endpoints x 2`. It defaults to 5000 — the two keys
+  # default differently on purpose. Boot awaits the dial before it binds
+  # ANY listener, so an endpoint that accepts the connection and then
+  # answers nothing used to hold both ports closed for as long as it
+  # stayed quiet, with the snapshot cache that exists for exactly that
+  # outage sitting unread behind it. Set `0` for the old unbounded
+  # behaviour. An expired
+  # dial is treated as an etcd that is not reachable — the gateway binds,
+  # serves whatever the snapshot cache holds, and keeps retrying in the
+  # background rather than exiting.
+  #
+  # `request_timeout_ms` is unset by default, and unset means unbounded.
+  # It bounds a single request/response call — the
+  # configuration range read at boot and on every reconnect, creating the
+  # watch, and the admin API's reads. It deliberately does not apply to
+  # the established watch stream, which is long-lived and would be torn
+  # down by any such bound.
+  #
+  # Leave `request_timeout_ms` unset unless you specifically want a slow
+  # etcd to fail fast: the range read grows with the size of your
+  # configuration, and a bound it cannot finish inside makes the gateway
+  # retry the same read forever without ever serving traffic.
+  # dial_timeout_ms: 5000   # this is the default; 0 = unbounded
+  # request_timeout_ms: 5000
   # Optional TLS / mTLS bundle. Required when connecting to an
-  # AISIX Cloud Data Plane Manager (endpoint is https:// and the control plane issues
+  # AISIX Enterprise or AISIX Cloud Data Plane Manager (endpoint is https:// and the control plane issues
   # a client cert via IssueAIDataplaneCertificate). Uncomment and
   # point to your mTLS bundle.
   # tls:
@@ -34,17 +71,45 @@ etcd:
 proxy:
   addr: "0.0.0.0:3000"
   # Cap on inbound request bodies (JSON, multipart, passthrough, MCP,
-  # A2A). Omit it (or set 0) to keep bodies unlimited. Set a positive
-  # value to cap every endpoint; over-limit requests get a 413 in the
-  # caller's error envelope.
-  # request_body_limit_bytes: 33554432
+  # A2A). 0 — the default — disables the cap: providers accept larger
+  # requests than any fixed gateway default (Anthropic takes 32 MB), so
+  # a gateway-side cap rejects requests the upstream would have served.
+  # Set a value to bound per-request memory; over-limit requests get a
+  # 413 in the caller's error envelope. Media the gateway downloads for a
+  # request (upstream.media_fetch) counts against the same limit together
+  # with the inbound body, so a request whose body plus downloads pass it
+  # gets that 413 too.
+  # request_body_limit_bytes: 0
   # tls:
   #   cert_file: "/etc/aisix/tls/proxy.crt"
   #   key_file:  "/etc/aisix/tls/proxy.key"
+  # Several proxy listeners, each with its own optional TLS — for a
+  # deployment that has to answer HTTPS and plaintext HTTP at the same
+  # time. Set, this is the COMPLETE set of proxy listeners: only the
+  # addresses listed here are bound, `addr` above is ignored (it stays a
+  # required field, and the gateway logs one line at startup saying so),
+  # and `tls` above must be absent — a certificate that would apply to no
+  # listener is a configuration error, not something to drop silently.
+  # Put the certificate on the entry that should serve it. Every
+  # listener serves the same routes and the same configuration.
+  # Env-only deployments set the whole set as one JSON array:
+  # AISIX_PROXY__LISTENERS='[{"addr":"0.0.0.0:3443","tls":{"cert_file":"/etc/aisix/tls/proxy.crt","key_file":"/etc/aisix/tls/proxy.key"}},{"addr":"0.0.0.0:3000"}]'
+  # listeners:
+  #   - addr: "0.0.0.0:3443"
+  #     tls:
+  #       cert_file: "/etc/aisix/tls/proxy.crt"
+  #       key_file:  "/etc/aisix/tls/proxy.key"
+  #   - addr: "0.0.0.0:3000"
   # Real-client-IP resolution for usage logs (#492). nginx
   # set_real_ip_from + real_ip_recursive parity. Default trusts nothing
   # and logs the immediate TCP peer; configure trusted_proxies when the
   # gateway sits behind an L7 LB / ingress that sets x-forwarded-for.
+  # A peer in trusted_proxies may also open the connection with a PROXY
+  # protocol v1/v2 header (an L4 load balancer that rewrites the source
+  # address); the header's source address then stands in for the TCP
+  # peer, including for the x-forwarded-for trust check. Detection is
+  # automatic on every proxy listener; a header from any other peer
+  # closes the connection.
   # Env-only deployments set the CIDR list comma-separated:
   # AISIX_PROXY__REAL_IP__TRUSTED_PROXIES=10.0.0.0/8,127.0.0.1/32
   # real_ip:
@@ -92,10 +157,22 @@ proxy:
   # AISIX_PROXY__URL_REWRITES='[{"match":"...","rewrite":"..."}]'
   # Example: serve per-server MCP URLs like /mcp-servers/github/mcp on
   # the /mcp/{server} endpoint.
+  # Runs before ALL routing, including host-matched passthrough routes.
+  # Optional hosts restrict a rule to those inbound hosts; omit for all hosts.
+  # Host matching ignores case/port; *.example.com matches one extra label.
   # url_rewrites:
   #   - name: per-server-mcp-compat
+  #     hosts: ["gateway.example.com"]
   #     match: "^/mcp-servers/([^/]+)/mcp$"
   #     rewrite: "/mcp/$1"
+  # Send debug response headers on /v1/chat/completions: x-aisix-call-id,
+  # x-aisix-served-by (the routing target that answered), x-aisix-route
+  # (the semantic route that matched) and x-aisix-cache / -cache-layer /
+  # -cache-similarity. Off by default: served-by and route reveal to the
+  # caller which model behind a model group answered. Usage events, access
+  # logs, metrics and traces record the same facts either way. Applied at
+  # startup.
+  # expose_debug_headers: false
 
 # Admin listener — read-only resource surface, OpenAPI reference, and
 # playground. Resources are managed declaratively (resources_file or
@@ -111,10 +188,34 @@ admin:
   #   key_file:  "/etc/aisix/tls/admin.key"
 
 observability:
+  # Also the `service.name` resource attribute on every trace an `otlp_http`
+  # observability exporter sends.
   service_name: "aisix"
   log_level: "info"
+  # One access-log line ("proxy request completed") per request, written at
+  # `info`, so the effective log filter (`RUST_LOG` when set, else `log_level`)
+  # must allow `info` for it to appear. false turns the access log off whatever
+  # the filter; every other log line is unaffected.
   access_log: true
   metrics:
+    # Complete label lists per metric. Omitted metrics retain their defaults.
+    # Restart after changing labels. [] removes all optional business labels;
+    # gauges retain required identity labels, and the two time-to-first-token
+    # metrics and aisix_request_e2e_latency_seconds always keep `side`
+    # (upstream/downstream) whether listed or not.
+    # See the variable reference:
+    # https://docs.api7.ai/ai-gateway/dev/reference/metric-labels
+    # Env: AISIX_OBSERVABILITY__METRICS__LABELS='{"aisix_request_ttft_seconds":["provider_key_name","model"]}'
+    # labels:
+    #   aisix_request_ttft_seconds:
+    #     - env_id
+    #     - endpoint
+    #     - model
+    #     - provider
+    #     - status_class
+    #     - streaming
+    #     - provider_key_name
+    labels: {}
     prometheus:
       enabled: true
       path: "/metrics"
@@ -123,9 +224,6 @@ observability:
       # address; the endpoint is unauthenticated, so restrict access at
       # the network layer.
       addr: "0.0.0.0:9090"
-    otlp:
-      enabled: false
-      endpoint: "http://127.0.0.1:4317"
     # Optional User-Agent -> client_type mapping rules for the
     # aisix_llm_tokens_by_client_total metric. Tried in order (first match
     # wins) BEFORE the built-in client allowlist, so you can classify
@@ -161,16 +259,40 @@ observability:
     #   request_e2e_latency: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 420, 600]
     #   request_ttft: [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300]
     #   guardrail_latency: [0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30]
-  tracing:
-    otlp:
-      enabled: false
-      endpoint: "http://127.0.0.1:4317"
-      sample_ratio: 1.0
+
+  # Diagnostics listener. Serves GET /debug/pprof/heap: a heap profile of
+  # this process as gzipped pprof, with function names, for
+  # `go tool pprof`. Unauthenticated, so it binds loopback by default;
+  # reach it from the host, or with `kubectl port-forward`. A bind failure
+  # is logged and does not stop the gateway.
+  # Env: AISIX_OBSERVABILITY__DEBUG__ADDR / AISIX_OBSERVABILITY__DEBUG__ENABLED
+  debug:
+    enabled: true
+    addr: "127.0.0.1:9091"
+  # Heap sampling is always on in the Linux build (one sample per 2 MiB
+  # allocated on average). Turn it off without a rebuild with the jemalloc
+  # environment variable `_RJEM_MALLOC_CONF=prof_active:false`.
+  heap_profiling:
+    # Write a heap profile to `dir` when resident memory crosses each
+    # threshold — a fraction of the container's memory limit, or of the
+    # host's memory when there is none. Each threshold fires once per
+    # upward crossing and re-arms after memory falls 5 points below it.
+    # Files are named <UTC time>-<host name>-auto-<percent>.pb.gz; only the
+    # newest `keep` of this host's files are kept. `dir` is created if missing; one that cannot be
+    # created or written logs one warning and turns this off. In Kubernetes, point `dir` at a volume that survives
+    # a container restart, so the profile outlives an OOM kill.
+    # Env-only deployments set the thresholds comma-separated:
+    # AISIX_OBSERVABILITY__HEAP_PROFILING__AUTO_DUMP__THRESHOLDS=0.8,0.9
+    auto_dump:
+      enabled: true
+      thresholds: [0.8, 0.9]
+      dir: "/var/lib/aisix/heap"
+      keep: 5
 
 # Managed-mode switch. Uncomment when connecting the gateway to
-# AISIX Cloud: the admin API and Playground will NOT be bound — all
+# AISIX Enterprise or AISIX Cloud: the admin API and Playground will NOT be bound — all
 # configuration flows from etcd via the mTLS channel above, driven
-# by the AISIX Cloud control plane.
+# by the connected control plane.
 # managed:
 #   enabled: true
 
@@ -192,9 +314,10 @@ cache:
   # exact matches only (probed and logged at boot).
   backend: "memory"   # memory | redis
   # redis:
-  #   # mode picks the topology. Credentials travel inside the URLs, as
-  #   # in single mode; a `rediss://` URL turns TLS on and the `tls` block
-  #   # below configures what it trusts.
+  #   # mode picks the topology. Credentials can travel inside the URLs,
+  #   # or be given below as `username`/`password`/`database`, which win
+  #   # over anything the URL carries; a `rediss://` URL turns TLS on and
+  #   # the `tls` block below configures what it trusts.
   #   mode: "single"   # single | cluster | sentinel
   #   # mode: single  → one endpoint:
   #   url: "redis://127.0.0.1:6379"
@@ -202,14 +325,20 @@ cache:
   #   # nodes: ["redis://10.0.0.1:6379", "redis://10.0.0.2:6379"]
   #   # mode: sentinel → sentinel node URLs + the monitored master name.
   #   # Sentinel auth goes in the sentinels URLs; username/password/database
-  #   # below authenticate the data node (master) Sentinel discovers — it
-  #   # has no URL of its own. Supply `password` via the matching env var
-  #   # (AISIX_CACHE__REDIS__PASSWORD) to keep it out of this file.
+  #   # below authenticate the data node — the cluster nodes, or the master
+  #   # Sentinel discovers, which has no URL of its own. Supply `password`
+  #   # via the matching env var (AISIX_CACHE__REDIS__PASSWORD) to keep it
+  #   # out of this file.
   #   # sentinels: ["redis://10.0.0.1:26379", "redis://10.0.0.2:26379"]
   #   # master_name: "mymaster"
-  #   # username: "default"      # Redis ACL user (cluster nodes / sentinel master)
+  #   # Env-only deployments set nodes / sentinels comma-separated, e.g.
+  #   # AISIX_CACHE__REDIS__NODES=redis://10.0.0.1:6379,redis://10.0.0.2:6379
+  #   # Applied in every mode, and they OVERRIDE a credential embedded in
+  #   # the URL — a value injected through the environment is no use if a
+  #   # stale one left in `url` outranks it.
+  #   # username: "default"      # Redis ACL user for the data node
   #   # password: "s3cret"
-  #   # database: 0              # DB index for the sentinel master (not used by cluster)
+  #   # database: 0              # DB index (single / sentinel; Redis Cluster has only DB 0)
   #   # Trust settings for a `rediss://` URL, ignored on plaintext
   #   # `redis://`. Separate from `upstream.tls` because an in-cluster
   #   # Redis is normally issued by a different authority than the model
@@ -223,6 +352,45 @@ cache:
   #   # roots for the master it discovers, so ca_file does not apply there
   #   # (it is logged at startup). Use SSL_CERT_FILE or the system trust
   #   # store for that one case; `verify` does apply.
+  #   #
+  #   # Seconds one Redis round trip, or the startup connection, may take
+  #   # before it is abandoned and the request proceeds without the cache.
+  #   # A Redis that stops answering without closing the socket (host
+  #   # down, network partition, stopped container) would otherwise block
+  #   # the request for minutes instead of degrading it. The startup
+  #   # connection gets this budget once per endpoint the discovery may
+  #   # have to walk, plus one — so `cluster` mode with two nodes can
+  #   # spend three of them, and `sentinel` mode one per sentinel plus one
+  #   # for the master. A cache Redis that is unreachable at STARTUP does
+  #   # not stop the gateway: the listeners bind, every `backend: redis`
+  #   # policy is served as a miss, one WARN names the backend, and the
+  #   # connection is attached in the background as soon as Redis answers.
+  #   # Settings the server ANSWERS and refuses — a rejected credential,
+  #   # a `database` it does not have — degrade the same way, and the WARN
+  #   # says the server REFUSED rather than that it timed out. They are
+  #   # retried too: the credential may be corrected on the server, and
+  #   # the connection is then attached without restarting the gateway.
+  #   # Only configuration this process can reject by itself still ends
+  #   # the boot: a `url` the driver cannot parse, TLS material that
+  #   # cannot be read. Nothing outside the process can fix those.
+  #   # After a failure, commands short-circuit for 30 seconds and then
+  #   # ONE request probes, so an outage costs this budget roughly once per
+  #   # 30 seconds rather than once per request. Must be >= 1.
+  #   #
+  #   # The cool-off is per SUBSYSTEM, not per connection. This cache
+  #   # opens two connections to this Redis — the exact-KV one and, for
+  #   # policies with a `semantic` block, the vector-search one — and they
+  #   # share one cool-off, so a request pays this budget once for the
+  #   # cache rather than once per cache operation. The 30-second cool-off
+  #   # is sized to outlast an upstream call, because a request's cache
+  #   # read and its cache write straddle that call; a request whose
+  #   # upstream leg runs longer than 30 seconds finds the cool-off expired
+  #   # and pays a second budget on the write.
+  #   #
+  #   # In sentinel mode, discovering the master is not one round trip —
+  #   # the client walks the sentinels one at a time — so that step gets
+  #   # this budget once per configured sentinel, plus one for the master.
+  #   # timeout_secs: 5
 
 # Rate-limit counter backend (api7/#798).
 #
@@ -232,7 +400,10 @@ cache:
 # enforces ONE global window — set this on multi-replica deployments.
 # May point at the same Redis as `cache` (keys are namespaced
 # `aisix:rl:`). On a Redis outage the limiter fails open to per-replica
-# in-memory counting (logged) so traffic keeps flowing.
+# in-memory counting (logged) so traffic keeps flowing — including when
+# Redis is already unreachable at startup, where the gateway binds its
+# listeners anyway and attaches the shared backend in the background as
+# soon as Redis answers. It never falls back to `memory` permanently.
 ratelimit:
   backend: "memory"   # memory | redis
   # redis:
@@ -243,6 +414,36 @@ ratelimit:
   #   # sentinels: ["redis://10.0.0.1:26379"]   # mode: sentinel
   #   # master_name: "mymaster"                  # mode: sentinel
   #   # tls: { ca_file: "/etc/aisix/tls/redis-ca.pem" }   # for rediss://
+  #   # Data-node credentials, as in cache.redis above: applied in every
+  #   # mode, and they override a credential embedded in the URL. Supply
+  #   # `password` via AISIX_RATELIMIT__REDIS__PASSWORD to keep it out of
+  #   # this file.
+  #   # username: "default"
+  #   # password: "s3cret"
+  #   # database: 0              # single / sentinel; Redis Cluster has only DB 0
+  #   # Seconds one Redis round trip, or the startup connection, may take
+  #   # before it is abandoned and the limiter falls back to per-replica
+  #   # counting. Same field and same meaning as cache.redis above,
+  #   # including the per-endpoint multiplier on the startup connection;
+  #   # without it an unreachable Redis blocks every rate-limited request
+  #   # — and the whole boot — for minutes instead of degrading.
+  #   # Must be >= 1.
+  #   #
+  #   # A Redis that is unreachable at STARTUP does not stop the gateway:
+  #   # the listeners bind, counting is per-replica (so cluster-wide
+  #   # limits are not enforced), one WARN names the backend, and the
+  #   # shared backend is attached in the background as soon as Redis
+  #   # answers. A Redis that ANSWERS and refuses the settings degrades
+  #   # the same way, with a WARN that says REFUSED rather than timed out,
+  #   # and is retried too. Only configuration this process can reject by
+  #   # itself still ends the boot: a `url` the driver cannot parse, TLS
+  #   # material that cannot be read.
+  #   #
+  #   # The limiter is a separate subsystem from the cache and cools off
+  #   # independently, so a request that uses both can pay one budget for
+  #   # each while a shared Redis is down — but only one within each,
+  #   # however many Redis operations that subsystem performs.
+  #   # timeout_secs: 5
   # Seconds before an unreleased concurrency slot (crashed replica /
   # hung upstream) is reclaimed. Redis backend only.
   # concurrency_ttl_secs: 300
@@ -270,7 +471,10 @@ upstream:
   # stream_timeout_ms: 0
 
   # Max time for DNS + TCP + TLS before an attempt fails. Without it a
-  # black-holed upstream is bounded only by the model's own timeout.
+  # black-holed upstream is bounded only by the model's own timeout. On
+  # `/v1/realtime` it also covers the WebSocket handshake, which has no
+  # other deadline — the session idle limit only starts once the socket
+  # is up.
   # connect_timeout_ms: 5000
 
   # TCP keepalive. Idle time before the first probe, the interval
@@ -335,6 +539,73 @@ upstream:
   #   # client certificate either), and Redis in sentinel mode.
   #   # verify: true
 
+  # Media URLs in chat requests. When an image, audio or file part is a
+  # URL the target upstream cannot read itself — Amazon Bedrock, Claude
+  # on Vertex AI, or an http:// URL toward Anthropic or Gemini — the
+  # gateway downloads it and sends the bytes inline. An upstream that
+  # reads the URL itself still gets the URL.
+  #
+  # The URL is the caller's, so which addresses the download may reach is
+  # outbound.ssrf_protection (below). Otherwise it is an ordinary upstream
+  # request: it goes through HTTPS_PROXY / HTTP_PROXY / ALL_PROXY unless
+  # NO_PROXY covers the host, and verifies certificates per upstream.tls
+  # (ca_file, verify) — but never presents the upstream.tls client
+  # certificate. It follows at most 10 redirects, the request's own
+  # upstream timeout, retries a timeout or connection failure up to 3
+  # attempts in all, and never forwards the caller's headers.
+  # media_fetch:
+  #   # false refuses such parts with a 400 instead of downloading them.
+  #   enabled: true
+  #   # Largest download accepted per URL, in bytes (default 50 MiB).
+  #   # All downloads of one request also count, with its inbound body,
+  #   # against proxy.request_body_limit_bytes when that is set (413 past it).
+  #   max_bytes: 52428800
+
+  # Amazon Bedrock endpoints a provider key's api_base does not name.
+  # bedrock:
+  #   # Bedrock Mantle, where /v1/messages/count_tokens for a Claude model is
+  #   # counted when bedrock-runtime's CountTokens refuses that model (Claude
+  #   # models served only through cross-region inference). null derives the
+  #   # public regional host from the provider key's region,
+  #   # https://bedrock-mantle.{region}.api.aws; set it for a VPC endpoint or
+  #   # GovCloud. One value serves every Bedrock provider key.
+  #   mantle_endpoint: null
+
+# Outbound requests to URLs the operator did not choose: the media download
+# (upstream.media_fetch), whose URL an API caller supplied, and an OAuth
+# document or endpoint an MCP server's metadata names on another scheme, host
+# or port than the server's url. URLs an operator configured (a provider key's
+# api_base, guardrail, MCP and A2A endpoints, a trust provider and its
+# discovery document, an MCP server's configured OAuth endpoints and what it
+# publishes on its own address, JWKS, exporters) are not affected.
+# outbound:
+#   # Server-side request forgery protection. On (the default), such a
+#   # request only reaches publicly routable addresses: loopback, private
+#   # (RFC 1918), CGNAT, link-local (including the 169.254.169.254 metadata
+#   # endpoint), benchmarking (198.18.0.0/15), IPv6 unique-local /
+#   # link-local, multicast and reserved ranges are refused, for every
+#   # address a name resolves to. A media download is refused with a 400 and
+#   # each of its redirect hops is checked; an MCP sign-in fails with an error
+#   # page or an OAuth error and follows no redirects. A direct
+#   # connection goes only to the addresses that were checked. When a
+#   # proxy applies to the URL, the name is resolved and checked locally
+#   # first and the proxy then resolves it again itself.
+#   #
+#   # Behind a fake-ip DNS or a transparent proxy (Clash, sing-box,
+#   # Surge, …) public names resolve into 198.18.0.0/15, so every such
+#   # request is refused: list those hosts in allowed_hosts, or turn the
+#   # check off.
+#   ssrf_protection:
+#     # false turns the address check off entirely — no address is
+#     # refused and allowed_hosts is ignored.
+#     enabled: true
+#     # Hosts that may be reached although they resolve to a non-public
+#     # address, as host (any port) or host:port; IPv6 with a port as
+#     # [addr]:port. Env: AISIX_OUTBOUND__SSRF_PROTECTION__ALLOWED_HOSTS
+#     # takes a comma-separated list.
+#     allowed_hosts: []
+#     # e.g. ["media.internal", "10.0.0.5:9000"]
+
 # Connection-layer settings for the inbound side — the clients, or the
 # gateway in front of this one, talking to the listeners above. The
 # mirror image of `upstream:`.
@@ -358,8 +629,51 @@ downstream:
   # connection. 0 disables the heartbeat.
   # sse_keepalive_interval_secs: 15
 
+# ---------------------------------------------------------------------------
+# Shutdown
+# ---------------------------------------------------------------------------
+# What happens between SIGINT/SIGTERM and the process exiting.
+#
+# The signal makes /readyz answer 503 straight away, but a load balancer
+# only learns that on its next health check and keeps routing new
+# connections until then. So the gateway keeps accepting after the signal
+# and only stops once the balancer has had time to withdraw it AND nothing
+# is left in flight. In-flight requests then drain with no deadline — an
+# inference call or an SSE stream may run for minutes — so the platform
+# (Kubernetes terminationGracePeriodSeconds, systemd TimeoutStopSec) is
+# the only hard bound.
+#
+# Size that bound for TWO requests back to back, not one. The gateway
+# retires a client's connection by answering `Connection: close`, which
+# rides on the response head — and a streamed response commits its head
+# at the first token, so a stream already running at SIGTERM can never
+# carry it, however long it runs. That connection returns to the client's
+# pool unmarked and gets used once more; only THAT request's head is
+# generated during the drain, carries the header, and ends the chain. So
+# the tail is the stream still running at the signal plus the one request
+# its connection is reused for, each able to run to its own client
+# timeout. The aisix Helm chart's "Termination and draining" section
+# works a default out from that.
+shutdown:
+  # Minimum seconds to keep accepting new connections after the signal,
+  # while /readyz already reports 503.
+  #
+  # Size it ABOVE the detection latency of whatever load-balances this
+  # instance: a Kubernetes readiness probe needs periodSeconds x
+  # failureThreshold, an external balancer its own check interval times
+  # its retry count. Too low and the listener closes while traffic is
+  # still being routed here; too high only delays the exit.
+  #
+  # It is a minimum, not a deadline — after it elapses the gateway still
+  # waits for the in-flight count to reach zero, so a balancer slower than
+  # configured cannot make it close under live traffic.
+  #
+  # 0 drops the window entirely and is only correct when nothing routes
+  # here by health check.
+  min_drain_secs: 30
+
 # Models, API keys, provider keys, guardrails, cache policies, and
 # observability exporters are NOT defined in this file. They come from
 # the configured resource source: the `resources_file` above, direct
-# etcd writes, or the AISIX Cloud control plane. This file only
+# etcd writes, or an AISIX Enterprise or AISIX Cloud control plane. This file only
 # bootstraps the gateway.

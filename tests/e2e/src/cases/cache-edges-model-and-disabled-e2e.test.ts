@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -57,7 +58,7 @@ describe("cache edges: model in fingerprint + enabled:false bypass", () => {
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
-    app = await spawnApp();
+    app = await spawnApp({ exposeDebugHeaders: true });
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     // Two distinct Models pointing at the SAME mock upstream — only
@@ -115,6 +116,7 @@ describe("cache edges: model in fingerprint + enabled:false bypass", () => {
     // on this key, and that only implies the rest of the seed set when nothing
     // is written after it. A resource seeded afterwards can still be
     // propagating when the gate opens.
+    // The final caller key gates all three policies, not just model A's.
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: [
@@ -123,7 +125,8 @@ describe("cache edges: model in fingerprint + enabled:false bypass", () => {
         "cache-edges-disabled",
       ],
     });
-
+    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
   });
 
   afterAll(async () => {

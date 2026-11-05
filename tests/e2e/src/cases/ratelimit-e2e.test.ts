@@ -209,17 +209,13 @@ describe("rate limit policy schedules e2e (#1104)", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    // Start from the pre-`schedules` shape (field absent).
+    // Start from the pre-`schedules` shape (field absent). Written
+    // BEFORE the caller key, so the key authenticating implies the policy
+    // is in the snapshot too (tests/e2e/AGENTS.md) — the spec's first
+    // assertion is that this policy is already enforcing.
     await seed.update("rate_limit_policies", SCHED_POLICY_ID, policyDoc());
-    // The caller key goes LAST, per `tests/e2e/AGENTS.md`: the readiness gate
-    // below waits on this key, and that only implies the rest of the seed set
-    // if nothing is written after it. With the policy seeded afterwards the
-    // gate could pass before the limit existed, and the first assertion — a
-    // second call returning 429 — would see 200 because nothing was limiting
-    // yet.
-    //
-    // api_key scope matches on the key's etcd entry id, so the key needs a
-    // fixed id — seed it straight to etcd.
+    // api_key scope matches on the key's etcd entry id, so the key
+    // needs a fixed id — seed it straight to etcd.
     await etcd.put(
       `${app.etcdPrefix}/api_keys/${SCHED_KEY_ID}`,
       JSON.stringify({

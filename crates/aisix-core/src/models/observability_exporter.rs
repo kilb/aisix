@@ -35,6 +35,13 @@ use serde::{Deserialize, Serialize};
 use crate::resource::Resource;
 
 /// Exporter backend selected by the `kind` discriminator.
+///
+/// The per-kind configs deliberately carry no `#[serde(deny_unknown_fields)]`:
+/// a type-level guard here would also apply to the etcd loader, which
+/// deserialises the same types and would drop the whole exporter row the
+/// first time a newer control plane added a field. Unknown-field strictness
+/// is the write path's, and lives in the branch closures in
+/// [`observability_exporter_root_schema`](crate::models::schema::observability_exporter_root_schema).
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExporterKind {
@@ -46,13 +53,10 @@ pub enum ExporterKind {
 
 /// OTLP/HTTP trace exporter configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct OtlpHttpConfig {
-    /// Full URL of the OTLP/HTTP traces endpoint. Include the receiver's
+    /// Full `http://` or `https://` URL of the OTLP/HTTP traces endpoint. Include the receiver's
     /// expected path, such as `/v1/traces`.
-    #[schemars(regex(
-        pattern = r"^https://.+|^http://(mock-otlp|otel-collector|127\.0\.0\.1|localhost)(:[0-9]+)?(/.*)?$"
-    ))]
+    #[schemars(regex(pattern = r"^https?://.+"))]
     pub endpoint: String,
 
     /// Static headers attached to every export request, such as authorization or vendor-specific API-key headers.
@@ -76,7 +80,6 @@ pub struct OtlpHttpConfig {
 
 /// Aliyun SLS PutLogs exporter configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct AliyunSlsConfig {
     /// SLS regional endpoint host without a scheme, such as `ap-southeast-3.log.aliyuncs.com`.
     /// Signed requests are sent to this endpoint with the SLS project as the host prefix.
@@ -127,7 +130,6 @@ const fn default_content_max_bytes() -> u32 {
 
 /// Datadog native Logs HTTP intake exporter configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct DatadogConfig {
     /// Datadog site, such as `datadoghq.com`, `us3.datadoghq.com`, or `datadoghq.eu`.
     #[schemars(regex(
@@ -177,7 +179,6 @@ const fn default_dd_content_max_bytes() -> u32 {
 
 /// Object-storage exporter configuration for S3, GCS, Azure Blob, and compatible S3 backends.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct ObjectStoreConfig {
     /// Which object-storage backend the bucket lives in.
     pub provider: ObjectStoreProvider,
@@ -196,11 +197,9 @@ pub struct ObjectStoreConfig {
     #[schemars(length(min = 1))]
     pub region: Option<String>,
 
-    /// Backend host override for S3-compatible stores such as MinIO, Aliyun OSS, or Cloudflare R2. When omitted, the provider's native endpoint is used.
+    /// Backend endpoint override, an `http://` or `https://` URL: an S3-compatible host such as MinIO, Aliyun OSS, or Cloudflare R2, a Cloud Storage XML API base URL such as a private endpoint, or an Azure Blob endpoint. A `gcs` endpoint must implement the Cloud Storage XML API and accept the percent-encoded object names the gateway sends; the stock fake-gcs-server image does not, so it cannot receive objects. When omitted, the provider's native endpoint is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(regex(
-        pattern = r"^https://.+|^http://(minio|azurite|fake-gcs-server|fake-gcs|127\.0\.0\.1|localhost)(:[0-9]+)?(/.*)?$"
-    ))]
+    #[schemars(regex(pattern = r"^https?://.+"))]
     pub endpoint: Option<String>,
 
     /// Compression applied to each NDJSON file before upload.
@@ -270,6 +269,14 @@ pub struct ObservabilityExporter {
     /// struct's fields land at the same level on the wire.
     #[serde(flatten)]
     pub kind: ExporterKind,
+
+    /// Request headers whose values this exporter records, by lowercase name. A header the request did not send is left out; a header sent more than once is joined with `, `. Values are stripped of control characters and capped at 256 characters. Credential headers (such as `authorization`, `x-api-key` and `cookie`) and duplicate names are refused. Recording a header never changes what is forwarded upstream. When omitted, no request header is recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_headers: Vec<String>,
+
+    /// Upstream response headers whose values this exporter records for each attempt, by lowercase name, read off that attempt's upstream response. Values follow the same rules as `request_headers`. Credential headers, `set-cookie` and duplicate names are refused. When omitted, no upstream response header is recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstream_response_headers: Vec<String>,
 
     /// etcd-key uuid. Filled by the loader and never included in the JSON payload.
     #[serde(skip)]
@@ -403,13 +410,136 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_inner_field() {
-        // OtlpHttpConfig has deny_unknown_fields so a typo at the
-        // flattened level is rejected.
-        let r: Result<ObservabilityExporter, _> = serde_json::from_str(
+    fn rejects_unknown_inner_field_on_write_and_ignores_it_on_read() {
+        // The closed kind branch in the strict schema is what refuses a typo
+        // at the flattened level. The loader's lenient twin drops that
+        // closure, so a stored exporter written by a newer control plane
+        // keeps exporting with the field ignored instead of going dark.
+        let v: serde_json::Value = serde_json::from_str(
             r#"{"name":"x","kind":"otlp_http","endpoint":"https://x","timeout":5}"#,
-        );
-        assert!(r.is_err());
+        )
+        .unwrap();
+        assert!(crate::models::validate_observability_exporter(&v).is_err());
+        assert!(crate::models::validate_observability_exporter_lenient(&v).is_ok());
+        let e: ObservabilityExporter = serde_json::from_value(v).unwrap();
+        assert!(matches!(e.kind, ExporterKind::OtlpHttp(_)));
+    }
+
+    #[test]
+    fn an_endpoint_is_any_http_or_https_url_on_both_paths() {
+        let otlp = |endpoint: &str| serde_json::json!({"name": "x", "kind": "otlp_http", "endpoint": endpoint});
+        let object_store = |endpoint: &str| {
+            serde_json::json!({
+                "name": "x", "kind": "object_store", "provider": "s3", "bucket": "b", "prefix": "p",
+                "credential_ref": "c", "endpoint": endpoint,
+            })
+        };
+        let both = |v: &serde_json::Value| {
+            (
+                crate::models::validate_observability_exporter(v).is_ok(),
+                crate::models::validate_observability_exporter_lenient(v).is_ok(),
+            )
+        };
+        for (doc, accepted) in [
+            (otlp("http://otel-collector-dev:4318/v1/traces"), true),
+            (otlp("http://10.0.3.7:4318/v1/traces"), true),
+            (
+                otlp("http://user:pw@collector.svc.cluster.local/v1/traces"),
+                true,
+            ),
+            (otlp("https://api.honeycomb.io/v1/traces"), true),
+            (otlp("grpc://otel-collector:4317"), false),
+            (otlp("otel-collector:4318/v1/traces"), false),
+            (otlp("http://"), false),
+            (object_store("http://minio-prod.internal:9000"), true),
+            (object_store("http://ak:sk@10.0.3.8:9000"), true),
+            (object_store("https://oss-cn-hangzhou.aliyuncs.com"), true),
+            (object_store("s3://bucket"), false),
+            (object_store("minio:9000"), false),
+        ] {
+            assert_eq!(both(&doc), (accepted, accepted), "{doc}");
+        }
+    }
+
+    /// Both header lists on every kind: lowercase token names only, no
+    /// duplicates, never a credential slot — and never `set-cookie` among
+    /// the response headers. Refused on the write path only: a stored row
+    /// naming one still loads (the gateway drops the name when capturing),
+    /// so a later tightening cannot take a whole exporter dark.
+    #[test]
+    fn header_lists_are_validated_on_every_kind_on_both_paths() {
+        let kinds = [
+            serde_json::json!({"kind": "otlp_http", "endpoint": "https://x"}),
+            serde_json::json!({"kind": "aliyun_sls", "endpoint": "ap-southeast-3.log.aliyuncs.com",
+                "project": "p", "logstore": "l", "credential_ref": "r"}),
+            serde_json::json!({"kind": "datadog", "site": "datadoghq.com", "credential_ref": "r",
+                "service": "s"}),
+            serde_json::json!({"kind": "object_store", "provider": "s3", "bucket": "b",
+                "prefix": "p", "credential_ref": "r"}),
+        ];
+        let doc = |kind: &serde_json::Value, field: &str, names: serde_json::Value| {
+            let mut v = kind.clone();
+            v["name"] = "x".into();
+            v[field] = names;
+            v
+        };
+        let both = |v: &serde_json::Value| {
+            (
+                crate::models::validate_observability_exporter(v).is_ok(),
+                crate::models::validate_observability_exporter_lenient(v).is_ok(),
+            )
+        };
+        for kind in &kinds {
+            for field in ["request_headers", "upstream_response_headers"] {
+                let ok = doc(
+                    kind,
+                    field,
+                    serde_json::json!(["x-sub-user", "x-request-id"]),
+                );
+                assert_eq!(both(&ok), (true, true), "{ok}");
+                let e: ObservabilityExporter = serde_json::from_value(ok).unwrap();
+                let list = if field == "request_headers" {
+                    &e.request_headers
+                } else {
+                    &e.upstream_response_headers
+                };
+                assert_eq!(
+                    list,
+                    &vec!["x-sub-user".to_string(), "x-request-id".to_string()]
+                );
+                let mut bad: Vec<serde_json::Value> = vec![
+                    serde_json::json!(["X-Sub-User"]),
+                    serde_json::json!(["x sub"]),
+                    serde_json::json!([""]),
+                    serde_json::json!(["x-a", "x-a"]),
+                ];
+                bad.extend(
+                    crate::forwarded_headers::CREDENTIAL_SLOT_HEADERS
+                        .iter()
+                        .chain([&crate::forwarded_headers::GATEWAY_CREDENTIAL_HEADER])
+                        .map(|n| serde_json::json!([n])),
+                );
+                for names in bad {
+                    let v = doc(kind, field, names);
+                    assert_eq!(both(&v), (false, true), "{v}");
+                }
+                let wrong_type = doc(kind, field, serde_json::json!("x-sub-user"));
+                assert_eq!(both(&wrong_type), (false, false), "{wrong_type}");
+            }
+            let cookie = doc(
+                kind,
+                "upstream_response_headers",
+                serde_json::json!(["set-cookie"]),
+            );
+            assert_eq!(both(&cookie), (false, true));
+            let req_cookie = doc(kind, "request_headers", serde_json::json!(["set-cookie"]));
+            assert_eq!(both(&req_cookie), (true, true));
+        }
+        // Absent means nothing captured, and stays off the wire.
+        let e: ObservabilityExporter = serde_json::from_str(VALID_OTLP).unwrap();
+        assert!(e.request_headers.is_empty() && e.upstream_response_headers.is_empty());
+        let v = serde_json::to_value(&e).unwrap();
+        assert!(v.get("request_headers").is_none());
     }
 
     #[test]
@@ -497,16 +627,22 @@ mod tests {
     #[test]
     fn rejects_plaintext_credentials_in_config() {
         // The AccessKey must NEVER be a config field — only a
-        // `credential_ref`. `deny_unknown_fields` on the inner config
-        // rejects any attempt to smuggle a plaintext key onto the kine path.
+        // `credential_ref`. The closed kind branch in the strict schema
+        // rejects any attempt to smuggle a plaintext key in; on the read
+        // path the field is ignored, never consumed as a credential.
         for key in ["access_key_secret", "access_key_id", "ak", "sk"] {
-            let json = format!(
+            let v: serde_json::Value = serde_json::from_str(&format!(
                 r#"{{"name":"x","kind":"aliyun_sls","endpoint":"ap-southeast-3.log.aliyuncs.com","project":"p","logstore":"l","credential_ref":"r","{key}":"AKIASECRET"}}"#
-            );
-            let r: Result<ObservabilityExporter, _> = serde_json::from_str(&json);
+            ))
+            .unwrap();
             assert!(
-                r.is_err(),
+                crate::models::validate_observability_exporter(&v).is_err(),
                 "plaintext credential field `{key}` must be rejected"
+            );
+            let e: ObservabilityExporter = serde_json::from_value(v).unwrap();
+            assert!(
+                !serde_json::to_string(&e).unwrap().contains("AKIASECRET"),
+                "plaintext credential field `{key}` must not be retained"
             );
         }
     }
@@ -606,20 +742,26 @@ mod tests {
     #[test]
     fn rejects_plaintext_credentials_in_object_store_config() {
         // Cloud keys must NEVER be config fields — only `credential_ref`.
-        // `deny_unknown_fields` rejects any smuggled plaintext secret.
+        // The closed kind branch in the strict schema rejects any smuggled
+        // plaintext secret; on the read path it is ignored, never consumed.
         for key in [
             "access_key_id",
             "secret_access_key",
             "sas_token",
             "service_account_json",
         ] {
-            let json = format!(
+            let v: serde_json::Value = serde_json::from_str(&format!(
                 r#"{{"name":"x","kind":"object_store","provider":"s3","bucket":"b","prefix":"p","credential_ref":"r","{key}":"PLAINTEXT"}}"#
-            );
-            let r: Result<ObservabilityExporter, _> = serde_json::from_str(&json);
+            ))
+            .unwrap();
             assert!(
-                r.is_err(),
+                crate::models::validate_observability_exporter(&v).is_err(),
                 "plaintext credential field `{key}` must be rejected"
+            );
+            let e: ObservabilityExporter = serde_json::from_value(v).unwrap();
+            assert!(
+                !serde_json::to_string(&e).unwrap().contains("PLAINTEXT"),
+                "plaintext credential field `{key}` must not be retained"
             );
         }
     }
@@ -695,16 +837,22 @@ mod tests {
     #[test]
     fn rejects_plaintext_api_key_in_datadog_config() {
         // The Datadog API key must NEVER be a config field — only a
-        // `credential_ref`. `deny_unknown_fields` on the inner config rejects
-        // any attempt to smuggle a plaintext key onto the kine path.
+        // `credential_ref`. The closed kind branch in the strict schema
+        // rejects any attempt to smuggle a plaintext key in; on the read
+        // path it is ignored, never consumed as a credential.
         for key in ["api_key", "apikey", "dd_api_key", "key"] {
-            let json = format!(
+            let v: serde_json::Value = serde_json::from_str(&format!(
                 r#"{{"name":"x","kind":"datadog","site":"datadoghq.com","credential_ref":"r","service":"s","{key}":"DDSECRET"}}"#
-            );
-            let r: Result<ObservabilityExporter, _> = serde_json::from_str(&json);
+            ))
+            .unwrap();
             assert!(
-                r.is_err(),
+                crate::models::validate_observability_exporter(&v).is_err(),
                 "plaintext credential field `{key}` must be rejected"
+            );
+            let e: ObservabilityExporter = serde_json::from_value(v).unwrap();
+            assert!(
+                !serde_json::to_string(&e).unwrap().contains("DDSECRET"),
+                "plaintext credential field `{key}` must not be retained"
             );
         }
     }

@@ -7,7 +7,8 @@
 //! classification — is shared across all three backends.
 //!
 //! A batch becomes ONE object: the records are serialized to NDJSON (one
-//! [`SinkRecord`] per line, including opt-in captured content), optionally
+//! [`SinkRecord`] per line, metadata only — the fan-out attaches captured
+//! content to no object-storage exporter, see `content_record`), optionally
 //! gzipped, and `put` under a **content-addressed** key
 //! `…/dt=YYYY-MM-DD/hh=HH/<sha256(body)[..32]>.ndjson[.gz]`. The content
 //! address makes an *in-process* retry reuse the **same** key (the pipeline
@@ -38,6 +39,7 @@
 //! Org/env partitioning of the key prefix remains a genuine follow-up.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use object_store::path::Path as ObjectPath;
@@ -51,8 +53,8 @@ use aisix_core::models::observability_exporter::{
 };
 
 use super::{
-    BatchUnit, EventBatch, IdempotencyMarker, IdempotencyScheme, ObservabilitySink, OrderingScope,
-    SinkAck, SinkCapabilities, SinkError, SinkHealth, SinkResult,
+    BatchUnit, ErrorRedactor, EventBatch, IdempotencyMarker, IdempotencyScheme, ObservabilitySink,
+    OrderingScope, SinkAck, SinkCapabilities, SinkError, SinkHealth, SinkResult,
 };
 
 /// Cap on a masked error-detail string surfaced to logs / health.
@@ -68,6 +70,7 @@ pub struct ObjectStoreSink {
     /// Key prefix the partition path is appended to.
     prefix: String,
     compression: ObjectStoreCompression,
+    redactor: ErrorRedactor,
 }
 
 impl ObjectStoreSink {
@@ -85,7 +88,15 @@ impl ObjectStoreSink {
             store,
             prefix: prefix.into(),
             compression,
+            redactor: ErrorRedactor::default(),
         }
+    }
+
+    /// Declare the endpoint and credentials the backend was built with, so
+    /// the pipeline keeps them out of this sink's delivery errors.
+    pub fn with_error_redactor(mut self, redactor: ErrorRedactor) -> Self {
+        self.redactor = redactor;
+        self
     }
 
     /// Serialize a batch to (optionally gzipped) NDJSON bytes — the object
@@ -185,11 +196,15 @@ impl ObservabilitySink for ObjectStoreSink {
         // via `SinkStats::last_error` (mirrors the other sinks).
         SinkHealth::healthy()
     }
+
+    fn error_redactor(&self) -> ErrorRedactor {
+        self.redactor.clone()
+    }
 }
 
 /// Provider-resolved cloud credentials. The plaintext key never lives in the
 /// exporter config / kine path — it is resolved DP-side from a
-/// `credential_ref` (see [`resolve_object_store_credential`]).
+/// `credential_ref` (see [`resolve_object_store_credential_with`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObjectStoreCredentials {
     S3 {
@@ -207,17 +222,73 @@ pub enum ObjectStoreCredentials {
     },
 }
 
-/// HTTP client options carrying the deployment's outbound TLS trust, so
-/// an on-prem object store — a MinIO or an internal S3-compatible host
-/// behind an enterprise CA — is reachable on the same `upstream.tls`
-/// setting the provider bridges use.
+/// The one sink family whose client retries underneath the pipeline: the
+/// `object_store` builders default to a ladder of their own that runs for
+/// three minutes before the error is ever returned. Left alone, one
+/// pipeline attempt could outlast most of the pipeline's whole retry
+/// budget, so the two ladders would compound into a single slow one.
+///
+/// Bound it to the pipeline's own backoff ceiling instead: an attempt that
+/// cannot get through in 30s hands the failure back, and the pipeline —
+/// which is the only layer that knows about the queue behind it, the drop
+/// accounting, and shutdown — decides what happens next.
+fn export_retry_config() -> object_store::RetryConfig {
+    object_store::RetryConfig {
+        retry_timeout: Duration::from_secs(30),
+        ..Default::default()
+    }
+}
+
+/// HTTP client options carrying the deployment's `upstream` settings, so
+/// the exporters reach an object store on the same trust and connection
+/// settings the provider bridges use — an on-prem MinIO or internal
+/// S3-compatible host sits behind the same enterprise CA and the same
+/// LB/NAT hops the rest of the gateway's outbound traffic crosses.
 ///
 /// Applied first in every builder chain: `with_client_options` replaces
 /// the whole options value, so a later `with_allow_http` layers onto
 /// this rather than the other way round.
-fn tls_client_options() -> object_store::ClientOptions {
-    let tls = &aisix_gateway::upstream_http::config().tls;
+fn upstream_client_options() -> object_store::ClientOptions {
+    client_options_for(aisix_gateway::upstream_http::config())
+}
+
+/// The options themselves, over an explicit config so a test can watch a
+/// value that is not also the default arrive.
+///
+/// `object_store`'s own defaults leave `pool_idle_timeout` unset, which
+/// is reqwest's 90s idle lifetime — the value `upstream_http`'s default
+/// guard rejects, because it outlives a typical hop's idle timer and the
+/// pool then hands out connections the far end has already closed. Its
+/// `connect_timeout` default happens to equal ours today, which is not
+/// the same as honouring an operator who changed it.
+///
+/// `None` is the operator's "off" (config `0`), not "use whatever the
+/// library defaults to" — so `connect_timeout` has to be disabled
+/// explicitly or `ClientOptions` puts its own 5s back, the same trap the
+/// Bedrock stack steps around. `pool_idle_timeout` has no disable entry
+/// point here, so `0` leaves reqwest's 90s instead of the never-expire
+/// the reqwest clients get; that is the pre-existing behaviour and the
+/// conservative direction, but it is a divergence.
+///
+/// The three `tcp_keepalive_*` settings have no entry point on
+/// `ClientOptions` at all, so they stop here — the same shape as the AWS
+/// SDK stack, and worth knowing before assuming the whole `upstream`
+/// block reaches this client.
+fn client_options_for(
+    cfg: &aisix_gateway::upstream_http::UpstreamHttpConfig,
+) -> object_store::ClientOptions {
+    let tls = &cfg.tls;
     let mut options = object_store::ClientOptions::new();
+    if let Some(d) = cfg.pool_idle_timeout {
+        options = options.with_pool_idle_timeout(d);
+    }
+    match cfg.connect_timeout {
+        Some(d) => options = options.with_connect_timeout(d),
+        None => options = options.with_connect_timeout_disabled(),
+    }
+    if let Some(n) = cfg.pool_max_idle_per_host {
+        options = options.with_pool_max_idle_per_host(n);
+    }
     if let Some(pem) = &tls.extra_ca_pem {
         // Validated at boot by `TlsSettings::load`.
         match object_store::Certificate::from_pem_bundle(pem) {
@@ -242,7 +313,7 @@ fn tls_client_options() -> object_store::ClientOptions {
 /// exporter. **This is the only provider-specific code** — each arm picks the
 /// matching `object_store` builder, which owns that cloud's signing. An
 /// `endpoint` (S3-compatible MinIO / R2, or an emulator) is honored and HTTP
-/// is allowed only for explicit `http://` endpoints (loopback emulators).
+/// is allowed only for explicit `http://` endpoints.
 pub fn build_object_store(
     provider: ObjectStoreProvider,
     bucket: &str,
@@ -260,7 +331,8 @@ pub fn build_object_store(
             },
         ) => {
             let mut b = object_store::aws::AmazonS3Builder::new()
-                .with_client_options(tls_client_options())
+                .with_client_options(upstream_client_options())
+                .with_retry(export_retry_config())
                 .with_bucket_name(bucket)
                 .with_access_key_id(access_key_id)
                 .with_secret_access_key(secret_access_key);
@@ -273,7 +345,7 @@ pub fn build_object_store(
             if let Some(ep) = endpoint {
                 b = b.with_endpoint(ep);
                 // S3-compatible servers (MinIO / emulators) are path-style and
-                // commonly plaintext on loopback.
+                // often served over plain http.
                 b = b.with_virtual_hosted_style_request(false);
                 if ep.starts_with("http://") {
                     b = b.with_allow_http(true);
@@ -290,15 +362,28 @@ pub fn build_object_store(
                 service_account_key,
             },
         ) => {
-            // GCS has no HTTP-endpoint override on the builder the way S3 /
-            // Azure do (`with_url` expects a `gs://` location, not a host). An
-            // emulator base URL (fake-gcs-server) or a private endpoint rides
-            // the service-account JSON's `gcs_base_url` field instead, so the
-            // `endpoint` config is intentionally not applied for GCS.
-            let b = object_store::gcp::GoogleCloudStorageBuilder::new()
-                .with_client_options(tls_client_options())
+            let mut b = object_store::gcp::GoogleCloudStorageBuilder::new()
+                .with_client_options(upstream_client_options())
+                .with_retry(export_retry_config())
                 .with_bucket_name(bucket)
                 .with_service_account_key(service_account_key);
+            // `endpoint` is the XML API base URL (a private endpoint) and
+            // takes precedence over a `gcs_base_url` in the service-account
+            // JSON. object_store uploads through the XML API, which the stock
+            // fake-gcs-server image does not implement (fsouza/fake-gcs-server#331):
+            // it rejects every upload, encoded object name or not. GCS's builder has no `with_allow_http`,
+            // so plaintext http is enabled through its client config.
+            if let Some(ep) = endpoint {
+                b = b.with_base_url(ep);
+                if ep.starts_with("http://") {
+                    b = b.with_config(
+                        object_store::gcp::GoogleConfigKey::Client(
+                            object_store::ClientConfigKey::AllowHttp,
+                        ),
+                        "true",
+                    );
+                }
+            }
             let store = b
                 .build()
                 .map_err(|e| SinkError::Permanent(format!("object_store: build gcs: {e}")))?;
@@ -312,7 +397,8 @@ pub fn build_object_store(
             },
         ) => {
             let mut b = object_store::azure::MicrosoftAzureBuilder::new()
-                .with_client_options(tls_client_options())
+                .with_client_options(upstream_client_options())
+                .with_retry(export_retry_config())
                 .with_container_name(bucket)
                 .with_account(account)
                 .with_access_key(access_key);
@@ -341,7 +427,8 @@ pub fn build_object_store(
 /// is rejected for S3, since ambient credentials require the provider's
 /// metadata service. **GCS** uses
 /// Application Default Credentials (GKE Workload Identity / GCE metadata) by
-/// constructing the builder with no service-account key. **Azure** is not
+/// constructing the builder with no service-account key; a custom `endpoint`
+/// is rejected for GCS too, as the control plane does. **Azure** is not
 /// supported here — its managed identity still needs a non-secret account name
 /// the keyless config does not carry; the control plane rejects that combination at create
 /// time, and this arm returns a clear permanent error as a backstop.
@@ -368,7 +455,8 @@ pub fn build_object_store_ambient(
                 ));
             }
             let mut b = object_store::aws::AmazonS3Builder::from_env()
-                .with_client_options(tls_client_options())
+                .with_client_options(upstream_client_options())
+                .with_retry(export_retry_config())
                 .with_bucket_name(bucket);
             if let Some(r) = region {
                 b = b.with_region(r);
@@ -379,10 +467,21 @@ pub fn build_object_store_ambient(
             Ok(Arc::new(store))
         }
         ObjectStoreProvider::Gcs => {
+            // Refused like S3, and as the control plane refuses it for every
+            // provider: a custom base URL is only reachable with a
+            // credential_ref service account.
+            if endpoint.is_some() {
+                return Err(SinkError::Permanent(
+                    "object_store: cloud_identity for gcs does not support a custom \
+                     endpoint; use credential_ref"
+                        .to_string(),
+                ));
+            }
             // No service-account key set → `object_store` sources Application
             // Default Credentials (GKE Workload Identity / GCE metadata).
             let store = object_store::gcp::GoogleCloudStorageBuilder::new()
-                .with_client_options(tls_client_options())
+                .with_client_options(upstream_client_options())
+                .with_retry(export_retry_config())
                 .with_bucket_name(bucket)
                 .build()
                 .map_err(|e| {
@@ -410,9 +509,23 @@ pub fn build_object_store_sink(
     name: String,
     cfg: &ObjectStoreConfig,
 ) -> Arc<dyn ObservabilitySink> {
+    build_object_store_sink_with(name, cfg, |k| std::env::var(k).ok())
+}
+
+/// [`build_object_store_sink`], parameterized over the credential source.
+fn build_object_store_sink_with(
+    name: String,
+    cfg: &ObjectStoreConfig,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Arc<dyn ObservabilitySink> {
+    let mut redactor = ErrorRedactor::default();
+    if let Some(endpoint) = &cfg.endpoint {
+        redactor = redactor.url(endpoint);
+    }
     let store = match cfg.auth_mode {
         ObjectStoreAuthMode::CredentialRef => {
-            let Some(creds) = resolve_object_store_credential(cfg.provider, &cfg.credential_ref)
+            let Some(creds) =
+                resolve_object_store_credential_with(cfg.provider, &cfg.credential_ref, lookup)
             else {
                 return Arc::new(BrokenSink::new(
                     name,
@@ -420,7 +533,21 @@ pub fn build_object_store_sink(
                         "object_store: no credentials resolved for credential_ref {:?}",
                         cfg.credential_ref
                     ),
+                    redactor,
                 ));
+            };
+            redactor = match &creds {
+                ObjectStoreCredentials::S3 {
+                    secret_access_key,
+                    session_token,
+                    ..
+                } => redactor
+                    .secret(secret_access_key)
+                    .secret(session_token.as_deref().unwrap_or_default()),
+                ObjectStoreCredentials::Gcs {
+                    service_account_key,
+                } => redactor.secret(service_account_key),
+                ObjectStoreCredentials::Azure { access_key, .. } => redactor.secret(access_key),
             };
             build_object_store(
                 cfg.provider,
@@ -438,13 +565,11 @@ pub fn build_object_store_sink(
         ),
     };
     match store {
-        Ok(store) => Arc::new(ObjectStoreSink::new(
-            name,
-            store,
-            cfg.prefix.clone(),
-            cfg.compression,
-        )),
-        Err(e) => Arc::new(BrokenSink::new(name, e.to_string())),
+        Ok(store) => Arc::new(
+            ObjectStoreSink::new(name, store, cfg.prefix.clone(), cfg.compression)
+                .with_error_redactor(redactor),
+        ),
+        Err(e) => Arc::new(BrokenSink::new(name, e.to_string(), redactor)),
     }
 }
 
@@ -455,13 +580,15 @@ pub fn build_object_store_sink(
 struct BrokenSink {
     name: String,
     reason: String,
+    redactor: ErrorRedactor,
 }
 
 impl BrokenSink {
-    fn new(name: impl Into<String>, reason: impl Into<String>) -> Self {
+    fn new(name: impl Into<String>, reason: impl Into<String>, redactor: ErrorRedactor) -> Self {
         Self {
             name: name.into(),
             reason: reason.into(),
+            redactor,
         }
     }
 }
@@ -488,7 +615,11 @@ impl ObservabilitySink for BrokenSink {
     }
 
     async fn healthcheck(&self) -> SinkHealth {
-        SinkHealth::unhealthy(self.reason.clone())
+        SinkHealth::unhealthy(self.redactor.redact(&self.reason))
+    }
+
+    fn error_redactor(&self) -> ErrorRedactor {
+        self.redactor.clone()
     }
 }
 
@@ -501,15 +632,9 @@ impl ObservabilitySink for BrokenSink {
 /// not `AISIX_`, which the config loader owns). Returns `None` when a required
 /// field is unset/blank — the caller surfaces a delivery-health auth error
 /// rather than building a half-credentialed client.
-pub fn resolve_object_store_credential(
-    provider: ObjectStoreProvider,
-    credential_ref: &str,
-) -> Option<ObjectStoreCredentials> {
-    resolve_object_store_credential_with(provider, credential_ref, |k| std::env::var(k).ok())
-}
-
-/// Resolution core, parameterized over the variable source so it is testable
-/// without mutating the process environment.
+///
+/// Parameterized over the variable source so it is testable without
+/// mutating the process environment.
 fn resolve_object_store_credential_with(
     provider: ObjectStoreProvider,
     credential_ref: &str,
@@ -577,15 +702,17 @@ fn partition(occurred_at: &str) -> (String, String) {
 
 /// Map an `object_store` error to the pipeline's retry/permanent decision.
 /// Auth, missing-bucket and unsupported-operation errors are permanent (a
-/// retry fails the same way); transport / throttle / 5xx surface as
-/// `Error::Generic` and are transient. The detail is length-capped; the crate
-/// does not echo secrets in error text.
+/// retry fails the same way), and so is any other 4xx the store answered
+/// except 408 / 429 — the classification every HTTP sink shares. Transport
+/// failures, 5xx, 408 and 429 are transient. The detail is length-capped; the
+/// crate does not echo secrets in error text.
 fn map_object_store_err(e: object_store::Error) -> SinkError {
     use object_store::Error as E;
     // The full source chain, not just the outer Display: object_store's
     // retry error stops at "Error performing PUT <url>" and keeps the
-    // connect/DNS/TLS cause in `source()`.
-    let detail = truncate(&super::error_chain(&e));
+    // connect/DNS/TLS cause — and the response status — in `source()`.
+    let chain = super::error_chain(&e);
+    let detail = truncate(&chain);
     match e {
         E::PermissionDenied { .. }
         | E::Unauthenticated { .. }
@@ -594,8 +721,41 @@ fn map_object_store_err(e: object_store::Error) -> SinkError {
         | E::NotImplemented { .. }
         | E::InvalidPath { .. }
         | E::UnknownConfigurationKey { .. } => SinkError::Permanent(detail),
-        _ => SinkError::Transient(detail),
+        _ => match response_status(&chain) {
+            Some(status)
+                if status.is_client_error()
+                    && !super::is_retryable_status(status)
+                    && !TRANSIENT_4XX_CODES.iter().any(|code| chain.contains(code)) =>
+            {
+                SinkError::Permanent(detail)
+            }
+            _ => SinkError::Transient(detail),
+        },
     }
+}
+
+/// S3 error codes that arrive on a 4xx but clear on retry: the store timed
+/// out reading a slow upload (400), or a conflicting operation on the bucket
+/// was still in progress (409).
+const TRANSIENT_4XX_CODES: &[&str] = &[
+    "<Code>RequestTimeout</Code>",
+    "<Code>OperationAborted</Code>",
+];
+
+/// How object_store renders a non-2xx response in its error chain.
+const RESPONSE_STATUS_MARKER: &str = "Server returned non-2xx status code: ";
+
+/// The HTTP status an object_store error chain reports, if it reports one.
+///
+/// Read from the text because the status lives in a retry error type that
+/// object_store does not export. The `rejected_put_*` tests drive a real store
+/// against a receiver answering 400, so an object_store upgrade that renders
+/// the status differently fails them rather than silently turning every 4xx
+/// back into a retry.
+fn response_status(chain: &str) -> Option<reqwest::StatusCode> {
+    let rest = &chain[chain.find(RESPONSE_STATUS_MARKER)? + RESPONSE_STATUS_MARKER.len()..];
+    let code = rest.get(..3)?.parse::<u16>().ok()?;
+    reqwest::StatusCode::from_u16(code).ok()
 }
 
 /// Truncate a masked detail string to a bounded length for logs / health.
@@ -638,6 +798,177 @@ mod tests {
 
     fn sink(store: Arc<dyn ObjectStore>, compression: ObjectStoreCompression) -> ObjectStoreSink {
         ObjectStoreSink::new("obj-test", store, "ai-gateway", compression)
+    }
+
+    /// `object_store::ClientOptions` starts from its OWN defaults, not the
+    /// deployment's: it leaves `pool_idle_timeout` unset, which is
+    /// reqwest's 90s idle lifetime, and its `connect_timeout` happens to
+    /// equal ours today — which is not the same as honouring an operator
+    /// who changed either one. Nothing else makes these exporters read
+    /// the `upstream` block, and a client on budgets nobody configured
+    /// works against every public bucket and fails only where the
+    /// settings exist, which is to say in the customer's environment.
+    ///
+    /// The values below are none of the defaults on either side, so the
+    /// comparison cannot pass on a coincidence.
+    #[test]
+    fn the_configured_upstream_connection_settings_reach_the_exporter_client_options() {
+        use object_store::ClientConfigKey;
+
+        let cfg = aisix_gateway::upstream_http::UpstreamHttpConfig {
+            pool_idle_timeout: Some(std::time::Duration::from_secs(17)),
+            connect_timeout: Some(std::time::Duration::from_secs(11)),
+            pool_max_idle_per_host: Some(7),
+            ..Default::default()
+        };
+        let applied = client_options_for(&cfg);
+        // `ClientOptions` exposes no getters for these; `get_config_value`
+        // is the only readback. Comparing against options built straight
+        // from the same values keeps the assertion off its string format.
+        let expected = object_store::ClientOptions::new()
+            .with_pool_idle_timeout(cfg.pool_idle_timeout.unwrap())
+            .with_connect_timeout(cfg.connect_timeout.unwrap())
+            .with_pool_max_idle_per_host(cfg.pool_max_idle_per_host.unwrap());
+        for key in [
+            ClientConfigKey::PoolIdleTimeout,
+            ClientConfigKey::ConnectTimeout,
+            ClientConfigKey::PoolMaxIdlePerHost,
+        ] {
+            assert_ne!(
+                expected.get_config_value(&key),
+                object_store::ClientOptions::new().get_config_value(&key),
+                "{key:?} was given the object_store default, so the next assertion \
+                 would hold whether or not the setting was applied",
+            );
+            assert_eq!(
+                applied.get_config_value(&key),
+                expected.get_config_value(&key),
+                "{key:?} did not reach the exporter client options",
+            );
+        }
+    }
+
+    /// The five production chains call `upstream_client_options()`, not
+    /// `client_options_for`, so the tests above say nothing about the
+    /// one-line join between them. Left unpinned that accessor can be
+    /// reduced to a bare `ClientOptions::new()` with every guard here
+    /// still green — and it would take the `upstream.tls` trust material
+    /// this helper already carried down with it, which is the private-CA
+    /// support the TLS matrix in the docs promises for these exporters.
+    ///
+    /// `PoolIdleTimeout` is the key that can carry this: no test binary
+    /// calls `upstream_http::init()`, so `config()` is the 30s default,
+    /// while `ClientOptions` leaves the same key unset. `ConnectTimeout`
+    /// is 5s on both sides and would pin nothing.
+    #[test]
+    fn the_production_accessor_reads_the_process_upstream_config() {
+        use object_store::ClientConfigKey;
+
+        let key = ClientConfigKey::PoolIdleTimeout;
+        let from_process_config = client_options_for(aisix_gateway::upstream_http::config());
+        assert_ne!(
+            from_process_config.get_config_value(&key),
+            object_store::ClientOptions::new().get_config_value(&key),
+            "the process config must differ from object_store's default here, \
+             or the next assertion holds for a client that read neither",
+        );
+        assert_eq!(
+            upstream_client_options().get_config_value(&key),
+            from_process_config.get_config_value(&key),
+            "`upstream_client_options()` must be \
+             `client_options_for(upstream_http::config())`",
+        );
+    }
+
+    /// `None` on these fields is the operator's "off" — `upstream_http`'s
+    /// loader maps config `0` to it, and every reqwest client and the
+    /// Bedrock SDK read it as unbounded. `ClientOptions` reads an unset
+    /// `connect_timeout` as "use mine" and would put 5s back, so a dial
+    /// the operator disabled would still be aborted, and only on the
+    /// export path.
+    #[test]
+    fn a_disabled_connect_timeout_is_disabled_on_the_exporter_client_too() {
+        use object_store::ClientConfigKey;
+
+        let cfg = aisix_gateway::upstream_http::UpstreamHttpConfig {
+            connect_timeout: None,
+            ..Default::default()
+        };
+        // `with_connect_timeout_disabled()` clears the field, which reads
+        // back as absent — distinct from the default's own 5s.
+        assert_eq!(
+            client_options_for(&cfg).get_config_value(&ClientConfigKey::ConnectTimeout),
+            None,
+            "a disabled connect timeout must not be replaced by object_store's own",
+        );
+        assert!(
+            object_store::ClientOptions::new()
+                .get_config_value(&ClientConfigKey::ConnectTimeout)
+                .is_some(),
+            "object_store stopped defaulting this, so the assertion above proves nothing",
+        );
+    }
+
+    /// The helper only helps the chains that call it, and
+    /// `with_client_options` REPLACES the whole options value — so one
+    /// chain left on `object_store`'s defaults exports on the wrong
+    /// trust and the wrong budgets while every test here, which hands
+    /// the sink an `InMemory` store and never builds a backend, stays
+    /// green.
+    ///
+    /// Scoped to the production half: this module's own text names all
+    /// of these. The sibling scan in `aisix-gateway`'s `upstream_http`
+    /// catches a chain moved to another file; this one catches a chain
+    /// in this file losing the call, and a new chain added without it.
+    #[test]
+    fn every_exporter_builder_chain_takes_the_shared_client_options() {
+        let production = include_str!("object_store.rs")
+            .split_once("\n#[cfg(test)]\nmod ")
+            .expect("this file has a test module")
+            .0;
+
+        let chains: usize = [
+            "AmazonS3Builder::new()",
+            "AmazonS3Builder::from_env()",
+            "GoogleCloudStorageBuilder::new()",
+            "MicrosoftAzureBuilder::new()",
+        ]
+        .iter()
+        .map(|c| production.matches(c).count())
+        .sum();
+        assert_eq!(
+            chains, 5,
+            "the exporter backends are built in 5 chains (s3 / gcs / azure on \
+             credential_ref, s3 / gcs on cloud identity); a new one needs the \
+             shared client options too, then this count",
+        );
+        assert_eq!(
+            production
+                .matches("with_client_options(upstream_client_options())")
+                .count(),
+            chains,
+            "every builder chain must take `upstream_client_options()`",
+        );
+        assert_eq!(
+            production.matches("with_client_options(").count(),
+            chains,
+            "no builder chain may pass client options from anywhere else",
+        );
+        // Left off, a chain keeps the crate's own three-minute retry
+        // ladder underneath the pipeline's, and one pipeline attempt can
+        // outlast most of the pipeline's whole budget.
+        assert_eq!(
+            production
+                .matches("with_retry(export_retry_config())")
+                .count(),
+            chains,
+            "every builder chain must bound its own retry to `export_retry_config()`",
+        );
+        assert_eq!(
+            production.matches("with_retry(").count(),
+            chains,
+            "no builder chain may set a retry policy from anywhere else",
+        );
     }
 
     #[tokio::test]
@@ -758,6 +1089,10 @@ mod tests {
             prompt: "what is 2+2?".into(),
             response: "4".into(),
             truncated: false,
+            prompt_truncated: false,
+            response_truncated: false,
+            max_bytes: None,
+            output: None,
         });
         s.append_batch(&batch_of(vec![rec]), &IdempotencyMarker::None)
             .await
@@ -854,6 +1189,25 @@ mod tests {
     }
 
     #[test]
+    fn build_object_store_ambient_gcs_rejects_endpoint() {
+        let r = build_object_store_ambient(
+            ObjectStoreProvider::Gcs,
+            "bucket",
+            None,
+            Some("https://storage-private.example.com"),
+        );
+        match r {
+            Err(SinkError::Permanent(msg)) => {
+                assert!(msg.contains("endpoint"), "msg: {msg}");
+                assert!(msg.contains("credential_ref"), "msg: {msg}");
+            }
+            other => {
+                panic!("expected Permanent error for gcs cloud_identity + endpoint, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
     fn build_object_store_ambient_dispatches_gcs() {
         // Cloud-identity GCS builds with no service-account key → Application
         // Default Credentials at request time; build() succeeds offline.
@@ -912,6 +1266,215 @@ mod tests {
         );
     }
 
+    /// A receiver that answers every PUT with `status` and the error body a
+    /// GCS-compatible server sends for an upload it does not implement.
+    async fn rejecting_receiver(status: u16) -> wiremock::MockServer {
+        receiver_answering(
+            status,
+            format!(r#"{{"error":{{"code":{status},"message":"invalid uploadType"}}}}"#),
+        )
+        .await
+    }
+
+    async fn receiver_answering(status: u16, body: String) -> wiremock::MockServer {
+        let server = wiremock::MockServer::builder().start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(wiremock::ResponseTemplate::new(status).set_body_string(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn s3_4xx_codes_that_clear_on_retry_stay_transient() {
+        for (status, code) in [(400u16, "RequestTimeout"), (409, "OperationAborted")] {
+            let server = receiver_answering(
+                status,
+                format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code><Message>try again</Message></Error>"),
+            )
+            .await;
+            let sink = ObjectStoreSink::new(
+                "obj-s3-retryable-4xx",
+                store_at(ObjectStoreProvider::S3, &server.uri()),
+                "rc",
+                ObjectStoreCompression::None,
+            );
+            let err = sink
+                .append_batch(
+                    &batch_of(vec![SinkRecord::metadata_only(event("r1"))]),
+                    &IdempotencyMarker::None,
+                )
+                .await
+                .expect_err("the receiver rejects the PUT");
+            assert!(err.is_transient(), "{status} {code} must be retried: {err}");
+        }
+    }
+
+    fn store_at(provider: ObjectStoreProvider, endpoint: &str) -> Arc<dyn ObjectStore> {
+        let creds = match provider {
+            ObjectStoreProvider::S3 => ObjectStoreCredentials::S3 {
+                access_key_id: "akid".into(),
+                secret_access_key: "secret".into(),
+                session_token: None,
+            },
+            ObjectStoreProvider::Gcs => ObjectStoreCredentials::Gcs {
+                service_account_key: r#"{"disable_oauth":true,"client_email":"e@example.iam.gserviceaccount.com","private_key_id":"","private_key":""}"#.into(),
+            },
+            ObjectStoreProvider::AzureBlob => ObjectStoreCredentials::Azure {
+                account: "devstoreaccount1".into(),
+                access_key: "a2V5".into(),
+            },
+        };
+        build_object_store(provider, "qabucket", None, Some(endpoint), creds)
+            .expect("build store against the mock endpoint")
+    }
+
+    #[tokio::test]
+    async fn rejected_put_4xx_is_permanent_for_every_provider() {
+        for provider in [
+            ObjectStoreProvider::S3,
+            ObjectStoreProvider::Gcs,
+            ObjectStoreProvider::AzureBlob,
+        ] {
+            for status in [400u16, 405, 413] {
+                let server = rejecting_receiver(status).await;
+                let sink = ObjectStoreSink::new(
+                    "obj-4xx",
+                    store_at(provider, &server.uri()),
+                    "rc",
+                    ObjectStoreCompression::None,
+                );
+                let err = sink
+                    .append_batch(
+                        &batch_of(vec![SinkRecord::metadata_only(event("r1"))]),
+                        &IdempotencyMarker::None,
+                    )
+                    .await
+                    .expect_err("the receiver rejects the PUT");
+                assert!(
+                    matches!(err, SinkError::Permanent(_)),
+                    "{provider:?} {status} must not be retried: {err}"
+                );
+            }
+        }
+    }
+
+    /// object_store renders the request URI — configured userinfo included —
+    /// into every error, and a receiver may echo the signing key back. The
+    /// delivery error the pipeline records must carry neither, for a store
+    /// built the way production builds it.
+    #[tokio::test]
+    async fn delivery_errors_carry_no_configured_credential() {
+        let server = receiver_answering(
+            403,
+            "<Error><Code>SignatureDoesNotMatch</Code>\
+             <Message>key objstore-secret-key</Message></Error>"
+                .to_string(),
+        )
+        .await;
+        let cfg = ObjectStoreConfig {
+            provider: ObjectStoreProvider::S3,
+            bucket: "b".into(),
+            prefix: "p".into(),
+            region: None,
+            endpoint: Some(server.uri().replace("http://", "http://obj-user:obj-pass@")),
+            compression: ObjectStoreCompression::None,
+            auth_mode: ObjectStoreAuthMode::CredentialRef,
+            credential_ref: "acme".into(),
+        };
+        let sink = build_object_store_sink_with("obj-redact".into(), &cfg, |key| match key {
+            "OBJSTORE_CRED_ACME_AWS_ACCESS_KEY_ID" => Some("akid".into()),
+            "OBJSTORE_CRED_ACME_AWS_SECRET_ACCESS_KEY" => Some("objstore-secret-key".into()),
+            _ => None,
+        });
+        let (handle, worker) = crate::sink::SinkPipeline::new(
+            sink,
+            crate::sink::PipelineConfig {
+                flush_interval: std::time::Duration::from_millis(20),
+                ..Default::default()
+            },
+        );
+        let (cancel_tx, cancel) = tokio::sync::watch::channel(false);
+        let run = tokio::spawn(worker.run(cancel));
+        assert!(handle.try_enqueue(Arc::new(SinkRecord::metadata_only(event("r1")))));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let last = loop {
+            if let Some(e) = handle.stats().last_error {
+                break e;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "no delivery error");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        cancel_tx.send(true).unwrap();
+        run.await.unwrap();
+
+        assert!(
+            last.contains("http://***@127.0.0.1") && last.contains("SignatureDoesNotMatch"),
+            "the cause stays diagnosable: {last}"
+        );
+        for secret in ["obj-user", "obj-pass", "objstore-secret-key"] {
+            assert!(!last.contains(secret), "{secret} leaked into: {last}");
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_put_drops_the_batch_on_its_first_attempt() {
+        let server = rejecting_receiver(400).await;
+        let sink: Arc<dyn ObservabilitySink> = Arc::new(ObjectStoreSink::new(
+            "gcs-rc",
+            store_at(ObjectStoreProvider::Gcs, &server.uri()),
+            "rc",
+            ObjectStoreCompression::None,
+        ));
+        let (handle, worker) = crate::sink::SinkPipeline::new(
+            sink,
+            crate::sink::PipelineConfig {
+                flush_interval: std::time::Duration::from_millis(20),
+                ..Default::default()
+            },
+        );
+        let (cancel_tx, cancel) = tokio::sync::watch::channel(false);
+        let run = tokio::spawn(worker.run(cancel));
+        assert!(handle.try_enqueue(Arc::new(SinkRecord::metadata_only(event("r1")))));
+
+        // The default budget retries a transient batch for minutes, so a
+        // drop inside this window can only be the permanent path.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while handle.stats().failed_batches == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a 400 batch was not dropped: {:?}",
+                handle.stats()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let stats = handle.stats();
+        assert_eq!(stats.retries, 0, "a 400 must not be retried: {stats:?}");
+        assert_eq!(stats.dropped, 1);
+        assert!(
+            stats
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("400")),
+            "the first failed batch reports its error: {stats:?}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+        cancel_tx.send(true).unwrap();
+        run.await.unwrap();
+    }
+
+    #[test]
+    fn response_status_reads_object_stores_status_text() {
+        assert_eq!(
+            response_status(
+                "Error performing PUT http://h/b/k in 1ms - Server returned non-2xx status code: 400 Bad Request: {}"
+            ),
+            Some(reqwest::StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(response_status("connection reset by peer"), None);
+    }
+
     #[test]
     fn maps_object_store_errors_to_retry_decision() {
         let perm = map_object_store_err(object_store::Error::PermissionDenied {
@@ -946,6 +1509,7 @@ mod tests {
         let s = BrokenSink::new(
             "obj-broken",
             "object_store: no credentials resolved for credential_ref \"acme\"",
+            ErrorRedactor::default(),
         );
         match s
             .append_batch(
@@ -1088,7 +1652,7 @@ mod tests {
     fn mapped_detail_carries_the_error_source_chain() {
         // A Generic transport error's Display stops at the outer layer
         // ("Error performing PUT <url>"); the connect/DNS cause lives in
-        // `source()`. The nightly real-cloud smoke failed for five weeks
+        // `source()`. The scheduled real-cloud smoke failed for five weeks
         // with a detail that never named the cause — the mapped detail
         // must include the chain.
         #[derive(Debug)]
@@ -1110,7 +1674,8 @@ mod tests {
                 "failed to lookup address information: Name or service not known",
             ))),
         };
-        let (SinkError::Transient(detail) | SinkError::Permanent(detail)) = map_object_store_err(e);
+        let err = map_object_store_err(e);
+        let detail = err.to_string();
         assert!(
             detail.contains("failed to lookup address information"),
             "detail must surface the underlying cause, got: {detail}"
@@ -1285,9 +1850,9 @@ mod smoke {
 
     #[tokio::test]
     #[ignore = "GCS round-trip — set AISIX_E2E_OBJSTORE_GCS_* against REAL GCS or a \
-                conformant emulator. NOTE: fake-gcs-server's XML API does not round-trip \
-                object_store's percent-encoded object names (the `/` in partition keys → \
-                %2F), so build + auth verify there but the PUT only greens on real GCS. \
+                XML-API emulator. NOTE: the stock fake-gcs-server image implements no \
+                XML API upload (fsouza/fake-gcs-server#331) and rejects every PUT, so \
+                build + auth verify there but the PUT only greens on real GCS. \
                 cargo test -p aisix-obs -- --ignored objstore_smoke_gcs"]
     async fn objstore_smoke_gcs_roundtrip() {
         let (Some(bucket), Some(service_account_key)) = (
@@ -1297,14 +1862,14 @@ mod smoke {
             eprintln!("objstore_smoke_gcs: AISIX_E2E_OBJSTORE_GCS_* not set — skipping");
             return;
         };
-        // GCS ignores the `endpoint` arg (an emulator base URL rides the
-        // service-account JSON's `gcs_base_url` instead), so it is not read
-        // here — native GCS needs only the bucket + service-account key.
+        // endpoint optional: set it for an XML API endpoint (a private
+        // endpoint, an XML-API-capable emulator); omit it for native GCS.
+        let endpoint = env("AISIX_E2E_OBJSTORE_GCS_ENDPOINT");
         let store = build_object_store(
             ObjectStoreProvider::Gcs,
             &bucket,
             None,
-            None,
+            endpoint.as_deref(),
             ObjectStoreCredentials::Gcs {
                 service_account_key,
             },

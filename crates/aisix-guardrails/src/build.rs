@@ -11,14 +11,16 @@
 //! patterns are logged and skipped (the DP refuses to apply a rule
 //! it can't compile, so a typo doesn't silently disarm the policy).
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use aisix_core::models::{
     AisixSnapshot, AppliedGuardrail, Guardrail as DomainGuardrail, GuardrailAttachment,
-    GuardrailHookPoint, GuardrailKind, GuardrailMonitorHit, GuardrailScopeType, KeywordPattern,
+    GuardrailHookPoint, GuardrailInputMessages, GuardrailKind, GuardrailMonitorHit,
+    GuardrailScopeType, KeywordPattern,
 };
 use aisix_core::snapshot::ResourceTable;
-use aisix_core::SnapshotHandle;
+use aisix_core::{ConfigStatus, IncomingRejection, SnapshotHandle};
 use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 
@@ -26,7 +28,8 @@ use crate::index::{GuardrailIndex, RequestContext, ScopeKind};
 use crate::keyword::{KeywordBlocklist, KeywordRule};
 use crate::pii::{builtin_rule, PiiAction, PiiGuardrail, PiiRule};
 use crate::{
-    Guardrail, GuardrailChain, GuardrailVerdict, Redaction, SegmentsOutcome, StreamOutputPolicy,
+    Guardrail, GuardrailChain, GuardrailEmbedderSlot, GuardrailVerdict, Redaction, SegmentsOutcome,
+    StreamOutputPolicy,
 };
 
 /// A snapshot table's guardrail entries in deterministic chain order:
@@ -77,13 +80,30 @@ fn sorted_guardrail_entries(
 pub fn build_chain_from_snapshot(
     table: &ResourceTable<DomainGuardrail>,
     bedrock_endpoint_url: Option<&str>,
+    embedder: &GuardrailEmbedderSlot,
 ) -> GuardrailChain {
-    let mut chain: Vec<(String, Arc<dyn Guardrail>)> = Vec::new();
+    build_chain_from_snapshot_reported(
+        table,
+        bedrock_endpoint_url,
+        embedder,
+        &mut GuardrailInstances::default(),
+    )
+    .0
+}
+
+fn build_chain_from_snapshot_reported(
+    table: &ResourceTable<DomainGuardrail>,
+    bedrock_endpoint_url: Option<&str>,
+    embedder: &GuardrailEmbedderSlot,
+    instances: &mut GuardrailInstances,
+) -> (GuardrailChain, Vec<GuardrailBuildRejection>) {
+    let mut chain: Vec<(String, Arc<dyn Guardrail>, GuardrailInputMessages)> = Vec::new();
     // `applied` mirrors `chain` 1:1 — the `{kind, hook}` of each member that
     // actually materialised, for applied-guardrail telemetry (#379). Pushed
     // only on the `Ok(Some)` path so inert/invalid rows (which never join the
     // chain) never show up as "governed this request".
     let mut applied: Vec<AppliedGuardrail> = Vec::new();
+    let mut rejected = Vec::new();
 
     let entries = sorted_guardrail_entries(table);
     for entry in entries.iter() {
@@ -91,9 +111,14 @@ pub fn build_chain_from_snapshot(
         if !row.enabled {
             continue;
         }
-        match build_one(row, bedrock_endpoint_url) {
+        match instances.instance(
+            entry,
+            bedrock_endpoint_url,
+            embedder,
+            &mut BuildReuse::default(),
+        ) {
             Ok(Some(g)) => {
-                chain.push((row.name.clone(), g));
+                chain.push((row.name.clone(), g, row.input_messages));
                 applied.push(applied_for(row));
             }
             Ok(None) => {
@@ -101,18 +126,57 @@ pub fn build_chain_from_snapshot(
                 // keyword list). Skip silently — operators see this
                 // shape when they're staging a rule.
             }
-            Err(err) => {
-                tracing::warn!(
-                    name = %row.name,
-                    id = %entry.id,
-                    error = %err,
-                    "skipping guardrail with invalid config",
-                );
-            }
+            Err(rejection) => rejected.push(rejection),
         }
     }
 
-    GuardrailChain::new_with_applied(chain, applied)
+    instances.retain_present(table);
+    (GuardrailChain::new_with_applied(chain, applied), rejected)
+}
+
+/// One enabled guardrail row that would not join the chain.
+///
+/// Returned by [`unbuildable_guardrail_rows`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnbuildableGuardrailRow {
+    /// Operator-facing row name, as written in the configuration.
+    pub name: String,
+    /// Why the row does not build, in the same wording the boot log uses.
+    /// A `kind: custom` script error carries the engine's line and column.
+    pub reason: String,
+}
+
+/// Report the enabled guardrail rows in `table` whose configuration does
+/// not build — [`build_chain_from_snapshot`]'s error arm, made returnable.
+///
+/// The gateway logs those errors, reports them through config status, and
+/// keeps serving. A pre-deployment check still needs a synchronous report:
+/// the row silently not existing is the defect, even though the file itself
+/// loaded successfully.
+///
+/// [`BuildError::EmbedderUnavailable`] is deliberately excluded. The
+/// embedding dispatcher is a runtime capability, not part of the
+/// configuration, so a `kind: semantic` row fails to build here for a
+/// reason that says nothing about the file being checked.
+pub fn unbuildable_guardrail_rows(
+    table: &ResourceTable<DomainGuardrail>,
+    bedrock_endpoint_url: Option<&str>,
+) -> Vec<UnbuildableGuardrailRow> {
+    let embedder = GuardrailEmbedderSlot::none();
+    sorted_guardrail_entries(table)
+        .iter()
+        .filter(|entry| entry.value.enabled)
+        .filter_map(
+            |entry| match build_one(&entry.value, bedrock_endpoint_url, &embedder) {
+                Ok(_) => None,
+                Err(BuildError::EmbedderUnavailable) => None,
+                Err(err) => Some(UnbuildableGuardrailRow {
+                    name: entry.value.name.clone(),
+                    reason: err.to_string(),
+                }),
+            },
+        )
+        .collect()
 }
 
 /// The `{kind, hook}` telemetry descriptor for a guardrail row that
@@ -127,39 +191,105 @@ fn applied_for(row: &DomainGuardrail) -> AppliedGuardrail {
     }
 }
 
-/// Build the runtime guardrail for a row, applying its `enforcement_mode`
-/// and `mandatory` policy.
+/// Runtime guardrail instances kept across index/chain rebuilds.
 ///
-/// `enforcement_mode` `block` (the default) returns the guardrail as-is;
-/// `monitor` wraps it in [`MonitorGuardrail`] so it observes violations
-/// without blocking. `mandatory: true` wraps the result in
-/// [`MandatoryGuardrail`] so a remote guardrail that can't evaluate blocks
-/// the request instead of failing open. `mandatory` is applied outermost:
-/// a monitored guardrail still never blocks on its *content* decisions, but
-/// being unavailable is an infra failure that mandatory makes fatal.
+/// One instance per guardrail ROW, shared by every attachment that
+/// references it and reused by the next build unless the row itself
+/// changed. Constructing a network-backed guardrail builds a
+/// `reqwest::Client`, and every one of those reloads the operating
+/// system's CA store; doing that once per attachment on every rebuild is
+/// what a rebuild actually costs (AISIX-Cloud#1542).
+///
+/// Row identity is the `Arc` the snapshot holds, not the etcd revision:
+/// the copy-on-write publish shares row `Arc`s with the previous
+/// snapshot, so an unchanged row is literally the same allocation, and
+/// that holds for the declarative resources file too, where revisions
+/// carry no meaning. The memo keeps its own `Arc` on each row it
+/// remembers, so an address can never be recycled underneath it.
+#[derive(Default)]
+struct GuardrailInstances {
+    by_id: std::collections::HashMap<String, MemoSlot>,
+}
+
+struct MemoSlot {
+    row: Arc<aisix_core::resource::ResourceEntry<DomainGuardrail>>,
+    outcome: Result<Option<Arc<dyn Guardrail>>, GuardrailBuildRejection>,
+}
+
+/// How much of a build was construction and how much was reuse. Logged so
+/// an operator (and the e2e suite) can see that an unrelated
+/// configuration write did not reconstruct anything.
+#[derive(Debug, Default, Clone, Copy)]
+struct BuildReuse {
+    constructed: usize,
+    reused: usize,
+}
+
+impl GuardrailInstances {
+    fn instance(
+        &mut self,
+        entry: &Arc<aisix_core::resource::ResourceEntry<DomainGuardrail>>,
+        bedrock_endpoint_url: Option<&str>,
+        embedder: &GuardrailEmbedderSlot,
+        reuse: &mut BuildReuse,
+    ) -> Result<Option<Arc<dyn Guardrail>>, GuardrailBuildRejection> {
+        if let Some(slot) = self.by_id.get(&entry.id) {
+            if Arc::ptr_eq(&slot.row, entry) {
+                reuse.reused += 1;
+                return slot.outcome.clone();
+            }
+        }
+        reuse.constructed += 1;
+        let outcome = match build_one(&entry.value, bedrock_endpoint_url, embedder) {
+            Ok(built) => Ok(built),
+            Err(err) => {
+                tracing::warn!(
+                    guardrail_id = %entry.id,
+                    guardrail_name = %entry.value.name,
+                    error = %err,
+                    "skipping guardrail with invalid config",
+                );
+                Err(GuardrailBuildRejection {
+                    id: entry.id.clone(),
+                    reason: err.status_reason(),
+                })
+            }
+        };
+        self.by_id.insert(
+            entry.id.clone(),
+            MemoSlot {
+                row: Arc::clone(entry),
+                outcome: outcome.clone(),
+            },
+        );
+        outcome
+    }
+
+    /// Forget rows the snapshot no longer carries, so create/delete churn
+    /// cannot grow the memo without bound.
+    fn retain_present(&mut self, guardrails: &ResourceTable<DomainGuardrail>) {
+        self.by_id
+            .retain(|id, _| guardrails.get_by_id(id).is_some());
+    }
+}
+
+/// Build the runtime guardrail for a row, applying its `enforcement_mode`.
+///
+/// `block` (the default) returns the guardrail as-is; `monitor` wraps it
+/// in [`MonitorGuardrail`] so it observes violations without blocking.
+///
+/// Monitor mode is unconditional: a monitored row never blocks, for any
+/// reason. What to do about a failed evaluation is `fail_open`'s job, and
+/// a monitored row does not act on that decision either — an operator who
+/// wants an unreachable provider to refuse traffic is asking for
+/// enforcement, which is what `block` mode is.
 fn build_one(
     row: &DomainGuardrail,
     bedrock_endpoint_url: Option<&str>,
+    embedder: &GuardrailEmbedderSlot,
 ) -> Result<Option<Arc<dyn Guardrail>>, BuildError> {
-    Ok(build_one_inner(row, bedrock_endpoint_url)?
-        .map(|g| apply_enforcement_mode(row, g))
-        .map(|g| apply_mandatory(row, g)))
-}
-
-/// Wrap `inner` in [`MandatoryGuardrail`] when `row.mandatory` is set, so a
-/// fail-open remote guardrail that couldn't reach its upstream blocks
-/// instead of bypassing. A no-op for the default (`mandatory: false`) and
-/// for guardrails that never emit `Bypass` (e.g. keyword) — so it's only
-/// ever paid for by rows that opt in.
-fn apply_mandatory(row: &DomainGuardrail, inner: Arc<dyn Guardrail>) -> Arc<dyn Guardrail> {
-    if row.mandatory {
-        Arc::new(MandatoryGuardrail {
-            row_name: row.name.clone(),
-            inner,
-        })
-    } else {
-        inner
-    }
+    Ok(build_one_inner(row, bedrock_endpoint_url, embedder)?
+        .map(|g| apply_enforcement_mode(row, g)))
 }
 
 /// Wrap `inner` per the row's `enforcement_mode`. See [`build_one`].
@@ -168,6 +298,7 @@ fn apply_enforcement_mode(row: &DomainGuardrail, inner: Arc<dyn Guardrail>) -> A
         "block" => inner,
         "monitor" => Arc::new(MonitorGuardrail {
             row_name: row.name.clone(),
+            kind: row.config.kind_str(),
             inner,
         }),
         other => {
@@ -184,6 +315,7 @@ fn apply_enforcement_mode(row: &DomainGuardrail, inner: Arc<dyn Guardrail>) -> A
 fn build_one_inner(
     row: &DomainGuardrail,
     bedrock_endpoint_url: Option<&str>,
+    embedder: &GuardrailEmbedderSlot,
 ) -> Result<Option<Arc<dyn Guardrail>>, BuildError> {
     match &row.config {
         GuardrailKind::Keyword(cfg) => {
@@ -196,6 +328,7 @@ fn build_one_inner(
                     KeywordPattern::Literal(s) => KeywordRule::literal(s.clone()),
                     KeywordPattern::Regex(s) => {
                         KeywordRule::regex(s).map_err(|e| BuildError::InvalidRegex {
+                            field: "patterns[].value",
                             pattern: s.clone(),
                             source: e,
                         })?
@@ -212,7 +345,7 @@ fn build_one_inner(
                 GuardrailHookPoint::Output => KeywordBlocklist::output_only(rules),
                 GuardrailHookPoint::Both => KeywordBlocklist::new(rules),
             };
-            Ok(Some(Arc::new(blocklist)))
+            Ok(Some(Arc::new(blocklist.with_fail_open(row.fail_open))))
         }
         GuardrailKind::Pii(cfg) => {
             if cfg.detectors.is_empty() && cfg.custom_patterns.is_empty() {
@@ -249,12 +382,23 @@ fn build_one_inner(
                         value: s.to_owned(),
                     })?,
                 };
-                let rule = PiiRule::new(p.name.clone(), &p.regex, action, None).map_err(|e| {
-                    BuildError::InvalidRegex {
+                // `replacement` only means something to a mask rewrite; on a
+                // block-action pattern it would be accepted-but-unread config
+                // (the #962 class), so the row is rejected instead. cp-api
+                // validates the same combination at write time; this covers
+                // the declarative-file source and defends the invariant.
+                if p.replacement.is_some() && action == PiiAction::Block {
+                    return Err(BuildError::ReplacementOnBlock {
+                        name: p.name.clone(),
+                    });
+                }
+                let rule = PiiRule::new(p.name.clone(), &p.regex, action, None)
+                    .map_err(|e| BuildError::InvalidRegex {
+                        field: "custom_patterns[].regex",
                         pattern: p.regex.clone(),
                         source: e,
-                    }
-                })?;
+                    })?
+                    .with_replacement(p.replacement.clone());
                 rules.push(rule);
             }
             let on_exceeded_fail_open = cfg.on_buffer_exceeded == "fail_open";
@@ -263,7 +407,8 @@ fn build_one_inner(
                 row.hook_point,
                 usize::try_from(cfg.max_buffer_bytes).unwrap_or(usize::MAX),
                 on_exceeded_fail_open,
-            );
+            )
+            .with_fail_open(row.fail_open);
             Ok(Some(Arc::new(g)))
         }
         #[cfg(feature = "bedrock")]
@@ -444,6 +589,60 @@ fn build_one_inner(
         }
         #[cfg(not(feature = "presidio"))]
         GuardrailKind::Presidio(_) => Err(BuildError::FeatureDisabled("presidio")),
+        GuardrailKind::Semantic(cfg) => {
+            // A row with neither list can never reach a verdict. Skipping
+            // it here (rather than letting it screen every request to
+            // discover that) keeps it exactly as inert as an empty
+            // keyword blocklist.
+            if cfg.deny_examples.is_empty() && cfg.allow_examples.is_empty() {
+                return Ok(None);
+            }
+            // Unlike the compile-time kinds, this one needs a RUNTIME
+            // capability the guardrails crate cannot supply itself: a
+            // dispatcher for the `embedding`-kind Model the row names.
+            // Without one the row is skipped and warned rather than
+            // silently admitting everything it was meant to screen.
+            let Some(embedder) = embedder.get() else {
+                return Err(BuildError::EmbedderUnavailable);
+            };
+            let g = crate::semantic::SemanticGuardrail::new(
+                &row.name,
+                cfg,
+                row.hook_point,
+                row.fail_open,
+                Arc::clone(embedder),
+            );
+            Ok(Some(Arc::new(g)))
+        }
+        GuardrailKind::Custom(cfg) => {
+            // A whitespace-only script clears the schema's `minLength: 1`
+            // and reaches here; an omitted or empty one is refused by BOTH
+            // schemas, so it never gets this far. It must not build: an
+            // empty module parses, exports no hook, and every hook would
+            // return Allow — a row that looks configured and screens
+            // nothing.
+            if cfg.script.trim().is_empty() {
+                return Err(BuildError::InvalidValue {
+                    field: "script",
+                    value: String::new(),
+                });
+            }
+            // Compiling here (rather than on the first request that hits
+            // the row) keeps the refusal off the request path: it parses
+            // only, so nothing the operator wrote runs on the config-apply
+            // path. The refusal is logged and published through config
+            // status; `aisix validate` reports it synchronously, and cp-api's
+            // own esbuild pass catches it at save time.
+            let g = crate::custom::CustomGuardrail::new(
+                row.name.clone(),
+                cfg,
+                row.hook_point,
+                row.fail_open,
+                embedder.clone(),
+            )
+            .map_err(BuildError::ScriptCompile)?;
+            Ok(Some(Arc::new(g)))
+        }
     }
 }
 
@@ -451,6 +650,7 @@ fn build_one_inner(
 enum BuildError {
     #[error("invalid regex {pattern:?}: {source}")]
     InvalidRegex {
+        field: &'static str,
         pattern: String,
         source: regex::Error,
     },
@@ -459,6 +659,14 @@ enum BuildError {
     /// skipped + warned rather than silently running a weaker policy.
     #[error("invalid {field} value {value:?}")]
     InvalidValue { field: &'static str, value: String },
+    /// A `custom_patterns[].replacement` on a pattern whose effective
+    /// action is `block` — the replacement would never be read (never
+    /// half-honor a knob, #963). Carries the pattern NAME only, never
+    /// the replacement text or a matched value.
+    #[error(
+        "custom_patterns[].replacement requires action=mask (pattern {name:?} resolves to block)"
+    )]
+    ReplacementOnBlock { name: String },
     /// A guardrail kind whose runtime dispatch was compiled out via
     /// feature flags (e.g. a pruned build that excluded `--features bedrock`
     /// or `--features azure-content-safety`). The chain treats the row as
@@ -471,6 +679,39 @@ enum BuildError {
     #[allow(dead_code)]
     #[error("guardrail kind {0:?} not compiled into this build; treating row as disabled")]
     FeatureDisabled(&'static str),
+    /// A `kind: "semantic"` row built by a caller that supplied no
+    /// embedding dispatcher. The operator fix is not a node repair:
+    /// nothing is missing from the node, the chain was built outside
+    /// the proxy (a bare unit-test construction, a tool that only wants
+    /// the compile-time kinds).
+    #[error(
+        "no embedding dispatcher available for the semantic guardrail; \
+         treating row as disabled"
+    )]
+    EmbedderUnavailable,
+    /// A `kind: "custom"` row whose script does not compile. Carries the
+    /// engine's own message, which names the offending line and column, so
+    /// the operator sees the same diagnostic their editor would show.
+    #[error("custom guardrail script does not compile: {0}")]
+    ScriptCompile(crate::custom::CompileError),
+}
+
+impl BuildError {
+    /// Bounded, value-free diagnostic for unauthenticated status surfaces.
+    /// Detailed values remain in the local warning log and validation output.
+    fn status_reason(&self) -> String {
+        let (category, field) = match self {
+            Self::InvalidRegex { field, .. } => ("invalid_regex", *field),
+            Self::InvalidValue { field, .. } => ("invalid_value", *field),
+            Self::ReplacementOnBlock { .. } => {
+                ("incompatible_fields", "custom_patterns[].replacement")
+            }
+            Self::FeatureDisabled(_) => ("feature_disabled", "kind"),
+            Self::EmbedderUnavailable => ("runtime_unavailable", "embedding_model"),
+            Self::ScriptCompile(_) => ("compile_failed", "script"),
+        };
+        format!("guardrail runtime build failed: {category} at config.{field}")
+    }
 }
 
 /// `enforcement_mode: monitor` decorator. Runs the wrapped guardrail exactly
@@ -485,25 +726,22 @@ enum BuildError {
 /// monitor mode observes at end-of-stream without adding hold-back latency,
 /// and it can never weaken a *blocking* peer's hold-back (the chain folds to
 /// the strictest member).
+/// Monitor-hit action for a suppressed mask a real run would have applied.
+const ACTION_WOULD_MASK: &str = "would_mask";
+/// Monitor-hit action for a mask rule that matched at a call site with no
+/// channel to write a mask back: enforcing the rule would not mask either.
+const ACTION_WOULD_MASK_UNSUPPORTED: &str = "would_mask_unsupported";
+
 struct MonitorGuardrail {
     row_name: String,
+    /// Code-owned discriminator used to replace the inner Block reason in
+    /// usage telemetry. Inner reasons can contain operator patterns, remote
+    /// category names, or custom-script data and remain in ops logs only.
+    kind: &'static str,
     inner: Arc<dyn Guardrail>,
 }
 
 impl MonitorGuardrail {
-    /// Keyword verdicts deliberately include the configured literal/regex in
-    /// their ops-only reason. Monitor hits leave the process through usage
-    /// telemetry, so that detail must be replaced with a stable category.
-    /// Other current guardrails construct reasons from detector/category
-    /// names only and retain that useful staging signal.
-    fn telemetry_reason(&self, reason: &str) -> String {
-        if self.inner.name() == "keyword_blocklist" {
-            "keyword policy matched".to_owned()
-        } else {
-            reason.to_owned()
-        }
-    }
-
     /// Log the mask counts a monitor-mode redacting guardrail WOULD have
     /// applied. Counts carry detector names only, never matched values.
     fn observe_redaction(&self, hook: &'static str, r: Option<Redaction>) {
@@ -533,27 +771,39 @@ impl MonitorGuardrail {
     }
 
     /// `would_block` telemetry hit for a downgraded Block (#562).
-    fn would_block_hit(&self, hook: &'static str, reason: &str) -> GuardrailMonitorHit {
+    fn would_block_hit(
+        &self,
+        hook: &'static str,
+        unavailable: Option<&str>,
+    ) -> GuardrailMonitorHit {
+        let reason = match unavailable {
+            Some(tag) => format!("{} guardrail evaluation unavailable ({tag})", self.kind),
+            None => format!("{} guardrail policy matched", self.kind),
+        };
         GuardrailMonitorHit {
             guardrail_name: self.row_name.clone(),
             hook: hook.to_owned(),
             action: "would_block".to_owned(),
-            reason: self.telemetry_reason(reason),
+            reason,
+            error_type: unavailable.unwrap_or_default().to_owned(),
             counts: std::collections::BTreeMap::new(),
         }
     }
 
-    /// `would_mask` telemetry hit for suppressed mask counts.
+    /// `would_mask` (or, where the call site cannot write a mask back,
+    /// `would_mask_unsupported`) telemetry hit for suppressed mask counts.
     fn would_mask_hit(
         &self,
         hook: &'static str,
+        action: &'static str,
         counts: std::collections::BTreeMap<String, u32>,
     ) -> GuardrailMonitorHit {
         GuardrailMonitorHit {
             guardrail_name: self.row_name.clone(),
             hook: hook.to_owned(),
-            action: "would_mask".to_owned(),
+            action: action.to_owned(),
             reason: String::new(),
+            error_type: String::new(),
             counts,
         }
     }
@@ -566,8 +816,11 @@ impl MonitorGuardrail {
         verdict: GuardrailVerdict,
         hits: &mut Vec<GuardrailMonitorHit>,
     ) -> GuardrailVerdict {
-        if let GuardrailVerdict::Block { ref reason, .. } = verdict {
-            hits.push(self.would_block_hit(hook, reason));
+        if let GuardrailVerdict::Block {
+            ref unavailable, ..
+        } = verdict
+        {
+            hits.push(self.would_block_hit(hook, unavailable.as_deref()));
         }
         self.observe(hook, verdict)
     }
@@ -586,7 +839,7 @@ impl MonitorGuardrail {
                 counts = ?outcome.counts,
                 "guardrail in monitor mode observed maskable spans; not redacting (enforcement_mode=monitor)",
             );
-            hits.push(self.would_mask_hit(hook, outcome.counts));
+            hits.push(self.would_mask_hit(hook, ACTION_WOULD_MASK, outcome.counts));
         }
         let verdict = self.observe_hit(hook, outcome.verdict, &mut hits);
         SegmentsOutcome {
@@ -604,6 +857,7 @@ impl MonitorGuardrail {
     fn probe_redaction(
         &self,
         hook: &'static str,
+        action: &'static str,
         redacts: bool,
         redact: impl FnOnce() -> Option<Redaction>,
         hits: &mut Vec<GuardrailMonitorHit>,
@@ -613,9 +867,58 @@ impl MonitorGuardrail {
         }
         let r = redact();
         if let Some(ref red) = r {
-            hits.push(self.would_mask_hit(hook, red.counts.clone()));
+            hits.push(self.would_mask_hit(hook, action, red.counts.clone()));
         }
         self.observe_redaction(hook, r);
+    }
+
+    /// `check_input_observed`, recording a suppressed mask under
+    /// `mask_action`.
+    async fn observe_input(
+        &self,
+        req: &ChatFormat,
+        mask_action: &'static str,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let mut hits = Vec::new();
+        let verdict = self.observe_hit("input", self.inner.check_input(req).await, &mut hits);
+        // Recover the would-mask counts the suppressed sync redactor
+        // (kind=pii) would have produced, from the same text its
+        // check_input scans.
+        let text: String = req
+            .messages
+            .iter()
+            .map(crate::message_scan_text)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.probe_redaction(
+            "input",
+            mask_action,
+            self.inner.redacts_input() && !text.is_empty(),
+            || self.inner.redact_input_text(&text),
+            &mut hits,
+        );
+        (verdict, hits)
+    }
+
+    /// `check_output_observed`, recording a suppressed mask under
+    /// `mask_action`.
+    async fn observe_output(
+        &self,
+        resp: &ChatResponse,
+        mask_action: &'static str,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let mut hits = Vec::new();
+        let verdict = self.observe_hit("output", self.inner.check_output(resp).await, &mut hits);
+        let text = resp.guardrail_output_text();
+        self.probe_redaction(
+            "output",
+            mask_action,
+            self.inner.redacts_output() && !text.is_empty(),
+            || self.inner.redact_output_text(&text),
+            &mut hits,
+        );
+        (verdict, hits)
     }
 }
 
@@ -641,41 +944,29 @@ impl Guardrail for MonitorGuardrail {
         &self,
         req: &ChatFormat,
     ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
-        let mut hits = Vec::new();
-        let verdict = self.observe_hit("input", self.inner.check_input(req).await, &mut hits);
-        // Recover the would-mask counts the suppressed sync redactor
-        // (kind=pii) would have produced, from the same text its
-        // check_input scans.
-        let text: String = req
-            .messages
-            .iter()
-            .map(crate::message_scan_text)
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        self.probe_redaction(
-            "input",
-            self.inner.redacts_input() && !text.is_empty(),
-            || self.inner.redact_input_text(&text),
-            &mut hits,
-        );
-        (verdict, hits)
+        self.observe_input(req, ACTION_WOULD_MASK).await
     }
 
     async fn check_output_observed(
         &self,
         resp: &ChatResponse,
     ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
-        let mut hits = Vec::new();
-        let verdict = self.observe_hit("output", self.inner.check_output(resp).await, &mut hits);
-        let text = resp.guardrail_output_text();
-        self.probe_redaction(
-            "output",
-            self.inner.redacts_output() && !text.is_empty(),
-            || self.inner.redact_output_text(&text),
-            &mut hits,
-        );
-        (verdict, hits)
+        self.observe_output(resp, ACTION_WOULD_MASK).await
+    }
+
+    async fn check_input_unmaskable_observed(
+        &self,
+        req: &ChatFormat,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        self.observe_input(req, ACTION_WOULD_MASK_UNSUPPORTED).await
+    }
+
+    async fn check_output_unmaskable_observed(
+        &self,
+        resp: &ChatResponse,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        self.observe_output(resp, ACTION_WOULD_MASK_UNSUPPORTED)
+            .await
     }
 
     /// Delegate so a monitored segment moderator (bedrock/lakera/presidio)
@@ -686,6 +977,60 @@ impl Guardrail for MonitorGuardrail {
         self.inner.moderates_segments()
     }
 
+    fn checks_local_segments(&self) -> bool {
+        self.inner.checks_local_segments()
+    }
+
+    /// The inner verdict downgraded, plus the counts the suppressed sync
+    /// redactor would have masked over the SAME rewritable segments the
+    /// enforced mask pass rewrites — so a staged rule previews exactly
+    /// what enforcing it does (#1027).
+    fn check_local_segments(
+        &self,
+        segments: &[crate::ScanSegment],
+        input: bool,
+    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
+        let hook = if input { "input" } else { "output" };
+        let (verdict, mut hits) = self.inner.check_local_segments(segments, input);
+        let verdict = self.observe_hit(hook, verdict, &mut hits);
+        let redacts = if input {
+            self.inner.redacts_input()
+        } else {
+            self.inner.redacts_output()
+        };
+        if redacts {
+            let mut counts = std::collections::BTreeMap::new();
+            for seg in segments
+                .iter()
+                .filter(|s| s.role == crate::SegmentRole::Rewritable)
+            {
+                let r = if input {
+                    self.inner.redact_input_text(&seg.text)
+                } else {
+                    self.inner.redact_output_text(&seg.text)
+                };
+                if let Some(r) = r {
+                    Redaction::merge_counts(&mut counts, &r.counts);
+                }
+            }
+            if !counts.is_empty() {
+                self.probe_redaction(
+                    hook,
+                    ACTION_WOULD_MASK,
+                    true,
+                    || {
+                        Some(Redaction {
+                            text: String::new(),
+                            counts,
+                        })
+                    },
+                    &mut hits,
+                );
+            }
+        }
+        (verdict, hits)
+    }
+
     async fn moderate_input_segments(
         &self,
         texts: &[String],
@@ -694,6 +1039,20 @@ impl Guardrail for MonitorGuardrail {
         self.observe_segments(
             "input",
             self.inner.moderate_input_segments(texts, newest_from).await,
+        )
+    }
+
+    async fn moderate_input_segments_for_model(
+        &self,
+        texts: &[String],
+        newest_from: Option<usize>,
+        model: Option<&str>,
+    ) -> SegmentsOutcome {
+        self.observe_segments(
+            "input",
+            self.inner
+                .moderate_input_segments_for_model(texts, newest_from, model)
+                .await,
         )
     }
 
@@ -709,6 +1068,17 @@ impl Guardrail for MonitorGuardrail {
         self.inner.runs_on_output()
     }
 
+    /// Forwarded, NOT forced false. A monitor row still participates in
+    /// the proxy-raised `unscannable_body` refusals — that is a settled
+    /// product decision, not an oversight (monitor mode downgrades a
+    /// guardrail's own verdict, and these refusals have none). Forcing
+    /// either hook predicate to `false` here would also disable
+    /// end-of-stream OBSERVATION, which `responses.rs` gates on
+    /// `runs_on_output`; a monitor row exists precisely to observe.
+    fn runs_on_input(&self) -> bool {
+        self.inner.runs_on_input()
+    }
+
     // Monitor mode never refuses or rewrites a request.
     fn enforces_input(&self) -> bool {
         false
@@ -718,6 +1088,27 @@ impl Guardrail for MonitorGuardrail {
     // would.
     fn checks_input_remotely(&self) -> bool {
         self.inner.checks_input_remotely()
+    }
+
+    fn fails_closed_on_input(&self) -> bool {
+        self.inner.fails_closed_on_input()
+    }
+
+    fn fails_closed_on_output(&self) -> bool {
+        self.inner.fails_closed_on_output()
+    }
+
+    /// Forward the bind and re-wrap. A monitor-mode row is the one an
+    /// operator is actively tuning, so it is the LAST place scores may go
+    /// missing.
+    fn bind_score_log(&self, log: &Arc<crate::GuardrailAuditLog>) -> Option<Arc<dyn Guardrail>> {
+        self.inner.bind_score_log(log).map(|inner| {
+            Arc::new(MonitorGuardrail {
+                row_name: self.row_name.clone(),
+                kind: self.kind,
+                inner,
+            }) as Arc<dyn Guardrail>
+        })
     }
 
     // Monitor mode observes without modifying: redaction is suppressed the
@@ -743,151 +1134,16 @@ impl Guardrail for MonitorGuardrail {
     }
 }
 
-/// `mandatory: true` decorator. A remote guardrail that can't reach its
-/// upstream returns `Bypass` when `fail_open` is set — the request proceeds
-/// unscanned. For a guardrail an operator marked mandatory that fail-open is
-/// the wrong call: the point of `mandatory` is that the rule MUST evaluate,
-/// so an unreachable upstream is a hard failure. This decorator upgrades a
-/// `Bypass` verdict to `Block`, overriding `fail_open` on the failure path.
-/// `Allow` and `Block` pass through unchanged, and only remote guardrails
-/// ever emit `Bypass`, so keyword rows wrapped here are behaviourally
-/// untouched.
+/// Adapter that wraps a snapshot handle and rebuilds the runtime chain
+/// whenever the `guardrails` table changes. The chat handler holds an
+/// `Arc<dyn Guardrail>` pointing at this; it never sees the rebuild.
 ///
-/// Everything else delegates to the inner guardrail — stream policy,
-/// `runs_on_output`, redaction, the segment pass and the monitor-hit
-/// observing checks — so the decorator changes nothing but the verdict a
-/// failed evaluation produces. In particular a masking segment moderator
-/// (bedrock/lakera/presidio/aliyun_ai_guardrail) keeps answering through the segment pass,
-/// where it can mask, rather than the blob check, where a maskable outcome
-/// is a block; and a monitor-mode row keeps its would-* hits.
-struct MandatoryGuardrail {
-    row_name: String,
-    inner: Arc<dyn Guardrail>,
-}
-
-impl MandatoryGuardrail {
-    fn enforce(&self, hook: &'static str, verdict: GuardrailVerdict) -> GuardrailVerdict {
-        match verdict {
-            GuardrailVerdict::Bypass { reason } => {
-                tracing::warn!(
-                    guardrail_name = %self.row_name,
-                    hook,
-                    reason = %reason,
-                    "mandatory guardrail could not evaluate; blocking (mandatory=true overrides fail_open)",
-                );
-                // Carry the row name so downstream handlers can name the
-                // guardrail in the 422 envelope (#519 B.4b) — `block()` would
-                // drop it to `None` and surface an unnamed content-filter block.
-                GuardrailVerdict::Block {
-                    reason: format!("mandatory guardrail unavailable: {reason}"),
-                    guardrail_name: Some(self.row_name.clone()),
-                }
-            }
-            other => other,
-        }
-    }
-}
-
-#[async_trait]
-impl Guardrail for MandatoryGuardrail {
-    fn name(&self) -> &'static str {
-        self.inner.name()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
-        self.enforce("input", self.inner.check_input(req).await)
-    }
-
-    async fn check_output(&self, resp: &ChatResponse) -> GuardrailVerdict {
-        self.enforce("output", self.inner.check_output(resp).await)
-    }
-
-    async fn check_input_observed(
-        &self,
-        req: &ChatFormat,
-    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
-        let (verdict, hits) = self.inner.check_input_observed(req).await;
-        (self.enforce("input", verdict), hits)
-    }
-
-    async fn check_output_observed(
-        &self,
-        resp: &ChatResponse,
-    ) -> (GuardrailVerdict, Vec<GuardrailMonitorHit>) {
-        let (verdict, hits) = self.inner.check_output_observed(resp).await;
-        (self.enforce("output", verdict), hits)
-    }
-
-    fn moderates_segments(&self) -> bool {
-        self.inner.moderates_segments()
-    }
-
-    async fn moderate_input_segments(
-        &self,
-        texts: &[String],
-        newest_from: Option<usize>,
-    ) -> SegmentsOutcome {
-        let mut outcome = self.inner.moderate_input_segments(texts, newest_from).await;
-        outcome.verdict = self.enforce("input", outcome.verdict);
-        outcome
-    }
-
-    async fn moderate_output_segments(&self, texts: &[String]) -> SegmentsOutcome {
-        let mut outcome = self.inner.moderate_output_segments(texts).await;
-        outcome.verdict = self.enforce("output", outcome.verdict);
-        outcome
-    }
-
-    fn stream_output_policy(&self) -> StreamOutputPolicy {
-        self.inner.stream_output_policy()
-    }
-
-    fn runs_on_output(&self) -> bool {
-        self.inner.runs_on_output()
-    }
-
-    fn enforces_input(&self) -> bool {
-        self.inner.enforces_input()
-    }
-
-    fn checks_input_remotely(&self) -> bool {
-        self.inner.checks_input_remotely()
-    }
-
-    // Mandatory only rewrites the failure (Bypass) verdict; redaction
-    // passes straight through to the inner guardrail.
-    fn redacts_input(&self) -> bool {
-        self.inner.redacts_input()
-    }
-
-    fn redacts_output(&self) -> bool {
-        self.inner.redacts_output()
-    }
-
-    fn redact_input_text(&self, text: &str) -> Option<Redaction> {
-        self.inner.redact_input_text(text)
-    }
-
-    fn redact_output_text(&self, text: &str) -> Option<Redaction> {
-        self.inner.redact_output_text(text)
-    }
-}
-
-/// Adapter that wraps a snapshot handle and rebuilds the runtime
-/// chain whenever the snapshot generation changes. The chat handler
-/// holds an `Arc<dyn Guardrail>` pointing at this; it never sees
-/// the rebuild.
-///
-/// Cheap path (cache hit): one atomic load + one generation compare,
-/// then a clone of an `Arc<GuardrailChain>`. Rebuild path (cache
-/// miss): runs through the entries table and recompiles regexes.
-/// Compilation only happens on the first call after each snapshot
-/// store from the etcd supervisor — typical run is one or zero
-/// rebuilds per minute even on a chatty configuration.
+/// Cheap path (cache hit): one snapshot load + one generation compare,
+/// then a clone of an `Arc<GuardrailChain>`. Rebuild path (cache miss):
+/// runs through the entries table, reusing the runtime instance of every
+/// row whose content did not change. Keyed on
+/// [`ResourceTable::generation`] and NOT on the snapshot version, so a
+/// write to any other resource kind rebuilds nothing (#1542).
 ///
 /// `bedrock_endpoint_url` is captured at construct time and reused
 /// on every rebuild; this is a deployment-wide setting (sourced
@@ -896,14 +1152,22 @@ impl Guardrail for MandatoryGuardrail {
 pub struct LiveGuardrailChain {
     snapshot: SnapshotHandle<AisixSnapshot>,
     bedrock_endpoint_url: Option<String>,
+    embedder: GuardrailEmbedderSlot,
+    config_status: Option<ConfigStatus>,
     /// `ArcSwap` for the same reason as [`LiveGuardrailIndex::cache`]: the
-    /// hit path is a version compare and an `Arc` clone, and a process-wide
+    /// hit path is a generation compare and an `Arc` clone, and a process-wide
     /// lock there serializes an otherwise lock-free read path.
     cache: arc_swap::ArcSwap<Cache>,
+    /// Single-flights a rebuild, and owns the row instances a rebuild reuses.
+    /// The hit path never takes it.
+    rebuild: Mutex<GuardrailInstances>,
 }
 
 struct Cache {
-    last_version: u64,
+    /// The `guardrails` table generation the cached chain was built
+    /// from — NOT the snapshot version, which moves on every published
+    /// write of any kind. See [`ResourceTable::generation`].
+    last_generation: u64,
     chain: Arc<GuardrailChain>,
 }
 
@@ -911,36 +1175,77 @@ impl LiveGuardrailChain {
     pub fn new(
         snapshot: SnapshotHandle<AisixSnapshot>,
         bedrock_endpoint_url: Option<String>,
+        embedder: GuardrailEmbedderSlot,
     ) -> Arc<Self> {
-        let view = snapshot.load_versioned();
-        let chain = Arc::new(build_chain_from_snapshot(
-            &view.snapshot.guardrails,
+        Self::new_with_status(snapshot, bedrock_endpoint_url, embedder, None)
+    }
+
+    /// Construct the legacy whole-environment chain with configuration-build
+    /// reporting. Production uses [`LiveGuardrailIndex`], but this exported
+    /// adapter must preserve the same status contract for direct consumers.
+    pub fn new_with_status(
+        snapshot: SnapshotHandle<AisixSnapshot>,
+        bedrock_endpoint_url: Option<String>,
+        embedder: GuardrailEmbedderSlot,
+        config_status: Option<ConfigStatus>,
+    ) -> Arc<Self> {
+        // The generation is read from the snapshot that is built from, so
+        // the two can never disagree — unlike a version read beside the
+        // load, which has to be ordered by hand.
+        let snap = snapshot.load();
+        let last_generation = snap.guardrails.generation();
+        let mut instances = GuardrailInstances::default();
+        let (chain, rejected) = build_chain_from_snapshot_reported(
+            &snap.guardrails,
             bedrock_endpoint_url.as_deref(),
-        ));
+            &embedder,
+            &mut instances,
+        );
+        publish_build_rejections(config_status.as_ref(), rejected);
         Arc::new(Self {
             snapshot,
             bedrock_endpoint_url,
+            embedder,
+            config_status,
             cache: arc_swap::ArcSwap::from_pointee(Cache {
-                last_version: view.version,
-                chain,
+                last_generation,
+                chain: Arc::new(chain),
             }),
+            rebuild: Mutex::new(instances),
         })
     }
 
     fn current(&self) -> Arc<GuardrailChain> {
-        let view = self.snapshot.load_versioned();
+        // Fast path: one snapshot load and one atomic load, no lock.
+        let generation = self.snapshot.load().guardrails.generation();
         let cached = self.cache.load();
-        if cached.last_version >= view.version {
+        if cached.last_generation == generation {
             return Arc::clone(&cached.chain);
         }
-        let chain = Arc::new(build_chain_from_snapshot(
-            &view.snapshot.guardrails,
+
+        let mut instances = self
+            .rebuild
+            .lock()
+            .expect("LiveGuardrailChain mutex poisoned");
+        // Loaded under the lock, so the chain installed is always the one
+        // built from the newest snapshot any caller has seen and an older
+        // build can never replace a newer one.
+        let snap = self.snapshot.load();
+        let generation = snap.guardrails.generation();
+        let cached = self.cache.load();
+        if cached.last_generation == generation {
+            return Arc::clone(&cached.chain);
+        }
+        let (chain, rejected) = build_chain_from_snapshot_reported(
+            &snap.guardrails,
             self.bedrock_endpoint_url.as_deref(),
-        ));
-        // Last writer wins; concurrent rebuilds from the same version are
-        // equivalent.
+            &self.embedder,
+            &mut instances,
+        );
+        publish_build_rejections(self.config_status.as_ref(), rejected);
+        let chain = Arc::new(chain);
         self.cache.store(Arc::new(Cache {
-            last_version: view.version,
+            last_generation: generation,
             chain: Arc::clone(&chain),
         }));
         chain
@@ -983,6 +1288,26 @@ impl Guardrail for LiveGuardrailChain {
         self.current().checks_input_remotely()
     }
 
+    fn runs_on_input(&self) -> bool {
+        self.current().runs_on_input()
+    }
+
+    fn fails_closed_on_input(&self) -> bool {
+        self.current().fails_closed_on_input()
+    }
+
+    fn fails_closed_on_output(&self) -> bool {
+        self.current().fails_closed_on_output()
+    }
+
+    fn refuses_unevaluable_input(&self) -> bool {
+        self.current().refuses_unevaluable_input()
+    }
+
+    fn refuses_unevaluable_output(&self) -> bool {
+        self.current().refuses_unevaluable_output()
+    }
+
     fn redacts_input(&self) -> bool {
         self.current().redacts_input()
     }
@@ -993,6 +1318,17 @@ impl Guardrail for LiveGuardrailChain {
 
     fn redact_input_text(&self, text: &str) -> Option<Redaction> {
         self.current().redact_input_text(text)
+    }
+
+    /// Forwarded for the same reason the hold-back methods above are: the
+    /// trait default would delegate to `redact_input_text`, dropping the
+    /// window and quietly letting an `input_messages: latest_turn` row
+    /// rewrite history. (This wrapper does not forward the segment hooks
+    /// either, which predates this change — it is exported but unused by
+    /// the proxy, which resolves chains through `LiveGuardrailIndex`.)
+    fn redact_input_text_in_turn(&self, text: &str, in_latest_turn: bool) -> Option<Redaction> {
+        self.current()
+            .redact_input_text_in_turn(text, in_latest_turn)
     }
 
     fn redact_output_text(&self, text: &str) -> Option<Redaction> {
@@ -1017,17 +1353,56 @@ impl Guardrail for LiveGuardrailChain {
 ///
 /// The resulting index is pre-sorted by priority (descending) so
 /// `GuardrailIndex::resolve` can walk it linearly.
+///
+/// **Attachments are the whole of a guardrail's scope.** A guardrail with no
+/// enabled attachment governs nothing — it is not a no-op by oversight but by
+/// definition, because an attachment is the only thing that says which traffic
+/// the rule inspects.
+///
+/// This used to have a backward-compat arm that applied a guardrail carrying
+/// ZERO attachment rows to the entire environment at priority 0, for the P0c
+/// rolling-upgrade window where the data plane had attachments and the control
+/// plane had not written any yet. That window closed, and the arm was actively
+/// harmful: because it keyed on the ABSENCE of rows, removing a guardrail's
+/// last attachment WIDENED it. Deleting the one model a guardrail was scoped
+/// to promoted that guardrail to the whole environment (AISIX-Cloud#1450) —
+/// the exact opposite of what the operator asked for, silently, on a security
+/// control. Scope now comes from the attachments and from nothing else.
 pub fn build_index_from_snapshot(
     guardrails: &ResourceTable<DomainGuardrail>,
     attachments: &ResourceTable<GuardrailAttachment>,
     bedrock_endpoint_url: Option<&str>,
+    embedder: &GuardrailEmbedderSlot,
 ) -> GuardrailIndex {
+    build_index_from_snapshot_reported(
+        guardrails,
+        attachments,
+        bedrock_endpoint_url,
+        embedder,
+        &mut GuardrailInstances::default(),
+    )
+    .0
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GuardrailBuildRejection {
+    id: String,
+    reason: String,
+}
+
+/// Build the production index and retain one failure per guardrail row.
+/// Multiple attachments may reference the same row; reporting it once keeps
+/// `/status/config` row-oriented like loader rejections.
+fn build_index_from_snapshot_reported(
+    guardrails: &ResourceTable<DomainGuardrail>,
+    attachments: &ResourceTable<GuardrailAttachment>,
+    bedrock_endpoint_url: Option<&str>,
+    embedder: &GuardrailEmbedderSlot,
+    instances: &mut GuardrailInstances,
+) -> (GuardrailIndex, Vec<GuardrailBuildRejection>, BuildReuse) {
     let mut entries = Vec::new();
-    // Track guardrail IDs that have ANY attachment record (enabled or not).
-    // The backward-compat fallback below only fires for guardrails that have
-    // zero attachment rows — operators who explicitly disabled an attachment
-    // are expressing intent; we must not override it with the env-scope fallback.
-    let mut attached_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut rejected = BTreeMap::<String, GuardrailBuildRejection>::new();
+    let mut reuse = BuildReuse::default();
 
     // Deterministic attachment order: `GuardrailIndex::new` sorts by
     // (priority desc, scope-specificity desc) with a STABLE sort, so
@@ -1040,11 +1415,6 @@ pub fn build_index_from_snapshot(
 
     for attachment_arc in attachment_entries.iter() {
         let attachment = &attachment_arc.value;
-        // Track ALL attachment references (enabled or not) so the backward-compat
-        // fallback below treats "has an explicit attachment" as opt-in to P0c
-        // attachment semantics — even if all attachments are currently disabled.
-        attached_ids.insert(attachment.guardrail_id.clone());
-
         if !attachment.enabled {
             continue;
         }
@@ -1067,18 +1437,18 @@ pub fn build_index_from_snapshot(
             continue;
         }
 
-        let runtime_guardrail = match build_one(row, bedrock_endpoint_url) {
-            Ok(Some(g)) => g,
-            Ok(None) => continue, // inert (e.g. empty keyword list)
-            Err(err) => {
-                tracing::warn!(
-                    guardrail_id = %gid,
-                    error = %err,
-                    "skipping guardrail with invalid config in index build",
-                );
-                continue;
-            }
-        };
+        // One instance per ROW, shared by all its attachments: `build_one`
+        // reads only the row, and everything the attachment contributes
+        // (scope, priority) lands on the index entry below.
+        let runtime_guardrail =
+            match instances.instance(&guardrail_arc, bedrock_endpoint_url, embedder, &mut reuse) {
+                Ok(Some(g)) => g,
+                Ok(None) => continue, // inert (e.g. empty keyword list)
+                Err(rejection) => {
+                    rejected.entry(gid.clone()).or_insert(rejection);
+                    continue;
+                }
+            };
 
         let scope_kind = match attachment.scope_type {
             GuardrailScopeType::Env => ScopeKind::Env,
@@ -1096,103 +1466,353 @@ pub fn build_index_from_snapshot(
             attachment.scope_id.clone(),
             attachment.priority,
             runtime_guardrail,
+            row.input_messages,
             applied_for(row),
         ));
     }
 
-    // Backward compat: a guardrail definition that has no enabled attachment
-    // fires on every request in the env at priority 0 (same as the pre-P0c
-    // behavior where all guardrails in the snapshot were applied globally).
-    // This covers the rolling-upgrade window where the DP has been updated to
-    // P0c but the CP hasn't yet written attachment rows for existing guardrails.
-    //
-    // TODO(P0c-cleanup): Remove this block once the CP is fully rolled out and
-    // guaranteed to write at least one attachment row for every guardrail
-    // (tracked in https://github.com/api7/ai-gateway/issues/417).
-    // After removal, a guardrail with zero attachment rows is a silent no-op —
-    // operators must explicitly attach it to a scope.
-    //
-    // NOTE: the standalone resources-file source (aisix-core::filesource)
-    // deliberately writes NO attachment rows — its v1 format has no
-    // attachment collection, so file-defined guardrails are env-global
-    // through exactly this fallback. Do not remove this block without
-    // giving the file format a scoping surface (or synthesizing env-scope
-    // attachments in the file loader). The file-resource-source e2e pins
-    // that a file-defined guardrail fires.
-    // Same deterministic created_at-ascending order as the chain-build
-    // path: these implicit entries all share priority 0 + env scope, so
-    // without a pre-sort their relative order — and which Block fires
-    // first — would follow the DashMap's arbitrary iteration (#519 B.4a).
-    for guardrail_arc in sorted_guardrail_entries(guardrails) {
-        if attached_ids.contains(guardrail_arc.id.as_str()) {
-            continue; // explicit attachment governs this guardrail
-        }
-        let row = &guardrail_arc.value;
-        if !row.enabled {
-            continue;
-        }
-        match build_one(row, bedrock_endpoint_url) {
-            Ok(Some(g)) => {
-                tracing::info!(
-                    guardrail_id = %guardrail_arc.id,
-                    guardrail_name = %row.name,
-                    "guardrail has no attachment rows; applying as implicit env-scope at priority 0 (backward-compat rolling-upgrade window)",
-                );
-                entries.push(GuardrailIndex::push_entry(
-                    guardrail_arc.id.clone(),
-                    row.name.clone(),
-                    ScopeKind::Env,
-                    None,
-                    0,
-                    g,
-                    applied_for(row),
-                ));
-            }
-            Ok(None) => {}
-            Err(err) => {
-                tracing::warn!(
-                    guardrail_id = %guardrail_arc.id,
-                    error = %err,
-                    "skipping guardrail with invalid config (no-attachment backward-compat path)",
-                );
-            }
-        }
-    }
+    instances.retain_present(guardrails);
+    (
+        GuardrailIndex::from_entries(entries),
+        rejected.into_values().collect(),
+        reuse,
+    )
+}
 
-    GuardrailIndex::from_entries(entries)
+fn publish_build_rejections(
+    config_status: Option<&ConfigStatus>,
+    rejected: Vec<GuardrailBuildRejection>,
+) {
+    let Some(config_status) = config_status else {
+        return;
+    };
+    let seen_at = chrono::Utc::now();
+    config_status.record_build_rejections(
+        rejected
+            .into_iter()
+            .map(|row| IncomingRejection {
+                // Keep the synthetic identity in the heartbeat's kine-key
+                // shape so cp-api can still derive resource_kind/id. The
+                // non-UUID environment segment prevents collision with a
+                // real stored key.
+                identity: format!("/aisix/runtime/guardrails/{}", row.id),
+                resource_kind: "guardrails".to_string(),
+                resource_id: row.id,
+                last_error_kind: "schema_failed".to_string(),
+                last_error: row.reason,
+                seen_at,
+                serving_stale_since: None,
+            })
+            .collect(),
+    );
+}
+
+/// Ids of the enabled guardrails no attachment names — the rows that are
+/// loaded, counted, and inert.
+///
+/// A DISABLED attachment still counts as naming its guardrail: switching an
+/// attachment off is the operator saying "not here, for now", and reporting
+/// that as an oversight would train them to ignore the line.
+fn unattached_ids(
+    guardrails: &ResourceTable<DomainGuardrail>,
+    attachments: &ResourceTable<GuardrailAttachment>,
+) -> Vec<(String, String)> {
+    let attached: std::collections::HashSet<String> = attachments
+        .entries()
+        .into_iter()
+        .map(|a| a.value.guardrail_id.clone())
+        .collect();
+    let mut out: Vec<(String, String)> = guardrails
+        .entries()
+        .into_iter()
+        .filter(|e| e.value.enabled && !attached.contains(e.id.as_str()))
+        .map(|e| (e.id.clone(), e.value.name.clone()))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Names of the enabled-but-unattached guardrails, for `aisix validate` —
+/// the one place an operator looks BEFORE deploying, where the runtime WARN
+/// below has not had a chance to fire yet.
+pub fn unattached_guardrail_names(
+    guardrails: &ResourceTable<DomainGuardrail>,
+    attachments: &ResourceTable<GuardrailAttachment>,
+) -> Vec<String> {
+    unattached_ids(guardrails, attachments)
+        .into_iter()
+        .map(|(_, name)| name)
+        .collect()
+}
+
+/// How long a guardrail must have been present-and-unattached before the
+/// notice is due.
+///
+/// A guardrail and its attachment are separate documents in separate outbox
+/// rows, so every ordinary creation has a build where the data plane holds
+/// the guardrail and not yet its attachment. Reporting there named
+/// correctly-attached guardrails as inspecting nothing — permanently, since
+/// the notice is deduplicated per id for the process lifetime.
+///
+/// The grace is measured in TIME, not in builds. A build is not a unit of
+/// duration: the index is rebuilt on every snapshot version change AND
+/// concurrently by every request that arrives during one rebuild, so two or
+/// more builds fit between the two writes — sometimes within a single
+/// version. Any "seen in the previous build" rule is therefore satisfied
+/// while the attachment is still in flight. Thirty seconds is far above the
+/// gap the control plane leaves — the two documents come from two separate
+/// API calls a client round trip apart, each with an outbox tick behind it,
+/// NOT from one batch — and short enough to name a genuinely inert rule
+/// early in a deployment.
+const UNATTACHED_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often `sweep_unattached_guardrails` should be called. Exported so the
+/// interval and the grace stay legible together: a row is named between one
+/// and two sweeps after the grace expires.
+pub const UNATTACHED_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Which enabled-but-unattached guardrails this build should report, given
+/// when each guardrail id was first SEEN — attached or not — and what has
+/// already been said.
+///
+/// Timing from first sight rather than from first sight *unattached* is what
+/// separates the two states that look identical in one snapshot: a guardrail
+/// whose attachment has not arrived yet, and one whose attachment is gone.
+/// The first is new, so its clock has barely started; the second has been
+/// around, so it is due immediately. Timing from "first seen unattached"
+/// collapses them and makes a deleted attachment wait for a second build —
+/// which, since builds only happen on config changes, means waiting for an
+/// unrelated write that may never come.
+///
+/// Pure, and takes `now`, so the grace is testable without sleeping and
+/// without a tracing subscriber — the shape the retired
+/// `implicit_env_scope_first_seen` helper had, and for the same reason.
+fn unattached_to_report(
+    unattached: &[(String, String)],
+    present_since: &std::collections::HashMap<String, std::time::Instant>,
+    warned: &std::collections::HashSet<String>,
+    now: std::time::Instant,
+) -> Vec<(String, String)> {
+    unattached
+        .iter()
+        .filter(|(id, _)| {
+            !warned.contains(id)
+                && present_since
+                    .get(id)
+                    .is_some_and(|t| now.saturating_duration_since(*t) >= UNATTACHED_GRACE)
+        })
+        .cloned()
+        .collect()
+}
+
+/// (already reported, first build each enabled guardrail id was seen in)
+type UnattachedState = (
+    std::collections::HashSet<String>,
+    std::collections::HashMap<String, std::time::Instant>,
+);
+
+/// Shared by the build-time notice and the startup report so a row named at
+/// boot is not named again by the first rebuild.
+static UNATTACHED_STATE: std::sync::OnceLock<std::sync::Mutex<UnattachedState>> =
+    std::sync::OnceLock::new();
+
+/// Cap on both halves of the state. Beyond it the notice degrades to
+/// silence rather than to repetition — the right direction for a log line.
+const MAX_REMEMBERED: usize = 4096;
+
+fn unattached_state() -> std::sync::MutexGuard<'static, UnattachedState> {
+    // Poison-tolerant: this state only shapes log lines, so a panic while the
+    // lock was held must not wedge every later index build.
+    UNATTACHED_STATE
+        .get_or_init(|| {
+            std::sync::Mutex::new((
+                std::collections::HashSet::new(),
+                std::collections::HashMap::new(),
+            ))
+        })
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Test-only view of the sweep's process-global state. The cap it exists to
+/// check is on the CUMULATIVE set, so nothing short of driving real sweeps
+/// across several generations of ids can see it.
+#[cfg(test)]
+fn unattached_state_for_test() -> (usize, usize) {
+    let guard = unattached_state();
+    (guard.0.len(), guard.1.len())
+}
+
+/// Test-only: backdate the presence stamps so a sweep sees rows that have
+/// already outlived the grace, instead of the test sleeping through it.
+#[cfg(test)]
+fn backdate_unattached_stamps_for_test() {
+    let mut guard = unattached_state();
+    let aged = std::time::Instant::now()
+        .checked_sub(UNATTACHED_GRACE * 2)
+        .expect("test clock is past the grace");
+    for stamp in guard.1.values_mut() {
+        *stamp = aged;
+    }
+}
+
+fn emit_unattached_notice(id: &str, name: &str) {
+    tracing::warn!(
+        guardrail_id = %id,
+        guardrail_name = %name,
+        "guardrail is enabled but has no attachment, so it inspects no traffic; \
+         attach it to an environment, model, MCP server, API key, team or \
+         passthrough route to put it in force",
+    );
+}
+
+/// The presence timestamps for the next sweep: every enabled guardrail id,
+/// keeping the timestamp an id already had.
+///
+/// Attached rows are timestamped too, and that is the whole point — the
+/// stamp says "when this row appeared", which is what tells a guardrail
+/// whose attachment has not arrived yet from one whose attachment is gone.
+/// Stamping only the unattached ones collapses the two and makes a deleted
+/// attachment serve out a fresh grace, as if the rule were new.
+///
+/// Sorted before the cap so truncation keeps the same ids each sweep,
+/// rather than letting rows drift in and out and restart their clocks.
+fn presence_timestamps(
+    guardrails: &ResourceTable<DomainGuardrail>,
+    previous: &std::collections::HashMap<String, std::time::Instant>,
+    now: std::time::Instant,
+) -> std::collections::HashMap<String, std::time::Instant> {
+    let mut enabled: Vec<String> = guardrails
+        .entries()
+        .into_iter()
+        .filter(|e| e.value.enabled)
+        .map(|e| e.id.clone())
+        .collect();
+    enabled.sort();
+    enabled
+        .into_iter()
+        .take(MAX_REMEMBERED)
+        .map(|id| {
+            let since = previous.get(&id).copied().unwrap_or(now);
+            (id, since)
+        })
+        .collect()
+}
+
+/// Name the enabled guardrails that have been attached to nothing for longer
+/// than the grace. Called on a timer; see `UNATTACHED_GRACE`.
+///
+/// A TIMER, and not the index build it used to ride on, because the thing
+/// being reported does not coincide with a configuration change. A build
+/// happens only when the snapshot version moves, so a notice emitted from
+/// one can only ever be delivered by somebody writing something — and the
+/// two cases that matter most are exactly the ones where nobody does:
+///
+///   - a scope target is deleted, its attachment goes with it, and the rule
+///     that was screening traffic yesterday is now inert. The delete itself
+///     is one version change, and if the row is younger than the grace at
+///     that moment the notice is not yet due; the next build may be days
+///     away, or never.
+///   - a gateway restarts onto standing configuration. Nothing has changed,
+///     so nothing rebuilds, so nothing is said.
+///
+/// Riding the build also put the emit on the request path, where
+/// `LiveGuardrailIndex::current()` built outside the lock and every request
+/// arriving during one rebuild ran its own — which is how the original
+/// "seen in two consecutive builds" rule managed to see two builds inside a
+/// single snapshot version. That build is single-flighted now
+/// (AISIX-Cloud#1542), but the timer is what makes the two cases above
+/// reportable at all, so it stays.
+pub fn sweep_unattached_guardrails(
+    guardrails: &ResourceTable<DomainGuardrail>,
+    attachments: &ResourceTable<GuardrailAttachment>,
+) {
+    let mut guard = unattached_state();
+    let (warned, present_since) = &mut *guard;
+
+    let now = std::time::Instant::now();
+    let unattached = unattached_ids(guardrails, attachments);
+    let next = presence_timestamps(guardrails, present_since, now);
+
+    for (id, name) in unattached_to_report(&unattached, &next, warned, now) {
+        // Stop rather than emit-without-remembering. `next` caps what ONE
+        // sweep can stamp, but `warned` is the union across every sweep, so
+        // it grows with each generation of ids and nothing bounds it —
+        // ~4096 rows reported, deleted, replaced, reported again. Skipping
+        // only the insert would keep emitting and re-emit the same row on
+        // every sweep from then on, which is a log flood rather than the
+        // silence this cap promises.
+        if warned.len() >= MAX_REMEMBERED {
+            break;
+        }
+        emit_unattached_notice(&id, &name);
+        warned.insert(id);
+    }
+    // Rebuilt rather than merged, so a guardrail that left the snapshot
+    // drops out and one that comes back starts a fresh clock.
+    *present_since = next;
 }
 
 // ---------------------------------------------------------------------------
 // LiveGuardrailIndex — lazy-rebuild adapter over a snapshot handle
 // ---------------------------------------------------------------------------
 
-/// Wraps a snapshot handle and rebuilds the runtime index whenever the
-/// snapshot generation changes. The proxy chat handler calls `resolve(ctx)`
-/// on each request to get the applicable `GuardrailChain`.
+/// Wraps a snapshot handle and rebuilds the runtime index when — and only
+/// when — the `guardrails` or `guardrail_attachments` table changes. The
+/// endpoint handlers call `resolve(ctx)` on each request to get the
+/// applicable `GuardrailChain`.
 ///
-/// Rebuild semantics are identical to `LiveGuardrailChain`: one atomic
-/// publication load + one generation compare on the hot path; a full index build (linear
-/// in the number of attachment rows) only on the first call after each
-/// snapshot swap.
+/// Hot path: one snapshot load, one generation-pair compare, one `Arc`
+/// clone. A rebuild walks the attachment rows and constructs a runtime
+/// instance only for guardrail rows whose content changed, single-flighted
+/// across every worker thread. Keying on the tables the build reads,
+/// rather than on the snapshot version, is what keeps an unrelated
+/// configuration write off the request path (#1542).
 pub struct LiveGuardrailIndex {
     snapshot: SnapshotHandle<AisixSnapshot>,
     bedrock_endpoint_url: Option<String>,
+    embedder: GuardrailEmbedderSlot,
     /// Per-execution telemetry receiver, attached to every resolved chain
     /// (#1076). `None` (tests, standalone construction) records
     /// nothing; the server bootstrap wires the metrics layer's sink.
     metrics_sink: Option<Arc<dyn aisix_core::GuardrailMetricsSink>>,
+    /// Load-observability handle. Production supplies it so a row that
+    /// passes the lenient loader but fails runtime construction is visible on
+    /// `/status/config` and the managed heartbeat.
+    config_status: Option<ConfigStatus>,
     /// `ArcSwap`, not a `Mutex`: `current()` runs on every request just to
-    /// compare a version and clone an `Arc`, and on a thread-per-core
-    /// deployment a process-wide lock there is the one place the otherwise
-    /// lock-free read path serializes. A concurrent rebuild is harmless —
-    /// both writers build an equivalent index from the same snapshot
-    /// version — so last-writer-wins needs no extra synchronization.
+    /// compare a key and clone an `Arc`, and on a thread-per-core deployment
+    /// a process-wide lock there is the one place the otherwise lock-free
+    /// read path serializes. A miss takes [`Self::rebuild`].
     cache: arc_swap::ArcSwap<IndexCache>,
+    /// Single-flights a rebuild, and owns the row instances a rebuild reuses.
+    /// The hit path never takes it.
+    rebuild: Mutex<GuardrailInstances>,
+    /// Index builds this instance has run. The observable behind the
+    /// invalidation and single-flight contracts — "an unrelated
+    /// configuration write did not rebuild anything" has no other
+    /// externally visible form.
+    rebuilds: std::sync::atomic::AtomicU64,
 }
 
 struct IndexCache {
-    last_version: u64,
+    /// The `(guardrails, guardrail_attachments)` table generations the
+    /// cached index was built from. Keying on these instead of the
+    /// snapshot version is the whole point: the version moves on every
+    /// published write of ANY kind, so an API-key edit used to invalidate
+    /// the index and make the next request on each worker thread rebuild
+    /// every enabled attachment synchronously (#1542).
+    last_key: (u64, u64),
     index: Arc<GuardrailIndex>,
+}
+
+/// The invalidation key for [`IndexCache`]: the generations of exactly
+/// the two tables [`build_index_from_snapshot_reported`] reads.
+fn index_key(snap: &AisixSnapshot) -> (u64, u64) {
+    (
+        snap.guardrails.generation(),
+        snap.guardrail_attachments.generation(),
+    )
 }
 
 impl LiveGuardrailIndex {
@@ -1200,62 +1820,131 @@ impl LiveGuardrailIndex {
         snapshot: SnapshotHandle<AisixSnapshot>,
         bedrock_endpoint_url: Option<String>,
     ) -> Arc<Self> {
-        Self::new_with_sink(snapshot, bedrock_endpoint_url, None)
+        Self::new_with_sink(
+            snapshot,
+            bedrock_endpoint_url,
+            None,
+            GuardrailEmbedderSlot::none(),
+        )
     }
 
     /// Like [`LiveGuardrailIndex::new`], also attaching a metrics sink to
-    /// every chain [`LiveGuardrailIndex::resolve`] hands out.
+    /// every chain [`LiveGuardrailIndex::resolve`] hands out and the
+    /// process's embedding dispatcher for `kind: "semantic"` rows.
     pub fn new_with_sink(
         snapshot: SnapshotHandle<AisixSnapshot>,
         bedrock_endpoint_url: Option<String>,
         metrics_sink: Option<Arc<dyn aisix_core::GuardrailMetricsSink>>,
+        embedder: GuardrailEmbedderSlot,
     ) -> Arc<Self> {
-        let view = snapshot.load_versioned();
-        let index = Arc::new(build_index_from_snapshot(
-            &view.snapshot.guardrails,
-            &view.snapshot.guardrail_attachments,
+        Self::new_with_sink_and_status(snapshot, bedrock_endpoint_url, metrics_sink, embedder, None)
+    }
+
+    /// Production constructor: additionally reports lazy index-build
+    /// failures through the shared configuration status.
+    pub fn new_with_sink_and_status(
+        snapshot: SnapshotHandle<AisixSnapshot>,
+        bedrock_endpoint_url: Option<String>,
+        metrics_sink: Option<Arc<dyn aisix_core::GuardrailMetricsSink>>,
+        embedder: GuardrailEmbedderSlot,
+        config_status: Option<ConfigStatus>,
+    ) -> Arc<Self> {
+        let snap = snapshot.load();
+        let last_key = index_key(&snap);
+        let mut instances = GuardrailInstances::default();
+        let (index, rejected, _) = build_index_from_snapshot_reported(
+            &snap.guardrails,
+            &snap.guardrail_attachments,
             bedrock_endpoint_url.as_deref(),
-        ));
+            &embedder,
+            &mut instances,
+        );
+        publish_build_rejections(config_status.as_ref(), rejected);
         Arc::new(Self {
             snapshot,
             bedrock_endpoint_url,
+            embedder,
             metrics_sink,
+            config_status,
             cache: arc_swap::ArcSwap::from_pointee(IndexCache {
-                last_version: view.version,
-                index,
+                last_key,
+                index: Arc::new(index),
             }),
+            rebuild: Mutex::new(instances),
+            rebuilds: std::sync::atomic::AtomicU64::new(1),
         })
     }
 
-    fn current(&self) -> Arc<GuardrailIndex> {
-        let view = self.snapshot.load_versioned();
+    /// Index builds run so far, the first (in the constructor) included.
+    #[cfg(test)]
+    fn rebuilds(&self) -> u64 {
+        self.rebuilds.load(std::sync::atomic::Ordering::Relaxed)
+    }
 
-        // Fast path: one atomic load, no lock.
+    /// The index for the current snapshot, rebuilding it only when the
+    /// guardrail or attachment tables actually changed.
+    ///
+    /// The hit path takes no lock. A miss is bounded: one build per call at
+    /// most, and no retry loop. The build runs under [`Self::rebuild`], which
+    /// single-flights it — concurrent callers on every worker thread used to
+    /// each run their own — and makes the install trivially monotonic,
+    /// because the snapshot a build reads is loaded while holding that same
+    /// lock and `load` never goes backwards. The previous shape read the
+    /// version outside the lock, discarded any build whose snapshot moved
+    /// underneath it, and started over with no bound on the number of
+    /// attempts; a bulk configuration edit kept that loop going while the
+    /// worker's current-thread runtime could not schedule anything else,
+    /// `/livez` included (#1542).
+    fn current(&self) -> Arc<GuardrailIndex> {
+        let key = index_key(&self.snapshot.load());
         let cached = self.cache.load();
-        if cached.last_version >= view.version {
+        if cached.last_key == key {
             return Arc::clone(&cached.index);
         }
 
-        let new_index = Arc::new(build_index_from_snapshot(
-            &view.snapshot.guardrails,
-            &view.snapshot.guardrail_attachments,
+        let mut instances = self
+            .rebuild
+            .lock()
+            .expect("LiveGuardrailIndex mutex poisoned");
+        let snap = self.snapshot.load();
+        let key = index_key(&snap);
+        let cached = self.cache.load();
+        if cached.last_key == key {
+            return Arc::clone(&cached.index);
+        }
+        let (new_index, rejected, reuse) = build_index_from_snapshot_reported(
+            &snap.guardrails,
+            &snap.guardrail_attachments,
             self.bedrock_endpoint_url.as_deref(),
-        ));
-
-        // Last writer wins; both writers built from the same version, and a
-        // stale-but-newer entry can only be replaced by an equal one.
+            &self.embedder,
+            &mut instances,
+        );
+        tracing::info!(
+            guardrails = snap.guardrails.len(),
+            attachments = snap.guardrail_attachments.len(),
+            entries = new_index.len(),
+            constructed = reuse.constructed,
+            reused = reuse.reused,
+            "guardrail index rebuilt",
+        );
+        let new_index = Arc::new(new_index);
         self.cache.store(Arc::new(IndexCache {
-            last_version: view.version,
+            last_key: key,
             index: Arc::clone(&new_index),
         }));
+        self.rebuilds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Published under the same lock so the cache and the reported
+        // rejection state advance together.
+        publish_build_rejections(self.config_status.as_ref(), rejected);
         new_index
     }
 
     /// Resolve the guardrail chain applicable to `ctx`.
     ///
-    /// Cheap on the cache-hit path (one atomic load + version compare +
+    /// Cheap on the cache-hit path (one atomic load + key compare +
     /// arc clone + `O(n)` linear walk over attachment rows). Rebuilds only
-    /// on snapshot version change.
+    /// when the guardrail or attachment tables change.
     ///
     /// An empty index (no guardrails configured — the default) resolves
     /// to the same empty chain for every request, so that case returns
@@ -1268,15 +1957,25 @@ impl LiveGuardrailIndex {
         if index.is_empty() {
             return GuardrailChain::empty();
         }
-        index
+        let chain = index
             .resolve(ctx)
-            .with_metrics_sink(self.metrics_sink.clone())
+            .with_metrics_sink(self.metrics_sink.clone());
+        // A fresh audit log per resolve — and a chain is resolved exactly
+        // once per request — is what makes the log request-scoped
+        // (AISIX-Cloud#1330). Skipped when nothing matched: a non-empty
+        // index still resolves to an empty chain for every request outside
+        // the scope of its one team-scoped row, and those must not pay an
+        // allocation for a log no member can ever write to.
+        if chain.is_empty() {
+            return chain;
+        }
+        let log = crate::GuardrailAuditLog::for_applied(chain.applied().to_vec());
+        chain.with_audit_log(Some(Arc::new(log)))
     }
 
-    /// `true` when the resolved index has no guardrail entries — neither
-    /// from explicit attachment rows nor from the backward-compat implicit
-    /// env-scope fallback for no-attachment guardrails. Callers can use
-    /// this to skip chain allocation on the hot path.
+    /// `true` when the index has no entries — no enabled attachment names a
+    /// guardrail this build can run. Callers use it to skip chain allocation
+    /// on the hot path.
     pub fn is_empty(&self) -> bool {
         self.current().is_empty()
     }
@@ -1295,12 +1994,51 @@ mod tests {
         ResourceEntry::new(id, row, 1)
     }
 
+    #[test]
+    fn an_empty_custom_script_is_rejected_rather_than_admitting_everything() {
+        // `script` defaults at the type level so a row an older or broken
+        // writer produced still deserializes (AGENTS.md), which makes the
+        // empty case reachable here. An empty ES module parses and exports
+        // nothing, so every hook would return Allow — a row that reads as
+        // configured and screens nothing. It must not build.
+        let row = parse(
+            r#"{
+                "id": "00000000-0000-0000-0000-0000000000ff",
+                "name": "empty-script",
+                "enabled": true,
+                "hook_point": "both",
+                "kind": "custom",
+                "script": "   "
+            }"#,
+        );
+        match build_one(&row, None, &GuardrailEmbedderSlot::none()) {
+            Err(BuildError::InvalidValue {
+                field: "script", ..
+            }) => {}
+            Err(other) => panic!("wrong error: {other:?}"),
+            Ok(_) => panic!("an empty script must not build"),
+        }
+    }
+
     fn parse(json: &str) -> DomainGuardrail {
         serde_json::from_str(json).unwrap()
     }
 
     fn req(msg: &str) -> ChatFormat {
         ChatFormat::new("m", vec![ChatMessage::user(msg)])
+    }
+
+    fn resp(text: &str) -> ChatResponse {
+        ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
+            id: "r".into(),
+            model: "m".into(),
+            message: ChatMessage::assistant(text),
+            finish_reason: aisix_gateway::FinishReason::Stop,
+            usage: aisix_gateway::UsageStats::new(0, 0),
+            service_tier: None,
+        }
     }
 
     #[tokio::test]
@@ -1319,7 +2057,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None);
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
         assert_eq!(chain.len(), 1);
         let v = chain.check_input(&req("here is AKIAEXAMPLE")).await;
         assert!(v.is_block());
@@ -1344,7 +2082,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None);
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
         assert_eq!(chain.len(), 1, "monitor-mode row still materialises");
         // Would block under `block` mode; monitor downgrades to Allow.
         let v = chain.check_input(&req("here is AKIAEXAMPLE")).await;
@@ -1352,11 +2090,14 @@ mod tests {
         assert_eq!(v, GuardrailVerdict::Allow);
         // Output hook is monitored the same way.
         let resp = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "r".into(),
             model: "m".into(),
             message: ChatMessage::assistant("leaking AKIAEXAMPLE"),
             finish_reason: aisix_gateway::FinishReason::Stop,
             usage: aisix_gateway::UsageStats::new(0, 0),
+            service_tier: None,
         };
         assert!(!chain.check_output(&resp).await.is_block());
     }
@@ -1383,7 +2124,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None);
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
 
         // mask-action detector match → would_mask hit with counts.
         let (v, hits) = chain
@@ -1400,16 +2141,14 @@ mod tests {
             "matched value must never ride a hit",
         );
 
-        // block-action detector match → would_block hit carrying the reason.
+        // block-action detector match → would_block hit carrying only a
+        // code-owned summary, not the detector or matched value.
         let (v, hits) = chain.check_input_observed(&req("ssn 123-45-6789")).await;
         assert_eq!(v, GuardrailVerdict::Allow);
         assert_eq!(hits.len(), 1, "hits: {hits:?}");
         assert_eq!(hits[0].action, "would_block");
-        assert!(
-            hits[0].reason.contains("us_ssn"),
-            "reason: {}",
-            hits[0].reason
-        );
+        assert_eq!(hits[0].reason, "pii guardrail policy matched");
+        assert!(!hits[0].reason.contains("us_ssn"));
         assert!(!hits[0].reason.contains("123-45-6789"));
 
         // clean input → no hits.
@@ -1433,7 +2172,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None);
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
 
         let (verdict, hits) = chain
             .check_input_observed(&req("contains tenant-secret-pattern"))
@@ -1442,8 +2181,210 @@ mod tests {
         assert_eq!(verdict, GuardrailVerdict::Allow);
         assert_eq!(hits.len(), 1, "hits: {hits:?}");
         assert_eq!(hits[0].action, "would_block");
-        assert_eq!(hits[0].reason, "keyword policy matched");
+        assert_eq!(hits[0].reason, "keyword guardrail policy matched");
         assert!(!format!("{hits:?}").contains("tenant-secret-pattern"));
+    }
+
+    #[tokio::test]
+    async fn custom_monitor_reason_cannot_enter_usage_telemetry() {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "custom-monitor",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "custom-monitor",
+                    "enforcement_mode": "monitor",
+                    "kind": "custom",
+                    "secrets": {"TOKEN": "telemetry-secret"},
+                    "script": "export function checkInput(ctx) { return { action: 'block', reason: ctx.secrets.TOKEN + ':' + ctx.text }; }"
+                }"#,
+            ),
+        ));
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+
+        let (verdict, hits) = chain
+            .check_input_observed(&req("customer-private-text"))
+            .await;
+        assert_eq!(verdict, GuardrailVerdict::Allow);
+        assert_eq!(hits.len(), 1, "hits: {hits:?}");
+        assert_eq!(hits[0].action, "would_block");
+        assert_eq!(hits[0].reason, "custom guardrail policy matched");
+        let wire = serde_json::to_string(&hits).unwrap();
+        assert!(!wire.contains("telemetry-secret"), "{wire}");
+        assert!(!wire.contains("customer-private-text"), "{wire}");
+    }
+
+    /// A monitor-mode row must hand the addressed model through to its
+    /// script on the segment pass, or a staged model policy never records
+    /// the hit it would enforce.
+    #[tokio::test]
+    async fn custom_monitor_passes_the_model_through_the_segment_pass() {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "custom-monitor-model",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "custom-monitor-model",
+                    "enforcement_mode": "monitor",
+                    "kind": "custom",
+                    "script": "export function checkInput(ctx) { return ctx.model === 'restricted' ? { action: 'block' } : { action: 'none' }; }"
+                }"#,
+            ),
+        ));
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let outcome = chain
+            .moderate_input_segments_for_model(&["hi".to_owned()], None, Some("restricted"))
+            .await;
+        assert_eq!(outcome.verdict, GuardrailVerdict::Allow);
+        assert_eq!(outcome.monitor_hits.len(), 1, "{:?}", outcome.monitor_hits);
+        assert_eq!(outcome.monitor_hits[0].action, "would_block");
+    }
+
+    #[tokio::test]
+    async fn custom_monitor_preserves_each_safe_failure_tag() {
+        #[derive(Default)]
+        struct ErrorTypes(std::sync::Mutex<Vec<Option<String>>>);
+
+        impl aisix_core::GuardrailMetricsSink for ErrorTypes {
+            fn record_guardrail_execution(&self, exec: &aisix_core::GuardrailExecution<'_>) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(exec.error_type.map(str::to_owned));
+            }
+            fn record_guardrail_bypass(&self, _reason: &str) {}
+        }
+
+        for (script, tag) in [
+            (
+                "export function checkInput() { return { action: 'maybe' }; }",
+                "custom_unknown_action",
+            ),
+            (
+                "export function checkInput() { return {}; }",
+                "custom_no_verdict",
+            ),
+        ] {
+            let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+            table.insert(entry(
+                "custom-monitor",
+                "g-1",
+                serde_json::from_value(serde_json::json!({
+                    "name": "custom-monitor",
+                    "enforcement_mode": "monitor",
+                    "kind": "custom",
+                    "script": script,
+                }))
+                .unwrap(),
+            ));
+            let sink = Arc::new(ErrorTypes::default());
+            let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none())
+                .with_metrics_sink(Some(sink.clone()));
+
+            let (verdict, hits) = chain.check_input_observed(&req("anything")).await;
+            assert_eq!(verdict, GuardrailVerdict::Allow);
+            assert_eq!(hits.len(), 1, "{tag}: {hits:?}");
+            assert_eq!(hits[0].error_type, tag);
+            assert_eq!(
+                hits[0].reason,
+                format!("custom guardrail evaluation unavailable ({tag})")
+            );
+            let wire = serde_json::to_string(&hits).unwrap();
+            assert!(wire.contains(tag), "{wire}");
+            assert!(!wire.contains("error_type"), "{wire}");
+            assert_eq!(
+                *sink.0.lock().unwrap(),
+                vec![Some(tag.to_owned())],
+                "{tag} must reach the histogram label",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn keyword_monitor_reason_cannot_enter_usage_telemetry() {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "keyword-monitor",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "keyword-monitor",
+                    "enforcement_mode": "monitor",
+                    "kind": "keyword",
+                    "patterns": [{ "kind": "literal", "value": "customer-private-pattern" }]
+                }"#,
+            ),
+        ));
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+
+        let (verdict, hits) = chain
+            .check_input_observed(&req("prefix customer-private-pattern suffix"))
+            .await;
+        assert_eq!(verdict, GuardrailVerdict::Allow);
+        assert_eq!(hits.len(), 1, "hits: {hits:?}");
+        assert_eq!(hits[0].reason, "keyword guardrail policy matched");
+        let wire = serde_json::to_string(&hits).unwrap();
+        assert!(!wire.contains("customer-private-pattern"), "{wire}");
+        assert!(!wire.contains("prefix"), "{wire}");
+    }
+
+    fn custom_mask_table(enforcement_mode: &str) -> ResourceTable<DomainGuardrail> {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "custom-mask",
+            "g-1",
+            parse(&format!(
+                r#"{{
+                    "name": "custom-mask",
+                    "enforcement_mode": "{enforcement_mode}",
+                    "kind": "custom",
+                    "secrets": {{"TOKEN": "telemetry-secret"}},
+                    "script": "export function checkInput(ctx) {{ const key = ctx.secrets.TOKEN + ':' + ctx.text; return {{ action: 'mask', segments: ctx.segments.map(() => '***'), counts: {{ [key]: 4294967295 }} }}; }}"
+                }}"#,
+            )),
+        ));
+        table
+    }
+
+    #[tokio::test]
+    async fn custom_monitor_mask_uses_code_owned_counts() {
+        let table = custom_mask_table("monitor");
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        let original = vec!["customer-private-text".to_owned()];
+
+        let outcome = chain.moderate_input_segments(&original, None).await;
+        assert_eq!(outcome.verdict, GuardrailVerdict::Allow);
+        assert_eq!(outcome.masked, None, "monitor mode must not rewrite");
+        assert!(outcome.counts.is_empty(), "monitor counts are not applied");
+        assert_eq!(outcome.monitor_hits.len(), 1, "{outcome:?}");
+        assert_eq!(outcome.monitor_hits[0].action, "would_mask");
+        assert_eq!(outcome.monitor_hits[0].counts.get("custom"), Some(&1));
+        let wire = serde_json::to_string(&outcome.monitor_hits).unwrap();
+        assert!(!wire.contains("telemetry-secret"), "{wire}");
+        assert!(!wire.contains("customer-private-text"), "{wire}");
+        assert!(!wire.contains("4294967295"), "{wire}");
+    }
+
+    #[tokio::test]
+    async fn custom_enforced_mask_uses_code_owned_counts() {
+        let table = custom_mask_table("block");
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none())
+            .with_audit_log(Some(Arc::new(crate::GuardrailAuditLog::new())));
+        let original = vec!["customer-private-text".to_owned()];
+
+        let outcome = chain.moderate_input_segments(&original, None).await;
+        assert_eq!(outcome.verdict, GuardrailVerdict::Allow);
+        assert_eq!(outcome.masked, Some(vec!["***".to_owned()]));
+        assert_eq!(outcome.counts.get("custom"), Some(&1));
+        let hits = chain.enforced_hits();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].counts.get("custom"), Some(&1));
+        let wire = serde_json::to_string(&(outcome.counts, hits)).unwrap();
+        assert!(!wire.contains("telemetry-secret"), "{wire}");
+        assert!(!wire.contains("customer-private-text"), "{wire}");
+        assert!(!wire.contains("4294967295"), "{wire}");
     }
 
     /// An ENFORCING (block-mode) guardrail must not produce monitor hits —
@@ -1462,7 +2403,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None);
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
         let (v, hits) = chain
             .check_input_observed(&req("here is AKIAEXAMPLE"))
             .await;
@@ -1500,7 +2441,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None);
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
         let (v, hits) = chain
             .check_input_observed(&req("here is AKIAEXAMPLE"))
             .await;
@@ -1534,7 +2475,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None);
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
         assert!(
             !chain.stream_output_policy().holds_back(),
             "monitor-mode output rule must not hold the stream back",
@@ -1561,7 +2502,7 @@ mod tests {
                     )),
                 ));
             }
-            build_chain_from_snapshot(&table, None)
+            build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none())
         };
         assert!(chain_of(&[("input", "block")]).enforces_input());
         assert!(chain_of(&[("both", "block")]).enforces_input());
@@ -1588,7 +2529,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None);
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
         assert!(
             chain
                 .check_input(&req("here is AKIAEXAMPLE"))
@@ -1598,209 +2539,173 @@ mod tests {
         );
     }
 
-    /// A stub remote guardrail that always fails open (returns `Bypass`),
-    /// standing in for a Bedrock/Azure guardrail whose upstream is down.
-    struct AlwaysBypass;
-    #[async_trait]
-    impl Guardrail for AlwaysBypass {
-        fn name(&self) -> &'static str {
-            "always-bypass"
-        }
-        async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
-            GuardrailVerdict::Bypass {
-                reason: "upstream_unreachable".into(),
-            }
-        }
-        async fn check_output(&self, _resp: &ChatResponse) -> GuardrailVerdict {
-            GuardrailVerdict::Bypass {
-                reason: "upstream_unreachable".into(),
-            }
+    /// AISIX-Cloud#1334: a capture-group custom pattern with a
+    /// `replacement` builds and rewrites only group 1 through the chain.
+    #[test]
+    fn pii_custom_pattern_replacement_and_group_build_from_row() {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "eda",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "eda",
+                    "kind": "pii",
+                    "custom_patterns": [{
+                        "name": "eda_version",
+                        "regex": "version\\s*:\\s*(\\d+(?:\\.\\d+)+)",
+                        "action": "mask",
+                        "replacement": "***"
+                    }]
+                }"#,
+            ),
+        ));
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+        assert_eq!(chain.len(), 1);
+        let r = chain.redact_input_text("tool version: 12.1 done").unwrap();
+        assert_eq!(r.text, "tool version: *** done");
+    }
+
+    fn seg(text: &str, role: crate::SegmentRole) -> crate::ScanSegment {
+        crate::ScanSegment {
+            text: text.to_owned(),
+            role,
+            in_latest_turn: true,
         }
     }
 
-    fn row_with_mandatory(mandatory: bool) -> DomainGuardrail {
-        let mut v = serde_json::json!({
-            "name": "remote",
-            "kind": "keyword",
-            "patterns": [{ "kind": "literal", "value": "x" }],
-        });
-        if mandatory {
-            v["mandatory"] = serde_json::Value::Bool(true);
-        }
-        serde_json::from_value(v).unwrap()
+    fn pii_chain(enforcement_mode: &str, action: &str) -> GuardrailChain {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "pin",
+            "g-1",
+            parse(&format!(
+                r#"{{
+                    "name": "pin",
+                    "kind": "pii",
+                    "enforcement_mode": "{enforcement_mode}",
+                    "custom_patterns": [{{
+                        "name": "pin",
+                        "regex": "^\\d{{4}}$",
+                        "action": "{action}"
+                    }}]
+                }}"#
+            )),
+        ));
+        build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none())
     }
 
-    fn resp(text: &str) -> ChatResponse {
-        ChatResponse {
-            id: "r".into(),
-            model: "m".into(),
-            message: ChatMessage::assistant(text),
-            finish_reason: aisix_gateway::FinishReason::Stop,
-            usage: aisix_gateway::UsageStats::new(0, 0),
-        }
+    /// #1027: a local kind judges each segment on its own, so a rule
+    /// anchored to a whole value blocks on the slot the mask pass would
+    /// rewrite — it could never match the joined blob.
+    #[test]
+    fn local_segments_anchor_each_slot() {
+        use crate::SegmentRole::Rewritable;
+        let chain = pii_chain("block", "block");
+        let (v, _) =
+            chain.check_local_segments(&[seg("pay", Rewritable), seg("1234", Rewritable)], true);
+        assert!(v.is_block(), "the bare slot matches ^\\d{{4}}$: {v:?}");
+        let (v, _) = chain.check_local_segments(&[seg("pay 1234", Rewritable)], true);
+        assert_eq!(v, GuardrailVerdict::Allow);
     }
 
-    /// #911 finding [26]: `mandatory: true` turns a fail-open `Bypass` into a
-    /// `Block`, so a remote guardrail marked mandatory can't be silently
-    /// skipped when its upstream is unreachable. Before the fix the field was
-    /// parsed but never enforced — a mandatory guardrail still failed open.
-    #[tokio::test]
-    async fn mandatory_upgrades_bypass_to_block() {
-        let g = apply_mandatory(&row_with_mandatory(true), Arc::new(AlwaysBypass));
-        let vin = g.check_input(&req("hi")).await;
-        // The block must carry the row name so the 422 envelope can name the
-        // guardrail (#519 B.4b) rather than surfacing an unnamed block.
+    /// A mask rule that matches an object key has nowhere to write, so it
+    /// blocks; the same hit on a scan-only slot is forwarded (#1104).
+    #[test]
+    fn a_mask_hit_on_a_key_blocks_but_not_on_a_scan_only_slot() {
+        use crate::SegmentRole::{Label, Rewritable, ScanOnly};
+        let chain = pii_chain("block", "mask");
+        assert!(chain
+            .check_local_segments(&[seg("1234", Label)], true)
+            .0
+            .is_block());
         assert_eq!(
-            vin,
-            GuardrailVerdict::Block {
-                reason: "mandatory guardrail unavailable: upstream_unreachable".to_string(),
-                guardrail_name: Some("remote".to_string()),
-            },
-            "mandatory input Bypass must become a named Block, got {vin:?}",
+            chain.check_local_segments(&[seg("1234", ScanOnly)], true).0,
+            GuardrailVerdict::Allow
         );
-        let vout = g.check_output(&resp("hi")).await;
         assert_eq!(
-            vout,
-            GuardrailVerdict::Block {
-                reason: "mandatory guardrail unavailable: upstream_unreachable".to_string(),
-                guardrail_name: Some("remote".to_string()),
-            },
-            "mandatory output Bypass must become a named Block, got {vout:?}",
+            chain
+                .check_local_segments(&[seg("1234", Rewritable)], true)
+                .0,
+            GuardrailVerdict::Allow,
+            "a rewritable slot is masked, not blocked"
         );
     }
 
-    /// The default (`mandatory: false`) keeps the fail-open behaviour: a
-    /// `Bypass` stays a `Bypass`.
-    #[tokio::test]
-    async fn non_mandatory_leaves_bypass_untouched() {
-        let g = apply_mandatory(&row_with_mandatory(false), Arc::new(AlwaysBypass));
+    /// A monitored mask rule previews the counts enforcement would mask
+    /// over the same rewritable slots: one per slot, none for a key.
+    #[test]
+    fn monitor_would_mask_counts_the_rewritable_slots() {
+        use crate::SegmentRole::{Label, Rewritable};
+        let chain = pii_chain("monitor", "mask");
+        let (v, hits) = chain.check_local_segments(
+            &[
+                seg("1234", Rewritable),
+                seg("5678", Rewritable),
+                seg("1234 5678", Rewritable),
+                seg("9999", Label),
+            ],
+            false,
+        );
+        assert_eq!(v, GuardrailVerdict::Allow, "monitor never blocks");
+        let would_mask: Vec<_> = hits.iter().filter(|h| h.action == "would_mask").collect();
+        assert_eq!(would_mask.len(), 1);
+        assert_eq!(would_mask[0].counts.get("pin"), Some(&2));
         assert!(
-            g.check_input(&req("hi")).await.is_bypass(),
-            "non-mandatory guardrail must keep failing open",
+            hits.iter().any(|h| h.action == "would_block"),
+            "the key would have blocked: {hits:?}"
         );
     }
 
-    /// Mandatory only rewrites the failure verdict — `Allow` and `Block`
-    /// pass through, so a healthy mandatory guardrail never becomes a false
-    /// block and a real block is preserved.
-    #[tokio::test]
-    async fn mandatory_passes_allow_and_block_through() {
-        struct AlwaysAllow;
-        #[async_trait]
-        impl Guardrail for AlwaysAllow {
-            fn name(&self) -> &'static str {
-                "always-allow"
-            }
-            async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
-                GuardrailVerdict::Allow
-            }
-        }
-        struct AlwaysBlock;
-        #[async_trait]
-        impl Guardrail for AlwaysBlock {
-            fn name(&self) -> &'static str {
-                "always-block"
-            }
-            async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
-                GuardrailVerdict::block("nope")
-            }
-        }
-        let allow = apply_mandatory(&row_with_mandatory(true), Arc::new(AlwaysAllow));
-        assert_eq!(allow.check_input(&req("hi")).await, GuardrailVerdict::Allow);
-        let block = apply_mandatory(&row_with_mandatory(true), Arc::new(AlwaysBlock));
-        assert!(block.check_input(&req("hi")).await.is_block());
-    }
-
-    /// A mandatory segment moderator keeps answering through the segment
-    /// pass, so its mask comes back unchanged; only an unavailable
-    /// provider's `Bypass` becomes a named `Block` there.
-    #[tokio::test]
-    async fn mandatory_segment_moderator_masks_and_blocks_only_when_unavailable() {
-        struct Segments(GuardrailVerdict, Option<Vec<String>>);
-        impl Segments {
-            fn outcome(&self) -> SegmentsOutcome {
-                SegmentsOutcome {
-                    verdict: self.0.clone(),
-                    masked: self.1.clone(),
-                    counts: std::collections::BTreeMap::new(),
-                    monitor_hits: Vec::new(),
-                }
-            }
-        }
-        #[async_trait]
-        impl Guardrail for Segments {
-            fn name(&self) -> &'static str {
-                "segments"
-            }
-            fn moderates_segments(&self) -> bool {
-                true
-            }
-            async fn moderate_input_segments(
-                &self,
-                _texts: &[String],
-                _newest_from: Option<usize>,
-            ) -> SegmentsOutcome {
-                self.outcome()
-            }
-            async fn moderate_output_segments(&self, _texts: &[String]) -> SegmentsOutcome {
-                self.outcome()
-            }
-        }
-        let texts = vec!["mail a@b.c".to_string()];
-
-        let masking = apply_mandatory(
-            &row_with_mandatory(true),
-            Arc::new(Segments(
-                GuardrailVerdict::Allow,
-                Some(vec!["mail <EMAIL>".into()]),
-            )),
-        );
-        assert!(masking.moderates_segments());
-        for out in [
-            masking.moderate_input_segments(&texts, None).await,
-            masking.moderate_output_segments(&texts).await,
+    /// A `replacement` on a pattern whose effective action is `block`
+    /// (explicit or via `default_action`) rejects the row — the knob
+    /// would otherwise be accepted but never read (#963).
+    #[test]
+    fn pii_replacement_on_block_action_rejects_row() {
+        for row in [
+            // Explicit per-pattern block.
+            r#"{
+                "name": "bad-explicit",
+                "kind": "pii",
+                "custom_patterns": [{
+                    "name": "p", "regex": "x(y)", "action": "block", "replacement": "*"
+                }]
+            }"#,
+            // Inherited block via default_action.
+            r#"{
+                "name": "bad-inherited",
+                "kind": "pii",
+                "default_action": "block",
+                "custom_patterns": [{
+                    "name": "p", "regex": "x(y)", "replacement": "*"
+                }]
+            }"#,
         ] {
-            assert_eq!(out.verdict, GuardrailVerdict::Allow);
-            assert_eq!(out.masked, Some(vec!["mail <EMAIL>".to_string()]));
-        }
-
-        let down = apply_mandatory(
-            &row_with_mandatory(true),
-            Arc::new(Segments(
-                GuardrailVerdict::Bypass {
-                    reason: "upstream_unreachable".into(),
-                },
-                None,
-            )),
-        );
-        for out in [
-            down.moderate_input_segments(&texts, None).await,
-            down.moderate_output_segments(&texts).await,
-        ] {
-            assert_eq!(
-                out.verdict,
-                GuardrailVerdict::Block {
-                    reason: "mandatory guardrail unavailable: upstream_unreachable".to_string(),
-                    guardrail_name: Some("remote".to_string()),
-                },
+            let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+            table.insert(entry("bad", "g-1", parse(row)));
+            let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
+            assert!(
+                chain.is_empty(),
+                "replacement+block row must be skipped, not half-honored",
             );
         }
     }
 
-    /// `monitor` + `mandatory`: the would-block hit the monitor wrapper
-    /// records survives the mandatory wrapper around it.
+    /// A monitor row built through `build_one` keeps its would-block hit on
+    /// both hooks.
     #[tokio::test]
-    async fn mandatory_keeps_monitor_hits() {
+    async fn built_monitor_row_keeps_monitor_hits() {
         let row = parse(
             r#"{
                 "name": "monitored",
                 "kind": "keyword",
                 "enforcement_mode": "monitor",
-                "mandatory": true,
                 "patterns": [{ "kind": "literal", "value": "AKIA" }]
             }"#,
         );
-        let g = build_one(&row, None).unwrap().unwrap();
+        let g = build_one(&row, None, &GuardrailEmbedderSlot::none())
+            .unwrap()
+            .unwrap();
         let (verdict, hits) = g.check_input_observed(&req("key AKIAEXAMPLE")).await;
         assert_eq!(verdict, GuardrailVerdict::Allow);
         assert_eq!(hits.len(), 1, "{hits:?}");
@@ -1836,7 +2741,7 @@ mod tests {
                 let id = format!("g-{i}");
                 table.insert(entry(&id, &id, row));
             }
-            build_chain_from_snapshot(&table, None)
+            build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none())
         };
         let keyword = |hook: &str| {
             parse(&format!(
@@ -1859,16 +2764,192 @@ mod tests {
         assert!(!chain_of(vec![]).checks_input_remotely());
     }
 
+    /// Every kind answers the two input predicates per hook and mode: a new
+    /// kind inheriting the trait defaults unchecked would either refuse
+    /// requests on an output-only row or call a billed service on a key that
+    /// is not admitted first. `semantic` needs an embedder and is pinned next
+    /// to its own tests.
+    #[test]
+    fn every_kind_answers_the_input_predicates_per_hook_and_mode() {
+        let kinds: Vec<(&str, bool)> = vec![
+            (
+                r#""kind":"keyword","patterns":[{"kind":"literal","value":"x"}]"#,
+                false,
+            ),
+            (
+                r#""kind":"pii","custom_patterns":[{"name":"p","regex":"x","action":"block"}]"#,
+                false,
+            ),
+            (
+                r#""kind":"azure_content_safety","endpoint":"https://e","api_key":"k""#,
+                true,
+            ),
+            (
+                r#""kind":"azure_content_safety_text_moderation","endpoint":"https://e","api_key":"k""#,
+                true,
+            ),
+            (
+                r#""kind":"aliyun_text_moderation","region":"cn-shanghai","access_key_id":"ak","access_key_secret":"sk""#,
+                true,
+            ),
+            (
+                r#""kind":"aliyun_ai_guardrail","region":"cn-shanghai","access_key_id":"ak","access_key_secret":"sk""#,
+                true,
+            ),
+            (r#""kind":"lakera","api_key":"k""#, true),
+            (r#""kind":"openai_moderation","api_key":"k""#, true),
+            (
+                r#""kind":"presidio","analyzer_url":"http://a","anonymizer_url":"http://b""#,
+                true,
+            ),
+            // A script reaches its service over `fetch` / `aisix.embed`.
+            (
+                r#""kind":"custom","script":"export function checkInput() { return { action: \"allow\" }; }""#,
+                true,
+            ),
+            #[cfg(feature = "bedrock")]
+            (
+                r#""kind":"bedrock","guardrail_id":"abcdefgh1234","guardrail_version":"DRAFT","region":"us-east-1","aws_credentials":{"kind":"static","access_key_id":"AKIA","secret_access_key":"s"},"latency_mode":{"kind":"serial"}"#,
+                true,
+            ),
+        ];
+        for (body, remote) in &kinds {
+            let built = |hook: &str, mode: &str| {
+                let row = parse(&format!(
+                    r#"{{"name":"n","hook_point":"{hook}","enforcement_mode":"{mode}",{body}}}"#
+                ));
+                build_one(&row, None, &GuardrailEmbedderSlot::none())
+                    .unwrap_or_else(|e| panic!("{body} must build: {e}"))
+                    .unwrap_or_else(|| panic!("{body} must not be inert"))
+            };
+            for hook in ["input", "both"] {
+                let enforcing = built(hook, "block");
+                assert!(enforcing.enforces_input(), "{body} on {hook}");
+                assert_eq!(
+                    enforcing.checks_input_remotely(),
+                    *remote,
+                    "{body} on {hook}"
+                );
+                let monitored = built(hook, "monitor");
+                assert!(!monitored.enforces_input(), "{body} monitored on {hook}");
+                assert_eq!(
+                    monitored.checks_input_remotely(),
+                    *remote,
+                    "{body} monitored on {hook} observes by making the same calls"
+                );
+            }
+            for mode in ["block", "monitor"] {
+                let output_only = built("output", mode);
+                assert!(!output_only.enforces_input(), "{body} output-only {mode}");
+                assert!(
+                    !output_only.checks_input_remotely(),
+                    "{body} output-only {mode} makes no call on a request"
+                );
+            }
+        }
+    }
+
     /// #1010: `enforcement_mode: "monitor"` must never block —
     /// including when the remote provider call itself FAILS, not just when
     /// content is flagged. With `fail_open: false` a provider 5xx surfaces
     /// as a `Block` from the inner guardrail; the monitor wrapper must
     /// downgrade it. Composed through `build_one` so the decorator
     /// ordering itself is what's pinned.
+    /// Every kind that splits its failure policy per hook must report the
+    /// SAME split through `fails_closed_on_*`. Built with the two values
+    /// deliberately asymmetric — `fail_open: true` on the row (input),
+    /// `output_fail_open: false` in the kind config (output) — so a
+    /// swapped pair cannot pass: it would have to claim the input hook
+    /// fails closed and the output hook fails open, which is the exact
+    /// inverse of what is configured.
+    ///
+    /// The table is the guard against a per-kind override drifting from
+    /// the field that kind actually consults on that hook. `keyword` and
+    /// `pii` are absent on purpose: they have no `output_fail_open`, so
+    /// there is no pair to swap.
+    #[test]
+    fn every_split_kind_reports_its_policy_on_the_matching_hook() {
+        // `fail_open` sits on the row, `output_fail_open` inside the
+        // kind's own flattened config — the shape cp-api projects.
+        const ASYMMETRIC: &str = r#""fail_open": true, "output_fail_open": false"#;
+        let rows: Vec<(&str, String)> = vec![
+            (
+                "azure_content_safety",
+                format!(
+                    r#"{{"name":"n","kind":"azure_content_safety","endpoint":"https://e","api_key":"k",{ASYMMETRIC}}}"#
+                ),
+            ),
+            (
+                "azure_content_safety_text_moderation",
+                format!(
+                    r#"{{"name":"n","kind":"azure_content_safety_text_moderation","endpoint":"https://e","api_key":"k",{ASYMMETRIC}}}"#
+                ),
+            ),
+            (
+                "aliyun_text_moderation",
+                format!(
+                    r#"{{"name":"n","kind":"aliyun_text_moderation","region":"cn-shanghai","access_key_id":"ak","access_key_secret":"sk",{ASYMMETRIC}}}"#
+                ),
+            ),
+            (
+                "aliyun_ai_guardrail",
+                format!(
+                    r#"{{"name":"n","kind":"aliyun_ai_guardrail","region":"cn-shanghai","access_key_id":"ak","access_key_secret":"sk",{ASYMMETRIC}}}"#
+                ),
+            ),
+            (
+                "lakera",
+                format!(r#"{{"name":"n","kind":"lakera","api_key":"k",{ASYMMETRIC}}}"#),
+            ),
+            (
+                "openai_moderation",
+                format!(r#"{{"name":"n","kind":"openai_moderation","api_key":"k",{ASYMMETRIC}}}"#),
+            ),
+            (
+                "presidio",
+                format!(
+                    r#"{{"name":"n","kind":"presidio","analyzer_url":"http://a","anonymizer_url":"http://b",{ASYMMETRIC}}}"#
+                ),
+            ),
+            (
+                "custom",
+                format!(
+                    r#"{{"name":"n","kind":"custom","script":"export function checkInput() {{ return {{ action: \"allow\" }}; }}",{ASYMMETRIC}}}"#
+                ),
+            ),
+            #[cfg(feature = "bedrock")]
+            (
+                "bedrock",
+                format!(
+                    r#"{{"name":"n","kind":"bedrock","guardrail_id":"abcdefgh1234","guardrail_version":"DRAFT","region":"us-east-1","aws_credentials":{{"kind":"static","access_key_id":"AKIA","secret_access_key":"s"}},"latency_mode":{{"kind":"serial"}},{ASYMMETRIC}}}"#
+                ),
+            ),
+        ];
+
+        for (kind, json) in &rows {
+            let row = parse(json);
+            let g = build_one(&row, None, &GuardrailEmbedderSlot::none())
+                .unwrap_or_else(|e| panic!("{kind} row must build: {e}"))
+                .unwrap_or_else(|| panic!("{kind} row must not be inert"));
+            assert!(
+                !g.fails_closed_on_input(),
+                "{kind}: the row set fail_open, so the INPUT hook must fail open"
+            );
+            assert!(
+                g.fails_closed_on_output(),
+                "{kind}: output_fail_open is false, so the OUTPUT hook must fail closed"
+            );
+        }
+        assert!(
+            rows.len() >= 8,
+            "the table must not silently shrink to nothing"
+        );
+    }
+
     #[tokio::test]
     async fn monitor_downgrades_provider_failure_block() {
         use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
@@ -1877,7 +2958,9 @@ mod tests {
             &server.uri(),
             r#", "enforcement_mode": "monitor", "fail_open": false"#,
         );
-        let g = build_one(&row, None).unwrap().unwrap();
+        let g = build_one(&row, None, &GuardrailEmbedderSlot::none())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             g.check_input(&req("hello")).await,
             GuardrailVerdict::Allow,
@@ -1885,27 +2968,51 @@ mod tests {
         );
     }
 
-    /// The documented exception to the above: `mandatory: true` is applied
-    /// OUTSIDE the monitor wrapper (`build_one`), so provider
-    /// unavailability stays fatal even in monitor mode — the fail-open
-    /// `Bypass` passes through the monitor wrapper untouched and is then
-    /// upgraded to a named `Block`.
+    /// A monitor row that suppressed a Block still reports it, so the
+    /// operator can see what would have happened.
     #[tokio::test]
-    async fn mandatory_keeps_unavailability_fatal_in_monitor_mode() {
+    async fn downgraded_unavailability_block_still_emits_would_block() {
         use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;
-        let row = aliyun_row_against(
-            &server.uri(),
-            r#", "enforcement_mode": "monitor", "mandatory": true"#,
+        let row = aliyun_row_against(&server.uri(), r#", "enforcement_mode": "monitor""#);
+        let g = build_one(&row, None, &GuardrailEmbedderSlot::none())
+            .unwrap()
+            .unwrap();
+        let (verdict, hits) = g.check_input_observed(&req("hello")).await;
+        assert_eq!(verdict, GuardrailVerdict::Allow, "monitor downgrades it");
+        assert_eq!(hits.len(), 1, "the suppression is still reported");
+        assert_eq!(hits[0].action, "would_block");
+        assert_eq!(
+            hits[0].reason,
+            "aliyun_text_moderation guardrail evaluation unavailable (aliyun_5xx)"
         );
-        let g = build_one(&row, None).unwrap().unwrap();
-        assert!(
-            g.check_input(&req("hello")).await.is_block(),
-            "mandatory must keep provider unavailability fatal in monitor mode",
+        assert_eq!(hits[0].error_type, "aliyun_5xx");
+    }
+
+    /// Monitor mode is unconditional: a provider outage is still only
+    /// observed, fail-closed default included. There is no configuration
+    /// that makes a monitored row block — that is what `block` mode is
+    /// for.
+    #[tokio::test]
+    async fn monitor_never_blocks_on_provider_failure() {
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let row = aliyun_row_against(&server.uri(), r#", "enforcement_mode": "monitor""#);
+        let g = build_one(&row, None, &GuardrailEmbedderSlot::none())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            g.check_input(&req("hello")).await,
+            GuardrailVerdict::Allow,
+            "a monitored row must not block, whatever the failure",
         );
     }
 
@@ -1926,7 +3033,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None);
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
         assert_eq!(chain.len(), 0);
     }
 
@@ -1944,7 +3051,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None);
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
         assert_eq!(chain.len(), 0, "empty list adds nothing to the chain");
     }
 
@@ -1978,7 +3085,7 @@ mod tests {
             ),
         ));
 
-        let chain = build_chain_from_snapshot(&table, None);
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
         // Only the good row makes it in.
         assert_eq!(chain.len(), 1);
         let v = chain.check_input(&req("ok")).await;
@@ -2004,7 +3111,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None);
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
         assert_eq!(chain.len(), 0, "out-of-range threshold row must be skipped");
     }
 
@@ -2047,7 +3154,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None);
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
         // Both rows compose. We don't probe the bedrock arm — its
         // own tests cover the dispatch path; this one only pins the
         // chain composition contract.
@@ -2058,7 +3165,7 @@ mod tests {
     async fn live_chain_rebuilds_on_snapshot_swap() {
         let initial = AisixSnapshot::new();
         let handle = SnapshotHandle::new(initial);
-        let live = LiveGuardrailChain::new(handle.clone(), None);
+        let live = LiveGuardrailChain::new(handle.clone(), None, GuardrailEmbedderSlot::none());
 
         // Empty snapshot → no rules → input passes.
         assert!(!live.check_input(&req("AKIA-EXAMPLE")).await.is_block());
@@ -2083,6 +3190,88 @@ mod tests {
         handle.store(next);
 
         assert!(live.check_input(&req("AKIA-EXAMPLE")).await.is_block());
+    }
+
+    #[tokio::test]
+    async fn live_chain_reports_and_clears_build_rejections() {
+        let broken = AisixSnapshot::new();
+        broken.guardrails.insert(entry(
+            "broken",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "sensitive-name-do-not-expose",
+                    "kind": "custom",
+                    "script": "sensitive-script-do-not-expose export function checkInput( {"
+                }"#,
+            ),
+        ));
+        let handle = SnapshotHandle::new(broken);
+        let status = ConfigStatus::new(aisix_core::SourceKind::Etcd);
+        let live = LiveGuardrailChain::new_with_status(
+            handle.clone(),
+            None,
+            GuardrailEmbedderSlot::none(),
+            Some(status.clone()),
+        );
+        assert_eq!(status.view().rejected.len(), 1);
+        assert_eq!(
+            status.view().rejected[0].last_error,
+            "guardrail runtime build failed: compile_failed at config.script"
+        );
+        let public_status = serde_json::to_string(&status.view()).unwrap();
+        assert!(!public_status.contains("sensitive-name-do-not-expose"));
+        assert!(!public_status.contains("sensitive-script-do-not-expose"));
+
+        let fixed = AisixSnapshot::new();
+        fixed.guardrails.insert(entry(
+            "fixed",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "fixed",
+                    "kind": "keyword",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+        handle.store(fixed);
+        assert!(live.check_input(&req("AKIA")).await.is_block());
+        assert!(status.view().rejected.is_empty());
+    }
+
+    #[test]
+    fn runtime_status_redacts_invalid_regex_values() {
+        let broken = AisixSnapshot::new();
+        broken.guardrails.insert(entry(
+            "private-name-do-not-expose",
+            "g-private",
+            parse(
+                r#"{
+                    "name": "private-name-do-not-expose",
+                    "kind": "keyword",
+                    "patterns": [{"kind":"regex","value":"private-pattern-do-not-expose[("}]
+                }"#,
+            ),
+        ));
+        let status = ConfigStatus::new(aisix_core::SourceKind::Etcd);
+        let _live = LiveGuardrailChain::new_with_status(
+            SnapshotHandle::new(broken),
+            None,
+            GuardrailEmbedderSlot::none(),
+            Some(status.clone()),
+        );
+
+        let body = serde_json::to_string(&status.view()).unwrap();
+        assert!(body.contains("invalid_regex at config.patterns[].value"));
+        assert!(!body.contains("private-pattern-do-not-expose"));
+        assert!(!body.contains("private-name-do-not-expose"));
+        let heartbeat = status.rejection_snapshots();
+        assert_eq!(heartbeat.len(), 1);
+        assert_eq!(
+            heartbeat[0].error,
+            "guardrail runtime build failed: invalid_regex at config.patterns[].value"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2136,7 +3325,8 @@ mod tests {
     /// assertion fails intermittently (#519 B.4a).
     #[test]
     fn chain_order_is_created_at_ascending_with_id_tiebreak() {
-        let chain = build_chain_from_snapshot(&shuffled_table(), None);
+        let chain =
+            build_chain_from_snapshot(&shuffled_table(), None, &GuardrailEmbedderSlot::none());
         assert_eq!(chain.member_names(), EXPECTED_ORDER);
     }
 
@@ -2148,19 +3338,49 @@ mod tests {
         for (id, name) in [("g-3", "z"), ("g-1", "y"), ("g-2", "x")] {
             table.insert(entry(name, id, keyword_row(name, None)));
         }
-        let chain = build_chain_from_snapshot(&table, None);
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
         assert_eq!(chain.member_names(), ["y", "x", "z"]);
     }
 
-    /// The production per-request path: guardrails with no attachment
-    /// rows fall back to implicit env-scope entries that all share
-    /// priority 0, so their relative order in the resolved chain is
-    /// decided by the index build's iteration — which must be the same
-    /// created_at-ascending order as the chain-build path (#519 B.4a).
+    /// The production per-request path. Every guardrail here carries an
+    /// env attachment at the same priority, so nothing but the build's own
+    /// iteration order separates them — which must be deterministic, or the
+    /// DashMap's run-to-run order decides which Block fires first
+    /// (#519 B.4a).
     #[test]
-    fn no_attachment_fallback_resolves_in_created_at_order() {
+    fn index_ties_resolve_in_attachment_id_order() {
+        // The index sorts by (priority desc, scope-specificity desc) with a
+        // STABLE sort, so insertion order decides what is left — and insertion
+        // walks attachments sorted by their own id. Every attachment here is
+        // env-scope at the same priority, so attachment id is the ONLY
+        // tiebreak; without the build-time sort the DashMap's arbitrary,
+        // run-to-run-varying order would make this flap (#519 B.4a).
+        //
+        // Guardrail `created_at` deliberately does not decide this order: that
+        // is the chain path's rule (`chain_order_is_created_at_ascending_with_id_tiebreak`),
+        // and the two are different mechanisms. This test used to exercise the
+        // index through the zero-attachment fallback, which borrowed the
+        // chain's ordering; with that fallback retired (AISIX-Cloud#1450) the
+        // index is reached only through explicit attachments.
         let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
-        let index = build_index_from_snapshot(&shuffled_table(), &attachments, None);
+        for (i, (guardrail_id, _, _)) in SHUFFLED_ROWS.iter().enumerate() {
+            // Attachment ids run opposite to the row order they attach, so a
+            // pass that forgot to sort would surface as the insertion order.
+            let attachment_id = format!("a-{:02}", SHUFFLED_ROWS.len() - i);
+            attachments.insert(attachment_entry(
+                &attachment_id,
+                parse_attachment(&format!(
+                    r#"{{ "guardrail_id": "{guardrail_id}", "scope_type": "env", "priority": 100 }}"#
+                )),
+            ));
+        }
+
+        let index = build_index_from_snapshot(
+            &shuffled_table(),
+            &attachments,
+            None,
+            &GuardrailEmbedderSlot::none(),
+        );
         let chain = index.resolve(&RequestContext {
             passthrough_route_id: "",
             model_id: "m",
@@ -2168,7 +3388,14 @@ mod tests {
             api_key_id: "k",
             team_id: None,
         });
-        assert_eq!(chain.member_names(), EXPECTED_ORDER);
+        // a-01 attaches the LAST row, a-10 the first — so ascending attachment
+        // id walks SHUFFLED_ROWS backwards.
+        let expected: Vec<&str> = SHUFFLED_ROWS
+            .iter()
+            .rev()
+            .map(|(_, name, _)| *name)
+            .collect();
+        assert_eq!(chain.member_names(), expected);
     }
 
     // -----------------------------------------------------------------------
@@ -2210,7 +3437,12 @@ mod tests {
             ),
         ));
 
-        let index = build_index_from_snapshot(&guardrails, &attachments, None);
+        let index = build_index_from_snapshot(
+            &guardrails,
+            &attachments,
+            None,
+            &GuardrailEmbedderSlot::none(),
+        );
         assert_eq!(index.len(), 1);
 
         let ctx = RequestContext {
@@ -2252,7 +3484,12 @@ mod tests {
             ),
         ));
 
-        let index = build_index_from_snapshot(&guardrails, &attachments, None);
+        let index = build_index_from_snapshot(
+            &guardrails,
+            &attachments,
+            None,
+            &GuardrailEmbedderSlot::none(),
+        );
         assert_eq!(index.len(), 0);
         // Verify the guardrail does not fire (not just that the index is empty).
         let ctx = RequestContext {
@@ -2274,9 +3511,9 @@ mod tests {
 
     #[tokio::test]
     async fn one_enabled_one_disabled_attachment_fires_exactly_once() {
-        // Verifies the HashSet boundary: a guardrail with one enabled + one disabled
-        // attachment must fire exactly once (via the enabled attachment) and must NOT
-        // trigger the backward-compat env-scope fallback.
+        // A guardrail with one enabled + one disabled attachment must fire
+        // exactly once — through the enabled one, with the disabled row
+        // contributing no second entry that `resolve` would have to dedupe.
         let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
         guardrails.insert(entry(
             "g",
@@ -2297,7 +3534,12 @@ mod tests {
             ),
         ));
 
-        let index = build_index_from_snapshot(&guardrails, &attachments, None);
+        let index = build_index_from_snapshot(
+            &guardrails,
+            &attachments,
+            None,
+            &GuardrailEmbedderSlot::none(),
+        );
         // Exactly one entry — from the enabled attachment only.
         // The disabled attachment must NOT produce a second entry or trigger the fallback.
         assert_eq!(
@@ -2322,11 +3564,320 @@ mod tests {
         );
     }
 
+    /// A guardrail and its attachment arrive as separate documents, so a build
+    /// falling between them holds the guardrail alone. Reporting there named a
+    /// correctly-attached guardrail as inspecting nothing — permanently, since
+    /// the notice is deduplicated per id for the process lifetime.
+    #[test]
+    fn the_unattached_notice_waits_out_the_grace() {
+        use std::collections::{HashMap, HashSet};
+        use std::time::{Duration, Instant};
+
+        let rows = vec![("g-1".to_string(), "one".to_string())];
+        let t0 = Instant::now();
+        let mut first_seen: HashMap<String, Instant> = HashMap::new();
+        let mut warned: HashSet<String> = HashSet::new();
+
+        assert!(
+            unattached_to_report(&rows, &first_seen, &warned, t0).is_empty(),
+            "an id with no recorded first sighting is inside its attachment's window",
+        );
+        first_seen.insert("g-1".to_string(), t0);
+
+        assert!(
+            unattached_to_report(&rows, &first_seen, &warned, t0 + UNATTACHED_GRACE / 2).is_empty(),
+            "half a grace in is still the window, however many builds have run",
+        );
+
+        let due = unattached_to_report(&rows, &first_seen, &warned, t0 + UNATTACHED_GRACE);
+        assert_eq!(
+            due.len(),
+            1,
+            "unattached for the whole grace is a standing property, not a race",
+        );
+        warned.insert("g-1".to_string());
+
+        assert!(
+            unattached_to_report(
+                &rows,
+                &first_seen,
+                &warned,
+                t0 + UNATTACHED_GRACE + Duration::from_secs(600),
+            )
+            .is_empty(),
+            "and it is said once, not on every rebuild after",
+        );
+    }
+
+    /// `warned` is the union across every sweep, not a per-sweep set, so
+    /// the cap on what one sweep can stamp does not bound it. Rows get
+    /// reported, deleted, and replaced by a new generation of ids, and the
+    /// set grows with each one — this asserted otherwise in a comment
+    /// before it was measured.
+    ///
+    /// The only test in this file that touches the process-global state;
+    /// nothing else drives `sweep_unattached_guardrails`, so it owns it.
+    #[test]
+    fn the_reported_set_stops_growing_at_the_cap() {
+        let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
+        for generation in 0..3 {
+            let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
+            for i in 0..MAX_REMEMBERED {
+                guardrails.insert(entry(
+                    "secrets",
+                    &format!("g-{generation}-{i}"),
+                    parse(
+                        r#"{
+                            "name": "inert",
+                            "kind": "keyword",
+                            "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                        }"#,
+                    ),
+                ));
+            }
+            // First sweep stamps the generation, the backdate ages it past
+            // the grace, the second reports it — the shape of a fleet that
+            // churns guardrails faster than the cap.
+            sweep_unattached_guardrails(&guardrails, &attachments);
+            backdate_unattached_stamps_for_test();
+            sweep_unattached_guardrails(&guardrails, &attachments);
+        }
+
+        let (warned, present_since) = unattached_state_for_test();
+        assert!(
+            warned <= MAX_REMEMBERED,
+            "the reported set grew to {warned}, past its {MAX_REMEMBERED} cap",
+        );
+        assert!(
+            present_since <= MAX_REMEMBERED,
+            "stamps grew to {present_since}"
+        );
+
+        // …and past the cap it goes SILENT, rather than emitting rows it
+        // cannot remember. Stopping and skipping-the-insert both keep the
+        // set at the cap, so the size assertion above cannot tell them
+        // apart — and the second one re-emits the same rows on every sweep
+        // for the life of the process, which is the louder failure.
+        crate::keep_callsites_enabled();
+        let _capture_guard = crate::TRACING_CAPTURE_LOCK.blocking_lock();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(CaptureWriter(buf.clone()))
+            .finish();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let overflow: ResourceTable<DomainGuardrail> = ResourceTable::default();
+            overflow.insert(entry(
+                "secrets",
+                "g-past-the-cap",
+                parse(
+                    r#"{
+                        "name": "past-the-cap",
+                        "kind": "keyword",
+                        "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                    }"#,
+                ),
+            ));
+            sweep_unattached_guardrails(&overflow, &attachments);
+            backdate_unattached_stamps_for_test();
+            sweep_unattached_guardrails(&overflow, &attachments);
+        }
+        let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            !logged.contains("past-the-cap"),
+            "reported a row it could not remember; it will say the same thing \
+             again on every sweep from now on:\n{logged}",
+        );
+    }
+
+    /// Minimal `MakeWriter` for the capture above; the crate's other
+    /// capture helper is async and this test is not.
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The grace's VALUE, not just its arithmetic. Every other test here
+    /// expresses its instants as multiples of `UNATTACHED_GRACE`, so they
+    /// hold for any positive value — including one small enough to put the
+    /// original bug back, where a guardrail is named while the second of
+    /// its two documents is still in flight.
+    ///
+    /// Two lower bounds, both load-bearing rather than arbitrary. The
+    /// sweep is the only thing that can observe a row, so a grace shorter
+    /// than two sweep periods can be satisfied by the first two sweeps
+    /// after a guardrail appears — which is where its attachment still is.
+    /// And the absolute floor is about the writer, not the reader. The
+    /// guardrail and its attachment are not one write: the console creates
+    /// the guardrail, then reconciles its attachments in a second API call,
+    /// so the gap is a client round trip plus the outbox tick behind each —
+    /// and the grace has to outlast that by a wide margin on a loaded
+    /// control plane, not merely beat its median.
+    #[test]
+    fn the_grace_outlasts_two_sweeps_and_a_slow_two_document_write() {
+        assert!(
+            UNATTACHED_GRACE >= UNATTACHED_SWEEP_INTERVAL * 2,
+            "grace {UNATTACHED_GRACE:?} must span at least two sweeps of \
+             {UNATTACHED_SWEEP_INTERVAL:?}",
+        );
+        assert!(
+            UNATTACHED_GRACE >= std::time::Duration::from_secs(20),
+            "grace {UNATTACHED_GRACE:?} is too short to outlast a slow outbox drain",
+        );
+    }
+
+    /// The clock is kept for ATTACHED guardrails too. That is the whole of
+    /// what makes a deleted attachment reportable: without it the row is
+    /// "first seen" on the build its attachment goes, serves out a fresh
+    /// grace as if it were new, and — since a sweep only reports what has
+    /// outlived the grace — the moment that mattered is gone.
+    ///
+    /// Pinned here rather than only through the sweep, because stamping the
+    /// unattached rows alone leaves every other test in this file green.
+    #[test]
+    fn presence_is_timestamped_for_attached_rows_too() {
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        guardrails.insert(entry(
+            "secrets",
+            "g-attached",
+            parse(
+                r#"{
+                    "name": "block-secrets",
+                    "kind": "keyword",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+        let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
+        attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(
+                r#"{ "guardrail_id": "g-attached", "scope_type": "env", "priority": 100 }"#,
+            ),
+        ));
+        assert!(
+            unattached_ids(&guardrails, &attachments).is_empty(),
+            "fixture must be attached, or this test proves nothing",
+        );
+
+        let t0 = Instant::now();
+        let stamped = presence_timestamps(&guardrails, &HashMap::new(), t0);
+        assert_eq!(
+            stamped.get("g-attached"),
+            Some(&t0),
+            "an attached guardrail must carry a timestamp; without it, losing its \
+             attachment later reads as a brand-new row",
+        );
+
+        // …and the stamp survives, so age accumulates while it is attached.
+        let later = t0 + UNATTACHED_GRACE * 3;
+        let carried = presence_timestamps(&guardrails, &stamped, later);
+        assert_eq!(
+            carried.get("g-attached"),
+            Some(&t0),
+            "the clock must not restart on every sweep",
+        );
+
+        // Which is what makes the attachment's removal reportable at once.
+        let orphaned = vec![("g-attached".to_string(), "block-secrets".to_string())];
+        assert_eq!(
+            unattached_to_report(
+                &orphaned,
+                &carried,
+                &std::collections::HashSet::new(),
+                later,
+            )
+            .len(),
+            1,
+        );
+    }
+
+    /// A guardrail that has been around and just lost its attachment is due
+    /// at once. This is the one case the notice exists for — a scope target
+    /// was deleted and the rule is now inert — and timing from "first seen
+    /// UNATTACHED" instead of "first seen" would make it wait for a second
+    /// build, i.e. for an unrelated config write that may never come.
+    #[test]
+    fn losing_an_attachment_is_reported_on_the_next_build() {
+        use std::collections::{HashMap, HashSet};
+        use std::time::Instant;
+
+        let rows = vec![("g-1".to_string(), "one".to_string())];
+        let created = Instant::now();
+        let mut present_since: HashMap<String, Instant> = HashMap::new();
+        // Present, and attached, since well before the grace.
+        present_since.insert("g-1".to_string(), created);
+        let warned: HashSet<String> = HashSet::new();
+
+        let due = unattached_to_report(
+            &rows,
+            &present_since,
+            &warned,
+            created + UNATTACHED_GRACE * 2,
+        );
+        assert_eq!(
+            due.len(),
+            1,
+            "a row that has outlived the grace is due the build its attachment goes",
+        );
+    }
+
+    /// The clock has to be measured in time, not in builds. Two builds fit
+    /// between a guardrail and its attachment whenever anything else is being
+    /// written, so a consecutive-build rule reports a correctly-attached
+    /// guardrail under ordinary config churn — the very bug it was meant to
+    /// close, just harder to reproduce.
+    #[test]
+    fn many_builds_inside_the_grace_still_report_nothing() {
+        use std::collections::{HashMap, HashSet};
+        use std::time::Instant;
+
+        let rows = vec![("g-1".to_string(), "one".to_string())];
+        let t0 = Instant::now();
+        let mut first_seen: HashMap<String, Instant> = HashMap::new();
+        first_seen.insert("g-1".to_string(), t0);
+        let warned: HashSet<String> = HashSet::new();
+
+        for i in 1..=50 {
+            let now = t0 + (UNATTACHED_GRACE / 100) * i;
+            assert!(
+                unattached_to_report(&rows, &first_seen, &warned, now).is_empty(),
+                "build {i} is inside the grace and must stay quiet",
+            );
+        }
+    }
+
     #[tokio::test]
-    async fn no_attachment_guardrail_fires_globally_backward_compat() {
-        // Core backward-compat contract: a guardrail with ZERO attachment rows
-        // must fire on every request (env-scope at priority 0), preserving
-        // the pre-P0c "apply globally" behavior during rolling upgrade.
+    async fn guardrail_without_attachment_governs_nothing() {
+        // AISIX-Cloud#1450. This used to assert the opposite: a guardrail with
+        // ZERO attachment rows fired on every request, a rolling-upgrade
+        // fallback from the window where the data plane read attachments and
+        // the control plane had not written any yet.
+        //
+        // Keying on the ABSENCE of rows made removing a guardrail's last
+        // attachment a scope WIDENING — delete the one model it was scoped to
+        // and it started inspecting the entire environment. An attachment is
+        // the only thing that says which traffic a rule sees, so no attachment
+        // now means no traffic.
         let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
         guardrails.insert(entry(
             "g",
@@ -2341,11 +3892,16 @@ mod tests {
         ));
         let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
 
-        let index = build_index_from_snapshot(&guardrails, &attachments, None);
+        let index = build_index_from_snapshot(
+            &guardrails,
+            &attachments,
+            None,
+            &GuardrailEmbedderSlot::none(),
+        );
         assert_eq!(
             index.len(),
-            1,
-            "no-attachment guardrail must appear as env-scope entry",
+            0,
+            "an unattached guardrail must not enter the index",
         );
 
         let ctx = RequestContext {
@@ -2356,12 +3912,12 @@ mod tests {
             team_id: None,
         };
         assert!(
-            index
+            !index
                 .resolve(&ctx)
                 .check_input(&req("here AKIA"))
                 .await
                 .is_block(),
-            "no-attachment guardrail must block matching requests",
+            "an unattached guardrail must not block anything, however well its pattern matches",
         );
     }
 
@@ -2382,7 +3938,12 @@ mod tests {
             ),
         ));
 
-        let index = build_index_from_snapshot(&guardrails, &attachments, None);
+        let index = build_index_from_snapshot(
+            &guardrails,
+            &attachments,
+            None,
+            &GuardrailEmbedderSlot::none(),
+        );
         assert_eq!(index.len(), 0);
     }
 
@@ -2414,8 +3975,149 @@ mod tests {
             ),
         ));
 
-        let index = build_index_from_snapshot(&guardrails, &attachments, None);
+        let index = build_index_from_snapshot(
+            &guardrails,
+            &attachments,
+            None,
+            &GuardrailEmbedderSlot::none(),
+        );
         assert_eq!(index.len(), 0);
+    }
+
+    // --- similarity scores reach the request's log (AISIX-Cloud#1467) -----
+
+    /// Every text embeds to the same unit vector, so a candidate scores
+    /// exactly 1.0 against any example — a deterministic "over threshold"
+    /// with no bearing on which real model is configured.
+    struct IdenticalEmbedder;
+
+    #[async_trait]
+    impl crate::GuardrailEmbedder for IdenticalEmbedder {
+        async fn embed(
+            &self,
+            _model_alias: &str,
+            _model_id: Option<&str>,
+            texts: &[String],
+            _cacheable: bool,
+            _timeout: std::time::Duration,
+        ) -> Result<crate::Embedded, crate::EmbedError> {
+            Ok(crate::Embedded {
+                model: "stub-embedder".to_owned(),
+                vectors: texts.iter().map(|_| vec![1.0, 0.0]).collect(),
+            })
+        }
+    }
+
+    fn semantic_row(enforcement_mode: &str) -> DomainGuardrail {
+        parse(&format!(
+            r#"{{
+                "name": "semantic-row",
+                "enabled": true,
+                "hook_point": "input",
+                "enforcement_mode": "{enforcement_mode}",
+                "kind": "semantic",
+                "embedding_model": "embed-1",
+                "deny_examples": ["forbidden topic"],
+                "deny_threshold": 0.75
+            }}"#
+        ))
+    }
+
+    fn semantic_index(enforcement_mode: &str) -> Arc<LiveGuardrailIndex> {
+        let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        guardrails.insert(entry("semantic", "g-1", semantic_row(enforcement_mode)));
+        let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
+        attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(
+                r#"{
+                    "guardrail_id": "g-1",
+                    "scope_type": "env",
+                    "priority": 50
+                }"#,
+            ),
+        ));
+        let mut snap = AisixSnapshot::new();
+        snap.guardrails = guardrails;
+        snap.guardrail_attachments = attachments;
+        LiveGuardrailIndex::new_with_sink(
+            SnapshotHandle::new(snap),
+            None,
+            None,
+            GuardrailEmbedderSlot::new(Arc::new(IdenticalEmbedder)),
+        )
+    }
+
+    fn any_ctx() -> RequestContext<'static> {
+        RequestContext {
+            passthrough_route_id: "",
+            model_id: "m1",
+            mcp_server_id: "",
+            api_key_id: "k1",
+            team_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resolved_chain_carries_the_semantic_score() {
+        // The bind happens at resolve time, where the per-request log is
+        // minted — the index's own member is shared and cannot hold one.
+        let chain = semantic_index("block").resolve(&any_ctx());
+        assert!(chain.check_input(&req("anything")).await.is_block());
+
+        let scores = chain.scores();
+        assert_eq!(scores.len(), 1, "{scores:?}");
+        assert_eq!(scores[0].guardrail_name, "semantic-row");
+        assert_eq!(scores[0].hook, "input");
+        assert_eq!(scores[0].direction, "deny");
+        // The model the embedder RESOLVED for this call, not the alias
+        // the row configures — the row may name its embedder by id.
+        assert_eq!(scores[0].embedding_model, "stub-embedder");
+        assert!(scores[0].matched);
+    }
+
+    #[tokio::test]
+    async fn a_monitor_mode_row_scores_through_the_decorator() {
+        // Monitor mode is where an operator tunes a threshold, so it is the
+        // last place the score may go missing. The decorator wraps the
+        // semantic guardrail, so it has to forward the bind — without that
+        // forward the chain resolves, the row runs, and the array is empty.
+        let chain = semantic_index("monitor").resolve(&any_ctx());
+        let (verdict, hits) = chain.check_input_observed(&req("anything")).await;
+        assert!(
+            matches!(verdict, GuardrailVerdict::Allow),
+            "monitor never blocks: {verdict:?}"
+        );
+        assert_eq!(hits.len(), 1, "the suppressed block is still observed");
+
+        let scores = chain.scores();
+        assert_eq!(scores.len(), 1, "{scores:?}");
+        assert_eq!(scores[0].guardrail_name, "semantic-row");
+        assert!(scores[0].matched);
+    }
+
+    #[tokio::test]
+    async fn a_chain_with_no_scoring_member_reports_nothing() {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "secrets",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "block-secrets",
+                    "enabled": true,
+                    "hook_point": "input",
+                    "kind": "keyword",
+                    "patterns": [
+                        { "kind": "literal", "value": "AKIA" }
+                    ]
+                }"#,
+            ),
+        ));
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none())
+            .with_audit_log(Some(Arc::new(crate::GuardrailAuditLog::new())));
+        assert!(chain.check_input(&req("AKIA-EXAMPLE")).await.is_block());
+        assert!(chain.scores().is_empty());
     }
 
     #[tokio::test]
@@ -2474,6 +4176,384 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_index_reports_and_clears_lazy_build_rejections() {
+        let broken = AisixSnapshot::new();
+        broken.guardrails.insert(entry(
+            "broken",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "broken-script",
+                    "kind": "custom",
+                    "script": " "
+                }"#,
+            ),
+        ));
+        broken.guardrail_attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(
+                r#"{
+                    "guardrail_id": "g-1",
+                    "scope_type": "env",
+                    "priority": 50
+                }"#,
+            ),
+        ));
+        // A blank semantic model is deliberately valid on the lenient read
+        // path: the built guardrail fails closed at request time. It must not
+        // be reclassified as a build rejection, which would drop the row and
+        // admit traffic instead.
+        broken.guardrails.insert(entry(
+            "semantic-empty-model",
+            "g-2",
+            parse(
+                r#"{
+                    "name": "semantic-empty-model",
+                    "kind": "semantic",
+                    "embedding_model": "",
+                    "deny_examples": ["forbidden"],
+                    "deny_threshold": 0.75
+                }"#,
+            ),
+        ));
+        broken.guardrail_attachments.insert(attachment_entry(
+            "a-2",
+            parse_attachment(
+                r#"{
+                    "guardrail_id": "g-2",
+                    "scope_type": "env",
+                    "priority": 40
+                }"#,
+            ),
+        ));
+        let handle = SnapshotHandle::new(broken);
+        let status = ConfigStatus::new(aisix_core::SourceKind::Etcd);
+        status.record_load(aisix_core::LoadObservation {
+            source_hash: "broken".into(),
+            observed_revision: Some(1),
+            applied: Some(aisix_core::AppliedSnapshot {
+                config_hash: "broken".into(),
+                revision: Some(1),
+                resource_counts: [("guardrails".to_string(), 2)].into_iter().collect(),
+            }),
+            rejected: vec![],
+            partially_compatible: vec![],
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: true,
+            wholly_rejected: false,
+        });
+        let live = LiveGuardrailIndex::new_with_sink_and_status(
+            handle.clone(),
+            None,
+            None,
+            GuardrailEmbedderSlot::new(Arc::new(IdenticalEmbedder)),
+            Some(status.clone()),
+        );
+
+        let rejected = status.view();
+        assert_eq!(rejected.state, aisix_core::ConfigState::Degraded);
+        assert_eq!(rejected.rejected.len(), 1, "{rejected:?}");
+        let custom = rejected
+            .rejected
+            .iter()
+            .find(|row| row.resource_id == "g-1")
+            .expect("custom rejection");
+        assert_eq!(custom.resource_kind, "guardrails");
+        assert_eq!(
+            custom.last_error,
+            "guardrail runtime build failed: invalid_value at config.script"
+        );
+        let applied = rejected.applied.as_ref().unwrap();
+        assert_eq!(applied.resource_counts["guardrails"], 1);
+        assert_ne!(
+            applied.config_hash.as_str(),
+            rejected.source.source_hash.as_deref().unwrap()
+        );
+        assert_eq!(
+            status
+                .rejection_snapshots()
+                .into_iter()
+                .map(|row| row.key)
+                .collect::<Vec<_>>(),
+            vec!["/aisix/runtime/guardrails/g-1".to_string()],
+            "heartbeat keys must retain the kine shape cp-api parses"
+        );
+        assert!(live
+            .resolve(&any_ctx())
+            .check_input(&req("anything"))
+            .await
+            .is_block());
+
+        let fixed = AisixSnapshot::new();
+        fixed.guardrails.insert(entry(
+            "fixed",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "fixed",
+                    "kind": "keyword",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+        fixed.guardrail_attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(
+                r#"{
+                    "guardrail_id": "g-1",
+                    "scope_type": "env",
+                    "priority": 50
+                }"#,
+            ),
+        ));
+        handle.store(fixed);
+        status.record_load(aisix_core::LoadObservation {
+            source_hash: "fixed".into(),
+            observed_revision: Some(2),
+            applied: Some(aisix_core::AppliedSnapshot {
+                config_hash: "fixed".into(),
+                revision: Some(2),
+                resource_counts: [("guardrails".to_string(), 1)].into_iter().collect(),
+            }),
+            rejected: vec![],
+            partially_compatible: vec![],
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: false,
+            wholly_rejected: false,
+        });
+        // Rebuilds are deliberately lazy, so the previous signal remains
+        // until the first request observes the new snapshot.
+        assert_eq!(status.view().rejected.len(), 1);
+        let _ = live.resolve(&any_ctx());
+        assert!(status.view().rejected.is_empty());
+        let repaired = status.view();
+        assert_eq!(repaired.state, aisix_core::ConfigState::Synced);
+        assert_eq!(repaired.applied.unwrap().resource_counts["guardrails"], 1);
+    }
+
+    #[test]
+    fn concurrent_resolves_run_one_build_and_publish_the_newest_snapshot() {
+        // Every worker thread resolves through the same index. Before
+        // AISIX-Cloud#1542 each of them ran its own build on the first
+        // request after any snapshot change, and a build whose snapshot
+        // moved underneath it was thrown away and restarted with no
+        // bound — which is also how an obsolete rejection could be
+        // republished over a newer one. The build now runs under the
+        // cache lock, from a snapshot loaded while holding it.
+        let broken = AisixSnapshot::new();
+        broken.guardrails.insert(entry(
+            "broken",
+            "g-1",
+            parse(r#"{"name":"broken","kind":"custom","script":" "}"#),
+        ));
+        broken.guardrail_attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(r#"{"guardrail_id":"g-1","scope_type":"env","priority":0}"#),
+        ));
+        let handle = SnapshotHandle::new(broken);
+        let status = ConfigStatus::new(aisix_core::SourceKind::Etcd);
+        status.record_load(aisix_core::LoadObservation {
+            source_hash: "old".into(),
+            observed_revision: Some(1),
+            applied: Some(aisix_core::AppliedSnapshot {
+                config_hash: "old".into(),
+                revision: Some(1),
+                resource_counts: [("guardrails".to_string(), 1)].into_iter().collect(),
+            }),
+            rejected: vec![],
+            partially_compatible: vec![],
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: true,
+            wholly_rejected: false,
+        });
+        let live = LiveGuardrailIndex::new_with_sink_and_status(
+            handle.clone(),
+            None,
+            None,
+            GuardrailEmbedderSlot::none(),
+            Some(status.clone()),
+        );
+        assert_eq!(status.view().rejected.len(), 1);
+        assert_eq!(live.rebuilds(), 1);
+
+        let fixed = AisixSnapshot::new();
+        fixed.guardrails.insert(entry(
+            "fixed",
+            "g-1",
+            parse(
+                r#"{"name":"fixed","kind":"keyword","patterns":[{"kind":"literal","value":"AKIA"}]}"#,
+            ),
+        ));
+        fixed.guardrail_attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(r#"{"guardrail_id":"g-1","scope_type":"env","priority":0}"#),
+        ));
+        handle.store(fixed);
+        status.record_load(aisix_core::LoadObservation {
+            source_hash: "new".into(),
+            observed_revision: Some(2),
+            applied: Some(aisix_core::AppliedSnapshot {
+                config_hash: "new".into(),
+                revision: Some(2),
+                resource_counts: [("guardrails".to_string(), 1)].into_iter().collect(),
+            }),
+            rejected: vec![],
+            partially_compatible: vec![],
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: false,
+            wholly_rejected: false,
+        });
+
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let live = Arc::clone(&live);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    live.current().len()
+                })
+            })
+            .collect();
+        for t in threads {
+            assert_eq!(t.join().unwrap(), 1);
+        }
+
+        // Eight callers, one build.
+        assert_eq!(live.rebuilds(), 2);
+        let view = status.view();
+        assert!(
+            view.rejected.is_empty(),
+            "obsolete result restored: {view:?}"
+        );
+        assert_eq!(view.applied.unwrap().config_hash, "new");
+    }
+
+    #[test]
+    fn a_write_to_an_unrelated_table_does_not_rebuild_the_index() {
+        // The bug AISIX-Cloud#1542 reported: one API key edit bumped the
+        // single global snapshot version, so the next request on every
+        // worker thread rebuilt every enabled attachment's runtime
+        // instance — one `reqwest::Client` each, each reloading the
+        // system CA store.
+        let snap = AisixSnapshot::new();
+        snap.guardrails.insert(entry(
+            "kw",
+            "g-1",
+            parse(
+                r#"{"name":"kw","kind":"keyword","patterns":[{"kind":"literal","value":"AKIA"}]}"#,
+            ),
+        ));
+        snap.guardrail_attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(r#"{"guardrail_id":"g-1","scope_type":"env","priority":0}"#),
+        ));
+        let handle = SnapshotHandle::new(snap);
+        let live = LiveGuardrailIndex::new(handle.clone(), None);
+        let first = live.current();
+        assert_eq!(live.rebuilds(), 1);
+
+        // A published write to a table the index does not read. The
+        // structural clone shares the guardrail rows, so their table's
+        // generation rides along unchanged.
+        for _ in 0..5 {
+            let next = handle.load().as_ref().clone();
+            next.apikeys
+                .insert(aisix_core::resource::ResourceEntry::new(
+                    "k-1",
+                    serde_json::from_str::<aisix_core::models::ApiKey>(
+                        r#"{"key_hash":"abc","allowed_models":["m"]}"#,
+                    )
+                    .unwrap(),
+                    1,
+                ));
+            handle.store(next);
+        }
+
+        assert!(handle.version() > 0);
+        assert!(Arc::ptr_eq(&first, &live.current()));
+        assert_eq!(live.rebuilds(), 1);
+    }
+
+    #[test]
+    fn an_attachment_write_rebuilds_the_index_but_reuses_unchanged_instances() {
+        let snap = AisixSnapshot::new();
+        for i in 1..=3 {
+            snap.guardrails.insert(entry(
+                &format!("kw-{i}"),
+                &format!("g-{i}"),
+                parse(&format!(
+                    r#"{{"name":"kw-{i}","kind":"keyword","patterns":[{{"kind":"literal","value":"AKIA{i}"}}]}}"#
+                )),
+            ));
+            snap.guardrail_attachments.insert(attachment_entry(
+                &format!("a-{i}"),
+                parse_attachment(&format!(
+                    r#"{{"guardrail_id":"g-{i}","scope_type":"env","priority":0}}"#
+                )),
+            ));
+        }
+        let handle = SnapshotHandle::new(snap);
+        let live = LiveGuardrailIndex::new(handle.clone(), None);
+        let before = live.current();
+        assert_eq!(before.len(), 3);
+        let members_before = before.instances();
+
+        // A fourth attachment onto an existing guardrail: the index has
+        // to change, the three instances behind it must not.
+        let next = handle.load().as_ref().clone();
+        next.guardrail_attachments.insert(attachment_entry(
+            "a-4",
+            parse_attachment(r#"{"guardrail_id":"g-1","scope_type":"env","priority":1}"#),
+        ));
+        handle.store(next);
+
+        let after = live.current();
+        assert_eq!(after.len(), 4);
+        assert_eq!(live.rebuilds(), 2);
+        let members_after = after.instances();
+        for member in &members_before {
+            assert!(
+                members_after.iter().any(|m| Arc::ptr_eq(m, member)),
+                "an unchanged guardrail row was reconstructed",
+            );
+        }
+
+        // Now change one row's content: that one — and only that one —
+        // is reconstructed.
+        let next = handle.load().as_ref().clone();
+        next.guardrails.insert(entry(
+            "kw-2",
+            "g-2",
+            parse(r#"{"name":"kw-2","kind":"keyword","patterns":[{"kind":"literal","value":"SECRET"}]}"#),
+        ));
+        handle.store(next);
+
+        let changed = live.current();
+        let changed_members = changed.instances();
+        let g2_before = before
+            .instance_for("g-2")
+            .expect("g-2 in the pre-change index")
+            .clone();
+        assert!(
+            !changed_members.iter().any(|m| Arc::ptr_eq(m, &g2_before)),
+            "the changed guardrail row kept its old instance",
+        );
+        let g1_before = before
+            .instance_for("g-1")
+            .expect("g-1 in the pre-change index")
+            .clone();
+        assert!(
+            changed_members.iter().any(|m| Arc::ptr_eq(m, &g1_before)),
+            "an unchanged guardrail row was reconstructed",
+        );
+    }
+
+    #[tokio::test]
     async fn live_index_empty_fast_path_resolves_empty_chain() {
         // Zero-config fast path: an empty index resolves to an empty
         // chain with an empty applied set — the same observable shape
@@ -2507,6 +4587,7 @@ mod tests {
                 exec.result,
             ));
         }
+        fn record_guardrail_bypass(&self, _reason: &str) {}
     }
 
     /// A sink attached via `LiveGuardrailIndex::new_with_sink` reaches every
@@ -2544,9 +4625,24 @@ mod tests {
                 }"#,
             ),
         ));
+        // Both rows need an explicit env attachment: scope comes only from
+        // attachments now, so an unattached guardrail never reaches the index
+        // (AISIX-Cloud#1450).
+        for (attachment_id, guardrail_id) in [("a-1", "g-1"), ("a-2", "g-2")] {
+            snap.guardrail_attachments.insert(attachment_entry(
+                attachment_id,
+                parse_attachment(&format!(
+                    r#"{{ "guardrail_id": "{guardrail_id}", "scope_type": "env", "priority": 100 }}"#
+                )),
+            ));
+        }
         let sink = Arc::new(RecordingSink::default());
-        let live =
-            LiveGuardrailIndex::new_with_sink(SnapshotHandle::new(snap), None, Some(sink.clone()));
+        let live = LiveGuardrailIndex::new_with_sink(
+            SnapshotHandle::new(snap),
+            None,
+            Some(sink.clone()),
+            GuardrailEmbedderSlot::none(),
+        );
         let ctx = RequestContext {
             passthrough_route_id: "",
             model_id: "m1",
@@ -2619,17 +4715,20 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table, None);
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
         // input check fires...
         assert!(chain.check_input(&req("secret")).await.is_block());
         // ...but output check is a noop on this rule.
         use aisix_gateway::{ChatResponse, FinishReason, UsageStats};
         let resp = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "r".into(),
             model: "m".into(),
             message: ChatMessage::assistant("secret"),
             finish_reason: FinishReason::Stop,
             usage: UsageStats::new(0, 0),
+            service_tier: None,
         };
         assert!(!chain.check_output(&resp).await.is_block());
     }
@@ -2669,7 +4768,7 @@ mod tests {
             ),
         ));
 
-        let chain = build_chain_from_snapshot(&table, None);
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
         // `applied` mirrors the chain 1:1 (pushed in lockstep); the absolute
         // member order is a `ResourceTable::entries()` concern tested
         // elsewhere, so sort by hook before comparing to pin only that BOTH
@@ -2727,7 +4826,7 @@ mod tests {
             ),
         ));
 
-        let chain = build_chain_from_snapshot(&table, None);
+        let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
         assert_eq!(chain.len(), 1, "only the live row materialises");
         assert_eq!(
             chain.applied(),
@@ -2770,7 +4869,12 @@ mod tests {
             ),
         ));
 
-        let index = build_index_from_snapshot(&guardrails, &attachments, None);
+        let index = build_index_from_snapshot(
+            &guardrails,
+            &attachments,
+            None,
+            &GuardrailEmbedderSlot::none(),
+        );
         let chain = index.resolve(&RequestContext {
             passthrough_route_id: "",
             model_id: "m-A",
@@ -2814,7 +4918,12 @@ mod tests {
             ),
         ));
 
-        let index = build_index_from_snapshot(&guardrails, &attachments, None);
+        let index = build_index_from_snapshot(
+            &guardrails,
+            &attachments,
+            None,
+            &GuardrailEmbedderSlot::none(),
+        );
         assert_eq!(index.len(), 1, "the attachment must not be skipped");
 
         let matched = index.resolve(&RequestContext {
@@ -2871,7 +4980,12 @@ mod tests {
             ),
         ));
 
-        let index = build_index_from_snapshot(&guardrails, &attachments, None);
+        let index = build_index_from_snapshot(
+            &guardrails,
+            &attachments,
+            None,
+            &GuardrailEmbedderSlot::none(),
+        );
         let chain = index.resolve(&RequestContext {
             passthrough_route_id: "",
             model_id: "m-OTHER",

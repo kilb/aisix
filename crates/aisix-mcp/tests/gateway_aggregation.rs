@@ -522,7 +522,7 @@ async fn from_snapshot_degrades_misconfigured_oauth2_upstream_gracefully() {
 
 #[test]
 fn tool_acl_from_allowed_semantics() {
-    // No allowed_tools / empty → deny all.
+    // No list / empty → deny all.
     assert!(!ToolAcl::from_allowed(None).permits("github__create_issue"));
     assert!(!ToolAcl::from_allowed(Some(&[])).permits("github__create_issue"));
     // Wildcard → allow all.
@@ -540,7 +540,7 @@ fn tool_acl_from_allowed_semantics() {
     assert!(!scoped.permits("slack__post_message"));
 }
 
-// ---- policy-driven effective-ACL resolution (`ToolAcl::resolve`) ----
+// ---- layered effective-ACL resolution (`ToolAcl::resolve`) ----
 
 /// Build a caller key from raw JSON (the etcd document shape).
 fn acl_key(json: serde_json::Value) -> aisix_core::models::ApiKey {
@@ -560,74 +560,60 @@ fn policy_snapshot(rows: &[(&str, serde_json::Value)]) -> AisixSnapshot {
 }
 
 fn resolve_now(snapshot: &AisixSnapshot, key: &aisix_core::models::ApiKey) -> ToolAcl {
-    ToolAcl::resolve(snapshot, key)
+    // A fresh index per call: these tests build one snapshot each, and a
+    // shared one would hide a rebuild the generation key is meant to force.
+    ToolAcl::resolve(
+        snapshot,
+        &aisix_core::models::LiveMcpServerIndex::new(),
+        key,
+    )
+}
+
+/// Register the given `(id, name)` MCP servers on `snapshot`, so an
+/// id-form ACL entry has something to resolve against.
+fn with_servers(snapshot: AisixSnapshot, servers: &[(&str, &str)]) -> AisixSnapshot {
+    for (id, name) in servers {
+        let server: aisix_core::models::McpServer = serde_json::from_value(serde_json::json!({
+            "name": name,
+            "url": "https://example.test/mcp",
+        }))
+        .unwrap();
+        snapshot
+            .mcp_servers
+            .insert(ResourceEntry::new(*id, server, 1));
+    }
+    snapshot
 }
 
 #[test]
-fn resolve_legacy_key_without_policies_matches_from_allowed() {
+fn resolve_grants_nothing_when_no_layer_is_configured() {
+    // Deny-by-default: an empty conjunction must not mean "everything".
     let snapshot = AisixSnapshot::new();
-    let no_tools = acl_key(serde_json::json!({"key_hash":"h","allowed_models":[]}));
-    assert!(!resolve_now(&snapshot, &no_tools).permits("github__create_issue"));
+    let key = acl_key(serde_json::json!({"key_hash":"h","allowed_models":[]}));
+    assert!(!resolve_now(&snapshot, &key).permits("github__create_issue"));
+}
 
-    let listed = acl_key(serde_json::json!({
-        "key_hash":"h","allowed_models":[],"allowed_tools":["github__*"]
+#[test]
+fn resolve_key_layer_alone_governs_when_no_policy_exists() {
+    let snapshot = AisixSnapshot::new();
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"mcp_access":{"allow":["github__*"]}
     }));
-    let acl = resolve_now(&snapshot, &listed);
+    let acl = resolve_now(&snapshot, &key);
     assert!(acl.permits("github__create_issue"));
     assert!(!acl.permits("slack__post_message"));
 }
 
 #[test]
-fn resolve_legacy_key_gets_deny_overlay_but_no_policy_grant() {
-    // An env policy grants everything and denies one tool. A legacy key
-    // (no mcp_access block) must NOT be widened by the grant — its
-    // allowed_tools stays the whole allow side — but the deny overlay
-    // applies: deny covers every key the policy covers.
-    let snapshot = policy_snapshot(&[(
-        "p-env",
-        serde_json::json!({"scope":"env","mode":"all","deny":["github__delete_repo"]}),
-    )]);
-    let key = acl_key(serde_json::json!({
-        "key_hash":"h","allowed_models":[],"allowed_tools":["github__*"]
-    }));
-    let acl = resolve_now(&snapshot, &key);
-    assert!(acl.permits("github__create_issue"));
-    assert!(
-        !acl.permits("github__delete_repo"),
-        "policy deny must subtract from a legacy key's grant"
-    );
-    assert!(
-        !acl.permits("slack__post_message"),
-        "an env grant must not widen a legacy key"
-    );
-}
-
-#[test]
-fn resolve_deny_mode_grants_nothing() {
-    let snapshot = policy_snapshot(&[("p-env", serde_json::json!({"scope":"env","mode":"all"}))]);
-    let key = acl_key(serde_json::json!({
-        "key_hash":"h","allowed_models":[],
-        "allowed_tools":["*"],
-        "mcp_access":{"mode":"deny"}
-    }));
-    let acl = resolve_now(&snapshot, &key);
-    assert!(!acl.permits("github__create_issue"));
-    assert!(!acl.permits("anything__at_all"));
-}
-
-#[test]
-fn resolve_inherit_takes_env_default() {
+fn resolve_env_layer_alone_governs_a_key_with_no_block() {
+    // A key that adds no constraint of its own takes the env layer as-is.
     let snapshot = policy_snapshot(&[(
         "p-env",
         serde_json::json!({
-            "scope":"env","mode":"selected",
-            "allow":["github__*"],
-            "deny":["github__delete_repo"]
+            "scope":"env","allow":["github__*"],"deny":["github__delete_repo"]
         }),
     )]);
-    let key = acl_key(serde_json::json!({
-        "key_hash":"h","allowed_models":[],"mcp_access":{"mode":"inherit"}
-    }));
+    let key = acl_key(serde_json::json!({"key_hash":"h","allowed_models":[]}));
     let acl = resolve_now(&snapshot, &key);
     assert!(acl.permits("github__create_issue"));
     assert!(!acl.permits("github__delete_repo"), "deny beats allow");
@@ -635,177 +621,198 @@ fn resolve_inherit_takes_env_default() {
 }
 
 #[test]
-fn resolve_inherit_env_all_and_none_modes() {
-    let all = policy_snapshot(&[("p", serde_json::json!({"scope":"env","mode":"all"}))]);
-    let none = policy_snapshot(&[("p", serde_json::json!({"scope":"env","mode":"none"}))]);
-    let key = acl_key(serde_json::json!({
-        "key_hash":"h","allowed_models":[],"mcp_access":{"mode":"inherit"}
+fn resolve_empty_allow_list_on_any_layer_grants_nothing() {
+    // The explicit "block everything" spelling, replacing the removed
+    // `mode: none` / `mode: deny`.
+    let wide_env = policy_snapshot(&[("p-env", serde_json::json!({"scope":"env","allow":["*"]}))]);
+    let blocked_key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"mcp_access":{"allow":[]}
     }));
-    assert!(resolve_now(&all, &key).permits("anything__at_all"));
-    assert!(!resolve_now(&none, &key).permits("anything__at_all"));
+    assert!(!resolve_now(&wide_env, &blocked_key).permits("github__create_issue"));
+
+    let blocked_env = policy_snapshot(&[("p-env", serde_json::json!({"scope":"env","allow":[]}))]);
+    let wide_key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"mcp_access":{"allow":["*"]}
+    }));
+    assert!(!resolve_now(&blocked_env, &wide_key).permits("github__create_issue"));
 }
 
 #[test]
-fn resolve_inherit_without_any_policy_grants_nothing() {
-    let snapshot = AisixSnapshot::new();
-    let key = acl_key(serde_json::json!({
-        "key_hash":"h","allowed_models":[],"mcp_access":{"mode":"inherit"}
-    }));
-    assert!(!resolve_now(&snapshot, &key).permits("github__create_issue"));
-}
-
-#[test]
-fn resolve_team_policy_replaces_env_grant_for_member_keys() {
-    let snapshot = policy_snapshot(&[
-        (
-            "p-env",
-            serde_json::json!({"scope":"env","mode":"selected","allow":["slack__*"]}),
-        ),
-        (
-            "p-team",
-            serde_json::json!({
-                "scope":"team","scope_ref":"team-1","mode":"selected","allow":["github__*"]
-            }),
-        ),
-    ]);
-
-    // A key in team-1 gets the team grant, not the env default.
-    let member = acl_key(serde_json::json!({
-        "key_hash":"h","allowed_models":[],"team_id":"team-1",
-        "mcp_access":{"mode":"inherit"}
-    }));
-    let acl = resolve_now(&snapshot, &member);
-    assert!(acl.permits("github__create_issue"));
-    assert!(
-        !acl.permits("slack__post_message"),
-        "the team policy replaces the env grant, it does not union with it"
-    );
-
-    // A key outside any team falls back to the env default.
-    let unbound = acl_key(serde_json::json!({
-        "key_hash":"h","allowed_models":[],"mcp_access":{"mode":"inherit"}
-    }));
-    let acl = resolve_now(&snapshot, &unbound);
-    assert!(acl.permits("slack__post_message"));
-    assert!(!acl.permits("github__create_issue"));
-
-    // A key in a team WITHOUT its own policy also falls back to the env
-    // default.
-    let other_team = acl_key(serde_json::json!({
-        "key_hash":"h","allowed_models":[],"team_id":"team-2",
-        "mcp_access":{"mode":"inherit"}
-    }));
-    assert!(resolve_now(&snapshot, &other_team).permits("slack__post_message"));
-}
-
-#[test]
-fn resolve_env_deny_survives_team_takeover() {
-    // The approved deny semantics: deny patterns are a global union — an
-    // environment-level deny holds even when a team policy replaces the
-    // environment's grant with a broader one.
-    let snapshot = policy_snapshot(&[
-        (
-            "p-env",
-            serde_json::json!({
-                "scope":"env","mode":"selected","allow":["slack__*"],
-                "deny":["github__delete_repo"]
-            }),
-        ),
-        (
-            "p-team",
-            serde_json::json!({"scope":"team","scope_ref":"team-1","mode":"all"}),
-        ),
-    ]);
-    let key = acl_key(serde_json::json!({
-        "key_hash":"h","allowed_models":[],"team_id":"team-1",
-        "mcp_access":{"mode":"inherit"}
-    }));
-    let acl = resolve_now(&snapshot, &key);
-    assert!(acl.permits("github__create_issue"));
-    assert!(
-        !acl.permits("github__delete_repo"),
-        "an env-level deny must survive a team policy taking over the grant"
-    );
-}
-
-#[test]
-fn resolve_restrict_narrows_but_never_widens() {
-    let snapshot = policy_snapshot(&[("p-env", serde_json::json!({"scope":"env","mode":"all"}))]);
+fn resolve_key_layer_narrows_but_never_widens_the_policy_layers() {
+    let snapshot = policy_snapshot(&[("p-env", serde_json::json!({"scope":"env","allow":["*"]}))]);
     let key = acl_key(serde_json::json!({
         "key_hash":"h","allowed_models":[],
-        "mcp_access":{"mode":"restrict","allow":["github__*"],"deny":["github__delete_repo"]}
+        "mcp_access":{"allow":["github__*"],"deny":["github__delete_repo"]}
     }));
     let acl = resolve_now(&snapshot, &key);
     assert!(acl.permits("github__create_issue"));
-    assert!(
-        !acl.permits("slack__post_message"),
-        "restrict narrows `all`"
-    );
+    assert!(!acl.permits("slack__post_message"), "the key narrows `*`");
     assert!(!acl.permits("github__delete_repo"), "key deny subtracts");
 
-    // Restriction patterns outside the base grant add nothing: base is
-    // selected [slack__*], the key asks for github — the intersection is
-    // empty in the github direction and slack is cut by the key layer.
-    let narrow_base = policy_snapshot(&[(
+    // The key cannot reach outside a narrower env layer either: the
+    // intersection of [slack__*] and [github__*] is empty.
+    let narrow_env = policy_snapshot(&[(
         "p-env",
-        serde_json::json!({"scope":"env","mode":"selected","allow":["slack__*"]}),
+        serde_json::json!({"scope":"env","allow":["slack__*"]}),
     )]);
-    let acl = resolve_now(&narrow_base, &key);
+    let acl = resolve_now(&narrow_env, &key);
     assert!(!acl.permits("github__create_issue"));
     assert!(!acl.permits("slack__post_message"));
 }
 
 #[test]
-fn resolve_inherit_ignores_key_allow_patterns() {
-    // `allow` participates only in restrict mode; an inherit key carrying
-    // stray allow patterns must not have them narrow (or widen) the grant.
-    let snapshot = policy_snapshot(&[("p-env", serde_json::json!({"scope":"env","mode":"all"}))]);
-    let key = acl_key(serde_json::json!({
-        "key_hash":"h","allowed_models":[],
-        "mcp_access":{"mode":"inherit","allow":["github__*"]}
-    }));
-    assert!(resolve_now(&snapshot, &key).permits("slack__post_message"));
-}
-
-#[test]
-fn resolve_ignores_disabled_policies() {
-    let key = acl_key(serde_json::json!({
-        "key_hash":"h","allowed_models":[],"team_id":"team-1",
-        "mcp_access":{"mode":"inherit"}
-    }));
-
-    // Disabled team policy → fall back to the env default.
+fn resolve_team_layer_intersects_with_env_rather_than_replacing_it() {
     let snapshot = policy_snapshot(&[
         (
             "p-env",
-            serde_json::json!({"scope":"env","mode":"selected","allow":["slack__*"]}),
+            serde_json::json!({"scope":"env","allow":["github__*","slack__*"]}),
         ),
         (
             "p-team",
             serde_json::json!({
-                "scope":"team","scope_ref":"team-1","mode":"all","enabled":false
+                "scope":"team","scope_ref":"team-1","allow":["github__*","jira__*"]
             }),
         ),
     ]);
+
+    // A key in team-1 gets exactly the overlap of the two layers: the team
+    // layer narrows the environment and cannot add `jira__*` on its own.
+    let member = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"team_id":"team-1"
+    }));
+    let acl = resolve_now(&snapshot, &member);
+    assert!(acl.permits("github__create_issue"));
+    assert!(
+        !acl.permits("slack__post_message"),
+        "the team layer narrows the env layer"
+    );
+    assert!(
+        !acl.permits("jira__create_ticket"),
+        "a team layer must never widen beyond the env layer"
+    );
+
+    // A key outside any team sees the env layer alone.
+    let unbound = acl_key(serde_json::json!({"key_hash":"h","allowed_models":[]}));
+    let acl = resolve_now(&snapshot, &unbound);
+    assert!(acl.permits("slack__post_message"));
+    assert!(acl.permits("github__create_issue"));
+
+    // A key in a team WITHOUT its own policy also sees the env layer alone.
+    let other_team = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"team_id":"team-2"
+    }));
+    assert!(resolve_now(&snapshot, &other_team).permits("slack__post_message"));
+}
+
+#[test]
+fn resolve_all_three_layers_intersect() {
+    let snapshot = policy_snapshot(&[
+        (
+            "p-env",
+            serde_json::json!({"scope":"env","allow":["*"],"deny":["github__delete_repo"]}),
+        ),
+        (
+            "p-team",
+            serde_json::json!({"scope":"team","scope_ref":"team-1","allow":["github__*"]}),
+        ),
+    ]);
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"team_id":"team-1",
+        "mcp_access":{"allow":["github__create_issue","github__delete_repo"]}
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(acl.permits("github__create_issue"));
+    assert!(
+        !acl.permits("github__list_issues"),
+        "the key layer narrows the team layer"
+    );
+    assert!(
+        !acl.permits("github__delete_repo"),
+        "an env deny survives allows on every other layer"
+    );
+}
+
+#[test]
+fn resolve_env_deny_survives_a_broader_team_layer() {
+    // Deny patterns are a global union: an environment-level deny holds
+    // however wide the team and key layers are.
+    let snapshot = policy_snapshot(&[
+        (
+            "p-env",
+            serde_json::json!({
+                "scope":"env","allow":["*"],"deny":["github__delete_repo"]
+            }),
+        ),
+        (
+            "p-team",
+            serde_json::json!({"scope":"team","scope_ref":"team-1","allow":["*"]}),
+        ),
+    ]);
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"team_id":"team-1"
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(acl.permits("github__create_issue"));
+    assert!(
+        !acl.permits("github__delete_repo"),
+        "an env-level deny must survive a wide-open team layer"
+    );
+}
+
+#[test]
+fn resolve_deny_only_layer_is_spelled_with_a_wildcard_allow() {
+    // A layer that only means to subtract writes `allow: ["*"]`; forgetting
+    // it is a schema error rather than a silent lockout (see
+    // `mcp_policy_requires_an_explicit_allow_side` in aisix-core).
+    let snapshot = policy_snapshot(&[(
+        "p-env",
+        serde_json::json!({"scope":"env","allow":["*"],"deny":["github__delete_repo"]}),
+    )]);
+    let key = acl_key(serde_json::json!({"key_hash":"h","allowed_models":[]}));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(acl.permits("slack__post_message"));
+    assert!(!acl.permits("github__delete_repo"));
+}
+
+#[test]
+fn resolve_ignores_disabled_policies() {
+    // Disabled team policy → the env layer is the only policy layer left.
+    let snapshot = policy_snapshot(&[
+        (
+            "p-env",
+            serde_json::json!({"scope":"env","allow":["slack__*"]}),
+        ),
+        (
+            "p-team",
+            serde_json::json!({
+                "scope":"team","scope_ref":"team-1","allow":["github__*"],"enabled":false
+            }),
+        ),
+    ]);
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"team_id":"team-1"
+    }));
     let acl = resolve_now(&snapshot, &key);
     assert!(acl.permits("slack__post_message"));
     assert!(!acl.permits("github__create_issue"));
 
-    // Disabled env policy → no grant at all, and its deny stops
-    // applying (a disabled policy neither grants nor denies).
+    // Disabled env policy → neither its grant nor its deny applies, leaving
+    // the key layer as the only layer.
     let snapshot = policy_snapshot(&[(
         "p-env",
         serde_json::json!({
-            "scope":"env","mode":"all","deny":["slack__*"],
-            "enabled":false
+            "scope":"env","allow":["*"],"deny":["slack__*"],"enabled":false
         }),
     )]);
-    let legacy = acl_key(serde_json::json!({
-        "key_hash":"h","allowed_models":[],"allowed_tools":["slack__*"]
+    let scoped = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"mcp_access":{"allow":["slack__*"]}
     }));
-    assert!(!resolve_now(&snapshot, &key).permits("anything__at_all"));
     assert!(
-        resolve_now(&snapshot, &legacy).permits("slack__post_message"),
+        !resolve_now(&snapshot, &key).permits("anything__at_all"),
+        "with every policy disabled and no key block, nothing is granted"
+    );
+    assert!(
+        resolve_now(&snapshot, &scoped).permits("slack__post_message"),
         "a disabled policy's deny must stop applying"
     );
 }
@@ -817,16 +824,14 @@ fn resolve_duplicate_scope_rows_pick_lowest_id() {
     let snapshot = policy_snapshot(&[
         (
             "p-b",
-            serde_json::json!({"scope":"env","mode":"selected","allow":["beta__*"]}),
+            serde_json::json!({"scope":"env","allow":["beta__*"]}),
         ),
         (
             "p-a",
-            serde_json::json!({"scope":"env","mode":"selected","allow":["alpha__*"]}),
+            serde_json::json!({"scope":"env","allow":["alpha__*"]}),
         ),
     ]);
-    let key = acl_key(serde_json::json!({
-        "key_hash":"h","allowed_models":[],"mcp_access":{"mode":"inherit"}
-    }));
+    let key = acl_key(serde_json::json!({"key_hash":"h","allowed_models":[]}));
     let acl = resolve_now(&snapshot, &key);
     assert!(acl.permits("alpha__echo"));
     assert!(!acl.permits("beta__echo"));
@@ -935,13 +940,11 @@ fn resolve_duplicate_scope_rows_deny_union_survives_tie_break() {
     let snapshot = policy_snapshot(&[
         (
             "p-b",
-            serde_json::json!({"scope":"env","mode":"all","deny":["beta__echo"]}),
+            serde_json::json!({"scope":"env","allow":["*"],"deny":["beta__echo"]}),
         ),
-        ("p-a", serde_json::json!({"scope":"env","mode":"all"})),
+        ("p-a", serde_json::json!({"scope":"env","allow":["*"]})),
     ]);
-    let key = acl_key(serde_json::json!({
-        "key_hash":"h","allowed_models":[],"mcp_access":{"mode":"inherit"}
-    }));
+    let key = acl_key(serde_json::json!({"key_hash":"h","allowed_models":[]}));
     let acl = resolve_now(&snapshot, &key);
     assert!(acl.permits("alpha__echo"));
     assert!(
@@ -951,23 +954,13 @@ fn resolve_duplicate_scope_rows_deny_union_survives_tie_break() {
 }
 
 #[test]
-fn resolve_restrict_with_empty_allow_grants_nothing() {
-    // restrict + empty allow = the empty intersection, whatever the base.
-    let snapshot = policy_snapshot(&[("p-env", serde_json::json!({"scope":"env","mode":"all"}))]);
+fn resolve_key_block_without_an_allow_side_grants_nothing() {
+    // A key block is the key's whole allow side; an empty one is the empty
+    // intersection, whatever the policy layers grant. (The write path
+    // requires the field, so this only guards the runtime loader.)
+    let snapshot = policy_snapshot(&[("p-env", serde_json::json!({"scope":"env","allow":["*"]}))]);
     let key = acl_key(serde_json::json!({
-        "key_hash":"h","allowed_models":[],"mcp_access":{"mode":"restrict"}
-    }));
-    assert!(!resolve_now(&snapshot, &key).permits("alpha__echo"));
-}
-
-#[test]
-fn resolve_selected_with_empty_allow_grants_nothing() {
-    let snapshot = policy_snapshot(&[(
-        "p-env",
-        serde_json::json!({"scope":"env","mode":"selected"}),
-    )]);
-    let key = acl_key(serde_json::json!({
-        "key_hash":"h","allowed_models":[],"mcp_access":{"mode":"inherit"}
+        "key_hash":"h","allowed_models":[],"mcp_access":{"allow":[]}
     }));
     assert!(!resolve_now(&snapshot, &key).permits("alpha__echo"));
 }
@@ -981,13 +974,12 @@ fn resolve_team_row_without_scope_ref_matches_no_key() {
     let snapshot = policy_snapshot(&[
         (
             "p-env",
-            serde_json::json!({"scope":"env","mode":"selected","allow":["alpha__*"]}),
+            serde_json::json!({"scope":"env","allow":["alpha__*"]}),
         ),
-        ("p-bad", serde_json::json!({"scope":"team","mode":"all"})),
+        ("p-bad", serde_json::json!({"scope":"team","allow":["*"]})),
     ]);
     let teamed = acl_key(serde_json::json!({
-        "key_hash":"h","allowed_models":[],"team_id":"team-1",
-        "mcp_access":{"mode":"inherit"}
+        "key_hash":"h","allowed_models":[],"team_id":"team-1"
     }));
     let acl = resolve_now(&snapshot, &teamed);
     assert!(
@@ -996,22 +988,20 @@ fn resolve_team_row_without_scope_ref_matches_no_key() {
     );
     assert!(
         !acl.permits("beta__echo"),
-        "a scope_ref-less team row must not grant anything"
+        "a scope_ref-less team row must not apply to any key"
     );
 }
 
 #[tokio::test]
 async fn policy_resolved_acl_filters_list_and_rejects_calls() {
-    // Full wiring: an env policy granting alpha only, denied one level up
-    // by nothing; the key inherits. beta stays hidden from tools/list and
-    // rejected on tools/call, exactly like a legacy allowlist would.
+    // Full wiring: an env policy granting alpha only and a key that adds no
+    // constraint of its own. beta stays hidden from tools/list and rejected
+    // on tools/call.
     let snapshot = policy_snapshot(&[(
         "p-env",
-        serde_json::json!({"scope":"env","mode":"selected","allow":["alpha__*"]}),
+        serde_json::json!({"scope":"env","allow":["alpha__*"]}),
     )]);
-    let key = acl_key(serde_json::json!({
-        "key_hash":"h","allowed_models":[],"mcp_access":{"mode":"inherit"}
-    }));
+    let key = acl_key(serde_json::json!({"key_hash":"h","allowed_models":[]}));
     let acl = resolve_now(&snapshot, &key);
 
     let gateway = McpGateway::new([
@@ -1056,4 +1046,293 @@ async fn policy_resolved_acl_filters_list_and_rejects_calls() {
 fn call(name: &'static str, text: &str) -> CallToolRequestParams {
     let args = serde_json::json!({ "text": text });
     CallToolRequestParams::new(name).with_arguments(args.as_object().unwrap().clone())
+}
+
+// ---- the id spelling of a layer's two sides (`allow_ids` / `deny_ids`) ----
+
+#[test]
+fn allow_ids_grant_by_server_resource_id() {
+    let snapshot = with_servers(
+        policy_snapshot(&[]),
+        &[("s-github", "github"), ("s-slack", "slack")],
+    );
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],
+        "mcp_access":{"allow":[],"allow_ids":[{"server_id":"s-github","tool":"create_issue"}]}
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(acl.permits("github__create_issue"));
+    assert!(!acl.permits("github__delete_repo"));
+    assert!(!acl.permits("slack__post_message"));
+}
+
+#[test]
+fn an_allow_id_tool_glob_covers_the_whole_server() {
+    let snapshot = with_servers(policy_snapshot(&[]), &[("s-github", "github")]);
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],
+        "mcp_access":{"allow":[],"allow_ids":[{"server_id":"s-github","tool":"*"}]}
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(acl.permits("github__create_issue"));
+    assert!(acl.permits("github__anything_at_all"));
+    assert!(!acl.permits("slack__post_message"));
+}
+
+#[test]
+fn an_id_grant_survives_a_server_rename() {
+    // The whole point: the key document is byte-identical across the
+    // rename, and the grant follows the id to the server's new namespace.
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],
+        "mcp_access":{"allow":["github__create_issue"],
+                      "allow_ids":[{"server_id":"s-github","tool":"create_issue"}]}
+    }));
+
+    let before = with_servers(policy_snapshot(&[]), &[("s-github", "github")]);
+    assert!(resolve_now(&before, &key).permits("github__create_issue"));
+
+    let after = with_servers(policy_snapshot(&[]), &[("s-github", "github-v2")]);
+    let acl = resolve_now(&after, &key);
+    assert!(
+        acl.permits("github-v2__create_issue"),
+        "the grant follows the id into the server's new namespace"
+    );
+    assert!(
+        !acl.permits("github__create_issue"),
+        "and does not linger on the old one, which now names no server"
+    );
+}
+
+#[test]
+fn allow_ids_win_over_allow_on_the_same_layer() {
+    let snapshot = with_servers(
+        policy_snapshot(&[]),
+        &[("s-github", "github"), ("s-slack", "slack")],
+    );
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],
+        "mcp_access":{"allow":["slack__*"],
+                      "allow_ids":[{"server_id":"s-github","tool":"create_issue"}]}
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(acl.permits("github__create_issue"));
+    assert!(
+        !acl.permits("slack__post_message"),
+        "the name side is not read at all once the id side is present"
+    );
+
+    // Even a wide-open name side loses to an empty id side.
+    let widened = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],
+        "mcp_access":{"allow":["*"],"allow_ids":[]}
+    }));
+    assert!(!resolve_now(&snapshot, &widened).permits("github__create_issue"));
+}
+
+#[test]
+fn an_unresolvable_server_id_matches_nothing_and_spares_its_neighbours() {
+    let snapshot = with_servers(
+        policy_snapshot(&[]),
+        &[("s-github", "github"), ("s-slack", "slack")],
+    );
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],
+        "mcp_access":{"allow":[],"allow_ids":[
+            {"server_id":"s-gone","tool":"*"},
+            {"server_id":"s-slack","tool":"post_message"}
+        ]}
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(acl.permits("slack__post_message"));
+    assert!(!acl.permits("github__create_issue"));
+    assert!(!acl.permits("s-gone__anything"));
+}
+
+#[test]
+fn deny_ids_subtract_and_win_over_every_allow_layer() {
+    let snapshot = with_servers(
+        policy_snapshot(&[(
+            "p-env",
+            serde_json::json!({
+                "scope":"env","allow":["*"],"deny":[],
+                "deny_ids":[{"server_id":"s-github","tool":"delete_repo"}]
+            }),
+        )]),
+        &[("s-github", "github")],
+    );
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"mcp_access":{"allow":["*"]}
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(acl.permits("github__create_issue"));
+    assert!(!acl.permits("github__delete_repo"));
+}
+
+#[test]
+fn deny_ids_win_over_deny_on_the_same_layer() {
+    let snapshot = with_servers(
+        policy_snapshot(&[(
+            "p-env",
+            serde_json::json!({
+                "scope":"env","allow":["*"],
+                "deny":["github__create_issue"],
+                "deny_ids":[{"server_id":"s-github","tool":"delete_repo"}]
+            }),
+        )]),
+        &[("s-github", "github")],
+    );
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"mcp_access":{"allow":["*"]}
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(
+        acl.permits("github__create_issue"),
+        "the name side of deny is not read once the id side is present"
+    );
+    assert!(!acl.permits("github__delete_repo"));
+}
+
+#[test]
+fn the_two_spellings_mix_across_layers() {
+    // An env layer written by name, a key layer written by id: both are
+    // resolved against the same addressed tool, so the intersection holds.
+    let snapshot = with_servers(
+        policy_snapshot(&[(
+            "p-env",
+            serde_json::json!({"scope":"env","allow":["github__*","slack__*"]}),
+        )]),
+        &[("s-github", "github"), ("s-slack", "slack")],
+    );
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],
+        "mcp_access":{"allow":[],"allow_ids":[{"server_id":"s-github","tool":"*"}]}
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(acl.permits("github__create_issue"));
+    assert!(
+        !acl.permits("slack__post_message"),
+        "the id-spelled key layer still narrows the name-spelled env layer"
+    );
+    assert!(!acl.permits("jira__create_ticket"));
+}
+
+#[test]
+fn a_server_id_is_never_glob_matched_through_its_name() {
+    // A registered name may legally contain a `*` (only `__` and a
+    // trailing `_` are forbidden). Resolving an id to that name and
+    // pasting it into a `<name>__<tool>` pattern would let one server's
+    // grant reach another server's tools, so the server half is compared
+    // as an exact id instead.
+    let snapshot = with_servers(
+        policy_snapshot(&[]),
+        &[("s-star", "gh*"), ("s-other", "ghost")],
+    );
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],
+        "mcp_access":{"allow":[],"allow_ids":[{"server_id":"s-star","tool":"*"}]}
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(acl.permits("gh*__read"));
+    assert!(
+        !acl.permits("ghost__read"),
+        "the grant must not spread to a server whose name the other's matches as a glob"
+    );
+}
+
+#[test]
+fn an_id_layer_admits_nothing_for_a_tool_outside_every_namespace() {
+    let snapshot = with_servers(policy_snapshot(&[]), &[("s-github", "github")]);
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],
+        "mcp_access":{"allow":[],"allow_ids":[{"server_id":"s-github","tool":"*"}]}
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(!acl.permits("create_issue"), "no namespace prefix at all");
+    assert!(!acl.permits("unregistered__create_issue"));
+}
+
+#[test]
+fn an_env_policy_may_write_its_allow_side_by_id() {
+    // The policy layers carry the id spelling too, and nothing else in
+    // this suite exercises a policy's `allow_ids`: the key layer is where
+    // every other id case above puts it.
+    let snapshot = with_servers(
+        policy_snapshot(&[(
+            "p-env",
+            serde_json::json!({
+                "scope": "env", "allow": [],
+                "allow_ids": [{"server_id": "s-github", "tool": "create_issue"}]
+            }),
+        )]),
+        &[("s-github", "github"), ("s-slack", "slack")],
+    );
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"mcp_access":{"allow":["*"]}
+    }));
+    let acl = resolve_now(&snapshot, &key);
+    assert!(acl.permits("github__create_issue"));
+    assert!(!acl.permits("github__delete_repo"));
+    assert!(
+        !acl.permits("slack__post_message"),
+        "the env layer's id grant narrows the key's `*`"
+    );
+}
+
+#[test]
+fn a_team_policy_may_write_its_allow_side_by_id() {
+    let snapshot = with_servers(
+        policy_snapshot(&[
+            ("p-env", serde_json::json!({"scope": "env", "allow": ["*"]})),
+            (
+                "p-team",
+                serde_json::json!({
+                    "scope": "team", "scope_ref": "team-1", "allow": [],
+                    "allow_ids": [{"server_id": "s-github", "tool": "*"}]
+                }),
+            ),
+        ]),
+        &[("s-github", "github"), ("s-slack", "slack")],
+    );
+    let member = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"team_id":"team-1",
+        "mcp_access":{"allow":["*"]}
+    }));
+    let acl = resolve_now(&snapshot, &member);
+    assert!(acl.permits("github__create_issue"));
+    assert!(!acl.permits("slack__post_message"));
+
+    // A key outside the team is not narrowed by it, so the id-spelled
+    // team layer really is what produced the result above.
+    let outsider = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"team_id":"team-2",
+        "mcp_access":{"allow":["*"]}
+    }));
+    assert!(resolve_now(&snapshot, &outsider).permits("slack__post_message"));
+}
+
+#[test]
+fn a_policy_id_grant_survives_a_server_rename() {
+    let policy_row = serde_json::json!({
+        "scope": "env", "allow": ["github__create_issue"],
+        "allow_ids": [{"server_id": "s-github", "tool": "create_issue"}]
+    });
+    let key = acl_key(serde_json::json!({
+        "key_hash":"h","allowed_models":[],"mcp_access":{"allow":["*"]}
+    }));
+
+    let before = with_servers(
+        policy_snapshot(&[("p-env", policy_row.clone())]),
+        &[("s-github", "github")],
+    );
+    assert!(resolve_now(&before, &key).permits("github__create_issue"));
+
+    // Same policy document, same key document, renamed server.
+    let after = with_servers(
+        policy_snapshot(&[("p-env", policy_row)]),
+        &[("s-github", "github-v2")],
+    );
+    let acl = resolve_now(&after, &key);
+    assert!(acl.permits("github-v2__create_issue"));
+    assert!(!acl.permits("github__create_issue"));
 }

@@ -88,7 +88,7 @@ describe("MCP server and A2A agent IP allowlists", () => {
       key_hash: sha256(KEY),
       allowed_models: [],
       allowed_agents: ["*"],
-      allowed_tools: ["*"],
+      mcp_access: { allow: ["*"] },
     });
   });
 

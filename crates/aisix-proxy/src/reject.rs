@@ -64,15 +64,18 @@ pub(crate) fn reject_before_dispatch(
     let status = err.status().as_u16();
     let elapsed = started.elapsed();
     let (error_kind, error) = crate::attempt::access_log_error(&err);
-    AccessLog {
+    crate::attribution::emit_access_log(AccessLog {
         method,
         path,
         status,
         latency: elapsed,
+        duration: elapsed,
         // Nothing is resolved this early: no upstream was picked, and the
         // body naming the model is exactly what we refused to read.
         provider: None,
         model: None,
+        upstream_model: None,
+        provider_key_id: None,
         api_key_id,
         prompt_tokens: None,
         completion_tokens: None,
@@ -84,15 +87,18 @@ pub(crate) fn reject_before_dispatch(
         routing_fallback_count: None,
         error_kind: Some(error_kind),
         error: Some(&error),
-    }
-    .emit();
+        mcp: None,
+        cache: None,
+        request_body_bytes: None,
+        response_body_bytes: None,
+    });
     // `path` must be normalized, not passed through: `AisixPath` below hands
     // this the RAW `parts.uri.path()` so the access log can name the
     // malformed segment, and that string is caller-controlled (#451).
     // `request_metrics` keys the LLM-vs-proxy split off the result, so a 413
     // on /v1/chat/completions lands in the same families as the
     // model-not-found the handler itself records.
-    crate::request_metrics::record(
+    crate::request_metrics::record_undispatched(
         state,
         crate::normalize_endpoint_label(path),
         crate::request_metrics::Caller::unattributed(api_key_id),
@@ -102,12 +108,97 @@ pub(crate) fn reject_before_dispatch(
             ..Default::default()
         },
         status,
+        crate::attempt::error_source(&err),
         elapsed,
     );
     match envelope {
         Envelope::OpenAi => err.into_response(),
         Envelope::Anthropic => err.into_anthropic_response(),
     }
+}
+
+/// Write the access-log line for a request answered without dispatch and
+/// without a typed error: a discovery document, the model list, an
+/// unrouted path's 404, the router's 405. Only what is known is written —
+/// no upstream, no model, no error class.
+pub(crate) fn emit_unrouted_access_log(
+    method: &str,
+    path: &str,
+    request_id: &str,
+    api_key_id: Option<&str>,
+    status: u16,
+    started: Instant,
+) {
+    let elapsed = started.elapsed();
+    crate::attribution::emit_access_log(AccessLog {
+        method,
+        path,
+        status,
+        latency: elapsed,
+        duration: elapsed,
+        provider: None,
+        model: None,
+        upstream_model: None,
+        provider_key_id: None,
+        api_key_id,
+        prompt_tokens: None,
+        completion_tokens: None,
+        total_tokens: None,
+        request_id,
+        provider_request_id: None,
+        served_by_model: None,
+        routing_attempt_count: None,
+        routing_fallback_count: None,
+        error_kind: None,
+        error: None,
+        mcp: None,
+        cache: None,
+        request_body_bytes: None,
+        response_body_bytes: None,
+    });
+}
+
+/// Count a request answered without dispatch (`/v1/models`, the A2A agent
+/// card, the OAuth discovery documents) in the request families. Nothing
+/// upstream was resolved, so only the route, the caller and the outcome are
+/// labelled.
+pub(crate) fn record_undispatched(
+    state: &ProxyState,
+    path: &str,
+    caller: crate::request_metrics::Caller<'_>,
+    status: u16,
+    error_source: aisix_obs::ErrorSource,
+    started: Instant,
+) {
+    crate::request_metrics::record_undispatched(
+        state,
+        crate::normalize_endpoint_label(path),
+        caller,
+        crate::request_metrics::Upstream::default(),
+        status,
+        error_source,
+        started.elapsed(),
+    );
+}
+
+/// The router's answer to a known path with a method it does not serve.
+/// axum's own 405 (it still adds `Allow`), plus the request's access-log
+/// line, which the built-in fallback never wrote.
+pub(crate) async fn method_not_allowed(request: axum::extract::Request) -> Response {
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .map(|r| r.0.clone())
+        .unwrap_or_default();
+    emit_unrouted_access_log(
+        request.method().as_str(),
+        request.uri().path(),
+        &request_id,
+        None,
+        axum::http::StatusCode::METHOD_NOT_ALLOWED.as_u16(),
+        Instant::now(),
+    );
+    axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response()
 }
 
 /// `axum::extract::Path` with the rejection routed through
@@ -203,13 +294,15 @@ mod tests {
             .insert(ResourceEntry::new("ak-1", apikey, 1));
         let cfg = ProxyConfig {
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: Some(0),
+            request_body_limit_bytes: 0,
             tls: None,
+            listeners: Vec::new(),
             real_ip: Default::default(),
             request_id: Default::default(),
             thread_per_core: None,
             workers: None,
             url_rewrites: Vec::new(),
+            expose_debug_headers: false,
         };
         ProxyState::new(
             SnapshotHandle::new(snapshot),

@@ -7,44 +7,42 @@
 //! so semantic routing reuses all of the streaming / failover / telemetry
 //! machinery and only adds the "which target" decision on top.
 //!
-//! The scoring core ([`cosine_similarity`], [`decide`],
-//! [`embedding_failure_target`]) and the example-vector cache
-//! ([`SemanticVectorCache`]) are pure and unit-tested in isolation; the
-//! async embedding call lives in [`resolve`].
+//! A router with a `classifier` block makes the same decision a different
+//! way: one call to a hosted decision model ([`classify`]) picks a route by
+//! its description. Everything after the pick — the member gates, the
+//! failure policy, the served-route attribution — is shared.
+//!
+//! The scoring core ([`decide`], [`failure_target`]) and the
+//! example-vector cache ([`SemanticVectorCache`]) are pure and unit-tested
+//! in isolation; the async embedding call lives in [`resolve`].
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use dashmap::DashMap;
 
-use aisix_core::models::{EmbeddingFailureMode, OnEmbeddingFailure, Semantic};
+use aisix_core::models::{
+    resolve_model_ref, EmbeddingFailureMode, OnEmbeddingFailure, Semantic, SemanticClassifier,
+    SemanticRoute, TYPESAFE_PROVIDER,
+};
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{AisixSnapshot, Model};
-use aisix_gateway::{EmbeddingRequest, EmbeddingVector};
+use aisix_gateway::{EmbeddingRequest, EmbeddingUsageSource, EmbeddingVector};
+use aisix_obs::{
+    GatewayEmbeddingCall, GatewayEmbeddingOutcome, GatewayEmbeddingPurpose,
+    GatewayEmbeddingUsageSource, SemanticAccessLog, SemanticFallback,
+};
 
 use crate::error::ProxyError;
 use crate::routing::AttemptModel;
 use crate::state::ProxyState;
 
-/// Cosine similarity of two equal-length vectors. Returns `0.0` for a
-/// length mismatch or a zero-magnitude vector, so a degenerate embedding
-/// can never inject `NaN` into the `max` aggregation.
-pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() {
-        return 0.0;
-    }
-    let mut dot = 0.0f32;
-    let mut na = 0.0f32;
-    let mut nb = 0.0f32;
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
-    if na == 0.0 || nb == 0.0 {
-        return 0.0;
-    }
-    dot / (na.sqrt() * nb.sqrt())
-}
+// Scoring primitives are shared with the `kind: "semantic"` guardrail,
+// which scores the same way against its example prototypes — one
+// implementation in `aisix-core` so the two cannot drift on the
+// degenerate cases (length mismatch, zero magnitude, empty prototype
+// set).
+pub(crate) use aisix_core::best_similarity;
 
 /// Outcome of scoring a request against a semantic router.
 #[derive(Debug, Clone, PartialEq)]
@@ -68,11 +66,12 @@ pub(crate) fn decide(
 ) -> RouteDecision {
     let mut scores = Vec::with_capacity(semantic.routes.len());
     for ex_vecs in route_example_vecs {
-        let best = ex_vecs
-            .iter()
-            .map(|v| cosine_similarity(request_vec, v))
-            .fold(f32::NEG_INFINITY, f32::max);
-        scores.push(if best.is_finite() { best } else { 0.0 });
+        // A route with no cached example vectors scores 0.0, not
+        // `-inf`: it must lose to every real route without poisoning the
+        // comparison.
+        scores.push(
+            best_similarity(request_vec, ex_vecs.iter().map(|v| v.as_slice())).unwrap_or(0.0),
+        );
     }
     let mut winner: Option<usize> = None;
     let mut best = f32::NEG_INFINITY;
@@ -85,20 +84,109 @@ pub(crate) fn decide(
     RouteDecision { winner, scores }
 }
 
-/// Direct-model alias to dispatch to when the embedding call fails, per
-/// `on_embedding_failure`. `None` means the policy is `fail` — the caller
-/// returns `503`.
-pub(crate) fn embedding_failure_target(semantic: &Semantic) -> Option<&str> {
-    match &semantic.on_embedding_failure {
-        OnEmbeddingFailure::Mode(EmbeddingFailureMode::Default) => Some(&semantic.default),
+/// Why a semantic router could not make its decision: the closed vocabulary
+/// [`ProxyError::SemanticDecisionFailed`] carries to the caller and the
+/// access log. Free text about the failure goes only to the warn line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionFailure {
+    ClassifierTimeout,
+    /// The classifier answered a non-2xx status, or the call failed in
+    /// transport.
+    ClassifierUpstream,
+    /// The classifier answered 2xx with no usable choice.
+    ClassifierInvalidResponse,
+    /// The classifier's provider key is missing or not a `typesafe` one.
+    ClassifierUnavailable,
+    EmbeddingTimeout,
+    /// The embedding upstream answered an error, or the call failed in
+    /// transport or decoding.
+    EmbeddingUpstream,
+    /// The embedding model is missing, misconfigured, or returned vectors
+    /// that do not fit it.
+    EmbeddingUnavailable,
+}
+
+impl DecisionFailure {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ClassifierTimeout => "classifier_timeout",
+            Self::ClassifierUpstream => "classifier_upstream",
+            Self::ClassifierInvalidResponse => "classifier_invalid_response",
+            Self::ClassifierUnavailable => "classifier_unavailable",
+            Self::EmbeddingTimeout => "embedding_timeout",
+            Self::EmbeddingUpstream => "embedding_upstream",
+            Self::EmbeddingUnavailable => "embedding_unavailable",
+        }
+    }
+
+    fn of_classifier_transport(err: &reqwest::Error) -> (Self, String) {
+        let failure = if err.is_timeout() {
+            Self::ClassifierTimeout
+        } else {
+            Self::ClassifierUpstream
+        };
+        (failure, aisix_gateway::transport_error_message(err))
+    }
+
+    fn of_embedding_error(err: &EmbedTextsError) -> Self {
+        use aisix_gateway::BridgeError;
+        match err {
+            EmbedTextsError::Dispatch(ProxyError::Bridge(BridgeError::Timeout { .. })) => {
+                Self::EmbeddingTimeout
+            }
+            EmbedTextsError::Dispatch(ProxyError::Bridge(
+                BridgeError::UpstreamStatus { .. }
+                | BridgeError::UpstreamInBand { .. }
+                | BridgeError::UpstreamDecode(_)
+                | BridgeError::UpstreamBodyUnread { .. }
+                | BridgeError::TokenExchangeDecode(_)
+                | BridgeError::Transport(_)
+                | BridgeError::StreamAborted,
+            )) => Self::EmbeddingUpstream,
+            EmbedTextsError::Dispatch(_) | EmbedTextsError::UnusableResponse(_) => {
+                Self::EmbeddingUnavailable
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for DecisionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Direct-model alias to dispatch to when the router cannot decide — the
+/// embedding call failed (`on_embedding_failure`), or the classifier call
+/// did (`classifier.on_failure`). `None` means the policy is `fail` — the
+/// caller returns `503`.
+///
+/// Each of the two aliases it can return is a model reference in its own
+/// right, so both are resolved against the snapshot: an id spelling follows
+/// a rename, and an id that resolves to nothing comes back as itself and
+/// dispatches nowhere, exactly as a dangling alias does.
+pub(crate) fn failure_target<'a>(
+    snapshot: &AisixSnapshot,
+    semantic: &'a Semantic,
+) -> Option<Cow<'a, str>> {
+    let policy = match &semantic.classifier {
+        Some(classifier) => &classifier.on_failure,
+        None => &semantic.on_embedding_failure,
+    };
+    match policy {
+        OnEmbeddingFailure::Mode(EmbeddingFailureMode::Default) => {
+            Some(semantic.default_ref(snapshot))
+        }
         OnEmbeddingFailure::Mode(EmbeddingFailureMode::Fail) => None,
-        OnEmbeddingFailure::Target { target } => Some(target),
+        OnEmbeddingFailure::Target { target, target_id } => {
+            Some(resolve_model_ref(snapshot, target, target_id.as_deref()))
+        }
     }
 }
 
 /// Per-instance cache of route example-utterance embeddings, populated
 /// lazily on the first request that needs them and reused across requests
-/// so the steady-state per-request cost is a single embedding call for the
+/// so a steady-state request's logical embedding batch contains only the
 /// prompt. Keyed by `(embedding_model_id, dimensions, example_text)` —
 /// changing the embedding model or its dimensions auto-invalidates, since
 /// a stale vector of the wrong dimension must never be served.
@@ -108,6 +196,11 @@ pub struct SemanticVectorCache {
 }
 
 impl SemanticVectorCache {
+    /// Embeddings cached; nothing is ever evicted.
+    pub fn entry_count(&self) -> u64 {
+        self.vectors.len() as u64
+    }
+
     pub(crate) fn get(
         &self,
         embedding_model_id: &str,
@@ -133,10 +226,28 @@ impl SemanticVectorCache {
     }
 }
 
+/// What a router's decision step produced, before the member gates run.
+struct Pick {
+    /// Index into `Semantic::routes` of the chosen route; `None` sends the
+    /// request to `default`.
+    winner: Option<usize>,
+    /// The deciding score: the winning (or, with no winner, the best)
+    /// route's cosine similarity, or the classifier's confidence.
+    score: Option<f64>,
+    /// Why there is no winner.
+    miss: Option<SemanticFallback>,
+    /// 这次决策本身花的钱（micro-USD）。只有嵌入决策有：分类器不是一条
+    /// Model，既不按模型计量也不定价。
+    embed_spend: u64,
+}
+
 /// Resolve a semantic router to a single direct-model attempt + the name
 /// of the route that matched (`None` when the request fell through to
 /// `default`). The returned `Vec<AttemptModel>` always has exactly one
 /// element; the chat dispatch loop drives it like any routing target.
+///
+/// How it decided is published for the request's access-log line
+/// ([`crate::attribution::note_semantic_decision`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve(
     state: &ProxyState,
@@ -157,30 +268,140 @@ pub(crate) async fn resolve(
         .expect("resolve called on a non-semantic model");
     let router = &router_entry.value;
 
+    // Every alias this function dispatches to is read through the model
+    // reference helpers: a router that names its targets by id keeps
+    // working across a rename of any of them, and an id that resolves to
+    // nothing behaves as the dangling alias it stands in for.
+    let default_target = semantic.default_ref(snapshot);
+
     // No user text to classify (e.g. a system-only or tool-only request):
-    // route to `default` without an embedding call rather than embedding an
-    // empty string, which could spuriously match a route.
+    // route to `default` without a decision call rather than deciding on
+    // an empty string, which could spuriously match a route.
     if prompt.trim().is_empty() {
+        note_decision(None, None, Some(SemanticFallback::EmptyPrompt));
         let (attempt, _) =
-            select_eligible(state, snapshot, router, source_ip, &semantic.default, None)?;
+            select_eligible(state, snapshot, router, source_ip, &default_target, None)?;
         // 没有可分类的文本 → 不发嵌入调用 → 这次没有额外花费。
         return Ok((vec![attempt], None, 0));
     }
 
+    let pick = match &semantic.classifier {
+        Some(classifier) => match classify(snapshot, &semantic.routes, classifier, prompt).await {
+            Ok((picked, confidence)) => {
+                let confident = confidence >= classifier.min_confidence;
+                Ok(Pick {
+                    winner: confident.then_some(picked),
+                    score: Some(confidence),
+                    miss: (!confident).then_some(SemanticFallback::LowConfidence),
+                    embed_spend: 0,
+                })
+            }
+            Err((failure, error)) => {
+                tracing::warn!(
+                    router = %router.display_name,
+                    reason = %failure,
+                    error = %error,
+                    "semantic classifier call failed; applying classifier.on_failure",
+                );
+                Err(failure)
+            }
+        },
+        None => {
+            decide_by_embedding(
+                state,
+                snapshot,
+                router_entry,
+                auth,
+                semantic,
+                prompt,
+                request_id,
+                parent_counted,
+            )
+            .await
+        }
+    };
+    let pick = match pick {
+        Ok(pick) => pick,
+        Err(failure) => {
+            note_decision(None, None, Some(SemanticFallback::DecisionFailed));
+            return fallback(state, snapshot, router, source_ip, semantic, failure);
+        }
+    };
+
+    let (attempt, route_name): (AttemptModel, Option<String>) = match pick.winner {
+        Some(i) => {
+            let (attempt, fell_back) = select_eligible(
+                state,
+                snapshot,
+                router,
+                source_ip,
+                &semantic.routes[i].target_ref(snapshot),
+                Some(&default_target),
+            )?;
+            // `x-aisix-route` reports the route that actually served the
+            // request: a winner displaced by its target's gates is a
+            // fall-through to `default`, not a served route.
+            let name = (!fell_back).then(|| semantic.routes[i].name.clone());
+            note_decision(
+                name.clone(),
+                pick.score,
+                fell_back.then_some(SemanticFallback::TargetUnavailable),
+            );
+            (attempt, name)
+        }
+        None => {
+            note_decision(None, pick.score, pick.miss);
+            let (attempt, _) =
+                select_eligible(state, snapshot, router, source_ip, &default_target, None)?;
+            (attempt, None)
+        }
+    };
+    tracing::debug!(
+        router = %router_entry.value.display_name,
+        resolved_route = ?route_name,
+        target = %attempt.model.display_name,
+        "semantic routing decision",
+    );
+    Ok((vec![attempt], route_name, pick.embed_spend))
+}
+
+fn note_decision(route: Option<String>, score: Option<f64>, fallback: Option<SemanticFallback>) {
+    crate::attribution::note_semantic_decision(SemanticAccessLog {
+        route,
+        score,
+        fallback,
+    });
+}
+
+/// The embedding decision: embed the prompt, score it against every
+/// route's examples. `Err` when the embedding could not be computed, which
+/// the caller answers with `on_embedding_failure`.
+#[allow(clippy::too_many_arguments)]
+async fn decide_by_embedding(
+    state: &ProxyState,
+    snapshot: &AisixSnapshot,
+    router_entry: &ResourceEntry<Model>,
+    auth: &crate::auth::AuthenticatedKey,
+    semantic: &Semantic,
+    prompt: &str,
+    request_id: &str,
+    parent_counted: &mut Vec<String>,
+) -> Result<Pick, DecisionFailure> {
     // Resolve the embedding model + its modality metadata. A dangling or
     // wrong-kind reference is a config error; degrade via the failure
     // policy rather than 500.
-    let embed_entry = match snapshot.models.get_by_name(&semantic.embedding_model) {
+    let embedding_model = semantic.embedding_model_ref(snapshot);
+    let embed_entry = match snapshot.models.get_by_name(&embedding_model) {
         Some(e) if e.value.is_embedding() => e,
         other => {
             tracing::warn!(
                 router = %router_entry.value.display_name,
-                embedding_model = %semantic.embedding_model,
+                embedding_model = %embedding_model,
                 found = other.is_some(),
                 "semantic router references a missing or non-embedding embedding_model; \
                  applying on_embedding_failure",
             );
-            return fallback(state, snapshot, router, source_ip, semantic);
+            return Err(DecisionFailure::EmbeddingUnavailable);
         }
     };
     let dims = embed_entry
@@ -190,8 +411,9 @@ pub(crate) async fn resolve(
         .map(|e| e.dimensions)
         .unwrap_or(0);
 
-    // Batch the prompt (index 0) with every uncached example text in one
-    // embedding call. Steady state: only the prompt is uncached.
+    // Assemble the prompt (index 0) with every uncached example text as one
+    // logical embedding batch. Providers without batch input may split it
+    // into multiple upstream calls. Steady state: only the prompt is uncached.
     let mut pending: Vec<String> = Vec::new();
     for route in &semantic.routes {
         for ex in &route.examples {
@@ -236,7 +458,7 @@ pub(crate) async fn resolve(
         &embed_entry.id,
         &embed_entry.value,
         crate::quota::RoutingParent {
-            name: &router.display_name,
+            name: &router_entry.value.display_name,
             entry_id: &router_entry.id,
         },
         parent_counted,
@@ -252,27 +474,30 @@ pub(crate) async fn resolve(
                 "semantic classifier refused by its own limits; applying \
                  on_embedding_failure",
             );
-            return fallback(state, snapshot, router, source_ip, semantic);
+            return Err(DecisionFailure::EmbeddingUnavailable);
         }
     };
     let embedded = match embed_texts(
-        state,
+        &state.hub,
         snapshot,
         &embed_entry,
         embed_deadline,
         request_id,
+        GatewayEmbeddingPurpose::SemanticRoute,
         &to_embed,
     )
     .await
     {
         Ok(v) => v,
         Err(e) => {
+            let failure = DecisionFailure::of_embedding_error(&e);
             tracing::warn!(
                 router = %router_entry.value.display_name,
-                error = %e,
+                reason = %failure,
+                error = %embed_failure_text(&e),
                 "semantic embedding call failed; applying on_embedding_failure",
             );
-            return fallback(state, snapshot, router, source_ip, semantic);
+            return Err(failure);
         }
     };
 
@@ -308,60 +533,229 @@ pub(crate) async fn resolve(
         .collect();
 
     let decision = decide(semantic, &prompt_vec, &route_vecs);
-    let (attempt, route_name): (AttemptModel, Option<String>) = match decision.winner {
-        Some(i) => {
-            let (attempt, fell_back) = select_eligible(
-                state,
-                snapshot,
-                router,
-                source_ip,
-                semantic.routes[i].target.as_str(),
-                Some(semantic.default.as_str()),
-            )?;
-            // `x-aisix-route` reports the route that actually served the
-            // request: a winner displaced by its target's gates is a
-            // fall-through to `default`, not a served route.
-            let name = (!fell_back).then(|| semantic.routes[i].name.clone());
-            (attempt, name)
-        }
-        None => {
-            let (attempt, _) = select_eligible(
-                state,
-                snapshot,
-                router,
-                source_ip,
-                semantic.default.as_str(),
-                None,
-            )?;
-            (attempt, None)
-        }
+    // The winner's score, or with no winner the closest miss: the number an
+    // operator tunes a threshold against.
+    let score = match decision.winner {
+        Some(i) => decision.scores.get(i).copied(),
+        None => decision.scores.iter().copied().reduce(f32::max),
     };
-    tracing::debug!(
-        router = %router_entry.value.display_name,
-        resolved_route = ?route_name,
-        target = %attempt.model.display_name,
-        "semantic routing decision",
-    );
-    Ok((vec![attempt], route_name, embed_spend))
+    Ok(Pick {
+        winner: decision.winner,
+        score: score.map(log_score),
+        miss: decision
+            .winner
+            .is_none()
+            .then_some(SemanticFallback::NoMatch),
+        embed_spend,
+    })
 }
 
-/// Apply the `on_embedding_failure` policy: route to the fallback target,
-/// or surface `503` when the policy is `fail`.
+/// A cosine score as the access log writes it. Widening an `f32` exposes
+/// its binary representation (`0.8` becomes `0.800000011920929`), which
+/// reads as precision the score does not have.
+fn log_score(score: f32) -> f64 {
+    (f64::from(score) * 1e6).round() / 1e6
+}
+
+/// Apply the router's failure policy: route to the fallback target, or
+/// surface `503` when the policy is `fail`.
 fn fallback(
     state: &ProxyState,
     snapshot: &AisixSnapshot,
     router: &Model,
     source_ip: &str,
     semantic: &Semantic,
+    failure: DecisionFailure,
 ) -> Result<(Vec<AttemptModel>, Option<String>, u64), ProxyError> {
-    match embedding_failure_target(semantic) {
+    match failure_target(snapshot, semantic) {
         Some(alias) => {
-            let (attempt, _) = select_eligible(state, snapshot, router, source_ip, alias, None)?;
-            // 嵌入调用失败了，上游没有报回 usage —— 没有可计的花费。
+            let (attempt, _) = select_eligible(state, snapshot, router, source_ip, &alias, None)?;
+            // 决策没有做成，上游没有报回 usage —— 没有可计的花费。
             Ok((vec![attempt], None, 0))
         }
-        None => Err(ProxyError::ProviderUnavailable),
+        None => Err(ProxyError::SemanticDecisionFailed {
+            router: router.display_name.clone(),
+            reason: failure,
+        }),
     }
+}
+
+/// Endpoint a `typesafe` Provider Key reaches when it sets no `api_base`.
+pub(crate) const TYPESAFE_DEFAULT_API_BASE: &str = "https://api.typesafe.ai";
+
+/// The one question every classifier call asks. The wording is the one the
+/// classifier mode was validated with; change it only against a fresh
+/// evaluation.
+const CLASSIFIER_QUESTION: &str = "route";
+const CLASSIFIER_INSTRUCTIONS: &str =
+    "Which route should handle this user request to an AI assistant?";
+
+#[derive(serde::Serialize)]
+struct ClassifierRequest<'a> {
+    state: &'a str,
+    model: &'a str,
+    questions: ClassifierQuestions<'a>,
+}
+
+struct ClassifierQuestions<'a>(&'a [SemanticRoute]);
+
+impl serde::Serialize for ClassifierQuestions<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        #[derive(serde::Serialize)]
+        struct Choice<'a> {
+            r#type: &'static str,
+            instructions: &'static str,
+            criteria: Criteria<'a>,
+        }
+        let mut map = s.serialize_map(Some(1))?;
+        map.serialize_entry(
+            CLASSIFIER_QUESTION,
+            &Choice {
+                r#type: "choice",
+                instructions: CLASSIFIER_INSTRUCTIONS,
+                criteria: Criteria(self.0),
+            },
+        )?;
+        map.end()
+    }
+}
+
+/// The options: exactly the configured routes, in configured order — which
+/// a `serde_json::Map` (sorted by key) would not keep. The gateway adds no
+/// option of its own; a catch-all is a route the operator configures.
+struct Criteria<'a>(&'a [SemanticRoute]);
+
+impl serde::Serialize for Criteria<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(Some(self.0.len()))?;
+        for route in self.0 {
+            map.serialize_entry(
+                &route.name,
+                route.description.as_deref().unwrap_or_default(),
+            )?;
+        }
+        map.end()
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ClassifierResponse {
+    #[serde(default)]
+    answers: std::collections::HashMap<String, ClassifierAnswer>,
+}
+
+#[derive(serde::Deserialize)]
+struct ClassifierAnswer {
+    choice: String,
+    confidence: f64,
+}
+
+/// Ask the classifier which route fits `prompt`. Returns the index of the
+/// route it picked and its confidence.
+/// Every way the call can fail comes back as `Err` with a reason for the
+/// log, and the caller applies `classifier.on_failure`.
+///
+/// Detached, like the embedding sub-call: it is a call the GATEWAY decided
+/// to make, not one the caller addressed, and it is not metered as one.
+async fn classify(
+    snapshot: &AisixSnapshot,
+    routes: &[SemanticRoute],
+    classifier: &SemanticClassifier,
+    prompt: &str,
+) -> Result<(usize, f64), (DecisionFailure, String)> {
+    crate::attribution::detached(classify_inner(snapshot, routes, classifier, prompt)).await
+}
+
+async fn classify_inner(
+    snapshot: &AisixSnapshot,
+    routes: &[SemanticRoute],
+    classifier: &SemanticClassifier,
+    prompt: &str,
+) -> Result<(usize, f64), (DecisionFailure, String)> {
+    use DecisionFailure::{ClassifierInvalidResponse, ClassifierUnavailable, ClassifierUpstream};
+    let pk = snapshot
+        .provider_keys
+        .get_by_id(&classifier.provider_key_id)
+        .ok_or_else(|| {
+            (
+                ClassifierUnavailable,
+                format!(
+                    "classifier provider_key_id {:?} matches no provider key",
+                    classifier.provider_key_id
+                ),
+            )
+        })?;
+    if pk.value.provider != TYPESAFE_PROVIDER {
+        return Err((
+            ClassifierUnavailable,
+            format!(
+                "classifier provider key {:?} has provider {:?}, not {TYPESAFE_PROVIDER:?}",
+                pk.value.display_name, pk.value.provider
+            ),
+        ));
+    }
+    let base = pk
+        .value
+        .api_base
+        .as_deref()
+        .filter(|b| !b.is_empty())
+        .unwrap_or(TYPESAFE_DEFAULT_API_BASE)
+        .trim_end_matches('/');
+    let body = serde_json::to_vec(&ClassifierRequest {
+        state: prompt,
+        model: &classifier.model,
+        questions: ClassifierQuestions(routes),
+    })
+    .map_err(|e| {
+        (
+            ClassifierUnavailable,
+            format!("encoding the classifier request: {e}"),
+        )
+    })?;
+    let resp = crate::http_client::client_for(pk.value.upstream_connection().as_ref())
+        .post(format!("{base}/v1/systemone"))
+        .bearer_auth(&pk.value.api_key)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .timeout(classifier.timeout())
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| DecisionFailure::of_classifier_transport(&e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err((
+            ClassifierUpstream,
+            format!("classifier returned HTTP {}", status.as_u16()),
+        ));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| DecisionFailure::of_classifier_transport(&e))?;
+    // Neither error below repeats what the classifier answered: its
+    // response can quote the prompt it was sent (`state`), and these
+    // errors end up on the router's warn line.
+    let mut parsed: ClassifierResponse = serde_json::from_slice(&bytes).map_err(|e| {
+        (
+            ClassifierInvalidResponse,
+            format!(
+                "classifier response is not the expected shape (line {} column {})",
+                e.line(),
+                e.column()
+            ),
+        )
+    })?;
+    let answer = parsed.answers.remove(CLASSIFIER_QUESTION).ok_or((
+        ClassifierInvalidResponse,
+        "classifier response carries no answer to the routing question".to_owned(),
+    ))?;
+    let picked = routes.iter().position(|r| r.name == answer.choice).ok_or((
+        ClassifierInvalidResponse,
+        "classifier picked a choice that is not one of the offered routes".to_owned(),
+    ))?;
+    Ok((picked, answer.confidence))
 }
 
 /// Resolve a direct-model alias to the single `AttemptModel` the dispatch
@@ -375,6 +769,8 @@ fn attempt_for_target(snapshot: &AisixSnapshot, alias: &str) -> Result<AttemptMo
     Ok(AttemptModel {
         id: entry.id.clone(),
         model: entry.value.clone(),
+        priority: 0,
+        weight: 1,
     })
 }
 
@@ -387,6 +783,8 @@ fn attempt_for_target(snapshot: &AisixSnapshot, alias: &str) -> Result<AttemptMo
 ///   gets the same 403 as the entry gate, naming only the alias they
 ///   addressed (`routing.rs` does the same for all-excluded groups, so
 ///   a router never becomes a probe for which members exist);
+/// - the member's provider-key budget is a HARD gate too: with every
+///   candidate excluded by it, the caller gets the budget's own answer;
 /// - member health (request-path cooldown / background-unhealthy) is a
 ///   SOFT preference: prefer an available candidate, but with none
 ///   available dispatch the primary anyway — the router has no
@@ -429,6 +827,31 @@ fn select_eligible(
     if candidates.is_empty() {
         return Err(ProxyError::ModelIpRestricted(router.display_name.clone()));
     }
+    // A candidate on a provider key whose budget is exhausted is excluded
+    // as hard as one outside its allowlist.
+    let gate = crate::budget::gate(state, snapshot);
+    let mut refusal: Option<ProxyError> = None;
+    candidates.retain(
+        |(attempt, fell_back)| match gate.check_model(&attempt.model) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::debug!(
+                    router = %router.display_name,
+                    target = %attempt.model.display_name,
+                    fallback = fell_back,
+                    error = %err,
+                    "semantic target excluded by its provider key's budget",
+                );
+                if !matches!(refusal, Some(ProxyError::BudgetExceeded(_))) {
+                    refusal = Some(err);
+                }
+                false
+            }
+        },
+    );
+    if let (true, Some(err)) = (candidates.is_empty(), refusal) {
+        return Err(err);
+    }
     let picked = candidates
         .iter()
         .position(|(attempt, _)| {
@@ -457,6 +880,24 @@ fn select_eligible(
     Ok((attempt, fell_back))
 }
 
+/// Why [`embed_texts`] produced no vectors.
+#[derive(Debug)]
+pub(crate) enum EmbedTextsError {
+    /// The call could not be made, or it failed: the embedding model's
+    /// configuration, transport, a timeout, or an upstream error answer.
+    Dispatch(ProxyError),
+    /// The upstream answered 2xx with vectors that do not fit the request:
+    /// the wrong dimension, base64 instead of floats, or the wrong count.
+    /// The text names only lengths, never response content.
+    UnusableResponse(String),
+}
+
+impl From<ProxyError> for EmbedTextsError {
+    fn from(err: ProxyError) -> Self {
+        Self::Dispatch(err)
+    }
+}
+
 /// Embed `texts` through the embedding model's bridge in one batched call,
 /// returning one float vector per input in input order. Shared by the
 /// semantic router (route matching) and the cache gate's semantic layer
@@ -467,33 +908,68 @@ fn select_eligible(
 /// 带上 usage 是为了让调用方能给这次调用**定价**。原先只回向量，于是这笔真金
 /// 白银的上游调用在所有账上都不存在：不进花费指标、不占任何额度、门户也永远
 /// 扣不到它。
+#[derive(Debug)]
 pub(crate) struct Embedded {
     pub vectors: Vec<Vec<f32>>,
     pub prompt_tokens: u32,
 }
 
 pub(crate) async fn embed_texts(
-    state: &ProxyState,
+    hub: &aisix_gateway::Hub,
     snapshot: &AisixSnapshot,
     embed_entry: &ResourceEntry<Model>,
     timeout: Option<std::time::Duration>,
     request_id: &str,
+    purpose: GatewayEmbeddingPurpose,
     texts: &[String],
-) -> Result<Embedded, ProxyError> {
+) -> Result<Embedded, EmbedTextsError> {
+    // Detached: this is a dispatch the GATEWAY decided to make — for a
+    // semantic guardrail, a semantic route, or the semantic cache — not one
+    // the caller addressed. Two of its three callers run after the winning
+    // attempt has already settled, so letting it commit the embedding model
+    // to the request's attribution cell would put that model on the
+    // request's own access-log line and usage event
+    // (see `attribution::detached`).
+    crate::attribution::detached(embed_texts_inner(
+        hub,
+        snapshot,
+        embed_entry,
+        timeout,
+        request_id,
+        purpose,
+        texts,
+    ))
+    .await
+}
+
+async fn embed_texts_inner(
+    hub: &aisix_gateway::Hub,
+    snapshot: &AisixSnapshot,
+    embed_entry: &ResourceEntry<Model>,
+    timeout: Option<std::time::Duration>,
+    request_id: &str,
+    purpose: GatewayEmbeddingPurpose,
+    texts: &[String],
+) -> Result<Embedded, EmbedTextsError> {
     let model = &embed_entry.value;
     crate::dispatch::require_provider(model)?;
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
-    let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
+    let bridge = crate::dispatch::resolve_bridge(hub, &pk_entry.value)
         .ok_or(ProxyError::ProviderUnavailable)?;
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
+    let audit_model_id = crate::attribution::capped_gateway_embedding_model_id(&embed_entry.id);
     let dimensions = model.embedding.as_ref().map(|e| e.dimensions);
 
     let req = EmbeddingRequest {
+        extra: Default::default(),
+        token_input: None,
         model: upstream_model,
         input: texts.to_vec(),
         input_was_single: texts.len() == 1,
         encoding_format: Some("float".to_string()),
         dimensions,
+        input_type: None,
+        embedding_types: None,
     };
     let ctx = {
         let base = crate::dispatch::bridge_ctx(
@@ -510,7 +986,44 @@ pub(crate) async fn embed_texts(
         }
     };
 
-    let resp = bridge.embed(&req, &ctx).await.map_err(ProxyError::Bridge)?;
+    // Keep this guard alive across the bridge await. If the downstream client
+    // cancels this parent request while the bridge is pending, its Drop writes
+    // a failed child audit directly to the shared parent ledger before the
+    // cancel emitter takes that ledger into the terminal 499 event.
+    let mut audit_call = crate::attribution::begin_gateway_embedding_call(purpose, &audit_model_id);
+    let response = bridge.embed(&req, &ctx).await;
+    let latency_ms = audit_call.settle();
+    let resp = match response {
+        Ok(resp) => {
+            crate::attribution::note_gateway_embedding_call(GatewayEmbeddingCall {
+                count: 1,
+                purpose,
+                embedding_model_id: audit_model_id.clone(),
+                prompt_tokens: resp.usage.prompt_tokens,
+                total_tokens: resp.usage.total_tokens,
+                usage_source: match resp.usage.source {
+                    EmbeddingUsageSource::Reported => GatewayEmbeddingUsageSource::Reported,
+                    EmbeddingUsageSource::Unavailable => GatewayEmbeddingUsageSource::Unavailable,
+                },
+                latency_ms,
+                outcome: GatewayEmbeddingOutcome::Succeeded,
+            });
+            resp
+        }
+        Err(err) => {
+            crate::attribution::note_gateway_embedding_call(GatewayEmbeddingCall {
+                count: 1,
+                purpose,
+                embedding_model_id: audit_model_id,
+                prompt_tokens: 0,
+                total_tokens: 0,
+                usage_source: GatewayEmbeddingUsageSource::Unavailable,
+                latency_ms,
+                outcome: GatewayEmbeddingOutcome::Failed,
+            });
+            return Err(ProxyError::Bridge(err).into());
+        }
+    };
     let prompt_tokens = resp.usage.prompt_tokens;
     let mut data = resp.data;
     data.sort_by_key(|d| d.index);
@@ -520,12 +1033,12 @@ pub(crate) async fn embed_texts(
         match obj.embedding {
             EmbeddingVector::Float(v) => {
                 // Surface a wrong-dimension response explicitly instead of
-                // letting cosine_similarity fold the length mismatch into
+                // letting cosine similarity fold the length mismatch into
                 // 0.0 (which would silently route every request to default).
                 if let Some(expected) = expected_dims {
                     if v.len() != expected {
-                        return Err(ProxyError::InvalidRequest(format!(
-                            "embedding endpoint returned a {}-dim vector; expected {expected}",
+                        return Err(EmbedTextsError::UnusableResponse(format!(
+                            "embedding endpoint returned a vector of length {}; expected {expected}",
                             v.len(),
                         )));
                     }
@@ -533,16 +1046,14 @@ pub(crate) async fn embed_texts(
                 out.push(v);
             }
             EmbeddingVector::Base64(_) => {
-                return Err(ProxyError::InvalidRequest(
-                    "embedding endpoint returned base64 vectors; semantic routing needs \
-                     encoding_format=float support"
-                        .into(),
+                return Err(EmbedTextsError::UnusableResponse(
+                    "embedding endpoint returned base64 vectors; float vectors are required".into(),
                 ));
             }
         }
     }
     if out.len() != texts.len() {
-        return Err(ProxyError::InvalidRequest(format!(
+        return Err(EmbedTextsError::UnusableResponse(format!(
             "embedding endpoint returned {} vectors for {} inputs",
             out.len(),
             texts.len(),
@@ -602,6 +1113,9 @@ pub(crate) fn record_embed_usage(
             input: prompt_tokens,
             output: 0,
             total: prompt_tokens,
+            cached: 0,
+            cache_read: 0,
+            cache_creation: 0,
             spend_usd: spend as f64 / 1_000_000.0,
             // 发起者是网关自己（语义路由的分类调用），不是某个客户端。
             client_type: "gateway",
@@ -610,9 +1124,94 @@ pub(crate) fn record_embed_usage(
     spend
 }
 
+/// What a failed [`embed_texts`] call may say on a log line.
+///
+/// The text embedded is a caller's prompt or a guardrail's screened input,
+/// and an upstream response can quote it back, so nothing a response said
+/// is kept: an error envelope keeps only its status, and a decode failure
+/// only the position serde reported (its message quotes the offending
+/// value). Everything else — transport, timeout, configuration — keeps
+/// its full error chain.
+pub(crate) fn embed_failure_text(err: &EmbedTextsError) -> String {
+    use aisix_gateway::BridgeError;
+    let err = match err {
+        EmbedTextsError::Dispatch(err) => err,
+        EmbedTextsError::UnusableResponse(message) => return message.clone(),
+    };
+    match err {
+        ProxyError::Bridge(BridgeError::UpstreamStatus { status, .. }) => {
+            format!("upstream returned HTTP {status}")
+        }
+        ProxyError::Bridge(BridgeError::UpstreamInBand { status, .. }) => match status {
+            Some(status) => format!("upstream reported an in-band error (status {status})"),
+            None => "upstream reported an in-band error".to_owned(),
+        },
+        ProxyError::Bridge(BridgeError::UpstreamDecode(message)) => {
+            match decode_position(message) {
+                Some((line, column)) => {
+                    format!("upstream response could not be decoded (line {line} column {column})")
+                }
+                None => "upstream response could not be decoded".to_owned(),
+            }
+        }
+        _ => aisix_guardrails::error_chain(err),
+    }
+}
+
+/// The `line N column M` suffix serde_json appends to its messages. Only
+/// the two numbers are taken, so nothing of the message itself survives.
+fn decode_position(message: &str) -> Option<(u64, u64)> {
+    let (_, position) = message.rsplit_once(" at line ")?;
+    let (line, column) = position.split_once(" column ")?;
+    Some((line.parse().ok()?, column.parse().ok()?))
+}
+
+#[cfg(test)]
+mod embed_failure_text_tests {
+    use super::*;
+    use aisix_gateway::BridgeError;
+
+    fn logged(err: BridgeError) -> String {
+        embed_failure_text(&EmbedTextsError::Dispatch(ProxyError::Bridge(err)))
+    }
+
+    #[test]
+    fn an_error_envelope_keeps_only_its_status() {
+        let err = BridgeError::upstream_status(400, "invalid input: screened text");
+        assert_eq!(logged(err), "upstream returned HTTP 400");
+    }
+
+    #[test]
+    fn a_decode_failure_keeps_only_its_position() {
+        let serde = serde_json::from_str::<Vec<f32>>(r#""screened text""#).unwrap_err();
+        let message = format!("upstream body: {serde}");
+        assert!(message.contains("screened text"), "{message}");
+        assert_eq!(
+            logged(BridgeError::UpstreamDecode(message)),
+            "upstream response could not be decoded (line 1 column 15)"
+        );
+        assert_eq!(
+            logged(BridgeError::UpstreamDecode(
+                "error decoding response body".into()
+            )),
+            "upstream response could not be decoded"
+        );
+    }
+
+    #[test]
+    fn transport_and_configuration_errors_keep_their_text() {
+        assert!(logged(BridgeError::Transport("connection refused".into()))
+            .contains("connection refused"));
+        let config =
+            BridgeError::Config("token mint upstream returned HTTP 400: invalid_grant".into());
+        assert!(logged(config).contains("invalid_grant"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aisix_core::resource::ResourceEntry;
 
     fn semantic(json: &str) -> Semantic {
         serde_json::from_str(json).unwrap()
@@ -620,28 +1219,6 @@ mod tests {
 
     fn arc(v: Vec<f32>) -> Arc<Vec<f32>> {
         Arc::new(v)
-    }
-
-    #[test]
-    fn cosine_identical_is_one_orthogonal_is_zero() {
-        assert!((cosine_similarity(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-6);
-        assert!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
-        // Opposite direction → -1.
-        assert!((cosine_similarity(&[1.0, 0.0], &[-1.0, 0.0]) + 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn cosine_degenerate_inputs_are_zero_not_nan() {
-        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
-        assert_eq!(cosine_similarity(&[1.0, 2.0, 3.0], &[1.0, 2.0]), 0.0); // length mismatch
-        assert!(!cosine_similarity(&[0.0], &[0.0]).is_nan());
-    }
-
-    #[test]
-    fn cosine_is_scale_invariant() {
-        // Same direction, different magnitude → still ~1.
-        let s = cosine_similarity(&[1.0, 1.0], &[5.0, 5.0]);
-        assert!((s - 1.0).abs() < 1e-6, "expected ~1, got {s}");
     }
 
     fn router() -> Semantic {
@@ -656,6 +1233,88 @@ mod tests {
                 "match": {"threshold": 0.5}
             }"#,
         )
+    }
+
+    /// Embedding is a dispatch the GATEWAY decides to make, and two of its
+    /// three callers — a semantic guardrail's OUTPUT hook, and the semantic
+    /// cache's write — run after the winning attempt has already settled.
+    ///
+    /// The request's attribution cell records the last target
+    /// `resolve_provider_key` committed to, and the access-log line and the
+    /// cancelled-request usage event both read it. So without a cell of its
+    /// own, an ordinary request that happens to run a semantic guardrail
+    /// would report the EMBEDDING model as the upstream it dispatched to —
+    /// on the very line an operator reads to find out which member of a
+    /// routing group served them (AISIX-Cloud#1571). Wrong, not merely
+    /// absent, which is the worse of the two.
+    #[tokio::test]
+    async fn embedding_does_not_overwrite_the_caller_s_target() {
+        use aisix_core::snapshot::ResourceTable;
+
+        let embed_model: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "bge-m3",
+            "provider": "openai",
+            "model_name": "text-embedding-3-small",
+            "provider_key_id": "pk-embed",
+        }))
+        .unwrap();
+        let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
+            "display_name": "embed-key",
+            "secret": "sk-embed",
+            "api_base": "http://127.0.0.1:1",
+            "provider": "openai",
+            "adapter": "openai",
+        }))
+        .unwrap();
+        let provider_keys = ResourceTable::default();
+        provider_keys.insert(ResourceEntry::new("pk-embed", pk, 1));
+        let snapshot = AisixSnapshot {
+            provider_keys,
+            ..Default::default()
+        };
+        let embed_entry = ResourceEntry::new("m-embed", embed_model, 1);
+
+        let cell = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
+        crate::attribution::scope(cell.clone(), async {
+            // What the CALLER addressed and the gateway dispatched to.
+            let served: Model = serde_json::from_value(serde_json::json!({
+                "display_name": "served-by",
+                "provider": "anthropic",
+                "model_name": "claude-sonnet-4",
+                "provider_key_id": "pk-chat",
+            }))
+            .unwrap();
+            crate::attribution::note_target(&served, "pk-chat");
+
+            // An empty `Hub` means no bridge, so this fails — but only
+            // AFTER `resolve_provider_key` has committed the embedding
+            // target, which is the write under test.
+            let err = embed_texts(
+                &aisix_gateway::Hub::new(),
+                &snapshot,
+                &embed_entry,
+                None,
+                "req-embed",
+                GatewayEmbeddingPurpose::SemanticRoute,
+                &["scan me".to_string()],
+            )
+            .await
+            .expect_err("premise: no bridge is registered, so this must fail");
+            assert!(
+                matches!(
+                    err,
+                    EmbedTextsError::Dispatch(ProxyError::ProviderUnavailable)
+                ),
+                "premise: it must fail at bridge resolution, i.e. after the \
+                 provider key was resolved — got {err:?}",
+            );
+
+            let resolved = crate::attribution::current().expect("in scope");
+            assert_eq!(resolved.upstream_model, "claude-sonnet-4");
+            assert_eq!(resolved.provider, "anthropic");
+            assert_eq!(resolved.provider_key_id, "pk-chat");
+        })
+        .await;
     }
 
     #[test]
@@ -714,21 +1373,68 @@ mod tests {
     }
 
     #[test]
-    fn embedding_failure_target_maps_each_policy() {
+    fn failure_target_maps_each_policy() {
+        let snap = AisixSnapshot::default();
         let default_policy = router();
-        assert_eq!(embedding_failure_target(&default_policy), Some("gpt-4o"));
+        assert_eq!(
+            failure_target(&snap, &default_policy).as_deref(),
+            Some("gpt-4o")
+        );
 
         let fail = semantic(
             r#"{"embedding_model":"e","routes":[{"name":"a","target":"m","examples":["x"]}],
                 "default":"d","match":{"threshold":0.5},"on_embedding_failure":"fail"}"#,
         );
-        assert_eq!(embedding_failure_target(&fail), None);
+        assert!(failure_target(&snap, &fail).is_none());
 
         let target = semantic(
             r#"{"embedding_model":"e","routes":[{"name":"a","target":"m","examples":["x"]}],
                 "default":"d","match":{"threshold":0.5},"on_embedding_failure":{"target":"safe"}}"#,
         );
-        assert_eq!(embedding_failure_target(&target), Some("safe"));
+        assert_eq!(failure_target(&snap, &target).as_deref(), Some("safe"));
+    }
+
+    /// The id spelling decides at both `on_embedding_failure` shapes, and
+    /// resolves against the live table — so a rename of the fallback model
+    /// needs no edit to the router.
+    #[test]
+    fn failure_target_follows_the_id_spelling() {
+        let snap = AisixSnapshot::default();
+        snap.models.insert(ResourceEntry::new(
+            "m-safe",
+            serde_json::from_str::<Model>(
+                r#"{"display_name":"safe-v2","provider":"openai","model_name":"gpt-4o",
+                    "provider_key_id":"11111111-1111-1111-1111-111111111111"}"#,
+            )
+            .unwrap(),
+            1,
+        ));
+
+        let explicit = semantic(
+            r#"{"embedding_model":"e","routes":[{"name":"a","target":"m","examples":["x"]}],
+                "default":"d","match":{"threshold":0.5},
+                "on_embedding_failure":{"target":"stale","target_id":"m-safe"}}"#,
+        );
+        assert_eq!(failure_target(&snap, &explicit).as_deref(), Some("safe-v2"));
+
+        let by_default = semantic(
+            r#"{"embedding_model":"e","routes":[{"name":"a","target":"m","examples":["x"]}],
+                "default":"stale","default_id":"m-safe","match":{"threshold":0.5}}"#,
+        );
+        assert_eq!(
+            failure_target(&snap, &by_default).as_deref(),
+            Some("safe-v2")
+        );
+
+        // An id that resolves to nothing stands in as its own name, which
+        // dispatches nowhere — what a dangling alias already does.
+        let dangling = semantic(
+            r#"{"embedding_model":"e","routes":[{"name":"a","target":"m","examples":["x"]}],
+                "default":"d","default_id":"m-gone","match":{"threshold":0.5}}"#,
+        );
+        let resolved = failure_target(&snap, &dangling).unwrap();
+        assert_eq!(resolved, "m-gone");
+        assert!(snap.models.get_by_name(&resolved).is_none());
     }
 
     #[test]

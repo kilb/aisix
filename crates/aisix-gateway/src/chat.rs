@@ -15,9 +15,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Role of a chat message. Providers that only
-/// support system/user/assistant are expected to reject `Tool` at their
-/// own boundary rather than silently collapsing roles.
+/// Role of a chat message. Provider bridges are responsible for preserving
+/// roles that their upstream accepts and translating the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -30,11 +29,19 @@ pub enum Role {
     User,
     Assistant,
     Tool,
+    /// The deprecated function-calling result turn (`role: "function"`,
+    /// with `name` and `content`). OpenAI-wire upstreams receive it as is;
+    /// every other bridge sees it as a `tool` result through
+    /// [`crate::tool_calls::legacy_functions_as_tools`].
+    Function,
 }
 
 impl Role {
-    /// System instructions under either name.
-    pub fn is_system(self) -> bool {
+    /// Whether the message is an instruction from the application rather
+    /// than a conversation turn. `developer` is OpenAI's newer spelling of
+    /// `system`, so anything that treats system messages specially must
+    /// treat developer messages the same way.
+    pub fn is_instruction(self) -> bool {
         matches!(self, Role::System | Role::Developer)
     }
 }
@@ -58,33 +65,34 @@ impl Role {
 ///     (`[{type: "text", text}, {type: "image_url", image_url: {url}}]` —
 ///     used by vision/multimodal callers).
 ///
-/// We split the array form across two fields so existing call sites
-/// keep their `&str` access path:
-///   * [`Self::content`] holds the concatenated **text** of any text
-///     blocks. For non-array shapes this is the original string (or
-///     `""` for `null`). Bridges that don't speak content blocks
-///     (Anthropic / Gemini cross-provider translation today) read this
-///     and silently skip non-text blocks (images/audio): a cross-provider
-///     request keeps only the text. Documented for users under
-///     "Cross-Provider Content Limitations" in the provider-compatibility
-///     reference.
+/// We split the array form across two fields, and store its text once:
+///   * [`Self::content`] holds the string of the non-array shapes (`None`
+///     for `null`). For the array shape it is `None`: the text is the
+///     concatenated text of the text blocks, derived on read by
+///     [`Self::text`] / [`Self::content_str`] and emitted as `content` on
+///     serialization, so a request carrying megabytes of text blocks does
+///     not hold them twice. Read text through those accessors, never the
+///     field. A bridge that builds its own request shape (Anthropic,
+///     Gemini, Bedrock) translates the blocks through
+///     [`crate::content_part`] instead of reading this text, so a non-text
+///     part is converted or refused, never silently dropped.
 ///   * [`Self::content_blocks`] holds the **raw array** verbatim when
 ///     the caller sent the typed-block form. Bridges that DO support
 ///     content blocks (the OpenAI-compat bridge) forward this verbatim
 ///     to the upstream so vision input reaches OpenAI / Gemini /
 ///     DeepSeek upstreams unchanged.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(from = "ChatMessageRaw")]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "ChatMessageRaw")]
 pub struct ChatMessage {
     pub role: Role,
     /// Assistant/text content. `Option<String>` (not `String`) so the
     /// OpenAI `string | null` shape round-trips faithfully: a `tool_calls`
     /// response upstream returns `content: null` and we must surface
     /// exactly `null` to the SDK caller, not `""` (#395). On the request
-    /// path callers always send a string; `None` only arises on the
-    /// response-projection path (or an inbound `content: null` from a
-    /// history-replay assistant message).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// path callers always send a string; `None` arises on the
+    /// response-projection path, for an inbound `content: null` from a
+    /// history-replay assistant message, and whenever the text is derived
+    /// from [`Self::content_blocks`] (see the type docs).
     pub content: Option<String>,
     /// Raw content-block array when the caller sent
     /// `content: [{type, ...}, ...]`. `None` for the bare-string and
@@ -94,19 +102,45 @@ pub struct ChatMessage {
     /// block types INTO this OpenAI-shaped array (#722); bridges that
     /// don't understand blocks consult only `content` (concatenated
     /// text).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_blocks: Option<Vec<Value>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     /// Forward-compatible bag for OpenAI message fields the gateway
     /// doesn't model directly: `tool_calls`, `refusal`, `audio`, plus
     /// any future additions. Round-tripped verbatim so OpenAI
     /// conversation history replay works through the proxy without a
     /// schema bump every time OpenAI ships a new field.
-    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty", flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Serialized with the text a block-array message derives written out as
+/// `content`, exactly as when it was stored beside the blocks.
+impl Serialize for ChatMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            role: Role,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            content: Option<std::borrow::Cow<'a, str>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            content_blocks: &'a Option<Vec<Value>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            name: &'a Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tool_call_id: &'a Option<String>,
+            #[serde(skip_serializing_if = "serde_json::Map::is_empty", flatten)]
+            extra: &'a serde_json::Map<String, serde_json::Value>,
+        }
+        Wire {
+            role: self.role,
+            content: self.text(),
+            content_blocks: &self.content_blocks,
+            name: &self.name,
+            tool_call_id: &self.tool_call_id,
+            extra: &self.extra,
+        }
+        .serialize(serializer)
+    }
 }
 
 /// Wire-shape mirror for [`ChatMessage`]. The `content` field accepts
@@ -136,23 +170,158 @@ struct ChatMessageRaw {
     extra: serde_json::Map<String, serde_json::Value>,
 }
 
-impl From<ChatMessageRaw> for ChatMessage {
-    fn from(raw: ChatMessageRaw) -> Self {
-        let (content, derived_blocks) = split_content(raw.content);
+impl TryFrom<ChatMessageRaw> for ChatMessage {
+    type Error = String;
+
+    fn try_from(raw: ChatMessageRaw) -> Result<Self, Self::Error> {
+        let (content, derived_blocks) = split_content(raw.content)?;
         // If the wire form supplied `content_blocks` explicitly
         // (round-trip from a previous serialization), prefer it over
         // anything we'd derive from `content`. Otherwise use the
         // blocks extracted from the array-form of `content`.
         let content_blocks = raw.content_blocks.or(derived_blocks);
-        Self {
+        let mut message = Self {
             role: raw.role,
             content,
             content_blocks,
             name: raw.name,
             tool_call_id: raw.tool_call_id,
             extra: raw.extra,
-        }
+        };
+        // A serialized block-array message (a cache round trip) carries the
+        // derived text beside its blocks; it is not stored twice either.
+        message.drop_derived_content();
+        Ok(message)
     }
+}
+
+/// The text of a content-block array: the `text` of every `text` block,
+/// concatenated.
+pub fn blocks_text(blocks: &[Value]) -> String {
+    blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .collect()
+}
+
+/// One text slot of a reasoning content part, and whether a non-empty
+/// `signature` covers it. A signed slot must reach the upstream
+/// byte-identical, so it may be judged but never rewritten.
+pub struct ReasoningSlot<T> {
+    pub text: T,
+    pub signed: bool,
+}
+
+fn is_signed(v: &Value) -> bool {
+    v.get("signature")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty())
+}
+
+/// Where a reasoning content part keeps its text, by shape:
+/// Mistral's `{type: "thinking", thinking: [{type: "text", text}],
+/// signature?}` and Databricks' `{type: "reasoning", summary:
+/// [{type: "summary_text", text, signature?}]}` hold entries; an
+/// Anthropic-shaped `{type: "thinking", thinking: "<text>", signature?}`
+/// holds the text itself.
+enum ReasoningShape {
+    Entries(&'static str),
+    Text,
+}
+
+fn reasoning_shape(part: &Value) -> Option<ReasoningShape> {
+    let key = match part.get("type").and_then(Value::as_str)? {
+        "thinking" => "thinking",
+        "reasoning" => "summary",
+        _ => return None,
+    };
+    match part.get(key)? {
+        Value::Array(_) => Some(ReasoningShape::Entries(key)),
+        Value::String(_) if key == "thinking" => Some(ReasoningShape::Text),
+        _ => None,
+    }
+}
+
+/// Any entry with a string `text`, whatever its `type`: the whole part is
+/// forwarded verbatim, so an entry type this list did not name would
+/// otherwise carry text past the scan.
+fn is_reasoning_entry(entry: &Value) -> bool {
+    entry.get("text").is_some_and(Value::is_string)
+}
+
+/// Whether `part` is a reasoning content part (see [`reasoning_part_slots`]).
+pub fn is_reasoning_part(part: &Value) -> bool {
+    reasoning_shape(part).is_some()
+}
+
+/// The text slots of one reasoning content part, empty for any other
+/// part. The single parser of these shapes: every reader of replayed or
+/// generated reasoning parts goes through this or its `_mut` twin.
+pub fn reasoning_part_slots(part: &Value) -> Vec<ReasoningSlot<&str>> {
+    let part_signed = is_signed(part);
+    match reasoning_shape(part) {
+        None => Vec::new(),
+        Some(ReasoningShape::Text) => part["thinking"]
+            .as_str()
+            .map(|text| ReasoningSlot {
+                text,
+                signed: part_signed,
+            })
+            .into_iter()
+            .collect(),
+        Some(ReasoningShape::Entries(key)) => part[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|e| is_reasoning_entry(e))
+            .filter_map(|e| {
+                Some(ReasoningSlot {
+                    text: e.get("text")?.as_str()?,
+                    signed: part_signed || is_signed(e),
+                })
+            })
+            .collect(),
+    }
+}
+
+/// [`reasoning_part_slots`] with each `text` value borrowed mutably.
+pub fn reasoning_part_slots_mut(part: &mut Value) -> Vec<ReasoningSlot<&mut Value>> {
+    let part_signed = is_signed(part);
+    match reasoning_shape(part) {
+        None => Vec::new(),
+        Some(ReasoningShape::Text) => part
+            .get_mut("thinking")
+            .map(|text| ReasoningSlot {
+                text,
+                signed: part_signed,
+            })
+            .into_iter()
+            .collect(),
+        Some(ReasoningShape::Entries(key)) => part[key]
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+            .filter(|e| is_reasoning_entry(e))
+            .filter_map(|e| {
+                let signed = part_signed || is_signed(e);
+                Some(ReasoningSlot {
+                    text: e.get_mut("text")?,
+                    signed,
+                })
+            })
+            .collect(),
+    }
+}
+
+/// The concatenated text of one reasoning content part, `None` when it is
+/// not one or carries no text.
+pub fn reasoning_part_text(part: &Value) -> Option<String> {
+    let text: String = reasoning_part_slots(part)
+        .into_iter()
+        .map(|s| s.text)
+        .collect();
+    (!text.is_empty()).then_some(text)
 }
 
 /// Split a wire-form `content` value into the gateway's
@@ -165,29 +334,15 @@ impl From<ChatMessageRaw> for ChatMessage {
 ///     blocks), Some(raw array)) — vision / multimodal input. Non-text
 ///     blocks (e.g. `image_url`) are skipped on the text-extraction path
 ///     but preserved verbatim in the raw array for forwarding.
-///   * Anything else → (None, None) — defensive default; unexpected
-///     shapes don't fail the request, they degrade to absent text
-///     so the bridge can still dispatch.
-fn split_content(v: Value) -> (Option<String>, Option<Vec<Value>>) {
+///   * Anything else is not a `content` any OpenAI role takes, and is
+///     refused rather than read as absent text.
+fn split_content(v: Value) -> Result<(Option<String>, Option<Vec<Value>>), String> {
     match v {
-        Value::String(s) => (Some(s), None),
-        Value::Null => (None, None),
-        Value::Array(blocks) => {
-            let text = blocks
-                .iter()
-                .filter_map(|b| {
-                    let ty = b.get("type").and_then(Value::as_str)?;
-                    if ty == "text" {
-                        b.get("text").and_then(Value::as_str).map(str::to_owned)
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("");
-            (Some(text), Some(blocks))
-        }
-        _ => (None, None),
+        Value::String(s) => Ok((Some(s), None)),
+        Value::Null => Ok((None, None)),
+        // The text is derived from the blocks on read.
+        Value::Array(blocks) => Ok((None, Some(blocks))),
+        _ => Err("`content` must be a string, an array of content parts, or null".into()),
     }
 }
 
@@ -195,6 +350,17 @@ impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: Role::System,
+            content: Some(content.into()),
+            content_blocks: None,
+            name: None,
+            tool_call_id: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    pub fn developer(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Developer,
             content: Some(content.into()),
             content_blocks: None,
             name: None,
@@ -225,11 +391,89 @@ impl ChatMessage {
         }
     }
 
-    /// The text content as a `&str`, treating absent (`null`) content as
-    /// `""`. Use this for bridges/guardrails that need a plain string and
-    /// for which the string-vs-null distinction is irrelevant.
-    pub fn content_str(&self) -> &str {
-        self.content.as_deref().unwrap_or("")
+    /// A tool RESULT the caller replays. `tool_call_id` is left unset:
+    /// the constructor exists for the scan-side views (`ChatFormat`s built
+    /// only to be handed to the guardrail chain), which read role and text
+    /// and never dispatch. A message built for dispatch must set the id
+    /// itself — OpenAI rejects a `role: "tool"` message without one.
+    pub fn tool(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: Some(content.into()),
+            content_blocks: None,
+            name: None,
+            tool_call_id: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    /// The message text: the stored string, else the text of the content
+    /// blocks, else `None` (`content: null`).
+    pub fn text(&self) -> Option<std::borrow::Cow<'_, str>> {
+        match (&self.content, &self.content_blocks) {
+            (Some(text), _) => Some(std::borrow::Cow::Borrowed(text)),
+            (None, Some(blocks)) => Some(std::borrow::Cow::Owned(blocks_text(blocks))),
+            (None, None) => None,
+        }
+    }
+
+    /// The message text, treating absent (`null`) content as `""`. Use this
+    /// for bridges/guardrails that need a plain string and for which the
+    /// string-vs-null distinction is irrelevant.
+    pub fn content_str(&self) -> std::borrow::Cow<'_, str> {
+        self.text().unwrap_or(std::borrow::Cow::Borrowed(""))
+    }
+
+    /// The upstream's chain-of-thought: the `reasoning_content` slot, else
+    /// the reasoning parts of an array `content` (see
+    /// [`reasoning_part_slots`]). Every reader of an answer's reasoning goes through this.
+    pub fn reasoning_text(&self) -> Option<std::borrow::Cow<'_, str>> {
+        if let Some(text) = self
+            .extra
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(std::borrow::Cow::Borrowed(text));
+        }
+        let text: String = self
+            .content_blocks
+            .iter()
+            .flatten()
+            .filter_map(reasoning_part_text)
+            .collect();
+        (!text.is_empty()).then_some(std::borrow::Cow::Owned(text))
+    }
+
+    /// Stop storing `content` when it is exactly the text the content
+    /// blocks derive, so the text is held once. A `content` that says
+    /// something else is kept as it is.
+    pub fn drop_derived_content(&mut self) {
+        if let (Some(text), Some(blocks)) = (&self.content, &self.content_blocks) {
+            if *text == blocks_text(blocks) {
+                self.content = None;
+            }
+        }
+    }
+
+    /// An assistant turn whose only payload is reasoning — the
+    /// `reasoning_content` slot or reasoning content parts (see
+    /// [`Self::reasoning_text`]): no text, no other content blocks, no
+    /// tool calls. A client replaying a model's earlier chain-of-thought
+    /// that no answer followed sends one (the `/v1/responses` bridge
+    /// builds it from such a `reasoning` item). A bridge whose wire has no
+    /// slot for replayed reasoning must skip it rather than render an
+    /// empty assistant turn, which those upstreams reject.
+    pub fn is_reasoning_only(&self) -> bool {
+        matches!(self.role, Role::Assistant)
+            && self.text().is_none_or(|t| t.is_empty())
+            && self.content_blocks.iter().flatten().all(is_reasoning_part)
+            && self
+                .extra
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+            && self.reasoning_text().is_some()
     }
 }
 
@@ -249,10 +493,12 @@ impl ChatMessage {
 pub struct ChatFormat {
     pub model: String,
     pub messages: Vec<ChatMessage>,
+    /// `f64`, so the caller's decimal reaches the upstream as written
+    /// (`0.7`, not `0.699999988`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
+    pub temperature: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f32>,
+    pub top_p: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -261,6 +507,42 @@ pub struct ChatFormat {
     /// params at the gateway — each Bridge decides what to forward.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty", flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+    /// The gateway itself set `response_format.json_schema.strict` while
+    /// translating another protocol's structured-output request, so the
+    /// OpenAI edge owes the schema the closing strict mode demands. A
+    /// `strict` the caller sent is theirs, and its schema goes out as
+    /// written.
+    #[serde(skip)]
+    pub gateway_strict_schema: bool,
+    /// `top_k` from a `/v1/messages` caller. The OpenAI wire has no such
+    /// parameter, so it never rides `extra`; a bridge whose target takes a
+    /// top-k slot writes it there (Claude `top_k`, Converse Claude / Nova,
+    /// Gemini `topK`) and every other bridge leaves it unsent.
+    #[serde(skip)]
+    pub top_k: Option<u64>,
+    /// The exact `thinking.budget_tokens` of a `/v1/messages` caller whose
+    /// thinking is `enabled`. `extra.reasoning_effort` still carries the
+    /// tier bucketed from it, for targets that take only a tier; a target
+    /// with a token-budget slot (Claude `thinking.budget_tokens`, Gemini 2.5
+    /// `thinkingBudget`) writes this exact budget instead of mapping the
+    /// tier back to one.
+    #[serde(skip)]
+    pub thinking_budget_tokens: Option<u64>,
+    /// Whether the caller's own request asked to see the model's thoughts,
+    /// decided by each inbound protocol before `effort_mapping` runs. Unlike
+    /// `extra.reasoning_effort`, which an operator's mapping or a
+    /// `/v1/messages` caller's `output_config.effort` can also write, it says
+    /// who asked, for a target that returns thoughts only on request.
+    #[serde(skip)]
+    pub thoughts_requested: bool,
+}
+
+/// Whether a `reasoning_effort` or `reasoning.effort` value, as the caller
+/// sent it, asks for thinking.
+pub fn effort_asks_for_thoughts(effort: Option<&Value>) -> bool {
+    effort
+        .and_then(Value::as_str)
+        .is_some_and(|effort| !matches!(effort, "" | "none"))
 }
 
 impl ChatFormat {
@@ -273,11 +555,26 @@ impl ChatFormat {
             max_tokens: None,
             stream: None,
             extra: serde_json::Map::new(),
+            gateway_strict_schema: false,
+            top_k: None,
+            thinking_budget_tokens: None,
+            thoughts_requested: false,
         }
     }
 
     pub fn is_streaming(&self) -> bool {
         self.stream.unwrap_or(false)
+    }
+
+    /// The caller asked for `stream_options.include_usage`: a streamed
+    /// response ends with one extra chunk carrying the usage, with an
+    /// empty `choices` array, and no other chunk carries usage.
+    pub fn include_usage(&self) -> bool {
+        self.extra
+            .get("stream_options")
+            .and_then(|so| so.get("include_usage"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
     }
 }
 
@@ -328,6 +625,9 @@ pub struct UsageStats {
     /// OpenAI prompt-cache hit count. Subset of `prompt_tokens`.
     #[serde(default)]
     pub cached_prompt_tokens: u32,
+    /// Raw OpenAI cache-write count; it is not additive to prompt tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u32>,
     /// OpenAI o1/o3 reasoning tokens. Subset of `completion_tokens`.
     #[serde(default)]
     pub reasoning_tokens: u32,
@@ -363,6 +663,409 @@ pub struct UsageStats {
     /// (#542). See `prompt_cache_hit_tokens`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_miss_tokens: Option<u32>,
+    /// The upstream's own total, verbatim (Gemini `totalTokenCount`, an
+    /// OpenAI-shape `usage.total_tokens`, Bedrock `totalTokens`). `0` means
+    /// the upstream reported none. Unlike `total_tokens`, which the gateway
+    /// may compute, this is never a sum built here: it is what the
+    /// UsageEvent records, and cp-api reads `prompt + completion + reasoning
+    /// == total` as "reasoning is billed beside completion", so a
+    /// synthesised total that happens to match would bill the reasoning
+    /// twice.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub upstream_total_tokens: u32,
+    /// Reasoning tokens the upstream reported BESIDE its completion count
+    /// that `completion_tokens` has folded in, because OpenAI accounting has
+    /// no third output bucket (Gemini `thoughtsTokenCount` outside
+    /// `candidatesTokenCount`). Every consumer reads the folded
+    /// `completion_tokens`; only the UsageEvent subtracts this back out to
+    /// record the upstream's own count — see
+    /// [`recorded_completion_tokens`].
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reasoning_folded_into_completion: u32,
+    /// Audio / image breakdowns of the two sides, as the upstream reported
+    /// them. Subsets, never added to a total.
+    ///
+    /// Not serialized: a cached `ChatResponse` carries this type, and this
+    /// type denies unknown fields, so writing it would make every entry a
+    /// gateway release without the field shares the cache with (a rolling
+    /// upgrade, a rollback) unreadable. A cache hit reports none.
+    #[serde(skip)]
+    pub modality: ModalityTokens,
+    /// The split of `cache_creation_tokens` by cache lifetime, when the
+    /// upstream reported one. Not serialized, for the same reason as
+    /// `modality`.
+    #[serde(skip)]
+    pub cache_creation_ttl: CacheCreationTtl,
+    /// The OpenAI-shape `*_tokens_details` counters an upstream reported,
+    /// for the client-facing OpenAI projection only. Not serialized, for
+    /// the same reason as `modality`.
+    #[serde(skip)]
+    pub openai_details: OpenAiUsageDetails,
+}
+
+/// Prompt-cache writes by cache lifetime, as the upstream reported them:
+/// Anthropic `usage.cache_creation.ephemeral_5m_input_tokens` /
+/// `ephemeral_1h_input_tokens`, Bedrock Converse `usage.cacheDetails[]` by
+/// `ttl`. Each is a part of `cache_creation_tokens`, and `None` when the
+/// upstream reported no split — distinct from a reported `0`. A one-hour
+/// write is priced above a five-minute one, so only the split tells them
+/// apart. Serialized under the usage event's own field names.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheCreationTtl {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_5m_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_1h_tokens: Option<u32>,
+}
+
+impl CacheCreationTtl {
+    /// Nothing reported.
+    pub const NONE: Self = Self {
+        cache_creation_5m_tokens: None,
+        cache_creation_1h_tokens: None,
+    };
+
+    /// Read an Anthropic-shape `usage.cache_creation` object; anything but
+    /// an object reports no split.
+    pub fn from_anthropic(cache_creation: Option<&serde_json::Value>) -> Self {
+        let Some(split) = cache_creation.filter(|v| v.is_object()) else {
+            return Self::NONE;
+        };
+        let count = |key: &str| {
+            Some(
+                split
+                    .get(key)
+                    .and_then(serde_json::Value::as_u64)
+                    .map_or(0, |n| n.min(u64::from(u32::MAX)) as u32),
+            )
+        };
+        Self {
+            cache_creation_5m_tokens: count("ephemeral_5m_input_tokens"),
+            cache_creation_1h_tokens: count("ephemeral_1h_input_tokens"),
+        }
+    }
+
+    /// Bedrock Converse `cacheDetails[]`, given as `(ttl, inputTokens)`
+    /// pairs. Taken only when the recognised lifetimes account for the
+    /// whole `cacheWriteInputTokens`: a partial breakdown, or one with a
+    /// lifetime this gateway does not know, would understate the write.
+    pub fn from_converse_details<'a>(
+        details: impl IntoIterator<Item = (&'a str, i32)>,
+        cache_write_tokens: u32,
+    ) -> Self {
+        let (mut five_m, mut one_h, mut any) = (0u32, 0u32, false);
+        for (ttl, tokens) in details {
+            any = true;
+            let tokens = tokens.max(0) as u32;
+            match ttl {
+                "5m" => five_m = five_m.saturating_add(tokens),
+                "1h" => one_h = one_h.saturating_add(tokens),
+                _ => {}
+            }
+        }
+        if !any || five_m.saturating_add(one_h) != cache_write_tokens {
+            return Self::NONE;
+        }
+        Self {
+            cache_creation_5m_tokens: Some(five_m),
+            cache_creation_1h_tokens: Some(one_h),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::NONE
+    }
+
+    /// The split as a record of a `total`-token write: kept, with an
+    /// unreported part as `0`, only when its parts add up to a non-zero
+    /// total. A split that misses the total — a partial upstream report, a
+    /// lifetime this gateway does not read, frames or members merged
+    /// unevenly — would misstate what was written at which lifetime, so it
+    /// is no split at all, as is any split of a write that did not happen.
+    pub fn accounting_for(self, total: u32) -> Self {
+        let five_m = self.cache_creation_5m_tokens.unwrap_or(0);
+        let one_h = self.cache_creation_1h_tokens.unwrap_or(0);
+        if self.is_empty() || total == 0 || five_m.saturating_add(one_h) != total {
+            return Self::NONE;
+        }
+        Self {
+            cache_creation_5m_tokens: Some(five_m),
+            cache_creation_1h_tokens: Some(one_h),
+        }
+    }
+
+    /// Field-wise sum, `None` only where neither side reported.
+    pub fn saturating_add(&self, other: &Self) -> Self {
+        fn add(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+            match (a, b) {
+                (None, None) => None,
+                _ => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+            }
+        }
+        Self {
+            cache_creation_5m_tokens: add(
+                self.cache_creation_5m_tokens,
+                other.cache_creation_5m_tokens,
+            ),
+            cache_creation_1h_tokens: add(
+                self.cache_creation_1h_tokens,
+                other.cache_creation_1h_tokens,
+            ),
+        }
+    }
+
+    /// Field-wise maximum, for a stream that reports usage on more than
+    /// one frame.
+    pub fn max_fieldwise(&self, other: &Self) -> Self {
+        Self {
+            cache_creation_5m_tokens: self
+                .cache_creation_5m_tokens
+                .max(other.cache_creation_5m_tokens),
+            cache_creation_1h_tokens: self
+                .cache_creation_1h_tokens
+                .max(other.cache_creation_1h_tokens),
+        }
+    }
+}
+
+/// The per-modality token counts an upstream reports inside its usage
+/// (OpenAI `*_tokens_details.audio_tokens` / `image_tokens`, Gemini
+/// `promptTokensDetails` / `candidatesTokensDetails` by `modality`). Each is
+/// a subset of its side's total, inclusive of any cached portion, and
+/// `None` when the upstream did not report it — distinct from a reported
+/// `0`. Serialized under the usage event's own field names.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModalityTokens {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_audio_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_image_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_audio_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_image_tokens: Option<u32>,
+}
+
+impl ModalityTokens {
+    /// Nothing reported.
+    pub const NONE: Self = Self {
+        prompt_audio_tokens: None,
+        prompt_image_tokens: None,
+        completion_audio_tokens: None,
+        completion_image_tokens: None,
+    };
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Read the OpenAI-shape detail objects: `input` is
+    /// `prompt_tokens_details` / `input_tokens_details` /
+    /// `input_token_details`, `output` the completion-side twin. Each
+    /// counter is taken only when the object carries it.
+    pub fn from_openai_details(
+        input: Option<&serde_json::Value>,
+        output: Option<&serde_json::Value>,
+    ) -> Self {
+        let count = |details: Option<&serde_json::Value>, key: &str| {
+            details
+                .and_then(|d| d.get(key))
+                .and_then(serde_json::Value::as_u64)
+                .map(|n| n.min(u64::from(u32::MAX)) as u32)
+        };
+        Self {
+            prompt_audio_tokens: count(input, "audio_tokens"),
+            prompt_image_tokens: count(input, "image_tokens"),
+            completion_audio_tokens: count(output, "audio_tokens"),
+            completion_image_tokens: count(output, "image_tokens"),
+        }
+    }
+
+    /// Read Gemini's `promptTokensDetails` / `candidatesTokensDetails`
+    /// arrays of `{modality, tokenCount}`; a modality entry without a count
+    /// reports `0`.
+    pub fn from_gemini_details(
+        prompt: Option<&serde_json::Value>,
+        candidates: Option<&serde_json::Value>,
+    ) -> Self {
+        let count = |details: Option<&serde_json::Value>, modality: &str| {
+            details?
+                .as_array()?
+                .iter()
+                .filter(|d| d.get("modality").and_then(serde_json::Value::as_str) == Some(modality))
+                .map(|d| {
+                    d.get("tokenCount")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0)
+                })
+                .reduce(|a, b| a.saturating_add(b))
+                .map(|n| n.min(u64::from(u32::MAX)) as u32)
+        };
+        Self {
+            prompt_audio_tokens: count(prompt, "AUDIO"),
+            prompt_image_tokens: count(prompt, "IMAGE"),
+            completion_audio_tokens: count(candidates, "AUDIO"),
+            completion_image_tokens: count(candidates, "IMAGE"),
+        }
+    }
+
+    /// Field-wise sum, `None` only where neither side reported.
+    pub fn saturating_add(&self, other: &Self) -> Self {
+        fn add(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+            match (a, b) {
+                (None, None) => None,
+                _ => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+            }
+        }
+        Self {
+            prompt_audio_tokens: add(self.prompt_audio_tokens, other.prompt_audio_tokens),
+            prompt_image_tokens: add(self.prompt_image_tokens, other.prompt_image_tokens),
+            completion_audio_tokens: add(
+                self.completion_audio_tokens,
+                other.completion_audio_tokens,
+            ),
+            completion_image_tokens: add(
+                self.completion_image_tokens,
+                other.completion_image_tokens,
+            ),
+        }
+    }
+
+    /// Field-wise maximum, for a stream that reports usage on more than
+    /// one frame.
+    pub fn max_fieldwise(&self, other: &Self) -> Self {
+        Self {
+            prompt_audio_tokens: self.prompt_audio_tokens.max(other.prompt_audio_tokens),
+            prompt_image_tokens: self.prompt_image_tokens.max(other.prompt_image_tokens),
+            completion_audio_tokens: self
+                .completion_audio_tokens
+                .max(other.completion_audio_tokens),
+            completion_image_tokens: self
+                .completion_image_tokens
+                .max(other.completion_image_tokens),
+        }
+    }
+}
+
+/// The OpenAI `prompt_tokens_details` / `completion_tokens_details`
+/// counters the gateway has no accounting slot for, plus whether the cache
+/// and reasoning counters were reported at all. Each count is `None` when
+/// the upstream did not report it — distinct from a reported `0` — so the
+/// client sees what the upstream sent and nothing it did not. The values
+/// that do have a slot (`cached_prompt_tokens`, `reasoning_tokens`,
+/// `modality`) stay there; the two `*_reported` flags only mark presence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OpenAiUsageDetails {
+    pub cached_tokens_reported: bool,
+    pub reasoning_tokens_reported: bool,
+    pub prompt_text_tokens: Option<u32>,
+    pub completion_text_tokens: Option<u32>,
+    pub accepted_prediction_tokens: Option<u32>,
+    pub rejected_prediction_tokens: Option<u32>,
+}
+
+impl OpenAiUsageDetails {
+    /// Field-wise sum, `None` only where neither side reported.
+    pub fn saturating_add(&self, other: &Self) -> Self {
+        fn add(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+            match (a, b) {
+                (None, None) => None,
+                _ => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+            }
+        }
+        Self {
+            cached_tokens_reported: self.cached_tokens_reported || other.cached_tokens_reported,
+            reasoning_tokens_reported: self.reasoning_tokens_reported
+                || other.reasoning_tokens_reported,
+            prompt_text_tokens: add(self.prompt_text_tokens, other.prompt_text_tokens),
+            completion_text_tokens: add(self.completion_text_tokens, other.completion_text_tokens),
+            accepted_prediction_tokens: add(
+                self.accepted_prediction_tokens,
+                other.accepted_prediction_tokens,
+            ),
+            rejected_prediction_tokens: add(
+                self.rejected_prediction_tokens,
+                other.rejected_prediction_tokens,
+            ),
+        }
+    }
+
+    /// Field-wise maximum, for a stream that reports usage on more than
+    /// one frame.
+    pub fn max_fieldwise(&self, other: &Self) -> Self {
+        Self {
+            cached_tokens_reported: self.cached_tokens_reported || other.cached_tokens_reported,
+            reasoning_tokens_reported: self.reasoning_tokens_reported
+                || other.reasoning_tokens_reported,
+            prompt_text_tokens: self.prompt_text_tokens.max(other.prompt_text_tokens),
+            completion_text_tokens: self
+                .completion_text_tokens
+                .max(other.completion_text_tokens),
+            accepted_prediction_tokens: self
+                .accepted_prediction_tokens
+                .max(other.accepted_prediction_tokens),
+            rejected_prediction_tokens: self
+                .rejected_prediction_tokens
+                .max(other.rejected_prediction_tokens),
+        }
+    }
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// The completion count a UsageEvent records: the upstream's own, before
+/// the gateway folded its separately-reported reasoning in.
+///
+/// Only when the unfolded row states that itself: cp-api reads reasoning
+/// as counted BESIDE the completion exactly when
+/// `prompt + completion + reasoning` equals the upstream's total, and as a
+/// subset of the completion otherwise. An unfolded row that misses that
+/// identity — no total reported, or a total built from terms this gateway
+/// does not map — would bill the candidates as nothing under the subset
+/// reading, so the record keeps the folded count, which that reading bills
+/// correctly.
+///
+/// Takes the completion the caller is about to record rather than reading
+/// `UsageStats`, because that value may have been estimated (#1074) or
+/// zeroed (#419) since the upstream reported it. Both only ever touch a
+/// count that is `0` or zero it outright, and the folded amount never
+/// exceeds the folded completion, so subtracting with saturation is exact
+/// in every case.
+pub fn recorded_completion_tokens(
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    reasoning_tokens: u32,
+    reasoning_folded: u32,
+    upstream_total_tokens: u32,
+) -> u32 {
+    if reasoning_folded == 0 || upstream_total_tokens == 0 {
+        return completion_tokens;
+    }
+    let unfolded = completion_tokens.saturating_sub(reasoning_folded);
+    let additive = u64::from(prompt_tokens) + u64::from(unfolded) + u64::from(reasoning_tokens)
+        == u64::from(upstream_total_tokens);
+    if additive {
+        unfolded
+    } else {
+        completion_tokens
+    }
+}
+
+/// Fold one streamed usage frame's [`UsageStats::upstream_total_tokens`]
+/// into a stream's running value. `acc` is `None` until the first
+/// usage-bearing frame. The counters are cumulative, so the latest (max)
+/// value stands — but only while every frame reported a total: one frame
+/// without it means the stream's total is not the upstream's own, and it
+/// records `0`.
+pub fn merge_stream_upstream_total(acc: &mut Option<u32>, frame_total: u32) {
+    *acc = Some(match *acc {
+        None => frame_total,
+        Some(0) => 0,
+        Some(_) if frame_total == 0 => 0,
+        Some(prev) => prev.max(frame_total),
+    });
 }
 
 impl UsageStats {
@@ -421,6 +1124,7 @@ impl UsageStats {
             cached_prompt_tokens: self
                 .cached_prompt_tokens
                 .saturating_add(other.cached_prompt_tokens),
+            cache_write_tokens: add_opt(self.cache_write_tokens, other.cache_write_tokens),
             reasoning_tokens: self.reasoning_tokens.saturating_add(other.reasoning_tokens),
             cache_creation_tokens: self
                 .cache_creation_tokens
@@ -444,8 +1148,242 @@ impl UsageStats {
                 self.prompt_cache_miss_tokens,
                 other.prompt_cache_miss_tokens,
             ),
+            // A sum of totals is the upstreams' own only when every
+            // addend reported one; otherwise it is not a total any
+            // upstream stated, and recording it would mislead billing.
+            upstream_total_tokens: if self.upstream_total_tokens > 0
+                && other.upstream_total_tokens > 0
+            {
+                self.upstream_total_tokens
+                    .saturating_add(other.upstream_total_tokens)
+            } else {
+                0
+            },
+            reasoning_folded_into_completion: self
+                .reasoning_folded_into_completion
+                .saturating_add(other.reasoning_folded_into_completion),
+            modality: self.modality.saturating_add(&other.modality),
+            cache_creation_ttl: self
+                .cache_creation_ttl
+                .saturating_add(&other.cache_creation_ttl),
+            openai_details: self.openai_details.saturating_add(&other.openai_details),
         }
     }
+
+    /// Field-wise maximum of two usage records — the accumulator for a
+    /// stream whose upstream may stamp `usage` on more than one chunk
+    /// (Gemini/Vertex reports cumulative counts on every chunk), so that
+    /// neither a repeat nor a late partial frame shrinks what was reported.
+    pub fn max_fieldwise(&self, other: &UsageStats) -> UsageStats {
+        UsageStats {
+            prompt_tokens: self.prompt_tokens.max(other.prompt_tokens),
+            completion_tokens: self.completion_tokens.max(other.completion_tokens),
+            total_tokens: self.total_tokens.max(other.total_tokens),
+            cached_prompt_tokens: self.cached_prompt_tokens.max(other.cached_prompt_tokens),
+            cache_write_tokens: self.cache_write_tokens.max(other.cache_write_tokens),
+            reasoning_tokens: self.reasoning_tokens.max(other.reasoning_tokens),
+            cache_creation_tokens: self.cache_creation_tokens.max(other.cache_creation_tokens),
+            cache_read_tokens: self.cache_read_tokens.max(other.cache_read_tokens),
+            web_search_requests: self.web_search_requests.max(other.web_search_requests),
+            web_fetch_requests: self.web_fetch_requests.max(other.web_fetch_requests),
+            prompt_cache_hit_tokens: self
+                .prompt_cache_hit_tokens
+                .max(other.prompt_cache_hit_tokens),
+            prompt_cache_miss_tokens: self
+                .prompt_cache_miss_tokens
+                .max(other.prompt_cache_miss_tokens),
+            // Same fold as `merge_stream_upstream_total`: a frame without a
+            // total means the stream stated none.
+            upstream_total_tokens: if self.upstream_total_tokens == 0
+                || other.upstream_total_tokens == 0
+            {
+                0
+            } else {
+                self.upstream_total_tokens.max(other.upstream_total_tokens)
+            },
+            // Describes the frame's own folded completion, so the latest
+            // frame's value stands.
+            reasoning_folded_into_completion: other.reasoning_folded_into_completion,
+            modality: self.modality.max_fieldwise(&other.modality),
+            cache_creation_ttl: self
+                .cache_creation_ttl
+                .max_fieldwise(&other.cache_creation_ttl),
+            openai_details: self.openai_details.max_fieldwise(&other.openai_details),
+        }
+    }
+
+    // ── Client-facing protocol projections ─────────────────────────
+    //
+    // `UsageStats` stores whichever accounting shape the UPSTREAM used,
+    // because that is what UsageEvent / Prometheus / billing must keep
+    // reporting (AISIX-Cloud#1447). The client, though, must be answered
+    // in ITS OWN protocol's accounting — so every client-facing renderer
+    // projects through the methods below rather than copying fields.
+    //
+    // The two shapes disagree on one thing only: whether the cache
+    // counters live INSIDE the input count or BESIDE it.
+    //
+    //   OpenAI shape     prompt_tokens INCLUDES cached_prompt_tokens
+    //   Anthropic shape  prompt_tokens EXCLUDES cache_creation/read
+    //
+    // A single upstream fills exactly one family and zeroes the other,
+    // so each projection is a plain fold that reduces to the identity
+    // on its own shape. Summing rather than picking also keeps an
+    // ENSEMBLE aggregate right: `saturating_add` can merge an
+    // OpenAI-shape member with an Anthropic-shape one, and only the
+    // additive form reports both members' cache hits.
+    //
+    // Both directions are defined here, together, on purpose: they are
+    // two halves of one contract, and splitting them across the two
+    // renderer crates is how one gets fixed while the other silently
+    // keeps the old semantics.
+
+    /// Total input the model processed, in either accounting shape —
+    /// the quantity both protocols agree on, since it is what the
+    /// upstream actually billed for.
+    pub fn total_input_tokens(&self) -> u32 {
+        self.prompt_tokens
+            .saturating_add(self.cache_creation_tokens)
+            .saturating_add(self.cache_read_tokens)
+    }
+
+    /// OpenAI `usage.prompt_tokens` / Responses `usage.input_tokens`:
+    /// the FULL input, cache hits and cache writes included.
+    pub fn openai_prompt_tokens(&self) -> u32 {
+        self.total_input_tokens()
+    }
+
+    /// OpenAI `prompt_tokens_details.cached_tokens` /
+    /// Responses `input_tokens_details.cached_tokens`: the cache-read
+    /// portion, a SUBSET of [`Self::openai_prompt_tokens`]. A cache
+    /// WRITE is billed input but is not a hit, so it is deliberately
+    /// not counted here.
+    pub fn openai_cached_tokens(&self) -> u32 {
+        self.cached_prompt_tokens
+            .saturating_add(self.cache_read_tokens)
+    }
+
+    /// OpenAI `usage.total_tokens`.
+    ///
+    /// Recomputed only when the projection actually MOVED tokens between
+    /// fields — that is, when the upstream reported its cache counters
+    /// beside the input. There the stored total was built under the
+    /// other accounting and relaying it is what produced #1447's
+    /// `40 + 10 = 150`; and a Bedrock Converse total, which excludes the
+    /// cache entirely, would under-report.
+    ///
+    /// Otherwise the upstream's own total stands, because recomputing it
+    /// can only lose information: a provider counting overhead we cannot
+    /// see would be silently corrected downward, and one that reports a
+    /// bare `total_tokens` with no breakdown would render as `0`.
+    pub fn openai_total_tokens(&self) -> u32 {
+        let converted = self.cache_creation_tokens > 0 || self.cache_read_tokens > 0;
+        if !converted && self.total_tokens > 0 {
+            return self.total_tokens;
+        }
+        self.openai_prompt_tokens()
+            .saturating_add(self.completion_tokens)
+    }
+
+    /// Anthropic `usage.input_tokens`: NON-cached input only.
+    pub fn anthropic_input_tokens(&self) -> u32 {
+        self.prompt_tokens.saturating_sub(self.cached_prompt_tokens)
+    }
+
+    /// Anthropic `usage.cache_read_input_tokens`, a counter BESIDE
+    /// `input_tokens`.
+    pub fn anthropic_cache_read_input_tokens(&self) -> u32 {
+        self.cache_read_tokens
+            .saturating_add(self.cached_prompt_tokens)
+    }
+
+    /// Anthropic `usage.cache_creation_input_tokens`. OpenAI cache writes
+    /// keep their own raw field; they do not use this additive accounting.
+    pub fn anthropic_cache_creation_input_tokens(&self) -> u32 {
+        self.cache_creation_tokens
+    }
+}
+
+/// The service tier an upstream response reports it actually served the
+/// request on, verbatim — never the tier the request asked for, and never
+/// a default the gateway filled in. Tier names differ across providers and
+/// change over time, so the value is any string; which wire it came from
+/// decides whether an OpenAI-shape client body may repeat it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceTier {
+    /// The top-level `service_tier` of an OpenAI-shape response (chat
+    /// completions or Responses), in the vocabulary an OpenAI client reads.
+    OpenAi(String),
+    /// Any other protocol's indicator (Anthropic `usage.speed` /
+    /// `usage.service_tier`, Bedrock `serviceTier.type`). Recorded, never
+    /// written into an OpenAI-shape body.
+    Native(String),
+}
+
+impl ServiceTier {
+    /// An OpenAI-shape tier, `None` for an absent or empty value.
+    pub fn openai(value: Option<String>) -> Option<Self> {
+        value.filter(|v| !v.is_empty()).map(Self::OpenAi)
+    }
+
+    /// Another protocol's tier, `None` for an absent or empty value.
+    pub fn native(value: Option<String>) -> Option<Self> {
+        value.filter(|v| !v.is_empty()).map(Self::Native)
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::OpenAi(v) | Self::Native(v) => v,
+        }
+    }
+
+    /// The value an OpenAI-shape client body may carry.
+    pub fn openai_value(&self) -> Option<&str> {
+        match self {
+            Self::OpenAi(v) => Some(v),
+            Self::Native(_) => None,
+        }
+    }
+}
+
+/// The tier an Anthropic `usage` object reports: `speed` when it names
+/// something other than `"standard"` (fast mode), else `service_tier`.
+pub fn anthropic_service_tier(speed: Option<&str>, service_tier: Option<&str>) -> Option<String> {
+    speed
+        .filter(|v| !v.is_empty() && *v != "standard")
+        .or(service_tier.filter(|v| !v.is_empty()))
+        .map(str::to_owned)
+}
+
+/// The response header a Gemini upstream names its serving tier in.
+pub const GEMINI_SERVICE_TIER_HEADER: &str = "x-gemini-service-tier";
+
+/// The tier the `x-gemini-service-tier` response header names, verbatim.
+/// Only Google sends it, so it is read off any upstream response; it is the
+/// fallback for a response whose body reported no tier.
+pub fn gemini_header_service_tier(headers: &http::HeaderMap) -> Option<ServiceTier> {
+    ServiceTier::native(
+        headers
+            .get(GEMINI_SERVICE_TIER_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().to_owned()),
+    )
+}
+
+/// Gemini `usageMetadata.serviceTier`, verbatim; an `unspecified` value (in
+/// any spelling, `SERVICE_TIER_UNSPECIFIED` included) reports nothing.
+pub fn gemini_usage_service_tier(value: Option<&str>) -> Option<ServiceTier> {
+    ServiceTier::native(
+        value
+            .filter(|v| !v.to_ascii_lowercase().ends_with("unspecified"))
+            .map(str::to_owned),
+    )
+}
+
+/// [`anthropic_service_tier`] over a raw Anthropic `usage` object.
+pub fn anthropic_usage_service_tier(usage: &serde_json::Value) -> Option<String> {
+    let field = |k: &str| usage.get(k).and_then(serde_json::Value::as_str);
+    anthropic_service_tier(field("speed"), field("service_tier"))
 }
 
 /// Full (non-streaming) chat response.
@@ -454,12 +1392,57 @@ impl UsageStats {
 pub struct ChatResponse {
     pub id: String,
     pub model: String,
+    /// The first choice's message.
     pub message: ChatMessage,
     pub finish_reason: FinishReason,
+    /// The first choice's `logprobs`, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<Value>,
+    /// Every choice after the first (`n > 1`), in upstream order. A
+    /// renderer whose protocol has one answer per response reads only the
+    /// first choice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub more_choices: Vec<ChatChoice>,
     pub usage: UsageStats,
+    /// Not serialized: a cached response was served by no upstream, so a
+    /// cache hit reports no tier — and this type denies unknown fields, so
+    /// writing it would make every cache entry unreadable to a gateway
+    /// release without the field.
+    #[serde(skip)]
+    pub service_tier: Option<ServiceTier>,
+}
+
+/// One choice of a multi-choice response, past the first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatChoice {
+    pub index: u32,
+    pub message: ChatMessage,
+    pub finish_reason: FinishReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<Value>,
 }
 
 impl ChatResponse {
+    /// Every choice's message, the first included.
+    pub fn messages(&self) -> impl Iterator<Item = &ChatMessage> {
+        std::iter::once(&self.message).chain(self.more_choices.iter().map(|c| &c.message))
+    }
+
+    /// [`Self::messages`], mutably.
+    pub fn messages_mut(&mut self) -> impl Iterator<Item = &mut ChatMessage> {
+        std::iter::once(&mut self.message)
+            .chain(self.more_choices.iter_mut().map(|c| &mut c.message))
+    }
+
+    /// Take `fallback` as the tier when the body reported none.
+    pub fn with_fallback_service_tier(mut self, fallback: Option<ServiceTier>) -> Self {
+        if self.service_tier.is_none() {
+            self.service_tier = fallback;
+        }
+        self
+    }
+
     /// The client-visible output text that content/DLP output guardrails
     /// must inspect: the assistant `content` plus any `tool_calls` or legacy
     /// `function_call` material (function names + arguments, and Anthropic
@@ -469,40 +1452,43 @@ impl ChatResponse {
     ///
     /// Reasoning/thinking content is intentionally NOT included — it is
     /// left out of output-guardrail scope by design.
+    ///
+    /// Every choice is scanned: a multi-choice response renders them all.
     pub fn guardrail_output_text(&self) -> String {
-        let mut out = self.message.content.clone().unwrap_or_default();
-        for tool_payload in [
-            self.message.extra.get("tool_calls"),
-            self.message.extra.get("function_call"),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if !tool_payload.is_null() {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                // Serialize the whole tool-call payload so no function
-                // name or argument can escape inspection regardless of the
-                // provider-specific shape.
-                out.push_str(&tool_payload.to_string());
-            }
-        }
-        for text in [
-            self.message.extra.get("refusal").and_then(Value::as_str),
-            self.message
-                .extra
-                .get("audio")
-                .and_then(|audio| audio.get("transcript"))
-                .and_then(Value::as_str),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        let mut out = String::new();
+        for message in self.messages() {
             if !out.is_empty() {
                 out.push('\n');
             }
-            out.push_str(text);
+            out.push_str(&message.content_str());
+            if let Some(refusal) = message.extra.get("refusal").and_then(Value::as_str) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(refusal);
+            }
+            for key in ["tool_calls", "function_call"] {
+                if let Some(calls) = message.extra.get(key).filter(|v| !v.is_null()) {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    // Serialize the whole tool-call payload so no function
+                    // name or argument can escape inspection regardless of
+                    // the provider-specific shape (tool-call ids left out).
+                    out.push_str(&crate::tool_calls::tool_calls_scan_text(calls));
+                }
+            }
+            if let Some(transcript) = message
+                .extra
+                .get("audio")
+                .and_then(|audio| audio.get("transcript"))
+                .and_then(Value::as_str)
+            {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(transcript);
+            }
         }
         out
     }
@@ -514,15 +1500,82 @@ impl ChatResponse {
 pub struct ChatChunk {
     pub id: String,
     pub model: String,
+    /// The choice this delta belongs to (`n > 1`); `0` for the first. A
+    /// renderer whose protocol has one answer per response drops the
+    /// others.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub choice_index: u32,
     pub delta: ChatDelta,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<FinishReason>,
+    /// The choice's streamed `logprobs`, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageStats>,
+    /// The tier the upstream reported so far on this stream; see
+    /// [`ChatResponse::service_tier`] for why it is not serialized.
+    #[serde(skip)]
+    pub service_tier: Option<ServiceTier>,
+    /// Usage the upstream reported for the gateway's own accounting only,
+    /// ahead of the event that reports it to the caller (Claude's
+    /// `message_start` input and cache counts), so a stream that stops
+    /// before its end is accounted as far as the upstream reported. Never
+    /// serialized, and never rendered to a caller.
+    #[serde(skip)]
+    pub accounting_usage: Option<UsageStats>,
+}
+
+impl ChatChunk {
+    /// Take `fallback` as the tier when this chunk's body reported none.
+    pub fn with_fallback_service_tier(mut self, fallback: &Option<ServiceTier>) -> Self {
+        if self.service_tier.is_none() {
+            self.service_tier.clone_from(fallback);
+        }
+        self
+    }
+
+    /// Carries nothing for the caller but a finish reason or usage: no
+    /// delta payload of any kind.
+    pub fn has_no_payload(&self) -> bool {
+        let d = &self.delta;
+        d.role.is_none()
+            && d.content.is_none()
+            && d.tool_calls.is_none()
+            && d.function_call.is_none()
+            && d.reasoning_content.is_none()
+            && d.audio.is_none()
+            && d.extra.is_empty()
+            && self.logprobs.is_none()
+    }
+
+    /// This chunk as a renderer with one answer per response reads it: a
+    /// later choice's delta, finish and logprobs are left out, and only
+    /// what the stream as a whole reports (usage, tier) stays.
+    pub fn first_choice_only(&self) -> std::borrow::Cow<'_, ChatChunk> {
+        if self.choice_index == 0 {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        std::borrow::Cow::Owned(ChatChunk {
+            id: self.id.clone(),
+            model: self.model.clone(),
+            choice_index: 0,
+            delta: ChatDelta::default(),
+            finish_reason: None,
+            logprobs: None,
+            usage: self.usage.clone(),
+            service_tier: self.service_tier.clone(),
+            accounting_usage: self.accounting_usage.clone(),
+        })
+    }
+
+    /// The `include_usage` terminal frame: usage and nothing else.
+    pub fn is_usage_only(&self) -> bool {
+        self.usage.is_some() && self.finish_reason.is_none() && self.has_no_payload()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ChatDelta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<Role>,
@@ -544,6 +1597,15 @@ pub struct ChatDelta {
     /// emitter is a passthrough.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// OpenAI's streamed audio output (`delta.audio`: `id`, `transcript`,
+    /// `data`, `expires_at`), relayed as the upstream sent it — the
+    /// streaming counterpart of the non-stream `message.audio`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<serde_json::Value>,
+    /// Every other delta field an OpenAI-shape upstream streamed
+    /// (`refusal`, `function_call`, `annotations`, …), relayed as sent.
+    #[serde(default, flatten, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 // ─── Embeddings ──────────────────────────────────────────────────────────────
@@ -593,8 +1655,9 @@ pub struct EmbeddingObject {
 /// caller sent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingRequest {
-    /// The public-facing model name (resolved to an upstream model by the
-    /// proxy before the Bridge sees it).
+    /// The model name the caller addressed. Bridges take the upstream model
+    /// id from the target's [`crate::BridgeContext`], never from here, so one
+    /// request can be handed to every attempt without a per-target copy.
     pub model: String,
     /// Texts to embed. A single-string input is normalised to
     /// `vec![text]` by the proxy handler; bridges consult
@@ -615,6 +1678,36 @@ pub struct EmbeddingRequest {
     /// Optional dimensions hint forwarded verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dimensions: Option<u32>,
+    /// The caller's embedding purpose for providers that take one (Cohere's
+    /// `input_type`: `search_document`, `search_query`, `classification`,
+    /// `clustering`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_type: Option<String>,
+    /// The caller's requested embedding types for providers that take them
+    /// (Cohere's `embedding_types`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_types: Option<serde_json::Value>,
+    /// The caller's `input` when it is token ids (`[1, 2]` or
+    /// `[[1, 2], [3]]`), verbatim; `input` is then empty. Only an
+    /// OpenAI-wire upstream takes it; any other refuses the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_input: Option<serde_json::Value>,
+    /// Every other field the caller sent (`user`, …), forwarded as is to
+    /// an OpenAI-wire upstream.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl EmbeddingRequest {
+    /// Refuse token-id input on an upstream that takes text only.
+    pub fn require_text_input(&self) -> Result<(), crate::BridgeError> {
+        match self.token_input {
+            Some(_) => Err(crate::BridgeError::InvalidRequest(
+                "`input` as token ids is not supported for this model; send text".into(),
+            )),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Normalised embedding response.
@@ -626,15 +1719,59 @@ pub struct EmbeddingResponse {
     pub usage: EmbeddingUsage,
 }
 
+/// Provenance of the token counters on an embedding response.
+///
+/// Embedding providers may return vectors without a complete usage block.
+/// `Reported` means the provider supplied the count needed to populate this
+/// input-only response's counters; `Unavailable` keeps an absent count from
+/// being mistaken for a provider-reported zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EmbeddingUsageSource {
+    Reported,
+    #[default]
+    Unavailable,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EmbeddingUsage {
     pub prompt_tokens: u32,
     pub total_tokens: u32,
+    /// The upstream's own total, verbatim; `0` when it reported none. A
+    /// bridge fills `total_tokens` for the client from the prompt count, so
+    /// only this is what the usage event records — see
+    /// [`UsageStats::upstream_total_tokens`].
+    #[serde(skip)]
+    pub upstream_total_tokens: u32,
+    /// Internal provenance for telemetry. Client embedding response bodies
+    /// retain their established OpenAI-compatible `usage` shape.
+    #[serde(skip)]
+    pub source: EmbeddingUsageSource,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A usage-only frame is dropped by the chat relay, so a legacy streamed
+    /// call has to read as a payload or its name and arguments go with it.
+    #[test]
+    fn a_legacy_function_call_delta_is_a_payload() {
+        let mut chunk = ChatChunk {
+            id: String::new(),
+            model: String::new(),
+            choice_index: 0,
+            delta: ChatDelta::default(),
+            finish_reason: None,
+            logprobs: None,
+            usage: Some(UsageStats::default()),
+            service_tier: None,
+            accounting_usage: None,
+        };
+        assert!(chunk.is_usage_only());
+        chunk.delta.function_call = Some(serde_json::json!({"name": "lookup"}));
+        assert!(!chunk.has_no_payload());
+        assert!(!chunk.is_usage_only());
+    }
 
     #[test]
     fn developer_role_parses_and_counts_as_system() {
@@ -642,15 +1779,86 @@ mod tests {
             serde_json::from_value(serde_json::json!({"role": "developer", "content": "x"}))
                 .unwrap();
         assert_eq!(m.role, Role::Developer);
-        assert!(m.role.is_system());
+        assert!(m.role.is_instruction());
         assert_eq!(serde_json::to_value(m.role).unwrap(), "developer");
-        assert!(Role::System.is_system());
-        assert!(!Role::User.is_system());
+        assert!(Role::System.is_instruction());
+        assert!(!Role::User.is_instruction());
+    }
+
+    #[test]
+    fn reasoning_part_slots_read_text_and_signature() {
+        let mistral = serde_json::json!({"type": "thinking", "signature": "s",
+            "thinking": [{"type": "text", "text": "a"}, {"type": "image", "url": "x"}]});
+        let slots = reasoning_part_slots(&mistral);
+        assert_eq!(slots.len(), 1);
+        assert_eq!((slots[0].text, slots[0].signed), ("a", true));
+
+        let databricks = serde_json::json!({"type": "reasoning", "summary": [
+            {"type": "summary_text", "text": "b", "signature": ""},
+            {"type": "summary_text", "text": "c", "signature": "s"}
+        ]});
+        let slots: Vec<(&str, bool)> = reasoning_part_slots(&databricks)
+            .into_iter()
+            .map(|s| (s.text, s.signed))
+            .collect();
+        assert_eq!(slots, [("b", false), ("c", true)]);
+
+        // Anthropic's shape holds the text itself.
+        let anthropic = serde_json::json!({"type": "thinking", "thinking": "a", "signature": "s"});
+        let slots: Vec<(&str, bool)> = reasoning_part_slots(&anthropic)
+            .into_iter()
+            .map(|s| (s.text, s.signed))
+            .collect();
+        assert_eq!(slots, [("a", true)]);
+        let unsigned = serde_json::json!({"type": "thinking", "thinking": "a", "signature": ""});
+        assert!(!reasoning_part_slots(&unsigned)[0].signed);
+        // A `summary` string is not a reasoning part.
+        assert!(!is_reasoning_part(
+            &serde_json::json!({"type": "reasoning", "summary": "a"})
+        ));
+    }
+
+    #[test]
+    fn a_turn_of_reasoning_parts_alone_is_reasoning_only() {
+        let msg = |v: serde_json::Value| -> ChatMessage { serde_json::from_value(v).unwrap() };
+        let thinking = serde_json::json!({"type": "thinking",
+            "thinking": [{"type": "text", "text": "t"}]});
+        assert!(
+            msg(serde_json::json!({"role": "assistant", "content": [thinking.clone()]}))
+                .is_reasoning_only()
+        );
+        assert!(msg(serde_json::json!({"role": "assistant",
+            "content": [{"type": "thinking", "thinking": "t", "signature": "s"}]}))
+        .is_reasoning_only());
+        assert!(msg(
+            serde_json::json!({"role": "assistant", "content": [{"type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "t", "signature": "s"}]}]})
+        )
+        .is_reasoning_only());
+        // Beside text, a tool call, or with no text in it, it is not.
+        assert!(!msg(serde_json::json!({"role": "assistant",
+            "content": [thinking.clone(), {"type": "text", "text": "a"}]}))
+        .is_reasoning_only());
+        assert!(!msg(
+            serde_json::json!({"role": "assistant", "content": [thinking],
+            "tool_calls": [{"id": "c", "type": "function",
+                "function": {"name": "f", "arguments": "{}"}}]})
+        )
+        .is_reasoning_only());
+        assert!(!msg(
+            serde_json::json!({"role": "assistant", "content": [{"type": "thinking",
+            "thinking": [{"type": "text", "text": ""}]}]})
+        )
+        .is_reasoning_only());
     }
 
     #[test]
     fn chat_format_round_trips_through_json() {
         let f = ChatFormat {
+            gateway_strict_schema: false,
+            top_k: None,
+            thinking_budget_tokens: None,
+            thoughts_requested: false,
             model: "my-gpt4".into(),
             messages: vec![
                 ChatMessage::system("you are helpful"),
@@ -698,6 +1906,29 @@ mod tests {
     }
 
     #[test]
+    fn chat_message_accepts_and_round_trips_developer_role() {
+        let m: ChatMessage = serde_json::from_str(
+            r#"{"role": "developer", "content": "Follow application instructions"}"#,
+        )
+        .expect("developer is a documented Chat Completions message role");
+
+        let value = serde_json::to_value(m).unwrap();
+        assert_eq!(value["role"], "developer");
+        assert_eq!(value["content"], "Follow application instructions");
+    }
+
+    #[test]
+    fn chat_message_rejects_unknown_and_mis_cased_roles() {
+        for role in ["Developer", "tool_result"] {
+            let raw = format!(r#"{{"role":"{role}","content":"x"}}"#);
+            assert!(
+                serde_json::from_str::<ChatMessage>(&raw).is_err(),
+                "role {role:?} must remain invalid"
+            );
+        }
+    }
+
+    #[test]
     fn content_null_preserved_as_none() {
         // #395: `content: null` (OpenAI's assistant-with-tool_calls shape)
         // is preserved as `None` so it round-trips back to JSON `null`,
@@ -723,7 +1954,9 @@ mod tests {
         )
         .unwrap();
         // Concatenated text from text blocks (non-text blocks skipped).
-        assert_eq!(m.content.as_deref(), Some("What's in this image?"));
+        assert_eq!(m.text().as_deref(), Some("What's in this image?"));
+        // Derived from the blocks, not stored beside them.
+        assert_eq!(m.content, None);
         // Raw blocks preserved verbatim for forwarding.
         let blocks = m.content_blocks.expect("blocks should be Some");
         assert_eq!(blocks.len(), 2);
@@ -745,7 +1978,9 @@ mod tests {
         .unwrap();
         // An array of only non-text blocks yields empty-but-present text
         // (the array form is never `null`); blocks are preserved.
-        assert_eq!(m.content.as_deref(), Some(""));
+        assert_eq!(m.text().as_deref(), Some(""));
+        // Derived from the blocks, not stored beside them.
+        assert_eq!(m.content, None);
         assert!(m.content_blocks.is_some());
     }
 
@@ -761,7 +1996,30 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(m.content.as_deref(), Some("line one\nline two"));
+        assert_eq!(m.text().as_deref(), Some("line one\nline two"));
+        // Derived from the blocks, not stored beside them.
+        assert_eq!(m.content, None);
+    }
+
+    #[test]
+    fn a_block_array_message_serializes_with_its_text_as_before() {
+        // Content capture and the cache store the serialized request, so
+        // the derived text is written out as `content` exactly where the
+        // stored copy used to be.
+        let m: ChatMessage = serde_json::from_str(
+            r#"{"role":"user","content":[{"type":"text","text":"a"},{"type":"image_url","image_url":{"url":"u"}},{"type":"text","text":"b"}],"name":"n"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&m).unwrap(),
+            r#"{"role":"user","content":"ab","content_blocks":[{"text":"a","type":"text"},{"image_url":{"url":"u"},"type":"image_url"},{"text":"b","type":"text"}],"name":"n"}"#
+        );
+        // A stored `content` the blocks do not derive is kept as it is.
+        let explicit: ChatMessage = serde_json::from_str(
+            r#"{"role":"user","content":"","content_blocks":[{"type":"text","text":"x"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(explicit.content.as_deref(), Some(""));
     }
 
     #[test]
@@ -823,6 +2081,256 @@ mod tests {
         assert_eq!(UsageStats::with_cache(10, 4, 0, 0).total_tokens, 14);
     }
 
+    // ── Client-facing protocol projections ─────────────────────────
+    //
+    // The reporter's numbers from AISIX-Cloud#1447, used throughout so
+    // the same call is followed across every source shape: 40 uncached
+    // input + 30 cache write + 70 cache read + 10 output. Whoever
+    // reports it, the model processed 140 input tokens and 150 total.
+    const N: u32 = 40;
+    const W: u32 = 30;
+    const R: u32 = 70;
+    const O: u32 = 10;
+
+    /// What an Anthropic-shape upstream (anthropic, bedrock) stores.
+    fn anthropic_shape() -> UsageStats {
+        UsageStats::with_cache(N, O, W, R)
+    }
+
+    /// What an OpenAI-shape upstream (openai, azure, deepseek, gemini)
+    /// stores for the SAME call: no cache-write concept, and the read is
+    /// already inside `prompt_tokens`.
+    fn openai_shape() -> UsageStats {
+        UsageStats {
+            prompt_tokens: N + W + R,
+            completion_tokens: O,
+            total_tokens: N + W + R + O,
+            cached_prompt_tokens: R,
+            ..UsageStats::default()
+        }
+    }
+
+    #[test]
+    fn projections_agree_on_total_input_across_source_shapes() {
+        // The whole point of the projection layer: an OpenAI client and
+        // an Anthropic client, in front of EITHER upstream shape, must
+        // be told the model read the same 140 tokens.
+        for u in [anthropic_shape(), openai_shape()] {
+            assert_eq!(u.total_input_tokens(), N + W + R);
+            assert_eq!(u.openai_prompt_tokens(), N + W + R);
+            assert_eq!(
+                u.anthropic_input_tokens()
+                    + u.anthropic_cache_creation_input_tokens()
+                    + u.anthropic_cache_read_input_tokens(),
+                N + W + R,
+                "Anthropic's three input counters must sum to the same input"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_projection_keeps_cached_a_subset_of_prompt() {
+        for u in [anthropic_shape(), openai_shape()] {
+            assert!(
+                u.openai_cached_tokens() <= u.openai_prompt_tokens(),
+                "cached_tokens > prompt_tokens is the contradiction #1447 reported"
+            );
+            assert_eq!(u.openai_cached_tokens(), R, "cache READ is the hit");
+            assert_eq!(
+                u.openai_total_tokens(),
+                u.openai_prompt_tokens() + u.completion_tokens,
+                "OpenAI clients decompose total into prompt + completion"
+            );
+            assert_eq!(u.openai_total_tokens(), N + W + R + O);
+        }
+    }
+
+    #[test]
+    fn anthropic_projection_keeps_input_free_of_cache() {
+        // The cache READ is reportable by both shapes, so it converts
+        // exactly either way.
+        for u in [anthropic_shape(), openai_shape()] {
+            assert_eq!(u.anthropic_cache_read_input_tokens(), R);
+        }
+        // OpenAI's raw write count is not Anthropic's additive creation
+        // count. Non-hit OpenAI input remains plain Anthropic input.
+        let ant = anthropic_shape();
+        assert_eq!(ant.anthropic_input_tokens(), N);
+        assert_eq!(ant.anthropic_cache_creation_input_tokens(), W);
+
+        let oai = openai_shape();
+        assert_eq!(oai.anthropic_input_tokens(), N + W);
+        assert_eq!(oai.anthropic_cache_creation_input_tokens(), 0);
+    }
+
+    /// `total_tokens` is only recomputed when the projection moved
+    /// tokens. Recomputing unconditionally erases whatever an upstream
+    /// counted outside `prompt + completion` — including the extreme
+    /// case of one that reports a bare total and no breakdown, which
+    /// would have rendered as `0`.
+    #[test]
+    fn openai_total_defers_to_the_upstream_unless_the_shape_converted() {
+        // Converted: the stored total was built under Anthropic
+        // accounting, so it must not be relayed as-is.
+        assert_eq!(anthropic_shape().openai_total_tokens(), N + W + R + O);
+        // …and a Bedrock-style total that EXCLUDES the cache is likewise
+        // recomputed rather than under-reported.
+        let bedrock_like = UsageStats {
+            prompt_tokens: N,
+            completion_tokens: O,
+            total_tokens: N + O,
+            cache_creation_tokens: W,
+            cache_read_tokens: R,
+            ..UsageStats::default()
+        };
+        assert_eq!(bedrock_like.openai_total_tokens(), N + W + R + O);
+
+        // Not converted: the upstream's own total stands, even when it
+        // exceeds prompt + completion because the provider is counting
+        // overhead we cannot see.
+        let with_overhead = UsageStats {
+            prompt_tokens: 1000,
+            completion_tokens: 400,
+            total_tokens: 1500,
+            ..UsageStats::default()
+        };
+        assert_eq!(with_overhead.openai_total_tokens(), 1500);
+
+        // The degenerate upstream: a total and nothing else.
+        let total_only = UsageStats {
+            total_tokens: 42,
+            ..UsageStats::default()
+        };
+        assert_eq!(total_only.openai_total_tokens(), 42);
+
+        // A missing total still falls back to the parts.
+        let no_total = UsageStats {
+            prompt_tokens: 7,
+            completion_tokens: 3,
+            ..UsageStats::default()
+        };
+        assert_eq!(no_total.openai_total_tokens(), 10);
+    }
+
+    /// The first turn of a cached conversation WRITES without reading.
+    /// Those tokens are billed input, so they are inside
+    /// `openai_prompt_tokens` — and if nothing names them the caller
+    /// sees an unexplained increase it cannot price, since a write costs
+    /// more than plain input.
+    #[test]
+    fn a_cache_write_without_a_read_is_still_reportable() {
+        let write_only = UsageStats::with_cache(N, O, W, 0);
+        assert_eq!(write_only.openai_prompt_tokens(), N + W);
+        assert_eq!(write_only.openai_cached_tokens(), 0, "a write is not a hit");
+        assert_eq!(write_only.anthropic_cache_creation_input_tokens(), W);
+        assert_eq!(write_only.openai_total_tokens(), N + W + O);
+    }
+
+    #[test]
+    fn projections_are_the_identity_without_any_cache() {
+        let u = UsageStats::new(N, O);
+        assert_eq!(u.openai_prompt_tokens(), N);
+        assert_eq!(u.openai_cached_tokens(), 0);
+        assert_eq!(u.openai_total_tokens(), N + O);
+        assert_eq!(u.anthropic_input_tokens(), N);
+        assert_eq!(u.anthropic_cache_read_input_tokens(), 0);
+        assert_eq!(u.anthropic_cache_creation_input_tokens(), 0);
+    }
+
+    #[test]
+    fn projections_sum_both_cache_families_on_a_mixed_aggregate() {
+        // An ensemble fans out to members on different providers, and
+        // `saturating_add` merges their usage into ONE client-facing
+        // record — the only place both cache representations co-occur.
+        // Picking whichever is non-zero (an easy shortcut when each
+        // upstream fills exactly one family) would silently drop a whole
+        // member's cache hit here.
+        let mixed = anthropic_shape().saturating_add(&openai_shape());
+        assert_eq!(mixed.openai_prompt_tokens(), 2 * (N + W + R));
+        assert_eq!(mixed.openai_cached_tokens(), 2 * R);
+        assert_eq!(mixed.openai_total_tokens(), 2 * (N + W + R + O));
+
+        // The Anthropic side sums to the same 2 × 140 of input, but
+        // splits it differently: that OpenAI member's non-hit input is
+        // all plain input. Only the Anthropic member contributes an
+        // additive cache-creation count.
+        assert_eq!(mixed.anthropic_input_tokens(), N + (W + N));
+        assert_eq!(mixed.anthropic_cache_read_input_tokens(), 2 * R);
+        assert_eq!(mixed.anthropic_cache_creation_input_tokens(), W);
+        assert_eq!(
+            mixed.anthropic_input_tokens()
+                + mixed.anthropic_cache_creation_input_tokens()
+                + mixed.anthropic_cache_read_input_tokens(),
+            2 * (N + W + R)
+        );
+    }
+
+    /// A cached response carries `UsageStats`, and a gateway release that
+    /// predates `modality` denies unknown fields: the field never reaches
+    /// the serialized form a shared cache stores.
+    #[test]
+    fn modality_stays_out_of_the_cached_form() {
+        let u = UsageStats {
+            modality: ModalityTokens {
+                prompt_audio_tokens: Some(0),
+                ..ModalityTokens::NONE
+            },
+            ..UsageStats::new(1, 2)
+        };
+        let json = serde_json::to_string(&u).unwrap();
+        assert!(!json.contains("modality"), "{json}");
+        let back: UsageStats = serde_json::from_str(&json).unwrap();
+        assert!(back.modality.is_empty());
+    }
+
+    #[test]
+    fn cache_creation_ttl_reads_only_a_reported_split() {
+        let split =
+            serde_json::json!({"ephemeral_5m_input_tokens": 20, "ephemeral_1h_input_tokens": 300});
+        assert_eq!(
+            CacheCreationTtl::from_anthropic(Some(&split)),
+            CacheCreationTtl {
+                cache_creation_5m_tokens: Some(20),
+                cache_creation_1h_tokens: Some(300),
+            }
+        );
+        assert!(CacheCreationTtl::from_anthropic(None).is_empty());
+        assert!(CacheCreationTtl::from_anthropic(Some(&serde_json::Value::Null)).is_empty());
+
+        assert_eq!(
+            CacheCreationTtl::from_converse_details([("5m", 20), ("1h", 300)], 320),
+            CacheCreationTtl {
+                cache_creation_5m_tokens: Some(20),
+                cache_creation_1h_tokens: Some(300),
+            }
+        );
+        // A breakdown that does not account for the whole write, or carries
+        // a lifetime this gateway does not know, is no split at all.
+        assert!(CacheCreationTtl::from_converse_details([("1h", 300)], 320).is_empty());
+        assert!(
+            CacheCreationTtl::from_converse_details([("1h", 300), ("24h", 20)], 320).is_empty()
+        );
+        assert!(CacheCreationTtl::from_converse_details([], 320).is_empty());
+
+        let one_hour = CacheCreationTtl {
+            cache_creation_5m_tokens: None,
+            cache_creation_1h_tokens: Some(300),
+        };
+        assert_eq!(
+            one_hour.accounting_for(300),
+            CacheCreationTtl {
+                cache_creation_5m_tokens: Some(0),
+                cache_creation_1h_tokens: Some(300),
+            }
+        );
+        assert!(one_hour.accounting_for(320).is_empty());
+        let zeros = CacheCreationTtl {
+            cache_creation_5m_tokens: Some(0),
+            cache_creation_1h_tokens: Some(0),
+        };
+        assert!(zeros.accounting_for(0).is_empty());
+    }
+
     #[test]
     fn usage_stats_saturating_add_sums_every_field() {
         let a = UsageStats {
@@ -830,6 +2338,7 @@ mod tests {
             completion_tokens: 5,
             total_tokens: 15,
             cached_prompt_tokens: 2,
+            cache_write_tokens: Some(3),
             reasoning_tokens: 3,
             cache_creation_tokens: 1,
             cache_read_tokens: 4,
@@ -837,12 +2346,28 @@ mod tests {
             web_fetch_requests: 1,
             prompt_cache_hit_tokens: Some(2),
             prompt_cache_miss_tokens: None,
+            upstream_total_tokens: 15,
+            reasoning_folded_into_completion: 3,
+            modality: ModalityTokens {
+                prompt_audio_tokens: Some(4),
+                ..ModalityTokens::NONE
+            },
+            cache_creation_ttl: CacheCreationTtl {
+                cache_creation_5m_tokens: Some(0),
+                cache_creation_1h_tokens: Some(1),
+            },
+            openai_details: OpenAiUsageDetails {
+                accepted_prediction_tokens: Some(2),
+                rejected_prediction_tokens: Some(0),
+                ..OpenAiUsageDetails::default()
+            },
         };
         let b = UsageStats {
             prompt_tokens: 20,
             completion_tokens: 7,
             total_tokens: 27,
             cached_prompt_tokens: 1,
+            cache_write_tokens: Some(5),
             reasoning_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 6,
@@ -850,8 +2375,40 @@ mod tests {
             web_fetch_requests: 0,
             prompt_cache_hit_tokens: None,
             prompt_cache_miss_tokens: Some(8),
+            upstream_total_tokens: 27,
+            reasoning_folded_into_completion: 0,
+            modality: ModalityTokens {
+                prompt_audio_tokens: Some(6),
+                completion_image_tokens: Some(1),
+                ..ModalityTokens::NONE
+            },
+            cache_creation_ttl: CacheCreationTtl::NONE,
+            openai_details: OpenAiUsageDetails {
+                accepted_prediction_tokens: Some(5),
+                prompt_text_tokens: Some(7),
+                ..OpenAiUsageDetails::default()
+            },
         };
         let sum = a.saturating_add(&b);
+        assert_eq!(
+            sum.openai_details,
+            OpenAiUsageDetails {
+                accepted_prediction_tokens: Some(7),
+                rejected_prediction_tokens: Some(0),
+                prompt_text_tokens: Some(7),
+                ..OpenAiUsageDetails::default()
+            }
+        );
+        assert_eq!(sum.cache_creation_ttl, a.cache_creation_ttl);
+        assert_eq!(
+            sum.modality,
+            ModalityTokens {
+                prompt_audio_tokens: Some(10),
+                prompt_image_tokens: None,
+                completion_audio_tokens: None,
+                completion_image_tokens: Some(1),
+            }
+        );
         assert_eq!(sum.prompt_tokens, 30);
         assert_eq!(sum.completion_tokens, 12);
         assert_eq!(sum.total_tokens, 42);
@@ -860,12 +2417,15 @@ mod tests {
         // ensemble's aggregate sums them rather than taking a maximum.
         assert_eq!(sum.web_search_requests, 5);
         assert_eq!(sum.web_fetch_requests, 1);
+        assert_eq!(sum.cache_write_tokens, Some(8));
         assert_eq!(sum.reasoning_tokens, 3);
         assert_eq!(sum.cache_creation_tokens, 1);
         assert_eq!(sum.cache_read_tokens, 10);
         // None + Some(8) = Some(8); Some(2) + None = Some(2). None + None stays None.
         assert_eq!(sum.prompt_cache_hit_tokens, Some(2));
         assert_eq!(sum.prompt_cache_miss_tokens, Some(8));
+        assert_eq!(sum.upstream_total_tokens, 42);
+        assert_eq!(sum.reasoning_folded_into_completion, 3);
         assert_eq!(
             UsageStats::default()
                 .saturating_add(&UsageStats::default())
@@ -879,6 +2439,69 @@ mod tests {
                 .prompt_tokens,
             u32::MAX,
         );
+    }
+
+    /// An aggregate's upstream total is the upstreams' own only when every
+    /// contributor reported one. An ensemble member that reported none
+    /// (Anthropic) must zero the sum: a partial sum is a number no upstream
+    /// stated, and cp-api would read it as a billing identity.
+    #[test]
+    fn upstream_total_sums_only_when_every_contributor_reported_one() {
+        let reported = UsageStats {
+            upstream_total_tokens: 150,
+            ..UsageStats::new(100, 50)
+        };
+        let unreported = UsageStats::with_cache(10, 5, 0, 0);
+        assert_eq!(unreported.upstream_total_tokens, 0);
+        assert_eq!(
+            reported.saturating_add(&unreported).upstream_total_tokens,
+            0
+        );
+        assert_eq!(
+            unreported.saturating_add(&reported).upstream_total_tokens,
+            0
+        );
+        assert_eq!(
+            reported.saturating_add(&reported).upstream_total_tokens,
+            300
+        );
+    }
+
+    /// The streamed counterpart: cumulative frames keep the latest total,
+    /// but one usage frame without a total makes the stream's total
+    /// unreported, wherever it falls.
+    #[test]
+    fn stream_upstream_total_keeps_the_latest_only_while_every_frame_reports_one() {
+        let run = |frames: &[u32]| {
+            let mut acc = None;
+            for f in frames {
+                merge_stream_upstream_total(&mut acc, *f);
+            }
+            acc.unwrap_or(0)
+        };
+        assert_eq!(run(&[]), 0);
+        assert_eq!(run(&[120, 150]), 150);
+        assert_eq!(run(&[0, 150]), 0);
+        assert_eq!(run(&[120, 0]), 0);
+    }
+
+    #[test]
+    fn recorded_completion_removes_only_the_folded_reasoning() {
+        // prompt 100, candidates 20, thoughts 30, total 150: additive.
+        assert_eq!(recorded_completion_tokens(100, 50, 30, 30, 150), 20);
+        assert_eq!(recorded_completion_tokens(100, 50, 30, 0, 150), 50);
+        // #419 zeroes the completion (and reasoning) of a stream nobody
+        // received.
+        assert_eq!(recorded_completion_tokens(100, 0, 0, 30, 150), 0);
+        // Without the upstream's total nothing marks the reasoning as
+        // beside the completion, so the folded count stands.
+        assert_eq!(recorded_completion_tokens(100, 50, 30, 30, 0), 50);
+        // A total the unfolded row does not add up to reads as the subset
+        // shape too.
+        assert_eq!(recorded_completion_tokens(100, 50, 30, 30, 160), 50);
+        // A thinking-only frame whose total has not caught up (candidates
+        // 0, thoughts 30, total == prompt).
+        assert_eq!(recorded_completion_tokens(100, 30, 30, 30, 100), 30);
     }
 
     /// PR #442 audit MEDIUM-4 (forward-compat): an *old-shape*
@@ -911,6 +2534,7 @@ mod tests {
     #[test]
     fn message_constructors_set_role() {
         assert_eq!(ChatMessage::system("x").role, Role::System);
+        assert_eq!(ChatMessage::developer("x").role, Role::Developer);
         assert_eq!(ChatMessage::user("x").role, Role::User);
         assert_eq!(ChatMessage::assistant("x").role, Role::Assistant);
     }
@@ -1007,17 +2631,23 @@ mod tests {
     #[test]
     fn chat_chunk_omits_optional_fields_on_wire() {
         let chunk = ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "cmpl-1".into(),
             model: "m".into(),
             delta: ChatDelta {
+                extra: Default::default(),
                 role: None,
                 content: Some("hello".into()),
                 tool_calls: None,
                 function_call: None,
                 reasoning_content: None,
+                audio: None,
             },
             finish_reason: None,
             usage: None,
+            service_tier: None,
+            accounting_usage: None,
         };
         let json = serde_json::to_string(&chunk).unwrap();
         assert!(!json.contains("\"finish_reason\""));

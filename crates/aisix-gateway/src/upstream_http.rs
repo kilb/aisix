@@ -21,6 +21,8 @@ use std::time::Duration;
 use crate::bridge::BridgeError;
 use crate::upstream_tls::TlsSettings;
 
+pub use aisix_core::redact_url_for_log;
+
 /// Suffixes marking a query parameter whose value is a credential and must
 /// be redacted out of logged URLs. Vertex/Gemini accept `?key=` and
 /// `?access_token=`, and an operator can put either directly in a
@@ -71,6 +73,8 @@ const MAX_SOURCE_DEPTH: usize = 8;
 pub struct UpstreamHttpConfig {
     /// Max time for DNS + TCP + TLS before the attempt fails. Without it a
     /// black-holed upstream is only bounded by the model's overall timeout.
+    /// The Realtime dial — the one outbound stack with no deadline of its
+    /// own — spends it on the WebSocket handshake exchange too.
     pub connect_timeout: Option<Duration>,
     /// Idle time before the kernel sends the first TCP keepalive probe.
     /// Keeps a long wait for a slow first token from being reaped by a NAT
@@ -170,10 +174,29 @@ pub fn build_client_or_default(builder: reqwest::ClientBuilder, what: &str) -> r
     }
 }
 
-/// A `reqwest::ClientBuilder` with the connection settings **and the
-/// deployment's outbound TLS trust** applied. Callers add their own
-/// `user_agent` and `build()`.
+/// A `reqwest::ClientBuilder` with the connection settings, deployment's
+/// outbound TLS trust, and versioned `aisix` user agent applied.
 pub fn client_builder() -> reqwest::ClientBuilder {
+    let b = base_client_builder();
+    apply_tls(b, &config().tls)
+}
+
+/// [`client_builder`] for a peer the caller, not the operator, chose (a
+/// media URL): the same connection settings and certificate verification
+/// (`upstream.tls.ca_file` and `verify`), but never the upstream mTLS
+/// client identity, which only upstreams may be shown.
+pub fn caller_chosen_peer_client_builder() -> reqwest::ClientBuilder {
+    let mut b = base_client_builder();
+    for root in &crate::upstream_tls::reqwest_material().roots {
+        b = b.add_root_certificate(root.clone());
+    }
+    if !config().tls.verify {
+        b = b.danger_accept_invalid_certs(true);
+    }
+    b
+}
+
+fn base_client_builder() -> reqwest::ClientBuilder {
     let cfg = config();
     let mut b = reqwest::Client::builder()
         // Do not follow redirects. reqwest's default follows up to ten, and
@@ -201,6 +224,14 @@ pub fn client_builder() -> reqwest::ClientBuilder {
         // has had it. If an upstream ever does need a redirect followed, the
         // symptom is a visible 3xx rather than a leaked credential.
         .redirect(reqwest::redirect::Policy::none())
+        .user_agent(format!("aisix/{}", &*aisix_core::BUILD_VERSION))
+        // Every client in the process resolves through the one cache, so
+        // a burst of new connections to a host costs one lookup however
+        // many clients it is spread over — including the per-ProviderKey
+        // and per-guardrail ones rebuilt on each configuration snapshot.
+        // Per-name overrides (`resolve_to_addrs`, the private-link
+        // address pin) still apply on top and never reach it.
+        .dns_resolver(crate::dns_cache::shared())
         .pool_idle_timeout(cfg.pool_idle_timeout)
         .tcp_keepalive(cfg.tcp_keepalive);
     if let Some(d) = cfg.connect_timeout {
@@ -215,7 +246,7 @@ pub fn client_builder() -> reqwest::ClientBuilder {
     if let Some(n) = cfg.pool_max_idle_per_host {
         b = b.pool_max_idle_per_host(n);
     }
-    apply_tls(b, &cfg.tls)
+    b
 }
 
 /// Layer the outbound trust decision onto a builder. Split out so the
@@ -259,6 +290,33 @@ pub fn transport_error_message(err: &reqwest::Error) -> String {
     msg
 }
 
+/// The [`BridgeError`] for a success response whose body could not be read off
+/// the wire.
+///
+/// Its text reaches the usage event's `error_message`, so it stays reqwest's
+/// top-level message; the cause chain that names the fault goes to the log here.
+pub fn upstream_body_read_error(err: &reqwest::Error) -> BridgeError {
+    log_body_read_causes(err);
+    BridgeError::UpstreamDecode(err.to_string())
+}
+
+/// Log why a response body could not be read. `Response::json` reports a parse
+/// failure through the same error type, and that source is a serde message that
+/// can quote the body, a token included, so a parse failure logs nothing here.
+pub fn log_body_read_causes(err: &reqwest::Error) {
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        if cause.is::<serde_json::Error>() {
+            return;
+        }
+        source = cause.source();
+    }
+    tracing::warn!(
+        error = %transport_error_message(err),
+        "reading the upstream response body failed",
+    );
+}
+
 /// Classify a `reqwest` **send** failure into its [`BridgeError`].
 ///
 /// reqwest reports a *builder* error when the request could not even be
@@ -284,6 +342,23 @@ pub fn send_error(err: reqwest::Error) -> BridgeError {
     } else {
         BridgeError::Transport(transport_error_message(&err))
     }
+}
+
+/// Serialize an upstream request body into an exactly-sized buffer.
+///
+/// Send it with `.body(bytes)` instead of `RequestBuilder::json`, and build
+/// it BEFORE the request future, so whatever it was built from — a
+/// `serde_json::Value`, a translated wire struct — is dropped before the
+/// upstream is awaited. reqwest keeps the body until the response head
+/// arrives, which for a non-streaming call is the whole upstream wait, and
+/// the handler still holds its parsed request for retry and fallback; every
+/// other copy alive across that await is one more multiple of a request
+/// that can carry tens of MB of base64 images. `to_vec` grows its buffer by
+/// doubling, so the spare capacity is handed back before the buffer is held.
+pub fn json_body<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Result<bytes::Bytes> {
+    let mut buf = serde_json::to_vec(value)?;
+    buf.shrink_to_fit();
+    Ok(bytes::Bytes::from(buf))
 }
 
 /// Same as [`transport_error_message`] for error types that aren't
@@ -314,14 +389,20 @@ fn append_source_chain(msg: &mut String, err: &(dyn std::error::Error + 'static)
     }
 }
 
-/// Replace the values of credential-bearing query parameters with
-/// `REDACTED`, leaving everything else (host, path, `api-version`, …)
-/// intact for diagnosis.
+/// Drop any userinfo and replace the values of credential-bearing query
+/// parameters with `REDACTED`, leaving everything else (host, path,
+/// `api-version`, …) intact for diagnosis.
+///
+/// reqwest moves userinfo into a header when it builds a request, but gives up
+/// on a part that is not valid UTF-8 once percent-decoded and leaves it in the
+/// URL it renders into its errors.
 fn redact_url(url: &reqwest::Url) -> String {
-    if url.query().is_none() {
-        return url.as_str().to_string();
-    }
     let mut out = url.clone();
+    let _ = out.set_username("");
+    let _ = out.set_password(None);
+    if url.query().is_none() {
+        return out.to_string();
+    }
     let pairs: Vec<(String, String)> = url
         .query_pairs()
         .map(|(k, v)| {
@@ -342,27 +423,24 @@ fn redact_url(url: &reqwest::Url) -> String {
     out.to_string()
 }
 
-/// An operator-configured upstream URL reduced to `scheme://host[:port]/`
-/// for a log line or a `Debug` rendering: userinfo, path, query, and
-/// fragment are all dropped, since any of them can carry a credential
-/// (`user:pass@`, a tenant-secret path segment, `?token=`). Unlike
-/// [`redact_url`], nothing past the origin is kept — the value identifies
-/// which upstream it is, and is never needed to reach it.
-pub fn redact_url_for_log(raw: &str) -> String {
-    let Ok(mut url) = reqwest::Url::parse(raw) else {
-        return "<invalid URL>".to_string();
-    };
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
-    url.set_path("/");
-    url.set_query(None);
-    url.set_fragment(None);
-    url.to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_body_is_the_serialization_in_a_buffer_of_exactly_its_length() {
+        // Large enough that `to_vec`'s doubling leaves spare capacity.
+        let value = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "x".repeat(300_000)}],
+        });
+        let body = json_body(&value).unwrap();
+        assert_eq!(body, serde_json::to_vec(&value).unwrap());
+        // Converting back hands over the buffer as it is held, capacity
+        // included.
+        let len = body.len();
+        assert_eq!(Vec::from(body).capacity(), len);
+    }
 
     #[test]
     fn defaults_bound_connect_and_expire_idle_before_reqwest_would() {
@@ -463,13 +541,26 @@ mod tests {
         let src =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/upstream_http.rs"))
                 .expect("this module is readable");
-        let builder = src
-            .split_once("pub fn client_builder() -> reqwest::ClientBuilder {")
-            .expect("client_builder is declared here")
-            .1
-            .split_once("\n}")
-            .expect("client_builder is closed")
-            .0;
+        let body_of = |signature: &str| -> String {
+            src.split_once(signature)
+                .expect("declared here")
+                .1
+                .split_once("\n}")
+                .expect("closed")
+                .0
+                .to_string()
+        };
+        for public in [
+            "pub fn client_builder() -> reqwest::ClientBuilder {",
+            "pub fn caller_chosen_peer_client_builder() -> reqwest::ClientBuilder {",
+        ] {
+            assert!(
+                body_of(public).contains("base_client_builder()"),
+                "`{public}` must start from `base_client_builder`, which holds \
+                 the redirect policy"
+            );
+        }
+        let builder = body_of("fn base_client_builder() -> reqwest::ClientBuilder {");
         // Comment lines do not count: the explanation survives deleting the
         // call, and a guard satisfied by its own rationale guards nothing.
         assert!(
@@ -659,17 +750,19 @@ mod tests {
 
     /// The outbound stacks that are *not* reqwest each have exactly one
     /// sanctioned construction site, and each of those sites is the only
-    /// thing standing between `upstream.tls` and a client that quietly
-    /// trusts the wrong set of roots.
+    /// thing standing between the `upstream` block and a client that
+    /// quietly trusts the wrong set of roots or dials on a budget nobody
+    /// configured.
     ///
     /// Nothing else catches a regression here: a client built without the
-    /// shared trust material works perfectly against every public
-    /// provider and fails only against the private CA the setting exists
-    /// for — which is to say, only in the customer's environment.
+    /// shared material works perfectly against every public provider and
+    /// fails only against the private CA the setting exists for, or only
+    /// once a hop starts reaping connections — which is to say, only in
+    /// the customer's environment.
     ///
     /// Each entry is (probe, what the file must also mention, why).
     #[test]
-    fn every_non_reqwest_outbound_stack_applies_the_shared_tls_settings() {
+    fn every_non_reqwest_outbound_stack_applies_the_shared_upstream_settings() {
         const RULES: &[(&str, &str, &str)] = &[
             (
                 // Catches a *new* WebSocket call site: `connect_async`
@@ -689,24 +782,124 @@ mod tests {
                  `upstream_tls::rustls_client_config()`",
             ),
             (
+                // Both WebSocket probes again, for the other half of the
+                // `upstream` block: the Realtime dial is the one upstream
+                // path with no deadline of its own — the session's idle
+                // cap only starts once the socket is up, so an unbounded
+                // dial hangs the upgrade until the kernel exhausts its
+                // SYN retries, minutes after every other route would have
+                // failed at `upstream.connect_timeout`.
+                "tokio_tungstenite::connect_async(",
+                "upstream_http::config().connect_timeout",
+                "the Realtime WebSocket dial must be bounded by \
+                 `upstream.connect_timeout`",
+            ),
+            (
+                "connect_async_tls_with_config",
+                "upstream_http::config().connect_timeout",
+                "the Realtime WebSocket dial must be bounded by \
+                 `upstream.connect_timeout`",
+            ),
+            (
+                // The proxy-aware dial: `client_async_tls_with_config`
+                // takes whatever connector it is handed, `None` included.
+                "client_async_tls_with_config",
+                "rustls_client_config",
+                "the Realtime WebSocket connector must come from \
+                 `upstream_tls::rustls_client_config()`",
+            ),
+            (
+                "client_async_tls_with_config",
+                "upstream_http::config().connect_timeout",
+                "the Realtime WebSocket dial must be bounded by \
+                 `upstream.connect_timeout`",
+            ),
+            (
+                // The proxy environment: a WebSocket dial that opens its
+                // own socket reaches the upstream directly even where
+                // every other upstream call goes through HTTPS_PROXY.
+                "tokio_tungstenite::connect_async(",
+                "upstream_dial::connect(",
+                "the Realtime WebSocket must open its stream with `upstream_dial::connect` \
+                 so it follows the proxy environment",
+            ),
+            (
+                "connect_async_tls_with_config",
+                "upstream_dial::connect(",
+                "the Realtime WebSocket must open its stream with `upstream_dial::connect` \
+                 so it follows the proxy environment",
+            ),
+            (
+                "client_async_tls_with_config",
+                "upstream_dial::connect(",
+                "the Realtime WebSocket must open its stream with `upstream_dial::connect` \
+                 so it follows the proxy environment",
+            ),
+            (
                 "aws_config::SdkConfig::builder()",
-                "aws_http_client",
+                // Spelled in full: `build_aws_http_client()` contains
+                // the bare name, and it is the un-memoized builder a
+                // production call site must NOT reach.
+                "upstream_tls::aws_http_client()",
                 "Bedrock SDK clients must be built on `upstream_tls::aws_http_client()`",
             ),
             (
+                // A `SdkConfig` without one does not fall back to the
+                // shared settings: the SDK's own default plugins put
+                // their 3.1s connect timeout back, so the operator's
+                // `upstream.connect_timeout` reaches every outbound
+                // client except this one.
+                "aws_config::SdkConfig::builder()",
+                "timeout_config",
+                "Bedrock SDK clients must carry a `TimeoutConfig` built from \
+                 `upstream_http::config()`",
+            ),
+            (
+                // The STS / default-chain loader behind Bedrock credentials.
+                "aws_config::defaults(",
+                "upstream_tls::aws_http_client()",
+                "AWS SDK configuration must be built on `upstream_tls::aws_http_client()`",
+            ),
+            (
+                // A credential chain built by hand takes its HTTP client from
+                // its `ProviderConfig`; without one it falls back to the
+                // SDK's own connector, which carries neither the trust roots
+                // nor the credential-endpoint routing.
+                "DefaultCredentialsChain::builder()",
+                "upstream_tls::aws_credential_chain_http_client()",
+                "the AWS default credential chain must be built on \
+                 `upstream_tls::aws_credential_chain_http_client()`",
+            ),
+            (
+                "aws_config::imds::Client::builder()",
+                "upstream_tls::aws_credential_endpoint_http_client()",
+                "the instance-metadata client must be built on \
+                 `upstream_tls::aws_credential_endpoint_http_client()`",
+            ),
+            (
+                "aws_config::defaults(",
+                "timeout_config",
+                "AWS SDK configuration must carry a `TimeoutConfig` built from \
+                 `upstream_http::config()`",
+            ),
+            (
+                // `object_store`'s own `ClientOptions` defaults carry
+                // neither the deployment's trust roots nor its pool and
+                // dial budgets — it leaves `pool_idle_timeout` unset,
+                // which is reqwest's 90s.
                 "AmazonS3Builder::",
-                "tls_client_options",
-                "object-store exporters must pass `tls_client_options()` as client options",
+                "upstream_client_options",
+                "object-store exporters must pass `upstream_client_options()` as client options",
             ),
             (
                 "MicrosoftAzureBuilder::",
-                "tls_client_options",
-                "object-store exporters must pass `tls_client_options()` as client options",
+                "upstream_client_options",
+                "object-store exporters must pass `upstream_client_options()` as client options",
             ),
             (
                 "GoogleCloudStorageBuilder::",
-                "tls_client_options",
-                "object-store exporters must pass `tls_client_options()` as client options",
+                "upstream_client_options",
+                "object-store exporters must pass `upstream_client_options()` as client options",
             ),
         ];
 
@@ -724,9 +917,193 @@ mod tests {
         assert!(
             offenders.is_empty(),
             "these reach an external service without the deployment's outbound TLS \
-             trust:\n{}",
+             trust or its connection settings:\n{}",
             offenders.join("\n"),
         );
+    }
+
+    /// Request bodies bound for a model upstream go out as [`json_body`]
+    /// bytes, never through `RequestBuilder::json`. The builder form keeps
+    /// whatever it serialized from alive for as long as the call site
+    /// does, which on these routes is the whole upstream wait, and it
+    /// hands reqwest a buffer with doubling slack; either one multiplies
+    /// what a request carrying tens of MB of images costs while it waits.
+    #[test]
+    fn upstream_request_bodies_are_sent_as_json_body_bytes() {
+        let crates_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+        let mut offenders = Vec::new();
+        for file in rust_sources(crates_dir) {
+            let in_scope = file.components().any(|c| {
+                let c = c.as_os_str().to_string_lossy();
+                c == "aisix-proxy" || c.starts_with("aisix-provider-")
+            });
+            if !in_scope {
+                continue;
+            }
+            let src = std::fs::read_to_string(&file).expect("read source");
+            let production = without_test_modules(&src);
+            for (at, _) in production.match_indices(".json(") {
+                let rest = production[at + ".json(".len()..].trim_start();
+                // `resp.json()` decodes a response; only an argument sends one.
+                if !rest.starts_with(')') {
+                    let start = production[..at].rfind('\n').map_or(0, |i| i + 1);
+                    let end = production[at..]
+                        .find('\n')
+                        .map_or(production.len(), |i| at + i);
+                    offenders.push(format!(
+                        "{}: {}",
+                        file.display(),
+                        production[start..end].trim()
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "send upstream request bodies as `aisix_gateway::json_body` bytes built \
+             before the request future, not with `RequestBuilder::json`:\n{}",
+            offenders.join("\n"),
+        );
+    }
+
+    /// A provider bridge that keeps the default `chat_cow` /
+    /// `chat_stream_cow` borrows the request for the whole call, so a
+    /// translated or rewritten request handed over by value stays alive
+    /// through the upstream wait next to its wire body.
+    #[test]
+    fn provider_bridges_drop_an_owned_request_before_the_upstream_wait() {
+        let crates_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+        let mut offenders = Vec::new();
+        for file in rust_sources(crates_dir) {
+            let in_provider = file.components().any(|c| {
+                c.as_os_str()
+                    .to_string_lossy()
+                    .starts_with("aisix-provider-")
+            });
+            if !in_provider {
+                continue;
+            }
+            let src = std::fs::read_to_string(&file).expect("read source");
+            let production = without_test_modules(&src);
+            if !production.contains("impl Bridge for ") {
+                continue;
+            }
+            for method in ["async fn chat_cow(", "async fn chat_stream_cow("] {
+                if !production.contains(method) {
+                    offenders.push(format!("{}: {method}", file.display()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "provider bridges must override the owned-request entry points:\n{}",
+            offenders.join("\n"),
+        );
+    }
+
+    /// `src` with every `#[cfg(test)] mod … { … }` block removed, wherever
+    /// it sits. [`production_half`] stops at the first test module, and a
+    /// file can declare one (`#[cfg(test)] mod x;`) or nest one near the
+    /// top with production code after it.
+    fn without_test_modules(src: &str) -> String {
+        const MARKER: &str = "#[cfg(test)]";
+        let mut out = String::with_capacity(src.len());
+        let mut rest = src;
+        while let Some(at) = rest.find(MARKER) {
+            let after = &rest[at + MARKER.len()..];
+            let item = after.trim_start();
+            let block = item.starts_with("mod ")
+                && item
+                    .find(['{', ';'])
+                    .is_some_and(|i| item.as_bytes()[i] == b'{');
+            if !block {
+                out.push_str(&rest[..at + MARKER.len()]);
+                rest = after;
+                continue;
+            }
+            out.push_str(&rest[..at]);
+            let open = rest.len() - item.len() + item.find('{').unwrap();
+            let mut depth = 0usize;
+            let mut end = rest.len();
+            for (i, c) in rest[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            rest = &rest[end..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// A file-level scan cannot bind the rule above to the production
+    /// call site: one qualified mention of `aws_http_client()` anywhere
+    /// in the file would excuse a `cfg(not(test))` branch that reached
+    /// the un-memoized builder instead. That branch would rebuild the
+    /// connector, and re-read the platform trust store, on every Bedrock
+    /// request — `build_client` runs per call. So every CALL of the
+    /// builder must sit in a function the compiler drops from a release
+    /// build.
+    #[test]
+    fn the_uncached_aws_client_is_only_called_under_cfg_test() {
+        let crates_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+        let mut offenders = Vec::new();
+        for file in rust_sources(crates_dir) {
+            // This file names the probe in the scan's own source; the
+            // builders it guards live in `upstream_tls`.
+            if file.ends_with("aisix-gateway/src/upstream_http.rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&file).expect("read source");
+            let lines: Vec<&str> = src.lines().collect();
+            for (n, line) in lines.iter().enumerate() {
+                let trimmed = line.trim();
+                if !trimmed.contains("build_aws_http_client()")
+                    // The declaration itself, and prose about it.
+                    || trimmed.contains("fn build_aws_http_client()")
+                    || trimmed.starts_with("//")
+                {
+                    continue;
+                }
+                if !cfg_test_gated(&lines, n) {
+                    offenders.push(format!("{}:{}", file.display(), n + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "`build_aws_http_client()` is the un-memoized constructor and must only be \
+             called from a `#[cfg(test)]` function; production calls \
+             `upstream_tls::aws_http_client()`:\n{}",
+            offenders.join("\n"),
+        );
+    }
+
+    /// Whether the function containing line `n` is `#[cfg(test)]`:
+    /// walk back to its signature, then over the attributes and doc
+    /// comments stacked above it.
+    fn cfg_test_gated(lines: &[&str], n: usize) -> bool {
+        let Some(sig) = lines[..n].iter().rposition(|l| {
+            l.trim_start().starts_with("fn ") || l.trim_start().starts_with("pub fn ")
+        }) else {
+            return false;
+        };
+        lines[..sig]
+            .iter()
+            .rev()
+            .take_while(|l| {
+                let t = l.trim();
+                t.starts_with('#') || t.starts_with("///") || t.starts_with("//")
+            })
+            .any(|l| l.trim() == "#[cfg(test)]")
     }
 
     /// The part of a source file that is not the test module.
@@ -757,9 +1134,8 @@ mod tests {
     }
 
     /// On a thread-per-core worker every dispatch runs on that worker's
-    /// own pool, and that one pool stands in for all of the clients
-    /// below — so it is built with a single user agent
-    /// (`upstream_tls::DISPATCH_USER_AGENT`).
+    /// own pool, and that one pool stands in for all dispatch clients.
+    /// They must inherit the same user agent from `client_builder`.
     ///
     /// That substitution is only invisible while the clients it replaces
     /// agree on the user agent. Give one bridge its own and the header
@@ -770,30 +1146,32 @@ mod tests {
     #[test]
     fn every_dispatch_client_presents_the_same_user_agent() {
         let crates_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
-        // Only literals: the telemetry, heartbeat, and OTLP clients build
-        // theirs from a version string or a named constant, and none of
-        // them talks to a model provider or reaches the per-worker pool.
-        const NEEDLE: &str = ".user_agent(\"";
         let mut offenders = Vec::new();
         for file in rust_sources(crates_dir) {
+            // These clients never reach the dispatch pools; their
+            // existing control-plane/exporter identities are separate.
+            if [
+                "aisix-gateway/src/upstream_http.rs",
+                "aisix-server/src/telemetry.rs",
+                "aisix-server/src/heartbeat.rs",
+                "aisix-obs/src/otlp_http_sink.rs",
+            ]
+            .iter()
+            .any(|path| file.ends_with(path))
+            {
+                continue;
+            }
             let src = std::fs::read_to_string(&file).expect("read source");
             for (n, line) in production_half(&src).lines().enumerate() {
-                let Some(rest) = line.split_once(NEEDLE).map(|(_, r)| r) else {
-                    continue;
-                };
-                let Some((agent, _)) = rest.split_once('"') else {
-                    continue;
-                };
-                if agent != crate::upstream_tls::DISPATCH_USER_AGENT {
-                    offenders.push(format!("{}:{}: {agent}", file.display(), n + 1));
+                if line.contains(".user_agent(") {
+                    offenders.push(format!("{}:{}", file.display(), n + 1));
                 }
             }
         }
         assert!(
             offenders.is_empty(),
-            "these dispatch clients present a user agent the per-worker \
-             pool would replace with `{}`:\n{}",
-            crate::upstream_tls::DISPATCH_USER_AGENT,
+            "these clients override the user agent inherited from \
+             `client_builder`, which the per-worker pool also uses:\n{}",
             offenders.join("\n"),
         );
     }
@@ -894,6 +1272,24 @@ mod tests {
         );
         assert_eq!(out, "https://mcp.example.com:8443/");
         assert_eq!(redact_url_for_log("not a url"), "<invalid URL>");
+    }
+
+    /// reqwest gives up on moving a part out of the URL when it does not
+    /// decode to UTF-8, so its own error text can still carry the password.
+    #[tokio::test]
+    async fn a_transport_error_never_shows_userinfo_reqwest_left_in_the_url() {
+        let err = reqwest::Client::new()
+            .post("http://user%FF:sk-live-9f2b1e@127.0.0.1:1/v1/chat?alt=sse")
+            .send()
+            .await
+            .expect_err("nothing listens on port 1");
+        assert!(
+            err.url().is_some_and(|u| u.password().is_some()),
+            "reqwest now strips this shape itself: {err}"
+        );
+        let text = transport_error_message(&err);
+        assert!(!text.contains("sk-live-9f2b1e"), "{text}");
+        assert!(text.contains("127.0.0.1:1/v1/chat?alt=sse"), "{text}");
     }
 
     #[test]
@@ -1095,5 +1491,141 @@ mod tests {
              说明），要么直接 panic（护栏索引跟着快照重建，所以这条路在配置热加\
              载上——一个客户端造不出来会把整个正在服务的网关带走）：{offenders:#?}"
         );
+    }
+
+    /// Run `f` under a capturing subscriber; returns its result and what it logged.
+    async fn capture_logs<T>(f: impl std::future::Future<Output = T>) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // A callsite first hit where no subscriber was set has cached "disabled".
+        tracing::callsite::rebuild_interest_cache();
+        let out = f.await;
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (out, logged)
+    }
+
+    /// The diagnosis the OIDC discovery and JWKS logs depend on: against a real
+    /// TLS handshake, reqwest's `Display` says only "error sending request",
+    /// the certificate failure is in the chain, and the credential in the query
+    /// stays out of it.
+    #[tokio::test]
+    async fn an_untrusted_certificate_is_named_and_the_query_credential_is_not() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let _ = acceptor.accept(sock).await;
+                });
+            }
+        });
+
+        let err = client_builder()
+            .build()
+            .unwrap()
+            .get(format!(
+                "https://localhost:{port}/jwks?access_token=sk-live-1"
+            ))
+            .send()
+            .await
+            .expect_err("the certificate is not trusted");
+
+        assert!(
+            !err.to_string().to_lowercase().contains("certificate"),
+            "reqwest's Display is expected to hide the cause: {err}"
+        );
+        let message = transport_error_message(&err);
+        assert!(message.contains("certificate"), "{message}");
+        assert!(!message.contains("sk-live-1"), "{message}");
+    }
+
+    /// A body that stops short of its `Content-Length`: the error's text, which
+    /// reaches the usage event, stays reqwest's top-level message, and the cause
+    /// goes to the log.
+    #[tokio::test]
+    async fn a_failed_body_read_logs_its_cause_and_keeps_its_text() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = sock.read(&mut request).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nshort")
+                .await
+                .unwrap();
+        });
+
+        let read_err = reqwest::get(format!("http://{addr}/"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .expect_err("the body is cut short");
+        let top_level = read_err.to_string();
+        let cause = std::error::Error::source(&read_err)
+            .expect("reqwest carries the cause in source()")
+            .to_string();
+        assert!(!top_level.contains(&cause), "{top_level}");
+
+        let (err, logged) = capture_logs(async { upstream_body_read_error(&read_err) }).await;
+        assert!(
+            matches!(&err, BridgeError::UpstreamDecode(text) if *text == top_level),
+            "{err:?}"
+        );
+        assert!(logged.contains(&cause), "{logged}");
+    }
+
+    /// serde quotes what it could not parse, and this body may be a token response.
+    #[tokio::test]
+    async fn an_unparsable_body_logs_nothing_that_could_quote_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = sock.read(&mut request).await;
+            let body = r#"{"access_token": 1, "x": "tok-LEAK"#;
+            let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.write_all(body.as_bytes()).await.unwrap();
+        });
+
+        let parse_err = reqwest::get(format!("http://{addr}/"))
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .expect_err("the body is not JSON");
+        let (_, logged) = capture_logs(async { log_body_read_causes(&parse_err) }).await;
+        assert!(logged.is_empty(), "{logged}");
     }
 }

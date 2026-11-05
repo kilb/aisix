@@ -3,6 +3,7 @@ import { connect } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  etcdEndpoint,
   SeedClient,
   ProxyClient,
   spawnApp,
@@ -34,7 +35,7 @@ const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
 
-const ETCD_ENDPOINT = process.env.AISIX_E2E_ETCD ?? "http://127.0.0.1:2379";
+const ETCD_ENDPOINT = etcdEndpoint();
 const REDIS_URL = process.env.AISIX_E2E_REDIS ?? "redis://127.0.0.1:6379";
 
 // Both envs use the SAME model alias so the request fingerprints collide
@@ -70,8 +71,6 @@ function envEtcd(prefix: string, envId: string) {
     endpoints: [ETCD_ENDPOINT],
     prefix,
     env_id: envId,
-    dial_timeout_ms: 5000,
-    request_timeout_ms: 5000,
   };
 }
 
@@ -121,16 +120,17 @@ async function seed(etcdRoot: string, upstreamBase: string) {
     model_name: "gpt-4o-mini",
     provider_key_id: pk.id,
   });
-  await seed.createApiKey({
-    key_hash: CALLER_KEY_HASH,
-    allowed_models: [MODEL],
-  });
   await seed.createCachePolicy({
     name: `${MODEL}-redis-policy`,
     enabled: true,
     backend: "redis",
     ttl_seconds: 300,
     applies_to: "all",
+  });
+  // Authenticating this final row also proves the cache policy has arrived.
+  await seed.createApiKey({
+    key_hash: CALLER_KEY_HASH,
+    allowed_models: [MODEL],
   });
 }
 
@@ -169,8 +169,8 @@ describe("response cache is isolated per env on a shared Redis (#788 P1-1)", () 
     });
 
     const cache = { backend: "memory", redis: { url: REDIS_URL } };
-    appA = await spawnApp({ extra: { etcd: envEtcd(prefix, envA), cache } });
-    appB = await spawnApp({ extra: { etcd: envEtcd(prefix, envB), cache } });
+    appA = await spawnApp({ exposeDebugHeaders: true, extra: { etcd: envEtcd(prefix, envA), cache } });
+    appB = await spawnApp({ exposeDebugHeaders: true, extra: { etcd: envEtcd(prefix, envB), cache } });
 
     await seed(`${prefix}/${envA}`, upstreamA.baseUrl);
     await seed(`${prefix}/${envB}`, upstreamB.baseUrl);

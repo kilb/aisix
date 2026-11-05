@@ -99,8 +99,13 @@ async function waitForSpans(
 ): Promise<Array<Record<string, string>>> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
+    // Attempt carriers only: since AISIX-Cloud#1279 the export also ships
+    // the trace's structural SERVER / logical spans, which share
+    // `aisix.request_id` but carry no per-attempt usage attributes.
     const hits = recv.spans.filter(
-      (a) => a["aisix.request_id"] === requestId,
+      (a) =>
+        a["aisix.request_id"] === requestId &&
+        a["aisix.attempt_index"] !== undefined,
     );
     if (hits.length >= count) return hits;
     if (Date.now() >= deadline) {
@@ -138,7 +143,7 @@ describe("client-supplied request id (#1288)", () => {
     const etcd = new EtcdClient();
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
-    app = await spawnApp();
+    app = await spawnApp({ exposeDebugHeaders: true });
     seed = new SeedClient(etcd, app.etcdPrefix);
     otlp = await startOtlpReceiver();
     await seed.createObservabilityExporter({
@@ -485,6 +490,7 @@ describe("client-supplied request id: x-request-id opted in", () => {
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     app = await spawnApp({
+      exposeDebugHeaders: true,
       requestId: { accept_headers: ["x-aisix-request-id", "x-request-id"] },
     });
     seed = new SeedClient(etcd, app.etcdPrefix);

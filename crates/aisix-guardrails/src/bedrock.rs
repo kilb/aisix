@@ -22,8 +22,11 @@
 //! | 5xx / IO error                  | false       | Block { "bedrock unavailable" } |
 //! | timeout (`latency_mode=timed`)  | true        | Bypass { "bedrock_timeout" }   |
 //! | timeout (`latency_mode=timed`)  | false       | Block { "bedrock timeout" }    |
-//! | throttle (4xx ThrottlingException) | true     | Bypass { "bedrock_throttled" } |
+//! | throttle (ThrottlingException or 429) | true  | Bypass { "bedrock_throttled" } |
 //! | throttle                        | false       | Block { "bedrock throttled" }  |
+//! | other 4xx, or credentials refused before signing | true | Bypass { "bedrock_config_error" } |
+//! | other 4xx, or credentials refused before signing | false | Block { "bedrock unavailable" } |
+//! | payload refused for its size    | n/a         | re-sent in pieces; only a refusal that cannot be made smaller surfaces, as Bypass { "bedrock_too_large" } / Block |
 //!
 //! `latency_mode=serial` waits unconditionally — the timeout row
 //! never fires.
@@ -34,10 +37,10 @@ use std::time::Duration;
 use aisix_core::models::{
     BedrockAWSCredentials, BedrockConfig, BedrockLatencyMode, GuardrailHookPoint,
 };
+use aisix_gateway::aws_auth::{AssumeRole, AwsAuth, AwsAuthMode, AwsAuthSpec};
 use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
-use aws_credential_types::provider::SharedCredentialsProvider;
-use aws_credential_types::Credentials;
+use aws_sdk_bedrockruntime::config::timeout::TimeoutConfig;
 use aws_sdk_bedrockruntime::config::{BehaviorVersion, Region};
 use aws_sdk_bedrockruntime::operation::apply_guardrail::{
     ApplyGuardrailError, ApplyGuardrailOutput,
@@ -51,6 +54,21 @@ use aws_smithy_runtime_api::client::result::SdkError;
 use aws_smithy_runtime_api::http::Response;
 
 use crate::{Guardrail, GuardrailVerdict, SegmentsOutcome};
+
+/// Batch size, in characters, used to re-send content AWS has already
+/// refused as too large.
+///
+/// Not a limit: AWS's real per-request ceiling is a service quota that
+/// varies by region, by policy type, by tier, and is adjustable per
+/// account (25–1 000 text units of 1 000 characters each), so it cannot
+/// be known here — see `crate::too_large`. Requests AWS accepts are
+/// always sent whole, in a single call, and this value only takes effect
+/// after a refusal. 25 000 is the smallest ceiling any region publishes
+/// (25 text units), so a batch built to it is one AWS will take
+/// everywhere; a batch that is somehow still refused is split again, so
+/// the value trades round trips against batch size and cannot fail a
+/// request on its own.
+const BEDROCK_REFUSAL_BATCH_CHARS: usize = 25_000;
 
 /// One Bedrock guardrail row, materialised into a request-time
 /// dispatcher. Built once per snapshot from
@@ -76,6 +94,71 @@ pub struct BedrockGuardrail {
     client: Arc<Client>,
 }
 
+/// The HTTP stack this guardrail's SDK client is built on.
+///
+/// One pool for the process is right for the gateway, which runs a
+/// single tokio runtime for as long as it lives, and wrong for this
+/// crate's test binary, where each `#[tokio::test]` owns a runtime and
+/// drops it while the process-wide pool keeps the connections spawned
+/// on it — a later test handed one gets hyper's `DispatchGone` instead
+/// of the upstream's answer. Under test, one pool per client. Same
+/// reasoning, same shape, as the Bedrock provider bridge.
+#[cfg(not(test))]
+fn sdk_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+    aisix_gateway::upstream_tls::aws_http_client()
+}
+
+#[cfg(test)]
+fn sdk_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+    aisix_gateway::upstream_tls::build_aws_http_client()
+}
+
+/// How a guardrail's `aws_credentials` authenticate, in its region.
+/// AssumeRole options without a `role_arn` have no role to apply to and
+/// are not used.
+fn auth_spec(cfg: &BedrockConfig) -> AwsAuthSpec {
+    let assume = |role_arn: &Option<String>,
+                  external_id: &Option<String>,
+                  role_session_name: &Option<String>| {
+        role_arn.as_ref().map(|role_arn| AssumeRole {
+            role_arn: role_arn.clone(),
+            external_id: external_id.clone(),
+            role_session_name: role_session_name.clone(),
+        })
+    };
+    let (mode, assume_role) = match &cfg.aws_credentials {
+        BedrockAWSCredentials::Static {
+            access_key_id,
+            secret_access_key,
+            session_token,
+            role_arn,
+            external_id,
+            role_session_name,
+        } => (
+            AwsAuthMode::AccessKey {
+                access_key_id: access_key_id.clone(),
+                secret_access_key: secret_access_key.clone(),
+                session_token: session_token.clone(),
+            },
+            assume(role_arn, external_id, role_session_name),
+        ),
+        BedrockAWSCredentials::ApiKey { api_key } => (AwsAuthMode::ApiKey(api_key.clone()), None),
+        BedrockAWSCredentials::DefaultChain {
+            role_arn,
+            external_id,
+            role_session_name,
+        } => (
+            AwsAuthMode::DefaultChain,
+            assume(role_arn, external_id, role_session_name),
+        ),
+    };
+    AwsAuthSpec {
+        mode,
+        assume_role,
+        region: cfg.region.clone(),
+    }
+}
+
 impl BedrockGuardrail {
     /// Build the dispatcher from a parsed [`BedrockConfig`]. Caller
     /// owns the row's `name`, `hook_point`, and `fail_open` (they
@@ -92,8 +175,9 @@ impl BedrockGuardrail {
     /// blocking call from inside the etcd-watch supervisor's
     /// `arc_swap::store`), and `aws_config::defaults().load().await`
     /// is only async because of credential-source discovery (env,
-    /// IMDS, file). With static credentials we have nothing to
-    /// discover, so we compose `SdkConfig` directly via the builder.
+    /// IMDS, file). Discovery is left to the credentials provider,
+    /// which runs it on the first call and refreshes it after, so the
+    /// `SdkConfig` is composed directly via the builder.
     pub fn new(
         row_name: impl Into<String>,
         cfg: &BedrockConfig,
@@ -101,14 +185,16 @@ impl BedrockGuardrail {
         fail_open: bool,
         endpoint_url: Option<String>,
     ) -> Self {
+        let row_name = row_name.into();
         if let Some(url) = endpoint_url.as_ref() {
             // Visible at INFO so an operator inspecting DP logs sees
             // "Bedrock isn't talking to AWS" without having to grep
             // env. Prints once per BedrockGuardrail materialised from
             // the snapshot, which is rare (snapshot rebuild only).
             tracing::info!(
-                endpoint = %url,
-                guardrail_id = %cfg.guardrail_id,
+                guardrail_name = %row_name,
+                endpoint = %aisix_gateway::redact_url_for_log(url),
+                bedrock_guardrail_id = %cfg.guardrail_id,
                 "BedrockGuardrail using endpoint URL override (Config.bedrock_endpoint_url)",
             );
         }
@@ -126,38 +212,48 @@ impl BedrockGuardrail {
         fail_open: bool,
         endpoint_url: Option<String>,
     ) -> Self {
-        let BedrockAWSCredentials::Static {
-            access_key_id,
-            secret_access_key,
-        } = &cfg.aws_credentials;
-        // Static credentials provider — no STS, no role assume.
-        // Phase 4 will add a kind=role_arn variant.
-        let creds = Credentials::new(
-            access_key_id.clone(),
-            secret_access_key.clone(),
-            // No session token (static keys are long-lived).
-            None,
-            None,
-            "aisix-guardrails-bedrock",
-        );
+        let auth = aisix_gateway::aws_auth::resolve(&auth_spec(cfg));
+        // The dial budget the operator configured, exactly as the
+        // provider bridge applies it. Without a `TimeoutConfig` the SDK's
+        // default plugins substitute their own 3.1s and
+        // `upstream.connect_timeout` never reaches this client at all.
+        // `0` (disabled) has to be passed on explicitly, or those same
+        // plugins put the 3.1s back.
+        let mut timeouts = TimeoutConfig::builder();
+        match aisix_gateway::upstream_http::config().connect_timeout {
+            Some(d) => timeouts = timeouts.connect_timeout(d),
+            None => timeouts = timeouts.disable_connect_timeout(),
+        }
         let mut builder = aws_config::SdkConfig::builder()
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(cfg.region.clone()))
-            .credentials_provider(SharedCredentialsProvider::new(creds))
-            // Same shared HTTP stack as the Bedrock provider bridge, so
-            // `upstream.tls.ca_file` covers the guardrail call too.
-            .http_client(aisix_gateway::upstream_tls::aws_http_client())
+            .timeout_config(timeouts.build())
+            // Same HTTP stack as the Bedrock provider bridge, so
+            // `upstream.tls.ca_file` covers the guardrail call too and
+            // pooled connections expire on `upstream.pool_idle_timeout`.
+            .http_client(sdk_http_client())
             // The retry sleep_impl is needed for the SDK's built-in
             // retries; aws-config's default features set this when
             // the rt-tokio feature is on (see workspace Cargo.toml).
             .sleep_impl(aws_smithy_async::rt::sleep::SharedAsyncSleep::new(
                 aws_smithy_async::rt::sleep::TokioSleep::new(),
             ));
+        if let AwsAuth::SigV4(provider) = &auth {
+            builder = builder.credentials_provider(provider.clone());
+        }
         if let Some(url) = endpoint_url {
             builder = builder.endpoint_url(url);
         }
         let sdk_cfg = builder.build();
-        let client = Client::new(&sdk_cfg);
+        let mut conf = aws_sdk_bedrockruntime::config::Builder::from(&sdk_cfg);
+        if let AwsAuth::Bearer(token) = auth {
+            conf = conf
+                .bearer_token(aws_sdk_bedrockruntime::config::Token::new(token, None))
+                .auth_scheme_preference([
+                    aws_smithy_runtime_api::client::auth::http::HTTP_BEARER_AUTH_SCHEME_ID,
+                ]);
+        }
+        let client = Client::from_conf(conf.build());
         Self {
             row_name: row_name.into(),
             guardrail_id: cfg.guardrail_id.clone(),
@@ -217,6 +313,147 @@ impl BedrockGuardrail {
         }
     }
 
+    /// `send`, splitting the payload only if AWS refuses it as too large.
+    ///
+    /// The whole payload goes first, so a request AWS would have accepted
+    /// still costs exactly one call. Packing into fixed batches up front
+    /// instead would split conversations AWS was happy to take whole and
+    /// multiply both billed text units and guardrail latency on traffic
+    /// that never had a size problem — and no fixed budget could avoid
+    /// that, because the real ceiling is account-specific and unknowable
+    /// here (see [`BEDROCK_REFUSAL_BATCH_CHARS`]).
+    ///
+    /// Once a refusal proves the payload is over the ceiling, a
+    /// multi-slot payload is re-sent as batches of whole slots. Batching
+    /// by slot rather than bisecting is what keeps the mask write-back
+    /// aligned: each batch's `outputs[]` lines up with the slots that
+    /// batch carried, so concatenating the batches reproduces a vector
+    /// aligned with `texts`. A single slot that is itself over the
+    /// ceiling has no slots left to divide, so its own text is split and
+    /// the pieces' replacements are joined back into that one slot.
+    ///
+    /// A real block on any piece returns immediately: callers must not
+    /// lose that verdict by continuing with the rest.
+    async fn apply_split(
+        &self,
+        source: GuardrailContentSource,
+        texts: &[String],
+    ) -> Result<SplitOutcome, BedrockFailure> {
+        match self.send(source.clone(), texts).await {
+            Ok(resp) => Ok(SplitOutcome::from_response(
+                &resp,
+                texts,
+                &self.guardrail_id,
+                &self.row_name,
+            )),
+            Err(BedrockFailure::TooLarge { detail }) => {
+                let batches = batch_by_chars(texts, BEDROCK_REFUSAL_BATCH_CHARS);
+                if batches.len() > 1 {
+                    tracing::warn!(
+                        guardrail_name = %self.row_name,
+                        bedrock_guardrail_id = %self.guardrail_id,
+                        slots = texts.len(),
+                        batches = batches.len(),
+                        budget = BEDROCK_REFUSAL_BATCH_CHARS,
+                        detail = %detail,
+                        "bedrock refused the payload as too large; re-sending in batches",
+                    );
+                    let mut combined = SplitOutcome::Allow {
+                        masked: Vec::new(),
+                        counts: Default::default(),
+                    };
+                    for batch in batches {
+                        let part = Box::pin(self.apply_split(source.clone(), &batch)).await?;
+                        combined = match combined.merge(part) {
+                            Some(c) => c,
+                            None => return Ok(SplitOutcome::Block),
+                        };
+                    }
+                    return Ok(combined);
+                }
+                if texts.len() > 1 {
+                    // Bin-packing made no progress: the account's real
+                    // ceiling is below our batch budget, which we cannot
+                    // know (see BEDROCK_REFUSAL_BATCH_CHARS). Halve the
+                    // slot list instead. This is also what guarantees
+                    // termination — a payload that packs back to itself
+                    // keeps halving until one slot is left, and that slot
+                    // is divided by its own text below.
+                    let (left, right) = texts.split_at(texts.len() / 2);
+                    tracing::warn!(
+                        guardrail_name = %self.row_name,
+                        bedrock_guardrail_id = %self.guardrail_id,
+                        slots = texts.len(),
+                        detail = %detail,
+                        "bedrock refused a payload already inside the batch budget; \
+                         halving the content blocks",
+                    );
+                    let a = Box::pin(self.apply_split(source.clone(), left)).await?;
+                    let b = Box::pin(self.apply_split(source.clone(), right)).await?;
+                    return Ok(a.merge(b).unwrap_or(SplitOutcome::Block));
+                }
+                // One slot, still too large: divide its own text.
+                let [only] = texts else {
+                    // Zero slots and a refusal: nothing to divide.
+                    return Err(BedrockFailure::TooLarge { detail });
+                };
+                // Aim for the batch budget, but never for a target that
+                // would leave the text in one piece: a slot already
+                // inside the budget and still refused has to be halved,
+                // for the same reason the slot list above does — the
+                // real ceiling is lower than anything we can assume.
+                let len = only.chars().count();
+                if len < 2 {
+                    return Err(BedrockFailure::TooLarge { detail });
+                }
+                let target = BEDROCK_REFUSAL_BATCH_CHARS.min(len.div_ceil(2));
+                let pieces = crate::chunk::chunk_text(only, target);
+                if pieces.len() < 2 {
+                    return Err(BedrockFailure::TooLarge { detail });
+                }
+                tracing::warn!(
+                    guardrail_name = %self.row_name,
+                    bedrock_guardrail_id = %self.guardrail_id,
+                    pieces = pieces.len(),
+                    budget = BEDROCK_REFUSAL_BATCH_CHARS,
+                    detail = %detail,
+                    "bedrock refused a single content block as too large; splitting its text",
+                );
+                let mut rebuilt = String::with_capacity(only.len());
+                let mut counts: std::collections::BTreeMap<String, u32> = Default::default();
+                for piece in &pieces {
+                    let part =
+                        Box::pin(self.apply_split(source.clone(), std::slice::from_ref(piece)))
+                            .await?;
+                    match part {
+                        SplitOutcome::Block => return Ok(SplitOutcome::Block),
+                        SplitOutcome::Allow {
+                            masked,
+                            counts: more,
+                        } => match masked.first() {
+                            // A piece AWS rewrote contributes its
+                            // replacement; one it left alone contributes
+                            // its original text, so the slot is rebuilt
+                            // whole either way.
+                            Some(m) if m != piece => {
+                                for (k, v) in more {
+                                    *counts.entry(k).or_insert(0) += v;
+                                }
+                                rebuilt.push_str(m);
+                            }
+                            _ => rebuilt.push_str(piece),
+                        },
+                    }
+                }
+                Ok(SplitOutcome::Allow {
+                    masked: vec![rebuilt],
+                    counts,
+                })
+            }
+            Err(other) => Err(other),
+        }
+    }
+
     /// Blob-mode `ApplyGuardrail`: one joined content block, verdict only.
     /// Serves `check_input`/`check_output` — the families with no mask
     /// write-back channel — so an ANONYMIZE disposition maps to Block
@@ -224,18 +461,24 @@ impl BedrockGuardrail {
     /// policy; the segment path is where masking is honored).
     async fn apply(&self, source: GuardrailContentSource, text: String) -> GuardrailVerdict {
         let fail_open = self.fail_open_for(&source);
-        match self.send(source, std::slice::from_ref(&text)).await {
-            Ok(resp) => match classify_response(&resp, &self.guardrail_id) {
-                BedrockOutcome::Allow => GuardrailVerdict::Allow,
-                BedrockOutcome::Block => GuardrailVerdict::block(format!(
-                    "bedrock guardrail {} intervened",
-                    self.guardrail_id
-                )),
-                BedrockOutcome::Mask(_) => GuardrailVerdict::block(format!(
-                    "bedrock guardrail {} anonymized content",
-                    self.guardrail_id
-                )),
-            },
+        let texts = std::slice::from_ref(&text);
+        match self.apply_split(source, texts).await {
+            Ok(SplitOutcome::Block) => GuardrailVerdict::block(format!(
+                "bedrock guardrail {} intervened",
+                self.guardrail_id
+            )),
+            Ok(outcome) => {
+                if outcome.rewrote(texts) {
+                    // No write-back channel on this path — fail toward
+                    // the policy, as before the split existed.
+                    GuardrailVerdict::block(format!(
+                        "bedrock guardrail {} anonymized content",
+                        self.guardrail_id
+                    ))
+                } else {
+                    GuardrailVerdict::Allow
+                }
+            }
             Err(failure) => self.handle_failure(failure, fail_open),
         }
     }
@@ -253,36 +496,24 @@ impl BedrockGuardrail {
         texts: &[String],
     ) -> SegmentsOutcome {
         let fail_open = self.fail_open_for(&source);
-        match self.send(source, texts).await {
-            Ok(resp) => match classify_response(&resp, &self.guardrail_id) {
-                BedrockOutcome::Allow => SegmentsOutcome::allow(),
-                BedrockOutcome::Block => SegmentsOutcome::from_verdict(GuardrailVerdict::block(
-                    format!("bedrock guardrail {} intervened", self.guardrail_id),
-                )),
-                BedrockOutcome::Mask(outputs) => {
-                    if outputs.len() == texts.len() {
-                        SegmentsOutcome {
-                            verdict: GuardrailVerdict::Allow,
-                            masked: Some(outputs),
-                            counts: anonymized_counts(&resp),
-                            monitor_hits: Vec::new(),
-                        }
-                    } else {
-                        tracing::warn!(
-                            row = %self.row_name,
-                            guardrail_id = %self.guardrail_id,
-                            expected = texts.len(),
-                            got = outputs.len(),
-                            "bedrock masked outputs don't align with input \
-                             blocks; skipping mask write-back",
-                        );
-                        SegmentsOutcome::from_verdict(GuardrailVerdict::block(format!(
-                            "bedrock guardrail {} returned misaligned masked outputs",
-                            self.guardrail_id,
-                        )))
-                    }
+        match self.apply_split(source, texts).await {
+            Ok(SplitOutcome::Block) => SegmentsOutcome::from_verdict(GuardrailVerdict::block(
+                format!("bedrock guardrail {} intervened", self.guardrail_id),
+            )),
+            Ok(outcome) => {
+                if !outcome.rewrote(texts) {
+                    return SegmentsOutcome::allow();
                 }
-            },
+                let SplitOutcome::Allow { masked, counts } = outcome else {
+                    unreachable!("Block handled above")
+                };
+                SegmentsOutcome {
+                    verdict: GuardrailVerdict::Allow,
+                    masked: Some(masked),
+                    counts,
+                    monitor_hits: Vec::new(),
+                }
+            }
             Err(failure) => SegmentsOutcome::from_verdict(self.handle_failure(failure, fail_open)),
         }
     }
@@ -290,8 +521,8 @@ impl BedrockGuardrail {
     fn handle_failure(&self, failure: BedrockFailure, fail_open: bool) -> GuardrailVerdict {
         let (reason, error_detail, error_source) = failure.log_fields();
         tracing::warn!(
-            row = %self.row_name,
-            guardrail_id = %self.guardrail_id,
+            guardrail_name = %self.row_name,
+            bedrock_guardrail_id = %self.guardrail_id,
             failure_tag = reason,
             error = error_detail,
             source = error_source,
@@ -303,9 +534,125 @@ impl BedrockGuardrail {
                 reason: reason.into(),
             }
         } else {
-            GuardrailVerdict::block(format!("bedrock unavailable ({reason})"))
+            GuardrailVerdict::block_unavailable(format!("bedrock unavailable ({reason})"), reason)
         }
     }
+}
+
+/// The result of one `apply_split` call, carrying enough to rebuild a
+/// mask vector aligned with the slots it covered.
+///
+/// `Allow.masked[i]` is always present and always corresponds to slot
+/// `i` — it holds AWS's replacement where one was returned and the
+/// original text where it was not. Keeping unchanged slots in the vector
+/// (rather than an `Option` per slot) is what lets batches concatenate:
+/// merging two batches is appending their vectors, with no index
+/// arithmetic to get wrong.
+#[derive(Debug, PartialEq, Eq)]
+enum SplitOutcome {
+    Block,
+    Allow {
+        masked: Vec<String>,
+        /// Entity-type counts AWS reported, summed across every call the
+        /// split took. Names only — never matched values (#932).
+        counts: std::collections::BTreeMap<String, u32>,
+    },
+}
+
+impl SplitOutcome {
+    fn from_response(
+        resp: &ApplyGuardrailOutput,
+        texts: &[String],
+        guardrail_id: &str,
+        row_name: &str,
+    ) -> Self {
+        match classify_response(resp, guardrail_id, row_name) {
+            BedrockOutcome::Allow => Self::Allow {
+                masked: texts.to_vec(),
+                counts: Default::default(),
+            },
+            BedrockOutcome::Block => Self::Block,
+            BedrockOutcome::Mask(outputs) => {
+                if outputs.len() == texts.len() {
+                    Self::Allow {
+                        masked: outputs,
+                        counts: anonymized_counts(resp),
+                    }
+                } else {
+                    // An unattributable rewrite cannot be applied to any
+                    // slot, and dropping it would release content the
+                    // provider said required anonymization: fail closed.
+                    tracing::warn!(
+                        guardrail_name = %row_name,
+                        bedrock_guardrail_id = %guardrail_id,
+                        expected = texts.len(),
+                        got = outputs.len(),
+                        "bedrock masked outputs don't align with input \
+                         blocks; blocking",
+                    );
+                    Self::Block
+                }
+            }
+        }
+    }
+
+    /// Append `other`'s slots after this one's. `None` means the merge
+    /// hit a block, which ends the whole scan.
+    fn merge(self, other: Self) -> Option<Self> {
+        match (self, other) {
+            (Self::Block, _) | (_, Self::Block) => None,
+            (
+                Self::Allow {
+                    mut masked,
+                    mut counts,
+                },
+                Self::Allow {
+                    masked: rest,
+                    counts: more,
+                },
+            ) => {
+                masked.extend(rest);
+                for (k, v) in more {
+                    *counts.entry(k).or_insert(0) += v;
+                }
+                Some(Self::Allow { masked, counts })
+            }
+        }
+    }
+
+    /// Whether any slot came back rewritten, i.e. whether the write-back
+    /// is worth doing at all.
+    fn rewrote(&self, texts: &[String]) -> bool {
+        match self {
+            Self::Block => false,
+            Self::Allow { masked, .. } => masked.len() == texts.len() && masked != texts,
+        }
+    }
+}
+
+/// Group `texts` into batches whose combined length stays within
+/// `budget` characters, keeping every slot whole and in order.
+///
+/// A slot longer than the budget on its own becomes its own batch — it
+/// cannot be made smaller by grouping, and `apply_split` divides its
+/// text instead.
+fn batch_by_chars(texts: &[String], budget: usize) -> Vec<Vec<String>> {
+    let mut batches: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    for text in texts {
+        let len = text.chars().count();
+        if !current.is_empty() && used + len > budget {
+            batches.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        used += len;
+        current.push(text.clone());
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
 }
 
 /// The masking-aware interpretation of an `ApplyGuardrail` response.
@@ -336,7 +683,11 @@ enum BedrockOutcome {
 /// Classify an `ApplyGuardrail` response into allow / block / mask.
 /// Secure by default: an intervention that is neither a recognizable
 /// block nor accompanied by masked output is treated as a block.
-fn classify_response(resp: &ApplyGuardrailOutput, guardrail_id: &str) -> BedrockOutcome {
+fn classify_response(
+    resp: &ApplyGuardrailOutput,
+    guardrail_id: &str,
+    row_name: &str,
+) -> BedrockOutcome {
     match resp.action() {
         GuardrailAction::None => BedrockOutcome::Allow,
         GuardrailAction::GuardrailIntervened => {
@@ -362,7 +713,8 @@ fn classify_response(resp: &ApplyGuardrailOutput, guardrail_id: &str) -> Bedrock
             // upgrade. `intervened` is the active signal, so an unknown
             // action is treated as no-intervention (Allow).
             tracing::warn!(
-                guardrail_id = %guardrail_id,
+                guardrail_name = %row_name,
+                bedrock_guardrail_id = %guardrail_id,
                 action = ?other,
                 "unknown ApplyGuardrail action; treating as Allow",
             );
@@ -446,15 +798,33 @@ fn assessment_has_hard_block(a: &GuardrailAssessment) -> bool {
 }
 
 /// Failure cause buckets that map onto `guardrail_bypassed_reason`
-/// telemetry tags. `Other` collapses every long-tail SDK error onto
-/// `bedrock_5xx` so an unrecognised AWS error doesn't leak its
-/// internal shape into our wire schema — but it carries the original
-/// SDK error detail for the failure log line so operators can tell a
-/// network blip from an auth/validation error (#106).
+/// telemetry tags. `ConfigError` is every non-`429` `4xx` AWS answered
+/// with (`AccessDeniedException`, `ValidationException`,
+/// `ResourceNotFoundException`, …), and credentials the provider chain
+/// reports missing or refused before the call is signed — a credential,
+/// role, guardrail id or region the operator has to fix, tagged
+/// `bedrock_config_error` like
+/// the other kinds' `_config_error`. `Other` collapses the rest — 5xx,
+/// transport, a response the SDK could not read — onto `bedrock_5xx` so
+/// an unrecognised AWS error doesn't leak its internal shape into our
+/// wire schema. Both carry the original SDK error detail for the failure
+/// log line (#106).
 #[derive(Debug)]
 enum BedrockFailure {
     Timeout,
     Throttled,
+    /// AWS refused the payload for its size. Its own detail is kept so
+    /// the log still names the exception; the variant exists separately
+    /// because it is the one failure the dispatcher can act on — the
+    /// content is re-sent in smaller pieces rather than the request
+    /// simply failing (AISIX-Cloud#1386).
+    TooLarge {
+        detail: String,
+    },
+    ConfigError {
+        detail: String,
+        source: Option<String>,
+    },
     Other {
         /// Human-readable detail for logs: the modeled service error
         /// (carries the exception code, e.g. AccessDeniedException) or
@@ -465,18 +835,54 @@ enum BedrockFailure {
     },
 }
 
+/// Whether `err` carries a credential provider's verdict that the
+/// configured credentials are missing or refused.
+fn credentials_refused(err: &(dyn std::error::Error + 'static)) -> bool {
+    use aws_credential_types::provider::error::CredentialsError;
+    let mut cur = Some(err);
+    while let Some(e) = cur {
+        if let Some(c) = e.downcast_ref::<CredentialsError>() {
+            return aisix_gateway::aws_auth::credentials_refused(c);
+        }
+        cur = e.source();
+    }
+    false
+}
+
 impl BedrockFailure {
     fn from_sdk(err: SdkError<ApplyGuardrailError, Response>) -> Self {
         // ThrottlingException is the SDK's named throttle variant.
         if let SdkError::ServiceError(svc) = &err {
-            if matches!(svc.err(), ApplyGuardrailError::ThrottlingException(_)) {
-                return Self::Throttled;
-            }
             // Surface the modeled service error — its Debug carries the
             // exception code (AccessDeniedException, ValidationException,
             // …) so the failure log is greppable.
-            return Self::Other {
-                detail: format!("{:?}", svc.err()),
+            let detail = format!("{:?}", svc.err());
+            // Size first, and by MESSAGE rather than by exception type:
+            // AWS's per-request ceiling is a service quota, so the
+            // refusal arrives as a ValidationException in the documented
+            // case and has been observed as a throttle in practice —
+            // the wording is the reliable signal, not the variant.
+            if crate::too_large::body_says_too_large(&detail) {
+                return Self::TooLarge { detail };
+            }
+            let status = svc.raw().status().as_u16();
+            if matches!(svc.err(), ApplyGuardrailError::ThrottlingException(_)) || status == 429 {
+                return Self::Throttled;
+            }
+            let source = std::error::Error::source(&err).map(|s| s.to_string());
+            if (400..500).contains(&status) {
+                return Self::ConfigError { detail, source };
+            }
+            return Self::Other { detail, source };
+        }
+        // Missing or refused credentials (a denied sts:AssumeRole, an
+        // empty default chain) never reach ApplyGuardrail: they surface
+        // while the request is being signed, as the credential provider's
+        // own error somewhere in the source chain. The provider bridge
+        // reads the same two variants as a credential problem.
+        if credentials_refused(&err) {
+            return Self::ConfigError {
+                detail: err.to_string(),
                 source: std::error::Error::source(&err).map(|s| s.to_string()),
             };
         }
@@ -493,17 +899,21 @@ impl BedrockFailure {
         match self {
             Self::Timeout => "bedrock_timeout",
             Self::Throttled => "bedrock_throttled",
+            Self::TooLarge { .. } => "bedrock_too_large",
+            Self::ConfigError { .. } => "bedrock_config_error",
             Self::Other { .. } => "bedrock_5xx",
         }
     }
 
     /// Fields for the failure log line: the wire-stable tag plus, for
-    /// `Other`, the captured SDK error detail and underlying source.
+    /// `ConfigError` and `Other`, the captured SDK error detail and
+    /// underlying source.
     fn log_fields(&self) -> (&'static str, Option<&str>, Option<&str>) {
         match self {
-            Self::Other { detail, source } => {
+            Self::ConfigError { detail, source } | Self::Other { detail, source } => {
                 (self.bypass_tag(), Some(detail.as_str()), source.as_deref())
             }
+            Self::TooLarge { detail } => (self.bypass_tag(), Some(detail.as_str()), None),
             _ => (self.bypass_tag(), None, None),
         }
     }
@@ -520,7 +930,7 @@ impl Guardrail for BedrockGuardrail {
         )
     }
 
-    fn enforces_input(&self) -> bool {
+    fn runs_on_input(&self) -> bool {
         matches!(
             self.hook_point,
             GuardrailHookPoint::Input | GuardrailHookPoint::Both
@@ -528,7 +938,15 @@ impl Guardrail for BedrockGuardrail {
     }
 
     fn checks_input_remotely(&self) -> bool {
-        self.enforces_input()
+        self.runs_on_input()
+    }
+
+    fn fails_closed_on_input(&self) -> bool {
+        !self.fail_open
+    }
+
+    fn fails_closed_on_output(&self) -> bool {
+        !self.output_fail_open
     }
 
     fn name(&self) -> &'static str {
@@ -694,7 +1112,7 @@ mod tests {
         #[test]
         fn action_none_is_allow() {
             let r = resp(GuardrailAction::None, vec![], vec![]);
-            assert_eq!(classify_response(&r, "gid"), BedrockOutcome::Allow);
+            assert_eq!(classify_response(&r, "gid", "row"), BedrockOutcome::Allow);
         }
 
         #[test]
@@ -705,7 +1123,7 @@ mod tests {
                 vec![pii(PiiAction::Anonymized)],
             );
             assert_eq!(
-                classify_response(&r, "gid"),
+                classify_response(&r, "gid", "row"),
                 BedrockOutcome::Mask(vec!["contact {EMAIL} about the order".to_owned()])
             );
         }
@@ -717,7 +1135,7 @@ mod tests {
                 vec!["irrelevant"],
                 vec![pii(PiiAction::Blocked)],
             );
-            assert_eq!(classify_response(&r, "gid"), BedrockOutcome::Block);
+            assert_eq!(classify_response(&r, "gid", "row"), BedrockOutcome::Block);
         }
 
         #[test]
@@ -728,7 +1146,7 @@ mod tests {
                 vec!["masked text"],
                 vec![topic()],
             );
-            assert_eq!(classify_response(&r, "gid"), BedrockOutcome::Block);
+            assert_eq!(classify_response(&r, "gid", "row"), BedrockOutcome::Block);
         }
 
         #[test]
@@ -738,14 +1156,14 @@ mod tests {
                 vec!["masked"],
                 vec![pii(PiiAction::Anonymized), pii(PiiAction::Blocked)],
             );
-            assert_eq!(classify_response(&r, "gid"), BedrockOutcome::Block);
+            assert_eq!(classify_response(&r, "gid", "row"), BedrockOutcome::Block);
         }
 
         #[test]
         fn intervened_without_hard_block_or_masked_output_is_block() {
             // Secure default: an intervention we can't read as a mask blocks.
             let r = resp(GuardrailAction::GuardrailIntervened, vec![], vec![]);
-            assert_eq!(classify_response(&r, "gid"), BedrockOutcome::Block);
+            assert_eq!(classify_response(&r, "gid", "row"), BedrockOutcome::Block);
         }
 
         #[test]
@@ -774,7 +1192,7 @@ mod tests {
                 ],
             );
             assert_eq!(
-                classify_response(&r, "gid"),
+                classify_response(&r, "gid", "row"),
                 BedrockOutcome::Mask(vec!["contact {EMAIL}".to_owned()])
             );
         }
@@ -790,7 +1208,7 @@ mod tests {
                 vec![pii(PiiAction::Anonymized)],
             );
             assert_eq!(
-                classify_response(&r, "gid"),
+                classify_response(&r, "gid", "row"),
                 BedrockOutcome::Mask(vec![String::new(), "masked tail".to_owned()])
             );
         }
@@ -834,6 +1252,10 @@ mod tests {
             aws_credentials: BedrockAWSCredentials::Static {
                 access_key_id: "AKIAEXAMPLE".into(),
                 secret_access_key: "TEST".into(),
+                session_token: None,
+                role_arn: None,
+                external_id: None,
+                role_session_name: None,
             },
             latency_mode: BedrockLatencyMode::Serial,
             // Default fail-closed output (the control plane omits the field when unset).
@@ -857,6 +1279,14 @@ mod tests {
             .bypass_tag(),
             "bedrock_5xx",
         );
+        assert_eq!(
+            BedrockFailure::ConfigError {
+                detail: "x".into(),
+                source: None,
+            }
+            .bypass_tag(),
+            "bedrock_config_error",
+        );
     }
 
     /// #106: the `Other` bucket keeps the wire-stable `bedrock_5xx`
@@ -866,12 +1296,12 @@ mod tests {
     #[test]
     fn other_failure_log_fields_carry_detail_and_source() {
         let f = BedrockFailure::Other {
-            detail: "AccessDeniedException(...)".into(),
+            detail: "InternalServerException(...)".into(),
             source: Some("dispatch failure: connection refused".into()),
         };
         let (tag, detail, source) = f.log_fields();
         assert_eq!(tag, "bedrock_5xx");
-        assert_eq!(detail, Some("AccessDeniedException(...)"));
+        assert_eq!(detail, Some("InternalServerException(...)"));
         assert_eq!(source, Some("dispatch failure: connection refused"));
 
         let (tag, detail, source) = BedrockFailure::Timeout.log_fields();
@@ -917,7 +1347,7 @@ mod tests {
         let g = build_test(true);
         let v = g.handle_failure(
             BedrockFailure::Other {
-                detail: "AccessDeniedException(...)".into(),
+                detail: "InternalServerException(...)".into(),
                 source: None,
             },
             g.fail_open,
@@ -1031,6 +1461,26 @@ mod tests {
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// The guardrail's Bedrock client is the process's second AWS SDK
+    /// client, and it used to carry no `TimeoutConfig` at all — so the
+    /// SDK's default plugins quietly substituted their own 3.1s dial
+    /// budget in place of `upstream.connect_timeout`. Nothing else
+    /// notices: the call still works, it just dials on a budget the
+    /// operator never set.
+    #[test]
+    fn the_guardrail_client_dials_on_the_configured_connect_timeout() {
+        let configured = aisix_gateway::upstream_http::config().connect_timeout;
+        assert!(configured.is_some(), "the default must bound the dial");
+        let g = build_with_endpoint("http://127.0.0.1:1".into(), false);
+        assert_eq!(
+            g.client
+                .config()
+                .timeout_config()
+                .and_then(|t| t.connect_timeout()),
+            configured,
+        );
+    }
+
     fn build_with_endpoint(endpoint: String, fail_open: bool) -> BedrockGuardrail {
         BedrockGuardrail::with_endpoint(
             "wiremock-test",
@@ -1041,6 +1491,256 @@ mod tests {
         )
     }
 
+    // --- reactive split on an over-limit refusal (AISIX-Cloud#1386) ------
+    //
+    // AWS's per-request ceiling is a service quota that varies by region,
+    // policy type and tier and is adjustable per account, so it cannot be
+    // known here and cannot be enforced ahead of the call. These mocks
+    // stand in for whatever ceiling the account has: they refuse a body
+    // over `LIMIT` the way AWS does — a ValidationException whose message
+    // names text units — and accept anything under it.
+
+    const MOCK_LIMIT: usize = 4_000;
+
+    fn clean_body() -> serde_json::Value {
+        json!({
+            "action": "NONE",
+            "outputs": [],
+            "assessments": [],
+            "usage": {
+                "topicPolicyUnits": 0, "contentPolicyUnits": 0, "wordPolicyUnits": 0,
+                "sensitiveInformationPolicyUnits": 0,
+                "sensitiveInformationPolicyFreeUnits": 0,
+                "contextualGroundingPolicyUnits": 0
+            }
+        })
+    }
+
+    /// Refuses any request body over `MOCK_LIMIT` bytes with AWS's
+    /// size wording; otherwise answers clean. Records every body it saw
+    /// so a test can prove the whole content was submitted.
+    struct SizeLimitedBedrock {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        refused: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl wiremock::Respond for SizeLimitedBedrock {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let body = String::from_utf8_lossy(&request.body).to_string();
+            if body.len() > MOCK_LIMIT {
+                self.refused
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return ResponseTemplate::new(400)
+                    .append_header("x-amzn-errortype", "ValidationException")
+                    .set_body_json(json!({
+                        "message": "Input is too long: the request exceeds the maximum \
+                                    input size in text units for this guardrail"
+                    }));
+            }
+            self.seen.lock().unwrap().push(body);
+            ResponseTemplate::new(200).set_body_json(clean_body())
+        }
+    }
+
+    /// The whole point: content AWS refuses is re-sent in pieces until it
+    /// is all scanned, instead of the request simply failing. Every
+    /// segment must appear in something the mock accepted.
+    #[tokio::test]
+    async fn over_limit_payload_is_resent_in_batches_until_all_scanned() {
+        let server = MockServer::builder().start().await;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let refused = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/guardrail/.+/apply$"))
+            .respond_with(SizeLimitedBedrock {
+                seen: seen.clone(),
+                refused: refused.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        // Four slots, each well under the ceiling alone but far over it
+        // together, plus a distinct marker per slot.
+        let texts: Vec<String> = (0..4)
+            .map(|i| format!("MARKER{i}{}", "x".repeat(1_500)))
+            .collect();
+
+        let g = build_with_endpoint(server.uri(), false);
+        let outcome = g
+            .apply_segments(GuardrailContentSource::Input, &texts)
+            .await;
+
+        assert_eq!(
+            outcome.verdict,
+            GuardrailVerdict::Allow,
+            "a clean split must not fail the request",
+        );
+        assert!(
+            refused.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the payload was never refused — this test would pass without any split",
+        );
+        let accepted = seen.lock().unwrap().concat();
+        for i in 0..4 {
+            assert!(
+                accepted.contains(&format!("MARKER{i}")),
+                "slot {i} never reached the provider — it was dropped, not split",
+            );
+        }
+    }
+
+    /// A single slot bigger than the ceiling has no other slots to group
+    /// with, so its own text must be divided rather than the request
+    /// failing.
+    #[tokio::test]
+    async fn single_over_limit_slot_has_its_text_split() {
+        let server = MockServer::builder().start().await;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let refused = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/guardrail/.+/apply$"))
+            .respond_with(SizeLimitedBedrock {
+                seen: seen.clone(),
+                refused: refused.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        // One slot, several times the ceiling, whitespace-separated so
+        // the split has boundaries to prefer. Sized well past MOCK_LIMIT
+        // so the refusal path is certain to fire — the assertion below
+        // pins that it did.
+        let text = (0..2_000)
+            .map(|i| format!("token{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let g = build_with_endpoint(server.uri(), false);
+        let v = g.apply(GuardrailContentSource::Input, text.clone()).await;
+
+        assert_eq!(v, GuardrailVerdict::Allow);
+        assert!(
+            refused.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the slot was never refused — this test would pass without any split",
+        );
+        let accepted = seen.lock().unwrap().concat();
+        assert!(
+            accepted.contains("token0") && accepted.contains("token1999"),
+            "both ends of the oversized slot must be scanned",
+        );
+    }
+
+    /// A block found in any piece ends the scan — the split must not let
+    /// a later clean piece overwrite an earlier refusal.
+    #[tokio::test]
+    async fn a_block_in_any_piece_blocks_the_request() {
+        let server = MockServer::builder().start().await;
+        struct BlockOnMarker;
+        impl wiremock::Respond for BlockOnMarker {
+            fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+                let body = String::from_utf8_lossy(&request.body).to_string();
+                if body.len() > MOCK_LIMIT {
+                    return ResponseTemplate::new(400)
+                        .append_header("x-amzn-errortype", "ValidationException")
+                        .set_body_json(json!({ "message": "exceeds the maximum input size" }));
+                }
+                if body.contains("FORBIDDEN") {
+                    return ResponseTemplate::new(200).set_body_json(json!({
+                        "action": "GUARDRAIL_INTERVENED",
+                        "outputs": [{ "text": "blocked" }],
+                        "assessments": [{
+                            "topicPolicy": { "topics": [
+                                { "name": "t", "type": "DENY", "action": "BLOCKED" }
+                            ]}
+                        }],
+                        "usage": {
+                            "topicPolicyUnits": 1, "contentPolicyUnits": 0,
+                            "wordPolicyUnits": 0, "sensitiveInformationPolicyUnits": 0,
+                            "sensitiveInformationPolicyFreeUnits": 0,
+                            "contextualGroundingPolicyUnits": 0
+                        }
+                    }));
+                }
+                ResponseTemplate::new(200).set_body_json(clean_body())
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/guardrail/.+/apply$"))
+            .respond_with(BlockOnMarker)
+            .mount(&server)
+            .await;
+
+        // The offending content sits in the LAST slot, so a split that
+        // stopped early would miss it.
+        let mut texts: Vec<String> = (0..3)
+            .map(|i| format!("clean{i}{}", "x".repeat(1_500)))
+            .collect();
+        texts.push("FORBIDDEN".to_owned());
+
+        let g = build_with_endpoint(server.uri(), false);
+        let outcome = g
+            .apply_segments(GuardrailContentSource::Input, &texts)
+            .await;
+        assert!(
+            outcome.verdict.is_block(),
+            "a block in the final batch must still block the request",
+        );
+    }
+
+    /// A payload AWS accepts must still cost exactly one call — the
+    /// split is reactive, so it must not add round trips to traffic that
+    /// never had a size problem.
+    #[tokio::test]
+    async fn accepted_payload_is_still_a_single_call() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/guardrail/.+/apply$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(clean_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let g = build_with_endpoint(server.uri(), false);
+        let texts = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let outcome = g
+            .apply_segments(GuardrailContentSource::Input, &texts)
+            .await;
+        assert_eq!(outcome.verdict, GuardrailVerdict::Allow);
+    }
+
+    /// A refusal we cannot make smaller still fails — and fails as a size
+    /// problem, not as an outage or a throttle, so the operator is told
+    /// what actually to change.
+    #[tokio::test]
+    async fn unsplittable_refusal_reports_too_large() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/guardrail/.+/apply$"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .append_header("x-amzn-errortype", "ValidationException")
+                    .set_body_json(json!({ "message": "exceeds the maximum input size" })),
+            )
+            .mount(&server)
+            .await;
+        let g = build_with_endpoint(server.uri(), true);
+        // A single short slot: nothing to batch, nothing to divide.
+        let v = g.apply(GuardrailContentSource::Input, "hi".into()).await;
+        match v {
+            GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "bedrock_too_large"),
+            other => panic!("expected a size-tagged bypass, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batching_keeps_slots_whole_and_ordered() {
+        let texts: Vec<String> = vec!["a".repeat(60), "b".repeat(60), "c".repeat(10)];
+        let batches = batch_by_chars(&texts, 100);
+        assert_eq!(batches.len(), 2, "60+60 exceeds 100, so it must split");
+        assert_eq!(batches.concat(), texts, "no slot may be lost or reordered");
+        // A slot bigger than the budget becomes its own batch rather than
+        // being dropped — apply_split divides its text instead.
+        let huge = vec!["z".repeat(500)];
+        assert_eq!(batch_by_chars(&huge, 100).len(), 1);
+    }
+
     /// Happy-path: Bedrock returns `action=NONE` → Allow. This is the
     /// most common production response (the operator's guardrail
     /// didn't fire). Also pins that the request actually hits
@@ -1048,7 +1748,7 @@ mod tests {
     /// exactly one POST under `/guardrail/.../apply`.
     #[tokio::test]
     async fn apply_returns_allow_on_action_none() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1078,7 +1778,7 @@ mod tests {
     /// should never reach the upstream LLM.
     #[tokio::test]
     async fn apply_returns_block_on_action_intervened() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1118,7 +1818,7 @@ mod tests {
     /// the SDK gives up and we map the failure.
     #[tokio::test]
     async fn apply_5xx_with_fail_open_true_returns_bypass() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(ResponseTemplate::new(500).set_body_json(json!({
@@ -1142,7 +1842,7 @@ mod tests {
     /// block on Bedrock outage (correctness over availability).
     #[tokio::test]
     async fn apply_5xx_with_fail_open_false_returns_block() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(ResponseTemplate::new(500).set_body_json(json!({
@@ -1164,7 +1864,7 @@ mod tests {
     /// differently from Bedrock service outages.
     #[tokio::test]
     async fn apply_429_throttling_with_fail_open_tags_throttled() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(ResponseTemplate::new(429).set_body_json(json!({
@@ -1194,12 +1894,32 @@ mod tests {
     // is verified by the downstream e2e suite against a real
     // fakecloud sidecar.
 
+    /// The override is logged at INFO when the row is built, and a configured
+    /// URL may carry `user:pass@`.
+    #[tokio::test]
+    async fn the_endpoint_override_log_line_never_shows_a_password() {
+        use crate::call_error::testing::*;
+        let logged = capture_logs(|| async {
+            let _ = BedrockGuardrail::new(
+                "row",
+                &cfg(),
+                GuardrailHookPoint::Both,
+                false,
+                Some("http://svc:url-LEAK@127.0.0.1:9".to_owned()),
+            );
+        })
+        .await;
+        assert!(logged.contains("endpoint URL override"), "{logged}");
+        assert!(logged.contains("127.0.0.1:9"), "{logged}");
+        assert!(!logged.contains("url-LEAK"), "{logged}");
+    }
+
     /// `latency_mode=timed` + Bedrock takes longer than the timeout
     /// → tagged `bedrock_timeout`. wiremock's `set_delay` makes the
     /// server hang past our 100ms timeout.
     #[tokio::test]
     async fn apply_timed_mode_aborts_at_timeout_and_tags_timeout() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(
@@ -1270,7 +1990,7 @@ mod tests {
     /// texts + entity-type counts.
     #[tokio::test]
     async fn apply_segments_sends_one_block_per_text_and_masks_positionally() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(
@@ -1319,7 +2039,7 @@ mod tests {
     /// provider's intervention.
     #[tokio::test]
     async fn apply_segments_misaligned_outputs_block() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(
@@ -1342,7 +2062,7 @@ mod tests {
     /// blocks — masking never bypasses a blocking disposition.
     #[tokio::test]
     async fn apply_segments_hard_block_still_blocks() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1381,7 +2101,7 @@ mod tests {
     /// un-masked content there would defeat the operator's policy.
     #[tokio::test]
     async fn blob_apply_still_blocks_on_anonymize() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(
@@ -1406,7 +2126,7 @@ mod tests {
     /// with `fail_open=false` blocks, with `fail_open=true` bypasses.
     #[tokio::test]
     async fn apply_segments_5xx_honors_fail_open() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/guardrail/.+/apply$"))
             .respond_with(ResponseTemplate::new(500).set_body_json(json!({

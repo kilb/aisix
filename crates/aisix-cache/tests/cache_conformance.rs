@@ -103,6 +103,9 @@ impl Drop for Redis {
 
 fn response(text: &str) -> ChatResponse {
     ChatResponse {
+        logprobs: None,
+        more_choices: Vec::new(),
+        service_tier: None,
         id: "resp-1".into(),
         model: "m".into(),
         message: ChatMessage::assistant(text.to_string()),

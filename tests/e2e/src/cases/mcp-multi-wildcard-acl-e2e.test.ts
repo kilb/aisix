@@ -14,7 +14,7 @@ import {
 //
 // `deny: ["*reverse*"]` 是拦掉「名字里带 reverse 的工具」最自然的写法。拒绝表里
 // 的模式匹配不到任何东西，等于这条拒绝不存在 —— 管理员以为拦住了，其实全放行。
-// 允许表一侧同理：`allowed_tools: ["*__*cho"]` 匹配不到任何东西就什么都不给。
+// 允许表一侧同理：`mcp_access.allow: ["*__*cho"]` 匹配不到任何东西就什么都不给。
 //
 // 两个真 MCP 上游（官方 TypeScript SDK），各有 echo 与 reverse 两个工具，命名空间
 // 后是 alpha__echo、alpha__reverse、beta__echo、beta__reverse。
@@ -129,7 +129,7 @@ describe("mcp tool patterns with more than one `*`", () => {
     await seed.createApiKey({
       key_hash: sha256(KEY_ALLOWLIST),
       allowed_models: [],
-      allowed_tools: ["*__*cho"],
+      mcp_access: { allow: ["*__*cho"] },
     });
 
     // 等每把密钥的行都到位：只看到 servers 与策略、密钥还没加载时是 401。

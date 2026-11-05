@@ -22,15 +22,15 @@
 //! Atomicity: `store` writes to `<path>.tmp` first, fsyncs, then
 //! renames over the destination. A torn write never corrupts the
 //! committed file. Disabled when [`SnapshotCache::disabled`] is used
-//! (passed when `managed.snapshot_cache_path` is empty so operators
-//! can opt out).
+//! (the default unless `managed.snapshot_cache_enabled` is true).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
 
 use crate::provider::RawEntry;
@@ -53,13 +53,28 @@ pub struct SnapshotCache {
 struct Inner {
     /// Some(path) → enabled; None → no-op.
     path: Option<PathBuf>,
+    /// Hands out [`WriteTicket`]s in the order snapshots are captured.
+    next_ticket: AtomicU64,
     /// Serialise concurrent writes so the tmp-file rename dance can't
-    /// race with itself. Reads are unguarded — they go through OS
-    /// caches and the rename is atomic.
-    write_lock: Mutex<()>,
+    /// race with itself, and carry the ticket of the last committed write
+    /// so they also commit in capture order. Reads are unguarded — they
+    /// go through OS caches and the rename is atomic.
+    ///
+    /// Applies spawn independent tasks, so a later capture may acquire
+    /// the lock first. Never let a late earlier capture replace it — not
+    /// even at the same revision: a delete flushes at the current
+    /// revision floor, so two captures can share a revision and differ
+    /// in content. Zero until the first write; tickets start at one.
+    write_lock: Mutex<u64>,
     #[cfg(test)]
     write_count: std::sync::atomic::AtomicUsize,
 }
+
+/// The position of one captured snapshot in apply order. Taken where the
+/// snapshot is captured, not where it is written, because the write runs
+/// on a task of its own and may reach the lock out of order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct WriteTicket(u64);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedFile {
@@ -112,7 +127,8 @@ impl SnapshotCache {
         Self {
             inner: Arc::new(Inner {
                 path: Some(path.into()),
-                write_lock: Mutex::new(()),
+                next_ticket: AtomicU64::new(0),
+                write_lock: Mutex::new(0),
                 #[cfg(test)]
                 write_count: std::sync::atomic::AtomicUsize::new(0),
             }),
@@ -126,7 +142,8 @@ impl SnapshotCache {
         Self {
             inner: Arc::new(Inner {
                 path: None,
-                write_lock: Mutex::new(()),
+                next_ticket: AtomicU64::new(0),
+                write_lock: Mutex::new(0),
                 #[cfg(test)]
                 write_count: std::sync::atomic::AtomicUsize::new(0),
             }),
@@ -182,13 +199,15 @@ impl SnapshotCache {
             .stale
             .into_iter()
             .map(|s| {
-                B64.decode(&s.value_b64).map(|value| StaleServing {
-                    entry: RawEntry {
-                        key: s.key,
-                        value,
-                        revision: s.revision,
-                    },
-                    since_unix_secs: s.since_unix_secs,
+                B64.decode(&s.value_b64).map(|value| {
+                    StaleServing::new(
+                        RawEntry {
+                            key: s.key,
+                            value,
+                            revision: s.revision,
+                        },
+                        s.since_unix_secs,
+                    )
                 })
             })
             .collect();
@@ -210,45 +229,54 @@ impl SnapshotCache {
     /// cache is not worth blowing up an otherwise-healthy DP — at worst
     /// the next restart rebuilds from etcd.
     pub async fn store(&self, entries: &[RawEntry], revision: i64, stale: &[StaleServing]) {
-        let Some(path) = self.inner.path.clone() else {
+        if !self.is_enabled() {
+            return;
+        }
+        let ticket = self.ticket();
+        let entries: Vec<_> = entries.iter().map(encode_entry).collect();
+        let stale: Vec<_> = stale.iter().map(encode_stale).collect();
+        self.store_encoded(ticket, &entries, revision, &stale).await;
+    }
+
+    /// Reserve the next position in apply order. Take it while the
+    /// snapshot being written is captured.
+    pub(crate) fn ticket(&self) -> WriteTicket {
+        WriteTicket(self.inner.next_ticket.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    pub(crate) async fn store_encoded(
+        &self,
+        ticket: WriteTicket,
+        entries: &[Arc<[u8]>],
+        revision: i64,
+        stale: &[Arc<[u8]>],
+    ) {
+        let Some(path) = self.inner.path.as_ref() else {
             return;
         };
-        let cached = CachedFile {
-            version: FORMAT_VERSION,
-            revision,
-            entries: entries
-                .iter()
-                .map(|e| CachedEntry {
-                    key: e.key.clone(),
-                    value_b64: B64.encode(&e.value),
-                    revision: e.revision,
-                })
-                .collect(),
-            stale: stale
-                .iter()
-                .map(|s| CachedStaleEntry {
-                    key: s.entry.key.clone(),
-                    value_b64: B64.encode(&s.entry.value),
-                    revision: s.entry.revision,
-                    since_unix_secs: s.since_unix_secs,
-                })
-                .collect(),
-        };
-        let bytes = match serde_json::to_vec(&cached) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(error = %e, "snapshot cache serialise failed");
-                return;
-            }
-        };
-        let _guard = self.inner.write_lock.lock().await;
+        let mut committed = self.inner.write_lock.lock().await;
+        // A write that lost the serialisation race to a LATER capture has
+        // nothing to add: committing it would roll the cache back to a
+        // snapshot the gateway has already moved past, and the next
+        // restart would then serve it.
+        if ticket.0 <= *committed {
+            return;
+        }
+        // A later capture already holds a ticket and its write is on the way,
+        // so this one would be overwritten at once. A burst of applies costs
+        // one full-snapshot write and one fsync rather than one per apply.
+        if self.inner.next_ticket.load(Ordering::Relaxed) > ticket.0 {
+            return;
+        }
         #[cfg(test)]
         self.inner
             .write_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Err(e) = atomic_write(&path, &bytes).await {
+        if let Err(e) = atomic_write(path, entries, revision, stale).await {
             tracing::warn!(error = %e, path = %path.display(), "snapshot cache write failed");
+            return;
         }
+        *committed = ticket.0;
     }
 
     #[cfg(test)]
@@ -259,8 +287,31 @@ impl SnapshotCache {
     }
 }
 
-/// Write `bytes` to `path` atomically: write to a sibling tmp file,
-/// fsync, rename. Survives crashes between any two of those steps.
+pub(crate) fn encode_entry(entry: &RawEntry) -> Arc<[u8]> {
+    serde_json::to_vec(&CachedEntry {
+        key: entry.key.clone(),
+        value_b64: B64.encode(&entry.value),
+        revision: entry.revision,
+    })
+    .expect("snapshot entries contain only strings and integers")
+    .into()
+}
+
+pub(crate) fn encode_stale(stale: &StaleServing) -> Arc<[u8]> {
+    serde_json::to_vec(&CachedStaleEntry {
+        key: stale.entry.key.clone(),
+        value_b64: B64.encode(&stale.entry.value),
+        revision: stale.entry.revision,
+        since_unix_secs: stale.since_unix_secs,
+    })
+    .expect("stale entries contain only strings and integers")
+    .into()
+}
+
+/// Write the snapshot to `path` atomically: write to a sibling tmp file,
+/// fsync, rename. Survives crashes between any two of those steps. Preserves
+/// the v1 JSON envelope while writing shared records through a bounded
+/// buffer, so no full-snapshot byte buffer is assembled per apply.
 ///
 /// Created owner-only. This file holds every document under the watched
 /// prefix, verbatim — `provider_keys` included, whose upstream credential
@@ -275,7 +326,12 @@ impl SnapshotCache {
 /// previous build left at the destination. The directory mode applies only
 /// to components this call creates; an operator-provided directory keeps
 /// the permissions the operator chose.
-async fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+async fn atomic_write(
+    path: &Path,
+    entries: &[Arc<[u8]>],
+    revision: i64,
+    stale: &[Arc<[u8]>],
+) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             #[cfg(unix)]
@@ -297,7 +353,7 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         // （`aisix-portal/src/resources.rs` 里也记着这一条）。
         #[cfg(unix)]
         opts.mode(0o600);
-        let mut f = opts.open(&tmp).await?;
+        let f = opts.open(&tmp).await?;
         // Re-assert: `mode()` applies only to a file this call CREATES, and a
         // crash between the create and the rename leaves a `.tmp` behind. The
         // next write reuses it, keeps whatever mode it had, and the rename
@@ -309,10 +365,34 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             f.set_permissions(std::fs::Permissions::from_mode(0o600))
                 .await?;
         }
-        f.write_all(bytes).await?;
-        f.sync_all().await?;
+        let mut writer = BufWriter::with_capacity(64 * 1024, f);
+        writer
+            .write_all(
+                format!(r#"{{"version":{FORMAT_VERSION},"revision":{revision},"entries":["#)
+                    .as_bytes(),
+            )
+            .await?;
+        write_records(&mut writer, entries).await?;
+        writer.write_all(b"],\"stale\":[").await?;
+        write_records(&mut writer, stale).await?;
+        writer.write_all(b"]}").await?;
+        writer.flush().await?;
+        writer.get_ref().sync_all().await?;
     }
     tokio::fs::rename(&tmp, path).await
+}
+
+async fn write_records(
+    writer: &mut BufWriter<tokio::fs::File>,
+    records: &[Arc<[u8]>],
+) -> std::io::Result<()> {
+    for (index, record) in records.iter().enumerate() {
+        if index > 0 {
+            writer.write_all(b",").await?;
+        }
+        writer.write_all(record).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -345,14 +425,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_write_that_lost_its_race_cannot_roll_the_cache_back() {
+        // The supervisor captures a snapshot per apply and spawns its
+        // write, so the write for an earlier apply can reach the lock
+        // after a later one. Committing it would roll the cache back to a
+        // snapshot the gateway has already moved past, and the next
+        // restart would serve it.
+        let dir = tempdir().unwrap();
+        let cache = SnapshotCache::new(dir.path().join("snap.json"));
+
+        let older = [encode_entry(&entry(
+            "/aisix/models/m-1",
+            br#"{"name":"old"}"#,
+            8,
+        ))];
+        let newer_entry = entry("/aisix/models/m-1", br#"{"name":"new"}"#, 9);
+        let older_ticket = cache.ticket();
+        let newer_ticket = cache.ticket();
+        cache
+            .store_encoded(newer_ticket, &[encode_entry(&newer_entry)], 9, &[])
+            .await;
+        cache.store_encoded(older_ticket, &older, 8, &[]).await;
+
+        let cached = cache.load().expect("cache file exists");
+        assert_eq!(
+            cached.revision, 9,
+            "the older apply must not overwrite the newer one"
+        );
+        assert_eq!(cached.entries, vec![newer_entry]);
+    }
+
+    #[tokio::test]
+    async fn a_late_write_at_the_same_revision_cannot_restore_a_deleted_row() {
+        // A delete flushes at the current revision floor, so the capture
+        // before it and the capture after it share a revision. If the
+        // earlier one lands last, the deleted row comes back on restart.
+        let dir = tempdir().unwrap();
+        let cache = SnapshotCache::new(dir.path().join("snap.json"));
+
+        let before_delete = [encode_entry(&entry(
+            "/aisix/models/m-1",
+            br#"{"name":"m1"}"#,
+            9,
+        ))];
+        let before_ticket = cache.ticket();
+        let after_ticket = cache.ticket();
+        cache.store_encoded(after_ticket, &[], 9, &[]).await;
+        cache
+            .store_encoded(before_ticket, &before_delete, 9, &[])
+            .await;
+
+        let cached = cache.load().expect("cache file exists");
+        assert!(
+            cached.entries.is_empty(),
+            "the deleted row must stay deleted: {:?}",
+            cached.entries,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_at_the_same_revision_still_commits() {
+        // Same-revision captures carry different content, so a later one
+        // must still replace the earlier.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("snap.json");
+        let cache = SnapshotCache::new(&path);
+
+        let before = vec![entry("/aisix/models/m-1", br#"{"name":"m1"}"#, 9)];
+        cache.store(&before, 9, &[]).await;
+        cache.store(&[], 9, &[]).await;
+
+        let cached = cache.load().expect("cache file exists");
+        assert!(
+            cached.entries.is_empty(),
+            "a same-revision write must still commit",
+        );
+    }
+
+    #[tokio::test]
     async fn round_trips_stale_entries() {
         let dir = tempdir().unwrap();
         let cache = SnapshotCache::new(dir.path().join("snap.json"));
         let entries = vec![entry("/aisix/models/m-1", br#"{"bad":true}"#, 9)];
-        let stale = vec![StaleServing {
-            entry: entry("/aisix/models/m-1", br#"{"name":"last-good"}"#, 7),
-            since_unix_secs: 1_770_000_000,
-        }];
+        let stale = vec![StaleServing::new(
+            entry("/aisix/models/m-1", br#"{"name":"last-good"}"#, 7),
+            1_770_000_000,
+        )];
         cache.store(&entries, 9, &stale).await;
 
         let cached = cache.load().expect("cache file exists");

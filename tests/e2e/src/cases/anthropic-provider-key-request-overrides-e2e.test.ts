@@ -67,6 +67,7 @@ async function startClaudeUpstream(): Promise<ClaudeUpstream> {
         headers: Object.fromEntries(
           Object.entries(req.headers).map(([k, v]) => [k, Array.isArray(v) ? v.join(",") : (v ?? "")]),
         ),
+        headerNames: req.rawHeaders.filter((_, i) => i % 2 === 0).map((n) => n.toLowerCase()),
         body: raw,
       });
       const body = JSON.parse(raw || "{}") as { model?: string; stream?: boolean };

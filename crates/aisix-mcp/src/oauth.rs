@@ -12,46 +12,24 @@
 //! expiry; [`invalidate`] drops an entry early when the upstream rejects the
 //! token so the next attempt re-mints.
 
-use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::bridge::{redact_request_url, OAuthClientConfig, DEFAULT_UPSTREAM_TIMEOUT};
+use crate::bridge::{transport_failure_text, OAuthClientConfig, DEFAULT_UPSTREAM_TIMEOUT};
 use crate::error::McpError;
+use crate::token_cache::{token_lifetime, TokenCache};
 
-/// Stop reusing a cached token this long before its reported expiry, so an
-/// upstream operation never starts with a token about to lapse mid-flight.
-const EXPIRY_SKEW: Duration = Duration::from_secs(60);
-
-/// Assumed lifetime when the token endpoint omits `expires_in` (RFC 6749 §5.1
-/// only recommends it).
-const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(3600);
-
-/// Cap on a reported `expires_in`. A hostile or broken identity provider can
-/// return any u64; an absurd value would overflow `Instant + Duration` and
-/// panic the connect task. Thirty days is beyond any sane token lifetime and
-/// far below the overflow horizon.
-const MAX_TOKEN_LIFETIME: Duration = Duration::from_secs(30 * 24 * 3600);
-
-/// One minted upstream access token. Never printed: the struct deliberately
-/// has no `Debug` impl, and nothing in this module logs the token value.
-struct CachedToken {
-    access_token: String,
-    expires_at: Instant,
-}
-
-/// Process-global token cache. Guards are held only for map lookups/inserts,
-/// never across an await; concurrent misses for the same key may fetch in
-/// parallel (each minted token is valid — last insert wins). Entries are
+/// Process-global token cache. Concurrent misses for the same key may fetch
+/// in parallel (each minted token is valid — last insert wins). Entries are
 /// evicted only by 401-invalidation or key rotation, so tokens for deleted
 /// servers linger until restart — the map is bounded by the set of distinct
 /// configs ever seen (~100 bytes each), which is acceptable.
-fn cache() -> &'static RwLock<HashMap<String, CachedToken>> {
-    static CACHE: OnceLock<RwLock<HashMap<String, CachedToken>>> = OnceLock::new();
-    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+fn cache() -> &'static TokenCache {
+    static CACHE: OnceLock<TokenCache> = OnceLock::new();
+    CACHE.get_or_init(|| TokenCache::new(None))
 }
 
 /// Shared HTTP client for token fetches, bounded per request by the same
@@ -59,7 +37,7 @@ fn cache() -> &'static RwLock<HashMap<String, CachedToken>> {
 /// disabled: a token endpoint never legitimately redirects, and following one
 /// would re-POST the secret-bearing form to wherever it points (307/308 keep
 /// the body; a chain may even downgrade to plain HTTP).
-fn http_client() -> &'static reqwest::Client {
+pub(crate) fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         // 不是「只设了超时和重定向策略」：`client_builder()` 还带着部署的出站
@@ -99,8 +77,8 @@ fn cache_key(cfg: &OAuthClientConfig) -> String {
 }
 
 /// Return the cached access token for `cfg`, minting a fresh one at the token
-/// endpoint on a miss or when the cached token is within [`EXPIRY_SKEW`] of
-/// expiry.
+/// endpoint on a miss or when the cached token is within
+/// [`crate::token_cache::EXPIRY_SKEW`] of expiry.
 ///
 /// A config missing `client_id`, the client secret, or `token_url` fails here
 /// with a clean error (no panic): the mis-configured server simply becomes
@@ -115,19 +93,12 @@ pub(crate) async fn get_or_fetch(cfg: &OAuthClientConfig) -> Result<String, McpE
     }
 
     let key = cache_key(cfg);
-    if let Some(token) = cached_token(&key) {
+    if let Some(token) = cache().get(&key) {
         return Ok(token);
     }
 
     let (access_token, lifetime) = fetch_token(cfg).await?;
-    let entry = CachedToken {
-        access_token: access_token.clone(),
-        expires_at: Instant::now() + lifetime,
-    };
-    cache()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(key, entry);
+    cache().insert(key, &access_token, lifetime);
     Ok(access_token)
 }
 
@@ -135,21 +106,7 @@ pub(crate) async fn get_or_fetch(cfg: &OAuthClientConfig) -> Result<String, McpE
 /// re-mint. Called when the upstream rejects the presented token with `401`
 /// (revoked, or expired earlier than `expires_in` promised).
 pub(crate) fn invalidate(cfg: &OAuthClientConfig) {
-    cache()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(&cache_key(cfg));
-}
-
-fn cached_token(key: &str) -> Option<String> {
-    let cache = cache()
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let entry = cache.get(key)?;
-    if entry.expires_at <= Instant::now() + EXPIRY_SKEW {
-        return None;
-    }
-    Some(entry.access_token.clone())
+    cache().remove(&cache_key(cfg));
 }
 
 /// Token endpoint success payload (RFC 6749 §5.1). Unknown fields (`scope`,
@@ -189,8 +146,10 @@ async fn fetch_token(cfg: &OAuthClientConfig) -> Result<(String, Duration), McpE
         .map_err(|e| {
             // reqwest transport errors describe the connection (and name the
             // token_url, reduced here to its origin), never the form body.
-            let message = redact_request_url(e.to_string(), e.url().map(|u| u.as_str()));
-            McpError::Connect(format!("upstream OAuth token request failed: {message}"))
+            McpError::Connect(format!(
+                "upstream OAuth token request failed: {}",
+                transport_failure_text(e)
+            ))
         })?;
 
     let status = response.status();
@@ -200,7 +159,8 @@ async fn fetch_token(cfg: &OAuthClientConfig) -> Result<(String, Duration), McpE
         )));
     }
 
-    let token: TokenResponse = response.json().await.map_err(|_| {
+    let token: TokenResponse = response.json().await.map_err(|e| {
+        aisix_gateway::log_body_read_causes(&e);
         McpError::Connect(
             "upstream OAuth token endpoint returned a malformed token response".to_string(),
         )
@@ -210,16 +170,12 @@ async fn fetch_token(cfg: &OAuthClientConfig) -> Result<(String, Duration), McpE
             "upstream OAuth token endpoint returned an empty access_token".to_string(),
         ));
     }
-    let lifetime = token
-        .expires_in
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_TOKEN_LIFETIME)
-        .min(MAX_TOKEN_LIFETIME);
-    Ok((token.access_token, lifetime))
+    Ok((token.access_token, token_lifetime(token.expires_in)))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -618,5 +574,21 @@ mod tests {
                 "error should name the misconfiguration: {err}"
             );
         }
+    }
+
+    /// A loopback address nothing listens on, so a connect is refused at once.
+    fn refused_url(path: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}{path}", listener.local_addr().unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_failed_token_request_names_its_cause() {
+        let err = get_or_fetch(&config(refused_url("/oauth/token")))
+            .await
+            .expect_err("nothing listens");
+        let text = err.to_string();
+        assert!(text.to_lowercase().contains("refused"), "{text}");
+        assert!(!text.contains("s3cret"), "{text}");
     }
 }

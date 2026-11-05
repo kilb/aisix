@@ -12,22 +12,26 @@
 //! rmcp's still-moving API contained to this file.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aisix_core::{McpAuthType, McpServer};
 use aisix_gateway::redact_url_for_log;
 use async_trait::async_trait;
+use futures::future::{BoxFuture, FutureExt};
 use http::{HeaderName, HeaderValue};
 use rmcp::model::{CallToolRequestParams, CallToolResponse, ClientInfo, ProtocolVersion};
 use rmcp::service::{ClientInitializeError, RoleClient, RunningService, ServiceError};
 use rmcp::transport::streamable_http_client::{
-    StreamableHttpClientTransportConfig, StreamableHttpError,
+    SseError, StreamableHttpClientTransportConfig, StreamableHttpError,
 };
 use rmcp::transport::{DynamicTransportError, StreamableHttpClientTransport};
 use rmcp::ClientCacheConfig;
 use rmcp::{ClientLifecycleMode, ClientServiceExt};
 
 use crate::error::McpError;
+use crate::token_exchange::{SubjectToken, TokenExchangeAuth, TokenExchangeConfig};
+use crate::user_oauth::{UserOAuthManager, UserOAuthServer, UserSubject};
 
 /// Default deadline for a single upstream operation (connect / list / call).
 /// rmcp's high-level client sets no request timeout and reqwest has no default
@@ -92,6 +96,10 @@ fn build_http_client(disable_env_proxy: bool) -> rmcp_reqwest::Client {
         // vendors its own reqwest and cannot share ours; the redirect policy
         // is part of what has to mirror.
         .redirect(rmcp_reqwest::redirect::Policy::none())
+        // rmcp pins its own reqwest major, so this client cannot be built
+        // from `client_builder()` — but it resolves through the same
+        // process-wide cache, via that crate version's own resolver trait.
+        .dns_resolver(std::sync::Arc::new(CachedResolver))
         .pool_idle_timeout(cfg.pool_idle_timeout)
         .tcp_keepalive(cfg.tcp_keepalive);
     if let Some(d) = cfg.connect_timeout {
@@ -118,7 +126,7 @@ fn build_http_client(disable_env_proxy: bool) -> rmcp_reqwest::Client {
                 }
             }
             Err(e) => tracing::error!(
-                error = %e,
+                error = %aisix_gateway::error_with_causes(&e),
                 "upstream.tls.ca_file not applied to MCP upstream connections"
             ),
         }
@@ -127,7 +135,7 @@ fn build_http_client(disable_env_proxy: bool) -> rmcp_reqwest::Client {
         match rmcp_reqwest::Identity::from_pem(&configured.joined()) {
             Ok(identity) => b = b.identity(identity),
             Err(e) => tracing::error!(
-                error = %e,
+                error = %aisix_gateway::error_with_causes(&e),
                 "upstream.tls client identity not applied to MCP upstream connections"
             ),
         }
@@ -154,7 +162,7 @@ fn build_http_client(disable_env_proxy: bool) -> rmcp_reqwest::Client {
     // 条策略，不能靠“默认更严”。
     b.build().unwrap_or_else(|e| {
         tracing::error!(
-            error = %e,
+            error = %aisix_gateway::error_with_causes(&e),
             "upstream.tls settings not applied to MCP upstream connections: the \
              configured client could not be built, falling back to a default one \
              (no custom CA, no client identity, no proxy opt-out)"
@@ -166,16 +174,40 @@ fn build_http_client(disable_env_proxy: bool) -> rmcp_reqwest::Client {
     })
 }
 
+/// The workspace DNS cache, behind rmcp's reqwest major's resolver trait.
+struct CachedResolver;
+
+impl rmcp_reqwest::dns::Resolve for CachedResolver {
+    fn resolve(&self, name: rmcp_reqwest::dns::Name) -> rmcp_reqwest::dns::Resolving {
+        let cache = aisix_gateway::dns_cache::shared();
+        Box::pin(async move {
+            let addrs = cache.lookup(name.as_str()).await?;
+            Ok(
+                Box::new(addrs.iter().copied().collect::<Vec<_>>().into_iter())
+                    as rmcp_reqwest::dns::Addrs,
+            )
+        })
+    }
+}
+
 /// Header carrying the gateway-held key for `api_key` upstream auth.
 const API_KEY_HEADER: &str = "x-api-key";
 
-/// How the gateway authenticates to an upstream MCP server. The credential is
-/// held here on the gateway side and is never exposed to the calling agent —
-/// the agent presents only its AISIX key. The MCP authorization spec
-/// (2025-11-25) also requires that a downstream client token is never passed
-/// through to the upstream; every credential set here — a Bearer, an API key,
-/// or an OAuth token the gateway mints itself — is a distinct, gateway-held
-/// credential.
+/// How the gateway authenticates to an upstream MCP server. Every variant but
+/// [`McpAuth::Delegate`] is a gateway-held credential — a Bearer, an API key,
+/// or an OAuth token the gateway mints or exchanges itself — and none of them
+/// is ever exposed to the calling agent.
+///
+/// Relaying the CALLER's own credentials is a separate, opt-in mechanism
+/// ([`McpUpstream::forwarded_client_headers`], from the server's
+/// `forward_client_headers`), never a property of this enum. The normative
+/// rule it has to respect is the audience one — a server "MUST only accept
+/// tokens specifically intended for themselves" (MCP authorization,
+/// 2025-06-18 and later) — so relaying is for an internal server that reads
+/// the claims of a token its own identity provider issued, not for one that
+/// validates `aud` against itself. There is no normative prohibition on the
+/// relay itself; the "token passthrough is forbidden" wording lives in a
+/// non-normative security best-practices guide.
 #[derive(Clone)]
 pub enum McpAuth {
     /// No upstream auth — the server is reachable as-is.
@@ -190,6 +222,93 @@ pub enum McpAuth {
     /// <access_token>`. The token is gateway-minted and gateway-held — never
     /// the caller's credential (see [`crate::oauth`]).
     OAuth2(OAuthClientConfig),
+    /// Relay the caller's own `Authorization` value unchanged — the one the
+    /// caller did NOT authenticate to the gateway with. `None` reaches the
+    /// upstream without credentials.
+    Delegate(Option<HeaderValue>),
+    /// Exchange the caller's verified token for an upstream access token and
+    /// send it as `Authorization: Bearer <access_token>` (see
+    /// [`crate::token_exchange`]).
+    TokenExchange(TokenExchangeAuth),
+    /// Send the access token the caller obtained by signing in to this server
+    /// as `Authorization: Bearer <access_token>` (see [`crate::user_oauth`]).
+    UserOAuth(UserOAuthAuth),
+}
+
+/// The per-request halves of [`McpAuth::UserOAuth`].
+#[derive(Clone)]
+pub struct UserOAuthAuth {
+    pub(crate) server: UserOAuthServer,
+    pub(crate) caller: Option<UserOAuthCaller>,
+}
+
+/// What a request contributes to [`McpAuth::UserOAuth`]: where tokens are
+/// kept, and whose to use. A caller the gateway could not name a user for has
+/// no `subject`.
+#[derive(Clone)]
+pub struct UserOAuthCaller {
+    pub manager: Arc<UserOAuthManager>,
+    pub subject: Option<UserSubject>,
+}
+
+impl UserOAuthAuth {
+    fn resolved(&self) -> Result<(&Arc<UserOAuthManager>, &UserSubject), McpError> {
+        let caller = self.caller.as_ref();
+        let subject = caller.and_then(|c| c.subject.as_ref());
+        match (caller, subject) {
+            (Some(caller), Some(subject)) => Ok((&caller.manager, subject)),
+            _ => Err(crate::error::UserOAuthFailure::NoSubject.into()),
+        }
+    }
+
+    pub(crate) async fn token(&self) -> Result<String, McpError> {
+        let (manager, subject) = self.resolved()?;
+        Ok(manager.access_token(&self.server, subject).await?)
+    }
+}
+
+/// The calling agent's own credentials, resolved per request by the proxy,
+/// for the auth types that act for the caller rather than with a
+/// gateway-held credential.
+#[derive(Clone, Default)]
+pub struct CallerCredentials {
+    /// The caller's `Authorization` header when it was not what the gateway
+    /// admitted the request with — the upstream token an `oauth_delegate`
+    /// server receives.
+    pub delegated_authorization: Option<HeaderValue>,
+    /// The bearer token the gateway verified through a JWT trust provider on
+    /// this request — the only token an `oauth2_token_exchange` server
+    /// exchanges.
+    pub subject_token: Option<Arc<str>>,
+    /// The token store and the signed-in user an
+    /// `oauth2_authorization_code` server is called as.
+    pub user_oauth: Option<UserOAuthCaller>,
+}
+
+impl std::fmt::Debug for CallerCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallerCredentials")
+            .field(
+                "delegated_authorization",
+                &self
+                    .delegated_authorization
+                    .as_ref()
+                    .map(|_| "***redacted***"),
+            )
+            .field(
+                "subject_token",
+                &self.subject_token.as_ref().map(|_| "***redacted***"),
+            )
+            .field(
+                "user_oauth_subject",
+                &self
+                    .user_oauth
+                    .as_ref()
+                    .and_then(|c| c.subject.as_ref())
+                    .map(UserSubject::id),
+            )
+            .finish()
+    }
 }
 
 /// Client-credentials parameters for [`McpAuth::OAuth2`].
@@ -233,6 +352,14 @@ impl std::fmt::Debug for McpAuth {
             McpAuth::ApiKey(_) => f.write_str("ApiKey(***redacted***)"),
             // Delegates to the redacting `OAuthClientConfig` impl above.
             McpAuth::OAuth2(cfg) => f.debug_tuple("OAuth2").field(cfg).finish(),
+            McpAuth::Delegate(value) => f
+                .debug_tuple("Delegate")
+                .field(&value.as_ref().map(|_| "***redacted***"))
+                .finish(),
+            McpAuth::TokenExchange(auth) => f.debug_tuple("TokenExchange").field(auth).finish(),
+            McpAuth::UserOAuth(auth) => {
+                f.debug_tuple("UserOAuth").field(&auth.server.name).finish()
+            }
         }
     }
 }
@@ -270,6 +397,15 @@ pub struct McpUpstream {
     /// Protocol revision the session is opened with. Defaults to the
     /// legacy `initialize` handshake.
     pub protocol: McpProtocol,
+    /// Inbound client headers this server's `forward_client_headers`
+    /// admits, resolved per request against the calling agent's own
+    /// request. Empty when the server configures none, or when nothing the
+    /// agent sent matched.
+    ///
+    /// Independent of `auth`, which stays the gateway's own credential —
+    /// except when both name the same header, where the forwarded value
+    /// wins and the gateway's is not sent at all.
+    pub forwarded_client_headers: Vec<(HeaderName, HeaderValue)>,
 }
 
 // Manual so a `Bearer` token cannot leak through `McpUpstream`'s `Debug`
@@ -282,6 +418,16 @@ impl std::fmt::Debug for McpUpstream {
             .field("auth", &self.auth)
             .field("timeout", &self.timeout)
             .field("protocol", &self.protocol)
+            .field(
+                // Names only: a forwarded header may be the caller's own
+                // credential.
+                "forwarded_client_headers",
+                &self
+                    .forwarded_client_headers
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -294,7 +440,18 @@ impl McpUpstream {
             auth: McpAuth::None,
             timeout: DEFAULT_UPSTREAM_TIMEOUT,
             protocol: McpProtocol::default(),
+            forwarded_client_headers: Vec::new(),
         }
+    }
+
+    /// Deliver the client headers this server forwards, as already
+    /// resolved against the inbound request.
+    pub fn with_forwarded_client_headers(
+        mut self,
+        forwarded: Vec<(HeaderName, HeaderValue)>,
+    ) -> Self {
+        self.forwarded_client_headers = forwarded;
+        self
     }
 
     /// Select the protocol revision the session is opened with.
@@ -318,6 +475,21 @@ impl McpUpstream {
     /// Set OAuth 2.0 client-credentials auth.
     pub fn with_oauth2(mut self, config: OAuthClientConfig) -> Self {
         self.auth = McpAuth::OAuth2(config);
+        self
+    }
+
+    /// Fill the caller-held halves of [`McpAuth::Delegate`] and
+    /// [`McpAuth::TokenExchange`] from this request's caller. Other auth
+    /// types are gateway-held and unaffected.
+    pub fn with_caller_credentials(mut self, caller: &CallerCredentials) -> Self {
+        match &mut self.auth {
+            McpAuth::Delegate(value) => *value = caller.delegated_authorization.clone(),
+            McpAuth::TokenExchange(auth) => {
+                auth.subject = caller.subject_token.clone().map(SubjectToken);
+            }
+            McpAuth::UserOAuth(auth) => auth.caller = caller.user_oauth.clone(),
+            _ => {}
+        }
         self
     }
 
@@ -373,6 +545,14 @@ pub trait McpBridge: Send + Sync {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<McpToolResult, McpError>;
+
+    /// Obtain, without running any MCP operation, the upstream credential an
+    /// `oauth2_token_exchange` server needs for the current caller (see
+    /// `McpGateway::preflight_upstream_auth`). Every other bridge has nothing
+    /// to check.
+    async fn preflight_auth(&self) -> Result<(), McpError> {
+        Ok(())
+    }
 }
 
 /// `rmcp`-backed [`McpBridge`]: holds one running client session to the
@@ -413,23 +593,61 @@ impl RmcpBridge {
     /// or handshake-free `server/discover` for `2026-07-28` upstreams. The
     /// whole sequence, token minting included, is bounded by the upstream's
     /// timeout.
+    ///
+    /// An upstream `401` drops a cached minted or exchanged token; an
+    /// exchanged one is then exchanged afresh and the connect retried once.
     pub async fn connect(upstream: &McpUpstream) -> Result<Self, McpError> {
-        let establish = async {
-            // Every arm goes through `with_client(shared_http_client(), ..)`
-            // so the transport inherits the deployment's `upstream.*`
-            // connection settings — `from_uri`/`from_config` would build
-            // rmcp's own default client with none of them — and through
-            // `transport_config` for the pinned transport defaults.
-            let transport = match &upstream.auth {
-                McpAuth::None => StreamableHttpClientTransport::with_client(
-                    shared_http_client(),
-                    transport_config(&upstream.url),
-                ),
-                McpAuth::Bearer(token) => StreamableHttpClientTransport::with_client(
-                    shared_http_client(),
-                    transport_config(&upstream.url).auth_header(token.clone()),
-                ),
-                McpAuth::ApiKey(key) => {
+        match Self::connect_once(upstream).await {
+            Err(ConnectFailure::Unauthorized(error)) => match &upstream.auth {
+                McpAuth::OAuth2(cfg) => {
+                    crate::oauth::invalidate(cfg);
+                    Err(error)
+                }
+                McpAuth::TokenExchange(auth) => {
+                    auth.invalidate();
+                    Self::connect_once(upstream).await.map_err(|failure| {
+                        // A fresh token rejected too is not kept either.
+                        if matches!(failure, ConnectFailure::Unauthorized(_)) {
+                            auth.invalidate();
+                        }
+                        failure.into_error().after_upstream_contact()
+                    })
+                }
+                _ => Err(error),
+            },
+            other => other.map_err(ConnectFailure::into_error),
+        }
+    }
+
+    async fn connect_once(upstream: &McpUpstream) -> Result<Self, ConnectFailure> {
+        // One deadline for the whole sequence. The upstream credential is
+        // obtained outside `establish` so that a token exchange running out
+        // of it is reported as the identity provider being unavailable, not
+        // as the upstream failing to connect.
+        let deadline = tokio::time::Instant::now() + upstream.timeout;
+        // Gateway credential and forwarded client headers are
+        // resolved into one header set rather than one arm each,
+        // because they can name the same slot: an operator who lists
+        // `authorization` in `forward_client_headers` is choosing the
+        // caller's own credential over the gateway's, and the upstream
+        // must receive exactly one of them.
+        //
+        // The claimed set is read before anything fills a slot, so
+        // suppressing the gateway credential and delivering the
+        // forwarded value cannot disagree.
+        let forwarded = &upstream.forwarded_client_headers;
+        let claims = |name: &str| forwarded.iter().any(|(n, _)| n.as_str() == name);
+        let mut custom: HashMap<HeaderName, HeaderValue> = HashMap::new();
+        let mut auth_header: Option<String> = None;
+        match &upstream.auth {
+            McpAuth::None => {}
+            McpAuth::Bearer(token) => {
+                if !claims("authorization") {
+                    auth_header = Some(token.clone());
+                }
+            }
+            McpAuth::ApiKey(key) => {
+                if !claims(API_KEY_HEADER) {
                     // A key with non-header-safe bytes is a clean config error,
                     // not a panic — and the key itself never enters the message.
                     let mut value = HeaderValue::from_str(key).map_err(|_| {
@@ -440,20 +658,61 @@ impl RmcpBridge {
                     // Marks the value opaque to `Debug` formatting of the
                     // header map, mirroring this module's redaction posture.
                     value.set_sensitive(true);
-                    let headers = HashMap::from([(HeaderName::from_static(API_KEY_HEADER), value)]);
-                    StreamableHttpClientTransport::with_client(
-                        shared_http_client(),
-                        transport_config(&upstream.url).custom_headers(headers),
-                    )
+                    custom.insert(HeaderName::from_static(API_KEY_HEADER), value);
                 }
-                McpAuth::OAuth2(cfg) => {
-                    let token = crate::oauth::get_or_fetch(cfg).await?;
-                    StreamableHttpClientTransport::with_client(
-                        shared_http_client(),
-                        transport_config(&upstream.url).auth_header(token),
-                    )
+            }
+            McpAuth::OAuth2(cfg) => {
+                // Minted only when it will actually be sent: a token a
+                // forwarded header is about to displace is a round trip
+                // to the identity provider whose only possible effect is
+                // failing a request that did not need it.
+                if !claims("authorization") {
+                    auth_header = Some(
+                        tokio::time::timeout_at(deadline, crate::oauth::get_or_fetch(cfg))
+                            .await
+                            .map_err(|_| connect_timed_out())??,
+                    );
                 }
-            };
+            }
+            McpAuth::Delegate(value) => {
+                // Relayed as the caller sent it, scheme included.
+                if let (false, Some(value)) = (claims("authorization"), value) {
+                    let mut value = value.clone();
+                    value.set_sensitive(true);
+                    custom.insert(http::header::AUTHORIZATION, value);
+                }
+            }
+            McpAuth::TokenExchange(auth) => {
+                if !claims("authorization") {
+                    auth_header = Some(auth.token(deadline).await?);
+                }
+            }
+            McpAuth::UserOAuth(auth) => {
+                auth_header = Some(
+                    tokio::time::timeout_at(deadline, auth.token())
+                        .await
+                        .map_err(|_| connect_timed_out())??,
+                );
+            }
+        }
+        for (name, value) in forwarded {
+            custom.insert(name.clone(), value.clone());
+        }
+        let establish = async {
+            // Through `with_client(shared_http_client(), ..)` so the
+            // transport inherits the deployment's `upstream.*` connection
+            // settings — `from_uri`/`from_config` would build rmcp's own
+            // default client with none of them — and through
+            // `transport_config` for the pinned transport defaults.
+            let mut config = transport_config(&upstream.url);
+            if let Some(token) = auth_header {
+                config = config.auth_header(token);
+            }
+            if !custom.is_empty() {
+                config = config.custom_headers(custom);
+            }
+            let transport =
+                StreamableHttpClientTransport::with_client(shared_http_client(), config);
             // Lifecycle follows the configured protocol revision. The
             // handler is `ClientInfo::default()` on BOTH paths — identical
             // handshake bytes to the previous unit handler (whose default
@@ -473,14 +732,6 @@ impl RmcpBridge {
                 .serve_with_lifecycle(transport, lifecycle)
                 .await
                 .map_err(|e| {
-                    // An upstream 401 against a minted token means the token was
-                    // revoked or expired earlier than promised: drop the cache
-                    // entry so the next attempt re-mints instead of replaying it.
-                    if let McpAuth::OAuth2(cfg) = &upstream.auth {
-                        if init_error_is_unauthorized(&e) {
-                            crate::oauth::invalidate(cfg);
-                        }
-                    }
                     // Bound + sanitize: a bare-401 shape embeds the upstream's
                     // response body in the error text, which lands in gateway
                     // logs. An upstream that reflects request headers into its
@@ -488,18 +739,32 @@ impl RmcpBridge {
                     // must not get either past this point verbatim. The
                     // request URL a transport failure names is redacted first,
                     // before truncation can cut it anywhere.
-                    let message = match &e {
-                        ClientInitializeError::TransportError { error, .. } => {
-                            redact_transport_url(e.to_string(), error)
-                        }
-                        _ => e.to_string(),
+                    let (message, causes) = match &e {
+                        ClientInitializeError::TransportError { error, .. } => (
+                            redact_transport_url(e.to_string(), error),
+                            transport_causes(error),
+                        ),
+                        _ => (e.to_string(), String::new()),
                     };
-                    McpError::Connect(sanitize_error_message(&message))
+                    // Bounded apart: rmcp's own text can fill the bound by itself.
+                    let error = McpError::Connect(format!(
+                        "{}{}",
+                        sanitize_error_message(&message),
+                        sanitize_error_message(&causes)
+                    ));
+                    // An upstream 401 is handed to `connect`, which decides
+                    // per auth type (drop a minted token, re-exchange, or
+                    // surface it to the caller).
+                    if init_error_is_unauthorized(&e) {
+                        ConnectFailure::Unauthorized(error)
+                    } else {
+                        ConnectFailure::Other(error)
+                    }
                 })
         };
-        let running = tokio::time::timeout(upstream.timeout, establish)
+        let running = tokio::time::timeout_at(deadline, establish)
             .await
-            .map_err(|_| McpError::Connect("upstream MCP connect timed out".to_string()))??;
+            .map_err(|_| connect_timed_out())??;
         // rmcp 3.x ships a client response cache that is ENABLED by default
         // (`ClientCacheConfig::default()`), keyed per peer and honoring the
         // server's `ttlMs`/`cacheScope` hints. A pooled or persistent bridge
@@ -524,6 +789,31 @@ impl RmcpBridge {
     }
 }
 
+fn connect_timed_out() -> McpError {
+    McpError::Connect("upstream MCP connect timed out".to_string())
+}
+
+/// A failed connect attempt, with an upstream `401` kept apart so
+/// [`RmcpBridge::connect`] can act on it.
+enum ConnectFailure {
+    Unauthorized(McpError),
+    Other(McpError),
+}
+
+impl ConnectFailure {
+    fn into_error(self) -> McpError {
+        match self {
+            ConnectFailure::Unauthorized(error) | ConnectFailure::Other(error) => error,
+        }
+    }
+}
+
+impl From<McpError> for ConnectFailure {
+    fn from(error: McpError) -> Self {
+        ConnectFailure::Other(error)
+    }
+}
+
 /// Bound an upstream-derived error message for logging: control characters
 /// (log-injection vectors) are stripped and the text is truncated, since a
 /// bare non-success response embeds the upstream's body verbatim.
@@ -541,12 +831,26 @@ pub(crate) fn sanitize_error_message(message: &str) -> String {
     }
 }
 
+/// A failed reqwest request as one log line: the origin of the URL it was
+/// sent to ([`redact_url_for_log`]), reqwest's message, and the causes below
+/// it. reqwest renders the URL into its own text — userinfo already moved into
+/// a header, path and query intact — so the message is taken without it: the
+/// path and query can carry a credential or a tool's arguments, and a long one
+/// would push the cause past the log bound.
+pub(crate) fn transport_failure_text(error: reqwest::Error) -> String {
+    let origin = error.url().map(|url| redact_url_for_log(url.as_str()));
+    let message = aisix_gateway::transport_error_message(&error.without_url());
+    match origin {
+        Some(origin) => format!("{origin}: {message}"),
+        None => message,
+    }
+}
+
 /// `message` with the request URL it names reduced to its origin
-/// ([`redact_url_for_log`]). reqwest renders the URL it was sending to into
-/// its error text — userinfo already moved into a header, path and query
-/// intact — and the gateway logs these errors. `url` is the error's own
-/// [`reqwest::Error::url`], i.e. exactly the text reqwest rendered.
-pub(crate) fn redact_request_url(message: String, url: Option<&str>) -> String {
+/// ([`redact_url_for_log`]). rmcp's transport text renders the URL it was
+/// sending to, and the gateway logs these errors. `url` is the error's own
+/// `url()`, i.e. exactly the text reqwest rendered.
+fn redact_request_url(message: String, url: Option<&str>) -> String {
     match url {
         Some(url) if !url.is_empty() => message.replace(url, &redact_url_for_log(url)),
         _ => message,
@@ -603,6 +907,48 @@ fn init_error_is_unauthorized(error: &ClientInitializeError) -> bool {
     let ClientInitializeError::TransportError { error, .. } = error else {
         return false;
     };
+    transport_error_is_unauthorized(error)
+}
+
+fn request_error(error: rmcp::ServiceError) -> McpError {
+    match &error {
+        rmcp::ServiceError::TransportSend(transport)
+            if transport_error_is_unauthorized(transport) =>
+        {
+            McpError::Unauthorized(service_error_message(&error))
+        }
+        rmcp::ServiceError::TransportSend(transport) => {
+            // Bounded apart, as on connect.
+            McpError::Request(format!(
+                "{}{}",
+                service_error_message(&error),
+                sanitize_error_message(&transport_causes(transport))
+            ))
+        }
+        _ => McpError::Request(service_error_message(&error)),
+    }
+}
+
+/// `": <causes>"` when the transport failed inside its HTTP client, otherwise
+/// empty. rmcp's `StreamableHttpError` and the SSE decoder under it show the
+/// client error's own `Display` and hide it from `source()`, so each is opened
+/// by hand.
+fn transport_causes(error: &rmcp::transport::DynamicTransportError) -> String {
+    use std::error::Error as _;
+    let cause = match error
+        .error
+        .downcast_ref::<StreamableHttpError<rmcp_reqwest::Error>>()
+    {
+        Some(StreamableHttpError::Client(client)) => client.source(),
+        Some(StreamableHttpError::Sse(SseError::Body(body))) => body.source(),
+        _ => None,
+    };
+    cause
+        .map(|cause| format!(": {}", aisix_gateway::error_with_causes(cause)))
+        .unwrap_or_default()
+}
+
+fn transport_error_is_unauthorized(error: &rmcp::transport::DynamicTransportError) -> bool {
     match error
         .error
         .downcast_ref::<StreamableHttpError<rmcp_reqwest::Error>>()
@@ -623,7 +969,7 @@ impl McpBridge for RmcpBridge {
         let result = tokio::time::timeout(self.timeout, self.running.list_tools(None))
             .await
             .map_err(|_| McpError::Request("upstream tools/list timed out".to_string()))?
-            .map_err(|e| McpError::Request(service_error_message(&e)))?;
+            .map_err(request_error)?;
         Ok(result.tools.into_iter().map(into_mcp_tool).collect())
     }
 
@@ -653,7 +999,7 @@ impl McpBridge for RmcpBridge {
         let response = tokio::time::timeout(self.timeout, self.running.call_tool_once(params))
             .await
             .map_err(|_| McpError::Request("upstream tools/call timed out".to_string()))?
-            .map_err(|e| McpError::Request(service_error_message(&e)))?;
+            .map_err(request_error)?;
         let result = match response {
             CallToolResponse::Complete(result) => result,
             CallToolResponse::InputRequired(_) => {
@@ -729,17 +1075,43 @@ fn is_cleartext(url: &str) -> bool {
 /// pin the selection.
 pub(crate) fn cleartext_findings(server: &McpServer) -> Vec<(&'static str, String)> {
     let mut findings = Vec::new();
-    if server.auth_type != McpAuthType::None && is_cleartext(&server.url) {
-        findings.push((
-            "the gateway-held upstream credential",
-            redact_url_for_log(&server.url),
-        ));
+    match server.auth_type {
+        McpAuthType::None => {}
+        McpAuthType::OauthDelegate => {
+            if is_cleartext(&server.url) {
+                findings.push((
+                    "the caller's relayed upstream token",
+                    redact_url_for_log(&server.url),
+                ));
+            }
+        }
+        _ => {
+            if is_cleartext(&server.url) {
+                findings.push((
+                    "the gateway-held upstream credential",
+                    redact_url_for_log(&server.url),
+                ));
+            }
+        }
     }
-    if server.auth_type == McpAuthType::OAuth2 {
-        let token_url = server.token_url.as_deref().unwrap_or_default();
-        if is_cleartext(token_url) {
+    let token_url = server.token_url.as_deref().unwrap_or_default();
+    match server.auth_type {
+        McpAuthType::OAuth2 if is_cleartext(token_url) => {
             findings.push(("the OAuth client secret", redact_url_for_log(token_url)));
         }
+        McpAuthType::OAuth2TokenExchange if is_cleartext(token_url) => {
+            findings.push((
+                "the OAuth client secret and the caller's token",
+                redact_url_for_log(token_url),
+            ));
+        }
+        McpAuthType::OAuth2AuthorizationCode if is_cleartext(token_url) => {
+            findings.push((
+                "the users' upstream OAuth tokens",
+                redact_url_for_log(token_url),
+            ));
+        }
+        _ => {}
     }
     findings
 }
@@ -771,6 +1143,37 @@ pub(crate) fn warn_cleartext_credential(server: &McpServer) {
     }
 }
 
+/// Header slots the MCP transport itself owns on this hop.
+///
+/// `mcp-session-id`, `mcp-protocol-version` and `last-event-id` name the
+/// session the CALLER holds with this gateway, not the one the gateway
+/// opens upstream, so a relayed copy identifies a session the upstream
+/// never issued. rmcp refuses a custom `mcp-session-id` / `last-event-id`
+/// outright — the connection then fails rather than degrades — and while
+/// it does let `mcp-protocol-version` through, that one selects the
+/// revision the session is opened at, which is the transport's decision
+/// and not the caller's.
+pub const MCP_PROTOCOL_HEADERS: &[&str] =
+    &["last-event-id", "mcp-protocol-version", "mcp-session-id"];
+
+/// The inbound client headers `server` forwards out of `client_headers`.
+///
+/// `None` — a gateway built from the snapshot alone, with no request
+/// behind it — forwards nothing.
+pub fn forwarded_client_headers(
+    server: &McpServer,
+    client_headers: Option<&http::HeaderMap>,
+) -> Vec<(HeaderName, HeaderValue)> {
+    let Some(client) = client_headers else {
+        return Vec::new();
+    };
+    aisix_core::resolve_forwarded_client_headers(
+        &server.forward_client_headers,
+        client,
+        MCP_PROTOCOL_HEADERS,
+    )
+}
+
 pub fn upstream_from_mcp_server(server: &McpServer) -> McpUpstream {
     let auth = match server.auth_type {
         McpAuthType::None => McpAuth::None,
@@ -781,6 +1184,19 @@ pub fn upstream_from_mcp_server(server: &McpServer) -> McpUpstream {
             client_secret: server.secret.clone().unwrap_or_default(),
             token_url: server.token_url.clone().unwrap_or_default(),
             scopes: server.scopes.clone().unwrap_or_default(),
+        }),
+        // The caller-held halves are filled per request
+        // (`McpUpstream::with_caller_credentials`).
+        McpAuthType::OauthDelegate => McpAuth::Delegate(None),
+        McpAuthType::OAuth2TokenExchange => McpAuth::TokenExchange(TokenExchangeAuth {
+            config: token_exchange_config(server),
+            subject: None,
+        }),
+        // The stored server id and the caller are filled per request
+        // (`McpGateway`'s `bridge_for`).
+        McpAuthType::OAuth2AuthorizationCode => McpAuth::UserOAuth(UserOAuthAuth {
+            server: UserOAuthServer::new("", server),
+            caller: None,
         }),
     };
     let timeout = server
@@ -799,6 +1215,24 @@ pub fn upstream_from_mcp_server(server: &McpServer) -> McpUpstream {
         auth,
         timeout,
         protocol,
+        // Per-request, so it is attached by the gateway that holds the
+        // inbound headers (`McpGateway::from_snapshot_for_request`), not
+        // derived from the stored server row here.
+        forwarded_client_headers: Vec::new(),
+    }
+}
+
+/// The exchange parameters of an `oauth2_token_exchange` server. A row
+/// missing any of them fails at exchange time, like every other incomplete
+/// credential set.
+pub(crate) fn token_exchange_config(server: &McpServer) -> TokenExchangeConfig {
+    TokenExchangeConfig {
+        profile: server.token_exchange_profile,
+        token_url: server.token_url.clone().unwrap_or_default(),
+        client_id: server.client_id.clone().unwrap_or_default(),
+        client_secret: server.secret.clone().unwrap_or_default(),
+        scopes: server.scopes.clone().unwrap_or_default(),
+        server: format!("{}\x1f{}", server.name, server.url),
     }
 }
 
@@ -824,6 +1258,13 @@ impl EphemeralBridge {
 #[async_trait]
 impl McpBridge for EphemeralBridge {
     async fn list_tools(&self) -> Result<Vec<McpTool>, McpError> {
+        if let McpAuth::UserOAuth(auth) = &self.upstream.auth {
+            return self
+                .as_signed_in_user(auth, |bridge| {
+                    async move { bridge.list_tools().await }.boxed()
+                })
+                .await;
+        }
         RmcpBridge::connect(&self.upstream)
             .await?
             .list_tools()
@@ -835,10 +1276,91 @@ impl McpBridge for EphemeralBridge {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<McpToolResult, McpError> {
+        if let McpAuth::UserOAuth(auth) = &self.upstream.auth {
+            return self
+                .as_signed_in_user(auth, |bridge| {
+                    let arguments = arguments.clone();
+                    async move { bridge.call_tool(name, arguments).await }.boxed()
+                })
+                .await;
+        }
         RmcpBridge::connect(&self.upstream)
             .await?
             .call_tool(name, arguments)
             .await
+    }
+
+    async fn preflight_auth(&self) -> Result<(), McpError> {
+        let claimed = self
+            .upstream
+            .forwarded_client_headers
+            .iter()
+            .any(|(name, _)| name == http::header::AUTHORIZATION);
+        match &self.upstream.auth {
+            McpAuth::TokenExchange(auth) if !claimed => auth
+                .token(tokio::time::Instant::now() + self.upstream.timeout)
+                .await
+                .map(drop),
+            McpAuth::UserOAuth(auth) => auth.token().await.map(drop),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl EphemeralBridge {
+    /// Run `operation` with the caller's token. A `401` on an apparently
+    /// valid token earns one forced refresh and one more try; that one being
+    /// refused as well means the token endpoint and the server disagree, and
+    /// only a new sign-in can settle it.
+    ///
+    /// The retry cannot repeat a tool's side effects: a server that answered
+    /// `401` did not run it.
+    async fn as_signed_in_user<'a, T>(
+        &'a self,
+        auth: &'a UserOAuthAuth,
+        operation: impl Fn(RmcpBridge) -> BoxFuture<'a, Result<T, McpError>>,
+    ) -> Result<T, McpError> {
+        let (manager, subject) = auth.resolved()?;
+        let token = auth.token().await?;
+        let attempt = |token: String| {
+            let upstream = McpUpstream {
+                auth: McpAuth::Bearer(token),
+                ..self.upstream.clone()
+            };
+            let operation = &operation;
+            async move {
+                let bridge = RmcpBridge::connect_once(&upstream).await?;
+                operation(bridge).await.map_err(|error| match error {
+                    McpError::Unauthorized(_) => ConnectFailure::Unauthorized(error),
+                    other => ConnectFailure::Other(other),
+                })
+            }
+        };
+        let after_contact = |failure| {
+            McpError::UserOAuth(crate::error::UserOAuthError {
+                failure,
+                reached_upstream: true,
+            })
+        };
+        match attempt(token.clone()).await {
+            Err(ConnectFailure::Unauthorized(_)) => {}
+            other => return other.map_err(ConnectFailure::into_error),
+        }
+        let fresh = manager
+            .refresh_rejected(&auth.server, subject, &token)
+            .await
+            .map_err(after_contact)?;
+        match attempt(fresh.clone()).await {
+            Err(ConnectFailure::Unauthorized(_)) => {
+                manager
+                    .discard_rejected(&auth.server, subject, &fresh)
+                    .await;
+                Err(after_contact(
+                    crate::error::UserOAuthFailure::AuthorizationRequired,
+                ))
+            }
+            other => other.map_err(ConnectFailure::into_error),
+        }
     }
 }
 
@@ -1049,13 +1571,37 @@ mod tests {
         let oauth = McpAuth::OAuth2(OAuthClientConfig {
             client_id: "cid".into(),
             client_secret: "cs-LEAK".into(),
-            token_url: "https://idp.example.com/token".into(),
+            token_url: "https://cid:basic@idp.example.com/token".into(),
             scopes: vec!["read".into()],
         });
+        let upstream = McpUpstream {
+            url: "https://svc:pw@mcp.example.com/mcp".into(),
+            auth: McpAuth::None,
+            timeout: Duration::from_secs(1),
+            protocol: McpProtocol::default(),
+            forwarded_client_headers: Vec::new(),
+        };
+        let exchange = McpAuth::TokenExchange(TokenExchangeAuth {
+            config: TokenExchangeConfig {
+                profile: Some(aisix_core::McpTokenExchangeProfile::EntraObo),
+                token_url: "https://login.example.com/token".into(),
+                client_id: "cid".into(),
+                client_secret: "obo-secret-LEAK".into(),
+                scopes: vec!["api://x/.default".into()],
+                server: "s\x1fhttps://svc:url-LEAK@mcp.example.com/mcp".into(),
+            },
+            subject: Some(SubjectToken("subject-LEAK".into())),
+        });
+        let caller = CallerCredentials {
+            delegated_authorization: Some(HeaderValue::from_static("Bearer user-LEAK")),
+            subject_token: Some("jwt-LEAK".into()),
+            user_oauth: None,
+        };
         let rendered = format!(
-            "{oauth:?} {:?} {:?}",
+            "{oauth:?} {:?} {:?} {upstream:?} {exchange:?} {caller:?} {:?}",
             McpAuth::ApiKey("key-LEAK".into()),
-            McpAuth::Bearer("tok-LEAK".into())
+            McpAuth::Bearer("tok-LEAK".into()),
+            McpAuth::Delegate(Some(HeaderValue::from_static("Bearer user-LEAK"))),
         );
         assert!(
             !rendered.contains("LEAK"),
@@ -1080,5 +1626,47 @@ mod tests {
         let truncated = sanitize_error_message(&long);
         assert!(truncated.chars().count() <= 257, "bounded output");
         assert!(truncated.ends_with('…'));
+    }
+
+    /// rmcp's text ends at reqwest's "error sending request"; the failed session
+    /// has to reach the gateway's warn line with what actually went wrong.
+    #[tokio::test]
+    async fn a_failed_connect_names_its_cause() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let upstream = McpUpstream::new(format!("http://{addr}/mcp"));
+        let err = RmcpBridge::connect(&upstream)
+            .await
+            .err()
+            .expect("nothing listens");
+        let text = err.to_string();
+        assert!(text.to_lowercase().contains("refused"), "{text}");
+    }
+
+    /// After the session opened, a dead connection arrives two ways: the POST
+    /// failing, and the response's event stream failing mid-body.
+    #[tokio::test]
+    async fn a_failed_request_names_its_cause() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let send = || async {
+            rmcp_reqwest::get(format!("http://{addr}/mcp"))
+                .await
+                .expect_err("nothing listens")
+        };
+        let client = StreamableHttpError::<rmcp_reqwest::Error>::Client(send().await);
+        let body =
+            StreamableHttpError::<rmcp_reqwest::Error>::Sse(SseError::Body(Box::new(send().await)));
+        for failure in [client, body] {
+            let transport = rmcp::transport::DynamicTransportError::from_parts(
+                "test",
+                std::any::TypeId::of::<()>(),
+                Box::new(failure),
+            );
+            let text = request_error(rmcp::ServiceError::TransportSend(transport)).to_string();
+            assert!(text.to_lowercase().contains("refused"), "{text}");
+        }
     }
 }

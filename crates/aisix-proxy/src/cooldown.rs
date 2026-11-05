@@ -6,6 +6,7 @@
 //!  - `/v1/responses` (responses.rs — OpenAI Responses API passthrough)
 //!  - `/v1/audio/{speech,transcriptions,translations}` (audio.rs)
 //!  - `/v1/rerank` (rerank.rs)
+//!  - `/v1/systemone`, `/v1/decisions` (decisions.rs)
 //!
 //! Every one of those paths surfaces upstream failures as
 //! [`BridgeError`]. The runtime-status layer (see [`crate::health`])
@@ -47,13 +48,21 @@ use crate::health::ModelRuntimeStatusTracker;
 /// `default_seconds: 0` is treated as "do not cool down on this
 /// category" — matches the operator's likely intent of "disable
 /// cooldown TTL" (M-2 audit on PR #268).
+///
+/// Cooldown itself is opt-in. A model with no `cooldown` block never
+/// reaches the decision at all: it used to be handed a
+/// `CooldownConfig::default()` whose `enabled` then read as `true`,
+/// which is how every direct model nobody configured ended up cooling
+/// down for 30s on a built-in status list while the console showed the
+/// feature as disabled (AISIX-Cloud#1499). The knobs INSIDE an enabled
+/// block keep their defaults — those are parameters of a feature the
+/// operator opted into.
 pub fn decide_cooldown(
     err: &BridgeError,
     cfg: Option<&CooldownConfig>,
 ) -> Option<(Duration, &'static str)> {
-    let default_cfg = CooldownConfig::default();
-    let cfg = cfg.unwrap_or(&default_cfg);
-    if !cfg.enabled_or_default() {
+    let cfg = cfg?;
+    if !cfg.is_enabled() {
         return None;
     }
 
@@ -114,7 +123,11 @@ pub fn decide_cooldown(
         {
             Some((default_ttl, "transport_error"))
         }
-        BridgeError::UpstreamDecode(_) if cfg.trigger_on_transport_or_default() => {
+        // A 2xx whose body the gateway could not read says nothing about
+        // the upstream's health.
+        BridgeError::UpstreamDecode(_) | BridgeError::UpstreamBodyUnread { .. } => None,
+        // A credential exchange that answered unreadably served nothing.
+        BridgeError::TokenExchangeDecode(_) if cfg.trigger_on_transport_or_default() => {
             Some((default_ttl, "upstream_decode_error"))
         }
         // Config errors mean WE are misconfigured (missing provider, bad
@@ -170,6 +183,16 @@ mod tests {
         BridgeError::upstream_status(status, "boom")
     }
 
+    /// The minimum an operator writes to turn cooldown on. Cooldown is
+    /// opt-in, so passing `None` here would make every knob assertion
+    /// below pass for the wrong reason.
+    fn enabled() -> CooldownConfig {
+        CooldownConfig {
+            enabled: Some(true),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn in_band_errors_cool_down_by_embedded_status_or_transport_gate() {
         let in_band = |status: Option<u16>| BridgeError::UpstreamInBand {
@@ -180,16 +203,17 @@ mod tests {
         };
         // Embedded status follows the trigger-status list: 503 is in
         // the default list, 400 is not.
-        let (ttl, reason) = decide_cooldown(&in_band(Some(503)), None).expect("cooldown");
+        let (ttl, reason) =
+            decide_cooldown(&in_band(Some(503)), Some(&enabled())).expect("cooldown");
         assert_eq!(reason, "upstream_server_error");
         assert!(ttl > Duration::ZERO);
-        assert!(decide_cooldown(&in_band(Some(400)), None).is_none());
+        assert!(decide_cooldown(&in_band(Some(400)), Some(&enabled())).is_none());
         // Status-less in-band errors follow the transport gate.
-        let (_, reason) = decide_cooldown(&in_band(None), None).expect("cooldown");
+        let (_, reason) = decide_cooldown(&in_band(None), Some(&enabled())).expect("cooldown");
         assert_eq!(reason, "upstream_in_band_error");
         let cfg = CooldownConfig {
             trigger_on_transport: Some(false),
-            ..Default::default()
+            ..enabled()
         };
         assert!(decide_cooldown(&in_band(None), Some(&cfg)).is_none());
     }
@@ -201,7 +225,7 @@ mod tests {
         // cap, which surprised operators who expected disable.
         let cfg = CooldownConfig {
             default_seconds: Some(0),
-            ..Default::default()
+            ..enabled()
         };
         assert!(decide_cooldown(&upstream(429), Some(&cfg)).is_none());
         assert!(decide_cooldown(&upstream(503), Some(&cfg)).is_none());
@@ -232,7 +256,8 @@ mod tests {
         // responses.rs / audio.rs / rerank.rs all route through here.
         let tracker = ModelRuntimeStatusTracker::new();
         let err = BridgeError::Transport("connection refused".into());
-        let returned = note_failure(&tracker, "m-1", None, err);
+        let cfg = enabled();
+        let returned = note_failure(&tracker, "m-1", Some(&cfg), err);
         // Error returned unchanged.
         assert!(matches!(returned, BridgeError::Transport(_)));
         // Tracker now reports cooldown for this target.
@@ -247,13 +272,29 @@ mod tests {
     }
 
     #[test]
-    fn note_failure_marks_cooldown_for_decode_errors() {
+    fn note_failure_leaves_a_decode_error_out_of_cooldown() {
         let tracker = ModelRuntimeStatusTracker::new();
         let err = BridgeError::UpstreamDecode("bad json".into());
-        let _ = note_failure(&tracker, "m-1", None, err);
+        let cfg = enabled();
+        let _ = note_failure(&tracker, "m-1", Some(&cfg), err);
+        assert_ne!(
+            tracker.status("m-1").status,
+            crate::health::RuntimeStatus::Cooldown
+        );
+    }
+
+    #[test]
+    fn note_failure_cools_down_on_an_unreadable_token_exchange() {
+        let tracker = ModelRuntimeStatusTracker::new();
+        let err = BridgeError::TokenExchangeDecode("bad token json".into());
+        let _ = note_failure(&tracker, "m-1", Some(&enabled()), err);
         assert_eq!(
             tracker.status("m-1").status,
             crate::health::RuntimeStatus::Cooldown
+        );
+        assert_eq!(
+            tracker.status("m-1").status_reason.as_deref(),
+            Some("upstream_decode_error")
         );
     }
 
@@ -273,10 +314,25 @@ mod tests {
     }
 
     #[test]
+    fn note_failure_no_op_when_no_cooldown_config() {
+        // AISIX-Cloud#1499: `None` — the shape every model gets when the
+        // operator never enabled cooldown — takes nothing out of
+        // rotation. This is the same guard as the test above, on the
+        // input the control plane actually projects.
+        let tracker = ModelRuntimeStatusTracker::new();
+        let err = BridgeError::upstream_status(503, "boom");
+        let _ = note_failure(&tracker, "m-1", None, err);
+        assert_eq!(
+            tracker.status("m-1").status,
+            crate::health::RuntimeStatus::Healthy
+        );
+    }
+
+    #[test]
     fn honor_retry_after_clamps_to_max_seconds() {
         let cfg = CooldownConfig {
             max_seconds: Some(60),
-            ..Default::default()
+            ..enabled()
         };
         let err = BridgeError::upstream_status_with_retry_after(
             429,

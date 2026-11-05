@@ -1,11 +1,11 @@
 //! Bearer-token authentication for the proxy surface.
 //!
-//! The extractor [`AuthenticatedKey`] parses `Authorization: Bearer <key>`
-//! (or `x-api-key: <key>` as a convenience alternative), looks the key
-//! up in the current `AisixSnapshot`, and yields the matching `ApiKey`
-//! entity. Handlers take `AuthenticatedKey` as an argument — if parsing
-//! or lookup fails the request is short-circuited with a 401 envelope
-//! before the handler runs.
+//! The extractor [`AuthenticatedKey`] reads the caller's gateway credential
+//! from the request headers ([`header_credential`] has the precedence),
+//! looks the key up in the current `AisixSnapshot`, and yields the
+//! matching `ApiKey` entity. Handlers take `AuthenticatedKey` as an
+//! argument — if parsing or lookup fails the request is short-circuited
+//! with a 401 envelope before the handler runs.
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::ApiKey;
@@ -25,29 +25,115 @@ pub struct AuthenticatedKey {
     /// cannot name the subject once claim mappings let many identities
     /// share one key (#564).
     pub jwt: Option<Arc<JwtIdentity>>,
+    /// `true` when the principal came from an entry's anonymous
+    /// configuration instead of a credential the caller presented —
+    /// the MCP anonymous entries (AISIX-Cloud#1313) and passthrough
+    /// routes in `auth_mode: anonymous`.
+    ///
+    /// `entry` names the principal either way; this says whether the
+    /// caller PROVED it, which `entry` alone cannot tell once a key
+    /// doubles as an anonymous principal. A handler that sets it must
+    /// also stamp `UsageEvent::auth_type` (see
+    /// `usage_attr::apply_auth_type`), or anonymous traffic becomes
+    /// indistinguishable from the key's own in the usage record.
+    pub anonymous: bool,
+    /// The team and member documents the key's `team_id` / `user_id`
+    /// name, resolved against the snapshot the request authenticated on.
+    /// Read through [`AuthenticatedKey::team_name`] and
+    /// [`AuthenticatedKey::user_name`], never off the key directly — the
+    /// key's own `user_name` is only the fallback.
+    pub owner: aisix_core::KeyOwnerNames,
+    /// The request's effective cost-attribution tags, resolved from the key
+    /// and its `owner` rows ([`aisix_core::KeyOwnerNames::effective_tags`])
+    /// and, for a JWT caller, overridden per key by what the provider's
+    /// `tag_claims` reads from the token ([`AuthenticatedKey::for_jwt`]).
+    /// Read by tag budgets and the `tag:` rate-limit policy dimensions, and
+    /// stamped on every usage event through [`AuthenticatedKey::caller`].
+    pub tags: Arc<aisix_core::Tags>,
 }
 
+/// The principal's effective tags, published beside its owner names so
+/// `ClientContext` reuses them instead of resolving them again.
+#[derive(Clone)]
+pub(crate) struct EffectiveTags(pub(crate) Arc<aisix_core::Tags>);
+
 /// The verified JWT identity a request authenticated as.
-#[derive(Debug)]
 pub struct JwtIdentity {
     /// Value of the trust provider's identity claim (`sub` by default).
     pub subject: String,
     /// Name of the OIDC provider that verified the token.
     pub provider: String,
+    /// That provider's configured issuer, which keys this caller's stored
+    /// upstream credentials. `None` on a provider that pins none.
+    pub(crate) issuer: Option<String>,
+    /// That provider's identity claim, which keys them too: `subject` means
+    /// someone else under another claim.
+    pub(crate) identity_claim: String,
     /// Name of the claim mapping that selected the API key, or `None`
     /// when the subject was bound to the key directly via `jwt_subject`.
     pub claim_mapping: Option<String>,
+    /// The bearer token itself, exactly as the trust provider verified it —
+    /// what an `oauth2_token_exchange` MCP server exchanges on the caller's
+    /// behalf. Never printed. `None` for a session token: the gateway's own
+    /// credential, which means nothing to anyone else and never leaves here.
+    pub(crate) token: Option<Arc<str>>,
 }
 
-/// Per-request context carried onto an authentication denial.
-///
-/// A 401 short-circuits ahead of every handler, so the request never
-/// reaches an access-log emit; #1081 deliberately kept these out
-/// of the access log because an internet-facing DP would drown in scanner
-/// probes, leaving `aisix_auth_decisions_total` as the only record. That
-/// metric answers "how many" but not "who, when, against what" — so the
-/// denial log line, which an operator turns on precisely when investigating,
-/// carries the identifying detail instead.
+impl JwtIdentity {
+    pub fn new(
+        subject: String,
+        provider: String,
+        issuer: Option<String>,
+        identity_claim: String,
+        claim_mapping: Option<String>,
+        token: Arc<str>,
+    ) -> Self {
+        Self {
+            subject,
+            provider,
+            issuer,
+            identity_claim,
+            claim_mapping,
+            token: Some(token),
+        }
+    }
+
+    /// The identity of a session token, which a trust provider verified at
+    /// sign-in rather than on this request.
+    pub(crate) fn for_session(
+        subject: String,
+        provider: String,
+        issuer: Option<String>,
+        identity_claim: String,
+        claim_mapping: Option<String>,
+    ) -> Self {
+        Self {
+            subject,
+            provider,
+            issuer,
+            identity_claim,
+            claim_mapping,
+            token: None,
+        }
+    }
+}
+
+/// Hand-written so this type keeps a single, reviewed print shape: it is
+/// carried on the request extensions through every handler, and a derived
+/// form would follow whatever fields it grows next.
+impl std::fmt::Debug for JwtIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JwtIdentity")
+            .field("subject", &self.subject)
+            .field("provider", &self.provider)
+            .field("claim_mapping", &self.claim_mapping)
+            .finish()
+    }
+}
+
+/// Per-request context carried onto an authentication denial's
+/// `aisix::auth` log line, beside the access-log line the extractor writes
+/// for the same request (see [`emit_denial_access_log`]).
 #[derive(Clone, Copy)]
 pub(crate) struct DenialContext<'a> {
     pub method: &'a str,
@@ -84,8 +170,72 @@ impl LazySourceIp<'_> {
 }
 
 impl AuthenticatedKey {
+    /// A principal resolved from `snapshot`, with its owner names read
+    /// from the same snapshot.
+    pub(crate) fn new(
+        snapshot: &aisix_core::AisixSnapshot,
+        entry: Arc<ResourceEntry<ApiKey>>,
+        jwt: Option<Arc<JwtIdentity>>,
+        anonymous: bool,
+    ) -> Self {
+        let owner = aisix_core::KeyOwnerNames::resolve(snapshot, &entry.value);
+        Self {
+            tags: Arc::new(owner.effective_tags(&entry.value)),
+            owner,
+            entry,
+            jwt,
+            anonymous,
+        }
+    }
+
+    /// A principal a trust provider vouched for, by a token verified on this
+    /// request or at sign-in. The one way a JWT identity becomes a principal,
+    /// so neither path can miss the tags `provider` reads from `claims`.
+    pub(crate) fn for_jwt(
+        snapshot: &aisix_core::AisixSnapshot,
+        entry: Arc<ResourceEntry<ApiKey>>,
+        jwt: JwtIdentity,
+        provider: &aisix_core::models::OidcProvider,
+        claims: &serde_json::Value,
+    ) -> Self {
+        let mut auth = Self::new(snapshot, entry, Some(Arc::new(jwt)), false);
+        crate::jwt::apply_tag_claims(Arc::make_mut(&mut auth.tags), provider, claims);
+        auth
+    }
+
     pub fn key(&self) -> &ApiKey {
         &self.entry.value
+    }
+
+    /// Publish the principal to the request's extensions, where
+    /// `ClientContext` reads the key, its resolved owner names and tags.
+    pub(crate) fn publish(&self, parts: &mut Parts) {
+        parts.extensions.insert(self.entry.clone());
+        parts.extensions.insert(self.owner.clone());
+        parts
+            .extensions
+            .insert(EffectiveTags(Arc::clone(&self.tags)));
+    }
+
+    /// The key's display name, for the `api_key_name` metric label.
+    pub(crate) fn api_key_name(&self) -> Option<&str> {
+        self.key().telemetry_name()
+    }
+
+    /// See [`aisix_core::KeyOwnerNames::team_name`].
+    pub(crate) fn team_name(&self) -> Option<&str> {
+        self.owner.team_name()
+    }
+
+    /// See [`aisix_core::KeyOwnerNames::user_name`].
+    pub(crate) fn user_name(&self) -> Option<&str> {
+        self.owner.user_name(self.key())
+    }
+
+    /// The caller identity a usage event is attributed to, resolved from
+    /// the same owner rows as [`Self::user_name`].
+    pub(crate) fn caller(&self) -> aisix_gateway::CallerIdentity {
+        aisix_gateway::CallerIdentity::from_entry(&self.entry, &self.owner, Arc::clone(&self.tags))
     }
 }
 
@@ -98,55 +248,140 @@ where
     type Rejection = ProxyError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let proxy_state = ProxyState::from_ref(state);
-        let request_id = parts
-            .extensions
-            .get::<crate::request_id::RequestId>()
-            .map(|r| r.0.as_str())
-            .unwrap_or_default();
-        let ctx = DenialContext {
-            method: parts.method.as_str(),
-            path: parts.uri.path(),
-            request_id,
-            // Deferred: only a denial resolves the source IP.
-            source_ip: LazySourceIp::Deferred(&*parts, proxy_state.real_ip.as_ref()),
-        };
-        let token = match extract_bearer(parts) {
-            Ok(t) => t,
-            Err(e) => {
-                // No credential at all: metric + a debug line, never the
-                // access log — logging every scanner probe at the default
-                // level would be noise (#1081).
-                proxy_state
-                    .metrics
-                    .record_auth_decision("none", false, "missing_credentials");
-                tracing::debug!(
-                    target: "aisix::auth",
-                    method = "none",
-                    reason = "missing_credentials",
-                    http_method = %ctx.method,
-                    path = %ctx.path,
-                    request_id = %ctx.request_id,
-                    source_ip = %ctx.source_ip.resolve(),
-                    "rejected inbound request without a credential",
-                );
-                return Err(e);
-            }
-        };
-        let authed = authenticate_token(&proxy_state, &token, ctx).await?;
-        // Publish the resolved key so extractors that run after this one can
-        // see who is calling without re-authenticating. `ClientContext` reads
-        // it for the `${request.api_key.*}` header templates
-        // (#1112) — which is why every handler declares
-        // `auth: AuthenticatedKey` before `client: ClientContext`.
-        parts.extensions.insert(authed.entry.clone());
-        // Same for the JWT identity: `ClientContext` carries it to each
-        // handler's usage-event emitter for attribution.
-        if let Some(jwt) = &authed.jwt {
-            parts.extensions.insert(jwt.clone());
+        let started = std::time::Instant::now();
+        let result = extract_authenticated_key(parts, state).await;
+        if let Err(err) = &result {
+            emit_denial_access_log(parts, started, err);
+            record_denial_metrics(&ProxyState::from_ref(state), parts, started, err);
         }
-        Ok(authed)
+        result
     }
+}
+
+/// Count a request the extractor refused in the request families, as every
+/// other refusal is: without it a 401 / 403 on a typed route existed in the
+/// access log and nowhere in `aisix_proxy_*` / `aisix_llm_*`.
+pub(crate) fn record_denial_metrics(
+    state: &ProxyState,
+    parts: &Parts,
+    started: std::time::Instant,
+    err: &ProxyError,
+) {
+    crate::request_metrics::record_undispatched(
+        state,
+        // The raw path is caller-controlled; only the route template may
+        // become a label (#451).
+        crate::normalize_endpoint_label(parts.uri.path()),
+        crate::request_metrics::Caller::unattributed(None),
+        crate::request_metrics::Upstream {
+            provider: crate::request_metrics::UNKNOWN,
+            model: crate::usage_attr::UNRESOLVED_MODEL_LABEL,
+            ..Default::default()
+        },
+        err.status().as_u16(),
+        crate::attempt::error_source(err),
+        started.elapsed(),
+    );
+}
+
+/// Write the access-log line for a request the extractor refused.
+///
+/// The refusal short-circuits ahead of the handler, which is where every
+/// other line is written, so without this an authentication denial left no
+/// access-log record at all. Nothing about the caller is resolved yet: the
+/// line carries no key id (a disabled or expired key's id is on the
+/// `aisix::auth` warn line), and never any part of the presented credential.
+pub(crate) fn emit_denial_access_log(parts: &Parts, started: std::time::Instant, err: &ProxyError) {
+    let request_id = parts
+        .extensions
+        .get::<crate::request_id::RequestId>()
+        .map(|r| r.0.as_str())
+        .unwrap_or_default();
+    let elapsed = started.elapsed();
+    let (error_kind, error) = crate::attempt::access_log_error(err);
+    crate::attribution::emit_access_log(aisix_obs::AccessLog {
+        method: parts.method.as_str(),
+        path: parts.uri.path(),
+        status: err.status().as_u16(),
+        latency: elapsed,
+        duration: elapsed,
+        provider: None,
+        model: None,
+        upstream_model: None,
+        provider_key_id: None,
+        api_key_id: None,
+        prompt_tokens: None,
+        completion_tokens: None,
+        total_tokens: None,
+        request_id,
+        provider_request_id: None,
+        served_by_model: None,
+        routing_attempt_count: None,
+        routing_fallback_count: None,
+        error_kind: Some(error_kind),
+        error: Some(&error),
+        mcp: None,
+        cache: None,
+        request_body_bytes: None,
+        response_body_bytes: None,
+    });
+}
+
+async fn extract_authenticated_key<S>(
+    parts: &mut Parts,
+    state: &S,
+) -> Result<AuthenticatedKey, ProxyError>
+where
+    S: Send + Sync,
+    ProxyState: FromRef<S>,
+{
+    let proxy_state = ProxyState::from_ref(state);
+    let request_id = parts
+        .extensions
+        .get::<crate::request_id::RequestId>()
+        .map(|r| r.0.as_str())
+        .unwrap_or_default();
+    let ctx = DenialContext {
+        method: parts.method.as_str(),
+        path: parts.uri.path(),
+        request_id,
+        // Deferred: only a denial resolves the source IP.
+        source_ip: LazySourceIp::Deferred(&*parts, proxy_state.real_ip.as_ref()),
+    };
+    let token = match extract_bearer(parts) {
+        Ok(t) => t,
+        Err(e) => {
+            // No credential at all: the scanner-probe shape, so the
+            // `aisix::auth` line stays at debug.
+            proxy_state
+                .metrics
+                .record_auth_decision("none", false, "missing_credentials");
+            tracing::debug!(
+                target: "aisix::auth",
+                method = "none",
+                reason = "missing_credentials",
+                http_method = %ctx.method,
+                path = %ctx.path,
+                request_id = %ctx.request_id,
+                source_ip = %ctx.source_ip.resolve(),
+                "rejected inbound request without a credential",
+            );
+            return Err(e);
+        }
+    };
+    let authed = authenticate_token(&proxy_state, &token, ctx).await?;
+    // Publish the resolved key so extractors that run after this one can
+    // see who is calling without re-authenticating. `ClientContext` reads
+    // it for the `${request.api_key.*}` header templates
+    // (AISIX-Cloud#1112) — which is why every handler declares
+    // `auth: AuthenticatedKey` before `client: ClientContext`.
+    authed.publish(parts);
+    // Same for the JWT identity: `ClientContext` carries it to each
+    // handler's usage-event emitter for attribution.
+    if let Some(jwt) = &authed.jwt {
+        parts.extensions.insert(jwt.clone());
+    }
+    Ok(authed)
 }
 
 /// Authenticate a plaintext bearer and enforce key lifecycle. The single
@@ -163,6 +398,24 @@ pub(crate) async fn authenticate_token(
     token: &str,
     ctx: DenialContext<'_>,
 ) -> Result<AuthenticatedKey, ProxyError> {
+    let authed = authenticate_token_inner(state, token, ctx).await?;
+    // Hand the principal to the request's attribution cell, so a caller
+    // that hangs up still files an ATTRIBUTABLE usage row
+    // (AISIX-Cloud#1571). Here rather than in the extractor above because
+    // three surfaces authenticate without it — a passthrough route's own
+    // `auth_mode`, `/v1/realtime`'s WebSocket subprotocol, and `/mcp` —
+    // and two of them build no `ClientContext` either. The two places that
+    // mint an ANONYMOUS principal instead of verifying a credential note it
+    // themselves (`mcp::resolve_caller`, `passthrough_route::authenticate`).
+    crate::attribution::note_authenticated(&authed);
+    Ok(authed)
+}
+
+async fn authenticate_token_inner(
+    state: &ProxyState,
+    token: &str,
+    ctx: DenialContext<'_>,
+) -> Result<AuthenticatedKey, ProxyError> {
     let snapshot = state.snapshot.load();
     // Provider gate first: it is O(1) when no trust provider is
     // configured, so key-only deployments never pay the structural JWT
@@ -173,7 +426,7 @@ pub(crate) async fn authenticate_token(
         // custom-imported key that happens to look like a JWT keeps
         // authenticating on deployments that never enable JWT auth.
     }
-    // Self-hosted CP (prd-09a §9A.7B.4): the snapshot stores
+    // The control plane (prd-09a §9A.7B.4) stores
     // SHA-256 hashes of the plaintext bearer, never the plaintext
     // itself. Hash the incoming token via the canonical helper
     // and look up by the hex digest. The control plane hashes with the same
@@ -214,14 +467,11 @@ pub(crate) async fn authenticate_token(
         ));
     }
     state.metrics.record_auth_decision("api_key", true, "");
-    Ok(AuthenticatedKey { entry, jwt: None })
+    Ok(AuthenticatedKey::new(&snapshot, entry, None, false))
 }
 
-/// Record an API-key denial on the decision metric + log
-/// (#1081 — before this, a 401 was invisible: the extractor
-/// short-circuits ahead of every handler, so neither the request
-/// counter nor the access log ever fired). The token itself is never
-/// logged.
+/// Record an API-key denial on the decision metric + log. The token itself
+/// is never logged.
 ///
 /// `unknown_key` is the scanner-probe shape (`Bearer <junk>`), so it logs
 /// at `debug` and an internet-facing DP is not flooded at the default
@@ -229,10 +479,8 @@ pub(crate) async fn authenticate_token(
 /// provisioned, so they stay at `warn` and carry `api_key_id`.
 ///
 /// Every line carries the [`DenialContext`] — the caller's address, the
-/// route it hit, and the request id. Without it the record was
-/// unactionable: the metric has no such dimensions, and the 401 never
-/// reaches the access log, so "who is hammering us with a bad key" had no
-/// answer anywhere.
+/// route it hit, and the request id — which the metric has no dimensions
+/// for and the access-log line does not carry (it has no source address).
 fn deny_key(
     state: &ProxyState,
     reason: &'static str,
@@ -268,27 +516,102 @@ fn deny_key(
     err
 }
 
+/// Dedicated header for the caller's gateway credential. When present it
+/// is the ONLY header read for gateway authentication, which leaves
+/// `Authorization` free to carry a credential meant for an upstream (an MCP
+/// server's own OAuth token, for instance). Its `x-aisix-` prefix keeps it
+/// off every upstream request (`aisix_core::header_forward_blocked`).
+pub(crate) const GATEWAY_KEY_HEADER: &str =
+    aisix_core::forwarded_headers::GATEWAY_CREDENTIAL_HEADER;
+
+/// How a `MissingAuth` message spells `Authorization` (display text, not
+/// the lowercase wire name) — also what it names when the request carries
+/// no credential header at all.
+pub(crate) const AUTHORIZATION_LABEL: &str = "Authorization";
+pub(crate) const X_API_KEY_HEADER: &str = "x-api-key";
+
+/// Whether the request OFFERS an inbound gateway credential at all.
+///
+/// Deliberately wider than [`header_credential`]: a present-but-unusable
+/// credential header — wrong scheme, empty value, bytes that are not
+/// ASCII — counts as offered. Anonymous entry (AISIX-Cloud#1313) is the
+/// no-credential path, so a caller that tried to authenticate and got
+/// it wrong must be rejected rather than quietly succeed as the
+/// anonymous principal with a different grant than it asked for.
+pub(crate) fn credential_offered(parts: &Parts) -> bool {
+    [
+        GATEWAY_KEY_HEADER,
+        axum::http::header::AUTHORIZATION.as_str(),
+        X_API_KEY_HEADER,
+    ]
+    .iter()
+    .any(|name| parts.headers.contains_key(*name))
+}
+
+/// Whether the caller's gateway credential came from [`GATEWAY_KEY_HEADER`]
+/// rather than `Authorization` / `x-api-key` — i.e. whether an
+/// `Authorization` on the request was NOT what the gateway admitted it with.
+pub(crate) fn admitted_via_gateway_key_header(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key(GATEWAY_KEY_HEADER)
+}
+
+/// The caller's gateway credential, read from the request headers by
+/// precedence: [`GATEWAY_KEY_HEADER`] when the header is present, else
+/// `Authorization: Bearer`, else `x-api-key`. The first header present
+/// decides — an empty or malformed one is `MissingAuth` naming that
+/// header, never a fall-through to the next. `None` when none of the three
+/// is present.
+pub(crate) fn header_credential(
+    headers: &axum::http::HeaderMap,
+) -> Option<Result<String, ProxyError>> {
+    if let Some(raw) = headers.get(GATEWAY_KEY_HEADER) {
+        return Some(gateway_key_header_credential(raw));
+    }
+    if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
+        let Ok(s) = auth.to_str() else {
+            return Some(Err(ProxyError::MissingAuth(AUTHORIZATION_LABEL)));
+        };
+        return Some(
+            match aisix_core::forwarded_headers::strip_bearer_scheme(s).map(str::trim) {
+                Some(rest) if !rest.is_empty() => Ok(rest.to_string()),
+                _ => Err(ProxyError::MissingAuth(AUTHORIZATION_LABEL)),
+            },
+        );
+    }
+    headers
+        .get(X_API_KEY_HEADER)
+        .map(|raw| raw_credential(raw, X_API_KEY_HEADER))
+}
+
+/// The credential in [`GATEWAY_KEY_HEADER`]: the key itself, or the key
+/// behind a `Bearer ` scheme for clients that only know how to send one.
+pub(crate) fn gateway_key_header_credential(
+    raw: &axum::http::HeaderValue,
+) -> Result<String, ProxyError> {
+    let value = raw_credential(raw, GATEWAY_KEY_HEADER)?;
+    match aisix_core::forwarded_headers::strip_bearer_scheme(&value).map(str::trim) {
+        Some("") => Err(ProxyError::MissingAuth(GATEWAY_KEY_HEADER)),
+        Some(key) => Ok(key.to_string()),
+        None => Ok(value),
+    }
+}
+
+fn raw_credential(
+    raw: &axum::http::HeaderValue,
+    header: &'static str,
+) -> Result<String, ProxyError> {
+    let s = raw
+        .to_str()
+        .map_err(|_| ProxyError::MissingAuth(header))?
+        .trim();
+    if s.is_empty() {
+        return Err(ProxyError::MissingAuth(header));
+    }
+    Ok(s.to_string())
+}
+
 fn extract_bearer(parts: &Parts) -> Result<String, ProxyError> {
-    if let Some(auth) = parts.headers.get(axum::http::header::AUTHORIZATION) {
-        let s = auth.to_str().map_err(|_| ProxyError::MissingAuth)?;
-        if let Some(rest) = s.strip_prefix("Bearer ") {
-            let rest = rest.trim();
-            if rest.is_empty() {
-                return Err(ProxyError::MissingAuth);
-            }
-            return Ok(rest.to_string());
-        }
-        return Err(ProxyError::MissingAuth);
-    }
-    if let Some(raw) = parts.headers.get("x-api-key") {
-        let s = raw.to_str().map_err(|_| ProxyError::MissingAuth)?;
-        let s = s.trim();
-        if s.is_empty() {
-            return Err(ProxyError::MissingAuth);
-        }
-        return Ok(s.to_string());
-    }
-    Err(ProxyError::MissingAuth)
+    header_credential(&parts.headers).unwrap_or(Err(ProxyError::MissingAuth(AUTHORIZATION_LABEL)))
 }
 
 #[cfg(test)]
@@ -431,11 +754,13 @@ mod tests {
             thread_per_core: None,
             workers: None,
             addr: "127.0.0.1:0".into(),
-            request_body_limit_bytes: Some(1 << 20),
+            request_body_limit_bytes: 1 << 20,
             tls: None,
+            listeners: Vec::new(),
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),
+            expose_debug_headers: false,
         };
         crate::build_router(
             ProxyState::new(
@@ -515,6 +840,14 @@ mod tests {
         req.into_parts().0
     }
 
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (name, value) in pairs {
+            h.insert(*name, HeaderValue::from_static(value));
+        }
+        h
+    }
+
     #[test]
     fn extract_bearer_happy_path() {
         let mut h = HeaderMap::new();
@@ -535,11 +868,45 @@ mod tests {
     }
 
     #[test]
+    fn the_gateway_key_header_wins_and_never_falls_through() {
+        let both = headers(&[
+            ("x-aisix-api-key", "sk-gateway"),
+            ("authorization", "Bearer upstream-token"),
+            ("x-api-key", "sk-other"),
+        ]);
+        assert_eq!(extract_bearer(&parts_with(both)).unwrap(), "sk-gateway");
+        let with_scheme = headers(&[("x-aisix-api-key", "Bearer sk-gateway")]);
+        assert_eq!(
+            extract_bearer(&parts_with(with_scheme)).unwrap(),
+            "sk-gateway"
+        );
+        // Present but empty: the missing-auth error, not the next header.
+        let empty = headers(&[
+            ("x-aisix-api-key", "  "),
+            ("authorization", "Bearer sk-valid"),
+        ]);
+        assert!(matches!(
+            extract_bearer(&parts_with(empty.clone())),
+            Err(ProxyError::MissingAuth(_))
+        ));
+        assert!(credential_offered(&parts_with(headers(&[(
+            "x-aisix-api-key",
+            "sk-gateway"
+        )]))));
+        // Without it, Authorization still precedes x-api-key.
+        let legacy = headers(&[
+            ("authorization", "Bearer sk-auth"),
+            ("x-api-key", "sk-xapi"),
+        ]);
+        assert_eq!(extract_bearer(&parts_with(legacy)).unwrap(), "sk-auth");
+    }
+
+    #[test]
     fn extract_bearer_rejects_missing_header() {
         let parts = parts_with(HeaderMap::new());
         assert!(matches!(
             extract_bearer(&parts),
-            Err(ProxyError::MissingAuth)
+            Err(ProxyError::MissingAuth(_))
         ));
     }
 
@@ -553,8 +920,67 @@ mod tests {
         let parts = parts_with(h);
         assert!(matches!(
             extract_bearer(&parts),
-            Err(ProxyError::MissingAuth)
+            Err(ProxyError::MissingAuth(_))
         ));
+    }
+
+    #[test]
+    fn credential_offered_covers_unusable_credentials() {
+        // Absent → not offered: the anonymous path may serve these.
+        assert!(!credential_offered(&parts_with(HeaderMap::new())));
+
+        // Present but unusable → offered: must fail, never downgrade. An
+        // empty or whitespace-only value is one of those.
+        for name in [
+            GATEWAY_KEY_HEADER,
+            axum::http::header::AUTHORIZATION.as_str(),
+            X_API_KEY_HEADER,
+        ] {
+            for value in ["", "   ", "Bearer   ", "Basic dXNlcjpwdw==", "sk-abc"] {
+                let mut h = HeaderMap::new();
+                h.insert(name, HeaderValue::from_str(value).unwrap());
+                assert!(
+                    credential_offered(&parts_with(h)),
+                    "{name}: {value:?} must count as an offered credential"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_bearer_scheme_is_case_insensitive() {
+        for value in ["bearer sk-abc", "BEARER sk-abc", "bEaReR sk-abc"] {
+            assert_eq!(
+                extract_bearer(&parts_with(headers(&[("authorization", value)]))).unwrap(),
+                "sk-abc"
+            );
+            let key = headers(&[("x-aisix-api-key", value)]);
+            assert_eq!(extract_bearer(&parts_with(key)).unwrap(), "sk-abc");
+        }
+    }
+
+    #[test]
+    fn missing_auth_names_the_header_that_failed() {
+        let message = |pairs: &[(&'static str, &'static str)]| {
+            extract_bearer(&parts_with(headers(pairs)))
+                .unwrap_err()
+                .to_string()
+        };
+        let authorization = "missing or malformed Authorization header";
+        assert_eq!(message(&[]), authorization);
+        assert_eq!(message(&[("authorization", "")]), authorization);
+        assert_eq!(message(&[("authorization", "Basic abc")]), authorization);
+        assert_eq!(
+            message(&[
+                ("x-aisix-api-key", ""),
+                ("authorization", "Bearer sk-valid")
+            ]),
+            "missing or malformed x-aisix-api-key header"
+        );
+        assert_eq!(
+            message(&[("x-api-key", "  ")]),
+            "missing or malformed x-api-key header"
+        );
     }
 
     #[test]
@@ -567,7 +993,7 @@ mod tests {
         let parts = parts_with(h);
         assert!(matches!(
             extract_bearer(&parts),
-            Err(ProxyError::MissingAuth)
+            Err(ProxyError::MissingAuth(_))
         ));
     }
 }

@@ -114,6 +114,12 @@ pub trait Cache: Send + Sync + 'static {
         value: CachedBody,
         ttl: Duration,
     ) -> Result<(), CacheError>;
+
+    /// Entries held in this process, for an in-process store; `None` for
+    /// a shared backend whose contents live elsewhere.
+    fn local_entry_count(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[cfg(test)]
