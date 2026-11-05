@@ -1295,6 +1295,10 @@ async fn run_session(
     // separately, which needs its own status decision.
     let mut session_error: Option<ProxyError> = None;
     let mut opening = SessionOpening::default();
+    let mut held_output = aisix_guardrails::Guardrail::runs_on_output(&chain)
+        .then(|| aisix_guardrails::Guardrail::stream_output_policy(&chain).hold_cap())
+        .flatten()
+        .map(|(max_buffer_bytes, fail_open)| HeldOutput::new(max_buffer_bytes, fail_open));
 
     loop {
         let next = async {
@@ -1415,31 +1419,75 @@ async fn run_session(
                 Some(Ok(TgMessage::Text(text))) => {
                     usage.absorb(&text);
                     opening.observe(&state, &model_entry.id, Some(&text));
+                    let mut refused = None;
                     if !chain.is_empty() {
-                        if let Some(resp) = guardrail_block_event(
+                        refused = guardrail_block_event(
                             &chain,
                             &model_entry.value.display_name,
                             &text,
                             false,
                             &mut monitor_hits,
                         )
-                        .await
-                        {
-                            let (resp, refusal) = resp;
-                            let _ = client_tx.send(AxMessage::Text(resp)).await;
-                            let _ = client_tx
-                                .send(AxMessage::Close(Some(CloseFrame {
-                                    code: 1011,
-                                    reason: "content policy".into(),
-                                })))
-                                .await;
-                            close_status = 400;
-                            session_error = Some(refusal);
+                        .await;
+                    }
+                    let step = match held_output.as_mut().filter(|_| refused.is_none()) {
+                        Some(held) => held.observe(text),
+                        None => OutputStep::release(text),
+                    };
+                    let (scan, frames) = match step {
+                        OutputStep::Held => continue,
+                        OutputStep::Release { scan, frames } => (scan, frames),
+                        OutputStep::Overflow { fail_open, frames } => {
+                            if fail_open {
+                                crate::guardrail_stream::release_output_buffer_unscanned(&chain);
+                                held_output = None;
+                            } else {
+                                aisix_guardrails::Guardrail::record_output_buffer_exceeded(&chain);
+                                let refusal = crate::error::guardrail_block_error(
+                                    "response",
+                                    None,
+                                    Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+                                );
+                                refused = Some((content_filtered_event(&refusal), refusal));
+                            }
+                            (Vec::new(), frames)
+                        }
+                    };
+                    // What was held is judged whole before any of it goes out.
+                    for text in &scan {
+                        if refused.is_some() {
+                            break;
+                        }
+                        refused = guardrail_block_event(
+                            &chain,
+                            &model_entry.value.display_name,
+                            text,
+                            false,
+                            &mut monitor_hits,
+                        )
+                        .await;
+                    }
+                    if let Some((resp, refusal)) = refused {
+                        let _ = client_tx.send(AxMessage::Text(resp)).await;
+                        let _ = client_tx
+                            .send(AxMessage::Close(Some(CloseFrame {
+                                code: 1011,
+                                reason: "content policy".into(),
+                            })))
+                            .await;
+                        close_status = 400;
+                        session_error = Some(refusal);
+                        break;
+                    }
+                    let mut client_gone = false;
+                    for text in frames {
+                        let text = restamp_session_model_out(text, &requested_model);
+                        if client_tx.send(AxMessage::Text(text)).await.is_err() {
+                            client_gone = true;
                             break;
                         }
                     }
-                    let text = restamp_session_model_out(text, &requested_model);
-                    if client_tx.send(AxMessage::Text(text)).await.is_err() {
+                    if client_gone {
                         break;
                     }
                 }
@@ -2049,6 +2097,172 @@ fn binary_frame_refusal(
         chain.record_unevaluable_output_bypass(crate::error::TAG_UNSCANNABLE_BODY);
     }
     None
+}
+
+/// Output text held until the item it belongs to can be judged whole.
+///
+/// A block-capable output chain has to see an answer before any of it reaches
+/// the caller, and on this surface an answer is many delta frames: a literal
+/// across two of them matches neither, and by the `.done` that carries it whole
+/// the caller has it. So under such a chain the text deltas wait, per item, for
+/// that item's `.done`, as a stream on the other routes waits for its end. The
+/// audio of a voice answer cannot be read and is not held: holding it would only
+/// make it late.
+struct HeldOutput {
+    max_buffer_bytes: usize,
+    fail_open: bool,
+    items: Vec<HeldOutputItem>,
+    /// What `items` holds: generated text, which the cap measures, and raw
+    /// frames, which it bounds too.
+    content: usize,
+    raw: usize,
+    gauge: crate::held_content::HeldBytes,
+}
+
+struct HeldOutputItem {
+    item_id: String,
+    text: String,
+    frames: Vec<String>,
+}
+
+/// What [`HeldOutput::observe`] did with a frame.
+enum OutputStep {
+    /// It went into the hold.
+    Held,
+    /// `frames` may go out once `scan` has been judged.
+    Release {
+        scan: Vec<String>,
+        frames: Vec<String>,
+    },
+    /// The hold outgrew its cap, with `frames` all it had, in order.
+    Overflow {
+        fail_open: bool,
+        frames: Vec<String>,
+    },
+}
+
+impl OutputStep {
+    fn release(frame: String) -> Self {
+        Self::Release {
+            scan: Vec::new(),
+            frames: vec![frame],
+        }
+    }
+}
+
+/// The fields of an upstream frame the hold reads. Borrowed, since an audio
+/// delta's payload is the bulk of a voice session's traffic.
+#[derive(serde::Deserialize)]
+struct OutputFrameHead<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: std::borrow::Cow<'a, str>,
+    #[serde(default, borrow)]
+    item_id: Option<std::borrow::Cow<'a, str>>,
+    #[serde(default, borrow)]
+    delta: Option<std::borrow::Cow<'a, str>>,
+    #[serde(default, borrow)]
+    item: Option<OutputFrameItem<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct OutputFrameItem<'a> {
+    #[serde(default, borrow)]
+    id: Option<std::borrow::Cow<'a, str>>,
+}
+
+impl HeldOutput {
+    fn new(max_buffer_bytes: usize, fail_open: bool) -> Self {
+        Self {
+            max_buffer_bytes,
+            fail_open,
+            items: Vec::new(),
+            content: 0,
+            raw: 0,
+            gauge: Default::default(),
+        }
+    }
+
+    fn observe(&mut self, frame: String) -> OutputStep {
+        let Ok(head) = serde_json::from_str::<OutputFrameHead<'_>>(&frame) else {
+            return OutputStep::release(frame);
+        };
+        let kind = head.kind.as_ref();
+        // An answer is over, whichever way: nothing else will close its items.
+        if kind == "response.done" {
+            return self.release_items(None, frame);
+        }
+        if !kind.starts_with("response.") {
+            return OutputStep::release(frame);
+        }
+        if kind.ends_with(".done") {
+            let item_id = head
+                .item_id
+                .or_else(|| head.item.and_then(|item| item.id))
+                .map(|id| id.into_owned());
+            return match item_id {
+                Some(item_id) => self.release_items(Some(&item_id), frame),
+                None => OutputStep::release(frame),
+            };
+        }
+        let is_audio = matches!(kind, "response.output_audio.delta" | "response.audio.delta");
+        let (true, false, Some(delta)) = (kind.ends_with(".delta"), is_audio, head.delta) else {
+            return OutputStep::release(frame);
+        };
+        let item_id = head.item_id.unwrap_or_default();
+        let position = self.items.iter().position(|i| i.item_id == item_id);
+        let item = match position {
+            Some(position) => &mut self.items[position],
+            None => {
+                self.items.push(HeldOutputItem {
+                    item_id: item_id.into_owned(),
+                    text: String::new(),
+                    frames: Vec::new(),
+                });
+                self.items.last_mut().expect("just pushed")
+            }
+        };
+        item.text.push_str(&delta);
+        self.content = self.content.saturating_add(delta.len());
+        self.raw = self.raw.saturating_add(frame.len());
+        item.frames.push(frame);
+        self.gauge.set(self.raw);
+        let mut held = crate::held_content::HeldBuffer::default();
+        held.hold(self.content, self.raw);
+        if !held.exceeds(self.max_buffer_bytes) {
+            return OutputStep::Held;
+        }
+        let frames = self.items.drain(..).flat_map(|item| item.frames).collect();
+        self.content = 0;
+        self.raw = 0;
+        self.gauge.clear();
+        OutputStep::Overflow {
+            fail_open: self.fail_open,
+            frames,
+        }
+    }
+
+    /// Release `item_id`'s item, or every item, ahead of `frame`.
+    fn release_items(&mut self, item_id: Option<&str>, frame: String) -> OutputStep {
+        let mut scan = Vec::new();
+        let mut frames = Vec::new();
+        let mut kept = Vec::new();
+        for item in self.items.drain(..) {
+            if item_id.is_none_or(|id| id == item.item_id) {
+                self.content = self.content.saturating_sub(item.text.len());
+                self.raw = self
+                    .raw
+                    .saturating_sub(item.frames.iter().map(String::len).sum());
+                scan.push(item.text);
+                frames.extend(item.frames);
+            } else {
+                kept.push(item);
+            }
+        }
+        self.items = kept;
+        self.gauge.set(self.raw);
+        frames.push(frame);
+        OutputStep::Release { scan, frames }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2929,6 +3143,218 @@ mod tests {
         assert_eq!(ev.requested_model, "rt-model");
         assert_eq!(ev.requested_model_id, "m-rt");
         assert_eq!(ev.api_key_id, "k-1");
+    }
+
+    /// An upstream that plays `frames` as soon as the client speaks, then keeps
+    /// the session open.
+    async fn spawn_scripted_upstream(frames: Vec<serde_json::Value>) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut tx, mut rx) = ws.split();
+            let _ = rx.next().await;
+            for frame in frames {
+                tx.send(TgMessage::Text(frame.to_string())).await.unwrap();
+            }
+            while rx.next().await.is_some() {}
+        });
+        addr
+    }
+
+    /// The frames a client receives for `frames` under `guardrail`, up to the
+    /// session's close or `response.done`.
+    async fn relayed_frames(
+        frames: Vec<serde_json::Value>,
+        guardrail: &str,
+    ) -> Vec<serde_json::Value> {
+        let up_addr = spawn_scripted_upstream(frames).await;
+        let snap = snapshot(&format!("http://{up_addr}/v1"), "openai", "openai");
+        let row: aisix_core::Guardrail = serde_json::from_str(guardrail).unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-1", row, 1));
+        let (addr, _state, _rx) = serve(snap).await;
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer sk-caller".parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        let (mut tx, mut rx) = ws.split();
+        tx.send(TgMessage::Text(r#"{"type":"response.create"}"#.to_string()))
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        while let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_secs(3), rx.next()).await
+        {
+            match msg {
+                TgMessage::Text(t) => {
+                    let frame: serde_json::Value = serde_json::from_str(&t).unwrap();
+                    let last = frame["type"] == "response.done";
+                    seen.push(frame);
+                    if last {
+                        break;
+                    }
+                }
+                TgMessage::Close(_) => break,
+                _ => {}
+            }
+        }
+        seen
+    }
+
+    fn delta(kind: &str, item: &str, delta: &str) -> serde_json::Value {
+        serde_json::json!({"type": kind, "item_id": item, "delta": delta})
+    }
+
+    const KEYWORD_OUTPUT_BLOCK: &str = r#"{"name":"out-block","enabled":true,"hook_point":"output","kind":"keyword","patterns":[{"kind":"literal","value":"FORBIDDEN"}]}"#;
+
+    /// A literal across two deltas matches neither, so a chain that can block
+    /// has to judge the item whole before any of it goes out.
+    #[tokio::test]
+    async fn a_literal_split_across_deltas_never_reaches_the_client() {
+        for (delta_kind, done) in [
+            (
+                "response.output_text.delta",
+                serde_json::json!({"type": "response.output_text.done", "item_id": "i1"}),
+            ),
+            (
+                "response.output_audio_transcript.delta",
+                serde_json::json!({"type": "response.output_audio_transcript.done", "item_id": "i1"}),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                serde_json::json!({"type": "response.function_call_arguments.done", "item_id": "i1"}),
+            ),
+        ] {
+            let seen = relayed_frames(
+                vec![
+                    delta(delta_kind, "i1", "say FORB"),
+                    delta(delta_kind, "i1", "IDDEN now"),
+                    done,
+                ],
+                KEYWORD_OUTPUT_BLOCK,
+            )
+            .await;
+            assert_eq!(seen.len(), 1, "only the refusal: {seen:?}");
+            assert_eq!(seen[0]["type"], "error", "{seen:?}");
+            assert_eq!(seen[0]["error"]["code"], "content_filtered");
+        }
+    }
+
+    /// A clean item goes out whole and in order, and a voice answer's audio
+    /// does not wait for it.
+    #[tokio::test]
+    async fn a_clean_item_is_released_in_order_and_audio_is_not_held() {
+        let seen = relayed_frames(
+            vec![
+                delta("response.output_audio_transcript.delta", "i1", "hel"),
+                delta("response.output_audio.delta", "i1", "AAAA"),
+                delta("response.output_audio_transcript.delta", "i1", "lo"),
+                serde_json::json!({"type": "response.output_audio_transcript.done", "item_id": "i1", "transcript": "hello"}),
+                serde_json::json!({"type": "response.done", "response": {"usage": {"input_tokens": 1, "output_tokens": 1}}}),
+            ],
+            KEYWORD_OUTPUT_BLOCK,
+        )
+        .await;
+        let kinds: Vec<_> = seen.iter().map(|f| f["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "response.output_audio.delta",
+                "response.output_audio_transcript.delta",
+                "response.output_audio_transcript.delta",
+                "response.output_audio_transcript.done",
+                "response.done",
+            ]
+        );
+    }
+
+    /// An upstream that ends the response without closing the item (a cancelled
+    /// response does) still has it judged and released.
+    #[tokio::test]
+    async fn a_response_ending_without_its_item_done_releases_the_hold() {
+        let clean = relayed_frames(
+            vec![
+                delta("response.output_text.delta", "i1", "partial"),
+                serde_json::json!({"type": "response.done", "response": {"status": "cancelled"}}),
+            ],
+            KEYWORD_OUTPUT_BLOCK,
+        )
+        .await;
+        assert_eq!(clean.len(), 2, "{clean:?}");
+        assert_eq!(clean[0]["delta"], "partial");
+
+        let blocked = relayed_frames(
+            vec![
+                delta("response.output_text.delta", "i1", "FORB"),
+                delta("response.output_text.delta", "i1", "IDDEN"),
+                serde_json::json!({"type": "response.done", "response": {"status": "cancelled"}}),
+            ],
+            KEYWORD_OUTPUT_BLOCK,
+        )
+        .await;
+        assert_eq!(blocked.len(), 1, "{blocked:?}");
+        assert_eq!(blocked[0]["type"], "error");
+    }
+
+    /// A chain that cannot block holds nothing back: it observes.
+    #[tokio::test]
+    async fn a_monitor_chain_does_not_hold_deltas() {
+        let up_addr = spawn_scripted_upstream(vec![delta(
+            "response.output_text.delta",
+            "i1",
+            "never closed",
+        )])
+        .await;
+        let snap = snapshot(&format!("http://{up_addr}/v1"), "openai", "openai");
+        let row: aisix_core::Guardrail = serde_json::from_str(
+            r#"{"name":"m","enabled":true,"hook_point":"output","enforcement_mode":"monitor","kind":"keyword","patterns":[{"kind":"literal","value":"FORBIDDEN"}]}"#,
+        )
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-1", row, 1));
+        let (addr, _state, _rx) = serve(snap).await;
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer sk-caller".parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        let (mut tx, mut rx) = ws.split();
+        tx.send(TgMessage::Text(r#"{"type":"response.create"}"#.to_string()))
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(3), rx.next())
+            .await
+            .expect("a monitor chain relays the delta at once")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(first, TgMessage::Text(t) if t.contains("never closed")));
+    }
+
+    /// Past the chain's cap the hold follows the row's overflow policy: refuse,
+    /// or release what it has unscanned and stop holding.
+    #[test]
+    fn the_hold_follows_the_overflow_policy_past_its_cap() {
+        let frame = |text: &str| delta("response.output_text.delta", "i1", text).to_string();
+        let mut closed = HeldOutput::new(4, false);
+        assert!(matches!(closed.observe(frame("abc")), OutputStep::Held));
+        assert!(matches!(
+            closed.observe(frame("defg")),
+            OutputStep::Overflow {
+                fail_open: false,
+                ..
+            }
+        ));
+        let mut open = HeldOutput::new(4, true);
+        assert!(matches!(open.observe(frame("abc")), OutputStep::Held));
+        match open.observe(frame("defg")) {
+            OutputStep::Overflow { fail_open, frames } => {
+                assert!(fail_open);
+                assert_eq!(frames.len(), 2, "what it held goes out, in order");
+            }
+            _ => panic!("expected an overflow"),
+        }
     }
 
     /// `/v1/realtime` builds its upstream handshake by hand rather than
