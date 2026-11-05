@@ -234,7 +234,7 @@ pub struct CooldownConfig {
     /// Whether request-path timeouts trigger cooldown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_on_timeout: Option<bool>,
-    /// Whether transport, decode, or stream-abort errors trigger cooldown.
+    /// Whether transport errors, aborted streams, in-band stream errors that carry no status, and unreadable credential exchanges trigger cooldown. A successful response whose body the gateway cannot decode does not trigger cooldown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_on_transport: Option<bool>,
 }

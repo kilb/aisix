@@ -20,6 +20,7 @@ const MODELS = {
   fallback: "ct-health-fallback",
   group: "ct-health-group",
   truncated: "ct-health-truncated",
+  control: "ct-health-control",
 } as const;
 
 describe("count_tokens health and routing telemetry", () => {
@@ -82,6 +83,7 @@ describe("count_tokens health and routing telemetry", () => {
     modelIds.primary = await createDirect(MODELS.primary, primary.baseUrl);
     modelIds.fallback = await createDirect(MODELS.fallback, fallback.baseUrl);
     modelIds.truncated = await createDirect(MODELS.truncated, truncatedBaseUrl);
+    modelIds.control = await createDirect(MODELS.control, primary.baseUrl);
     const group = await seed.createModel({
       display_name: MODELS.group,
       routing: {
@@ -172,7 +174,7 @@ describe("count_tokens health and routing telemetry", () => {
     ).toBe(1);
   });
 
-  test("a truncated 200 is a decode failure and never marks the target healthy", async (ctx) => {
+  test("a truncated 200 is a decode failure and leaves the target healthy", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
       return;
@@ -183,7 +185,11 @@ describe("count_tokens health and routing telemetry", () => {
     expect(response.status).toBe(502);
     expect(truncatedRequests).toBe(baseline + 1);
 
-    await waitConfigPropagation(async () => {
+    // A real failure on the same route, sent after it, cools its own target:
+    // once that shows, the read below is one that could have found a cooldown.
+    const control = await countTokens(MODELS.control);
+    expect(control.status).toBeGreaterThanOrEqual(500);
+    const statusOf = async (id: string | undefined) => {
       const status = await fetch(`${app!.metricsUrl}/status/models`);
       if (status.status !== 200) {
         throw new Error(`model status probe returned ${status.status}`);
@@ -193,13 +199,15 @@ describe("count_tokens health and routing telemetry", () => {
         status?: string;
         status_reason?: string;
       }>;
-      return rows.some(
-        (row) =>
-          row.id === modelIds.truncated &&
-          row.status === "cooldown" &&
-          row.status_reason === "upstream_decode_error",
-      );
+      return rows.find((row) => row.id === id);
+    };
+    await waitConfigPropagation(async () => {
+      const row = await statusOf(modelIds.control);
+      return row?.status === "cooldown" && row.status_reason === "upstream_server_error";
     });
+    const row = await statusOf(modelIds.truncated);
+    expect(row?.status).toBe("healthy");
+    expect(row?.status_reason).toBeUndefined();
 
     const after = await scrapeMetrics(app.metricsUrl);
     expect(

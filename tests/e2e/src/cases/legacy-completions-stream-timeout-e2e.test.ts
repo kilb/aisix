@@ -95,23 +95,46 @@ async function waitForTimeoutObservability(
   reason = "request_timeout",
 ): Promise<void> {
   await waitConfigPropagation(async () => {
-    const response = await fetch(`${app!.metricsUrl}/status/models`);
-    if (response.status !== 200) {
-      throw new Error(`model status probe returned ${response.status}`);
-    }
-    const rows = (await response.json()) as Array<{
-      id?: string;
-      status?: string;
-      status_reason?: string;
-    }>;
-    return rows.some(
-      (row) =>
-        row.id === modelId &&
-        row.status === "cooldown" &&
-        row.status_reason === reason,
-    );
+    const row = await modelStatus(modelId);
+    return row?.status === "cooldown" && row.status_reason === reason;
   });
 
+  await waitForFailureRow(model, usageBaseline);
+}
+
+/**
+ * An undecodable 2xx fails the request and says nothing about the target's
+ * health. Read once the failure row has landed: whatever the stream's ending
+ * does to the status it has done by then, and this spec's other cases show a
+ * real failure turning this same field into `cooldown`.
+ */
+async function waitForDecodeFailure(
+  modelId: string,
+  model: string,
+  usageBaseline: number,
+): Promise<void> {
+  await waitForFailureRow(model, usageBaseline);
+  const row = await modelStatus(modelId);
+  expect(row?.status).toBe("healthy");
+  expect(row?.status_reason).toBeUndefined();
+}
+
+async function modelStatus(
+  modelId: string,
+): Promise<{ id?: string; status?: string; status_reason?: string } | undefined> {
+  const response = await fetch(`${app!.metricsUrl}/status/models`);
+  if (response.status !== 200) {
+    throw new Error(`model status probe returned ${response.status}`);
+  }
+  const rows = (await response.json()) as Array<{
+    id?: string;
+    status?: string;
+    status_reason?: string;
+  }>;
+  return rows.find((row) => row.id === modelId);
+}
+
+async function waitForFailureRow(model: string, usageBaseline: number): Promise<void> {
   await waitConfigPropagation(async () => {
     const response = await fetch(`${app!.metricsUrl}/metrics`);
     if (response.status !== 200) {
@@ -449,12 +472,7 @@ describe("legacy completions stream timeout", () => {
     expect(response.status).toBe(200);
     expect(await response.text()).toContain("not-json");
     expect(malformed.receivedRequests).toHaveLength(upstreamBaseline + 1);
-    await waitForTimeoutObservability(
-      malformedModelId,
-      "legacy-malformed",
-      usageBaseline,
-      "upstream_decode_error",
-    );
+    await waitForDecodeFailure(malformedModelId, "legacy-malformed", usageBaseline);
   });
 
   test("malformed SSE before DONE is a billed decode failure without a success terminal", async (ctx) => {
@@ -475,11 +493,10 @@ describe("legacy completions stream timeout", () => {
     expect(body).toContain("not-json");
     expect(body).not.toContain("[DONE]");
     expect(malformedDone.receivedRequests).toHaveLength(upstreamBaseline + 1);
-    await waitForTimeoutObservability(
+    await waitForDecodeFailure(
       malformedDoneModelId,
       "legacy-malformed-before-done",
       usageBaseline,
-      "upstream_decode_error",
     );
     await waitConfigPropagation(
       async () =>

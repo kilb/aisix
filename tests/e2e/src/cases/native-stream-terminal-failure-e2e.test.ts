@@ -44,40 +44,49 @@ async function outputTokenCounter(app: SpawnedApp, model: string): Promise<numbe
   return total;
 }
 
+async function modelStatus(
+  app: SpawnedApp,
+  modelId: string,
+): Promise<{ id?: string; status?: string; status_reason?: string } | undefined> {
+  const response = await fetch(`${app.metricsUrl}/status/models`);
+  if (response.status !== 200) {
+    throw new Error(`model status probe returned ${response.status}`);
+  }
+  const rows = (await response.json()) as Array<{
+    id?: string;
+    status?: string;
+    status_reason?: string;
+  }>;
+  return rows.find((row) => row.id === modelId);
+}
+
+/**
+ * `reason` is what the target's cooldown names; `null` for an undecodable 2xx,
+ * which is a failure of the request and says nothing about the target's health.
+ */
 async function waitForFailure(
   app: SpawnedApp,
   modelId: string,
   model: string,
   endpoint: "/v1/messages" | "/v1/responses",
-  reason: string,
+  reason: string | null,
   usageBaseline: number,
   outputBaseline: number,
   expectedOutputTokens?: number,
 ): Promise<void> {
   let observedStatus: unknown;
-  try {
-    await waitConfigPropagation(async () => {
-      const response = await fetch(`${app.metricsUrl}/status/models`);
-      if (response.status !== 200) {
-        throw new Error(`model status probe returned ${response.status}`);
-      }
-      const rows = (await response.json()) as Array<{
-        id?: string;
-        status?: string;
-        status_reason?: string;
-      }>;
-      observedStatus = rows.find((row) => row.id === modelId);
-      return rows.some(
-        (row) =>
-          row.id === modelId &&
-          row.status === "cooldown" &&
-          row.status_reason === reason,
+  if (reason !== null) {
+    try {
+      await waitConfigPropagation(async () => {
+        const row = await modelStatus(app, modelId);
+        observedStatus = row;
+        return row?.status === "cooldown" && row.status_reason === reason;
+      });
+    } catch (error) {
+      throw new Error(
+        `${String(error)}; observed model status: ${JSON.stringify(observedStatus)}`,
       );
-    });
-  } catch (error) {
-    throw new Error(
-      `${String(error)}; observed model status: ${JSON.stringify(observedStatus)}`,
-    );
+    }
   }
 
   try {
@@ -122,6 +131,15 @@ async function waitForFailure(
     throw new Error(
       `output tokens: ${String(error)}; ${outputBaseline}->${await outputTokenCounter(app, model)}`,
     );
+  }
+
+  // Read once the failure row has landed: whatever the stream's ending does to
+  // the target's status it has done by then, and a real failure on this spec's
+  // other legs does turn this same field into `cooldown`.
+  if (reason === null) {
+    const row = await modelStatus(app, modelId);
+    expect(row?.status).toBe("healthy");
+    expect(row?.status_reason).toBeUndefined();
   }
 }
 
@@ -272,7 +290,7 @@ describe("native stream protocol failures are not healthy completions", () => {
         endpoint: "/v1/messages" as const,
         modelKey: "messagesMalformed" as const,
         upstream: upstreams.messagesMalformed!,
-        reason: "upstream_decode_error",
+        reason: null,
         rawMarker: "billed malformed output",
         deliversScanned: false,
       },
@@ -280,7 +298,7 @@ describe("native stream protocol failures are not healthy completions", () => {
         endpoint: "/v1/responses" as const,
         modelKey: "responsesMalformed" as const,
         upstream: upstreams.responsesMalformed!,
-        reason: "upstream_decode_error",
+        reason: null,
         rawMarker: "billed malformed output",
         deliversScanned: false,
       },

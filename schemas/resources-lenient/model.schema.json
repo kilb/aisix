@@ -138,7 +138,7 @@
           "type": "boolean"
         },
         "trigger_on_transport": {
-          "description": "Whether transport, decode, or stream-abort errors trigger cooldown.",
+          "description": "Whether transport errors, aborted streams, in-band stream errors that carry no status, and unreadable credential exchanges trigger cooldown. A successful response whose body the gateway cannot decode does not trigger cooldown.",
           "type": "boolean"
         },
         "trigger_statuses": {
