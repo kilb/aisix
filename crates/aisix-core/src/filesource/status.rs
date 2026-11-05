@@ -114,7 +114,10 @@ fn resource_counts(snap: &AisixSnapshot) -> std::collections::BTreeMap<String, u
         ("rate_limit_policies", snap.rate_limit_policies.len()),
         ("mcp_servers", snap.mcp_servers.len()),
         ("a2a_agents", snap.a2a_agents.len()),
+        ("oidc_providers", snap.oidc_providers.len()),
+        ("claim_mappings", snap.claim_mappings.len()),
         ("passthrough_routes", snap.passthrough_routes.len()),
+        ("mcp_auth_settings", snap.mcp_auth_settings.len()),
     ] {
         if n > 0 {
             counts.insert(kind.to_string(), n);
@@ -227,6 +230,47 @@ mod tests {
         assert!(json["source"].get("observed_revision").is_none());
         assert!(json["applied"].get("applied_revision").is_none());
         assert_eq!(json["applied"]["resource_counts"]["provider_keys"], 1);
+    }
+
+    /// The status counts what was loaded, whichever source loaded it.
+    #[test]
+    fn tracked_load_counts_every_collection_the_file_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resources.yaml");
+        std::fs::write(
+            &path,
+            r#"_format_version: "1"
+oidc_providers:
+  - name: corp
+    issuer: https://sso.example.com/realms/agents
+    audiences: ["aisix"]
+api_keys:
+  - display_name: k
+    key_hash: 1460db1b6902f8b1fc2a40d9381a24d0fd22c3bc1b2c6f999c521da73776fbe0
+    allowed_models: []
+claim_mappings:
+  - name: finance
+    jwt_provider: corp
+    priority: 100
+    match:
+      - claim: department
+        op: exact
+        values: ["finance"]
+    resolve:
+      api_key: k
+mcp_auth_settings:
+  - resource_url: https://gw.example.com/mcp
+"#,
+        )
+        .unwrap();
+        let cs = ConfigStatus::new(SourceKind::File);
+        let result = load_resources_file_tracked(&path, 1, true, &cs);
+        assert!(result.is_ok(), "load failed: {}", result.err().unwrap());
+        let json = serde_json::to_value(cs.view()).unwrap();
+        let counts = &json["applied"]["resource_counts"];
+        assert_eq!(counts["oidc_providers"], 1, "{counts}");
+        assert_eq!(counts["claim_mappings"], 1, "{counts}");
+        assert_eq!(counts["mcp_auth_settings"], 1, "{counts}");
     }
 
     #[test]
