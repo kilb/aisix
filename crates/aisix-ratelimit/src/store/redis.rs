@@ -75,6 +75,11 @@ pub const DEFAULT_GRACE_SECS: u64 = 5;
 /// which runs on the serving thread, and in thread-per-core mode that thread
 /// is the whole core's event loop.
 const POST_STREAM_QUEUE_DEPTH: usize = 8192;
+/// Updates in flight against Redis at once. Past it the worker stops taking from
+/// the queue, so a slow or hung Redis backs the queue up until it sheds, which is
+/// what the queue's bound and the shed metric are there for, instead of growing
+/// a task per update.
+const POST_STREAM_IN_FLIGHT: usize = 256;
 /// How often a gateway that started without its shared backend re-states
 /// that it is still counting per replica. Long enough that a Redis which
 /// is merely late says nothing beyond the boot WARN, short enough that a
@@ -547,7 +552,7 @@ fn spawn_post_stream_worker(
         .enable_all()
         .build()
         .map_err(|err| post_stream_worker_error(err.to_string()))?;
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<PostStreamTokenAdd>(POST_STREAM_QUEUE_DEPTH);
+    let (tx, rx) = tokio::sync::mpsc::channel::<PostStreamTokenAdd>(POST_STREAM_QUEUE_DEPTH);
     std::thread::Builder::new()
         .name("aisix-ratelimit-commit".to_string())
         .spawn(move || {
@@ -555,10 +560,10 @@ fn spawn_post_stream_worker(
                 // 启动时没连上的 store 每笔记账都会失败，可能持续几个小时：
                 // 计数每笔都记，日志一轮故障只打一条。
                 let warned = Arc::new(AtomicBool::new(false));
-                while let Some(command) = rx.recv().await {
+                drain_post_stream(rx, POST_STREAM_IN_FLIGHT, move |command| {
                     let conn = conn.clone();
                     let warned = Arc::clone(&warned);
-                    tokio::spawn(async move {
+                    async move {
                         let result =
                             add_tokens_remote(&conn, &command.prefix, command.tokens, grace).await;
                         // Nobody is waiting on this: report it here or it is
@@ -577,12 +582,37 @@ fn spawn_post_stream_worker(
                                 }
                             }
                         }
-                    });
-                }
+                    }
+                })
+                .await;
             });
         })
         .map_err(|err| post_stream_worker_error(err.to_string()))?;
     Ok(tx)
+}
+
+/// Run `work` on each queued update, at most `limit` at a time. The next update
+/// stays in the queue until one finishes.
+async fn drain_post_stream<F, Fut>(
+    mut rx: tokio::sync::mpsc::Receiver<PostStreamTokenAdd>,
+    limit: usize,
+    work: F,
+) where
+    F: Fn(PostStreamTokenAdd) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(limit));
+    while let Some(command) = rx.recv().await {
+        // 信号量从不关闭，拿不到许可只可能是它已被丢弃。
+        let Ok(permit) = Arc::clone(&in_flight).acquire_owned().await else {
+            return;
+        };
+        let job = work(command);
+        tokio::spawn(async move {
+            job.await;
+            drop(permit);
+        });
+    }
 }
 
 async fn add_tokens_remote(
@@ -1162,6 +1192,37 @@ mod tests {
             "the request path must never wait on billing, waited {:?}",
             started.elapsed()
         );
+    }
+
+    /// With Redis hanging, updates back up in the queue until it sheds. A worker
+    /// that spawned a task per update would empty the queue forever: nothing
+    /// would ever shed and the tasks would pile up instead.
+    #[tokio::test]
+    async fn a_stuck_redis_backs_the_queue_up_until_it_sheds() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&started);
+        tokio::spawn(drain_post_stream(rx, 2, move |_| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            std::future::pending::<()>()
+        }));
+
+        let mut accepted = 0;
+        let mut full = false;
+        for _ in 0..64 {
+            match tx.try_send(add("rate:k")) {
+                Ok(()) => accepted += 1,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => full = true,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    panic!("the worker stopped")
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(full, "the queue never filled, after {accepted} updates");
+        assert_eq!(started.load(Ordering::Relaxed), 2);
+        // 两个在跑、一个等许可、四个排队。
+        assert_eq!(accepted, 7);
     }
 
     #[test]
