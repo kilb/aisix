@@ -157,10 +157,15 @@ export interface MoneyFixture {
     model?: string,
   ): Promise<number>;
   /**
+   * 像真实调用方那样建一个批处理任务：传输入文件，再拿网关给的文件 id 建批次。
+   * 返回网关给的批次 id —— 门户铸的密钥都带归属范围，只能用这种 id 指批次。
+   */
+  createBatch(plaintext: string): Promise<string>;
+  /**
    * 取一个批处理任务。存根回的是「已完成」，于是网关会去下载输出并事后落账
    * —— 那是与请求路径完全不同的一条计费代码。
    */
-  retrieveBatch(plaintext: string, batchId: string, model?: string): Promise<number>;
+  retrieveBatch(plaintext: string, batchId: string): Promise<number>;
   /**
    * 同 `saying`，但把应答正文也带回来 —— 用来检查错误信封的**形状**，那是每个
    * 端点自己的协议契约，和状态码是两回事。
@@ -206,7 +211,7 @@ export interface MoneyFixture {
  * 命名空间与算法抄自 `aisix-core` 的 `derive_id`；这里只在测试里用来指认一把
  * 密钥，不参与任何生产路径。
  */
-function deriveKeyId(displayName: string): string {
+export function deriveKeyId(displayName: string): string {
   const NS = Buffer.from("63e50ab2677a54d38d1ec0cb29ceae94", "hex");
   const h = createHash("sha1");
   h.update(NS);
@@ -343,6 +348,7 @@ export async function startMoney(): Promise<MoneyFixture> {
 
   /** 桩上游收到的嵌入调用次数。语义路由每次分类都会打一发。 */
   let embedCalls = 0;
+  const batches = new Map<string, Record<string, unknown>>();
 
   // 桩上游：OpenAI 兼容的应答，带固定 usage 让花费可预期。
   //
@@ -372,20 +378,47 @@ export async function startMoney(): Promise<MoneyFixture> {
       } catch {
         /* 不是 JSON 就回 ok */
       }
-      // 批处理：retrieve 回一个已完成的批次，输出文件里每行带自己的 usage。
-      // 网关首次看到 completed 时会把输出下载下来聚合 —— 这条路径上的钱是
-      // 「事后落账」的，和请求路径完全不同。
-      if ((req.url ?? "").includes("/batches/")) {
+      // 批处理，和真上游一样：批次的 metadata 建的时候怎么给，之后每次读都原样
+      // 还回来（网关靠它认出提交者），id 不认识就 404。建出来就算跑完了：任何一
+      // 次读都是 completed，输出文件里每行带自己的 usage。网关首次看到 completed
+      // 时会把输出下载下来聚合 —— 这条路径上的钱是「事后落账」的，和请求路径完全
+      // 不同。
+      const path = new URL(req.url ?? "/", "http://x").pathname;
+      if (req.method === "POST" && path.endsWith("/files")) {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(
-          JSON.stringify({
-            id: "batch_e2e",
-            object: "batch",
-            status: "completed",
-            output_file_id: "file-out-e2e",
-            endpoint: "/v1/chat/completions",
-          }),
+          JSON.stringify({ id: "file-in-e2e", object: "file", purpose: "batch", bytes: body.length }),
         );
+        return;
+      }
+      if (path.endsWith("/files/file-in-e2e/content")) {
+        res.writeHead(200, { "content-type": "application/x-ndjson" });
+        res.end(`${BATCH_INPUT_LINE}\n`);
+        return;
+      }
+      if (req.method === "POST" && path.endsWith("/batches")) {
+        const asked = JSON.parse(body || "{}");
+        // 向上取整：秒级时间戳不能让一个刚建的批次看着比这一刻还早。
+        const now = Math.ceil(Date.now() / 1000);
+        const id = `batch_e2e_${batches.size}`;
+        const batch = {
+          id,
+          object: "batch",
+          endpoint: asked.endpoint,
+          input_file_id: asked.input_file_id,
+          metadata: asked.metadata ?? null,
+          created_at: now,
+        };
+        batches.set(id, { ...batch, status: "completed", output_file_id: "file-out-e2e", completed_at: now });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ...batch, status: "in_progress" }));
+        return;
+      }
+      const batchId = /\/batches\/([^/]+)$/.exec(path)?.[1];
+      if (batchId !== undefined) {
+        const batch = batches.get(batchId);
+        res.writeHead(batch ? 200 : 404, { "content-type": "application/json" });
+        res.end(JSON.stringify(batch ?? { error: { message: "no such batch" } }));
         return;
       }
       if ((req.url ?? "").includes("/files/file-out-e2e/content")) {
@@ -894,11 +927,35 @@ observability:
     async chatStream(plaintext: string) {
       return chatWith(proxyPort, plaintext, true);
     },
-    async retrieveBatch(plaintext: string, batchId: string, model = "gpt-4o-mini") {
-      const r = await fetch(
-        `http://127.0.0.1:${proxyPort}/v1/batches/${batchId}?model=${model}`,
-        { headers: { authorization: `Bearer ${plaintext}` } },
-      );
+    async createBatch(plaintext: string) {
+      const authorization = `Bearer ${plaintext}`;
+      const form = new FormData();
+      form.set("purpose", "batch");
+      form.set("file", new Blob([`${BATCH_INPUT_LINE}\n`]), "input.jsonl");
+      const file = await fetch(`http://127.0.0.1:${proxyPort}/v1/files`, {
+        method: "POST",
+        headers: { authorization, "x-aisix-model": "gpt-4o-mini" },
+        body: form,
+      });
+      const uploaded = await file.text();
+      if (file.status !== 200) throw new Error(`上传批处理输入 ${file.status}: ${uploaded}`);
+      const created = await fetch(`http://127.0.0.1:${proxyPort}/v1/batches`, {
+        method: "POST",
+        headers: { authorization, "content-type": "application/json" },
+        body: JSON.stringify({
+          input_file_id: JSON.parse(uploaded).id,
+          endpoint: "/v1/chat/completions",
+          completion_window: "24h",
+        }),
+      });
+      const batch = await created.text();
+      if (created.status !== 200) throw new Error(`建批次 ${created.status}: ${batch}`);
+      return JSON.parse(batch).id as string;
+    },
+    async retrieveBatch(plaintext: string, batchId: string) {
+      const r = await fetch(`http://127.0.0.1:${proxyPort}/v1/batches/${batchId}`, {
+        headers: { authorization: `Bearer ${plaintext}` },
+      });
       await r.text();
       return r.status;
     },
@@ -1049,6 +1106,14 @@ async function chatWith(
   await r.text();
   return r.status;
 }
+
+/** 批处理输入文件的一行。金额不看它，看的是输出文件里每行报的 usage。 */
+const BATCH_INPUT_LINE = JSON.stringify({
+  custom_id: "r1",
+  method: "POST",
+  url: "/v1/chat/completions",
+  body: { model: "gpt-4o-mini", messages: [{ role: "user", content: "hello" }] },
+});
 
 function writeResources(
   path: string,

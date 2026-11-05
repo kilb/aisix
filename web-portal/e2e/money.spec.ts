@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { startMoney, ADMIN_TOKEN, CALLER_KEY, type MoneyFixture } from "./money.fixture";
+import { startMoney, deriveKeyId, ADMIN_TOKEN, CALLER_KEY, type MoneyFixture } from "./money.fixture";
 
 /**
  * 钱路：真网关 + 真流量 + 真指标 + 真账本 + 真停用。
@@ -881,7 +881,7 @@ test("批处理跑完的钱_也要进指标和额度", async () => {
   };
 
   const before = await spend();
-  expect(await fx.retrieveBatch(k.plaintext, "batch_e2e")).toBe(200);
+  expect(await fx.retrieveBatch(k.plaintext, await fx.createBatch(k.plaintext))).toBe(200);
   // 落账在脱离请求的任务里，所以等它落地。输出两行、各 1000+1000 token，
   // 按 $0.5/1k 算整批 $2.00。
   await waitFor(async () => (await spend()) > before, "批处理的花费没进指标，门户永远扣不到");
@@ -895,13 +895,120 @@ test("批处理跑完的钱_也要进指标和额度", async () => {
   // 变异检查照过。改成先用免费的观察（指标）等五个批次都落账；网关是先扣额度
   // 再发指标的，所以指标到了就意味着额度也到了。
   for (let i = 0; i < 4; i++) {
-    expect(await fx.retrieveBatch(k.plaintext, `batch_e2e_${i}`)).toBe(200);
+    expect(await fx.retrieveBatch(k.plaintext, await fx.createBatch(k.plaintext))).toBe(200);
   }
   await waitFor(async () => (await spend()) - before === 10_000_000, "五个批次都落账");
   expect(
     await fx.saying("chat", k.plaintext, "hello"),
     "批处理的花费没扣额度，可以无上限地跑",
   ).toBe(429);
+});
+
+/** 记在这把密钥头上的花费。`keyName` 是它在配置里的名字。 */
+async function spendOf(keyName: string): Promise<number> {
+  const id = deriveKeyId(keyName);
+  const m = await fetch(fx.metricsUrl).then((r) => r.text());
+  return m
+    .split("\n")
+    .filter((l) => l.startsWith("aisix_llm_spend_micro_usd_total{") && l.includes(`api_key_id="${id}"`))
+    .reduce((a, l) => a + (Number(l.slice(l.lastIndexOf("}") + 1).trim()) || 0), 0);
+}
+
+/** 等对账跑过两轮，账本上的数才是这之前所有花费都落完之后的数。 */
+async function ledgerSettled(): Promise<void> {
+  const ticks = async () => {
+    const text = await fetch(fx.portalMetricsUrl).then((x) => x.text());
+    return Number(
+      text.split("\n").find((l) => l.startsWith("aisix_portal_reconcile_ticks_total "))?.split(" ")[1],
+    );
+  };
+  const t = await ticks();
+  await waitFor(async () => (await ticks()) > t + 1, "对账轮数没有增长");
+}
+
+test("批处理的钱记在提交者头上_读多少遍都只收一次", async () => {
+  // 同一个账号的两把密钥：一把提交批次，另一把碰巧先读到它跑完。付钱的是提交
+  // 者。额度把这件事量出来：提交者 $4，读者只有 $1 —— 批次 $2 要是记到读者头上，
+  // 读者当场就没额度了。
+  const cookie = await fx.sessionCookie();
+  await setQuota(1_000_000_000);
+  const submitter = await mint(cookie, "批次提交者");
+  const reader = await mint(cookie, "批次读者");
+  const submitterName = `${submitter.name} · 批次提交者`;
+  const readerName = `${reader.name} · 批次读者`;
+  expect((await setKeyQuota(cookie, submitter.name, 4_000_000)).status).toBe(200);
+  expect((await setKeyQuota(cookie, reader.name, 1_000_000)).status).toBe(200);
+  await waitFor(
+    async () =>
+      fx.readResources().includes(`portal-key-${submitter.name}`) &&
+      fx.readResources().includes(`portal-key-${reader.name}`),
+    "额度推下去",
+  );
+
+  await ledgerSettled();
+  const balanceBefore = await balance(cookie);
+  const id = await fx.createBatch(submitter.plaintext);
+  expect(await fx.retrieveBatch(reader.plaintext, id), "同账号的另一把密钥读得到").toBe(200);
+  await waitFor(async () => (await spendOf(submitterName)) > 0, "批次的花费没记到提交者头上");
+
+  // 再读几遍，谁读都一样：一批一次。
+  expect(await fx.retrieveBatch(reader.plaintext, id)).toBe(200);
+  expect(await fx.retrieveBatch(submitter.plaintext, id)).toBe(200);
+  await ledgerSettled();
+  expect(await spendOf(submitterName), "这一批只该收一次：$2").toBe(2_000_000);
+  expect(await spendOf(readerName), "读者一分钱也不该出").toBe(0);
+  expect(balanceBefore - (await balance(cookie)), "账本扣的金额不对").toBe(2_000_000);
+
+  // 额度那一侧。读者的 $1 还在；提交者的 $4 里批次占了 $2，再两发就到顶。
+  expect(await fx.saying("chat", reader.plaintext, "hello"), "批次的钱记到读者头上了").toBe(200);
+  expect(await fx.saying("chat", submitter.plaintext, "hello")).toBe(200);
+  expect(await fx.saying("chat", submitter.plaintext, "hello")).toBe(200);
+  expect(
+    await fx.saying("chat", submitter.plaintext, "hello"),
+    "批次的钱没扣提交者的额度",
+  ).toBe(429);
+});
+
+test("网关重启之后_早已结束的批次不再收一次", async () => {
+  // 默认存储里「这批收过了」的记号随进程没了，而账本是持久的：重启后再读一遍，
+  // 指标涨上去，门户就把同一批又扣一次。同时读一个新批次，证明归因在新进程里
+  // 是活的，账本上的差也因此是两批而不是一批。
+  const cookie = await fx.sessionCookie();
+  await setQuota(1_000_000_000);
+  const k = await mint(cookie, "重启的批次");
+  const name = `${k.name} · 重启的批次`;
+  await waitFor(async () => (await fx.retrieveBatch(k.plaintext, "no-such")) !== 401, "新密钥可用");
+
+  await ledgerSettled();
+  const balanceBefore = await balance(cookie);
+  const id = await fx.createBatch(k.plaintext);
+  expect(await fx.retrieveBatch(k.plaintext, id)).toBe(200);
+  await waitFor(async () => (await spendOf(name)) > 0, "批次没有记账");
+  await ledgerSettled();
+  expect(balanceBefore - (await balance(cookie)), "重启前账本扣的金额不对").toBe(2_000_000);
+
+  await fx.restartGateway();
+  expect(await fx.retrieveBatch(k.plaintext, id)).toBe(200);
+  expect(await fx.retrieveBatch(k.plaintext, await fx.createBatch(k.plaintext))).toBe(200);
+  await waitFor(async () => (await spendOf(name)) > 0, "重启后的新批次没有记账");
+  await ledgerSettled();
+  expect(await spendOf(name), "重启之后把旧批次又收了一遍").toBe(2_000_000);
+  expect(balanceBefore - (await balance(cookie)), "账本上该是两批").toBe(4_000_000);
+});
+
+test("建了批次之后再也没人读_钱照样进账", async () => {
+  // 批次没人读也不能白跑：只上传输入、建批次，之后不再碰它（客户端完全可以只靠
+  // 通知、或只下载输出）。网关自己盯着它跑完，记在提交者头上。网关每分钟看一次，
+  // 所以这条要等够一分钟。
+  const cookie = await fx.sessionCookie();
+  await setQuota(1_000_000_000);
+  const k = await mint(cookie, "没人读的批次");
+  const name = `${k.name} · 没人读的批次`;
+  // 读一个不存在的 id 不花钱，401 变成别的就是这把密钥已经生效了。
+  await waitFor(async () => (await fx.retrieveBatch(k.plaintext, "no-such")) !== 401, "新密钥可用");
+  await fx.createBatch(k.plaintext);
+  await waitFor(async () => (await spendOf(name)) > 0, "没人读的批次没有记账");
+  expect(await spendOf(name), "金额不对").toBe(2_000_000);
 });
 
 test("额度耗尽的账号_网关重启后依然进不来", async () => {
