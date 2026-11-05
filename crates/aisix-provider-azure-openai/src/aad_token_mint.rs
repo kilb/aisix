@@ -236,6 +236,11 @@ struct CachedToken {
     expires_at: Instant,
 }
 
+/// How long one mint may take. It runs under a gate every other request on
+/// the same credential waits behind, and a caller with no deadline of its own
+/// must not be able to hold that gate on a stalled token endpoint.
+const TOKEN_MINT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// In-process token cache + minter. One instance per
 /// `AzureOpenAiBridge`. Cache is keyed by a fingerprint of the whole
 /// credential, so ProviderKeys backed by the same app registration
@@ -253,6 +258,7 @@ pub(crate) struct TokenMinter {
     /// endpoint: a throttled mint fails the request rather than slowing
     /// it. Bounded by credential count, like the cache beside it.
     mint_gates: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    mint_timeout: Duration,
     /// Test-only override for the AAD token endpoint. In production
     /// the URL is derived from the tenant id; tests substitute a
     /// wiremock URI here.
@@ -266,6 +272,7 @@ impl TokenMinter {
             client,
             cache: Arc::new(RwLock::new(HashMap::new())),
             mint_gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            mint_timeout: TOKEN_MINT_TIMEOUT,
             #[cfg(test)]
             token_endpoint_override: None,
         }
@@ -334,6 +341,7 @@ impl TokenMinter {
         let resp = self
             .client
             .post(&endpoint)
+            .timeout(self.mint_timeout)
             .form(&[
                 ("grant_type", "client_credentials"),
                 ("client_id", &creds.client_id),
@@ -701,6 +709,41 @@ mod tests {
         minter.get_token(&sovereign).await.unwrap();
         // `.expect(2)` above is the assertion: two distinct authority
         // hosts must not collapse into one cache slot.
+    }
+
+    /// A stalled token endpoint fails the mint on its own clock, and the gate
+    /// it held lets the next caller through.
+    #[tokio::test]
+    async fn a_stalled_mint_gives_the_gate_back() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({"access_token": "late", "expires_in": 3600})),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"access_token": "next", "expires_in": 3600})),
+            )
+            .mount(&server)
+            .await;
+        let mut minter = TokenMinter::new(Client::new()).with_token_endpoint_override(server.uri());
+        minter.mint_timeout = Duration::from_millis(100);
+
+        let stalled =
+            tokio::time::timeout(Duration::from_secs(5), minter.get_token(&sample_creds()))
+                .await
+                .expect("the mint's own timeout ends it");
+        assert!(
+            matches!(stalled, Err(BridgeError::Transport(_))),
+            "{stalled:?}"
+        );
+        assert_eq!(minter.get_token(&sample_creds()).await.unwrap(), "next");
     }
 
     #[tokio::test]

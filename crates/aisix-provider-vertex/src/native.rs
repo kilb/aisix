@@ -84,7 +84,9 @@ impl VertexBridge {
             .map_err(BridgeError::InvalidRequest)?;
         drop(fetched);
 
-        let access_token = creds.resolve_access_token(&self.token_minter).await?;
+        let access_token = creds
+            .resolve_access_token(&self.token_minter, ctx.deadline)
+            .await?;
         let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         // Every `anthropic-beta` value reaching Vertex AI — the caller's
         // own, and any an operator header adds — is filtered to the ones it
@@ -151,7 +153,9 @@ impl VertexBridge {
         let body = platform::vertex_count_tokens_body(&body, model);
         let url =
             self.anthropic_url(ctx, &creds, "count-tokens", "vertex/anthropic-count-tokens")?;
-        let access_token = creds.resolve_access_token(&self.token_minter).await?;
+        let access_token = creds
+            .resolve_access_token(&self.token_minter, ctx.deadline)
+            .await?;
         let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         // Token counting takes no beta, and an unknown one is a 400.
         headers.remove("anthropic-beta");

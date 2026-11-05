@@ -40,6 +40,11 @@ const VERTEX_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 /// has its OWN TTL (also typically 1h); cache uses that, not this.
 const JWT_EXPIRY_SECS: u64 = 3600;
 
+/// How long one mint may take. It runs under a gate every other request on
+/// the same credential waits behind, and a caller with no deadline of its own
+/// must not be able to hold that gate on a stalled token endpoint.
+const TOKEN_MINT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Refresh cached tokens at least this many seconds before their
 /// reported expiry. Prevents a request from picking up a token that
 /// expires while the request is mid-flight.
@@ -184,6 +189,7 @@ pub(crate) struct TokenMinter {
     /// endpoint: a throttled mint fails the request rather than slowing it.
     /// Bounded by credential count, like the cache beside it.
     mint_gates: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    mint_timeout: Duration,
     /// Test-only override for the SA-supplied `token_uri`. In
     /// production we POST directly to the SA's own `token_uri`
     /// (typically `https://oauth2.googleapis.com/token`). Tests
@@ -199,6 +205,7 @@ impl TokenMinter {
             client,
             cache: Arc::new(RwLock::new(HashMap::new())),
             mint_gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            mint_timeout: TOKEN_MINT_TIMEOUT,
             #[cfg(test)]
             token_endpoint_override: None,
         }
@@ -290,6 +297,7 @@ impl TokenMinter {
         let resp = self
             .client
             .post(&endpoint)
+            .timeout(self.mint_timeout)
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
                 ("assertion", &jwt),
@@ -424,6 +432,42 @@ mod tests {
             1,
             "16 concurrent callers must produce one token mint, not a herd"
         );
+    }
+
+    /// A stalled token endpoint fails the mint on its own clock, and the gate
+    /// it held lets the next caller through.
+    #[tokio::test]
+    async fn a_stalled_mint_gives_the_gate_back() {
+        let (private_pem, _) = test_key_pair();
+        let sa = sample_sa(&private_pem, "http://token.example/token");
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({"access_token": "late", "expires_in": 3600})),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"access_token": "next", "expires_in": 3600})),
+            )
+            .mount(&server)
+            .await;
+        let mut minter = TokenMinter::new(Client::new()).with_token_endpoint_override(server.uri());
+        minter.mint_timeout = Duration::from_millis(100);
+
+        let stalled = tokio::time::timeout(Duration::from_secs(5), minter.get_token(&sa))
+            .await
+            .expect("the mint's own timeout ends it");
+        assert!(
+            matches!(stalled, Err(BridgeError::Transport(_))),
+            "{stalled:?}"
+        );
+        assert_eq!(minter.get_token(&sa).await.unwrap(), "next");
     }
 
     /// A token shorter-lived than the refresh margin must still be cached

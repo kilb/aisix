@@ -546,13 +546,19 @@ impl VertexSecret {
 
     /// Resolve the bearer token to use on this request. Returns the
     /// pre-minted token verbatim if set; otherwise mints (or pulls
-    /// from cache) via the bridge's [`TokenMinter`].
-    async fn resolve_access_token(&self, minter: &TokenMinter) -> Result<String, BridgeError> {
+    /// from cache) via the bridge's [`TokenMinter`], under the request's
+    /// deadline: waiting on a stalled token endpoint must not outlast it, and
+    /// the timeout is what lets the request fail over.
+    async fn resolve_access_token(
+        &self,
+        minter: &TokenMinter,
+        deadline: Option<Duration>,
+    ) -> Result<String, BridgeError> {
         if let Some(token) = &self.access_token {
             return Ok(token.clone());
         }
         if let Some(sa) = &self.service_account_json {
-            return minter.get_token(sa).await;
+            return with_deadline(deadline, Instant::now(), minter.get_token(sa)).await;
         }
         // parse() rejects neither-set, so this is unreachable in
         // practice — keep the explicit error for defense in depth.
@@ -925,7 +931,9 @@ impl Bridge for VertexBridge {
             outbound_bytes(&body)?
         };
 
-        let access_token = creds.resolve_access_token(&self.token_minter).await?;
+        let access_token = creds
+            .resolve_access_token(&self.token_minter, ctx.deadline)
+            .await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         let client = self.client_for(ctx);
         let started = Instant::now();
@@ -1078,7 +1086,9 @@ impl VertexBridge {
         // Resolve bearer: pre-minted token verbatim, or mint+cache
         // via the in-process token minter from SA JSON. Failure
         // surfaces as a Config error (operator-actionable).
-        let access_token = creds.resolve_access_token(&self.token_minter).await?;
+        let access_token = creds
+            .resolve_access_token(&self.token_minter, ctx.deadline)
+            .await?;
         let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         with_shared_request_type(&mut headers, shared_request_type);
         let client = self.client_for(ctx);
@@ -1210,7 +1220,9 @@ impl VertexBridge {
         // The owned request is not needed past its wire bytes.
         drop(req);
 
-        let access_token = creds.resolve_access_token(&self.token_minter).await?;
+        let access_token = creds
+            .resolve_access_token(&self.token_minter, ctx.deadline)
+            .await?;
         let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         retain_vertex_betas(&mut headers)?;
         let client = self.client_for(ctx);
@@ -1330,7 +1342,9 @@ impl VertexBridge {
 
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
-        let access_token = creds.resolve_access_token(&self.token_minter).await?;
+        let access_token = creds
+            .resolve_access_token(&self.token_minter, ctx.deadline)
+            .await?;
         let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         retain_vertex_betas(&mut headers)?;
         let client = self.client_for(ctx);
@@ -1368,12 +1382,17 @@ impl VertexBridge {
             let mut decoder = SseDecoder::new();
             let mut state = StreamState::default();
             let mut byte_stream = Box::pin(byte_stream);
+            // `message_stop` ends the stream below. A `stop_reason` already
+            // said the answer is complete, so a body that ends after one is
+            // whole; one that ends before either is truncated.
+            let mut semantic_terminal_seen = false;
 
             loop {
                 // At EOF, `finish` flushes a last frame the upstream never
                 // terminated, and reports a frame that outgrew the bound
                 // after the last events were returned.
                 let (events, eof) = match byte_stream.next().await {
+                    Some(Err(_)) if semantic_terminal_seen => return,
                     Some(item) => {
                         let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
                         (decoder.feed(bytes.as_ref()).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?, false)
@@ -1395,6 +1414,7 @@ impl VertexBridge {
                         Err(aisix_provider_anthropic::wire::stream_error_into_bridge_error(error))?;
                     }
                     if let Some(chunk) = state.next_chunk(&parsed) {
+                        semantic_terminal_seen |= chunk.finish_reason.is_some();
                         yield chunk;
                     }
                     if StreamState::is_terminal(&parsed) {
@@ -1404,6 +1424,9 @@ impl VertexBridge {
                 if eof {
                     break;
                 }
+            }
+            if !semantic_terminal_seen {
+                Err(BridgeError::StreamAborted)?;
             }
         };
 
@@ -1476,7 +1499,9 @@ impl VertexBridge {
         // The owned request is not needed past its wire bytes.
         drop(req);
 
-        let access_token = creds.resolve_access_token(&self.token_minter).await?;
+        let access_token = creds
+            .resolve_access_token(&self.token_minter, ctx.deadline)
+            .await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         let client = self.client_for(ctx);
         let started = Instant::now();
@@ -1545,7 +1570,9 @@ impl VertexBridge {
 
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
-        let access_token = creds.resolve_access_token(&self.token_minter).await?;
+        let access_token = creds
+            .resolve_access_token(&self.token_minter, ctx.deadline)
+            .await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         let client = self.client_for(ctx);
         let started = Instant::now();
@@ -1577,9 +1604,18 @@ impl VertexBridge {
             let mut decoder = SseDecoder::new();
             let mut tool_call_indexer = ToolCallIndexer::default();
             let mut byte_stream = Box::pin(byte_stream);
+            // `[DONE]` or a finish reason says the answer is complete; a body
+            // that ends before either is truncated.
+            let mut terminal_seen = false;
 
             while let Some(item) = byte_stream.next().await {
-                let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                let bytes: Bytes = match item {
+                    Ok(bytes) => bytes,
+                    Err(_) if terminal_seen => return,
+                    Err(e) => {
+                        Err(BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?
+                    }
+                };
                 for event in decoder
                     .feed(bytes.as_ref())
                     .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
@@ -1591,28 +1627,37 @@ impl VertexBridge {
                                 "vertex openai-shim stream chunk parse",
                             )?;
                             for chunk in openai_stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
+                                terminal_seen |= chunk.finish_reason.is_some();
                                 yield chunk.with_fallback_service_tier(&header_tier);
                             }
                         }
                         // OpenAI shim terminates with `data: [DONE]`;
                         // stop emitting on the sentinel.
-                        SseEvent::Done => {}
+                        SseEvent::Done => terminal_seen = true,
                     }
                 }
             }
             // Flush a partial trailing chunk if the connection drops
             // without a final blank line.
-            if let Some(SseEvent::Data(data)) = decoder
+            match decoder
                 .finish()
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
             {
-                let parsed = parse_vertex_openai_stream_payload(
-                    &data,
-                    "vertex openai-shim stream tail parse",
-                )?;
-                for chunk in openai_stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
-                    yield chunk.with_fallback_service_tier(&header_tier);
+                Some(SseEvent::Done) => terminal_seen = true,
+                Some(SseEvent::Data(data)) => {
+                    let parsed = parse_vertex_openai_stream_payload(
+                        &data,
+                        "vertex openai-shim stream tail parse",
+                    )?;
+                    for chunk in openai_stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
+                        terminal_seen |= chunk.finish_reason.is_some();
+                        yield chunk.with_fallback_service_tier(&header_tier);
+                    }
                 }
+                None => {}
+            }
+            if !terminal_seen {
+                Err(BridgeError::StreamAborted)?;
             }
         };
 
@@ -1710,7 +1755,9 @@ impl VertexBridge {
         // The owned request is not needed past its wire bytes.
         drop(req);
 
-        let access_token = creds.resolve_access_token(&self.token_minter).await?;
+        let access_token = creds
+            .resolve_access_token(&self.token_minter, ctx.deadline)
+            .await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         let client = self.client_for(ctx);
         let started = Instant::now();
@@ -1795,7 +1842,9 @@ impl VertexBridge {
 
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
-        let access_token = creds.resolve_access_token(&self.token_minter).await?;
+        let access_token = creds
+            .resolve_access_token(&self.token_minter, ctx.deadline)
+            .await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         let client = self.client_for(ctx);
         let started = Instant::now();
@@ -1827,9 +1876,18 @@ impl VertexBridge {
             let mut decoder = SseDecoder::new();
             let mut tool_call_indexer = ToolCallIndexer::default();
             let mut byte_stream = Box::pin(byte_stream);
+            // `[DONE]` or a finish reason says the answer is complete; a body
+            // that ends before either is truncated.
+            let mut terminal_seen = false;
 
             while let Some(item) = byte_stream.next().await {
-                let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                let bytes: Bytes = match item {
+                    Ok(bytes) => bytes,
+                    Err(_) if terminal_seen => return,
+                    Err(e) => {
+                        Err(BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?
+                    }
+                };
                 for event in decoder
                     .feed(bytes.as_ref())
                     .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
@@ -1841,26 +1899,35 @@ impl VertexBridge {
                                 "vertex partner :streamRawPredict chunk parse",
                             )?;
                             for chunk in openai_stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
+                                terminal_seen |= chunk.finish_reason.is_some();
                                 yield chunk.with_fallback_service_tier(&header_tier);
                             }
                         }
                         // OpenAI-compatible upstreams (Mistral / AI21)
                         // terminate with `data: [DONE]`; stop on the sentinel.
-                        SseEvent::Done => {}
+                        SseEvent::Done => terminal_seen = true,
                     }
                 }
             }
-            if let Some(SseEvent::Data(data)) = decoder
+            match decoder
                 .finish()
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
             {
-                let parsed = parse_vertex_openai_stream_payload(
-                    &data,
-                    "vertex partner :streamRawPredict tail parse",
-                )?;
-                for chunk in openai_stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
-                    yield chunk.with_fallback_service_tier(&header_tier);
+                Some(SseEvent::Done) => terminal_seen = true,
+                Some(SseEvent::Data(data)) => {
+                    let parsed = parse_vertex_openai_stream_payload(
+                        &data,
+                        "vertex partner :streamRawPredict tail parse",
+                    )?;
+                    for chunk in openai_stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
+                        terminal_seen |= chunk.finish_reason.is_some();
+                        yield chunk.with_fallback_service_tier(&header_tier);
+                    }
                 }
+                None => {}
+            }
+            if !terminal_seen {
+                Err(BridgeError::StreamAborted)?;
             }
         };
 
@@ -1936,7 +2003,9 @@ impl VertexBridge {
         // Resolve bearer (pre-minted OR minted-from-SA) BEFORE
         // entering the stream future so token-mint errors surface
         // as a direct Err return rather than being yielded mid-stream.
-        let access_token = creds.resolve_access_token(&self.token_minter).await?;
+        let access_token = creds
+            .resolve_access_token(&self.token_minter, ctx.deadline)
+            .await?;
         let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         with_shared_request_type(&mut headers, shared_request_type);
         let client = self.client_for(ctx);
@@ -1979,9 +2048,18 @@ impl VertexBridge {
                 ..Default::default()
             };
             let mut byte_stream = Box::pin(byte_stream);
+            // Gemini ends a whole answer with a `finishReason` and sends no
+            // sentinel; a body that closes before one is truncated.
+            let mut terminal_seen = false;
 
             while let Some(item) = byte_stream.next().await {
-                let bytes: Bytes = item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+                let bytes: Bytes = match item {
+                    Ok(bytes) => bytes,
+                    Err(_) if terminal_seen => return,
+                    Err(e) => {
+                        Err(BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?
+                    }
+                };
                 for event in decoder
                     .feed(bytes.as_ref())
                     .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
@@ -1994,6 +2072,7 @@ impl VertexBridge {
                         for chunk in
                             gemini_chunk_into_chat_chunks(parsed, &upstream_id_owned, &mut state)
                         {
+                            terminal_seen |= chunk.finish_reason.is_some();
                             yield chunk;
                         }
                     }
@@ -2018,8 +2097,12 @@ impl VertexBridge {
                 for chunk in
                     gemini_chunk_into_chat_chunks(parsed, &upstream_id_owned, &mut state)
                 {
+                    terminal_seen |= chunk.finish_reason.is_some();
                     yield chunk;
                 }
+            }
+            if !terminal_seen {
+                Err(BridgeError::StreamAborted)?;
             }
         };
 
@@ -7555,6 +7638,149 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         );
         // wiremock's .expect(1) on the OAuth mock fires here at drop —
         // proves the cache prevented a second mint on the second chat.
+    }
+
+    /// The request's deadline covers the token mint: a stalled token endpoint
+    /// answers this attempt with a timeout it can fail over from, on the chat
+    /// and the streaming path alike, and the next request mints in its turn.
+    #[tokio::test]
+    async fn a_stalled_token_mint_times_out_under_the_request_deadline() {
+        let oauth_server = MockServer::builder().start().await;
+        let vertex_server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({"access_token": "late", "expires_in": 3600})),
+            )
+            .up_to_n_times(2)
+            .mount(&oauth_server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "ya29.next",
+                "expires_in": 3600
+            })))
+            .mount(&oauth_server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(default_gemini_response_template())
+            .mount(&vertex_server)
+            .await;
+        let bridge = VertexBridge::new()
+            .with_api_base_override(vertex_server.uri())
+            .with_token_endpoint_override(oauth_server.uri());
+        let pk = sample_pk_with_secret(&sa_credential_secret(&oauth_server.uri()));
+        let ctx = BridgeContext::new("req-1", sample_model_with("gemini-1.5-pro"), pk)
+            .with_deadline(std::time::Duration::from_millis(200));
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        let budget = std::time::Duration::from_secs(5);
+
+        let buffered = tokio::time::timeout(budget, bridge.chat(&req, &ctx))
+            .await
+            .expect("the deadline ends the wait");
+        assert!(
+            matches!(buffered, Err(BridgeError::Timeout { .. })),
+            "{buffered:?}"
+        );
+        let streamed = tokio::time::timeout(budget, bridge.chat_stream(&req, &ctx))
+            .await
+            .expect("the deadline ends the wait");
+        assert!(matches!(streamed, Err(BridgeError::Timeout { .. })));
+
+        bridge
+            .chat(&req, &ctx)
+            .await
+            .expect("the gate was given back");
+    }
+
+    /// EOF with no terminal is a failure on every publisher rail; what counts
+    /// as the terminal is each wire's own.
+    #[tokio::test]
+    async fn a_stream_that_ends_with_no_terminal_fails_on_every_rail() {
+        const OPENAI: &str =
+            "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        const OPENAI_FINISH: &str = "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+        const GEMINI: &str =
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n\n";
+        const GEMINI_FINISH: &str =
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\".\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+        const CLAUDE: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"c\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n";
+        const CLAUDE_FINISH: &str = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n";
+
+        let cases: Vec<(&str, String, bool)> = vec![
+            ("gemini-2.5-flash", GEMINI.into(), true),
+            (
+                "gemini-2.5-flash",
+                format!("{GEMINI}{GEMINI_FINISH}"),
+                false,
+            ),
+            ("claude-sonnet-4-5@20250929", CLAUDE.into(), true),
+            (
+                "claude-sonnet-4-5@20250929",
+                format!("{CLAUDE}{CLAUDE_FINISH}"),
+                false,
+            ),
+            ("meta/llama-3.3-70b-instruct-maas", OPENAI.into(), true),
+            (
+                "meta/llama-3.3-70b-instruct-maas",
+                format!("{OPENAI}{OPENAI_FINISH}"),
+                false,
+            ),
+            (
+                "meta/llama-3.3-70b-instruct-maas",
+                format!("{OPENAI}data: [DONE]\n\n"),
+                false,
+            ),
+            (
+                "meta/llama-3.3-70b-instruct-maas",
+                format!("{OPENAI}data: [DONE]\n"),
+                false,
+            ),
+            ("mistral-large-2411", OPENAI.into(), true),
+            (
+                "mistral-large-2411",
+                format!("{OPENAI}{OPENAI_FINISH}"),
+                false,
+            ),
+            (
+                "mistral-large-2411",
+                format!("{OPENAI}data: [DONE]\n\n"),
+                false,
+            ),
+        ];
+        for (model, body, aborted) in cases {
+            let server = MockServer::builder().start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(body.clone(), "text/event-stream"),
+                )
+                .mount(&server)
+                .await;
+            let bridge = VertexBridge::new().with_api_base_override(server.uri());
+            let ctx = BridgeContext::new(
+                "req-1",
+                sample_model_with(model),
+                sample_pk_with_secret(
+                    r#"{"access_token":"t","project":"my-proj","region":"us-central1"}"#,
+                ),
+            );
+            let req = ChatFormat::new("m", vec![ChatMessage::user("hi")]);
+            let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
+            let (mut text, mut failure) = (String::new(), None);
+            while let Some(item) = futures::StreamExt::next(&mut stream).await {
+                match item {
+                    Ok(chunk) => text.push_str(chunk.delta.content.as_deref().unwrap_or("")),
+                    Err(e) => failure = Some(e),
+                }
+            }
+            assert!(text.starts_with("hi"), "{model}: {text:?}");
+            assert_eq!(
+                matches!(failure, Some(BridgeError::StreamAborted)),
+                aborted,
+                "{model} {body:?}: {failure:?}"
+            );
+        }
     }
 
     // ─── RequestOverrides applied on the wire (#339) ───────────────────

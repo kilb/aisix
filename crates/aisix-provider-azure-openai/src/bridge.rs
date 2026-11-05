@@ -187,7 +187,10 @@ impl AzureOpenAiBridge {
     /// or a `bearer_token` (freshly minted-or-cached AAD access
     /// token). Token-mint failures (e.g. AAD 401 invalid_client)
     /// surface as `Err` here so `chat()` / `chat_stream()` short-
-    /// circuit BEFORE attempting the upstream Azure OpenAI call.
+    /// circuit BEFORE attempting the upstream Azure OpenAI call. The
+    /// mint runs under the request's deadline: waiting on a stalled token
+    /// endpoint must not outlast it, and the timeout is what lets the request
+    /// fail over.
     async fn resolve_auth(&self, ctx: &BridgeContext) -> Result<AzureAuth, BridgeError> {
         match AzureSecret::parse(&ctx.provider_key.api_key)? {
             AzureSecret::ApiKey(key) => Ok(AzureAuth {
@@ -195,7 +198,12 @@ impl AzureOpenAiBridge {
                 bearer_token: None,
             }),
             AzureSecret::Aad(creds) => {
-                let token = self.token_minter.get_token(&creds).await?;
+                let token = with_deadline(
+                    ctx.deadline,
+                    Instant::now(),
+                    self.token_minter.get_token(&creds),
+                )
+                .await?;
                 Ok(AzureAuth {
                     api_key: None,
                     bearer_token: Some(token),
@@ -1101,6 +1109,7 @@ where
         let mut tool_call_indexer = ToolCallIndexer::default();
         let mut stream = Box::pin(byte_stream);
         let mut done_marker_seen = false;
+        let mut semantic_terminal_seen = false;
         'outer: loop {
             // Audit H2: bound each individual chunk wait. `tokio::time::timeout`
             // (not `timeout_at`) so the budget restarts on every chunk — the
@@ -1120,7 +1129,13 @@ where
                 None => stream.next().await,
             };
             let Some(next) = next else { break 'outer; };
-            let chunk = next.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
+            let chunk = match next {
+                Ok(chunk) => chunk,
+                Err(_) if semantic_terminal_seen => return,
+                Err(e) => {
+                    Err(BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?
+                }
+            };
             for event in decoder
                 .feed(chunk.as_ref())
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?
@@ -1133,6 +1148,7 @@ where
                     SseEvent::Data(payload) => {
                         let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
                         for chunk in stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
+                            semantic_terminal_seen |= chunk.finish_reason.is_some();
                             yield chunk;
                         }
                     }
@@ -1149,6 +1165,7 @@ where
             Some(SseEvent::Data(payload)) => {
                 let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
                 for chunk in stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
+                    semantic_terminal_seen |= chunk.finish_reason.is_some();
                     yield chunk;
                 }
             }
@@ -1175,6 +1192,9 @@ where
                     );
                 }
             }
+        }
+        if !done_marker_seen && !semantic_terminal_seen {
+            Err(BridgeError::StreamAborted)?;
         }
     }
 }
@@ -2999,6 +3019,159 @@ mod tests {
             !headers.contains_key("api-key"),
             "AAD path must NOT send api-key: header (mutually exclusive auth schemes)"
         );
+    }
+
+    fn chunks_of(body: &str) -> impl futures::Stream<Item = reqwest::Result<bytes::Bytes>> {
+        futures::stream::iter(vec![Ok(bytes::Bytes::copy_from_slice(body.as_bytes()))])
+    }
+
+    /// EOF with no terminal is a failure; `[DONE]` or a finish reason is the
+    /// terminal.
+    #[tokio::test]
+    async fn a_stream_that_ends_with_no_terminal_fails() {
+        const CONTENT: &str =
+            "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        const FINISH: &str = "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+        for (body, aborted) in [
+            (CONTENT.to_string(), true),
+            (format!("{CONTENT}{FINISH}"), false),
+            (format!("{CONTENT}data: [DONE]\n\n"), false),
+            (format!("{CONTENT}data: [DONE]\n"), false),
+        ] {
+            let mut stream = Box::pin(build_chunk_stream(
+                chunks_of(&body),
+                None,
+                None,
+                "azure-openai",
+                "req".to_string(),
+                None,
+            ));
+            let mut failure = None;
+            while let Some(item) = stream.next().await {
+                if let Err(e) = item {
+                    failure = Some(e);
+                }
+            }
+            assert_eq!(
+                matches!(failure, Some(BridgeError::StreamAborted)),
+                aborted,
+                "{body:?}: {failure:?}"
+            );
+        }
+    }
+
+    /// A connection that resets after the finish reason lost nothing the
+    /// caller needs: the answer stands. One that resets before it is a failure.
+    #[tokio::test]
+    async fn a_reset_after_the_finish_reason_does_not_fail_the_stream() {
+        const CONTENT: &str =
+            "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        const FINISH: &str = "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+        // 一个返回半截 chunked 响应体就断开的上游，才能拿到真实的 reqwest 读错误。
+        async fn relay(body: &'static [u8]) -> Option<BridgeError> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 2048];
+                let _ = socket.read(&mut request).await;
+                let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+                let chunk = format!("{:x}\r\n", body.len());
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(chunk.as_bytes()).await.unwrap();
+                socket.write_all(body).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+                socket.flush().await.unwrap();
+            });
+            let resp = reqwest::get(format!("http://{addr}/")).await.unwrap();
+            let mut stream = Box::pin(build_chunk_stream(
+                resp.bytes_stream(),
+                None,
+                None,
+                "azure-openai",
+                "req".to_string(),
+                None,
+            ));
+            let mut failure = None;
+            while let Some(item) = stream.next().await {
+                if let Err(e) = item {
+                    failure = Some(e);
+                }
+            }
+            failure
+        }
+        let whole: &'static str = Box::leak(format!("{CONTENT}{FINISH}").into_boxed_str());
+        let answered = relay(whole.as_bytes()).await;
+        assert!(answered.is_none(), "{answered:?}");
+        let cut = relay(CONTENT.as_bytes()).await;
+        assert!(matches!(cut, Some(BridgeError::Transport(_))), "{cut:?}");
+    }
+
+    /// The request's deadline covers the token mint: a stalled token endpoint
+    /// answers this attempt with a timeout it can fail over from, on the chat
+    /// and the streaming path alike, and the next request mints in its turn.
+    #[tokio::test]
+    async fn a_stalled_token_mint_times_out_under_the_request_deadline() {
+        let aad_server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/v2.0/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({"access_token": "late", "expires_in": 3600})),
+            )
+            .up_to_n_times(2)
+            .mount(&aad_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/v2.0/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "next",
+                "expires_in": 3600
+            })))
+            .mount(&aad_server)
+            .await;
+        let azure_server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-1",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hi"},
+                    "finish_reason": "stop"
+                }]
+            })))
+            .mount(&azure_server)
+            .await;
+        let bridge = AzureOpenAiBridge::new()
+            .with_url_override(mock_chat_url(&azure_server.uri(), "gpt4o-prod"))
+            .with_aad_token_endpoint_override(format!("{}/oauth2/v2.0/token", aad_server.uri()));
+        let ctx = BridgeContext::new(
+            "req-azure-1",
+            sample_model(),
+            sample_pk_with_aad_secret("https://acme-west.openai.azure.com"),
+        )
+        .with_deadline(std::time::Duration::from_millis(200));
+        let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
+        let budget = std::time::Duration::from_secs(5);
+
+        let buffered = tokio::time::timeout(budget, bridge.chat(&req, &ctx))
+            .await
+            .expect("the deadline ends the wait");
+        assert!(
+            matches!(buffered, Err(BridgeError::Timeout { .. })),
+            "{buffered:?}"
+        );
+        let streamed = tokio::time::timeout(budget, bridge.chat_stream(&req, &ctx))
+            .await
+            .expect("the deadline ends the wait");
+        assert!(matches!(streamed, Err(BridgeError::Timeout { .. })));
+
+        bridge
+            .chat(&req, &ctx)
+            .await
+            .expect("the gate was given back");
     }
 
     #[tokio::test]

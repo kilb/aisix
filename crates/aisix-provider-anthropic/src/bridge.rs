@@ -585,6 +585,7 @@ where
             // terminated, and reports a frame that outgrew the bound after
             // the last events were returned.
             let (events, eof) = match stream.next().await {
+                Some(Err(_)) if semantic_terminal_seen => return,
                 Some(next) => {
                     let chunk = next.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
                     (decoder.feed(chunk.as_ref()).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?, false)
