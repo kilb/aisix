@@ -126,6 +126,13 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
   const occurrences = (req: { headerNames: string[] }, name: string): number =>
     req.headerNames.filter((n) => n === name).length;
 
+  /** The key the caller authenticated with reaches a provider nowhere. */
+  const expectNoGatewayKey = (req: ReceivedRequest): void => {
+    expect(req.headers["x-aisix-api-key"]).toBeUndefined();
+    expect(JSON.stringify(req.headers)).not.toContain(CALLER_KEY);
+    expect(req.body).not.toContain(CALLER_KEY);
+  };
+
   const bodyOf = async (res: Response, what: string): Promise<string> => {
     const text = await res.text();
     expect(
@@ -538,17 +545,22 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
     if (!etcdReachable) return;
     const mark = upstream!.receivedRequests.length;
 
-    // The caller authenticates to the GATEWAY with its own AISIX key; the
-    // operator has declared that this upstream reads the caller's
-    // credential rather than the ProviderKey's.
-    await chat(FORWARD_MODEL).then((r) => bodyOf(r, "credential-slot forward"));
+    // The caller authenticates to the GATEWAY in the header kept for that,
+    // and sends a separate credential for the upstream; the operator has
+    // declared that this upstream reads the caller's credential rather than
+    // the ProviderKey's.
+    await chat(FORWARD_MODEL, {
+      "x-aisix-api-key": CALLER_KEY,
+      authorization: CALLER_CREDENTIAL,
+    }).then((r) => bodyOf(r, "credential-slot forward"));
 
     const seen = since(mark).at(-1)!;
-    expect(seen.headers.authorization).toBe(`Bearer ${CALLER_KEY}`);
+    expect(seen.headers.authorization).toBe(CALLER_CREDENTIAL);
     // And ALONE. Counting occurrences rather than reading the collapsed
     // value is the whole point: node keeps only the FIRST `authorization`,
     // so a second one appended behind it would be invisible here.
     expect(occurrences(seen, "authorization")).toBe(1);
+    expectNoGatewayKey(seen);
   });
 
   test("the Anthropic bridge forwards too, into its own credential slot", async () => {
@@ -982,9 +994,11 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
     if (!etcdReachable) return;
     const mark = upstream!.receivedRequests.length;
 
-    await chat(ENSEMBLE_MODEL, { [CUSTOM_HEADER]: "carried.verbatim" }).then((r) =>
-      bodyOf(r, "the ensemble entry"),
-    );
+    await chat(ENSEMBLE_MODEL, {
+      [CUSTOM_HEADER]: "carried.verbatim",
+      "x-aisix-api-key": CALLER_KEY,
+      authorization: CALLER_CREDENTIAL,
+    }).then((r) => bodyOf(r, "the ensemble entry"));
 
     // Two panel members plus the judge, each a separate upstream call
     // built by `ProxyModelCaller::call` rather than by the single
@@ -996,7 +1010,9 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
       // Each sub-call reads its OWN ProviderKey's list, which here also
       // names the credential slot — the ensemble entry has no
       // ProviderKey to inherit one from.
-      expect(call.headers.authorization).toBe(`Bearer ${CALLER_KEY}`);
+      expect(call.headers.authorization).toBe(CALLER_CREDENTIAL);
+      expect(occurrences(call, "authorization")).toBe(1);
+      expectNoGatewayKey(call);
     }
   });
 
