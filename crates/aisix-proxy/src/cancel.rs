@@ -174,6 +174,7 @@ impl HeldStream {
             usage_attr::input_tokens_for_pricing(
                 u64::from(usage.prompt_tokens),
                 u64::from(usage.cached_prompt_tokens),
+                u64::from(usage.cache_write_tokens.unwrap_or(0)),
                 u64::from(usage.cache_read_tokens),
                 u64::from(usage.cache_creation_tokens),
             ),
