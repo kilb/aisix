@@ -253,6 +253,21 @@ pub enum ProxyError {
     /// caller supplied it, so it leaks nothing.
     #[error("video {0:?} not found")]
     VideoNotFound(String),
+    /// A file, batch or fine-tuning id that names another owner, or no owner
+    /// to a caller that has one. Refused on the id alone, so it reads the same
+    /// whether or not the upstream holds it. The id echoes back verbatim: the
+    /// caller supplied it, so it leaks nothing.
+    #[error("resource {0:?} not found")]
+    JobResourceNotFound(String),
+    /// A team- or user-scoped key asked for a list of files, batches or
+    /// fine-tuning jobs. The upstream's list spans its whole account, and the
+    /// gateway cannot say which of it the caller owns.
+    #[error(
+        "listing is not available to a key that belongs to a team or user: the provider's \
+         list cannot be attributed to an owner. Use the ids returned when the resources \
+         were created"
+    )]
+    JobListRefused,
     #[error("API key is not allowed to use model {0:?}")]
     ModelForbidden(String),
     /// The resolved client IP is outside the model's `allowed_cidrs`
@@ -508,6 +523,8 @@ impl ProxyError {
             ProxyError::RouteForbidden(_) => StatusCode::FORBIDDEN,
             ProxyError::ModelNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::VideoNotFound(_) => StatusCode::NOT_FOUND,
+            ProxyError::JobResourceNotFound(_) => StatusCode::NOT_FOUND,
+            ProxyError::JobListRefused => StatusCode::FORBIDDEN,
             ProxyError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             ProxyError::WebSocketUpgradeRequired { status, .. } => *status,
             ProxyError::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
@@ -559,6 +576,8 @@ impl ProxyError {
             ProxyError::RouteForbidden(_) => "permission_denied",
             ProxyError::ModelNotFound(_) => "model_not_found",
             ProxyError::VideoNotFound(_) => "video_not_found",
+            ProxyError::JobResourceNotFound(_) => "resource_not_found",
+            ProxyError::JobListRefused => "permission_denied",
             ProxyError::InvalidRequest(_) => "invalid_request_error",
             ProxyError::WebSocketUpgradeRequired { .. } => "websocket_upgrade_required",
             ProxyError::RequestTooLarge { .. } => "invalid_request_error",

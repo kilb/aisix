@@ -669,7 +669,7 @@ pub(crate) fn fixture(surface: &str) -> Option<Request<Body>> {
         "/v1/batches" => json(
             surface,
             serde_json::json!({
-                "input_file_id": crate::jobs::encode_routed_id("file-census", "census-openai"),
+                "input_file_id": crate::jobs::encode_routed_id("file-census", "census-openai", None),
                 "endpoint": "/v1/chat/completions",
                 "completion_window": "24h",
             }),
@@ -678,7 +678,7 @@ pub(crate) fn fixture(surface: &str) -> Option<Request<Body>> {
             surface,
             serde_json::json!({
                 "model": "gpt-4o-mini-2024-07-18",
-                "training_file": crate::jobs::encode_routed_id("file-census", "census-openai"),
+                "training_file": crate::jobs::encode_routed_id("file-census", "census-openai", None),
             }),
         ),
         // `tasks/get` carries no message at all.

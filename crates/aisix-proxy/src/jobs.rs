@@ -25,6 +25,20 @@
 //! ids are still accepted (routing falls back to the explicit/default
 //! model), mirroring LiteLLM's tolerance on list/retrieve flows.
 //!
+//! ## Ownership
+//!
+//! The upstream account has one namespace, so a Provider Key shared between
+//! teams would otherwise hand each team the others' files. A key with a team or
+//! user ([`job_owner`]) therefore owns what it creates: the id it is handed
+//! carries that owner, and an id that names anyone else, or no one, reads as an
+//! id that does not exist, on every call that addresses one. Ids derived from
+//! an owned resource (a batch's `output_file_id`) carry the owner because only
+//! the owner can read the resource they appear on. It cannot list, because the
+//! gateway has no way to attribute the upstream's list to an owner. A key with
+//! neither is what a single-tenant deployment uses, and stays shared with every
+//! other such key. The id is not signed: forging one takes the upstream's
+//! random id, which a scoped caller has no list to find.
+//!
 //! ## Provider coverage
 //!
 //! v1 targets adapter `openai` (any OpenAI-compatible `api_base`,
@@ -106,28 +120,70 @@ const BATCH_WATCH_LIMIT: Duration = Duration::from_secs(8 * 24 * 3600);
 // ─────────────────────────── id codec ───────────────────────────
 
 /// Encode a provider-issued id + its routing Model into a gateway id:
-/// `aisix-<base64url_nopad("<raw>;model,<display_name>")>`.
-pub(crate) fn encode_routed_id(raw: &str, model: &str) -> String {
-    format!(
-        "{ROUTED_ID_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(format!("{raw};model,{model}"))
-    )
+/// `aisix-<base64url_nopad("<raw>;model,<display_name>")>`, with
+/// `;owner,<owner>` after the raw id when the resource has an owner.
+pub(crate) fn encode_routed_id(raw: &str, model: &str, owner: Option<&str>) -> String {
+    let plain = match owner {
+        Some(owner) => format!("{raw};owner,{owner};model,{model}"),
+        None => format!("{raw};model,{model}"),
+    };
+    format!("{ROUTED_ID_PREFIX}{}", URL_SAFE_NO_PAD.encode(plain))
 }
 
-/// Decode a gateway-minted id back to `(raw_provider_id, model)`.
-/// Returns `None` for anything that isn't a well-formed gateway id —
-/// callers treat those as raw provider ids (LiteLLM parity).
-pub(crate) fn decode_routed_id(id: &str) -> Option<(String, String)> {
+/// A gateway-minted id, decoded.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RoutedId {
+    pub(crate) raw: String,
+    pub(crate) model: String,
+    pub(crate) owner: Option<String>,
+}
+
+/// Decode a gateway-minted id. Returns `None` for anything that isn't a
+/// well-formed gateway id — callers treat those as raw provider ids (LiteLLM
+/// parity).
+pub(crate) fn decode_routed_id(id: &str) -> Option<RoutedId> {
     let b64 = id.strip_prefix(ROUTED_ID_PREFIX)?;
     let bytes = URL_SAFE_NO_PAD.decode(b64).ok()?;
     let s = String::from_utf8(bytes).ok()?;
     // rsplit: a model display name cannot contain the separator without
     // making the encode ambiguous; raw provider ids never do.
-    let (raw, model) = s.rsplit_once(";model,")?;
-    if raw.is_empty() || model.is_empty() {
+    let (head, model) = s.rsplit_once(";model,")?;
+    let (raw, owner) = match head.split_once(";owner,") {
+        Some((raw, owner)) => (raw, Some(owner.to_string())),
+        None => (head, None),
+    };
+    if raw.is_empty() || model.is_empty() || owner.as_deref() == Some("") {
         return None;
     }
-    Some((raw.to_string(), model.to_string()))
+    Some(RoutedId {
+        raw: raw.to_string(),
+        model: model.to_string(),
+        owner,
+    })
+}
+
+/// Who a key's job resources belong to: its team, else its user. `None` for a
+/// key with neither.
+fn job_owner(auth: &AuthenticatedKey) -> Option<String> {
+    let key = auth.key();
+    let non_empty = |id: &Option<String>| id.clone().filter(|id| !id.is_empty());
+    non_empty(&key.team_id)
+        .map(|team| format!("team:{team}"))
+        .or_else(|| non_empty(&key.user_id).map(|user| format!("user:{user}")))
+}
+
+/// Refuse an id whose owner is not the caller's. Decided on the id alone, with
+/// no upstream call, so the answer says nothing about whether it exists.
+fn require_job_owner(
+    auth: &AuthenticatedKey,
+    id: &str,
+    owner: Option<&str>,
+) -> Result<(), ProxyError> {
+    if job_owner(auth).as_deref() == owner {
+        Ok(())
+    } else {
+        Err(ProxyError::JobResourceNotFound(id.to_string()))
+    }
 }
 
 /// Charset guard for ids interpolated into upstream URL paths. A decoded
@@ -844,7 +900,7 @@ const ID_FIELDS: &[&str] = &[
     "validation_file",
 ];
 
-fn rewrite_response_ids(v: &mut Value, model: &str) {
+fn rewrite_response_ids(v: &mut Value, model: &str, owner: Option<&str>) {
     let Some(obj) = v.as_object_mut() else { return };
     // 网关自己的标记不是调用方写的 metadata，不该出现在给它的应答里。
     if let Some(Value::Object(metadata)) = obj.get_mut("metadata") {
@@ -854,7 +910,7 @@ fn rewrite_response_ids(v: &mut Value, model: &str) {
     for field in ID_FIELDS {
         if let Some(Value::String(s)) = obj.get_mut(*field) {
             if !s.is_empty() && !s.starts_with(ROUTED_ID_PREFIX) {
-                *s = encode_routed_id(s, model);
+                *s = encode_routed_id(s, model, owner);
             }
         }
     }
@@ -863,7 +919,7 @@ fn rewrite_response_ids(v: &mut Value, model: &str) {
         for f in files {
             if let Value::String(s) = f {
                 if !s.is_empty() && !s.starts_with(ROUTED_ID_PREFIX) {
-                    *s = encode_routed_id(s, model);
+                    *s = encode_routed_id(s, model, owner);
                 }
             }
         }
@@ -1166,10 +1222,11 @@ fn json_response(
     upstream_headers: &HeaderMap,
     bytes: Bytes,
     rewrite_model: Option<&str>,
+    owner: Option<&str>,
 ) -> Response {
     let body = match (rewrite_model, serde_json::from_slice::<Value>(&bytes).ok()) {
         (Some(model), Some(mut v)) => {
-            rewrite_response_ids(&mut v, model);
+            rewrite_response_ids(&mut v, model, owner);
             Bytes::from(serde_json::to_vec(&v).unwrap_or_else(|_| bytes.to_vec()))
         }
         _ => bytes,
@@ -1187,15 +1244,15 @@ fn json_response(
 }
 
 /// Routing-model precedence shared by id-addressed calls:
-/// id-embedded → explicit query/header → default.
+/// id-embedded → explicit query/header → default. The id's owner beside it.
 fn routed_model_hint(
     id: &str,
     params: &HashMap<String, String>,
     headers: &HeaderMap,
-) -> (String, Option<String>) {
+) -> (String, Option<String>, Option<String>) {
     match decode_routed_id(id) {
-        Some((raw, model)) => (raw, Some(model)),
-        None => (id.to_string(), explicit_model(params, headers)),
+        Some(routed) => (routed.raw, Some(routed.model), routed.owner),
+        None => (id.to_string(), explicit_model(params, headers), None),
     }
 }
 
@@ -1408,7 +1465,13 @@ pub(crate) async fn create_file(
         .await?;
         let model = target.display_name().to_string();
         Ok((
-            json_response(status, &resp_headers, bytes, Some(&model)),
+            json_response(
+                status,
+                &resp_headers,
+                bytes,
+                Some(&model),
+                job_owner(&auth).as_deref(),
+            ),
             target,
         ))
     }
@@ -1474,7 +1537,7 @@ pub(crate) async fn get_file(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    let (raw, embedded) = routed_model_hint(&id, &params, &headers);
+    let (raw, embedded, owner) = routed_model_hint(&id, &params, &headers);
     forward_simple(
         state,
         auth,
@@ -1488,7 +1551,7 @@ pub(crate) async fn get_file(
             upstream_path: format!("/files/{raw}"),
             raw_query: None,
             body: None,
-            id: Some((raw, embedded)),
+            id: Some((raw, embedded, owner)),
             rewrite_ids: true,
             relay_raw_body: false,
         },
@@ -1504,7 +1567,7 @@ pub(crate) async fn delete_file(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    let (raw, embedded) = routed_model_hint(&id, &params, &headers);
+    let (raw, embedded, owner) = routed_model_hint(&id, &params, &headers);
     forward_simple(
         state,
         auth,
@@ -1518,7 +1581,7 @@ pub(crate) async fn delete_file(
             upstream_path: format!("/files/{raw}"),
             raw_query: None,
             body: None,
-            id: Some((raw, embedded)),
+            id: Some((raw, embedded, owner)),
             rewrite_ids: true,
             relay_raw_body: false,
         },
@@ -1534,7 +1597,7 @@ pub(crate) async fn file_content(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    let (raw, embedded) = routed_model_hint(&id, &params, &headers);
+    let (raw, embedded, owner) = routed_model_hint(&id, &params, &headers);
     forward_simple(
         state,
         auth,
@@ -1548,7 +1611,7 @@ pub(crate) async fn file_content(
             upstream_path: format!("/files/{raw}/content"),
             raw_query: None,
             body: None,
-            id: Some((raw, embedded)),
+            id: Some((raw, embedded, owner)),
             rewrite_ids: false,
             relay_raw_body: true,
         },
@@ -1628,9 +1691,15 @@ pub(crate) async fn create_batch(
 
         // Routing precedence (LiteLLM scenario order): file-id-embedded
         // model → explicit body `model` / query / header → default.
-        let (raw_file_id, embedded) = decode_routed_id(&input_file_id)
-            .map(|(raw, model)| (raw, Some(model)))
-            .unwrap_or((input_file_id.clone(), None));
+        let (raw_file_id, embedded) = match decode_routed_id(&input_file_id) {
+            Some(id) => {
+                require_job_owner(&auth, &id.raw, id.owner.as_deref())?;
+                (id.raw, Some(id.model))
+            }
+            // A provider's own id in a create body names no owner, and stays
+            // accepted: whoever holds it could write an id naming itself.
+            None => (input_file_id.clone(), None),
+        };
         require_safe_upstream_id(&raw_file_id)?;
         let body_model = req_json
             .get("model")
@@ -1708,7 +1777,13 @@ pub(crate) async fn create_batch(
         .await?;
         let model = target.display_name().to_string();
         Ok((
-            json_response(status, &resp_headers, bytes, Some(&model)),
+            json_response(
+                status,
+                &resp_headers,
+                bytes,
+                Some(&model),
+                job_owner(&auth).as_deref(),
+            ),
             target,
         ))
     }
@@ -1745,7 +1820,7 @@ pub(crate) async fn get_batch(
 ) -> Response {
     let started = Instant::now();
     let request_id = client.request_id.clone();
-    let (raw, embedded) = routed_model_hint(&id, &params, &headers);
+    let (raw, embedded, owner) = routed_model_hint(&id, &params, &headers);
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     // 控制体路线只查不改：计数表恒空，仍然交给 `finish`，这样签名只有一份。
     let redactions = crate::redact::RedactionCounts::new();
@@ -1759,6 +1834,7 @@ pub(crate) async fn get_batch(
 
     let result = async {
         require_safe_upstream_id(&raw)?;
+        require_job_owner(&auth, &raw, owner.as_deref())?;
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
         let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
         let _reservation = crate::quota::enforce(
@@ -1807,7 +1883,13 @@ pub(crate) async fn get_batch(
 
         let model = target.display_name().to_string();
         Ok((
-            json_response(status, &resp_headers, bytes, Some(&model)),
+            json_response(
+                status,
+                &resp_headers,
+                bytes,
+                Some(&model),
+                job_owner(&auth).as_deref(),
+            ),
             target,
         ))
     }
@@ -1842,7 +1924,7 @@ pub(crate) async fn cancel_batch(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    let (raw, embedded) = routed_model_hint(&id, &params, &headers);
+    let (raw, embedded, owner) = routed_model_hint(&id, &params, &headers);
     forward_simple(
         state,
         auth,
@@ -1856,7 +1938,7 @@ pub(crate) async fn cancel_batch(
             upstream_path: format!("/batches/{raw}/cancel"),
             raw_query: None,
             body: None,
-            id: Some((raw, embedded)),
+            id: Some((raw, embedded, owner)),
             rewrite_ids: true,
             relay_raw_body: false,
         },
@@ -1965,9 +2047,14 @@ pub(crate) async fn create_ft_job(
                 "`training_file` is required".into(),
             ));
         }
-        let (raw_training, embedded) = decode_routed_id(&training_file)
-            .map(|(raw, model)| (raw, Some(model)))
-            .unwrap_or((training_file.clone(), None));
+        let (raw_training, embedded) = match decode_routed_id(&training_file) {
+            Some(id) => {
+                require_job_owner(&auth, &id.raw, id.owner.as_deref())?;
+                (id.raw, Some(id.model))
+            }
+            // See `create_batch`.
+            None => (training_file.clone(), None),
+        };
         require_safe_upstream_id(&raw_training)?;
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
         crate::usage_attr::hold_ahead_of_chain(&state, &snapshot, &auth, wanted.as_deref());
@@ -1976,9 +2063,10 @@ pub(crate) async fn create_ft_job(
         if let Some(obj) = req_json.as_object_mut() {
             obj.insert("training_file".into(), Value::String(raw_training));
             if let Some(vf) = obj.get("validation_file").and_then(Value::as_str) {
-                if let Some((raw_vf, _)) = decode_routed_id(vf) {
-                    require_safe_upstream_id(&raw_vf)?;
-                    obj.insert("validation_file".into(), Value::String(raw_vf));
+                if let Some(id) = decode_routed_id(vf) {
+                    require_safe_upstream_id(&id.raw)?;
+                    require_job_owner(&auth, &id.raw, id.owner.as_deref())?;
+                    obj.insert("validation_file".into(), Value::String(id.raw));
                 }
             }
             obj.remove("provider");
@@ -2031,7 +2119,13 @@ pub(crate) async fn create_ft_job(
         .await?;
         let model = target.display_name().to_string();
         Ok((
-            json_response(status, &resp_headers, bytes, Some(&model)),
+            json_response(
+                status,
+                &resp_headers,
+                bytes,
+                Some(&model),
+                job_owner(&auth).as_deref(),
+            ),
             target,
         ))
     }
@@ -2066,7 +2160,7 @@ pub(crate) async fn get_ft_job(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    let (raw, embedded) = routed_model_hint(&id, &params, &headers);
+    let (raw, embedded, owner) = routed_model_hint(&id, &params, &headers);
     forward_simple(
         state,
         auth,
@@ -2080,7 +2174,7 @@ pub(crate) async fn get_ft_job(
             upstream_path: format!("/fine_tuning/jobs/{raw}"),
             raw_query: None,
             body: None,
-            id: Some((raw, embedded)),
+            id: Some((raw, embedded, owner)),
             rewrite_ids: true,
             relay_raw_body: false,
         },
@@ -2096,7 +2190,7 @@ pub(crate) async fn cancel_ft_job(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    let (raw, embedded) = routed_model_hint(&id, &params, &headers);
+    let (raw, embedded, owner) = routed_model_hint(&id, &params, &headers);
     forward_simple(
         state,
         auth,
@@ -2110,7 +2204,7 @@ pub(crate) async fn cancel_ft_job(
             upstream_path: format!("/fine_tuning/jobs/{raw}/cancel"),
             raw_query: None,
             body: None,
-            id: Some((raw, embedded)),
+            id: Some((raw, embedded, owner)),
             rewrite_ids: true,
             relay_raw_body: false,
         },
@@ -2156,9 +2250,10 @@ struct FwdSpec {
     upstream_path: String,
     raw_query: Option<String>,
     body: Option<Bytes>,
-    /// `(raw_id, id_embedded_model)` for id-addressed calls; the raw id
-    /// is charset-validated before touching the upstream URL.
-    id: Option<(String, Option<String>)>,
+    /// `(raw_id, id_embedded_model, id_owner)` for id-addressed calls; the raw
+    /// id is charset-validated before touching the upstream URL. `None` is a
+    /// list.
+    id: Option<(String, Option<String>, Option<String>)>,
     rewrite_ids: bool,
     /// Relay the upstream body verbatim (file content download) instead
     /// of JSON id rewriting.
@@ -2195,17 +2290,19 @@ async fn forward_simple(
         let model = spec
             .id
             .as_ref()
-            .and_then(|(_, embedded)| embedded.clone())
+            .and_then(|(_, embedded, _)| embedded.clone())
             .or_else(|| explicit_model(&params, &headers));
         crate::usage_attr::hold_ahead_of_chain(&state, &snapshot, &auth, model.as_deref());
     }
 
     let result = async {
         let embedded = match &spec.id {
-            Some((raw, embedded)) => {
+            Some((raw, embedded, owner)) => {
                 require_safe_upstream_id(raw)?;
+                require_job_owner(&auth, raw, owner.as_deref())?;
                 embedded.clone()
             }
+            None if job_owner(&auth).is_some() => return Err(ProxyError::JobListRefused),
             None => None,
         };
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
@@ -2277,7 +2374,13 @@ async fn forward_simple(
             resp
         } else {
             let model = spec.rewrite_ids.then(|| target.display_name().to_string());
-            json_response(status, &resp_headers, bytes, model.as_deref())
+            json_response(
+                status,
+                &resp_headers,
+                bytes,
+                model.as_deref(),
+                job_owner(&auth).as_deref(),
+            )
         };
         Ok((resp, target))
     }
@@ -3145,14 +3248,19 @@ mod tests {
         assert_ne!(single, batch_attribution_request_id("batch_2", 0, false));
     }
 
+    fn routed(raw: &str, model: &str) -> RoutedId {
+        RoutedId {
+            raw: raw.to_string(),
+            model: model.to_string(),
+            owner: None,
+        }
+    }
+
     #[test]
     fn routed_id_roundtrip() {
-        let id = encode_routed_id("file-abc123", "jobs-a");
+        let id = encode_routed_id("file-abc123", "jobs-a", None);
         assert!(id.starts_with(ROUTED_ID_PREFIX));
-        assert_eq!(
-            decode_routed_id(&id),
-            Some(("file-abc123".to_string(), "jobs-a".to_string()))
-        );
+        assert_eq!(decode_routed_id(&id), Some(routed("file-abc123", "jobs-a")));
         // Raw provider ids are not gateway ids.
         assert_eq!(decode_routed_id("file-abc123"), None);
         assert_eq!(decode_routed_id("batch_xyz"), None);
@@ -3231,6 +3339,213 @@ mod tests {
         b
     }
 
+    #[test]
+    fn an_owner_round_trips_and_an_unowned_id_reads_as_before() {
+        let owned = encode_routed_id("file-abc", "jobs-a", Some("team:t1"));
+        assert_eq!(
+            decode_routed_id(&owned),
+            Some(RoutedId {
+                raw: "file-abc".into(),
+                model: "jobs-a".into(),
+                owner: Some("team:t1".into()),
+            })
+        );
+        // The shape every id minted before owners existed has.
+        let legacy = format!(
+            "{ROUTED_ID_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode("file-abc;model,jobs-a")
+        );
+        assert_eq!(legacy, encode_routed_id("file-abc", "jobs-a", None));
+        assert_eq!(
+            decode_routed_id(&legacy),
+            Some(routed("file-abc", "jobs-a"))
+        );
+    }
+
+    fn scoped_key(token: &str, id: &str, fields: Value) -> ResourceEntry<ApiKey> {
+        let mut doc = serde_json::json!({
+            "key_hash": ApiKey::hash_bearer(token),
+            "allowed_models": ["*"],
+        });
+        for (k, v) in fields.as_object().unwrap() {
+            doc[k] = v.clone();
+        }
+        ResourceEntry::new(id, serde_json::from_value(doc).unwrap(), 1)
+    }
+
+    /// One upstream account, three kinds of key on it. What the owner holds is
+    /// its own; everyone else, the shared key included, finds no such id. A
+    /// refused call reaches no upstream, so it cannot tell whether the id exists.
+    #[tokio::test]
+    async fn a_scoped_key_reaches_only_what_it_owns() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/files/file-a/content"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("team a's data"))
+            .mount(&upstream)
+            .await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})))
+            .mount(&upstream)
+            .await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/batches/batch-a"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "batch-a",
+                "status": "in_progress",
+                "input_file_id": "file-a",
+                "output_file_id": "file-out",
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(scoped_key(
+            "sk-a",
+            "k-a",
+            serde_json::json!({"team_id": "t-a"}),
+        ));
+        snap.apikeys.insert(scoped_key(
+            "sk-b",
+            "k-b",
+            serde_json::json!({"team_id": "t-b"}),
+        ));
+        snap.apikeys.insert(scoped_key(
+            "sk-u",
+            "k-u",
+            serde_json::json!({"user_id": "u-1"}),
+        ));
+        snap.apikeys
+            .insert(scoped_key("sk-shared", "k-s", serde_json::json!({})));
+        let app = build_app(snap);
+        let call = |token: &'static str, method: &'static str, uri: String| {
+            let app = app.clone();
+            async move {
+                let req = Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                let status = resp.status();
+                let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+                (status, String::from_utf8_lossy(&bytes).into_owned())
+            }
+        };
+
+        let a_file = encode_routed_id("file-a", "jobs-a", Some("team:t-a"));
+        let content = format!("/v1/files/{a_file}/content");
+        let (status, body) = call("sk-a", "GET", content.clone()).await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "team a's data"));
+
+        let seen = || async { upstream.received_requests().await.unwrap().len() };
+        let before = seen().await;
+        for token in ["sk-b", "sk-u", "sk-shared"] {
+            let (status, _) = call(token, "GET", content.clone()).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{token}");
+        }
+        // A raw id, and one with no owner, name nobody a scoped key can be.
+        for uri in [
+            "/v1/files/file-a/content?model=jobs-a".to_string(),
+            format!(
+                "/v1/files/{}/content",
+                encode_routed_id("file-a", "jobs-a", None)
+            ),
+        ] {
+            let (status, _) = call("sk-b", "GET", uri).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+        // A key with a user and no team is its own owner.
+        let (status, _) = call(
+            "sk-u",
+            "GET",
+            format!(
+                "/v1/files/{}/content",
+                encode_routed_id("file-a", "jobs-a", Some("user:u-2"))
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // Lists span the account: scoped keys are told so, by name of the reason.
+        for uri in ["/v1/files", "/v1/batches", "/v1/fine_tuning/jobs"] {
+            let (status, body) = call("sk-a", "GET", format!("{uri}?model=jobs-a")).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+            assert!(body.contains("listing is not available"), "{uri}: {body}");
+        }
+        assert_eq!(
+            seen().await,
+            before,
+            "none of the above reached the upstream"
+        );
+
+        // A key with no owner keeps the raw id and the list.
+        let (status, _) = call(
+            "sk-shared",
+            "GET",
+            "/v1/files/file-a/content?model=jobs-a".into(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call("sk-shared", "GET", "/v1/files?model=jobs-a".into()).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // What an owned batch names is owned too.
+        let a_batch = encode_routed_id("batch-a", "jobs-a", Some("team:t-a"));
+        let (status, body) = call("sk-a", "GET", format!("/v1/batches/{a_batch}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        for field in ["id", "input_file_id", "output_file_id"] {
+            let decoded = decode_routed_id(v[field].as_str().unwrap()).unwrap();
+            assert_eq!(decoded.owner.as_deref(), Some("team:t-a"), "{field}");
+        }
+    }
+
+    /// A job created from a file is a read of that file.
+    #[tokio::test]
+    async fn a_job_cannot_be_created_from_someone_elses_file() {
+        let upstream = MockServer::builder().start().await;
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(scoped_key(
+            "sk-b",
+            "k-b",
+            serde_json::json!({"team_id": "t-b"}),
+        ));
+        let app = build_app(snap);
+        let a_file = encode_routed_id("file-a", "jobs-a", Some("team:t-a"));
+        let b_file = encode_routed_id("file-b", "jobs-a", Some("team:t-b"));
+        for (uri, body) in [
+            (
+                "/v1/batches",
+                serde_json::json!({"input_file_id": a_file, "endpoint": "/v1/chat/completions"}),
+            ),
+            (
+                "/v1/fine_tuning/jobs",
+                serde_json::json!({"training_file": a_file, "model": "gpt-4o-mini"}),
+            ),
+            (
+                "/v1/fine_tuning/jobs",
+                serde_json::json!({"training_file": b_file, "validation_file": a_file, "model": "gpt-4o-mini"}),
+            ),
+        ] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("authorization", "Bearer sk-b")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}: {body}");
+        }
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn create_file_routes_by_form_model_and_encodes_response_id() {
         let upstream = MockServer::builder().start().await;
@@ -3273,7 +3588,7 @@ mod tests {
         let got_id = v["id"].as_str().unwrap();
         assert_eq!(
             decode_routed_id(got_id),
-            Some(("file-abc".to_string(), "jobs-a".to_string())),
+            Some(routed("file-abc", "jobs-a")),
             "response id must embed the routing model"
         );
 
@@ -3413,7 +3728,7 @@ mod tests {
         snap.apikeys.insert(apikey_entry(&["*"]));
         let app = build_app(snap);
 
-        let encoded = encode_routed_id("file-realB", "jobs-b");
+        let encoded = encode_routed_id("file-realB", "jobs-b", None);
         let body = serde_json::json!({
             "input_file_id": encoded,
             "endpoint": "/v1/chat/completions",
@@ -3439,11 +3754,11 @@ mod tests {
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             decode_routed_id(v["id"].as_str().unwrap()),
-            Some(("batch_777".to_string(), "jobs-b".to_string()))
+            Some(routed("batch_777", "jobs-b"))
         );
         assert_eq!(
             decode_routed_id(v["input_file_id"].as_str().unwrap()),
-            Some(("file-realB".to_string(), "jobs-b".to_string()))
+            Some(routed("file-realB", "jobs-b"))
         );
         assert!(
             upstream_a.received_requests().await.unwrap().is_empty(),
@@ -3502,7 +3817,7 @@ mod tests {
         snap.apikeys.insert(apikey_entry(&["*"]));
         let (app, mut rx, _state) = build_app_with_sink_and_state(snap);
 
-        let encoded = encode_routed_id("batch_1", "jobs-a");
+        let encoded = encode_routed_id("batch_1", "jobs-a", None);
         let req = Request::builder()
             .method("GET")
             .uri(format!("/v1/batches/{encoded}"))
@@ -3579,7 +3894,7 @@ mod tests {
         snap.apikeys.insert(apikey_entry(&["*"]));
         let (app, _rx, state) = build_app_with_sink_and_state(snap);
 
-        let encoded = encode_routed_id("batch_1", "jobs-a");
+        let encoded = encode_routed_id("batch_1", "jobs-a", None);
         let req = Request::builder()
             .method("GET")
             .uri(format!("/v1/batches/{encoded}"))
@@ -3673,7 +3988,7 @@ mod tests {
             "标记该是空的"
         );
 
-        let encoded = encode_routed_id("batch_1", "jobs-a");
+        let encoded = encode_routed_id("batch_1", "jobs-a", None);
         let req = Request::builder()
             .method("GET")
             .uri(format!("/v1/batches/{encoded}"))
@@ -4180,7 +4495,7 @@ mod tests {
         snap.apikeys.insert(apikey_entry(&["*"]));
         let (app, mut rx) = build_app_with_sink(snap);
 
-        let encoded = encode_routed_id("batch_1", "jobs-a");
+        let encoded = encode_routed_id("batch_1", "jobs-a", None);
         let mk_req = || {
             Request::builder()
                 .method("GET")
@@ -4197,7 +4512,7 @@ mod tests {
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             decode_routed_id(v["output_file_id"].as_str().unwrap()),
-            Some(("file-out".to_string(), "jobs-a".to_string()))
+            Some(routed("file-out", "jobs-a"))
         );
 
         // Two events expected: the zero-token management event plus ONE
@@ -4282,7 +4597,7 @@ mod tests {
             // The provider BASE model forwards verbatim; routing rides the
             // encoded training_file id.
             "model": "gpt-4o-mini-2024-07-18",
-            "training_file": encode_routed_id("file-train", "jobs-a"),
+            "training_file": encode_routed_id("file-train", "jobs-a", None),
         });
         let req = Request::builder()
             .method("POST")
@@ -4306,11 +4621,11 @@ mod tests {
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             decode_routed_id(v["id"].as_str().unwrap()),
-            Some(("ftjob-9".to_string(), "jobs-a".to_string()))
+            Some(routed("ftjob-9", "jobs-a"))
         );
         assert_eq!(
             decode_routed_id(v["result_files"][0].as_str().unwrap()),
-            Some(("file-res".to_string(), "jobs-a".to_string()))
+            Some(routed("file-res", "jobs-a"))
         );
     }
 
@@ -4340,7 +4655,7 @@ mod tests {
         snap.apikeys.insert(apikey_entry(&["*"]));
         let app = build_app(snap);
 
-        let encoded = encode_routed_id("batch_az", "jobs-az");
+        let encoded = encode_routed_id("batch_az", "jobs-az", None);
         let req = Request::builder()
             .method("GET")
             .uri(format!("/v1/batches/{encoded}"))
@@ -4486,7 +4801,7 @@ mod tests {
         let (app, _rx, state) = build_app_with_sink_and_state(snap);
 
         let body = serde_json::json!({
-            "input_file_id": encode_routed_id("file-in", "jobs-a"),
+            "input_file_id": encode_routed_id("file-in", "jobs-a", None),
             "endpoint": "/v1/chat/completions",
             "completion_window": "24h"
         });
@@ -5158,7 +5473,7 @@ mod tests {
         let app = build_app(snap);
 
         let body = serde_json::json!({
-            "input_file_id": encode_routed_id("file-real", "jobs-a"),
+            "input_file_id": encode_routed_id("file-real", "jobs-a", None),
             "endpoint": "/v1/chat/completions",
             "completion_window": "24h",
             "metadata": { "note": "custom_id" }
