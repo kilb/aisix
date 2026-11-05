@@ -95,7 +95,7 @@ use aisix_provider_azure_openai::AzureOpenAiBridge;
 use aisix_provider_bedrock::BedrockBridge;
 use aisix_provider_openai::OpenAiBridge;
 use aisix_provider_vertex::VertexBridge;
-use aisix_proxy::background::run_background_model_check_once;
+use aisix_proxy::background::run_background_model_checks;
 use aisix_proxy::{CacheBackends, ProxyState};
 use aisix_ratelimit::{Limiter, RedisStore};
 use clap::Parser;
@@ -1574,10 +1574,6 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
     let health_tracker = proxy_state.health.clone();
     let livez_state = proxy_state.livez.clone();
     let runtime_status_tracker = proxy_state.runtime_status.clone();
-    let background_snapshot = snapshot_handle.clone();
-    let background_hub = hub.clone();
-    let background_runtime_status_tracker = runtime_status_tracker.clone();
-    let background_cancel_rx = cancel_rx.clone();
     // Wire the config-freshness probe so the proxy's /readyz reflects etcd
     // watch staleness (and pre-first-apply startup), not just shutdown (#591).
     proxy_state = match supervisor.as_ref() {
@@ -1603,31 +1599,12 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
     let exporter_fan_out = proxy_state.otlp_fan_out.clone();
     let proxy_router = aisix_proxy::build_router(proxy_state);
 
-    let background_check_task = tokio::spawn(async move {
-        let mut cancel = background_cancel_rx;
-        loop {
-            if *cancel.borrow() {
-                break;
-            }
-            let snapshot = background_snapshot.load();
-            run_background_model_check_once(
-                snapshot.clone(),
-                background_hub.clone(),
-                background_runtime_status_tracker.clone(),
-                "background-model-check",
-            )
-            .await;
-            let sleep_for = background_check_interval(snapshot.as_ref());
-            tokio::select! {
-                changed = cancel.changed() => {
-                    if changed.is_err() || *cancel.borrow() {
-                        break;
-                    }
-                }
-                _ = tokio::time::sleep(sleep_for) => {}
-            }
-        }
-    });
+    let background_check_task = tokio::spawn(run_background_model_checks(
+        snapshot_handle.clone(),
+        hub.clone(),
+        runtime_status_tracker.clone(),
+        cancel_rx.clone(),
+    ));
 
     // Admin router + listener are only built in standalone mode.
     // In managed mode (`cfg.managed.enabled = true`) the DP reads
@@ -2598,19 +2575,6 @@ fn build_hub() -> Hub {
     hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
 
     hub
-}
-
-fn background_check_interval(snapshot: &aisix_core::AisixSnapshot) -> std::time::Duration {
-    let min_interval = snapshot
-        .models
-        .entries()
-        .into_iter()
-        .filter_map(|entry| entry.value.background_model_check.clone())
-        .filter(|cfg| cfg.enabled)
-        .map(|cfg| cfg.interval_seconds)
-        .min()
-        .unwrap_or(1);
-    std::time::Duration::from_secs(min_interval.max(1))
 }
 
 /// The two moments a listener has to tell apart during a shutdown.
