@@ -1390,6 +1390,10 @@ impl<P: ConfigProvider> Supervisor<P> {
             for r in stats.rejections.drain(..) {
                 self.push_rejection(r);
             }
+            // Processed, if not applied: there is nothing further coming for
+            // this write, and a control plane comparing revisions would
+            // otherwise show it as still propagating until the next good one.
+            stamp_max(apply_stamp, entry.revision);
             // A rejected watch event still changes the reported state
             // (rejected[] gains this entry — or unknown_kinds[] for a kind
             // this build does not know, which leaves last_reload alone),
@@ -5439,6 +5443,23 @@ mod tests {
         status.record_apply(12);
         status.record_apply(7);
         assert_eq!(status.snapshot().revision, 12);
+    }
+
+    /// The heartbeat's `applied_revision` answers "has this write been dealt
+    /// with". A rejected one has: it is on `/status/config`, and nothing further
+    /// is coming for it, so it must not read as still propagating.
+    #[tokio::test]
+    async fn a_rejected_or_unknown_write_still_moves_the_reported_revision() {
+        let provider = Arc::new(FakeProvider::new(vec![], 10));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+        assert_eq!(sup.watch_status().snapshot().revision, 10);
+
+        assert!(!sup.apply_put(&entry("/aisix/models/bad", b"not-json", 60)));
+        assert_eq!(sup.watch_status().snapshot().revision, 60);
+
+        assert!(!sup.apply_put(&entry("/aisix/a_kind_from_the_future/x", b"{}", 70)));
+        assert_eq!(sup.watch_status().snapshot().revision, 70);
     }
 
     #[tokio::test]
