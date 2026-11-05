@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -82,7 +83,8 @@ describe("cross-provider multimodal dispatch", () => {
       return;
     }
 
-    await waitConfigPropagation(async () => (await chat("ready")).status === 200);
+    const proxy = new ProxyClient(app.proxyUrl, CALLER);
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
 
     const before = upstream!.receivedRequests.length;
     expect((await chat(`data:image/png;base64,${PNG_B64}`)).status).toBe(200);
