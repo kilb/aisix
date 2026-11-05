@@ -1545,6 +1545,11 @@ pub struct Guardrail {
     /// `unscannable_body`. `true` allows the request; `false` (the
     /// default) blocks with 422.
     ///
+    /// A guardrail whose configuration does not compile, such as an invalid
+    /// pattern or script, cannot run either. An edit that breaks a working
+    /// guardrail leaves its previous configuration enforcing; one that has
+    /// never worked answers according to this field until it is repaired.
+    ///
     /// Both causes apply to EVERY kind: the second one is the gateway
     /// failing to produce scannable text, which happens before any
     /// guardrail runs and so reaches all of them. `keyword` and `pii`

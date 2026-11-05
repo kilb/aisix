@@ -69,8 +69,8 @@ fn sorted_guardrail_entries(
 /// Rows are evaluated in deterministic `created_at`-ascending order (see
 /// [`sorted_guardrail_entries`]). Each row produces at most one runtime
 /// `dyn Guardrail`. Failures (invalid regex, etc.) are logged, and the row
-/// serves its last good build, or nothing if it has none — same contract the
-/// loader uses for malformed etcd rows.
+/// serves its last good build, as the loader does for a malformed etcd row, or
+/// [`UnbuiltGuardrail`] if it has none.
 ///
 /// `bedrock_endpoint_url` is the deployment-wide override for the
 /// AWS Bedrock endpoint URL (sourced from
@@ -100,8 +100,8 @@ fn build_chain_from_snapshot_reported(
     let mut chain: Vec<(String, Arc<dyn Guardrail>, GuardrailInputMessages)> = Vec::new();
     // `applied` mirrors `chain` 1:1 — the `{kind, hook}` of each member that
     // actually materialised, for applied-guardrail telemetry (#379). Pushed
-    // only on the `Ok(Some)` path so inert/invalid rows (which never join the
-    // chain) never show up as "governed this request".
+    // only for a member that joined, so an inert row never shows up as
+    // "governed this request".
     let mut applied: Vec<AppliedGuardrail> = Vec::new();
     let mut rejected = Vec::new();
 
@@ -119,7 +119,7 @@ fn build_chain_from_snapshot_reported(
         );
         rejected.extend(outcome.rejection);
         // `None`: technically valid but inert (e.g. empty keyword list), which
-        // operators see when they're staging a rule, or it has never built.
+        // operators see when they're staging a rule.
         if let Some(g) = outcome.serving {
             chain.push((row.name.clone(), g, row.input_messages));
             applied.push(applied_for(row));
@@ -146,9 +146,10 @@ pub struct UnbuildableGuardrailRow {
 /// not build — [`build_chain_from_snapshot`]'s error arm, made returnable.
 ///
 /// An etcd node logs those errors, reports them through config status, and
-/// keeps serving. `aisix validate` and a file-mode load need a synchronous
-/// report: the row silently not existing is the defect, even though the file
-/// itself loaded successfully.
+/// keeps serving, with the row answering as [`UnbuiltGuardrail`] if it has no
+/// earlier build to keep. `aisix validate` and a file-mode load need a
+/// synchronous report: a rule that cannot run is the defect, even though the
+/// file itself loaded successfully.
 ///
 /// [`BuildError::EmbedderUnavailable`] is deliberately excluded. The
 /// embedding dispatcher is a runtime capability, not part of the
@@ -215,9 +216,18 @@ struct MemoSlot {
 /// What a row contributes to the chain, and why its current config does not.
 #[derive(Clone)]
 struct BuildOutcome {
-    /// `None` for an inert row, or one that has never built.
+    /// `None` for an inert row.
     serving: Option<Arc<dyn Guardrail>>,
     rejection: Option<GuardrailBuildRejection>,
+}
+
+impl BuildOutcome {
+    /// What a failed rebuild may keep: an instance the row actually built, not
+    /// the stand-in for one that never did.
+    fn last_good(&self) -> Option<Arc<dyn Guardrail>> {
+        let built = self.rejection.as_ref().is_none_or(|r| r.serving_stale);
+        self.serving.clone().filter(|_| built)
+    }
 }
 
 /// How much of a build was construction and how much was reuse. Logged so
@@ -252,25 +262,27 @@ impl GuardrailInstances {
             Err(err) => {
                 // A bad edit must not switch a rule off: the instance the row
                 // last built keeps serving until an edit builds, as the loader
-                // keeps the last good copy of a row it cannot parse.
-                let serving = self
+                // keeps the last good copy of a row it cannot parse. With none
+                // to keep, the row answers as a check that could not run.
+                let last_good = self
                     .by_id
                     .get(&entry.id)
-                    .and_then(|slot| slot.outcome.serving.clone());
+                    .and_then(|slot| slot.outcome.last_good());
+                let serving_stale = last_good.is_some();
                 tracing::warn!(
                     guardrail_id = %entry.id,
                     guardrail_name = %entry.value.name,
                     error = %err,
-                    keeps_serving_last_good = serving.is_some(),
+                    keeps_serving_last_good = serving_stale,
                     "guardrail has an invalid config",
                 );
                 BuildOutcome {
+                    serving: last_good.or_else(|| unbuilt_row(&entry.value, &err)),
                     rejection: Some(GuardrailBuildRejection {
                         id: entry.id.clone(),
                         reason: err.status_reason(),
-                        serving_stale: serving.is_some(),
+                        serving_stale,
                     }),
-                    serving,
                 }
             }
         };
@@ -688,15 +700,16 @@ enum BuildError {
     ReplacementOnBlock { name: String },
     /// A guardrail kind whose runtime dispatch was compiled out via
     /// feature flags (e.g. a pruned build that excluded `--features bedrock`
-    /// or `--features azure-content-safety`). The chain treats the row as
-    /// disabled and the warn log surfaces the kind name so the misconfig is visible.
+    /// or `--features azure-content-safety`). The row answers as
+    /// [`UnbuiltGuardrail`] and the warn log surfaces the kind name so the
+    /// misconfig is visible.
     ///
     /// Always declared in the enum (not behind `#[cfg]`) so `build_one` can
     /// reference it from any `not(feature = "…")` arm. When all features are
     /// enabled (the default), the variant exists but is never constructed —
     /// the dead_code lint is suppressed below.
     #[allow(dead_code)]
-    #[error("guardrail kind {0:?} not compiled into this build; treating row as disabled")]
+    #[error("guardrail kind {0:?} not compiled into this build")]
     FeatureDisabled(&'static str),
     /// A `kind: "semantic"` row built by a caller that supplied no
     /// embedding dispatcher. The operator fix is not a node repair:
@@ -730,6 +743,123 @@ impl BuildError {
             Self::ScriptCompile(_) => ("compile_failed", "script"),
         };
         format!("guardrail runtime build failed: {category} at config.{field}")
+    }
+}
+
+/// The stand-in for a row whose config does not build and that has no earlier
+/// build to keep: nothing can evaluate it, so it answers every check as any
+/// guardrail that could not run. A fail-closed policy refuses the request; under
+/// `fail_open` it goes through with the bypass recorded. A monitored row is
+/// wrapped like any other, so it never refuses.
+///
+/// `None` for a semantic row with no embedder: nothing is wrong with that row,
+/// the chain was built outside the proxy by a caller with no dispatch to offer.
+fn unbuilt_row(row: &DomainGuardrail, err: &BuildError) -> Option<Arc<dyn Guardrail>> {
+    if matches!(err, BuildError::EmbedderUnavailable) {
+        return None;
+    }
+    let output_fail_open = match &row.config {
+        // These have no `output_fail_open`: `fail_open` governs both hooks.
+        GuardrailKind::Keyword(_) | GuardrailKind::Pii(_) => row.fail_open,
+        GuardrailKind::Bedrock(c) => c.output_fail_open,
+        GuardrailKind::AzureContentSafety(c) => c.output_fail_open,
+        GuardrailKind::AzureContentSafetyTextModeration(c) => c.output_fail_open,
+        GuardrailKind::AliyunTextModeration(c) => c.output_fail_open,
+        GuardrailKind::AliyunAiGuardrail(c) => c.output_fail_open,
+        GuardrailKind::Lakera(c) => c.output_fail_open,
+        GuardrailKind::OpenaiModeration(c) => c.output_fail_open,
+        GuardrailKind::Presidio(c) => c.output_fail_open,
+        GuardrailKind::Semantic(c) => c.output_fail_open,
+        GuardrailKind::Custom(c) => c.output_fail_open,
+    };
+    Some(apply_enforcement_mode(
+        row,
+        Arc::new(UnbuiltGuardrail {
+            kind: row.config.kind_str(),
+            hook_point: row.hook_point,
+            input_fail_open: row.fail_open,
+            output_fail_open,
+        }),
+    ))
+}
+
+/// See [`unbuilt_row`].
+struct UnbuiltGuardrail {
+    kind: &'static str,
+    hook_point: GuardrailHookPoint,
+    input_fail_open: bool,
+    output_fail_open: bool,
+}
+
+impl UnbuiltGuardrail {
+    /// The bounded failure tag, on a refusal and on a bypass alike.
+    const TAG: &'static str = "guardrail_invalid_config";
+
+    fn verdict(fail_open: bool) -> GuardrailVerdict {
+        if fail_open {
+            GuardrailVerdict::Bypass {
+                reason: Self::TAG.to_owned(),
+            }
+        } else {
+            GuardrailVerdict::block_unavailable("guardrail config does not build", Self::TAG)
+        }
+    }
+}
+
+#[async_trait]
+impl Guardrail for UnbuiltGuardrail {
+    fn name(&self) -> &'static str {
+        self.kind
+    }
+
+    async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
+        if self.runs_on_input() {
+            Self::verdict(self.input_fail_open)
+        } else {
+            GuardrailVerdict::Allow
+        }
+    }
+
+    async fn check_output(&self, _resp: &ChatResponse) -> GuardrailVerdict {
+        if self.runs_on_output() {
+            Self::verdict(self.output_fail_open)
+        } else {
+            GuardrailVerdict::Allow
+        }
+    }
+
+    /// Under `output_fail_open` the verdict is already known, and holding the
+    /// stream back for it would only add latency.
+    fn stream_output_policy(&self) -> StreamOutputPolicy {
+        if self.output_fail_open {
+            StreamOutputPolicy::EndOfStreamCheck
+        } else {
+            StreamOutputPolicy::BufferFull {
+                max_buffer_bytes: crate::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
+                on_exceeded_fail_open: false,
+            }
+        }
+    }
+
+    fn runs_on_input(&self) -> bool {
+        !matches!(self.hook_point, GuardrailHookPoint::Output)
+    }
+
+    fn runs_on_output(&self) -> bool {
+        !matches!(self.hook_point, GuardrailHookPoint::Input)
+    }
+
+    // It calls nothing.
+    fn checks_input_remotely(&self) -> bool {
+        false
+    }
+
+    fn fails_closed_on_input(&self) -> bool {
+        !self.input_fail_open
+    }
+
+    fn fails_closed_on_output(&self) -> bool {
+        !self.output_fail_open
     }
 }
 
@@ -1499,7 +1629,7 @@ fn build_index_from_snapshot_reported(
         if let Some(rejection) = outcome.rejection {
             rejected.entry(gid.clone()).or_insert(rejection);
         }
-        // `None`: inert (e.g. empty keyword list), or it has never built.
+        // `None`: inert (e.g. empty keyword list).
         let Some(runtime_guardrail) = outcome.serving else {
             continue;
         };
@@ -2784,10 +2914,10 @@ mod tests {
         ] {
             let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
             table.insert(entry("bad", "g-1", parse(row)));
-            let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
-            assert!(
-                chain.is_empty(),
-                "replacement+block row must be skipped, not half-honored",
+            assert_eq!(
+                unbuildable_guardrail_rows(&table, None).len(),
+                1,
+                "replacement+block row must not build, not half-honored",
             );
         }
     }
@@ -3218,7 +3348,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_regex_is_skipped_with_warning() {
+    async fn invalid_regex_row_answers_as_a_check_that_could_not_run() {
         let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
         table.insert(entry(
             "good",
@@ -3248,10 +3378,14 @@ mod tests {
         ));
 
         let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
-        // Only the good row makes it in.
-        assert_eq!(chain.len(), 1);
+        // The good row still decides what it matches...
+        assert_eq!(chain.len(), 2);
         let v = chain.check_input(&req("ok")).await;
         assert!(v.is_block());
+        assert_eq!(v.unavailable_tag(), None);
+        // ...and what it passes, the rule that cannot run refuses.
+        let v = chain.check_input(&req("clean")).await;
+        assert_eq!(v.unavailable_tag(), Some("guardrail_invalid_config"));
     }
 
     /// #52: an openai_moderation row with a category threshold outside
@@ -3259,7 +3393,7 @@ mod tests {
     /// such a threshold can never — or always — fire).
     #[cfg(feature = "openai-moderation")]
     #[tokio::test]
-    async fn openai_moderation_out_of_range_threshold_skips_row() {
+    async fn openai_moderation_out_of_range_threshold_does_not_build() {
         let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
         table.insert(entry(
             "bad-threshold",
@@ -3273,8 +3407,10 @@ mod tests {
                 }"#,
             ),
         ));
+        assert_eq!(unbuildable_guardrail_rows(&table, None).len(), 1);
         let chain = build_chain_from_snapshot(&table, None, &GuardrailEmbedderSlot::none());
-        assert_eq!(chain.len(), 0, "out-of-range threshold row must be skipped");
+        let v = chain.check_input(&req("anything")).await;
+        assert_eq!(v.unavailable_tag(), Some("guardrail_invalid_config"));
     }
 
     /// Phase 2 contract: kind=bedrock rows materialise into the
@@ -4335,6 +4471,138 @@ mod tests {
             .await
             .is_block());
         assert!(!live.is_empty());
+    }
+
+    /// A row that has never built answers as a check that could not run, per
+    /// the policy of each hook, and a monitored one never refuses.
+    #[tokio::test]
+    async fn a_row_that_never_built_answers_per_its_fail_policy() {
+        const BAD: &str = r#""script": "export function checkInput( {""#;
+        let unbuilt = |extra: &str| {
+            let row = parse(&format!(
+                r#"{{"name": "n", "kind": "custom", {BAD}{extra}}}"#
+            ));
+            let err = build_one(&row, None, &GuardrailEmbedderSlot::none())
+                .err()
+                .expect("the script does not compile");
+            unbuilt_row(&row, &err).expect("a stand-in")
+        };
+        let response = resp("answer");
+        const TAG: &str = "guardrail_invalid_config";
+
+        let closed = unbuilt("");
+        let verdict = closed.check_input(&req("anything")).await;
+        assert_eq!(verdict.unavailable_tag(), Some(TAG));
+        let verdict = closed.check_output(&response).await;
+        assert_eq!(verdict.unavailable_tag(), Some(TAG));
+        assert!(closed.refuses_unevaluable_input());
+        assert!(!closed.checks_input_remotely());
+
+        // Each hook follows its own policy.
+        let open = unbuilt(r#", "fail_open": true, "output_fail_open": false"#);
+        let verdict = open.check_input(&req("anything")).await;
+        assert_eq!(verdict.bypass_reason(), Some(TAG));
+        assert!(!open.refuses_unevaluable_input());
+        assert!(open.check_output(&response).await.is_block());
+        let open = unbuilt(r#", "output_fail_open": true"#);
+        assert!(open.check_input(&req("anything")).await.is_block());
+        let verdict = open.check_output(&response).await;
+        assert_eq!(verdict.bypass_reason(), Some(TAG));
+        assert!(matches!(
+            open.stream_output_policy(),
+            StreamOutputPolicy::EndOfStreamCheck
+        ));
+
+        // A hook the row is not on is not its business.
+        let input_only = unbuilt(r#", "hook_point": "input""#);
+        assert_eq!(
+            input_only.check_output(&response).await,
+            GuardrailVerdict::Allow
+        );
+        assert!(!input_only.runs_on_output());
+        let output_only = unbuilt(r#", "hook_point": "output""#);
+        assert_eq!(
+            output_only.check_input(&req("x")).await,
+            GuardrailVerdict::Allow
+        );
+        assert!(!output_only.refuses_unevaluable_input());
+
+        // A monitored row never refuses, and says what it would have done.
+        let monitored = unbuilt(r#", "enforcement_mode": "monitor""#);
+        assert_eq!(
+            monitored.check_input(&req("x")).await,
+            GuardrailVerdict::Allow
+        );
+        assert_eq!(
+            monitored.check_output(&response).await,
+            GuardrailVerdict::Allow
+        );
+        assert!(!monitored.refuses_unevaluable_input());
+        assert!(!monitored.refuses_unevaluable_output());
+        let (verdict, hits) = monitored.check_input_observed(&req("x")).await;
+        assert_eq!(verdict, GuardrailVerdict::Allow);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].action, "would_block");
+        assert_eq!(hits[0].error_type, TAG);
+    }
+
+    /// The stand-in is not a build: a further bad edit reads the row's new
+    /// policy, and only a real build is ever kept.
+    #[tokio::test]
+    async fn the_stand_in_is_never_kept_as_a_last_good_build() {
+        let snapshot_of = |row: &str| {
+            let snap = AisixSnapshot::new();
+            snap.guardrails.insert(entry("kw", "g-1", parse(row)));
+            snap.guardrail_attachments.insert(attachment_entry(
+                "a-1",
+                parse_attachment(r#"{"guardrail_id": "g-1", "scope_type": "env", "priority": 50}"#),
+            ));
+            snap
+        };
+        let bad = |extra: &str| {
+            format!(
+                r#"{{"name": "kw", "kind": "keyword"{extra},
+                    "patterns": [{{"kind": "regex", "value": "oops[("}}]}}"#
+            )
+        };
+        let good = r#"{"name": "kw", "kind": "keyword",
+            "patterns": [{"kind": "literal", "value": "AKIA"}]}"#;
+
+        let handle = SnapshotHandle::new(snapshot_of(&bad("")));
+        let status = ConfigStatus::new(aisix_core::SourceKind::Etcd);
+        let live = LiveGuardrailIndex::new_with_sink_and_status(
+            handle.clone(),
+            None,
+            None,
+            GuardrailEmbedderSlot::none(),
+            Some(status.clone()),
+        );
+        let check = |text: &'static str| {
+            let chain = live.resolve(&any_ctx());
+            async move { chain.check_input(&req(text)).await }
+        };
+        assert!(check("anything").await.is_block());
+        let rejections = status.rejection_snapshots();
+        assert_eq!(rejections.len(), 1, "{rejections:?}");
+        assert!(rejections[0].stale_serving_since_unix_secs.is_none());
+
+        handle.store(snapshot_of(&bad(r#", "fail_open": true"#)));
+        assert!(check("anything").await.is_bypass());
+        assert!(status.rejection_snapshots()[0]
+            .stale_serving_since_unix_secs
+            .is_none());
+
+        // Once it has built, a bad edit keeps that build, whatever the edit
+        // says about its policy.
+        handle.store(snapshot_of(good));
+        assert!(check("AKIA123").await.is_block());
+        assert_eq!(check("anything").await, GuardrailVerdict::Allow);
+        handle.store(snapshot_of(&bad(r#", "fail_open": true"#)));
+        assert!(check("AKIA123").await.is_block());
+        assert_eq!(check("anything").await, GuardrailVerdict::Allow);
+        assert!(status.rejection_snapshots()[0]
+            .stale_serving_since_unix_secs
+            .is_some());
     }
 
     /// An edit that cannot build must not switch off the rule it was editing:

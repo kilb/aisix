@@ -535,6 +535,80 @@ describe("status/config: etcd watch source", () => {
     await seed.delete("api_keys", key.id);
   });
 
+  test("a rule that has never run answers by its failure policy, and a monitored one never refuses", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+    const plaintext = `sk-status-never-built-${randomUUID()}`;
+    const key = await seed.createApiKey({
+      key_hash: createHash("sha256").update(plaintext).digest("hex"),
+      allowed_models: ["status-model"],
+    });
+    const proxy = new ProxyClient(app.proxyUrl, plaintext);
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
+    const chat = () =>
+      proxy.chat({ model: "status-model", messages: [{ role: "user", content: "hello" }] });
+    expect((await chat()).status).toBe(200);
+
+    const broken = (name: string, extra: Record<string, unknown>) =>
+      seed!.createGuardrail(
+        {
+          name,
+          enabled: true,
+          hook_point: "input",
+          kind: "keyword",
+          patterns: [{ kind: "regex", value: "oops[(" }],
+          ...extra,
+        },
+        { attach: false },
+      );
+    const bypasses = async () =>
+      (await scrape(app!))
+        .split("\n")
+        .filter((l) => l.startsWith("aisix_guardrail_bypasses_total{"))
+        .reduce((sum, l) => sum + Number(l.slice(l.lastIndexOf(" ") + 1)), 0);
+
+    // Fail-closed: refused, and the caller is told the rule could not run.
+    const closed = await broken("status-never-built-closed", { fail_open: false });
+    const closedAttachment = await seed.attachGuardrailToEnv(closed.id);
+    await waitConfigPropagation(async () => (await chat()).status === 422);
+    const refused = await chat();
+    const body = refused.body as { error?: { code?: string } };
+    expect(refused.status).toBe(422);
+    expect(body.error?.code).toBe("guardrail_unavailable");
+    await seed.delete("guardrail_attachments", closedAttachment.id);
+    await seed.delete("guardrails", closed.id);
+    await waitConfigPropagation(async () => (await chat()).status === 200);
+
+    // Fail-open: goes through, and the bypass is on the record.
+    const open = await broken("status-never-built-open", { fail_open: true });
+    const openAttachment = await seed.attachGuardrailToEnv(open.id);
+    const before = await bypasses();
+    await waitConfigPropagation(async () => {
+      expect((await chat()).status).toBe(200);
+      return (await bypasses()) > before;
+    });
+    await seed.delete("guardrail_attachments", openAttachment.id);
+    await seed.delete("guardrails", open.id);
+
+    // Monitored, on a fail-closed row: observes, never refuses.
+    const monitored = await broken("status-never-built-monitored", {
+      fail_open: false,
+      enforcement_mode: "monitor",
+    });
+    const monitoredAttachment = await seed.attachGuardrailToEnv(monitored.id);
+    await waitConfigPropagation(async () => {
+      expect((await chat()).status).toBe(200);
+      const cfg = await getStatusConfig(app!);
+      return cfg.rejected.some((r) => r.resource_id === monitored.id);
+    });
+    expect((await chat()).status).toBe(200);
+    await seed.delete("guardrail_attachments", monitoredAttachment.id);
+    await seed.delete("guardrails", monitored.id);
+    await seed.delete("api_keys", key.id);
+  });
+
   test("a lazy guardrail build failure degrades status and clears after repair", async (ctx) => {
     if (!etcdReachable || !app || !seed) {
       ctx.skip();
@@ -565,7 +639,7 @@ describe("status/config: etcd watch source", () => {
 
     // Index construction is lazy: the first request after the snapshot swap
     // is what discovers the script the loader deliberately accepted cannot
-    // compile.
+    // compile. A rule that cannot run, under a fail-closed policy, refuses.
     expect(
       (
         await proxy.chat({
@@ -573,7 +647,7 @@ describe("status/config: etcd watch source", () => {
           messages: [{ role: "user", content: "trigger the lazy build" }],
         })
       ).status,
-    ).toBe(200);
+    ).toBe(422);
 
     let cfg: StatusConfig | undefined;
     await waitConfigPropagation(async () => {
