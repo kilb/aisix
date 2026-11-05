@@ -20,7 +20,7 @@
 //! The kind is direction-neutral. `hook_point` decides whether requests,
 //! responses or both are screened, and the SAME example lists apply to
 //! whichever hooks run; two directions needing different examples are
-//! two guardrail rows. (Kong ships this as two plugins,
+//! two guardrail rows. (Another gateway ships this as two plugins,
 //! `ai-semantic-prompt-guard` and `ai-semantic-response-guard`, because
 //! its plugin config has no hook selector; ours does.)
 //!

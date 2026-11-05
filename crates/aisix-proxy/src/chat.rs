@@ -6813,7 +6813,7 @@ where
                 Ok(chunk) => {
                     // Record TTFT on the first upstream chunk of ANY type,
                     // role-only preambles included — the industry convention
-                    // (LiteLLM, caller-side gateways), so the figure matches
+                    // (mainstream gateways), so the figure matches
                     // what external observers report (#1225).
                     if !first_chunk_seen {
                         first_chunk_seen = true;

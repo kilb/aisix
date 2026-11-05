@@ -16,8 +16,8 @@ import { metricDelta, scrapeMetrics } from "../harness/metrics.js";
 // E2E: `upstream_ttft_ms` stops on the FIRST streamed frame of any type
 // (#1225, both rounds).
 //
-// The clock deliberately uses the industry convention — LiteLLM's
-// `completion_start_time` and caller-side gateways (istio/Higress-class
+// The clock deliberately uses the industry convention — mainstream
+// gateways' completion start time and caller-side gateways (istio/Higress-class
 // AI gateways) all stamp the first response chunk, whatever it carries.
 // A "generated output only" predicate looked more truthful but made the
 // figure structurally incomparable: a hidden-reasoning upstream that

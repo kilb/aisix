@@ -555,11 +555,11 @@ impl Drop for InFlightGuard {
 
 /// nginx's non-standard "client closed request" status, used here purely
 /// as a recorded outcome — nothing is ever sent to a caller that already
-/// hung up. LiteLLM reports the same event as 499, so an operator running
+/// hung up. A mainstream gateway reports the same event as 499, so an operator running
 /// both reads one number.
 pub(crate) const CLIENT_CLOSED_REQUEST: u16 = 499;
 
-/// `error_class` for an abandoned request, mirroring LiteLLM's
+/// `error_class` for an abandoned request, mirroring a mainstream gateway's
 /// `ClientDisconnected` error class.
 const CLIENT_DISCONNECTED_KIND: &str = "client_disconnected";
 

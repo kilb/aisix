@@ -473,7 +473,7 @@ struct EmbedDispatchSuccess {
     /// Monitor-mode guardrail observations (#562).
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// Captured request/response content for content-capturing exporters
-    /// (#700, LiteLLM parity: the full response JSON — vectors included —
+    /// (#700: the full response JSON — vectors included —
     /// truncated at the capture cap). `Some` only when an exporter opted
     /// into `content_mode = full`.
     captured_content: Option<CapturedContent>,
@@ -643,7 +643,7 @@ async fn dispatch(
 
     // Content capture (#700): the client-facing request body
     // (post-#932-redaction) is the prompt; the full response JSON — vectors
-    // included, matching LiteLLM's logging payload — is the response, both
+    // included, matching a mainstream gateway's logging payload — is the response, both
     // truncated at the largest cap an enabled exporter wants.
     let content_cap = content_capture_cap(
         snapshot
@@ -903,7 +903,7 @@ async fn dispatch(
             let provider_label = provider.clone();
             let upstream_total_tokens = embed_resp.usage.upstream_total_tokens;
             // Content capture (#700): the full response JSON, vectors
-            // included (LiteLLM parity); CapturedContent::new truncates to
+            // included; CapturedContent::new truncates to
             // the cap.
             let captured_prompt = content_cap.map(|_| captured_embeddings_prompt(&req));
             let captured_content = match (&captured_prompt, content_cap) {

@@ -125,7 +125,7 @@ describe("anthropic /v1/messages with system role in messages[] (#597)", () => {
     expect(body.content[0]?.text).toBe("Bonjour!");
 
     // The translated upstream request must keep the system turn in
-    // place — dropping it silently (LiteLLM behavior) loses content.
+    // place — dropping it silently loses content.
     const sent = upstream.receivedRequests.find((r) =>
       r.path.endsWith("/chat/completions"),
     );

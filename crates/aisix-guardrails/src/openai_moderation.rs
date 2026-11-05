@@ -18,10 +18,10 @@
 //! ```
 //!
 //! Decision rule: with `category_thresholds` empty (the default), the
-//! API's `flagged` boolean decides — the LiteLLM `openai_moderation`
+//! API's `flagged` boolean decides — a mainstream gateway's moderation guardrail
 //! baseline behavior. With thresholds configured, ONLY the listed
 //! categories are enforced: a category blocks when its score reaches its
-//! threshold, and the API's own `flagged` is ignored (LiteLLM has no
+//! threshold, and the API's own `flagged` is ignored (a mainstream gateway has no
 //! equivalent knob).
 //!
 //! The the control plane decrypts the envelope-encrypted `api_key` at kine-projection
@@ -225,7 +225,7 @@ impl OpenaiModerationGuardrail {
         };
 
         if self.category_thresholds.is_empty() {
-            // LiteLLM-baseline behavior: the API's own flagged boolean.
+            // Baseline behavior: the API's own flagged boolean.
             if !result.flagged {
                 return GuardrailVerdict::Allow;
             }
@@ -406,7 +406,7 @@ impl Guardrail for OpenaiModerationGuardrail {
 }
 
 /// Concatenate all message contents into one blob for input scanning
-/// (LiteLLM joins texts with `\n` for its single-string moderation call).
+/// (a mainstream gateway joins texts with `\n` for its single-string moderation call).
 fn collect_input_text(req: &ChatFormat) -> String {
     req.messages
         .iter()

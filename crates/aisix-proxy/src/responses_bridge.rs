@@ -2729,7 +2729,7 @@ pub fn build_responses_bridge_stream(
             match item {
                 Ok(chunk) => {
                     // First upstream chunk of ANY type stops the TTFT clock —
-                    // the industry convention (LiteLLM, caller-side gateways),
+                    // the industry convention (mainstream gateways),
                     // so the figure matches external observers
                     // (#1225).
                     if !first_chunk_seen {

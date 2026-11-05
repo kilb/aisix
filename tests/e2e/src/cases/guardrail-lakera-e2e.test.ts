@@ -23,7 +23,7 @@ import {
 //
 // References:
 // - Lakera Guard v2 <https://docs.lakera.ai>
-// - LiteLLM `lakera_ai_v2` (behavior baseline): flagged + only pii/*
+// - A mainstream gateway's guardrail (behavior baseline): flagged + only pii/*
 //   detections → mask via payload offsets; any non-PII detection → block.
 
 const CALLER = "sk-lakera-e2e-caller";
@@ -279,7 +279,7 @@ describe("lakera guardrail e2e: injection blocks, PII-only masks, 5xx fail-open"
     });
     // Request went through (mask, not block) …
     expect(res.choices[0]?.message.role).toBe("assistant");
-    // … and the upstream saw the LiteLLM-shaped mask token, never the value.
+    // … and the upstream saw the mask token, never the value.
     const lastReq = upstream.receivedRequests.at(-1);
     expect(lastReq).toBeDefined();
     expect(lastReq!.body).toContain("[MASKED EMAIL]");

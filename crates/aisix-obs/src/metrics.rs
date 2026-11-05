@@ -336,8 +336,8 @@ pub const M_AUTH_DECISIONS_TOTAL: &str = "aisix_auth_decisions_total";
 ///   policy" from "this guardrail is broken or its provider is down".
 ///
 /// The `_count` series doubles as a per-guardrail execution counter, so
-/// there is no separate `aisix_guardrail_requests_total` (LiteLLM's
-/// `litellm_guardrail_requests_total` equivalent = `sum by (...)` of it).
+/// there is no separate `aisix_guardrail_requests_total` (a mainstream gateway's
+/// equivalent = `sum by (...)` of it).
 pub const M_GUARDRAIL_LATENCY_SECONDS: &str = "aisix_guardrail_latency_seconds";
 /// Issue #408: counter for UsageEvent emission attempts, incremented before
 /// the `UsageSink` accepts or rejects the event. Operators slice this by:

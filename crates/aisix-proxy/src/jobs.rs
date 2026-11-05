@@ -8,22 +8,21 @@
 //! request whose body carries no `model`** (a batch create references a
 //! previously-uploaded file id; the models are inside the JSONL lines).
 //!
-//! ## Routing (LiteLLM-baseline mechanism)
+//! ## Routing (the established gateway mechanism)
 //!
-//! Following LiteLLM's file-id encoding scheme
-//! (`litellm/proxy/openai_files_endpoints/common_utils.py`), a file
+//! Following a mainstream gateway's file-id encoding scheme, a file
 //! uploaded through the gateway names its routing Model once (multipart
 //! `model` field, `?model=` query, or `x-aisix-model` header); the file id
 //! returned to the caller is re-encoded to embed that Model. Every later
 //! call that references the id (batch create, file retrieve/delete/content,
 //! fine-tuning `training_file`) decodes the id and routes automatically —
 //! no per-call provider hint needed. Precedence per call, matching
-//! LiteLLM's scenario order: **id-embedded model → explicit
+//! a mainstream gateway's scenario order: **id-embedded model → explicit
 //! body/query/header model → first accessible OpenAI-compatible model**.
 //!
 //! Ids minted by the gateway look like `aisix-<base64url>`; raw provider
 //! ids are still accepted (routing falls back to the explicit/default
-//! model), mirroring LiteLLM's tolerance on list/retrieve flows.
+//! model), mirroring a mainstream gateway's tolerance on list/retrieve flows.
 //!
 //! ## Ownership
 //!
@@ -58,9 +57,8 @@
 //! from the batch identity — the telemetry contract requires a UUID),
 //! aggregates per-line `usage`, and
 //! emits real token counts grouped by the provider-billed model —
-//! LiteLLM's `_handle_completed_batch` equivalent
-//! (`litellm/batches/batch_utils.py`). The key that submitted the batch pays,
-//! not the one that happened to observe it ([`BATCH_SUBMITTER_KEY`]).
+//! the equivalent of a mainstream gateway's completed-batch handling. The key
+//! that submitted the batch pays, not the one that happened to observe it ([`BATCH_SUBMITTER_KEY`]).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -139,8 +137,7 @@ pub(crate) struct RoutedId {
 }
 
 /// Decode a gateway-minted id. Returns `None` for anything that isn't a
-/// well-formed gateway id — callers treat those as raw provider ids (LiteLLM
-/// parity).
+/// well-formed gateway id — callers treat those as raw provider ids.
 pub(crate) fn decode_routed_id(id: &str) -> Option<RoutedId> {
     let b64 = id.strip_prefix(ROUTED_ID_PREFIX)?;
     let bytes = URL_SAFE_NO_PAD.decode(b64).ok()?;
@@ -282,8 +279,8 @@ fn explicit_model(params: &HashMap<String, String>, headers: &HeaderMap) -> Opti
 /// Resolve the routing target for a jobs request.
 ///
 /// `wanted = None` falls back to the first non-routing Model the key can
-/// access whose ProviderKey uses a supported adapter (LiteLLM's
-/// `custom_llm_provider="openai"` default). Deterministic operation
+/// access whose ProviderKey uses a supported adapter (a mainstream
+/// gateway's default). Deterministic operation
 /// should pass an explicit model — documented in the proxy docs.
 pub(crate) fn resolve_target(
     snapshot: &aisix_core::AisixSnapshot,
@@ -895,7 +892,7 @@ async fn scan_output_blob(
 
 /// Top-level id fields the gateway re-encodes on create/retrieve
 /// responses so later calls route automatically. List responses are
-/// forwarded untouched (LiteLLM parity — raw ids there fall back to
+/// forwarded untouched (raw ids there fall back to
 /// explicit/default routing on the next call).
 const ID_FIELDS: &[&str] = &[
     "id",
@@ -1695,7 +1692,7 @@ pub(crate) async fn create_batch(
             ));
         }
 
-        // Routing precedence (LiteLLM scenario order): file-id-embedded
+        // Routing precedence (a mainstream gateway's scenario order): file-id-embedded
         // model → explicit body `model` / query / header → default.
         let (raw_file_id, embedded) = match decode_routed_id(&input_file_id) {
             Some(id) => {
@@ -2764,7 +2761,7 @@ async fn poll_batch(target: &JobTarget, raw_batch_id: &str, request_id: &str) ->
 
 /// Download the completed batch's output JSONL and emit aggregated
 /// UsageEvents (one per provider-billed model appearing in the lines).
-/// LiteLLM parity: `_handle_completed_batch` → per-line usage/cost.
+/// Per-line usage and cost, as mainstream gateways handle a completed batch.
 async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
     let state = &job.state;
     let api_key_id = job.payer.entry.id.as_str();

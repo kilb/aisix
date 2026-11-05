@@ -3098,7 +3098,7 @@ mod tests {
     }
 
     /// A transient 5xx on submit IS retried (send it again is the whole
-    /// point of the budget — no response committed, LiteLLM/OpenAI SDK
+    /// point of the budget — no response committed, other gateways and the OpenAI SDK
     /// retry their own paid generation POSTs the same way), and the
     /// second attempt recovers the request.
     #[tokio::test]

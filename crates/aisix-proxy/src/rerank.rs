@@ -57,7 +57,7 @@ struct RerankDispatchSuccess {
     /// Monitor-mode guardrail observations (#562).
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// Captured request/response content for content-capturing exporters
-    /// (#700, LiteLLM parity: the full rerank response JSON). `Some` only
+    /// (#700: the full rerank response JSON). `Some` only
     /// when an exporter opted into `content_mode = full`.
     captured_content: Option<CapturedContent>,
 }
@@ -478,7 +478,7 @@ async fn dispatch(
     });
     // Content capture (#700): the client-facing request body
     // (post-#932-redaction) is the prompt; the response is the upstream's
-    // rerank JSON verbatim (LiteLLM parity), both truncated at the cap.
+    // rerank JSON verbatim, both truncated at the cap.
     let content_cap = content_capture_cap(
         snapshot
             .observability_exporters

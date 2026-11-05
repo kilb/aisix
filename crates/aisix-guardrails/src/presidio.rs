@@ -20,10 +20,10 @@
 //!
 //! vs. the built-in `kind: "pii"`: Presidio adds NER/ML entities a regex
 //! cannot express (`PERSON`, `LOCATION`, `NRP`, …) and selectable
-//! anonymize operators (`replace`, `mask`, `hash`, `redact`). LiteLLM's
+//! anonymize operators (`replace`, `mask`, `hash`, `redact`). A mainstream gateway's
 //! `presidio` guardrail is the behavior baseline (per-entity MASK/BLOCK,
 //! `language`, skip-empty-text); operator selection is our superset —
-//! LiteLLM always uses Presidio's default replace.
+//! a mainstream gateway always uses Presidio's default replace.
 //!
 //! Block reasons and telemetry counts carry entity type NAMES only, never
 //! matched values (#153 / #932 no-leak criterion).
@@ -168,7 +168,7 @@ impl PresidioGuardrail {
     }
 
     /// `POST {analyzer_url}/analyze` for one text. Empty/whitespace-only
-    /// text short-circuits to no results (Presidio 500s on it; LiteLLM
+    /// text short-circuits to no results (Presidio 500s on it; a mainstream gateway
     /// skips it the same way).
     async fn analyze(
         &self,

@@ -381,7 +381,7 @@ pub struct UsageEvent {
     /// measured from the start of THIS attempt to the first SSE frame
     /// the upstream delivered, whatever its type (metadata preambles
     /// like `response.created` / `message_start` / a role-only chat
-    /// chunk included). This is the industry TTFT convention — LiteLLM
+    /// chunk included). This is the industry TTFT convention — mainstream gateways
     /// and front-side gateways stamp the same event — so the figure is
     /// directly comparable with what a caller-side proxy reports. A
     /// hidden-reasoning model that streams nothing while it thinks

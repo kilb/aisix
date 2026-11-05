@@ -64,7 +64,7 @@ const MAX_SOURCE_DEPTH: usize = 8;
 
 /// Connection-layer settings shared by every upstream provider client.
 ///
-/// Defaults follow the same reasoning LiteLLM applies to its own upstream
+/// Defaults follow the same reasoning a mainstream gateway applies to its own upstream
 /// pool: bound the connect phase, keep the kernel probing so a NAT/LB hop
 /// can't silently reap a connection while a slow model is still thinking,
 /// and expire pooled connections well before a typical upstream idle

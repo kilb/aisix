@@ -34,8 +34,7 @@ import {
 // the issue calls out as the pair most likely to drift.
 //
 // Reference:
-//   - LiteLLM's equivalent: `forward_client_headers_to_llm_api`
-//     <https://docs.litellm.ai/docs/proxy/forward_client_headers>
+//   - The equivalent setting mainstream gateways offer for forwarding client headers
 //   - Anthropic beta headers (the canonical forwarding case)
 //     <https://docs.anthropic.com/en/api/beta-headers>
 

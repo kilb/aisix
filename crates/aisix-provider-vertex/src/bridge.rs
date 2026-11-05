@@ -879,9 +879,8 @@ impl Bridge for VertexBridge {
     }
 
     /// Native Vertex embeddings (#723): google-publisher `:predict`
-    /// with the text-embedding `instances` shape — LiteLLM
-    /// `VertexEmbedding` (`vertex_embeddings/embedding_handler.py`)
-    /// parity. Every embedding model on this adapter is a
+    /// with the text-embedding `instances` shape, as mainstream gateways
+    /// do. Every embedding model on this adapter is a
     /// google-publisher surface (the Claude / MaaS publishers expose
     /// no embeddings), so there is no publisher dispatch here.
     async fn embed(
@@ -3361,7 +3360,7 @@ impl GeminiUsageMetadata {
     /// `thoughtsTokenCount` is the subtle one. Gemini changed its mind
     /// about whether `candidatesTokenCount` includes it, so neither
     /// answer can be hard-coded; `totalTokenCount` settles it, exactly
-    /// as LiteLLM's adapter decides the same question. Left unmapped
+    /// as a mainstream gateway's adapter decides the same question. Left unmapped
     /// (the pre-fix behaviour) a thinking model reported
     /// `reasoning_tokens: 0` and a `completion_tokens` short of what
     /// Google billed, which every client-facing protocol then inherited

@@ -1217,9 +1217,9 @@ impl Bridge for BedrockBridge {
             .map(|stream| legacy.reply_stream(stream))
     }
 
-    /// Native Bedrock embeddings (#723), LiteLLM `litellm/llms/bedrock/embed/`
-    /// parity: `amazon.titan-embed-*` (Titan G1/V2 — the model embeds ONE
-    /// text per InvokeModel, so batch inputs loop; LiteLLM iterates the
+    /// Native Bedrock embeddings (#723):
+    /// `amazon.titan-embed-*` (Titan G1/V2 — the model embeds ONE
+    /// text per InvokeModel, so batch inputs loop; a mainstream gateway iterates the
     /// same way) and `cohere.embed-*` (whole batch in one call). Other
     /// publishers expose no embedding models on Bedrock.
     async fn embed(

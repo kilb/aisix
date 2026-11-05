@@ -664,7 +664,7 @@ fn batch_by_chars(texts: &[String], budget: usize) -> Vec<Vec<String>> {
 /// `action = BLOCKED`, is a hard block; a PII/regex entity with
 /// `action = ANONYMIZED` (and nothing blocking) is a mask, whose
 /// replacement text Bedrock returns in `outputs[].text`. Mirrors
-/// LiteLLM's `_should_raise_guardrail_blocked_exception` (raise iff any
+/// a mainstream gateway's blocked-exception check (raise iff any
 /// assessment entry is BLOCKED; otherwise apply the masked output).
 #[derive(Debug, PartialEq, Eq)]
 enum BedrockOutcome {
@@ -756,7 +756,7 @@ fn anonymized_counts(resp: &ApplyGuardrailOutput) -> std::collections::BTreeMap<
 /// ANONYMIZED). Every policy family also has a detect-only mode
 /// (`action = NONE`): entries are returned for observability but nothing
 /// was suppressed, so their mere presence must NOT be read as a block —
-/// mirrors LiteLLM's per-entry BLOCKED check.
+/// mirrors a mainstream gateway's per-entry BLOCKED check.
 fn assessment_has_hard_block(a: &GuardrailAssessment) -> bool {
     use aws_sdk_bedrockruntime::types::{
         GuardrailContentPolicyAction, GuardrailTopicPolicyAction, GuardrailWordPolicyAction,

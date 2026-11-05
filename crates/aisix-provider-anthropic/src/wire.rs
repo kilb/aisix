@@ -1811,7 +1811,7 @@ pub fn translate_anthropic_tool_choice_to_openai(
 /// (#953). Mirrors the `/v1/responses` bridge's
 /// whitelist-and-drop policy (#825) in the opposite direction.
 ///
-/// Translations (matching LiteLLM's Anthropic→OpenAI adapter):
+/// Translations (matching a mainstream gateway's Anthropic→OpenAI adapter):
 ///   tools / tool_choice                → OpenAI shapes (existing helpers)
 ///   tool_choice.disable_parallel_tool_use → parallel_tool_calls
 ///   stop_sequences                     → stop
@@ -1914,7 +1914,7 @@ pub fn translate_extras_to_openai_shape_with(
     // Anthropic carries a structured-output schema either at the legacy
     // top-level `output_format` or, since Structured Outputs, at
     // `output_config.format`. The legacy field wins when both are set,
-    // matching LiteLLM.
+    // matching mainstream gateways.
     let format = output_format
         .or_else(|| output_config.and_then(|c| c.get("format").cloned()))
         .and_then(anthropic_output_format_to_response_format);
@@ -1930,7 +1930,7 @@ pub fn translate_extras_to_openai_shape_with(
 ///
 /// 1. `thinking.type = "disabled"` → `none`. An explicit opt-out is a
 ///    stronger instruction than a depth tier, so a stray
-///    `output_config.effort` does not override it (LiteLLM resolves
+///    `output_config.effort` does not override it (a mainstream gateway resolves
 ///    this pair the same way).
 /// 2. `output_config.effort` → forwarded verbatim. This is Anthropic's
 ///    current effort control and the only one Opus 4.7 and later accept.
@@ -1974,8 +1974,8 @@ fn reasoning_effort_for(
 }
 
 /// Bucket an Anthropic `thinking` block into an OpenAI `reasoning_effort`
-/// label. `budget_tokens` thresholds match LiteLLM's
-/// `reasoning_effort_from_thinking_budget` (≥ 4096 → high, ≥ 2048 →
+/// label. `budget_tokens` thresholds match a mainstream gateway's
+/// (≥ 4096 → high, ≥ 2048 →
 /// medium, ≥ 1024 → low, below → minimal). `adaptive` carries no budget;
 /// it resolves to Anthropic's own default tier, and callers who want a
 /// different one send `output_config.effort` (see [`reasoning_effort_for`]).
@@ -2962,10 +2962,10 @@ impl StreamState {
 // is handled by `split_system` + `build_request` for the
 // Anthropic-upstream case above.
 //
-// Content-block coverage (#722, matching LiteLLM's
-// `LiteLLMAnthropicMessagesAdapter.translate_anthropic_messages_to_openai`):
-// `text`, `image` (base64 + url), `document` (→ image_url data URL, the
-// LiteLLM mapping), assistant `tool_use` (→ OpenAI `tool_calls`), and
+// Content-block coverage (#722, matching the established gateway
+// translation of the same shapes):
+// `text`, `image` (base64 + url), `document` (→ a text part, a `file` part for a
+// PDF, or an image_url data URL), assistant `tool_use` (→ OpenAI `tool_calls`), and
 // `tool_result` (→ a `role:"tool"` message; string / single-text /
 // multi-block content forms). An assistant turn's `thinking` blocks
 // replay as its `reasoning_content` — the slot OpenAI-compatible
@@ -3582,7 +3582,7 @@ fn tool_call_from_tool_use(
 }
 
 /// Translate one Anthropic `tool_result` block into the OpenAI
-/// `role:"tool"` message. Content forms (LiteLLM parity): absent → "",
+/// `role:"tool"` message. Content forms: absent → "",
 /// string → string, single-text array → collapsed string, multi-block
 /// array → combined text+image content parts on ONE tool message.
 fn tool_message_from_tool_result(block: &serde_json::Value, markers: CacheMarkers) -> ChatMessage {
@@ -3838,7 +3838,7 @@ fn translate_assistant_blocks(
 /// a client unconverted, and why summing (rather than picking) the two
 /// cache representations is what keeps an ensemble aggregate right.
 ///
-/// LiteLLM's `/v1/messages` adapter derives the same three numbers; it
+/// A mainstream gateway's `/v1/messages` adapter derives the same three numbers; it
 /// subtracts BOTH cache counters from `prompt_tokens` because its single
 /// `Usage` object has already folded the Anthropic-shape counters in,
 /// which ours deliberately has not.

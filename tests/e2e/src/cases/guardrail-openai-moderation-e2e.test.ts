@@ -23,7 +23,7 @@ import {
 //
 // References:
 // - OpenAI Moderation <https://platform.openai.com/docs/guides/moderation>
-// - LiteLLM `openai_moderation` (behavior baseline): block on the API's
+// - A mainstream gateway's moderation guardrail (behavior baseline): block on the API's
 //   `flagged` boolean. The threshold mode is our superset knob.
 
 const CALLER = "sk-moderation-e2e-caller";

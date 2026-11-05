@@ -6,7 +6,7 @@
 //! `paths` operation becomes one tool; the gateway-held credential is injected
 //! on every outbound request and is never visible to the calling agent.
 //!
-//! The generation rules follow LiteLLM's `openapi_to_mcp_generator` so tool
+//! The generation rules follow a mainstream gateway's OpenAPI-to-MCP generator so tool
 //! names and argument shapes stay familiar across gateways: the tool name is
 //! the sanitized `operationId` (fallback `<method>_<path>`), path/query
 //! parameters become top-level schema properties, and a JSON request body
@@ -492,7 +492,7 @@ pub(crate) fn generate_tools(spec: &Value) -> Result<Vec<GeneratedTool>, McpErro
 ///
 /// Every `{param}` in the template must be supplied: OpenAPI path parameters
 /// are required by definition, and leaving a literal `{param}` in the URL
-/// (LiteLLM's behavior) produces a request that can only 404. Values are
+/// (a mainstream gateway's behavior) produces a request that can only 404. Values are
 /// checked against traversal (`/`, `\`, `.`, `..`) and percent-encoded.
 fn build_url(
     base_url: &str,
@@ -565,7 +565,7 @@ fn scalar_to_string(value: &Value) -> String {
     }
 }
 
-/// Coerce the `body` argument into the JSON body to send, mirroring LiteLLM:
+/// Coerce the `body` argument into the JSON body to send, mirroring mainstream gateways:
 /// objects and arrays pass through; a string is parsed as JSON when possible
 /// and wrapped as `{"data": <string>}` otherwise; other scalars wrap the same
 /// way; null/absent means no body.
@@ -956,7 +956,7 @@ mod tests {
     }
 
     #[test]
-    fn coerce_body_matches_litellm_semantics() {
+    fn coerce_body_matches_the_gateway_convention() {
         assert_eq!(coerce_body(Some(&json!({"a": 1}))), Some(json!({"a": 1})));
         assert_eq!(
             coerce_body(Some(&json!(r#"{"parsed": true}"#))),

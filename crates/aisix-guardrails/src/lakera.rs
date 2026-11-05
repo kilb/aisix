@@ -18,7 +18,7 @@
 //!   "breakdown": [{ "detector_type": "prompt_attack", "detected": true }] }
 //! ```
 //!
-//! Outcome classification mirrors LiteLLM's `lakera_ai_v2`:
+//! Outcome classification mirrors a mainstream gateway's guardrail:
 //! - `flagged=false` → Allow.
 //! - `flagged=true` with ONLY `pii/*` detectors detected → mask each
 //!   detected span (offsets from `payload`) with `[MASKED <TYPE>]` and
@@ -143,7 +143,7 @@ impl LakeraGuardrail {
             project_id: self.project_id.as_deref(),
             // `payload` carries the span offsets masking needs; `breakdown`
             // carries the per-detector results the PII-only classification
-            // needs. Always on — LiteLLM parity.
+            // needs. Always on.
             payload: true,
             breakdown: true,
         };
@@ -359,7 +359,7 @@ enum LakeraOutcome {
     MaskPiiOnly(Vec<String>),
 }
 
-/// Classify per LiteLLM `_is_only_pii_violation`: flagged with a breakdown
+/// Classify the way mainstream gateways do: flagged with a breakdown
 /// whose every detected entry is `pii/*` masks; flagged with any non-PII
 /// detection (or no usable breakdown at all) blocks.
 fn classify_response(resp: &GuardResponse) -> LakeraOutcome {
@@ -385,7 +385,7 @@ fn classify_response(resp: &GuardResponse) -> LakeraOutcome {
 }
 
 /// Mask token for one detection: `pii/credit_card` → `[MASKED CREDIT_CARD]`
-/// (LiteLLM's token shape).
+/// (a mainstream gateway's token shape).
 fn mask_token(detector_type: &str) -> String {
     let typ = detector_type
         .rsplit('/')
@@ -398,7 +398,7 @@ fn mask_token(detector_type: &str) -> String {
 
 /// Apply the payload's span masks to the slots. `slot_of_message` maps the
 /// request's message positions (what `message_id` indexes) back to slot
-/// indices. Offsets are CHAR offsets into the message content (LiteLLM
+/// indices. Offsets are CHAR offsets into the message content (a mainstream gateway
 /// masks with Python string slicing); spans out of range or with
 /// `start >= end` are skipped. Returns the full positionally-aligned
 /// masked vec plus per-detector counts (detector NAMES only — the matched

@@ -544,7 +544,7 @@ pub struct HealthTracker {
 /// Smoothing factor for the per-target latency EWMA. Higher = more weight on
 /// the most recent sample (faster reaction to a slowing upstream), lower =
 /// smoother. 0.3 balances reacting to a real regression against per-request
-/// jitter, roughly matching LiteLLM's last-10-samples moving average.
+/// jitter, roughly matching a mainstream gateway's last-10-samples moving average.
 const LATENCY_EWMA_ALPHA: f64 = 0.3;
 
 /// Minimum gap between two `routing candidate excluded` lines for the same

@@ -84,7 +84,7 @@ struct AudioDispatchSuccess {
     /// Empty when nothing was blocked.
     guardrail_block_message: String,
     /// Captured request/response content for content-capturing exporters
-    /// (#700, LiteLLM parity: the audio bytes are represented by their
+    /// (#700: the audio bytes are represented by their
     /// sha256, text form fields verbatim; the response is the post-redaction
     /// transcript). `Some` only when an exporter opted into
     /// `content_mode = full`.
@@ -1207,7 +1207,7 @@ fn captured_transcription_fields(
     // forwarded) so no field disappears from the export. The filename is
     // deliberately NOT captured — it is user-controlled text that skips
     // the redaction path; the checksum alone represents the file,
-    // matching LiteLLM.
+    // matching mainstream gateways.
     let mut push = |key: String, value: String| match obj.get_mut(&key) {
         Some(Value::String(existing)) => {
             existing.push('\n');
@@ -1412,8 +1412,8 @@ async fn multipart_dispatch(
         crate::dispatch::mask_prompt_fields(&resolved_chain, &mut fields, &mut redactions);
     }
 
-    // Content capture (#700, LiteLLM parity): the audio bytes are NOT
-    // captured — the file is represented by its sha256 (exactly what LiteLLM
+    // Content capture (#700): the audio bytes are NOT
+    // captured — the file is represented by its sha256 (exactly what a mainstream gateway
     // logs for transcription input); the text form fields (model, prompt,
     // language, …) are captured verbatim, POST-redaction so a masked
     // `prompt` field stays masked in the exported content.
@@ -2344,9 +2344,9 @@ async fn speech_dispatch(
         }
     });
 
-    // Content capture (#700, LiteLLM parity): the post-redaction request
+    // Content capture (#700): the post-redaction request
     // body (the `input` text to synthesize) is the prompt; the binary audio
-    // response is NOT captured — LiteLLM logs no TTS response either.
+    // response is NOT captured — a mainstream gateway logs no TTS response either.
     let captured_content = content_capture_cap(
         snapshot
             .observability_exporters
@@ -2492,7 +2492,7 @@ async fn speech_dispatch(
             // relayed, not read here. See the same shape in rerank.rs for why
             // `note_failure` stays per attempt.
             //
-            // #998: the synthesized audio is forwarded chunk by chunk (LiteLLM's
+            // #998: the synthesized audio is forwarded chunk by chunk (a mainstream gateway's
             // `/v1/audio/speech` does the same, explicitly for latency) — a player
             // can start on the first bytes instead of waiting for the whole file.
             // That moves the read out of the retryable unit: once the 200 is on the

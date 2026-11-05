@@ -235,7 +235,7 @@ fn match_policy_layer(
     // Most scopes share one counter across every key the policy matches
     // (`policy:<scope>:<scope_ref>:<id>`). `team_member` appends the
     // request's `user_id` so each member of the team counts against an
-    // independent identical bucket (LiteLLM's `{team_id}:{user_id}`).
+    // independent identical bucket (a mainstream gateway's `{team_id}:{user_id}`).
     //
     // 花费桶跟着同一个后缀：token 上限在 `team_member` 下是每人一份，
     // 花费桶不拆就会变成全队共用一份预算——两个维度的拆分方式必须一致。
@@ -1188,7 +1188,7 @@ async fn reserve_model_layers(
 ///
 /// An `Err` means this target is over one of its own limits right now —
 /// the dispatch loops treat that as a failed 429 attempt and continue with
-/// the remaining targets (matching LiteLLM, which filters rate-limited
+/// the remaining targets (matching mainstream gateways, which filter rate-limited
 /// deployments out of the candidate set).
 pub(crate) async fn reserve_routing_target(
     state: &ProxyState,

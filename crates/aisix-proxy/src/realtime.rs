@@ -14,7 +14,7 @@
 //! xAI-style vendors) and `azure-openai` (`{base}/openai/realtime
 //! ?api-version=…&deployment=…`, `api-key` header). Gemini Live / AWS
 //! Bedrock speak entirely different session/event models and need a
-//! cross-protocol translation layer (LiteLLM ships those as dedicated
+//! cross-protocol translation layer (a mainstream gateway ships those as dedicated
 //! per-provider `transform_realtime_request/response` modules) — that is
 //! a separate feature, not part of this endpoint.
 //!
@@ -31,7 +31,7 @@
 //! Two credential channels, checked before the upgrade completes:
 //!
 //! 1. `Authorization: Bearer <key>` / `x-api-key` headers — server-side
-//!    clients (LiteLLM parity: `user_api_key_auth_websocket`).
+//!    clients.
 //! 2. The `sec-websocket-protocol` item `openai-insecure-api-key.<key>`
 //!    — browser clients cannot set headers; this is the documented
 //!    OpenAI browser flow. The gateway echoes the `realtime` subprotocol
@@ -776,7 +776,7 @@ async fn prepare(
             // OpenAI's GA `/v1/realtime` rejects the header outright
             // (`beta_api_shape_disabled`) and closes the session, so
             // sending it unconditionally broke every GA connection.
-            // LiteLLM parity (OpenAIRealtime._get_additional_headers):
+            // The established gateway convention:
             // forward it iff the client asked for it.
             if beta_realtime {
                 req.headers_mut()
@@ -1047,8 +1047,7 @@ impl SessionUsage {
                 self.responses += 1;
             }
             Some("conversation.item.input_audio_transcription.completed") => {
-                // Transcription-intent sessions bill via this frame
-                // (LiteLLM `_capture_transcription_usage`).
+                // Transcription-intent sessions bill via this frame.
                 let usage = &v["usage"];
                 if usage.get("type").and_then(Value::as_str) == Some("tokens") {
                     let input = usage["input_tokens"].as_u64().unwrap_or(0);

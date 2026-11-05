@@ -1812,7 +1812,7 @@ pub struct UpstreamConfig {
     /// neither its own `timeout` nor a group-level one. `0` restores the
     /// pre-default behaviour: no deadline at all.
     ///
-    /// The default matches the LiteLLM proxy's `request_timeout` (6000 s).
+    /// The default matches a mainstream gateway's request timeout (6000 s).
     /// It is a backstop against an upstream that accepted the connection
     /// and then goes silent forever — not a responsiveness target, which
     /// is what per-model `timeout` is for. Deliberately generous so it can
@@ -1850,7 +1850,7 @@ pub struct UpstreamConfig {
     /// dispatch that does not override it via `Model.retries` or a model
     /// group's `routing.retries`. `0` disables retrying deployment-wide.
     ///
-    /// The default matches the OpenAI SDK / LiteLLM router default (2), so
+    /// The default matches that of the OpenAI SDK and mainstream gateway routers (2), so
     /// a transient upstream fault is absorbed instead of surfacing to the
     /// caller. Raising it multiplies the load a failing upstream sees:
     /// each retry re-sends the full request body, and stacks on top of any
@@ -2056,12 +2056,12 @@ impl OutboundTlsConfig {
 }
 
 /// Deployment-wide retry default. Matches `openai.DEFAULT_MAX_RETRIES`,
-/// which is also what the LiteLLM router falls back to when neither
-/// `router_settings.num_retries` nor `litellm_settings.num_retries` is set.
+/// which is also what a mainstream gateway's router falls back to when neither
+/// a router-level nor a global retry count is set.
 pub const DEFAULT_UPSTREAM_RETRIES: u32 = 2;
 
-/// Deployment-wide request-timeout default: 6000 s, matching the LiteLLM
-/// proxy's `request_timeout`. See [`UpstreamConfig::timeout_ms`].
+/// Deployment-wide request-timeout default: 6000 s, matching a mainstream gateway's
+/// request timeout. See [`UpstreamConfig::timeout_ms`].
 pub const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 6_000_000;
 
 /// Connection-layer settings for the inbound side — the client (or the

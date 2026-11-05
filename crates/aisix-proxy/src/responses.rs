@@ -4363,7 +4363,7 @@ fn observe_responses_sse_frame(
     if let Some(json) = json {
         // First parsed frame of ANY type (`response.created`
         // included) → upstream TTFT. The industry convention
-        // (LiteLLM, caller-side gateways) stamps the same event, so
+        // (mainstream gateways) stamps the same event, so
         // the figure matches external observers. A generated-output
         // whitelist here reported the END of a silent thinking
         // phase on hidden-reasoning upstreams — #1225.

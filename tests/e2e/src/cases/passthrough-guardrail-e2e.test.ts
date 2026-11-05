@@ -13,7 +13,7 @@ import {
 // E2E for #911 finding [6]: the raw /passthrough/:provider/*rest tunnel
 // forwarded requests verbatim with NO guardrail scanning, so a tenant that
 // configured a content/DLP guardrail could bypass it by routing traffic
-// through passthrough. Following LiteLLM's passthrough default, the gateway
+// through passthrough. Following the mainstream passthrough default, the gateway
 // now scans the whole request AND response body as text against the resolved
 // chain. This drives both directions:
 //   - INPUT: a passthrough request whose body carries a forbidden word is

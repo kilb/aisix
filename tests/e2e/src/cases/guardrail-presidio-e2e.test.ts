@@ -25,7 +25,7 @@ import {
 //
 // References:
 // - Presidio API <https://presidio.dataprivacystack.org/api-docs/api-docs.html>
-// - LiteLLM `presidio` (behavior baseline): per-entity MASK/BLOCK,
+// - A mainstream gateway's `presidio` guardrail (behavior baseline): per-entity MASK/BLOCK,
 //   language, skip-empty-text. Operator selection is our superset.
 
 const CALLER = "sk-presidio-e2e-caller";

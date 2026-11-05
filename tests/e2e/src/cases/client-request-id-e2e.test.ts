@@ -21,10 +21,9 @@ import {
 // the same value. Before this, the gateway minted a fresh UUID per request
 // and the caller had to maintain a second mapping to find anything.
 //
-// The industry baseline is the same shape: LiteLLM reads its own
-// `x-litellm-call-id` off the request and only generates one when absent;
-// Portkey and Kong's correlation-id plugin behave the same way for their
-// own headers. Like LiteLLM we honour only OUR namespaced header by
+// The industry baseline is the same shape: mainstream gateways read their own
+// call-id or correlation-id header off the request and only generate one when
+// absent. Like them we honour only OUR namespaced header by
 // default — `x-request-id` is opt-in precisely because everything in front
 // of a gateway stamps it.
 //

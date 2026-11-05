@@ -78,7 +78,7 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses:
             !(400..500).contains(status)
         }
         // An in-band stream error with an embedded status follows the
-        // same status rules as an HTTP status error (LiteLLM applies
+        // same status rules as an HTTP status error (a mainstream gateway applies
         // its non-429-4xx filter to in-body stream errors identically).
         // Without a status the provider reported an unspecified stream
         // fault — transient by assumption, like Transport.
@@ -211,11 +211,11 @@ const RETRY_BACKOFF_MAX_MS: u64 = 2_000;
 const RETRY_BACKOFF_JITTER_MS: u64 = 250;
 
 /// Longest upstream-supplied `Retry-After` we are willing to sit on before
-/// falling back to our own exponential term. LiteLLM honours anything up to
+/// falling back to our own exponential term. A mainstream gateway honours anything up to
 /// 60s (`_calculate_retry_after`); an inline proxy cannot — the wait burns
 /// the caller's own latency budget, and a 45s hold reads as a hang to the
 /// client. Same reason the exponential bounds below are tightened relative
-/// to LiteLLM's library defaults.
+/// to a mainstream gateway's library defaults.
 const RETRY_AFTER_HONOR_MAX_MS: u64 = 5_000;
 
 /// Backoff before retrying the **same** target, for 1-based retry number
@@ -229,14 +229,14 @@ const RETRY_AFTER_HONOR_MAX_MS: u64 = 5_000;
 /// added, so a fleet retrying off the same upstream fault does not
 /// synchronise.
 ///
-/// Same strategy as LiteLLM's router (`_calculate_retry_after`: honour a
+/// Same strategy as a mainstream gateway's router (retry-after calculation: honour a
 /// sane `Retry-After`, else capped exponential floor + additive jitter —
 /// not full-jitter-to-zero, so a struggling upstream always gets a real
-/// pause), with bounds tightened from LiteLLM's library defaults (0.5s base
+/// pause), with bounds tightened from a mainstream gateway's library defaults (0.5s base
 /// / 8s cap / 60s `Retry-After` ceiling) to suit an inline proxy where the
 /// retry runs inside a single request's latency budget. Cross-target
 /// fallover is deliberately NOT backed off — a different, presumably
-/// healthy target should be tried immediately (LiteLLM's healthy-deployment
+/// healthy target should be tried immediately (a mainstream gateway's healthy-deployment
 /// fast-path).
 pub fn retry_backoff(retry: u32, retry_after: Option<Duration>) -> Duration {
     if retry == 0 {
@@ -287,11 +287,11 @@ pub fn retry_after_hint(err: &BridgeError) -> Option<Duration> {
 /// That distinction is what keeps the default from silently degrading
 /// `timeout`-driven fail-over (#554): a two-target group whose first target
 /// times out should move on after one timeout, not after three. It also
-/// tracks what LiteLLM actually does, which is easy to misread. Its
+/// tracks what a mainstream gateway actually does, which is easy to misread. Its
 /// `num_retries` does not re-hit one deployment — each retry re-enters
 /// deployment selection, and the failed deployment has meanwhile been
 /// cooled down, so a retry inside a multi-deployment group lands on a
-/// DIFFERENT deployment. Same-target grinding is what LiteLLM does only
+/// DIFFERENT deployment. Same-target grinding is what a mainstream gateway does only
 /// when a group holds a single deployment, which is exactly the case this
 /// keeps the default for.
 pub fn effective_retries(
@@ -428,8 +428,8 @@ impl Default for TimeoutDefaults {
 /// supplies a budget even to a member whose `timeout: 0` opted out of the
 /// request deadline. (A model with only `timeout` still gets that value
 /// as its streaming budget, and its `timeout: 0` still opts the stream
-/// out, whenever no resource-level `stream_timeout` exists.) This is the
-/// LiteLLM router's shape: the `stream_timeout` chain is exhausted before
+/// out, whenever no resource-level `stream_timeout` exists.) This is a mainstream
+/// gateway router's shape: the `stream_timeout` chain is exhausted before
 /// the non-stream `timeout` chain is consulted at all.
 pub fn effective_timeouts(
     target: &Model,
@@ -490,7 +490,7 @@ where
 /// upload, a second paid video task whose id the caller never saw). Those
 /// callers veto `UpstreamDecode` for non-idempotent methods. Send-phase
 /// transport failures stay retryable — whether the request reached the
-/// upstream is unknowable there, and the OpenAI SDK / LiteLLM router both
+/// upstream is unknowable there, and the OpenAI SDK and mainstream gateway routers both
 /// accept that ambiguity and retry POSTs on connection errors.
 ///
 /// The first-class endpoints don't need a veto: their POST bodies are
@@ -1247,7 +1247,7 @@ fn tier_fingerprint(tier: &[RoutingTarget]) -> u64 {
 }
 
 /// Narrow a routing model's targets to those eligible for this request's
-/// routing tags, mirroring LiteLLM's tag-based routing:
+/// routing tags, mirroring a mainstream gateway's tag-based routing:
 ///   * No target is tagged → tag routing isn't in use; every target eligible.
 ///   * Request carries tags → targets whose tags intersect it (match-any); if
 ///     none match, fall back to `"default"`-tagged targets.
@@ -4025,7 +4025,7 @@ mod tests {
         // Nothing configured + another target queued behind this one: prefer
         // failing over to grinding a failing upstream. This is what keeps the
         // default from tripling the latency of `timeout`-driven fail-over
-        // (#554) — and it matches LiteLLM, whose retries re-enter deployment
+        // (#554) — and it matches a mainstream gateway, whose retries re-enter deployment
         // selection rather than re-hitting the same deployment.
         assert_eq!(budget(None, None, 2, true).attempts, 0);
         assert_eq!(budget(None, Some(None), 2, true).attempts, 0);
@@ -4213,7 +4213,7 @@ mod tests {
         // The dedicated stream knob wins at every level: a group
         // `stream_timeout` beats a member's own `timeout` for the
         // streaming budget (the member's `timeout` still governs its
-        // non-streaming deadline). LiteLLM resolves the same way — the
+        // non-streaming deadline). A mainstream gateway resolves the same way — the
         // stream chain is exhausted before the non-stream chain starts.
         let group = model_with_timeouts(None, Some(700));
         let t = effective_timeouts(

@@ -19,7 +19,7 @@
 //!   (`message_start` / `content_block_*` / `message_delta` /
 //!   `message_stop`). The translation helpers live in
 //!   `aisix-provider-anthropic::wire`. Content blocks translate per the
-//!   LiteLLM map (#722): text / image / document / tool_use /
+//!   established map (#722): text / image / document / tool_use /
 //!   tool_result; thinking history blocks drop (non-replayable on the
 //!   OpenAI wire).
 //!
@@ -2071,7 +2071,7 @@ async fn anthropic_passthrough_dispatch(
                     &metric_upstream_model,
                     metric_caller.as_caller(),
                     // A stream the consumer abandoned mid-flight is reported
-                    // as 499, matching LiteLLM. The upstream work still
+                    // as 499, matching mainstream gateways. The upstream work still
                     // happened, so the event is emitted either way — only
                     // its outcome differs.
                     //
@@ -3597,7 +3597,7 @@ fn build_anthropic_sse_stream(
             match item {
                 Ok(chunk) => {
                     // First upstream chunk of ANY type stops the TTFT clock —
-                    // the industry convention (LiteLLM, caller-side gateways),
+                    // the industry convention (mainstream gateways),
                     // so the figure matches external observers
                     // (#1225).
                     if !first_chunk_seen {
@@ -4869,7 +4869,7 @@ fn update_anthropic_usage(
     response_text_cap: usize,
 ) {
     // First parsed frame of ANY type (`message_start` included) stops the
-    // TTFT clock — the industry convention (LiteLLM, caller-side gateways),
+    // TTFT clock — the industry convention (mainstream gateways),
     // so the figure matches external observers (#1225).
     if !*first_token_seen {
         *first_token_seen = true;
@@ -5044,7 +5044,7 @@ fn update_anthropic_usage(
                 // for some backends that is the ONLY place they appear
                 // (message_start ships no usable usage), which recorded
                 // prompt_tokens=0. Harvest them here too, max-wins with
-                // the message_start values (LiteLLM reads both frames).
+                // the message_start values (mainstream gateways read both frames).
                 if let Some(t) = usage.get("input_tokens").and_then(Value::as_u64) {
                     acc.prompt_tokens = acc.prompt_tokens.max(t as u32);
                 }

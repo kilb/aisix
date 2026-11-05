@@ -23,7 +23,7 @@ import {
 // Post-fix each routing attempt reserves the target's model-scoped
 // layers first (mirroring the ensemble per-sub-call reservation, #620):
 // an over-limit member becomes a failed 429 attempt that fails over to
-// the next target — LiteLLM's semantics, where rate-limited deployments
+// the next target — the mainstream semantics, where rate-limited deployments
 // are filtered from the candidate set — and a request served by a
 // member commits its token cost to that member's TPM bucket.
 

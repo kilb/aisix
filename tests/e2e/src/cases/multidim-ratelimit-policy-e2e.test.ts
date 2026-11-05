@@ -413,7 +413,7 @@ describe("conditional rate limit policies e2e (#892)", () => {
     // 1st call lands on target a and consumes bucket model=a.
     expect(servedContent(await chatRaw(KEY_ROUTE, "mdrl-rt-group"))).toBe("served-rt-a");
     // 2nd call: target a is over ITS bucket → failed attempt → fails
-    // over to b (LiteLLM semantics: rate-limited deployments filtered).
+    // over to b (the mainstream semantics: rate-limited deployments filtered).
     expect(servedContent(await chatRaw(KEY_ROUTE, "mdrl-rt-group"))).toBe("served-rt-b");
     // 3rd call: both target buckets exhausted → 429 that STILL carries
     // the structured policy attribution (the routing loop must not
