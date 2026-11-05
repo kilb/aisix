@@ -654,6 +654,12 @@ downstream:
 # its connection is reused for, each able to run to its own client
 # timeout. The aisix Helm chart's "Termination and draining" section
 # works a default out from that.
+#
+# Then add up to 30 seconds for the exit itself. Once the listeners close
+# the gateway waits up to 5 s for connections that never sent a request,
+# up to 20 s to deliver queued usage records and exporter batches, and up
+# to 5 s to flush this log. A bound that ends with the drain kills the
+# process while it delivers, and what it still held is lost uncounted.
 shutdown:
   # Minimum seconds to keep accepting new connections after the signal,
   # while /readyz already reports 503.

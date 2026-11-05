@@ -333,5 +333,10 @@ downstream:
 # retires its connection, and the client reuses that connection once more
 # before the successor's head — generated during the drain — ends the
 # chain. See the aisix Helm chart's "Termination and draining" section.
+# Then add up to 30 seconds for the exit itself: up to 5 s for connections
+# that never sent a request, up to 20 s to deliver the queued usage records
+# billing runs on and the exporter batches, and up to 5 s to flush the log.
+# A grace period that ends with the drain kills the process while it
+# delivers, and what it still held is lost uncounted.
 shutdown:
   min_drain_secs: 30

@@ -2134,6 +2134,10 @@ impl Default for DownstreamConfig {
 /// The platform caps the whole sequence (Kubernetes
 /// `terminationGracePeriodSeconds`, systemd `TimeoutStopSec`), which is
 /// the only hard bound.
+///
+/// That bound also has to cover up to 30 seconds after the drain: up to 5
+/// for connections that never sent a request, up to 20 to deliver queued
+/// usage records and exporter batches, and up to 5 to flush the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(default)]

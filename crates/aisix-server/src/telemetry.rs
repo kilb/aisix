@@ -143,7 +143,7 @@ const MAX_ANSWERED_FAILURES: usize = 8;
 /// queue is at its fullest exactly then, so without a limit the exit would take
 /// the better part of half an hour and the platform would kill it first, losing
 /// the count of what was dropped along with the log flush.
-const FINAL_DRAIN_BUDGET: Duration = Duration::from_secs(20);
+pub(crate) const FINAL_DRAIN_BUDGET: Duration = Duration::from_secs(20);
 
 /// `aisix_usage_event_drops_total{reason}` for a batch given up on without
 /// ever being re-sent: the control plane answered without

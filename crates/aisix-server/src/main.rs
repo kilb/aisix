@@ -5843,6 +5843,24 @@ managed:
         assert!(error.contains("x-aisix://dp/"), "{error}");
     }
 
+    /// Both shipped configs tell an operator how long the exit takes after the
+    /// drain, so the platform's grace period can cover it. A step that grows
+    /// past what they say makes a kill land while the gateway still delivers.
+    #[test]
+    fn the_documented_exit_tail_covers_every_step_after_the_drain() {
+        // Telemetry and the exporters drain side by side.
+        let tail = CONNECTION_GRACE_AFTER_DRAIN
+            + telemetry::FINAL_DRAIN_BUDGET.max(EXPORTER_DRAIN_DEADLINE)
+            + LOG_FLUSH_DEADLINE;
+        let said = format!("up to {} seconds for the exit itself", tail.as_secs());
+        for file in ["config.example.yaml", "config.managed.yaml"] {
+            let path = format!("{}/../../{file}", env!("CARGO_MANIFEST_DIR"));
+            let text = std::fs::read_to_string(&path).expect("shipped config is readable");
+            let text = text.replace("\n# ", " ");
+            assert!(text.contains(&said), "{file} does not say {said:?}");
+        }
+    }
+
     /// A connection that never says anything cannot keep the listener, and
     /// so the process, from finishing. Nothing else bounds one on the default
     /// config, which sets no idle timeout.
