@@ -56,7 +56,9 @@ test("口令过短在注册处就被挡下", async ({ page }) => {
   await page.getByLabel("邮箱").fill(mail("short"));
   await page.getByLabel("口令").fill("tooshort");
   await page.getByRole("button", { name: "注册并登录" }).click();
-  await expect(page.getByText(/至少 12 个字符/)).toBeVisible();
+  // 认准错误提示这个元素：表单的 label 里一直是「口令」加「至少 12 个字符」的提示，
+  // 按文字匹配的话，点之前就过了，错误一渲染出来又会同时匹配到两处。
+  await expect(page.locator(".note.crit", { hasText: "口令至少 12 个字符" })).toBeVisible();
 });
 
 test("注册后余额为零_管理员发放后可见_流水带备注", async ({ page }) => {
