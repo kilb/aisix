@@ -1064,6 +1064,11 @@ impl Guardrail for MonitorGuardrail {
         StreamOutputPolicy::EndOfStreamCheck
     }
 
+    /// The row's own: the policy above holds nothing, so it cannot say.
+    fn output_buffer_bytes(&self) -> usize {
+        self.inner.output_buffer_bytes()
+    }
+
     fn runs_on_output(&self) -> bool {
         self.inner.runs_on_output()
     }
@@ -1285,6 +1290,10 @@ impl Guardrail for LiveGuardrailChain {
     /// members' hooks.
     fn stream_output_policy(&self) -> StreamOutputPolicy {
         self.current().stream_output_policy()
+    }
+
+    fn output_buffer_bytes(&self) -> usize {
+        self.current().output_buffer_bytes()
     }
 
     fn runs_on_output(&self) -> bool {

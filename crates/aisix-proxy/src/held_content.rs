@@ -159,7 +159,7 @@ impl BoundedValues {
     }
 }
 
-fn json_len(v: &impl serde::Serialize) -> usize {
+pub(crate) fn json_len(v: &impl serde::Serialize) -> usize {
     struct Count(usize);
     impl std::io::Write for Count {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {

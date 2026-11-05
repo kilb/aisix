@@ -5543,6 +5543,36 @@ fn stream_guardrail_text(
     }
 }
 
+/// Whether this frame's text still fits what a live stream keeps for its
+/// end-of-stream scan, spending `room` when it does. `None` means the stream is
+/// held, whose hold cap bounds it. A frame is kept whole or not at all: its text
+/// is several source-keyed pieces, and the frame splitter already bounds its size.
+fn keep_live_scan_text(
+    chain: &aisix_guardrails::GuardrailChain,
+    room: &mut Option<usize>,
+    outgrown: &mut bool,
+    text: &StreamGuardrailText,
+) -> bool {
+    let Some(left) = room.as_mut() else {
+        return true;
+    };
+    let len = text
+        .continuations
+        .iter()
+        .map(|c| c.text.len())
+        .chain(text.supplemental.iter().map(String::len))
+        .sum::<usize>();
+    if len <= *left {
+        *left -= len;
+        return true;
+    }
+    if !*outgrown {
+        *outgrown = true;
+        crate::guardrail_stream::record_live_scan_outgrown(chain);
+    }
+    false
+}
+
 fn append_stream_guardrail_text(
     continuations: &mut Vec<StreamContinuation>,
     _continuation_tails: &mut Vec<StreamContinuation>,
@@ -6196,6 +6226,11 @@ fn stream_response(
         let mut sealed_guardrail_epochs: Vec<Vec<String>> = Vec::new();
         let mut queued_guardrail_candidates = 0;
         let mut scan_budget_exhausted = false;
+        // What the live path keeps for its end-of-stream scan; a held stream is
+        // bounded by its hold cap instead.
+        let mut live_scan = (output_guardrail_active && !policy.holds_back())
+            .then(|| crate::guardrail_stream::live_scan_cap(&chain));
+        let mut live_scan_outgrown = false;
         // Degrades a hold-back policy to live forwarding after a fail-open cap hit.
         let mut fail_opened = false;
         let mut blocked = false;
@@ -6348,7 +6383,10 @@ fn stream_response(
                         }
                     }
                 }
-                let guardrail_text = (output_guardrail_active && !scan_budget_exhausted && !fail_opened)
+                let guardrail_text = (output_guardrail_active
+                    && !scan_budget_exhausted
+                    && !fail_opened
+                    && !live_scan_outgrown)
                     .then(|| stream_guardrail_text(protocol, &frame, delta.clone()));
                 let unevaluable_output = guardrail_text.as_ref().is_some_and(|text| {
                     text.unevaluable
@@ -6412,13 +6450,15 @@ fn stream_response(
                     }
                     StreamOutputPolicy::EndOfStreamCheck => {
                         if let Some(text) = guardrail_text.as_ref().filter(|_| !unevaluable_output) {
-                            append_stream_guardrail_text(
-                                &mut continuation_bufs,
-                                &mut continuation_tails,
-                                &mut supplemental_buf,
-                                &mut closed_continuation_prefixes,
-                                text,
-                            );
+                            if keep_live_scan_text(&chain, &mut live_scan, &mut live_scan_outgrown, text) {
+                                append_stream_guardrail_text(
+                                    &mut continuation_bufs,
+                                    &mut continuation_tails,
+                                    &mut supplemental_buf,
+                                    &mut closed_continuation_prefixes,
+                                    text,
+                                );
+                            }
                         }
                         telemetry.mark_first_delivery();
                         yield Ok(frame);
@@ -6725,9 +6765,11 @@ fn stream_response(
                         yield Ok(Bytes::from(rest));
                     }
                     None => {
-                        let guardrail_text =
-                            (output_guardrail_active && !scan_budget_exhausted && !fail_opened)
-                                .then(|| stream_guardrail_text(protocol, &rest, delta.clone()));
+                        let guardrail_text = (output_guardrail_active
+                            && !scan_budget_exhausted
+                            && !fail_opened
+                            && !live_scan_outgrown)
+                            .then(|| stream_guardrail_text(protocol, &rest, delta.clone()));
                         let unevaluable_output = guardrail_text.as_ref().is_some_and(|text| {
                     text.unevaluable
                         || stream_continuation_would_exceed_cap(
@@ -6783,13 +6825,15 @@ fn stream_response(
                     }
                 }
                 if let Some(text) = guardrail_text.as_ref().filter(|_| !unevaluable_output) {
-                    append_stream_guardrail_text(
-                        &mut continuation_bufs,
-                        &mut continuation_tails,
-                        &mut supplemental_buf,
-                        &mut closed_continuation_prefixes,
-                        text,
-                    );
+                    if keep_live_scan_text(&chain, &mut live_scan, &mut live_scan_outgrown, text) {
+                        append_stream_guardrail_text(
+                            &mut continuation_bufs,
+                            &mut continuation_tails,
+                            &mut supplemental_buf,
+                            &mut closed_continuation_prefixes,
+                            text,
+                        );
+                    }
                 }
                 let rest = Bytes::from(rest);
                 // The tail is held like any frame, under the same cap.

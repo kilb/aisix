@@ -748,6 +748,17 @@ impl Guardrail for GuardrailChain {
             )
     }
 
+    /// The smallest among the members that read the output, so the chain's
+    /// tightest row is the one that binds.
+    fn output_buffer_bytes(&self) -> usize {
+        self.members
+            .iter()
+            .filter(|m| m.guardrail.runs_on_output())
+            .map(|m| m.guardrail.output_buffer_bytes())
+            .min()
+            .unwrap_or(crate::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES)
+    }
+
     fn runs_on_output(&self) -> bool {
         self.members.iter().any(|m| m.guardrail.runs_on_output())
     }

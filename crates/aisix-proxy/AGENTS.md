@@ -57,7 +57,11 @@ the four errors when missed:
   `runs_on_output(chain) && chain.stream_output_policy().holds_back()`. A
   monitor-only chain resolves to `EndOfStreamCheck` and must NOT hold the stream
   back — it takes the live path and scans once at
-  end-of-stream via `guardrail_stream::EosOutputScan`.
+  end-of-stream via `guardrail_stream::EosOutputScan`. The text it keeps for that
+  scan stops at `guardrail_stream::live_scan_cap`, 128 times the chain's
+  `max_buffer_bytes`: the scan reads what was kept, and the row records
+  `output_buffer_exceeded` for the rest (`LiveScanBudget`,
+  `record_live_scan_outgrown`).
 
 Retry semantics change too, and that is intended: the retryable unit ends at the
 status check, because once the first frame is on the wire there is no failing

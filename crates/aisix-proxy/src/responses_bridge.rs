@@ -2687,6 +2687,35 @@ pub fn build_responses_bridge_stream(
                             "stream_aborted",
                             STREAM_ASSEMBLY_MESSAGE,
                         ));
+                        // A monitored stream still gets its scan of what was
+                        // assembled, and the row says the rest went unread.
+                        if let (Some(chain), false) = (output_guardrail.as_ref(), buffering) {
+                            let (text, tool_calls) = encoder.assembled_assistant_message();
+                            let (text, tool_calls, outgrown) =
+                                bounded_live_scan(chain, text, tool_calls);
+                            if !outgrown {
+                                crate::guardrail_stream::record_live_scan_outgrown(chain.as_ref());
+                            }
+                            let mut message = aisix_gateway::ChatMessage::assistant(text);
+                            if !tool_calls.is_empty() {
+                                message.extra.insert("tool_calls".to_string(), Value::Array(tool_calls));
+                            }
+                            let synth = ChatResponse { logprobs: None, more_choices: Vec::new(),
+                                id: String::new(),
+                                model: model_label.clone(),
+                                message,
+                                finish_reason: FinishReason::Stop,
+                                usage: UsageStats::new(0, 0),
+                                service_tier: None,
+                            };
+                            let hits = crate::guardrail_stream::EosOutputScan::new(
+                                Arc::clone(chain),
+                                model_label.clone(),
+                            )
+                            .observe(&synth.guardrail_output_text(), None)
+                            .await;
+                            guard.comp().monitor_hits.extend(hits);
+                        }
                         return;
                     }
                     if buffering {
@@ -2907,6 +2936,13 @@ pub fn build_responses_bridge_stream(
         // frame rather than withheld bytes, mirroring the chat surface's
         // EndOfStreamCheck behavior.
         let (text, tool_calls) = encoder.assembled_assistant_message();
+        // The encoder keeps what its terminal event repeats; the scan reads up
+        // to the live bound, the chain's own.
+        let (text, tool_calls, live_scan_outgrown) = if buffering {
+            (text, tool_calls, false)
+        } else {
+            bounded_live_scan(chain, text, tool_calls)
+        };
         // Consulted with no text as well: a `custom` row decides for itself.
         // Live mode has no held frames for the segment pass to walk —
         // offer the flattened text as one segment so monitor-mode
@@ -3062,7 +3098,12 @@ pub fn build_responses_bridge_stream(
         }
         // Release the held events verbatim.
         if output_guardrail.is_some() {
-            guard.comp().response_capture_safe = held_capture_safe;
+            let capture_safe = held_capture_safe && !live_scan_outgrown;
+            let comp = guard.comp();
+            comp.response_capture_safe = capture_safe;
+            if !capture_safe {
+                comp.response_text.clear();
+            }
         }
         for b in held {
             downstream_mark!();
@@ -3077,6 +3118,23 @@ pub fn build_responses_bridge_stream(
         crate::request_id::in_request_span(stream),
         crate::sse_keepalive::interval(),
     ))
+}
+
+/// The part of an assembled answer a live stream's end-of-stream scan reads, and
+/// whether that left some out.
+fn bounded_live_scan(
+    chain: &Arc<aisix_guardrails::GuardrailChain>,
+    mut text: String,
+    mut tool_calls: Vec<Value>,
+) -> (String, Vec<Value>, bool) {
+    let mut budget = crate::guardrail_stream::LiveScanBudget::new(
+        Arc::clone(chain) as Arc<dyn aisix_guardrails::Guardrail>
+    );
+    let kept = budget.admit(&text).len();
+    text.truncate(kept);
+    tool_calls.retain(|call| budget.admit_whole(crate::held_content::json_len(call)));
+    let outgrown = budget.outgrown();
+    (text, tool_calls, outgrown)
 }
 
 /// The Responses-API `error` event, as the API itself defines it — FLAT,

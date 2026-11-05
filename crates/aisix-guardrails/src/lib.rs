@@ -926,6 +926,17 @@ pub trait Guardrail: Send + Sync + 'static {
         None
     }
 
+    /// The `max_buffer_bytes` this guardrail answers to on the OUTPUT hook,
+    /// whether or not it holds a stream back. A monitored row holds nothing, so
+    /// [`Self::stream_output_policy`] does not carry it, but the text a live
+    /// stream keeps for that row's end-of-stream scan is bounded by it all the
+    /// same.
+    fn output_buffer_bytes(&self) -> usize {
+        self.stream_output_policy()
+            .hold_cap()
+            .map_or(DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, |(cap, _)| cap)
+    }
+
     /// Whether this guardrail actually inspects the OUTPUT hook. Drives
     /// whether its `stream_output_policy` participates in the streamed-output
     /// hold-back fold (#466): an input-only guardrail must NOT force output

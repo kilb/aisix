@@ -3502,6 +3502,16 @@ fn build_anthropic_sse_stream(
         // kept raw — the guardrail scans their serialized text, no need to
         // reassemble by index.
         let mut tool_call_fragments: Vec<serde_json::Value> = Vec::new();
+        // What the live path keeps of both is bounded; a held stream is bounded
+        // by its hold cap instead.
+        let mut live_scan = output_guardrail
+            .as_ref()
+            .filter(|_| hold_policy.is_none())
+            .map(|chain| {
+                crate::guardrail_stream::LiveScanBudget::new(
+                    Arc::clone(chain) as Arc<dyn aisix_guardrails::Guardrail>
+                )
+            });
         // Chunks withheld from the encoder until the end-of-stream scan
         // clears them (hold-back policies only). Held PRE-encode so the
         // mask rewrite can run on the normalised chunks.
@@ -3686,15 +3696,23 @@ fn build_anthropic_sse_stream(
                     if let Some(fr) = chunk.finish_reason.as_ref() {
                         comp.finish_reason = finish_reason_label(fr);
                     }
-                    // Held or not, the end-of-stream scan judges all of the
-                    // generated text: a monitor-only chain holds nothing back,
-                    // so no hold cap applies to it.
+                    // Held or not, the end-of-stream scan judges the generated
+                    // text, as much of it as the stream's bound keeps.
                     if output_guardrail.is_some() && !released {
                         if let Some(t) = chunk.delta.content.as_deref() {
-                            content_text.push_str(t);
+                            content_text
+                                .push_str(live_scan.as_mut().map_or(t, |budget| budget.admit(t)));
                         }
                         if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
-                            tool_call_fragments.extend(tcs.iter().cloned());
+                            tool_call_fragments.extend(
+                                tcs.iter()
+                                    .filter(|tc| {
+                                        live_scan.as_mut().is_none_or(|budget| {
+                                            budget.admit_whole(crate::held_content::json_len(tc))
+                                        })
+                                    })
+                                    .cloned(),
+                            );
                         }
                     }
                     // Content capture: assemble the response (bounded to the
@@ -3881,8 +3899,10 @@ fn build_anthropic_sse_stream(
             }
         }
         if output_guardrail.is_some() {
-            guard.comp().response_capture_safe = moderation_capture_safe && !released;
-            if released {
+            let unexportable = released
+                || live_scan.as_ref().is_some_and(|budget| budget.outgrown());
+            guard.comp().response_capture_safe = moderation_capture_safe && !unexportable;
+            if unexportable {
                 guard.comp().response_text.clear();
             }
         }
@@ -4723,6 +4743,9 @@ struct AnthropicStreamUsage {
     /// enforcing full-response scan must fail closed, while exporters must
     /// omit the incomplete capture.
     response_text_truncated: bool,
+    /// A frame outgrew the parse buffer and went to the caller unparsed, so its
+    /// text is in neither `response_text` nor the end-of-stream scan.
+    released_unparsed_frame: bool,
     /// Generated output (text + thinking + tool name/arguments)
     /// accumulated for the token-estimation fallback (#1074).
     /// Separate from `response_text`, which belongs to the guardrail
@@ -5242,14 +5265,13 @@ where
     // bytes already sent. See `anthropic_stream_hold_policy` for which
     // chains hold.
     let hold_policy = anthropic_stream_hold_policy(output_guardrail.as_deref());
-    let response_text_cap = match (hold_policy, output_guardrail.is_some(), content_cap) {
+    let response_text_cap = match (hold_policy, output_guardrail.as_ref(), content_cap) {
         (Some((max_hold, _)), _, _) => max_hold,
         // A monitor-only chain holds nothing back, so no hold cap applies: its
-        // end-of-stream scan judges all of the generated text. Nothing bounds
-        // this text but the upstream's own output.
-        (None, true, _) => usize::MAX,
-        (None, false, Some(cap)) => cap as usize,
-        (None, false, None) => 0,
+        // end-of-stream scan judges the generated text up to the live bound.
+        (None, Some(chain), _) => crate::guardrail_stream::live_scan_cap(chain.as_ref()),
+        (None, None, Some(cap)) => cap as usize,
+        (None, None, None) => 0,
     };
     let inner = async_stream::stream! {
         // Live-forward output has already reached the caller. Held output is
@@ -5388,7 +5410,7 @@ where
                      terminator; releasing it unparsed (usage parsing and model \
                      restamp skipped for the oversized frame)"
                 );
-                guard.usage().response_text_truncated = true;
+                guard.usage().released_unparsed_frame = true;
                 forward.append(&mut buf);
             }
             if let Some((max_hold, fail_open)) = hold {
@@ -5640,6 +5662,9 @@ where
         let mut blocked = false;
         let mut moderation_capture_safe = true;
         if let (Some(chain), false) = (output_guardrail.as_ref(), released) {
+            if hold.is_none() && guard.usage().response_text_truncated {
+                crate::guardrail_stream::record_live_scan_outgrown(chain.as_ref());
+            }
             // Clone (not take) when content capture is on, so the assembled
             // response survives for the on_complete content capture below;
             // otherwise take it (nothing downstream reads it).
@@ -5793,7 +5818,8 @@ where
                 !released
                     && moderation_capture_safe
                     && usage.stream_failure.is_none()
-                    && !usage.response_text_truncated;
+                    && !usage.response_text_truncated
+                    && !usage.released_unparsed_frame;
             if !usage.response_capture_safe {
                 usage.response_text.clear();
             }

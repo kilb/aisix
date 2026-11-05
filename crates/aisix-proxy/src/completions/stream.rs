@@ -80,6 +80,8 @@ pub(super) struct CompletionSseAccumulator {
     text_bytes: usize,
     frame_cap: usize,
     text_cap: usize,
+    /// Some of the text did not fit under `text_cap`.
+    text_truncated: bool,
     pub(super) saw_done: bool,
     /// Where, in the bytes of the [`Self::push`] that found it, the `[DONE]`
     /// frame began — `0` when it began in an earlier push.
@@ -100,6 +102,7 @@ impl Default for CompletionSseAccumulator {
             text_bytes: 0,
             frame_cap: crate::messages::MAX_SSE_FRAME_BUF_BYTES,
             text_cap: crate::token_estimate::OUTPUT_ACCUMULATION_CAP,
+            text_truncated: false,
             saw_done: false,
             done_frame_start: 0,
             malformed_data: false,
@@ -234,6 +237,7 @@ impl CompletionSseAccumulator {
                     let appended =
                         push_capped(channel, text, self.text_cap.saturating_sub(self.text_bytes));
                     self.text_bytes += appended;
+                    self.text_truncated |= appended < text.len();
                     continue;
                 }
                 if self.text_by_choice.len() >= MAX_COMPLETION_CHOICES {
@@ -243,10 +247,12 @@ impl CompletionSseAccumulator {
                 let separator = usize::from(!self.text_by_choice.is_empty());
                 let remaining = self.text_cap.saturating_sub(self.text_bytes);
                 if remaining <= separator {
+                    self.text_truncated = true;
                     continue;
                 }
                 let mut channel = String::new();
                 let appended = push_capped(&mut channel, text, remaining - separator);
+                self.text_truncated |= appended < text.len();
                 if appended > 0 {
                     self.text_bytes += separator + appended;
                     self.text_by_choice.insert(index, channel);
@@ -442,14 +448,12 @@ where
     crate::request_id::in_request_span(async_stream::stream! {
         let output_guarded = output_observer.is_some();
         // A monitor-only chain holds nothing back, so no hold cap applies: its
-        // end-of-stream scan judges all of the generated text. Nothing bounds
-        // this text but the upstream's own output.
+        // end-of-stream scan judges the generated text up to the live bound.
         let accumulator = CompletionSseAccumulator {
-            text_cap: if output_guarded {
-                usize::MAX
-            } else {
-                crate::token_estimate::OUTPUT_ACCUMULATION_CAP
-            },
+            text_cap: output_observer.as_ref().map_or(
+                crate::token_estimate::OUTPUT_ACCUMULATION_CAP,
+                |chain| crate::guardrail_stream::live_scan_cap(chain.as_ref()),
+            ),
             ..CompletionSseAccumulator::default()
         };
         let mut guard = CompletionStreamGuard {
@@ -533,13 +537,20 @@ where
                 guard.drop_outcome = CompletionStreamOutcome::CleanEof;
                 let observation = match output_observer.as_ref() {
                     Some(chain) => {
-                        let text = guard
+                        let (text, truncated) = guard
                             .slot
                             .as_ref()
-                            .map(|(_, accumulator)| accumulator.output_text())
+                            .map(|(_, accumulator)| {
+                                (accumulator.output_text(), accumulator.text_truncated)
+                            })
                             .unwrap_or_default();
-                        observe_completion_stream_output(chain.as_ref(), &upstream_model, &text)
-                            .await
+                        observe_completion_stream_output(
+                            chain.as_ref(),
+                            &upstream_model,
+                            &text,
+                            truncated,
+                        )
+                        .await
                     }
                     None => CompletionOutputObservation::unguarded(),
                 };
@@ -584,12 +595,13 @@ where
         guard.drop_outcome = outcome;
         let observation = match output_observer.as_ref() {
             Some(chain) => {
-                let text = guard
+                let (text, truncated) = guard
                     .slot
                     .as_ref()
-                    .map(|(_, accumulator)| accumulator.output_text())
+                    .map(|(_, accumulator)| (accumulator.output_text(), accumulator.text_truncated))
                     .unwrap_or_default();
-                observe_completion_stream_output(chain.as_ref(), &upstream_model, &text).await
+                observe_completion_stream_output(chain.as_ref(), &upstream_model, &text, truncated)
+                    .await
             }
             None => CompletionOutputObservation::unguarded(),
         };
@@ -603,7 +615,12 @@ async fn observe_completion_stream_output(
     chain: &aisix_guardrails::GuardrailChain,
     upstream_model: &str,
     text: &str,
+    // `text` stopped at the live scan's bound, so the rest goes unread.
+    truncated: bool,
 ) -> CompletionOutputObservation {
+    if truncated {
+        crate::guardrail_stream::record_live_scan_outgrown(chain);
+    }
     if text.is_empty() {
         return CompletionOutputObservation {
             monitor_hits: Vec::new(),
@@ -641,7 +658,7 @@ async fn observe_completion_stream_output(
     }
     CompletionOutputObservation {
         monitor_hits: hits,
-        capture_safe: moderation.capture_safe,
+        capture_safe: moderation.capture_safe && !truncated,
     }
 }
 
@@ -1051,6 +1068,57 @@ mod tests {
         assert_eq!(hits.monitor_hits.len(), 1);
         assert_eq!(hits.monitor_hits[0].guardrail_name, "monitor-hit");
         assert!(hits.capture_safe);
+    }
+
+    /// Past the live bound the scan reads what was kept, the capture is off,
+    /// and the row and the metric's source both say the rest went unread.
+    #[tokio::test]
+    async fn a_monitored_stream_stops_collecting_at_the_live_bound() {
+        struct Capped;
+        #[async_trait::async_trait]
+        impl aisix_guardrails::Guardrail for Capped {
+            fn name(&self) -> &'static str {
+                "capped"
+            }
+            fn output_buffer_bytes(&self) -> usize {
+                1
+            }
+        }
+        let audit = std::sync::Arc::new(aisix_guardrails::GuardrailAuditLog::default());
+        let chain = Arc::new(
+            aisix_guardrails::GuardrailChain::new(vec![
+                Arc::new(Capped) as Arc<dyn aisix_guardrails::Guardrail>
+            ])
+            .with_audit_log(Some(Arc::clone(&audit))),
+        );
+        let cap = crate::held_content::RAW_HOLD_FACTOR;
+        let mut body = frame(&"z".repeat(cap - 1), true);
+        body.extend_from_slice(&frame("cut here", true));
+        body.extend_from_slice(b"data: [DONE]\n\n");
+        let upstream: CompletionByteStream =
+            Box::pin(futures::stream::iter([Ok(bytes::Bytes::from(body))]));
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let seen_in_callback = Arc::clone(&seen);
+        let stream = build_completion_passthrough_stream(
+            upstream,
+            Some(chain),
+            "model".to_string(),
+            move |accumulator, _, observation| {
+                *seen_in_callback.lock().unwrap() =
+                    Some((accumulator.output_text(), observation.capture_safe));
+            },
+        );
+        futures::pin_mut!(stream);
+        while stream.next().await.is_some() {}
+
+        let (text, capture_safe) = seen.lock().unwrap().take().expect("on_complete fired");
+        assert_eq!(text.len(), cap);
+        assert!(text.ends_with('c'), "cut at the bound");
+        assert!(!capture_safe);
+        assert_eq!(
+            audit.bypass_reason().as_deref(),
+            Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+        );
     }
 
     /// The end-of-stream scan of a monitored stream reads past the bound on the

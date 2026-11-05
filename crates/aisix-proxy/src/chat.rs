@@ -6633,6 +6633,12 @@ where
             .map(|ctx| ctx.chain.stream_output_policy())
             .unwrap_or_default();
         let hold_back = stream_policy.holds_back();
+        // What the live path keeps for its end-of-stream scan is bounded; a held
+        // stream is bounded by its hold cap instead.
+        let mut live_scan = output_guardrail
+            .as_ref()
+            .filter(|_| !hold_back)
+            .map(|ctx| crate::guardrail_stream::LiveScanBudget::new(Arc::clone(&ctx.chain)));
         // Any output-guarded stream starts capture-unsafe. Hold-back paths opt
         // in after moderation before release; live monitor paths opt in after
         // their end-of-stream observation. A disconnect or upstream error
@@ -6780,7 +6786,8 @@ where
                         ) {
                             window_buf.push(chunk.choice_index, channel, text);
                         } else if let Some(buf) = content_buffer.as_mut() {
-                            buf.push(chunk.choice_index, channel, text);
+                            let kept = live_scan.as_mut().map_or(text, |budget| budget.admit(text));
+                            buf.push(chunk.choice_index, channel, kept);
                         }
                         // Content capture: assemble the response for the
                         // observability fan-out, bounded to the cap so a long
@@ -6884,13 +6891,22 @@ where
                                 }
                                 eos_tool_calls.push(
                                     &keyed,
-                                    aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES
-                                        .saturating_mul(crate::held_content::RAW_HOLD_FACTOR),
+                                    live_scan.as_ref().map_or(
+                                        crate::held_content::DEFAULT_RAW_HOLD_BYTES,
+                                        |budget| budget.cap(),
+                                    ),
                                 );
                             }
-                            buf.push(chunk.choice_index, channel, &name);
-                            buf.push(chunk.choice_index, channel, &args);
+                            let name = live_scan.as_mut().map_or(name.as_ref(), |budget| budget.admit(&name));
+                            let args = live_scan.as_mut().map_or(args.as_ref(), |budget| budget.admit(&args));
+                            buf.push(chunk.choice_index, channel, name);
+                            buf.push(chunk.choice_index, channel, args);
                         }
+                    }
+                    if live_scan.as_ref().is_some_and(|budget| budget.outgrown())
+                        && comp.bypass_reason.is_empty()
+                    {
+                        comp.bypass_reason = crate::error::TAG_OUTPUT_BUFFER_EXCEEDED.to_owned();
                     }
                     if let Some(u) = chunk.usage.as_ref().or(chunk.accounting_usage.as_ref()) {
                         let acc = match stream_usage.as_ref() {
@@ -7490,7 +7506,9 @@ where
                 };
                 // The live path's opt-in (see the start of this stream): the
                 // caller already has these bytes, and this was their check.
-                let capture_safe = !verdict.is_block() && !verdict.is_bypass();
+                let capture_safe = !verdict.is_block()
+                    && !verdict.is_bypass()
+                    && !live_scan.as_ref().is_some_and(|budget| budget.outgrown());
                 guard.comp().response_capture_safe = capture_safe;
                 if !capture_safe {
                     guard.comp().response_text.clear();

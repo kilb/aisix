@@ -4572,15 +4572,14 @@ where
     // bounds delta accumulation; a terminal event's full output text is
     // instead bounded by MAX_SSE_FRAME_BUF_BYTES (an oversized frame
     // never parses). The end-of-stream scan reads all of it, so with one
-    // the accumulator is unbounded; `CapturedContent::new` re-truncates
-    // to the exporter cap either way.
-    let capture_cap = Some(if eos_scan.is_some() {
-        usize::MAX
-    } else {
-        content_cap
+    // the accumulator keeps up to the scan's own bound;
+    // `CapturedContent::new` re-truncates to the exporter cap either way.
+    let capture_cap = Some(match &eos_scan {
+        Some(scan) => scan.text_cap(),
+        None => content_cap
             .map(|cap| cap as usize)
             .unwrap_or(0)
-            .max(crate::token_estimate::OUTPUT_ACCUMULATION_CAP)
+            .max(crate::token_estimate::OUTPUT_ACCUMULATION_CAP),
     });
     // Re-attach the request span: the body is polled after the request-id
     // middleware returns, so the end-of-stream output-guardrail scan
@@ -4803,6 +4802,9 @@ where
                     .as_ref()
                     .map(|c| c.scan_text())
                     .unwrap_or_default();
+                if capture.as_ref().is_some_and(|c| c.truncated) {
+                    scan.record_outgrown();
+                }
                 let segments = capture.and_then(|c| c.terminal_segments());
                 // A failed stream with no text is not a response to judge.
                 if text.is_empty() && failed {

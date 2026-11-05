@@ -923,6 +923,8 @@ struct StreamedTranscript {
     /// the `/v1/responses` capture uses — so a provider that answers with
     /// the terminal event alone still yields a scannable transcript.
     terminal: Option<String>,
+    /// Some of the transcript did not fit under the cap on what is assembled.
+    text_truncated: bool,
     /// False when the caller disconnected before the upstream ended.
     reached_end: bool,
     /// When the first upstream frame arrived — relayed to the caller at the
@@ -1045,7 +1047,7 @@ where
 /// first; it owns the UsageEvent for this request.
 ///
 /// `content_cap` bounds the assembled transcript, unless an output chain
-/// needs the end-of-stream scan, which reads all of it.
+/// needs the end-of-stream scan, whose own bound applies instead.
 fn transcription_relay<S, F>(
     upstream: S,
     // Set when `upstream` ended on a read timeout rather than its own end.
@@ -1062,13 +1064,12 @@ where
 
     // Anchors a timed-out read's reported elapsed time.
     let started = std::time::Instant::now();
-    // The end-of-stream scan reads the whole transcript; the capture
-    // re-truncates to its own cap.
-    let text_cap = if eos_scan.is_some() {
-        usize::MAX
-    } else {
-        content_cap.map_or(0, |cap| cap as usize)
-    };
+    // The end-of-stream scan reads the transcript up to its own bound; the
+    // capture re-truncates to its own cap.
+    let text_cap = eos_scan.as_ref().map_or_else(
+        || content_cap.map_or(0, |cap| cap as usize),
+        |scan| scan.text_cap(),
+    );
     // Re-attach the request span: the body is polled after the request-id
     // middleware returns, so anything logged from here would otherwise lose
     // its `request_id` correlation (AISIX-Cloud#1060).
@@ -1133,6 +1134,9 @@ where
             // on the terminal frame drops this generator here, and the
             // Drop emit must still carry the usage it already parsed.
             let text = guard.observed().text().to_string();
+            if guard.observed().text_truncated {
+                scan.record_outgrown();
+            }
             // A failed stream with no text is not a response to judge.
             if !text.is_empty() || guard.observed().failure.is_none() {
                 let hits = scan.observe(&text, None).await;
@@ -1179,14 +1183,13 @@ fn observe_transcript_events(
             observed.duration_seconds = Some(seconds);
         }
         if let Some(full) = value.get("text").and_then(Value::as_str) {
+            observed.text_truncated |= full.len() > cap;
             observed.terminal = Some(truncate_on_char_boundary(full, cap).to_string());
             continue;
         }
-        if observed.deltas.len() >= cap {
-            continue;
-        }
         if let Some(delta) = value.get("delta").and_then(Value::as_str) {
-            let room = cap - observed.deltas.len();
+            let room = cap.saturating_sub(observed.deltas.len());
+            observed.text_truncated |= delta.len() > room;
             observed
                 .deltas
                 .push_str(truncate_on_char_boundary(delta, room));
@@ -1758,6 +1761,7 @@ async fn multipart_dispatch(
                         upstream_model.clone(),
                     )
                 });
+            let output_guarded_c = eos_scan.is_some();
 
             let state_c = state.clone();
             let request_id_c = request_id.to_string();
@@ -1819,7 +1823,13 @@ async fn multipart_dispatch(
                     );
                     let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &pk_id_c);
                     let captured_content = match (&captured_prompt_c, content_cap) {
-                        (Some(prompt), Some(cap)) if input_capture_safe => {
+                        // A live scan that stopped at its bound read only part
+                        // of the transcript. An unguarded stream's text is cut
+                        // to the capture's own cap instead.
+                        (Some(prompt), Some(cap))
+                            if input_capture_safe
+                                && !(output_guarded_c && outcome.text_truncated) =>
+                        {
                             Some(CapturedContent::new(prompt, outcome.text(), cap as usize))
                         }
                         _ => None,
