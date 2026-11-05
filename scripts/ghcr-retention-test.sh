@@ -131,4 +131,9 @@ run delete-502-exhausted 1 "101 101 101" delete-101="502 502 502"
 run delete-403-not-retried 1 "101" delete-101=403
 run delete-429-stops 0 "101 1 102" delete-102=429
 
+# The schedule fires in every fork that has Actions on, and deleting is only
+# ever this repository's business.
+workflow="$(dirname "$script")/../.github/workflows/ghcr-retention.yml"
+sed -n '/^  cleanup:/,$p' "$workflow" | grep -q "if: github.repository == 'api7/aisix' &&" || { echo "FAIL workflow: the deleting job does not guard on the repository"; fail=1; }
+
 exit "$fail"
