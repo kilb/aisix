@@ -449,10 +449,11 @@ fn response_is_sse(headers: &HeaderMap) -> bool {
 }
 
 /// A raw-relay client must never hand encoded success bytes to an output
-/// selector. `identity` is harmless; every other (or malformed) coding is
-/// unavailable for inspection unless the upstream honored our identity-only
-/// request negotiation.
-fn response_has_non_identity_content_encoding(headers: &HeaderMap) -> bool {
+/// selector, and a chain must never be handed an encoded request body as though
+/// it were what the upstream reads. `identity` is harmless; every other (or
+/// malformed) coding is unavailable for inspection unless the upstream honored
+/// our identity-only request negotiation.
+fn has_non_identity_content_encoding(headers: &HeaderMap) -> bool {
     headers
         .get_all(header::CONTENT_ENCODING)
         .iter()
@@ -470,6 +471,24 @@ fn response_has_non_identity_content_encoding(headers: &HeaderMap) -> bool {
             }
             !saw_coding
         })
+}
+
+/// A form body's names and values as the upstream decodes them, when
+/// percent-encoding could be hiding them from a scan of the bytes.
+fn form_decoded_text(headers: &HeaderMap, body: &[u8]) -> Option<String> {
+    let media_type = headers.get(header::CONTENT_TYPE)?.to_str().ok()?;
+    let media_type = media_type.split(';').next()?.trim();
+    if !media_type.eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        || !body.iter().any(|b| matches!(*b, b'%' | b'+'))
+    {
+        return None;
+    }
+    Some(
+        url::form_urlencoded::parse(body)
+            .flat_map(|(name, value)| [name, value])
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -677,6 +696,11 @@ async fn dispatch(
         JsonProbe::Protocol(protocol) => (protocol, None),
         JsonProbe::Unevaluable(error) => (PassthroughProtocol::Raw, Some(error)),
     };
+    // The upstream reads this body decoded, and the chain would read the coding.
+    let probe_error = probe_error.or_else(|| {
+        has_non_identity_content_encoding(&incoming_headers)
+            .then(crate::json_splice::SpliceError::unevaluable)
+    });
     let protocol = refine_request_protocol(protocol, &path, &incoming_headers);
     let raw_shape = detect_raw_usage_shape(protocol, &body_bytes);
     let metering = metering_protocol(protocol, raw_shape, &path);
@@ -721,7 +745,11 @@ async fn dispatch(
                 ));
             }
         };
-        if let Some(text) = text {
+        if let Some(mut text) = text {
+            if let Some(decoded) = form_decoded_text(&incoming_headers, &body_bytes) {
+                text.push('\n');
+                text.push_str(&decoded);
+            }
             let chat = aisix_gateway::ChatFormat::new(
                 route.name.clone(),
                 vec![aisix_gateway::ChatMessage::user(text)],
@@ -1058,7 +1086,7 @@ async fn dispatch(
     let is_sse = response_is_sse(&resp_headers);
     let success_response_is_encoded = status.is_success()
         && output_guardrail_active
-        && response_has_non_identity_content_encoding(&resp_headers);
+        && has_non_identity_content_encoding(&resp_headers);
     let bypass_uninspectable_output = success_response_is_encoded
         && !aisix_guardrails::Guardrail::refuses_unevaluable_output(&resolved_chain);
 
@@ -1104,7 +1132,7 @@ async fn dispatch(
         failure_status: None,
         error_detail: Vec::new(),
         error_body_encoded: !status.is_success()
-            && response_has_non_identity_content_encoding(upstream_resp.headers()),
+            && has_non_identity_content_encoding(upstream_resp.headers()),
         monitor_hits,
         audit: audit_out.clone(),
         captured_prompt,
@@ -8262,6 +8290,30 @@ mod tests {
     }
 
     #[test]
+    fn a_form_body_is_read_as_the_upstream_decodes_it() {
+        let form = |value: &'static str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::CONTENT_TYPE, HeaderValue::from_static(value));
+            h
+        };
+        assert_eq!(
+            form_decoded_text(
+                &form("application/x-www-form-urlencoded; charset=utf-8"),
+                b"prompt=%66or+bidden&%6Eame=x",
+            )
+            .as_deref(),
+            Some("prompt\nfor bidden\nname\nx")
+        );
+        // Nothing encoded: the bytes already say it.
+        assert_eq!(
+            form_decoded_text(&form("application/x-www-form-urlencoded"), b"a=b"),
+            None
+        );
+        assert_eq!(form_decoded_text(&form("application/json"), b"a=%62"), None);
+        assert_eq!(form_decoded_text(&HeaderMap::new(), b"a=%62"), None);
+    }
+
+    #[test]
     fn inbound_host_strips_port_and_lowercases() {
         let req = Request::builder()
             .uri("/x")
@@ -10712,7 +10764,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
                 );
             }
             assert_eq!(
-                response_has_non_identity_content_encoding(&headers),
+                has_non_identity_content_encoding(&headers),
                 encoded,
                 "{value:?}"
             );
@@ -10723,7 +10775,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
             header::CONTENT_ENCODING,
             HeaderValue::from_bytes(b"\xff").unwrap(),
         );
-        assert!(response_has_non_identity_content_encoding(&invalid));
+        assert!(has_non_identity_content_encoding(&invalid));
     }
 
     #[test]
