@@ -43,6 +43,8 @@ function Price({ v }: { v: unknown }) {
  */
 function unpricedModels(models: Record<string, unknown>[]): string[] {
   return models
+    // 路由、组合与语义模型不自己收钱：花费按实际派发到的目标模型的定价算。
+    .filter((m) => m.routing == null && m.ensemble == null && m.semantic == null)
     .filter((m) => {
       const c = m.cost as Record<string, unknown> | undefined;
       return c?.input_per_1k == null || c?.output_per_1k == null;
@@ -57,7 +59,8 @@ export function Models({ doc }: { doc: DocState }) {
 
   const [name, setName] = useState("");
   const [pk, setPk] = useState("");
-  const [provider, setProvider] = useState("openai");
+  /** 手选的供应商类型。null = 跟着绑定的供应商走，否则换了密钥类型还是旧的。 */
+  const [providerPicked, setProviderPicked] = useState<string | null>(null);
   const [upstream, setUpstream] = useState("");
   const [priceIn, setPriceIn] = useState("");
   const [priceOut, setPriceOut] = useState("");
@@ -73,31 +76,32 @@ export function Models({ doc }: { doc: DocState }) {
    */
   const [factorsOwned, setFactorsOwned] = useState(true);
 
+  const boundPk = pk || String(pks[0]?.display_name ?? "");
+  const boundProvider = String(
+    pks.find((p) => String(p.display_name) === boundPk)?.provider ?? "openai",
+  );
+  const provider = providerPicked ?? boundProvider;
+  const providerOptions = [...new Set([...Object.keys(CACHE_FACTORS), provider])];
+
   const factor = CACHE_FACTORS[provider] ?? { read: 1, write: 1, note: "" };
   const mulNum = useMemo(() => {
     const m = parseFloat(mul);
     return Number.isNaN(m) || m < 0 ? 1 : m;
   }, [mul]);
 
-  /** 输入价一变就按倍率重算缓存两项 —— 但只在它们还归自动换算时。 */
-  function onInputPrice(v: string) {
-    setPriceIn(v);
-    const base = parseFloat(v);
-    if (!Number.isNaN(base) && base >= 0 && factorsOwned) {
-      setCacheR(trimNum(base * factor.read * mulNum));
-      setCacheW(trimNum(base * factor.write * mulNum));
-    }
-  }
-
-  function onMul(v: string) {
-    setMul(v);
-    const m = parseFloat(v);
+  /** 缓存两格还归自动换算所有时，它们就是输入价乘上这家的倍率。 */
+  function derived(rate: number): string {
     const base = parseFloat(priceIn);
-    const eff = Number.isNaN(m) || m < 0 ? 1 : m;
-    if (!Number.isNaN(base) && base >= 0 && factorsOwned) {
-      setCacheR(trimNum(base * factor.read * eff));
-      setCacheW(trimNum(base * factor.write * eff));
-    }
+    return !Number.isNaN(base) && base >= 0 ? trimNum(base * rate) : "";
+  }
+  const shownCacheR = factorsOwned ? derived(factor.read) : cacheR;
+  const shownCacheW = factorsOwned ? derived(factor.write) : cacheW;
+
+  /** 手改其中一格：两格都从此归手工所有，另一格留在当前显示的值上。 */
+  function editCache(r: string, w: string) {
+    setFactorsOwned(false);
+    setCacheR(r);
+    setCacheW(w);
   }
 
   async function add() {
@@ -107,8 +111,8 @@ export function Models({ doc }: { doc: DocState }) {
     }
     const i = parseOrNull(priceIn);
     const o = parseOrNull(priceOut);
-    const cr = parseOrNull(cacheR);
-    const cw = parseOrNull(cacheW);
+    const cr = parseOrNull(shownCacheR);
+    const cw = parseOrNull(shownCacheW);
 
     // 只填一半的定价此前被整块丢掉：模型于是变成未定价，而未定价的模型
     // 不计入任何花费上限 —— 用户填了价、表单也接受了，得到的却是一个静默
@@ -130,9 +134,15 @@ export function Models({ doc }: { doc: DocState }) {
       provider_key: pk || String(pks[0]?.display_name ?? ""),
     };
     if (i != null && o != null) {
-      const cost: Record<string, number> = { input_per_1k: i, output_per_1k: o };
-      if (cr != null) cost.cached_input_per_1k = cr;
-      if (cw != null) cost.cache_write_per_1k = cw;
+      // 表单里是基础价，系数只在这里乘一次，四个价一视同仁。上游倍率已经含在
+      // 缓存两格的基础价里。
+      const priced = (v: number) => Number(trimNum(v * mulNum));
+      const cost: Record<string, number> = {
+        input_per_1k: priced(i),
+        output_per_1k: priced(o),
+      };
+      if (cr != null) cost.cached_input_per_1k = priced(cr);
+      if (cw != null) cost.cache_write_per_1k = priced(cw);
       item.cost = cost;
     }
     const ok = await run((d) => {
@@ -255,7 +265,13 @@ export function Models({ doc }: { doc: DocState }) {
           </label>
           <label className="f">
             <span>绑定供应商</span>
-            <select value={pk} onChange={(e) => setPk(e.target.value)}>
+            <select
+              value={pk}
+              onChange={(e) => {
+                setPk(e.target.value);
+                setProviderPicked(null);
+              }}
+            >
               {pks.map((p) => (
                 <option key={String(p.display_name)} value={String(p.display_name)}>
                   {String(p.display_name)}
@@ -265,8 +281,8 @@ export function Models({ doc }: { doc: DocState }) {
           </label>
           <label className="f">
             <span>供应商类型</span>
-            <select value={provider} onChange={(e) => setProvider(e.target.value)}>
-              {Object.keys(CACHE_FACTORS).map((k) => (
+            <select value={provider} onChange={(e) => setProviderPicked(e.target.value)}>
+              {providerOptions.map((k) => (
                 <option key={k} value={k}>
                   {k}
                 </option>
@@ -294,7 +310,7 @@ export function Models({ doc }: { doc: DocState }) {
               min="0"
               placeholder="0.00015"
               value={priceIn}
-              onChange={(e) => onInputPrice(e.target.value)}
+              onChange={(e) => setPriceIn(e.target.value)}
             />
           </label>
           <label className="f">
@@ -314,11 +330,8 @@ export function Models({ doc }: { doc: DocState }) {
               type="number"
               step="0.000001"
               min="0"
-              value={cacheR}
-              onChange={(e) => {
-                setFactorsOwned(false);
-                setCacheR(e.target.value);
-              }}
+              value={shownCacheR}
+              onChange={(e) => editCache(e.target.value, shownCacheW)}
             />
           </label>
           <label className="f">
@@ -327,17 +340,14 @@ export function Models({ doc }: { doc: DocState }) {
               type="number"
               step="0.000001"
               min="0"
-              value={cacheW}
-              onChange={(e) => {
-                setFactorsOwned(false);
-                setCacheW(e.target.value);
-              }}
+              value={shownCacheW}
+              onChange={(e) => editCache(shownCacheR, e.target.value)}
             />
           </label>
         </div>
         <div className="note">
           <strong>{provider}</strong> 的公开缓存倍率：{factor.note}
-          。填好输入价后自动换算；系数 {mulNum} 会同时乘到四个价上。
+          。填好输入价后自动换算；保存时系数 {mulNum} 会同时乘到四个价上。
           这些倍率是上游的计价规则，不是网关行为。
         </div>
         <label className="f" style={{ maxWidth: 320 }}>
@@ -347,7 +357,7 @@ export function Models({ doc }: { doc: DocState }) {
             step="0.01"
             min="0"
             value={mul}
-            onChange={(e) => onMul(e.target.value)}
+            onChange={(e) => setMul(e.target.value)}
           />
         </label>
         <button className="act" disabled={busy || pks.length === 0} onClick={() => void add()}>
