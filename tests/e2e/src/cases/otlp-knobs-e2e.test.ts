@@ -416,7 +416,7 @@ describe("otlp exporter knobs e2e (#519 B.2): sample_rate + content capture", ()
         expect(before.status).toBe(200);
         await before.text();
         await waitForSpan(otlp, (attrs) =>
-          (attrs["gen_ai.prompt"] ?? "").includes(beforeMarker),
+          (attrs["gen_ai.input.messages"] ?? "").includes(beforeMarker),
         );
         const beforeStatus = await getExporterStatus(app);
         expect(beforeStatus.count).toBe(1);
@@ -455,11 +455,11 @@ describe("otlp exporter knobs e2e (#519 B.2): sample_rate + content capture", ()
         expect(inFlight.status).toBe(200);
         await inFlight.text();
         await waitForSpan(control, (attrs) =>
-          (attrs["gen_ai.prompt"] ?? "").includes(inFlightMarker),
+          (attrs["gen_ai.input.messages"] ?? "").includes(inFlightMarker),
         );
         await expectNoSpanFor(
           otlp,
-          (attrs) => (attrs["gen_ai.prompt"] ?? "").includes(inFlightMarker),
+          (attrs) => (attrs["gen_ai.input.messages"] ?? "").includes(inFlightMarker),
           1_250,
         );
 
@@ -470,11 +470,11 @@ describe("otlp exporter knobs e2e (#519 B.2): sample_rate + content capture", ()
         expect(fullCycle.status).toBe(200);
         await fullCycle.text();
         await waitForSpan(control, (attrs) =>
-          (attrs["gen_ai.prompt"] ?? "").includes(fullCycleMarker),
+          (attrs["gen_ai.input.messages"] ?? "").includes(fullCycleMarker),
         );
         expect(
           otlp.spanAttrs.some((attrs) => {
-            const prompt = attrs["gen_ai.prompt"] ?? "";
+            const prompt = attrs["gen_ai.input.messages"] ?? "";
             return prompt.includes(inFlightMarker) || prompt.includes(fullCycleMarker);
           }),
         ).toBe(false);
