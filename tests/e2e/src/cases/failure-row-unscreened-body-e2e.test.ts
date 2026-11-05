@@ -20,6 +20,8 @@ import {
 // processed. A chain that calls out reserves its rate limit ahead of the check,
 // so a key at its limit is turned away with the rule never having run: that row
 // carries no body at all, on every surface, not the text as the caller sent it.
+// Once the chain has finished, a failure's row has the body back, masked, so a
+// route that never ended the hold shows here as a row with nothing in it.
 
 const CALLER = "sk-unscreened-body";
 const CREDENTIAL_REF = "mock";
@@ -51,37 +53,48 @@ describe("a request turned away ahead of its chain exports no unmasked body", ()
   let etcdReachable = false;
   let sls: MockSls | undefined;
   let upstream: OpenAiUpstream | undefined;
+  let failingUpstream: OpenAiUpstream | undefined;
   let mcp: McpUpstream | undefined;
   let app: SpawnedApp | undefined;
   let fileId = "";
 
   const OPENAI = "unscreened-openai";
   const messages = [{ role: "user", content: TEXT }];
-  const SURFACES: Array<[string, () => Request]> = [
-    ["chat", () => json("/v1/chat/completions", { model: OPENAI, messages })],
-    ["chat stream", () => json("/v1/chat/completions", { model: OPENAI, messages, stream: true })],
-    ["responses", () => json("/v1/responses", { model: OPENAI, input: TEXT })],
-    ["messages", () => json("/v1/messages", { model: OPENAI, max_tokens: 16, messages })],
-    ["count_tokens", () => json("/v1/messages/count_tokens", { model: "unscreened-anthropic", messages })],
-    ["completions", () => json("/v1/completions", { model: OPENAI, prompt: TEXT })],
-    ["embeddings", () => json("/v1/embeddings", { model: OPENAI, input: TEXT })],
-    ["rerank", () => json("/v1/rerank", { model: "unscreened-rerank", query: TEXT, documents: ["a"] })],
-    ["images", () => json("/v1/images/generations", { model: OPENAI, prompt: TEXT })],
-    ["image edits", () => multipart("/v1/images/edits", { model: OPENAI, prompt: TEXT }, "image")],
-    ["speech", () => json("/v1/audio/speech", { model: OPENAI, input: TEXT, voice: "alloy" })],
-    ["transcription", () => multipart("/v1/audio/transcriptions", { model: OPENAI, prompt: TEXT }, "file")],
-    ["videos", () => json("/v1/videos", { model: "unscreened-video", prompt: TEXT })],
+  interface Names {
+    openai: string;
+    rerank: string;
+    anthropic: string;
+    video: string;
+    route: string;
+    mcpTool: string;
+    /** What a batch names its file with, which is what routes it. */
+    batch: () => Record<string, unknown>;
+  }
+  const surfacesFor = (n: Names): Array<[string, () => Request]> => [
+    ["chat", () => json("/v1/chat/completions", { model: n.openai, messages })],
+    ["chat stream", () => json("/v1/chat/completions", { model: n.openai, messages, stream: true })],
+    ["responses", () => json("/v1/responses", { model: n.openai, input: TEXT })],
+    ["messages", () => json("/v1/messages", { model: n.openai, max_tokens: 16, messages })],
+    ["count_tokens", () => json("/v1/messages/count_tokens", { model: n.anthropic, messages })],
+    ["completions", () => json("/v1/completions", { model: n.openai, prompt: TEXT })],
+    ["embeddings", () => json("/v1/embeddings", { model: n.openai, input: TEXT })],
+    ["rerank", () => json("/v1/rerank", { model: n.rerank, query: TEXT, documents: ["a"] })],
+    ["images", () => json("/v1/images/generations", { model: n.openai, prompt: TEXT })],
+    ["image edits", () => multipart("/v1/images/edits", { model: n.openai, prompt: TEXT }, "image")],
+    ["speech", () => json("/v1/audio/speech", { model: n.openai, input: TEXT, voice: "alloy" })],
+    ["transcription", () => multipart("/v1/audio/transcriptions", { model: n.openai, prompt: TEXT }, "file")],
+    ["videos", () => json("/v1/videos", { model: n.video, prompt: TEXT })],
     [
       "batches",
       () =>
         json("/v1/batches", {
-          input_file_id: fileId,
+          ...n.batch(),
           endpoint: "/v1/chat/completions",
           completion_window: "24h",
           metadata: { note: TEXT },
         }),
     ],
-    ["passthrough", () => json("/unscreened-route/v1/chat/completions", { model: "m", messages })],
+    ["passthrough", () => json(`${n.route}/v1/chat/completions`, { model: "m", messages })],
     [
       "a2a",
       () =>
@@ -99,10 +112,35 @@ describe("a request turned away ahead of its chain exports no unmasked body", ()
           jsonrpc: "2.0",
           id: 1,
           method: "tools/call",
-          params: { name: "unscreenedmcp__echo", arguments: { text: TEXT } },
+          params: { name: n.mcpTool, arguments: { text: TEXT } },
         }),
     ],
   ];
+  const SURFACES = surfacesFor({
+    openai: OPENAI,
+    rerank: "unscreened-rerank",
+    anthropic: "unscreened-anthropic",
+    video: "unscreened-video",
+    route: "/unscreened-route",
+    mcpTool: "unscreenedmcp__echo",
+    batch: () => ({ input_file_id: fileId }),
+  });
+  // The same surfaces once the chain has passed, on an upstream that fails.
+  const FAILING = "unscreened-fail";
+  const FAILED_SURFACES = surfacesFor({
+    openai: FAILING,
+    rerank: `${FAILING}-rerank`,
+    anthropic: `${FAILING}-anthropic`,
+    video: `${FAILING}-video`,
+    route: `/${FAILING}-route`,
+    mcpTool: "unscreenedmcp__echo",
+    batch: () => ({ input_file_id: "file-unrouted", model: FAILING }),
+    // A tool call past the chain gets its answer from the tool, in a 200, so it
+    // leaves no failure row to read.
+  }).filter(([label]) => label !== "mcp");
+  // Relayed as sent, so a mask rule has nothing to write back into. Every other
+  // surface's row has the mask applied.
+  const NOT_REWRITTEN = new Set(["batches", "passthrough"]);
   const limitedKey = (label: string) => `${CALLER}-${label.replace(/\W/g, "-")}`;
   const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
@@ -113,6 +151,10 @@ describe("a request turned away ahead of its chain exports no unmasked body", ()
     sls = await startMockSls();
     upstream = await startOpenAiUpstream({
       pathBodies: { "/v1/files": { id: "file-unscreened", object: "file", purpose: "batch" } },
+    });
+    failingUpstream = await startOpenAiUpstream({
+      status: 500,
+      errorBody: { error: { message: "unscreened upstream failed" } },
     });
     mcp = await startMcpUpstream("unscreenedmcp");
     app = await spawnApp({
@@ -138,6 +180,10 @@ describe("a request turned away ahead of its chain exports no unmasked body", ()
       ["unscreened-rerank", "cohere", "rerank-v3.5", `${upstream.baseUrl}/v1`, "openai"],
       ["unscreened-anthropic", "anthropic", "claude-sonnet-4-5", upstream.baseUrl, undefined],
       ["unscreened-video", "alibaba", "wan-mock", upstream.baseUrl, undefined],
+      [FAILING, "openai", "gpt-4o-mini", `${failingUpstream.baseUrl}/v1`, undefined],
+      [`${FAILING}-rerank`, "cohere", "rerank-v3.5", `${failingUpstream.baseUrl}/v1`, "openai"],
+      [`${FAILING}-anthropic`, "anthropic", "claude-sonnet-4-5", failingUpstream.baseUrl, undefined],
+      [`${FAILING}-video`, "alibaba", "wan-mock", failingUpstream.baseUrl, undefined],
     ] as const) {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
@@ -157,6 +203,12 @@ describe("a request turned away ahead of its chain exports no unmasked body", ()
       name: "unscreened-route",
       path_prefix: "/unscreened-route",
       target_url: upstream.baseUrl,
+      provider_key_id: routePk.id,
+    });
+    await seed.createPassthroughRoute({
+      name: `${FAILING}-route`,
+      path_prefix: `/${FAILING}-route`,
+      target_url: failingUpstream.baseUrl,
       provider_key_id: routePk.id,
     });
     await seed.update("a2a_agents", randomUUID(), {
@@ -228,6 +280,7 @@ describe("a request turned away ahead of its chain exports no unmasked body", ()
     await app?.exit();
     await sls?.close();
     await upstream?.close();
+    await failingUpstream?.close();
     await mcp?.close();
   });
 
@@ -261,5 +314,20 @@ describe("a request turned away ahead of its chain exports no unmasked body", ()
     expect(exported, label).not.toContain(KEEP);
     // The row is still a full one: it says what the caller was told.
     expect(row.get("response"), label).toBeTruthy();
+  });
+
+  test.for(FAILED_SURFACES)("%s: a failure past the chain has the body back", { timeout: 30_000 }, async ([label, make], ctx) => {
+    if (!etcdReachable) return ctx.skip();
+    const req = make();
+    const res = await fetch(`${app!.proxyUrl}${new URL(req.url).pathname}`, await init(req, CALLER));
+    await res.text();
+    const requestId = res.headers.get("x-aisix-request-id");
+    expect(requestId, label).toBeTruthy();
+    const row = await waitForSlsLog(sls!, LOGSTORE, (r) => r.get("request_id") === requestId, `${label}: the failed row`);
+
+    expect(Number(row.get("status_code")) >= 400 || !!row.get("error_class"), `${label}: a failure row`).toBe(true);
+    const exported = [...row.values()].join("\n");
+    expect(exported, label).toContain(KEEP);
+    if (!NOT_REWRITTEN.has(label)) expect(exported, label).not.toContain(EMAIL);
   });
 });
