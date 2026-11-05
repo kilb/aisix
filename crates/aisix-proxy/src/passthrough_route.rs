@@ -6142,7 +6142,11 @@ fn stream_opaque_response(
                     telemetry.record_rate_limit_lease_lost();
                     telemetry.stream_reached_end = true;
                     telemetry.emit();
-                    yield Err(lease_lost_error());
+                    // A provider's error body is already marked by its status,
+                    // and stays its own bytes up to the cut.
+                    if status.is_success() {
+                        yield Err(lease_lost_error());
+                    }
                     return;
                 }
                 chunk = upstream.next() => chunk,
