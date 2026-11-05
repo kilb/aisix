@@ -4118,7 +4118,7 @@ mod tests {
         .await;
         let (app, _rx, state) = build_app_with_sink_and_state(ended_batch_snapshot(&upstream));
 
-        let encoded = encode_routed_id("batch_1", "jobs-a");
+        let encoded = encode_routed_id("batch_1", "jobs-a", None);
         let resp = app
             .oneshot(get_as(format!("/v1/batches/{encoded}"), "sk-other"))
             .await
@@ -4189,7 +4189,7 @@ mod tests {
             )
             .await;
             let (app, _rx, state) = build_app_with_sink_and_state(ended_batch_snapshot(&upstream));
-            let encoded = encode_routed_id("batch_1", "jobs-a");
+            let encoded = encode_routed_id("batch_1", "jobs-a", None);
             let resp = app
                 .oneshot(get_as(format!("/v1/batches/{encoded}"), "sk-caller"))
                 .await
@@ -4290,7 +4290,7 @@ mod tests {
         let app = crate::build_router(state.clone());
 
         let body = serde_json::json!({
-            "input_file_id": encode_routed_id("file-in", "jobs-a"),
+            "input_file_id": encode_routed_id("file-in", "jobs-a", None),
             "endpoint": "/v1/chat/completions",
             "completion_window": "24h"
         });
@@ -4326,7 +4326,7 @@ mod tests {
         let (app, _rx, _state) = build_app_with_sink_and_state(ended_batch_snapshot(&upstream));
 
         let body = serde_json::json!({
-            "input_file_id": encode_routed_id("file-in", "jobs-a"),
+            "input_file_id": encode_routed_id("file-in", "jobs-a", None),
             "endpoint": "/v1/chat/completions",
             "completion_window": "24h",
             "metadata": {"note": "x", BATCH_SUBMITTER_KEY: "k-other", BATCH_MODEL_KEY: "free"}
@@ -4396,7 +4396,7 @@ mod tests {
             "这条用例说的就是进程内存储"
         );
 
-        let encoded = encode_routed_id("batch_1", "jobs-a");
+        let encoded = encode_routed_id("batch_1", "jobs-a", None);
         let resp = app
             .oneshot(get_as(format!("/v1/batches/{encoded}"), "sk-caller"))
             .await
@@ -4437,7 +4437,7 @@ mod tests {
         )
         .await;
         let (app, _rx, state) = build_app_with_sink_and_state(ended_batch_snapshot(&upstream));
-        let encoded = encode_routed_id("batch_1", "jobs-a");
+        let encoded = encode_routed_id("batch_1", "jobs-a", None);
         let resp = app
             .oneshot(get_as(format!("/v1/batches/{encoded}"), "sk-caller"))
             .await
