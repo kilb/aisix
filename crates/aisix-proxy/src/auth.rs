@@ -619,6 +619,36 @@ mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue, Request};
 
+    /// Forwarding keeps the caller's gateway credential off every ProviderKey
+    /// upstream by reading it through `aisix_core`. It has to find the same
+    /// credential authentication does, or a key would leave through the gap.
+    #[test]
+    fn the_forwarding_rule_reads_the_credential_authentication_reads() {
+        let cases: &[&[(&str, &str)]] = &[
+            &[("authorization", "Bearer sk-a")],
+            &[("authorization", "bearer  sk-a ")],
+            &[("x-api-key", "sk-x")],
+            &[("x-api-key", " sk-x ")],
+            &[("x-aisix-api-key", "sk-g")],
+            &[("x-aisix-api-key", "Bearer sk-g")],
+            &[("x-aisix-api-key", "sk-g"), ("authorization", "Bearer b")],
+            &[("x-aisix-api-key", "sk-g"), ("x-api-key", "x")],
+            &[("authorization", "Bearer sk-a"), ("x-api-key", "sk-x")],
+        ];
+        for pairs in cases {
+            let mut headers = HeaderMap::new();
+            for (name, value) in *pairs {
+                headers.insert(*name, HeaderValue::from_str(value).unwrap());
+            }
+            let read = header_credential(&headers).map(|r| r.ok());
+            assert_eq!(
+                read.flatten().as_deref(),
+                aisix_core::inbound_gateway_credential(&headers),
+                "{pairs:?}"
+            );
+        }
+    }
+
     /// A tracing writer that appends every emitted byte into a shared buffer
     /// so a test can assert what a log line carried.
     #[derive(Clone)]

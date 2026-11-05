@@ -475,8 +475,8 @@ pub struct RequestOverrides {
     ///
     /// "When the caller did not set them" includes the gateway itself:
     /// an entry naming the slot this ProviderKey's credential occupies
-    /// is not applied. Use `forward_client_headers` to put the caller's
-    /// own credential there instead.
+    /// is not applied. Use `forward_client_headers` to put a credential the
+    /// caller sends for the upstream there instead.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub default_headers: HashMap<String, String>,
 
@@ -496,12 +496,18 @@ pub struct RequestOverrides {
     /// `proxy-authorization`, `x-api-key`, `api-key`, `x-goog-api-key`,
     /// `cookie`, and the AWS SigV4 trio `x-amz-security-token` /
     /// `x-amz-date` / `x-amz-content-sha256` — hands the upstream the
-    /// caller's own credential in place of the
+    /// credential the caller sent for it in place of the
     /// one this ProviderKey would inject there, never both. That is what lets an
     /// internal service that already authorizes on the end user's
     /// `Authorization` keep doing so unchanged. Any OTHER header the
     /// gateway had already set is left alone: it selects how the exchange
     /// works, not who it is from.
+    ///
+    /// The credential the caller authenticated to the gateway with is never
+    /// forwarded, whatever the patterns say: a header holding it is dropped,
+    /// and this ProviderKey's own credential goes out. A caller with a
+    /// separate credential for the upstream sends its gateway key in
+    /// `x-aisix-api-key` and that credential in the slot the upstream reads.
     ///
     /// A credential slot, and `traceparent` / `tracestate`, are forwarded
     /// only when a pattern names them exactly — a glob such as `"*"` or

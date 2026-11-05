@@ -510,8 +510,8 @@ async fn prepare(
     // the caller's own handshake. This face builds its upstream request by
     // hand instead of through the shared bridge pipeline, which is exactly
     // where a per-request mechanism goes silently missing — an operator
-    // who declared that this upstream reads the caller's credential got it
-    // on every other `/v1/*` endpoint and not here.
+    // who declared that this upstream reads a credential the caller sends
+    // got it on every other `/v1/*` endpoint and not here.
     let mut forwarded = aisix_gateway::ForwardedClientHeaders::resolve(
         &aisix_gateway::UpstreamHeaderContext::from_overrides(pk_entry.value.request.as_ref())
             .with_client_headers(headers)
@@ -2385,6 +2385,40 @@ mod tests {
             .into_client_request()
             .unwrap();
         req.headers_mut()
+            .insert("x-aisix-api-key", "sk-caller".parse().unwrap());
+        req.headers_mut()
+            .insert("authorization", "Bearer sk-for-upstream".parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("handshake");
+        let (mut tx, mut client_rx) = ws.split();
+        tx.send(TgMessage::Text("{\"type\":\"session.update\"}".into()))
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(3), client_rx.next()).await;
+
+        let (_uri, seen) = handshake
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("handshake recorded");
+        assert_eq!(header_str(&seen, "authorization"), "Bearer sk-for-upstream");
+        // And alone: a second value would let the upstream pick.
+        assert_eq!(seen.get_all("authorization").iter().count(), 1);
+    }
+
+    /// The key the caller authenticated to the gateway with stays home even
+    /// when the slot is named: the ProviderKey's secret opens the upstream.
+    #[tokio::test]
+    async fn the_callers_gateway_key_never_rides_the_upstream_handshake() {
+        let (up_addr, handshake, _frames) = spawn_upstream().await;
+        let snap = snapshot_forwarding(&format!("http://{up_addr}/v1"), &["authorization"]);
+        let (addr, _state, _rx) = serve(snap).await;
+
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
             .insert("authorization", "Bearer sk-caller".parse().unwrap());
         let (ws, _) = tokio_tungstenite::connect_async(req)
             .await
@@ -2400,8 +2434,7 @@ mod tests {
             .unwrap()
             .clone()
             .expect("handshake recorded");
-        assert_eq!(header_str(&seen, "authorization"), "Bearer sk-caller");
-        // And alone: a second value would let the upstream pick.
+        assert_eq!(header_str(&seen, "authorization"), "Bearer sk-up");
         assert_eq!(seen.get_all("authorization").iter().count(), 1);
     }
 

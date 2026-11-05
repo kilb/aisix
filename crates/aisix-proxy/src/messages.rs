@@ -6583,8 +6583,9 @@ mod tests {
         // `default_headers` is a fallback, never an override: the
         // bridge fills `x-api-key` before the merge, so an operator
         // entry of the same name is declined and the PK's secret stays
-        // the auth value upstream sees. (Putting the CALLER's own
-        // credential there is what `forward_client_headers` is for.)
+        // the auth value upstream sees. (Putting a credential the caller
+        // sends for the upstream there is what `forward_client_headers` is
+        // for.)
         let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))

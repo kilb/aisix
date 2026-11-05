@@ -8250,7 +8250,7 @@ mod forwarded_header_tests {
     fn a_forwarded_credential_outranks_a_static_operator_one() {
         for slot in ["x-api-key", "cookie", "api-key"] {
             let r = overrides(&[(slot, "operator-static")], &[slot]);
-            let inbound = header_map(&[(slot, "callers-own")]);
+            let inbound = header_map(&[("x-aisix-api-key", "sk-gateway"), (slot, "callers-own")]);
             let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
             assert_eq!(
                 filtered_extra_headers(&ctx, false),

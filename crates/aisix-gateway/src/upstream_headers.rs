@@ -18,14 +18,22 @@
 //! gateway's own. A FORWARDED CLIENT header does displace it, because the
 //! operator named that header on this specific upstream and the slot they
 //! most often name is the credential one: handing an internal service the
-//! caller's own `Authorization` in place of the gateway's is the whole
-//! reason the field exists. `insert` rather than `append`, so exactly one
-//! credential reaches the wire and the upstream never picks between two
+//! `Authorization` the caller sent for it in place of the gateway's is the
+//! whole reason the field exists. `insert` rather than `append`, so exactly
+//! one credential reaches the wire and the upstream never picks between two
 //! (the #411 shape). Between the two operator features, `default_headers`
 //! resolves first, so an operator's static header beats a client header of
 //! the same name — everywhere but a credential slot, where the forward is
 //! the whole reason the field exists and takes the slot from the static
 //! entry too.
+//!
+//! **The credential the caller authenticated to this gateway with is never
+//! forwarded, whatever the allowlist names.** It proves who the caller is to
+//! THIS gateway and can be replayed against it, so no upstream receives it:
+//! the header is dropped, claims no slot, and the bridge's own credential
+//! goes out. A caller that has a credential for the upstream sends its
+//! gateway key in `x-aisix-api-key` and that credential in the slot the
+//! upstream reads.
 //!
 //! What can never be forwarded is narrow and lives in
 //! `aisix_core::forwarded_headers`: the transport slots whose forwarding
@@ -247,17 +255,21 @@ impl ForwardedClientHeaders {
     /// configures none, and on a call with no client request behind it (a
     /// background poll of an async job, a semantic-routing embedding
     /// lookup) — those forward nothing.
+    ///
+    /// The caller's gateway credential is removed here, the one point every
+    /// ProviderKey dispatch resolves through: an entry that is gone claims
+    /// no slot, so each site goes on to inject the ProviderKey's secret.
     pub fn resolve(ctx: &UpstreamHeaderContext<'_>) -> Self {
         let (Some(r), Some(client)) = (ctx.overrides, ctx.client_headers) else {
             return Self::default();
         };
-        Self {
-            entries: aisix_core::resolve_forwarded_client_headers(
-                &r.forward_client_headers,
-                client,
-                ctx.surface_blocked,
-            ),
-        }
+        let mut entries = aisix_core::resolve_forwarded_client_headers(
+            &r.forward_client_headers,
+            client,
+            ctx.surface_blocked,
+        );
+        entries.retain(|(_, value)| !aisix_core::is_caller_gateway_credential(client, value));
+        Self { entries }
     }
 
     /// Whether the forward claims `name` (lowercase) — the question a site
@@ -377,14 +389,74 @@ mod tests {
         assert_eq!(headers["x-user-jwt"], "eyJraw");
     }
 
+    /// Whichever header the gateway read it from, and whichever slots the
+    /// allowlist names, the key that authenticated the caller stays home and
+    /// the credential the bridge placed is the one that goes out.
+    #[test]
+    fn the_callers_gateway_credential_is_never_forwarded() {
+        let named = [
+            "authorization",
+            "x-api-key",
+            "api-key",
+            "x-goog-api-key",
+            "x-corp-*",
+        ];
+        let arrivals: &[&[(&str, &str)]] = &[
+            &[("authorization", "Bearer sk-caller")],
+            &[("x-api-key", "sk-caller")],
+            &[("x-aisix-api-key", "sk-caller")],
+            // The same key copied into slots authentication did not read.
+            &[
+                ("authorization", "Bearer sk-caller"),
+                ("x-api-key", "sk-caller"),
+                ("api-key", "sk-caller"),
+                ("x-goog-api-key", "sk-caller"),
+                ("x-corp-copy", "sk-caller"),
+            ],
+            &[
+                ("x-aisix-api-key", "sk-caller"),
+                ("authorization", "Bearer sk-caller"),
+            ],
+        ];
+        let r = overrides(&[("x-api-key", "operator-typo")], &named);
+        for inbound in arrivals {
+            let inbound = client(inbound);
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                HeaderName::from_static("x-api-key"),
+                HeaderValue::from_static("provider-secret"),
+            );
+            let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
+            assert!(ForwardedClientHeaders::resolve(&ctx).is_empty());
+            apply_request_headers(&mut headers, &ctx);
+            assert_eq!(headers["x-api-key"], "provider-secret");
+            for (name, value) in &headers {
+                let value = value.to_str().unwrap();
+                assert!(!value.contains("sk-caller"), "leaked in {name}: {value}");
+            }
+            // The flattened form Bedrock consumes answers the same.
+            let flattened = resolve_extra_headers(&ctx);
+            assert!(
+                flattened
+                    .iter()
+                    .all(|(_, v)| !v.to_str().unwrap().contains("sk-caller")),
+                "{flattened:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_forwarded_header_replaces_the_bridge_owned_credential() {
         // The case the field exists for: the operator named
         // `authorization` on THIS ProviderKey, for an upstream that
-        // authorizes on the end user. Two credentials on the wire would
-        // let the upstream choose between them.
+        // authorizes on the end user, and the caller authenticated to the
+        // gateway separately. Two credentials on the wire would let the
+        // upstream choose between them.
         let r = overrides(&[], &["authorization"]);
-        let inbound = client(&[("authorization", "Bearer callers-own")]);
+        let inbound = client(&[
+            ("x-aisix-api-key", "sk-gateway"),
+            ("authorization", "Bearer callers-own"),
+        ]);
         let mut headers = HeaderMap::new();
         headers.insert(
             HeaderName::from_static("authorization"),
@@ -433,7 +505,10 @@ mod tests {
         // never "won" that name — and must not silently suppress the
         // forward, which CAN displace it.
         let r = overrides(&[("authorization", "Bearer static")], &["authorization"]);
-        let inbound = client(&[("authorization", "Bearer callers-own")]);
+        let inbound = client(&[
+            ("x-aisix-api-key", "sk-gateway"),
+            ("authorization", "Bearer callers-own"),
+        ]);
         let mut headers = HeaderMap::new();
         headers.insert(
             HeaderName::from_static("authorization"),
@@ -451,7 +526,10 @@ mod tests {
         // except a credential one, where the forward is the whole reason
         // the operator named it on this upstream.
         let r = overrides(&[("x-api-key", "operator-static")], &["x-api-key"]);
-        let inbound = client(&[("x-api-key", "callers-own")]);
+        let inbound = client(&[
+            ("authorization", "Bearer sk-gateway"),
+            ("x-api-key", "callers-own"),
+        ]);
         let mut headers = HeaderMap::new();
         let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
         apply_request_headers(&mut headers, &ctx);
@@ -469,7 +547,11 @@ mod tests {
             &[("x-api-key", "operator-static"), ("x-team", "operator")],
             &["x-api-key", "x-team"],
         );
-        let inbound = client(&[("x-api-key", "callers-own"), ("x-team", "client-claimed")]);
+        let inbound = client(&[
+            ("authorization", "Bearer sk-gateway"),
+            ("x-api-key", "callers-own"),
+            ("x-team", "client-claimed"),
+        ]);
         let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
 
         let resolved = resolve_extra_headers(&ctx);
@@ -535,7 +617,11 @@ mod tests {
     #[test]
     fn the_claimed_set_is_what_a_credential_site_asks() {
         let r = overrides(&[], &["authorization", "x-trace-*"]);
-        let inbound = client(&[("authorization", "Bearer c"), ("x-trace-id", "t")]);
+        let inbound = client(&[
+            ("x-aisix-api-key", "sk-gateway"),
+            ("authorization", "Bearer c"),
+            ("x-trace-id", "t"),
+        ]);
         let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
         let forwarded = ForwardedClientHeaders::resolve(&ctx);
         assert!(forwarded.claims("authorization"));
@@ -549,7 +635,10 @@ mod tests {
         // `Debug` on the header map is reachable from tracing; a forwarded
         // credential must not be printable through it.
         let r = overrides(&[], &["authorization"]);
-        let inbound = client(&[("authorization", "Bearer callers-own")]);
+        let inbound = client(&[
+            ("x-aisix-api-key", "sk-gateway"),
+            ("authorization", "Bearer callers-own"),
+        ]);
         let mut headers = HeaderMap::new();
         let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
         apply_request_headers(&mut headers, &ctx);
@@ -634,6 +723,7 @@ mod tests {
     fn a_forward_displaces_only_a_credential_slot() {
         let r = overrides(&[], &["authorization", "x-dashscope-async", "x-fresh"]);
         let inbound = client(&[
+            ("x-aisix-api-key", "sk-gateway"),
             ("authorization", "Bearer caller"),
             // A provider's own wire-shape selector: the gateway set it to
             // pick the submission mode it then decodes, so a caller's
@@ -663,6 +753,7 @@ mod tests {
         let r = overrides(&[], &["authorization", "x-api-key", "cookie"]);
         let mut headers = HeaderMap::new();
         let inbound = client(&[
+            ("x-aisix-api-key", "sk-gateway"),
             ("authorization", "Bearer caller"),
             ("x-api-key", "caller"),
             ("cookie", "session=1"),

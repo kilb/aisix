@@ -41,6 +41,11 @@
 //! in the slot that upstream already reads, is the capability's whole
 //! point, and the surface that injects a gateway credential into the same
 //! slot stands aside for it (see each dispatch site).
+//!
+//! The credential the caller authenticated to THIS gateway with is another
+//! matter on the `provider_key` face: [`is_caller_gateway_credential`] tells
+//! it apart from one the caller sent for the upstream, and that face never
+//! forwards it, whatever its allowlist names.
 
 use http::{HeaderMap, HeaderName, HeaderValue};
 
@@ -87,6 +92,34 @@ pub fn strip_bearer_scheme(value: &str) -> Option<&str> {
         .get(..SCHEME.len())
         .filter(|scheme| scheme.eq_ignore_ascii_case(SCHEME))
         .map(|_| &value[SCHEME.len()..])
+}
+
+/// The credential a header value holds: the value itself, or what follows a
+/// `Bearer ` scheme. `None` when the value is empty or not readable text.
+fn credential_in(value: &HeaderValue) -> Option<&str> {
+    let raw = value.to_str().ok()?.trim();
+    let credential = strip_bearer_scheme(raw).map_or(raw, str::trim);
+    (!credential.is_empty()).then_some(credential)
+}
+
+/// The caller's gateway credential as it arrived on `client`, by the
+/// precedence the gateway authenticates with: [`GATEWAY_CREDENTIAL_HEADER`]
+/// when present, else `authorization`, else `x-api-key`. The first header
+/// present decides, as it does for authentication.
+pub fn inbound_gateway_credential(client: &HeaderMap) -> Option<&str> {
+    [GATEWAY_CREDENTIAL_HEADER, "authorization", "x-api-key"]
+        .iter()
+        .find_map(|name| client.get(*name))
+        .and_then(credential_in)
+}
+
+/// Whether `value`, a header taken from `client`, holds the credential the
+/// caller authenticated to this gateway with. Compared by value rather than
+/// by header name, so the same key copied into a second slot is recognised
+/// too.
+pub fn is_caller_gateway_credential(client: &HeaderMap, value: &HeaderValue) -> bool {
+    inbound_gateway_credential(client)
+        .is_some_and(|credential| credential_in(value) == Some(credential))
 }
 
 /// Client headers never forwarded by a surface that REBUILDS the outbound
@@ -333,6 +366,54 @@ mod tests {
 
     fn names(pairs: &[(HeaderName, HeaderValue)]) -> Vec<&str> {
         pairs.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    #[test]
+    fn the_inbound_gateway_credential_follows_the_authentication_precedence() {
+        // Each row: the headers sent, and the credential authentication reads.
+        type Case<'a> = (&'a [(&'a str, &'a str)], Option<&'a str>);
+        let cases: &[Case<'_>] = &[
+            (&[("authorization", "Bearer sk-a")], Some("sk-a")),
+            (&[("authorization", "bearer  sk-a ")], Some("sk-a")),
+            (&[("x-api-key", "sk-x")], Some("sk-x")),
+            (&[("x-aisix-api-key", "sk-g")], Some("sk-g")),
+            (&[("x-aisix-api-key", "Bearer sk-g")], Some("sk-g")),
+            // The dedicated header leaves `authorization` to the upstream.
+            (
+                &[("x-aisix-api-key", "sk-g"), ("authorization", "Bearer b")],
+                Some("sk-g"),
+            ),
+            (
+                &[("authorization", "Bearer sk-a"), ("x-api-key", "sk-x")],
+                Some("sk-a"),
+            ),
+            // The first header present decides, even when it holds nothing.
+            (&[("authorization", ""), ("x-api-key", "sk-x")], None),
+            (&[("x-other", "v")], None),
+        ];
+        for (headers, want) in cases {
+            assert_eq!(
+                inbound_gateway_credential(&map(headers)),
+                *want,
+                "{headers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gateway_credential_is_recognised_by_value_in_any_slot() {
+        let client = map(&[("x-api-key", "sk-x")]);
+        for held in ["sk-x", " sk-x ", "Bearer sk-x", "bearer sk-x"] {
+            let value = HeaderValue::from_str(held).unwrap();
+            assert!(is_caller_gateway_credential(&client, &value), "{held}");
+        }
+        for other in ["sk-y", "sk-x2", "Bearer sk-y", ""] {
+            let value = HeaderValue::from_str(other).unwrap();
+            assert!(!is_caller_gateway_credential(&client, &value), "{other}");
+        }
+        // Nothing to compare against: an anonymous caller sent no credential.
+        let value = HeaderValue::from_static("sk-x");
+        assert!(!is_caller_gateway_credential(&HeaderMap::new(), &value));
     }
 
     #[test]

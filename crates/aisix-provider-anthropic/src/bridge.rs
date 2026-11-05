@@ -334,8 +334,10 @@ fn build_request_headers(
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
     let mut headers = HeaderMap::new();
-    // Suppressed when the operator forwards the caller's own credential
-    // into this slot: two `x-api-key` values would let the upstream pick.
+    // Suppressed when the operator forwards a credential the caller sent for
+    // the upstream into this slot: two `x-api-key` values would let the
+    // upstream pick. The caller's gateway key claims no slot, so it never
+    // displaces this one.
     if !aisix_gateway::ForwardedClientHeaders::resolve(hdr).claims("x-api-key") {
         let key = HeaderValue::from_str(api_key_str).map_err(|e| {
             BridgeError::InvalidUpstreamCredentials(format!(
