@@ -4,8 +4,10 @@ import {
   EtcdClient,
   SeedClient,
   awaitWindowHeadroom,
+  scrapeMetrics,
   spawnApp,
   startOpenAiUpstream,
+  sumMetric,
   waitConfigPropagation,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -48,22 +50,9 @@ function completionChunk(text: string): string {
 async function metricCounter(
   app: SpawnedApp,
   metric: string,
-  labels: Record<string, string>,
+  labels: Record<string, string> = {},
 ): Promise<number> {
-  const response = await fetch(`${app.metricsUrl}/metrics`);
-  if (response.status !== 200) {
-    throw new Error(`metrics probe returned ${response.status}`);
-  }
-  let total = 0;
-  for (const line of (await response.text()).split("\n")) {
-    if (!line.startsWith(`${metric}{`)) continue;
-    if (!Object.entries(labels).every(([key, value]) => line.includes(`${key}="${value}"`))) {
-      continue;
-    }
-    const value = Number(line.trim().split(/\s+/).at(-1));
-    if (Number.isFinite(value)) total += value;
-  }
-  return total;
+  return sumMetric(await scrapeMetrics(app.metricsUrl), metric, labels);
 }
 
 describe("fail-closed stream hold-back overflow usage", () => {
@@ -247,14 +236,22 @@ describe("fail-closed stream hold-back overflow usage", () => {
     });
   };
 
+  // `usageClass`: a refusal in a stream that had started reads 2xx on its row,
+  // and the row's `guardrail_blocked` is what says it was refused.
   const cases = [
-    { endpoint: "chat" as const, upstream: () => chatUpstream, status: 200 },
+    { endpoint: "chat" as const, upstream: () => chatUpstream, status: 200, usageClass: "2xx" },
     {
       endpoint: "completions" as const,
       upstream: () => completionsUpstream,
       status: 422,
+      usageClass: "4xx",
     },
-    { endpoint: "responses" as const, upstream: () => responsesUpstream, status: 422 },
+    {
+      endpoint: "responses" as const,
+      upstream: () => responsesUpstream,
+      status: 422,
+      usageClass: "4xx",
+    },
   ];
 
   for (const scenario of cases) {
@@ -271,8 +268,9 @@ describe("fail-closed stream hold-back overflow usage", () => {
       });
       const usageBaseline = await metricCounter(app, "aisix_usage_events_emitted_total", {
         handler: scenario.endpoint,
-        status_code: "4xx",
+        status_code: scenario.usageClass,
       });
+      const blockedBaseline = await metricCounter(app, "aisix_guardrail_blocks_total");
 
       await awaitWindowHeadroom();
       const response = await request(scenario.endpoint);
@@ -285,10 +283,11 @@ describe("fail-closed stream hold-back overflow usage", () => {
       await waitConfigPropagation(async () => {
         const usage = await metricCounter(app!, "aisix_usage_events_emitted_total", {
           handler: scenario.endpoint,
-          status_code: "4xx",
+          status_code: scenario.usageClass,
         });
         return usage === usageBaseline + 1;
       });
+      expect(await metricCounter(app, "aisix_guardrail_blocks_total")).toBe(blockedBaseline + 1);
       await waitConfigPropagation(async () => {
         const output = await metricCounter(app!, "aisix_llm_output_tokens_total", { model });
         return output > outputBaseline;

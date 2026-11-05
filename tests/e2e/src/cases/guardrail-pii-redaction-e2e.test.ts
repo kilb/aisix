@@ -74,6 +74,11 @@ async function usageStatusCounter(
   });
 }
 
+/** Terminal rows with `guardrail_blocked` set. */
+async function blockedRowCounter(app: SpawnedApp): Promise<number> {
+  return sumMetric(await scrapeMetrics(app.metricsUrl), "aisix_guardrail_blocks_total");
+}
+
 describe("pii guardrail e2e: mask + block on request and response", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
@@ -914,7 +919,10 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
     expect(JSON.stringify(received.at(-1))).toContain(ANTHROPIC_OUTPUT_KEY_NONSTREAM);
 
     const beforeRejectedStreamOutput = received.length;
-    const streamUsageBaseline = await usageStatusCounter(app, "messages", "4xx");
+    // A refusal in a stream that had started reads 2xx on its row, and the
+    // row's `guardrail_blocked` is what says it was refused.
+    const streamUsageBaseline = await usageStatusCounter(app, "messages", "2xx");
+    const streamBlockedBaseline = await blockedRowCounter(app);
     const rejectedStreamOutput = await fetch(`${app.proxyUrl}/v1/messages`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-api-key": anthCaller },
@@ -937,12 +945,14 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
     expect(JSON.stringify(received.at(-1))).toContain(ANTHROPIC_OUTPUT_KEY_STREAM);
     await waitConfigPropagation(
       async () =>
-        (await usageStatusCounter(app!, "messages", "4xx")) ===
+        (await usageStatusCounter(app!, "messages", "2xx")) ===
         streamUsageBaseline + 1,
     );
+    expect(await blockedRowCounter(app)).toBe(streamBlockedBaseline + 1);
 
     const beforeRejectedStartOutput = received.length;
-    const startUsageBaseline = await usageStatusCounter(app, "messages", "4xx");
+    const startUsageBaseline = await usageStatusCounter(app, "messages", "2xx");
+    const startBlockedBaseline = await blockedRowCounter(app);
     const rejectedStartOutput = await fetch(`${app.proxyUrl}/v1/messages`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-api-key": anthCaller },
@@ -963,9 +973,10 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
     expect(JSON.stringify(received.at(-1))).toContain(ANTHROPIC_OUTPUT_KEY_START);
     await waitConfigPropagation(
       async () =>
-        (await usageStatusCounter(app!, "messages", "4xx")) ===
+        (await usageStatusCounter(app!, "messages", "2xx")) ===
         startUsageBaseline + 1,
     );
+    expect(await blockedRowCounter(app)).toBe(startBlockedBaseline + 1);
 
     const identifierNonStreamBaseline = received.length;
     const identifierNonStream = await fetch(`${app.proxyUrl}/v1/messages`, {
@@ -1692,6 +1703,9 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
           upstream: chatStreamUpstream,
           marker: "chat-tool-stream-output-marker",
           expectedStatus: 200,
+          // A refusal in a chat stream that had started reads 2xx on its row,
+          // and the row's `guardrail_blocked` is what says it was refused.
+          usageClass: "2xx",
         },
         {
           path: "/v1/responses",
@@ -1729,7 +1743,9 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
       for (const outputCase of outputCases) {
         const baseline = outputCase.upstream.receivedRequests.length;
         const handler = outputCase.path === "/v1/chat/completions" ? "chat" : "responses";
-        const usageBaseline = await usageStatusCounter(app, handler, "4xx");
+        const usageClass = "usageClass" in outputCase ? outputCase.usageClass : "4xx";
+        const usageBaseline = await usageStatusCounter(app, handler, usageClass);
+        const blockedBaseline = await blockedRowCounter(app);
         const body =
           outputCase.path === "/v1/chat/completions"
             ? {
@@ -1760,8 +1776,9 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
         );
         await waitConfigPropagation(
           async () =>
-            (await usageStatusCounter(app!, handler, "4xx")) === usageBaseline + 1,
+            (await usageStatusCounter(app!, handler, usageClass)) === usageBaseline + 1,
         );
+        expect(await blockedRowCounter(app)).toBe(blockedBaseline + 1);
       }
     } finally {
       await chatUpstream?.close();
