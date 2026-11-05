@@ -3,9 +3,11 @@ import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  scrapeMetrics,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
+  sumMetric,
   waitConfigPropagation,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -66,19 +68,10 @@ async function usageStatusCounter(
   handler: string,
   statusClass: string,
 ): Promise<number> {
-  const response = await fetch(`${app.metricsUrl}/metrics`);
-  if (response.status !== 200) {
-    throw new Error(`metrics probe returned ${response.status}`);
-  }
-  const line = (await response.text())
-    .split("\n")
-    .find(
-      (candidate) =>
-        candidate.startsWith("aisix_usage_events_emitted_total{") &&
-        candidate.includes(`handler="${handler}"`) &&
-        candidate.includes(`status_code="${statusClass}"`),
-    );
-  return line ? Number(line.trim().split(/\s+/).at(-1)) : 0;
+  return sumMetric(await scrapeMetrics(app.metricsUrl), "aisix_usage_events_emitted_total", {
+    handler,
+    status_code: statusClass,
+  });
 }
 
 describe("pii guardrail e2e: mask + block on request and response", () => {

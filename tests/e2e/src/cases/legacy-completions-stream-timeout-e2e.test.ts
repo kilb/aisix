@@ -2,9 +2,11 @@ import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  scrapeMetrics,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
+  sumMetric,
   waitConfigPropagation,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -43,35 +45,17 @@ async function completion(model: string): Promise<Response> {
 }
 
 async function usage5xxCounter(): Promise<number> {
-  const response = await fetch(`${app!.metricsUrl}/metrics`);
-  if (response.status !== 200) {
-    throw new Error(`metrics probe returned ${response.status}`);
-  }
-  const line = (await response.text())
-    .split("\n")
-    .find(
-      (candidate) =>
-        candidate.startsWith("aisix_usage_events_emitted_total{") &&
-        candidate.includes('handler="completions"') &&
-        candidate.includes('status_code="5xx"'),
-    );
-  return line ? Number(line.trim().split(/\s+/).at(-1)) : 0;
+  return sumMetric(await scrapeMetrics(app!.metricsUrl), "aisix_usage_events_emitted_total", {
+    handler: "completions",
+    status_code: "5xx",
+  });
 }
 
 async function usage2xxCounter(): Promise<number> {
-  const response = await fetch(`${app!.metricsUrl}/metrics`);
-  if (response.status !== 200) {
-    throw new Error(`metrics probe returned ${response.status}`);
-  }
-  const line = (await response.text())
-    .split("\n")
-    .find(
-      (candidate) =>
-        candidate.startsWith("aisix_usage_events_emitted_total{") &&
-        candidate.includes('handler="completions"') &&
-        candidate.includes('status_code="2xx"'),
-    );
-  return line ? Number(line.trim().split(/\s+/).at(-1)) : 0;
+  return sumMetric(await scrapeMetrics(app!.metricsUrl), "aisix_usage_events_emitted_total", {
+    handler: "completions",
+    status_code: "2xx",
+  });
 }
 
 async function outputTokenCounter(model: string): Promise<number> {

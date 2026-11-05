@@ -7,6 +7,7 @@ import {
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
+  sumMetric,
   waitConfigPropagation,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -22,19 +23,10 @@ const MODELS = {
 } as const;
 
 async function usage5xxCounter(app: SpawnedApp, handler: string): Promise<number> {
-  const response = await fetch(`${app.metricsUrl}/metrics`);
-  if (response.status !== 200) {
-    throw new Error(`metrics probe returned ${response.status}`);
-  }
-  const line = (await response.text())
-    .split("\n")
-    .find(
-      (candidate) =>
-        candidate.startsWith("aisix_usage_events_emitted_total{") &&
-        candidate.includes(`handler="${handler}"`) &&
-        candidate.includes('status_code="5xx"'),
-    );
-  return line ? Number(line.trim().split(/\s+/).at(-1)) : 0;
+  return sumMetric(await scrapeMetrics(app.metricsUrl), "aisix_usage_events_emitted_total", {
+    handler,
+    status_code: "5xx",
+  });
 }
 
 async function outputTokenCounter(app: SpawnedApp, model: string): Promise<number> {
