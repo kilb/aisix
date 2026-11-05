@@ -2128,7 +2128,10 @@ async fn guardrail_block_event(
     input_side: bool,
     monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Option<(String, ProxyError)> {
-    let text = frame_scan_text(text);
+    let Some(text) = frame_scan_text(text) else {
+        // A frame the chain cannot be given, as a binary one is.
+        return binary_frame_refusal(chain, input_side);
+    };
     let (verdict, hits) = if input_side {
         let chat = aisix_gateway::ChatFormat::new(
             model_name,
@@ -2188,16 +2191,18 @@ fn content_filtered_event(refusal: &ProxyError) -> String {
 /// hides a word from the frame's bytes: where there is one, the decoded strings
 /// are read beside them. A frame with no backslash has no escape, and reading
 /// its bytes alone keeps an audio frame's cost where it was.
-fn frame_scan_text(frame: &str) -> String {
+///
+/// `None` when the frame has an escape and does not parse here: a peer may
+/// parse it anyway (a lone `\ud800`, or nesting past this parser's depth limit,
+/// is taken by Python, Node and Go), and its bytes are then not what it reads.
+fn frame_scan_text(frame: &str) -> Option<String> {
     if !frame.contains('\\') {
-        return frame.to_owned();
+        return Some(frame.to_owned());
     }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(frame) else {
-        return frame.to_owned();
-    };
+    let value = serde_json::from_str::<serde_json::Value>(frame).ok()?;
     let mut decoded = Vec::new();
     crate::jobs::json_decoded_strings(&value, &mut decoded);
-    format!("{frame}\n{}", decoded.join("\n"))
+    Some(format!("{frame}\n{}", decoded.join("\n")))
 }
 
 /// A binary frame holds nothing a chain can read. Refused where something reads
@@ -3009,10 +3014,20 @@ mod tests {
         crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-kw", g, 1));
         let (addr, _state, _rx) = serve(snap).await;
 
+        let too_deep = format!(
+            "{}{}{}",
+            "[".repeat(200),
+            user_item("\\u0066orbidden"),
+            "]".repeat(200)
+        );
         for frame in [
             TgMessage::Text(user_item("forbidden")),
             TgMessage::Text(user_item("\\u0066orbidden")),
             TgMessage::Binary(user_item("forbidden").into_bytes()),
+            // What this gateway cannot parse and a peer may: a lone surrogate,
+            // and nesting past the parser's depth limit.
+            TgMessage::Text(user_item("\\u0066orbidden \\ud800")),
+            TgMessage::Text(too_deep),
         ] {
             let mut ws = client(addr).await;
             ws.send(frame.clone()).await.unwrap();

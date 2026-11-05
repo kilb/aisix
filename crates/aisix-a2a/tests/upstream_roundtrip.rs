@@ -886,3 +886,39 @@ async fn a_streaming_call_forwards_too() {
         vec!["text/event-stream"]
     );
 }
+
+/// An agent that answers a JSON-RPC error quoting the credential it was sent
+/// does not hand it to the caller; the rest of its error stands.
+#[tokio::test]
+async fn a_json_rpc_error_quoting_the_credential_reaches_the_caller_without_it() {
+    async fn rpc(headers: HeaderMap, Json(body): Json<Value>) -> Json<Value> {
+        let saw = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        Json(json!({
+            "jsonrpc": "2.0",
+            "id": body["id"],
+            "error": {"code": -32001, "message": format!("token rejected; saw {saw}")},
+        }))
+    }
+    let app = Router::new().route("/a2a", post(rpc));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let bridge = HttpBridge::new(upstream(
+        format!("http://{addr}/a2a"),
+        A2aAuth::Bearer("agentTok0123456789".into()),
+    ));
+    let resp = aisix_gateway::response_tap::scope(
+        aisix_gateway::response_tap::detached(),
+        bridge.send(&message_send("req-err")),
+    )
+    .await
+    .unwrap();
+    let message = resp["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.starts_with("token rejected"), "{resp}");
+    assert!(!message.contains("agentTok0123456789"), "{resp}");
+    assert_eq!(resp["error"]["code"], -32001);
+}

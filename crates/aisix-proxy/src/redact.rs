@@ -4816,6 +4816,19 @@ pub async fn moderate_responses_sse(
     .await
 }
 
+/// Whether a mask rule of `chain` would rewrite any of `texts`, the text that
+/// token-id input decodes to. Ids cannot be written back, so such a match
+/// refuses the request as a block does.
+pub(crate) fn mask_would_rewrite(
+    chain: &aisix_guardrails::GuardrailChain,
+    texts: &[String],
+) -> bool {
+    aisix_guardrails::Guardrail::redacts_input(chain)
+        && texts
+            .iter()
+            .any(|text| aisix_guardrails::Guardrail::redact_input_text(chain, text).is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

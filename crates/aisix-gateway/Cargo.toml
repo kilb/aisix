@@ -25,6 +25,7 @@ tracing.workspace = true
 base64.workspace = true
 url.workspace = true
 regex.workspace = true
+percent-encoding.workspace = true
 # The environment-proxy matcher reqwest itself uses, so `ssrf` knows which
 # caller-supplied URLs a proxy will take, and the CONNECT tunnel reqwest
 # itself uses, for the outbound paths that dial without reqwest.

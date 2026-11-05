@@ -208,8 +208,10 @@ impl OpenApiBridge {
             .filter(|h| !h.is_empty())
             .unwrap_or(DEFAULT_API_KEY_HEADER);
         // What the gateway sends is noted, so a REST API that quotes it in an
-        // error does not hand it to the agent.
+        // error does not hand it to the agent: the base URL's userinfo too,
+        // which goes out as a Basic credential.
         let secret = server.secret.as_deref().unwrap_or("");
+        aisix_gateway::note_url_userinfo(&server.url);
         let request = match server.auth_type {
             McpAuthType::None => request,
             McpAuthType::Bearer if claims("authorization") => request,

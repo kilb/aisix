@@ -229,9 +229,27 @@ pub fn resolve_default_headers(ctx: &UpstreamHeaderContext<'_>) -> Vec<(HeaderNa
         let Ok(parsed_value) = HeaderValue::from_str(&rendered) else {
             continue;
         };
+        note_if_credential(parsed_name.as_str(), &rendered);
         out.push((parsed_name, parsed_value));
     }
     out
+}
+
+/// Note a `default_headers` value that carries a credential, so an upstream
+/// error quoting it does not hand it to the caller: one in a credential slot,
+/// or under a name that says it is one (an APIM `ocp-apim-subscription-key`, a
+/// vendor's `x-auth-token`). The token after an auth scheme is noted too.
+fn note_if_credential(name: &str, value: &str) {
+    let named_as_one = ["key", "token", "secret", "auth"]
+        .iter()
+        .any(|word| name.contains(word));
+    if !named_as_one && !aisix_core::CREDENTIAL_SLOT_HEADERS.contains(&name) {
+        return;
+    }
+    crate::note_sent_credential(value);
+    if let Some((_scheme, token)) = value.trim().split_once(' ') {
+        crate::note_sent_credential(token);
+    }
 }
 
 /// The inbound client headers one upstream call forwards, resolved from

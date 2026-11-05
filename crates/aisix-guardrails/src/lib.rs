@@ -1511,6 +1511,9 @@ mod tests {
                 {"type": "custom", "payload": {"deep": ["in a nested leaf"]}},
                 {"type": "image_url", "image_url": {"url": "https://x/in-a-media-part"}},
                 {"type": "unknown", "image": "data:image/png;base64,in-a-data-url"},
+                // Text that merely starts like a `data:` URL is text.
+                {"type": "refusal", "refusal": "data: led by data colon"},
+                {"type": "custom", "note": "data:text/plain;base64,aW4gdGV4dA=="},
             ],
         }))
         .unwrap();
@@ -1520,6 +1523,8 @@ mod tests {
             "in an unknown part",
             "in a text part's array",
             "in a nested leaf",
+            "led by data colon",
+            "data:text/plain",
         ] {
             assert!(scanned.contains(text), "{text}: {scanned:?}");
         }

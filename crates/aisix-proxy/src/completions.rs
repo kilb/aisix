@@ -461,15 +461,21 @@ pub async fn completions(
 
 /// Build a [`ChatFormat`](aisix_gateway::ChatFormat) from the legacy
 /// completions request so the input guardrail chain can scan it (#545).
-/// Token-id prompts are rejected before this projection whenever an input
-/// guardrail applies because the gateway cannot safely rewrite them. Never
-/// sent upstream.
-fn completions_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat {
+/// A token-id prompt is read as `decoded_prompt`, the text its ids decode to
+/// ([`crate::token_estimate::decode_token_ids`]). Never sent upstream.
+fn completions_input_to_chat(
+    model: &str,
+    body: &Value,
+    decoded_prompt: &[String],
+) -> aisix_gateway::ChatFormat {
     let prompt: Vec<&str> = match body.get("prompt") {
         Some(Value::String(s)) => vec![s.as_str()],
         Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).collect(),
         _ => Vec::new(),
     };
+    let prompt = prompt
+        .into_iter()
+        .chain(decoded_prompt.iter().map(String::as_str));
     // The whole request is new content — `user`, `suffix` and every prompt
     // item — so it is one newest message, as the segment walk
     // (`redact_completions_request_structured`) treats it.
@@ -538,19 +544,34 @@ async fn dispatch(
     let resolved_chain = Arc::new(state.guardrail_index.resolve(&guardrail_ctx));
     let applied_guardrails = resolved_chain.applied().to_vec();
     *audit_out = resolved_chain.audit_log();
-    // Token ids carry no text a guardrail could read, and the gateway cannot
-    // rewrite them. Refused like any other body the chain cannot be given
-    // (see `refuses_unevaluable_input`).
-    if completions_prompt_uses_token_ids(&body) {
-        if aisix_guardrails::Guardrail::refuses_unevaluable_input(resolved_chain.as_ref()) {
-            return Err(crate::error::guardrail_block_error(
-                "request",
-                None,
-                Some(crate::error::TAG_UNSCANNABLE_BODY),
-            ));
+    // A token-id prompt is read as the text its ids decode to, with the
+    // encoding of the model the upstream serves. One that does not decode is
+    // refused like any other body the chain cannot be given (see
+    // `refuses_unevaluable_input`).
+    let decoded_prompt = if completions_prompt_uses_token_ids(&body) {
+        let decoded = body
+            .get("prompt")
+            .and_then(crate::token_estimate::token_id_arrays)
+            .and_then(|arrays| {
+                crate::token_estimate::decode_token_ids(
+                    model_entry.value.model_name.as_deref(),
+                    &arrays,
+                )
+            });
+        if decoded.is_none() && !resolved_chain.is_empty() {
+            if aisix_guardrails::Guardrail::refuses_unevaluable_input(resolved_chain.as_ref()) {
+                return Err(crate::error::guardrail_block_error(
+                    "request",
+                    None,
+                    Some(crate::error::TAG_UNSCANNABLE_BODY),
+                ));
+            }
+            resolved_chain.record_unevaluable_input_bypass(crate::error::TAG_UNSCANNABLE_BODY);
         }
-        resolved_chain.record_unevaluable_input_bypass(crate::error::TAG_UNSCANNABLE_BODY);
-    }
+        decoded
+    } else {
+        None
+    };
     // A check that calls a remote moderation service is admitted by the
     // key's rate limits before it runs, and a refusal keeps the slot it took
     // (see `quota::reserve_before_costly_check`).
@@ -565,12 +586,19 @@ async fn dispatch(
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut input_capture_safe = true;
     if !resolved_chain.is_empty() {
-        let chat = completions_input_to_chat(model_name, &body);
-        let (verdict, hits) = aisix_guardrails::Guardrail::check_input_non_segment_observed(
-            resolved_chain.as_ref(),
-            &chat,
-        )
-        .await;
+        let decoded = decoded_prompt.as_deref().unwrap_or_default();
+        let chat = completions_input_to_chat(model_name, &body, decoded);
+        // Decoded ids are in no slot the segment pass walks, so every member
+        // reads them here.
+        let (verdict, hits) = if decoded.is_empty() {
+            aisix_guardrails::Guardrail::check_input_non_segment_observed(
+                resolved_chain.as_ref(),
+                &chat,
+            )
+            .await
+        } else {
+            aisix_guardrails::Guardrail::check_input_observed(resolved_chain.as_ref(), &chat).await
+        };
         monitor_hits.extend(hits);
         // Segment pass: one Bedrock call over the prompt slots; an
         // ANONYMIZE disposition writes the masked text back into the body
@@ -621,6 +649,15 @@ async fn dispatch(
                 guardrail_name.as_deref(),
                 unavailable.as_deref(),
             ));
+        }
+    }
+
+    // Ids cannot be rewritten, so a mask rule that would rewrite their text
+    // refuses the request.
+    if let Some(decoded) = &decoded_prompt {
+        if crate::redact::mask_would_rewrite(resolved_chain.as_ref(), decoded) {
+            crate::usage_attr::note_failure_request(snapshot, String::new);
+            return Err(crate::error::guardrail_block_error("request", None, None));
         }
     }
 
@@ -3401,9 +3438,73 @@ mod tests {
             "suffix": "s",
             "user": "u",
         });
-        let chat = super::completions_input_to_chat("m", &body);
+        let chat = super::completions_input_to_chat("m", &body, &[]);
         let contents: Vec<_> = chat.messages.iter().map(|m| m.content.as_deref()).collect();
         assert_eq!(contents, [Some("u\ns\np1\np2")]);
+    }
+
+    /// A token-id prompt is read as the text its ids decode to, as
+    /// `/v1/embeddings` reads token-id input: a blocked word in it is refused,
+    /// a clean one goes through, a mask rule's match refuses since ids cannot
+    /// be rewritten, and ids this gateway cannot decode are refused under a
+    /// chain that fails closed.
+    #[tokio::test]
+    async fn a_token_id_prompt_is_read_as_the_text_it_decodes_to() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-1", "object": "text_completion", "created": 1, "model": "m",
+                "choices": [{"index": 0, "text": "ok", "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            })))
+            .mount(&upstream)
+            .await;
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-completions"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
+        let mask: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
+            "name": "mask", "enabled": true, "hook_point": "input", "kind": "pii",
+            "detectors": [{"type": "email", "action": "mask"}],
+        }))
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-mask", mask, 1));
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let app = crate::build_router(
+            crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache(),
+        );
+        // `gpt-3.5-turbo-instruct` reads cl100k_base ids.
+        let ids = |text: &str| -> Vec<u64> {
+            tiktoken_rs::cl100k_base_singleton()
+                .encode_ordinary(text)
+                .into_iter()
+                .map(u64::from)
+                .collect()
+        };
+        let send = |prompt: serde_json::Value| {
+            tower::ServiceExt::oneshot(
+                app.clone(),
+                make_req(serde_json::json!({"model": "my-completions", "prompt": prompt})),
+            )
+        };
+        let resp = send(serde_json::json!(ids("say something kind")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let forwarded = upstream.received_requests().await.unwrap().len();
+        assert_eq!(forwarded, 1);
+        for prompt in [
+            serde_json::json!(ids("please BLOCKME")),
+            serde_json::json!([ids("clean"), ids("BLOCKME")]),
+            serde_json::json!(ids("write to alice@example.com")),
+            serde_json::json!([999_999_999u64]),
+        ] {
+            let resp = send(prompt.clone()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{prompt}");
+        }
+        assert_eq!(upstream.received_requests().await.unwrap().len(), forwarded);
     }
 
     /// AISIX-Cloud#1330 / #1024: a guardrail BLOCK leaves this handler

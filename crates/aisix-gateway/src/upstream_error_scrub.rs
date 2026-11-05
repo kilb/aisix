@@ -310,6 +310,56 @@ mod tests {
         });
     }
 
+    /// Credentials the gateway sends without naming them as one: a URL's
+    /// userinfo, which goes out as `Basic`, and a `default_headers` value
+    /// in a slot or under a name that says it is a credential.
+    #[test]
+    fn userinfo_and_credential_headers_are_noted_as_sent() {
+        use base64::Engine as _;
+        let basic = base64::engine::general_purpose::STANDARD.encode("svc-user:S3cret@Passw0rd99");
+        let overrides = aisix_core::models::RequestOverrides {
+            default_headers: [
+                ("ocp-apim-subscription-key", "apimSub0123456789abcdef"),
+                ("x-api-key", "Bearer vendorTok0123456789"),
+                ("x-tenant", "tenant-acme-production"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+            ..Default::default()
+        };
+        let got = with_sent(&[], || {
+            crate::note_url_userinfo("http://svc-user:S3cret%40Passw0rd99@api.internal/v1");
+            crate::resolve_default_headers(&crate::UpstreamHeaderContext::from_overrides(Some(
+                &overrides,
+            )));
+            scrub_upstream_error_text(&format!(
+                "saw Basic {basic}; password S3cret@Passw0rd99; sub apimSub0123456789abcdef; \
+                 token vendorTok0123456789; tenant tenant-acme-production"
+            ))
+        });
+        assert_eq!(
+            got,
+            "saw Basic <redacted>; password <redacted>; sub <redacted>; token <redacted>; \
+             tenant tenant-acme-production"
+        );
+    }
+
+    #[test]
+    fn the_newest_credentials_are_the_ones_kept() {
+        let first = "firstKey0123456789";
+        let newest = "newestKey0123456789";
+        let got = with_sent(&[], || {
+            crate::response_tap::note_sent_credential(first);
+            for i in 0..40 {
+                crate::response_tap::note_sent_credential(&format!("fallbackKey{i:04}xyz"));
+            }
+            crate::response_tap::note_sent_credential(newest);
+            scrub_upstream_error_text(&format!("bad key {newest}"))
+        });
+        assert_eq!(got, "bad key <redacted>");
+    }
+
     #[test]
     fn infrastructure_is_taken_out_and_the_diagnostic_stays() {
         for (raw, want) in [

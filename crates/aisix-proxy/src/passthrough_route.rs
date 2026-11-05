@@ -622,6 +622,7 @@ async fn dispatch(
     };
     let url =
         join_target_url(&base, rest, query.as_deref()).map_err(|e| RouteError::of(e, &auth))?;
+    aisix_gateway::note_url_userinfo(&url);
 
     // End-user identity injected by the upstream device, captured before
     // the strip pass and recorded on the usage event.
@@ -705,7 +706,7 @@ async fn dispatch(
     };
     // The upstream reads this body decoded, and the chain would read the coding.
     let probe_error = probe_error.or_else(|| {
-        has_non_identity_content_encoding(&incoming_headers)
+        (has_non_identity_content_encoding(&incoming_headers) || json_in_wide_encoding(&body_bytes))
             .then(crate::json_splice::SpliceError::unevaluable)
     });
     let protocol = refine_request_protocol(protocol, &path, &incoming_headers);
@@ -1818,6 +1819,19 @@ fn buffered_choices_response_protocol(
         return Err(());
     }
     Ok((true, selected))
+}
+
+/// JSON written in UTF-16 or UTF-32, which an upstream that detects the
+/// encoding as RFC 4627 §3 describes (Python's `json.loads` on bytes, and so a
+/// FastAPI server) reads as JSON, and a scan of the bytes reads as NUL-padded
+/// noise. Told by a byte-order mark, or by the NULs around a first character
+/// that opens a JSON document.
+fn json_in_wide_encoding(body: &[u8]) -> bool {
+    let opens = |b: u8| matches!(b, b'{' | b'[' | b' ' | b'\t' | b'\n' | b'\r');
+    body.starts_with(b"\xFF\xFE")
+        || body.starts_with(b"\xFE\xFF")
+        || body.starts_with(b"\x00\x00\xFE\xFF")
+        || matches!(body, [0, 0, 0, c, ..] | [0, c, ..] | [c, 0, ..] if opens(*c))
 }
 
 fn raw_json_container_like(body: &[u8]) -> bool {
@@ -3066,6 +3080,9 @@ fn decoded_responses_request_string_values(
         decoded_json_string_values_except_root_keys(body, &["model", "input"], scan_error)?;
     for input in raw_top_level_values(body, "input")? {
         let value = input.get().trim_start();
+        if append_token_id_text(&mut out, body, &input, scan_error)? {
+            continue;
+        }
         if value.starts_with('"') {
             append_raw_string_value(&mut out, &input)?;
         } else if value.starts_with('[') {
@@ -3080,6 +3097,38 @@ fn decoded_responses_request_string_values(
     Some(out)
 }
 
+/// A token-id `prompt` or `input` (`[1, 2]`, or `[[1, 2], [3]]`) holds the text
+/// its ids decode to with the encoding of the body's `model`, as the typed
+/// `/v1/completions` and `/v1/embeddings` read it: appended to `out`, and
+/// `Some(true)` returned. Ids that do not decode make the body unevaluable
+/// (`None`). `Some(false)` for a value that is no token-id array.
+fn append_token_id_text(
+    out: &mut String,
+    body: &[u8],
+    value: &RawJson<'_>,
+    scan_error: &mut Option<crate::json_splice::SpliceError>,
+) -> Option<bool> {
+    let parsed = serde_json::from_str::<serde_json::Value>(value.get()).ok();
+    let Some(arrays) = parsed
+        .as_ref()
+        .and_then(crate::token_estimate::token_id_arrays)
+    else {
+        return Some(false);
+    };
+    let model = raw_top_level_values(body, "model")?
+        .first()
+        .and_then(|m| serde_json::from_str::<String>(m.get()).ok());
+    let Some(texts) = crate::token_estimate::decode_token_ids(model.as_deref(), &arrays) else {
+        mark_unevaluable(scan_error);
+        return None;
+    };
+    for text in texts {
+        out.push('\n');
+        out.push_str(&text);
+    }
+    Some(true)
+}
+
 fn decoded_completions_request_string_values(
     body: &[u8],
     scan_error: &mut Option<crate::json_splice::SpliceError>,
@@ -3091,6 +3140,9 @@ fn decoded_completions_request_string_values(
     )?;
     for prompt in raw_top_level_values(body, "prompt")? {
         let value = prompt.get().trim_start();
+        if append_token_id_text(&mut out, body, &prompt, scan_error)? {
+            continue;
+        }
         if value.starts_with('"') {
             append_raw_string_value(&mut out, &prompt)?;
         } else if value.starts_with('[') {
@@ -6409,9 +6461,15 @@ fn stream_response(
                 if anthropic.is_none() && is_messages_family(protocol) {
                     anthropic = anthropic_stream_frame(&frame);
                 }
-                if let Some(err) = frame_in_band_error(protocol, &frame) {
-                    telemetry.record_failure(&err);
-                }
+                // An error event goes out, and into the capture, less the
+                // credentials this request sent.
+                let frame = match frame_in_band_error(protocol, &frame) {
+                    Some(err) => {
+                        telemetry.record_failure(&err);
+                        aisix_gateway::scrub_upstream_error_bytes(&frame).into_owned()
+                    }
+                    None => frame,
+                };
                 let (parts, usage, tier, labelled) =
                     frame_parts_and_tier(protocol, telemetry.metering, &frame);
                 if let Some(u) = labelled {
@@ -8324,6 +8382,65 @@ mod tests {
             upstream.received_requests().await.unwrap().is_empty(),
             "an invalid joined path must not send the ProviderKey upstream"
         );
+    }
+
+    /// JSON in UTF-16 or UTF-32 is no way past a rule: an upstream that detects
+    /// the encoding reads the words, so the chain is told it cannot read them.
+    #[test]
+    fn a_json_body_in_a_wide_encoding_is_one_the_chain_cannot_read() {
+        let json = r#"{"model":"m","messages":[{"role":"user","content":"forbidden"}]}"#;
+        let mut le_bom = vec![0xFF, 0xFE];
+        let mut be = Vec::new();
+        let mut utf32_le = Vec::new();
+        for unit in json.encode_utf16() {
+            le_bom.extend_from_slice(&unit.to_le_bytes());
+            be.extend_from_slice(&unit.to_be_bytes());
+        }
+        for c in json.chars() {
+            utf32_le.extend_from_slice(&(c as u32).to_le_bytes());
+        }
+        for body in [&le_bom, &be, &utf32_le] {
+            assert!(json_in_wide_encoding(body), "{body:?}");
+        }
+        // UTF-8 JSON, and bytes that are no JSON, are read as before.
+        for body in [json.as_bytes(), b"\x00\x01\x02\x03binary", b"plain text"] {
+            assert!(!json_in_wide_encoding(body), "{body:?}");
+        }
+    }
+
+    /// A token-id `prompt` or `input` is read as the text its ids decode to
+    /// with the body's model, as the typed endpoints read it, and ids that do
+    /// not decode make the body unevaluable.
+    #[test]
+    fn token_ids_on_a_route_are_read_as_the_text_they_decode_to() {
+        let ids: Vec<u32> = tiktoken_rs::cl100k_base_singleton().encode_ordinary("forbidden words");
+        let ids = serde_json::to_string(&ids).unwrap();
+        for (protocol, body) in [
+            (
+                PassthroughProtocol::OpenaiCompletions,
+                format!(r#"{{"model":"gpt-3.5-turbo-instruct","prompt":{ids}}}"#),
+            ),
+            (
+                PassthroughProtocol::OpenaiCompletions,
+                format!(r#"{{"model":"gpt-3.5-turbo-instruct","prompt":[{ids}]}}"#),
+            ),
+            (
+                PassthroughProtocol::OpenaiResponses,
+                format!(r#"{{"model":"text-embedding-3-small","input":{ids}}}"#),
+            ),
+        ] {
+            let text = try_request_guardrail_text(protocol, body.as_bytes()).expect(&body);
+            assert!(text.contains("forbidden words"), "{body} read as {text:?}");
+        }
+        for body in [
+            r#"{"model":"gpt-3.5-turbo-instruct","prompt":[999999999]}"#,
+            r#"{"model":"some-local-model","prompt":[1,2,3]}"#,
+        ] {
+            let err =
+                try_request_guardrail_text(PassthroughProtocol::OpenaiCompletions, body.as_bytes())
+                    .expect_err(body);
+            assert!(err.is_unevaluable(), "{body}");
+        }
     }
 
     #[test]

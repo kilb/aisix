@@ -152,14 +152,17 @@ describe("request override and legacy completions DLP boundaries", () => {
     }
   });
 
-  test("legacy completions blocks opaque token prompts and all prompt-bearing fields", async (ctx) => {
+  test("legacy completions blocks token prompts and all prompt-bearing fields", async (ctx) => {
     if (!etcdReachable || !app || !upstream) {
       ctx.skip();
       return;
     }
+    // "FORBIDDEN" and "clean" as gpt-3.5-turbo-instruct reads them (cl100k_base).
+    const forbiddenIds = [32002, 33, 39389];
+    const cleanIds = [18883];
     const blockedBodies = [
-      { model: "legacy-completions-dlp", prompt: [1, 2, 3] },
-      { model: "legacy-completions-dlp", prompt: [[1, 2], [3, 4]] },
+      { model: "legacy-completions-dlp", prompt: forbiddenIds },
+      { model: "legacy-completions-dlp", prompt: [cleanIds, forbiddenIds] },
       { model: "legacy-completions-dlp", prompt: "clean", suffix: "FORBIDDEN" },
       { model: "legacy-completions-dlp", prompt: "clean", user: STRUCTURAL_SECRET },
     ];

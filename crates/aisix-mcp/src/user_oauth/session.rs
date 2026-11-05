@@ -97,6 +97,9 @@ pub struct SessionIdentity {
 pub struct SessionTokenPair {
     pub access_token: String,
     pub refresh_token: String,
+    /// Seconds the access token is good for: less than its usual life once the
+    /// session's limit is nearer.
+    pub expires_in: i64,
 }
 
 /// The keys derived from an environment's secret.
@@ -208,15 +211,14 @@ impl SessionKeys {
             signed_in_at,
             claims: identity.claims.clone(),
         };
+        let access = token(TokenKind::Access, ACCESS_TOKEN_TTL_SECS);
         SessionTokenPair {
-            access_token: self.mint(
-                TokenKind::Access,
-                &token(TokenKind::Access, ACCESS_TOKEN_TTL_SECS),
-            ),
+            access_token: self.mint(TokenKind::Access, &access),
             refresh_token: self.mint(
                 TokenKind::Refresh,
                 &token(TokenKind::Refresh, REFRESH_TOKEN_TTL_SECS),
             ),
+            expires_in: (access.exp - iat).max(0),
         }
     }
 
@@ -555,6 +557,13 @@ mod tests {
         // Rotation carries the sign-in, and the last pair stops at the limit.
         let late = signed_in(SESSION_MAX_AGE_SECS - 3600);
         let first = keys.mint_pair("srv", "client", &late);
+        assert_eq!(first.expires_in, ACCESS_TOKEN_TTL_SECS);
+        let last_hour = keys.mint_pair("srv", "client", &signed_in(SESSION_MAX_AGE_SECS - 600));
+        assert!(
+            (595..=600).contains(&last_hour.expires_in),
+            "the client is told the token's real life: {}",
+            last_hour.expires_in
+        );
         let first = keys.open_refresh_token(&first.refresh_token).unwrap();
         assert_eq!(first.signed_in_at, late.signed_in_at);
         let next = keys.mint_pair("srv", "client", &first.identity());

@@ -16,9 +16,11 @@ import {
 // upload is the gateway. A key with a team or user owns what it creates: it can
 // read it, delete it, cancel it, build a job from it, and read what that job
 // produced. Anyone else addressing the same resource gets the answer an unknown
-// id gets, and nothing reaches the provider. A list spans the whole account, so
-// a key with an owner is told it cannot have one. A key with neither is the
-// single-tenant shape and works as it always has.
+// id gets, and nothing reaches the provider, however the id is re-written. A
+// list spans the whole account, and so does a provider's raw id: a key with an
+// owner never has either, and a key with neither has them only where no key
+// with an owner shares the Provider Key. That is the single-tenant shape, and it
+// works as it always has.
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 const TEAM_A = "sk-jobs-owner-team-a";
@@ -26,6 +28,8 @@ const TEAM_B = "sk-jobs-owner-team-b";
 const USER_C = "sk-jobs-owner-user-c";
 const SHARED = "sk-jobs-owner-shared";
 const MODEL = "jobs-owner-model";
+/** On a Provider Key of its own, which no key with an owner reaches. */
+const SOLO_MODEL = "jobs-owner-solo-model";
 
 const FILE_BODY = { id: "file-up-1", object: "file", purpose: "batch", filename: "in.jsonl" };
 const BATCH_BODY = {
@@ -119,6 +123,17 @@ describe("jobs resources belong to the team or user that created them", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
+    const soloPk = await seed.createProviderKey({
+      display_name: "jobs-owner-solo-pk",
+      secret: "sk-mock-solo",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: SOLO_MODEL,
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: soloPk.id,
+    });
     await seed.createApiKey({
       key_hash: sha256(TEAM_A),
       allowed_models: [MODEL],
@@ -134,7 +149,7 @@ describe("jobs resources belong to the team or user that created them", () => {
       allowed_models: [MODEL],
       user_id: "user-c",
     });
-    await seed.createApiKey({ key_hash: sha256(SHARED), allowed_models: [MODEL] });
+    await seed.createApiKey({ key_hash: sha256(SHARED), allowed_models: [MODEL, SOLO_MODEL] });
 
     await waitConfigPropagation(async () => {
       try {
@@ -210,6 +225,33 @@ describe("jobs resources belong to the team or user that created them", () => {
     expect(upstream.receivedRequests.length).toBe(before);
   });
 
+  test("an id re-written to name another owner does not open", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) return ctx.skip();
+    // The id is base64 text naming its owner. Team B reads team A's id, names
+    // itself in it, and writes it back.
+    const prefix = aFile.slice(0, aFile.indexOf("-") + 1);
+    const plain = Buffer.from(aFile.slice(prefix.length), "base64url").toString();
+    expect(plain).toContain("team-a");
+    const forged = prefix + Buffer.from(plain.replace("team-a", "team-b")).toString("base64url");
+    const before = upstream.receivedRequests.length;
+    for (const [method, path] of [
+      ["GET", `/v1/files/${forged}/content`],
+      ["DELETE", `/v1/files/${forged}`],
+    ] as const) {
+      const r = await request(TEAM_B, method, path);
+      expect(r.status, `${method} ${path}`).toBe(404);
+      await r.text();
+    }
+    const built = await request(TEAM_B, "POST", "/v1/batches", {
+      input_file_id: forged,
+      endpoint: "/v1/chat/completions",
+      completion_window: "24h",
+    });
+    expect(built.status).toBe(404);
+    await built.text();
+    expect(upstream.receivedRequests.length).toBe(before);
+  });
+
   test("the provider's own id does not get a scoped key in", async (ctx) => {
     if (!etcdReachable || !app || !upstream) return ctx.skip();
     const before = upstream.receivedRequests.length;
@@ -269,21 +311,53 @@ describe("jobs resources belong to the team or user that created them", () => {
     expect(upstream.receivedRequests.length).toBe(before);
   });
 
-  test("a key with no owner stays as it was", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
+  test("a key with no owner keeps its own ids where teams share the provider, and no more", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) return ctx.skip();
     const own = ((await (await upload(SHARED)).json()) as { id: string }).id;
+    const r = await request(SHARED, "GET", `/v1/files/${own}/content`);
+    expect(r.status).toBe(200);
+    await r.text();
+    const built = await request(SHARED, "POST", "/v1/batches", {
+      input_file_id: own,
+      endpoint: "/v1/chat/completions",
+      completion_window: "24h",
+    });
+    expect(built.status).toBe(200);
+    await built.text();
+
+    // The provider's raw id and its lists would hand it the teams' files.
+    const before = upstream.receivedRequests.length;
+    const raw = await request(SHARED, "GET", `/v1/files/file-up-1/content?model=${MODEL}`);
+    expect(raw.status).toBe(404);
+    await raw.text();
+    for (const path of ["/v1/files", "/v1/batches", "/v1/fine_tuning/jobs"]) {
+      const listed = await request(SHARED, "GET", `${path}?model=${MODEL}`);
+      expect(listed.status, path).toBe(403);
+      await listed.text();
+    }
+    const rawBuilt = await request(SHARED, "POST", `/v1/batches?model=${MODEL}`, {
+      input_file_id: "file-up-1",
+      endpoint: "/v1/chat/completions",
+      completion_window: "24h",
+    });
+    expect(rawBuilt.status).toBe(404);
+    await rawBuilt.text();
+    expect(upstream.receivedRequests.length).toBe(before);
+  });
+
+  test("a key with no owner stays as it was where no team shares the provider", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
     for (const path of [
-      `/v1/files/${own}/content`,
-      `/v1/files/file-up-1/content?model=${MODEL}`,
-      `/v1/files?model=${MODEL}`,
-      `/v1/batches?model=${MODEL}`,
-      `/v1/fine_tuning/jobs?model=${MODEL}`,
+      `/v1/files/file-up-1/content?model=${SOLO_MODEL}`,
+      `/v1/files?model=${SOLO_MODEL}`,
+      `/v1/batches?model=${SOLO_MODEL}`,
+      `/v1/fine_tuning/jobs?model=${SOLO_MODEL}`,
     ]) {
       const r = await request(SHARED, "GET", path);
       expect(r.status, path).toBe(200);
       await r.text();
     }
-    const created = await request(SHARED, "POST", `/v1/batches?model=${MODEL}`, {
+    const created = await request(SHARED, "POST", `/v1/batches?model=${SOLO_MODEL}`, {
       input_file_id: "file-up-1",
       endpoint: "/v1/chat/completions",
       completion_window: "24h",

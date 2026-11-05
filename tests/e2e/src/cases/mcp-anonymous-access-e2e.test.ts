@@ -276,6 +276,17 @@ describe("mcp anonymous access e2e", () => {
     expect(await initialize("/mcp/ghost", undefined)).toBe(401);
   });
 
+  test("on the aggregated entry too, a switched-off listed server reads as an unknown one", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+
+    const answer = async (server: string) => {
+      const got = await callTool("/mcp", undefined, `${server}__echo`, "hi");
+      expect(got.ok, server).toBe(false);
+      return (got.error ?? "").replaceAll(server, "<server>");
+    };
+    expect(await answer("retired")).toBe(await answer("ghost"));
+  });
+
   test("a failed credential never downgrades to anonymous", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
 

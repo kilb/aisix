@@ -2311,11 +2311,10 @@ mod tests {
     #[tokio::test]
     async fn empty_key_allow_list_rejects_tool_calls_at_the_acl() {
         // An `mcp_access` block whose allow side is empty leaves the key no
-        // MCP access even though an env policy grants everything. The
-        // rejection is the ACL's neutral "not available" (reached before
-        // upstream routing), not the router's "unknown MCP server", which
-        // proves the endpoint resolves the layered ACL rather than falling
-        // through to routing.
+        // MCP access even though an env policy grants everything. The tool's
+        // server is registered, so routing would reach it: the ACL's neutral
+        // "not available" proves the endpoint resolves the layered ACL rather
+        // than falling through to routing.
         let key_hash = ApiKey::hash_bearer(TOKEN);
         let apikey: ApiKey = serde_json::from_value(serde_json::json!({
             "key_hash": key_hash,
@@ -2335,6 +2334,7 @@ mod tests {
         snapshot
             .mcp_policies
             .insert(ResourceEntry::new("p-env", policy, 1));
+        insert_mcp_server(&snapshot, "mcp-ghost", "ghost", true);
 
         let router = router_with(snapshot);
         let resp = router
@@ -2381,8 +2381,7 @@ mod tests {
     async fn env_policy_deny_overlays_a_wildcard_key_at_the_endpoint() {
         // An env policy allowing everything but denying exactly one tool:
         // the denied tool is rejected by the ACL while any other name still
-        // reaches routing (and fails as "unknown MCP server" — no upstreams
-        // are registered).
+        // reaches its server (and fails there: nothing listens at its URL).
         let key_hash = ApiKey::hash_bearer(TOKEN);
         let apikey: ApiKey = serde_json::from_value(serde_json::json!({
             "key_hash": key_hash,
@@ -2402,6 +2401,7 @@ mod tests {
         snapshot
             .mcp_policies
             .insert(ResourceEntry::new("p-env", policy, 1));
+        insert_mcp_server(&snapshot, "mcp-other", "other", true);
 
         let router = router_with(snapshot);
 
@@ -2427,7 +2427,7 @@ mod tests {
         let body = body_json(other).await;
         let message = body["error"]["message"].as_str().unwrap_or_default();
         assert!(
-            message.contains("unknown MCP server"),
+            !message.is_empty() && !message.contains("not available"),
             "a non-denied tool must still pass the ACL, got: {body}"
         );
     }
@@ -2610,6 +2610,61 @@ mod tests {
                 "{server} must be indistinguishable from an unknown server"
             );
         }
+    }
+
+    /// On the aggregated entry too: a listed name whose server is gone or
+    /// switched off reads as an unlisted one, so a prober learns neither.
+    #[tokio::test]
+    async fn the_aggregated_anonymous_entry_answers_every_unreachable_name_alike() {
+        // The principal may reach any tool, so what answers is the server
+        // lookup and the anonymous ceiling, not an empty grant.
+        let apikey: ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": ApiKey::hash_bearer(TOKEN),
+            "allowed_models": ["*"],
+            "mcp_access": { "allow": ["*"] },
+        }))
+        .expect("valid apikey");
+        let snapshot = AisixSnapshot::new();
+        snapshot
+            .apikeys
+            .insert(ResourceEntry::new("ak-1", apikey, 1));
+        let settings: aisix_core::models::McpAuthSettings =
+            serde_json::from_value(serde_json::json!({ "anonymous": {
+                "api_key_id": "ak-1",
+                "source_cidrs": ["10.0.0.0/8"],
+                "servers": ["docs", "off", "gone"],
+                "aggregate_entry": true,
+            }}))
+            .expect("valid mcp_auth_settings");
+        snapshot
+            .mcp_auth_settings
+            .insert(ResourceEntry::new("env-1", settings, 1));
+        insert_mcp_server(&snapshot, "mcp-docs", "docs", true);
+        insert_mcp_server(&snapshot, "mcp-kb", "kb", true);
+        insert_mcp_server(&snapshot, "mcp-off", "off", false);
+        let app = router_with(snapshot);
+        let mut answers = Vec::new();
+        for name in ["off__x", "gone__x", "ghost__x", "kb__x"] {
+            let response = app
+                .clone()
+                .oneshot(from_ip(
+                    unauthenticated_tools_call("/mcp", name),
+                    "10.1.2.3",
+                ))
+                .await
+                .expect("router responds");
+            let status = response.status();
+            let body = body_json(response).await;
+            let message = body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .replace(name, "<name>");
+            answers.push((status, message));
+        }
+        assert!(
+            answers.windows(2).all(|w| w[0] == w[1]),
+            "every name an anonymous caller cannot reach answers alike: {answers:?}"
+        );
     }
 
     /// A listed name whose server is gone or switched off answers as an
@@ -4094,6 +4149,20 @@ mod tests {
         snapshot
             .mcp_servers
             .insert(ResourceEntry::new(id, server, 1));
+    }
+
+    /// An unauthenticated `tools/call` for `name` on `path`.
+    fn unauthenticated_tools_call(path: &str, name: &str) -> HttpRequest<Body> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": name, "arguments": {} }
+        });
+        HttpRequest::post(path)
+            .header("host", "mcp.aisix.example.com")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(Body::from(body.to_string()))
+            .expect("request")
     }
 
     /// A JSON-RPC request to `/mcp/{server}`, optionally authenticated.

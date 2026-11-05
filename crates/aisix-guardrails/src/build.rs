@@ -121,8 +121,9 @@ fn build_chain_from_snapshot_reported(
         // `None`: technically valid but inert (e.g. empty keyword list), which
         // operators see when they're staging a rule.
         if let Some(g) = outcome.serving {
-            chain.push((row.name.clone(), g, row.input_messages));
-            applied.push(applied_for(row));
+            let built = &outcome.serving_row.value;
+            chain.push((built.name.clone(), g, built.input_messages));
+            applied.push(applied_for(built));
         }
     }
 
@@ -218,15 +219,26 @@ struct MemoSlot {
 struct BuildOutcome {
     /// `None` for an inert row.
     serving: Option<Arc<dyn Guardrail>>,
+    /// The row `serving` answers for: the one it was built from, so a stale
+    /// build keeps the name, reading window and kind it was built with
+    /// rather than wearing the edit that failed.
+    serving_row: Arc<aisix_core::resource::ResourceEntry<DomainGuardrail>>,
     rejection: Option<GuardrailBuildRejection>,
 }
 
 impl BuildOutcome {
-    /// What a failed rebuild may keep: an instance the row actually built, not
-    /// the stand-in for one that never did.
-    fn last_good(&self) -> Option<Arc<dyn Guardrail>> {
+    /// What a failed rebuild may keep: an instance the row actually built, with
+    /// the row it was built from, not the stand-in for one that never did.
+    #[allow(clippy::type_complexity)]
+    fn last_good(
+        &self,
+    ) -> Option<(
+        Arc<dyn Guardrail>,
+        Arc<aisix_core::resource::ResourceEntry<DomainGuardrail>>,
+    )> {
         let built = self.rejection.as_ref().is_none_or(|r| r.serving_stale);
-        self.serving.clone().filter(|_| built)
+        let serving = self.serving.clone().filter(|_| built)?;
+        Some((serving, Arc::clone(&self.serving_row)))
     }
 }
 
@@ -257,6 +269,7 @@ impl GuardrailInstances {
         let outcome = match build_one(&entry.value, bedrock_endpoint_url, embedder) {
             Ok(serving) => BuildOutcome {
                 serving,
+                serving_row: Arc::clone(entry),
                 rejection: None,
             },
             Err(err) => {
@@ -276,8 +289,13 @@ impl GuardrailInstances {
                     keeps_serving_last_good = serving_stale,
                     "guardrail has an invalid config",
                 );
+                let (serving, serving_row) = match last_good {
+                    Some((serving, row)) => (Some(serving), row),
+                    None => (unbuilt_row(&entry.value, &err), Arc::clone(entry)),
+                };
                 BuildOutcome {
-                    serving: last_good.or_else(|| unbuilt_row(&entry.value, &err)),
+                    serving,
+                    serving_row,
                     rejection: Some(GuardrailBuildRejection {
                         id: entry.id.clone(),
                         reason: err.status_reason(),
@@ -1633,6 +1651,8 @@ fn build_index_from_snapshot_reported(
         let Some(runtime_guardrail) = outcome.serving else {
             continue;
         };
+        // What the instance was built from, which a stale build keeps.
+        let row = &outcome.serving_row.value;
 
         let scope_kind = match attachment.scope_type {
             GuardrailScopeType::Env => ScopeKind::Env,
@@ -4607,6 +4627,49 @@ mod tests {
 
     /// An edit that cannot build must not switch off the rule it was editing:
     /// the last good instance keeps enforcing, and status says it is stale.
+    /// The build a bad edit leaves in force is the whole row it was built
+    /// from: its name, and the messages it reads, not the edit's.
+    #[tokio::test]
+    async fn a_stale_build_keeps_the_name_and_window_it_was_built_with() {
+        let snapshot_of = |row: &str| {
+            let snap = AisixSnapshot::new();
+            snap.guardrails.insert(entry("kw", "g-1", parse(row)));
+            snap.guardrail_attachments.insert(attachment_entry(
+                "a-1",
+                parse_attachment(r#"{"guardrail_id": "g-1", "scope_type": "env", "priority": 50}"#),
+            ));
+            snap
+        };
+        let good = r#"{"name": "kw", "kind": "keyword",
+            "patterns": [{"kind": "literal", "value": "AKIA"}]}"#;
+        let bad = r#"{"name": "renamed", "kind": "keyword", "input_messages": "latest_turn",
+            "patterns": [{"kind": "literal", "value": "AKIA"}, {"kind": "regex", "value": "oops[("}]}"#;
+        let handle = SnapshotHandle::new(snapshot_of(good));
+        let live = LiveGuardrailIndex::new_with_sink_and_status(
+            handle.clone(),
+            None,
+            None,
+            GuardrailEmbedderSlot::none(),
+            None,
+        );
+        let _ = live.resolve(&any_ctx());
+        handle.store(snapshot_of(bad));
+        // The word sits in history, which a `latest_turn` window would not read.
+        let history = ChatFormat::new(
+            "m",
+            vec![
+                ChatMessage::user("AKIA123"),
+                ChatMessage::assistant("noted"),
+                ChatMessage::user("clean"),
+            ],
+        );
+        let verdict = live.resolve(&any_ctx()).check_input(&history).await;
+        let GuardrailVerdict::Block { guardrail_name, .. } = verdict else {
+            panic!("the build in force reads every message: {verdict:?}");
+        };
+        assert_eq!(guardrail_name.as_deref(), Some("kw"));
+    }
+
     #[tokio::test]
     async fn a_bad_edit_keeps_the_last_good_instance_enforcing() {
         let snapshot_of = |row: &str| {

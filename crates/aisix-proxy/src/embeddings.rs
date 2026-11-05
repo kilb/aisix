@@ -140,12 +140,13 @@ impl InputField {
 /// [`crate::redact::newest_content_for_inspection`]); the synthesized
 /// request is never sent upstream (the original `input` shape is forwarded
 /// verbatim).
-fn embeddings_input_to_chat(model: &str, input: &InputField) -> ChatFormat {
+/// `decoded` is the text token-id input decodes to
+/// ([`crate::token_estimate::decode_token_ids`]); a text input ignores it.
+fn embeddings_input_to_chat(model: &str, input: &InputField, decoded: &[String]) -> ChatFormat {
     let items = match input {
         InputField::Single(s) => std::slice::from_ref(s),
         InputField::Multi(v) => v.as_slice(),
-        // Token ids carry no text to scan.
-        InputField::Tokens(_) | InputField::TokenArrays(_) => &[],
+        InputField::Tokens(_) | InputField::TokenArrays(_) => decoded,
     };
     crate::redact::newest_content_for_inspection(model, items)
 }
@@ -562,13 +563,19 @@ async fn dispatch(
     // Same line, same reason: fill the caller's out-param so the failure
     // path — the one a Block takes — can surface the enforced hits too.
     *audit_out = resolved_chain.audit_log();
-    // Token ids carry no text a guardrail could read, and the gateway cannot
-    // rewrite them. Refused like any other body the chain cannot be given, as
-    // `/v1/completions` refuses a token-id prompt.
-    if matches!(
-        body.input,
-        InputField::Tokens(_) | InputField::TokenArrays(_)
-    ) {
+    // Token ids are read as the text they decode to, with the encoding of the
+    // model the upstream serves, as `/v1/completions` reads a token-id prompt.
+    // Input that does not decode is refused like any other body the chain
+    // cannot be given.
+    let token_arrays = match &body.input {
+        InputField::Tokens(ids) => Some(vec![ids.clone()]),
+        InputField::TokenArrays(arrays) => Some(arrays.clone()),
+        InputField::Single(_) | InputField::Multi(_) => None,
+    };
+    let decoded = token_arrays.as_deref().map(|arrays| {
+        crate::token_estimate::decode_token_ids(model_entry.value.model_name.as_deref(), arrays)
+    });
+    if matches!(decoded, Some(None)) && !resolved_chain.is_empty() {
         if aisix_guardrails::Guardrail::refuses_unevaluable_input(&resolved_chain) {
             return Err(crate::error::guardrail_block_error(
                 "request",
@@ -578,6 +585,7 @@ async fn dispatch(
         }
         resolved_chain.record_unevaluable_input_bypass(crate::error::TAG_UNSCANNABLE_BODY);
     }
+    let decoded = decoded.flatten().unwrap_or_default();
     // A check that calls a remote moderation service is admitted by the
     // key's rate limits before it runs, and a refusal keeps the slot it took
     // (see `quota::reserve_before_costly_check`).
@@ -590,7 +598,7 @@ async fn dispatch(
     .await?;
     let mut input_capture_safe = true;
     if !resolved_chain.is_empty() {
-        let chat = embeddings_input_to_chat(&body.model, &body.input);
+        let chat = embeddings_input_to_chat(&body.model, &body.input, &decoded);
         let (verdict, hits) =
             aisix_guardrails::Guardrail::check_input_observed(&resolved_chain, &chat).await;
         telemetry.monitor_hits.extend(hits);
@@ -621,6 +629,13 @@ async fn dispatch(
                 unavailable.as_deref(),
             ));
         }
+    }
+
+    // Ids cannot be rewritten, so a mask rule that would rewrite their text
+    // refuses the request.
+    if crate::redact::mask_would_rewrite(&resolved_chain, &decoded) {
+        crate::usage_attr::note_failure_request(snapshot, String::new);
+        return Err(crate::error::guardrail_block_error("request", None, None));
     }
 
     // #932: mask-action PII rules rewrite the embeddings input in place
@@ -1599,38 +1614,86 @@ mod tests {
         assert_eq!(ev.status_code, 422);
     }
 
-    /// Token ids hold the text a rule exists to read, in a form no rule can.
-    /// A chain that fails closed refuses them, and the provider hears nothing.
+    /// The ids of `text` in the encoding `text-embedding-3-small` uses, as a
+    /// client such as LangChain sends them.
+    fn cl100k(text: &str) -> Vec<u64> {
+        tiktoken_rs::cl100k_base_singleton()
+            .encode_ordinary(text)
+            .into_iter()
+            .map(u64::from)
+            .collect()
+    }
+
+    /// Token ids are read as the text they decode to: a blocked word in them
+    /// is refused, clean ones go through, and a mask rule's match refuses since
+    /// ids cannot be rewritten. Ids this gateway cannot decode, out of the
+    /// encoding's range or for a model whose encoding it does not know, are
+    /// refused under a chain that fails closed.
     #[tokio::test]
-    async fn token_ids_are_refused_by_a_chain_that_fails_closed() {
+    async fn token_ids_are_read_as_the_text_they_decode_to() {
         let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
             .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
-            .expect(0)
             .mount(&upstream)
             .await;
         let snap = new_snap(&upstream.uri());
         snap.models.insert(model_entry("my-embed"));
+        let unknown: Model = serde_json::from_str(&format!(
+            r#"{{"display_name": "bge", "provider": "openai", "model_name": "bge-m3", "provider_key_id": "{PK_ID}"}}"#
+        ))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-bge", unknown, 1));
         snap.apikeys.insert(apikey_entry(&["*"]));
         crate::seed_env_scoped_guardrail(&snap, keyword_input_guardrail("BLOCKME"));
+        let mask: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
+            "name": "mask", "enabled": true, "hook_point": "input", "kind": "pii",
+            "detectors": [{"type": "email", "action": "mask"}],
+        }))
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-mask", mask, 1));
         let hub = Arc::new(Hub::new());
         hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
         let app = crate::build_router(state);
-        for input in [
-            serde_json::json!([1, 2, 3]),
-            serde_json::json!([[1, 2], [3]]),
+        let send = |model: &str, input: serde_json::Value| {
+            let body = serde_json::json!({"model": model, "input": input});
+            tower::ServiceExt::oneshot(app.clone(), make_req(body))
+        };
+        let clean = serde_json::json!([cl100k("what the gateway reads")]);
+        let resp = send("my-embed", clean.clone()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let forwarded = upstream.received_requests().await.unwrap().len();
+        assert_eq!(forwarded, 1);
+        for (model, input) in [
+            ("my-embed", serde_json::json!(cl100k("please BLOCKME now"))),
+            (
+                "my-embed",
+                serde_json::json!([cl100k("clean"), cl100k("BLOCKME")]),
+            ),
+            (
+                "my-embed",
+                serde_json::json!([cl100k("write to alice@example.com")]),
+            ),
+            ("my-embed", serde_json::json!([999_999_999u64])),
+            ("bge", clean.clone()),
         ] {
-            let body = serde_json::json!({"model": "my-embed", "input": input});
-            let resp = tower::ServiceExt::oneshot(app.clone(), make_req(body))
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{input}");
+            let resp = send(model, input.clone()).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{model} {input}"
+            );
         }
+        assert_eq!(
+            upstream.received_requests().await.unwrap().len(),
+            forwarded,
+            "nothing refused reached the provider"
+        );
     }
 
-    /// A row that fails open lets them through, and the request says so.
+    /// A row that fails open lets ids it cannot read through, and the request
+    /// says so.
     #[tokio::test]
     async fn token_ids_past_a_chain_that_fails_open_are_recorded_as_a_bypass() {
         use aisix_obs::UsageSink;
@@ -1657,7 +1720,8 @@ mod tests {
             .without_cache()
             .with_usage_sink(UsageSink::new(tx));
         let app = crate::build_router(state);
-        let body = serde_json::json!({"model": "my-embed", "input": [1, 2, 3]});
+        // Ids out of the encoding's range: nothing says what they read as.
+        let body = serde_json::json!({"model": "my-embed", "input": [999_999_999u64]});
         let resp = tower::ServiceExt::oneshot(app, make_req(body))
             .await
             .unwrap();
@@ -2939,7 +3003,7 @@ mod tests {
     #[test]
     fn input_list_is_inspected_as_one_newest_message() {
         let input = super::InputField::Multi(vec!["first".into(), String::new(), "second".into()]);
-        let chat = super::embeddings_input_to_chat("m", &input);
+        let chat = super::embeddings_input_to_chat("m", &input, &[]);
         let contents: Vec<_> = chat.messages.iter().map(|m| m.content.as_deref()).collect();
         assert_eq!(contents, [Some("first\nsecond")]);
     }

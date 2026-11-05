@@ -114,6 +114,18 @@ fn log_transport_causes(err: &reqwest::Error) {
     );
 }
 
+/// Every string in `value` through [`aisix_gateway::scrub_upstream_error_text`].
+fn scrub_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = aisix_gateway::scrub_upstream_error_text(text);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(scrub_strings),
+        serde_json::Value::Object(map) => map.values_mut().for_each(scrub_strings),
+        _ => {}
+    }
+}
+
 /// Convert reqwest failures without ever retaining the request URL. Reqwest's
 /// default Display includes it, including path/query values that may contain
 /// tenant secrets in rows written before URL validation was tightened.
@@ -427,6 +439,7 @@ impl HttpBridge {
         if let A2aAuth::Bearer(secret) | A2aAuth::ApiKey(secret) = &self.upstream.auth {
             aisix_gateway::note_sent_credential(secret);
         }
+        aisix_gateway::note_url_userinfo(&self.upstream.url);
         let req = match &self.upstream.auth {
             A2aAuth::None => req,
             A2aAuth::Bearer(token) if !claims("authorization") => req.bearer_auth(token),
@@ -566,8 +579,14 @@ impl A2aBridge for HttpBridge {
             return Err(A2aError::UpstreamStatus(status));
         }
         let bytes = read_capped(resp).await?;
-        serde_json::from_slice::<serde_json::Value>(&bytes)
-            .map_err(|e| A2aError::Request(format!("malformed JSON-RPC response: {e}")))
+        let mut value = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map_err(|e| A2aError::Request(format!("malformed JSON-RPC response: {e}")))?;
+        // A JSON-RPC error is the agent's own failure, relayed to the caller:
+        // it passes the shared scrubber, as an LLM upstream's error does.
+        if let Some(error) = value.get_mut("error") {
+            scrub_strings(error);
+        }
+        Ok(value)
     }
 
     async fn send_stream(&self, request: &serde_json::Value) -> Result<A2aEventStream, A2aError> {

@@ -213,14 +213,52 @@ pub fn fill_missing(
 }
 
 fn bpe_for(model: &str) -> &'static CoreBPE {
-    match get_tokenizer(model) {
-        Some(Tokenizer::O200kHarmony) => tiktoken_rs::o200k_harmony_singleton(),
-        Some(Tokenizer::O200kBase) => tiktoken_rs::o200k_base_singleton(),
-        Some(Tokenizer::P50kBase) => tiktoken_rs::p50k_base_singleton(),
-        Some(Tokenizer::P50kEdit) => tiktoken_rs::p50k_edit_singleton(),
-        Some(Tokenizer::R50kBase | Tokenizer::Gpt2) => tiktoken_rs::r50k_base_singleton(),
-        Some(Tokenizer::Cl100kBase) | None => tiktoken_rs::cl100k_base_singleton(),
+    known_bpe(model).unwrap_or_else(tiktoken_rs::cl100k_base_singleton)
+}
+
+/// The encoding tiktoken's model map names for `model`, and nothing for a model
+/// it does not know.
+fn known_bpe(model: &str) -> Option<&'static CoreBPE> {
+    Some(match get_tokenizer(model)? {
+        Tokenizer::O200kHarmony => tiktoken_rs::o200k_harmony_singleton(),
+        Tokenizer::O200kBase => tiktoken_rs::o200k_base_singleton(),
+        Tokenizer::P50kBase => tiktoken_rs::p50k_base_singleton(),
+        Tokenizer::P50kEdit => tiktoken_rs::p50k_edit_singleton(),
+        Tokenizer::R50kBase | Tokenizer::Gpt2 => tiktoken_rs::r50k_base_singleton(),
+        Tokenizer::Cl100kBase => tiktoken_rs::cl100k_base_singleton(),
+    })
+}
+
+/// The token-id arrays a `prompt` or `input` value holds: `[1, 2]` is one and
+/// `[[1, 2], [3]]` is two, the shapes the OpenAI completions and embeddings
+/// APIs take. `None` for any other value.
+pub(crate) fn token_id_arrays(value: &Value) -> Option<Vec<Vec<u64>>> {
+    let items = value.as_array().filter(|items| !items.is_empty())?;
+    let ids = |items: &[Value]| items.iter().map(Value::as_u64).collect::<Option<Vec<_>>>();
+    if let Some(one) = ids(items) {
+        return Some(vec![one]);
     }
+    items.iter().map(|item| ids(item.as_array()?)).collect()
+}
+
+/// The text each array of token ids stands for, decoded as an upstream serving
+/// `model` decodes it: with the encoding tiktoken's model map names, which is
+/// what a client such as LangChain encodes with. `None` when that map knows no
+/// encoding for the model, or an id is not one of the encoding's: nothing then
+/// says what the upstream will read.
+pub(crate) fn decode_token_ids(model: Option<&str>, arrays: &[Vec<u64>]) -> Option<Vec<String>> {
+    let bpe = known_bpe(model?)?;
+    arrays
+        .iter()
+        .map(|ids| {
+            let ids = ids
+                .iter()
+                .map(|&id| u32::try_from(id).ok())
+                .collect::<Option<Vec<_>>>()?;
+            let bytes = bpe.decode_bytes(&ids).ok()?;
+            Some(String::from_utf8_lossy(&bytes).into_owned())
+        })
+        .collect()
 }
 
 fn clamp(n: usize) -> u32 {
@@ -978,6 +1016,42 @@ mod tests {
 
     fn chat_est(model: &str, req: ChatFormat) -> Estimator {
         Estimator::new(model, PromptInput::Chat(Box::new(req)))
+    }
+
+    /// Ids decode in the model's own encoding, and only there: an id outside
+    /// it, or a model tiktoken's map does not know, decodes to nothing.
+    #[test]
+    fn token_ids_decode_in_the_model_encoding() {
+        let hello_cl100k = vec![15339, 1070];
+        let hello_o200k = vec![24912, 1354];
+        assert_eq!(
+            decode_token_ids(
+                Some("text-embedding-3-small"),
+                std::slice::from_ref(&hello_cl100k)
+            ),
+            Some(vec!["hello there".to_string()])
+        );
+        assert_eq!(
+            decode_token_ids(Some("gpt-4o-mini"), &[hello_o200k]),
+            Some(vec!["hello there".to_string()])
+        );
+        assert_eq!(
+            decode_token_ids(Some("bge-m3"), std::slice::from_ref(&hello_cl100k)),
+            None
+        );
+        assert_eq!(decode_token_ids(None, &[hello_cl100k]), None);
+        assert_eq!(
+            decode_token_ids(Some("gpt-4o-mini"), &[vec![999_999_999]]),
+            None
+        );
+        assert_eq!(
+            token_id_arrays(&json!([[1, 2], [3]])),
+            Some(vec![vec![1, 2], vec![3]])
+        );
+        assert_eq!(token_id_arrays(&json!([1, 2])), Some(vec![vec![1, 2]]));
+        assert_eq!(token_id_arrays(&json!(["text"])), None);
+        assert_eq!(token_id_arrays(&json!([1, "two"])), None);
+        assert_eq!(token_id_arrays(&json!([])), None);
     }
 
     fn msg(role: Role, content: &str) -> ChatMessage {

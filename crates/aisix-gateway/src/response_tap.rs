@@ -198,7 +198,8 @@ pub fn note_upstream_error_body(body: &bytes::Bytes) {
 }
 
 /// The most credentials one request keeps: a request reaches a handful of
-/// upstreams at most (retries, fallbacks, a judge).
+/// upstreams at most (retries, fallbacks, a judge). Past it the oldest goes, so
+/// the attempt whose error is relayed always has its own.
 const MAX_SENT_CREDENTIALS: usize = 16;
 /// Shorter values are not looked for: they would match ordinary text.
 const MIN_SENT_CREDENTIAL_BYTES: usize = 8;
@@ -218,9 +219,12 @@ pub fn note_sent_credential(value: &str) {
             .sent_credentials
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if sent.len() < MAX_SENT_CREDENTIALS && !sent.iter().any(|v| v == value) {
-            sent.push(value.to_owned());
+        if let Some(at) = sent.iter().position(|v| v == value) {
+            sent.remove(at);
+        } else if sent.len() == MAX_SENT_CREDENTIALS {
+            sent.remove(0);
         }
+        sent.push(value.to_owned());
     });
 }
 
@@ -236,6 +240,31 @@ pub fn detached() -> Arc<ResponseHeaderTap> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = sent_credentials();
     Arc::new(tap)
+}
+
+/// Note the credential a configured URL carries in its userinfo. reqwest sends
+/// it as `Authorization: Basic base64(user:password)`, the password
+/// percent-decoded, so the password is noted as written and decoded, and so is
+/// the header's token: an upstream that quotes what it received quotes that.
+pub fn note_url_userinfo(url: &str) {
+    use base64::Engine as _;
+    let Ok(url) = url::Url::parse(url) else {
+        return;
+    };
+    let Some(password) = url.password() else {
+        return;
+    };
+    let decode = |s: &str| {
+        percent_encoding::percent_decode_str(s)
+            .decode_utf8_lossy()
+            .into_owned()
+    };
+    let (user, decoded) = (decode(url.username()), decode(password));
+    note_sent_credential(password);
+    note_sent_credential(&decoded);
+    note_sent_credential(
+        &base64::engine::general_purpose::STANDARD.encode(format!("{user}:{decoded}")),
+    );
 }
 
 /// What [`note_sent_credential`] noted for the current request.

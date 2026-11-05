@@ -31,6 +31,9 @@ import {
 
 const CALLER = "sk-credential-scrub-caller";
 const KEY = "pkScrubE2Ez9Y8X7W6V5U4T3S2R1Q0";
+/** The password in a base URL's userinfo, which goes upstream as `Basic`. */
+const URL_PASSWORD = "urlPassE2Ez9Y8X7W6V5U4";
+const BASIC = Buffer.from(`svc:${URL_PASSWORD}`).toString("base64");
 const LOGSTORE = "credential-scrub-rows";
 const REFUSED = "Incorrect API key provided.";
 const BROKE_OFF = "The server had an error while streaming.";
@@ -167,6 +170,7 @@ describe("an upstream that quotes the credential it was sent", () => {
     const refusing = await refusingUpstream();
     const failing = await failingStreamUpstream();
     const names: string[] = [];
+    const modelIds: Record<string, string> = {};
     const model = async (name: string, provider: string, apiBase: string, adapter?: string) => {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
@@ -175,7 +179,7 @@ describe("an upstream that quotes the credential it was sent", () => {
         ...(adapter ? { adapter } : {}),
         api_base: apiBase,
       });
-      await seed.createModel({
+      const created = await seed.createModel({
         display_name: name,
         provider,
         model_name: "m",
@@ -183,6 +187,7 @@ describe("an upstream that quotes the credential it was sent", () => {
         cooldown: { enabled: false },
       });
       names.push(name);
+      modelIds[name] = created.id;
       return pk.id;
     };
     const openAiPk = await model("openai-refusing", "openai", `${refusing}/v1`);
@@ -191,10 +196,35 @@ describe("an upstream that quotes the credential it was sent", () => {
     await model("cohere-refusing", "cohere", refusing, "openai");
     await model("openai-failing", "openai", `${failing}/v1`);
     await model("anthropic-failing", "anthropic", failing);
+    // The credential sits in the base URL, and the upstream sees it as Basic.
+    await model(
+      "anthropic-userinfo",
+      "anthropic",
+      refusing.replace("http://", `http://svc:${URL_PASSWORD}@`),
+    );
+    // A stream held for a block-capable output rule releases what it held.
+    await model("openai-failing-held", "openai", `${failing}/v1`);
+    const held = await seed.createGuardrail(
+      {
+        name: "scrub-held-output",
+        enabled: true,
+        hook_point: "output",
+        kind: "keyword",
+        patterns: [{ kind: "literal", value: "never-in-an-answer" }],
+      },
+      { attach: false },
+    );
+    await seed.attachGuardrailToModel(held.id, modelIds["openai-failing-held"]);
     await seed.createPassthroughRoute({
       name: "scrub-passthrough",
       path_prefix: "/scrub-passthrough",
       target_url: refusing,
+      provider_key_id: openAiPk,
+    });
+    await seed.createPassthroughRoute({
+      name: "scrub-passthrough-stream",
+      path_prefix: "/scrub-passthrough-stream",
+      target_url: failing,
       provider_key_id: openAiPk,
     });
     await seed.createApiKey({ key_hash: sha256(CALLER), allowed_routes: ["*"], allowed_models: names });
@@ -241,7 +271,9 @@ describe("an upstream that quotes the credential it was sent", () => {
     );
     if (text) expect(final.get("error_message") ?? "").toContain(text);
     for (const row of slsLogsFor(sls!, LOGSTORE).filter((l) => l.get("request_id") === requestId)) {
-      expect(JSON.stringify([...row.entries()])).not.toContain(KEY);
+      const all = JSON.stringify([...row.entries()]);
+      expect(all).not.toContain(KEY);
+      expect(all).not.toContain(BASIC);
     }
     await waitForLogLine(app!, (l) => l.includes(requestId), `the access-log line of ${requestId}`);
   }
@@ -274,6 +306,7 @@ describe("an upstream that quotes the credential it was sent", () => {
       json({ input_file_id: "file-x", endpoint: "/v1/chat/completions", completion_window: "24h" }),
     ],
     ["passthrough route", "/scrub-passthrough/v1/chat/completions", json({ model: "m", messages })],
+    ["native messages on a URL with a password", "/v1/messages", json({ model: "anthropic-userinfo", messages, max_tokens: 5 })],
   ];
 
   test.each(REFUSED_ROUTES)("%s: the refusal arrives with its status and text, without the key", async (_what, path, init) => {
@@ -282,6 +315,8 @@ describe("an upstream that quotes the credential it was sent", () => {
     expect(got.status, got.text).toBe(401);
     expect(got.text).toContain(REFUSED);
     expect(got.text).not.toContain(KEY);
+    expect(got.text).not.toContain(BASIC);
+    expect(got.text).not.toContain(URL_PASSWORD);
     await expectRowsClean(got.requestId, REFUSED);
   });
 
@@ -314,6 +349,16 @@ describe("an upstream that quotes the credential it was sent", () => {
       json({ model: "anthropic-failing", messages, max_tokens: 5, stream: true }),
     ],
     ["native responses", "/v1/responses", json({ model: "openai-failing", input: "hi", stream: true })],
+    [
+      "native responses held for an output rule",
+      "/v1/responses",
+      json({ model: "openai-failing-held", input: "hi", stream: true }),
+    ],
+    [
+      "passthrough route",
+      "/scrub-passthrough-stream/v1/chat/completions",
+      json({ model: "m", messages, stream: true }),
+    ],
   ];
 
   test.each(BROKEN_STREAMS)("%s: an error inside a started stream arrives without the key", async (_what, path, init) => {
@@ -329,5 +374,7 @@ describe("an upstream that quotes the credential it was sent", () => {
     if (!etcdReachable) return;
     expect(app!.output()).toContain(REFUSED);
     expect(app!.output()).not.toContain(KEY);
+    expect(app!.output()).not.toContain(BASIC);
+    expect(app!.output()).not.toContain(URL_PASSWORD);
   });
 });

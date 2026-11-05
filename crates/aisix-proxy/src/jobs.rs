@@ -34,10 +34,15 @@
 //! id that does not exist, on every call that addresses one. Ids derived from
 //! an owned resource (a batch's `output_file_id`) carry the owner because only
 //! the owner can read the resource they appear on. It cannot list, because the
-//! gateway has no way to attribute the upstream's list to an owner. A key with
-//! neither is what a single-tenant deployment uses, and stays shared with every
-//! other such key. The id is not signed: forging one takes the upstream's
-//! random id, which a scoped caller has no list to find.
+//! gateway has no way to attribute the upstream's list to an owner. The owner
+//! is sealed into the id ([`owner_tag`]), so an id read off a log or a shared
+//! link cannot be re-issued under another owner.
+//!
+//! A key with neither reaches the unowned ids it was handed. Where no key with
+//! an owner can reach the provider key, which is a single-tenant deployment,
+//! it also lists and uses the provider's raw ids, as before ownership existed.
+//! Where one can, it does neither: the provider's list and raw ids would hand
+//! it the owned resources ([`pk_serves_owned_keys`]).
 //!
 //! ## Provider coverage
 //!
@@ -120,13 +125,48 @@ const BATCH_WATCH_LIMIT: Duration = Duration::from_secs(8 * 24 * 3600);
 
 /// Encode a provider-issued id + its routing Model into a gateway id:
 /// `aisix-<base64url_nopad("<raw>;model,<display_name>")>`, with
-/// `;owner,<owner>` after the raw id when the resource has an owner.
-pub(crate) fn encode_routed_id(raw: &str, model: &str, owner: Option<&str>) -> String {
+/// `;owner,<owner>,<tag>` after the raw id when the resource has an owner,
+/// `owner` being `(owner, provider key secret)` ([`owner_tag`]).
+pub(crate) fn encode_routed_id(raw: &str, model: &str, owner: Option<(&str, &str)>) -> String {
     let plain = match owner {
-        Some(owner) => format!("{raw};owner,{owner};model,{model}"),
+        Some((owner, secret)) => {
+            let tag = owner_tag(secret, raw, owner);
+            format!("{raw};owner,{owner},{tag};model,{model}")
+        }
         None => format!("{raw};model,{model}"),
     };
     format!("{ROUTED_ID_PREFIX}{}", URL_SAFE_NO_PAD.encode(plain))
+}
+
+/// The seal on an owned id: an HMAC-SHA256 over the raw id and its owner,
+/// keyed by the secret of the provider key the id was minted on. Every replica
+/// serving that key checks it with nothing more to share, and a caller who
+/// reads an id cannot re-issue it under another owner. Rotating that secret
+/// invalidates the owned ids it sealed: their owners find them gone, as an id
+/// minted anywhere else.
+fn owner_tag(secret: &str, raw: &str, owner: &str) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+    URL_SAFE_NO_PAD.encode(ring::hmac::sign(&key, &owner_tag_message(raw, owner)))
+}
+
+fn owner_tag_message(raw: &str, owner: &str) -> Vec<u8> {
+    [
+        b"aisix-job-owner-v1\0",
+        raw.as_bytes(),
+        b"\0",
+        owner.as_bytes(),
+    ]
+    .concat()
+}
+
+/// Whether `tag` seals `raw` for `owner` under `secret`, compared in constant
+/// time.
+fn owner_tag_matches(secret: &str, raw: &str, owner: &str, tag: &str) -> bool {
+    let Ok(tag) = URL_SAFE_NO_PAD.decode(tag) else {
+        return false;
+    };
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+    ring::hmac::verify(&key, &owner_tag_message(raw, owner), &tag).is_ok()
 }
 
 /// A gateway-minted id, decoded.
@@ -135,6 +175,8 @@ pub(crate) struct RoutedId {
     pub(crate) raw: String,
     pub(crate) model: String,
     pub(crate) owner: Option<String>,
+    /// The owner's seal ([`owner_tag`]), as the id carries it.
+    pub(crate) tag: Option<String>,
 }
 
 /// Decode a gateway-minted id. Returns `None` for anything that isn't a
@@ -146,9 +188,13 @@ pub(crate) fn decode_routed_id(id: &str) -> Option<RoutedId> {
     // rsplit: a model display name cannot contain the separator without
     // making the encode ambiguous; raw provider ids never do.
     let (head, model) = s.rsplit_once(";model,")?;
-    let (raw, owner) = match head.split_once(";owner,") {
-        Some((raw, owner)) => (raw, Some(owner.to_string())),
-        None => (head, None),
+    let (raw, owner, tag) = match head.split_once(";owner,") {
+        // The tag is base64url, so the last comma ends the owner.
+        Some((raw, sealed)) => match sealed.rsplit_once(',') {
+            Some((owner, tag)) => (raw, Some(owner.to_string()), Some(tag.to_string())),
+            None => (raw, Some(sealed.to_string()), None),
+        },
+        None => (head, None, None),
     };
     if raw.is_empty() || model.is_empty() || owner.as_deref() == Some("") {
         return None;
@@ -157,6 +203,7 @@ pub(crate) fn decode_routed_id(id: &str) -> Option<RoutedId> {
         raw: raw.to_string(),
         model: model.to_string(),
         owner,
+        tag,
     })
 }
 
@@ -170,18 +217,77 @@ fn job_owner(auth: &AuthenticatedKey) -> Option<String> {
         .or_else(|| non_empty(&key.user_id).map(|user| format!("user:{user}")))
 }
 
-/// Refuse an id whose owner is not the caller's. Decided on the id alone, with
-/// no upstream call, so the answer says nothing about whether it exists.
+/// Refuse an id the caller does not own, once its target is known. Decided on
+/// the id and the configuration, with no upstream call, so the answer says
+/// nothing about whether the upstream holds it. `routed` is the gateway id
+/// `raw` came in, `None` for a provider's raw id.
+///
+/// - A key with an owner reaches only ids sealed for it on this provider key.
+/// - A key without one reaches unowned gateway ids, and a raw id only where no
+///   key with an owner can reach this provider key ([`pk_serves_owned_keys`]).
 fn require_job_owner(
     auth: &AuthenticatedKey,
-    id: &str,
-    owner: Option<&str>,
+    snapshot: &aisix_core::AisixSnapshot,
+    target: &JobTarget,
+    raw: &str,
+    routed: Option<&RoutedId>,
 ) -> Result<(), ProxyError> {
-    if job_owner(auth).as_deref() == owner {
+    let reachable = match (job_owner(auth), routed) {
+        (Some(mine), Some(id)) => {
+            id.owner.as_deref() == Some(mine.as_str())
+                && id
+                    .tag
+                    .as_deref()
+                    .is_some_and(|tag| owner_tag_matches(&target.secret, raw, &mine, tag))
+        }
+        (Some(_), None) => false,
+        (None, Some(id)) => id.owner.is_none(),
+        (None, None) => !pk_serves_owned_keys(snapshot, &target.pk_entry.id),
+    };
+    if reachable {
         Ok(())
     } else {
-        Err(ProxyError::JobResourceNotFound(id.to_string()))
+        Err(ProxyError::JobResourceNotFound(raw.to_string()))
     }
+}
+
+/// Refuse a list where the provider's would show the caller resources it does
+/// not own: always to a key with an owner, and to one without where a key with
+/// an owner can reach the same provider key.
+fn require_job_list(
+    auth: &AuthenticatedKey,
+    snapshot: &aisix_core::AisixSnapshot,
+    target: &JobTarget,
+) -> Result<(), ProxyError> {
+    if job_owner(auth).is_some() || pk_serves_owned_keys(snapshot, &target.pk_entry.id) {
+        Err(ProxyError::JobListRefused)
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether a key with a team or user can reach a model on the provider key
+/// `pk_id`, so that the provider's account holds owned resources.
+fn pk_serves_owned_keys(snapshot: &aisix_core::AisixSnapshot, pk_id: &str) -> bool {
+    let models: Vec<String> = snapshot
+        .models
+        .entries()
+        .iter()
+        .filter(|m| m.value.provider_key_id.as_deref() == Some(pk_id))
+        .map(|m| m.value.display_name.clone())
+        .collect();
+    let has = |id: &Option<String>| id.as_deref().is_some_and(|id| !id.is_empty());
+    snapshot.apikeys.entries().iter().any(|entry| {
+        let key = &entry.value;
+        (has(&key.team_id) || has(&key.user_id))
+            && models.iter().any(|model| key.can_access(snapshot, model))
+    })
+}
+
+/// The owner a key's new job resources are sealed for, with the secret that
+/// seals them.
+fn owner_seal<'a>(owner: Option<&'a str>, target: &'a JobTarget) -> Option<(&'a str, &'a str)> {
+    owner.map(|owner| (owner, target.secret.as_str()))
 }
 
 /// Charset guard for ids interpolated into upstream URL paths. A decoded
@@ -622,6 +728,22 @@ pub(crate) fn json_decoded_strings(value: &serde_json::Value, out: &mut Vec<Stri
     }
 }
 
+/// Whether an uploaded JSONL line holds an escape this gateway cannot decode: it
+/// looks like JSON, has a backslash and does not parse here. The scan would read
+/// its bytes, and an upstream whose parser takes what this one refuses (a lone
+/// `\ud800`, which Python, Node and Go take) reads text the scan never saw.
+fn holds_undecodable_escape(blob: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(blob);
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    text.lines().any(|line| {
+        let line = line.trim_start();
+        (line.starts_with('{') || line.starts_with('['))
+            && line.contains('\\')
+            // A full parse: skipping a value checks no escape's meaning.
+            && serde_json::from_str::<serde_json::Value>(line).is_err()
+    })
+}
+
 /// 输入审查读的文本：原样的字节之外，还有 JSONL 每行解码后的字符串。上游读
 /// 的是解码后的内容，`\u0068ow to …` 这类转义、以及 Python `json.dumps` 默认
 /// 把非 ASCII 全部转义成的 `\uXXXX`，在原样字节里都对不上规则。没有反斜杠就
@@ -724,6 +846,18 @@ async fn scan_input_blob(
     }
     if applied.is_empty() {
         *applied = chain.applied().to_vec();
+    }
+    // A body the chain cannot read as the upstream will, refused or recorded
+    // like any other it cannot be given.
+    if holds_undecodable_escape(blob) {
+        if aisix_guardrails::Guardrail::refuses_unevaluable_input(&chain) {
+            return Err(crate::error::guardrail_block_error(
+                "request",
+                None,
+                Some(crate::error::TAG_UNSCANNABLE_BODY),
+            ));
+        }
+        chain.record_unevaluable_input_bypass(crate::error::TAG_UNSCANNABLE_BODY);
     }
     let chat = aisix_gateway::ChatFormat::new(
         target.display_name(),
@@ -909,13 +1043,17 @@ const ID_FIELDS: &[&str] = &[
     "validation_file",
 ];
 
-fn rewrite_response_ids(v: &mut Value, model: &str, owner: Option<&str>) {
-    let Some(obj) = v.as_object_mut() else { return };
-    // 网关自己的标记不是调用方写的 metadata，不该出现在给它的应答里。
-    if let Some(Value::Object(metadata)) = obj.get_mut("metadata") {
+/// 网关自己的标记不是调用方写的 metadata，不该出现在给它的应答里。
+fn strip_gateway_markers(v: &mut Value) {
+    if let Some(Value::Object(metadata)) = v.get_mut("metadata") {
         metadata.remove(BATCH_SUBMITTER_KEY);
         metadata.remove(BATCH_MODEL_KEY);
     }
+}
+
+fn rewrite_response_ids(v: &mut Value, model: &str, owner: Option<(&str, &str)>) {
+    strip_gateway_markers(v);
+    let Some(obj) = v.as_object_mut() else { return };
     for field in ID_FIELDS {
         if let Some(Value::String(s)) = obj.get_mut(*field) {
             if !s.is_empty() && !s.starts_with(ROUTED_ID_PREFIX) {
@@ -1231,11 +1369,23 @@ fn json_response(
     upstream_headers: &HeaderMap,
     bytes: Bytes,
     rewrite_model: Option<&str>,
-    owner: Option<&str>,
+    owner: Option<(&str, &str)>,
 ) -> Response {
     let body = match (rewrite_model, serde_json::from_slice::<Value>(&bytes).ok()) {
         (Some(model), Some(mut v)) => {
             rewrite_response_ids(&mut v, model, owner);
+            Bytes::from(serde_json::to_vec(&v).unwrap_or_else(|_| bytes.to_vec()))
+        }
+        // A list keeps its ids, but not the gateway's own markers on each
+        // batch: attribution read them off the upstream's bytes already.
+        (None, Some(mut v))
+            if bytes
+                .windows(BATCH_SUBMITTER_KEY.len())
+                .any(|w| w == BATCH_SUBMITTER_KEY.as_bytes()) =>
+        {
+            if let Some(Value::Array(items)) = v.get_mut("data") {
+                items.iter_mut().for_each(strip_gateway_markers);
+            }
             Bytes::from(serde_json::to_vec(&v).unwrap_or_else(|_| bytes.to_vec()))
         }
         _ => bytes,
@@ -1253,14 +1403,15 @@ fn json_response(
 }
 
 /// Routing-model precedence shared by id-addressed calls:
-/// id-embedded → explicit query/header → default. The id's owner beside it.
+/// id-embedded → explicit query/header → default. The decoded gateway id
+/// beside it, for [`require_job_owner`].
 fn routed_model_hint(
     id: &str,
     params: &HashMap<String, String>,
     headers: &HeaderMap,
-) -> (String, Option<String>, Option<String>) {
+) -> (String, Option<String>, Option<RoutedId>) {
     match decode_routed_id(id) {
-        Some(routed) => (routed.raw, Some(routed.model), routed.owner),
+        Some(routed) => (routed.raw.clone(), Some(routed.model.clone()), Some(routed)),
         None => (id.to_string(), explicit_model(params, headers), None),
     }
 }
@@ -1479,7 +1630,7 @@ pub(crate) async fn create_file(
                 &resp_headers,
                 bytes,
                 Some(&model),
-                job_owner(&auth).as_deref(),
+                owner_seal(job_owner(&auth).as_deref(), &target),
             ),
             target,
         ))
@@ -1546,7 +1697,7 @@ pub(crate) async fn get_file(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    let (raw, embedded, owner) = routed_model_hint(&id, &params, &headers);
+    let (raw, embedded, routed) = routed_model_hint(&id, &params, &headers);
     forward_simple(
         state,
         auth,
@@ -1560,7 +1711,7 @@ pub(crate) async fn get_file(
             upstream_path: format!("/files/{raw}"),
             raw_query: None,
             body: None,
-            id: Some((raw, embedded, owner)),
+            id: Some((raw, embedded, routed)),
             rewrite_ids: true,
             relay_raw_body: false,
         },
@@ -1576,7 +1727,7 @@ pub(crate) async fn delete_file(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    let (raw, embedded, owner) = routed_model_hint(&id, &params, &headers);
+    let (raw, embedded, routed) = routed_model_hint(&id, &params, &headers);
     forward_simple(
         state,
         auth,
@@ -1590,7 +1741,7 @@ pub(crate) async fn delete_file(
             upstream_path: format!("/files/{raw}"),
             raw_query: None,
             body: None,
-            id: Some((raw, embedded, owner)),
+            id: Some((raw, embedded, routed)),
             rewrite_ids: true,
             relay_raw_body: false,
         },
@@ -1606,7 +1757,7 @@ pub(crate) async fn file_content(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    let (raw, embedded, owner) = routed_model_hint(&id, &params, &headers);
+    let (raw, embedded, routed) = routed_model_hint(&id, &params, &headers);
     forward_simple(
         state,
         auth,
@@ -1620,7 +1771,7 @@ pub(crate) async fn file_content(
             upstream_path: format!("/files/{raw}/content"),
             raw_query: None,
             body: None,
-            id: Some((raw, embedded, owner)),
+            id: Some((raw, embedded, routed)),
             rewrite_ids: false,
             relay_raw_body: true,
         },
@@ -1700,17 +1851,10 @@ pub(crate) async fn create_batch(
 
         // Routing precedence (a mainstream gateway's scenario order): file-id-embedded
         // model → explicit body `model` / query / header → default.
-        let (raw_file_id, embedded) = match decode_routed_id(&input_file_id) {
-            Some(id) => {
-                require_job_owner(&auth, &id.raw, id.owner.as_deref())?;
-                (id.raw, Some(id.model))
-            }
-            // A provider's own id names no owner, so only a key with none may
-            // use it.
-            None => {
-                require_job_owner(&auth, &input_file_id, None)?;
-                (input_file_id.clone(), None)
-            }
+        let routed = decode_routed_id(&input_file_id);
+        let (raw_file_id, embedded) = match &routed {
+            Some(id) => (id.raw.clone(), Some(id.model.clone())),
+            None => (input_file_id.clone(), None),
         };
         require_safe_upstream_id(&raw_file_id)?;
         let body_model = req_json
@@ -1722,6 +1866,8 @@ pub(crate) async fn create_batch(
             .or_else(|| explicit_model(&params, &headers));
         crate::usage_attr::hold_ahead_of_chain(&state, &snapshot, &auth, wanted.as_deref());
         let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
+        // A job built on a file is a read of that file.
+        require_job_owner(&auth, &snapshot, &target, &raw_file_id, routed.as_ref())?;
 
         // Forward the provider wire shape: raw file id, no gateway-only
         // routing fields.
@@ -1794,7 +1940,7 @@ pub(crate) async fn create_batch(
                 &resp_headers,
                 bytes,
                 Some(&model),
-                job_owner(&auth).as_deref(),
+                owner_seal(job_owner(&auth).as_deref(), &target),
             ),
             target,
         ))
@@ -1832,7 +1978,7 @@ pub(crate) async fn get_batch(
 ) -> Response {
     let started = Instant::now();
     let request_id = client.request_id.clone();
-    let (raw, embedded, owner) = routed_model_hint(&id, &params, &headers);
+    let (raw, embedded, routed) = routed_model_hint(&id, &params, &headers);
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     // 控制体路线只查不改：计数表恒空，仍然交给 `finish`，这样签名只有一份。
     let redactions = crate::redact::RedactionCounts::new();
@@ -1846,9 +1992,9 @@ pub(crate) async fn get_batch(
 
     let result = async {
         require_safe_upstream_id(&raw)?;
-        require_job_owner(&auth, &raw, owner.as_deref())?;
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
         let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
+        require_job_owner(&auth, &snapshot, &target, &raw, routed.as_ref())?;
         let _reservation = crate::quota::enforce(
             &state,
             &snapshot,
@@ -1900,7 +2046,7 @@ pub(crate) async fn get_batch(
                 &resp_headers,
                 bytes,
                 Some(&model),
-                job_owner(&auth).as_deref(),
+                owner_seal(job_owner(&auth).as_deref(), &target),
             ),
             target,
         ))
@@ -1936,7 +2082,7 @@ pub(crate) async fn cancel_batch(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    let (raw, embedded, owner) = routed_model_hint(&id, &params, &headers);
+    let (raw, embedded, routed) = routed_model_hint(&id, &params, &headers);
     forward_simple(
         state,
         auth,
@@ -1950,7 +2096,7 @@ pub(crate) async fn cancel_batch(
             upstream_path: format!("/batches/{raw}/cancel"),
             raw_query: None,
             body: None,
-            id: Some((raw, embedded, owner)),
+            id: Some((raw, embedded, routed)),
             rewrite_ids: true,
             relay_raw_body: false,
         },
@@ -2059,21 +2205,17 @@ pub(crate) async fn create_ft_job(
                 "`training_file` is required".into(),
             ));
         }
-        let (raw_training, embedded) = match decode_routed_id(&training_file) {
-            Some(id) => {
-                require_job_owner(&auth, &id.raw, id.owner.as_deref())?;
-                (id.raw, Some(id.model))
-            }
-            // See `create_batch`.
-            None => {
-                require_job_owner(&auth, &training_file, None)?;
-                (training_file.clone(), None)
-            }
+        let routed = decode_routed_id(&training_file);
+        let (raw_training, embedded) = match &routed {
+            Some(id) => (id.raw.clone(), Some(id.model.clone())),
+            None => (training_file.clone(), None),
         };
         require_safe_upstream_id(&raw_training)?;
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
         crate::usage_attr::hold_ahead_of_chain(&state, &snapshot, &auth, wanted.as_deref());
         let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
+        // See `create_batch`.
+        require_job_owner(&auth, &snapshot, &target, &raw_training, routed.as_ref())?;
 
         if let Some(obj) = req_json.as_object_mut() {
             obj.insert("training_file".into(), Value::String(raw_training));
@@ -2081,10 +2223,10 @@ pub(crate) async fn create_ft_job(
                 match decode_routed_id(vf) {
                     Some(id) => {
                         require_safe_upstream_id(&id.raw)?;
-                        require_job_owner(&auth, &id.raw, id.owner.as_deref())?;
+                        require_job_owner(&auth, &snapshot, &target, &id.raw, Some(&id))?;
                         obj.insert("validation_file".into(), Value::String(id.raw));
                     }
-                    None => require_job_owner(&auth, vf, None)?,
+                    None => require_job_owner(&auth, &snapshot, &target, vf, None)?,
                 }
             }
             obj.remove("provider");
@@ -2142,7 +2284,7 @@ pub(crate) async fn create_ft_job(
                 &resp_headers,
                 bytes,
                 Some(&model),
-                job_owner(&auth).as_deref(),
+                owner_seal(job_owner(&auth).as_deref(), &target),
             ),
             target,
         ))
@@ -2178,7 +2320,7 @@ pub(crate) async fn get_ft_job(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    let (raw, embedded, owner) = routed_model_hint(&id, &params, &headers);
+    let (raw, embedded, routed) = routed_model_hint(&id, &params, &headers);
     forward_simple(
         state,
         auth,
@@ -2192,7 +2334,7 @@ pub(crate) async fn get_ft_job(
             upstream_path: format!("/fine_tuning/jobs/{raw}"),
             raw_query: None,
             body: None,
-            id: Some((raw, embedded, owner)),
+            id: Some((raw, embedded, routed)),
             rewrite_ids: true,
             relay_raw_body: false,
         },
@@ -2208,7 +2350,7 @@ pub(crate) async fn cancel_ft_job(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    let (raw, embedded, owner) = routed_model_hint(&id, &params, &headers);
+    let (raw, embedded, routed) = routed_model_hint(&id, &params, &headers);
     forward_simple(
         state,
         auth,
@@ -2222,7 +2364,7 @@ pub(crate) async fn cancel_ft_job(
             upstream_path: format!("/fine_tuning/jobs/{raw}/cancel"),
             raw_query: None,
             body: None,
-            id: Some((raw, embedded, owner)),
+            id: Some((raw, embedded, routed)),
             rewrite_ids: true,
             relay_raw_body: false,
         },
@@ -2271,7 +2413,7 @@ struct FwdSpec {
     /// `(raw_id, id_embedded_model, id_owner)` for id-addressed calls; the raw
     /// id is charset-validated before touching the upstream URL. `None` is a
     /// list.
-    id: Option<(String, Option<String>, Option<String>)>,
+    id: Option<(String, Option<String>, Option<RoutedId>)>,
     rewrite_ids: bool,
     /// Relay the upstream body verbatim (file content download) instead
     /// of JSON id rewriting.
@@ -2315,16 +2457,20 @@ async fn forward_simple(
 
     let result = async {
         let embedded = match &spec.id {
-            Some((raw, embedded, owner)) => {
+            Some((raw, embedded, _)) => {
                 require_safe_upstream_id(raw)?;
-                require_job_owner(&auth, raw, owner.as_deref())?;
                 embedded.clone()
             }
-            None if job_owner(&auth).is_some() => return Err(ProxyError::JobListRefused),
             None => None,
         };
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
         let target = resolve_target(&snapshot, &auth, wanted.as_deref(), &client)?;
+        match &spec.id {
+            Some((raw, _, routed)) => {
+                require_job_owner(&auth, &snapshot, &target, raw, routed.as_ref())?
+            }
+            None => require_job_list(&auth, &snapshot, &target)?,
+        }
 
         let early_reservation =
             reserve_before_costly_scan(&state, &snapshot, &auth, &target).await?;
@@ -2397,7 +2543,7 @@ async fn forward_simple(
                 &resp_headers,
                 bytes,
                 model.as_deref(),
-                job_owner(&auth).as_deref(),
+                owner_seal(job_owner(&auth).as_deref(), &target),
             )
         };
         Ok((resp, target))
@@ -3151,6 +3297,8 @@ mod tests {
 
     const PK_A: &str = "11111111-1111-1111-1111-11111111111a";
     const PK_B: &str = "11111111-1111-1111-1111-11111111111b";
+    /// The secret [`openai_pk`] gives `PK_A`, which seals ids minted on it.
+    const SECRET_A: &str = "sk-up-11111111-1111-1111-1111-11111111111a";
 
     fn openai_pk(id: &str, api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
@@ -3271,6 +3419,7 @@ mod tests {
             raw: raw.to_string(),
             model: model.to_string(),
             owner: None,
+            tag: None,
         }
     }
 
@@ -3359,15 +3508,27 @@ mod tests {
 
     #[test]
     fn an_owner_round_trips_and_an_unowned_id_reads_as_before() {
-        let owned = encode_routed_id("file-abc", "jobs-a", Some("team:t1"));
+        let owned = encode_routed_id("file-abc", "jobs-a", Some(("team:t1", SECRET_A)));
+        let decoded = decode_routed_id(&owned).expect("an owned id decodes");
         assert_eq!(
-            decode_routed_id(&owned),
-            Some(RoutedId {
-                raw: "file-abc".into(),
-                model: "jobs-a".into(),
-                owner: Some("team:t1".into()),
-            })
+            (
+                decoded.raw.as_str(),
+                decoded.model.as_str(),
+                decoded.owner.as_deref()
+            ),
+            ("file-abc", "jobs-a", Some("team:t1"))
         );
+        let tag = decoded.tag.expect("an owned id is sealed");
+        assert!(owner_tag_matches(SECRET_A, "file-abc", "team:t1", &tag));
+        // The seal names this raw id, this owner and this provider key's secret.
+        assert!(!owner_tag_matches(SECRET_A, "file-abc", "team:t2", &tag));
+        assert!(!owner_tag_matches(SECRET_A, "file-xyz", "team:t1", &tag));
+        assert!(!owner_tag_matches(
+            "another-secret",
+            "file-abc",
+            "team:t1",
+            &tag
+        ));
         // The shape every id minted before owners existed has.
         let legacy = format!(
             "{ROUTED_ID_PREFIX}{}",
@@ -3455,7 +3616,7 @@ mod tests {
             }
         };
 
-        let a_file = encode_routed_id("file-a", "jobs-a", Some("team:t-a"));
+        let a_file = encode_routed_id("file-a", "jobs-a", Some(("team:t-a", SECRET_A)));
         let content = format!("/v1/files/{a_file}/content");
         let (status, body) = call("sk-a", "GET", content.clone()).await;
         assert_eq!((status, body.as_str()), (StatusCode::OK, "team a's data"));
@@ -3483,7 +3644,7 @@ mod tests {
             "GET",
             format!(
                 "/v1/files/{}/content",
-                encode_routed_id("file-a", "jobs-a", Some("user:u-2"))
+                encode_routed_id("file-a", "jobs-a", Some(("user:u-2", SECRET_A)))
             ),
         )
         .await;
@@ -3500,25 +3661,162 @@ mod tests {
             "none of the above reached the upstream"
         );
 
-        // A key with no owner keeps the raw id and the list.
+        // A key with no owner, on a provider key that owned keys reach, has
+        // neither the raw id nor the list: both would hand it their files. It
+        // keeps the unowned ids it was handed.
         let (status, _) = call(
             "sk-shared",
             "GET",
             "/v1/files/file-a/content?model=jobs-a".into(),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _) = call("sk-shared", "GET", "/v1/files?model=jobs-a".into()).await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, body) = call(
+            "sk-shared",
+            "GET",
+            format!(
+                "/v1/files/{}/content",
+                encode_routed_id("file-a", "jobs-a", None)
+            ),
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "team a's data"));
 
         // What an owned batch names is owned too.
-        let a_batch = encode_routed_id("batch-a", "jobs-a", Some("team:t-a"));
+        let a_batch = encode_routed_id("batch-a", "jobs-a", Some(("team:t-a", SECRET_A)));
         let (status, body) = call("sk-a", "GET", format!("/v1/batches/{a_batch}")).await;
         assert_eq!(status, StatusCode::OK);
         let v: Value = serde_json::from_str(&body).unwrap();
         for field in ["id", "input_file_id", "output_file_id"] {
             let decoded = decode_routed_id(v[field].as_str().unwrap()).unwrap();
             assert_eq!(decoded.owner.as_deref(), Some("team:t-a"), "{field}");
+        }
+    }
+
+    /// An owner is sealed into the id: one re-issued under another owner, with
+    /// a seal guessed or left off, reads as an id that does not exist on every
+    /// call that addresses it, and the provider hears nothing.
+    #[tokio::test]
+    async fn an_id_re_issued_under_another_owner_does_not_open() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/files/file-a/content"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("team a's data"))
+            .mount(&upstream)
+            .await;
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        for (token, id, team) in [("sk-a", "k-a", "t-a"), ("sk-b", "k-b", "t-b")] {
+            snap.apikeys
+                .insert(scoped_key(token, id, serde_json::json!({"team_id": team})));
+        }
+        let app = build_app(snap);
+        let call = |method: &'static str, uri: String, body: Option<Value>| {
+            let app = app.clone();
+            async move {
+                let mut req = Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("authorization", "Bearer sk-b");
+                let body = match body {
+                    Some(v) => {
+                        req = req.header("content-type", "application/json");
+                        axum::body::Body::from(v.to_string())
+                    }
+                    None => axum::body::Body::empty(),
+                };
+                app.oneshot(req.body(body).unwrap()).await.unwrap().status()
+            }
+        };
+        let a_file = encode_routed_id("file-a", "jobs-a", Some(("team:t-a", SECRET_A)));
+        let raw = decode_routed_id(&a_file).unwrap().raw;
+        let unsealed = format!(
+            "{ROUTED_ID_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(format!("{raw};owner,team:t-b;model,jobs-a"))
+        );
+        let guessed = encode_routed_id(&raw, "jobs-a", Some(("team:t-b", "a-guessed-secret")));
+        for forged in [unsealed, guessed] {
+            assert_eq!(
+                call("GET", format!("/v1/files/{forged}/content"), None).await,
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                call("DELETE", format!("/v1/files/{forged}"), None).await,
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                call(
+                    "POST",
+                    "/v1/batches".into(),
+                    Some(serde_json::json!({"input_file_id": forged, "endpoint": "/v1/chat/completions"})),
+                )
+                .await,
+                StatusCode::NOT_FOUND
+            );
+        }
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+    }
+
+    /// Where no key with an owner reaches the provider key, a key without one
+    /// lists and uses raw ids as it always did: a single-tenant deployment does
+    /// not change.
+    #[tokio::test]
+    async fn a_single_tenant_deployment_keeps_raw_ids_and_lists() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/files/file-a/content"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("data"))
+            .mount(&upstream)
+            .await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})))
+            .mount(&upstream)
+            .await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/batches"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [{"id": "batch-a", "status": "in_progress",
+                          "metadata": {"aisix_api_key_id": "k-s", "aisix_model": "jobs-a", "note": "x"}}],
+            })))
+            .mount(&upstream)
+            .await;
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(PK_A, &upstream.uri()));
+        snap.provider_keys.insert(openai_pk(PK_B, &upstream.uri()));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        snap.models.insert(model("m-b", "jobs-b", PK_B));
+        snap.apikeys
+            .insert(scoped_key("sk-shared", "k-s", serde_json::json!({})));
+        // An owned key that reaches only the other provider key.
+        snap.apikeys.insert(scoped_key(
+            "sk-t",
+            "k-t",
+            serde_json::json!({"team_id": "t", "allowed_models": ["jobs-b"]}),
+        ));
+        let app = build_app(snap);
+        for uri in [
+            "/v1/files/file-a/content?model=jobs-a",
+            "/v1/files?model=jobs-a",
+            "/v1/batches?model=jobs-a",
+        ] {
+            let req = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("authorization", "Bearer sk-shared")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            // A list carries the caller's metadata, not the gateway's markers.
+            let body = to_bytes(resp.into_body(), 65536).await.unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert!(!body.contains("aisix_api_key_id"), "{uri}: {body}");
+            assert!(!body.contains("aisix_model"), "{uri}: {body}");
         }
     }
 
@@ -3535,8 +3833,8 @@ mod tests {
             serde_json::json!({"team_id": "t-b"}),
         ));
         let app = build_app(snap);
-        let a_file = encode_routed_id("file-a", "jobs-a", Some("team:t-a"));
-        let b_file = encode_routed_id("file-b", "jobs-a", Some("team:t-b"));
+        let a_file = encode_routed_id("file-a", "jobs-a", Some(("team:t-a", SECRET_A)));
+        let b_file = encode_routed_id("file-b", "jobs-a", Some(("team:t-b", SECRET_A)));
         for (uri, body) in [
             (
                 "/v1/batches",
@@ -5281,6 +5579,35 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// A line this gateway cannot parse is no way past a rule either: a lone
+    /// `\ud800` is refused here and taken by Python, Node and Go, which then
+    /// read the escaped word the bytes hide. Refused under a rule that fails
+    /// closed, forwarded with the bypass recorded under one that fails open, and
+    /// a plain-text upload with a backslash in it is not mistaken for one.
+    #[tokio::test]
+    async fn an_upload_line_this_gateway_cannot_parse_is_not_read_as_its_bytes() {
+        const LINE: &str = r#"{"custom_id":"r1","body":{"messages":[{"role":"user","content":"\u0068ow to pick a lock \ud800"}]}}"#;
+        let rule = |fail_open: bool| {
+            format!(
+                r#"{{"name":"kw","enabled":true,"hook_point":"input","fail_open":{fail_open},"kind":"keyword","patterns":[{{"kind":"literal","value":"how to pick a lock"}}]}}"#
+            )
+        };
+        let (status, sent) = upload_with_guardrail(&rule(false), &[("b.jsonl", LINE)]).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(sent.is_empty(), "nothing may reach the provider");
+
+        let (status, sent) = upload_with_guardrail(&rule(true), &[("b.jsonl", LINE)]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!sent.is_empty());
+
+        let (status, _) = upload_with_guardrail(
+            &rule(false),
+            &[("notes.txt", r"see C:\docs\plan for the schedule")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     /// GBK bytes for 你好 inside an otherwise well-formed JSONL line.

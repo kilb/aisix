@@ -705,6 +705,9 @@ pub(crate) fn require_api_key<'a>(
     // Every route that sends its own request reads its credential here, so
     // here is where an upstream's echo of it is armed against.
     aisix_gateway::note_sent_credential(&provider_key.api_key);
+    if let Some(base) = &provider_key.api_base {
+        aisix_gateway::note_url_userinfo(base);
+    }
     Ok(provider_key.api_key.as_str())
 }
 
@@ -731,6 +734,10 @@ pub(crate) fn bridge_ctx(
     provider_key: Arc<ProviderKey>,
     client: Option<&crate::client_ip::ClientContext>,
 ) -> aisix_gateway::BridgeContext {
+    // A bridge sends the base URL's userinfo as a Basic credential.
+    if let Some(base) = &provider_key.api_base {
+        aisix_gateway::note_url_userinfo(base);
+    }
     let ctx = aisix_gateway::BridgeContext::new(request_id, model, provider_key)
         .with_resource_ids(model_id, provider_key_id);
     match client {

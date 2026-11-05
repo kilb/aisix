@@ -37,7 +37,7 @@ use aisix_core::AisixSnapshot;
 use aisix_mcp::user_oauth::{
     normalized_issuer, pkce_pair, random_token, FlowStage, FlowState, LoginCode, LoginExchange,
     RedeemError, RedeemRequest, SessionIdentity, SessionKeys, UpstreamLeg, ACCESS_TOKEN_PREFIX,
-    ACCESS_TOKEN_TTL_SECS, FLOW_TTL_SECS,
+    FLOW_TTL_SECS,
 };
 use aisix_mcp::{UserOAuthFailure, UserOAuthServer, UserSubject};
 use axum::body::to_bytes;
@@ -1304,7 +1304,7 @@ fn session_response(
     let mut response = Json(json!({
         "access_token": pair.access_token,
         "token_type": "Bearer",
-        "expires_in": ACCESS_TOKEN_TTL_SECS,
+        "expires_in": pair.expires_in,
         "refresh_token": pair.refresh_token,
         "scope": oauth.scopes().join(" "),
     }))

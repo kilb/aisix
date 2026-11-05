@@ -974,8 +974,11 @@ impl ServerHandler for McpGateway {
             ));
         }
 
+        // An absent server answers as the ACL does: an anonymous caller's
+        // ceiling admits a listed name whose server is off or gone, and a
+        // different wording here would tell it which names are listed.
         let bridge = self.find(server).ok_or_else(|| {
-            ErrorData::invalid_params(format!("unknown MCP server '{server}'"), None)
+            ErrorData::invalid_params(format!("tool '{request_name}' is not available"), None)
         })?;
 
         let arguments = request

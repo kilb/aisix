@@ -80,6 +80,12 @@ describe("input rule: request shapes", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
+    await seed.createModel({
+      display_name: "shapes-embed",
+      provider: "openai",
+      model_name: "text-embedding-3-small",
+      provider_key_id: pk.id,
+    });
     const realtimePk = await seed.createProviderKey({
       display_name: "shapes-realtime-pk",
       secret: "sk-mock",
@@ -139,17 +145,52 @@ describe("input rule: request shapes", () => {
     expect(upstream!.receivedRequests.length, label).toBe(before);
   };
 
-  test("token ids on /v1/embeddings", async (ctx) => {
+  // Token ids in the public encodings: "hello there" and the forbidden word in
+  // cl100k_base (text-embedding-3-small, gpt-3.5-turbo-instruct), and the word
+  // in o200k_base (gpt-4o-mini).
+  const HELLO_CL100K = [15339, 1070];
+  const WORD_CL100K = [2000, 22886, 28810];
+  const WORD_O200K = [1938, 41148, 55463];
+
+  test("token ids are read as the text they stand for", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
-    for (const input of [[1, 2, 3], [[1, 2], [3]]]) {
-      await refused(
-        () => post("/v1/embeddings", { model: "shapes-model", input }),
-        JSON.stringify(input),
-      );
-    }
-    const clean = await post("/v1/embeddings", { model: "shapes-model", input: "hello" });
+    // What LangChain's OpenAIEmbeddings sends by default: each document as
+    // tiktoken ids, a batch of them per call, through the OpenAI SDK, which
+    // asks for base64 vectors.
+    const clean = await post("/v1/embeddings", {
+      model: "shapes-embed",
+      input: [HELLO_CL100K],
+      encoding_format: "base64",
+    });
     expect(clean.status).toBe(200);
     await clean.text();
+    await refused(
+      () =>
+        post("/v1/embeddings", {
+          model: "shapes-embed",
+          input: [HELLO_CL100K, WORD_CL100K],
+          encoding_format: "base64",
+        }),
+      "embeddings",
+    );
+    await refused(
+      () => post("/v1/completions", { model: "shapes-model", prompt: WORD_O200K }),
+      "completions",
+    );
+    await refused(
+      () =>
+        fetch(`${app!.proxyUrl}/shapes/v1/completions`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+          body: JSON.stringify({ model: "gpt-3.5-turbo-instruct", prompt: WORD_CL100K }),
+        }),
+      "passthrough",
+    );
+    // An id no encoding of the model holds says nothing about what it reads.
+    await refused(
+      () => post("/v1/embeddings", { model: "shapes-embed", input: [999999999] }),
+      "out of range",
+    );
   });
 
   test("a chat content part that is not plain text", async (ctx) => {
@@ -157,6 +198,10 @@ describe("input rule: request shapes", () => {
     const shapes: unknown[] = [
       [
         { role: "assistant", content: [{ type: "refusal", refusal: WORD }] },
+        { role: "user", content: "hi" },
+      ],
+      [
+        { role: "assistant", content: [{ type: "refusal", refusal: `data: ${WORD}` }] },
         { role: "user", content: "hi" },
       ],
       [{ role: "user", content: [{ type: "input_text", text: WORD }] }],
@@ -199,6 +244,10 @@ describe("input rule: request shapes", () => {
       ),
       "form",
     );
+    await refused(
+      send({ "content-type": "application/json" }, Buffer.from(`\ufeff${plain}`, "utf16le")),
+      "utf-16",
+    );
     const clean = await send(
       { "content-type": "application/x-www-form-urlencoded" },
       "prompt=hello%20there",
@@ -233,6 +282,8 @@ describe("input rule: request shapes", () => {
     const escaped = `\\u${WORD.charCodeAt(0).toString(16).padStart(4, "0")}${WORD.slice(1)}`;
     expect(await refusal(item(WORD), false)).toContain("content_filtered");
     expect(await refusal(item(escaped), false)).toContain("content_filtered");
+    // An escape this gateway's parser refuses and a lenient peer takes.
+    expect(await refusal(item(`${escaped} \\ud800`), false)).toContain("content_filtered");
     expect(await refusal(Buffer.from(item(WORD)), true)).toContain("content_filtered");
     expect(realtimeFrames.filter((frame) => frame.includes(WORD.slice(1)))).toEqual([]);
 

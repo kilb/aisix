@@ -259,13 +259,14 @@ pub enum ProxyError {
     /// caller supplied it, so it leaks nothing.
     #[error("resource {0:?} not found")]
     JobResourceNotFound(String),
-    /// A team- or user-scoped key asked for a list of files, batches or
-    /// fine-tuning jobs. The upstream's list spans its whole account, and the
-    /// gateway cannot say which of it the caller owns.
+    /// A list of files, batches or fine-tuning jobs asked for on a provider key
+    /// that keys belonging to a team or user reach. The upstream's list spans
+    /// its whole account, and the gateway cannot say which of it the caller
+    /// owns.
     #[error(
-        "listing is not available to a key that belongs to a team or user: the provider's \
-         list cannot be attributed to an owner. Use the ids returned when the resources \
-         were created"
+        "listing is not available where keys that belong to a team or user share the \
+         provider: the provider's list cannot be attributed to an owner. Use the ids \
+         returned when the resources were created"
     )]
     JobListRefused,
     #[error("API key is not allowed to use model {0:?}")]

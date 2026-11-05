@@ -4677,6 +4677,16 @@ where
             &requested_model,
             crate::model_echo::responses_snapshot_model,
         );
+        // A failure the upstream reported is released as it sent it, less the
+        // credentials this request sent, as the live relay releases it.
+        let buf = if matches!(
+            terminal_failure,
+            Some(crate::stream_timeout::RawStreamFailure::UpstreamInBand { .. })
+        ) {
+            aisix_gateway::scrub_upstream_error_bytes(&buf).into_owned()
+        } else {
+            buf
+        };
         // Content capture (#947): the assembled output text,
         // read from the POST-redaction buffer so masked PII stays masked
         // in the exported content.

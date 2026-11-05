@@ -21,7 +21,6 @@ const CALLER = "sk-error-source-caller";
 const NARROW = "sk-error-source-narrow";
 const BROKE = "sk-error-source-broke";
 const ROUTE_LIMITED = "sk-error-source-route-limited";
-const UNOWNED = "sk-error-source-unowned";
 const USER = "error-source-user";
 const BROKE_KEY_ID = randomUUID();
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -224,11 +223,33 @@ describe("error_source on the request counters", () => {
       enabled: true,
     });
     const refusing = await fixedUpstream(400);
-    for (const name of ["es-jobs-400", "es-realtime-400"]) {
+    // Takes an upload, so a job can be built on a file the caller holds, and
+    // refuses everything else.
+    const jobs = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        const upload = req.method === "POST" && req.url === "/v1/files";
+        res.writeHead(upload ? 200 : 400, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify(
+            upload
+              ? { id: "file-es", object: "file", purpose: "batch", filename: "in.jsonl" }
+              : { error: { message: "sentinel-upstream-failure" } },
+          ),
+        );
+      });
+    });
+    httpServers.push(jobs);
+    await new Promise<void>((r) => jobs.listen(0, "127.0.0.1", r));
+    const jobsBase = `http://127.0.0.1:${(jobs.address() as { port: number }).port}`;
+    for (const [name, base] of [
+      ["es-jobs-400", jobsBase],
+      ["es-realtime-400", refusing],
+    ]) {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
         secret: "sk-mock",
-        api_base: `${refusing}/v1`,
+        api_base: `${base}/v1`,
       });
       await seed.createModel({
         display_name: name,
@@ -263,7 +284,6 @@ describe("error_source on the request counters", () => {
       allowed_routes: ["es-route-500"],
       rate_limit: { rpm: 1 },
     });
-    await seed.createApiKey({ key_hash: hash(UNOWNED), allowed_models: ["es-jobs-400"] });
     // Written last: its authenticating implies every row above has landed.
     await seed.createApiKey({
       key_hash: hash(CALLER),
@@ -502,8 +522,19 @@ describe("error_source on the request counters", () => {
     expect(await send("/a2a/es-no-such-agent", call)).toBe(404);
     await expectSource({ endpoint: "/a2a", status: "404" }, "aisix", proxyOnly);
 
-    // A key with no owner: a provider's own id is not one a scoped key may use.
-    expect(await send("/v1/batches?model=es-jobs-400", { input_file_id: "f" }, UNOWNED)).toBe(400);
+    // A job built on a file the caller uploaded: an id the caller holds.
+    const form = new FormData();
+    form.append("model", "es-jobs-400");
+    form.append("purpose", "batch");
+    form.append("file", new Blob(['{"custom_id":"1"}\n'], { type: "application/jsonl" }), "in.jsonl");
+    const uploaded = await fetch(`${app!.proxyUrl}/v1/files`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLER}` },
+      body: form,
+    });
+    expect(uploaded.status).toBe(200);
+    const file = ((await uploaded.json()) as { id: string }).id;
+    expect(await send("/v1/batches?model=es-jobs-400", { input_file_id: file })).toBe(400);
     await expectSource({ endpoint: "/v1/batches", status: "400" }, "upstream", proxyOnly);
 
     await new Promise<void>((resolve, reject) => {

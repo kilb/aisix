@@ -216,14 +216,24 @@ fn part_has_named_slots(part: &Value) -> bool {
     }
 }
 
+/// A `data:` URL carrying media bytes, `data:<type>;base64,<bytes>` (RFC 2397),
+/// which no model reads as text. Anything else that merely starts with `data:`
+/// is text a caller wrote, and a `text/*` payload is text however it is coded.
+fn is_media_data_url(text: &str) -> bool {
+    text.strip_prefix("data:")
+        .and_then(|rest| rest.split_once(','))
+        .is_some_and(|(meta, _)| meta.ends_with(";base64") && !meta.starts_with("text/"))
+}
+
 /// Every string of a content part no named slot covers, and a bridge that
 /// forwards blocks verbatim still forwards: a `refusal` part, a part type this
 /// gateway does not model, a `text` part whose `text` is not a string. The part's
-/// `type` names the part rather than saying anything, and a `data:` URL is media.
+/// `type` names the part rather than saying anything, and a base64 `data:` URL is
+/// media ([`is_media_data_url`]).
 pub fn unnamed_part_strings_mut(part: &mut Value) -> Vec<&mut Value> {
     fn walk<'a>(value: &'a mut Value, out: &mut Vec<&'a mut Value>) {
         match value {
-            Value::String(text) if !text.starts_with("data:") => out.push(value),
+            Value::String(text) if !is_media_data_url(text) => out.push(value),
             Value::Array(items) => items.iter_mut().for_each(|item| walk(item, out)),
             Value::Object(map) => map.values_mut().for_each(|item| walk(item, out)),
             _ => {}
@@ -248,7 +258,7 @@ pub fn unnamed_part_strings_mut(part: &mut Value) -> Vec<&mut Value> {
 pub fn unnamed_part_strings(part: &Value) -> Vec<&str> {
     fn walk<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
         match value {
-            Value::String(text) if !text.starts_with("data:") => out.push(text),
+            Value::String(text) if !is_media_data_url(text) => out.push(text),
             Value::Array(items) => items.iter().for_each(|item| walk(item, out)),
             Value::Object(map) => map.values().for_each(|item| walk(item, out)),
             _ => {}

@@ -540,3 +540,65 @@ async fn the_mcp_session_slots_are_never_forwarded() {
     .await;
     assert_eq!(seen["mcp_session_id"], "");
 }
+
+/// A base URL's userinfo goes out as `Authorization: Basic`, and a REST API
+/// that quotes the headers it saw must not hand that credential to the agent,
+/// encoded or not.
+#[tokio::test]
+async fn a_rest_api_quoting_the_basic_credential_of_its_url_does_not_reach_the_agent() {
+    use base64::Engine as _;
+    let api = serve(axum::Router::new().route(
+        "/v1/fail",
+        get(|headers: HeaderMap| async move {
+            let saw = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            (
+                StatusCode::UNAUTHORIZED,
+                format!("rejected credentials: {saw} (password S3cretPassw0rd99)"),
+            )
+        }),
+    ))
+    .await;
+    let snapshot = AisixSnapshot::new();
+    let server: McpServer = serde_json::from_value(json!({
+        "name": "erp",
+        "type": "openapi",
+        "url": format!("http://svc-user:S3cretPassw0rd99@{api}/v1"),
+        "spec": {
+            "openapi": "3.0.0",
+            "info": { "title": "ERP", "version": "1.0.0" },
+            "paths": { "/fail": { "get": { "operationId": "failOp" } } }
+        },
+        "auth_type": "none",
+    }))
+    .unwrap();
+    snapshot
+        .mcp_servers
+        .insert(ResourceEntry::new("e1", server, 1));
+    let gw = spawn_gateway(McpGateway::from_snapshot(&snapshot)).await;
+    let client = ()
+        .serve(StreamableHttpClientTransport::from_uri(format!(
+            "http://{gw}/mcp"
+        )))
+        .await
+        .unwrap();
+    let result = client
+        .call_tool(call("erp__failop", Value::Null))
+        .await
+        .expect("call failOp");
+    let text = first_text(&result);
+    let basic = base64::engine::general_purpose::STANDARD.encode("svc-user:S3cretPassw0rd99");
+    assert!(text.contains("rejected credentials"), "got: {text}");
+    assert!(
+        !text.contains(&basic),
+        "the Basic credential reached the agent: {text}"
+    );
+    assert!(
+        !text.contains("S3cretPassw0rd99"),
+        "the password reached the agent: {text}"
+    );
+    client.cancel().await.ok();
+}
