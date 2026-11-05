@@ -547,18 +547,20 @@ impl VertexSecret {
     /// Resolve the bearer token to use on this request. Returns the
     /// pre-minted token verbatim if set; otherwise mints (or pulls
     /// from cache) via the bridge's [`TokenMinter`], under the request's
-    /// deadline: waiting on a stalled token endpoint must not outlast it, and
-    /// the timeout is what lets the request fail over.
+    /// deadline counted from `started`, the attempt's start: waiting on a
+    /// stalled token endpoint must not outlast it, the upstream call gets only
+    /// what the mint left, and the timeout is what lets the request fail over.
     async fn resolve_access_token(
         &self,
         minter: &TokenMinter,
         deadline: Option<Duration>,
+        started: Instant,
     ) -> Result<String, BridgeError> {
         if let Some(token) = &self.access_token {
             return Ok(token.clone());
         }
         if let Some(sa) = &self.service_account_json {
-            return with_deadline(deadline, Instant::now(), minter.get_token(sa)).await;
+            return with_deadline(deadline, started, minter.get_token(sa)).await;
         }
         // parse() rejects neither-set, so this is unreachable in
         // practice — keep the explicit error for defense in depth.
@@ -611,7 +613,9 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
         .ok_or_else(|| BridgeError::InvalidUpstreamConfig("model.model_name missing".into()))
 }
 
-/// Wrap a future in the optional deadline. `None` → no timeout.
+/// Wrap a future in the optional deadline, counted from `started`: a wait
+/// that follows another on the same attempt gets only what is left of it.
+/// `None` → no timeout.
 async fn with_deadline<T, F>(
     deadline: Option<Duration>,
     started: Instant,
@@ -622,7 +626,7 @@ where
 {
     match deadline {
         None => fut.await,
-        Some(d) => match tokio::time::timeout(d, fut).await {
+        Some(d) => match tokio::time::timeout(d.saturating_sub(started.elapsed()), fut).await {
             Ok(r) => r,
             Err(_) => Err(BridgeError::Timeout {
                 elapsed_ms: started.elapsed().as_millis() as u64,
@@ -929,12 +933,12 @@ impl Bridge for VertexBridge {
             outbound_bytes(&body)?
         };
 
+        let started = Instant::now();
         let access_token = creds
-            .resolve_access_token(&self.token_minter, ctx.deadline)
+            .resolve_access_token(&self.token_minter, ctx.deadline, started)
             .await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         let client = self.client_for(ctx);
-        let started = Instant::now();
         let model_echo = req.model.clone();
 
         with_deadline(ctx.deadline, started, async move {
@@ -1084,13 +1088,13 @@ impl VertexBridge {
         // Resolve bearer: pre-minted token verbatim, or mint+cache
         // via the in-process token minter from SA JSON. Failure
         // surfaces as a Config error (operator-actionable).
+        let started = Instant::now();
         let access_token = creds
-            .resolve_access_token(&self.token_minter, ctx.deadline)
+            .resolve_access_token(&self.token_minter, ctx.deadline, started)
             .await?;
         let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         with_shared_request_type(&mut headers, shared_request_type);
         let client = self.client_for(ctx);
-        let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
             let resp = url
@@ -1227,13 +1231,13 @@ impl VertexBridge {
         // The owned request is not needed past its wire bytes.
         drop(req);
 
+        let started = Instant::now();
         let access_token = creds
-            .resolve_access_token(&self.token_minter, ctx.deadline)
+            .resolve_access_token(&self.token_minter, ctx.deadline, started)
             .await?;
         let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         retain_vertex_betas(&mut headers)?;
         let client = self.client_for(ctx);
-        let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
             let resp = url
@@ -1357,13 +1361,13 @@ impl VertexBridge {
 
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
+        let started = Instant::now();
         let access_token = creds
-            .resolve_access_token(&self.token_minter, ctx.deadline)
+            .resolve_access_token(&self.token_minter, ctx.deadline, started)
             .await?;
         let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         retain_vertex_betas(&mut headers)?;
         let client = self.client_for(ctx);
-        let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
             url.post_on(&client)
@@ -1514,12 +1518,12 @@ impl VertexBridge {
         // The owned request is not needed past its wire bytes.
         drop(req);
 
+        let started = Instant::now();
         let access_token = creds
-            .resolve_access_token(&self.token_minter, ctx.deadline)
+            .resolve_access_token(&self.token_minter, ctx.deadline, started)
             .await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         let client = self.client_for(ctx);
-        let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
             let resp = url
@@ -1585,12 +1589,12 @@ impl VertexBridge {
 
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
+        let started = Instant::now();
         let access_token = creds
-            .resolve_access_token(&self.token_minter, ctx.deadline)
+            .resolve_access_token(&self.token_minter, ctx.deadline, started)
             .await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         let client = self.client_for(ctx);
-        let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
             url.post_on(&client)
@@ -1770,12 +1774,12 @@ impl VertexBridge {
         // The owned request is not needed past its wire bytes.
         drop(req);
 
+        let started = Instant::now();
         let access_token = creds
-            .resolve_access_token(&self.token_minter, ctx.deadline)
+            .resolve_access_token(&self.token_minter, ctx.deadline, started)
             .await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         let client = self.client_for(ctx);
-        let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
             let resp = url
@@ -1857,12 +1861,12 @@ impl VertexBridge {
 
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
+        let started = Instant::now();
         let access_token = creds
-            .resolve_access_token(&self.token_minter, ctx.deadline)
+            .resolve_access_token(&self.token_minter, ctx.deadline, started)
             .await?;
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         let client = self.client_for(ctx);
-        let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
             url.post_on(&client)
@@ -2018,13 +2022,13 @@ impl VertexBridge {
         // Resolve bearer (pre-minted OR minted-from-SA) BEFORE
         // entering the stream future so token-mint errors surface
         // as a direct Err return rather than being yielded mid-stream.
+        let started = Instant::now();
         let access_token = creds
-            .resolve_access_token(&self.token_minter, ctx.deadline)
+            .resolve_access_token(&self.token_minter, ctx.deadline, started)
             .await?;
         let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         with_shared_request_type(&mut headers, shared_request_type);
         let client = self.client_for(ctx);
-        let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
             url.post_on(&client)
@@ -7660,6 +7664,55 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         );
         // wiremock's .expect(1) on the OAuth mock fires here at drop —
         // proves the cache prevented a second mint on the second chat.
+    }
+
+    /// A mint that answers in time still spends the attempt's deadline: the
+    /// upstream call gets what is left of it, so the two together cannot take
+    /// twice the target's timeout.
+    #[tokio::test]
+    async fn a_mint_and_its_upstream_call_share_one_deadline() {
+        let delay = std::time::Duration::from_millis;
+        // 两段各自都在期限内，加起来超了：第二段只能用第一段剩下的时间。
+        for (mint, upstream, times_out) in [(350, 350, true), (50, 50, false)] {
+            let oauth_server = MockServer::builder().start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(delay(mint))
+                        .set_body_json(
+                            serde_json::json!({"access_token": "t", "expires_in": 3600}),
+                        ),
+                )
+                .mount(&oauth_server)
+                .await;
+            let vertex_server = MockServer::builder().start().await;
+            Mock::given(method("POST"))
+                .respond_with(default_gemini_response_template().set_delay(delay(upstream)))
+                .mount(&vertex_server)
+                .await;
+            let pk = sample_pk_with_secret(&sa_credential_secret(&oauth_server.uri()));
+            let ctx = BridgeContext::new("req-1", sample_model_with("gemini-1.5-pro"), pk)
+                .with_deadline(delay(500));
+            let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+            // A fresh bridge per call, so each one mints rather than reading the cache.
+            let bridge = || {
+                VertexBridge::new()
+                    .with_api_base_override(vertex_server.uri())
+                    .with_token_endpoint_override(oauth_server.uri())
+            };
+            let buffered = bridge().chat(&req, &ctx).await;
+            assert_eq!(
+                matches!(buffered, Err(BridgeError::Timeout { .. })),
+                times_out,
+                "{mint}+{upstream}: {buffered:?}"
+            );
+            let streamed = bridge().chat_stream(&req, &ctx).await;
+            assert_eq!(
+                matches!(streamed, Err(BridgeError::Timeout { .. })),
+                times_out,
+                "{mint}+{upstream} streamed"
+            );
+        }
     }
 
     /// The request's deadline covers the token mint: a stalled token endpoint

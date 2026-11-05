@@ -84,8 +84,9 @@ impl VertexBridge {
             .map_err(BridgeError::InvalidRequest)?;
         drop(fetched);
 
+        let started = Instant::now();
         let access_token = creds
-            .resolve_access_token(&self.token_minter, ctx.deadline)
+            .resolve_access_token(&self.token_minter, ctx.deadline, started)
             .await?;
         let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         // Every `anthropic-beta` value reaching Vertex AI — the caller's
@@ -105,7 +106,6 @@ impl VertexBridge {
         drop(body);
 
         let client = self.client_for(ctx);
-        let started = Instant::now();
         let resp = with_deadline(ctx.deadline, started, async {
             url.post_on(&client)
                 .headers(headers)
@@ -153,15 +153,15 @@ impl VertexBridge {
         let body = platform::vertex_count_tokens_body(&body, model);
         let url =
             self.anthropic_url(ctx, &creds, "count-tokens", "vertex/anthropic-count-tokens")?;
+        let started = Instant::now();
         let access_token = creds
-            .resolve_access_token(&self.token_minter, ctx.deadline)
+            .resolve_access_token(&self.token_minter, ctx.deadline, started)
             .await?;
         let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         // Token counting takes no beta, and an unknown one is a 400.
         headers.remove("anthropic-beta");
         let bytes = outbound_bytes(&body)?;
         let client = self.client_for(ctx);
-        let started = Instant::now();
         with_deadline(ctx.deadline, started, async {
             let resp = url
                 .post_on(&client)

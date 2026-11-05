@@ -210,3 +210,156 @@ describe("a token endpoint that never answers", () => {
     );
   }
 });
+
+// A token endpoint that answers, but slowly, spends the same budget: the
+// upstream call gets what the mint left of the target's timeout, so a slow mint
+// followed by a slow upstream fails in time instead of taking both in full.
+const MINT_DELAY_MS = 1_000;
+const UPSTREAM_DELAY_MS = 1_000;
+
+describe("a token endpoint that answers slowly", () => {
+  let app: SpawnedApp | undefined;
+  let upstream: Server | undefined;
+  let mint: Server | undefined;
+  let etcdReachable = false;
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+
+    mint = createServer((req, res) => {
+      req.resume();
+      req.on("end", () =>
+        setTimeout(() => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ access_token: "slow-token", token_type: "Bearer", expires_in: 3600 }));
+        }, MINT_DELAY_MS),
+      );
+    });
+    upstream = createServer((req, res) => {
+      const parts: Buffer[] = [];
+      req.on("data", (c: Buffer) => parts.push(c));
+      req.on("end", () =>
+        setTimeout(() => {
+          const path = req.url ?? "";
+          const gemini = { candidates: [{ content: { role: "model", parts: [{ text: "served" }] }, finishReason: "STOP" }] };
+          if (path.includes(":streamGenerateContent")) {
+            res.writeHead(200, { "content-type": "text/event-stream" });
+            res.end(`data: ${JSON.stringify(gemini)}\n\n`);
+          } else if (path.includes(":generateContent")) {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify(gemini));
+          } else {
+            chatAnswer(res, JSON.parse(Buffer.concat(parts).toString("utf8") || "{}"));
+          }
+        }, UPSTREAM_DELAY_MS),
+      );
+    });
+    await Promise.all([
+      new Promise<void>((resolve) => mint!.listen(0, "127.0.0.1", resolve)),
+      new Promise<void>((resolve) => upstream!.listen(0, "127.0.0.1", resolve)),
+    ]);
+    const portOf = (server: Server) => {
+      const addr = server.address();
+      if (addr === null || typeof addr === "string") throw new Error("no port");
+      return addr.port;
+    };
+    const mintBase = `http://127.0.0.1:${portOf(mint)}`;
+    const upstreamBase = `http://127.0.0.1:${portOf(upstream)}`;
+    const { privateKey } = generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+
+    app = await spawnApp();
+    const seed = new SeedClient(etcd, app.etcdPrefix);
+    const limits = { timeout: TARGET_TIMEOUT_MS, stream_timeout: TARGET_TIMEOUT_MS, retries: 0 };
+    // One credential per case: a minted token is cached, and each case must mint.
+    for (const mode of ["whole", "stream"]) {
+      const vertexKey = await seed.createProviderKey({
+        display_name: `slow-mint-vertex-${mode}-pk`,
+        provider: "google",
+        adapter: "vertex",
+        secret: JSON.stringify({
+          project: "p",
+          region: "us-central1",
+          service_account_json: {
+            type: "service_account",
+            client_email: `sa-${mode}@p.iam.gserviceaccount.com`,
+            private_key: privateKey,
+            token_uri: `${mintBase}/token`,
+          },
+        }),
+        api_base: upstreamBase,
+      });
+      await seed.createModel({
+        display_name: `slow-mint-vertex-${mode}`,
+        provider: "google",
+        model_name: "gemini-2.5-flash",
+        provider_key_id: vertexKey.id,
+        ...limits,
+      });
+      const azureKey = await seed.createProviderKey({
+        display_name: `slow-mint-azure-${mode}-pk`,
+        provider: "azure-openai",
+        adapter: "azure-openai",
+        secret: JSON.stringify({
+          tenant_id: "tenant",
+          client_id: `client-${mode}`,
+          client_secret: "secret",
+          authority_host: mintBase,
+        }),
+        api_base: upstreamBase,
+      });
+      await seed.createModel({
+        display_name: `slow-mint-azure-${mode}`,
+        provider: "azure-openai",
+        model_name: "gpt4o-prod",
+        provider_key_id: azureKey.id,
+        ...limits,
+      });
+    }
+    await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: ["*"] });
+    const probe = new ProxyClient(app.proxyUrl, CALLER);
+    await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    mint?.closeAllConnections();
+    upstream?.closeAllConnections();
+    await Promise.all(
+      [mint, upstream].map((s) => new Promise<void>((resolve) => (s ? s.close(() => resolve()) : resolve()))),
+    );
+  });
+
+  for (const rail of ["vertex", "azure"]) {
+    for (const stream of [false, true]) {
+      test(
+        `${rail}${stream ? " stream" : ""}: a slow mint and a slow upstream fail within the target's timeout`,
+        async (ctx) => {
+          if (!etcdReachable || !app) return ctx.skip();
+          const started = Date.now();
+          const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+            method: "POST",
+            headers: { authorization: `Bearer ${CALLER}`, "content-type": "application/json" },
+            body: JSON.stringify({
+              model: `slow-mint-${rail}-${stream ? "stream" : "whole"}`,
+              messages: [{ role: "user", content: "hi" }],
+              ...(stream ? { stream } : {}),
+            }),
+            signal: AbortSignal.timeout(CALLER_PATIENCE_MS),
+          });
+          const raw = await res.text();
+          const elapsed = Date.now() - started;
+          expect(res.status, raw).toBeGreaterThanOrEqual(500);
+          // Each wait alone is inside the timeout; both in full would take this long.
+          expect(elapsed).toBeLessThan(MINT_DELAY_MS + UPSTREAM_DELAY_MS);
+        },
+        CALLER_PATIENCE_MS + 5_000,
+      );
+    }
+  }
+});

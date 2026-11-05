@@ -188,22 +188,24 @@ impl AzureOpenAiBridge {
     /// token). Token-mint failures (e.g. AAD 401 invalid_client)
     /// surface as `Err` here so `chat()` / `chat_stream()` short-
     /// circuit BEFORE attempting the upstream Azure OpenAI call. The
-    /// mint runs under the request's deadline: waiting on a stalled token
-    /// endpoint must not outlast it, and the timeout is what lets the request
-    /// fail over.
-    async fn resolve_auth(&self, ctx: &BridgeContext) -> Result<AzureAuth, BridgeError> {
+    /// mint runs under the request's deadline counted from `started`, the
+    /// attempt's start: waiting on a stalled token endpoint must not outlast
+    /// it, the upstream call gets only what the mint left, and the timeout is
+    /// what lets the request fail over.
+    async fn resolve_auth(
+        &self,
+        ctx: &BridgeContext,
+        started: Instant,
+    ) -> Result<AzureAuth, BridgeError> {
         match AzureSecret::parse(&ctx.provider_key.api_key)? {
             AzureSecret::ApiKey(key) => Ok(AzureAuth {
                 api_key: Some(key),
                 bearer_token: None,
             }),
             AzureSecret::Aad(creds) => {
-                let token = with_deadline(
-                    ctx.deadline,
-                    Instant::now(),
-                    self.token_minter.get_token(&creds),
-                )
-                .await?;
+                let token =
+                    with_deadline(ctx.deadline, started, self.token_minter.get_token(&creds))
+                        .await?;
                 Ok(AzureAuth {
                     api_key: None,
                     bearer_token: Some(token),
@@ -627,7 +629,9 @@ fn parse_azure_error_envelope(body: &[u8]) -> Option<aisix_gateway::UpstreamErro
     Some(view)
 }
 
-/// Wrap a future in the optional deadline. `None` → no timeout.
+/// Wrap a future in the optional deadline, counted from `started`: a wait
+/// that follows another on the same attempt gets only what is left of it.
+/// `None` → no timeout.
 async fn with_deadline<T, F>(
     deadline: Option<Duration>,
     started: Instant,
@@ -638,7 +642,7 @@ where
 {
     match deadline {
         None => fut.await,
-        Some(d) => match tokio::time::timeout(d, fut).await {
+        Some(d) => match tokio::time::timeout(d.saturating_sub(started.elapsed()), fut).await {
             Ok(r) => r,
             Err(_) => Err(BridgeError::Timeout {
                 elapsed_ms: started.elapsed().as_millis() as u64,
@@ -803,7 +807,8 @@ impl Bridge for AzureOpenAiBridge {
         // Resolve auth BEFORE entering the request future so AAD
         // mint failures surface as a direct Err return rather than
         // a transport timeout. api-key path is a no-op string copy.
-        let auth = self.resolve_auth(ctx).await?;
+        let started = Instant::now();
+        let auth = self.resolve_auth(ctx, started).await?;
         // Azure expects the deployment name in the URL path; the JSON
         // body's `model` field is ignored by Azure (or echoed back).
         // We still set it to the deployment name for log-trace clarity
@@ -825,7 +830,6 @@ impl Bridge for AzureOpenAiBridge {
         let headers = build_request_headers(&auth, &ctx.request_id, false, &ctx.header_ctx())?;
         let url = self.resolve_url(ctx, &upstream);
         let client = self.client_for(ctx);
-        let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
             let resp = url
@@ -876,7 +880,8 @@ impl Bridge for AzureOpenAiBridge {
         let _ = wire::reserved_auth_headers();
 
         // See chat() — resolve auth before the request future.
-        let auth = self.resolve_auth(ctx).await?;
+        let started = Instant::now();
+        let auth = self.resolve_auth(ctx, started).await?;
         let body = {
             let messages = messages_from(&req, AZURE_DEVELOPER_ROLE_MODE);
             let typed = build_request(&req, deployment, &messages, true);
@@ -894,7 +899,6 @@ impl Bridge for AzureOpenAiBridge {
         let headers = build_request_headers(&auth, &ctx.request_id, true, &ctx.header_ctx())?;
         let url = self.resolve_url(ctx, &upstream);
         let client = self.client_for(ctx);
-        let started = Instant::now();
 
         let resp = with_deadline(ctx.deadline, started, async move {
             url.post_on(&client)
@@ -970,7 +974,8 @@ impl Bridge for AzureOpenAiBridge {
         let upstream = AzureUpstreamRef::resolve(deployment, ctx.provider_key.api_base.as_deref())?;
         // Resolve auth BEFORE the request future so an AAD mint failure
         // surfaces as itself rather than as a transport timeout.
-        let auth = self.resolve_auth(ctx).await?;
+        let started = Instant::now();
+        let auth = self.resolve_auth(ctx, started).await?;
         // The deployment is the model as far as Azure is concerned; the
         // body's `model` is ignored, and is set to the deployment name for
         // log-trace clarity, matching `chat()`.
@@ -987,7 +992,6 @@ impl Bridge for AzureOpenAiBridge {
             upstream.embeddings_url()
         });
         let client = self.client_for(ctx);
-        let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
             let resp = url
@@ -1022,7 +1026,8 @@ impl Bridge for AzureOpenAiBridge {
     ) -> Result<Value, BridgeError> {
         let deployment = upstream_model(ctx)?;
         let upstream = AzureUpstreamRef::resolve(deployment, ctx.provider_key.api_base.as_deref())?;
-        let auth = self.resolve_auth(ctx).await?;
+        let started = Instant::now();
+        let auth = self.resolve_auth(ctx, started).await?;
         // Azure reads the deployment from the URL and ignores the body's
         // `model`; it is set to the deployment name for log-trace clarity,
         // matching `chat()` and `embed()`.
@@ -1043,7 +1048,6 @@ impl Bridge for AzureOpenAiBridge {
         let headers = build_request_headers(&auth, &ctx.request_id, false, &ctx.header_ctx())?;
         let url = self.resolve_route_url(ctx, &upstream, "azure/images", || upstream.images_url());
         let client = self.client_for(ctx);
-        let started = Instant::now();
 
         with_deadline(ctx.deadline, started, async move {
             let resp = url
@@ -3076,6 +3080,73 @@ mod tests {
         assert!(answered.is_none(), "{answered:?}");
         let cut = relay(CONTENT.as_bytes()).await;
         assert!(matches!(cut, Some(BridgeError::Transport(_))), "{cut:?}");
+    }
+
+    /// A mint that answers in time still spends the attempt's deadline: the
+    /// upstream call gets what is left of it, so the two together cannot take
+    /// twice the target's timeout.
+    #[tokio::test]
+    async fn a_mint_and_its_upstream_call_share_one_deadline() {
+        let delay = std::time::Duration::from_millis;
+        // 两段各自都在期限内，加起来超了：第二段只能用第一段剩下的时间。
+        for (mint, upstream, times_out) in [(350, 350, true), (50, 50, false)] {
+            let aad_server = MockServer::builder().start().await;
+            Mock::given(method("POST"))
+                .and(path("/oauth2/v2.0/token"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(delay(mint))
+                        .set_body_json(
+                            serde_json::json!({"access_token": "t", "expires_in": 3600}),
+                        ),
+                )
+                .mount(&aad_server)
+                .await;
+            let azure_server = MockServer::builder().start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(delay(upstream))
+                        .set_body_json(serde_json::json!({
+                            "id": "chatcmpl-1",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "hi"},
+                                "finish_reason": "stop"
+                            }]
+                        })),
+                )
+                .mount(&azure_server)
+                .await;
+            let ctx = BridgeContext::new(
+                "req-azure-1",
+                sample_model(),
+                sample_pk_with_aad_secret("https://acme-west.openai.azure.com"),
+            )
+            .with_deadline(delay(500));
+            let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
+            // A fresh bridge per call, so each one mints rather than reading the cache.
+            let bridge = || {
+                AzureOpenAiBridge::new()
+                    .with_url_override(mock_chat_url(&azure_server.uri(), "gpt4o-prod"))
+                    .with_aad_token_endpoint_override(format!(
+                        "{}/oauth2/v2.0/token",
+                        aad_server.uri()
+                    ))
+            };
+            let buffered = bridge().chat(&req, &ctx).await;
+            assert_eq!(
+                matches!(buffered, Err(BridgeError::Timeout { .. })),
+                times_out,
+                "{mint}+{upstream}: {buffered:?}"
+            );
+            let streamed = bridge().chat_stream(&req, &ctx).await;
+            assert_eq!(
+                matches!(streamed, Err(BridgeError::Timeout { .. })),
+                times_out,
+                "{mint}+{upstream} streamed"
+            );
+        }
     }
 
     /// The request's deadline covers the token mint: a stalled token endpoint
