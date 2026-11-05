@@ -742,6 +742,9 @@ async fn dispatch(
                     reason = %reason,
                     "guardrail blocked passthrough-route request",
                 );
+                crate::usage_attr::note_refused_request(snapshot, &resolved_chain, true, || {
+                    String::from_utf8_lossy(&body_bytes).into_owned()
+                });
                 return Err(RouteError::of(
                     crate::error::guardrail_block_error(
                         "request",

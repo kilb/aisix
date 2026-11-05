@@ -12,7 +12,7 @@
 
 use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
-use regex::Regex;
+use regex::{NoExpand, Regex};
 
 use aisix_core::models::GuardrailMonitorHit;
 
@@ -58,6 +58,52 @@ impl KeywordRule {
             KeywordRule::Regex(r) => format!("regex /{}/", r.as_str()),
         }
     }
+
+    /// `text` with every match of this rule masked, `None` without a match.
+    fn mask(&self, text: &str) -> Option<String> {
+        match self {
+            KeywordRule::Literal { lower, .. } if lower.is_empty() => None,
+            KeywordRule::Literal { lower, .. } => mask_literal(text, lower),
+            KeywordRule::Regex(re) => re
+                .is_match(text)
+                .then(|| re.replace_all(text, NoExpand(MASK_TOKEN)).into_owned()),
+        }
+    }
+}
+
+/// What a match becomes in the export copy of a refused request. Keyword rules
+/// have no name of their own to put in it.
+const MASK_TOKEN: &str = "[KEYWORD_REDACTED]";
+
+/// [`KeywordRule::matches`]' literal comparison, located in the original text.
+/// Lowercasing can change a character's length, so the walk keeps both offsets
+/// and masks every original character a match touches.
+fn mask_literal(text: &str, lower: &str) -> Option<String> {
+    let lowered = text.to_lowercase();
+    let mut hits = lowered
+        .match_indices(lower)
+        .map(|(at, found)| at..at + found.len())
+        .peekable();
+    hits.peek()?;
+    let mut out = String::with_capacity(text.len());
+    let (mut at, mut in_hit) = (0, false);
+    for c in text.chars() {
+        let end = at + c.to_lowercase().map(char::len_utf8).sum::<usize>();
+        while hits.next_if(|hit| hit.end <= at).is_some() {
+            in_hit = false;
+        }
+        match hits.peek() {
+            Some(hit) if hit.start < end => {
+                if !in_hit {
+                    out.push_str(MASK_TOKEN);
+                    in_hit = true;
+                }
+            }
+            _ => out.push(c),
+        }
+        at = end;
+    }
+    Some(out)
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +269,20 @@ impl Guardrail for KeywordBlocklist {
             }
             None => GuardrailVerdict::Allow,
         }
+    }
+
+    // A rule either matches a span of the text or does not.
+    fn locates_input_hits(&self) -> bool {
+        true
+    }
+
+    fn mask_input_hits(&self, text: &str) -> Option<String> {
+        if !self.check_input_enabled {
+            return None;
+        }
+        self.rules.iter().fold(None, |masked, rule| {
+            rule.mask(masked.as_deref().unwrap_or(text)).or(masked)
+        })
     }
 }
 

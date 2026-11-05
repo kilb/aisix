@@ -710,6 +710,32 @@ pub(crate) fn note_failure_request(snap: &AisixSnapshot, prompt: impl FnOnce() -
     }
 }
 
+/// Hold the copy of a request an input guardrail refused that its failure rows
+/// report: the body with every hit of the chain's input rules masked, or no
+/// body when that cannot be proved ([`aisix_guardrails::mask_refused_request`])
+/// or the route found the body unsafe to capture (`capture_safe`: a key a mask
+/// cannot rename, say). It wins over any [`note_failure_request`], before or
+/// after it, and over what the route captured. `prompt` runs only under a
+/// full-content export and is what the success path would capture; nothing
+/// here changes the refusal or what an upstream would have received.
+pub(crate) fn note_refused_request(
+    snap: &AisixSnapshot,
+    chain: &dyn aisix_guardrails::Guardrail,
+    capture_safe: bool,
+    prompt: impl FnOnce() -> String,
+) {
+    if let Some(cap) = content_cap(snap) {
+        let masked = capture_safe
+            .then(prompt)
+            .and_then(|body| aisix_guardrails::mask_refused_request(chain, &body));
+        crate::attribution::note_refused_request(aisix_obs::CapturedContent::new(
+            masked.as_deref().unwrap_or_default(),
+            "",
+            cap as usize,
+        ));
+    }
+}
+
 /// Hold the error body the caller is about to be sent, for the terminal
 /// failure row. Only a full-content export reads it.
 pub(crate) fn note_client_error(snap: &AisixSnapshot, err: &ProxyError) {
@@ -746,8 +772,12 @@ fn failure_row_content(
     if !is_failure_row(event) {
         return None;
     }
-    let (noted_request, noted_error) = crate::attribution::failure_notes();
+    let (noted_request, noted_error, refused) = crate::attribution::failure_notes();
     let row = match content {
+        // Not what the route captured: nothing masked that.
+        _ if refused => {
+            noted_request.unwrap_or_else(|| aisix_obs::CapturedContent::new("", "", cap))
+        }
         Some(c) if !c.prompt.is_empty() => c.clone(),
         given => {
             // A bodyless request's note says nothing; `given` may hold a response.
@@ -1500,6 +1530,59 @@ mod tests {
     /// - Anthropic：`cache_read_input_tokens` / `cache_creation_input_tokens`
     ///   与 `input_tokens` 不相交，所以不能减，减了就把已经计费的 token
     ///   当成没有。
+    /// A refused request's row reports the masked copy held for it or no body:
+    /// never the note taken before the chain ran, nor what the route captured.
+    /// A refused RESPONSE leaves the request's own note standing.
+    #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)] // A literal here would read as an emitter to the scans below.
+    async fn a_refused_request_row_reports_only_its_masked_copy() {
+        let cell = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
+        crate::attribution::scope(cell, async {
+            let mut event = UsageEvent::default();
+            event.status_code = 422;
+            let event = event;
+            let captured = aisix_obs::CapturedContent::new("route-captured", "", 1000);
+            crate::attribution::note_failure_request(aisix_obs::CapturedContent::new(
+                "raw-note", "", 1000,
+            ));
+            let prompt = |content| {
+                failure_row_content(&event, content, None, true, 1000)
+                    .map(|row| row.prompt)
+                    .unwrap_or_default()
+            };
+            assert_eq!(prompt(None), "raw-note");
+
+            let _ = crate::error::guardrail_block_error("response", None, None);
+            let _ = crate::error::guardrail_block_error("tool result", None, None);
+            assert_eq!(prompt(None), "raw-note", "the request itself passed");
+
+            let _ = crate::error::guardrail_block_error("request", None, None);
+            assert_eq!(prompt(None), "", "a refused request with no masked copy");
+            assert_eq!(
+                prompt(Some(&captured)),
+                "",
+                "nothing masked what the route captured"
+            );
+
+            crate::attribution::note_refused_request(aisix_obs::CapturedContent::new(
+                "masked-copy",
+                "",
+                1000,
+            ));
+            assert_eq!(prompt(None), "masked-copy");
+            assert_eq!(prompt(Some(&captured)), "masked-copy");
+
+            // A later plain note does not take its place.
+            crate::attribution::note_failure_request(aisix_obs::CapturedContent::new(
+                "later-note",
+                "",
+                1000,
+            ));
+            assert_eq!(prompt(None), "masked-copy");
+        })
+        .await;
+    }
+
     #[test]
     fn pricing_buckets_follow_each_upstream_vocabulary() {
         // OpenAI 形状：cached 是子集。

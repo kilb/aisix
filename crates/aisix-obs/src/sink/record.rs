@@ -92,14 +92,11 @@ pub(crate) struct ContentEncoding<'a> {
 
 impl ContentEncoding<'_> {
     /// The flat prompt text for a sink without the MCP-specific fields:
-    /// whatever was not structured, written even when empty, as these
-    /// sinks always have.
+    /// whatever was not structured. A row with no request body writes no
+    /// field: a refusal that withheld its body must not read as an empty
+    /// request.
     pub fn flat_prompt(&self) -> Option<&str> {
-        self.raw_prompt.or(self.tool_call_arguments).or(self
-            .structured
-            .input_messages
-            .is_none()
-            .then_some(""))
+        self.raw_prompt.or(self.tool_call_arguments)
     }
 
     /// The flat response counterpart of [`Self::flat_prompt`].

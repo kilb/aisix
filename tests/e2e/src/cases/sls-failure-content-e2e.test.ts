@@ -22,21 +22,17 @@ import {
 // keyword guardrail, and reads the delivered SLS protobuf back:
 //
 //   1. upstream failure (chat)        → record carries `input_messages`
-//   2. guardrail input block 422      → UNDECIDED, both cases below; see the note
+//   2. guardrail input block 422      → record carries `input_messages` with
+//                                       the blocked keyword masked
 //   3. 403 model-forbidden            → record carries `input_messages`
 //   4. /v1/messages upstream failure  → record carries `input_messages`
 //   5. unrewritable sensitive tool key → record exists WITHOUT `input_messages`
 //   6. malformed /v1/messages DLP shape → record exists WITHOUT `input_messages`
 //   7. /v1/responses upstream failure → record carries `input_messages`
 //
-// Case 2 is an open contradiction, left for a human to settle. "carries the
-// prompt" and "captures the POST-mask body" (with
-// `failure-row-block-mask-parity-e2e`) export a blocked request's body masked.
-// "suppresses the prompt", "never exports the rejected body" and the
-// /v1/responses metadata case export no body at all, because a keyword's or a
-// blocking detector's match is not masked and would reach the logstore in the
-// clear. Both sets stay, so one of them fails until that is decided; neither
-// may be loosened to fit the other.
+// A blocked request's body is exported so an auditor can read what was refused,
+// and what it was refused for stays out of the logstore: a blocking keyword or
+// detector's match is masked like a mask rule's, the rest of the text is kept.
 //
 // A metadata_only exporter runs alongside and must never see any prompt.
 
@@ -52,7 +48,9 @@ const META_LOGSTORE = "failure-content-meta";
 
 const FORBIDDEN_WORD = "failurecontentforbidden";
 const UPSTREAM_FAIL_SENTINEL = "upstream-fail-prompt-7c1d2e";
-const GUARDRAIL_SENTINEL = `${FORBIDDEN_WORD} plus context 4b9f0a`;
+const GUARDRAIL_CONTEXT = "plus context 4b9f0a";
+const GUARDRAIL_SENTINEL = `${FORBIDDEN_WORD} ${GUARDRAIL_CONTEXT}`;
+const RESPONSES_BLOCK_CONTEXT = "responses-block-context-8d2c7e";
 const FORBIDDEN_MODEL_SENTINEL = "forbidden-model-prompt-9e3a1b";
 const MESSAGES_SENTINEL = "messages-fail-prompt-5d8c4f";
 const RESPONSES_SENTINEL = "responses-fail-prompt-2a6e9d";
@@ -333,7 +331,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     expect(log.get("guardrail_blocked")).toBe("true");
   });
 
-  test("guardrail input block (422): the record suppresses the prompt", async (ctx) => {
+  test("guardrail input block (422): the record masks the keyword and keeps the rest", async (ctx) => {
     if (!etcdReachable || !app || !sls) {
       ctx.skip();
       return;
@@ -348,13 +346,12 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     const log = await waitForLog(
       sls,
       (l) => l.get("request_id") === KEYWORD_BLOCK_REQUEST_ID,
-      "guardrail-blocked record without prompt",
+      "guardrail-blocked record",
     );
     expect(log.get("status_code")).toBe("422");
     expect(log.get("guardrail_blocked")).toBe("true");
-    expect(log.has("prompt")).toBe(false);
-    expect(log.has("input_messages")).toBe(false);
-    expect([...log.values()].join("\n")).not.toContain(GUARDRAIL_SENTINEL);
+    expect(log.get("input_messages")).toContain(GUARDRAIL_CONTEXT);
+    expect([...log.values()].join("\n")).not.toContain(FORBIDDEN_WORD);
   });
 
   test("/v1/responses exports blocked and applied guardrail metadata", async (ctx) => {
@@ -371,7 +368,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
       },
       body: JSON.stringify({
         model: "failure-content-ok",
-        input: `responses ${FORBIDDEN_WORD}`,
+        input: `${RESPONSES_BLOCK_CONTEXT} ${FORBIDDEN_WORD}`,
       }),
     });
     await response.text();
@@ -383,8 +380,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
       "blocked /v1/responses guardrail metadata",
     );
     expect(log.get("guardrail_blocked")).toBe("true");
-    expect(log.get("prompt")).toBeUndefined();
-    expect(log.get("input_messages")).toBeUndefined();
+    expect(log.get("input_messages")).toContain(RESPONSES_BLOCK_CONTEXT);
     for (const value of log.values()) {
       expect(value).not.toContain(FORBIDDEN_WORD);
     }
@@ -564,7 +560,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
       }),
     });
     const responseBody = await res.text();
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(422);
     expect(responseBody).not.toContain(MALFORMED_MESSAGES_SECRET);
     expect(okUpstream.receivedRequests).toHaveLength(upstreamBaseline);
 
@@ -575,7 +571,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
         `malformed Messages failure in ${logstore}`,
         logstore,
       );
-      expect(log.get("status_code")).toBe("400");
+      expect(log.get("status_code")).toBe("422");
       expect(log.get("prompt")).toBeUndefined();
       expect(log.get("input_messages")).toBeUndefined();
       for (const value of log.values()) {
@@ -642,7 +638,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     }
   });
 
-  test("blocked request carrying PII never exports the rejected body", async (ctx) => {
+  test("blocked request carrying PII exports the body with the rejected value masked", async (ctx) => {
     if (!etcdReachable || !app || !sls) {
       ctx.skip();
       return;
@@ -657,11 +653,10 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     const log = await waitForLog(
       sls,
       (l) => l.get("request_id") === PII_BLOCK_REQUEST_ID,
-      "pii-blocked record without prompt",
+      "pii-blocked record",
     );
     expect(log.get("guardrail_blocked")).toBe("true");
-    expect(log.has("prompt")).toBe(false);
-    expect(log.has("input_messages")).toBe(false);
+    expect(log.get("input_messages")).toContain(MASKED_BLOCK_SENTINEL);
     for (const l of logsFor(sls, FULL_LOGSTORE)) {
       for (const v of l.values()) {
         expect(v).not.toContain(EMAIL);

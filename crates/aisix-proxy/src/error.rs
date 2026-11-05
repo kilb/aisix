@@ -437,11 +437,19 @@ pub(crate) fn guardrail_block_message(
 /// results, hand-built JSON bodies) use the message helper directly; every
 /// site that returns a [`ProxyError`] goes through this one so the message
 /// and the `unavailable` tag can never be set from different verdicts.
+///
+/// Every refusal passes through here, so this is also what takes a refused
+/// request's body off its failure rows, unless the route holds a masked copy
+/// for them (`usage_attr::note_refused_request`): a route that forgets exports
+/// nothing rather than the body it noted before the chain ran.
 pub(crate) fn guardrail_block_error(
     side: &str,
     guardrail_name: Option<&str>,
     unavailable: Option<&str>,
 ) -> ProxyError {
+    if !matches!(side, "response" | "tool result") {
+        crate::attribution::note_request_refused();
+    }
     ProxyError::ContentFiltered {
         message: guardrail_block_message(side, guardrail_name, unavailable),
         unavailable: unavailable.map(str::to_owned),

@@ -493,17 +493,11 @@ async fn dispatch(
                     reason = %reason,
                     "guardrail blocked /v1/images/edits request (prompt field)",
                 );
-                // A blocked request exports what the success path would have sent.
-                if crate::usage_attr::content_cap(snapshot).is_some() {
-                    crate::dispatch::mask_prompt_fields(
-                        &resolved_chain.without_audit(),
-                        &mut fields,
-                        &mut crate::redact::RedactionCounts::new(),
-                    );
-                    crate::usage_attr::note_failure_request(snapshot, || {
-                        captured_edit_fields(&fields)
-                    });
-                }
+                // A blocked request exports what the success path would have sent,
+                // with what refused it masked too.
+                crate::usage_attr::note_refused_request(snapshot, &resolved_chain, true, || {
+                    captured_edit_fields(&fields)
+                });
                 return Err(crate::error::guardrail_block_error(
                     "request",
                     guardrail_name.as_deref(),

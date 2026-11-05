@@ -1591,6 +1591,15 @@ async fn guardrail_block_response(
             reason = %reason,
             "guardrail blocked A2A request",
         );
+        // The row reports the JSON-RPC body, masked. A hit outside the text the
+        // rewrite reaches can sit in file content the scan decoded, which the
+        // body still holds encoded, so such a body stays out.
+        crate::usage_attr::note_refused_request(
+            snapshot,
+            chain,
+            aisix_guardrails::Guardrail::mask_input_hits(chain, &scan.unrewritable).is_none(),
+            || value.to_string(),
+        );
         return Some(guardrail_refusal(
             state,
             snapshot,

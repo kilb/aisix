@@ -591,6 +591,7 @@ async fn reserve_before_costly_scan(
 #[allow(clippy::too_many_arguments)]
 async fn scan_input_blob(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     target: &JobTarget,
     blob: &[u8],
@@ -659,6 +660,14 @@ async fn scan_input_blob(
             reason = %reason,
             "guardrail blocked jobs request",
         );
+        // A control body is what its failure rows report, masked. An uploaded
+        // file never is: those rows carry the form's fields and the file's hash,
+        // none of which is what the scan read, so they report no body.
+        if redactions.is_none() {
+            crate::usage_attr::note_refused_request(snapshot, &chain, true, || {
+                String::from_utf8_lossy(blob).into_owned()
+            });
+        }
         return Err(crate::error::guardrail_block_error(
             "request",
             guardrail_name.as_deref(),
@@ -1297,6 +1306,7 @@ pub(crate) async fn create_file(
                 file_parts += 1;
                 if let Some(m) = scan_input_blob(
                     &state,
+                    snapshot,
                     &auth,
                     &target,
                     bytes,
@@ -1594,6 +1604,7 @@ pub(crate) async fn create_batch(
             reserve_before_costly_scan(&state, &snapshot, &auth, &target).await?;
         scan_input_blob(
             &state,
+            &snapshot,
             &auth,
             &target,
             &out_body,
@@ -1919,6 +1930,7 @@ pub(crate) async fn create_ft_job(
             reserve_before_costly_scan(&state, &snapshot, &auth, &target).await?;
         scan_input_blob(
             &state,
+            &snapshot,
             &auth,
             &target,
             &out_body,
@@ -2139,6 +2151,7 @@ async fn forward_simple(
         if let Some(body) = &spec.body {
             scan_input_blob(
                 &state,
+                &snapshot,
                 &auth,
                 &target,
                 body,
@@ -4266,8 +4279,7 @@ mod tests {
             );
             assert_eq!(
                 ev.guardrail_bypassed_reason, "",
-                "purpose {purpose:?}: nothing offered to screen this request, \
-                 so nothing was bypassed: {ev:?}"
+                "purpose {purpose:?}: the chain read the file, so nothing was bypassed: {ev:?}"
             );
         }
     }

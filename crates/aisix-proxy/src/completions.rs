@@ -607,20 +607,20 @@ async fn dispatch(
                 reason = %reason,
                 "guardrail blocked /v1/completions request",
             );
-            // A blocked request exports what the success path would have sent.
+            // A blocked request exports what the success path would have sent,
+            // with what refused it masked too.
             if crate::usage_attr::content_cap(snapshot).is_some() {
                 let masked = crate::redact::redact_completions_request_structured(
                     &resolved_chain.without_audit(),
                     &mut body,
                 );
                 // A structural field a mask cannot rewrite is still in the body.
-                crate::usage_attr::note_failure_request(snapshot, || {
-                    if masked.unrewritable_tool_key {
-                        String::new()
-                    } else {
-                        body.to_string()
-                    }
-                });
+                crate::usage_attr::note_refused_request(
+                    snapshot,
+                    resolved_chain.as_ref(),
+                    !masked.unrewritable_tool_key,
+                    || body.to_string(),
+                );
             }
             return Err(crate::error::guardrail_block_error(
                 "request",

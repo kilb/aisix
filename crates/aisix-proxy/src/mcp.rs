@@ -1501,19 +1501,14 @@ fn tool_call_capture(
     aisix_obs::CapturedContent::new(&prompt, &response, cap as usize)
 }
 
-/// Note a blocked tool call for its failure row as the success path would
-/// have sent it: masked, though the block ended the call before the write-back.
+/// Note a blocked tool call for its failure row: masked, though the block ended
+/// the call before the write-back, and what refused it masked too.
 fn note_blocked_tool_call(
     snapshot: &aisix_core::AisixSnapshot,
     chain: &aisix_guardrails::GuardrailChain,
     bytes: &[u8],
 ) {
-    crate::usage_attr::note_failure_request(snapshot, || {
-        match rewrite_tool_arguments(&chain.without_audit(), bytes) {
-            Ok(Some((masked, _))) => tool_call_prompt(&masked),
-            _ => tool_call_prompt(bytes),
-        }
-    });
+    crate::usage_attr::note_refused_request(snapshot, chain, true, || tool_call_prompt(bytes));
 }
 
 /// The prompt half of [`tool_call_capture`].

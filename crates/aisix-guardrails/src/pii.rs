@@ -357,9 +357,15 @@ impl PiiGuardrail {
     /// Apply every mask-action rule to `text`, in rule order. `None` when
     /// nothing matched (caller keeps the original untouched).
     fn mask_text(&self, text: &str) -> Option<Redaction> {
+        self.mask_with(text, |rule| rule.action == PiiAction::Mask)
+    }
+
+    /// Apply the rules `selected` picks to `text`, in rule order, each with
+    /// its own mask token.
+    fn mask_with(&self, text: &str, selected: impl Fn(&PiiRule) -> bool) -> Option<Redaction> {
         let mut counts: BTreeMap<String, u32> = BTreeMap::new();
         let mut current = Cow::Borrowed(text);
-        for rule in self.rules.iter().filter(|r| r.action == PiiAction::Mask) {
+        for rule in self.rules.iter().filter(|r| selected(r)) {
             let (next, count) = rule.mask_all(&current);
             if count > 0 {
                 *counts.entry(rule.name.clone()).or_insert(0) += count;
@@ -519,6 +525,20 @@ impl Guardrail for PiiGuardrail {
             return None;
         }
         self.mask_text(text)
+    }
+
+    // A rule either matches a span of the text or does not.
+    fn locates_input_hits(&self) -> bool {
+        true
+    }
+
+    /// Block-action rules too: the span that refused the request is the one
+    /// the export copy must not carry.
+    fn mask_input_hits(&self, text: &str) -> Option<String> {
+        if !self.check_input_enabled {
+            return None;
+        }
+        self.mask_with(text, |_| true).map(|r| r.text)
     }
 
     fn redact_output_text(&self, text: &str) -> Option<Redaction> {
@@ -784,6 +804,33 @@ mod tests {
                 on_exceeded_fail_open: true,
             },
         );
+    }
+
+    #[test]
+    fn export_mask_covers_block_rules_and_only_the_input_hook() {
+        let id = "11010519491231002X";
+        let g = guardrail(vec![
+            builtin("china_id_card", PiiAction::Block),
+            builtin("email", PiiAction::Mask),
+        ]);
+        let text = format!("write to a@b.co about {id} today");
+        assert_eq!(
+            g.mask_input_hits(&text).as_deref(),
+            Some("write to [EMAIL_REDACTED] about [CHINA_ID_CARD_REDACTED] today"),
+        );
+        // The rewrite on the way upstream still leaves a block rule's span:
+        // the request never gets there.
+        assert!(g.redact_input_text(&text).unwrap().text.contains(id));
+        assert_eq!(g.mask_input_hits("nothing here"), None);
+        assert!(g.locates_input_hits());
+
+        let output_only = PiiGuardrail::new(
+            vec![builtin("china_id_card", PiiAction::Block)],
+            GuardrailHookPoint::Output,
+            1024,
+            false,
+        );
+        assert_eq!(output_only.mask_input_hits(id), None);
     }
 
     #[test]

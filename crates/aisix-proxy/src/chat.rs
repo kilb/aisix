@@ -1793,6 +1793,12 @@ async fn dispatch(
             if redaction.unrewritable_tool_key {
                 *failure_content_safe_out = false;
             }
+            crate::usage_attr::note_refused_request(
+                snapshot,
+                resolved_chain.as_ref(),
+                *failure_content_safe_out,
+                || captured_request_json(req),
+            );
             tracing::warn!(
                 guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                 guardrail_hook = "input",

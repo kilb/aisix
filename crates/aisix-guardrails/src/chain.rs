@@ -1353,6 +1353,25 @@ impl Guardrail for GuardrailChain {
     /// Members apply in chain order, each rewriting the previous member's
     /// output, so stacked redacting guardrails compose. Counts merge across
     /// members.
+    // A check that failed open read nothing, whatever its kind can do.
+    fn locates_input_hits(&self) -> bool {
+        self.bypass_reason().is_none()
+            && self
+                .members
+                .iter()
+                .all(|m| m.guardrail.locates_input_hits())
+    }
+
+    /// Every member, whatever its `input_messages` window: what a refused
+    /// request's export carries is the whole body.
+    fn mask_input_hits(&self, text: &str) -> Option<String> {
+        self.members.iter().fold(None, |masked, m| {
+            m.guardrail
+                .mask_input_hits(masked.as_deref().unwrap_or(text))
+                .or(masked)
+        })
+    }
+
     fn redact_input_text(&self, text: &str) -> Option<Redaction> {
         self.redact_input_text_in_turn(text, true)
     }

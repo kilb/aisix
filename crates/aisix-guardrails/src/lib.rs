@@ -42,6 +42,7 @@ mod pii;
 mod presidio;
 #[cfg(feature = "azure-content-safety")]
 mod prompt_shield;
+mod refused_export;
 mod semantic;
 #[cfg(feature = "azure-content-safety")]
 mod text_moderation;
@@ -478,6 +479,7 @@ pub use pii::{builtin_rule, PiiAction, PiiGuardrail, PiiRule, BUILTIN_DETECTORS}
 pub use presidio::PresidioGuardrail;
 #[cfg(feature = "azure-content-safety")]
 pub use prompt_shield::PromptShieldGuardrail;
+pub use refused_export::mask_refused_request;
 pub use semantic::SemanticGuardrail;
 #[cfg(feature = "azure-content-safety")]
 pub use text_moderation::TextModerationGuardrail;
@@ -1072,6 +1074,27 @@ pub trait Guardrail: Send + Sync + 'static {
     fn redact_input_text_in_turn(&self, text: &str, in_latest_turn: bool) -> Option<Redaction> {
         let _ = in_latest_turn;
         self.redact_input_text(text)
+    }
+
+    // --- the export copy of a refused request ------------------------------
+    //
+    // A refused request's body still goes to a full-content exporter, so an
+    // auditor can read what was refused, but what the guardrail refused it
+    // for must not reach the logstore. Nothing here runs on the way to the
+    // caller or the upstream, and it records nothing. See
+    // [`crate::mask_refused_request`].
+
+    /// Whether whatever this guardrail finds in a request can be found again
+    /// in the request's text. Default: only a guardrail that never reads the
+    /// request can say so; a remote verdict names no span.
+    fn locates_input_hits(&self) -> bool {
+        !self.runs_on_input()
+    }
+
+    /// `text` with everything this guardrail's input rules match masked,
+    /// whatever the rule's action. `None` when nothing matched.
+    fn mask_input_hits(&self, _text: &str) -> Option<String> {
+        None
     }
 
     // --- remote segment moderation (#932 bedrock follow-up) ---------------

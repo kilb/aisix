@@ -1978,19 +1978,11 @@ async fn dispatch_create(
                 "guardrail blocked /v1/videos request",
             );
             // The refusal's row reports the request body under full-content
-            // export: mask it there too, so a blocked row never exports what
-            // the success path would have hidden.
-            if crate::usage_attr::content_cap(snapshot).is_some() {
-                if let Some(r) = aisix_guardrails::Guardrail::redact_input_text(
-                    &resolved_chain.without_audit(),
-                    &body.prompt,
-                ) {
-                    body.prompt = r.text;
-                }
-                crate::usage_attr::note_failure_request(snapshot, || {
-                    serde_json::to_string(&body).unwrap_or_default()
-                });
-            }
+            // export: masked there too, so a blocked row never exports what
+            // the success path would have hidden, or what refused it.
+            crate::usage_attr::note_refused_request(snapshot, &resolved_chain, true, || {
+                serde_json::to_string(&body).unwrap_or_default()
+            });
             return Err(crate::error::guardrail_block_error(
                 "request",
                 guardrail_name.as_deref(),

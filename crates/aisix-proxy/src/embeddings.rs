@@ -593,17 +593,11 @@ async fn dispatch(
                 reason = %reason,
                 "guardrail blocked /v1/embeddings request",
             );
-            // A blocked request exports what the success path would have sent.
-            if crate::usage_attr::content_cap(snapshot).is_some() {
-                mask_input(
-                    &resolved_chain.without_audit(),
-                    &mut body.input,
-                    &mut crate::redact::RedactionCounts::new(),
-                );
-                crate::usage_attr::note_failure_request(snapshot, || {
-                    serde_json::to_string(&body).unwrap_or_default()
-                });
-            }
+            // A blocked request exports what the success path would have sent,
+            // with what refused it masked too.
+            crate::usage_attr::note_refused_request(snapshot, &resolved_chain, true, || {
+                serde_json::to_string(&body).unwrap_or_default()
+            });
             return Err(crate::error::guardrail_block_error(
                 "request",
                 guardrail_name.as_deref(),

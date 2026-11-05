@@ -453,15 +453,17 @@ async fn screen_input(
             reason = %reason,
             "guardrail blocked /v1/messages/count_tokens request",
         );
-        // A blocked request exports what the success path would have sent.
-        // Only a key the mask cannot rename withholds it.
+        // A blocked request exports what the success path would have sent,
+        // with what refused it masked too. Only a key the mask cannot rename
+        // withholds it.
         if crate::usage_attr::content_cap(snapshot).is_some() {
             let redaction = crate::redact::redact_anthropic_request(&chain.without_audit(), body);
-            if redaction.unrewritable_tool_key {
-                screening.withhold_request_body(snapshot);
-            } else {
-                crate::usage_attr::note_failure_request(snapshot, || body.to_string());
-            }
+            crate::usage_attr::note_refused_request(
+                snapshot,
+                &chain,
+                !redaction.unrewritable_tool_key,
+                || body.to_string(),
+            );
         }
         return Err(crate::error::guardrail_block_error(
             "request",

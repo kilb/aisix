@@ -247,6 +247,14 @@ pub(crate) struct CancelContext {
     /// ever set under a full-content export. See
     /// [`crate::usage_attr::note_failure_request`].
     pub failure_request: Option<aisix_obs::CapturedContent>,
+    /// An input guardrail refused this request, so `failure_request` no longer
+    /// speaks for it: its rows report `refused_request` or no body. Set where
+    /// the refusal is built, which is what a route that forgets the note
+    /// cannot skip. See [`crate::error::guardrail_block_error`].
+    pub request_refused: bool,
+    /// The masked export copy of a refused request. See
+    /// [`crate::usage_attr::note_refused_request`].
+    pub refused_request: Option<aisix_obs::CapturedContent>,
     /// What the caller is being sent for this failure. See
     /// [`crate::usage_attr::note_client_error`].
     pub client_error_body: Option<String>,
@@ -1721,10 +1729,38 @@ pub(crate) fn note_client_error_body(body: String) {
     with_cancel(|c| c.client_error_body = Some(body));
 }
 
-/// The noted request body and client error body, for a failure row.
-pub(crate) fn failure_notes() -> (Option<aisix_obs::CapturedContent>, Option<String>) {
-    let mut notes = (None, None);
-    with_cancel(|c| notes = (c.failure_request.clone(), c.client_error_body.clone()));
+/// See [`CancelContext::request_refused`].
+pub(crate) fn note_request_refused() {
+    with_cancel(|c| c.request_refused = true);
+}
+
+/// See [`CancelContext::refused_request`].
+pub(crate) fn note_refused_request(content: aisix_obs::CapturedContent) {
+    with_cancel(|c| c.refused_request = Some(content));
+}
+
+impl CancelContext {
+    /// The request body this request's failure rows report.
+    pub(crate) fn failure_body(&self) -> Option<&aisix_obs::CapturedContent> {
+        if self.request_refused {
+            self.refused_request.as_ref()
+        } else {
+            self.failure_request.as_ref()
+        }
+    }
+}
+
+/// For a failure row: the request body it reports, the client error body, and
+/// whether an input guardrail refused the request.
+pub(crate) fn failure_notes() -> (Option<aisix_obs::CapturedContent>, Option<String>, bool) {
+    let mut notes = (None, None, false);
+    with_cancel(|c| {
+        notes = (
+            c.failure_body().cloned(),
+            c.client_error_body.clone(),
+            c.request_refused,
+        );
+    });
     notes
 }
 

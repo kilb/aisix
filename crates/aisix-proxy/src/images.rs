@@ -474,20 +474,20 @@ async fn dispatch(
                 reason = %reason,
                 "guardrail blocked /v1/images/generations request",
             );
-            // A blocked request exports what the success path would have sent.
+            // A blocked request exports what the success path would have sent,
+            // with what refused it masked too.
             if crate::usage_attr::content_cap(snapshot).is_some() {
                 let redaction = crate::redact::redact_images_request_structured(
                     &resolved_chain.without_audit(),
                     &mut body,
                 );
                 // A `user` no mask can rewrite stays out of the row.
-                crate::usage_attr::note_failure_request(snapshot, || {
-                    if redaction.unrewritable_tool_key {
-                        String::new()
-                    } else {
-                        body.to_string()
-                    }
-                });
+                crate::usage_attr::note_refused_request(
+                    snapshot,
+                    &resolved_chain,
+                    !redaction.unrewritable_tool_key,
+                    || body.to_string(),
+                );
             }
             return Err(crate::error::guardrail_block_error(
                 "request",

@@ -742,6 +742,12 @@ async fn dispatch(
             let redaction = crate::redact::redact_anthropic_request(resolved_chain.as_ref(), body);
             *suppress_failure_content_out |= redaction.unrewritable_tool_key;
             crate::redact::merge_counts(redactions_out, redaction.counts);
+            crate::usage_attr::note_refused_request(
+                snapshot,
+                resolved_chain.as_ref(),
+                !*suppress_failure_content_out,
+                || serde_json::to_string(&*body).unwrap_or_default(),
+            );
             tracing::warn!(
                 guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
                 guardrail_hook = "input",

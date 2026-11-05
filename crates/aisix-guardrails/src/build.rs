@@ -1128,6 +1128,13 @@ impl Guardrail for MonitorGuardrail {
         None
     }
 
+    // A monitored row refuses nothing, so it has no hit a refused request's
+    // export owes anyone, and it masks nothing there either, as on every other
+    // row it observes.
+    fn locates_input_hits(&self) -> bool {
+        true
+    }
+
     fn redact_output_text(&self, text: &str) -> Option<Redaction> {
         self.observe_redaction("output", self.inner.redact_output_text(text));
         None
@@ -1314,6 +1321,14 @@ impl Guardrail for LiveGuardrailChain {
 
     fn redacts_output(&self) -> bool {
         self.current().redacts_output()
+    }
+
+    fn locates_input_hits(&self) -> bool {
+        self.current().locates_input_hits()
+    }
+
+    fn mask_input_hits(&self, text: &str) -> Option<String> {
+        self.current().mask_input_hits(text)
     }
 
     fn redact_input_text(&self, text: &str) -> Option<Redaction> {
