@@ -1006,7 +1006,7 @@ mod disconnect_tests {
                         (round * 7 + i * 21) % 1300,
                     ))
                     .await;
-                    let _ = s.set_linger(Some(std::time::Duration::ZERO));
+                    let _ = s.set_zero_linger();
                 });
             }
             while set.join_next().await.is_some() {}
