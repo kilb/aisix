@@ -48,6 +48,13 @@ pub(crate) fn interval() -> Option<Duration> {
 /// the stream when the upstream goes quiet for too long, this keeps
 /// waiting — the two compose, with the read timeout deciding when a silent
 /// upstream has failed and this one keeping the connection warm until then.
+///
+/// A failure is held back for one poll, so everything before it is flushed
+/// first. Offered bytes and then an error with no pause between them, the
+/// server only buffers those bytes and aborts the response with them unsent,
+/// so what a caller received would depend on whether the upstream's last frames
+/// happened to land in one read. This is the last wrapper before the response
+/// body on the streaming endpoints, so they all get it here.
 pub(crate) fn with_heartbeat<S, E>(
     upstream: S,
     interval: Option<Duration>,
@@ -59,17 +66,21 @@ where
     async_stream::stream! {
         let mut upstream = std::pin::pin!(upstream);
         loop {
-            match interval {
+            let item = match interval {
                 None => match upstream.next().await {
-                    Some(item) => yield item,
+                    Some(item) => item,
                     None => break,
                 },
                 Some(d) => match tokio::time::timeout(d, upstream.next()).await {
-                    Ok(Some(item)) => yield item,
+                    Ok(Some(item)) => item,
                     Ok(None) => break,
-                    Err(_) => yield Ok(Bytes::from_static(HEARTBEAT)),
+                    Err(_) => Ok(Bytes::from_static(HEARTBEAT)),
                 },
+            };
+            if item.is_err() {
+                tokio::task::yield_now().await;
             }
+            yield item;
         }
     }
 }
@@ -115,6 +126,50 @@ mod tests {
             .await;
         let frames: Vec<Vec<u8>> = out.into_iter().map(|r| r.unwrap().to_vec()).collect();
         assert_eq!(frames, vec![vec![0], vec![1], vec![2]]);
+    }
+
+    /// What an upstream delivered before failing has to reach the caller.
+    /// Both items are ready at once here, the shape of two upstream frames
+    /// landing in one read: served through a real HTTP server, whose response
+    /// abort on a body error used to drop the bytes it had only buffered.
+    #[tokio::test]
+    async fn bytes_ready_just_before_a_failure_reach_the_client() {
+        for interval in [None, Some(Duration::from_secs(15))] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::get(move || async move {
+                    let upstream = futures::stream::iter([
+                        Ok(Bytes::from_static(b"data: before-the-failure\n\n")),
+                        Err(std::io::Error::other("upstream failed")),
+                    ]);
+                    axum::body::Body::from_stream(with_heartbeat(upstream, interval))
+                }),
+            );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            let response = reqwest::get(format!("http://{addr}/")).await.unwrap();
+            let mut body = response.bytes_stream();
+            let mut received = Vec::new();
+            let mut failed = false;
+            while let Some(item) = body.next().await {
+                match item {
+                    Ok(bytes) => received.extend_from_slice(&bytes),
+                    Err(_) => failed = true,
+                }
+            }
+            server.abort();
+
+            assert_eq!(
+                String::from_utf8_lossy(&received),
+                "data: before-the-failure\n\n",
+                "interval {interval:?}",
+            );
+            assert!(failed, "the caller must still see the response fail");
+        }
     }
 
     #[tokio::test(start_paused = true)]

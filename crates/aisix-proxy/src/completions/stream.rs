@@ -515,14 +515,6 @@ where
                         let before_done = done_frame_start.min(bytes.len());
                         if before_done > 0 {
                             yield Ok(bytes.slice(..before_done));
-                            // Pending once before the failure, so the server
-                            // flushes those bytes first. Polled again at once,
-                            // it would buffer them and abort the response on
-                            // the error with them still unsent — the same
-                            // bytes arriving in their own read reach the
-                            // caller because the wait for the next read is
-                            // that pause.
-                            tokio::task::yield_now().await;
                         }
                     }
                     yield Err(BridgeError::UpstreamDecode(
