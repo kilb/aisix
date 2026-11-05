@@ -307,11 +307,14 @@ pub(crate) fn resolve_target(
             }
             entry
         }
+        // The lowest id rather than the first the table yields: it iterates
+        // in no fixed order, so "first" would be a different provider key
+        // on each replica and after each restart.
         None => snapshot
             .models
             .entries()
             .into_iter()
-            .find(|e| {
+            .filter(|e| {
                 let m = &e.value;
                 !m.is_routing()
                     && !m.is_ensemble()
@@ -323,6 +326,7 @@ pub(crate) fn resolve_target(
                         .and_then(|id| snapshot.provider_keys.get_by_id(id))
                         .is_some_and(|pk| supported_adapter(&pk.value).is_some())
             })
+            .min_by(|a, b| a.id.cmp(&b.id))
             .ok_or_else(|| {
                 ProxyError::InvalidRequest(
                     "no model specified and no accessible OpenAI-compatible model found; \
@@ -4771,6 +4775,46 @@ mod tests {
             "got {v}"
         );
     }
+    /// With no model named, the row a jobs request lands on picks the provider
+    /// key it is sent with, so it has to be the same on every replica: the
+    /// model table iterates in no fixed order.
+    #[tokio::test]
+    async fn the_default_target_does_not_depend_on_table_order() {
+        let chosen = MockServer::builder().start().await;
+        let other = MockServer::builder().start().await;
+        for server in [&chosen, &other] {
+            Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/v1/batches"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})),
+                )
+                .mount(server)
+                .await;
+        }
+        for _ in 0..32 {
+            let snap = AisixSnapshot::new();
+            snap.provider_keys.insert(openai_pk(PK_A, &chosen.uri()));
+            snap.provider_keys.insert(openai_pk(PK_B, &other.uri()));
+            snap.models.insert(model("m-1", "first", PK_A));
+            snap.models.insert(model("m-2", "second", PK_B));
+            snap.apikeys.insert(apikey_entry(&["*"]));
+            let resp = build_app(snap)
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/v1/batches")
+                        .header("authorization", "Bearer sk-caller")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        assert_eq!(chosen.received_requests().await.unwrap().len(), 32);
+        assert!(other.received_requests().await.unwrap().is_empty());
+    }
+
     /// 这条路和 /v1/chat/completions 花的是同一个 key 级窗口，所以也得照实
     /// 汇报——头给调用方，gauge 给运维。
     ///
