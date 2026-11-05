@@ -69,9 +69,19 @@ const NON_STREAM_BODY = {
   },
 };
 
+const streamChunk = (text: string, finish_reason: string | null) => ({
+  id: "cmpl-completions-legacy-stream",
+  object: "text_completion",
+  created: 1_700_000_000,
+  model: "gpt-3.5-turbo-instruct",
+  choices: [{ text, index: 0, logprobs: null, finish_reason }],
+});
+const STREAM_CHUNKS = [streamChunk(" distant", null), streamChunk(" kingdom", null), streamChunk("", "stop")];
+
 describe("legacy /v1/completions e2e: text-in / text-out passthrough", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
+  let streamUpstream: OpenAiUpstream | undefined;
   let seed: SeedClient | undefined;
   let etcdReachable = false;
 
@@ -82,6 +92,9 @@ describe("legacy /v1/completions e2e: text-in / text-out passthrough", () => {
 
     upstream = await startOpenAiUpstream({
       nonStreamBody: NON_STREAM_BODY,
+    });
+    streamUpstream = await startOpenAiUpstream({
+      streamEvents: [...STREAM_CHUNKS.map((chunk) => JSON.stringify(chunk)), "[DONE]"],
     });
     app = await spawnApp();
     seed = new SeedClient(etcd, app.etcdPrefix);
@@ -97,9 +110,20 @@ describe("legacy /v1/completions e2e: text-in / text-out passthrough", () => {
       model_name: "gpt-3.5-turbo-instruct",
       provider_key_id: pk.id,
     });
+    const streamPk = await seed.createProviderKey({
+      display_name: "completions-legacy-stream-pk",
+      secret: "sk-mock",
+      api_base: `${streamUpstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "completions-legacy-stream-model",
+      provider: "openai",
+      model_name: "gpt-3.5-turbo-instruct",
+      provider_key_id: streamPk.id,
+    });
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
-      allowed_models: ["completions-legacy-model"],
+      allowed_models: ["completions-legacy-model", "completions-legacy-stream-model"],
     });
 
     // The caller key is seeded last, so it authenticating implies every
@@ -126,6 +150,7 @@ describe("legacy /v1/completions e2e: text-in / text-out passthrough", () => {
   afterAll(async () => {
     await app?.exit();
     await upstream?.close();
+    await streamUpstream?.close();
   });
 
   test(
@@ -227,57 +252,50 @@ describe("legacy /v1/completions e2e: text-in / text-out passthrough", () => {
     60_000,
   );
 
-  // #1093. `stream: true` used to be forwarded verbatim: the provider
-  // generated (and charged for) an SSE response, the dispatch path — which
-  // reads the upstream answer as a single JSON document — failed to decode
-  // it, and the caller got a 502 with no usage recorded. The upstream had
-  // already done the work.
-  //
-  // The route has no streaming relay, so the request is refused instead,
-  // and refused BEFORE the provider is contacted. That the upstream is
-  // never called is the property under test: a fix that returned 400 after
-  // dispatching would still have the caller paying for a refused request,
-  // and a status-only assertion could not tell the two apart.
   test(
-    "POST /v1/completions with stream:true is refused without calling the upstream",
+    "POST /v1/completions with stream:true relays the upstream's frames, calling it once",
     async (ctx) => {
-      if (!etcdReachable || !app || !upstream) {
+      if (!etcdReachable || !app || !streamUpstream) {
         ctx.skip();
         return;
       }
 
-      const reqHeaders = {
-        authorization: `Bearer ${CALLER_PLAINTEXT}`,
-        "content-type": "application/json",
-      };
-      const baseline = upstream.receivedRequests.length;
+      const baseline = streamUpstream.receivedRequests.length;
       const res = await fetch(`${app.proxyUrl}/v1/completions`, {
         method: "POST",
-        headers: reqHeaders,
+        headers: {
+          authorization: `Bearer ${CALLER_PLAINTEXT}`,
+          "content-type": "application/json",
+        },
         body: JSON.stringify({
-          model: "completions-legacy-model",
+          model: "completions-legacy-stream-model",
           prompt: PROMPT_TEXT,
           stream: true,
         }),
       });
 
-      expect(res.status).toBe(400);
-      const body = (await res.json()) as {
-        error?: { message?: string; type?: string };
-      };
-      expect(body.error?.type).toBe("invalid_request_error");
-      // The message names the endpoint that does stream, so a caller can act
-      // on it without reading the docs. Pinned whole rather than by
-      // substring: this sentence is the endpoint's refusal contract, and a
-      // substring assertion would pass through a reword that changed what a
-      // caller is told to do next.
-      expect(body.error?.message).toBe(
-        "request payload is invalid: `stream` is not supported on " +
-          "/v1/completions; use /v1/chat/completions for streaming",
-      );
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/event-stream");
+      const frames = (await res.text())
+        .split(/\r?\n\r?\n/)
+        .map((block) =>
+          block
+            .split(/\r?\n/)
+            .filter((line) => line.startsWith("data:"))
+            .map((line) => line.slice("data:".length).trim())
+            .join("\n"),
+        )
+        .filter((data) => data !== "");
+      expect(frames.at(-1)).toBe("[DONE]");
+      expect(frames.slice(0, -1).map((frame) => JSON.parse(frame) as unknown)).toEqual(STREAM_CHUNKS);
 
-      // The no-billing property: the provider was never asked.
-      expect(upstream.receivedRequests.slice(baseline)).toHaveLength(0);
+      const sent = streamUpstream.receivedRequests.slice(baseline);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.path).toBe("/v1/completions");
+      const forwarded = JSON.parse(sent[0]!.body) as { model?: string; prompt?: string; stream?: boolean };
+      expect(forwarded.stream).toBe(true);
+      expect(forwarded.prompt).toBe(PROMPT_TEXT);
+      expect(forwarded.model).toBe("gpt-3.5-turbo-instruct");
     },
     60_000,
   );
