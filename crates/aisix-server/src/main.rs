@@ -1042,7 +1042,7 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
             // resolved addresses (DNS works; the failure is higher in the
             // tonic / TLS stack) or logs the raw io::Error (DNS actually
             // fails). Both outcomes narrow triage substantially.
-            probe_etcd_dns(&cfg.etcd.endpoints).await;
+            spawn_etcd_dns_probe(cfg.etcd.endpoints.clone());
 
             // Same extra trust root reused by the etcd connect options.
             let connect_options =
@@ -1720,6 +1720,16 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
 
         let admin_addr: std::net::SocketAddr = cfg.admin.addr.parse()?;
         let admin_tls = cfg.admin.tls.clone();
+        // Fail boot loudly on an occupied port or a certificate that cannot be
+        // loaded: the task is only joined after shutdown, so an error inside
+        // it leaves a gateway with no admin surface and nothing said about it
+        // until it exits. Same pattern, and the same benign re-bind gap, as
+        // the metrics and proxy listeners' probes below.
+        std::net::TcpListener::bind(admin_addr)
+            .map_err(|e| anyhow::anyhow!("admin listener bind {admin_addr} failed: {e}"))?;
+        if let Some(tls) = admin_tls.as_ref() {
+            downstream_tls_acceptor(tls, "admin.tls").await?;
+        }
         Some(tokio::spawn(serve_http(
             admin_addr,
             admin_router,
@@ -1918,8 +1928,8 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
         .await
     };
 
-    // Step 10: shutdown coordinator. Whichever of (signal, proxy, admin)
-    // completes first triggers the rest.
+    // Step 10: shutdown coordinator. A signal, or the proxy listener
+    // ending, triggers the rest.
     let signal_task = tokio::spawn(wait_for_signal(
         cancel_tx.clone(),
         retire_tx,
@@ -2355,8 +2365,14 @@ fn spawn_cache_attach(
 /// Extract the host portion of a URL-like endpoint (`http://host:2379`,
 /// `https://host:2379`, or bare `host:2379`) for use as the TLS SNI.
 /// Per-endpoint DNS probe logged at info / warn. Not part of the
-/// connect path — purely diagnostic. See the call site in [`run`]
-/// for why this exists.
+/// connect path — purely diagnostic, so it runs on its own task: a
+/// resolver that hangs costs its full timeout per endpoint, and the boot
+/// has no listener up while it waits. See the call site in [`run`] for
+/// why this exists.
+fn spawn_etcd_dns_probe(endpoints: Vec<String>) {
+    tokio::spawn(async move { probe_etcd_dns(&endpoints).await });
+}
+
 async fn probe_etcd_dns(endpoints: &[String]) {
     for raw in endpoints {
         // `redact_userinfo` because an endpoint may be a bare `host:port`,
@@ -2502,11 +2518,15 @@ fn derive_cp_etcd_url(managed: &aisix_core::ManagedConfig) -> anyhow::Result<Str
                  (set AISIX_MANAGED__CP_BASE_URL)"
             )
         })?;
+    // The authority alone. A base URL may carry a path for the REST calls,
+    // and in the etcd URL that path would end up in the TLS server name.
     let host_port = cp_base
         .strip_prefix("https://")
         .or_else(|| cp_base.strip_prefix("http://"))
         .unwrap_or(cp_base)
-        .trim_end_matches('/');
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
     Ok(format!("https://{host_port}"))
 }
 
@@ -4777,6 +4797,27 @@ managed:
         );
     }
 
+    /// A path on the base URL is for the REST calls. It must not reach the
+    /// etcd dial, where it would become part of the TLS server name while
+    /// heartbeat and telemetry went on working.
+    #[test]
+    fn managed_etcd_url_drops_a_path_on_the_base_url() {
+        for (base, expected) in [
+            ("https://cp.example.com/api", "https://cp.example.com"),
+            (
+                "https://cp.example.com:7944/api/",
+                "https://cp.example.com:7944",
+            ),
+            ("cp.example.com:7944/api?x=1", "https://cp.example.com:7944"),
+        ] {
+            let m = aisix_core::ManagedConfig {
+                cp_base_url: Some(base.to_string()),
+                ..aisix_core::ManagedConfig::default()
+            };
+            assert_eq!(derive_cp_etcd_url(&m).unwrap(), expected, "{base}");
+        }
+    }
+
     /// `cp_etcd_endpoint` is the field with the opposite convention:
     /// `derive_cp_etcd_url` prepends `https://` itself, so an operator
     /// who writes one — the natural mistake now that the neighbouring
@@ -5647,6 +5688,15 @@ managed:
                 .is_err(),
             "the listener must be closed once the drain has ended",
         );
+    }
+
+    /// Diagnostic only, so the boot does not wait for it. Returning `()` is the
+    /// guarantee: there is nothing to await. Nothing here can make a real
+    /// resolver hang, and this stops compiling if the probe goes back to being
+    /// something the boot awaits.
+    #[tokio::test]
+    async fn the_dns_probe_leaves_the_boot_path_at_once() {
+        let () = spawn_etcd_dns_probe(vec!["http://unresolvable.invalid:2379".to_string()]);
     }
 
     fn leaf_naming_a_dp(dp_id: Option<&str>) -> String {

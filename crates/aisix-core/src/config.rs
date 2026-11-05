@@ -390,17 +390,17 @@ impl ManagedConfig {
     /// via the api7ee-parity dashboard flow — either inlined as
     /// PEM env vars (`cp_cert_pem` / `cp_key_pem` / `cp_ca_pem`) or
     /// referenced by file path (`cp_cert_file` / `cp_key_file` /
-    /// `cp_ca_file`). All three slots in the same triplet must be
-    /// present together; mixing inline-and-file forms within a
-    /// single role is rejected at boot for clarity.
+    /// `cp_ca_file`). All three roles must be present together, each
+    /// in either form; setting both forms for a single role is rejected
+    /// at boot for clarity.
     pub fn cert_bundle_provided(&self) -> bool {
-        let has_pem = self.cp_cert_pem.as_deref().is_some_and(|s| !s.is_empty())
-            && self.cp_key_pem.as_deref().is_some_and(|s| !s.is_empty())
-            && self.cp_ca_pem.as_deref().is_some_and(|s| !s.is_empty());
-        let has_file = self.cp_cert_file.as_deref().is_some_and(|s| !s.is_empty())
-            && self.cp_key_file.as_deref().is_some_and(|s| !s.is_empty())
-            && self.cp_ca_file.as_deref().is_some_and(|s| !s.is_empty());
-        has_pem || has_file
+        let present = |pem: &Option<String>, file: &Option<String>| {
+            pem.as_deref().is_some_and(|s| !s.is_empty())
+                || file.as_deref().is_some_and(|s| !s.is_empty())
+        };
+        present(&self.cp_cert_pem, &self.cp_cert_file)
+            && present(&self.cp_key_pem, &self.cp_key_file)
+            && present(&self.cp_ca_pem, &self.cp_ca_file)
     }
 
     /// Resolve the optional cache only after the operator enables it.
@@ -711,7 +711,10 @@ pub struct ProxyConfig {
     /// cap rejects requests the upstream would have served. Set a value
     /// to bound per-request memory; over-limit requests get a 413 in
     /// the caller's error envelope.
-    #[serde(default = "ProxyConfig::default_body_limit")]
+    #[serde(
+        default = "ProxyConfig::default_body_limit",
+        deserialize_with = "deserialize_body_limit"
+    )]
     pub request_body_limit_bytes: usize,
     /// TLS for the listener `addr` binds. Part of the shorthand form, so
     /// it cannot be combined with a non-empty `listeners` — a certificate
@@ -803,6 +806,15 @@ pub struct ProxyConfig {
     /// Applied at startup. Changing it requires a restart.
     #[serde(default)]
     pub expose_debug_headers: bool,
+}
+
+/// `null` reads as the default, no cap: the field was optional until `0` took
+/// over that meaning, and a config written then must keep loading.
+fn deserialize_body_limit<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<usize>::deserialize(deserializer)?.unwrap_or_else(ProxyConfig::default_body_limit))
 }
 
 impl ProxyConfig {
@@ -1220,8 +1232,8 @@ pub struct AdminConfig {
 impl AdminConfig {
     fn default_addr() -> String {
         // Intentionally non-routable. Managed-mode configs never bind
-        // this; standalone configs are rejected by `Config::validate`
-        // if they leave it at the default without overriding.
+        // this; a standalone config that leaves it gets a loopback listener
+        // on a port nobody chose, which is in effect no admin surface.
         "127.0.0.1:0".into()
     }
 
@@ -2497,6 +2509,16 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), BootstrapError> {
+        // A login needs both halves. With one, the dial goes out
+        // unauthenticated, and an etcd that has auth on answers in a way that
+        // reads as an expired token rather than a missing setting.
+        let set = |value: &Option<String>| value.as_deref().is_some_and(|s| !s.is_empty());
+        if set(&self.etcd.user) != set(&self.etcd.password_env) {
+            return Err(BootstrapError::Config(
+                "etcd.user and etcd.password_env must be set together".to_string(),
+            ));
+        }
+
         // Fail fast on an unusable rewrite rule: a broken rule would
         // otherwise surface at runtime as silently mis-routed or 404ing
         // legacy traffic, which is much harder to trace back to a typo in
@@ -3112,6 +3134,62 @@ admin:
         assert!(!cfg.proxy.real_ip.recursive);
         assert_eq!(cfg.proxy.real_ip.header, "x-forwarded-for");
         assert!(cfg.proxy.real_ip.parse_trusted().unwrap().is_empty());
+    }
+
+    /// The field used to be optional, with `null` meaning no cap. A config
+    /// written then says the same thing now, and must not stop the boot.
+    #[test]
+    fn request_body_limit_reads_null_as_no_cap() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+  request_body_limit_bytes: null
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.proxy.request_body_limit_bytes, 0);
+    }
+
+    fn load_with_etcd_login(login: &str) -> Result<Config, BootstrapError> {
+        let f = write_yaml(&format!(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+{login}
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#
+        ));
+        Config::load_from_path(Some(f.path()))
+    }
+
+    #[test]
+    fn half_an_etcd_login_stops_the_boot() {
+        for half in ["  user: root", "  password_env: ETCD_PASSWORD"] {
+            let error = load_with_etcd_login(half).unwrap_err().to_string();
+            assert!(error.contains("etcd.user"), "{half}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_whole_etcd_login_or_none_at_all_loads() {
+        for login in [
+            "  user: root\n  password_env: ETCD_PASSWORD",
+            "",
+            // What an empty environment variable produces: not half a login.
+            "  user: \"\"",
+        ] {
+            load_with_etcd_login(login).unwrap_or_else(|e| panic!("{login}: {e}"));
+        }
     }
 
     #[test]

@@ -372,6 +372,28 @@ mod tests {
         assert!(cfg.cert_bundle_provided());
     }
 
+    /// Each role picks its own form. A rotated certificate supplied inline next
+    /// to a key on a mounted file must not read as "nothing supplied", which
+    /// would serve the stale bundle on disk instead.
+    #[tokio::test]
+    async fn a_different_form_per_role_counts_as_provided_and_provisions() {
+        let tmp = TempDir::new().unwrap();
+        let (cert_pem, key_pem) = synth_leaf("env-3", "dp-3");
+        let key_file = tmp.path().join("key.pem");
+        tokio::fs::write(&key_file, &key_pem).await.unwrap();
+        let cfg = ManagedConfig {
+            mtls_dir: tmp.path().join("bundle").to_string_lossy().into_owned(),
+            cp_cert_pem: Some(cert_pem.clone()),
+            cp_key_file: Some(key_file.to_string_lossy().into_owned()),
+            cp_ca_pem: Some(cert_pem),
+            ..ManagedConfig::default()
+        };
+
+        assert!(cfg.cert_bundle_provided());
+        let p = provision(&cfg).await.unwrap();
+        assert_eq!(p.dp_id, "dp-3");
+    }
+
     #[test]
     fn cert_bundle_provided_partial_inline_is_false() {
         let cfg = ManagedConfig {
