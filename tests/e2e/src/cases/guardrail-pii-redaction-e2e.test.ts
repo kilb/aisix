@@ -629,7 +629,7 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
         );
       });
     });
-    await new Promise<void>((resolve) => anthropicUpstream!.listen(0, resolve));
+    await new Promise<void>((resolve) => anthropicUpstream!.listen(0, "127.0.0.1", resolve));
     const anthPort = (anthropicUpstream.address() as { port: number }).port;
 
     const anthPk = await seed.createProviderKey({
