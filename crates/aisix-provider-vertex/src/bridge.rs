@@ -1109,10 +1109,11 @@ impl VertexBridge {
                 return Err(map_http_error(status, resp).await);
             }
             let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
-            let parsed: GeminiGenerateContentResponse = resp
-                .json()
-                .await
-                .map_err(|e| aisix_gateway::upstream_body_read_error(&e))?;
+            // Every field of this shape has a default, so a 2xx that reports
+            // an error would otherwise read as an empty answer.
+            let parsed: GeminiGenerateContentResponse =
+                aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::Vertex)
+                    .await?;
             Ok(gemini_response_into_chat_response(parsed, upstream_id)
                 .with_fallback_service_tier(header_tier))
         })
@@ -1210,6 +1211,8 @@ impl VertexBridge {
             if let Some(obj) = body_value.as_object_mut() {
                 obj.remove("model");
                 obj.remove("stream");
+                // Vertex AI refuses the field whatever its value.
+                obj.remove("service_tier");
                 obj.insert(
                     "anthropic_version".to_string(),
                     serde_json::Value::String(VERTEX_ANTHROPIC_VERSION.to_string()),
@@ -1330,6 +1333,8 @@ impl VertexBridge {
             apply_body_overrides(&mut body_value, ctx)?;
             if let Some(obj) = body_value.as_object_mut() {
                 obj.remove("model");
+                // Vertex AI refuses the field whatever its value.
+                obj.remove("service_tier");
                 obj.insert(
                     "anthropic_version".to_string(),
                     serde_json::Value::String(VERTEX_ANTHROPIC_VERSION.to_string()),
@@ -3068,7 +3073,9 @@ fn build_gemini_request_with(
     let config = GeminiGenerationConfig {
         temperature: req.temperature,
         top_p: req.top_p,
-        top_k: req.top_k,
+        top_k: req
+            .top_k
+            .or_else(|| req.extra.get("top_k").and_then(serde_json::Value::as_u64)),
         max_output_tokens: extra("max_completion_tokens")
             .or_else(|| req.max_tokens.map(Into::into)),
         stop_sequences: gemini_stop_sequences(req)?,
@@ -3517,8 +3524,10 @@ fn finish_with_tool_calls(reason: Option<&str>) -> FinishReason {
 /// - `SAFETY` / `RECITATION` / `BLOCKLIST` / `PROHIBITED_CONTENT` /
 ///   `SPII` / `IMAGE_SAFETY` / `IMAGE_PROHIBITED_CONTENT` / `IMAGE_RECITATION`
 ///   / `IMAGE_OTHER` / `NO_IMAGE` / `LANGUAGE` → `FinishReason::ContentFilter`
-/// - `MALFORMED_FUNCTION_CALL` / `UNEXPECTED_TOOL_CALL` / `OTHER` /
-///   `FINISH_REASON_UNSPECIFIED` / unknown → `FinishReason::Stop`
+/// - `MALFORMED_FUNCTION_CALL` / `UNEXPECTED_TOOL_CALL` →
+///   `FinishReason::Other`, as sent: the turn failed, and `stop` over an empty
+///   answer would not say so
+/// - `OTHER` / `FINISH_REASON_UNSPECIFIED` / unknown → `FinishReason::Stop`
 ///
 /// **Audit LOW-3:** `IMAGE_SAFETY` and `LANGUAGE` previously fell
 /// through to `Stop` — misleading for tracing, because a customer
@@ -3539,6 +3548,9 @@ fn map_gemini_finish_reason(reason: Option<&str>) -> FinishReason {
         | Some("IMAGE_OTHER")
         | Some("NO_IMAGE")
         | Some("LANGUAGE") => FinishReason::ContentFilter,
+        Some(reason @ ("MALFORMED_FUNCTION_CALL" | "UNEXPECTED_TOOL_CALL")) => {
+            FinishReason::Other(reason.to_string())
+        }
         _ => FinishReason::Stop,
     }
 }
@@ -4548,7 +4560,7 @@ mod tests {
             serde_json::json!({
                 "maxOutputTokens": 20, "stopSequences": ["END"], "seed": 7,
                 "presencePenalty": 0.5, "frequencyPenalty": -0.25, "candidateCount": 2,
-                "responseLogprobs": true, "logprobs": 3,
+                "responseLogprobs": true, "logprobs": 3, "topK": 9,
             })
         );
         assert_eq!(
@@ -7783,6 +7795,86 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         }
     }
 
+    /// Vertex AI refuses `service_tier` on Claude, on both rails.
+    #[tokio::test]
+    async fn vertex_claude_never_sends_service_tier() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "m",
+                "model": "c",
+                "content": [{"type": "text", "text": "hi"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("claude-sonnet-4-5@20250929"),
+            sample_pk_with_secret(
+                r#"{"access_token":"t","project":"my-proj","region":"us-central1"}"#,
+            ),
+        );
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("hi")]);
+        req.extra.insert("service_tier".into(), "auto".into());
+        bridge.chat(&req, &ctx).await.unwrap();
+        // 流式这条轨只看请求体，响应是不是 SSE 与此无关。
+        let _ = bridge.chat_stream(&req, &ctx).await;
+        let sent = server.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 2);
+        for request in sent {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert!(body.get("service_tier").is_none(), "{body}");
+        }
+    }
+
+    /// A 2xx that reports an error is that error, not an empty answer.
+    #[tokio::test]
+    async fn a_gemini_2xx_reporting_an_error_is_not_an_empty_answer() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error": {"code": 503, "message": "try later", "status": "UNAVAILABLE"}
+            })))
+            .mount(&server)
+            .await;
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-2.5-flash"),
+            sample_pk_with_secret(
+                r#"{"access_token":"t","project":"my-proj","region":"us-central1"}"#,
+            ),
+        );
+        let req = ChatFormat::new("m", vec![ChatMessage::user("hi")]);
+        let err = bridge.chat(&req, &ctx).await.err().expect("an error");
+        assert!(matches!(err, BridgeError::UpstreamInBand { .. }), "{err:?}");
+        assert!(err.to_string().contains("try later"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_tool_turn_does_not_finish_as_stop() {
+        for reason in ["MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL"] {
+            assert_eq!(
+                map_gemini_finish_reason(Some(reason)),
+                FinishReason::Other(reason.to_string())
+            );
+        }
+        assert_eq!(map_gemini_finish_reason(Some("OTHER")), FinishReason::Stop);
+    }
+
+    /// `top_k` in a chat body has Gemini's `topK` to go to, as it has Claude's
+    /// and Converse's `top_k`.
+    #[test]
+    fn a_chat_callers_top_k_reaches_top_k() {
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("hi")]);
+        req.extra.insert("top_k".into(), 40.into());
+        let built = build_gemini_request(&req, "gemini-2.5-flash").unwrap();
+        assert_eq!(built.generation_config.and_then(|c| c.top_k), Some(40));
+    }
+
     // ─── RequestOverrides applied on the wire (#339) ───────────────────
     //
     // These pin that the per-`ProviderKey` override pipeline actually
@@ -8553,6 +8645,9 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         assert_eq!(finish("STOP"), FinishReason::ToolCalls);
         assert_eq!(finish("MAX_TOKENS"), FinishReason::Length);
         assert_eq!(finish("SAFETY"), FinishReason::ContentFilter);
-        assert_eq!(finish("MALFORMED_FUNCTION_CALL"), FinishReason::Stop);
+        assert_eq!(
+            finish("MALFORMED_FUNCTION_CALL"),
+            FinishReason::Other("MALFORMED_FUNCTION_CALL".into())
+        );
     }
 }

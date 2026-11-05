@@ -1054,15 +1054,10 @@ pub fn chat_response_to_responses_json(
     reply: &ResponsesReplyContext,
 ) -> Value {
     let (status, incomplete_reason) = responses_status(&resp.finish_reason);
-    // A refusal-only answer is not an empty one: see `next_events`.
-    let refusal = resp.message.extra.get("refusal").and_then(Value::as_str);
     let output = build_output_items(
         resp.message.reasoning_text().as_deref(),
-        resp.message
-            .text()
-            .as_deref()
-            .filter(|text| !text.is_empty())
-            .or(refusal),
+        resp.message.text().as_deref(),
+        resp.message.extra.get("refusal").and_then(Value::as_str),
         resp.message
             .extra
             .get("tool_calls")
@@ -1311,6 +1306,18 @@ fn reasoning_item_json(item_id: &str, text: &str) -> Value {
     })
 }
 
+/// A completed assistant `message` item carrying a model's refusal, the
+/// content part the Responses API defines for it.
+fn refusal_item_json(item_id: &str, refusal: &str) -> Value {
+    json!({
+        "type": "message",
+        "id": item_id,
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "refusal", "refusal": refusal}],
+    })
+}
+
 /// A completed assistant `message` item carrying `text`.
 fn message_item_json(item_id: &str, text: &str) -> Value {
     json!({
@@ -1324,13 +1331,15 @@ fn message_item_json(item_id: &str, text: &str) -> Value {
 
 /// Assemble the `output` array: a `reasoning` item carrying the upstream's
 /// chain-of-thought (when any), then a `message` item carrying the assistant
-/// text (when any), followed by one tool-call item per tool call —
+/// text (when any), another carrying its refusal (when any), followed by one
+/// tool-call item per tool call —
 /// `custom_tool_call` for a call naming one of the request's `custom`
 /// tools, `function_call` for everything else (see
 /// [`ResponsesReplyContext`]).
 fn build_output_items(
     reasoning: Option<&str>,
     text: Option<&str>,
+    refusal: Option<&str>,
     tool_calls: Option<&Vec<Value>>,
     reply: &ResponsesReplyContext,
 ) -> Vec<Value> {
@@ -1352,6 +1361,12 @@ fn build_output_items(
             "role": "assistant",
             "content": [{"type": "output_text", "text": text, "annotations": []}],
         }));
+    }
+    if let Some(refusal) = refusal.filter(|s| !s.is_empty()) {
+        output.push(refusal_item_json(
+            &format!("msg_{}", Uuid::new_v4().simple()),
+            refusal,
+        ));
     }
     if let Some(tool_calls) = tool_calls {
         for tc in tool_calls {
@@ -1508,6 +1523,26 @@ struct ReasoningState {
     text: String,
 }
 
+/// The refusal text of one chunk, for a stream that carries one in its own
+/// delta field.
+fn refusal_delta(chunk: &ChatChunk) -> Option<&str> {
+    chunk
+        .delta
+        .extra
+        .get("refusal")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+/// Per-refusal streaming state: one `message` item holding one `refusal`
+/// part, kept apart from the text so the two stay on their own events.
+#[derive(Debug)]
+struct RefusalState {
+    item_id: String,
+    output_index: u32,
+    text: String,
+}
+
 /// Per-tool-call streaming state.
 #[derive(Debug)]
 struct ToolCallState {
@@ -1589,6 +1624,10 @@ pub struct ResponsesSseEncoder {
     /// Message items already closed by reasoning that followed their text,
     /// as `(item_id, output_index, text)`.
     text_done: Vec<(String, u32, String)>,
+    /// The refusal item currently streaming, if any.
+    refusal_open: Option<RefusalState>,
+    /// Refusal items already closed.
+    refusal_done: Vec<RefusalState>,
     /// Set once the per-item `*.done` events have been emitted, so
     /// `close_items` is idempotent across the finish chunk + `force_finish`.
     items_closed: bool,
@@ -1645,6 +1684,8 @@ impl ResponsesSseEncoder {
             accumulated_bytes: 0,
             overflowed: false,
             text_done: Vec::new(),
+            refusal_open: None,
+            refusal_done: Vec::new(),
             items_closed: false,
             reasoning_open: None,
             reasoning_done: Vec::new(),
@@ -1816,6 +1857,12 @@ impl ResponsesSseEncoder {
             .iter()
             .map(|(_, _, text)| text.as_str())
             .chain([self.text_accum.as_str()])
+            .chain(
+                self.refusal_done
+                    .iter()
+                    .chain(self.refusal_open.iter())
+                    .map(|r| r.text.as_str()),
+            )
             .collect();
         (text, tool_calls.into_iter().map(|(_, v)| v).collect())
     }
@@ -1873,6 +1920,9 @@ impl ResponsesSseEncoder {
         {
             items.push((output_index, message_item_json(id, text)));
         }
+        for r in self.refusal_done.iter().chain(self.refusal_open.iter()) {
+            items.push((r.output_index, refusal_item_json(&r.item_id, &r.text)));
+        }
         for tc in self.tool_calls.values() {
             items.push((tc.output_index, tc.done_item()));
         }
@@ -1903,18 +1953,11 @@ impl ResponsesSseEncoder {
             return Vec::new();
         }
 
-        // A refusal streams in its own delta field, and this encoder writes it
-        // as the answer's text: a refusal-only answer is not an empty one.
-        let text: Option<String> = [
-            chunk.delta.content.as_deref(),
-            chunk.delta.extra.get("refusal").and_then(Value::as_str),
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .reduce(|content, refusal| content + &refusal);
-        let has_content = text.is_some();
+        let has_content = chunk
+            .delta
+            .content
+            .as_deref()
+            .is_some_and(|s| !s.is_empty());
         let has_tools = chunk
             .delta
             .tool_calls
@@ -1926,11 +1969,15 @@ impl ResponsesSseEncoder {
             .as_deref()
             .is_some_and(|s| !s.is_empty());
         let has_finish = chunk.finish_reason.is_some();
+        let refusal = refusal_delta(chunk);
 
-        let mut additional = text
+        let mut additional = chunk
+            .delta
+            .content
             .as_deref()
             .map_or(0, str::len)
-            .saturating_add(chunk.delta.reasoning_content.as_deref().map_or(0, str::len));
+            .saturating_add(chunk.delta.reasoning_content.as_deref().map_or(0, str::len))
+            .saturating_add(refusal.map_or(0, str::len));
         if let Some(tool_calls) = chunk.delta.tool_calls.as_ref() {
             for tc in tool_calls {
                 let index = tc.get("index").and_then(Value::as_u64).unwrap_or(0);
@@ -1959,7 +2006,9 @@ impl ResponsesSseEncoder {
 
         let mut events = Vec::new();
 
-        if !self.sent_created && (has_content || has_tools || has_reasoning || has_finish) {
+        if !self.sent_created
+            && (has_content || has_tools || has_reasoning || has_finish || refusal.is_some())
+        {
             self.sent_created = true;
             events.extend(self.opening_events());
         }
@@ -2019,13 +2068,14 @@ impl ResponsesSseEncoder {
 
         // The first content or tool-call delta after a reasoning run ends it,
         // so the item that follows opens at the next `output_index`.
-        if has_content || has_tools {
+        if has_content || has_tools || refusal.is_some() {
             events.extend(self.close_reasoning());
         }
 
         // ── Text content ──
         if has_content {
-            let delta = text.unwrap_or_default();
+            events.extend(self.close_refusal());
+            let delta = chunk.delta.content.clone().unwrap_or_default();
             if self.text_item_id.is_none() {
                 let item_id = format!("msg_{}", Uuid::new_v4().simple());
                 let output_index = self.next_output_index;
@@ -2054,6 +2104,53 @@ impl ResponsesSseEncoder {
             self.text_accum.push_str(&delta);
             events.push(self.event(
                 "response.output_text.delta",
+                json!({
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "delta": delta,
+                }),
+            ));
+        }
+
+        // ── Refusal ──
+        if let Some(delta) = refusal {
+            events.extend(self.close_text());
+            if self.refusal_open.is_none() {
+                let item_id = format!("msg_{}", Uuid::new_v4().simple());
+                let output_index = self.next_output_index;
+                self.next_output_index += 1;
+                self.refusal_open = Some(RefusalState {
+                    item_id: item_id.clone(),
+                    output_index,
+                    text: String::new(),
+                });
+                events.push(self.event(
+                    "response.output_item.added",
+                    json!({
+                        "output_index": output_index,
+                        "item": {"type": "message", "id": item_id, "status": "in_progress", "role": "assistant", "content": []},
+                    }),
+                ));
+                events.push(self.event(
+                    "response.content_part.added",
+                    json!({
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "part": {"type": "refusal", "refusal": ""},
+                    }),
+                ));
+            }
+            let (item_id, output_index) = match self.refusal_open.as_mut() {
+                Some(r) => {
+                    r.text.push_str(delta);
+                    (r.item_id.clone(), r.output_index)
+                }
+                None => (String::new(), 0),
+            };
+            events.push(self.event(
+                "response.refusal.delta",
                 json!({
                     "item_id": item_id,
                     "output_index": output_index,
@@ -2217,6 +2314,40 @@ impl ResponsesSseEncoder {
         ]
     }
 
+    /// Close the open refusal item, if any: its text, then its part, then the
+    /// item. Empty when none is open.
+    fn close_refusal(&mut self) -> Vec<ResponsesSseEvent> {
+        let Some(r) = self.refusal_open.take() else {
+            return Vec::new();
+        };
+        let (item_id, output_index, text) = (r.item_id.clone(), r.output_index, r.text.clone());
+        self.refusal_done.push(r);
+        vec![
+            self.event(
+                "response.refusal.done",
+                json!({
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "refusal": text,
+                }),
+            ),
+            self.event(
+                "response.content_part.done",
+                json!({
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "part": {"type": "refusal", "refusal": text},
+                }),
+            ),
+            self.event(
+                "response.output_item.done",
+                json!({"output_index": output_index, "item": refusal_item_json(&item_id, &text)}),
+            ),
+        ]
+    }
+
     /// Close the open message item, if any: its text, then its part, then
     /// the item. Empty when no message item is open.
     fn close_text(&mut self) -> Vec<ResponsesSseEvent> {
@@ -2266,6 +2397,7 @@ impl ResponsesSseEncoder {
         // or a truncation) still owes the item's closing events.
         let mut events = self.close_reasoning();
         events.extend(self.close_text());
+        events.extend(self.close_refusal());
         let pending: Vec<u64> = self
             .tool_calls
             .iter()
@@ -2625,14 +2757,17 @@ pub fn build_responses_bridge_stream(
                         // bounded to the cap so a long stream can't grow the
                         // buffer without limit. Only when an exporter wants
                         // full content — mirrors chat.rs's stream capture.
-                        if let (false, Some(cap), Some(text)) =
-                            (released, content_cap, chunk.delta.content.as_deref())
+                        for text in [chunk.delta.content.as_deref(), refusal_delta(&chunk)]
+                            .into_iter()
+                            .flatten()
                         {
-                            let _ = crate::token_estimate::push_capped_to(
-                                &mut comp.response_text,
-                                text,
-                                cap as usize,
-                            );
+                            if let (false, Some(cap)) = (released, content_cap) {
+                                let _ = crate::token_estimate::push_capped_to(
+                                    &mut comp.response_text,
+                                    text,
+                                    cap as usize,
+                                );
+                            }
                         }
                         // Token-estimation accumulator (#1074):
                         // all generated output, always on (whether the
@@ -2644,6 +2779,9 @@ pub fn build_responses_bridge_stream(
                                 push_capped(&mut comp.est_output_text, text);
                             }
                             if let Some(text) = chunk.delta.reasoning_content.as_deref() {
+                                push_capped(&mut comp.est_output_text, text);
+                            }
+                            if let Some(text) = refusal_delta(&chunk) {
                                 push_capped(&mut comp.est_output_text, text);
                             }
                             if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
@@ -4722,9 +4860,10 @@ mod tests {
     }
 
     /// An upstream's refusal is the answer the caller gets: dropping it hands
-    /// them an empty message that reads as success.
+    /// them an empty message that reads as success. It stays a refusal, because
+    /// a client that parses structured output parses `output_text`.
     #[test]
-    fn a_refusal_is_the_answers_text_streamed_and_not() {
+    fn a_refusal_on_the_finish_chunk_is_the_answer_streamed_and_not() {
         let mut extra = serde_json::Map::new();
         extra.insert("refusal".into(), "I can't help with that".into());
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
@@ -4744,7 +4883,7 @@ mod tests {
         });
         let last = events.pop().expect("a terminal event");
         assert_eq!(
-            last.data["response"]["output"][0]["content"][0]["text"],
+            last.data["response"]["output"][0]["content"][0]["refusal"],
             "I can't help with that"
         );
         assert_eq!(
@@ -4770,7 +4909,7 @@ mod tests {
             &ResponsesReplyContext::default(),
         );
         assert_eq!(
-            json["output"][0]["content"][0]["text"],
+            json["output"][0]["content"][0]["refusal"],
             "I can't help with that"
         );
     }
@@ -5175,6 +5314,68 @@ mod tests {
     /// The guardrail scan text is unchanged by reasoning: generated
     /// reasoning is out of output-guardrail scope on every /v1/responses
     /// path, so it must not reach the assembled assistant message.
+    /// A refusal is the model's answer, on both paths: a client that reads only
+    /// `output` must find it, and the end-of-stream scan must read it.
+    #[test]
+    fn an_upstream_refusal_reaches_the_responses_caller() {
+        let mut message = ChatMessage::assistant("");
+        message.content = None;
+        message
+            .extra
+            .insert("refusal".into(), "I can't help".into());
+        let resp = ChatResponse {
+            id: "c".into(),
+            model: "m".into(),
+            message,
+            finish_reason: FinishReason::Stop,
+            logprobs: None,
+            more_choices: Vec::new(),
+            usage: UsageStats::default(),
+            service_tier: None,
+        };
+        let body =
+            chat_response_to_responses_json(&resp, "m", 0, &ResponsesReplyContext::default());
+        assert_eq!(
+            body["output"][0]["content"],
+            json!([{"type": "refusal", "refusal": "I can't help"}])
+        );
+
+        let mut enc = ResponsesSseEncoder::new("r", "m", 0, ResponsesReplyContext::default());
+        let mut events = Vec::new();
+        for (refusal, finish) in [
+            (Some("I can't"), None),
+            (Some(" help"), None),
+            (None, Some(FinishReason::Stop)),
+        ] {
+            let mut delta = aisix_gateway::ChatDelta::default();
+            if let Some(refusal) = refusal {
+                delta.extra.insert("refusal".into(), refusal.into());
+            }
+            events.extend(enc.next_events(&ChatChunk {
+                id: "c".into(),
+                model: "m".into(),
+                choice_index: 0,
+                delta,
+                finish_reason: finish,
+                logprobs: None,
+                usage: None,
+                service_tier: None,
+                accounting_usage: None,
+            }));
+        }
+        events.extend(enc.force_finish());
+        let names: Vec<&str> = events.iter().map(|e| e.event_type).collect();
+        assert!(names.contains(&"response.refusal.delta"), "{names:?}");
+        assert!(names.contains(&"response.refusal.done"), "{names:?}");
+        let completed = events.last().unwrap();
+        assert_eq!(completed.event_type, "response.completed");
+        assert_eq!(
+            completed.data["response"]["output"][0]["content"],
+            json!([{"type": "refusal", "refusal": "I can't help"}])
+        );
+        assert_eq!(enc.assembled_assistant_message().0, "I can't help");
+    }
+
     #[test]
     fn assembled_assistant_message_excludes_reasoning() {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());

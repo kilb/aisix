@@ -798,6 +798,7 @@ pub fn build_request<'a>(
     };
     translate_stop_to_anthropic(&mut extras)?;
     translate_openai_only_fields(&mut extras);
+    translate_service_tier(&mut extras);
     if let Some(top_k) = req.top_k {
         extras.entry("top_k").or_insert(top_k.into());
     }
@@ -989,6 +990,23 @@ fn translate_openai_only_fields(extras: &mut serde_json::Map<String, serde_json:
     };
     if let Some(user_id) = user_id.or(identifier) {
         extras.insert("metadata".into(), serde_json::json!({ "user_id": user_id }));
+    }
+}
+
+/// OpenAI's `service_tier` in Anthropic's vocabulary, `auto` or `standard_only`
+/// (<https://platform.claude.com/docs/en/api/messages>): `default` is the same
+/// request as `standard_only`, and `flex`, `scale` and `priority` name tiers
+/// Anthropic has no request value for. Anything else is Anthropic's own to
+/// answer.
+fn translate_service_tier(extras: &mut serde_json::Map<String, serde_json::Value>) {
+    match extras.get("service_tier").and_then(|t| t.as_str()) {
+        Some("default") => {
+            extras.insert("service_tier".to_string(), "standard_only".into());
+        }
+        Some("flex" | "scale" | "priority") => {
+            extras.remove("service_tier");
+        }
+        _ => {}
     }
 }
 
@@ -2105,6 +2123,12 @@ pub struct AnthropicServerToolUse {
     pub web_fetch_requests: u32,
 }
 
+/// A token counter that may be sent as `null`, which reads as `0`. `default`
+/// alone covers only an absent field.
+fn nullable_count<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+    Ok(Option::<u32>::deserialize(deserializer)?.unwrap_or(0))
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct AnthropicUsage {
@@ -2115,11 +2139,12 @@ pub struct AnthropicUsage {
     #[serde(default)]
     pub server_tool_use: Option<AnthropicServerToolUse>,
     /// Tokens written to the prompt cache (1.25× input rate). Optional
-    /// — present only on requests with cache_control segments.
-    #[serde(default)]
+    /// — present only on requests with cache_control segments, and typed
+    /// nullable by the SDK.
+    #[serde(default, deserialize_with = "nullable_count")]
     pub cache_creation_input_tokens: u32,
     /// Tokens served from the prompt cache (0.10× input rate).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable_count")]
     pub cache_read_input_tokens: u32,
     /// `cache_creation_input_tokens` split by cache lifetime.
     #[serde(default)]
@@ -2396,11 +2421,14 @@ pub fn anthropic_error_kind_status(kind: Option<&str>) -> Option<u16> {
     match kind? {
         "invalid_request_error" => Some(400),
         "authentication_error" => Some(401),
+        "billing_error" => Some(402),
         "permission_error" => Some(403),
         "not_found_error" => Some(404),
+        "conflict_error" => Some(409),
         "request_too_large" => Some(413),
         "rate_limit_error" => Some(429),
         "api_error" => Some(500),
+        "timeout_error" => Some(504),
         "overloaded_error" => Some(529),
         _ => None,
     }
@@ -3383,17 +3411,6 @@ fn parse_inbound(
     Ok(chat)
 }
 
-/// OpenAI function-name length cap; LiteLLM truncates the same way
-/// (`truncate_tool_name`).
-const OPENAI_TOOL_NAME_MAX: usize = 64;
-
-fn truncate_tool_name(name: &str) -> &str {
-    match name.char_indices().nth(OPENAI_TOOL_NAME_MAX) {
-        Some((byte_idx, _)) => &name[..byte_idx],
-        None => name,
-    }
-}
-
 /// Under [`CacheMarkers::Keep`], a system prompt given as blocks of which at
 /// least one carries a `cache_control` marker, as a system message holding
 /// its text blocks as parts with their markers. `None` otherwise, for the
@@ -3449,12 +3466,53 @@ fn concat_text_blocks(blocks: &[serde_json::Value]) -> String {
     out
 }
 
-/// Translate one Anthropic `image` or `document` block into the OpenAI
-/// `image_url` content part. Base64 sources become `data:` URLs; URL
-/// sources pass through. Documents map to `image_url` as well — the
-/// LiteLLM `_translate_anthropic_image_to_openai` behavior.
+/// The text of a `document` block whose source carries it: `text` holds it in
+/// `data`, `content` as a string or as text blocks.
+fn document_source_text(block: &serde_json::Value) -> Option<String> {
+    use serde_json::Value;
+    if block.get("type").and_then(Value::as_str) != Some("document") {
+        return None;
+    }
+    let source = block.get("source")?;
+    match source.get("type").and_then(Value::as_str)? {
+        "text" => source
+            .get("data")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        "content" => match source.get("content")? {
+            Value::String(text) => Some(text.clone()),
+            Value::Array(blocks) => Some(concat_text_blocks(blocks)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Translate one Anthropic `image` or `document` block into an OpenAI content
+/// part. Base64 sources become `data:` URLs, in an `image_url` part except for
+/// a PDF, which chat takes in a `file` part
+/// (<https://platform.openai.com/docs/api-reference/chat/create>); URL sources
+/// pass through as `image_url`.
 fn openai_media_part_from_anthropic(block: &serde_json::Value) -> Option<serde_json::Value> {
     let source = block.get("source")?;
+    if block.get("type").and_then(serde_json::Value::as_str) == Some("document")
+        && source.get("type").and_then(serde_json::Value::as_str) == Some("base64")
+        && source.get("media_type").and_then(serde_json::Value::as_str) == Some("application/pdf")
+    {
+        let data = source.get("data").and_then(serde_json::Value::as_str)?;
+        let filename = block
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .filter(|title| !title.is_empty())
+            .unwrap_or("document.pdf");
+        return Some(serde_json::json!({
+            "type": "file",
+            "file": {
+                "filename": filename,
+                "file_data": format!("data:application/pdf;base64,{data}"),
+            },
+        }));
+    }
     let url = match source.get("type").and_then(serde_json::Value::as_str) {
         Some("base64") => {
             let media_type = source
@@ -3490,7 +3548,7 @@ fn tool_call_from_tool_use(
             "id": id,
             "type": "function",
             "function": {
-                "name": truncate_tool_name(name),
+                "name": name,
                 "arguments": input.to_string(),
             }
         }),
@@ -3595,6 +3653,16 @@ fn translate_user_blocks(
                     ));
                     non_text |= marked;
                 }
+            }
+            Some("document") if document_source_text(block).is_some() => {
+                let t = document_source_text(block).unwrap_or_default();
+                parts.push(with_marker_of(
+                    serde_json::json!({"type": "text", "text": t}),
+                    block,
+                    markers,
+                ));
+                text.push_str(&t);
+                non_text |= marked;
             }
             Some("image") | Some("document") => {
                 if let Some(p) = openai_media_part_from_anthropic(block) {
@@ -9163,7 +9231,7 @@ mod tests {
     }
 
     #[test]
-    fn inbound_image_url_and_document_become_image_parts() {
+    fn inbound_image_url_becomes_an_image_part_and_a_pdf_a_file_part() {
         let body = serde_json::json!({
             "model": "claude",
             "messages": [{
@@ -9180,7 +9248,7 @@ mod tests {
         let blocks = chat.messages[0].content_blocks.as_ref().unwrap();
         assert_eq!(blocks[0]["image_url"]["url"], "https://x.example/cat.png");
         assert_eq!(
-            blocks[1]["image_url"]["url"],
+            blocks[1]["file"]["file_data"],
             "data:application/pdf;base64,cGRm"
         );
     }
@@ -9228,20 +9296,6 @@ mod tests {
         // OpenAI's canonical pure-tool-call history turn is content: null.
         assert_eq!(chat.messages[0].content, None);
         assert!(chat.messages[0].extra.contains_key("tool_calls"));
-    }
-
-    #[test]
-    fn inbound_tool_name_truncates_to_openai_64_char_cap() {
-        let long = "x".repeat(80);
-        let body = serde_json::json!({
-            "model": "claude",
-            "messages": [{"role": "assistant", "content": [
-                {"type": "tool_use", "id": "t1", "name": long, "input": {}},
-            ]}],
-        });
-        let chat = parse_inbound_request(&body).unwrap();
-        let calls = chat.messages[0].extra["tool_calls"].as_array().unwrap();
-        assert_eq!(calls[0]["function"]["name"].as_str().unwrap().len(), 64);
     }
 
     #[test]
@@ -10116,5 +10170,137 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["function"]["name"], "get_weather");
         assert_eq!(chunks[2].finish_reason, Some(FinishReason::ToolCalls));
+    }
+}
+
+#[cfg(test)]
+mod request_contract_tests {
+    use super::*;
+
+    fn built_with(key: &str, value: serde_json::Value, model: &str) -> serde_json::Value {
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("hi")]);
+        req.extra.insert(key.into(), value);
+        let (system, messages) = split_system(&req).unwrap();
+        serde_json::to_value(build_request(&req, model, system, messages, false).unwrap()).unwrap()
+    }
+
+    /// Anthropic takes `auto` and `standard_only`: an OpenAI value is mapped
+    /// where it has a counterpart and dropped where it has none, not refused.
+    #[test]
+    fn openai_service_tiers_fit_anthropics_vocabulary() {
+        for (sent, expected) in [
+            ("default", Some("standard_only")),
+            ("auto", Some("auto")),
+            ("standard_only", Some("standard_only")),
+            ("flex", None),
+            ("scale", None),
+            ("priority", None),
+        ] {
+            let body = built_with("service_tier", sent.into(), "claude-sonnet-4-5");
+            assert_eq!(
+                body.get("service_tier").and_then(|t| t.as_str()),
+                expected,
+                "{sent}"
+            );
+        }
+    }
+
+    /// The SDK types both cache counters as nullable, so `null` is an answer
+    /// the upstream already billed, not an undecodable one.
+    #[test]
+    fn null_cache_counters_do_not_fail_the_answer() {
+        let body = r#"{"id":"m","model":"c","content":[{"type":"text","text":"hi"}],
+            "stop_reason":"end_turn",
+            "usage":{"input_tokens":3,"output_tokens":4,
+                     "cache_creation_input_tokens":null,"cache_read_input_tokens":null}}"#;
+        let parsed: AnthropicResponse = serde_json::from_str(body).unwrap();
+        let chat = response_into_chat_response(parsed);
+        assert_eq!(chat.usage.prompt_tokens, 3);
+        assert_eq!(chat.usage.cache_read_tokens, 0);
+    }
+
+    #[test]
+    fn every_documented_error_type_has_its_status() {
+        for (kind, status) in [
+            ("billing_error", 402),
+            ("conflict_error", 409),
+            ("timeout_error", 504),
+            ("overloaded_error", 529),
+        ] {
+            assert_eq!(
+                anthropic_error_kind_status(Some(kind)),
+                Some(status),
+                "{kind}"
+            );
+        }
+    }
+
+    fn user_parts(block: serde_json::Value) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        translate_user_blocks(
+            &[
+                block,
+                serde_json::json!({"type": "text", "text": "what does it say?"}),
+            ],
+            CacheMarkers::Drop,
+            &mut out,
+        );
+        match out.pop() {
+            Some(m) => {
+                let text = m.content_str().to_string();
+                m.content_blocks
+                    .unwrap_or_else(|| vec![serde_json::json!({"type": "text", "text": text})])
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// A document that carries its own text reaches the model as text, rather
+    /// than leaving it to answer blind.
+    #[test]
+    fn a_document_with_a_text_source_keeps_its_text() {
+        for block in [
+            serde_json::json!({"type": "document",
+                "source": {"type": "text", "media_type": "text/plain", "data": "the contract"}}),
+            serde_json::json!({"type": "document",
+                "source": {"type": "content", "content": "the contract"}}),
+            serde_json::json!({"type": "document",
+                "source": {"type": "content", "content": [{"type": "text", "text": "the contract"}]}}),
+        ] {
+            let parts = user_parts(block);
+            let text = parts[0]["text"].as_str().unwrap();
+            assert!(text.starts_with("the contract"), "{parts:?}");
+        }
+    }
+
+    /// Chat takes a PDF in a `file` part; an image part refuses it.
+    #[test]
+    fn a_base64_pdf_travels_as_a_file_part() {
+        let parts = user_parts(serde_json::json!({"type": "document", "title": "c.pdf",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}}));
+        assert_eq!(parts[0]["type"], "file");
+        assert_eq!(parts[0]["file"]["filename"], "c.pdf");
+        assert_eq!(
+            parts[0]["file"]["file_data"],
+            "data:application/pdf;base64,JVBERi0="
+        );
+        // The native bridges read the same part.
+        assert!(matches!(
+            aisix_gateway::content_part::parse_part(&parts[0]),
+            Ok(ContentPart::Media(_))
+        ));
+    }
+
+    /// A replayed call names the tool the definitions offered, whatever its
+    /// length: the name is the upstream's to judge, on both sides alike.
+    #[test]
+    fn a_replayed_tool_call_keeps_its_name() {
+        let name = "t".repeat(80);
+        let call = tool_call_from_tool_use(
+            &serde_json::json!({"type": "tool_use", "id": "t1", "name": name, "input": {}}),
+            CacheMarkers::Drop,
+        )
+        .unwrap();
+        assert_eq!(call["function"]["name"], name.as_str());
     }
 }

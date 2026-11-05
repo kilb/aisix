@@ -18,8 +18,9 @@
 //! literally OpenAI chat-completions, so the
 //! [`aisix-provider-azure-openai`](crate::aisix_provider_azure_openai)
 //! crate parses Azure responses through these same types (Azure's
-//! `prompt_filter_results` / `content_filter_results` extensions pass
-//! through because none of the types set `deny_unknown_fields`). Future
+//! `prompt_filter_results` / `content_filter_results` extensions do not
+//! fail the decode, because none of the types set `deny_unknown_fields`, and
+//! are not relayed). Future
 //! OpenAI-compatible bridges (additional self-hosted endpoints, etc.)
 //! follow the same pattern. The visibility is **not a public-SDK
 //! stability promise**; it's an internal workspace contract. Embedding

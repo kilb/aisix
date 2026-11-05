@@ -579,9 +579,10 @@ pub struct ChatFormat {
     #[serde(skip)]
     pub gateway_strict_schema: bool,
     /// `top_k` from a `/v1/messages` caller. The OpenAI wire has no such
-    /// parameter, so it never rides `extra`; a bridge whose target takes a
-    /// top-k slot writes it there (Claude `top_k`, Converse Claude / Nova,
-    /// Gemini `topK`) and every other bridge leaves it unsent.
+    /// parameter, so it does not ride `extra` from there; a bridge whose target
+    /// takes a top-k slot writes it there (Claude `top_k`, Converse Claude /
+    /// Nova, Gemini `topK`), as it does one a chat caller put in `extra`, and
+    /// every other bridge leaves it unsent.
     #[serde(skip)]
     pub top_k: Option<u64>,
     /// The exact `thinking.budget_tokens` of a `/v1/messages` caller whose

@@ -306,11 +306,9 @@ impl std::fmt::Debug for AzureUpstreamRef {
 }
 
 impl AzureUpstreamRef {
-    /// Most recent GA REST API version at crate publish time.
-    /// Operators **must** pin an explicit version via
-    /// `provider_key.api_base` for production traffic — this constant
-    /// is a stop-gap default. Azure deprecates older versions on a
-    /// published schedule:
+    /// The GA REST API version every request is pinned to: `api_base` cannot
+    /// carry a query, so nothing overrides it. Azure deprecates older versions
+    /// on a published schedule:
     /// <https://learn.microsoft.com/en-us/azure/ai-services/openai/api-version-deprecation>.
     ///
     /// Pinned at a GA shape (`YYYY-MM-DD`, no `-preview` suffix) so a
