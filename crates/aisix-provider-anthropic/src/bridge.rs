@@ -909,6 +909,43 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
     }
 
+    /// The direct rail, whole and streamed: a caller's effort carries the block
+    /// and its raised default, and a caller's own cap stands.
+    #[tokio::test]
+    async fn adaptive_thinking_raises_the_default_max_tokens_on_the_direct_rail() {
+        let server = MockServer::builder().start().await;
+        mount_ok_nonstream(&server).await;
+        let model: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "my-claude",
+            "provider": "anthropic",
+            "model_name": "claude-opus-4-6",
+            "provider_key_id": "11111111-1111-1111-1111-111111111111",
+        }))
+        .unwrap();
+        let ctx = BridgeContext::new("req-1", Arc::new(model), sample_provider_key(&server.uri()));
+        let mut asked = req();
+        asked.extra.insert("reasoning_effort".into(), "high".into());
+        asked.thoughts_requested = true;
+        let mut capped = asked.clone();
+        capped.max_tokens = Some(100);
+        let bridge = AnthropicBridge::new();
+        bridge.chat(&asked, &ctx).await.unwrap();
+        let _ = bridge.chat_stream(&asked, &ctx).await;
+        bridge.chat(&capped, &ctx).await.unwrap();
+        let _ = bridge.chat_stream(&capped, &ctx).await;
+
+        let sent = server.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 4);
+        for (request, cap) in sent.iter().zip([16000, 16000, 100, 100]) {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(
+                body["thinking"],
+                serde_json::json!({"type": "adaptive", "display": "summarized"})
+            );
+            assert_eq!(body["max_tokens"], cap, "{body}");
+        }
+    }
+
     fn req() -> ChatFormat {
         ChatFormat::new(
             "my-claude",

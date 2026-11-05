@@ -7827,6 +7827,51 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         }
     }
 
+    /// The Vertex AI rail, whole and streamed: a caller's effort on Claude
+    /// carries the block and its raised default, and a caller's own cap stands.
+    #[tokio::test]
+    async fn adaptive_thinking_raises_the_default_max_tokens_on_vertex_claude() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "m",
+                "model": "c",
+                "content": [{"type": "text", "text": "hi"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("claude-opus-4-6"),
+            sample_pk_with_secret(
+                r#"{"access_token":"t","project":"my-proj","region":"us-central1"}"#,
+            ),
+        );
+        let mut asked = ChatFormat::new("m", vec![ChatMessage::user("hi")]);
+        asked.extra.insert("reasoning_effort".into(), "high".into());
+        asked.thoughts_requested = true;
+        let mut capped = asked.clone();
+        capped.max_tokens = Some(100);
+        bridge.chat(&asked, &ctx).await.unwrap();
+        let _ = bridge.chat_stream(&asked, &ctx).await;
+        bridge.chat(&capped, &ctx).await.unwrap();
+        let _ = bridge.chat_stream(&capped, &ctx).await;
+
+        let sent = server.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 4);
+        for (request, cap) in sent.iter().zip([16000, 16000, 100, 100]) {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(
+                body["thinking"],
+                serde_json::json!({"type": "adaptive", "display": "summarized"})
+            );
+            assert_eq!(body["max_tokens"], cap, "{body}");
+        }
+    }
+
     /// A 2xx that reports an error is that error, not an empty answer.
     #[tokio::test]
     async fn a_gemini_2xx_reporting_an_error_is_not_an_empty_answer() {

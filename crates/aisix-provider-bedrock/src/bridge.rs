@@ -4400,6 +4400,119 @@ mod tests {
         assert_eq!(chat.usage.total_tokens, 9);
     }
 
+    fn asking_for_effort(max_tokens: Option<u32>, converse: bool) -> ChatFormat {
+        let mut req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+        req.extra.insert("reasoning_effort".into(), "high".into());
+        req.thoughts_requested = true;
+        req.max_tokens = max_tokens;
+        if converse {
+            req.extra
+                .insert("requestMetadata".into(), serde_json::json!({"k": "v"}));
+        }
+        req
+    }
+
+    fn adaptive_ctx() -> BridgeContext {
+        BridgeContext::new(
+            "req-1",
+            sample_model_with("us.anthropic.claude-opus-4-6-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        )
+    }
+
+    /// The InvokeModel rail: the block and its raised default in the Anthropic
+    /// body, and a caller's own cap stands.
+    #[tokio::test]
+    async fn adaptive_thinking_raises_the_default_max_tokens_on_invoke_model() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/invoke$"))
+            .respond_with(default_anthropic_response_template())
+            .mount(&server)
+            .await;
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = adaptive_ctx();
+        for (max_tokens, cap) in [(None, 16000), (Some(100), 100)] {
+            bridge
+                .chat(&asking_for_effort(max_tokens, false), &ctx)
+                .await
+                .unwrap();
+            let sent = server.received_requests().await.unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&sent.last().unwrap().body).unwrap();
+            assert_eq!(
+                body["thinking"],
+                serde_json::json!({"type": "adaptive", "display": "summarized"})
+            );
+            assert_eq!(body["max_tokens"], cap, "{body}");
+        }
+    }
+
+    /// The Converse rail, whole and streamed: the block in the additional
+    /// fields, its raised default in `inferenceConfig`, and a caller's own cap
+    /// stands.
+    #[tokio::test]
+    async fn adaptive_thinking_raises_the_default_max_tokens_on_converse() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/converse(-stream)?$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = adaptive_ctx();
+        for (max_tokens, cap) in [(None, 16000), (Some(100), 100)] {
+            let _ = bridge
+                .chat(&asking_for_effort(max_tokens, true), &ctx)
+                .await;
+            let _ = bridge
+                .chat_stream(&asking_for_effort(max_tokens, false), &ctx)
+                .await;
+            let sent = server.received_requests().await.unwrap();
+            let [.., whole, streamed] = sent.as_slice() else {
+                panic!("both requests reach the upstream: {}", sent.len());
+            };
+            assert!(whole.url.path().ends_with("/converse"), "{}", whole.url);
+            assert!(
+                streamed.url.path().ends_with("/converse-stream"),
+                "{}",
+                streamed.url
+            );
+            for request in [whole, streamed] {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(
+                    body["additionalModelRequestFields"]["thinking"],
+                    serde_json::json!({"type": "adaptive", "display": "summarized"})
+                );
+                assert_eq!(body["inferenceConfig"]["maxTokens"], cap, "{body}");
+            }
+        }
+    }
+
+    /// With no block written Converse sends no cap of its own, as it always has.
+    #[tokio::test]
+    async fn an_effort_with_no_block_written_raises_nothing_on_converse() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/converse-stream$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let mut req = asking_for_effort(None, false);
+        req.thoughts_requested = false;
+        let _ = bridge.chat_stream(&req, &adaptive_ctx()).await;
+        let sent = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert!(
+            body["additionalModelRequestFields"]
+                .get("thinking")
+                .is_none(),
+            "{body}"
+        );
+        assert!(body["inferenceConfig"].get("maxTokens").is_none(), "{body}");
+    }
+
     /// The model's deadline must CANCEL a silent Bedrock call, not just
     /// relabel an error after the fact. Before the SDK `timeout_config`
     /// wiring, this call sat through the upstream's full 8 s delay and

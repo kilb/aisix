@@ -26,12 +26,16 @@ import {
 // (https://platform.claude.com/docs/en/build-with-claude/thinking-steering-and-cost#pricing).
 // Before API version 2026-10-21 `temperature` and `top_k` are incompatible with
 // thinking on Claude 4.6 (same page as the table, "Sampling parameters").
+// Thinking counts toward `max_tokens`, so a request that asked for it and named
+// no cap gets room for it; every other request keeps the ordinary default.
 
 const CALLER = "sk-reasoning-effort-adaptive";
 const CALLER_HASH = createHash("sha256").update(CALLER).digest("hex");
 const CREDENTIAL_REF = "e2e";
 const LOGSTORE = "reasoning-effort-adaptive-store";
 const ADAPTIVE = { type: "adaptive", display: "summarized" };
+const THINKING_DEFAULT_MAX_TOKENS = 16000;
+const ORDINARY_DEFAULT_MAX_TOKENS = 4096;
 
 const THOUGHT = "Weighing the capital of France.";
 const ANSWER = "Paris.";
@@ -122,6 +126,8 @@ const MODELS: Record<string, { pk: Record<string, string>; provider: string; mod
   "not-claude": { pk: ANTHROPIC_PK, provider: "anthropic", model_name: "glm-5" },
 };
 
+const MAPPED_MODEL = "adaptive-mapped-effort";
+
 describe("a caller's reasoning effort on a Claude model that takes adaptive thinking", () => {
   let app: SpawnedApp | undefined;
   let upstream: Server | undefined;
@@ -188,7 +194,19 @@ describe("a caller's reasoning effort on a Claude model that takes adaptive thin
         cost: { input_per_1k: INPUT_PER_1K, output_per_1k: OUTPUT_PER_1K },
       });
     }
-    await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: Object.keys(MODELS) });
+    const mappedPk = await seed.createProviderKey({
+      display_name: `${MAPPED_MODEL}-pk`,
+      api_base: `http://127.0.0.1:${addr.port}`,
+      ...ANTHROPIC_PK,
+    } as Parameters<typeof seed.createProviderKey>[0]);
+    await seed.createModel({
+      display_name: MAPPED_MODEL,
+      provider: "anthropic",
+      model_name: "claude-opus-4-6",
+      provider_key_id: mappedPk.id,
+      effort_mapping: { "": "high" },
+    });
+    await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: [...Object.keys(MODELS), MAPPED_MODEL] });
     const probe = new ProxyClient(app.proxyUrl, CALLER);
     await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
   });
@@ -214,6 +232,11 @@ describe("a caller's reasoning effort on a Claude model that takes adaptive thin
   /** What Claude was asked for, on the wire of whichever route carried it. */
   function claudeRequest(body: Record<string, any>) {
     return body.additionalModelRequestFields ?? body;
+  }
+
+  /** The output cap on the wire: Converse has its own slot for it. */
+  function maxTokensSent(body: Record<string, any>) {
+    return body.inferenceConfig?.maxTokens ?? body.max_tokens;
   }
 
   const chat = (model: string, extra: Record<string, unknown> = {}) => ({
@@ -242,6 +265,25 @@ describe("a caller's reasoning effort on a Claude model that takes adaptive thin
   ];
 
   for (const model of ["adaptive-anthropic", "adaptive-vertex", "adaptive-bedrock"]) {
+    for (const stream of [false, true]) {
+      const label = `${model}${stream ? " stream" : ""}`;
+      const streaming = stream ? { stream } : {};
+      test(`${label}: a caller's own cap stands, whatever its value, with thinking written`, async (ctx) => {
+        if (!etcdReachable || !app) return ctx.skip();
+        for (const [route, body, cap] of [
+          ["/v1/chat/completions", chat(model, { ...streaming, max_tokens: 1 }), 1],
+          ["/v1/chat/completions", chat(model, { ...streaming, max_tokens: 64000 }), 64000],
+          ["/v1/chat/completions", chat(model, { ...streaming, max_completion_tokens: 200 }), 200],
+          ["/v1/responses", { model, input: "hi", reasoning: { effort: "high" }, max_output_tokens: 300, ...streaming }, 300],
+        ] as const) {
+          const out = await send(route, body);
+          expect(out.status, out.raw).toBe(200);
+          expect(claudeRequest(sent.at(-1)!.body).thinking, route).toEqual(ADAPTIVE);
+          expect(maxTokensSent(sent.at(-1)!.body), route).toBe(cap);
+        }
+      });
+    }
+
     for (const family of FAMILIES) {
       for (const stream of [false, true]) {
         test(`${model} ${family.name}${stream ? " stream" : ""}: thinking is asked for, returned and billed`, async (ctx) => {
@@ -253,6 +295,7 @@ describe("a caller's reasoning effort on a Claude model that takes adaptive thin
           expect(wire.thinking).toEqual(ADAPTIVE);
           expect(wire.output_config).toEqual({ effort: "high" });
           expect(wire.reasoning_effort).toBeUndefined();
+          expect(maxTokensSent(sent.at(-1)!.body)).toBe(THINKING_DEFAULT_MAX_TOKENS);
 
           expect(out.raw).toContain(THOUGHT);
           expect(out.raw).toContain(ANSWER);
@@ -296,6 +339,7 @@ describe("a caller's reasoning effort on a Claude model that takes adaptive thin
       expect(out.status, out.raw).toBe(200);
       expect(sent.at(-1)!.body.thinking, model).toBeUndefined();
       expect(sent.at(-1)!.body.output_config, model).toEqual({ effort: "high" });
+      expect(sent.at(-1)!.body.max_tokens, model).toBe(ORDINARY_DEFAULT_MAX_TOKENS);
     }
     const out = await send("/v1/chat/completions", chat("older-sonnet-45"));
     expect(out.status, out.raw).toBe(200);
@@ -308,6 +352,7 @@ describe("a caller's reasoning effort on a Claude model that takes adaptive thin
     expect(out.status, out.raw).toBe(200);
     expect(sent.at(-1)!.body.thinking).toEqual({ type: "disabled" });
     expect(sent.at(-1)!.body.output_config).toBeUndefined();
+    expect(sent.at(-1)!.body.max_tokens).toBe(ORDINARY_DEFAULT_MAX_TOKENS);
   });
 
   test("a thinking the caller sent stands", async (ctx) => {
@@ -317,6 +362,7 @@ describe("a caller's reasoning effort on a Claude model that takes adaptive thin
     expect(out.status, out.raw).toBe(200);
     expect(sent.at(-1)!.body.thinking).toEqual(own);
     expect(sent.at(-1)!.body.output_config).toEqual({ effort: "high" });
+    expect(sent.at(-1)!.body.max_tokens).toBe(ORDINARY_DEFAULT_MAX_TOKENS);
   });
 
   test("on Claude 4.6 a request with sampling thinking excludes keeps working as an effort", async (ctx) => {
@@ -327,6 +373,16 @@ describe("a caller's reasoning effort on a Claude model that takes adaptive thin
       expect(sent.at(-1)!.body.thinking, model).toBeUndefined();
       expect(sent.at(-1)!.body.temperature, model).toBe(0.2);
       expect(sent.at(-1)!.body.output_config, model).toEqual({ effort: "high" });
+      expect(sent.at(-1)!.body.max_tokens, model).toBe(ORDINARY_DEFAULT_MAX_TOKENS);
     }
+  });
+
+  test("an effort only an operator's mapping wrote stays an effort at the ordinary cap", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const out = await send("/v1/chat/completions", chat(MAPPED_MODEL, { reasoning_effort: undefined }));
+    expect(out.status, out.raw).toBe(200);
+    expect(sent.at(-1)!.body.output_config).toEqual({ effort: "high" });
+    expect(sent.at(-1)!.body.thinking).toBeUndefined();
+    expect(sent.at(-1)!.body.max_tokens).toBe(ORDINARY_DEFAULT_MAX_TOKENS);
   });
 });

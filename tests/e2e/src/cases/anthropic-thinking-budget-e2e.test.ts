@@ -256,10 +256,11 @@ describe("reasoning effort → Claude families without effort support: thinking 
       expect(body.output_config, model).toEqual({ effort: "high" });
       if (model === "effort-sonnet-46") {
         expect(body.thinking, model).toEqual({ type: "adaptive", display: "summarized" });
+        expect(body.max_tokens, model).toBe(16000);
       } else {
         expect(body.thinking, model).toBeUndefined();
+        expect(body.max_tokens, model).toBe(4096);
       }
-      expect(body.max_tokens, model).toBe(4096);
       expect(body.reasoning_effort, model).toBeUndefined();
     }
     const responses = await upstreamBody(
@@ -269,7 +270,7 @@ describe("reasoning effort → Claude families without effort support: thinking 
     );
     expect(responses.output_config).toEqual({ effort: "low" });
     expect(responses.thinking).toEqual({ type: "adaptive", display: "summarized" });
-    expect(responses.max_tokens).toBe(4096);
+    expect(responses.max_tokens).toBe(16000);
   });
 
   test("a caller's max_tokens is kept and the budget is capped below it", async (ctx) => {

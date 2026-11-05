@@ -44,6 +44,15 @@ use serde::{Deserialize, Serialize};
 /// enough that a runaway prompt doesn't burn tokens silently.
 pub const DEFAULT_MAX_TOKENS: u32 = 4096;
 
+/// The `max_tokens` a request carries when the gateway wrote adaptive thinking
+/// and the caller sent none. Thinking counts toward `max_tokens`, so a cap sized
+/// for an answer alone is often too small
+/// (<https://platform.claude.com/docs/en/build-with-claude/thinking-steering-and-cost#cost-control>).
+/// Every model that takes adaptive thinking accepts 128K, so this needs no
+/// per-model clamp
+/// (<https://platform.claude.com/docs/en/build-with-claude/thinking#output-limits>).
+const ADAPTIVE_THINKING_MAX_TOKENS: u32 = 16000;
+
 /// The top-level `system` field — Anthropic accepts a plain string or an
 /// array of text content blocks, documented as equivalent shapes
 /// (<https://docs.anthropic.com/en/api/messages#parameter-system>).
@@ -1194,7 +1203,9 @@ fn claude_family_version(model: &str) -> Option<(u32, u32)> {
 /// model that takes adaptive thinking gets it beside the tier, with its
 /// summary on: without the block Claude 4.6-4.8 does not think at all and
 /// Claude 5 and later hide what they thought. See [`effort_turns_on_thinking`].
-/// A `thinking` the caller sent stands.
+/// Writing the block is also what raises the `max_tokens` such a request must
+/// carry when the caller sent none, to [`ADAPTIVE_THINKING_MAX_TOKENS`]. A
+/// `thinking` the caller sent stands, and raises nothing.
 ///
 /// An effort the caller expressed natively always wins, being the more
 /// specific statement of the same setting. That means `output_config.effort`
@@ -1302,10 +1313,12 @@ fn reasoning_effort_into_anthropic(
             );
         }
     }
-    if effort_turns_on_thinking(req, extras, model) {
-        extras
-            .entry("thinking")
-            .or_insert_with(|| serde_json::json!({"type": "adaptive", "display": "summarized"}));
+    if effort_turns_on_thinking(req, extras, model) && !extras.contains_key("thinking") {
+        extras.insert(
+            "thinking".to_string(),
+            serde_json::json!({"type": "adaptive", "display": "summarized"}),
+        );
+        return max_tokens.is_none().then_some(ADAPTIVE_THINKING_MAX_TOKENS);
     }
     None
 }
@@ -10346,6 +10359,49 @@ mod request_contract_tests {
             let body = effort_body(model, |_| {});
             assert_eq!(body["thinking"], SUMMARIZED(), "{model}");
             assert_eq!(body["output_config"]["effort"], "high", "{model}");
+            assert_eq!(body["max_tokens"], ADAPTIVE_THINKING_MAX_TOKENS, "{model}");
+        }
+    }
+
+    /// The raised default goes with the block and only with it: none of these
+    /// sends a `max_tokens`, and none has the gateway write a block.
+    #[test]
+    fn an_effort_with_no_block_written_keeps_the_ordinary_default() {
+        type Set = fn(&mut ChatFormat);
+        let cases: [(&str, Set); 8] = [
+            ("claude-opus-4-5", |_| {}),
+            ("glm-5", |_| {}),
+            ("claude-opus-4-6", |req| req.thoughts_requested = false),
+            ("claude-opus-4-6", |req| req.temperature = Some(0.2)),
+            ("claude-sonnet-4-6", |req| req.top_k = Some(5)),
+            ("claude-sonnet-4-6", |req| req.top_p = Some(0.5)),
+            ("claude-opus-4-6", |req| {
+                req.extra.insert("reasoning_effort".into(), "none".into());
+            }),
+            ("claude-opus-4-6", |req| {
+                req.extra
+                    .insert("thinking".into(), serde_json::json!({"type": "adaptive"}));
+            }),
+        ];
+        for (model, set) in cases {
+            let body = effort_body(model, set);
+            assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS, "{model}: {body}");
+        }
+    }
+
+    /// A caller's own cap stands whatever its value, under either name, and the
+    /// block is still written.
+    #[test]
+    fn a_callers_max_tokens_stands_beside_the_block() {
+        for cap in [1u32, 100, 16000, 64000] {
+            let named = effort_body("claude-opus-4-6", |req| req.max_tokens = Some(cap));
+            assert_eq!(named["max_tokens"], cap);
+            assert_eq!(named["thinking"], SUMMARIZED());
+            let newer = effort_body("claude-opus-4-6", |req| {
+                req.extra.insert("max_completion_tokens".into(), cap.into());
+            });
+            assert_eq!(newer["max_tokens"], cap);
+            assert_eq!(newer["thinking"], SUMMARIZED());
         }
     }
 
