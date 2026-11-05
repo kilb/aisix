@@ -997,14 +997,15 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
       }),
     });
     // Blocked, not delivered: the block pass reads raw text, so a payload
-    // nothing can parse is still scanned. Pre-fix this was a 200 carrying the
-    // literal.
-    expect(res.status).toBe(422);
+    // nothing can parse is still scanned. Pre-fix the literal reached the
+    // caller.
+    expect(res.status).toBe(200);
     const text = await res.text();
+    expect(text).toContain("content_filter");
     expect(text).not.toContain("ABSOLUTELYFORBIDDENWORD");
     // Which refusal matters. `unscannable_body` — the arm for a buffer the
-    // cut emptied — is the same 422 and the same `content_filter` type, so
-    // a status-only assertion would still pass if the excised frame's text
+    // cut emptied — ends on the same frames and the same `content_filter`
+    // code, so a status-only assertion would still pass if the excised frame's text
     // never reached the block scan. Only a keyword verdict names the
     // guardrail; the unavailable arm names the tag instead.
     expect(text).toContain("gr-model-echo-holdback");

@@ -218,6 +218,31 @@ describe("fail-closed stream hold-back overflow usage", () => {
     await responsesTimeoutUpstream?.close();
   });
 
+  // What a refused stream ends on, by endpoint. The events of /v1/responses come
+  // with its opening, since nothing else had gone out.
+  const expectFailureFrames = (endpoint: keyof typeof MODELS, body: string) => {
+    const events = body
+      .split("\n\n")
+      .filter((frame) => frame.startsWith("event: "))
+      .map((frame) => ({
+        event: /^event: (.*)$/m.exec(frame)?.[1],
+        data: JSON.parse(/^data: (.*)$/m.exec(frame)?.[1] ?? "null") as Record<string, any>,
+      }));
+    if (endpoint === "responses") {
+      expect(events.map((e) => e.event), body).toEqual([
+        "response.created",
+        "response.in_progress",
+        "error",
+        "response.failed",
+      ]);
+      expect(events[2]!.data.code).toBe("content_filter");
+      expect(events[3]!.data.response?.error?.code).toBe("invalid_prompt");
+    } else if (endpoint === "completions") {
+      expect(events.map((e) => e.event), body).toEqual(["error"]);
+      expect(events[0]!.data.error?.type).toBe("content_filter");
+    }
+  };
+
   const request = (endpoint: keyof typeof MODELS) => {
     const path = endpoint === "chat" ? "/v1/chat/completions" : `/v1/${endpoint}`;
     const body =
@@ -243,14 +268,14 @@ describe("fail-closed stream hold-back overflow usage", () => {
     {
       endpoint: "completions" as const,
       upstream: () => completionsUpstream,
-      status: 422,
-      usageClass: "4xx",
+      status: 200,
+      usageClass: "2xx",
     },
     {
       endpoint: "responses" as const,
       upstream: () => responsesUpstream,
-      status: 422,
-      usageClass: "4xx",
+      status: 200,
+      usageClass: "2xx",
     },
   ];
 
@@ -278,6 +303,7 @@ describe("fail-closed stream hold-back overflow usage", () => {
       const responseBody = await response.text();
       expect(responseBody).toContain("content_filter");
       expect(responseBody).not.toContain(OVERFLOW_MARKER);
+      expectFailureFrames(scenario.endpoint, responseBody);
       expect(upstream.receivedRequests).toHaveLength(upstreamBaseline + 1);
 
       await waitConfigPropagation(async () => {
@@ -304,7 +330,7 @@ describe("fail-closed stream hold-back overflow usage", () => {
       endpoint: "completions" as const,
       model: "held-timeout-completions",
       upstream: () => completionsTimeoutUpstream,
-      status: 504,
+      status: 200,
     },
     {
       endpoint: "responses" as const,

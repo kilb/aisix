@@ -20,10 +20,8 @@
 //!   no exit of the handler settled, with its tokens charged as the run
 //!   would have charged them (`crate::chat::PendingEnsemble`);
 //! - one terminal event for the request itself, `499` /
-//!   `client_disconnected`, naming the target that was in flight when the
-//!   caller went away: zero tokens and zero cost, unless a stream held back
-//!   inside the handler had already read some of the answer
-//!   ([`HeldStream`]).
+//!   `client_disconnected`, zero tokens and zero cost, naming the target
+//!   that was in flight when the caller went away.
 //!
 //! Exactly one emitter ever speaks for a given request. The guard rides the
 //! request from the middleware to the end of its response body and writes
@@ -100,123 +98,6 @@ impl Phase {
             Phase::BeforeHead => CANCELLED_BEFORE_HEAD,
             Phase::BeforeBody => CANCELLED_BEFORE_BODY,
         }
-    }
-}
-
-/// What a stream held back inside its handler has cost so far.
-///
-/// The native `/v1/responses` relay and `/v1/completions` read the whole
-/// response before they write a head, because the verdict can still answer it
-/// with a 422. A caller who leaves meanwhile takes the handler with what it had
-/// read, while the upstream goes on billing for it: published from `Drop` by the
-/// hold, so this row can report what the frames said and estimate the rest, the
-/// way a stream that had written its head reports itself. A hold that has read
-/// nothing publishes nothing, like any other attempt still waiting on the
-/// upstream.
-pub(crate) struct HeldStream {
-    /// The buckets the reservation would have charged; emptied once the
-    /// request's own exit has charged them.
-    pub(crate) token_keys: Vec<String>,
-    pub(crate) spend_keys: Vec<String>,
-    pub(crate) attempt_started: std::time::Instant,
-    /// Run only if the guard speaks: it may tokenize.
-    pub(crate) tally: Box<dyn FnOnce() -> HeldStreamTally + Send>,
-}
-
-/// See [`HeldStream`].
-pub(crate) struct HeldStreamTally {
-    pub(crate) usage: aisix_gateway::UsageStats,
-    pub(crate) estimated: bool,
-    pub(crate) upstream_ttft_ms: u32,
-    pub(crate) provider_request_id: String,
-}
-
-impl HeldStream {
-    /// Charge what the hold read and put it on the request's terminal event,
-    /// through the helpers a stream's own terminal emit uses.
-    fn settle(
-        self,
-        state: &ProxyState,
-        snap: &aisix_core::AisixSnapshot,
-        endpoint: &'static str,
-        resolved: &Resolved,
-        pk: &ResolvedPk<'_>,
-        event: &mut UsageEvent,
-    ) {
-        let tally = (self.tally)();
-        let usage = &tally.usage;
-        event.prompt_tokens = usage.prompt_tokens;
-        event.completion_tokens = aisix_gateway::chat::recorded_completion_tokens(
-            usage.prompt_tokens,
-            usage.completion_tokens,
-            usage.reasoning_tokens,
-            usage.reasoning_folded_into_completion,
-            usage.upstream_total_tokens,
-        );
-        event.reasoning_unfolded_from_completion = usage
-            .completion_tokens
-            .saturating_sub(event.completion_tokens);
-        event.reasoning_tokens = usage.reasoning_tokens;
-        event.total_tokens = usage.upstream_total_tokens;
-        event.cached_prompt_tokens = usage.cached_prompt_tokens;
-        event.cache_write_tokens = usage.cache_write_tokens;
-        event.modality_tokens = usage.modality;
-        event.cache_creation_ttl = usage.cache_creation_ttl;
-        event.cache_creation_tokens = usage.cache_creation_tokens;
-        event.cache_read_tokens = usage.cache_read_tokens;
-        event.usage_estimated = tally.estimated;
-        event.upstream_ttft_ms = tally.upstream_ttft_ms;
-        event.upstream_latency_ms = crate::attempt::measured_ms(self.attempt_started.elapsed());
-        event.provider_request_id = tally.provider_request_id;
-        event.cost_usd = usage_attr::request_cost_usd(
-            snap,
-            &event.model_id,
-            usage_attr::input_tokens_for_pricing(
-                u64::from(usage.prompt_tokens),
-                u64::from(usage.cached_prompt_tokens),
-                u64::from(usage.cache_write_tokens.unwrap_or(0)),
-                u64::from(usage.cache_read_tokens),
-                u64::from(usage.cache_creation_tokens),
-            ),
-            u64::from(usage.completion_tokens),
-        );
-        let total = usage_attr::total_tokens_with_cache(
-            usage.prompt_tokens,
-            usage.completion_tokens,
-            usage.cache_creation_tokens,
-            usage.cache_read_tokens,
-        );
-        state
-            .limiter
-            .add_tokens_post_stream_all(&self.token_keys, total);
-        state.limiter.add_tokens_post_stream_all(
-            &self.spend_keys,
-            usage_attr::spend_micro_usd(event.cost_usd),
-        );
-        let caller = crate::request_metrics::Caller::from_api_key_id(snap, &event.api_key_id);
-        crate::request_metrics::record_usage(
-            state,
-            endpoint,
-            caller.as_caller(),
-            crate::request_metrics::Upstream {
-                provider: &resolved.provider,
-                model: &resolved.requested_model,
-                upstream_model: &resolved.upstream_model,
-                pk: pk.labels(),
-                stream: true,
-                is_fallback: event.attempt_kind == "fallback",
-            },
-            crate::request_metrics::Tokens {
-                input: usage.prompt_tokens,
-                output: usage.completion_tokens,
-                total: total.min(u64::from(u32::MAX)) as u32,
-                cached: usage.cached_prompt_tokens,
-                cache_read: usage.cache_read_tokens,
-                cache_creation: usage.cache_creation_tokens,
-                spend_usd: event.cost_usd,
-                client_type: state.client_classifier.classify(&event.client_user_agent),
-            },
-        );
     }
 }
 
@@ -367,7 +248,7 @@ pub(crate) fn emit(
             })
         });
     let pk = ResolvedPk::resolve(&snap, &resolved.provider_key_id);
-    let mut event = UsageEvent {
+    let event = UsageEvent {
         // NO-GUARDRAIL-CHAIN: this emitter runs from `Drop` with no
         // handler. `applied_guardrails`, the enforced hits, the scores
         // and the bypass reason all come off a chain each handler
@@ -412,12 +293,7 @@ pub(crate) fn emit(
         error_message: phase.message().to_string(),
         ..base_event(request_id, resolved, &ctx, &client, inbound_protocol, &pk)
     };
-    let mut dispatched = attempt.as_ref().is_some_and(|a| a.dispatched);
-    if let Some(held) = ctx.held_stream.take() {
-        // The hold read an answer, so this attempt reached its provider.
-        dispatched = true;
-        held.settle(state, &snap, endpoint, resolved, &pk, &mut event);
-    }
+    let dispatched = attempt.as_ref().is_some_and(|a| a.dispatched);
     emit_one(
         state,
         &snap,

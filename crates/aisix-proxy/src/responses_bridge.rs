@@ -3379,7 +3379,7 @@ pub(crate) fn failure_frames(
 /// `response.failed` reports `invalid_prompt`: re-running the same turn
 /// meets the same guardrail, so the code is one clients treat as a request
 /// that will not succeed on retry, and show its message.
-fn guardrail_failure_frames(
+pub(crate) fn guardrail_failure_frames(
     encoder: &mut ResponsesSseEncoder,
     sent_downstream: bool,
     terminal_sent: bool,

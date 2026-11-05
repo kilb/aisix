@@ -251,12 +251,17 @@ describe("completions output guardrail (#911 [23])", () => {
         stream: true,
       }),
     });
-    expect(res.status).toBe(422);
+    // The head goes out ahead of the verdict, so the refusal is the one failure
+    // frame a chat stream ends on, and none of what was held.
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
     const body = await res.text();
     expect(body).not.toContain("leaked");
     expect(body).not.toContain("secret");
     expect(body).not.toContain("cmpl-stream-leak");
-    expect(JSON.parse(body).error?.type).toBe("content_filter");
+    const frame = /^event: error\ndata: (.*)\n\n$/.exec(body);
+    expect(frame, body).not.toBeNull();
+    expect(JSON.parse(frame![1]!).error?.type).toBe("content_filter");
     expect(streamUpstream.receivedRequests).toHaveLength(upstreamBaseline + 1);
     expect(streamUpstream.receivedRequests.at(-1)?.body).toContain("innocent question");
   });

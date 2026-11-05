@@ -21,7 +21,8 @@ mod stream;
 
 use aisix_core::AppliedGuardrail;
 use aisix_gateway::{
-    BridgeCapability, BridgeError, ChatMessage, ChatResponse, FinishReason, UsageStats,
+    BridgeCapability, BridgeError, ChatMessage, ChatResponse, CompletionByteStream, FinishReason,
+    UsageStats,
 };
 use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::extract::State;
@@ -34,29 +35,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use stream::{
-    build_completion_passthrough_stream, completion_usage_with_estimates, relay_whole_frames,
-    stamp_first_chunk, without_usage_frame, CompletionSseAccumulator, CompletionStreamFailure,
-    CompletionStreamOutcome, HeldCompletion, PreparedCompletionStream,
+    build_completion_passthrough_stream, build_held_completion_stream,
+    completion_usage_with_estimates, relay_whole_frames, stamp_first_chunk,
+    CompletionOutputObservation, CompletionSseAccumulator, CompletionStreamFailure,
+    CompletionStreamOutcome, HeldCompletionVerdict,
 };
 
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::{ErrorEnvelope, ProxyError};
 use crate::state::ProxyState;
-
-fn note_completion_failure(
-    health: &crate::health::HealthTracker,
-    runtime_status: &crate::health::ModelRuntimeStatusTracker,
-    model_display_name: &str,
-    model_id: &str,
-    cooldown: Option<&aisix_core::CooldownConfig>,
-    error: BridgeError,
-) -> BridgeError {
-    if error.http_status() >= 500 {
-        health.record_failure(model_display_name);
-    }
-    crate::cooldown::note_failure(runtime_status, model_id, cooldown, error)
-}
 
 /// Per-request payload from a successful dispatch — carries the
 /// response + provider + the bits the handler needs to emit a
@@ -124,7 +112,7 @@ struct CompletionDispatchSuccess {
 /// What one streamed attempt hands back: the prepared stream, or the provider's
 /// refusal of the surface; the provider label and key id; and the TTFT slot.
 type CompletionStreamAttempt = (
-    Result<PreparedCompletionStream, BridgeError>,
+    Result<CompletionByteStream, BridgeError>,
     String,
     String,
     Arc<std::sync::OnceLock<Duration>>,
@@ -712,13 +700,6 @@ async fn dispatch(
             aisix_guardrails::Guardrail::stream_output_policy(resolved_chain.as_ref());
         let hold_back = aisix_guardrails::Guardrail::runs_on_output(resolved_chain.as_ref())
             && output_policy.holds_back();
-        // The chain's folded cap and overflow policy, whether it resolved to a
-        // window or a whole-response hold: this relay holds the whole response.
-        let (max_buffer_bytes, fail_open) = output_policy
-            .hold_cap()
-            .unwrap_or((aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false));
-        // The hold runs inside the walk, ahead of the merge below.
-        let entry_keys = (reservation.token_keys(), reservation.spend_keys());
         let dispatched = crate::routing::dispatch_stream_with_failover(
             state,
             snapshot,
@@ -733,9 +714,7 @@ async fn dispatch(
             },
             |target, timeouts| {
                 let body = &body;
-                let resolved_chain = &resolved_chain;
                 let attempt_ctx = &attempt_ctx;
-                let entry_keys = &entry_keys;
                 async move {
                     let provider =
                         crate::dispatch::require_provider(&target.model)?.to_ascii_lowercase();
@@ -748,155 +727,38 @@ async fn dispatch(
                     // 随胜出的那次尝试一起带出 walk，各分支收尾时读。
                     let upstream_ttft = Arc::new(std::sync::OnceLock::new());
                     let attempt_started = Instant::now();
-                    let upstream_model = target.model.upstream_model().unwrap_or("unknown");
-                    let prepared: Result<PreparedCompletionStream, ProxyError> = if hold_back {
-                        async {
+                    let prepared: Result<CompletionByteStream, ProxyError> = async {
                         let stream = bridge
                             .complete_stream(body, &ctx)
                             .await
                             .map_err(ProxyError::Bridge)?;
-                        let stream = stamp_first_chunk(
+                        let stream =
+                            stamp_first_chunk(stream, attempt_started, Arc::clone(&upstream_ttft));
+                        let mut stream = crate::stream_timeout::with_read_timeout_completion(
                             stream,
-                            attempt_started,
-                            Arc::clone(&upstream_ttft),
+                            timeouts.stream,
                         );
-                let mut stream =
-                            crate::stream_timeout::with_read_timeout_completion(
-                                stream,
-                                timeouts.stream,
-                            );
-                let mut buffer = Vec::new();
-                // What `buffer` holds (#513): the generated text, which
-                // `max_buffer_bytes` caps, and the raw bytes it bounds too.
-                let mut held_content = crate::held_content::HeldBuffer::default();
-                let mut held = HeldCompletion::new(
-                    entry_keys.clone(),
-                    upstream_model.to_string(),
-                    body.get("prompt").cloned(),
-                    attempt_started,
-                    Arc::clone(&upstream_ttft),
-                );
-                while let Some(item) = stream.next().await {
-                    let chunk = match item {
-                        Ok(chunk) => chunk,
-                        Err(error) => {
-                            // A stream that died after generating output is
-                            // still an answer: the tokens were billed, so it
-                            // comes back as `Failed` rather than as an error,
-                            // and the arm that handles it marks the target's
-                            // health itself.
-                            if held.observed.has_observed_bytes() {
-                                let output_text = held.observed.finish_for_overflow_estimate();
-                                return Ok(PreparedCompletionStream::Failed {
-                                    error,
-                                    accumulator: std::mem::take(&mut held.observed),
-                                    output_text,
-                                });
-                            }
-                            return Err(ProxyError::Bridge(error));
-                        }
-                    };
-                    // The cap-triggering bytes were generated (and may be
-                    // billed) even though fail-closed policy withholds them.
-                    // Feed a separately bounded parser before enforcing the
-                    // wire-buffer limit so usage/token estimates include the
-                    // complete observed prefix without retaining it all.
-                    let generated_before = held.observed.generated_bytes();
-                    held.observed.push(&chunk);
-                    held_content.hold(
-                        held.observed.generated_bytes() - generated_before,
-                        chunk.len(),
-                    );
-                    if held_content.exceeds(max_buffer_bytes) {
-                        if fail_open {
-                            tracing::warn!(
-                                guardrail_hook = "output",
-                                model = %model_name,
-                                max_buffer_bytes,
-                                "streaming /v1/completions output exceeded buffer cap; failing open"
-                            );
-                            aisix_guardrails::Guardrail::record_output_bypass(
-                                resolved_chain.as_ref(),
-                                crate::error::TAG_OUTPUT_BUFFER_EXCEEDED,
-                            );
-                            let prefix =
-                                futures::stream::iter([Ok(bytes::Bytes::from(buffer)), Ok(chunk)]);
-                            return Ok(PreparedCompletionStream::Live {
-                                stream: Box::pin(prefix.chain(stream)),
-                                capture_bypassed: true,
-                            });
-                        }
-                        tracing::warn!(
-                            guardrail_hook = "output",
-                            model = %model_name,
-                            max_buffer_bytes,
-                            "streaming /v1/completions output exceeded buffer cap; failing closed"
-                        );
-                        let output_text = held.observed.finish_for_overflow_estimate();
-                        return Ok(PreparedCompletionStream::BufferExceeded {
-                            accumulator: std::mem::take(&mut held.observed),
-                            output_text,
-                        });
-                    }
-                    buffer.extend_from_slice(&chunk);
-                }
-                let mut inspection = CompletionSseAccumulator::with_security_cap(buffer.len());
-                inspection.push(&buffer);
-                inspection.finish();
-                if inspection.malformed_data {
-                    return Err(ProxyError::Bridge(BridgeError::UpstreamDecode(
-                        "malformed legacy completion SSE data event".to_string(),
-                    )));
-                }
-                if !inspection.saw_done {
-                    return Err(ProxyError::Bridge(BridgeError::StreamAborted));
-                }
-                Ok(PreparedCompletionStream::Buffered(buffer))
-                    }
-                    .await
-                    } else {
-                        async {
-                            let stream = bridge
-                                .complete_stream(body, &ctx)
-                                .await
-                                .map_err(ProxyError::Bridge)?;
-                            let stream = stamp_first_chunk(
-                                stream,
-                                attempt_started,
-                                Arc::clone(&upstream_ttft),
-                            );
-                            let mut stream = crate::stream_timeout::with_read_timeout_completion(
-                                stream,
-                                timeouts.stream,
-                            );
 
-                            // An explicitly configured per-model stream timeout is a
-                            // failover contract: wait for the first body chunk before
-                            // committing 200 so a TTFT timeout remains retryable. The
-                            // deployment default still wraps subsequent reads, but does
-                            // not add a pre-response wait to every legacy completion.
-                            if timeouts.stream_configured {
-                                return match stream.next().await {
-                                    Some(Ok(first)) => {
-                                        let prefix =
-                                            futures::stream::once(std::future::ready(Ok(first)));
-                                        Ok(PreparedCompletionStream::Live {
-                                            stream: Box::pin(prefix.chain(stream)),
-                                            capture_bypassed: false,
-                                        })
-                                    }
-                                    Some(Err(error)) => Err(ProxyError::Bridge(error)),
-                                    None => Err(ProxyError::Bridge(BridgeError::StreamAborted)),
-                                };
-                            }
-
-                            Ok(PreparedCompletionStream::Live {
-                                stream,
-                                capture_bypassed: false,
-                            })
+                        // An explicitly configured per-model stream timeout is a
+                        // failover contract: wait for the first body chunk before
+                        // committing 200 so a TTFT timeout remains retryable. The
+                        // deployment default still wraps subsequent reads, but does
+                        // not add a pre-response wait to every legacy completion.
+                        if timeouts.stream_configured {
+                            return match stream.next().await {
+                                Some(Ok(first)) => {
+                                    let prefix =
+                                        futures::stream::once(std::future::ready(Ok(first)));
+                                    Ok(Box::pin(prefix.chain(stream)) as CompletionByteStream)
+                                }
+                                Some(Err(error)) => Err(ProxyError::Bridge(error)),
+                                None => Err(ProxyError::Bridge(BridgeError::StreamAborted)),
+                            };
                         }
-                        .await
-                    };
+
+                        Ok(stream)
+                    }
+                    .await;
                     // A provider without the surface is the route's own 501,
                     // not a failed attempt. #701: every other failure marks
                     // the target, so the cooldown sees a flapping upstream
@@ -966,275 +828,9 @@ async fn dispatch(
             }
         };
 
-        match prepared {
-            PreparedCompletionStream::Buffered(mut buffer) => {
-                // The whole stream was consumed inside the walk and reached
-                // its end, so the staged attempt settles as the success it
-                // is — and the target earns its recovery signal here rather
-                // than at prepare time.
-                if let Some(deferred) = &deferred {
-                    deferred.finish(state, 200, true);
-                }
-                state.health.record_success(&model.display_name);
-                state
-                    .runtime_status
-                    .mark_healthy(&model_entry_id, attempt_started);
-                let mut accumulator = CompletionSseAccumulator::with_security_cap(buffer.len());
-                accumulator.push(&buffer);
-                accumulator.finish();
-                let output_text = accumulator.output_text();
-                let mut usage = completion_usage_with_estimates(
-                    accumulator.usage.unwrap_or_default(),
-                    &upstream_model,
-                    body.get("prompt"),
-                    &output_text,
-                );
-                usage.upstream_ttft = upstream_ttft.get().copied();
-                // Nothing reached the caller before the held buffer is released.
-                usage.downstream_ttft = usage.upstream_ttft.map(|_| attempt_started.elapsed());
-                reservation
-                    .commit(
-                        u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens),
-                        completion_spend_micro_usd(snapshot, &model_entry_id, &usage),
-                    )
-                    .await;
-                crate::attribution::note_held_stream_charged();
-
-                let synth = ChatResponse {
-                    logprobs: None,
-                    more_choices: Vec::new(),
-                    id: String::new(),
-                    model: model_name.to_string(),
-                    message: ChatMessage::assistant(output_text),
-                    finish_reason: FinishReason::Stop,
-                    usage: UsageStats::default(),
-                    service_tier: None,
-                };
-                let (verdict, hits) =
-                    aisix_guardrails::Guardrail::check_output_non_segment_observed(
-                        resolved_chain.as_ref(),
-                        &synth,
-                    )
-                    .await;
-                monitor_hits.extend(hits);
-                let moderation = crate::redact::moderate_body(
-                    resolved_chain.as_ref(),
-                    crate::redact::Direction::Output,
-                    None,
-                    verdict,
-                    &mut redactions,
-                    &mut monitor_hits,
-                    |guardrail| match crate::redact::redact_completions_sse(guardrail, &buffer) {
-                        Some((rewritten, counts)) => {
-                            buffer = rewritten;
-                            counts
-                        }
-                        None => crate::redact::RedactionCounts::new(),
-                    },
-                )
-                .await;
-                let capture_safe = moderation.capture_safe;
-                let verdict = moderation.verdict;
-                telemetry.monitor_hits.clone_from(&monitor_hits);
-                if let aisix_guardrails::GuardrailVerdict::Block {
-                    reason,
-                    guardrail_name,
-                    unavailable,
-                } = verdict
-                {
-                    tracing::warn!(
-                        guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
-                        guardrail_hook = "output",
-                        model = %model_name,
-                        reason = %reason,
-                        "guardrail blocked streaming /v1/completions response"
-                    );
-                    let block = crate::error::guardrail_block_error(
-                        "response",
-                        guardrail_name.as_deref(),
-                        unavailable.as_deref(),
-                    );
-                    let failure_message = crate::attempt::gateway_error_message(&block);
-                    return Ok(CompletionDispatchSuccess {
-                        response: block.into_response(),
-                        provider: provider_label,
-                        model_id: model_entry_id.clone(),
-                        provider_key_id: provider_key_id.clone(),
-                        upstream_model,
-                        applied_guardrails,
-                        provider_request_id: accumulator.provider_request_id,
-                        usage: Some(usage),
-                        upstream_called: true,
-                        redactions,
-                        monitor_hits,
-                        error_class: String::new(),
-                        guardrail_blocked: true,
-                        failure_message,
-                        captured_content: None,
-                        usage_handled_by_stream: false,
-                    });
-                }
-
-                if let Some((rewritten, counts)) =
-                    crate::redact::redact_completions_sse(resolved_chain.as_ref(), &buffer)
-                {
-                    buffer = rewritten;
-                    crate::redact::merge_counts(&mut redactions, counts);
-                }
-                let final_output = {
-                    let mut parsed = CompletionSseAccumulator::with_security_cap(buffer.len());
-                    parsed.push(&buffer);
-                    parsed.finish();
-                    parsed.output_text()
-                };
-                let captured_content = match (&captured_prompt, content_cap) {
-                    (Some(prompt), Some(cap)) if input_capture_safe && capture_safe => {
-                        Some(CapturedContent::new(prompt, &final_output, cap as usize))
-                    }
-                    _ => None,
-                };
-                if !caller_wants_usage {
-                    buffer = without_usage_frame(buffer);
-                }
-                let mut response = Response::new(axum::body::Body::from(buffer));
-                response.headers_mut().insert(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("text/event-stream"),
-                );
-                return Ok(CompletionDispatchSuccess {
-                    response,
-                    provider: provider_label,
-                    model_id: model_entry_id.clone(),
-                    provider_key_id: provider_key_id.clone(),
-                    upstream_model,
-                    applied_guardrails,
-                    provider_request_id: accumulator.provider_request_id,
-                    usage: Some(usage),
-                    upstream_called: true,
-                    redactions,
-                    monitor_hits,
-                    error_class: String::new(),
-                    guardrail_blocked: false,
-                    failure_message: String::new(),
-                    captured_content,
-                    usage_handled_by_stream: false,
-                });
-            }
-            PreparedCompletionStream::BufferExceeded {
-                accumulator,
-                output_text,
-            } => {
-                // The UPSTREAM delivered fine — the gateway's own fail-closed
-                // buffer cap is what withheld the answer. The deployment
-                // counters read as upstream health, so this settles as the
-                // success it was for the provider; the block is carried by
-                // `guardrail_blocked` on the event instead.
-                if let Some(deferred) = &deferred {
-                    deferred.finish(state, 200, true);
-                }
-                state.health.record_success(&model.display_name);
-                state
-                    .runtime_status
-                    .mark_healthy(&model_entry_id, attempt_started);
-                let mut usage = completion_usage_with_estimates(
-                    accumulator.usage.unwrap_or_default(),
-                    &upstream_model,
-                    body.get("prompt"),
-                    &output_text,
-                );
-                usage.upstream_ttft = upstream_ttft.get().copied();
-                reservation
-                    .commit(
-                        u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens),
-                        completion_spend_micro_usd(snapshot, &model_entry_id, &usage),
-                    )
-                    .await;
-                aisix_guardrails::Guardrail::record_output_buffer_exceeded(resolved_chain.as_ref());
-                let block = crate::error::guardrail_block_error(
-                    "response",
-                    aisix_guardrails::Guardrail::output_buffer_owner(resolved_chain.as_ref()),
-                    Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
-                );
-                let failure_message = crate::attempt::gateway_error_message(&block);
-                return Ok(CompletionDispatchSuccess {
-                    response: block.into_response(),
-                    provider: provider_label,
-                    model_id: model_entry_id.clone(),
-                    provider_key_id: provider_key_id.clone(),
-                    upstream_model,
-                    applied_guardrails,
-                    provider_request_id: accumulator.provider_request_id,
-                    usage: Some(usage),
-                    upstream_called: true,
-                    redactions,
-                    monitor_hits,
-                    error_class: String::new(),
-                    guardrail_blocked: true,
-                    failure_message,
-                    captured_content: None,
-                    usage_handled_by_stream: false,
-                });
-            }
-            PreparedCompletionStream::Failed {
-                error,
-                accumulator,
-                output_text,
-            } => {
-                let mut usage = completion_usage_with_estimates(
-                    accumulator.usage.unwrap_or_default(),
-                    &upstream_model,
-                    body.get("prompt"),
-                    &output_text,
-                );
-                usage.upstream_ttft = upstream_ttft.get().copied();
-                reservation
-                    .commit(
-                        u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens),
-                        completion_spend_micro_usd(snapshot, &model_entry_id, &usage),
-                    )
-                    .await;
-                let error_class = error.error_type().to_string();
-                // A stream that died after generating output came back from
-                // the walk as an answer. It was not one: settle the staged
-                // attempt as the failure it is, and record it against the
-                // row that served so its cooldown rules see it.
-                let error = note_completion_failure(
-                    &state.health,
-                    &state.runtime_status,
-                    &model.display_name,
-                    &model_entry_id,
-                    model.cooldown.as_ref(),
-                    error,
-                );
-                let failed = ProxyError::Bridge(error);
-                if let Some(deferred) = &deferred {
-                    deferred.finish(state, failed.status().as_u16(), false);
-                }
-                let failure_message = crate::attempt::gateway_error_message(&failed);
-                let response = failed.into_response();
-                return Ok(CompletionDispatchSuccess {
-                    response,
-                    provider: provider_label,
-                    model_id: model_entry_id.clone(),
-                    provider_key_id: provider_key_id.clone(),
-                    upstream_model,
-                    applied_guardrails,
-                    provider_request_id: accumulator.provider_request_id,
-                    usage: Some(usage),
-                    upstream_called: true,
-                    redactions,
-                    monitor_hits,
-                    error_class,
-                    guardrail_blocked: false,
-                    failure_message,
-                    captured_content: None,
-                    usage_handled_by_stream: false,
-                });
-            }
-            PreparedCompletionStream::Live {
-                stream,
-                capture_bypassed,
-            } => {
+        let stream = prepared;
+        {
+            {
                 // 花费层的桶记 micro-USD，和 token 桶不能共用一张键表——同一批键
                 // 加同一个数字会把 token 数当成钱记进去。
                 let post_stream_keys = reservation.token_keys();
@@ -1268,11 +864,14 @@ async fn dispatch(
                 let output_observer =
                     aisix_guardrails::Guardrail::runs_on_output(resolved_chain.as_ref())
                         .then(|| Arc::clone(&resolved_chain));
-                let parsed = build_completion_passthrough_stream(
-                    stream,
-                    output_observer,
-                    upstream_model.clone(),
-                    move |accumulator, outcome, output_observation| {
+                let held_verdict = Arc::new(std::sync::OnceLock::new());
+                let held_verdict_c = Arc::clone(&held_verdict);
+                let on_complete =
+                    move |accumulator: CompletionSseAccumulator,
+                          outcome: CompletionStreamOutcome,
+                          output_observation: CompletionOutputObservation| {
+                        let held: Option<&HeldCompletionVerdict> = held_verdict_c.get();
+                        let refusal = held.and_then(|held| held.refusal.as_ref());
                         // `least_busy` counts the target until the relay ends.
                         drop(in_flight);
                         let mut failure_message = String::new();
@@ -1328,7 +927,9 @@ async fn dispatch(
                                 terminal_status < 400,
                             );
                         }
-                        let output_text = accumulator.output_text();
+                        let output_text = held
+                            .and_then(|held| held.estimate_text.clone())
+                            .unwrap_or_else(|| accumulator.output_text());
                         let mut usage = completion_usage_with_estimates(
                             accumulator.usage.unwrap_or_default(),
                             &upstream_model_for_stream,
@@ -1337,16 +938,23 @@ async fn dispatch(
                         );
                         usage.upstream_ttft = upstream_ttft.get().copied();
                         // Relayed as it arrives, so the caller's first byte is
-                        // the upstream's.
-                        usage.downstream_ttft = usage.upstream_ttft;
+                        // the upstream's. Held, it is the release, if any.
+                        usage.downstream_ttft = if hold_back {
+                            held.and_then(|held| held.released_after)
+                                .filter(|_| usage.upstream_ttft.is_some())
+                        } else {
+                            usage.upstream_ttft
+                        };
                         let total =
                             u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens);
                         limiter.add_tokens_post_stream_all(&post_stream_keys, total);
                         drop(stream_hold);
+                        // A fail-open release went out unscanned, so what the
+                        // hold let through never enters a full-content exporter.
                         let captured_content = match (&captured_prompt_for_stream, content_cap) {
                             (Some(prompt), Some(cap))
                                 if input_capture_safe
-                                    && !capture_bypassed
+                                    && !hold_back
                                     && output_observation.capture_safe =>
                             {
                                 Some(CapturedContent::new(prompt, &output_text, cap as usize))
@@ -1355,6 +963,16 @@ async fn dispatch(
                         };
                         let mut all_hits = input_monitor_hits;
                         all_hits.extend(output_observation.monitor_hits);
+                        let mut all_redactions = input_redactions;
+                        if let Some(held) = held {
+                            crate::redact::merge_counts(
+                                &mut all_redactions,
+                                held.redactions.clone(),
+                            );
+                        }
+                        if let Some(refusal) = refusal {
+                            failure_message.clone_from(&refusal.error_message);
+                        }
                         let snapshot = state_for_stream.snapshot.load();
                         // 花费层记账（micro-USD），与上面的 token 记账成对。
                         // 一个流可能跨过几代配置，所以按流结束时生效的价格算，
@@ -1387,17 +1005,37 @@ async fn dispatch(
                             &client,
                             true,
                             error_class,
-                            false,
+                            refusal.is_some(),
                             &failure_message,
-                            input_redactions,
+                            all_redactions,
                             all_hits,
-                            captured_content.as_ref(),
+                            held.and_then(|held| held.captured.as_ref())
+                                .or(captured_content.as_ref()),
                             &audit_for_stream,
                             true,
                             winner.as_ref(),
                         );
-                    },
-                );
+                    };
+                let parsed: CompletionByteStream = if hold_back {
+                    Box::pin(build_held_completion_stream(
+                        stream,
+                        Arc::clone(&resolved_chain),
+                        model_name.to_string(),
+                        upstream_model.clone(),
+                        attempt_started,
+                        content_cap,
+                        captured_prompt.filter(|_| input_capture_safe),
+                        held_verdict,
+                        on_complete,
+                    ))
+                } else {
+                    Box::pin(build_completion_passthrough_stream(
+                        stream,
+                        output_observer,
+                        upstream_model.clone(),
+                        on_complete,
+                    ))
+                };
                 let parsed = crate::sse_keepalive::with_heartbeat(
                     relay_whole_frames(parsed, !caller_wants_usage),
                     crate::sse_keepalive::interval(),
@@ -2317,16 +1955,22 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        // The head went out ahead of the verdict, so the refusal is the frame
+        // a chat stream ends on, and nothing that was held.
+        assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 65_536).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let wire = String::from_utf8_lossy(&bytes);
+        let payload = wire
+            .strip_prefix("event: error\ndata: ")
+            .and_then(|rest| rest.strip_suffix("\n\n"))
+            .unwrap_or_else(|| panic!("one failure frame and nothing else: {wire}"));
+        let body: serde_json::Value = serde_json::from_str(payload).unwrap();
         assert_eq!(body["error"]["type"], "content_filter");
-        assert!(!String::from_utf8_lossy(&bytes).contains("BLOCKME"));
         let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
             .await
             .expect("blocked stream must emit billed usage")
             .expect("usage sink closed");
-        assert_eq!(event.status_code, 422);
+        assert_eq!(event.status_code, 200);
         assert!(event.guardrail_blocked);
         assert_eq!(event.prompt_tokens, 2);
         assert_eq!(event.completion_tokens, 2);
@@ -2536,12 +2180,58 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let wire = String::from_utf8_lossy(&body);
+        assert!(wire.starts_with("event: error\n"), "{wire}");
+        assert!(wire.contains("content_filter"), "{wire}");
     }
 
-    /// A caller who hangs up on a held completion takes the handler with it:
-    /// the row reports what the stream had read, estimated where no usage
-    /// frame had arrived, and the rate-limit bucket moves.
+    /// An upstream that ends without its `[DONE]` is a failure after what it did
+    /// say has been scanned and delivered: a chat-shaped error frame, and a row
+    /// with the failure's status.
+    #[tokio::test]
+    async fn a_truncated_held_completion_delivers_what_it_scanned_then_fails() {
+        let upstream = MockServer::builder().start().await;
+        let sse = "data: {\"id\":\"cmpl-cut\",\"object\":\"text_completion\",\"choices\":[{\"index\":0,\"text\":\"half\"}]}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&upstream)
+            .await;
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("instruct"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(aisix_obs::UsageSink::new(tx));
+        let resp = tower::ServiceExt::oneshot(
+            crate::build_router(state),
+            make_req(serde_json::json!({"model": "instruct", "prompt": "hi", "stream": true})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65_536).await.unwrap();
+        let wire = String::from_utf8_lossy(&bytes);
+        assert!(wire.starts_with(sse), "{wire}");
+        assert!(wire[sse.len()..].starts_with("event: error\n"), "{wire}");
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("the guard must emit")
+            .expect("usage sink closed");
+        assert_eq!(event.status_code, 502);
+        assert!(!event.guardrail_blocked);
+    }
+
+    /// The head of a held completion goes out ahead of the verdict, and a caller
+    /// who hangs up during the hold leaves a row reporting what the stream had
+    /// read, estimated where no usage frame had arrived, and the rate-limit
+    /// bucket moves.
     #[tokio::test]
     async fn a_caller_leaving_a_held_stream_is_charged_what_it_read() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2577,22 +2267,28 @@ mod tests {
             .without_cache()
             .with_usage_sink(aisix_obs::UsageSink::new(tx));
         let app = crate::build_router(state);
-        let held = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            tower::ServiceExt::oneshot(
-                app.clone(),
-                make_req(serde_json::json!({
-                    "model": "instruct",
-                    "prompt": "a prompt of several words",
-                    "stream": true,
-                })),
-            ),
+        let held = tower::ServiceExt::oneshot(
+            app.clone(),
+            make_req(serde_json::json!({
+                "model": "instruct",
+                "prompt": "a prompt of several words",
+                "stream": true,
+            })),
         )
-        .await;
+        .await
+        .unwrap();
+        assert_eq!(held.status(), StatusCode::OK);
+        let mut body = held.into_body().into_data_stream();
         assert!(
-            held.is_err(),
-            "a held stream writes no head before its verdict"
+            tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                futures::StreamExt::next(&mut body),
+            )
+            .await
+            .is_err(),
+            "nothing is released before the verdict",
         );
+        drop(body);
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
             .expect("the guard must emit")
@@ -2612,7 +2308,7 @@ mod tests {
         assert_eq!(next.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
-    /// BufferFull is bounded. A fail-closed output guardrail returns 422 before
+    /// BufferFull is bounded. A fail-closed output guardrail refuses before
     /// releasing any upstream bytes when the configured cap is exceeded.
     #[tokio::test]
     async fn output_guardrail_stream_buffer_overflow_fails_closed() {
@@ -2641,15 +2337,17 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 65_536).await.unwrap();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.starts_with("event: error\n"), "{text}");
+        assert!(text.contains("content_filter"), "{text}");
         assert!(!text.contains(&"x".repeat(64)));
     }
 
     /// The configured overflow action is part of the guardrail contract: a
     /// fail-open BufferFull chain releases the prefix and remaining live stream
-    /// byte-for-byte instead of converting the overflow into a 422.
+    /// byte-for-byte instead of converting the overflow into a refusal.
     #[tokio::test]
     async fn output_guardrail_stream_buffer_overflow_honors_fail_open() {
         let upstream = MockServer::builder().start().await;
@@ -2747,39 +2445,6 @@ mod tests {
         assert_eq!(runtime.status, crate::health::RuntimeStatus::Cooldown);
         assert_eq!(runtime.status_reason.as_deref(), Some("transport_error"));
         server.await.unwrap();
-    }
-
-    #[test]
-    fn precommit_timeout_records_health_and_runtime_failure() {
-        let health = crate::health::HealthTracker::new();
-        let runtime = crate::health::ModelRuntimeStatusTracker::new();
-        for _ in 0..3 {
-            health.record_failure("instruct");
-        }
-
-        let error = super::note_completion_failure(
-            &health,
-            &runtime,
-            "instruct",
-            "m-1",
-            Some(&aisix_core::CooldownConfig {
-                enabled: Some(true),
-                ..Default::default()
-            }),
-            aisix_gateway::BridgeError::Timeout {
-                elapsed_ms: 300,
-                cause: "first stream event".into(),
-            },
-        );
-
-        assert_eq!(error.http_status(), 504);
-        assert_eq!(
-            health.level("instruct"),
-            crate::health::HealthLevel::Degraded
-        );
-        let status = runtime.status("m-1");
-        assert_eq!(status.status, crate::health::RuntimeStatus::Cooldown);
-        assert_eq!(status.status_reason.as_deref(), Some("request_timeout"));
     }
 
     /// #545: a configured input guardrail must fire on /v1/completions — a

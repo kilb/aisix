@@ -565,7 +565,8 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
       }
     };
 
-    await assertDelta(422, "4xx");
+    // The head went out ahead of the verdict, so the refusal reads 2xx too.
+    await assertDelta(200, "2xx");
 
     const beforeUpdate = await appliedConfig();
     expect(beforeUpdate).toBeDefined();

@@ -1721,7 +1721,9 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
           stream: true,
           upstream: responsesStreamUpstream,
           marker: "responses-tool-stream-output-marker",
-          expectedStatus: 422,
+          expectedStatus: 200,
+          // The head of a held stream goes out before the verdict too.
+          usageClass: "2xx",
         },
         {
           path: "/v1/responses",
@@ -1953,7 +1955,8 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
           stream,
         });
         const responseBody = await response.text();
-        expect(response.status).toBe(422);
+        // The head of a held stream goes out before the verdict.
+        expect(response.status).toBe(stream ? 200 : 422);
         expect(responseBody).toContain("content_filter");
         expect(responseBody).not.toContain(CN_ID);
         expect(blockUpstream.receivedRequests).toHaveLength(baseline + 1);
@@ -2100,7 +2103,7 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
           path: "/v1/responses",
           model: "pii-responses-identifier-output",
           upstream: responsesIdentifierUpstream,
-          statuses: [422, 422],
+          statuses: [422, 200],
         },
       ] as const;
       for (const outputCase of cases) {

@@ -408,8 +408,7 @@ describe("held-back stream raw-byte bound", () => {
       },
       body: JSON.stringify({ ...body, stream: true }),
     });
-    // A refusal before anything was sent is a 422 (native `/v1/responses`
-    // holds the whole stream); the other routes refuse in-stream.
+    // Every route refuses in-stream, after the head.
     expect([200, 422]).toContain(res.status);
     return res.text();
   };

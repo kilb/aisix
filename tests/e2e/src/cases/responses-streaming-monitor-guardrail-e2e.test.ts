@@ -167,17 +167,18 @@ describe("responses streaming with monitor-mode output guardrail (#1010)", () =>
       return;
     }
 
-    // 1. Block mode: the >256 KiB stream must fail closed (422
-    //    content_filter) — the rule is loaded and the secure default holds.
+    // 1. Block mode: the >256 KiB stream must fail closed (failure frames
+    //    naming content_filter) — the rule is loaded and the secure default
+    //    holds.
     await waitConfigPropagation(async () => {
-      const { status } = await streamOnce();
-      return status === 422;
+      const { body } = await streamOnce();
+      return body.includes("content_filter");
     });
     const metricsBeforeResponse = await fetch(`${app.metricsUrl}/metrics`);
     expect(metricsBeforeResponse.status).toBe(200);
     const metricsBefore = await metricsBeforeResponse.text();
     const blocked = await streamOnce();
-    expect(blocked.status).toBe(422);
+    expect(blocked.status).toBe(200);
     expect(blocked.body).toContain("content_filter");
     expect(blocked.body).not.toContain(DELTA_TEXT);
     const metricsAfterResponse = await fetch(`${app.metricsUrl}/metrics`);
@@ -193,7 +194,7 @@ describe("responses streaming with monitor-mode output guardrail (#1010)", () =>
       model: "gr-1010-model",
       provider: "openai",
       streaming: "true",
-      status_class: "4xx",
+      status_class: "2xx",
       side: "upstream",
     };
     expect(

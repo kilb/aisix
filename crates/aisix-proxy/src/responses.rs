@@ -1994,596 +1994,15 @@ async fn responses_to_target(
         // clean, the same surface-switch bypass via `stream:true`. Mirror the
         // chat surface's secure default (BufferFull): hold the whole SSE
         // response, scan the assistant output text, then release the bytes
-        // verbatim or block with 422. A monitor-only chain resolves to
-        // EndOfStreamCheck — it can never block, so it must never hold the
-        // stream back nor fail closed on the buffer cap (#1010);
-        // it takes the live-forward path below, which scans at end-of-stream
-        // for observation. Requests with no output-hook guardrail keep the
-        // zero-copy verbatim passthrough.
+        // verbatim or end on failure frames ([`build_held_responses_stream`]).
+        // A monitor-only chain resolves to EndOfStreamCheck — it can never
+        // block, so it must never hold the stream back nor fail closed on the
+        // buffer cap (#1010); it takes the live-forward path below, which scans
+        // at end-of-stream for observation. Requests with no output-hook
+        // guardrail keep the zero-copy verbatim passthrough.
         let output_policy = aisix_guardrails::Guardrail::stream_output_policy(chain);
         let hold_back =
             aisix_guardrails::Guardrail::runs_on_output(chain) && output_policy.holds_back();
-        let mut upstream_body: std::pin::Pin<
-            Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
-        > = Box::pin(upstream_resp.bytes_stream());
-        let mut buf: Vec<u8> = Vec::new();
-        // Held until this dispatch returns: the scan below still reads `buf`.
-        let mut buf_held = crate::held_content::HeldBytes::default();
-        // What the hold-back loop reads off the frames as they arrive: the
-        // first frame's time, which re-parsing the buffer later cannot
-        // recover, and how the upstream ended the response.
-        let mut observed = HeldResponse::new(
-            &upstream_model,
-            &body_bytes,
-            attempt_started,
-            hold_back,
-            reservation.as_ref(),
-            member_reservation.as_ref(),
-        );
-        let mut observed_failure: Option<crate::stream_timeout::RawStreamFailure> = None;
-        // fail-open 放行时，扣留期间边读边量到的上游首帧时刻。放行后的流会把
-        // 缓冲前缀重新解析一遍，那时“看到”首帧已经是放行时刻了。
-        let mut released_ttft: Option<Duration> = None;
-        // Set when the hold-back cap is exceeded under `on_buffer_exceeded:
-        // fail_open`: what was held goes out unscanned, ahead of the rest of
-        // the response on the live-forward path below, with no output scan.
-        let mut fail_open_prefix: Option<Vec<u8>> = None;
-        if hold_back {
-            // Hold the whole SSE response back to scan it, but cap what is
-            // held so a huge (or malicious) upstream response can't OOM the
-            // gateway. Mirror the chat surface's BufferFull policy (#466):
-            // count the model-generated content as it arrives (#513) and,
-            // past the cap, fail closed — or, under fail-open, release it
-            // unscanned. The cap and the overflow policy are the chain's
-            // folded `max_buffer_bytes` / `on_buffer_exceeded`, whether it
-            // resolved to a window or a whole-response hold.
-            let (max_buffer_bytes, on_exceeded_fail_open) = output_policy
-                .hold_cap()
-                .unwrap_or((aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false));
-            let stream = &mut upstream_body;
-            // Effective streaming budget — applied to every buffered read,
-            // consistent with the verbatim branch and the connect deadline.
-            let read_to = timeouts.stream;
-            let mut saw_chunk = false;
-            let mut observed_first_frame = false;
-            // What `buf` holds (#513): content in `buf[..counted_upto]`,
-            // which `max_buffer_bytes` caps (the SSE/JSON envelope is not
-            // counted), and every raw byte, unterminated tail included.
-            let mut held_content = crate::held_content::HeldBuffer::default();
-            // A Responses stream repeats one logical output carrier in
-            // delta, done, part, item, and terminal events. Keep that
-            // bounded identity ledger across the entire held response.
-            let mut responses_held_content = crate::held_content::ResponsesHeldContent::default();
-            let mut counted_upto = 0usize;
-            let mut parsed_upto = 0usize;
-            // How much of `buf[parsed_upto..]` is known to hold no frame end.
-            let mut scanned = 0usize;
-            let mut exceeded = false;
-            loop {
-                // #554: bound each read so a stalled upstream fails over —
-                // the buffer path hasn't sent anything to the client yet, so
-                // a read timeout is a retryable failure, not a truncation.
-                let next = match read_to {
-                    Some(d) => match tokio::time::timeout(d, stream.next()).await {
-                        Ok(item) => item,
-                        Err(_) => {
-                            let elapsed_ms = d.as_millis() as u64;
-                            // Past the first chunk this is the response's
-                            // terminal failure, settled with the rest below.
-                            if saw_chunk {
-                                observed_failure =
-                                    Some(crate::stream_timeout::RawStreamFailure::Timeout {
-                                        elapsed_ms,
-                                    });
-                                break;
-                            }
-                            state.health.record_failure(&model.display_name);
-                            let error = crate::cooldown::note_failure(
-                                &state.runtime_status,
-                                model_id,
-                                model.cooldown.as_ref(),
-                                aisix_gateway::BridgeError::Timeout {
-                                    elapsed_ms,
-                                    cause: String::new(),
-                                },
-                            );
-                            return Err(ProxyError::Bridge(error));
-                        }
-                    },
-                    None => stream.next().await,
-                };
-                let Some(chunk) = next else {
-                    // #554: an upstream that returns 200 then closes with zero
-                    // bytes is a first-chunk failure — fail over rather than
-                    // serving an empty 200, matching the verbatim branch. Only
-                    // when a stream timeout is configured, so a model without
-                    // one keeps the pre-#554 behavior.
-                    if !saw_chunk && read_to.is_some() {
-                        state.health.record_failure(&model.display_name);
-                        let err = crate::cooldown::note_failure(
-                            &state.runtime_status,
-                            model_id,
-                            model.cooldown.as_ref(),
-                            aisix_gateway::BridgeError::StreamAborted,
-                        );
-                        return Err(ProxyError::Bridge(err));
-                    }
-                    break;
-                };
-                let chunk = match chunk {
-                    Ok(chunk) => chunk,
-                    Err(error) => {
-                        let error = aisix_gateway::upstream_body_read_error(&error);
-                        if saw_chunk {
-                            crate::attempt::StreamFailure::record(
-                                &mut observed.usage.get_or_insert_with(Default::default).failure,
-                                &error,
-                            );
-                            observed_failure =
-                                Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode);
-                            break;
-                        }
-                        state.health.record_failure(&model.display_name);
-                        let error = crate::cooldown::note_failure(
-                            &state.runtime_status,
-                            model_id,
-                            model.cooldown.as_ref(),
-                            error,
-                        );
-                        return Err(ProxyError::Bridge(error));
-                    }
-                };
-                saw_chunk = true;
-                push_capped_lossy_bytes(&mut observed.raw, &chunk);
-                buf.extend_from_slice(&chunk);
-                // Parse/account through the exact semantic-terminal boundary.
-                // A provider may coalesce later frames into the same transport
-                // item; those bytes are not part of this response.
-                let mut semantic_terminal = false;
-                while let Some(end) =
-                    aisix_gateway::sse::find_frame_end_from(&buf[parsed_upto..], scanned)
-                {
-                    let frame_end = parsed_upto + end;
-                    scanned = 0;
-                    semantic_terminal = observe_responses_sse_frame(
-                        &buf[parsed_upto..frame_end],
-                        &mut observed.usage,
-                        Some(&mut observed.capture),
-                        &mut observed_failure,
-                        attempt_started,
-                        &mut observed_first_frame,
-                    );
-                    parsed_upto = frame_end;
-                    if semantic_terminal {
-                        buf.truncate(parsed_upto);
-                        break;
-                    }
-                }
-                scanned = buf.len() - parsed_upto;
-                buf_held.set(buf.len());
-                held_content.hold(
-                    crate::held_content::responses_sse_held_frames(
-                        &mut responses_held_content,
-                        &buf[counted_upto..parsed_upto],
-                    ),
-                    chunk.len(),
-                );
-                counted_upto = parsed_upto;
-                if held_content.exceeds(max_buffer_bytes) {
-                    exceeded = true;
-                    break;
-                }
-                if semantic_terminal {
-                    break;
-                }
-            }
-            // A final frame the upstream never terminated is held content too.
-            if !exceeded && counted_upto < buf.len() {
-                held_content.hold(
-                    crate::held_content::responses_sse_held_frames(
-                        &mut responses_held_content,
-                        &buf[counted_upto..],
-                    ),
-                    0,
-                );
-                exceeded = held_content.exceeds(max_buffer_bytes);
-            }
-            if exceeded && on_exceeded_fail_open {
-                crate::guardrail_stream::release_output_buffer_unscanned(chain);
-                released_ttft = observed.usage.as_ref().and_then(|u| u.upstream_ttft);
-                fail_open_prefix = Some(std::mem::take(&mut buf));
-            } else if exceeded {
-                tracing::warn!(
-                    guardrail_name = crate::guardrail_stream::output_buffer_owner(chain),
-                    guardrail_hook = "output",
-                    model = %model.display_name,
-                    max_buffer_bytes,
-                    "streaming /v1/responses output exceeded buffer cap; failing closed",
-                );
-                aisix_guardrails::Guardrail::record_output_buffer_exceeded(chain);
-                state.health.record_success(&model.display_name);
-                state.runtime_status.mark_healthy(model_id, attempt_started);
-                // The upstream ran and bills for this response even though the
-                // caller gets none of it, and the terminal usage frame was
-                // never reached: count what arrived rather than record zero.
-                let output_text = observed.output_text();
-                let usage = held_refusal_usage(
-                    observed.usage.take(),
-                    &upstream_model,
-                    &body_bytes,
-                    &output_text,
-                );
-                // At least one upstream frame may already have arrived.
-                // Return the refusal as a terminal dispatch envelope so
-                // that measured TTFT is emitted exactly once even though
-                // the terminal usage frame was never reached.
-                let block = crate::error::guardrail_block_error(
-                    "response",
-                    None,
-                    Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
-                );
-                let guardrail_block_message = crate::attempt::gateway_error_message(&block);
-                return Ok(ResponseDispatchSuccess {
-                    response: block.into_response(),
-                    provider: provider_label,
-                    usage: Some(usage),
-                    model_id: model_id.to_string(),
-                    provider_key_id: provider_key_id.clone(),
-                    upstream_model: upstream_model.clone(),
-                    routing: RoutingTelemetry::default(),
-                    guardrail_blocked: true,
-                    guardrail_block_message,
-                    usage_handled_by_stream: false,
-                    captured_content: match (&captured_prompt, content_cap) {
-                        (Some(prompt), Some(cap)) if input_capture_safe => {
-                            Some(CapturedContent::new(prompt, "", cap as usize))
-                        }
-                        _ => None,
-                    },
-                    output_redactions: crate::redact::RedactionCounts::new(),
-                    output_monitor_hits: Vec::new(),
-                    cache: crate::response_cache::CacheTelemetry::default(),
-                });
-            }
-        }
-        if hold_back && fail_open_prefix.is_none() {
-            if observed_failure.is_none()
-                && observed
-                    .usage
-                    .as_ref()
-                    .is_some_and(|usage| usage.reached_end)
-                && !responses_sse_has_done(&buf)
-            {
-                let done = responses_done_frame(&buf);
-                buf.extend_from_slice(&done);
-            }
-            // #1091/#1100: the two passes below read this buffer
-            // differently — the line-based scan reads `data:` lines it can
-            // parse, the frame-based redactor reads terminator-delimited
-            // frames whose payload parses. Seal it first, so both read the
-            // same frames and no frame reaches the client whose payload
-            // neither could parse: a final frame missing only its terminator
-            // gets it, and a frame whose payload is not one JSON document is
-            // cut (its text still goes to the block scan below). Parsing is
-            // the whole test — see `seal_buffered_sse` for what that leaves.
-            let seal = crate::redact::seal_buffered_sse(&mut buf);
-            if let crate::redact::SseTailSeal::Dropped { dropped } = seal.tail {
-                tracing::warn!(
-                    guardrail_hook = "output",
-                    model = %model.display_name,
-                    dropped,
-                    "streaming /v1/responses ended on an SSE frame that could not be \
-                     parsed; dropping it rather than releasing it past the output \
-                     guardrail",
-                );
-            }
-            if !seal.excised.is_empty() {
-                tracing::warn!(
-                    guardrail_hook = "output",
-                    model = %model.display_name,
-                    frames = seal.excised.len(),
-                    dropped = seal.excised_bytes,
-                    "streaming /v1/responses carried SSE frames whose payload is not one \
-                     JSON document; dropping them rather than releasing them past the \
-                     output guardrail (their text is still scanned)",
-                );
-            }
-            // A terminated frame that does not parse failed the read loop above.
-            // A tail the upstream never finished is a truncated response, read
-            // here with that tail already gone.
-            let terminal_failure =
-                observed_failure.or_else(|| responses_sse_terminal_failure(&buf));
-            if let Some(failure) = terminal_failure {
-                let error = failure.bridge_error();
-                state.health.record_failure(&model.display_name);
-                let _ = crate::cooldown::note_failure(
-                    &state.runtime_status,
-                    model_id,
-                    model.cooldown.as_ref(),
-                    error,
-                );
-            } else {
-                state.health.record_success(&model.display_name);
-                state.runtime_status.mark_healthy(model_id, attempt_started);
-            }
-            // Nothing else arrived: the whole response was frames that
-            // could not be scanned. Dropping them silently would hand
-            // the caller an empty 200 with no signal, and there is no
-            // scanned content to release — refuse, the same shape the
-            // buffer-cap arm above and `/v1/messages` use. A buffer that
-            // was empty to begin with is an empty upstream response and
-            // is left alone.
-            if buf.is_empty() && seal.cut_anything() {
-                let usage = held_refusal_usage(
-                    observed.usage.take(),
-                    &upstream_model,
-                    &body_bytes,
-                    &seal.excised.join("\n"),
-                );
-                let block = crate::error::guardrail_block_error(
-                    "response",
-                    None,
-                    Some(crate::error::TAG_UNSCANNABLE_BODY),
-                );
-                let guardrail_block_message = crate::attempt::gateway_error_message(&block);
-                return Ok(ResponseDispatchSuccess {
-                    response: block.into_response(),
-                    provider: provider_label,
-                    usage: Some(usage),
-                    model_id: model_id.to_string(),
-                    provider_key_id: provider_key_id.clone(),
-                    upstream_model: upstream_model.clone(),
-                    routing: RoutingTelemetry::default(),
-                    guardrail_blocked: true,
-                    guardrail_block_message,
-                    usage_handled_by_stream: false,
-                    captured_content: match (&captured_prompt, content_cap) {
-                        (Some(prompt), Some(cap)) if input_capture_safe => {
-                            Some(CapturedContent::new(prompt, "", cap as usize))
-                        }
-                        _ => None,
-                    },
-                    output_redactions: crate::redact::RedactionCounts::new(),
-                    output_monitor_hits: Vec::new(),
-                    cache: crate::response_cache::CacheTelemetry::default(),
-                });
-            }
-            // #808: the whole SSE response is buffered here, so parse its
-            // terminal event for usage and let the handler emit (the body is
-            // a single complete chunk now, not a live stream). Do this before
-            // the guardrail verdict so a billed-then-blocked response keeps
-            // both its token usage and its first-frame latency.
-            //
-            // Token-estimation fallback (#1074): a buffered
-            // stream with zero/missing usage fills the counters locally —
-            // telemetry only, the buffered bytes forward untouched.
-            let mut usage = responses_sse_usage(&buf).unwrap_or_default();
-            // 首帧时刻是上面边读边缓冲时量的，事后重新解析缓冲区得不到；
-            // 不带过来的话，扣留路径的 TTFT 就整个丢了。
-            if let Some(observed) = observed.usage.as_ref() {
-                usage.upstream_ttft_ms = observed.upstream_ttft_ms;
-                usage.upstream_ttft = observed.upstream_ttft;
-                if usage.failure.is_none() {
-                    usage.failure.clone_from(&observed.failure);
-                }
-            }
-            // A held-back response that ended on a failure records that
-            // failure, whichever way the upstream reported it.
-            if let Some(failure) = terminal_failure {
-                crate::attempt::StreamFailure::record(&mut usage.failure, &failure.bridge_error());
-            }
-            // The usage gate is independent of the id: a stream whose
-            // terminal frame reported no usage still names the upstream
-            // call it was (#1289).
-            if usage.provider_request_id.is_empty() {
-                usage.provider_request_id = responses_sse_provider_request_id(&buf);
-            }
-            if usage.prompt_tokens == 0 || usage.completion_tokens == 0 {
-                let est = crate::token_estimate::Estimator::new(
-                    &upstream_model,
-                    crate::token_estimate::PromptInput::Responses(crate::util::outbound_value(
-                        &body_bytes,
-                    )),
-                );
-                let filled = crate::token_estimate::fill_missing(
-                    &est,
-                    usage.prompt_tokens,
-                    usage
-                        .cache_read_tokens
-                        .saturating_add(usage.cache_creation_tokens),
-                    usage.completion_tokens,
-                    Some(&responses_sse_output_text(&buf)),
-                );
-                if filled.estimated {
-                    usage.prompt_tokens = filled.prompt_tokens;
-                    usage.completion_tokens = filled.completion_tokens;
-                    usage.usage_estimated = true;
-                }
-            }
-            let mut out_text = responses_sse_guardrail_text(&buf);
-            // #1100: an excised frame is not released, but a forbidden
-            // literal inside it must still block the response — the block
-            // pass reads raw text, so it can scan a payload nothing could
-            // parse.
-            for payload in &seal.excised {
-                if !out_text.is_empty() {
-                    out_text.push('\n');
-                }
-                out_text.push_str(payload);
-            }
-            let synth = synth_chat_response(&upstream_model, out_text);
-            let (verdict, hits) =
-                aisix_guardrails::Guardrail::check_output_non_segment_observed(chain, &synth).await;
-            let mut output_monitor_hits = hits;
-            // Segment pass over the held SSE frames: one Bedrock call; an
-            // ANONYMIZE disposition rewrites `buf` in place (#932 bedrock
-            // follow-up). The capture below reads the post-mask buffer.
-            let mut output_redactions = crate::redact::RedactionCounts::new();
-            let unreleased = seal
-                .excised
-                .iter()
-                .map(|text| aisix_guardrails::ScanSegment {
-                    text: text.clone(),
-                    role: aisix_guardrails::SegmentRole::ScanOnly,
-                    in_latest_turn: true,
-                })
-                .collect();
-            let moderation = crate::redact::moderate_body_local_extra(
-                chain,
-                crate::redact::Direction::Output,
-                None,
-                verdict,
-                &mut output_redactions,
-                &mut output_monitor_hits,
-                unreleased,
-                |g| crate::redact::redact_responses_sse_structured(g, &buf).apply_to(&mut buf),
-            )
-            .await;
-            // The response has passed a complete moderation cycle only if the
-            // upstream finished it and every provider call answered.
-            let response_capture_safe = moderation.capture_safe && terminal_failure.is_none();
-            let mut verdict = moderation.verdict;
-            // #932: the whole SSE response is held here — mask the frames
-            // (channel reassembly) before anything reaches the wire. A mask
-            // that would have to rewrite a tool's structural field cannot be
-            // applied, so it refuses instead.
-            if !verdict.is_block() {
-                let redaction = crate::redact::redact_responses_sse_structured(chain, &buf);
-                if let Some(rewritten) = redaction.rewritten {
-                    buf = rewritten;
-                }
-                crate::redact::merge_counts(&mut output_redactions, redaction.counts);
-                if redaction.unrewritable_tool_key {
-                    verdict = crate::redact::unrewritable_tool_key_verdict();
-                }
-            }
-            if let aisix_guardrails::GuardrailVerdict::Block {
-                reason,
-                guardrail_name,
-                unavailable,
-            } = verdict
-            {
-                // Per #153 the matched-pattern detail stays in ops logs only.
-                tracing::warn!(
-                    guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
-                    guardrail_hook = "output",
-                    model = %model.display_name,
-                    reason = %reason,
-                    "guardrail blocked streaming /v1/responses response",
-                );
-                // The upstream completed and billed this request. Return the
-                // refusal as a successful dispatch envelope so the handler
-                // emits the terminal usage + TTFT observation with the 422
-                // this head carries, matching the non-streaming path.
-                // 非流式的输出拦截一直是这么收尾的（#543）；缓冲流式这条原先
-                // 走的是裸 `Err`，于是花费指标不记、额度闸也不扣，反复触发就能
-                // 无上限地花运营方在供应商那边的钱。
-                let block = crate::error::guardrail_block_error(
-                    "response",
-                    guardrail_name.as_deref(),
-                    unavailable.as_deref(),
-                );
-                let guardrail_block_message = crate::attempt::gateway_error_message(&block);
-                return Ok(ResponseDispatchSuccess {
-                    response: block.into_response(),
-                    provider: provider_label,
-                    usage: Some(usage),
-                    model_id: model_id.to_string(),
-                    provider_key_id: provider_key_id.clone(),
-                    upstream_model: upstream_model.clone(),
-                    routing: RoutingTelemetry::default(),
-                    guardrail_blocked: true,
-                    guardrail_block_message,
-                    usage_handled_by_stream: false,
-                    output_redactions: crate::redact::RedactionCounts::new(),
-                    output_monitor_hits,
-                    // 被拦下的正文不进采集：拦了又归档等于没拦。
-                    captured_content: match (&captured_prompt, content_cap) {
-                        (Some(prompt), Some(cap)) if input_capture_safe => {
-                            Some(CapturedContent::new(prompt, "", cap as usize))
-                        }
-                        _ => None,
-                    },
-                    cache: crate::response_cache::CacheTelemetry::default(),
-                });
-            }
-            // A block-capable output guardrail buffers the whole response and
-            // returns it here, never reaching the live relay that splices
-            // frame-by-frame — so the same pass runs once over the buffer.
-            // Without it, attaching such a guardrail would silently change
-            // which model name the caller is told (after masking, so a mask
-            // cannot reintroduce the upstream id).
-            let buf = crate::model_echo::restamp_sse_buffer(
-                &buf,
-                requested_model,
-                crate::model_echo::responses_snapshot_model,
-            );
-            // Content capture (#947): the assembled output text,
-            // read from the POST-redaction buffer so masked PII stays masked
-            // in the exported content.
-            let captured_content = match (&captured_prompt, content_cap) {
-                (Some(prompt), Some(cap)) if input_capture_safe && response_capture_safe => Some(
-                    CapturedContent::new(prompt, &responses_sse_output_text(&buf), cap as usize)
-                        .with_output(Some({
-                            let mut c = aisix_obs::OutputCollector::new(
-                                aisix_obs::OutputWire::OpenAiResponses,
-                                cap as usize,
-                            );
-                            c.feed_sse(&buf);
-                            c.finish()
-                        })),
-                ),
-                _ => None,
-            };
-            use crate::stream_timeout::RawStreamFailure;
-            let buf = match terminal_failure {
-                // The read failed, or a frame could not be understood: what
-                // was held is not sent alongside the gateway's terminal
-                // error. Its usage is kept for billing.
-                Some(
-                    failure @ (RawStreamFailure::Timeout { .. } | RawStreamFailure::UpstreamDecode),
-                ) => responses_stream_error_body(failure, body, requested_model, &mark, &[]),
-                other => {
-                    let mut finish = aisix_obs::ResponsesFinishObserver::default();
-                    finish.feed_sse(&buf);
-                    crate::attribution::note_responses_finish(finish.finish());
-                    // The upstream ended without a terminal event: the scanned
-                    // frames go out, and the stream closes on the failure. A
-                    // failure the upstream declared is already in them.
-                    let closing = other
-                        .filter(|failure| matches!(failure, RawStreamFailure::Upstream))
-                        .map(|failure| {
-                            responses_stream_error_body(failure, body, requested_model, &mark, &buf)
-                        });
-                    // After every telemetry read above, which records the
-                    // upstream's own ids.
-                    let mut released = mark.apply_to_sse_buffer(buf);
-                    if let Some(closing) = closing {
-                        released.extend_from_slice(&closing);
-                    }
-                    released
-                }
-            };
-            let mut response = axum::response::Response::new(axum::body::Body::from(buf));
-            apply_passthrough_headers(&mut response, &headers, request_id);
-            return Ok(ResponseDispatchSuccess {
-                response,
-                provider: provider_label,
-                usage: Some(usage),
-                model_id: model_id.to_string(),
-                provider_key_id: provider_key_id.clone(),
-                upstream_model: upstream_model.clone(),
-                routing: RoutingTelemetry::default(),
-                guardrail_blocked: false,
-                guardrail_block_message: String::new(),
-                usage_handled_by_stream: false,
-                output_redactions,
-                output_monitor_hits,
-                captured_content,
-                cache: crate::response_cache::CacheTelemetry::default(),
-            });
-        }
-
         // #554: enforce the per-chunk read timeout on the forwarded bytes.
         // When a `stream_timeout` is configured, peek the first byte so a
         // slow/erroring first token fails over before the 200 is committed;
@@ -2591,21 +2010,12 @@ async fn responses_to_target(
         // stall truncates the forwarded stream (no in-band error frame for
         // an opaque byte passthrough).
         let stream_budget = timeouts.stream;
-        let overflow_capture_unsafe = fail_open_prefix.is_some();
-        let wrapped: RawResponsesByteStream = Box::pin(
-            crate::stream_timeout::with_read_timeout_bytes(upstream_body, stream_budget),
-        );
-        let body_stream: RawResponsesByteStream = if let Some(prefix) = fail_open_prefix {
-            Box::pin(
-                futures::stream::once(std::future::ready(Ok::<
-                    bytes::Bytes,
-                    crate::stream_timeout::RawStreamError,
-                >(bytes::Bytes::from(
-                    prefix,
-                ))))
-                .chain(wrapped),
-            )
-        } else if timeouts.stream_configured {
+        let wrapped: RawResponsesByteStream =
+            Box::pin(crate::stream_timeout::with_read_timeout_bytes(
+                upstream_resp.bytes_stream(),
+                stream_budget,
+            ));
+        let body_stream: RawResponsesByteStream = if timeouts.stream_configured {
             let mut wrapped = wrapped;
             let first_bytes = match wrapped.next().await {
                 Some(Ok(b)) => b,
@@ -2719,12 +2129,11 @@ async fn responses_to_target(
         // the only way an output-hook chain reaches this live-forward branch)
         // still gets its end-of-stream scan, so would-block / would-mask
         // observations reach telemetry. `None` without an output hook.
-        let eos_scan = (aisix_guardrails::Guardrail::runs_on_output(chain)
-            && !overflow_capture_unsafe)
+        let eos_scan = (aisix_guardrails::Guardrail::runs_on_output(chain) && !hold_back)
             .then(|| EosOutputScan::new(Arc::clone(&chain_arc), upstream_model.clone()));
         // A live output-guarded response is uninspected until its
-        // end-of-stream scan completes, and a fail-open release never is.
-        let initial_capture_safe = !overflow_capture_unsafe && eos_scan.is_none();
+        // end-of-stream scan completes.
+        let initial_capture_safe = eos_scan.is_none();
         // Token-estimation fallback context (#1074): the closure
         // runs at end-of-stream Drop, so it keeps the wire bytes (a shared
         // `Bytes`, no copy) and parses them only if the upstream never
@@ -2733,17 +2142,17 @@ async fn responses_to_target(
             &upstream_model,
             crate::token_estimate::PromptInput::ResponsesWire(body_bytes.clone()),
         );
-        let parsed_stream = build_responses_passthrough_stream(
-            body_stream,
-            started,
-            attempt_started,
-            released_ttft,
-            content_cap,
-            eos_scan,
-            initial_capture_safe,
-            requested_model.to_string(),
-            mark,
-            move |mut usage, out_text, output_hits, output_capture_safe, stream_failure| {
+        let held_verdict = Arc::new(std::sync::OnceLock::new());
+        let held_verdict_c = Arc::clone(&held_verdict);
+        let on_complete =
+            move |mut usage: ResponseUsage,
+                  out_text: String,
+                  output_hits: Vec<aisix_core::GuardrailMonitorHit>,
+                  output_capture_safe: bool,
+                  stream_failure: Option<crate::stream_timeout::RawStreamFailure>| {
+                let held: Option<&HeldResponseVerdict> = held_verdict_c.get();
+                let refusal = held.and_then(|held| held.refusal.as_ref());
+                let refused = refusal.is_some();
                 // Streams that reach here are committed 200s — the
                 // `!status.is_success()` guard above returned early on errors.
                 //
@@ -2796,22 +2205,26 @@ async fn responses_to_target(
                 if let Some(deferred) = &attempt_c.deferred {
                     deferred.finish(
                         &state_c,
-                        terminal.status,
-                        terminal.error_class.is_empty() && terminal.status < 400,
+                        if refused { 200 } else { terminal.status },
+                        refused || (terminal.error_class.is_empty() && terminal.status < 400),
                     );
                 }
                 let mut terminal_attempt = attempt_c;
-                if let Some(f) = usage.failure.as_ref() {
+                if let Some(refusal) = refusal {
+                    refusal.apply_to(&mut terminal_attempt);
+                } else if let Some(f) = usage.failure.as_ref() {
                     f.apply_to(&mut terminal_attempt);
                 }
                 // Content capture (#947): prompt captured up front,
                 // output text assembled by the stream wrapper (empty when no
                 // exporter wants content).
                 // A provider call the chain failed open on left text nobody
-                // read, whatever the stream itself says.
+                // read, whatever the stream itself says. A hold decides its
+                // capture with its verdict.
                 let captured_content = match (&captured_prompt_c, content_cap) {
                     (Some(prompt), Some(cap))
-                        if input_capture_safe
+                        if !hold_back
+                            && input_capture_safe
                             && output_capture_safe
                             && crate::usage_attr::bypass_reason(&audit_c).is_empty() =>
                     {
@@ -2824,18 +2237,24 @@ async fn responses_to_target(
                 // 499. An upstream failure after the headers — a transport
                 // error, a read timeout, an in-band `error` or
                 // `response.failed` event — is recorded as that failure's
-                // status and error.
-                let terminal_status =
-                    crate::attempt::stream_status(usage.reached_end, usage.failure.as_ref());
+                // status and error. A refusal is the 200 the head committed.
+                let terminal_status = crate::attempt::guarded_stream_status(
+                    usage.reached_end,
+                    refused,
+                    usage.failure.as_ref(),
+                );
                 let snap_c = state_c.snapshot.load();
                 let pk_c = ResolvedPk::resolve(&snap_c, &provider_key_id_c);
-                // Live-forward path: no output masking possible (a masking
-                // guardrail holds back → buffered branch; a monitor-mode one
-                // suppresses its masks), so only the input-side counts apply.
-                // The end-of-stream scan's monitor observations ride along
-                // with the input-side hits (#1010).
+                // Output masking happens only under a hold; on the live path
+                // (a monitor-mode chain suppresses its masks) just the
+                // input-side counts apply. The end-of-stream scan's monitor
+                // observations ride along with the input-side hits (#1010).
                 let mut monitor_hits = input_monitor_hits.clone();
                 monitor_hits.extend(output_hits);
+                let mut redactions = input_redactions.clone();
+                if let Some(held) = held {
+                    crate::redact::merge_counts(&mut redactions, held.redactions.clone());
+                }
                 // A stream can outlive several config generations, so the
                 // end-of-stream emit reads a FRESH snapshot rather than the
                 // one the request started on (#941).
@@ -2879,21 +2298,49 @@ async fn responses_to_target(
                     crate::response_cache::CacheTelemetry::default(),
                     &client_c,
                     terminal_attempt,
-                    /* guardrail_blocked */ false,
-                    input_redactions.clone(),
+                    refused,
+                    redactions,
                     monitor_hits,
-                    captured_content.as_ref(),
+                    held.and_then(|held| held.captured.as_ref())
+                        .or(captured_content.as_ref()),
                     /* terminal */ true,
                     /* dispatched */ true,
                     &audit_c,
                 );
-            },
-        );
+            };
+        let parsed_stream: RawResponsesByteStream = if hold_back {
+            Box::pin(build_held_responses_stream(
+                body_stream,
+                Arc::clone(&chain_arc),
+                started,
+                attempt_started,
+                content_cap,
+                captured_prompt.filter(|_| input_capture_safe),
+                crate::responses_bridge::ResponsesReplyContext::from_request(body),
+                requested_model.to_string(),
+                upstream_model.clone(),
+                body_bytes.clone(),
+                model.display_name.clone(),
+                mark,
+                held_verdict,
+                on_complete,
+            ))
+        } else {
+            Box::pin(build_responses_passthrough_stream(
+                body_stream,
+                started,
+                attempt_started,
+                None,
+                content_cap,
+                eos_scan,
+                initial_capture_safe,
+                requested_model.to_string(),
+                mark,
+                on_complete,
+            ))
+        };
         let mut response = axum::response::Response::new(axum::body::Body::from_stream(
-            crate::sse_keepalive::with_heartbeat(
-                Box::pin(parsed_stream),
-                crate::sse_keepalive::interval(),
-            ),
+            crate::sse_keepalive::with_heartbeat(parsed_stream, crate::sse_keepalive::interval()),
         ));
         apply_passthrough_headers(&mut response, &headers, request_id);
 
@@ -4044,7 +3491,7 @@ fn responses_in_band_status(event: &Value) -> Option<u16> {
 /// numbering.
 fn responses_stream_error_body(
     failure: crate::stream_timeout::RawStreamFailure,
-    request: &Value,
+    reply: crate::responses_bridge::ResponsesReplyContext,
     requested_model: &str,
     mark: &crate::responses_affinity::ResponseMark,
     delivered: &[u8],
@@ -4062,7 +3509,7 @@ fn responses_stream_error_body(
         mark.response_id(response_id),
         requested_model,
         chrono::Utc::now().timestamp(),
-        crate::responses_bridge::ResponsesReplyContext::from_request(request),
+        reply,
     );
     encoder.continue_numbering_after(
         events
@@ -4081,45 +3528,52 @@ fn responses_stream_error_body(
     .to_vec()
 }
 
-/// What the hold-back loop has read off a response's frames. Dropped with the
-/// handler when the caller hangs up, which is when it reports them
-/// ([`crate::cancel::HeldStream`]).
+/// What a held-back response ends on when an output guardrail refuses it: the
+/// frames the translated path sends for the same refusal.
+fn responses_refusal_body(
+    reply: crate::responses_bridge::ResponsesReplyContext,
+    requested_model: &str,
+    mark: &crate::responses_affinity::ResponseMark,
+    guardrail_name: Option<&str>,
+    unavailable: Option<&str>,
+) -> bytes::Bytes {
+    let mut encoder = crate::responses_bridge::ResponsesSseEncoder::new(
+        mark.response_id(format!("resp_{}", Uuid::new_v4().simple())),
+        requested_model,
+        chrono::Utc::now().timestamp(),
+        reply,
+    );
+    crate::responses_bridge::guardrail_failure_frames(
+        &mut encoder,
+        false,
+        false,
+        guardrail_name,
+        unavailable,
+    )
+}
+
+/// What the hold-back loop has read off a response's frames: enough to settle
+/// the row of a response that never reached a verdict.
 struct HeldResponse {
     usage: Option<ResponseUsage>,
     capture: SseTextCapture,
     /// The bytes as they came, for a response whose frames gave up no text.
     raw: String,
+    /// How the upstream ended the response.
+    failure: Option<crate::stream_timeout::RawStreamFailure>,
     upstream_model: String,
     outbound_body: bytes::Bytes,
-    attempt_started: Instant,
-    /// `None` on a stream this dispatch does not hold back.
-    keys: Option<(Vec<String>, Vec<String>)>,
 }
 
 impl HeldResponse {
-    fn new(
-        upstream_model: &str,
-        outbound_body: &bytes::Bytes,
-        attempt_started: Instant,
-        hold_back: bool,
-        reservation: Option<&aisix_ratelimit::MultiReservation>,
-        member: Option<&aisix_ratelimit::MultiReservation>,
-    ) -> Self {
-        let keys = hold_back.then(|| {
-            let layers = || reservation.into_iter().chain(member);
-            (
-                layers().flat_map(|r| r.token_keys()).collect(),
-                layers().flat_map(|r| r.spend_keys()).collect(),
-            )
-        });
+    fn new(upstream_model: &str, outbound_body: &bytes::Bytes) -> Self {
         Self {
             usage: None,
             capture: SseTextCapture::new(crate::token_estimate::OUTPUT_ACCUMULATION_CAP),
             raw: String::new(),
+            failure: None,
             upstream_model: upstream_model.to_string(),
             outbound_body: outbound_body.clone(),
-            attempt_started,
-            keys,
         }
     }
 
@@ -4133,46 +3587,88 @@ impl HeldResponse {
             parsed
         }
     }
+
+    /// The usage of a response that went no further than this: what the frames
+    /// reported, with the rest estimated.
+    fn take_usage(&mut self) -> (ResponseUsage, String) {
+        let output_text = self.output_text();
+        let usage = held_refusal_usage(
+            self.usage.take(),
+            &self.upstream_model,
+            &self.outbound_body,
+            &output_text,
+        );
+        (usage, output_text)
+    }
 }
 
-impl Drop for HeldResponse {
+/// What a hold's verdict adds to the row, beyond what `on_complete` takes. Unset
+/// on a hold that never reached one.
+struct HeldResponseVerdict {
+    refusal: Option<crate::attempt::StreamRefusal>,
+    /// Per-detector counts of the output mask.
+    redactions: crate::redact::RedactionCounts,
+    captured: Option<CapturedContent>,
+}
+
+/// How a hold ended, once it has.
+struct HeldResponseEnd {
+    usage: ResponseUsage,
+    out_text: String,
+    monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    failure: Option<crate::stream_timeout::RawStreamFailure>,
+}
+
+/// Completes a hold's row however its stream ends. A caller who leaves before
+/// the verdict received nothing and leaves a 499, with the upstream's counts as
+/// far as the frames gave them and an estimate for the rest: the provider bills
+/// the call either way.
+struct HeldResponseGuard<F>
+where
+    F: FnOnce(
+        ResponseUsage,
+        String,
+        Vec<aisix_core::GuardrailMonitorHit>,
+        bool,
+        Option<crate::stream_timeout::RawStreamFailure>,
+    ),
+{
+    complete: Option<F>,
+    observed: HeldResponse,
+    end: Option<HeldResponseEnd>,
+}
+
+impl<F> Drop for HeldResponseGuard<F>
+where
+    F: FnOnce(
+        ResponseUsage,
+        String,
+        Vec<aisix_core::GuardrailMonitorHit>,
+        bool,
+        Option<crate::stream_timeout::RawStreamFailure>,
+    ),
+{
     fn drop(&mut self) {
-        let Some((token_keys, spend_keys)) = self.keys.take().filter(|_| !self.raw.is_empty())
-        else {
+        let Some(complete) = self.complete.take() else {
             return;
         };
-        let output_text = self.output_text();
-        let observed = self.usage.take();
-        let upstream_model = std::mem::take(&mut self.upstream_model);
-        let outbound_body = self.outbound_body.clone();
-        crate::attribution::publish_held_stream(crate::cancel::HeldStream {
-            token_keys,
-            spend_keys,
-            attempt_started: self.attempt_started,
-            tally: Box::new(move || {
-                let usage =
-                    held_refusal_usage(observed, &upstream_model, &outbound_body, &output_text);
-                crate::cancel::HeldStreamTally {
-                    estimated: usage.usage_estimated,
-                    upstream_ttft_ms: usage.upstream_ttft_ms,
-                    provider_request_id: usage.provider_request_id,
-                    usage: aisix_gateway::UsageStats {
-                        prompt_tokens: usage.prompt_tokens,
-                        completion_tokens: usage.completion_tokens,
-                        cached_prompt_tokens: usage.cached_prompt_tokens,
-                        cache_write_tokens: usage.cache_write_tokens,
-                        modality: usage.modality,
-                        cache_creation_ttl: usage.cache_creation_ttl,
-                        reasoning_tokens: usage.reasoning_tokens,
-                        cache_creation_tokens: usage.cache_creation_tokens,
-                        cache_read_tokens: usage.cache_read_tokens,
-                        upstream_total_tokens: usage.upstream_total_tokens,
-                        reasoning_folded_into_completion: usage.reasoning_folded_into_completion,
-                        ..Default::default()
-                    },
-                }
-            }),
+        let end = self.end.take().unwrap_or_else(|| {
+            let (mut usage, out_text) = self.observed.take_usage();
+            usage.reached_end = false;
+            HeldResponseEnd {
+                usage,
+                out_text,
+                monitor_hits: Vec::new(),
+                failure: self.observed.failure,
+            }
         });
+        complete(
+            end.usage,
+            end.out_text,
+            end.monitor_hits,
+            false,
+            end.failure,
+        );
     }
 }
 
@@ -4691,6 +4187,550 @@ impl<
             );
         }
     }
+}
+
+/// The body of a response a block-capable output chain holds back. The head has
+/// gone out by the time this runs and heartbeats keep the connection warm, so a
+/// long hold survives whatever sits in front of the gateway; what the hold can
+/// no longer do is answer with a status. The response is scanned once it is
+/// complete, then released, or replaced by failure frames, which is what a
+/// refusal is on every held stream. Past the chain's cap the hold follows its
+/// overflow policy: refuse, or hand what it has to the live relay unscanned.
+#[allow(clippy::too_many_arguments)]
+fn build_held_responses_stream<F>(
+    upstream: RawResponsesByteStream,
+    chain: Arc<aisix_guardrails::GuardrailChain>,
+    started: Instant,
+    attempt_started: Instant,
+    content_cap: Option<u32>,
+    // `None` when the request's own text may not be exported.
+    captured_prompt: Option<String>,
+    reply: crate::responses_bridge::ResponsesReplyContext,
+    requested_model: String,
+    upstream_model: String,
+    body_bytes: bytes::Bytes,
+    model_label: String,
+    mark: crate::responses_affinity::ResponseMark,
+    verdict_out: Arc<std::sync::OnceLock<HeldResponseVerdict>>,
+    on_complete: F,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, crate::stream_timeout::RawStreamError>> + Send
+where
+    F: FnOnce(
+            ResponseUsage,
+            String,
+            Vec<aisix_core::GuardrailMonitorHit>,
+            bool,
+            Option<crate::stream_timeout::RawStreamFailure>,
+        ) + Send
+        + 'static,
+{
+    crate::request_id::in_request_span(async_stream::stream! {
+        let mut guard = HeldResponseGuard {
+            complete: Some(on_complete),
+            observed: HeldResponse::new(&upstream_model, &body_bytes),
+            end: None,
+        };
+        // Hold the whole SSE response back to scan it, but cap what is
+        // held so a huge (or malicious) upstream response can't OOM the
+        // gateway. Mirror the chat surface's BufferFull policy (#466):
+        // count the model-generated content as it arrives (#513) and,
+        // past the cap, fail closed — or, under fail-open, release it
+        // unscanned. The cap and the overflow policy are the chain's
+        // folded `max_buffer_bytes` / `on_buffer_exceeded`, whether it
+        // resolved to a window or a whole-response hold.
+        let (max_buffer_bytes, on_exceeded_fail_open) =
+            aisix_guardrails::Guardrail::stream_output_policy(chain.as_ref())
+                .hold_cap()
+                .unwrap_or((aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false));
+        let mut upstream = upstream;
+        let mut buf: Vec<u8> = Vec::new();
+        // Held until the verdict: the scan reads `buf`.
+        let mut buf_held = crate::held_content::HeldBytes::default();
+        let mut observed_first_frame = false;
+        // What `buf` holds (#513): content in `buf[..counted_upto]`,
+        // which `max_buffer_bytes` caps (the SSE/JSON envelope is not
+        // counted), and every raw byte, unterminated tail included.
+        let mut held_content = crate::held_content::HeldBuffer::default();
+        // A Responses stream repeats one logical output carrier in
+        // delta, done, part, item, and terminal events. Keep that
+        // bounded identity ledger across the entire held response.
+        let mut responses_held_content = crate::held_content::ResponsesHeldContent::default();
+        let mut counted_upto = 0usize;
+        let mut parsed_upto = 0usize;
+        // How much of `buf[parsed_upto..]` is known to hold no frame end.
+        let mut scanned = 0usize;
+        let mut exceeded = false;
+        while let Some(chunk) = upstream.next().await {
+            let observed = &mut guard.observed;
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                // The response's terminal failure, settled with the rest below.
+                Err(crate::stream_timeout::RawStreamError::Timeout { elapsed_ms }) => {
+                    observed.failure =
+                        Some(crate::stream_timeout::RawStreamFailure::Timeout { elapsed_ms });
+                    break;
+                }
+                Err(crate::stream_timeout::RawStreamError::Upstream(error)) => {
+                    let error = aisix_gateway::upstream_body_read_error(&error);
+                    crate::attempt::StreamFailure::record(
+                        &mut observed.usage.get_or_insert_with(Default::default).failure,
+                        &error,
+                    );
+                    observed.failure =
+                        Some(crate::stream_timeout::RawStreamFailure::UpstreamDecode);
+                    break;
+                }
+            };
+            push_capped_lossy_bytes(&mut observed.raw, &chunk);
+            buf.extend_from_slice(&chunk);
+            // Parse/account through the exact semantic-terminal boundary.
+            // A provider may coalesce later frames into the same transport
+            // item; those bytes are not part of this response.
+            let mut semantic_terminal = false;
+            while let Some(end) =
+                aisix_gateway::sse::find_frame_end_from(&buf[parsed_upto..], scanned)
+            {
+                let frame_end = parsed_upto + end;
+                scanned = 0;
+                semantic_terminal = observe_responses_sse_frame(
+                    &buf[parsed_upto..frame_end],
+                    &mut observed.usage,
+                    Some(&mut observed.capture),
+                    &mut observed.failure,
+                    attempt_started,
+                    &mut observed_first_frame,
+                );
+                parsed_upto = frame_end;
+                if semantic_terminal {
+                    buf.truncate(parsed_upto);
+                    break;
+                }
+            }
+            scanned = buf.len() - parsed_upto;
+            buf_held.set(buf.len());
+            held_content.hold(
+                crate::held_content::responses_sse_held_frames(
+                    &mut responses_held_content,
+                    &buf[counted_upto..parsed_upto],
+                ),
+                chunk.len(),
+            );
+            counted_upto = parsed_upto;
+            if held_content.exceeds(max_buffer_bytes) {
+                exceeded = true;
+                break;
+            }
+            if semantic_terminal {
+                break;
+            }
+        }
+        // A final frame the upstream never terminated is held content too.
+        if !exceeded && counted_upto < buf.len() {
+            held_content.hold(
+                crate::held_content::responses_sse_held_frames(
+                    &mut responses_held_content,
+                    &buf[counted_upto..],
+                ),
+                0,
+            );
+            exceeded = held_content.exceeds(max_buffer_bytes);
+        }
+        if exceeded && on_exceeded_fail_open {
+            crate::guardrail_stream::release_output_buffer_unscanned(chain.as_ref());
+            // 扣留期间边读边量到的上游首帧时刻。放行后的流会把缓冲前缀重新解析
+            // 一遍，那时“看到”首帧已经是放行时刻了。
+            let released_ttft = guard.observed.usage.as_ref().and_then(|u| u.upstream_ttft);
+            let Some(complete) = guard.complete.take() else {
+                return;
+            };
+            buf_held.clear();
+            let prefix = bytes::Bytes::from(std::mem::take(&mut buf));
+            let rest: RawResponsesByteStream = Box::pin(
+                futures::stream::once(std::future::ready(Ok(prefix))).chain(upstream),
+            );
+            let live = build_responses_passthrough_stream(
+                rest,
+                started,
+                attempt_started,
+                released_ttft,
+                content_cap,
+                None,
+                // What goes out unscanned never reaches an exporter.
+                false,
+                requested_model,
+                mark,
+                complete,
+            );
+            futures::pin_mut!(live);
+            while let Some(item) = live.next().await {
+                yield item;
+            }
+            return;
+        }
+        if exceeded {
+            tracing::warn!(
+                guardrail_name = crate::guardrail_stream::output_buffer_owner(chain.as_ref()),
+                guardrail_hook = "output",
+                model = %model_label,
+                max_buffer_bytes,
+                "streaming /v1/responses output exceeded buffer cap; failing closed",
+            );
+            aisix_guardrails::Guardrail::record_output_buffer_exceeded(chain.as_ref());
+            // The upstream ran and bills for this response even though the
+            // caller gets none of it, and the terminal usage frame was
+            // never reached: count what arrived rather than record zero.
+            let (mut usage, out_text) = guard.observed.take_usage();
+            usage.reached_end = true;
+            usage.failure = None;
+            usage.downstream_latency_ms = crate::attempt::measured_ms(started.elapsed());
+            let _ = verdict_out.set(HeldResponseVerdict {
+                refusal: Some(crate::attempt::StreamRefusal::new(
+                    None,
+                    Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+                )),
+                redactions: crate::redact::RedactionCounts::new(),
+                captured: match (&captured_prompt, content_cap) {
+                    (Some(prompt), Some(cap)) => {
+                        Some(CapturedContent::new(prompt, "", cap as usize))
+                    }
+                    _ => None,
+                },
+            });
+            guard.end = Some(HeldResponseEnd {
+                usage,
+                out_text,
+                monitor_hits: Vec::new(),
+                failure: None,
+            });
+            yield Ok(responses_refusal_body(
+                reply,
+                &requested_model,
+                &mark,
+                None,
+                Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+            ));
+            return;
+        }
+        let observed_failure = guard.observed.failure;
+        if observed_failure.is_none()
+            && guard
+                .observed
+                .usage
+                .as_ref()
+                .is_some_and(|usage| usage.reached_end)
+            && !responses_sse_has_done(&buf)
+        {
+            let done = responses_done_frame(&buf);
+            buf.extend_from_slice(&done);
+        }
+        // #1091/#1100: the two passes below read this buffer
+        // differently — the line-based scan reads `data:` lines it can
+        // parse, the frame-based redactor reads terminator-delimited
+        // frames whose payload parses. Seal it first, so both read the
+        // same frames and no frame reaches the client whose payload
+        // neither could parse: a final frame missing only its terminator
+        // gets it, and a frame whose payload is not one JSON document is
+        // cut (its text still goes to the block scan below). Parsing is
+        // the whole test — see `seal_buffered_sse` for what that leaves.
+        let seal = crate::redact::seal_buffered_sse(&mut buf);
+        if let crate::redact::SseTailSeal::Dropped { dropped } = seal.tail {
+            tracing::warn!(
+                guardrail_hook = "output",
+                model = %model_label,
+                dropped,
+                "streaming /v1/responses ended on an SSE frame that could not be \
+                 parsed; dropping it rather than releasing it past the output \
+                 guardrail",
+            );
+        }
+        if !seal.excised.is_empty() {
+            tracing::warn!(
+                guardrail_hook = "output",
+                model = %model_label,
+                frames = seal.excised.len(),
+                dropped = seal.excised_bytes,
+                "streaming /v1/responses carried SSE frames whose payload is not one \
+                 JSON document; dropping them rather than releasing them past the \
+                 output guardrail (their text is still scanned)",
+            );
+        }
+        // A terminated frame that does not parse failed the read loop above.
+        // A tail the upstream never finished is a truncated response, read
+        // here with that tail already gone.
+        let terminal_failure = observed_failure.or_else(|| responses_sse_terminal_failure(&buf));
+        // Nothing else arrived: the whole response was frames that
+        // could not be scanned. Dropping them silently would hand
+        // the caller an empty answer with no signal, and there is no
+        // scanned content to release — refuse, the same shape the
+        // buffer-cap arm above and `/v1/messages` use. A buffer that
+        // was empty to begin with is an empty upstream response and
+        // is left alone.
+        if buf.is_empty() && seal.cut_anything() {
+            let mut usage = held_refusal_usage(
+                guard.observed.usage.take(),
+                &upstream_model,
+                &body_bytes,
+                &seal.excised.join("\n"),
+            );
+            usage.reached_end = true;
+            usage.failure = None;
+            usage.downstream_latency_ms = crate::attempt::measured_ms(started.elapsed());
+            let _ = verdict_out.set(HeldResponseVerdict {
+                refusal: Some(crate::attempt::StreamRefusal::new(
+                    None,
+                    Some(crate::error::TAG_UNSCANNABLE_BODY),
+                )),
+                redactions: crate::redact::RedactionCounts::new(),
+                captured: match (&captured_prompt, content_cap) {
+                    (Some(prompt), Some(cap)) => {
+                        Some(CapturedContent::new(prompt, "", cap as usize))
+                    }
+                    _ => None,
+                },
+            });
+            guard.end = Some(HeldResponseEnd {
+                usage,
+                out_text: seal.excised.join("\n"),
+                monitor_hits: Vec::new(),
+                failure: terminal_failure,
+            });
+            yield Ok(responses_refusal_body(
+                reply,
+                &requested_model,
+                &mark,
+                None,
+                Some(crate::error::TAG_UNSCANNABLE_BODY),
+            ));
+            return;
+        }
+        // #808: the whole SSE response is buffered here, so parse its
+        // terminal event for usage. Do this before the guardrail verdict so a
+        // billed-then-blocked response keeps both its token usage and its
+        // first-frame latency.
+        //
+        // Token-estimation fallback (#1074): a buffered
+        // stream with zero/missing usage fills the counters locally —
+        // telemetry only, the buffered bytes forward untouched.
+        let mut usage = responses_sse_usage(&buf).unwrap_or_default();
+        // 首帧时刻是上面边读边缓冲时量的，事后重新解析缓冲区得不到；
+        // 不带过来的话，扣留路径的 TTFT 就整个丢了。
+        if let Some(observed) = guard.observed.usage.as_ref() {
+            usage.upstream_ttft_ms = observed.upstream_ttft_ms;
+            usage.upstream_ttft = observed.upstream_ttft;
+            if usage.failure.is_none() {
+                usage.failure.clone_from(&observed.failure);
+            }
+        }
+        // A held-back response that ended on a failure records that
+        // failure, whichever way the upstream reported it.
+        if let Some(failure) = terminal_failure {
+            crate::attempt::StreamFailure::record(&mut usage.failure, &failure.bridge_error());
+        }
+        // The usage gate is independent of the id: a stream whose
+        // terminal frame reported no usage still names the upstream
+        // call it was (#1289).
+        if usage.provider_request_id.is_empty() {
+            usage.provider_request_id = responses_sse_provider_request_id(&buf);
+        }
+        let out_text_estimate = responses_sse_output_text(&buf);
+        if usage.prompt_tokens == 0 || usage.completion_tokens == 0 {
+            let est = crate::token_estimate::Estimator::new(
+                &upstream_model,
+                crate::token_estimate::PromptInput::Responses(crate::util::outbound_value(
+                    &body_bytes,
+                )),
+            );
+            let filled = crate::token_estimate::fill_missing(
+                &est,
+                usage.prompt_tokens,
+                usage
+                    .cache_read_tokens
+                    .saturating_add(usage.cache_creation_tokens),
+                usage.completion_tokens,
+                Some(&out_text_estimate),
+            );
+            if filled.estimated {
+                usage.prompt_tokens = filled.prompt_tokens;
+                usage.completion_tokens = filled.completion_tokens;
+                usage.usage_estimated = true;
+            }
+        }
+        // The upstream's part of this is over, whatever the verdict says.
+        usage.reached_end = true;
+        let mut out_text = responses_sse_guardrail_text(&buf);
+        // #1100: an excised frame is not released, but a forbidden
+        // literal inside it must still block the response — the block
+        // pass reads raw text, so it can scan a payload nothing could
+        // parse.
+        for payload in &seal.excised {
+            if !out_text.is_empty() {
+                out_text.push('\n');
+            }
+            out_text.push_str(payload);
+        }
+        let synth = synth_chat_response(&upstream_model, out_text);
+        let (verdict, hits) =
+            aisix_guardrails::Guardrail::check_output_non_segment_observed(chain.as_ref(), &synth)
+                .await;
+        let mut output_monitor_hits = hits;
+        // Segment pass over the held SSE frames: one Bedrock call; an
+        // ANONYMIZE disposition rewrites `buf` in place (#932 bedrock
+        // follow-up). The capture below reads the post-mask buffer.
+        let mut output_redactions = crate::redact::RedactionCounts::new();
+        let unreleased = seal
+            .excised
+            .iter()
+            .map(|text| aisix_guardrails::ScanSegment {
+                text: text.clone(),
+                role: aisix_guardrails::SegmentRole::ScanOnly,
+                in_latest_turn: true,
+            })
+            .collect();
+        let moderation = crate::redact::moderate_body_local_extra(
+            chain.as_ref(),
+            crate::redact::Direction::Output,
+            None,
+            verdict,
+            &mut output_redactions,
+            &mut output_monitor_hits,
+            unreleased,
+            |g| crate::redact::redact_responses_sse_structured(g, &buf).apply_to(&mut buf),
+        )
+        .await;
+        // The response has passed a complete moderation cycle only if the
+        // upstream finished it and every provider call answered.
+        let response_capture_safe = moderation.capture_safe && terminal_failure.is_none();
+        let mut verdict = moderation.verdict;
+        // #932: the whole SSE response is held here — mask the frames
+        // (channel reassembly) before anything reaches the wire. A mask
+        // that would have to rewrite a tool's structural field cannot be
+        // applied, so it refuses instead.
+        if !verdict.is_block() {
+            let redaction = crate::redact::redact_responses_sse_structured(chain.as_ref(), &buf);
+            if let Some(rewritten) = redaction.rewritten {
+                buf = rewritten;
+            }
+            crate::redact::merge_counts(&mut output_redactions, redaction.counts);
+            if redaction.unrewritable_tool_key {
+                verdict = crate::redact::unrewritable_tool_key_verdict();
+            }
+        }
+        usage.downstream_latency_ms = crate::attempt::measured_ms(started.elapsed());
+        if let aisix_guardrails::GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+            unavailable,
+        } = verdict
+        {
+            // Per #153 the matched-pattern detail stays in ops logs only.
+            tracing::warn!(
+                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
+                guardrail_hook = "output",
+                model = %model_label,
+                reason = %reason,
+                "guardrail blocked streaming /v1/responses response",
+            );
+            // The upstream completed and billed this request, so the row
+            // carries the usage. 被拦下的正文不进采集：拦了又归档等于没拦。
+            let _ = verdict_out.set(HeldResponseVerdict {
+                refusal: Some(crate::attempt::StreamRefusal::new(
+                    guardrail_name.as_deref(),
+                    unavailable.as_deref(),
+                )),
+                redactions: crate::redact::RedactionCounts::new(),
+                captured: match (&captured_prompt, content_cap) {
+                    (Some(prompt), Some(cap)) => {
+                        Some(CapturedContent::new(prompt, "", cap as usize))
+                    }
+                    _ => None,
+                },
+            });
+            guard.end = Some(HeldResponseEnd {
+                usage,
+                out_text: out_text_estimate,
+                monitor_hits: output_monitor_hits,
+                failure: terminal_failure,
+            });
+            yield Ok(responses_refusal_body(
+                reply,
+                &requested_model,
+                &mark,
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
+            ));
+            return;
+        }
+        // A block-capable output guardrail buffers the whole response and
+        // releases it here, never reaching the live relay that splices
+        // frame-by-frame — so the same pass runs once over the buffer.
+        // Without it, attaching such a guardrail would silently change
+        // which model name the caller is told (after masking, so a mask
+        // cannot reintroduce the upstream id).
+        let buf = crate::model_echo::restamp_sse_buffer(
+            &buf,
+            &requested_model,
+            crate::model_echo::responses_snapshot_model,
+        );
+        // Content capture (#947): the assembled output text,
+        // read from the POST-redaction buffer so masked PII stays masked
+        // in the exported content.
+        let captured_content = match (&captured_prompt, content_cap) {
+            (Some(prompt), Some(cap)) if response_capture_safe => Some(
+                CapturedContent::new(prompt, &responses_sse_output_text(&buf), cap as usize)
+                    .with_output(Some({
+                        let mut c = aisix_obs::OutputCollector::new(
+                            aisix_obs::OutputWire::OpenAiResponses,
+                            cap as usize,
+                        );
+                        c.feed_sse(&buf);
+                        c.finish()
+                    })),
+            ),
+            _ => None,
+        };
+        use crate::stream_timeout::RawStreamFailure;
+        let released = match terminal_failure {
+            // The read failed, or a frame could not be understood: what
+            // was held is not sent alongside the gateway's terminal
+            // error. Its usage is kept for billing.
+            Some(
+                failure @ (RawStreamFailure::Timeout { .. } | RawStreamFailure::UpstreamDecode),
+            ) => responses_stream_error_body(failure, reply, &requested_model, &mark, &[]),
+            other => {
+                let mut finish = aisix_obs::ResponsesFinishObserver::default();
+                finish.feed_sse(&buf);
+                crate::attribution::note_responses_finish(finish.finish());
+                // The upstream ended without a terminal event: the scanned
+                // frames go out, and the stream closes on the failure. A
+                // failure the upstream declared is already in them.
+                let closing = other
+                    .filter(|failure| matches!(failure, RawStreamFailure::Upstream))
+                    .map(|failure| {
+                        responses_stream_error_body(failure, reply, &requested_model, &mark, &buf)
+                    });
+                // After every telemetry read above, which records the
+                // upstream's own ids.
+                let mut released = mark.apply_to_sse_buffer(buf);
+                if let Some(closing) = closing {
+                    released.extend_from_slice(&closing);
+                }
+                released
+            }
+        };
+        let _ = verdict_out.set(HeldResponseVerdict {
+            refusal: None,
+            redactions: output_redactions,
+            captured: captured_content,
+        });
+        guard.end = Some(HeldResponseEnd {
+            usage,
+            out_text: out_text_estimate,
+            monitor_hits: output_monitor_hits,
+            failure: terminal_failure,
+        });
+        buf_held.clear();
+        yield Ok(bytes::Bytes::from(released));
+    })
 }
 
 /// Wrap a Responses-API upstream byte stream so the terminal event's usage is
@@ -6695,9 +6735,106 @@ mod tests {
         format!("http://{addr}")
     }
 
-    /// A held stream runs inside the handler, so a caller who hangs up takes
-    /// the handler with it. The upstream is billing by then: the row has to say
-    /// so, and the rate-limit buckets have to move.
+    /// What a refused held stream ends on, the frames the translated path sends
+    /// for the same refusal: its opening, the flat `error` a client reads the
+    /// reason from, and the `response.failed` that closes the response.
+    fn assert_held_refusal_frames(bytes: &[u8]) {
+        let events = crate::redact::parse_sse_json_stream(bytes).0;
+        let kinds: Vec<_> = events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "response.created",
+                "response.in_progress",
+                "error",
+                "response.failed"
+            ],
+            "{}",
+            String::from_utf8_lossy(bytes),
+        );
+        assert_eq!(events[2]["code"], "content_filter");
+        assert_eq!(events[3]["response"]["error"]["code"], "invalid_prompt");
+    }
+
+    /// A refusal goes out as a 200, since the head went out ahead of it, and the
+    /// row says so: 200, `guardrail_blocked`, and what the upstream billed.
+    #[tokio::test]
+    async fn a_refused_held_stream_is_a_200_row_that_bills_the_upstream() {
+        use aisix_obs::UsageSink;
+        let upstream = MockServer::builder().start().await;
+        let sse = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"BLOCKME\"}\n\n\
+                   event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_r\",\"usage\":{\"input_tokens\":31,\"output_tokens\":17,\"total_tokens\":48}}}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&upstream)
+            .await;
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let resp = crate::build_router(state)
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"hi","stream":true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert_held_refusal_frames(&bytes);
+        assert!(!String::from_utf8_lossy(&bytes).contains("BLOCKME"));
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("the guard must emit")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.status_code, 200);
+        assert!(event.guardrail_blocked);
+        assert_eq!(event.error_class, crate::attempt::GUARDRAIL_BLOCK_CLASS);
+        assert_eq!(event.prompt_tokens, 31);
+        assert_eq!(event.completion_tokens, 17);
+    }
+
+    /// The hold only starts once the upstream has answered. An upstream that
+    /// refuses the request is still that refusal's own status.
+    #[tokio::test]
+    async fn an_upstream_refusal_keeps_its_status_under_a_held_stream() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": {"message": "bad", "type": "invalid_request_error"},
+            })))
+            .mount(&upstream)
+            .await;
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
+        let resp = build_app(snap)
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"hi","stream":true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The head of a held stream goes out ahead of the verdict, and a caller who
+    /// hangs up during the hold still leaves what the upstream is billing: the
+    /// row has to say so, and the rate-limit buckets have to move.
     #[tokio::test]
     async fn a_caller_leaving_a_held_stream_is_charged_what_it_read() {
         use aisix_obs::UsageSink;
@@ -6723,19 +6860,27 @@ mod tests {
             .without_cache()
             .with_usage_sink(UsageSink::new(tx));
         let app = crate::build_router(state);
-        let held = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            app.clone().oneshot(make_req(serde_json::json!({
+        let held = app
+            .clone()
+            .oneshot(make_req(serde_json::json!({
                 "model": "gpt-4o-resp",
                 "input": "a prompt of several words",
                 "stream": true,
-            }))),
-        )
-        .await;
+            })))
+            .await
+            .unwrap();
+        assert_eq!(held.status(), StatusCode::OK);
+        let mut body = held.into_body().into_data_stream();
         assert!(
-            held.is_err(),
-            "a held stream writes no head before its verdict"
+            tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                futures::StreamExt::next(&mut body),
+            )
+            .await
+            .is_err(),
+            "nothing is released before the verdict",
         );
+        drop(body);
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
             .expect("the guard must emit")
@@ -6796,15 +6941,22 @@ mod tests {
         let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
             .without_cache()
             .with_usage_sink(UsageSink::new(tx));
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            crate::build_router(state).oneshot(make_req(serde_json::json!({
+        let held = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
                 "model": "gpt-4o-resp",
                 "input": "hi",
                 "stream": true,
-            }))),
+            })))
+            .await
+            .unwrap();
+        let mut body = held.into_body().into_data_stream();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            futures::StreamExt::next(&mut body),
         )
-        .await;
+        .await
+        .is_err());
+        drop(body);
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
             .expect("the guard must emit")
@@ -7353,15 +7505,14 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         // The held-back content must never reach the client.
         assert!(
             !String::from_utf8_lossy(&bytes).contains("BLOCKME"),
             "streamed content leaked despite output block",
         );
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"]["type"], "content_filter");
+        assert_held_refusal_frames(&bytes);
     }
 
     /// Streaming refusals use their own delta and aggregate events. The
@@ -7399,14 +7550,13 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         assert!(
             !String::from_utf8_lossy(&bytes).contains("BLOCKME"),
             "streamed refusal leaked despite output block",
         );
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"]["type"], "content_filter");
+        assert_held_refusal_frames(&bytes);
     }
 
     /// A Responses provider may emit only the final refusal event, without a
@@ -7441,14 +7591,13 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         assert!(
             !String::from_utf8_lossy(&bytes).contains("BLOCKME"),
             "done-only refusal leaked despite output block",
         );
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"]["type"], "content_filter");
+        assert_held_refusal_frames(&bytes);
     }
 
     /// #719 companion: a clean streaming response with an output guardrail
@@ -7792,14 +7941,9 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "oversized streamed response must fail closed, not be released unscanned",
-        );
+        assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"]["type"], "content_filter");
+        assert_held_refusal_frames(&bytes);
     }
 
     /// `keyword_output_guardrail` with `enforcement_mode: monitor` — the
@@ -8172,14 +8316,13 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         assert!(
             !String::from_utf8_lossy(&bytes).contains("BLOCKME"),
             "tool-call arguments leaked despite output block",
         );
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"]["type"], "content_filter");
+        assert_held_refusal_frames(&bytes);
     }
 
     /// #546 (audit HIGH): tool-call args on a `response.incomplete` terminal
@@ -8221,14 +8364,13 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         assert!(
             !String::from_utf8_lossy(&bytes).contains("BLOCKME"),
             "tool-call args leaked on response.incomplete terminal",
         );
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"]["type"], "content_filter");
+        assert_held_refusal_frames(&bytes);
     }
 
     /// #546 (audit HIGH): streamed tool-call argument deltas must be scanned —
@@ -8270,14 +8412,13 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         assert!(
             !String::from_utf8_lossy(&bytes).contains("BLOCK"),
             "streamed tool-call args leaked with no terminal event",
         );
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"]["type"], "content_filter");
+        assert_held_refusal_frames(&bytes);
     }
 
     /// #546 (audit HIGH): a stream that ends WITHOUT a terminal `response`
@@ -8318,14 +8459,13 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         assert!(
             !String::from_utf8_lossy(&bytes).contains("BLOCK"),
             "streamed tool-call args leaked with no terminal event",
         );
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"]["type"], "content_filter");
+        assert_held_refusal_frames(&bytes);
     }
 
     /// #546 (re-audit): MCP tool-call argument deltas stream via their own
@@ -8362,11 +8502,10 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("BLOCKME"));
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"]["type"], "content_filter");
+        assert_held_refusal_frames(&bytes);
     }
 
     /// #546 (re-audit): MCP tool-call argument deltas stream via their own
@@ -8401,11 +8540,10 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("BLOCKME"));
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"]["type"], "content_filter");
+        assert_held_refusal_frames(&bytes);
     }
 
     /// #542: a guardrail-blocked request must NOT consume a rate-limit slot.

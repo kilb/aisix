@@ -8,26 +8,6 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-pub(super) enum PreparedCompletionStream {
-    Buffered(Vec<u8>),
-    Live {
-        stream: CompletionByteStream,
-        /// True when hold-back overflow deliberately switched to wire
-        /// fail-open. The uninspected prefix may reach the caller but must
-        /// never enter a full-content exporter.
-        capture_bypassed: bool,
-    },
-    BufferExceeded {
-        accumulator: CompletionSseAccumulator,
-        output_text: String,
-    },
-    Failed {
-        error: BridgeError,
-        accumulator: CompletionSseAccumulator,
-        output_text: String,
-    },
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CompletionStreamFailure {
     Timeout,
@@ -91,7 +71,6 @@ pub(super) struct CompletionSseAccumulator {
     pub(super) malformed_data: bool,
     pub(super) usage: Option<CompletionUsage>,
     pub(super) provider_request_id: String,
-    observed_bytes: bool,
 }
 
 impl Default for CompletionSseAccumulator {
@@ -111,7 +90,6 @@ impl Default for CompletionSseAccumulator {
             malformed_data: false,
             usage: None,
             provider_request_id: String::new(),
-            observed_bytes: false,
         }
     }
 }
@@ -135,7 +113,6 @@ impl CompletionSseAccumulator {
         if self.saw_done {
             return 0;
         }
-        self.observed_bytes |= !bytes.is_empty();
         // Where the frame being read began in `bytes`: 0 for one carried over
         // from an earlier push.
         let mut frame_start = 0;
@@ -168,10 +145,6 @@ impl CompletionSseAccumulator {
             }
         }
         bytes.len()
-    }
-
-    pub(super) fn has_observed_bytes(&self) -> bool {
-        self.observed_bytes
     }
 
     /// What `max_buffer_bytes` caps on this stream: the generated text, not
@@ -416,23 +389,6 @@ fn is_usage_only_frame(frame: &[u8]) -> bool {
         })
 }
 
-/// `buffer` without the usage frame, for a held stream released at once.
-pub(super) fn without_usage_frame(buffer: Vec<u8>) -> Vec<u8> {
-    let mut splitter = aisix_gateway::sse::SseFrameSplitter::new(usize::MAX);
-    splitter.push(&buffer);
-    let mut out = Vec::with_capacity(buffer.len());
-    while let Ok(Some(frame)) = splitter.next_frame() {
-        if !is_usage_only_frame(&frame) {
-            out.extend_from_slice(&frame);
-        }
-    }
-    let rest = splitter.take_rest();
-    if !is_usage_only_frame(&rest) {
-        out.extend_from_slice(&rest);
-    }
-    out
-}
-
 /// A relayed completion stream in whole frames, without the usage frame unless
 /// the caller asked for it. Whole, because a heartbeat goes out on any silence:
 /// one landing inside a frame an upstream paused halfway through would cut that
@@ -508,85 +464,6 @@ pub(super) fn completion_usage_with_estimates(
     usage
 }
 
-/// What the hold-back loop has read off a completion's frames. Dropped with
-/// the handler when the caller hangs up, which is when it reports them
-/// ([`crate::cancel::HeldStream`]). An arm that hands `observed` on to the
-/// handler leaves an empty one here, which reports nothing.
-pub(super) struct HeldCompletion {
-    pub(super) observed: CompletionSseAccumulator,
-    entry_keys: (Vec<String>, Vec<String>),
-    upstream_model: String,
-    prompt: Option<Value>,
-    attempt_started: Instant,
-    upstream_ttft: Arc<OnceLock<Duration>>,
-}
-
-impl HeldCompletion {
-    pub(super) fn new(
-        entry_keys: (Vec<String>, Vec<String>),
-        upstream_model: String,
-        prompt: Option<Value>,
-        attempt_started: Instant,
-        upstream_ttft: Arc<OnceLock<Duration>>,
-    ) -> Self {
-        Self {
-            observed: CompletionSseAccumulator::default(),
-            entry_keys,
-            upstream_model,
-            prompt,
-            attempt_started,
-            upstream_ttft,
-        }
-    }
-}
-
-impl Drop for HeldCompletion {
-    fn drop(&mut self) {
-        if !self.observed.has_observed_bytes() {
-            return;
-        }
-        let mut observed = std::mem::take(&mut self.observed);
-        let upstream_model = std::mem::take(&mut self.upstream_model);
-        let prompt = self.prompt.take();
-        let upstream_ttft = Arc::clone(&self.upstream_ttft);
-        let (member_tokens, member_spend) = crate::attribution::member_reservation_keys();
-        let (mut token_keys, mut spend_keys) = std::mem::take(&mut self.entry_keys);
-        token_keys.extend(member_tokens);
-        spend_keys.extend(member_spend);
-        crate::attribution::publish_held_stream(crate::cancel::HeldStream {
-            token_keys,
-            spend_keys,
-            attempt_started: self.attempt_started,
-            tally: Box::new(move || {
-                let output_text = observed.finish_for_overflow_estimate();
-                let usage = completion_usage_with_estimates(
-                    observed.usage.take().unwrap_or_default(),
-                    &upstream_model,
-                    prompt.as_ref(),
-                    &output_text,
-                );
-                crate::cancel::HeldStreamTally {
-                    estimated: usage.usage_estimated,
-                    upstream_ttft_ms: upstream_ttft
-                        .get()
-                        .map_or(0, |ttft| crate::attempt::measured_ms(*ttft)),
-                    provider_request_id: std::mem::take(&mut observed.provider_request_id),
-                    usage: UsageStats {
-                        prompt_tokens: usage.prompt_tokens,
-                        completion_tokens: usage.completion_tokens,
-                        cached_prompt_tokens: usage.cached_prompt_tokens,
-                        cache_write_tokens: usage.cache_write_tokens,
-                        modality: usage.modality,
-                        reasoning_tokens: usage.reasoning_tokens,
-                        upstream_total_tokens: usage.upstream_total_tokens,
-                        ..Default::default()
-                    },
-                }
-            }),
-        });
-    }
-}
-
 struct CompletionStreamGuard<
     F: FnOnce(CompletionSseAccumulator, CompletionStreamOutcome, CompletionOutputObservation),
 > {
@@ -609,6 +486,350 @@ impl<F: FnOnce(CompletionSseAccumulator, CompletionStreamOutcome, CompletionOutp
             complete(accumulator, self.drop_outcome, observation);
         }
     }
+}
+
+/// What a hold's verdict adds to the row, beyond what `on_complete` takes. Unset
+/// on a hold that never reached one.
+#[derive(Default)]
+pub(super) struct HeldCompletionVerdict {
+    pub(super) refusal: Option<crate::attempt::StreamRefusal>,
+    /// Per-detector counts of the output mask.
+    pub(super) redactions: crate::redact::RedactionCounts,
+    pub(super) captured: Option<aisix_obs::CapturedContent>,
+    /// What the estimator reads where the answer never parsed whole.
+    pub(super) estimate_text: Option<String>,
+    /// How long after the attempt began the caller got its first byte.
+    pub(super) released_after: Option<Duration>,
+}
+
+/// The `event: error` frame a held completion ends on, the one a chat stream
+/// sends for the same failure.
+fn failure_frame(payload: &str) -> bytes::Bytes {
+    bytes::Bytes::from(format!("event: error\ndata: {payload}\n\n"))
+}
+
+/// The body of a completion a block-capable output chain holds back. The head
+/// has gone out by the time this runs and heartbeats keep the connection warm,
+/// so a long hold survives whatever sits in front of the gateway; what the hold
+/// can no longer do is answer with a status. A complete answer is scanned, then
+/// released or replaced by a failure frame, which is what a refusal is on every
+/// held stream. Past the chain's cap the hold follows its overflow policy:
+/// refuse, or hand what it has to the live relay unscanned.
+///
+/// A caller who leaves before the verdict received nothing and leaves a 499
+/// ([`CompletionStreamGuard`]), with the upstream's counts as far as the frames
+/// gave them and an estimate for the rest: the provider bills the call either
+/// way.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_held_completion_stream<F>(
+    upstream: CompletionByteStream,
+    chain: Arc<aisix_guardrails::GuardrailChain>,
+    model_name: String,
+    upstream_model: String,
+    attempt_started: Instant,
+    content_cap: Option<u32>,
+    // `None` when the request's own text may not be exported.
+    captured_prompt: Option<String>,
+    verdict_out: Arc<OnceLock<HeldCompletionVerdict>>,
+    on_complete: F,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, BridgeError>> + Send
+where
+    F: FnOnce(CompletionSseAccumulator, CompletionStreamOutcome, CompletionOutputObservation)
+        + Send
+        + 'static,
+{
+    crate::request_id::in_request_span(async_stream::stream! {
+        let mut guard = CompletionStreamGuard {
+            slot: Some((on_complete, CompletionSseAccumulator::default())),
+            drop_outcome: CompletionStreamOutcome::DownstreamDrop,
+            output_guarded: true,
+        };
+        // The chain's folded cap and overflow policy, whether it resolved to a
+        // window or a whole-response hold: this relay holds the whole response.
+        let (max_buffer_bytes, fail_open) =
+            aisix_guardrails::Guardrail::stream_output_policy(chain.as_ref())
+                .hold_cap()
+                .unwrap_or((aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES, false));
+        let mut upstream = upstream;
+        let mut buffer = Vec::new();
+        // What `buffer` holds (#513): the generated text, which
+        // `max_buffer_bytes` caps, and the raw bytes it bounds too.
+        let mut held_content = crate::held_content::HeldBuffer::default();
+        let mut buffer_held = crate::held_content::HeldBytes::default();
+        let mut failure = None;
+        while let Some(item) = upstream.next().await {
+            let chunk = match item {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            };
+            let Some((_, accumulator)) = guard.slot.as_mut() else {
+                return;
+            };
+            // The cap-triggering bytes were generated (and may be
+            // billed) even though fail-closed policy withholds them.
+            // Feed a separately bounded parser before enforcing the
+            // wire-buffer limit so usage/token estimates include the
+            // complete observed prefix without retaining it all.
+            let generated_before = accumulator.generated_bytes();
+            accumulator.push(&chunk);
+            held_content.hold(accumulator.generated_bytes() - generated_before, chunk.len());
+            if held_content.exceeds(max_buffer_bytes) {
+                if fail_open {
+                    tracing::warn!(
+                        guardrail_hook = "output",
+                        model = %model_name,
+                        max_buffer_bytes,
+                        "streaming /v1/completions output exceeded buffer cap; failing open"
+                    );
+                    aisix_guardrails::Guardrail::record_output_bypass(
+                        chain.as_ref(),
+                        crate::error::TAG_OUTPUT_BUFFER_EXCEEDED,
+                    );
+                    let Some((complete, _)) = guard.slot.take() else {
+                        return;
+                    };
+                    let _ = verdict_out.set(HeldCompletionVerdict {
+                        released_after: Some(attempt_started.elapsed()),
+                        ..Default::default()
+                    });
+                    buffer_held.clear();
+                    let prefix = futures::stream::iter([
+                        Ok(bytes::Bytes::from(std::mem::take(&mut buffer))),
+                        Ok(chunk),
+                    ]);
+                    let live = build_completion_passthrough_stream(
+                        Box::pin(prefix.chain(upstream)),
+                        Some(chain),
+                        upstream_model,
+                        complete,
+                    );
+                    futures::pin_mut!(live);
+                    while let Some(item) = live.next().await {
+                        yield item;
+                    }
+                    return;
+                }
+                tracing::warn!(
+                    guardrail_hook = "output",
+                    model = %model_name,
+                    max_buffer_bytes,
+                    "streaming /v1/completions output exceeded buffer cap; failing closed"
+                );
+                aisix_guardrails::Guardrail::record_output_buffer_exceeded(chain.as_ref());
+                let owner = aisix_guardrails::Guardrail::output_buffer_owner(chain.as_ref());
+                let estimate_text = accumulator.finish_for_overflow_estimate();
+                let _ = verdict_out.set(HeldCompletionVerdict {
+                    refusal: Some(crate::attempt::StreamRefusal::new(
+                        owner,
+                        Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+                    )),
+                    estimate_text: Some(estimate_text),
+                    ..Default::default()
+                });
+                guard.drop_outcome = CompletionStreamOutcome::CleanEof;
+                let frame = crate::error::guardrail_block_frame_payload(
+                    owner,
+                    Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED),
+                );
+                drop(guard);
+                yield Ok(failure_frame(&frame));
+                return;
+            }
+            buffer.extend_from_slice(&chunk);
+            buffer_held.set(buffer.len());
+        }
+        // A read that failed, or a frame nobody can parse: what was held is not
+        // sent alongside the gateway's terminal error. Its usage is kept for
+        // billing.
+        if let Some(error) = failure {
+            let Some((_, accumulator)) = guard.slot.as_mut() else {
+                return;
+            };
+            let estimate_text = accumulator.finish_for_overflow_estimate();
+            let _ = verdict_out.set(HeldCompletionVerdict {
+                estimate_text: Some(estimate_text),
+                ..Default::default()
+            });
+            guard.drop_outcome = CompletionStreamOutcome::UpstreamError {
+                status: error.http_status(),
+                failure: match &error {
+                    BridgeError::Timeout { .. } => CompletionStreamFailure::Timeout,
+                    BridgeError::UpstreamDecode(_) => CompletionStreamFailure::Decode,
+                    _ => CompletionStreamFailure::Other,
+                },
+                error_class: error.error_type(),
+            };
+            drop(guard);
+            yield Ok(failure_frame(&crate::chat::error_frame_payload(
+                error.error_type(),
+                &error.stream_frame_message(),
+            )));
+            return;
+        }
+        let mut accumulator = CompletionSseAccumulator::with_security_cap(buffer.len());
+        accumulator.push(&buffer);
+        accumulator.finish();
+        let truncated = !accumulator.saw_done;
+        if accumulator.malformed_data || (truncated && buffer.is_empty()) {
+            let error = if accumulator.malformed_data {
+                BridgeError::UpstreamDecode(
+                    "malformed legacy completion SSE data event".to_string(),
+                )
+            } else {
+                BridgeError::StreamAborted
+            };
+            guard.drop_outcome = CompletionStreamOutcome::UpstreamError {
+                status: error.http_status(),
+                failure: if accumulator.malformed_data {
+                    CompletionStreamFailure::Decode
+                } else {
+                    CompletionStreamFailure::Other
+                },
+                error_class: error.error_type(),
+            };
+            if let Some((_, held)) = guard.slot.as_mut() {
+                *held = accumulator;
+            }
+            drop(guard);
+            yield Ok(failure_frame(&crate::chat::error_frame_payload(
+                error.error_type(),
+                &error.stream_frame_message(),
+            )));
+            return;
+        }
+        let output_text = accumulator.output_text();
+        // The answer is whole, so the scan's parse speaks for it from here.
+        if let Some((_, held)) = guard.slot.as_mut() {
+            std::mem::swap(held, &mut accumulator);
+        }
+        let synth = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
+            id: String::new(),
+            model: model_name.clone(),
+            message: ChatMessage::assistant(output_text),
+            finish_reason: FinishReason::Stop,
+            usage: UsageStats::default(),
+            service_tier: None,
+        };
+        let (verdict, hits) = aisix_guardrails::Guardrail::check_output_non_segment_observed(
+            chain.as_ref(),
+            &synth,
+        )
+        .await;
+        let mut monitor_hits = hits;
+        let mut redactions = crate::redact::RedactionCounts::new();
+        let moderation = crate::redact::moderate_body(
+            chain.as_ref(),
+            crate::redact::Direction::Output,
+            None,
+            verdict,
+            &mut redactions,
+            &mut monitor_hits,
+            |guardrail| match crate::redact::redact_completions_sse(guardrail, &buffer) {
+                Some((rewritten, counts)) => {
+                    buffer = rewritten;
+                    counts
+                }
+                None => crate::redact::RedactionCounts::new(),
+            },
+        )
+        .await;
+        let capture_safe = moderation.capture_safe && !truncated;
+        let upstream_end = if truncated {
+            CompletionStreamOutcome::UpstreamError {
+                status: 502,
+                failure: CompletionStreamFailure::Other,
+                error_class: "stream_aborted",
+            }
+        } else {
+            CompletionStreamOutcome::CleanEof
+        };
+        if let aisix_guardrails::GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+            unavailable,
+        } = moderation.verdict
+        {
+            tracing::warn!(
+                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
+                guardrail_hook = "output",
+                model = %model_name,
+                reason = %reason,
+                "guardrail blocked streaming /v1/completions response"
+            );
+            let _ = verdict_out.set(HeldCompletionVerdict {
+                refusal: Some(crate::attempt::StreamRefusal::new(
+                    guardrail_name.as_deref(),
+                    unavailable.as_deref(),
+                )),
+                ..Default::default()
+            });
+            if let Some((complete, accumulator)) = guard.slot.take() {
+                complete(
+                    accumulator,
+                    CompletionStreamOutcome::CleanEof,
+                    CompletionOutputObservation {
+                        monitor_hits,
+                        capture_safe: false,
+                    },
+                );
+            }
+            yield Ok(failure_frame(&crate::error::guardrail_block_frame_payload(
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
+            )));
+            return;
+        }
+        if let Some((rewritten, counts)) =
+            crate::redact::redact_completions_sse(chain.as_ref(), &buffer)
+        {
+            buffer = rewritten;
+            crate::redact::merge_counts(&mut redactions, counts);
+        }
+        let captured = match (&captured_prompt, content_cap) {
+            (Some(prompt), Some(cap)) if capture_safe => {
+                let mut parsed = CompletionSseAccumulator::with_security_cap(buffer.len());
+                parsed.push(&buffer);
+                parsed.finish();
+                Some(aisix_obs::CapturedContent::new(
+                    prompt,
+                    &parsed.output_text(),
+                    cap as usize,
+                ))
+            }
+            _ => None,
+        };
+        let _ = verdict_out.set(HeldCompletionVerdict {
+            redactions,
+            captured,
+            released_after: Some(attempt_started.elapsed()),
+            ..Default::default()
+        });
+        if let Some((complete, accumulator)) = guard.slot.take() {
+            complete(
+                accumulator,
+                upstream_end,
+                CompletionOutputObservation {
+                    monitor_hits,
+                    capture_safe,
+                },
+            );
+        }
+        buffer_held.clear();
+        yield Ok(bytes::Bytes::from(buffer));
+        // The upstream ended without its `[DONE]`: the scanned frames went out,
+        // and the stream closes on the failure.
+        if truncated {
+            yield Ok(failure_frame(&crate::chat::error_frame_payload(
+                BridgeError::StreamAborted.error_type(),
+                &BridgeError::StreamAborted.stream_frame_message(),
+            )));
+        }
+    })
 }
 
 pub(super) fn build_completion_passthrough_stream<F>(
@@ -890,11 +1111,6 @@ mod tests {
         let done = "data: [DONE]\n\n";
         let whole = format!("{text}{usage}{done}");
         let expected = format!("{text}{done}");
-
-        assert_eq!(
-            without_usage_frame(whole.clone().into_bytes()),
-            expected.as_bytes()
-        );
 
         for cut in [1, 7, text.len() + 3, whole.len() - 2] {
             let (head, tail) = whole.as_bytes().split_at(cut);

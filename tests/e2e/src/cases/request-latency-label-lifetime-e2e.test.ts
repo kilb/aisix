@@ -88,7 +88,7 @@ describe("request latency labels survive buffering and configuration reloads", (
       await seed.createModel({ display_name: model, model_name: model, provider: "openai", provider_key_id: pk.id });
     }
     await authorize(app, seed, ["buffer-allowed", "buffer-blocked"]);
-    for (const [model, status] of [["buffer-allowed", 200], ["buffer-blocked", 422]] as const) {
+    for (const [model, status] of [["buffer-allowed", 200], ["buffer-blocked", 200]] as const) {
       const response = await request(app, "responses", model);
       const body = await response.text();
       expect(response.status, body).toBe(status);

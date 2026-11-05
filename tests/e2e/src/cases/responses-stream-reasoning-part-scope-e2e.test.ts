@@ -195,7 +195,9 @@ describe("native /v1/responses stream leaves a reasoning_text content part out o
     if (!etcdReachable || !app) ctx.skip();
     const res = await stream("resp-reasoning-block-control");
     const body = await res.text();
-    expect(res.status, body).toBe(422);
+    expect(res.status, body).toBe(200);
     expect(body).toContain("resp-reasoning-part-block");
+    expect(frames(body).some((f) => f.type === "response.failed"), body).toBe(true);
+    expect(frames(body).some((f) => f.type === "response.completed"), body).toBe(false);
   });
 });

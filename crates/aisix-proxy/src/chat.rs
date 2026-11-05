@@ -7761,7 +7761,7 @@ impl<T> Stream for DeliveryCounter<T> {
 /// the OpenAI error envelope shape per
 /// <https://platform.openai.com/docs/guides/error-codes/api-errors>:
 /// `{"error": {"message": "...", "type": "..."}}`.
-fn error_frame_payload(error_type: &str, message: &str) -> String {
+pub(crate) fn error_frame_payload(error_type: &str, message: &str) -> String {
     serde_json::to_string(&serde_json::json!({
         "error": {
             "message": message,

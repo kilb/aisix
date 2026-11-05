@@ -164,7 +164,7 @@ describe("standards-compliant SSE output guardrails", () => {
         stream: true,
       }),
     });
-    expect(result.status).toBe(422);
+    expect(result.status).toBe(200);
     const body = await result.text();
     expect(body).toContain("content_filter");
     expect(body).not.toContain("forbiddenstandard");
@@ -229,7 +229,7 @@ describe("standards-compliant SSE output guardrails", () => {
         stream: true,
       }),
     });
-    expect(result.status).toBe(422);
+    expect(result.status).toBe(200);
     const body = await result.text();
     expect(body).toContain("content_filter");
     expect(body).not.toContain("forbiddenstandard");
