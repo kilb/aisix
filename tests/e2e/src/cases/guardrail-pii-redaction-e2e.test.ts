@@ -1738,6 +1738,9 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
           upstream: chatStreamUpstream,
           marker: "responses-bridge-tool-stream-output-marker",
           expectedStatus: 200,
+          // A bridged stream's head goes out before the verdict, so its refusal
+          // reads the 2xx the caller received, like the chat stream's above.
+          usageClass: "2xx",
         },
       ] as const;
       for (const outputCase of outputCases) {

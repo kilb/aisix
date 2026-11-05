@@ -1915,7 +1915,7 @@ async fn anthropic_passthrough_dispatch(
                 // A refusal stays the 200 its response head committed, an upstream
                 // failure records its own status, and only a stream nobody
                 // finished reading is the caller's 499.
-                let terminal_status = anthropic_stream_status(
+                let terminal_status = crate::attempt::guarded_stream_status(
                     usage.reached_end,
                     usage.guardrail_blocked,
                     usage.failure.as_ref(),
@@ -3053,7 +3053,7 @@ async fn cross_provider_dispatch(
                 drop(in_flight);
 
                 // See the sibling passthrough path.
-                let terminal_status = anthropic_stream_status(
+                let terminal_status = crate::attempt::guarded_stream_status(
                     comp.reached_end,
                     comp.guardrail_blocked,
                     comp.failure.as_ref(),
@@ -4025,21 +4025,6 @@ fn finish_reason_label(reason: &aisix_gateway::FinishReason) -> String {
         FinishReason::ContentFilter => "content_filter".into(),
         FinishReason::ToolCalls => "tool_calls".into(),
         FinishReason::Other(s) => s.clone(),
-    }
-}
-
-/// The usage-event status of a `/v1/messages` stream. A guardrail refusal
-/// stays a `200` whatever `reached_end` says (AISIX-Cloud#1428); otherwise see
-/// [`crate::attempt::stream_status`].
-fn anthropic_stream_status(
-    reached_end: bool,
-    guardrail_blocked: bool,
-    failure: Option<&crate::attempt::StreamFailure>,
-) -> u16 {
-    if guardrail_blocked {
-        200
-    } else {
-        crate::attempt::stream_status(reached_end, failure)
     }
 }
 
@@ -8381,7 +8366,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         // A refusal is not an abandonment: the row keeps the 200 the response
         // head committed and names the refusal.
         assert_eq!(
-            super::anthropic_stream_status(
+            crate::attempt::guarded_stream_status(
                 completion.reached_end,
                 completion.guardrail_blocked,
                 completion.failure.as_ref(),
@@ -8501,7 +8486,7 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         assert!(usage.guardrail_blocked);
         assert!(!usage.reached_end);
         assert_eq!(
-            super::anthropic_stream_status(
+            crate::attempt::guarded_stream_status(
                 usage.reached_end,
                 usage.guardrail_blocked,
                 usage.failure.as_ref(),

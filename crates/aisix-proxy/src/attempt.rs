@@ -534,6 +534,22 @@ pub(crate) fn stream_status(reached_end: bool, failure: Option<&StreamFailure>) 
     }
 }
 
+/// The usage-event status of a stream an output guardrail may have refused. A
+/// refusal stays the `200` the response head committed, whatever `reached_end`
+/// says: the row says what the caller received, and its `guardrail_blocked`
+/// says the stream was refused. Otherwise see [`stream_status`].
+pub(crate) fn guarded_stream_status(
+    reached_end: bool,
+    guardrail_blocked: bool,
+    failure: Option<&StreamFailure>,
+) -> u16 {
+    if guardrail_blocked {
+        200
+    } else {
+        stream_status(reached_end, failure)
+    }
+}
+
 /// Failure class + reason for the access log's `error_class` / `error`
 /// fields: every variant contributes its `Display`.
 pub(crate) fn access_log_error(err: &ProxyError) -> (&'static str, String) {
@@ -1097,6 +1113,33 @@ mod tests {
         assert_eq!(stream_status(false, None), crate::CLIENT_CLOSED_REQUEST);
         assert_eq!(stream_status(true, None), 200);
         assert_eq!(failure.error_class, "timeout");
+    }
+
+    /// A refusal reads what its head committed, whether the caller stayed for
+    /// the end and whatever else went wrong; without one the row falls back to
+    /// how the stream ended.
+    #[test]
+    fn a_refused_stream_records_the_200_it_answered_with() {
+        let failure = StreamFailure::from_bridge(&BridgeError::Timeout {
+            elapsed_ms: 10,
+            cause: String::new(),
+        });
+        for reached_end in [true, false] {
+            assert_eq!(guarded_stream_status(reached_end, true, None), 200);
+            assert_eq!(
+                guarded_stream_status(reached_end, true, Some(&failure)),
+                200
+            );
+            assert_eq!(
+                guarded_stream_status(reached_end, false, Some(&failure)),
+                504
+            );
+        }
+        assert_eq!(guarded_stream_status(true, false, None), 200);
+        assert_eq!(
+            guarded_stream_status(false, false, None),
+            crate::CLIENT_CLOSED_REQUEST
+        );
     }
 
     /// The first failure is the cause; what the relay reports after it does

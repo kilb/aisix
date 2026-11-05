@@ -2431,8 +2431,8 @@ async fn responses_to_target(
                 );
                 // The upstream completed and billed this request. Return the
                 // refusal as a successful dispatch envelope so the handler
-                // emits the terminal usage + TTFT observation with status
-                // 422, matching the cross-provider and non-streaming paths.
+                // emits the terminal usage + TTFT observation with the 422
+                // this head carries, matching the non-streaming path.
                 // 非流式的输出拦截一直是这么收尾的（#543）；缓冲流式这条原先
                 // 走的是裸 `Err`，于是花费指标不记、额度闸也不扣，反复触发就能
                 // 无上限地花运营方在供应商那边的钱。
@@ -3360,10 +3360,10 @@ async fn responses_cross_provider_to_target(
                     failure: comp.failure.clone(),
                 };
                 // A typed upstream-body failure retains its 5xx status. A
-                // guardrail block is 422, a clean EOF is 200, and only an
-                // actual consumer cancellation is 499. This settles health,
-                // cooldown and the deployment metric, which wait for the
-                // stream's real ending rather than its head.
+                // guardrail block and a clean EOF are 200, and only an actual
+                // consumer cancellation is 499. This settles health, cooldown
+                // and the deployment metric, which wait for the stream's real
+                // ending rather than its head.
                 let terminal = crate::stream_timeout::finish_bridge_stream(
                     &state_c.health,
                     &state_c.runtime_status,
@@ -3372,7 +3372,7 @@ async fn responses_cross_provider_to_target(
                     cooldown_c.as_ref(),
                     comp.terminal_failure.take(),
                     comp.reached_end || comp.guardrail_blocked,
-                    if comp.guardrail_blocked { 422 } else { 200 },
+                    200,
                 );
                 if let Some(deferred) = &attempt_c.deferred {
                     deferred.finish(
@@ -3386,17 +3386,18 @@ async fn responses_cross_provider_to_target(
                             || (terminal.error_class.is_empty() && terminal.status < 400),
                     );
                 }
-                // A clean stream is a committed 200; an output-guardrail block
-                // (or fail-closed overflow) bills the upstream tokens but is
-                // recorded as a 422 marked guardrail_blocked, matching the
-                // non-streaming path so the Blocked tab + ledger see it. An
-                // abandoned stream is a 499, one an upstream failure ended
-                // carries that failure's status and error.
-                let status = if comp.guardrail_blocked {
-                    422
-                } else {
-                    crate::attempt::stream_status(comp.reached_end, comp.failure.as_ref())
-                };
+                // A clean stream is a committed 200, and so is an
+                // output-guardrail block (or fail-closed overflow): this head
+                // went out before the verdict, so the row says what the caller
+                // received, bills the upstream tokens, and its guardrail_blocked
+                // is what the Blocked tab + ledger see. An abandoned stream is a
+                // 499, one an upstream failure ended carries that failure's
+                // status and error.
+                let status = crate::attempt::guarded_stream_status(
+                    comp.reached_end,
+                    comp.guardrail_blocked,
+                    comp.failure.as_ref(),
+                );
                 let mut attempt_c = attempt_c;
                 if let Some(r) = comp.refusal.as_ref() {
                     r.apply_to(&mut attempt_c);
@@ -7012,9 +7013,10 @@ mod tests {
     }
 
     /// #825: a blocked cross-provider STREAM still bills the upstream tokens
-    /// but the emitted UsageEvent is marked guardrail_blocked (status 422) —
-    /// matching the non-streaming path — so the dashboard's Blocked tab and
-    /// the budget ledger see it rather than recording it as clean usage.
+    /// and the emitted UsageEvent is marked guardrail_blocked, so the
+    /// dashboard's Blocked tab and the budget ledger see it rather than
+    /// recording it as clean usage. Its status is the 200 the caller received,
+    /// since this head went out before the verdict.
     #[tokio::test]
     async fn streaming_cross_provider_block_emits_guardrail_blocked_usage_event() {
         use aisix_obs::UsageSink;
@@ -7064,10 +7066,65 @@ mod tests {
             event.guardrail_blocked,
             "a blocked stream must mark guardrail_blocked"
         );
-        assert_eq!(event.status_code, 422);
+        assert_eq!(event.status_code, 200);
+        assert_eq!(event.error_class, "content_filter");
         // The upstream-billed tokens are still recorded.
         assert_eq!(event.prompt_tokens, 5);
         assert_eq!(event.completion_tokens, 3);
+    }
+
+    /// The refusal that needs no verdict reads the same: a bridged stream that
+    /// outgrew its hold-back buffer answered a 200 and an in-band error, so its
+    /// row records the 200 as well.
+    #[tokio::test]
+    async fn streaming_cross_provider_overflow_records_the_head_it_sent() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::builder().start().await;
+        let big = serde_json::to_string(&"y".repeat(300_000)).unwrap();
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(anthropic_text_sse(&big)),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic_at(&upstream.uri());
+        snap.models.insert(anthropic_model("claude-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"claude-resp","input":"hi","stream":true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 1 << 21).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("content_filter"), "{body}");
+        assert!(!body.contains("yyyy"), "held bytes leaked: {body}");
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(1000), rx.recv())
+            .await
+            .expect("usage event must be emitted")
+            .expect("usage_sink sender dropped");
+        assert!(event.guardrail_blocked);
+        assert_eq!(event.status_code, 200);
     }
 
     /// #719 (audit HIGH-1): the streaming hold-back buffer is capped so a

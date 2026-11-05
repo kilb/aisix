@@ -2508,7 +2508,7 @@ async fn dispatch(
                     cooldown_for_telem.as_ref(),
                     comp.terminal_failure.take(),
                     comp.reached_end || comp.guardrail_blocked,
-                    if comp.guardrail_blocked { 422 } else { 200 },
+                    200,
                 );
                 // One figure for both the usage event and the spend metric —
                 // computing it twice is how the two drift.
@@ -5755,15 +5755,13 @@ impl crate::attempt::RecordsStreamRefusal for StreamCompletion {
     }
 }
 
-/// The terminal usage-event status of a chat stream. A guardrail block keeps
-/// what it recorded before upstream failures were told apart: `200` once the
-/// stream ran to its end, `499` if the caller left first.
+/// The terminal usage-event status of a chat stream.
 fn stream_terminal_status(comp: &StreamCompletion) -> u16 {
-    if comp.guardrail_blocked {
-        crate::attempt::stream_status(comp.reached_end, None)
-    } else {
-        crate::attempt::stream_status(comp.reached_end, comp.failure.as_ref())
-    }
+    crate::attempt::guarded_stream_status(
+        comp.reached_end,
+        comp.guardrail_blocked,
+        comp.failure.as_ref(),
+    )
 }
 
 /// Parameters needed to run output-guardrail evaluation at
@@ -7954,6 +7952,21 @@ mod complete_on_drop_tests {
     };
     use aisix_gateway::chat::UsageStats;
     use std::sync::{Arc, Mutex};
+
+    /// A refused stream's row reads the 200 its head committed, even when the
+    /// caller left on the refusal's own error frame, before the stream's end.
+    #[test]
+    fn a_refused_stream_is_a_200_even_if_the_caller_left_on_the_frame() {
+        use crate::attempt::RecordsStreamRefusal;
+        let mut comp = StreamCompletion::default();
+        assert_eq!(
+            super::stream_terminal_status(&comp),
+            crate::CLIENT_CLOSED_REQUEST
+        );
+        comp.record_refusal(None, None);
+        assert!(!comp.reached_end);
+        assert_eq!(super::stream_terminal_status(&comp), 200);
+    }
 
     /// Build the guard with `delivered_count` pre-set on the
     /// shared atomic, drop it, return whatever on_complete received.
