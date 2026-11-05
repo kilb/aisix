@@ -172,6 +172,11 @@ describe("mcp anonymous access e2e", () => {
       url: kb.url,
       enabled: true,
     });
+    await seed.update("mcp_servers", randomUUID(), {
+      display_name: "retired",
+      url: kb.url,
+      enabled: false,
+    });
 
     // The anonymous principal holds a WILDCARD grant on purpose: if the
     // server allowlist were only an entry gate, this key would reach `kb`
@@ -193,7 +198,7 @@ describe("mcp anonymous access e2e", () => {
         // The e2e client connects over loopback; both families, since
         // `localhost` may resolve either way.
         source_cidrs: ["127.0.0.0/8", "::1/128"],
-        servers: ["docs"],
+        servers: ["docs", "retired"],
         aggregate_entry: true,
       },
     });
@@ -259,6 +264,16 @@ describe("mcp anonymous access e2e", () => {
     for (const server of ["kb", "ghost"]) {
       expect(await initialize(`/mcp/${server}`, undefined)).toBe(401);
     }
+  });
+
+  test("a listed server that is switched off is indistinguishable from an unknown one", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+
+    // The name is on the allowlist and the server is registered, but it
+    // serves nobody. If it answered differently from `ghost`, an anonymous
+    // prober could read what is listed and what state it is in.
+    expect(await initialize("/mcp/retired", undefined)).toBe(401);
+    expect(await initialize("/mcp/ghost", undefined)).toBe(401);
   });
 
   test("a failed credential never downgrades to anonymous", async (ctx) => {

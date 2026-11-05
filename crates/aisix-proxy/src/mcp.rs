@@ -2612,6 +2612,33 @@ mod tests {
         }
     }
 
+    /// A listed name whose server is gone or switched off answers as an
+    /// unlisted one does, or a prober could read the allowlist off the 404.
+    #[tokio::test]
+    async fn a_listed_server_that_is_absent_answers_as_an_unlisted_one() {
+        let snapshot = snapshot_with_anonymous(serde_json::json!({
+            "servers": ["docs", "off", "gone"],
+        }));
+        insert_mcp_server(&snapshot, "mcp-off", "off", false);
+        let app = router_with(snapshot);
+        for (server, want) in [
+            ("off", StatusCode::UNAUTHORIZED),
+            ("gone", StatusCode::UNAUTHORIZED),
+            ("kb", StatusCode::UNAUTHORIZED),
+            ("docs", StatusCode::OK),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(from_ip(
+                    scoped_request(server, None, "initialize", serde_json::json!({})),
+                    "10.1.2.3",
+                ))
+                .await
+                .expect("router responds");
+            assert_eq!(response.status(), want, "{server}");
+        }
+    }
+
     #[tokio::test]
     async fn the_anonymous_entry_gate_reads_the_id_form_when_it_is_present() {
         // `servers` names `kb`, `server_ids` names `docs`'s id. The id
