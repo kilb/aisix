@@ -55,7 +55,8 @@
 //!
 //! The relay harvests `response.done` usage frames (and
 //! `conversation.item.input_audio_transcription.completed` token usage)
-//! from the upstream stream and emits ONE aggregated UsageEvent per
+//! from the upstream stream, charges each to the spend metric and the limits
+//! as it arrives, and emits ONE aggregated UsageEvent per
 //! session (`inbound_protocol = "realtime"`), committing total tokens to
 //! the rate-limit reservation like the other non-chat surfaces (#911
 //! [21]).
@@ -1069,6 +1070,129 @@ impl SessionUsage {
     }
 }
 
+/// What a session has charged so far, and everything it needs to charge more.
+///
+/// A session runs for as long as its traffic does, so nothing it spends can wait
+/// for the close: a ledger reading the spend counter would not see it, a limit
+/// could not act on it, and a process that dies in between would never bill it.
+/// It settles each usage frame as it arrives.
+struct SessionMeter<'a> {
+    state: &'a ProxyState,
+    auth: &'a crate::auth::AuthenticatedKey,
+    model_entry: &'a aisix_core::ResourceEntry<aisix_core::Model>,
+    pk_id: &'a str,
+    provider_label: &'a str,
+    requested_model: &'a str,
+    client_type: &'a str,
+    token_keys: Vec<String>,
+    spend_keys: Vec<String>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+    micro_usd: u64,
+    responses: u32,
+}
+
+impl SessionMeter<'_> {
+    /// Whether frames arrived that are not charged yet.
+    fn behind(&self, usage: &SessionUsage) -> bool {
+        self.responses != usage.responses
+    }
+
+    /// The session's whole cost so far, through the index every other reader of
+    /// a model's price uses, from the row the session started on: it can outlive
+    /// the generation that had that row, and re-reading it could price the whole
+    /// session at nothing.
+    fn cost_usd(&self, snap: &aisix_core::AisixSnapshot, usage: &SessionUsage) -> f64 {
+        // The session's `input_tokens` includes what it read back from the
+        // prompt cache (the OpenAI convention), so `cached_tokens` goes in the
+        // subset slot. This surface reports no cache writes and none of the
+        // separate read or write counters.
+        let input = crate::usage_attr::input_tokens_for_pricing(
+            usage.input_tokens,
+            usage.cached_tokens,
+            0,
+            0,
+            0,
+        );
+        self.state
+            .pricing
+            .for_snapshot(snap)
+            .resolve(&self.model_entry.value)
+            .map(|c| c.calculate_with_cache(input, usage.output_tokens))
+            .unwrap_or(0.0)
+    }
+
+    /// Charge what arrived since the last call. The metric and the limits get
+    /// the difference from the running total, so what they add up to is exactly
+    /// what the session's one usage event reports.
+    fn settle(&mut self, usage: &SessionUsage) {
+        if !self.behind(usage) {
+            return;
+        }
+        let snap = self.state.snapshot.load();
+        let pk = crate::usage_attr::ResolvedPk::resolve(&snap, self.pk_id);
+        let micro_usd = crate::usage_attr::spend_micro_usd(self.cost_usd(&snap, usage));
+        let spend = micro_usd.saturating_sub(self.micro_usd);
+        let input = usage.input_tokens.saturating_sub(self.input_tokens);
+        let output = usage.output_tokens.saturating_sub(self.output_tokens);
+        let cached = usage.cached_tokens.saturating_sub(self.cached_tokens);
+        (self.input_tokens, self.output_tokens, self.cached_tokens) =
+            (usage.input_tokens, usage.output_tokens, usage.cached_tokens);
+        self.micro_usd = self.micro_usd.max(micro_usd);
+        self.responses = usage.responses;
+
+        let limiter = &self.state.limiter;
+        limiter.add_tokens_post_stream_all(&self.token_keys, input + output);
+        limiter.add_tokens_post_stream_all(&self.spend_keys, spend);
+        // A realtime session bills real tokens against a real model. Its cost
+        // is resolved from the model row, same as every other endpoint, and
+        // feeds `aisix_llm_spend_micro_usd_total`.
+        crate::request_metrics::record_usage(
+            self.state,
+            "/v1/realtime",
+            crate::request_metrics::Caller::new(self.auth),
+            crate::request_metrics::Upstream {
+                provider: self.provider_label,
+                // The requested string so the emit chokepoint folds a
+                // wildcard-served alias's pair to the row's identities
+                // (non-wildcard: requested == display_name, unchanged).
+                model: self.requested_model,
+                upstream_model: self.model_entry.value.upstream_model().unwrap_or("unknown"),
+                pk: pk.labels(),
+                ..Default::default()
+            },
+            crate::request_metrics::Tokens {
+                input: input.min(u32::MAX as u64) as u32,
+                output: output.min(u32::MAX as u64) as u32,
+                total: (input + output).min(u32::MAX as u64) as u32,
+                // The Realtime session reports its cache hits in the
+                // OpenAI shape — inside `input_tokens`, never beside it.
+                cached: cached.min(u32::MAX as u64) as u32,
+                cache_read: 0,
+                cache_creation: 0,
+                spend_usd: spend as f64 / 1_000_000.0,
+                client_type: self.client_type,
+            },
+        );
+    }
+
+    /// Why this session may not go on, read off the current config: the key that
+    /// opened it was disabled, deleted or has expired, or a budget it answers to
+    /// ran out. Admission only looked once, and a session can run for hours.
+    fn refusal(&self) -> Option<ProxyError> {
+        let snap = self.state.snapshot.load();
+        match snap.apikeys.get_by_id(&self.auth.entry.id) {
+            Some(key) if key.value.is_expired_at(chrono::Utc::now()) => {
+                return Some(ProxyError::ApiKeyExpired)
+            }
+            Some(key) if !key.value.disabled => {}
+            _ => return Some(ProxyError::ApiKeyDisabled),
+        }
+        crate::budget::enforce_key(self.state, &snap, self.auth).err()
+    }
+}
+
 async fn run_session(
     state: ProxyState,
     prep: Prepared,
@@ -1277,6 +1401,23 @@ async fn run_session(
     };
     let (mut up_tx, mut up_rx) = upstream.split();
 
+    let client_type = state.client_classifier.classify(&client.user_agent);
+    let mut meter = SessionMeter {
+        state: &state,
+        auth: &auth,
+        model_entry: &model_entry,
+        pk_id: &pk_id,
+        provider_label: &provider_label,
+        requested_model: &requested_model,
+        client_type,
+        token_keys: reservation.token_keys(),
+        spend_keys: reservation.spend_keys(),
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_tokens: 0,
+        micro_usd: 0,
+        responses: 0,
+    };
     let mut usage = SessionUsage::default();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let mut close_status: u16 = 200;
@@ -1417,6 +1558,8 @@ async fn run_session(
             Dir::FromUpstream(m) => match m {
                 Some(Ok(TgMessage::Text(text))) => {
                     usage.absorb(&text);
+                    let usage_arrived = meter.behind(&usage);
+                    meter.settle(&usage);
                     opening.observe(&state, &model_entry.id, Some(&text));
                     let mut refused = None;
                     if !chain.is_empty() {
@@ -1487,6 +1630,19 @@ async fn run_session(
                         }
                     }
                     if client_gone {
+                        break;
+                    }
+                    // Between responses, so what the caller paid for is
+                    // delivered first.
+                    if let Some(refusal) = usage_arrived.then(|| meter.refusal()).flatten() {
+                        let _ = client_tx
+                            .send(AxMessage::Close(Some(CloseFrame {
+                                code: 1008,
+                                reason: "no longer authorized".into(),
+                            })))
+                            .await;
+                        close_status = refusal.status().as_u16();
+                        session_error = Some(refusal);
                         break;
                     }
                 }
@@ -1584,49 +1740,19 @@ async fn run_session(
     };
 
     let elapsed = started.elapsed();
-    let total_tokens = usage.input_tokens + usage.output_tokens;
     // A realtime session can run for minutes, so its terminal emits read a
     // FRESH snapshot rather than the one `prepare` resolved against (#941) —
-    // one ProviderKey lookup shared by the request metric, the usage event
-    // and `record_usage` below, where each used to do its own. The load
+    // one ProviderKey lookup shared by the request metric and the usage
+    // event, where each used to do its own. The load
     // itself is shared by everything here except `request_metrics::record`,
     // which takes its own for the model-label collapse.
     let snap = state.snapshot.load();
     let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &pk_id);
-    // Priced off the same fresh snapshot, through the index every other
-    // reader of a model's price uses: `pricing_key` first, inline `cost`
-    // second.
-    let pricing = state.pricing.for_snapshot(&snap);
-    // 会话的花费：算在提交之前，同一个数字既进花费桶也进下面的用量事件。
-    //
-    // 走家族共用的那个口子，而不是直接 `ModelCost::calculate(input, output)`：
-    // 会话里从提示缓存读回来的 token 有自己的费率（`cached_input_per_1k`），
-    // 按全价输入算会多收 —— 而事件里 `cached_prompt_tokens` 是照报的，于是
-    // 按事件重算花费的控制面会得到另一个数字，两个平面对同一次会话给出不同
-    // 的钱。`input_tokens` 含缓存那部分（OpenAI 的约定），`cached_tokens`
-    // 是它的子集，所以按「子集」那个位置传。
-    // 用会话开始时捕获的那一行模型，而不是按 id 重取：会话可以比它启动时那代
-    // 配置活得更久，而重取之后行可能已经不在了 —— 那会把一次会话的钱静默
-    // 归零。`calculate_with_cache` 与 `request_cost_usd` 用的是同一个函数。
-    let cost_usd = pricing
-        .resolve(&model_entry.value)
-        .map(|c| {
-            c.calculate_with_cache(
-                crate::usage_attr::input_tokens_for_pricing(
-                    usage.input_tokens,
-                    usage.cached_tokens,
-                    // 这个表面没有缓存写计数，也没有 Anthropic 那套分开的缓存读/写。
-                    0,
-                    0,
-                    0,
-                ),
-                usage.output_tokens,
-            )
-        })
-        .unwrap_or(0.0);
-    reservation
-        .commit(total_tokens, crate::usage_attr::spend_micro_usd(cost_usd))
-        .await;
+    // What the last frames brought, then the session's whole cost: one figure,
+    // the same one the event reports and the charges along the way add up to.
+    meter.settle(&usage);
+    let cost_usd = meter.cost_usd(&snap, &usage);
+    reservation.commit_tokens_no_spend(0).await;
 
     emit_access_log(
         &Method::GET,
@@ -1734,37 +1860,6 @@ async fn run_session(
         client.trace.as_ref(),
         /* terminal */ true,
         /* dispatched */ true,
-    );
-    // A realtime session bills real tokens against a real model, and this is
-    // the only place that knows the session's totals. Its cost is resolved
-    // from the model row, same as every other endpoint, and feeds
-    // `aisix_llm_spend_micro_usd_total`.
-    crate::request_metrics::record_usage(
-        &state,
-        "/v1/realtime",
-        crate::request_metrics::Caller::new(&auth),
-        crate::request_metrics::Upstream {
-            provider: &provider_label,
-            // The requested string so the emit chokepoint folds a
-            // wildcard-served alias's pair to the row's identities
-            // (non-wildcard: requested == display_name, unchanged).
-            model: &requested_model,
-            upstream_model: model_entry.value.upstream_model().unwrap_or("unknown"),
-            pk: pk.labels(),
-            ..Default::default()
-        },
-        crate::request_metrics::Tokens {
-            input: usage.input_tokens.min(u32::MAX as u64) as u32,
-            output: usage.output_tokens.min(u32::MAX as u64) as u32,
-            total: total_tokens.min(u32::MAX as u64) as u32,
-            // The Realtime session reports its cache hits in the
-            // OpenAI shape — inside `input_tokens`, never beside it.
-            cached: usage.cached_tokens.min(u32::MAX as u64) as u32,
-            cache_read: 0,
-            cache_creation: 0,
-            spend_usd: event.cost_usd,
-            client_type: state.client_classifier.classify(&client.user_agent),
-        },
     );
 }
 
@@ -2900,6 +2995,118 @@ mod tests {
                 [("binary", "opaque".to_string())]
             );
         }
+    }
+
+    /// A mock upstream that answers each client frame with one `response.done`
+    /// and stays open, until the gateway closes it.
+    async fn spawn_open_upstream() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut tx, mut rx) = ws.split();
+            while let Some(Ok(msg)) = rx.next().await {
+                if matches!(msg, TgMessage::Text(_)) {
+                    let done = serde_json::json!({
+                        "type": "response.done",
+                        "response": {"usage": {"input_tokens": 1000, "output_tokens": 1000}}
+                    });
+                    if tx.send(TgMessage::Text(done.to_string())).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        addr
+    }
+
+    /// The spend counter as `/metrics` shows it, waiting for it to reach `want`.
+    async fn spend_reaches(state: &crate::ProxyState, want: u64) -> u64 {
+        let mut seen = 0;
+        for _ in 0..60 {
+            seen = state
+                .metrics
+                .render()
+                .lines()
+                .filter(|l| l.starts_with(aisix_obs::metrics::M_LLM_SPEND_MICRO_USD_TOTAL))
+                .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+                .sum();
+            if seen >= want {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        seen
+    }
+
+    /// A session can run for hours. What it spends has to reach the counter a
+    /// ledger reads while it is open, a key disabled meanwhile has to stop it,
+    /// and what the session's one event reports is what the charges add up to.
+    #[tokio::test]
+    async fn an_open_session_is_charged_as_it_goes_and_ends_when_its_key_is_disabled() {
+        let up_addr = spawn_open_upstream().await;
+        let snap = snapshot_with_cost(
+            &format!("http://{up_addr}/v1"),
+            "openai",
+            "openai",
+            r#","cost":{"input_per_1k":0.5,"output_per_1k":0.5}"#,
+        );
+        let (addr, state, mut rx) = serve(snap).await;
+
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer sk-caller".parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("handshake");
+        let (mut tx, mut client_rx) = ws.split();
+        let ask = || TgMessage::Text(serde_json::json!({"type": "response.create"}).to_string());
+
+        // 1000 + 1000 tokens at $0.5/1k: $1 a response, with the session open.
+        tx.send(ask()).await.unwrap();
+        assert_eq!(spend_reaches(&state, 1_000_000).await, 1_000_000);
+        tx.send(ask()).await.unwrap();
+        assert_eq!(spend_reaches(&state, 2_000_000).await, 2_000_000);
+
+        let live = state.snapshot.load();
+        let key = live.apikeys.get_by_id("k-1").unwrap();
+        let mut disabled = (*key.value).clone();
+        disabled.disabled = true;
+        live.apikeys.insert(ResourceEntry::new("k-1", disabled, 2));
+
+        // The response in flight is still delivered, and billed; then it ends.
+        tx.send(ask()).await.unwrap();
+        let mut close_code = None;
+        let mut responses = 0;
+        while let Some(Ok(msg)) = client_rx.next().await {
+            match msg {
+                TgMessage::Text(_) => responses += 1,
+                TgMessage::Close(frame) => {
+                    close_code = frame.map(|f| u16::from(f.code));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(close_code, Some(1008));
+        assert_eq!(responses, 3);
+
+        let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("the session's event")
+            .expect("sink closed");
+        assert_eq!(ev.status_code, 401);
+        assert_eq!(ev.prompt_tokens, 3_000);
+        assert_eq!(ev.completion_tokens, 3_000);
+        assert!((ev.cost_usd - 3.0).abs() < 1e-9, "{}", ev.cost_usd);
+        assert_eq!(
+            spend_reaches(&state, 3_000_000).await,
+            3_000_000,
+            "the charges add up to what the event reports, and no further"
+        );
     }
 
     /// 虚拟父级（routing / ensemble / semantic）不能走 `/v1/realtime`。
