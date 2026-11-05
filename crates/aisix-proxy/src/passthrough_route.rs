@@ -1064,6 +1064,7 @@ async fn dispatch(
 
     let mut telemetry = RouteTelemetry {
         state: state.clone(),
+        token_keys: reservation.token_keys(),
         route_name: route.name.clone(),
         trace: client.trace.clone(),
         provider_label: pk_entry
@@ -7111,6 +7112,11 @@ fn push_capped(buf: &mut String, delta: &str, cap: Option<usize>) {
 /// calls it at end-of-stream, with `Drop` covering client disconnects.
 struct RouteTelemetry {
     state: ProxyState,
+    /// The token windows this request's reservation checked. The tokens are
+    /// only known when the relay ends, so they are charged from the emit, and
+    /// only for an exchange it identified ([`Metering::llm_tier`]): an opaque
+    /// body is never mined for meaning.
+    token_keys: Vec<String>,
     route_name: String,
     provider_label: String,
     /// The request's trace bundle (AISIX-Cloud#1279) — the Drop emit is
@@ -7467,6 +7473,15 @@ impl RouteTelemetry {
             event.auth_type = "anonymous".to_string();
         }
         if llm_tier {
+            self.state.limiter.add_tokens_post_stream_all(
+                &self.token_keys,
+                crate::usage_attr::total_tokens_with_cache(
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    usage.cache_creation_tokens,
+                    usage.cache_read_tokens,
+                ),
+            );
             // The token families the typed endpoints record. A route
             // resolves no Model, so `model` is the caller's body alias
             // bounded the way the usage event's label is (an unregistered
@@ -11559,6 +11574,77 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
                     "script {script}, upstream {upstream_status}: {sent}"
                 );
             }
+        }
+    }
+
+    /// A token limit holds on a route the same as on the typed endpoint: the
+    /// route reads the usage, so it charges it. An opaque relay is never mined
+    /// for meaning, so a caller-shaped body cannot mint or spend tokens.
+    #[tokio::test]
+    async fn an_identified_exchange_charges_its_tokens_and_an_opaque_one_does_not() {
+        let usage =
+            serde_json::json!({"prompt_tokens": 8, "completion_tokens": 7, "total_tokens": 15});
+        let buffered = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "chat.completion", "choices": [], "usage": usage,
+        }));
+        let streamed = ResponseTemplate::new(200).set_body_raw(
+            format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({"object": "chat.completion.chunk", "choices": [], "usage": usage})
+            ),
+            "text/event-stream",
+        );
+        let chat = serde_json::json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        for (body, answer, charged) in [
+            (&chat, buffered.clone(), true),
+            (&chat, streamed, true),
+            (&serde_json::json!({"anything": "else"}), buffered, false),
+        ] {
+            let upstream = MockServer::builder().start().await;
+            Mock::given(wm_method("POST"))
+                .respond_with(answer)
+                .mount(&upstream)
+                .await;
+            let snap = AisixSnapshot::new();
+            snap.provider_keys
+                .insert(provider_key_entry("http://unused"));
+            let caller = apikey_entry("sk-caller", Some(&["*"]));
+            let mut key = (*caller.value).clone();
+            key.rate_limit = Some(aisix_core::RateLimit {
+                tpm: Some(10),
+                ..Default::default()
+            });
+            snap.apikeys
+                .insert(ResourceEntry::new(caller.id.clone(), key, 1));
+            snap.passthrough_routes
+                .insert(inject_route(&upstream.uri()));
+            let app = build_app(snap);
+            let request = || {
+                Request::builder()
+                    .method("POST")
+                    .uri("/passthrough/openai/v1/chat/completions")
+                    .header("authorization", "Bearer sk-caller")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap()
+            };
+
+            let first = app.clone().oneshot(request()).await.unwrap();
+            assert_eq!(first.status(), StatusCode::OK, "{body}");
+            to_bytes(first.into_body(), 1 << 20).await.unwrap();
+            let second = app.oneshot(request()).await.unwrap();
+            assert_eq!(
+                second.status(),
+                if charged {
+                    StatusCode::TOO_MANY_REQUESTS
+                } else {
+                    StatusCode::OK
+                },
+                "{body}"
+            );
         }
     }
 
