@@ -1245,7 +1245,7 @@ async fn run_session(
     // the upstream-connect failure (AISIX-Cloud#1330 / #1024).
     let audit = chain.audit_log();
 
-    let (mut client_tx, mut client_rx) = client_ws.split();
+    let (client_tx, mut client_rx) = client_ws.split();
 
     // The upstream wait of a session is everything from the dial on, so
     // the gateway's own share is the time before it (`gateway_overhead_ms`).
@@ -1261,6 +1261,7 @@ async fn run_session(
     // streaming HTTP route's error body has its stream budget.
     let idle_cap =
         crate::routing::effective_timeouts(&model_entry.value, None, state.default_timeouts).stream;
+    let mut client_tx = ClientSink::new(client_tx, idle_cap);
     let (upstream, upgrade_request_id) = match connect_upstream(upstream_request).await {
         Ok((ws, resp)) => {
             let upgrade_request_id = crate::usage_attr::sanitize_provider_response_id(
@@ -1647,7 +1648,7 @@ async fn run_session(
                     for text in frames {
                         let text = restamp_session_model_out(text, &requested_model);
                         let text = without_sent_credentials(text);
-                        if client_tx.send(AxMessage::Text(text)).await.is_err() {
+                        if !client_tx.send(AxMessage::Text(text)).await {
                             client_gone = true;
                             break;
                         }
@@ -1683,7 +1684,7 @@ async fn run_session(
                         session_error = Some(refusal);
                         break;
                     }
-                    if client_tx.send(AxMessage::Binary(b)).await.is_err() {
+                    if !client_tx.send(AxMessage::Binary(b)).await {
                         break;
                     }
                 }
@@ -2039,6 +2040,55 @@ enum UpstreamEnd<'a> {
     Dropped,
 }
 
+/// The longest a send to the client may take: the session's idle budget, and no
+/// more than this even where the model lifts that budget.
+const CLIENT_SEND_MAX: Duration = Duration::from_secs(60);
+
+/// The client's half of a session, with every send bounded. A client that stops
+/// reading would otherwise hold a send pending for as long as its socket stays
+/// up: the loop never returns to its idle deadline, and the session keeps its
+/// concurrency slot, its upstream socket and the shutdown drain. One that
+/// accepts none of a frame within the bound has stopped reading, and is treated
+/// as gone, so later sends do not wait for it again.
+struct ClientSink<S> {
+    tx: S,
+    bound: Duration,
+    stuck: bool,
+}
+
+impl<S> ClientSink<S>
+where
+    S: futures::Sink<AxMessage> + Unpin,
+{
+    fn new(tx: S, idle_cap: Option<Duration>) -> Self {
+        Self {
+            tx,
+            bound: idle_cap.map_or(CLIENT_SEND_MAX, |cap| cap.min(CLIENT_SEND_MAX)),
+            stuck: false,
+        }
+    }
+
+    /// Whether `msg` reached the client.
+    async fn send(&mut self, msg: AxMessage) -> bool {
+        if self.stuck {
+            return false;
+        }
+        match tokio::time::timeout(self.bound, self.tx.send(msg)).await {
+            Ok(sent) => sent.is_ok(),
+            Err(_) => {
+                self.stuck = true;
+                false
+            }
+        }
+    }
+
+    async fn close(&mut self) {
+        if !self.stuck {
+            let _ = tokio::time::timeout(self.bound, self.tx.close()).await;
+        }
+    }
+}
+
 /// tungstenite (under both the upstream client and axum's server side)
 /// replaces a received Close whose code may not be sent (1004, 1016–2999,
 /// …) with exactly this frame and drops the original code, so it is
@@ -2050,8 +2100,11 @@ const LIBRARY_REJECTED_CLOSE: (u16, &str) = (1002, "Protocol violation");
 /// otherwise. An end other than a normal close is preceded by a Realtime
 /// `error` event describing it, since many clients surface only events, unless
 /// the upstream's own error event already told the client (`refused`).
-async fn close_client_after_upstream<S>(client_tx: &mut S, end: UpstreamEnd<'_>, refused: bool)
-where
+async fn close_client_after_upstream<S>(
+    client_tx: &mut ClientSink<S>,
+    end: UpstreamEnd<'_>,
+    refused: bool,
+) where
     S: futures::Sink<AxMessage> + Unpin,
 {
     let (code, reason, message) = match end {
@@ -3491,6 +3544,55 @@ mod tests {
     }
 
     const KEYWORD_OUTPUT_BLOCK: &str = r#"{"name":"out-block","enabled":true,"hook_point":"output","kind":"keyword","patterns":[{"kind":"literal","value":"FORBIDDEN"}]}"#;
+
+    /// A client that stops reading cannot hold the session: a send it never
+    /// accepts is bounded like a receive, and the session ends, settles and lets
+    /// go of what it held.
+    #[tokio::test]
+    async fn a_client_that_stops_reading_does_not_hold_the_session() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut tx, mut rx) = ws.split();
+            let _ = rx.next().await;
+            let frame = serde_json::json!({
+                "type": "response.output_audio.delta",
+                "item_id": "i1",
+                "delta": "A".repeat(1 << 20),
+            })
+            .to_string();
+            for _ in 0..64 {
+                if tx.send(TgMessage::Text(frame.clone())).await.is_err() {
+                    break;
+                }
+            }
+            while rx.next().await.is_some() {}
+        });
+        let snap = snapshot_with_cost(
+            &format!("http://{up_addr}/v1"),
+            "openai",
+            "openai",
+            r#","stream_timeout":500"#,
+        );
+        let (addr, _state, mut usage_rx) = serve(snap).await;
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer sk-caller".parse().unwrap());
+        let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        let (mut tx, _never_read) = ws.split();
+        tx.send(TgMessage::Text(r#"{"type":"response.create"}"#.to_string()))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(15), usage_rx.recv())
+            .await
+            .expect("the session ends though its client is still connected")
+            .expect("usage sink closed");
+        assert_eq!(event.requested_model, "rt-model");
+    }
 
     /// A literal across two deltas matches neither, so a chain that can block
     /// has to judge the item whole before any of it goes out.
