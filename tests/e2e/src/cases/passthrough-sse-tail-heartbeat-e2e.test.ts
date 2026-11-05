@@ -48,8 +48,8 @@ function startTailUpstream(): Promise<Mock> {
       req.on("end", () => {
         res.writeHead(200, { "content-type": "text/event-stream" });
         // 带文本的帧：流尾扫描只看从帧里取出的文本，没有文本就不扫。
-        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "hello " } }] })}\n\n`);
-        res.end(`data: ${JSON.stringify({ choices: [{ delta: { content: "world" } }] })}`);
+        res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "hello " } }] })}\n\n`);
+        res.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "world" } }] })}`);
       });
     }),
   );
