@@ -1054,9 +1054,15 @@ pub fn chat_response_to_responses_json(
     reply: &ResponsesReplyContext,
 ) -> Value {
     let (status, incomplete_reason) = responses_status(&resp.finish_reason);
+    // A refusal-only answer is not an empty one: see `next_events`.
+    let refusal = resp.message.extra.get("refusal").and_then(Value::as_str);
     let output = build_output_items(
         resp.message.reasoning_text().as_deref(),
-        resp.message.text().as_deref(),
+        resp.message
+            .text()
+            .as_deref()
+            .filter(|text| !text.is_empty())
+            .or(refusal),
         resp.message
             .extra
             .get("tool_calls")
@@ -1897,11 +1903,18 @@ impl ResponsesSseEncoder {
             return Vec::new();
         }
 
-        let has_content = chunk
-            .delta
-            .content
-            .as_deref()
-            .is_some_and(|s| !s.is_empty());
+        // A refusal streams in its own delta field, and this encoder writes it
+        // as the answer's text: a refusal-only answer is not an empty one.
+        let text: Option<String> = [
+            chunk.delta.content.as_deref(),
+            chunk.delta.extra.get("refusal").and_then(Value::as_str),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .reduce(|content, refusal| content + &refusal);
+        let has_content = text.is_some();
         let has_tools = chunk
             .delta
             .tool_calls
@@ -1914,9 +1927,7 @@ impl ResponsesSseEncoder {
             .is_some_and(|s| !s.is_empty());
         let has_finish = chunk.finish_reason.is_some();
 
-        let mut additional = chunk
-            .delta
-            .content
+        let mut additional = text
             .as_deref()
             .map_or(0, str::len)
             .saturating_add(chunk.delta.reasoning_content.as_deref().map_or(0, str::len));
@@ -2014,7 +2025,7 @@ impl ResponsesSseEncoder {
 
         // ── Text content ──
         if has_content {
-            let delta = chunk.delta.content.clone().unwrap_or_default();
+            let delta = text.unwrap_or_default();
             if self.text_item_id.is_none() {
                 let item_id = format!("msg_{}", Uuid::new_v4().simple());
                 let output_index = self.next_output_index;
@@ -2376,6 +2387,9 @@ pub struct ResponsesStreamCompletion {
     /// the generator is then dropped at a suspension point and the tail
     /// never runs — which the telemetry closure reports as `499`.
     pub reached_end: bool,
+    /// The upstream has ended and a hold-back verdict is still out, with
+    /// nothing released: a caller leaving now did walk away from the answer.
+    pub verdict_pending: bool,
     /// Typed upstream-body failure observed after the response was committed.
     /// `None` with `reached_end == false` means the downstream consumer left.
     pub terminal_failure: Option<aisix_gateway::BridgeError>,
@@ -2891,7 +2905,10 @@ pub fn build_responses_bridge_stream(
         // Upstream EOF — the response was received in full. Record it before
         // the guardrail work below, which awaits a remote provider and is a
         // routine drop point for clients that close on the terminal frame.
+        // Held, nothing has reached the caller yet, so that does not apply
+        // until the verdict is in.
         guard.comp().reached_end = true;
+        guard.comp().verdict_pending = buffering;
 
         // No output-hook guardrail, or its cap was exceeded under fail-open:
         // nothing to scan.
@@ -3093,6 +3110,7 @@ pub fn build_responses_bridge_stream(
             ));
             return;
         }
+        guard.comp().verdict_pending = false;
         if buffering {
             held = vec![bytes::Bytes::from(joined)];
         }
@@ -4703,6 +4721,60 @@ mod tests {
         );
     }
 
+    /// An upstream's refusal is the answer the caller gets: dropping it hands
+    /// them an empty message that reads as success.
+    #[test]
+    fn a_refusal_is_the_answers_text_streamed_and_not() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("refusal".into(), "I can't help with that".into());
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
+        let mut events = enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                extra: extra.clone(),
+                ..Default::default()
+            },
+            finish_reason: Some(FinishReason::Stop),
+            usage: Some(UsageStats::new(1, 1)),
+            service_tier: None,
+            accounting_usage: None,
+        });
+        let last = events.pop().expect("a terminal event");
+        assert_eq!(
+            last.data["response"]["output"][0]["content"][0]["text"],
+            "I can't help with that"
+        );
+        assert_eq!(
+            enc.assembled_assistant_message().0,
+            "I can't help with that"
+        );
+
+        let mut message = aisix_gateway::ChatMessage::assistant(String::new());
+        message.extra = extra;
+        let json = chat_response_to_responses_json(
+            &ChatResponse {
+                logprobs: None,
+                more_choices: Vec::new(),
+                id: "c".into(),
+                model: "m".into(),
+                message,
+                finish_reason: FinishReason::Stop,
+                usage: UsageStats::new(1, 1),
+                service_tier: None,
+            },
+            "m",
+            0,
+            &ResponsesReplyContext::default(),
+        );
+        assert_eq!(
+            json["output"][0]["content"][0]["text"],
+            "I can't help with that"
+        );
+    }
+
     #[test]
     fn streaming_length_finish_emits_incomplete_with_reason() {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
@@ -5851,6 +5923,75 @@ mod tests {
     /// usage-only frame — fails with a retryable code instead of completing
     /// with an empty output. Nothing went out before the failure, so it
     /// opens the stream with `response.created` + `response.in_progress`.
+    /// A caller who leaves while the verdict is out received nothing: the row
+    /// says so (499, not 200), and carries what the upstream billed.
+    #[tokio::test]
+    async fn a_caller_leaving_during_the_verdict_is_a_499_with_the_upstreams_counts() {
+        use aisix_guardrails::{Guardrail, GuardrailChain, GuardrailVerdict};
+        struct SlowVerdict;
+        #[async_trait::async_trait]
+        impl Guardrail for SlowVerdict {
+            fn name(&self) -> &'static str {
+                "slow-verdict"
+            }
+            async fn check_output(&self, _response: &ChatResponse) -> GuardrailVerdict {
+                std::future::pending().await
+            }
+        }
+        let chunk = ChatChunk {
+            choice_index: 0,
+            logprobs: None,
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                content: Some("the answer".into()),
+                ..Default::default()
+            },
+            finish_reason: Some(FinishReason::Stop),
+            usage: Some(UsageStats::new(31, 17)),
+            service_tier: None,
+            accounting_usage: None,
+        };
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let captured_out = Arc::clone(&captured);
+        let now = Instant::now();
+        let body = build_responses_bridge_stream(
+            Box::pin(futures::stream::iter(vec![Ok(chunk)])),
+            ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools()),
+            now,
+            now,
+            Some(Arc::new(GuardrailChain::new(vec![
+                Arc::new(SlowVerdict) as Arc<dyn Guardrail>
+            ]))),
+            true,
+            1 << 20,
+            false,
+            "m".into(),
+            None,
+            None,
+            move |completion| *captured_out.lock().unwrap() = Some(completion),
+        );
+        let mut frames = body.into_data_stream();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            futures::StreamExt::next(&mut frames),
+        )
+        .await
+        .is_err(),);
+        drop(frames);
+        let completion = captured.lock().unwrap().take().expect("on_complete fired");
+        assert_eq!(completion.prompt_tokens, 31);
+        assert_eq!(completion.completion_tokens, 17);
+        assert_eq!(
+            crate::attempt::guarded_stream_status(
+                completion.reached_end && !completion.verdict_pending,
+                completion.guardrail_blocked,
+                completion.failure.as_ref(),
+            ),
+            crate::CLIENT_CLOSED_REQUEST,
+        );
+    }
+
     #[tokio::test]
     async fn an_empty_upstream_stream_fails_instead_of_completing() {
         let usage_only = ChatChunk {

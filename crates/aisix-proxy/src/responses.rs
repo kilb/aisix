@@ -3415,7 +3415,7 @@ async fn responses_cross_provider_to_target(
                 // 499, one an upstream failure ended carries that failure's
                 // status and error.
                 let status = crate::attempt::guarded_stream_status(
-                    comp.reached_end,
+                    comp.reached_end && !comp.verdict_pending,
                     comp.guardrail_blocked,
                     comp.failure.as_ref(),
                 );

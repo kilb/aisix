@@ -1946,7 +1946,7 @@ async fn anthropic_passthrough_dispatch(
                 // failure records its own status, and only a stream nobody
                 // finished reading is the caller's 499.
                 let terminal_status = crate::attempt::guarded_stream_status(
-                    usage.reached_end,
+                    usage.reached_end && !usage.verdict_pending,
                     usage.guardrail_blocked,
                     usage.failure.as_ref(),
                 );
@@ -3085,7 +3085,7 @@ async fn cross_provider_dispatch(
 
                 // See the sibling passthrough path.
                 let terminal_status = crate::attempt::guarded_stream_status(
-                    comp.reached_end,
+                    comp.reached_end && !comp.verdict_pending,
                     comp.guardrail_blocked,
                     comp.failure.as_ref(),
                 );
@@ -3716,7 +3716,10 @@ fn build_anthropic_sse_stream(
                     // Held or not, the end-of-stream scan judges the generated
                     // text, as much of it as the stream's bound keeps.
                     if output_guardrail.is_some() && !released {
-                        if let Some(t) = chunk.delta.content.as_deref() {
+                        // A streamed `refusal` goes out as text too (the encoder
+                        // writes it so), so it is read with it.
+                        let refusal = chunk.delta.extra.get("refusal").and_then(Value::as_str);
+                        for t in chunk.delta.content.as_deref().into_iter().chain(refusal) {
                             content_text
                                 .push_str(live_scan.as_mut().map_or(t, |budget| budget.admit(t)));
                         }
@@ -3801,7 +3804,10 @@ fn build_anthropic_sse_stream(
         // Upstream stream over — the response was received in full. Record
         // it before the scan below, which awaits a remote provider and is a
         // routine drop point for clients that close on the terminal event.
+        // Held, nothing has reached the caller yet, so that does not apply
+        // until the verdict is in.
         guard.comp().reached_end = true;
+        guard.comp().verdict_pending = hold_policy.is_some() && !released;
         // End-of-stream output guardrail (#448): scan the accumulated
         // assistant text and, on a block, emit a terminal Anthropic
         // `error` event instead of completing the stream cleanly.
@@ -3923,6 +3929,7 @@ fn build_anthropic_sse_stream(
                 guard.comp().response_text.clear();
             }
         }
+        guard.comp().verdict_pending = false;
         // Hold-back release (#932): the scan cleared — mask the held
         // chunks (channel reassembly across chunk boundaries), then feed
         // them through the encoder as if they had streamed live.
@@ -4084,6 +4091,9 @@ struct AnthropicStreamCompletion {
     /// first — the generator is dropped at a suspension point and the tail
     /// never runs — which the telemetry closure reports as `499`.
     reached_end: bool,
+    /// The upstream has ended and a hold-back verdict is still out, with
+    /// nothing released: a caller leaving now did walk away from the answer.
+    verdict_pending: bool,
     /// Typed upstream-body failure observed after the response was committed.
     /// `None` with `reached_end == false` means the downstream consumer left.
     terminal_failure: Option<aisix_gateway::BridgeError>,
@@ -4732,6 +4742,14 @@ struct AnthropicStreamUsage {
     /// Count of upstream byte-chunks actually delivered to the client
     /// (read by the Drop guard for the #419 cost-leak gate).
     chunks_delivered: u32,
+    /// Frames of the answer went into the hold. That is the one way a stream
+    /// delivers nothing with the upstream's work already done, so the gate
+    /// above does not apply: what was read is reported, like a held stream on
+    /// the routes that hold inside the handler (`crate::cancel::HeldStream`).
+    held_output: bool,
+    /// A hold-back verdict is still out, with nothing released: a caller
+    /// leaving now did walk away from the answer.
+    verdict_pending: bool,
     /// Assistant text accumulated from `content_block_delta` frames, for
     /// the end-of-stream output guardrail (#448).
     response_text: String,
@@ -5160,7 +5178,7 @@ impl<F: FnOnce(AnthropicStreamUsage)> Drop for AnthropicStreamGuard<F> {
         if let Some((f, mut usage)) = self.slot.take() {
             let delivered = self.delivered.load(Ordering::Relaxed);
             usage.chunks_delivered = delivered;
-            if delivered == 0 {
+            if delivered == 0 && !usage.held_output {
                 // No bytes crossed the wire (client aborted before the
                 // first chunk). Don't bill the completion side; keep
                 // prompt_tokens per the "prompts always billed"
@@ -5181,7 +5199,8 @@ impl<F: FnOnce(AnthropicStreamUsage)> Drop for AnthropicStreamGuard<F> {
                 } else {
                     0
                 };
-                let output = (delivered > 0).then_some(usage.est_output_text.as_str());
+                let output =
+                    (delivered > 0 || usage.held_output).then_some(usage.est_output_text.as_str());
                 let filled = crate::token_estimate::fill_missing(
                     &est,
                     usage.prompt_tokens,
@@ -5425,6 +5444,9 @@ where
                 );
                 held.extend_from_slice(&forward);
                 held_len.set(held.len());
+                if !forward.is_empty() {
+                    guard.usage().held_output = true;
+                }
                 if !held_content.exceeds(max_hold) {
                     if terminal_seen {
                         break;
@@ -5655,6 +5677,7 @@ where
                 .usage()
                 .note_stream_failure(crate::stream_timeout::RawStreamFailure::Upstream);
         }
+        guard.usage().verdict_pending = hold.is_some();
         // End-of-stream output guardrail (#448): scan the accumulated
         // assistant text. On a block, emit a terminal Anthropic `error`
         // event. On the hold-back path (Window / BufferFull) nothing has
@@ -5827,6 +5850,7 @@ where
                 usage.response_text.clear();
             }
         }
+        guard.usage().verdict_pending = false;
         // Hold-back release (#932): the scan cleared — mask the held SSE
         // bytes (channel reassembly across frames) and release them.
         if hold.is_some() && !blocked && !held.is_empty() {
@@ -8329,7 +8353,8 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
 
         let usage = captured.lock().unwrap().take().expect("on_complete fired");
         assert_eq!(usage.prompt_tokens, 30);
-        assert_eq!(usage.completion_tokens, 0);
+        // Nothing reached the caller, and the upstream reported what it wrote.
+        assert_eq!(usage.completion_tokens, 17);
         assert_eq!(usage.chunks_delivered, 0);
         assert!(!usage.reached_end);
         assert!(matches!(
@@ -8338,6 +8363,204 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
         ));
         assert!(!usage.response_capture_safe);
         assert!(usage.response_text.is_empty());
+    }
+
+    /// A verdict that never comes back, so a test can leave during it.
+    struct SlowVerdict;
+
+    #[async_trait::async_trait]
+    impl aisix_guardrails::Guardrail for SlowVerdict {
+        fn name(&self) -> &'static str {
+            "slow-verdict"
+        }
+        fn stream_output_policy(&self) -> aisix_guardrails::StreamOutputPolicy {
+            aisix_guardrails::StreamOutputPolicy::BufferFull {
+                max_buffer_bytes: 1 << 20,
+                on_exceeded_fail_open: false,
+            }
+        }
+        async fn check_output(
+            &self,
+            _response: &aisix_gateway::ChatResponse,
+        ) -> aisix_guardrails::GuardrailVerdict {
+            std::future::pending().await
+        }
+    }
+
+    fn slow_verdict_chain() -> std::sync::Arc<aisix_guardrails::GuardrailChain> {
+        std::sync::Arc::new(aisix_guardrails::GuardrailChain::new(vec![
+            std::sync::Arc::new(SlowVerdict) as std::sync::Arc<dyn aisix_guardrails::Guardrail>,
+        ]))
+    }
+
+    /// A caller who leaves a native stream while the verdict is out received
+    /// nothing: the row says so (499, not 200), and carries what the upstream
+    /// billed rather than the zero of a stream that never ran.
+    #[tokio::test]
+    async fn a_caller_leaving_during_the_verdict_is_a_499_with_the_upstreams_counts() {
+        use futures::StreamExt;
+        use std::sync::{Arc, Mutex};
+        let raw = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_v\",\"model\":\"claude\",\"usage\":{\"input_tokens\":31,\"output_tokens\":1}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"the answer\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let upstream = futures::stream::iter([Ok::<_, crate::stream_timeout::RawStreamError>(
+            bytes::Bytes::from_static(raw.as_bytes()),
+        )]);
+        let captured = Arc::new(Mutex::new(None));
+        let captured_out = Arc::clone(&captured);
+        let now = std::time::Instant::now();
+        let mut stream = super::build_anthropic_passthrough_stream(
+            upstream,
+            now,
+            now,
+            Some(slow_verdict_chain()),
+            "relay-claude".into(),
+            None,
+            None,
+            move |usage| *captured_out.lock().unwrap() = Some(usage),
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), stream.next())
+                .await
+                .is_err(),
+            "nothing is released before the verdict",
+        );
+        drop(stream);
+        let usage = captured.lock().unwrap().take().expect("on_complete fired");
+        assert_eq!(usage.chunks_delivered, 0);
+        assert_eq!(usage.prompt_tokens, 31);
+        assert_eq!(usage.completion_tokens, 17);
+        assert_eq!(
+            crate::attempt::guarded_stream_status(
+                usage.reached_end && !usage.verdict_pending,
+                usage.guardrail_blocked,
+                usage.failure.as_ref(),
+            ),
+            crate::CLIENT_CLOSED_REQUEST,
+        );
+    }
+
+    /// The same on a stream translated from another provider's wire.
+    #[tokio::test]
+    async fn a_caller_leaving_a_bridged_stream_during_the_verdict_is_a_499() {
+        use aisix_gateway::{ChatChunk, ChatChunkStream, ChatDelta, FinishReason, UsageStats};
+        use std::sync::{Arc, Mutex};
+        let chunk = ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                content: Some("the answer".into()),
+                ..ChatDelta::default()
+            },
+            finish_reason: Some(FinishReason::Stop),
+            choice_index: 0,
+            logprobs: None,
+            usage: Some(UsageStats::new(31, 17)),
+            service_tier: None,
+            accounting_usage: None,
+        };
+        let upstream: ChatChunkStream = Box::pin(futures::stream::iter(vec![Ok(chunk)]));
+        let captured = Arc::new(Mutex::new(None));
+        let captured_out = Arc::clone(&captured);
+        let now = std::time::Instant::now();
+        let body = super::build_anthropic_sse_stream(
+            upstream,
+            aisix_provider_anthropic::AnthropicSseEncoder::new("msg_b", "m", 0),
+            now,
+            now,
+            Some(slow_verdict_chain()),
+            "m".into(),
+            None,
+            None,
+            move |completion| *captured_out.lock().unwrap() = Some(completion),
+        );
+        let mut frames = body.into_data_stream();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            futures::StreamExt::next(&mut frames),
+        )
+        .await
+        .is_err(),);
+        drop(frames);
+        let completion = captured.lock().unwrap().take().expect("on_complete fired");
+        assert_eq!(completion.prompt_tokens, 31);
+        assert_eq!(completion.completion_tokens, 17);
+        assert_eq!(
+            crate::attempt::guarded_stream_status(
+                completion.reached_end && !completion.verdict_pending,
+                completion.guardrail_blocked,
+                completion.failure.as_ref(),
+            ),
+            crate::CLIENT_CLOSED_REQUEST,
+        );
+    }
+
+    /// The encoder writes a streamed refusal as text, so a rule reads it too,
+    /// whichever pass it answers on.
+    #[tokio::test]
+    async fn a_bridged_stream_scans_a_refusal_it_writes_as_text() {
+        use aisix_gateway::{ChatChunk, ChatChunkStream, ChatDelta, ChatResponse, FinishReason};
+        use aisix_guardrails::{Guardrail, GuardrailChain, GuardrailVerdict};
+        use std::sync::{Arc, Mutex};
+        struct ReadsScanText;
+        #[async_trait::async_trait]
+        impl Guardrail for ReadsScanText {
+            fn name(&self) -> &'static str {
+                "reads-scan-text"
+            }
+            async fn check_output(&self, response: &ChatResponse) -> GuardrailVerdict {
+                if response.message.content_str().contains("SECRET") {
+                    GuardrailVerdict::block("matched")
+                } else {
+                    GuardrailVerdict::Allow
+                }
+            }
+        }
+        let mut extra = serde_json::Map::new();
+        extra.insert("refusal".into(), "the SECRET".into());
+        let chunk = ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                extra,
+                ..ChatDelta::default()
+            },
+            finish_reason: Some(FinishReason::Stop),
+            choice_index: 0,
+            logprobs: None,
+            usage: None,
+            service_tier: None,
+            accounting_usage: None,
+        };
+        let upstream: ChatChunkStream = Box::pin(futures::stream::iter(vec![Ok(chunk)]));
+        let captured = Arc::new(Mutex::new(None));
+        let captured_out = Arc::clone(&captured);
+        let now = std::time::Instant::now();
+        let body = super::build_anthropic_sse_stream(
+            upstream,
+            aisix_provider_anthropic::AnthropicSseEncoder::new("msg_r", "m", 0),
+            now,
+            now,
+            Some(Arc::new(GuardrailChain::new(vec![
+                Arc::new(ReadsScanText) as Arc<dyn Guardrail>
+            ]))),
+            "m".into(),
+            None,
+            None,
+            move |completion: super::AnthropicStreamCompletion| {
+                *captured_out.lock().unwrap() = Some(completion.guardrail_blocked)
+            },
+        );
+        let wire = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        assert!(!String::from_utf8_lossy(&wire).contains("SECRET"));
+        assert_eq!(*captured.lock().unwrap(), Some(true));
     }
 
     /// With no output guardrail no scan is owed: a relayed stream that failed

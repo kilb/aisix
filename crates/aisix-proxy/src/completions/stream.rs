@@ -433,10 +433,14 @@ pub(super) fn without_usage_frame(buffer: Vec<u8>) -> Vec<u8> {
     out
 }
 
-/// A relayed completion stream without the usage frame. A frame that outgrows
-/// the splitter's bound is relayed as it stands rather than held without limit.
-pub(super) fn strip_usage_frame<S>(
+/// A relayed completion stream in whole frames, without the usage frame unless
+/// the caller asked for it. Whole, because a heartbeat goes out on any silence:
+/// one landing inside a frame an upstream paused halfway through would cut that
+/// event in two. A frame that outgrows the splitter's bound is relayed as it
+/// stands rather than held without limit.
+pub(super) fn relay_whole_frames<S>(
     upstream: S,
+    strip_usage: bool,
 ) -> impl futures::Stream<Item = Result<bytes::Bytes, BridgeError>>
 where
     S: futures::Stream<Item = Result<bytes::Bytes, BridgeError>>,
@@ -461,7 +465,7 @@ where
             let mut out = Vec::with_capacity(bytes.len());
             loop {
                 match splitter.next_frame() {
-                    Ok(Some(frame)) if is_usage_only_frame(&frame) => {}
+                    Ok(Some(frame)) if strip_usage && is_usage_only_frame(&frame) => {}
                     Ok(Some(frame)) => out.extend_from_slice(&frame),
                     Ok(None) => break,
                     Err(_) => {
@@ -475,7 +479,7 @@ where
             }
         }
         let rest = splitter.take_rest();
-        if !rest.is_empty() && !is_usage_only_frame(&rest) {
+        if !rest.is_empty() && (!strip_usage || !is_usage_only_frame(&rest)) {
             yield Ok(bytes::Bytes::from(rest));
         }
     }
@@ -898,7 +902,7 @@ mod tests {
                 Ok(bytes::Bytes::copy_from_slice(head)),
                 Ok(bytes::Bytes::copy_from_slice(tail)),
             ];
-            let out: Vec<_> = strip_usage_frame(futures::stream::iter(parts))
+            let out: Vec<_> = relay_whole_frames(futures::stream::iter(parts), true)
                 .collect()
                 .await;
             let relayed: Vec<u8> = out
@@ -1160,6 +1164,40 @@ mod tests {
                 failure: CompletionStreamFailure::Decode,
                 error_class: "upstream_decode_error",
             })
+        );
+    }
+
+    /// An upstream that pauses inside a frame leaves the heartbeat something
+    /// to interrupt. What leaves the relay is whole frames, so the comment
+    /// lands between events however the upstream split them.
+    #[tokio::test(start_paused = true)]
+    async fn a_heartbeat_never_lands_inside_a_relayed_frame() {
+        let upstream: CompletionByteStream = Box::pin(async_stream::stream! {
+            yield Ok(bytes::Bytes::from_static(b"data: {\"id\":\"cmpl-1\",\"choi"));
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            yield Ok(bytes::Bytes::from_static(
+                b"ces\":[{\"text\":\"hi\",\"index\":0}]}\n\ndata: [DONE]\n\n",
+            ));
+        });
+        let parsed =
+            build_completion_passthrough_stream(upstream, None, "model".to_string(), |_, _, _| {});
+        let relayed = crate::sse_keepalive::with_heartbeat(
+            relay_whole_frames(parsed, false),
+            Some(Duration::from_secs(15)),
+        );
+        let mut wire = Vec::new();
+        for item in relayed.collect::<Vec<_>>().await {
+            wire.extend_from_slice(&item.unwrap());
+        }
+        let mut decoder = aisix_gateway::sse::SseDecoder::new();
+        assert_eq!(
+            decoder.feed(wire.as_slice()).unwrap(),
+            vec![
+                aisix_gateway::sse::SseEvent::Data(
+                    r#"{"id":"cmpl-1","choices":[{"text":"hi","index":0}]}"#.to_string()
+                ),
+                aisix_gateway::sse::SseEvent::Done,
+            ],
         );
     }
 

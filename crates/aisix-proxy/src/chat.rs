@@ -5711,6 +5711,14 @@ struct StreamCompletion {
     /// irrelevant — the customer must not be billed for tokens that
     /// never crossed the wire. Issue #419.
     chunks_delivered: u32,
+    /// A chunk of the answer went into the hold. That is the one way a stream
+    /// delivers nothing with the upstream's work already done, so the gate
+    /// above does not apply: what was read is reported, like a held stream on
+    /// the routes that hold inside the handler (`crate::cancel::HeldStream`).
+    held_output: bool,
+    /// The upstream has ended and a hold-back verdict is still out, with
+    /// nothing released: a caller leaving now did walk away from the answer.
+    verdict_pending: bool,
     /// Assembled assistant text for content-capturing exporters, accumulated
     /// across chunks ONLY when an exporter wants full content (bounded to the
     /// capture cap). Empty otherwise. Read by the on_complete telemetry
@@ -5767,7 +5775,7 @@ impl crate::attempt::RecordsStreamRefusal for StreamCompletion {
 /// The terminal usage-event status of a chat stream.
 fn stream_terminal_status(comp: &StreamCompletion) -> u16 {
     crate::attempt::guarded_stream_status(
-        comp.reached_end,
+        comp.reached_end && !comp.verdict_pending,
         comp.guardrail_blocked,
         comp.failure.as_ref(),
     )
@@ -6424,7 +6432,7 @@ impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
             // completion-side counters but keep `prompt_tokens` (the
             // prompt was processed by upstream regardless, and the
             // industry contract is "prompts always billed").
-            if delivered == 0 {
+            if delivered == 0 && !c.held_output {
                 c.completion_tokens = 0;
                 c.reasoning_tokens = 0;
                 // The upstream's total describes counters no longer being
@@ -6442,7 +6450,7 @@ impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
             // only for counters the upstream left at zero; a stream with a
             // real usage chunk is untouched.
             if let Some(est) = self.estimator.take() {
-                let output = (delivered > 0).then_some(c.est_output_text.as_str());
+                let output = (delivered > 0 || c.held_output).then_some(c.est_output_text.as_str());
                 let filled = crate::token_estimate::fill_missing(
                     &est,
                     c.prompt_tokens,
@@ -6490,12 +6498,21 @@ struct ChoiceTexts {
     kept: usize,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// What [`ChoiceTexts::push`] kept on this thread, which a test can read
+    /// where the buffer itself lives inside a stream's generator.
+    static CHOICE_TEXT_BYTES_PUSHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl ChoiceTexts {
     const CONTENT: u64 = 0;
     const REFUSAL: u64 = 1;
     const TRANSCRIPT: u64 = 2;
 
     fn push(&mut self, choice: u32, channel: u64, text: &str) {
+        #[cfg(test)]
+        CHOICE_TEXT_BYTES_PUSHED.with(|pushed| pushed.set(pushed.get() + text.len()));
         if !text.is_empty() {
             self.fresh += text.chars().count();
             self.texts
@@ -6797,14 +6814,17 @@ where
                     ];
                     for (channel, text) in channels {
                         let Some(text) = text else { continue };
-                        if matches!(
-                            stream_policy,
-                            aisix_guardrails::StreamOutputPolicy::Window { .. }
-                        ) {
-                            window_buf.push(chunk.choice_index, channel, text);
-                        } else if let Some(buf) = content_buffer.as_mut() {
-                            let kept = live_scan.as_mut().map_or(text, |budget| budget.admit(text));
-                            buf.push(chunk.choice_index, channel, kept);
+                        // Past a fail-open release no scan will read it.
+                        if !cap_released {
+                            if matches!(
+                                stream_policy,
+                                aisix_guardrails::StreamOutputPolicy::Window { .. }
+                            ) {
+                                window_buf.push(chunk.choice_index, channel, text);
+                            } else if let Some(buf) = content_buffer.as_mut() {
+                                let kept = live_scan.as_mut().map_or(text, |budget| budget.admit(text));
+                                buf.push(chunk.choice_index, channel, kept);
+                            }
                         }
                         // Content capture: assemble the response for the
                         // observability fan-out, bounded to the cap so a long
@@ -7059,6 +7079,7 @@ where
                 let chunk_content = crate::held_content::chat_delta(&chunk.delta);
                 let chunk_raw = crate::held_content::chat_chunk_raw(&chunk);
                 let chunk_images_raw = crate::held_content::chat_chunk_images_raw(&chunk);
+                guard.comp().held_output = true;
                 pending_bytes.add(chunk_raw);
                 pending.push(chunk);
                 match &stream_policy {
@@ -7245,6 +7266,9 @@ where
         // body only when the consumer pulls again. Same placement as the
         // sibling streams in messages.rs and responses_bridge.rs.
         guard.comp().reached_end = true;
+        // Held, nothing has reached the caller yet, so that reasoning does not
+        // apply until the verdict is in.
+        guard.comp().verdict_pending = hold_back && !cap_released && !errored;
         // The `include_usage` chunk. An ensemble's (#617) is the judge's
         // field-wise max plus the panel sum; a single upstream's is the last
         // report. Stamped like the last chunk.
@@ -7468,6 +7492,7 @@ where
                             }
                         }
                         if safe_to_release {
+                            guard.comp().verdict_pending = false;
                             guard.comp().response_capture_safe =
                                 moderation_capture_safe && !capture_bypassed;
                             for chunk in pending.drain(..) {
@@ -7888,6 +7913,169 @@ mod stream_output_scan_tests {
         assert!(!completion.guardrail_blocked, "{body}");
         assert!(!body.contains("alice@"), "{body}");
         assert!(body.contains("mail [EMAIL_REDACTED] now"), "{body}");
+    }
+
+    /// Past a fail-open release nothing will scan the text, so the stream stops
+    /// collecting it: the rest of a long answer is not kept for nobody.
+    #[tokio::test]
+    async fn a_fail_open_release_stops_collecting_the_scan_text() {
+        struct FailOpenHold;
+        #[async_trait]
+        impl Guardrail for FailOpenHold {
+            fn name(&self) -> &'static str {
+                "fail-open-hold"
+            }
+            fn stream_output_policy(&self) -> StreamOutputPolicy {
+                StreamOutputPolicy::BufferFull {
+                    max_buffer_bytes: 8,
+                    on_exceeded_fail_open: true,
+                }
+            }
+            async fn check_output(&self, _response: &ChatResponse) -> GuardrailVerdict {
+                GuardrailVerdict::Allow
+            }
+        }
+        let text = |t: &str| {
+            chunk(ChatDelta {
+                content: Some(t.into()),
+                ..Default::default()
+            })
+        };
+        super::CHOICE_TEXT_BYTES_PUSHED.with(|pushed| pushed.set(0));
+        let (body, _) = run(
+            vec![
+                text("0123456789"),
+                text("past the release"),
+                text("and more"),
+            ],
+            Arc::new(FailOpenHold),
+        )
+        .await;
+        assert!(body.contains("and more"), "{body}");
+        assert_eq!(
+            super::CHOICE_TEXT_BYTES_PUSHED.with(|pushed| pushed.get()),
+            "0123456789".len(),
+        );
+    }
+
+    /// A verdict that never comes back, so the test can leave during it.
+    struct SlowVerdict;
+
+    #[async_trait]
+    impl Guardrail for SlowVerdict {
+        fn name(&self) -> &'static str {
+            "slow-verdict"
+        }
+        fn stream_output_policy(&self) -> StreamOutputPolicy {
+            StreamOutputPolicy::BufferFull {
+                max_buffer_bytes: 1 << 20,
+                on_exceeded_fail_open: false,
+            }
+        }
+        async fn check_output(&self, _response: &ChatResponse) -> GuardrailVerdict {
+            std::future::pending().await
+        }
+    }
+
+    /// A caller who leaves while the verdict is out received nothing: the row
+    /// says so (499, not 200), and carries what the upstream billed.
+    #[tokio::test]
+    async fn a_caller_leaving_during_the_verdict_is_a_499_with_the_upstreams_counts() {
+        let mut held = chunk(ChatDelta {
+            content: Some("the answer".into()),
+            ..Default::default()
+        });
+        held.usage = Some(aisix_gateway::chat::UsageStats::new(31, 17));
+        let upstream: ChatChunkStream = Box::pin(futures::stream::iter(vec![Ok(held)]));
+        let captured = Arc::new(Mutex::new(None::<StreamCompletion>));
+        let out = Arc::clone(&captured);
+        let mut stream = Box::pin(build_sse_stream(
+            upstream,
+            1,
+            Some(StreamGuardrailContext {
+                chain: Arc::new(SlowVerdict),
+                model_name: "gw".into(),
+            }),
+            Instant::now(),
+            Instant::now(),
+            "gw".into(),
+            None,
+            false,
+            aisix_gateway::chat::UsageStats::default(),
+            None,
+            move |completion| {
+                *out.lock().unwrap() = Some(completion);
+            },
+        ));
+        let pulled = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            futures::StreamExt::next(&mut stream),
+        )
+        .await;
+        assert!(pulled.is_err(), "nothing is released before the verdict");
+        drop(stream);
+        let completion = captured.lock().unwrap().take().expect("on_complete fired");
+        assert_eq!(completion.chunks_delivered, 0);
+        assert_eq!(completion.prompt_tokens, 31);
+        assert_eq!(completion.completion_tokens, 17);
+        assert_eq!(
+            super::stream_terminal_status(&completion),
+            crate::CLIENT_CLOSED_REQUEST
+        );
+    }
+
+    /// With no usage frame yet, the held text is what the estimate reads.
+    #[tokio::test]
+    async fn a_caller_leaving_a_hold_before_any_usage_gets_an_estimate() {
+        let held = chunk(ChatDelta {
+            content: Some("the answer the provider already wrote".into()),
+            ..Default::default()
+        });
+        let upstream: ChatChunkStream = Box::pin(futures::StreamExt::chain(
+            futures::stream::iter(vec![Ok(held)]),
+            futures::stream::pending(),
+        ));
+        let captured = Arc::new(Mutex::new(None::<StreamCompletion>));
+        let out = Arc::clone(&captured);
+        let mut stream = Box::pin(build_sse_stream(
+            upstream,
+            1,
+            Some(StreamGuardrailContext {
+                chain: Arc::new(ReadsScanText),
+                model_name: "gw".into(),
+            }),
+            Instant::now(),
+            Instant::now(),
+            "gw".into(),
+            None,
+            false,
+            aisix_gateway::chat::UsageStats::default(),
+            Some(crate::token_estimate::Estimator::new(
+                "gpt-4o",
+                crate::token_estimate::PromptInput::Chat(Box::new(aisix_gateway::ChatFormat::new(
+                    "gw",
+                    vec![aisix_gateway::ChatMessage::user("a question".to_string())],
+                ))),
+            )),
+            move |completion| {
+                *out.lock().unwrap() = Some(completion);
+            },
+        ));
+        let pulled = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            futures::StreamExt::next(&mut stream),
+        )
+        .await;
+        assert!(pulled.is_err());
+        drop(stream);
+        let completion = captured.lock().unwrap().take().expect("on_complete fired");
+        assert!(completion.prompt_tokens > 0);
+        assert!(completion.completion_tokens > 0);
+        assert!(completion.usage_estimated);
+        assert_eq!(
+            super::stream_terminal_status(&completion),
+            crate::CLIENT_CLOSED_REQUEST
+        );
     }
 
     /// A window kind that takes its verdict from the segment pass: `custom`

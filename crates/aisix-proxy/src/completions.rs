@@ -34,8 +34,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use stream::{
-    build_completion_passthrough_stream, completion_usage_with_estimates, stamp_first_chunk,
-    strip_usage_frame, without_usage_frame, CompletionSseAccumulator, CompletionStreamFailure,
+    build_completion_passthrough_stream, completion_usage_with_estimates, relay_whole_frames,
+    stamp_first_chunk, without_usage_frame, CompletionSseAccumulator, CompletionStreamFailure,
     CompletionStreamOutcome, HeldCompletion, PreparedCompletionStream,
 };
 
@@ -1394,13 +1394,10 @@ async fn dispatch(
                         );
                     },
                 );
-                let parsed: aisix_gateway::CompletionByteStream = if caller_wants_usage {
-                    Box::pin(parsed)
-                } else {
-                    Box::pin(strip_usage_frame(parsed))
-                };
-                let parsed =
-                    crate::sse_keepalive::with_heartbeat(parsed, crate::sse_keepalive::interval());
+                let parsed = crate::sse_keepalive::with_heartbeat(
+                    relay_whole_frames(parsed, !caller_wants_usage),
+                    crate::sse_keepalive::interval(),
+                );
                 let mut response = Response::new(axum::body::Body::from_stream(parsed));
                 response.headers_mut().insert(
                     header::CONTENT_TYPE,
