@@ -587,19 +587,6 @@ enum UploadField {
 /// Every string value and object key of every JSONL line that parses,
 /// decoded, one per line. `None` when no line parses.
 fn jsonl_decoded_text(text: &str) -> Option<String> {
-    fn walk(value: &serde_json::Value, out: &mut Vec<String>) {
-        match value {
-            serde_json::Value::String(s) => out.push(s.clone()),
-            serde_json::Value::Array(items) => items.iter().for_each(|v| walk(v, out)),
-            serde_json::Value::Object(map) => {
-                for (k, v) in map {
-                    out.push(k.clone());
-                    walk(v, out);
-                }
-            }
-            _ => {}
-        }
-    }
     let mut out = Vec::new();
     let mut parsed_any = false;
     // 文件开头的 UTF-8 BOM 不属于第一行（见 `redact_jsonl_upload`）。
@@ -607,10 +594,25 @@ fn jsonl_decoded_text(text: &str) -> Option<String> {
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
             parsed_any = true;
-            walk(&value, &mut out);
+            json_decoded_strings(&value, &mut out);
         }
     }
     parsed_any.then(|| out.join("\n"))
+}
+
+/// Every string value and object key of `value`, decoded.
+pub(crate) fn json_decoded_strings(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(items) => items.iter().for_each(|v| json_decoded_strings(v, out)),
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                out.push(k.clone());
+                json_decoded_strings(v, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 输入审查读的文本：原样的字节之外，还有 JSONL 每行解码后的字符串。上游读

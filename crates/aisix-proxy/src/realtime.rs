@@ -1356,6 +1356,18 @@ async fn run_session(
                     }
                 }
                 Some(Ok(AxMessage::Binary(b))) => {
+                    if let Some((resp, refusal)) = binary_frame_refusal(&chain, true) {
+                        let _ = client_tx.send(AxMessage::Text(resp)).await;
+                        let _ = client_tx
+                            .send(AxMessage::Close(Some(CloseFrame {
+                                code: 1011,
+                                reason: "content policy".into(),
+                            })))
+                            .await;
+                        close_status = 400;
+                        session_error = Some(refusal);
+                        break;
+                    }
                     if up_tx.send(TgMessage::Binary(b)).await.is_err() {
                         break;
                     }
@@ -1433,6 +1445,18 @@ async fn run_session(
                 }
                 Some(Ok(TgMessage::Binary(b))) => {
                     opening.observe(&state, &model_entry.id, None);
+                    if let Some((resp, refusal)) = binary_frame_refusal(&chain, false) {
+                        let _ = client_tx.send(AxMessage::Text(resp)).await;
+                        let _ = client_tx
+                            .send(AxMessage::Close(Some(CloseFrame {
+                                code: 1011,
+                                reason: "content policy".into(),
+                            })))
+                            .await;
+                        close_status = 400;
+                        session_error = Some(refusal);
+                        break;
+                    }
                     if client_tx.send(AxMessage::Binary(b)).await.is_err() {
                         break;
                     }
@@ -1927,10 +1951,11 @@ async fn guardrail_block_event(
     input_side: bool,
     monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
 ) -> Option<(String, ProxyError)> {
+    let text = frame_scan_text(text);
     let (verdict, hits) = if input_side {
         let chat = aisix_gateway::ChatFormat::new(
             model_name,
-            vec![aisix_gateway::ChatMessage::user(text.to_string())],
+            vec![aisix_gateway::ChatMessage::user(text)],
         );
         aisix_guardrails::Guardrail::check_input_unmaskable_observed(chain, &chat).await
     } else {
@@ -1939,7 +1964,7 @@ async fn guardrail_block_event(
             more_choices: Vec::new(),
             id: String::new(),
             model: model_name.to_string(),
-            message: aisix_gateway::ChatMessage::assistant(text.to_string()),
+            message: aisix_gateway::ChatMessage::assistant(text),
             finish_reason: aisix_gateway::FinishReason::Stop,
             usage: aisix_gateway::UsageStats::default(),
             service_tier: None,
@@ -1965,16 +1990,63 @@ async fn guardrail_block_event(
             guardrail_name.as_deref(),
             unavailable.as_deref(),
         );
-        let event = serde_json::json!({
-            "type": "error",
-            "error": {
-                "type": "invalid_request_error",
-                "code": "content_filtered",
-                "message": refusal.to_string(),
-            }
-        })
-        .to_string();
-        return Some((event, refusal));
+        return Some((content_filtered_event(&refusal), refusal));
+    }
+    None
+}
+
+fn content_filtered_event(refusal: &ProxyError) -> String {
+    serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "code": "content_filtered",
+            "message": refusal.to_string(),
+        }
+    })
+    .to_string()
+}
+
+/// What a chain reads of a text frame. A peer decodes the JSON, so an escape
+/// hides a word from the frame's bytes: where there is one, the decoded strings
+/// are read beside them. A frame with no backslash has no escape, and reading
+/// its bytes alone keeps an audio frame's cost where it was.
+fn frame_scan_text(frame: &str) -> String {
+    if !frame.contains('\\') {
+        return frame.to_owned();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(frame) else {
+        return frame.to_owned();
+    };
+    let mut decoded = Vec::new();
+    crate::jobs::json_decoded_strings(&value, &mut decoded);
+    format!("{frame}\n{}", decoded.join("\n"))
+}
+
+/// A binary frame holds nothing a chain can read. Refused where something reads
+/// that side and fails closed, recorded as a bypass where not, as any other body
+/// a chain cannot be given.
+fn binary_frame_refusal(
+    chain: &aisix_guardrails::GuardrailChain,
+    input_side: bool,
+) -> Option<(String, ProxyError)> {
+    let refuses = if input_side {
+        aisix_guardrails::Guardrail::refuses_unevaluable_input(chain)
+    } else {
+        aisix_guardrails::Guardrail::refuses_unevaluable_output(chain)
+    };
+    if refuses {
+        let refusal = crate::error::guardrail_block_error(
+            if input_side { "request" } else { "response" },
+            None,
+            Some(crate::error::TAG_UNSCANNABLE_BODY),
+        );
+        return Some((content_filtered_event(&refusal), refusal));
+    }
+    if input_side {
+        chain.record_unevaluable_input_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+    } else {
+        chain.record_unevaluable_output_bypass(crate::error::TAG_UNSCANNABLE_BODY);
     }
     None
 }
@@ -2479,6 +2551,142 @@ mod tests {
             }
         });
         (addr, seen_handshake, seen_frames)
+    }
+
+    /// An upstream that records every frame it is sent, on any number of
+    /// connections.
+    async fn recording_upstream() -> (
+        std::net::SocketAddr,
+        Arc<Mutex<Vec<(&'static str, String)>>>,
+    ) {
+        let seen: Arc<Mutex<Vec<(&'static str, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let recorder = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let recorder = recorder.clone();
+                tokio::spawn(async move {
+                    let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    let (_tx, mut rx) = ws.split();
+                    while let Some(Ok(msg)) = rx.next().await {
+                        match msg {
+                            TgMessage::Text(t) => recorder.lock().unwrap().push(("text", t)),
+                            TgMessage::Binary(b) => recorder
+                                .lock()
+                                .unwrap()
+                                .push(("binary", String::from_utf8_lossy(&b).into_owned())),
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    async fn client(
+        addr: std::net::SocketAddr,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer sk-caller".parse().unwrap());
+        tokio_tungstenite::connect_async(req)
+            .await
+            .expect("handshake")
+            .0
+    }
+
+    fn user_item(text: &str) -> String {
+        format!(
+            r#"{{"type":"conversation.item.create","item":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{text}"}}]}}}}"#
+        )
+    }
+
+    async fn was_refused(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> bool {
+        let mut refused = false;
+        while let Ok(Some(Ok(msg))) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await
+        {
+            if let TgMessage::Text(t) = &msg {
+                refused |= t.contains("content_filtered");
+            }
+        }
+        refused
+    }
+
+    /// The upstream decodes the frame, so a rule reads what it will read: an
+    /// escape is no way around one, and neither is the same JSON in a frame the
+    /// chain cannot read at all.
+    #[tokio::test]
+    async fn an_escape_or_a_binary_frame_does_not_get_past_a_block_rule() {
+        let (up_addr, seen) = recording_upstream().await;
+        let snap = snapshot(&format!("http://{up_addr}/v1"), "openai", "openai");
+        let g: aisix_core::Guardrail = serde_json::from_value(serde_json::json!({
+            "name": "kw", "enabled": true, "hook_point": "input", "fail_open": false,
+            "kind": "keyword", "patterns": [{"kind": "literal", "value": "forbidden"}],
+        }))
+        .unwrap();
+        crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-kw", g, 1));
+        let (addr, _state, _rx) = serve(snap).await;
+
+        for frame in [
+            TgMessage::Text(user_item("forbidden")),
+            TgMessage::Text(user_item("\\u0066orbidden")),
+            TgMessage::Binary(user_item("forbidden").into_bytes()),
+        ] {
+            let mut ws = client(addr).await;
+            ws.send(frame.clone()).await.unwrap();
+            assert!(was_refused(&mut ws).await, "{frame:?}");
+        }
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+    }
+
+    /// A row that fails open lets a binary frame through, and an output-only row
+    /// has no say over what the client sends.
+    #[tokio::test]
+    async fn a_binary_frame_passes_a_chain_that_does_not_refuse() {
+        for row in [
+            serde_json::json!({"name": "kw", "enabled": true, "hook_point": "input",
+                "fail_open": true, "kind": "keyword",
+                "patterns": [{"kind": "literal", "value": "forbidden"}]}),
+            serde_json::json!({"name": "kw", "enabled": true, "hook_point": "output",
+                "fail_open": false, "kind": "keyword",
+                "patterns": [{"kind": "literal", "value": "forbidden"}]}),
+        ] {
+            let (up_addr, seen) = recording_upstream().await;
+            let snap = snapshot(&format!("http://{up_addr}/v1"), "openai", "openai");
+            let g: aisix_core::Guardrail = serde_json::from_value(row).unwrap();
+            crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-kw", g, 1));
+            let (addr, _state, _rx) = serve(snap).await;
+            let mut ws = client(addr).await;
+            ws.send(TgMessage::Binary(b"opaque".to_vec()))
+                .await
+                .unwrap();
+            for _ in 0..200 {
+                if !seen.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                seen.lock().unwrap().as_slice(),
+                [("binary", "opaque".to_string())]
+            );
+        }
     }
 
     /// 虚拟父级（routing / ensemble / semantic）不能走 `/v1/realtime`。
