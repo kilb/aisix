@@ -215,6 +215,9 @@ describe("an upstream that quotes the credential it was sent", () => {
       { attach: false },
     );
     await seed.attachGuardrailToModel(held.id, modelIds["openai-failing-held"]);
+    // The held relay on every other family too.
+    await model("anthropic-failing-held", "anthropic", failing);
+    await seed.attachGuardrailToModel(held.id, modelIds["anthropic-failing-held"]);
     await seed.createPassthroughRoute({
       name: "scrub-passthrough",
       path_prefix: "/scrub-passthrough",
@@ -353,6 +356,21 @@ describe("an upstream that quotes the credential it was sent", () => {
       "native responses held for an output rule",
       "/v1/responses",
       json({ model: "openai-failing-held", input: "hi", stream: true }),
+    ],
+    [
+      "chat held for an output rule",
+      "/v1/chat/completions",
+      json({ model: "openai-failing-held", messages, stream: true }),
+    ],
+    [
+      "completions held for an output rule",
+      "/v1/completions",
+      json({ model: "openai-failing-held", prompt: "hi", stream: true }),
+    ],
+    [
+      "native messages held for an output rule",
+      "/v1/messages",
+      json({ model: "anthropic-failing-held", messages, max_tokens: 5, stream: true }),
     ],
     [
       "passthrough route",

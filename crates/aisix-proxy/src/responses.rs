@@ -6775,6 +6775,52 @@ mod tests {
         assert_eq!(events[3]["response"]["error"]["code"], "invalid_prompt");
     }
 
+    /// An upstream's own failure frame reaches the caller less the key the
+    /// request sent, whether or not an output rule holds the stream back.
+    #[tokio::test]
+    async fn an_upstream_error_frame_is_scrubbed_held_or_live() {
+        const SECRET: &str = "sk-held-secret-0123456789";
+        for held in [false, true] {
+            let upstream = MockServer::builder().start().await;
+            let sse = format!(
+                "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_e\"}}}}\n\n\
+                 event: error\ndata: {{\"type\":\"error\",\"error\":{{\"message\":\"Incorrect API key provided: {SECRET}\",\"type\":\"invalid_request_error\"}}}}\n\n"
+            );
+            Mock::given(method("POST"))
+                .and(path("/v1/responses"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+                .mount(&upstream)
+                .await;
+            let snap = AisixSnapshot::new();
+            let pk: aisix_core::ProviderKey = serde_json::from_str(&format!(
+                r#"{{"display_name":"openai-up","secret":"{SECRET}","api_base":"{}","provider":"openai","adapter":"openai"}}"#,
+                upstream.uri()
+            ))
+            .unwrap();
+            snap.provider_keys
+                .insert(ResourceEntry::new(OPENAI_PK_ID, pk, 1));
+            snap.models.insert(openai_model("gpt-4o-resp"));
+            snap.apikeys.insert(apikey_entry(&["*"]));
+            if held {
+                crate::seed_env_scoped_guardrail(&snap, keyword_output_guardrail("BLOCKME"));
+            }
+            let resp = build_app(snap)
+                .oneshot(make_req(
+                    serde_json::json!({"model":"gpt-4o-resp","input":"hi","stream":true}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+            let wire = String::from_utf8_lossy(&bytes);
+            assert!(
+                wire.contains("Incorrect API key provided"),
+                "held={held}: {wire}"
+            );
+            assert!(!wire.contains(SECRET), "held={held}: {wire}");
+        }
+    }
+
     /// A refusal goes out as a 200, since the head went out ahead of it, and the
     /// row says so: 200, `guardrail_blocked`, and what the upstream billed.
     #[tokio::test]
