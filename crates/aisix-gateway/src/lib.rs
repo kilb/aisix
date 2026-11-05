@@ -48,15 +48,14 @@ pub mod upstream_tls;
 pub mod url_cache;
 
 pub use bridge::{
-    bounded_error_text, capture_in_band_error, capture_in_band_error_value,
-    capture_upstream_error_http, content_type_is_json, decode_success_body, in_band_error_body,
-    in_band_error_in_body, in_band_error_reported, parse_retry_after, read_body_capped,
-    read_body_capped_with_deadline, redact_userinfo, response_is_json, truncate_lossy,
-    upstream_error_message, upstream_status_from_response,
-    upstream_status_from_response_with_deadline, validate_api_base, Bridge, BridgeCapability,
-    BridgeContext, BridgeError, ChatChunkStream, CompletionByteStream, NativeMessages,
-    UpstreamErrorBody, UpstreamErrorView, UpstreamWire, MAX_UPSTREAM_ERROR_BODY_BYTES,
-    MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
+    capture_in_band_error, capture_in_band_error_value, capture_upstream_error_http,
+    content_type_is_json, decode_success_body, in_band_error_body, in_band_error_in_body,
+    in_band_error_reported, parse_retry_after, read_body_capped, redact_userinfo,
+    response_is_json, truncate_lossy, upstream_error_message, upstream_error_text,
+    upstream_error_within, upstream_status_of_body, upstream_status_parsed_from_response,
+    validate_api_base, Bridge, BridgeCapability, BridgeContext, BridgeError, ChatChunkStream,
+    CompletionByteStream, NativeMessages, UpstreamErrorBody, UpstreamErrorView, UpstreamWire,
+    MAX_UPSTREAM_ERROR_BODY_BYTES, MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
 };
 pub use chat::{
     CacheCreationTtl, ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, EmbeddingObject,

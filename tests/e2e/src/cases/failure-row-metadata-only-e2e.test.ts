@@ -398,8 +398,8 @@ describe("failure rows name the failure under metadata_only", () => {
       ws.on("error", reject);
     });
     const row = await rowOf(requestId, "the realtime row");
-    expect(row.get("status_code")).toBe("502");
-    expect(row.get("error_class")).toBe("transport");
+    expect(row.get("status_code")).toBe("400");
+    expect(row.get("error_class")).toBe("upstream_status");
     return row;
   }
 
@@ -409,16 +409,16 @@ describe("failure rows name the failure under metadata_only", () => {
       if (!etcdReachable) return ctx.skip();
       const row = await refusedRealtime(model);
       expect(row.get("error_message")).toBe(
-        `transport error: upstream returned HTTP 400: ${SENTINEL}`,
+        `upstream returned HTTP 400: ${SENTINEL}`,
       );
     },
   );
 
-  test("realtime: a refusal whose detail had not arrived claims nothing about it", async (ctx) => {
+  test("realtime: a refusal whose detail never arrived names the failed read", async (ctx) => {
     if (!etcdReachable) return ctx.skip();
     const row = await refusedRealtime("meta-realtime-late-detail");
-    expect(row.get("error_message")).toBe(
-      "transport error: upstream returned HTTP 400 during the realtime handshake",
+    expect(row.get("error_message")).toMatch(
+      /^upstream returned HTTP 400: failed to read response body: .+/,
     );
   });
 
@@ -432,7 +432,7 @@ describe("failure rows name the failure under metadata_only", () => {
     const row = await rowOf(r.requestId, "the blank in-band row");
     expect(row.get("error_class")).toBe("upstream_in_band");
     expect(row.get("error_message")).toBe(
-      "upstream reported an in-band stream error with no message: overloaded",
+      "upstream reported an in-band error with no message: overloaded",
     );
   });
 
@@ -448,7 +448,7 @@ describe("failure rows name the failure under metadata_only", () => {
     expect(r.text).not.toContain("with no message");
     const row = await rowOf(r.requestId, "the mid-stream in-band row");
     expect(row.get("error_message")).toBe(
-      "upstream reported an in-band stream error with no message: overloaded",
+      "upstream reported an in-band error with no message: overloaded",
     );
   });
 

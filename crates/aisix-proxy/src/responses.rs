@@ -1908,11 +1908,10 @@ async fn responses_to_target(
     let status = upstream_resp.status();
 
     if !status.is_success() {
-        let err = aisix_gateway::upstream_status_from_response_with_deadline(
-            upstream_resp,
-            aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES,
+        let err = aisix_gateway::upstream_error_within(
             connect_deadline,
-            aisix_gateway::bounded_error_text,
+            upstream_resp,
+            aisix_provider_openai::held_route_http_error,
         )
         .await;
         if err.http_status() >= 500 {

@@ -1633,26 +1633,11 @@ async fn anthropic_passthrough_dispatch(
             let status = upstream_resp.status();
 
             if !status.is_success() {
-                let retry_after = aisix_gateway::parse_retry_after(upstream_resp.headers());
-                // A streaming request carries no request-level timeout, so the
-                // error body is read under the same deadline the connect was:
-                // headers followed by a stalled body must not hang the request.
-                let err = match connect_deadline {
-                    None => aisix_provider_anthropic::map_http_error(status, upstream_resp).await,
-                    Some(deadline) => match tokio::time::timeout(
-                        deadline,
-                        aisix_provider_anthropic::map_http_error(status, upstream_resp),
-                    )
-                    .await
-                    {
-                        Ok(err) => err,
-                        Err(_) => aisix_gateway::BridgeError::upstream_status_with_retry_after(
-                            status.as_u16(),
-                            String::new(),
-                            retry_after,
-                        ),
-                    },
-                };
+                let err =
+                    aisix_gateway::upstream_error_within(connect_deadline, upstream_resp, |resp| {
+                        aisix_provider_anthropic::map_http_error(status, resp)
+                    })
+                    .await;
                 if err.http_status() >= 500 {
                     state.health.record_failure(&model.display_name);
                 }

@@ -1634,14 +1634,10 @@ async fn multipart_dispatch(
                                 tracker,
                                 model_id,
                                 cooldown_cfg,
-                                // The live path set no request-level timeout, so the
-                                // connect budget bounds this read too; a buffered call's
-                                // request timeout already covers it.
-                                aisix_gateway::upstream_status_from_response_with_deadline(
-                                    resp,
-                                    aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES,
+                                aisix_gateway::upstream_error_within(
                                     connect_deadline,
-                                    aisix_gateway::bounded_error_text,
+                                    resp,
+                                    aisix_provider_openai::held_route_http_error,
                                 )
                                 .await,
                             ));
@@ -2526,13 +2522,10 @@ async fn speech_dispatch(
                             tracker,
                             model_id,
                             cooldown_cfg,
-                            // No request-level timeout here, so the stream budget
-                            // bounds this read as well.
-                            aisix_gateway::upstream_status_from_response_with_deadline(
-                                resp,
-                                aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES,
+                            aisix_gateway::upstream_error_within(
                                 stream_budget,
-                                aisix_gateway::bounded_error_text,
+                                resp,
+                                aisix_provider_openai::held_route_http_error,
                             )
                             .await,
                         ));
