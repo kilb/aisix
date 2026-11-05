@@ -21,6 +21,7 @@ const CALLER = "sk-error-source-caller";
 const NARROW = "sk-error-source-narrow";
 const BROKE = "sk-error-source-broke";
 const ROUTE_LIMITED = "sk-error-source-route-limited";
+const UNOWNED = "sk-error-source-unowned";
 const USER = "error-source-user";
 const BROKE_KEY_ID = randomUUID();
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -262,6 +263,7 @@ describe("error_source on the request counters", () => {
       allowed_routes: ["es-route-500"],
       rate_limit: { rpm: 1 },
     });
+    await seed.createApiKey({ key_hash: hash(UNOWNED), allowed_models: ["es-jobs-400"] });
     // Written last: its authenticating implies every row above has landed.
     await seed.createApiKey({
       key_hash: hash(CALLER),
@@ -500,7 +502,8 @@ describe("error_source on the request counters", () => {
     expect(await send("/a2a/es-no-such-agent", call)).toBe(404);
     await expectSource({ endpoint: "/a2a", status: "404" }, "aisix", proxyOnly);
 
-    expect(await send("/v1/batches?model=es-jobs-400", { input_file_id: "f" })).toBe(400);
+    // A key with no owner: a provider's own id is not one a scoped key may use.
+    expect(await send("/v1/batches?model=es-jobs-400", { input_file_id: "f" }, UNOWNED)).toBe(400);
     await expectSource({ endpoint: "/v1/batches", status: "400" }, "upstream", proxyOnly);
 
     await new Promise<void>((resolve, reject) => {

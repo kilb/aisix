@@ -235,6 +235,16 @@ describe("jobs resources belong to the team or user that created them", () => {
         "/v1/fine_tuning/jobs",
         { training_file: bFile, validation_file: aFile, model: "gpt-4o-mini" },
       ],
+      // The provider's own id names no one, so it is not this key's either.
+      [
+        `/v1/batches?model=${MODEL}`,
+        { input_file_id: "file-up-1", endpoint: "/v1/chat/completions", completion_window: "24h" },
+      ],
+      [`/v1/fine_tuning/jobs?model=${MODEL}`, { training_file: "file-up-1", model: "gpt-4o-mini" }],
+      [
+        "/v1/fine_tuning/jobs",
+        { training_file: bFile, validation_file: "file-up-1", model: "gpt-4o-mini" },
+      ],
     ];
     for (const [path, body] of refused) {
       const r = await request(TEAM_B, "POST", path, body);
@@ -273,5 +283,12 @@ describe("jobs resources belong to the team or user that created them", () => {
       expect(r.status, path).toBe(200);
       await r.text();
     }
+    const created = await request(SHARED, "POST", `/v1/batches?model=${MODEL}`, {
+      input_file_id: "file-up-1",
+      endpoint: "/v1/chat/completions",
+      completion_window: "24h",
+    });
+    expect(created.status).toBe(200);
+    await created.text();
   });
 });

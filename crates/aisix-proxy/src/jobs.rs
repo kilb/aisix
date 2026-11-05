@@ -21,8 +21,9 @@
 //! body/query/header model → first accessible OpenAI-compatible model**.
 //!
 //! Ids minted by the gateway look like `aisix-<base64url>`; raw provider
-//! ids are still accepted (routing falls back to the explicit/default
-//! model), mirroring a mainstream gateway's tolerance on list/retrieve flows.
+//! ids are still accepted from a key with no owner (routing falls back to the
+//! explicit/default model), mirroring a mainstream gateway's tolerance on
+//! list/retrieve flows.
 //!
 //! ## Ownership
 //!
@@ -1699,9 +1700,12 @@ pub(crate) async fn create_batch(
                 require_job_owner(&auth, &id.raw, id.owner.as_deref())?;
                 (id.raw, Some(id.model))
             }
-            // A provider's own id in a create body names no owner, and stays
-            // accepted: whoever holds it could write an id naming itself.
-            None => (input_file_id.clone(), None),
+            // A provider's own id names no owner, so only a key with none may
+            // use it.
+            None => {
+                require_job_owner(&auth, &input_file_id, None)?;
+                (input_file_id.clone(), None)
+            }
         };
         require_safe_upstream_id(&raw_file_id)?;
         let body_model = req_json
@@ -2056,7 +2060,10 @@ pub(crate) async fn create_ft_job(
                 (id.raw, Some(id.model))
             }
             // See `create_batch`.
-            None => (training_file.clone(), None),
+            None => {
+                require_job_owner(&auth, &training_file, None)?;
+                (training_file.clone(), None)
+            }
         };
         require_safe_upstream_id(&raw_training)?;
         let wanted = embedded.or_else(|| explicit_model(&params, &headers));
@@ -2066,10 +2073,13 @@ pub(crate) async fn create_ft_job(
         if let Some(obj) = req_json.as_object_mut() {
             obj.insert("training_file".into(), Value::String(raw_training));
             if let Some(vf) = obj.get("validation_file").and_then(Value::as_str) {
-                if let Some(id) = decode_routed_id(vf) {
-                    require_safe_upstream_id(&id.raw)?;
-                    require_job_owner(&auth, &id.raw, id.owner.as_deref())?;
-                    obj.insert("validation_file".into(), Value::String(id.raw));
+                match decode_routed_id(vf) {
+                    Some(id) => {
+                        require_safe_upstream_id(&id.raw)?;
+                        require_job_owner(&auth, &id.raw, id.owner.as_deref())?;
+                        obj.insert("validation_file".into(), Value::String(id.raw));
+                    }
+                    None => require_job_owner(&auth, vf, None)?,
                 }
             }
             obj.remove("provider");
@@ -3534,6 +3544,19 @@ mod tests {
             (
                 "/v1/fine_tuning/jobs",
                 serde_json::json!({"training_file": b_file, "validation_file": a_file, "model": "gpt-4o-mini"}),
+            ),
+            // A provider's own id names no owner, so it is not this key's.
+            (
+                "/v1/batches?model=jobs-a",
+                serde_json::json!({"input_file_id": "file-a", "endpoint": "/v1/chat/completions"}),
+            ),
+            (
+                "/v1/fine_tuning/jobs?model=jobs-a",
+                serde_json::json!({"training_file": "file-a", "model": "gpt-4o-mini"}),
+            ),
+            (
+                "/v1/fine_tuning/jobs",
+                serde_json::json!({"training_file": b_file, "validation_file": "file-a", "model": "gpt-4o-mini"}),
             ),
         ] {
             let req = Request::builder()
