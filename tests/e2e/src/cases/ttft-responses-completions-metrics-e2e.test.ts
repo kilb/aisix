@@ -352,7 +352,13 @@ async function sendAndScrape(
 async function usageSpan(fx: Fixture, requestId: string): Promise<Record<string, unknown>> {
   const deadline = Date.now() + 10_000;
   for (;;) {
-    const hit = fx.otlp!.spans.find((s) => s.attributes["aisix.request_id"] === requestId);
+    // 只认带用量的 attempt span：同一次导出里还有 SERVER / 逻辑 span，它们也带
+    // `aisix.request_id`，但没有逐次尝试的用量字段。
+    const hit = fx.otlp!.spans.find(
+      (s) =>
+        s.attributes["aisix.request_id"] === requestId &&
+        s.attributes["aisix.attempt_index"] !== undefined,
+    );
     if (hit) return hit.attributes;
     if (Date.now() >= deadline) {
       throw new Error(
@@ -375,13 +381,15 @@ async function expectStreamTtft(
   heldBack = false,
   releasedAtMs = LEAD_MS + 2 * GAP_MS,
 ): Promise<void> {
-  const want = { endpoint: path, model };
+  // 这几个族按 `side` 把一个请求记成两次观测（上游一次、下游一次），所以每条
+  // 断言都要点名一侧：e2e 是调用方等了多久，TTFT 是上游首帧。
+  const want = { endpoint: path, model, side: "upstream" };
   const histogramWant = { ...want, streaming: "true" };
   const { before, after, e2eObservations, requestId, firstByteMs } = await sendAndScrape(
     fx,
     path,
     { model, stream: true, ...body },
-    histogramWant,
+    { endpoint: path, model, streaming: "true", side: "downstream" },
     (b, a) =>
       metricDelta(b, a, TTFT_HISTOGRAM_COUNT, histogramWant) >= 1 &&
       metricDelta(b, a, TTFT_LEGACY_COUNT, want) >= 1,
@@ -504,7 +512,8 @@ describe("TTFT metrics on /v1/responses and /v1/completions streams", () => {
         fx,
         path,
         { model, ...body },
-        { ...want, streaming: "false" },
+        // 这个族一个请求记两侧，这里数调用方这一侧；下面 TTFT 的 0 不分侧。
+        { ...want, streaming: "false", side: "downstream" },
         () => true,
       );
       expect(

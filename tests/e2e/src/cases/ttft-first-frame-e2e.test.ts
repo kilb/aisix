@@ -476,7 +476,8 @@ describe("upstream TTFT stops on the first streamed frame", () => {
     await createModel(model, upstream, "anthropic");
     await awaitPropagation("ff-messages-native-metrics");
 
-    const want = { endpoint: "/v1/messages", model };
+    // 两条序列按 `side` 把一个请求记成两次观测，这里数上游首帧这一侧。
+    const want = { endpoint: "/v1/messages", model, side: "upstream" };
     const before = await scrapeMetrics(app.metricsUrl);
 
     const res = await fetch(`${app.proxyUrl}/v1/messages`, {
