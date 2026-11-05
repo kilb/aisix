@@ -2675,12 +2675,27 @@ mod tests {
     }
 
     /// A name that does not resolve is logged as a DNS failure — the cause
-    /// reqwest's own message hides behind "error sending request".
+    /// reqwest's own message hides behind "error sending request". The client
+    /// answers for the name itself: a real lookup depends on the machine's
+    /// resolver, and any proxy in its environment would take the name instead.
     #[tokio::test]
     async fn unresolvable_host_logs_the_dns_error() {
         use crate::call_error::testing::*;
+        struct NoSuchName;
+        impl reqwest::dns::Resolve for NoSuchName {
+            fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+                Box::pin(async { Err(std::io::Error::other("no such name").into()) })
+            }
+        }
         let logged = capture_logs(|| async {
-            let g = build("http://aisix-guardrail-test.invalid", true);
+            let mut g = build("http://aisix-guardrail-test.invalid", true);
+            g.client = Arc::new(
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .dns_resolver(Arc::new(NoSuchName))
+                    .build()
+                    .unwrap(),
+            );
             assert!(g.check_input(&req(PROMPT_MARKER)).await.is_bypass());
         })
         .await;
