@@ -54,6 +54,7 @@ describe("sse line terminators e2e: a CR-framed upstream is read like any other"
     alias: string,
     upstream: OpenAiUpstream,
     provider: "openai" | "anthropic" = "openai",
+    guardrailId?: string,
   ): Promise<void> {
     const pk = await seed!.createProviderKey({
       display_name: `pk-${alias}`,
@@ -62,12 +63,13 @@ describe("sse line terminators e2e: a CR-framed upstream is read like any other"
       provider,
       adapter: provider,
     });
-    await seed!.createModel({
+    const model = await seed!.createModel({
       display_name: alias,
       provider,
       model_name: "provider-model-v1",
       provider_key_id: pk.id,
     });
+    if (guardrailId) await seed!.attachGuardrailToModel(guardrailId, model.id as string);
     await seed!.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
     await waitConfigPropagation(async () => {
       const r = await fetch(`${app!.proxyUrl}/v1/models`, {
@@ -183,5 +185,46 @@ describe("sse line terminators e2e: a CR-framed upstream is read like any other"
     expect(text.split(`"model":"cr-responses"`).length - 1).toBe(3);
     expect(text).toContain('"delta":"ok"');
     expect(text.endsWith("data: [DONE]\r\r")).toBe(true);
+  });
+
+  test("/v1/responses held back: a CR-framed stream is released in its own framing", async (ctx) => {
+    if (!etcdReachable || !app || !seed) return void ctx.skip();
+
+    const snapshot = (status: string) =>
+      `"id":"resp_cr_held","object":"response","status":"${status}","model":"${UPSTREAM_REPORTED_MODEL}"`;
+    const upstream = await startOpenAiUpstream({
+      rawStreamFrames: [
+        `event: response.created\rdata: {"type":"response.created","response":{${snapshot("in_progress")}}}\r\r`,
+        `event: response.output_text.delta\rdata: {"type":"response.output_text.delta","delta":"ok"}\r\r`,
+        `event: response.completed\rdata: {"type":"response.completed","response":{${snapshot("completed")},"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}\r\r`,
+        `data: [DONE]\r\r`,
+      ],
+      eventDelayMs: 5,
+    });
+    upstreams.push(upstream);
+    const guardrail = await seed.createGuardrail(
+      {
+        name: "cr-responses-held",
+        enabled: true,
+        hook_point: "output",
+        kind: "pii",
+        detectors: [{ type: "email", action: "mask" }],
+      },
+      { attach: false },
+    );
+    await seedAlias("cr-responses-held", upstream, "openai", guardrail.id as string);
+
+    const res = await fetch(`${app.proxyUrl}/v1/responses`, {
+      method: "POST",
+      headers: HEADERS,
+      body: JSON.stringify({ model: "cr-responses-held", input: "say ok", stream: true }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).not.toContain(UPSTREAM_REPORTED_MODEL);
+    expect(text).toContain('"delta":"ok"');
+    expect(text.split("[DONE]").length - 1).toBe(1);
+    expect(text.endsWith("data: [DONE]\r\r")).toBe(true);
+    expect(text).not.toContain("\n");
   });
 });

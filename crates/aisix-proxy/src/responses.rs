@@ -2210,7 +2210,8 @@ async fn responses_to_target(
                     .is_some_and(|usage| usage.reached_end)
                 && !responses_sse_has_done(&buf)
             {
-                buf.extend_from_slice(b"data: [DONE]\n\n");
+                let done = responses_done_frame(&buf);
+                buf.extend_from_slice(&done);
             }
             // #1091/#1100: the two passes below read this buffer
             // differently — the line-based scan reads `data:` lines it can
@@ -4052,11 +4053,24 @@ fn raw_stream_bridge_error(
 }
 
 fn responses_sse_has_done(bytes: &[u8]) -> bool {
-    bytes.split(|byte| *byte == b'\n').any(|line| {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        line.strip_prefix(b"data:")
+    aisix_gateway::sse::lines(bytes).any(|line| {
+        bytes[line.start..line.end]
+            .strip_prefix(b"data:")
             .is_some_and(|data| data.trim_ascii() == b"[DONE]")
     })
+}
+
+/// The `[DONE]` frame a stream that ended without one is closed with, framed
+/// like the frames before it: a relay keeps the upstream's own framing, so the
+/// frame it adds must not bring another line ending into the stream.
+fn responses_done_frame(frames: &[u8]) -> Vec<u8> {
+    let mut rest = frames;
+    let mut separator: &[u8] = b"\n\n";
+    while let Some((content_end, frame_end)) = aisix_gateway::sse::split_frame_end(rest) {
+        separator = &rest[content_end..frame_end];
+        rest = &rest[frame_end..];
+    }
+    [b"data: [DONE]", separator].concat()
 }
 
 fn push_capped_lossy_bytes(output: &mut String, bytes: &[u8]) {
@@ -4675,7 +4689,10 @@ where
                 .usage
                 .as_ref()
                 .is_some_and(|usage| usage.reached_end);
-            let terminal_has_done = responses_sse_has_done(&forward);
+            let closing_done = (terminal_seen
+                && successful_terminal
+                && !responses_sse_has_done(&forward))
+            .then(|| responses_done_frame(&forward));
             // The first forward is what the caller waited for.
             let acc = state.usage.get_or_insert_with(Default::default);
             if acc.downstream_latency_ms == 0 {
@@ -4684,8 +4701,8 @@ where
             }
             yield Ok(bytes::Bytes::from(forward));
             if terminal_seen {
-                if successful_terminal && !terminal_has_done {
-                    yield Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
+                if let Some(done) = closing_done {
+                    yield Ok(bytes::Bytes::from(done));
                 }
                 break;
             }
@@ -8333,6 +8350,52 @@ data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\"
             usage.provider_request_id, "resp_released",
             "the BOM-led first frame still parses as the first frame"
         );
+    }
+
+    /// The sentinel the relay closes a stream with is framed like the stream:
+    /// the upstream's line ending survives, so the frame it adds must not bring
+    /// another one in.
+    #[tokio::test]
+    async fn the_closing_done_frame_keeps_the_streams_own_framing() {
+        use futures::StreamExt;
+
+        for (terminator, done) in [
+            ("\n\n", "data: [DONE]\n\n"),
+            ("\r\n\r\n", "data: [DONE]\r\n\r\n"),
+            ("\r\r", "data: [DONE]\r\r"),
+        ] {
+            let terminal = format!(
+                "data: {{\"type\":\"response.completed\",\"response\":{{\"usage\":{{\"input_tokens\":3,\"output_tokens\":2}}}}}}{terminator}"
+            );
+            let upstream = futures::stream::iter([Ok::<_, crate::stream_timeout::RawStreamError>(
+                bytes::Bytes::from(terminal.clone()),
+            )]);
+            let now = std::time::Instant::now();
+            let stream = super::build_responses_passthrough_stream(
+                upstream,
+                now,
+                now,
+                None,
+                None,
+                None,
+                true,
+                "client-facing".to_string(),
+                Default::default(),
+                |_, _, _, _, _| {},
+            );
+            let wire: Vec<u8> = stream.map(|item| item.unwrap().to_vec()).concat().await;
+            assert_eq!(
+                String::from_utf8(wire).unwrap(),
+                format!("{terminal}{done}")
+            );
+            assert_eq!(
+                super::responses_done_frame(terminal.as_bytes()),
+                done.as_bytes()
+            );
+            assert!(super::responses_sse_has_done(done.as_bytes()), "{done:?}");
+        }
+        // Nothing framed yet: the framing the gateway writes itself.
+        assert_eq!(super::responses_done_frame(b""), b"data: [DONE]\n\n");
     }
 
     #[tokio::test]
