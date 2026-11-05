@@ -32,7 +32,15 @@ use uuid::Uuid;
 
 use crate::attempt::RecordsStreamRefusal;
 
-const MAX_STREAM_ASSEMBLY_BYTES: usize = crate::token_estimate::OUTPUT_ACCUMULATION_CAP;
+/// What the encoder may assemble of one response: `response.completed` repeats
+/// the whole output, so it has to keep it. Past this a stream fails with
+/// [`STREAM_ASSEMBLY_MESSAGE`] rather than grow without limit.
+const MAX_STREAM_ASSEMBLY_BYTES: usize = crate::held_content::DEFAULT_RAW_HOLD_BYTES;
+
+/// What a stream past [`MAX_STREAM_ASSEMBLY_BYTES`] fails with, on the wire and
+/// on its row.
+const STREAM_ASSEMBLY_MESSAGE: &str =
+    "response exceeded the 32 MiB this gateway can translate for one /v1/responses stream";
 
 /// Translate a `/v1/responses` request body into the gateway's canonical
 /// [`ChatFormat`]. Unlike `responses::responses_input_to_chat` (which is a
@@ -2666,7 +2674,10 @@ pub fn build_responses_bridge_stream(
                             comp.response_capture_safe = false;
                             comp.response_text.clear();
                         }
-                        crate::attempt::StreamFailure::record(&mut comp.failure, &aborted);
+                        comp.failure = Some(crate::attempt::StreamFailure {
+                            error_message: STREAM_ASSEMBLY_MESSAGE.to_string(),
+                            ..crate::attempt::StreamFailure::from_bridge(&aborted)
+                        });
                         comp.terminal_failure = Some(aborted);
                         yield Ok(failure_frames(
                             &mut encoder,
@@ -2674,7 +2685,7 @@ pub fn build_responses_bridge_stream(
                             false,
                             "stream_aborted",
                             "stream_aborted",
-                            "upstream stream exceeded translation limit",
+                            STREAM_ASSEMBLY_MESSAGE,
                         ));
                         return;
                     }
@@ -4661,6 +4672,8 @@ mod tests {
     #[test]
     fn streaming_encoder_rejects_one_oversized_chunk_before_copying_it() {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
+        // Ordinary large answers fit: the bound is not the estimation cap.
+        assert_eq!(super::MAX_STREAM_ASSEMBLY_BYTES, 32 * 1024 * 1024);
         let oversized = "x".repeat(super::MAX_STREAM_ASSEMBLY_BYTES + 1);
 
         assert!(enc.next_events(&content_chunk(&oversized)).is_empty());

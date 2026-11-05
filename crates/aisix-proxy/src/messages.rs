@@ -3652,7 +3652,7 @@ fn build_anthropic_sse_stream(
                             }
                         }
                         let total = encoder_tool_bytes.saturating_add(additional);
-                        if total > crate::token_estimate::OUTPUT_ACCUMULATION_CAP {
+                        if total > crate::held_content::DEFAULT_RAW_HOLD_BYTES {
                             let aborted = aisix_gateway::BridgeError::StreamAborted;
                             let comp = guard.comp();
                             crate::attempt::StreamFailure::record(&mut comp.failure, &aborted);

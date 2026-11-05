@@ -36,6 +36,12 @@ use sha2::{Digest, Sha256};
 /// normal response still trips on content first.
 pub(crate) const RAW_HOLD_FACTOR: usize = 128;
 
+/// That bound at the default `max_buffer_bytes`, for what a relay must keep to
+/// translate a stream whatever the guardrails (32 MiB): past it the stream fails
+/// rather than grow without limit.
+pub(crate) const DEFAULT_RAW_HOLD_BYTES: usize =
+    aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES * RAW_HOLD_FACTOR;
+
 /// What one hold-back buffer holds: generated content (the cap
 /// `max_buffer_bytes` names) and the raw bytes kept to hold it.
 #[derive(Debug, Default)]
