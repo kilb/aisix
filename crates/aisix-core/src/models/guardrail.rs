@@ -301,7 +301,9 @@ pub struct AzureContentSafetyTextModerationConfig {
     /// `/v1/chat/completions`) and no output guardrail in the chain uses
     /// `buffer_full`, whose rows alone then set the cap. Counts assistant
     /// text, reasoning, and tool-call arguments; SSE and JSON framing is not
-    /// counted.
+    /// counted. Also bounds what a stream under `monitor` mode accumulates for
+    /// its end-of-stream scan, at 128 times this value; past that, the rest of
+    /// the stream goes unscanned and the request records the bypass.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -418,7 +420,9 @@ pub struct AliyunTextModerationConfig {
     /// `/v1/chat/completions`) and no output guardrail in the chain uses
     /// `buffer_full`, whose rows alone then set the cap. Counts assistant
     /// text, reasoning, and tool-call arguments; SSE and JSON framing is not
-    /// counted.
+    /// counted. Also bounds what a stream under `monitor` mode accumulates for
+    /// its end-of-stream scan, at 128 times this value; past that, the rest of
+    /// the stream goes unscanned and the request records the bypass.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -505,7 +509,9 @@ pub struct AliyunAiGuardrailConfig {
     /// `/v1/chat/completions`) and no output guardrail in the chain uses
     /// `buffer_full`, whose rows alone then set the cap. Counts assistant
     /// text, reasoning, and tool-call arguments; SSE and JSON framing is not
-    /// counted.
+    /// counted. Also bounds what a stream under `monitor` mode accumulates for
+    /// its end-of-stream scan, at 128 times this value; past that, the rest of
+    /// the stream goes unscanned and the request records the bypass.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -594,7 +600,10 @@ pub struct PiiConfig {
     // Aliyun buffer_full parameters.
     /// Max bytes of model-generated content held back from a streamed response
     /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
-    /// and tool-call arguments; SSE and JSON framing is not counted.
+    /// and tool-call arguments; SSE and JSON framing is not counted. Also bounds
+    /// what a stream under `monitor` mode accumulates for its end-of-stream
+    /// scan, at 128 times this value; past that, the rest of the stream goes
+    /// unscanned and the request records the bypass.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -683,7 +692,10 @@ pub struct LakeraConfig {
     // uses the buffer_full policy on the output hook, like kind=pii.
     /// Max bytes of model-generated content held back from a streamed response
     /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
-    /// and tool-call arguments; SSE and JSON framing is not counted.
+    /// and tool-call arguments; SSE and JSON framing is not counted. Also bounds
+    /// what a stream under `monitor` mode accumulates for its end-of-stream
+    /// scan, at 128 times this value; past that, the rest of the stream goes
+    /// unscanned and the request records the bypass.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -815,7 +827,10 @@ pub struct PresidioConfig {
     // hook, like kind=pii.
     /// Max bytes of model-generated content held back from a streamed response
     /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
-    /// and tool-call arguments; SSE and JSON framing is not counted.
+    /// and tool-call arguments; SSE and JSON framing is not counted. Also bounds
+    /// what a stream under `monitor` mode accumulates for its end-of-stream
+    /// scan, at 128 times this value; past that, the rest of the stream goes
+    /// unscanned and the request records the bypass.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -956,7 +971,10 @@ pub struct SemanticConfig {
     // kind=pii and kind=presidio.
     /// Max bytes of model-generated content held back from a streamed response
     /// before `on_buffer_exceeded` applies. Counts assistant text, reasoning,
-    /// and tool-call arguments; SSE and JSON framing is not counted.
+    /// and tool-call arguments; SSE and JSON framing is not counted. Also bounds
+    /// what a stream under `monitor` mode accumulates for its end-of-stream
+    /// scan, at 128 times this value; past that, the rest of the stream goes
+    /// unscanned and the request records the bypass.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
@@ -1079,7 +1097,9 @@ pub struct CustomConfig {
     /// `/v1/chat/completions`) and no output guardrail in the chain uses
     /// `buffer_full`, whose rows alone then set the cap. Counts assistant
     /// text, reasoning, and tool-call arguments; SSE and JSON framing is not
-    /// counted.
+    /// counted. Also bounds what a stream under `monitor` mode accumulates for
+    /// its end-of-stream scan, at 128 times this value; past that, the rest of
+    /// the stream goes unscanned and the request records the bypass.
     #[serde(default = "default_acs_max_buffer_bytes")]
     #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
