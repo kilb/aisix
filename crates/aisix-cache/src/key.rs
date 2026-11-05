@@ -150,6 +150,18 @@ impl CacheKey {
         self
     }
 
+    /// The routing tags that steer this request to a target, when they do. An
+    /// answer belongs to the target that produced it, so requests with
+    /// different tags must not share an entry on either layer. Rides `extras`,
+    /// under a name no request field can have, so a key without tags keeps the
+    /// fingerprint it always had.
+    pub fn with_routing_tags(mut self, tags: Option<String>) -> Self {
+        if let Some(tags) = tags {
+            self.extras.push(("\0routing_tags".to_string(), tags));
+        }
+        self
+    }
+
     /// Hex-encoded 128-bit fingerprint, used as the cache backend's lookup
     /// key. See the module docs for why it is not `DefaultHasher`.
     pub fn fingerprint(&self) -> String {
@@ -512,6 +524,21 @@ mod tests {
             CacheKey::from_request(&a).fingerprint(),
             CacheKey::from_request(&b).fingerprint(),
         );
+    }
+
+    #[test]
+    fn routing_tags_separate_entries_and_their_absence_changes_nothing() {
+        let key = || CacheKey::from_request(&req("m", vec![ChatMessage::user("hi")], None));
+        let plain = key().fingerprint();
+        assert_eq!(key().with_routing_tags(None).fingerprint(), plain);
+
+        let eu = key().with_routing_tags(Some("eu".to_string()));
+        let us = key().with_routing_tags(Some("us".to_string()));
+        assert_ne!(eu.fingerprint(), us.fingerprint());
+        assert_ne!(eu.fingerprint(), plain);
+        // The semantic layer partitions on this one: a near match from another
+        // target must not qualify.
+        assert_ne!(eu.scope_fingerprint(), us.scope_fingerprint());
     }
 
     #[test]

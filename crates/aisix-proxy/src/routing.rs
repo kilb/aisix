@@ -1587,6 +1587,51 @@ fn targets_allowed_for_ip<'a>(
     std::borrow::Cow::Owned(targets.iter().filter(|t| allowed(t)).cloned().collect())
 }
 
+/// The caller's routing tags, when they can steer this model to a different
+/// target. A cached answer came from whichever target those tags selected, so
+/// they belong in the cache key: `eu` and `us` must not share an entry, and
+/// neither must two models a `premium` tag chooses between. `None` otherwise,
+/// so tags a model ignores cannot fragment its cache.
+pub(crate) fn cache_vary_tags(model: &Model, tags: &[String]) -> Option<String> {
+    let routing = model.routing.as_ref()?;
+    if tags.is_empty() || !routing.targets.iter().any(RoutingTarget::has_tags) {
+        return None;
+    }
+    let mut tags = tags.to_vec();
+    tags.sort_unstable();
+    tags.dedup();
+    Some(tags.join(","))
+}
+
+/// Refuse a caller no routing target admits, for an answer that will not reach
+/// [`resolve_attempt_models`]: a cache hit dispatches nothing, and an allowlist
+/// on a member has to hold for it all the same. Only the IP half of that walk;
+/// a target that names nothing is left for dispatch to report.
+pub(crate) fn check_member_ip_access(
+    snapshot: &AisixSnapshot,
+    virtual_name: &str,
+    model: &Model,
+    tags: &[String],
+    source_ip: &str,
+) -> Result<(), ProxyError> {
+    let Some(routing) = model.routing.as_ref() else {
+        return Ok(());
+    };
+    let eligible = eligible_targets(&routing.targets, tags);
+    let admitted = eligible.is_empty()
+        || eligible.iter().any(|t| {
+            snapshot
+                .models
+                .get_by_name(&t.model_ref(snapshot))
+                .is_none_or(|entry| entry.value.ip_allowed(source_ip))
+        });
+    if admitted {
+        Ok(())
+    } else {
+        Err(ProxyError::ModelIpRestricted(virtual_name.to_string()))
+    }
+}
+
 /// Drop the targets whose provider key has an exhausted `provider_key`
 /// budget (or, in strict mode, any budget it can no longer verify). With
 /// every target dropped, the request is refused with the budget's own

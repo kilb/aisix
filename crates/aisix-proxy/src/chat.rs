@@ -2854,11 +2854,14 @@ async fn dispatch(
                 CacheScope::ApiKey => Some(auth.entry.id.as_str()),
                 CacheScope::Env => None,
             };
-            Some(CacheKey::from_request(req).with_scope(
-                &entry.id,
-                entry.value.purge_generation,
-                scope_api_key,
-            ))
+            Some(
+                CacheKey::from_request(req)
+                    .with_scope(&entry.id, entry.value.purge_generation, scope_api_key)
+                    .with_routing_tags(crate::routing::cache_vary_tags(
+                        &virtual_entry.value,
+                        &client.routing_tags,
+                    )),
+            )
         }
         _ => None,
     };

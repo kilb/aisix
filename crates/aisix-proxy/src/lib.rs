@@ -6116,6 +6116,105 @@ data: [DONE]\n\n";
         assert_eq!(v["choices"][0]["message"]["content"], "cached");
     }
 
+    /// An exhausted budget refuses ahead of a remote check on chat as on every
+    /// sibling, or it keeps buying moderation calls it can never use.
+    #[tokio::test]
+    async fn an_exhausted_budget_refuses_before_a_remote_check_runs() {
+        let moderation = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(&moderation)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap("http://127.0.0.1:1");
+        snap.models.insert(model_entry_with_rate_limit(
+            "rl-open",
+            serde_json::json!({}),
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["rl-open"]));
+        let budget: aisix_core::models::Budget = serde_json::from_value(serde_json::json!({
+            "scope": "api_key",
+            "scope_ref": "key-id-1",
+            "period": "month",
+            "exhausted": {"reason": {"message": "monthly cap exceeded"}}
+        }))
+        .unwrap();
+        snap.budgets.insert(ResourceEntry::new("b-1", budget, 1));
+        let row: aisix_core::Guardrail = serde_json::from_str(&format!(
+            r#"{{"name":"textmod","kind":"azure_content_safety_text_moderation","hook_point":"input","endpoint":"{}","api_key":"k"}}"#,
+            moderation.uri()
+        ))
+        .unwrap();
+        seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-remote", row, 1));
+        let state = build_state(snap, hub);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"rl-open","messages":[{"role":"user","content":"go"}]}"#,
+            ))
+            .unwrap();
+        let resp = run(build_router(state), req).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        moderation.verify().await;
+    }
+
+    /// `message.refusal` beside an ordinary `stop` is the OpenAI shape of a
+    /// refusal. One refusal must not become minutes of replayed refusal.
+    #[tokio::test]
+    async fn a_chat_refusal_reported_on_the_message_is_not_cached() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-refused",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": null, "refusal": "I can't."},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(2)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        seed_cache_policy(&snap, "test-cache");
+        let state = build_state_with_cache(snap, hub);
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        for _ in 0..2 {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let resp = run(build_router(state.clone()), req).await;
+            assert_eq!(
+                resp.headers()
+                    .get("x-aisix-cache")
+                    .and_then(|v| v.to_str().ok()),
+                Some("miss"),
+            );
+        }
+    }
+
     /// Regression for #88. On a cache hit the DP must surface the
     /// cached response's prompt + completion tokens on a dedicated
     /// `cache_hit_saved_*` pair so the control plane can multiply by its pricing

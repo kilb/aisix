@@ -53,38 +53,78 @@ pub(crate) struct UnstorableAnswer;
 ///   image. `/v1/messages` and `/v1/responses` discard the images, so what they
 ///   would keep is the answer without them, which for an image-only answer is
 ///   an empty message replayed for the policy's whole TTL.
-/// - A content-filter refusal stays out for the reason a non-200 does: one
-///   refusal would become minutes of replayed refusal for a request a later
-///   attempt may well answer.
+/// - A refusal stays out for the reason a non-200 does: one refusal would
+///   become minutes of replayed refusal for a request a later attempt may well
+///   answer. The upstream says so with a content-filter finish, or on the
+///   OpenAI shape with `message.refusal` beside an ordinary `stop`.
 pub(crate) fn answer_is_storable(answer: &ChatResponse) -> bool {
     answer.finish_reason != FinishReason::ContentFilter
-        && !answer.messages().any(|m| m.extra.contains_key("images"))
+        && !answer.messages().any(|m| {
+            m.extra.contains_key("images")
+                || m.extra
+                    .get("refusal")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|refusal| !refusal.is_empty())
+        })
 }
 
-/// [`answer_is_storable`]'s refusal half for a body relayed from a native
-/// upstream, which never became a [`ChatResponse`]: `stop_reason: "refusal"` on
-/// a Messages answer (<https://docs.anthropic.com/en/api/messages>),
-/// `incomplete_details.reason: "content_filter"` on a Responses one
-/// (<https://platform.openai.com/docs/api-reference/responses/object>). Each
-/// field exists in one protocol only, so one check serves both endpoints.
-pub(crate) fn body_is_refusal(body: &[u8]) -> bool {
+/// [`answer_is_storable`] for a body relayed from a native upstream, which
+/// never became a [`ChatResponse`]. Each field exists in one protocol only, so
+/// one check serves both endpoints:
+///
+/// - `stop_reason: "refusal"` on a Messages answer
+///   (<https://docs.anthropic.com/en/api/messages>);
+/// - on a Responses object
+///   (<https://platform.openai.com/docs/api-reference/responses/object>),
+///   `incomplete_details.reason: "content_filter"` or a `refusal` output part;
+/// - a Responses object that is not an answer yet or at all: a 200 can carry
+///   `status: "failed"`, and `background: true` answers `queued`. Replaying
+///   either for the whole TTL would turn one upstream hiccup, or one
+///   submission, into every later caller's result.
+pub(crate) fn body_is_storable(body: &[u8]) -> bool {
     #[derive(serde::Deserialize)]
     struct Incomplete {
         reason: Option<String>,
     }
     #[derive(serde::Deserialize)]
+    struct Part {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Item {
+        // Only a message item carries an array here.
+        content: Option<serde_json::Value>,
+    }
+    #[derive(serde::Deserialize)]
     struct Answer {
         stop_reason: Option<String>,
+        status: Option<String>,
         incomplete_details: Option<Incomplete>,
+        output: Option<Vec<Item>>,
     }
     let Ok(answer) = serde_json::from_slice::<Answer>(body) else {
-        return false;
+        return true;
     };
-    answer.stop_reason.as_deref() == Some("refusal")
-        || answer
+    let refused_part = |item: &Item| {
+        item.content.clone().is_some_and(|content| {
+            serde_json::from_value::<Vec<Part>>(content).is_ok_and(|parts| {
+                parts
+                    .iter()
+                    .any(|part| part.kind.as_deref() == Some("refusal"))
+            })
+        })
+    };
+    answer.stop_reason.as_deref() != Some("refusal")
+        && answer
+            .status
+            .as_deref()
+            .is_none_or(|status| matches!(status, "completed" | "incomplete"))
+        && answer
             .incomplete_details
             .and_then(|d| d.reason)
-            .is_some_and(|reason| reason == "content_filter")
+            .is_none_or(|reason| reason != "content_filter")
+        && !answer.output.iter().flatten().any(refused_part)
 }
 
 /// What the cache did for one request, as the usage event reports it.
@@ -173,15 +213,18 @@ impl BodyCache {
     /// `key_material` is the endpoint's canonical request identity. Callers
     /// pass the fields that change the upstream answer; `serde_json`'s maps
     /// are sorted, so a serialized request body is already independent of
-    /// the caller's JSON key order.
+    /// the caller's JSON key order. A closure because it serializes the whole
+    /// request, and most deployments have no policy to compute it for.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn resolve(
         state: &ProxyState,
         snapshot: &AisixSnapshot,
         auth: &AuthenticatedKey,
-        headers: Option<&axum::http::HeaderMap>,
+        client: &crate::client_ip::ClientContext,
         endpoint: &str,
         model_name: &str,
-        key_material: &str,
+        model: &aisix_core::Model,
+        key_material: impl FnOnce() -> String,
     ) -> Option<Self> {
         // Same match rule as the chat gate: the first enabled policy whose
         // `applies_to` accepts (model, caller). A policy has no endpoint
@@ -205,15 +248,21 @@ impl BodyCache {
             CacheScope::Env => "",
         };
         let generation = entry.value.purge_generation.to_string();
-        let key = body_fingerprint(&[
+        let key_material = key_material();
+        let vary_tags = crate::routing::cache_vary_tags(model, &client.routing_tags);
+        let mut parts = vec![
             endpoint,
             model_name,
-            key_material,
+            &key_material,
             &entry.id,
             &generation,
             scope_api_key,
-        ]);
-        let directives = crate::chat::cache_control_directives_of(headers);
+        ];
+        // Only when present, so every entry of a model routing tags cannot
+        // steer keeps its fingerprint.
+        parts.extend(vary_tags.as_deref());
+        let key = body_fingerprint(&parts);
+        let directives = crate::chat::cache_control_directives_of(Some(client.headers.as_ref()));
         Some(Self {
             cache,
             key,
@@ -341,23 +390,85 @@ mod tests {
             .extra
             .insert("images".to_string(), serde_json::json!([]));
         assert!(!answer_is_storable(&with_images));
+
+        // The OpenAI shape reports a refusal beside an ordinary `stop`.
+        let mut refused = answer(FinishReason::Stop);
+        refused
+            .message
+            .extra
+            .insert("refusal".to_string(), serde_json::json!("I can't help."));
+        assert!(!answer_is_storable(&refused));
+        let mut no_refusal = answer(FinishReason::Stop);
+        no_refusal
+            .message
+            .extra
+            .insert("refusal".to_string(), serde_json::Value::Null);
+        assert!(answer_is_storable(&no_refusal));
+    }
+
+    /// The key material serializes the whole request, and most deployments have
+    /// no cache policy to compute it for.
+    #[test]
+    fn with_no_policy_the_key_material_is_never_computed() {
+        let snap = AisixSnapshot::new();
+        let state = crate::ProxyState::new(
+            aisix_core::snapshot::SnapshotHandle::new(snap.clone()),
+            Arc::new(aisix_gateway::Hub::new()),
+            &serde_json::from_value::<aisix_core::ProxyConfig>(serde_json::json!({
+                "addr": "127.0.0.1:0"
+            }))
+            .unwrap(),
+        );
+        let key: aisix_core::ApiKey =
+            serde_json::from_value(serde_json::json!({"key_hash": "h"})).unwrap();
+        let auth = AuthenticatedKey::new(
+            &snap,
+            Arc::new(aisix_core::resource::ResourceEntry::new("k", key, 1)),
+            None,
+            false,
+        );
+        let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "m",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "pk",
+        }))
+        .unwrap();
+        let gate = BodyCache::resolve(
+            &state,
+            &snap,
+            &auth,
+            &crate::client_ip::ClientContext::default(),
+            "/v1/embeddings",
+            "m",
+            &model,
+            || panic!("computed the key for a request no policy covers"),
+        );
+        assert!(gate.is_none());
     }
 
     #[test]
-    fn a_relayed_refusal_is_recognised_on_both_protocols() {
-        for refusal in [
+    fn a_relayed_body_that_is_not_an_answer_is_not_stored() {
+        for not_stored in [
             r#"{"type":"message","stop_reason":"refusal","content":[]}"#,
             r#"{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}"#,
+            r#"{"status":"failed","error":{"code":"server_error"}}"#,
+            r#"{"status":"queued"}"#,
+            r#"{"status":"in_progress"}"#,
+            r#"{"status":"cancelled"}"#,
+            r#"{"status":"completed","output":[{"type":"message","content":[{"type":"refusal","refusal":"no"}]}]}"#,
         ] {
-            assert!(body_is_refusal(refusal.as_bytes()), "{refusal}");
+            assert!(!body_is_storable(not_stored.as_bytes()), "{not_stored}");
         }
-        for answer in [
+        for stored in [
             r#"{"type":"message","stop_reason":"end_turn","content":[]}"#,
             r#"{"status":"completed","incomplete_details":null}"#,
             r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}"#,
+            r#"{"status":"completed","output":[{"type":"reasoning","content":null},{"type":"message","content":[{"type":"output_text","text":"hi"}]}]}"#,
+            r#"{"data":[{"embedding":[0.1]}]}"#,
             "not json",
         ] {
-            assert!(!body_is_refusal(answer.as_bytes()), "{answer}");
+            assert!(body_is_storable(stored.as_bytes()), "{stored}");
         }
     }
 }

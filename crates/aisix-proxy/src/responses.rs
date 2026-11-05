@@ -258,7 +258,7 @@ async fn store_in_cache(
         .as_ref()
         .map(|u| (u.prompt_tokens, u.completion_tokens))
         .unwrap_or((0, 0));
-    if !crate::response_cache::body_is_refusal(&bytes) {
+    if crate::response_cache::body_is_storable(&bytes) {
         gate.store(aisix_cache::CachedBody {
             content_type,
             body: bytes.to_vec(),
@@ -960,13 +960,21 @@ async fn dispatch(
             state,
             snapshot,
             auth,
-            Some(client.headers.as_ref()),
+            client,
             "/v1/responses",
             &model_name,
-            &body.to_string(),
+            &model_entry.value,
+            || body.to_string(),
         )
     };
     if let Some(gate) = cache_gate.as_ref() {
+        crate::routing::check_member_ip_access(
+            snapshot,
+            &model_name,
+            &model_entry.value,
+            &client.routing_tags,
+            &client.source_ip,
+        )?;
         if let Some(hit) = gate.lookup().await {
             if let Some(r) = reservation.take() {
                 r.commit_tokens_no_spend(0).await;
@@ -6165,6 +6173,184 @@ mod tests {
             first_body, second_body,
             "the Responses object must be replayed byte for byte",
         );
+    }
+
+    fn responses_cache_policy() -> ResourceEntry<aisix_core::CachePolicy> {
+        let policy: aisix_core::CachePolicy = serde_json::from_str(
+            r#"{"name":"resp-cache","enabled":true,"backend":"memory","ttl_seconds":60,"applies_to":"all"}"#,
+        )
+        .unwrap();
+        ResourceEntry::new("cp-1", policy, 1)
+    }
+
+    /// 一个 200 里的 `status: "failed"` 是上游的一次失败，不是答案；`queued` 是
+    /// 一次提交的回执。存进缓存就是把它们重放给之后整个 TTL 里的调用方。
+    #[tokio::test]
+    async fn a_response_object_that_is_not_an_answer_is_not_cached() {
+        for body in [
+            serde_json::json!({
+                "id": "resp_failed",
+                "object": "response",
+                "status": "failed",
+                "error": {"code": "server_error", "message": "boom"},
+                "output": []
+            }),
+            serde_json::json!({
+                "id": "resp_queued",
+                "object": "response",
+                "status": "queued",
+                "output": []
+            }),
+            // Refused through a part, with an ordinary `completed` status.
+            serde_json::json!({
+                "id": "resp_refused",
+                "object": "response",
+                "status": "completed",
+                "output": [{"type": "message", "content": [{"type": "refusal", "refusal": "no"}]}],
+                "usage": {"input_tokens": 9, "output_tokens": 4, "total_tokens": 13}
+            }),
+        ] {
+            let upstream = MockServer::builder().start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/responses"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+                .expect(2)
+                .mount(&upstream)
+                .await;
+            let snap = new_snap_openai(&upstream.uri());
+            snap.models.insert(openai_model("gpt-4o-resp"));
+            snap.apikeys.insert(apikey_entry(&["*"]));
+            snap.cache_policies.insert(responses_cache_policy());
+            let app = build_app_with_cache(snap);
+            let request = serde_json::json!({"model": "gpt-4o-resp", "input": "hi"});
+
+            for _ in 0..2 {
+                let resp = app
+                    .clone()
+                    .oneshot(make_req(request.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{body}");
+                assert_eq!(
+                    resp.headers()
+                        .get(crate::chat::CACHE_HEADER)
+                        .map(|v| v.to_str().unwrap()),
+                    Some("miss"),
+                    "{body}"
+                );
+            }
+        }
+    }
+
+    /// 成员的 `allowed_cidrs` 对缓存命中同样有效：chat 在查缓存之前就解析了目标，
+    /// 这里曾经是查完缓存才解析，于是被排除的地址能读到别人填进去的答案。
+    #[tokio::test]
+    async fn a_cache_hit_answers_to_a_members_ip_allowlist() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_cached",
+                "object": "response",
+                "status": "completed",
+                "output": [],
+                "usage": {"input_tokens": 9, "output_tokens": 4, "total_tokens": 13}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let snap = new_snap_openai(&upstream.uri());
+        let member: Model = serde_json::from_str(&format!(
+            r#"{{"display_name":"member","provider":"openai","model_name":"gpt-4o","provider_key_id":"{OPENAI_PK_ID}","allowed_cidrs":["10.0.0.0/8"]}}"#
+        ))
+        .unwrap();
+        snap.models
+            .insert(ResourceEntry::new("m-member", member, 1));
+        snap.models.insert(routing_model("group", "member"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.cache_policies.insert(responses_cache_policy());
+        let app = build_app_with_cache(snap);
+        let from = |ip: &str| {
+            let mut req = make_req(serde_json::json!({"model": "group", "input": "hi"}));
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(std::net::SocketAddr::new(
+                    ip.parse().unwrap(),
+                    40000,
+                )));
+            req
+        };
+
+        let filled = app.clone().oneshot(from("10.1.1.1")).await.unwrap();
+        assert_eq!(filled.status(), StatusCode::OK);
+        let hit = app.clone().oneshot(from("10.1.1.2")).await.unwrap();
+        assert_eq!(
+            hit.headers()
+                .get(crate::chat::CACHE_HEADER)
+                .map(|v| v.to_str().unwrap()),
+            Some("hit"),
+            "the entry has to be there for the next assertion to mean anything"
+        );
+        let outside = app.oneshot(from("8.8.8.8")).await.unwrap();
+        assert_eq!(outside.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// 路由标签选的是目标，答案属于产生它的那个目标。
+    #[tokio::test]
+    async fn requests_tagged_for_different_targets_do_not_share_a_cache_entry() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_cached",
+                "object": "response",
+                "status": "completed",
+                "output": [],
+                "usage": {"input_tokens": 9, "output_tokens": 4, "total_tokens": 13}
+            })))
+            .expect(2)
+            .mount(&upstream)
+            .await;
+        let snap = new_snap_openai(&upstream.uri());
+        for name in ["member-eu", "member-us"] {
+            let member: Model = serde_json::from_str(&format!(
+                r#"{{"display_name":"{name}","provider":"openai","model_name":"gpt-4o","provider_key_id":"{OPENAI_PK_ID}"}}"#
+            ))
+            .unwrap();
+            snap.models
+                .insert(ResourceEntry::new(format!("m-{name}"), member, 1));
+        }
+        let group: Model = serde_json::from_str(
+            r#"{"display_name":"group","routing":{"strategy":"failover","targets":[
+                {"model":"member-eu","tags":["eu"]},{"model":"member-us","tags":["us"]}
+            ]}}"#,
+        )
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-group", group, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.cache_policies.insert(responses_cache_policy());
+        let app = build_app_with_cache(snap);
+        let tagged = |tag: &str| {
+            let mut req = make_req(serde_json::json!({"model": "group", "input": "hi"}));
+            req.headers_mut()
+                .insert(crate::client_ip::ROUTING_TAGS_HEADER, tag.parse().unwrap());
+            req
+        };
+        let status = |resp: &axum::response::Response| {
+            resp.headers()
+                .get(crate::chat::CACHE_HEADER)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+
+        let eu = app.clone().oneshot(tagged("eu")).await.unwrap();
+        assert_eq!(status(&eu).as_deref(), Some("miss"));
+        let us = app.clone().oneshot(tagged("us")).await.unwrap();
+        assert_eq!(
+            status(&us).as_deref(),
+            Some("miss"),
+            "another target's answer"
+        );
+        let eu_again = app.oneshot(tagged("eu")).await.unwrap();
+        assert_eq!(status(&eu_again).as_deref(), Some("hit"));
     }
 
     /// #719 (the core fix): a configured INPUT guardrail that blocks on

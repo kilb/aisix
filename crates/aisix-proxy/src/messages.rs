@@ -827,13 +827,36 @@ async fn dispatch(
             state,
             snapshot,
             auth,
-            Some(client.headers.as_ref()),
+            client,
             "/v1/messages",
             &model_name,
-            &body.to_string(),
+            &model_entry.value,
+            || {
+                // The upstream reads these beside the body: a beta can change
+                // the answer, or be what makes the request valid at all.
+                let betas = client
+                    .headers
+                    .get_all("anthropic-beta")
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                if betas.is_empty() {
+                    body.to_string()
+                } else {
+                    format!("{body}\nanthropic-beta: {betas}")
+                }
+            },
         )
     };
     if let Some(gate) = cache_gate.as_ref() {
+        crate::routing::check_member_ip_access(
+            snapshot,
+            &model_name,
+            &model_entry.value,
+            &client.routing_tags,
+            &client.source_ip,
+        )?;
         if let Some(hit) = gate.lookup().await {
             // No upstream call, so nothing was consumed.
             if let Some(r) = reservation.take() {
@@ -4245,7 +4268,7 @@ async fn store_in_cache(
             return outcome;
         }
     };
-    if !crate::response_cache::body_is_refusal(&bytes) {
+    if crate::response_cache::body_is_storable(&bytes) {
         gate.store(aisix_cache::CachedBody {
             content_type,
             body: bytes.to_vec(),
@@ -6252,6 +6275,116 @@ mod tests {
             "the Anthropic envelope must be replayed byte for byte — a hit \
              rebuilt from a chat-shaped struct would drop whatever fields \
              the gateway does not itself read",
+        );
+    }
+
+    /// `anthropic-beta` goes upstream beside the body: a beta can change the
+    /// answer, or be what makes the request valid at all, so a caller without it
+    /// must not be handed the answer one with it got.
+    #[tokio::test]
+    async fn requests_with_different_betas_do_not_share_a_cache_entry() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_response()))
+            .expect(2)
+            .mount(&upstream)
+            .await;
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("claude-haiku"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.cache_policies.insert(memory_cache_policy());
+        let app = build_app_with_cache(snap);
+        let body = serde_json::json!({
+            "model": "claude-haiku",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 100
+        });
+        let with_beta = |beta: Option<&str>| {
+            let mut req = make_req(body.clone());
+            if let Some(beta) = beta {
+                req.headers_mut()
+                    .insert("anthropic-beta", beta.parse().unwrap());
+            }
+            req
+        };
+        let status = |resp: &axum::response::Response| {
+            resp.headers()
+                .get(crate::chat::CACHE_HEADER)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+
+        let plain = app.clone().oneshot(with_beta(None)).await.unwrap();
+        assert_eq!(status(&plain).as_deref(), Some("miss"));
+        let beta = app
+            .clone()
+            .oneshot(with_beta(Some("interleaved-thinking-2025-05-14")))
+            .await
+            .unwrap();
+        assert_eq!(status(&beta).as_deref(), Some("miss"));
+        let again = app.oneshot(with_beta(None)).await.unwrap();
+        assert_eq!(status(&again).as_deref(), Some("hit"));
+    }
+
+    /// A member's `allowed_cidrs` holds for a cache hit too: chat resolves its
+    /// targets before the cache, and this route used to do it after.
+    #[tokio::test]
+    async fn a_cache_hit_answers_to_a_members_ip_allowlist() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_response()))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let snap = new_snap_anthropic(&upstream.uri());
+        let member: Model = serde_json::from_str(&format!(
+            r#"{{"display_name":"member","provider":"anthropic","model_name":"claude-3-haiku-20240307","provider_key_id":"{ANTHROPIC_PK_ID}","allowed_cidrs":["10.0.0.0/8"]}}"#
+        ))
+        .unwrap();
+        snap.models
+            .insert(ResourceEntry::new("m-member", member, 1));
+        let group: Model = serde_json::from_str(
+            r#"{"display_name":"group","routing":{"strategy":"failover","targets":[{"model":"member"}]}}"#,
+        )
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-group", group, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.cache_policies.insert(memory_cache_policy());
+        let app = build_app_with_cache(snap);
+        let from = |ip: &str| {
+            let mut req = make_req(serde_json::json!({
+                "model": "group",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 100
+            }));
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(std::net::SocketAddr::new(
+                    ip.parse().unwrap(),
+                    40000,
+                )));
+            req
+        };
+
+        assert_eq!(
+            app.clone()
+                .oneshot(from("10.1.1.1"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let hit = app.clone().oneshot(from("10.1.1.2")).await.unwrap();
+        assert_eq!(
+            hit.headers()
+                .get(crate::chat::CACHE_HEADER)
+                .map(|v| v.to_str().unwrap()),
+            Some("hit"),
+            "the entry has to be there for the next assertion to mean anything"
+        );
+        assert_eq!(
+            app.oneshot(from("8.8.8.8")).await.unwrap().status(),
+            StatusCode::FORBIDDEN
         );
     }
 

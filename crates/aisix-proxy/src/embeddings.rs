@@ -654,20 +654,30 @@ async fn dispatch(
         state,
         snapshot,
         auth,
-        Some(client_ctx.headers.as_ref()),
+        client_ctx,
         "/v1/embeddings",
         &body.model,
-        &serde_json::json!({
-            "input": &body.input,
-            "encoding_format": &body.encoding_format,
-            "dimensions": &body.dimensions,
-            "input_type": &body.input_type,
-            "embedding_types": &body.embedding_types,
-            "extra": &body.extra,
-        })
-        .to_string(),
+        &model_entry.value,
+        || {
+            serde_json::json!({
+                "input": &body.input,
+                "encoding_format": &body.encoding_format,
+                "dimensions": &body.dimensions,
+                "input_type": &body.input_type,
+                "embedding_types": &body.embedding_types,
+                "extra": &body.extra,
+            })
+            .to_string()
+        },
     );
     if let Some(gate) = gate.as_ref() {
+        crate::routing::check_member_ip_access(
+            snapshot,
+            &body.model,
+            &model_entry.value,
+            &client_ctx.routing_tags,
+            &client_ctx.source_ip,
+        )?;
         if let Some(hit) = gate.lookup().await {
             // The upstream was never called, so nothing was consumed —
             // release the reservation without spending tokens, exactly as
@@ -2189,6 +2199,81 @@ mod tests {
             first_body, second_body,
             "a cache hit must replay the stored body byte for byte",
         );
+    }
+
+    /// A member's `allowed_cidrs` holds for a cache hit too, and routing tags
+    /// keep one target's vectors from answering for another's: a group can
+    /// tag models of different dimensions, and nothing would error.
+    #[tokio::test]
+    async fn a_group_cache_hit_answers_to_member_allowlists_and_routing_tags() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .expect(2)
+            .mount(&upstream)
+            .await;
+        let snap = new_snap(&upstream.uri());
+        for (name, cidrs) in [("embed-a", "10.0.0.0/8"), ("embed-b", "10.0.0.0/8")] {
+            let member: Model = serde_json::from_str(&format!(
+                r#"{{"display_name":"{name}","provider":"openai","model_name":"text-embedding-3-small","provider_key_id":"{PK_ID}","allowed_cidrs":["{cidrs}"]}}"#
+            ))
+            .unwrap();
+            snap.models
+                .insert(ResourceEntry::new(format!("m-{name}"), member, 1));
+        }
+        let group: Model = serde_json::from_str(
+            r#"{"display_name":"embed-group","routing":{"strategy":"failover","targets":[
+                {"model":"embed-a","tags":["a"]},{"model":"embed-b","tags":["b"]}
+            ]}}"#,
+        )
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-group", group, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let policy: aisix_core::CachePolicy = serde_json::from_str(
+            r#"{"name":"embed-cache","enabled":true,"backend":"memory","ttl_seconds":60,"applies_to":"all"}"#,
+        )
+        .unwrap();
+        snap.cache_policies
+            .insert(ResourceEntry::new("cp-1", policy, 1));
+        let app = build_app_with_cache(snap);
+        let request = |ip: &str, tag: &str| {
+            let mut req = make_req(serde_json::json!({"model": "embed-group", "input": "hello"}));
+            req.headers_mut()
+                .insert(crate::client_ip::ROUTING_TAGS_HEADER, tag.parse().unwrap());
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(std::net::SocketAddr::new(
+                    ip.parse().unwrap(),
+                    40000,
+                )));
+            req
+        };
+        let cache_status = |resp: &axum::response::Response| {
+            resp.headers()
+                .get(crate::chat::CACHE_HEADER)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+
+        let a = tower::ServiceExt::oneshot(app.clone(), request("10.1.1.1", "a"))
+            .await
+            .unwrap();
+        assert_eq!(cache_status(&a).as_deref(), Some("miss"));
+        let b = tower::ServiceExt::oneshot(app.clone(), request("10.1.1.1", "b"))
+            .await
+            .unwrap();
+        assert_eq!(
+            cache_status(&b).as_deref(),
+            Some("miss"),
+            "another target's vectors"
+        );
+        let hit = tower::ServiceExt::oneshot(app.clone(), request("10.1.1.2", "a"))
+            .await
+            .unwrap();
+        assert_eq!(cache_status(&hit).as_deref(), Some("hit"));
+        let outside = tower::ServiceExt::oneshot(app, request("8.8.8.8", "a"))
+            .await
+            .unwrap();
+        assert_eq!(outside.status(), StatusCode::FORBIDDEN);
     }
 
     /// A different `input` under the same policy is a different entry — the
