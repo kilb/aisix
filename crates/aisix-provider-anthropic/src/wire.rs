@@ -3907,6 +3907,48 @@ struct ToolCallState {
     name: String,
     content_block_index: usize,
     started: bool,
+    /// Argument fragments that arrived before the block could start.
+    pending_arguments: String,
+}
+
+impl ToolCallState {
+    /// Open this call's `tool_use` block at the next index.
+    fn start(&mut self, next_block_index: &mut usize, events: &mut Vec<AnthropicSseEvent>) {
+        self.started = true;
+        self.content_block_index = *next_block_index;
+        *next_block_index += 1;
+        events.push(AnthropicSseEvent {
+            event: "content_block_start",
+            data: serde_json::json!({
+                "type": "content_block_start",
+                "index": self.content_block_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": self.id,
+                    "name": self.name,
+                    "input": {},
+                },
+            }),
+        });
+    }
+
+    /// Write the argument fragments not yet on the wire.
+    fn flush_arguments(&mut self, events: &mut Vec<AnthropicSseEvent>) {
+        if self.pending_arguments.is_empty() {
+            return;
+        }
+        events.push(AnthropicSseEvent {
+            event: "content_block_delta",
+            data: serde_json::json!({
+                "type": "content_block_delta",
+                "index": self.content_block_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": std::mem::take(&mut self.pending_arguments),
+                },
+            }),
+        });
+    }
 }
 
 /// State machine for re-encoding a stream of internal `ChatChunk`s as
@@ -4150,6 +4192,7 @@ impl AnthropicSseEncoder {
                         name: String::new(),
                         content_block_index: 0,
                         started: false,
+                        pending_arguments: String::new(),
                     });
 
                 if !id.is_empty() {
@@ -4162,37 +4205,12 @@ impl AnthropicSseEncoder {
                 // Emit content_block_start once id and name are known.
                 // The index is taken here, not when the call is first seen,
                 // so a thinking block opening in between keeps them in order.
+                state.pending_arguments.push_str(arguments);
                 if !state.started && !state.id.is_empty() && !state.name.is_empty() {
-                    state.started = true;
-                    state.content_block_index = self.next_block_index;
-                    self.next_block_index += 1;
-                    events.push(AnthropicSseEvent {
-                        event: "content_block_start",
-                        data: serde_json::json!({
-                            "type": "content_block_start",
-                            "index": state.content_block_index,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": state.id,
-                                "name": state.name,
-                                "input": {},
-                            },
-                        }),
-                    });
+                    state.start(&mut self.next_block_index, &mut events);
                 }
-
-                if state.started && !arguments.is_empty() {
-                    events.push(AnthropicSseEvent {
-                        event: "content_block_delta",
-                        data: serde_json::json!({
-                            "type": "content_block_delta",
-                            "index": state.content_block_index,
-                            "delta": {
-                                "type": "input_json_delta",
-                                "partial_json": arguments,
-                            },
-                        }),
-                    });
+                if state.started {
+                    state.flush_arguments(&mut events);
                 }
             }
         }
@@ -4325,6 +4343,15 @@ impl AnthropicSseEncoder {
     /// reasoning held while a tool_use block was open as a thinking block
     /// of its own.
     fn close_open_blocks(&mut self, events: &mut Vec<AnthropicSseEvent>) {
+        // A call whose upstream never sent an id still happened: the stop
+        // reason says so, and the block needs one to be answered by.
+        for (index, state) in self.tool_calls.iter_mut() {
+            if !state.started && !state.name.is_empty() {
+                state.id = format!("toolu_{}_{index}", self.message_id);
+                state.start(&mut self.next_block_index, events);
+                state.flush_arguments(events);
+            }
+        }
         let mut open: Vec<usize> = Vec::new();
         open.extend(self.thinking_block_index.take());
         open.extend(self.text_block_index.take());
@@ -8688,6 +8715,72 @@ mod tests {
         assert_eq!(
             json["content"][0],
             serde_json::json!({"type": "thinking", "thinking": "6 times 7", "signature": ""})
+        );
+    }
+
+    fn tool_delta(call: serde_json::Value, finish: Option<FinishReason>) -> ChatChunk {
+        ChatChunk {
+            choice_index: 0,
+            logprobs: None,
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                tool_calls: Some(vec![call]),
+                ..Default::default()
+            },
+            finish_reason: finish,
+            usage: Some(UsageStats::new(1, 1)),
+            service_tier: None,
+            accounting_usage: None,
+        }
+    }
+
+    fn input_of(events: &[AnthropicSseEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|e| e.data["delta"]["partial_json"].as_str())
+            .collect()
+    }
+
+    /// Fragments ahead of the call's name are part of its input.
+    #[test]
+    fn arguments_ahead_of_the_tool_blocks_start_are_kept() {
+        let mut enc = AnthropicSseEncoder::new("msg_1", "m", 0);
+        let mut events = enc.next_events(&tool_delta(
+            serde_json::json!({"index": 0, "function": {"arguments": "{\"a\""}}),
+            None,
+        ));
+        events.extend(enc.next_events(&tool_delta(
+            serde_json::json!({"index": 0, "id": "call_1", "function": {"name": "f", "arguments": ":1}"}}),
+            Some(FinishReason::ToolCalls),
+        )));
+        assert_eq!(input_of(&events), "{\"a\":1}");
+    }
+
+    /// An upstream that never names an id still made the call the stop reason
+    /// reports: the block goes out with one of the gateway's.
+    #[test]
+    fn a_call_with_no_id_still_opens_its_block() {
+        let mut enc = AnthropicSseEncoder::new("msg_1", "m", 0);
+        let events = enc.next_events(&tool_delta(
+            serde_json::json!({"index": 0, "function": {"name": "f", "arguments": "{}"}}),
+            Some(FinishReason::ToolCalls),
+        ));
+        let start = events
+            .iter()
+            .find(|e| e.event == "content_block_start")
+            .expect("the block opens");
+        assert_eq!(start.data["content_block"]["name"], "f");
+        assert_eq!(start.data["content_block"]["id"], "toolu_msg_1_0");
+        assert_eq!(input_of(&events), "{}");
+        assert!(events.iter().any(|e| e.event == "content_block_stop"));
+        assert_eq!(
+            events
+                .iter()
+                .find(|e| e.event == "message_delta")
+                .expect("the message closes")
+                .data["delta"]["stop_reason"],
+            "tool_use"
         );
     }
 
