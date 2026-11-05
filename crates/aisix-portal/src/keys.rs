@@ -52,16 +52,15 @@ pub async fn create(
     // 余额不足时新密钥直接建成停用态。见模块注释：否则每建一把就白送一轮
     // 对账周期的推理。
     let ledger = Ledger::new(st.store.clone());
+    let born_disabled = ledger.balance(&uid).await.unwrap_or(0) <= 0;
     // 频率限制。放在写配置之前 —— 挡住的正是「循环铸密钥把网关按在重载上」。
-    if !st.mint_allowed(&uid).await {
+    if !st.mint_allowed(&uid, !born_disabled).await {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(json!({"error": "创建过于频繁，请稍后再试"})),
         )
             .into_response();
     }
-
-    let born_disabled = ledger.balance(&uid).await.unwrap_or(0) <= 0;
 
     let plaintext = mint_plaintext();
     let hash = sha256_hex(&plaintext);
@@ -136,14 +135,28 @@ pub async fn create(
         .await;
 
     if born_disabled && result.is_ok() {
-        // 生下来就停着的也是门户停的：有了额度要归对账环启用。记不上只是它不会
-        // 自动启用（方向是安全的），所以不让这次铸造失败 —— 明文已经生成了。
+        // 生下来就停着的也是门户停的：有了额度要归对账环启用。记不上的话它补了额也
+        // 永远停着，而界面上说的是「发放额度后会自动启用」—— 那就不算建成：明文不交出去，
+        // 配置里这一行也撤掉。撤不掉也无妨，没人拿着它的明文。
         if let Err(e) = st
             .store
             .record_portal_disabled(std::slice::from_ref(&display_name), &[])
             .await
         {
-            eprintln!("记录门户停用的密钥失败，{display_name} 补额后不会自动启用: {e}");
+            eprintln!("记录门户停用的密钥失败，撤回 {display_name}: {e}");
+            let dn = display_name.clone();
+            let _ = st
+                .resources()
+                .edit(move |doc| {
+                    let keys = resources::api_keys_mut(doc);
+                    let before = keys.len();
+                    keys.retain(|k| {
+                        k.get("display_name").and_then(Value::as_str) != Some(dn.as_str())
+                    });
+                    keys.len() != before
+                })
+                .await;
+            return server_error("密钥没有建成，请重试");
         }
     }
 

@@ -71,6 +71,20 @@ pub fn tick_secs() -> u64 {
         .unwrap_or(DEFAULT_TICK_SECS)
 }
 
+/// 原地打乱（Fisher–Yates）。
+fn shuffle<T>(v: &mut [T]) {
+    for i in (1..v.len()).rev() {
+        let j = (rand_core::RngCore::next_u64(&mut rand_core::OsRng) % (i as u64 + 1)) as usize;
+        v.swap(i, j);
+    }
+}
+
+/// 一轮里读消费最多花多久。超过之后这一轮剩下的人当成读不到，写配置照常走。
+#[cfg(not(test))]
+const READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+#[cfg(test)]
+const READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// 没有任何变化的用户隔多久推一次对账时刻。见 [`Sweeper::tick`]。
 const IDLE_SETTLE_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
 
@@ -186,8 +200,36 @@ pub struct Sweeper<S: ConsumptionSource> {
     ledger: Ledger,
     source: S,
     resources: crate::resources::Writer,
-    /// 第几轮了。决定这一轮从谁读起，见 [`Sweeper::tick`]。
-    round: std::sync::atomic::AtomicUsize,
+    /// 配置已经写了、`portal_disabled_keys` 还没记上的增删。写库失败时留在这里，下一轮
+    /// 连同新的一起再记；记上之前，它们照样算数（见 [`Sweeper::tick`]）。
+    ///
+    /// 不留的话，一次写库失败就让一把门户停掉的密钥从此不归门户：主人补多少额都不开。
+    pending_ours: std::sync::Mutex<OursChange>,
+}
+
+/// 对 `portal_disabled_keys` 的一批增删。
+#[derive(Default)]
+struct OursChange {
+    add: Vec<String>,
+    remove: Vec<String>,
+}
+
+impl OursChange {
+    /// 按发生的先后并进来：后来的一笔盖过先前的。
+    fn merge(&mut self, add: Vec<String>, remove: Vec<String>) {
+        for n in add {
+            self.remove.retain(|x| x != &n);
+            if !self.add.contains(&n) {
+                self.add.push(n);
+            }
+        }
+        for n in remove {
+            self.add.retain(|x| x != &n);
+            if !self.remove.contains(&n) {
+                self.remove.push(n);
+            }
+        }
+    }
 }
 
 impl<S: ConsumptionSource> Sweeper<S> {
@@ -197,7 +239,7 @@ impl<S: ConsumptionSource> Sweeper<S> {
             store,
             source,
             resources,
-            round: std::sync::atomic::AtomicUsize::new(0),
+            pending_ours: std::sync::Mutex::default(),
         }
     }
 
@@ -205,15 +247,11 @@ impl<S: ConsumptionSource> Sweeper<S> {
     pub async fn tick(&self, now: DateTime<Utc>) -> Result<TickReport, StoreError> {
         let mut r = TickReport::default();
         let mut users = self.store.all_users().await?;
-        // 每轮换一个人打头。读数卡住时这一轮后面的人都不读（见下），固定顺序的话，
-        // 总卡在同一个人身上时排在他后面的人就永远轮不到。
-        if !users.is_empty() {
-            let start = self
-                .round
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let start = start % users.len();
-            users.rotate_left(start);
-        }
+        // 每轮打乱顺序。读数卡住或用完预算时，这一轮后面的人都不读（见下）。按固定
+        // 顺序、哪怕每轮挪一格，总卡在同一个人身上时紧跟他的那几个人也几乎轮不到；打乱
+        // 之后每个人排在他前面的机会都是一半。
+        shuffle(&mut users);
+        let reads_started = std::time::Instant::now();
         // 读数卡住了没有。Prometheus 接了连接却不答的话，每个人都要耗满超时，而写
         // 配置排在所有人读完之后 —— 一轮要跑上个把小时，这期间谁也停不掉。这一轮里
         // 后面的人当成读不到（游标不动，下一轮补上），写配置照常走。
@@ -225,7 +263,9 @@ impl<S: ConsumptionSource> Sweeper<S> {
             // 这一轮的差额全按这份依据算；入账时在事务里再核对一遍（见 `settle`）。
             let basis = self.store.billing_basis(&u.id).await?;
             let since = basis.counted_through().unwrap_or(now);
-            let read = if stuck {
+            // 答得慢却答得上的 Prometheus 不算卡住，可每人十秒，两千个人就是五个多小时，
+            // 写配置（停账号、停密钥）一直排在后面。所以读数还有一个总预算。
+            let read = if stuck || reads_started.elapsed() >= READ_BUDGET {
                 None
             } else {
                 let started = std::time::Instant::now();
@@ -410,7 +450,14 @@ impl<S: ConsumptionSource> Sweeper<S> {
 
         // 必须先于配置读：表里记着的密钥，这样才一定已经在下面读到的文档里（铸密钥
         // 是先写配置再记表），不会被当成「已经不在了」撤掉。
-        let portal_off = self.store.portal_disabled_keys().await?;
+        let mut portal_off = self.store.portal_disabled_keys().await?;
+        {
+            let pending = self.pending_ours.lock().unwrap_or_else(|e| e.into_inner());
+            portal_off.extend(pending.add.iter().cloned());
+            for n in &pending.remove {
+                portal_off.remove(n);
+            }
+        }
         let mut state = KeyStateChange::default();
         let wrote = self
             .resources
@@ -426,10 +473,33 @@ impl<S: ConsumptionSource> Sweeper<S> {
             Ok(_) => {
                 r.disabled = state.disabled;
                 r.reenabled = state.reenabled;
-                if !state.ours_added.is_empty() || !state.ours_removed.is_empty() {
-                    self.store
-                        .record_portal_disabled(&state.ours_added, &state.ours_removed)
-                        .await?;
+                if !state.left_to_operator.is_empty() {
+                    eprintln!(
+                        "升级时已经停着的密钥按运维停的算，补了额也不会自动启用；确认是门户停的就\
+                         在控制台里打开: {}",
+                        state.left_to_operator.join(", ")
+                    );
+                }
+                let change = {
+                    let mut pending = self.pending_ours.lock().unwrap_or_else(|e| e.into_inner());
+                    pending.merge(state.ours_added, state.ours_removed);
+                    std::mem::take(&mut *pending)
+                };
+                if !change.add.is_empty() || !change.remove.is_empty() {
+                    if let Err(e) = self
+                        .store
+                        .record_portal_disabled(&change.add, &change.remove)
+                        .await
+                    {
+                        // 配置已经写了。记不上就留着下一轮再记，这期间照样算数。
+                        eprintln!("登记门户停用的密钥失败，下一轮重试: {e}");
+                        r.write_failures += 1;
+                        let mut pending =
+                            self.pending_ours.lock().unwrap_or_else(|e| e.into_inner());
+                        let newer = std::mem::take(&mut *pending);
+                        *pending = change;
+                        pending.merge(newer.add, newer.remove);
+                    }
                 }
             }
             Err(e) => {
@@ -797,6 +867,8 @@ struct KeyStateChange {
     ours_added: Vec<String>,
     /// 不再归门户名下的：已经启用了，或者密钥已经不在配置里。
     ours_removed: Vec<String>,
+    /// 升级后第一轮看到的、已经停着的有主密钥。门户证明不了是自己停的，按运维停的算。
+    left_to_operator: Vec<String>,
 }
 
 /// 把期望的启停状态落到文档里。返回是否改过；明细记在 `out` 里。
@@ -849,10 +921,12 @@ fn apply_key_state_to(
                 .map(|(_, want)| (uid, *want))
         });
         if let Some((uid, user_want)) = user_want {
+            // 升级时就停着的：门户证明不了是自己停的，一律按运维停的算 —— 宁可补了额不开，
+            // 也不能把运维停掉的（比如泄漏了的）密钥打开。登记这一轮只点名，不认领。
             if seeding && now {
-                out.ours_added.push(name.clone());
+                out.left_to_operator.push(name.clone());
             }
-            let ours = seeding || portal_off.contains(&name);
+            let ours = portal_off.contains(&name);
             // 这把密钥自己有没有花超。取更严的一侧 —— 用户还有余额，但这把的子额度
             // 用完了，同样要停。
             let want = user_want || exhausted.contains(&name);
@@ -1694,19 +1768,93 @@ api_keys:
 
     /// 升级之前门户停掉的密钥没有记录。第一轮要把它们认下来，否则补了额也回不来。
     #[tokio::test]
-    async fn 升级之前就停着的密钥_补额后照常启用() {
+    async fn 升级之前就停着的密钥_算运维停的_补额也不启用() {
         let f = fx().await;
         mark_disabled(&f.path, "a");
         f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
         assert!(read_disabled(&f.path, &f.uid), "前提：没余额，继续停着");
 
+        // 门户证明不了是自己停的。补额也不开：开错一把运维停掉的密钥比少开一把糟得多。
         f.ledger
             .credit(&f.uid, 5_000_000, Source::AdminGrant, None)
             .await
             .unwrap();
         let r = f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
-        assert_eq!(r.reenabled, 1);
+        assert_eq!(r.reenabled, 0);
+        assert!(read_disabled(&f.path, &f.uid));
+    }
+
+    /// 运维在升级前停掉一把泄漏的密钥，主人有余额。升级后哪一轮都不能把它打开 —— 运维
+    /// 再停一次也一样。
+    #[tokio::test]
+    async fn 升级前运维停掉的密钥_升级后哪一轮都不开() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 5_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        mark_disabled(&f.path, "a");
+        for at in ["2026-08-26T10:00:00Z", "2026-08-26T10:00:15Z"] {
+            let r = f.sw.tick(t(at)).await.unwrap();
+            assert_eq!(r.reenabled, 0, "{at}");
+            assert!(
+                read_disabled(&f.path, &f.uid),
+                "{at} 把运维停掉的密钥打开了"
+            );
+        }
+        operator_disables(&f.path, "a");
+        f.sw.tick(t("2026-08-26T10:00:30Z")).await.unwrap();
+        assert!(read_disabled(&f.path, &f.uid));
+    }
+
+    /// 配置写了、登记停用的那一笔没写进库：这把密钥仍然归门户，补额后照常打开。
+    #[tokio::test]
+    async fn 登记停用失败的那一轮之后_补额照样启用() {
+        let f = fx().await;
+        f.ledger
+            .credit(&f.uid, 1_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_record BEFORE INSERT ON portal_disabled_keys
+             BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(f.store.pool())
+        .await
+        .unwrap();
+        f.src.set_increase(1_200_000);
+        let r = f.sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
+        assert!(read_disabled(&f.path, &f.uid), "前提：花超后门户停了它");
+        assert_eq!(r.write_failures, 1, "登记失败要算进写失败");
+
+        sqlx::query("DROP TRIGGER fail_record")
+            .execute(f.store.pool())
+            .await
+            .unwrap();
+        f.ledger
+            .credit(&f.uid, 5_000_000, Source::AdminGrant, None)
+            .await
+            .unwrap();
+        f.src.set_increase(0);
+        let r = f.sw.tick(t("2026-08-26T10:00:30Z")).await.unwrap();
+        assert_eq!(r.reenabled, 1, "{r:?}");
         assert!(!read_disabled(&f.path, &f.uid));
+        // 另一个人（没余额）的 b 是门户停的，还在；a 已经开了，不再归门户。
+        let left = f.store.portal_disabled_keys().await.unwrap();
+        assert_eq!(left, ["b".to_string()].into(), "{left:?}");
+    }
+
+    #[test]
+    fn 增删按先后并起来() {
+        let mut c = OursChange::default();
+        c.merge(vec!["x".into()], vec![]);
+        c.merge(vec![], vec!["x".into()]);
+        assert!(c.add.is_empty());
+        assert_eq!(c.remove, ["x"]);
+        c.merge(vec!["x".into()], vec![]);
+        assert_eq!(c.add, ["x"]);
+        assert!(c.remove.is_empty());
     }
 
     /// 门户停过又启用之后，这把密钥就不再归它：之后运维再停，同样不动。
@@ -1773,10 +1921,75 @@ api_keys:
             "读数卡住时账号停用没有落下去"
         );
 
-        sw.tick(t("2026-08-26T10:00:15Z")).await.unwrap();
+        // 每轮打乱：总卡在某一个人身上时，别人排在他前面的机会是一半。二十轮里两个人
+        // 都得当过头一个（都碰不上的概率约百万分之二）。
+        for i in 0..19 {
+            sw.tick(t("2026-08-26T10:00:15Z") + chrono::TimeDelta::seconds(i))
+                .await
+                .unwrap();
+        }
         let asked = src.asked.lock().unwrap().clone();
-        assert_eq!(asked.len(), 2);
-        assert_ne!(asked[0], asked[1], "每轮还是同一个人打头");
+        assert_eq!(asked.len(), 20, "卡住之后还在一个个读");
+        for u in [&f.uid, &f.other] {
+            assert!(asked.contains(u), "{u} 二十轮里一次都没轮到: {asked:?}");
+        }
+    }
+
+    /// 总卡在某一个人身上时，任何一个别人排在他前面、这一轮读得到的机会都该是一半，
+    /// 不能是「紧跟他的那个人每 N 轮才轮到一次」。
+    #[test]
+    fn 打乱之后谁都有一半的机会排在卡住的人前面() {
+        let mut ahead = 0;
+        for _ in 0..2000 {
+            let mut v: Vec<usize> = (0..8).collect();
+            shuffle(&mut v);
+            let pos = |x| v.iter().position(|y| *y == x).unwrap();
+            if pos(3) < pos(2) {
+                ahead += 1;
+            }
+        }
+        assert!((800..1200).contains(&ahead), "{ahead} / 2000");
+    }
+
+    /// 答得上、但每次都慢。不算卡住，可总预算一到，后面的人这一轮就不读了。
+    #[derive(Default)]
+    struct SlowSource {
+        asked: std::sync::Mutex<usize>,
+    }
+
+    impl ConsumptionSource for Arc<SlowSource> {
+        async fn spend_series(
+            &self,
+            _user_id: &str,
+            _since: DateTime<Utc>,
+            _at: DateTime<Utc>,
+        ) -> Option<Vec<SpendSeries>> {
+            *self.asked.lock().unwrap() += 1;
+            tokio::time::sleep(READ_BUDGET / 2 + std::time::Duration::from_millis(50)).await;
+            Some(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn 读数答得慢时_总预算用完就不再读_停用照常落下() {
+        let f = fx().await;
+        f.store.set_user_disabled(&f.uid, true).await.unwrap();
+        for i in 3..8 {
+            f.store
+                .insert_user(&format!("u{i}"), &format!("u{i}@b.c"), "h", None)
+                .await
+                .unwrap();
+        }
+        let src = Arc::new(SlowSource::default());
+        let sw = Sweeper::new(
+            f.store.clone(),
+            src.clone(),
+            crate::resources::Writer::new(f.path.clone()),
+        );
+        let r = sw.tick(t("2026-08-26T10:00:00Z")).await.unwrap();
+        assert_eq!(*src.asked.lock().unwrap(), 2, "预算用完之后还在读");
+        assert_eq!(r.read_failures, 5);
+        assert!(read_disabled(&f.path, &f.uid), "账号停用没有落下去");
     }
 
     #[tokio::test]

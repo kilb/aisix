@@ -6,10 +6,9 @@
 --
 -- key_name 是 display_name，与 key_quotas 一致。
 --
--- `''` 是「还没登记过」的哨兵。升级之前门户停掉的密钥没有记录，不处理的话它们补了额
--- 也永远回不来。第一轮对账把当时已停用、且有主人的密钥全部登记成门户停的（此前能
--- 给这些密钥写 disabled 的基本只有门户），然后删掉哨兵。display_name 不能为空，
--- 撞不上真密钥。
+-- `''` 是「还没登记过」的哨兵。升级时已经停着的密钥，门户证明不了是自己停的，第一轮
+-- 对账把它们都算成运维停的（补了额也不启用），在日志里点名，然后删掉哨兵。
+-- display_name 不能为空，撞不上真密钥。
 CREATE TABLE portal_disabled_keys (
   key_name   TEXT PRIMARY KEY,
   updated_at TEXT NOT NULL

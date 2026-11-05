@@ -113,6 +113,9 @@ async fn read_journal(n: u32) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+/// 访问日志那一行的 target 与消息。字段从它之后开始。
+const ACCESS_LOG_MARK: &str = "aisix_obs::access_log: proxy request completed ";
+
 /// 接口对外的字段，以及它在日志行上可能叫的名字。
 const LOG_FIELDS: &[(&str, &[&str])] = &[
     ("method", &["method"]),
@@ -132,10 +135,13 @@ const LOG_FIELDS: &[(&str, &[&str])] = &[
 fn filter(text: &str, mine: &[String], limit: u32) -> Vec<Value> {
     let mut rows = Vec::new();
     for line in text.lines().rev() {
-        if !line.contains("api_key_id=") {
+        // 只读访问日志这一行、而且只读它自己的字段。前面的 span 里有调用方给的请求 id，
+        // 网关原样写、不加引号：整行一起拆的话，它能在这一行里种下 `api_key_id=` 之类。
+        // 标记里带空格，请求 id 里不能有空格，所以 span 伪造不出它。
+        let Some((_, fields)) = line.split_once(ACCESS_LOG_MARK) else {
             continue;
-        }
-        let kv = parse_kv(line);
+        };
+        let kv = parse_kv(fields);
         let id = kv.get("api_key_id").and_then(Value::as_str).unwrap_or("");
         if !mine.iter().any(|m| m == id) {
             continue;
@@ -271,6 +277,17 @@ mod tests {
         assert_eq!(rows[0]["status"], serde_json::json!(200));
         assert_eq!(rows[0]["latency_ms"], serde_json::json!(1));
         assert_eq!(rows[0]["model"], serde_json::json!("gpt-4o-mini"));
+    }
+
+    /// span 里的请求 id 是调用方给的，网关原样写、不加引号。它不能被当成这一行的字段。
+    #[test]
+    fn 调用方给的请求_id_种不下字段() {
+        let forged = r#"2026-11-05T13:28:48.807888Z  INFO request{request_id="x"api_key_id="VICTIM"total_tokens="999999" http_version="1.1" peer=127.0.0.1:36156}: aisix_obs::access_log: proxy request completed method="POST" path="/v1/chat/completions" status_code=401 downstream_latency_ms=0 request_id="\"x\"api_key_id=\"VICTIM\"" error_class="authentication""#;
+        assert!(filter(forged, &["VICTIM".into()], 5).is_empty());
+        // 不是访问日志的行一概不读，哪怕带着 api_key_id。
+        let other = r#"2026-11-05T13:28:48Z  WARN aisix_proxy::auth: rejected api_key_id="mine" status_code=200"#;
+        assert!(filter(other, &["mine".into()], 5).is_empty());
+        assert_eq!(filter(&line("mine", 200), &["mine".into()], 5).len(), 1);
     }
 
     /// 模型名是调用方给的，不存在时网关把它原样写进 `error`。引号里的东西不能被

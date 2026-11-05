@@ -950,6 +950,68 @@ mod abuse_tests {
         assert_eq!(codes, [201, 201, 429]);
     }
 
+    /// 已注册的邮箱反复提交（每次 409）不占注册名额。
+    #[tokio::test]
+    async fn 注册失败不占全站名额() {
+        let store = Store::open_memory().await.unwrap();
+        let state = AppState::with_admin_token(store, 4, None).with_register_max(2);
+        let base = serve(state).await;
+        let http = reqwest::Client::new();
+        let reg = |email: &'static str| {
+            let http = http.clone();
+            let url = format!("{base}/api/register");
+            async move {
+                http.post(url)
+                    .json(&json!({"email": email, "password": "correct horse battery"}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            }
+        };
+        assert_eq!(reg("taken@b.c").await, 201);
+        for _ in 0..5 {
+            assert_eq!(reg("taken@b.c").await, 409);
+        }
+        assert_eq!(reg("new@b.c").await, 201, "重复提交把名额用掉了");
+        assert_eq!(reg("third@b.c").await, 429);
+    }
+
+    /// 白开的账号把全站名额用完之后，有余额的用户照样能铸。
+    #[tokio::test]
+    async fn 全站名额用完时_有余额的用户照样能铸() {
+        let prom = FakeProm::start().await;
+        let path = temp_resources("api_keys: []\n");
+        let app = TestApp::start_with_usage(&prom, &path).await;
+        for u in 0..6 {
+            let email = format!("free{u}@b.c");
+            app.register(&email, "correct horse battery").await;
+            app.post(
+                "/api/login",
+                json!({"email": email, "password": "correct horse battery"}),
+            )
+            .await;
+            for _ in 0..10 {
+                assert_eq!(app.post("/api/keys", json!({"label": "k"})).await.0, 201);
+            }
+        }
+        let paid = app.register("paid@b.c", "correct horse battery").await;
+        let (s, _) = app
+            .post_admin(
+                &format!("/admin/users/{paid}/quota"),
+                json!({"micro_usd": 5_000_000}),
+            )
+            .await;
+        assert_eq!(s, 200);
+        app.post(
+            "/api/login",
+            json!({"email": "paid@b.c", "password": "correct horse battery"}),
+        )
+        .await;
+        assert_eq!(app.post("/api/keys", json!({"label": "k"})).await.0, 201);
+    }
+
     /// 单用户十把一分钟；账号是免费的，所以全站还有一道总数的上限。
     #[tokio::test]
     async fn 开一批账号一起铸也有上限() {
@@ -1033,6 +1095,42 @@ mod label_tests {
         }
         let (s, _) = app.post("/api/keys", json!({"label": "我的 密钥-1"})).await;
         assert_eq!(s, 201);
+    }
+}
+
+#[cfg(test)]
+mod mint_record_tests {
+    use super::testutil::{temp_resources, FakeProm, TestApp};
+    use serde_json::json;
+
+    /// 生下来就停着的那把，登记不上就补了额也永远停着。那就不算建成：不给明文，配置里
+    /// 也不留它。
+    #[tokio::test]
+    async fn 登记不上的停用密钥不交出明文() {
+        let prom = FakeProm::start().await;
+        let path = temp_resources("api_keys: []\n");
+        let app = TestApp::start_with_usage(&prom, &path).await;
+        app.register("a@b.c", "correct horse battery").await;
+        app.post(
+            "/api/login",
+            json!({"email": "a@b.c", "password": "correct horse battery"}),
+        )
+        .await;
+        sqlx::query(
+            "CREATE TRIGGER fail_record BEFORE INSERT ON portal_disabled_keys
+             BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(app.store.pool())
+        .await
+        .unwrap();
+        let (s, body) = app.post("/api/keys", json!({"label": "k"})).await;
+        assert_eq!(s, 500, "{body}");
+        assert!(!body.contains("sk-aisix-"), "{body}");
+        assert!(
+            !app.read_resources().contains("portal-"),
+            "{}",
+            app.read_resources()
+        );
     }
 }
 

@@ -214,8 +214,9 @@ impl AppState {
     /// 一个登录用户循环调这个接口，就能让网关一直在重载。
     ///
     /// 按用户记，一个人铸得再多也占不了别人的份额。全站还有一道总数的上限：账号是
-    /// 免费注册的，光按用户限的话，开一批账号就能把网关按在重载上。
-    pub async fn mint_allowed(&self, user_id: &str) -> bool {
+    /// 免费注册的，光按用户限的话，开一批账号就能把网关按在重载上。有余额的用户
+    /// （`funded`）不受这道总数约束：它挡的是白开的账号，不能让它们把付了钱的人挡在外面。
+    pub async fn mint_allowed(&self, user_id: &str, funded: bool) -> bool {
         let now = now_secs();
         let mut m = self.mints.write().await;
         m.retain(|_, v| {
@@ -223,7 +224,7 @@ impl AppState {
             !v.is_empty()
         });
         let total: usize = m.values().map(Vec::len).sum();
-        if total as u64 >= u64::from(self.mint_max) * u64::from(MINT_GLOBAL_FACTOR) {
+        if !funded && total as u64 >= u64::from(self.mint_max) * u64::from(MINT_GLOBAL_FACTOR) {
             return false;
         }
         let v = m.entry(user_id.to_string()).or_default();
@@ -246,6 +247,12 @@ impl AppState {
         }
         r.push_back(now);
         true
+    }
+
+    /// 这次注册没成（邮箱已被占用、写库失败）：名额还回去。不还的话，拿已注册的邮箱
+    /// 反复提交就能把所有人的注册挡上一分钟。
+    async fn release_registration(&self) {
+        self.registrations.lock().await.pop_back();
     }
 
     /// 排队进 argon2 的闸，等不到就是 `None`。
@@ -398,15 +405,21 @@ pub async fn register(State(st): State<AppState>, Json(req): Json<RegisterReq>) 
     let pw = req.password.clone();
     let hash = match tokio::task::spawn_blocking(move || hash_password(&pw)).await {
         Ok(Ok(h)) => h,
-        Ok(Err(_)) | Err(_) => return server_error("口令散列失败"),
+        Ok(Err(_)) | Err(_) => {
+            st.release_registration().await;
+            return server_error("口令散列失败");
+        }
     };
 
     let id = uuid::Uuid::new_v4().to_string();
-    match st
+    let inserted = st
         .store
         .insert_user(&id, &email, &hash, req.display_name.as_deref())
-        .await
-    {
+        .await;
+    if inserted.is_err() {
+        st.release_registration().await;
+    }
+    match inserted {
         Ok(()) => (StatusCode::CREATED, Json(json!({"user_id": id}))).into_response(),
         // 唯一约束冲突是可预期的用户错误，不是服务端故障。
         Err(StoreError::EmailTaken) => {
