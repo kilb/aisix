@@ -128,6 +128,37 @@ const MODELS: Record<string, { pk: Record<string, string>; provider: string; mod
 
 const MAPPED_MODEL = "adaptive-mapped-effort";
 
+// Provider keys whose request defaults the upstream receives as well: a sampling
+// value that Claude 4.6 does not take beside thinking, and a thinking of the
+// operator's own.
+const KEYED: Record<string, { pk: Record<string, unknown>; provider: string; model_name: string }> = {
+  "keyed-temperature-anthropic": {
+    pk: { ...ANTHROPIC_PK, request: { default_body_fields: { temperature: 0.2 } } },
+    provider: "anthropic",
+    model_name: "claude-opus-4-6",
+  },
+  "keyed-temperature-vertex": {
+    pk: { ...VERTEX_PK, request: { default_body_fields: { temperature: 0.2 } } },
+    provider: "google",
+    model_name: "claude-opus-4-6",
+  },
+  "keyed-temperature-bedrock": {
+    pk: { ...BEDROCK_PK, request: { default_body_fields: { temperature: 0.2 } } },
+    provider: "bedrock",
+    model_name: "us.anthropic.claude-opus-4-6-v1:0",
+  },
+  "keyed-top-k-anthropic": {
+    pk: { ...ANTHROPIC_PK, request: { default_body_fields: { top_k: 40 } } },
+    provider: "anthropic",
+    model_name: "claude-sonnet-4-6",
+  },
+  "keyed-thinking-anthropic": {
+    pk: { ...ANTHROPIC_PK, request: { default_body_fields: { thinking: { type: "disabled" } } } },
+    provider: "anthropic",
+    model_name: "claude-opus-4-6",
+  },
+};
+
 describe("a caller's reasoning effort on a Claude model that takes adaptive thinking", () => {
   let app: SpawnedApp | undefined;
   let upstream: Server | undefined;
@@ -180,7 +211,7 @@ describe("a caller's reasoning effort on a Claude model that takes adaptive thin
       logstore: LOGSTORE,
       credential_ref: CREDENTIAL_REF,
     });
-    for (const [display_name, model] of Object.entries(MODELS)) {
+    for (const [display_name, model] of [...Object.entries(MODELS), ...Object.entries(KEYED)]) {
       const pk = await seed.createProviderKey({
         display_name: `${display_name}-pk`,
         api_base: `http://127.0.0.1:${addr.port}`,
@@ -206,7 +237,10 @@ describe("a caller's reasoning effort on a Claude model that takes adaptive thin
       provider_key_id: mappedPk.id,
       effort_mapping: { "": "high" },
     });
-    await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: [...Object.keys(MODELS), MAPPED_MODEL] });
+    await seed.createApiKey({
+      key_hash: CALLER_HASH,
+      allowed_models: [...Object.keys(MODELS), ...Object.keys(KEYED), MAPPED_MODEL],
+    });
     const probe = new ProxyClient(app.proxyUrl, CALLER);
     await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
   });
@@ -383,6 +417,37 @@ describe("a caller's reasoning effort on a Claude model that takes adaptive thin
     expect(out.status, out.raw).toBe(200);
     expect(sent.at(-1)!.body.output_config).toEqual({ effort: "high" });
     expect(sent.at(-1)!.body.thinking).toBeUndefined();
+    expect(sent.at(-1)!.body.max_tokens).toBe(ORDINARY_DEFAULT_MAX_TOKENS);
+  });
+  for (const [model, stream] of [
+    ["keyed-temperature-anthropic", false],
+    ["keyed-temperature-anthropic", true],
+    ["keyed-temperature-vertex", false],
+    ["keyed-temperature-vertex", true],
+    ["keyed-temperature-bedrock", false],
+    ["keyed-top-k-anthropic", false],
+  ] as const) {
+    test(`${model}${stream ? " stream" : ""}: a key's sampling default keeps the effort alone, as the caller's own does`, async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const out = await send("/v1/chat/completions", chat(model, stream ? { stream } : {}));
+      expect(out.status, out.raw).toBe(200);
+      const body = sent.at(-1)!.body;
+      expect(body.thinking).toBeUndefined();
+      expect(body.output_config).toEqual({ effort: "high" });
+      expect(body.max_tokens).toBe(ORDINARY_DEFAULT_MAX_TOKENS);
+      if (model === "keyed-top-k-anthropic") {
+        expect(body.top_k).toBe(40);
+      } else {
+        expect(body.temperature).toBe(0.2);
+      }
+    });
+  }
+
+  test("a key's own thinking default stands in place of the gateway's", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const out = await send("/v1/chat/completions", chat("keyed-thinking-anthropic"));
+    expect(out.status, out.raw).toBe(200);
+    expect(sent.at(-1)!.body.thinking).toEqual({ type: "disabled" });
     expect(sent.at(-1)!.body.max_tokens).toBe(ORDINARY_DEFAULT_MAX_TOKENS);
   });
 });

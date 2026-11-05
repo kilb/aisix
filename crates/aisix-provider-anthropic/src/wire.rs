@@ -1314,36 +1314,112 @@ fn reasoning_effort_into_anthropic(
         }
     }
     if effort_turns_on_thinking(req, extras, model) && !extras.contains_key("thinking") {
-        extras.insert(
-            "thinking".to_string(),
-            serde_json::json!({"type": "adaptive", "display": "summarized"}),
-        );
+        extras.insert("thinking".to_string(), gateway_thinking_block());
         return max_tokens.is_none().then_some(ADAPTIVE_THINKING_MAX_TOKENS);
     }
     None
+}
+
+/// The thinking block the gateway writes for a caller's effort.
+fn gateway_thinking_block() -> serde_json::Value {
+    serde_json::json!({"type": "adaptive", "display": "summarized"})
+}
+
+/// Whether these sampling values keep thinking off on `model`. Opus 4.6 and
+/// Sonnet 4.6 accept them only while thinking is off: "`temperature` and
+/// `top_k` are incompatible with thinking, and `top_p` is allowed at values
+/// between 0.95 and 1"
+/// (<https://platform.claude.com/docs/en/build-with-claude/thinking#sampling-parameters>).
+/// The families after them refuse those values with thinking on or off.
+fn sampling_excludes_thinking(
+    model: &str,
+    temperature: bool,
+    top_k: bool,
+    top_p: Option<f64>,
+) -> bool {
+    claude_family_version(model) == Some((4, 6))
+        && (temperature || top_k || top_p.is_some_and(|p| !(0.95..=1.0).contains(&p)))
+}
+
+/// Settle the thinking block the gateway wrote against the body the upstream
+/// will receive, once the provider key's request overrides have run. Those
+/// fill absent fields after the translation, so the gate in
+/// [`effort_turns_on_thinking`] cannot see them:
+///
+/// - a `thinking` among the key's `default_body_fields` is the operator's own
+///   statement, and stands in place of the gateway's, as it did before the
+///   gateway wrote one;
+/// - a sampling value the key added that keeps thinking off on this model
+///   withdraws the block, rather than becoming a 400.
+///
+/// Either way the `max_tokens` the block raised goes back to the ordinary
+/// default when the caller set none. A `thinking` the caller sent is left alone.
+pub fn settle_gateway_thinking(
+    req: &ChatFormat,
+    body: &mut serde_json::Value,
+    model: &str,
+    provider_key: &aisix_core::ProviderKey,
+) {
+    if req.extra.contains_key("thinking") {
+        return;
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    if obj.get("thinking") != Some(&gateway_thinking_block()) {
+        return;
+    }
+    let sent = |key: &str| obj.get(key).is_some_and(|v| !v.is_null());
+    let excluded = sampling_excludes_thinking(
+        model,
+        sent("temperature"),
+        sent("top_k"),
+        obj.get("top_p").and_then(serde_json::Value::as_f64),
+    );
+    let operators = provider_key
+        .request
+        .as_ref()
+        .and_then(|r| r.default_body_fields.get("thinking"))
+        .cloned();
+    match operators {
+        Some(thinking) => {
+            obj.insert("thinking".to_string(), thinking);
+        }
+        None if excluded => {
+            obj.remove("thinking");
+        }
+        None => return,
+    }
+    let caller_set_a_cap = req.max_tokens.is_some()
+        || req
+            .extra
+            .get("max_completion_tokens")
+            .is_some_and(|v| !v.is_null());
+    if !caller_set_a_cap {
+        obj.insert("max_tokens".to_string(), DEFAULT_MAX_TOKENS.into());
+    }
 }
 
 /// Whether this request's effort also writes adaptive thinking: the caller
 /// asked for it themselves ([`ChatFormat::thoughts_requested`], which an
 /// operator's `effort_mapping` does not set), and the model takes it.
 ///
-/// Opus 4.6 and Sonnet 4.6 are the exception. They accept these sampling
-/// parameters only while thinking is off: "`temperature` and `top_k` are
-/// incompatible with thinking, and `top_p` is allowed at values between 0.95
-/// and 1" (<https://platform.claude.com/docs/en/build-with-claude/thinking#sampling-parameters>).
-/// A request that sets one keeps the effort alone rather than becoming a 400.
-/// The families after them refuse those values with thinking on or off.
+/// A request whose own sampling keeps thinking off on the model
+/// ([`sampling_excludes_thinking`]) keeps the effort alone rather than becoming
+/// a 400. What a provider key adds later is settled by
+/// [`settle_gateway_thinking`].
 fn effort_turns_on_thinking(
     req: &ChatFormat,
     extras: &serde_json::Map<String, serde_json::Value>,
     model: &str,
 ) -> bool {
-    let sampling_excludes_thinking = claude_family_version(model) == Some((4, 6))
-        && (req.temperature.is_some()
-            || req.top_k.is_some()
-            || extras.contains_key("top_k")
-            || req.top_p.is_some_and(|p| !(0.95..=1.0).contains(&p)));
-    req.thoughts_requested && takes_adaptive_thinking(model) && !sampling_excludes_thinking
+    let excluded = sampling_excludes_thinking(
+        model,
+        req.temperature.is_some(),
+        req.top_k.is_some() || extras.contains_key("top_k"),
+        req.top_p,
+    );
+    req.thoughts_requested && takes_adaptive_thinking(model) && !excluded
 }
 
 /// Whether `model` names a Claude model that takes `thinking.type: "adaptive"`:
@@ -10387,6 +10463,103 @@ mod request_contract_tests {
             let body = effort_body(model, set);
             assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS, "{model}: {body}");
         }
+    }
+
+    fn settled(
+        model: &str,
+        defaults: serde_json::Value,
+        set: fn(&mut ChatFormat),
+    ) -> serde_json::Value {
+        let mut body = effort_body(model, set);
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("hi")]);
+        req.extra.insert("reasoning_effort".into(), "high".into());
+        req.thoughts_requested = true;
+        set(&mut req);
+        let key: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
+            "display_name": "k",
+            "secret": "s",
+            "request": {"default_body_fields": defaults},
+        }))
+        .unwrap();
+        aisix_provider_openai::overrides::apply_default_body_fields(
+            &mut body,
+            &key.request.as_ref().unwrap().default_body_fields,
+        );
+        settle_gateway_thinking(&req, &mut body, model, &key);
+        body
+    }
+
+    /// A provider key's sampling default that keeps thinking off on Claude 4.6
+    /// withdraws the gateway's block and its raised cap, as the caller's own
+    /// would have kept them from being written.
+    #[test]
+    fn a_keys_sampling_default_withdraws_the_gateways_block_on_claude_4_6() {
+        for defaults in [
+            serde_json::json!({"temperature": 0.2}),
+            serde_json::json!({"top_k": 40}),
+            serde_json::json!({"top_p": 0.5}),
+        ] {
+            for model in ["claude-opus-4-6", "claude-sonnet-4-6"] {
+                let body = settled(model, defaults.clone(), |_| {});
+                assert!(body.get("thinking").is_none(), "{model} {defaults}: {body}");
+                assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS, "{model}");
+                assert_eq!(body["output_config"]["effort"], "high", "{model}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_key_default_that_does_not_conflict_leaves_the_block() {
+        for (model, defaults) in [
+            ("claude-opus-4-6", serde_json::json!({"top_p": 0.97})),
+            ("claude-opus-4-6", serde_json::json!({"seed": 7})),
+            ("claude-opus-4-7", serde_json::json!({"temperature": 0.2})),
+        ] {
+            let body = settled(model, defaults, |_| {});
+            assert_eq!(body["thinking"], SUMMARIZED(), "{model}");
+            assert_eq!(body["max_tokens"], ADAPTIVE_THINKING_MAX_TOKENS, "{model}");
+        }
+    }
+
+    /// A `thinking` the operator set as a default is theirs to state, as it
+    /// was before the gateway wrote one.
+    #[test]
+    fn a_keys_thinking_default_stands_in_place_of_the_gateways() {
+        let body = settled(
+            "claude-opus-4-6",
+            serde_json::json!({"thinking": {"type": "disabled"}}),
+            |_| {},
+        );
+        assert_eq!(body["thinking"], serde_json::json!({"type": "disabled"}));
+        assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
+    }
+
+    #[test]
+    fn settling_keeps_a_callers_cap_and_a_callers_thinking() {
+        let capped = settled(
+            "claude-opus-4-6",
+            serde_json::json!({"temperature": 0.2}),
+            |req| req.max_tokens = Some(100),
+        );
+        assert!(capped.get("thinking").is_none(), "{capped}");
+        assert_eq!(capped["max_tokens"], 100);
+
+        let mut body = effort_body("claude-opus-4-6", |req| {
+            req.extra.insert("thinking".into(), SUMMARIZED());
+        });
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("hi")]);
+        req.extra.insert("thinking".into(), SUMMARIZED());
+        let key: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
+            "display_name": "k", "secret": "s",
+            "request": {"default_body_fields": {"temperature": 0.2}},
+        }))
+        .unwrap();
+        aisix_provider_openai::overrides::apply_default_body_fields(
+            &mut body,
+            &key.request.as_ref().unwrap().default_body_fields,
+        );
+        settle_gateway_thinking(&req, &mut body, "claude-opus-4-6", &key);
+        assert_eq!(body["thinking"], SUMMARIZED());
     }
 
     /// A caller's own cap stands whatever its value, under either name, and the

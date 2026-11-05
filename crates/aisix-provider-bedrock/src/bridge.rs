@@ -1522,6 +1522,12 @@ impl BedrockBridge {
             // keeps the final say and an override can never reintroduce a
             // URL-borne `model` into the /invoke body.
             apply_body_overrides(&mut body_value, ctx)?;
+            aisix_provider_anthropic::wire::settle_gateway_thinking(
+                &req,
+                &mut body_value,
+                anthropic_model,
+                &ctx.provider_key,
+            );
             if let Some(obj) = body_value.as_object_mut() {
                 shape_invoke_body(obj, &req, header_betas(ctx));
                 obj.remove("model");
@@ -4494,6 +4500,35 @@ mod tests {
                 assert_eq!(body["inferenceConfig"]["maxTokens"], cap, "{body}");
             }
         }
+    }
+
+    /// A key's sampling default that keeps thinking off on Claude 4.6 withdraws
+    /// the gateway's block from the InvokeModel body, and its raised cap with it.
+    #[tokio::test]
+    async fn a_keys_sampling_default_withdraws_the_gateways_thinking_on_invoke_model() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/invoke$"))
+            .respond_with(default_anthropic_response_template())
+            .mount(&server)
+            .await;
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("us.anthropic.claude-opus-4-6-v1:0"),
+            sample_pk_with_request_overrides(
+                serde_json::json!({"default_body_fields": {"temperature": 0.2}}),
+            ),
+        );
+        bridge
+            .chat(&asking_for_effort(None, false), &ctx)
+            .await
+            .unwrap();
+        let sent = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert!(body.get("thinking").is_none(), "{body}");
+        assert_eq!(body["temperature"], 0.2);
+        assert_eq!(body["max_tokens"], 4096);
     }
 
     /// With no block written Converse sends no cap of its own, as it always has.

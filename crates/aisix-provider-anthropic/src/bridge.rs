@@ -232,8 +232,10 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
 /// override block to it: `param_renames` → `param_constraints` →
 /// `default_body_fields`, as every other path to an Anthropic upstream
 /// does (the `/v1/messages` passthrough, `count_tokens`, Claude on
-/// Vertex AI). Shared by the streaming and non-streaming paths.
+/// Vertex AI). Shared by the streaming and non-streaming paths. The thinking
+/// the gateway wrote is then settled against what the overrides added.
 fn prepare_outbound_body(
+    req: &ChatFormat,
     body: &crate::wire::AnthropicRequest<'_>,
     ctx: &BridgeContext,
 ) -> Result<serde_json::Value, BridgeError> {
@@ -247,6 +249,12 @@ fn prepare_outbound_body(
         }
         apply_default_body_fields(&mut body, &r.default_body_fields);
     }
+    let model = body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    crate::wire::settle_gateway_thinking(req, &mut body, &model, &ctx.provider_key);
     Ok(body)
 }
 
@@ -420,7 +428,7 @@ impl Bridge for AnthropicBridge {
                 .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
             let mut body = build_request(&req, upstream, system, messages, false)?;
             apply_auto_prompt_caching(&mut body, &ctx.model);
-            outbound_bytes(&prepare_outbound_body(&body, ctx)?)?
+            outbound_bytes(&prepare_outbound_body(&req, &body, ctx)?)?
         };
         let synthetic_json_tool = matches!(
             structured_output_for(&req, upstream),
@@ -519,7 +527,7 @@ impl Bridge for AnthropicBridge {
                 .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
             let mut body = build_request(&req, upstream, system, messages, true)?;
             apply_auto_prompt_caching(&mut body, &ctx.model);
-            outbound_bytes(&prepare_outbound_body(&body, ctx)?)?
+            outbound_bytes(&prepare_outbound_body(&req, &body, ctx)?)?
         };
         // The owned request is not needed past its wire bytes.
         drop(req);
@@ -999,6 +1007,46 @@ data: {\"type\":\"message_stop\"}\n\n";
         }))
         .unwrap();
         BridgeContext::new("req-1", sample_model(), Arc::new(pk))
+    }
+
+    /// A key's sampling default that keeps thinking off on Claude 4.6 reaches
+    /// the body after the translation; the gateway's block yields to it on
+    /// both calls, and its raised cap goes with it.
+    #[tokio::test]
+    async fn a_keys_sampling_default_withdraws_the_gateways_thinking_on_the_direct_rail() {
+        let server = MockServer::builder().start().await;
+        mount_ok_nonstream(&server).await;
+        let pk: ProviderKey = serde_json::from_value(serde_json::json!({
+            "display_name": "anthropic-prod",
+            "secret": "sk-ant-test",
+            "api_base": server.uri(),
+            "request": {"default_body_fields": {"temperature": 0.2}},
+        }))
+        .unwrap();
+        let model: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "my-claude",
+            "provider": "anthropic",
+            "model_name": "claude-opus-4-6",
+            "provider_key_id": "11111111-1111-1111-1111-111111111111",
+        }))
+        .unwrap();
+        let ctx = BridgeContext::new("req-1", Arc::new(model), Arc::new(pk));
+        let mut asked = req();
+        asked.extra.insert("reasoning_effort".into(), "high".into());
+        asked.thoughts_requested = true;
+        let bridge = AnthropicBridge::new();
+        bridge.chat(&asked, &ctx).await.unwrap();
+        let _ = bridge.chat_stream(&asked, &ctx).await;
+
+        let sent = server.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 2);
+        for request in sent {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert!(body.get("thinking").is_none(), "{body}");
+            assert_eq!(body["temperature"], 0.2);
+            assert_eq!(body["max_tokens"], 4096);
+            assert_eq!(body["output_config"]["effort"], "high");
+        }
     }
 
     #[tokio::test]

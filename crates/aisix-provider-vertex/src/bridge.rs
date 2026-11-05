@@ -1206,6 +1206,12 @@ impl VertexBridge {
             // the final say and an override can never reintroduce a URL-borne
             // `model` into the `:rawPredict` body.
             apply_body_overrides(&mut body_value, ctx)?;
+            aisix_provider_anthropic::wire::settle_gateway_thinking(
+                &req,
+                &mut body_value,
+                upstream_id,
+                &ctx.provider_key,
+            );
             if let Some(obj) = body_value.as_object_mut() {
                 obj.remove("model");
                 obj.remove("stream");
@@ -1329,6 +1335,12 @@ impl VertexBridge {
             // Vertex-specific shaping below (see the non-stream path). Here
             // `stream` is intentionally KEPT in the body.
             apply_body_overrides(&mut body_value, ctx)?;
+            aisix_provider_anthropic::wire::settle_gateway_thinking(
+                &req,
+                &mut body_value,
+                upstream_id,
+                &ctx.provider_key,
+            );
             if let Some(obj) = body_value.as_object_mut() {
                 obj.remove("model");
                 // Vertex AI refuses the field whatever its value.
@@ -7870,6 +7882,45 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
                 serde_json::json!({"type": "adaptive", "display": "summarized"})
             );
             assert_eq!(body["max_tokens"], cap, "{body}");
+        }
+    }
+
+    /// A key's sampling default that keeps thinking off on Claude 4.6 withdraws
+    /// the gateway's block on both Claude rails, and its raised cap with it.
+    #[tokio::test]
+    async fn a_keys_sampling_default_withdraws_the_gateways_thinking_on_vertex_claude() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "m",
+                "model": "c",
+                "content": [{"type": "text", "text": "hi"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let pk: ProviderKey = serde_json::from_value(serde_json::json!({
+            "display_name": "vertex-prod",
+            "secret": r#"{"access_token":"t","project":"my-proj","region":"us-central1"}"#,
+            "request": {"default_body_fields": {"temperature": 0.2}},
+        }))
+        .unwrap();
+        let ctx = BridgeContext::new("req-1", sample_model_with("claude-opus-4-6"), Arc::new(pk));
+        let mut asked = ChatFormat::new("m", vec![ChatMessage::user("hi")]);
+        asked.extra.insert("reasoning_effort".into(), "high".into());
+        asked.thoughts_requested = true;
+        bridge.chat(&asked, &ctx).await.unwrap();
+        let _ = bridge.chat_stream(&asked, &ctx).await;
+
+        let sent = server.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 2);
+        for request in sent {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert!(body.get("thinking").is_none(), "{body}");
+            assert_eq!(body["temperature"], 0.2);
+            assert_eq!(body["max_tokens"], 4096);
         }
     }
 
