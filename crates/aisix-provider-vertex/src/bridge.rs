@@ -7848,7 +7848,9 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
             ),
         );
         let req = ChatFormat::new("m", vec![ChatMessage::user("hi")]);
-        let err = bridge.chat(&req, &ctx).await.err().expect("an error");
+        let Err(err) = bridge.chat(&req, &ctx).await else {
+            panic!("a 2xx reporting an error must not read as an answer");
+        };
         assert!(matches!(err, BridgeError::UpstreamInBand { .. }), "{err:?}");
         assert!(err.to_string().contains("try later"), "{err}");
     }

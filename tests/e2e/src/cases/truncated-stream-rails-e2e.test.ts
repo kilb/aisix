@@ -26,6 +26,8 @@ const LOGSTORE = "truncated-stream-rails-store";
 const PARTIAL = "half an ans";
 /** A prompt carrying this gets the whole answer; every other gets it cut off. */
 const WHOLE = "answer in full";
+/** This one gets the answer through its finish, then the connection drops. */
+const DROPPED = "answer then drop";
 
 const sse = (...frames: unknown[]) => frames.map((f) => `data: ${JSON.stringify(f)}\n\n`).join("");
 const anthropic = (type: string, rest: Record<string, unknown>) =>
@@ -156,9 +158,15 @@ describe("a stream that closes before its terminal is a failure", () => {
       const parts: Buffer[] = [];
       req.on("data", (c: Buffer) => parts.push(c));
       req.on("end", () => {
-        const whole = Buffer.concat(parts).toString("utf8").includes(WHOLE);
-        const answer = reply(decodeURIComponent(req.url ?? ""), whole);
+        const prompt = Buffer.concat(parts).toString("utf8");
+        const dropped = prompt.includes(DROPPED);
+        const answer = reply(decodeURIComponent(req.url ?? ""), dropped || prompt.includes(WHOLE));
         res.writeHead(200, { "content-type": answer.contentType });
+        if (dropped) {
+          const body = typeof answer.body === "string" ? answer.body.replace("data: [DONE]\n\n", "") : answer.body;
+          res.write(body, () => setTimeout(() => res.socket?.destroy(), 20));
+          return;
+        }
         res.end(answer.body);
       });
     });
@@ -258,6 +266,20 @@ describe("a stream that closes before its terminal is a failure", () => {
       test(`${model} ${route}: whole, it finishes`, async (ctx) => {
         if (!etcdReachable || !app) return ctx.skip();
         const out = await send(route, body(model, WHOLE));
+        expect(out.raw, out.raw).toContain(finished);
+        const row = await waitForSlsLog(
+          sls!,
+          LOGSTORE,
+          (l) => l.get("request_id") === out.requestId,
+          `row for ${out.requestId}`,
+          15_000,
+        );
+        expect(Number(row.get("status_code")), JSON.stringify([...row])).toBe(200);
+      });
+
+      test(`${model} ${route}: the connection dropped after its finish, it still finishes`, async (ctx) => {
+        if (!etcdReachable || !app) return ctx.skip();
+        const out = await send(route, body(model, DROPPED));
         expect(out.raw, out.raw).toContain(finished);
         const row = await waitForSlsLog(
           sls!,
