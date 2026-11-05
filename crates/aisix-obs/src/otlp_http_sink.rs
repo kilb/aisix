@@ -50,10 +50,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aisix_core::models::{
-    AisixSnapshot, AliyunSlsConfig, DatadogConfig, ExporterKind, ObjectStoreConfig,
-    ObservabilityExporter, OtlpHttpConfig, SlsContentMode,
+    AliyunSlsConfig, DatadogConfig, ExporterKind, ObjectStoreConfig, ObservabilityExporter,
+    OtlpHttpConfig, SlsContentMode,
 };
-use aisix_core::snapshot::SnapshotHandle;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
@@ -415,43 +414,6 @@ impl OtlpHttpFanOut {
     /// the snapshot publication listener.
     fn reconcile_pipelines(&self, desired: &std::collections::HashMap<String, u64>) {
         self.inner.exporters.reconcile(desired);
-    }
-
-    /// Stop the pipeline of every exporter that was deleted, disabled or
-    /// reconfigured, each time a snapshot is published, until `cancel` fires.
-    /// Without it the pipeline — task, client, queue — outlives its exporter
-    /// for the life of the process (#954).
-    ///
-    /// Driven by the publish rather than by traffic or a timer: a deleted
-    /// exporter is by definition one no request will touch again. It keys
-    /// on the exporter table's generation, so a write to any other
-    /// collection costs one comparison. Stopping only touches the worker's
-    /// task handle, wherever it runs — under `proxy.thread_per_core` a
-    /// pipeline lives on the worker runtime whose request first saw the
-    /// exporter, not on the runtime running this loop.
-    pub async fn reap_on_config_change(
-        self,
-        snapshot: SnapshotHandle<AisixSnapshot>,
-        mut cancel: tokio::sync::watch::Receiver<bool>,
-    ) {
-        let mut published = snapshot.subscribe();
-        let mut reaped = None;
-        loop {
-            if *cancel.borrow() {
-                return;
-            }
-            let view = snapshot.load_versioned();
-            let generation = view.snapshot.observability_exporters.generation();
-            if reaped != Some(generation) {
-                let exporters = view.snapshot.observability_exporters.entries();
-                self.reconcile(view.version, exporters.iter().map(|e| &*e.value));
-                reaped = Some(generation);
-            }
-            tokio::select! {
-                changed = published.changed() => if changed.is_err() { return },
-                changed = cancel.changed() => if changed.is_err() { return },
-            }
-        }
     }
 
     /// Per-exporter delivery counters, keyed by exporter name. Read by the
@@ -1953,6 +1915,8 @@ fn _ensure_arc_clone(_: Arc<()>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aisix_core::models::AisixSnapshot;
+    use aisix_core::snapshot::SnapshotHandle;
 
     fn sample_event() -> UsageEvent {
         UsageEvent {
@@ -4109,6 +4073,12 @@ mod tests {
             ("off", true),
         ]));
         let f = OtlpHttpFanOut::new();
+        // The publication hook the proxy registers (`live_exporter_fan_out`).
+        let reconciler = f.clone();
+        handle.subscribe_before_publish(move |view| {
+            let exporters = view.snapshot.observability_exporters.entries();
+            reconciler.reconcile(view.version, exporters.iter().map(|entry| &*entry.value));
+        });
         let view = handle.load_versioned();
         let generation = view.version;
         let live = view.snapshot.observability_exporters.entries();
@@ -4124,8 +4094,6 @@ mod tests {
         names.sort();
         assert_eq!(names, ["gone", "keep", "off"]);
 
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let reaper = tokio::spawn(f.clone().reap_on_config_change(handle.clone(), cancel_rx));
         handle.store(snapshot_with(&[("keep", true), ("off", false)]));
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -4155,8 +4123,6 @@ mod tests {
             "a stale snapshot restarted a reaped pipeline"
         );
 
-        cancel_tx.send(true).unwrap();
-        reaper.await.unwrap();
         f.shutdown().await;
     }
 }

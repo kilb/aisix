@@ -2562,7 +2562,7 @@ impl Metrics {
         }
     }
 
-    pub fn record_time_to_first_token(
+    fn record_time_to_first_token(
         &self,
         labels: UsageLabels<'_>,
         side: LatencySide,
