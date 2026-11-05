@@ -4800,7 +4800,7 @@ struct AnthropicStreamUsage {
     /// Frames of the answer went into the hold. That is the one way a stream
     /// delivers nothing with the upstream's work already done, so the gate
     /// above does not apply: what was read is reported, like a held stream on
-    /// the routes that hold inside the handler (`crate::cancel::HeldStream`).
+    /// the native `/v1/responses` and `/v1/completions` relays.
     held_output: bool,
     /// A hold-back verdict is still out, with nothing released: a caller
     /// leaving now did walk away from the answer.
@@ -5028,7 +5028,8 @@ fn update_anthropic_usage(
                     .pointer("/output_tokens_details/thinking_tokens")
                     .and_then(Value::as_u64)
                 {
-                    acc.reasoning_tokens = acc.reasoning_tokens.max(t as u32);
+                    acc.reasoning_tokens =
+                        acc.reasoning_tokens.max(crate::usage_attr::token_count(t));
                 }
                 if let Some(v) = usage.get("output_tokens") {
                     if let Some(t) = v.as_u64() {
@@ -5232,7 +5233,7 @@ fn drain_anthropic_sse_frames(
 /// disconnect (the async-stream generator drops at its suspension
 /// point). Applies the #419 cost-leak gate: if no byte-chunk reached
 /// the client, the completion-side counters are zeroed (the prompt was
-/// processed upstream regardless, so `prompt_tokens` is kept).
+/// processed upstream regardless, so it is kept, cache counts included).
 struct AnthropicStreamGuard<F: FnOnce(AnthropicStreamUsage)> {
     slot: Option<(F, AnthropicStreamUsage)>,
     delivered: Arc<AtomicU32>,
@@ -5259,13 +5260,11 @@ impl<F: FnOnce(AnthropicStreamUsage)> Drop for AnthropicStreamGuard<F> {
             usage.chunks_delivered = delivered;
             if delivered == 0 && !usage.held_output {
                 // No bytes crossed the wire (client aborted before the
-                // first chunk). Don't bill the completion side; keep
-                // prompt_tokens per the "prompts always billed"
-                // industry contract (#419 parity).
+                // first chunk). Don't bill the completion side; keep the
+                // prompt per the "prompts always billed" industry contract
+                // (#419 parity), its cache reads and writes included: on this
+                // shape they are most of it, as chat keeps them.
                 usage.completion_tokens = 0;
-                usage.cache_creation_tokens = 0;
-                usage.cache_creation_ttl = aisix_gateway::CacheCreationTtl::NONE;
-                usage.cache_read_tokens = 0;
             }
             // Token-estimation fallback (#1074), after the #419
             // gate. A floor-only completion count (message_start placeholder,
@@ -6095,6 +6094,27 @@ mod stream_failure_tests {
             .expect("a malformed error event is still a failure");
         assert_eq!(failure.status, 502);
         assert_eq!(failure.error_class, "upstream_in_band");
+    }
+
+    /// A streamed reasoning count past `u32` saturates like every counter beside
+    /// it, rather than wrapping to a small plausible one.
+    #[test]
+    fn a_streamed_reasoning_count_saturates() {
+        let mut usage = AnthropicStreamUsage::default();
+        update_anthropic_usage(
+            &mut usage,
+            &serde_json::json!({
+                "type": "message_delta",
+                "usage": {
+                    "output_tokens": 1,
+                    "output_tokens_details": {"thinking_tokens": (1u64 << 32) + 5},
+                },
+            }),
+            Instant::now(),
+            &mut false,
+            usize::MAX,
+        );
+        assert_eq!(usage.reasoning_tokens, u32::MAX);
     }
 }
 
@@ -9280,8 +9300,11 @@ event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\
             out.completion_tokens, 0,
             "completion zeroed when delivered==0"
         );
-        assert_eq!(out.cache_creation_tokens, 0);
-        assert_eq!(out.cache_read_tokens, 0);
+        assert_eq!(
+            out.cache_creation_tokens, 3,
+            "the prompt's cache writes are kept"
+        );
+        assert_eq!(out.cache_read_tokens, 2, "and its cache reads");
         assert_eq!(out.chunks_delivered, 0);
 
         // delivered>0: counts preserved.

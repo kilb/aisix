@@ -5778,7 +5778,7 @@ struct StreamCompletion {
     /// A chunk of the answer went into the hold. That is the one way a stream
     /// delivers nothing with the upstream's work already done, so the gate
     /// above does not apply: what was read is reported, like a held stream on
-    /// the routes that hold inside the handler (`crate::cancel::HeldStream`).
+    /// the native `/v1/responses` and `/v1/completions` relays.
     held_output: bool,
     /// The upstream has ended and a hold-back verdict is still out, with
     /// nothing released: a caller leaving now did walk away from the answer.
