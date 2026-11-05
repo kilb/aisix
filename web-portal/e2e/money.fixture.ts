@@ -1259,14 +1259,18 @@ cache_policies:
     ttl_seconds: 300
     applies_to: "model:embed-cached"
 guardrails:
-  # 文件模式没有附着集合，护栏是全环境生效的 —— 所以这条只能靠"应答里出现
-  # 这个短语"来触发，别的用例发的是 hello / hi，不会命中。
+  # 挂在整个环境上 —— 所以这条只能靠"应答里出现这个短语"来触发，别的用例发的是
+  # hello / hi，不会命中。
   - name: block-that-phrase
     kind: keyword
     hook_point: output
     patterns:
       - kind: literal
         value: forbidden-output-phrase
+guardrail_attachments:
+  - guardrail_id: block-that-phrase
+    scope_type: env
+    priority: 100
 rate_limit_policies:
   # 条件式策略：带模型属性条件的行会延到「分派目标」阶段再判。它写的是**路由
   # 的名字**，所以只能通过预留里带着的父级身份匹配上 —— 分类子调用自己的模型
