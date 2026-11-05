@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -102,6 +103,8 @@ describe("a held stream sends its head and heartbeats during the hold", () => {
   let app: SpawnedApp | undefined;
   let sls: MockSls | undefined;
   const upstreams = new Map<string, OpenAiUpstream>();
+  /** Answers a whole completion, `[DONE]` included, and never ends the body. */
+  let openAfterDone: Server | undefined;
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
@@ -162,6 +165,34 @@ describe("a held stream sends its head and heartbeats during the hold", () => {
         provider_key_id: pk.id,
       });
     }
+    openAfterDone = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write(
+          `data: ${JSON.stringify({
+            id: "cmpl-open",
+            object: "text_completion",
+            created: 0,
+            model: "upstream-model",
+            choices: [{ index: 0, text: "a whole answer", finish_reason: "stop" }],
+          })}\n\ndata: [DONE]\n\n`,
+        );
+      });
+    });
+    await new Promise<void>((resolve) => openAfterDone!.listen(0, "127.0.0.1", resolve));
+    const openPort = (openAfterDone.address() as { port: number }).port;
+    const openPk = await seed.createProviderKey({
+      display_name: "hh-completions-open-pk",
+      secret: "sk-mock",
+      api_base: `http://127.0.0.1:${openPort}/v1`,
+    });
+    await seed.createModel({
+      display_name: "hh-completions-open",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: openPk.id,
+    });
     // Caller key last: it doubles as the propagation barrier for all of it.
     await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: ["*"] });
     await waitConfigPropagation(async () => {
@@ -176,6 +207,8 @@ describe("a held stream sends its head and heartbeats during the hold", () => {
     await app?.exit();
     await sls?.close();
     await Promise.all([...upstreams.values()].map((u) => u.close()));
+    openAfterDone?.closeAllConnections();
+    openAfterDone?.close();
   });
 
   const ready = () => etcdReachable && !!app && !!sls;
@@ -212,6 +245,18 @@ describe("a held stream sends its head and heartbeats during the hold", () => {
     expect(at, body).toBeGreaterThan(0);
     return body.slice(0, at).split(":\n\n").length - 1;
   };
+
+  test("completions: a held answer ends at its [DONE], though the upstream keeps the body open", async (ctx) => {
+    if (!ready()) return ctx.skip();
+    const started = Date.now();
+    const { path, body } = REQUESTS.completions("hh-completions-open");
+    const res = await post(path, body);
+    expect(res.status).toBe(200);
+    const wire = await res.text();
+    expect(Date.now() - started, "nothing waits on what comes after the end").toBeLessThan(5_000);
+    expect(wire).toContain("a whole answer");
+    expect(wire.trimEnd().endsWith("data: [DONE]"), wire).toBe(true);
+  }, 30_000);
 
   for (const endpoint of ["completions", "responses"] as const) {
     test(`${endpoint}: a clean answer longer than the heartbeat interval is preceded by heartbeats`, async (ctx) => {
