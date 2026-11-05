@@ -595,6 +595,7 @@ async fn dispatch(
             source_ip: &client.source_ip,
             context_origin: None,
             budget: Some(&budget_gate),
+            serves: Some(&|model| counts_anthropic_tokens(state, snapshot, model)),
         },
     )?;
     let retry_on_429 = model_entry
@@ -796,6 +797,12 @@ async fn dispatch(
                     // regions than its Messages route, so a refusal there moves
                     // on to the group's next target rather than ending the
                     // request a target behind it could have answered.
+                    let unusable = last_err
+                        .as_ref()
+                        .is_some_and(crate::routing::target_unusable);
+                    if unusable {
+                        break;
+                    }
                     if !retryable
                         && has_usable_fallback
                         && crate::dispatch::anthropic_platform_bridge(
@@ -829,7 +836,12 @@ async fn dispatch(
              on Amazon Bedrock or Vertex AI"
         )));
     }
-    Err(last_err.unwrap_or(ProxyError::ProviderUnavailable))
+    let err = last_err.unwrap_or(ProxyError::ProviderUnavailable);
+    Err(if is_routing_request {
+        crate::routing::group_refusal(err, &model_name)
+    } else {
+        err
+    })
 }
 
 /// Whether a target answers this route: an Anthropic-protocol upstream, or
@@ -1091,7 +1103,7 @@ async fn count_tokens_to_target(
     }
 
     state.health.record_success(&model.display_name);
-    state.runtime_status.mark_healthy(model_id);
+    state.runtime_status.mark_healthy(model_id, attempt_started);
 
     let mut resp = axum::response::Response::new(axum::body::Body::from(body_bytes));
     if let Some(ct) = upstream_headers.get("content-type") {
@@ -1180,7 +1192,7 @@ async fn platform_count_tokens(
         })
         .map_err(ProxyError::Bridge)?;
     state.health.record_success(&model.display_name);
-    state.runtime_status.mark_healthy(model_id);
+    state.runtime_status.mark_healthy(model_id, attempt_started);
     let mut resp = axum::response::IntoResponse::into_response(axum::Json(counted));
     if let Ok(hv) = HeaderValue::from_str(request_id) {
         resp.headers_mut()

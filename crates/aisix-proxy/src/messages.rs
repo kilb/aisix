@@ -978,6 +978,7 @@ async fn dispatch(
             source_ip: &client.source_ip,
             context_origin: None,
             budget: Some(&budget_gate),
+            serves: None,
         },
     )?;
 
@@ -1008,9 +1009,10 @@ async fn dispatch(
     let mut routing = RoutingTelemetry::for_request(&model_entry.value.display_name)
         .with_trace(client.trace.clone());
 
-    // Walk targets, failing over to the next only on a retryable upstream
-    // failure. A 4xx / config error is returned as-is — retrying other
-    // targets won't help. Streaming and non-streaming share this loop:
+    // Walk targets, failing over to the next on a retryable upstream failure
+    // or a failure of the target's own configuration. A 4xx is returned as-is
+    // — retrying other targets won't help. Streaming and non-streaming share
+    // this loop:
     // `dispatch_to_target` branches internally and, for streaming, only
     // returns Ok once the first chunk has arrived under `stream_timeout`
     // (#554) — so the 200 is committed to exactly one target and a slow
@@ -1041,6 +1043,57 @@ async fn dispatch(
             Some(&model_entry.value),
             state.default_timeouts,
         );
+        let target_model = if is_routing_request {
+            target.model.display_name.clone()
+        } else {
+            String::new()
+        };
+        // Reserve THIS target's own model rate-limit layers before
+        // dispatching to it (#1087), once for all its retries: a same-target
+        // retry is the same request, and charging it again would let the
+        // retries themselves exhaust the limit. Over-limit → record a 429
+        // attempt and move on to the remaining targets in strategy order.
+        let mut member_reservation = match crate::quota::reserve_routing_target(
+            state,
+            snapshot,
+            auth,
+            is_routing_request.then_some(crate::quota::RoutingParent {
+                name: &model_entry.value.display_name,
+                entry_id: &model_entry.id,
+            }),
+            &target.model.display_name,
+            &target.id,
+            &target.model,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let (idx, kind) = routing.begin_attempt(crate::attempt::AttemptTarget {
+                    display_name: &target.model.display_name,
+                    target_model: &target_model,
+                    model_id: &target.id,
+                });
+                routing.record(
+                    state,
+                    AttemptRecord {
+                        index: idx,
+                        kind,
+                        target_model,
+                        target_model_id: target.id.clone(),
+                        provider_key_id: pk_id.clone(),
+                        status: 429,
+                        success: false,
+                        error_class: "rate_limit_exceeded".to_string(),
+                        error_message: e.to_string(),
+                        latency_ms: 0,
+                        dispatched: false,
+                    },
+                );
+                last_err = Some(e);
+                continue 'targets;
+            }
+        };
         for attempt_idx in 0..=budget.attempts {
             // Upstream `Retry-After` when the last failure carried one, else
             // exponential backoff + jitter, before re-hitting the SAME target
@@ -1052,57 +1105,11 @@ async fn dispatch(
                 });
                 tokio::time::sleep(crate::routing::retry_backoff(attempt_idx as u32, hint)).await;
             }
-            let target_model = if is_routing_request {
-                target.model.display_name.clone()
-            } else {
-                String::new()
-            };
             let (idx, kind) = routing.begin_attempt(crate::attempt::AttemptTarget {
                 display_name: &target.model.display_name,
                 target_model: &target_model,
                 model_id: &target.id,
             });
-            // Reserve THIS target's own model rate-limit layers before
-            // dispatching to it (#1087). Over-limit → record a
-            // 429 attempt and move on to the remaining targets in strategy
-            // order (same-target retries can't help — the window won't
-            // reset mid-loop).
-            let mut member_reservation = match crate::quota::reserve_routing_target(
-                state,
-                snapshot,
-                auth,
-                is_routing_request.then_some(crate::quota::RoutingParent {
-                    name: &model_entry.value.display_name,
-                    entry_id: &model_entry.id,
-                }),
-                &target.model.display_name,
-                &target.id,
-                &target.model,
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    routing.record(
-                        state,
-                        AttemptRecord {
-                            index: idx,
-                            kind,
-                            target_model,
-                            target_model_id: target.id.clone(),
-                            provider_key_id: pk_id.clone(),
-                            status: 429,
-                            success: false,
-                            error_class: "rate_limit_exceeded".to_string(),
-                            error_message: e.to_string(),
-                            latency_ms: 0,
-                            dispatched: false,
-                        },
-                    );
-                    last_err = Some(e);
-                    continue 'targets;
-                }
-            };
             let attempt_started = Instant::now();
             let deferred_attempt = DeferredAttempt::default();
             match dispatch_to_target(
@@ -1141,7 +1148,7 @@ async fn dispatch(
                     let record = AttemptRecord {
                         index: idx,
                         kind,
-                        target_model,
+                        target_model: target_model.clone(),
                         target_model_id: target.id.clone(),
                         provider_key_id: outcome.provider_key_id.clone(),
                         status: 200,
@@ -1215,13 +1222,16 @@ async fn dispatch(
                         retryable,
                         fallback_statuses,
                     );
+                    if retryable {
+                        state.runtime_status.penalize_latency(&target.id);
+                    }
                     let (error_class, error_message) = attempt_error_from_proxy(&e);
                     routing.record(
                         state,
                         AttemptRecord {
                             index: idx,
                             kind,
-                            target_model,
+                            target_model: target_model.clone(),
                             target_model_id: target.id.clone(),
                             provider_key_id: pk_id.clone(),
                             status: e.status().as_u16(),
@@ -1238,12 +1248,17 @@ async fn dispatch(
                         ProxyError::Bridge(be) => budget.covers(be),
                         _ => true,
                     };
+                    let unusable = crate::routing::target_unusable(&e);
                     last_err = Some(e);
                     // Non-retryable → stop entirely (retrying or failing over
-                    // won't help). Retryable → re-hit the same target until
+                    // won't help), unless the failure is this target's own
+                    // configuration. Retryable → re-hit the same target until
                     // `retries` is exhausted, then fall over to the next target
                     // if there is one.
                     if !retryable {
+                        if unusable {
+                            break;
+                        }
                         break 'targets;
                     }
                     if attempt_idx == budget.attempts || !budget_covers {
@@ -1256,8 +1271,13 @@ async fn dispatch(
             }
         }
     }
+    let err = last_err.unwrap_or(ProxyError::ProviderUnavailable);
     Err(MessagesDispatchError {
-        err: last_err.unwrap_or(ProxyError::ProviderUnavailable),
+        err: if is_routing_request {
+            crate::routing::group_refusal(err, &model_name)
+        } else {
+            err
+        },
         routing,
     })
 }
@@ -1811,6 +1831,22 @@ async fn anthropic_passthrough_dispatch(
                     return Err(ProxyError::Bridge(err));
                 }
             };
+            // Nothing has reached the caller yet, so a failure reported as
+            // the first frame fails over like a failed status would, as it
+            // does on the bridged paths.
+            if let Some(err) = crate::dispatch::first_sse_frame_json(&first_bytes)
+                .and_then(|frame| aisix_provider_anthropic::wire::body_in_band_error(&frame))
+            {
+                if err.http_status() >= 500 {
+                    state.health.record_failure(&model.display_name);
+                }
+                return Err(ProxyError::Bridge(crate::cooldown::note_failure(
+                    &state.runtime_status,
+                    model_id,
+                    model.cooldown.as_ref(),
+                    err,
+                )));
+            }
             Box::pin(
                 futures::stream::once(std::future::ready(Ok::<
                     Bytes,
@@ -1959,6 +1995,7 @@ async fn anthropic_passthrough_dispatch(
                     usage.stream_failure.map(|failure| failure.bridge_error()),
                     usage.reached_end || usage.guardrail_blocked,
                     terminal_status,
+                    attempt_started,
                 );
                 if let Some(deferred) = &attempt_c.deferred {
                     deferred.finish(
@@ -2165,7 +2202,7 @@ async fn anthropic_passthrough_dispatch(
             })
             .map_err(ProxyError::Bridge)?;
         state.health.record_success(&model.display_name);
-        state.runtime_status.mark_healthy(model_id);
+        state.runtime_status.mark_healthy(model_id, attempt_started);
 
         let mut metrics = anthropic_metrics_from_response_json(&json_body);
         // Token-estimation fallback (#1074): an
@@ -2830,7 +2867,7 @@ async fn cross_provider_dispatch(
         .provider
         .as_deref()
         .ok_or_else(|| {
-            ProxyError::InvalidRequest(format!("model `{model_name}` has no provider prefix"))
+            ProxyError::UnusableTarget(format!("model `{model_name}` has no provider prefix"))
         })?
         .to_string();
     let bridge: Arc<dyn Bridge> = crate::dispatch::resolve_bridge(&state.hub, provider_key)
@@ -3098,6 +3135,7 @@ async fn cross_provider_dispatch(
                     comp.terminal_failure.take(),
                     comp.reached_end || comp.guardrail_blocked,
                     terminal_status,
+                    attempt_started_for_telem,
                 );
                 if let Some(deferred) = &attempt_for_telem.deferred {
                     deferred.finish(
@@ -3260,6 +3298,9 @@ async fn cross_provider_dispatch(
         .chat_cow(std::borrow::Cow::Owned(chat), &ctx)
         .await
         .map_err(|err| {
+            if err.http_status() >= 500 {
+                state.health.record_failure(&model.display_name);
+            }
             if let Some((ttl, reason)) =
                 crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
             {
@@ -3268,7 +3309,7 @@ async fn cross_provider_dispatch(
             ProxyError::Bridge(err)
         })?;
     state.health.record_success(&model.display_name);
-    state.runtime_status.mark_healthy(model_id);
+    state.runtime_status.mark_healthy(model_id, attempt_started);
 
     // #448 (#22): run output guardrails on the cross-provider response
     // before rendering it back as Anthropic JSON — the response is
@@ -8605,6 +8646,44 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
     }
 
     /// The same two rules on the cross-provider relay.
+    /// A bridged, non-streaming failure feeds the target's health like every
+    /// other failure on this endpoint: the admin health surface would
+    /// otherwise show the target Healthy through a whole outage.
+    #[tokio::test]
+    async fn a_failed_bridged_call_counts_against_the_targets_health() {
+        use aisix_provider_openai::OpenAiBridge;
+
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&upstream)
+            .await;
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("bridged-health"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
+        let app = crate::build_router(state.clone());
+        for _ in 0..2 {
+            let resp = app
+                .clone()
+                .oneshot(make_req(serde_json::json!({
+                    "model": "bridged-health",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 8
+                })))
+                .await
+                .unwrap();
+            assert!(resp.status().is_server_error(), "{}", resp.status());
+        }
+        assert_ne!(
+            state.health.level("bridged-health"),
+            crate::health::HealthLevel::Healthy
+        );
+    }
+
     #[tokio::test]
     async fn a_failed_bridged_stream_exports_only_what_needed_no_scan() {
         use aisix_core::models::GuardrailHookPoint;

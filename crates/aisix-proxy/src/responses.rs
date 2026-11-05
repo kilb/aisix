@@ -1106,6 +1106,7 @@ async fn dispatch(
             source_ip: &client.source_ip,
             context_origin: affinity.origin(),
             budget: Some(&budget_gate),
+            serves: None,
         },
     )?;
     let retry_on_429 = model_entry
@@ -1172,6 +1173,57 @@ async fn dispatch(
                 )
             })
             .flatten();
+        let target_model = if is_routing_request {
+            target.model.display_name.clone()
+        } else {
+            String::new()
+        };
+        // Reserve THIS target's own model rate-limit layers before
+        // dispatching to it (#1087), once for all its retries: a same-target
+        // retry is the same request, and charging it again would let the
+        // retries themselves exhaust the limit. Over-limit → record a 429
+        // attempt and move on to the remaining targets in strategy order.
+        let mut member_reservation = match crate::quota::reserve_routing_target(
+            state,
+            snapshot,
+            auth,
+            is_routing_request.then_some(crate::quota::RoutingParent {
+                name: &model_entry.value.display_name,
+                entry_id: &model_entry.id,
+            }),
+            &target.model.display_name,
+            &target.id,
+            &target.model,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let (idx, kind) = routing.begin_attempt(crate::attempt::AttemptTarget {
+                    display_name: &target.model.display_name,
+                    target_model: &target_model,
+                    model_id: &target.id,
+                });
+                routing.record(
+                    state,
+                    AttemptRecord {
+                        index: idx,
+                        kind,
+                        target_model,
+                        target_model_id: target.id.clone(),
+                        provider_key_id: pk_id.clone(),
+                        status: 429,
+                        success: false,
+                        error_class: "rate_limit_exceeded".to_string(),
+                        error_message: e.to_string(),
+                        latency_ms: 0,
+                        dispatched: false,
+                    },
+                );
+                last_err = Some(e);
+                continue 'targets;
+            }
+        };
         for attempt_idx in 0..=budget.attempts {
             // Upstream `Retry-After` when the last failure carried one, else
             // exponential backoff + jitter, before re-hitting the SAME target
@@ -1183,11 +1235,6 @@ async fn dispatch(
                 });
                 tokio::time::sleep(crate::routing::retry_backoff(attempt_idx as u32, hint)).await;
             }
-            let target_model = if is_routing_request {
-                target.model.display_name.clone()
-            } else {
-                String::new()
-            };
             let (idx, kind) = routing.begin_attempt(crate::attempt::AttemptTarget {
                 display_name: &target.model.display_name,
                 target_model: &target_model,
@@ -1204,47 +1251,6 @@ async fn dispatch(
                 model: target_model.clone(),
                 deferred: Some(deferred_attempt.clone()),
                 ..Default::default()
-            };
-            // Reserve THIS target's own model rate-limit layers before
-            // dispatching to it (#1087). Over-limit → record a
-            // 429 attempt and move on to the remaining targets in strategy
-            // order (same-target retries can't help — the window won't
-            // reset mid-loop).
-            let mut member_reservation = match crate::quota::reserve_routing_target(
-                state,
-                snapshot,
-                auth,
-                is_routing_request.then_some(crate::quota::RoutingParent {
-                    name: &model_entry.value.display_name,
-                    entry_id: &model_entry.id,
-                }),
-                &target.model.display_name,
-                &target.id,
-                &target.model,
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    routing.record(
-                        state,
-                        AttemptRecord {
-                            index: idx,
-                            kind,
-                            target_model,
-                            target_model_id: target.id.clone(),
-                            provider_key_id: pk_id.clone(),
-                            status: 429,
-                            success: false,
-                            error_class: "rate_limit_exceeded".to_string(),
-                            error_message: e.to_string(),
-                            latency_ms: 0,
-                            dispatched: false,
-                        },
-                    );
-                    last_err = Some(e);
-                    continue 'targets;
-                }
             };
             let attempt_body = stripped_body.as_ref().unwrap_or(body);
             let mark = affinity.response_mark(is_routing_request.then_some(target.id.as_str()));
@@ -1314,7 +1320,7 @@ async fn dispatch(
                     let record = AttemptRecord {
                         index: idx,
                         kind,
-                        target_model,
+                        target_model: target_model.clone(),
                         target_model_id: target.id.clone(),
                         provider_key_id: pk_id.clone(),
                         status: success.response.status().as_u16(),
@@ -1408,13 +1414,16 @@ async fn dispatch(
                         retryable,
                         fallback_statuses,
                     );
+                    if retryable {
+                        state.runtime_status.penalize_latency(&target.id);
+                    }
                     let (error_class, error_message) = attempt_error_from_proxy(&e);
                     routing.record(
                         state,
                         AttemptRecord {
                             index: idx,
                             kind,
-                            target_model,
+                            target_model: target_model.clone(),
                             target_model_id: target.id.clone(),
                             provider_key_id: pk_id.clone(),
                             status: e.status().as_u16(),
@@ -1431,11 +1440,16 @@ async fn dispatch(
                         ProxyError::Bridge(be) => budget.covers(be),
                         _ => true,
                     };
+                    let unusable = crate::routing::target_unusable(&e);
                     last_err = Some(e);
-                    // Non-retryable → stop entirely. Retryable → re-hit the
+                    // Non-retryable → stop entirely, unless the failure is
+                    // this target's own configuration. Retryable → re-hit the
                     // same target until `retries` is exhausted, then fall over
                     // to the next target (the outer loop advances).
                     if !retryable {
+                        if unusable {
+                            break;
+                        }
                         break 'targets;
                     }
                     if attempt_idx == budget.attempts || !budget_covers {
@@ -1446,8 +1460,13 @@ async fn dispatch(
         }
     }
 
+    let err = last_err.unwrap_or(ProxyError::ProviderUnavailable);
     Err(ResponsesDispatchError {
-        err: last_err.unwrap_or(ProxyError::ProviderUnavailable),
+        err: if is_routing_request {
+            crate::routing::group_refusal(err, &model_name)
+        } else {
+            err
+        },
         routing,
     })
 }
@@ -2183,7 +2202,7 @@ async fn responses_to_target(
                 );
                 aisix_guardrails::Guardrail::record_output_buffer_exceeded(chain);
                 state.health.record_success(&model.display_name);
-                state.runtime_status.mark_healthy(model_id);
+                state.runtime_status.mark_healthy(model_id, attempt_started);
                 // The upstream ran and bills for this response even though the
                 // caller gets none of it, and the terminal usage frame was
                 // never reached: count what arrived rather than record zero.
@@ -2285,7 +2304,7 @@ async fn responses_to_target(
                 );
             } else {
                 state.health.record_success(&model.display_name);
-                state.runtime_status.mark_healthy(model_id);
+                state.runtime_status.mark_healthy(model_id, attempt_started);
             }
             // Nothing else arrived: the whole response was frames that
             // could not be scanned. Dropping them silently would hand
@@ -2608,6 +2627,22 @@ async fn responses_to_target(
                     return Err(ProxyError::Bridge(err));
                 }
             };
+            // Nothing has reached the caller yet, so a failure reported as
+            // the first frame fails over like a failed status would, as it
+            // does on the bridged paths.
+            if let Some(err) = crate::dispatch::first_sse_frame_json(&first_bytes)
+                .and_then(|frame| responses_in_band_error(&frame))
+            {
+                if err.http_status() >= 500 {
+                    state.health.record_failure(&model.display_name);
+                }
+                return Err(ProxyError::Bridge(crate::cooldown::note_failure(
+                    &state.runtime_status,
+                    model_id,
+                    model.cooldown.as_ref(),
+                    err,
+                )));
+            }
             Box::pin(
                 futures::stream::once(std::future::ready(Ok::<
                     bytes::Bytes,
@@ -2750,6 +2785,7 @@ async fn responses_to_target(
                     stream_failure.map(|failure| failure.bridge_error()),
                     usage.reached_end,
                     200,
+                    attempt_started,
                 );
                 if let Some(deferred) = &attempt_c.deferred {
                     deferred.finish(
@@ -2893,7 +2929,7 @@ async fn responses_to_target(
                 })
                 .map_err(ProxyError::Bridge)?;
         state.health.record_success(&model.display_name);
-        state.runtime_status.mark_healthy(model_id);
+        state.runtime_status.mark_healthy(model_id, attempt_started);
 
         // Extract the upstream-reported usage block for telemetry
         // emission. Pulled here (before the response is moved into
@@ -3129,7 +3165,7 @@ async fn responses_cross_provider_to_target(
         .provider
         .as_deref()
         .ok_or_else(|| {
-            ProxyError::InvalidRequest(format!("model `{requested_model}` has no provider prefix"))
+            ProxyError::UnusableTarget(format!("model `{requested_model}` has no provider prefix"))
         })?
         .to_string();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
@@ -3394,6 +3430,7 @@ async fn responses_cross_provider_to_target(
                     comp.terminal_failure.take(),
                     comp.reached_end || comp.guardrail_blocked,
                     200,
+                    attempt_started,
                 );
                 if let Some(deferred) = &attempt_c.deferred {
                     deferred.finish(
@@ -3542,6 +3579,9 @@ async fn responses_cross_provider_to_target(
         .chat_cow(std::borrow::Cow::Owned(chat), &ctx)
         .await
         .map_err(|err| {
+            if err.http_status() >= 500 {
+                state.health.record_failure(&model.display_name);
+            }
             if let Some((ttl, reason)) =
                 crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
             {
@@ -3553,7 +3593,7 @@ async fn responses_cross_provider_to_target(
     // up front would be alive for the whole upstream wait.
     let captured_prompt = content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
     state.health.record_success(&model.display_name);
-    state.runtime_status.mark_healthy(model_id);
+    state.runtime_status.mark_healthy(model_id, attempt_started);
 
     let usage = {
         let mut u = ResponseUsage {
@@ -7477,6 +7517,40 @@ mod tests {
     /// bypasses the block. The bridge buffers the encoded SSE and, on a
     /// block, emits only a terminal `error` event; no output_text delta with
     /// the blocked literal reaches the client.
+    /// A bridged, non-streaming failure feeds the target's health like every
+    /// other failure on this endpoint: the admin health surface would
+    /// otherwise show the target Healthy through a whole outage.
+    #[tokio::test]
+    async fn a_failed_bridged_call_counts_against_the_targets_health() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&upstream)
+            .await;
+        let snap = new_snap_anthropic_at(&upstream.uri());
+        snap.models.insert(anthropic_model("bridged-health"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
+        let app = crate::build_router(state.clone());
+        for _ in 0..2 {
+            let resp = app
+                .clone()
+                .oneshot(make_req(
+                    serde_json::json!({"model":"bridged-health","input":"hi"}),
+                ))
+                .await
+                .unwrap();
+            assert!(resp.status().is_server_error(), "{}", resp.status());
+        }
+        assert_ne!(
+            state.health.level("bridged-health"),
+            crate::health::HealthLevel::Healthy
+        );
+    }
+
     #[tokio::test]
     async fn output_guardrail_blocks_streaming_cross_provider_response() {
         let upstream = MockServer::builder().start().await;

@@ -289,6 +289,14 @@ pub enum ProxyError {
     RouteForbidden(String),
     #[error("request payload is invalid: {0}")]
     InvalidRequest(String),
+    /// [`Self::InvalidRequest`] on the wire, raised for what a target's own
+    /// configuration lacks: a provider key that does not exist, an empty
+    /// secret, no base URL. Its own variant because the dispatch loops treat
+    /// the two differently: the next target of a Model Group has a
+    /// configuration of its own (`routing::target_unusable`), while a bad
+    /// request is bad on every target.
+    #[error("request payload is invalid: {0}")]
+    UnusableTarget(String),
     /// A non-WebSocket request reached the WebSocket-only realtime
     /// endpoint. Carries the upgrade layer's own classification — 400 for
     /// malformed upgrade headers, 426 for a connection that cannot
@@ -309,11 +317,12 @@ pub enum ProxyError {
         router: String,
         reason: crate::semantic::DecisionFailure,
     },
-    /// Every routing candidate was excluded by the runtime status layer
-    /// (all in cooldown or background-unhealthy) and the routing model
-    /// is configured with `when_all_unavailable: fail`. Caller-visible as
-    /// 503 with a Retry-After hint derived from the nearest cooldown
-    /// expiry. See [`aisix_core::WhenAllUnavailablePolicy`].
+    /// Every routing candidate is background-unhealthy and the routing
+    /// model is configured with `when_all_unavailable: fail`. Caller-visible
+    /// as 503 with a fixed Retry-After hint. Candidates in cooldown never
+    /// get here: with no healthy one left they are dispatched
+    /// (`routing::filter_attempt_models`). See
+    /// [`aisix_core::WhenAllUnavailablePolicy`].
     #[error("all routing candidates are unavailable")]
     AllCandidatesUnavailable { retry_after_secs: Option<u64> },
     /// Caller-visible message MUST NOT carry the matched-pattern detail.
@@ -525,7 +534,9 @@ impl ProxyError {
             ProxyError::VideoNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::JobResourceNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::JobListRefused => StatusCode::FORBIDDEN,
-            ProxyError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            ProxyError::InvalidRequest(_) | ProxyError::UnusableTarget(_) => {
+                StatusCode::BAD_REQUEST
+            }
             ProxyError::WebSocketUpgradeRequired { status, .. } => *status,
             ProxyError::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::SemanticDecisionFailed { .. } => StatusCode::SERVICE_UNAVAILABLE,
@@ -578,7 +589,9 @@ impl ProxyError {
             ProxyError::VideoNotFound(_) => "video_not_found",
             ProxyError::JobResourceNotFound(_) => "resource_not_found",
             ProxyError::JobListRefused => "permission_denied",
-            ProxyError::InvalidRequest(_) => "invalid_request_error",
+            ProxyError::InvalidRequest(_) | ProxyError::UnusableTarget(_) => {
+                "invalid_request_error"
+            }
             ProxyError::WebSocketUpgradeRequired { .. } => "websocket_upgrade_required",
             ProxyError::RequestTooLarge { .. } => "invalid_request_error",
             ProxyError::ProviderUnavailable => "provider_unavailable",

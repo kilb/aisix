@@ -976,7 +976,9 @@ async fn dispatch(
                     deferred.finish(state, 200, true);
                 }
                 state.health.record_success(&model.display_name);
-                state.runtime_status.mark_healthy(&model_entry_id);
+                state
+                    .runtime_status
+                    .mark_healthy(&model_entry_id, attempt_started);
                 let mut accumulator = CompletionSseAccumulator::with_security_cap(buffer.len());
                 accumulator.push(&buffer);
                 accumulator.finish();
@@ -1131,7 +1133,9 @@ async fn dispatch(
                     deferred.finish(state, 200, true);
                 }
                 state.health.record_success(&model.display_name);
-                state.runtime_status.mark_healthy(&model_entry_id);
+                state
+                    .runtime_status
+                    .mark_healthy(&model_entry_id, attempt_started);
                 let mut usage = completion_usage_with_estimates(
                     accumulator.usage.unwrap_or_default(),
                     &upstream_model,
@@ -1279,7 +1283,7 @@ async fn dispatch(
                                     .record_success(&model_display_name_for_stream);
                                 state_for_stream
                                     .runtime_status
-                                    .mark_healthy(&model_id_for_stream);
+                                    .mark_healthy(&model_id_for_stream, attempt_started);
                                 (200, "")
                             }
                             CompletionStreamOutcome::UpstreamError {
@@ -1478,6 +1482,7 @@ async fn dispatch(
     let crate::routing::Dispatched {
         value: (answered, provider_label, pk_id),
         target,
+        attempt_started,
         member_reservation,
         ..
     } = match dispatched {
@@ -1503,7 +1508,9 @@ async fn dispatch(
             // #701: clear any cooldown/unhealthy mark now the upstream
             // answered — same recovery signal as rerank/audio/chat.
             state.health.record_success(&model.display_name);
-            state.runtime_status.mark_healthy(&target.id);
+            state
+                .runtime_status
+                .mark_healthy(&target.id, attempt_started);
             // Extract usage BEFORE moving resp_json into the Response
             // so the success struct carries typed counters rather
             // than re-parsing JSON downstream.

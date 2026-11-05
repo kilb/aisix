@@ -621,6 +621,7 @@ async fn dispatch(
     let crate::routing::Dispatched {
         value: (body_bytes, answers, upstream, provider, pk_id, upstream_model),
         target,
+        attempt_started,
         member_reservation,
         ..
     } = match dispatched {
@@ -635,7 +636,9 @@ async fn dispatch(
         reservation.merge(member);
     }
     state.health.record_success(&target.model.display_name);
-    state.runtime_status.mark_healthy(&target.id);
+    state
+        .runtime_status
+        .mark_healthy(&target.id, attempt_started);
 
     let parsed = serde_json::from_slice::<Value>(&body_bytes);
     let (usage, reported_model, provider_request_id) = match &parsed {

@@ -757,6 +757,7 @@ async fn dispatch(
     let crate::routing::Dispatched {
         value: (mut resp_json, provider_label, pk_id, upstream_model),
         target,
+        attempt_started,
         member_reservation,
         ..
     } = match dispatched {
@@ -774,7 +775,9 @@ async fn dispatch(
     }
 
     state.health.record_success(&target.model.display_name);
-    state.runtime_status.mark_healthy(&target.id);
+    state
+        .runtime_status
+        .mark_healthy(&target.id, attempt_started);
 
     // #911 [21]: commit the actual token cost so TPM/TPD is enforced.
     let usage = crate::images::image_usage_stats(&resp_json);

@@ -757,6 +757,7 @@ async fn dispatch(
     let crate::routing::Dispatched {
         value: (upstream_headers, body_bytes, provider_label, pk_id, upstream_model),
         target,
+        attempt_started,
         member_reservation,
         ..
     } = match dispatched {
@@ -774,7 +775,9 @@ async fn dispatch(
     }
 
     state.health.record_success(&target.model.display_name);
-    state.runtime_status.mark_healthy(&target.id);
+    state
+        .runtime_status
+        .mark_healthy(&target.id, attempt_started);
 
     // Extract usage from the upstream body BEFORE handing the bytes
     // off to the response builder. We parse for telemetry but still

@@ -1718,7 +1718,9 @@ async fn multipart_dispatch(
     }
 
     state.health.record_success(&target.model.display_name);
-    state.runtime_status.mark_healthy(&target.id);
+    state
+        .runtime_status
+        .mark_healthy(&target.id, attempt_started);
 
     let body_bytes = match upstream_body {
         AudioUpstreamBody::Buffered(bytes) => bytes,
@@ -2577,7 +2579,9 @@ async fn speech_dispatch(
     }
 
     state.health.record_success(&target.model.display_name);
-    state.runtime_status.mark_healthy(&target.id);
+    state
+        .runtime_status
+        .mark_healthy(&target.id, attempt_started);
 
     // #911 [21]: speech synthesis (TTS) reports no token usage — it is billed
     // per input character — so there are no tokens to add to TPM/TPD. The

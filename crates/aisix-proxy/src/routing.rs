@@ -94,9 +94,9 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses:
             }
             None => true,
         },
-        // Customer-fixable config / credentials (#367) is the caller's
-        // mistake — retrying or failing over won't help, same as a
-        // non-429 4xx.
+        // Customer-fixable config / credentials (#367): re-sending to this
+        // target won't help, same as a non-429 4xx. Another target may be
+        // fine, which is `target_unusable`'s question.
         BridgeError::InvalidUpstreamConfig(_)
         | BridgeError::InvalidRequest(_)
         | BridgeError::RequestTooLarge { .. }
@@ -122,6 +122,43 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses:
         | BridgeError::Transport(_)
         | BridgeError::Config(_)
         | BridgeError::StreamAborted => true,
+    }
+}
+
+/// Whether a failure is this target's own configuration rather than anything
+/// about the request or the upstream's answer: a key that cannot be used, a
+/// row that names no provider key, an adapter with no bridge. Re-sending to
+/// this target cannot help ([`is_retryable`] says no), but the next target
+/// has a configuration of its own, so a dispatch loop moves on instead of
+/// ending the request. With no target left the caller gets this error, as a
+/// direct model's caller does.
+pub(crate) fn target_unusable(err: &ProxyError) -> bool {
+    match err {
+        ProxyError::UnusableTarget(_) | ProxyError::ProviderUnavailable => true,
+        ProxyError::Bridge(be) => bridge_target_unusable(be),
+        _ => false,
+    }
+}
+
+/// [`target_unusable`] for the `BridgeError`-typed dispatch loops.
+pub(crate) fn bridge_target_unusable(err: &BridgeError) -> bool {
+    matches!(
+        err,
+        BridgeError::InvalidUpstreamConfig(_) | BridgeError::InvalidUpstreamCredentials(_)
+    )
+}
+
+/// The refusal a Model Group's caller gets when its walk ended on a target's
+/// own configuration. That error's text names the member and its provider
+/// key, for a direct model's operator; a group's caller gets the name it
+/// addressed ([`refused_model_label`]), and the attempt's row keeps the rest.
+pub(crate) fn group_refusal(err: ProxyError, addressed: &str) -> ProxyError {
+    match err {
+        ProxyError::UnusableTarget(_) => ProxyError::UnusableTarget(format!(
+            "{} has no usable target",
+            refused_model_label(addressed)
+        )),
+        other => other,
     }
 }
 
@@ -554,8 +591,9 @@ pub(crate) fn refused_model_label(addressed: &str) -> String {
 /// target's resolved deadlines. It must build all the per-target state it
 /// needs (provider key, upstream model id, request body rewrite) from
 /// the target, never from the caller-addressed entry — a group has no
-/// provider. Only a retryable `ProxyError::Bridge` moves on; any other error
-/// (a config gap, a 4xx) is returned as-is. `permit` can veto spending the
+/// provider. A retryable `ProxyError::Bridge` or a failure of the target's own
+/// configuration ([`target_unusable`]) moves on; any other error (a 4xx) is
+/// returned as-is. `permit` can veto spending the
 /// retry/fail-over budget on a failure after which a replay would duplicate
 /// a non-idempotent upstream write (see [`retrying_dispatch_gated`]).
 ///
@@ -695,6 +733,7 @@ where
             source_ip: &client.source_ip,
             context_origin: None,
             budget: Some(&budget_gate),
+            serves: None,
         },
     )?;
     let routing = entry.value.routing.as_ref();
@@ -845,6 +884,7 @@ where
                             // rest, which is the whole point of the group.
                             if transient {
                                 state.health.record_failure(&target.model.display_name);
+                                state.runtime_status.penalize_latency(&target.id);
                             }
                             (transient && permit(be), budget.covers(be))
                         }
@@ -878,6 +918,10 @@ where
                         },
                     );
                     if !retryable {
+                        if target_unusable(&e) {
+                            last_err = Some(e);
+                            break;
+                        }
                         return Err(e);
                     }
                     last_err = Some(e);
@@ -888,7 +932,12 @@ where
             }
         }
     }
-    Err(last_err.unwrap_or(ProxyError::ProviderUnavailable))
+    let err = last_err.unwrap_or(ProxyError::ProviderUnavailable);
+    Err(if routing.is_some() {
+        group_refusal(err, requested_name)
+    } else {
+        err
+    })
 }
 
 /// Balancing state is keyed per (virtual model, tier priority). Priority is
@@ -896,13 +945,22 @@ where
 /// sets and must not share rotation state.
 type TierKey = (String, i32);
 
+/// Suffix of the state key a route serving only part of a group rotates
+/// under ([`RoutingRequest::serves`]). A NUL cannot appear in a model name.
+const PARTIAL_ROUTE_ROTATION: &str = "\0partial";
+
 /// Smooth weighted round-robin state for one (virtual model, tier).
 struct WrrState {
-    /// Fingerprint of the (model, weight) list this state was built for. A
-    /// config change — or a different tag/IP-filtered subset — resets the
-    /// rotation rather than letting stale counters index a different list.
+    /// Fingerprint of the group's whole configured target list. A config
+    /// change restarts every rotation.
     fingerprint: u64,
-    current: Vec<i64>,
+    /// One rotation per request-filtered subset of the tier, by that subset's
+    /// fingerprint. The subset differs per caller (tags, client IP) and with
+    /// each target's health, so a single rotation would have to restart at
+    /// every change: interleaved callers would wipe each other's counters on
+    /// each request and every one would land on its subset's first target.
+    /// Bounded by the subsets that actually occur, and cleared with the config.
+    rotations: std::collections::HashMap<u64, Vec<i64>>,
 }
 
 const RING_POINTS_PER_UNIT: usize = 160;
@@ -930,9 +988,9 @@ impl HashRing {
             }
             a
         }
-        // An explicit weight of 0 still gets one unit: a target with no ring
-        // points would be silently unreachable in its tier, turning a weight
-        // typo into a dropped target.
+        // A 0 only gets here when every candidate is at 0
+        // (`targets_with_share`): they have no share to compare, so each
+        // gets one unit rather than the ring going empty.
         let weights: Vec<u64> = targets
             .iter()
             .map(|t| u64::from(t.weight_or_default().max(1)))
@@ -1002,8 +1060,10 @@ impl RoutingRegistry {
     /// Drop balancing state for routing models the snapshot no longer
     /// carries. Keyed by configuration, so nothing else reclaims it.
     pub fn retain_configured(&self, is_configured: &dyn Fn(&str) -> bool) {
-        self.wrr.retain(|(name, _), _| is_configured(name));
-        self.rings.retain(|(name, _), _| is_configured(name));
+        let configured =
+            |name: &str| is_configured(name.strip_suffix(PARTIAL_ROUTE_ROTATION).unwrap_or(name));
+        self.wrr.retain(|(name, _), _| configured(name));
+        self.rings.retain(|(name, _), _| configured(name));
     }
 
     pub fn new() -> Self {
@@ -1017,8 +1077,8 @@ impl RoutingRegistry {
     /// lower tier is reached only after every higher-tier target failed or
     /// was filtered. Length is bounded by the initial target plus
     /// `routing.max_fallbacks_or_default()`.
-    /// `targets` is the request-eligible subset (tag filter, then client-IP
-    /// and budget filters), passed alongside `routing` rather than spliced
+    /// `targets` is the request-eligible subset (tag filter, then client-IP,
+    /// budget, weight and health filters), passed alongside `routing` rather than spliced
     /// into a clone of it: the strategy knobs come from `routing`, the
     /// candidate list from here, and rebuilding a whole `Routing` just to
     /// swap one field copied its own target vector only to drop it.
@@ -1041,6 +1101,7 @@ impl RoutingRegistry {
             return targets.iter().map(|t| t.model.clone()).collect();
         }
         let mut order = Vec::with_capacity(targets.len());
+        let config_fingerprint = tier_fingerprint(&routing.targets);
         for tier in partition_by_priority(targets) {
             let priority = tier[0].priority_or_default();
             match routing.strategy {
@@ -1048,7 +1109,7 @@ impl RoutingRegistry {
                     order.extend(tier.iter().map(|t| t.model.clone()));
                 }
                 RoutingStrategy::RoundRobin => {
-                    let start = self.wrr_pick(virtual_name, priority, &tier);
+                    let start = self.wrr_pick(virtual_name, priority, config_fingerprint, &tier);
                     order.extend(attempt_order(&tier, start, tier.len()));
                 }
                 RoutingStrategy::ConsistentHash => {
@@ -1072,39 +1133,46 @@ impl RoutingRegistry {
     /// each target's weight to its running counter, takes the max, and
     /// subtracts the weight total from the winner. Proportional AND
     /// interleaved; equal weights degrade to a declaration-order cycle.
-    fn wrr_pick(&self, virtual_name: &str, priority: i32, tier: &[RoutingTarget]) -> usize {
+    fn wrr_pick(
+        &self,
+        virtual_name: &str,
+        priority: i32,
+        config_fingerprint: u64,
+        tier: &[RoutingTarget],
+    ) -> usize {
         let weights: Vec<i64> = tier
             .iter()
             .map(|t| i64::from(t.weight_or_default().max(1)))
             .collect();
         let total: i64 = weights.iter().sum();
-        let fingerprint = tier_fingerprint(tier);
         let entry = self
             .wrr
             .entry((virtual_name.to_string(), priority))
             .or_insert_with(|| {
                 Mutex::new(WrrState {
-                    fingerprint,
-                    current: vec![0; weights.len()],
+                    fingerprint: config_fingerprint,
+                    rotations: std::collections::HashMap::new(),
                 })
             });
         let mut state = entry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.fingerprint != fingerprint || state.current.len() != weights.len() {
-            *state = WrrState {
-                fingerprint,
-                current: vec![0; weights.len()],
-            };
+        if state.fingerprint != config_fingerprint {
+            state.fingerprint = config_fingerprint;
+            state.rotations.clear();
         }
+        let current = state
+            .rotations
+            .entry(tier_fingerprint(tier))
+            .or_insert_with(|| vec![0; weights.len()]);
         let mut best = 0;
         for (i, w) in weights.iter().enumerate() {
-            state.current[i] += w;
-            if state.current[i] > state.current[best] {
+            current[i] += w;
+            if current[i] > current[best] {
                 best = i;
             }
         }
-        state.current[best] -= total;
+        current[best] -= total;
         best
     }
 
@@ -1160,13 +1228,17 @@ fn partition_by_priority(targets: &[RoutingTarget]) -> Vec<Vec<RoutingTarget>> {
         .collect()
 }
 
-/// Fingerprint of a tier's identity for balancing-state reuse: the ordered
-/// (model, weight) pairs. Priorities are already part of the state key and
-/// tags do not affect selection within a surviving subset.
+/// Fingerprint of a target list's identity for balancing-state reuse: the
+/// ordered (model, weight) pairs. Priorities are already part of the state
+/// key and tags do not affect selection within a surviving subset. A target
+/// named by id carries that id, since its `model` is empty until it is
+/// normalized.
 fn tier_fingerprint(tier: &[RoutingTarget]) -> u64 {
     let mut h = FNV_OFFSET_BASIS;
     for t in tier {
         h = fnv1a_extend(h, t.model.as_bytes());
+        h = fnv1a_extend(h, &[0]);
+        h = fnv1a_extend(h, t.model_id.as_deref().unwrap_or("").as_bytes());
         h = fnv1a_extend(h, &[0]);
         h = fnv1a_extend(h, &t.weight_or_default().to_le_bytes());
         h = fnv1a_extend(h, &[1]);
@@ -1336,8 +1408,12 @@ fn cost_key(pricing: &PricingIndex, model: &Model) -> f64 {
 
 /// Observed-latency key used to rank `least_latency` targets. A target with
 /// no latency samples yet sorts first (treated as −∞) so it gets probed;
-/// once it has an EWMA it ranks by that.
+/// once it has an EWMA it ranks by that. A target that just failed sorts
+/// last until its penalty lapses, whatever it had before.
 fn latency_key(runtime_status: &crate::ModelRuntimeStatusTracker, id: &str) -> f64 {
+    if runtime_status.latency_penalized(id) {
+        return f64::INFINITY;
+    }
     runtime_status
         .latency_ewma_ms(id)
         .unwrap_or(f64::NEG_INFINITY)
@@ -1423,6 +1499,9 @@ pub(crate) const EXCLUDED_COOLING: &str = "cooling";
 /// `reason` on an [`ExcludedCandidate`] dropped because its background
 /// health check has it marked down.
 pub(crate) const EXCLUDED_UNHEALTHY: &str = "unhealthy";
+/// `reason` on an [`ExcludedCandidate`] whose name resolves to no Model in
+/// this snapshot: its row was deleted while the group still names it.
+pub(crate) const EXCLUDED_MISSING: &str = "missing";
 
 /// Outcome of routing-candidate filtering. Lifts the "all candidates
 /// excluded" case out into a typed result so the dispatch loop can
@@ -1557,6 +1636,14 @@ pub(crate) struct RoutingRequest<'a> {
     /// exhausted is not a candidate, and a direct model on one is refused.
     /// `None` only in tests that exercise no budget.
     pub budget: Option<&'a crate::budget::BudgetGate>,
+    /// Set by a route that only some of a group's targets can answer. The
+    /// others are not candidates, so they cannot use up a `max_fallbacks`
+    /// slot, and a group with none left resolves to an empty list for the
+    /// route to refuse in its own words. Such a route also rotates on its
+    /// own, because its traffic says nothing about the group's other routes:
+    /// a client alternating it with those would otherwise always land them
+    /// on the same target.
+    pub serves: Option<&'a dyn Fn(&Model) -> bool>,
 }
 
 /// Drop the targets whose own `allowed_cidrs` excludes `source_ip`.
@@ -1572,9 +1659,9 @@ fn targets_allowed_for_ip<'a>(
     targets: std::borrow::Cow<'a, [RoutingTarget]>,
     source_ip: &str,
 ) -> std::borrow::Cow<'a, [RoutingTarget]> {
-    // An unresolvable name is left in place so the resolution loop below
-    // still reports it as a config error, rather than being silently
-    // swallowed here as an IP rejection.
+    // An unresolvable name is left in place for the resolution below to
+    // count as the missing member it is, rather than being silently swallowed
+    // here as an IP rejection.
     let allowed = |t: &RoutingTarget| {
         snapshot
             .models
@@ -1632,6 +1719,34 @@ pub(crate) fn check_member_ip_access(
     }
 }
 
+/// Drop the targets a weight-using strategy gives no share to: `weight: 0`
+/// takes a target out of rotation, which is how an operator drains one.
+/// With every candidate at 0 there is no share to compare, so they all stay
+/// and the strategies treat them as equal rather than refuse the request.
+/// `failover`, `least_cost` and `least_latency` do not read the field.
+fn targets_with_share<'a>(
+    strategy: RoutingStrategy,
+    targets: std::borrow::Cow<'a, [RoutingTarget]>,
+) -> std::borrow::Cow<'a, [RoutingTarget]> {
+    let weighted = matches!(
+        strategy,
+        RoutingStrategy::RoundRobin | RoutingStrategy::ConsistentHash | RoutingStrategy::LeastBusy
+    );
+    if !weighted || targets.iter().all(|t| t.weight_or_default() > 0) {
+        return targets;
+    }
+    let kept: Vec<RoutingTarget> = targets
+        .iter()
+        .filter(|t| t.weight_or_default() > 0)
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        targets
+    } else {
+        std::borrow::Cow::Owned(kept)
+    }
+}
+
 /// Drop the targets whose provider key has an exhausted `provider_key`
 /// budget (or, in strict mode, any budget it can no longer verify). With
 /// every target dropped, the request is refused with the budget's own
@@ -1677,9 +1792,10 @@ fn targets_within_budget<'a>(
 
 /// Resolve the ordered list of concrete Models a request will attempt.
 ///
-/// For a routing model (Model Group), walk `routing.targets` per the
-/// configured strategy, resolve each target name to a Model in the
-/// snapshot, then apply the health/cooldown filter. For a direct
+/// For a routing model (Model Group), narrow `routing.targets` to the ones
+/// this request can use (tags, client IP, budget, weight, whether the name
+/// still resolves, health/cooldown), then order what is left per the
+/// configured strategy and cap it at `max_fallbacks`. For a direct
 /// (non-routing) model, the list is just the model itself.
 ///
 /// Shared by `/v1/chat/completions` and `/v1/messages` so both endpoints
@@ -1770,6 +1886,25 @@ pub(crate) fn resolve_attempt_models(
                 .collect::<Vec<_>>(),
         )
     };
+    let eligible = match req.serves {
+        Some(serves) => {
+            let kept: Vec<RoutingTarget> = eligible
+                .iter()
+                .filter(|t| {
+                    snapshot
+                        .models
+                        .get_by_name(&t.model)
+                        .is_some_and(|entry| serves(&entry.value))
+                })
+                .cloned()
+                .collect();
+            if kept.is_empty() {
+                return Ok(Vec::new());
+            }
+            std::borrow::Cow::Owned(kept)
+        }
+        None => eligible,
+    };
     // Client-IP pre-filter (#1087 follow-up): a target whose own
     // `allowed_cidrs` excludes this caller is not a candidate. Applied BEFORE
     // the strategy picks, so `max_fallbacks` budgets attempts across the
@@ -1791,38 +1926,102 @@ pub(crate) fn resolve_attempt_models(
         Some(gate) => targets_within_budget(snapshot, gate, eligible)?,
         None => eligible,
     };
+    let eligible = targets_with_share(routing.strategy, eligible);
+
+    // Everything still eligible, resolved. A name that resolves to nothing
+    // is a member deleted while the group still names it, and it costs the
+    // group that member rather than the whole group. The refusal for a group
+    // left with none names nobody, for the reason `refused_model_label`
+    // gives.
+    let mut dropped = Vec::new();
+    let mut candidates = Vec::with_capacity(eligible.len());
+    for t in eligible.iter() {
+        match snapshot.models.get_by_name(&t.model) {
+            Some(entry) => candidates.push(AttemptModel {
+                id: entry.id.clone(),
+                model: entry.value.clone(),
+                priority: t.priority_or_default(),
+                weight: t.weight_or_default(),
+            }),
+            None => dropped.push(ExcludedCandidate {
+                id: t.model.clone(),
+                model: t.model.clone(),
+                reason: EXCLUDED_MISSING,
+            }),
+        }
+    }
+    if candidates.is_empty() {
+        log_candidate_exclusions(runtime_status, virtual_name, 0, &dropped);
+        return Err(ProxyError::InvalidRequest(
+            "routing model has no target that resolves to a Model".into(),
+        ));
+    }
+
+    // The health and cooldown filter runs ahead of the strategy, like the
+    // client-IP and budget filters above and for the same reason: an
+    // unavailable target must not use up a `max_fallbacks` slot, or a healthy
+    // target or a whole backup tier goes untried, and its share belongs to
+    // the targets that can serve. It also means a cooling target's traffic
+    // spreads across the rest instead of landing on its neighbour.
+    let attempts = match filter_attempt_models(
+        runtime_status,
+        candidates,
+        routing.when_all_unavailable_or_default(),
+    ) {
+        FilterOutcome::Selected { attempts, excluded } => {
+            dropped.extend(excluded);
+            attempts
+        }
+        FilterOutcome::AllUnhealthy {
+            retry_after_secs,
+            excluded,
+        } => {
+            dropped.extend(excluded);
+            log_candidate_exclusions(runtime_status, virtual_name, 0, &dropped);
+            tracing::warn!(
+                virtual_model = %virtual_name,
+                retry_after_secs,
+                "all routing candidates are unavailable; failing fast",
+            );
+            return Err(ProxyError::AllCandidatesUnavailable { retry_after_secs });
+        }
+    };
+    let available = if attempts.len() == eligible.len() {
+        eligible
+    } else {
+        std::borrow::Cow::Owned(
+            eligible
+                .iter()
+                .filter(|t| attempts.iter().any(|a| a.model.display_name == t.model))
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    };
 
     let hash_key = if routing.strategy == RoutingStrategy::ConsistentHash {
         resolve_hash_key(routing, &req)
     } else {
         String::new()
     };
-    let names = routing_registry.pick_targets(virtual_name, routing, &eligible, &hash_key);
+    let rotation = match req.serves {
+        Some(_) => std::borrow::Cow::Owned(format!("{virtual_name}{PARTIAL_ROUTE_ROTATION}")),
+        None => std::borrow::Cow::Borrowed(virtual_name),
+    };
+    let names = routing_registry.pick_targets(&rotation, routing, &available, &hash_key);
     if names.is_empty() {
         return Err(ProxyError::InvalidRequest(
             "routing model has no targets".into(),
         ));
     }
-    let mut resolved = Vec::with_capacity(names.len());
-    for name in &names {
-        let target_entry = snapshot.models.get_by_name(name).ok_or_else(|| {
-            ProxyError::InvalidRequest(format!(
-                "routing target {name:?} does not resolve to a Model"
-            ))
-        })?;
-        // One entry per resolved model (see the normalization above), so
-        // the first match is the only match.
-        let target = eligible
-            .iter()
-            .find(|t| t.model == *name)
-            .expect("picked name comes from the eligible targets");
-        resolved.push(AttemptModel {
-            id: target_entry.id.clone(),
-            model: target_entry.value.clone(),
-            priority: target.priority_or_default(),
-            weight: target.weight_or_default(),
-        });
-    }
+    let mut resolved: Vec<AttemptModel> = names
+        .iter()
+        .filter_map(|name| {
+            attempts
+                .iter()
+                .find(|a| a.model.display_name == *name)
+                .cloned()
+        })
+        .collect();
     // Metric-ordered strategies get the full target set from `pick_targets`;
     // rank it best-first here (target Models are now resolved) and cap it to
     // the same attempt budget the positional strategies apply upstream. The
@@ -1839,7 +2038,7 @@ pub(crate) fn resolve_attempt_models(
         resolved.sort_by_key(|a| std::cmp::Reverse(a.priority));
     }
     if let Some(origin) = req.context_origin {
-        resolved = pin_context_origin(snapshot, runtime_status, &eligible, resolved, origin);
+        resolved = pin_context_origin(snapshot, runtime_status, &available, resolved, origin);
         tracing::debug!(
             virtual_model = %virtual_name,
             origin,
@@ -1848,28 +2047,8 @@ pub(crate) fn resolve_attempt_models(
         );
     }
     resolved.truncate(routing.max_fallbacks_or_default() + 1);
-    match filter_attempt_models(
-        runtime_status,
-        resolved,
-        routing.when_all_unavailable_or_default(),
-    ) {
-        FilterOutcome::Selected { attempts, excluded } => {
-            log_candidate_exclusions(runtime_status, virtual_name, attempts.len(), &excluded);
-            Ok(attempts)
-        }
-        FilterOutcome::AllUnhealthy {
-            retry_after_secs,
-            excluded,
-        } => {
-            log_candidate_exclusions(runtime_status, virtual_name, 0, &excluded);
-            tracing::warn!(
-                virtual_model = %virtual_name,
-                retry_after_secs,
-                "all routing candidates are unavailable; failing fast",
-            );
-            Err(ProxyError::AllCandidatesUnavailable { retry_after_secs })
-        }
-    }
+    log_candidate_exclusions(runtime_status, virtual_name, resolved.len(), &dropped);
+    Ok(resolved)
 }
 
 /// Put the targets that can read a conversation's context first: the origin
@@ -1877,11 +2056,10 @@ pub(crate) fn resolve_attempt_models(
 /// strategy's order. Targets the strategy left out of `resolved` (its
 /// `max_fallbacks` cut) are brought back behind the ones it ordered, since
 /// the pinned order can push those out and the cut is applied again after
-/// this. Only targets that survived the tag and client-IP filters are
-/// considered — `targets` is already that set. A boundary member
-/// that is cooling or unhealthy goes behind every other target, so it cannot
-/// spend the `max_fallbacks` budget ahead of an available one; whether it is
-/// tried at all is still [`filter_attempt_models`]'s call.
+/// this. Only targets that survived the filters are considered — `targets`
+/// is already that set. When every target left is cooling, a boundary member
+/// goes behind the others, so it cannot spend the `max_fallbacks` budget
+/// ahead of one that can serve whatever it is sent.
 fn pin_context_origin(
     snapshot: &AisixSnapshot,
     runtime_status: &crate::ModelRuntimeStatusTracker,
@@ -2368,6 +2546,688 @@ mod tests {
         );
     }
 
+    // ───────────────── the selection path, filters and strategy together ─────────
+
+    fn group_model(routing: Routing) -> std::sync::Arc<Model> {
+        let mut group: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "group",
+            "routing": {"strategy": "failover", "targets": []},
+        }))
+        .unwrap();
+        group.routing = Some(routing);
+        std::sync::Arc::new(group)
+    }
+
+    /// One real walk through `resolve_attempt_models`, naming what comes out.
+    fn select(
+        registry: &RoutingRegistry,
+        status: &crate::ModelRuntimeStatusTracker,
+        snap: &AisixSnapshot,
+        routing: Routing,
+        req: RoutingRequest<'_>,
+    ) -> Result<Vec<String>, ProxyError> {
+        resolve_attempt_models(
+            registry,
+            status,
+            &LivePricingIndex::new(),
+            snap,
+            "group",
+            "g-1",
+            &group_model(routing),
+            req,
+        )
+        .map(|attempts| {
+            attempts
+                .into_iter()
+                .map(|a| a.model.display_name.clone())
+                .collect()
+        })
+    }
+
+    fn snap_of(names: &[&str]) -> AisixSnapshot {
+        let rows: Vec<(&str, &str)> = names.iter().map(|n| (*n, "pk-1")).collect();
+        pk_snapshot(&rows)
+    }
+
+    fn cooling(names: &[&str]) -> crate::ModelRuntimeStatusTracker {
+        let status = crate::ModelRuntimeStatusTracker::new();
+        for name in names {
+            status.mark_cooldown(&format!("id-{name}"), Duration::from_secs(60), "test");
+        }
+        status
+    }
+
+    /// How often each target comes first over `rounds` requests.
+    fn first_picks<'a>(
+        rounds: usize,
+        mut pick: impl FnMut(usize) -> Vec<String> + 'a,
+    ) -> std::collections::BTreeMap<String, usize> {
+        let mut counts = std::collections::BTreeMap::new();
+        for round in 0..rounds {
+            *counts.entry(pick(round).remove(0)).or_default() += 1;
+        }
+        counts
+    }
+
+    #[test]
+    fn a_cooling_target_does_not_spend_the_fallback_budget() {
+        let snap = snap_of(&["a", "b", "c"]);
+        let status = cooling(&["a", "b"]);
+        let routing = r(
+            RoutingStrategy::Failover,
+            vec![
+                RoutingTarget::new("a"),
+                RoutingTarget::new("b"),
+                RoutingTarget::new("c"),
+            ],
+            Some(1),
+        );
+        assert_eq!(
+            select(
+                &RoutingRegistry::new(),
+                &status,
+                &snap,
+                routing,
+                RoutingRequest::default()
+            )
+            .unwrap(),
+            ["c"],
+        );
+    }
+
+    #[test]
+    fn a_cooling_tier_leaves_the_backup_tier_reachable() {
+        let snap = snap_of(&["a", "b", "backup"]);
+        let status = cooling(&["a", "b"]);
+        let routing = r(
+            RoutingStrategy::Failover,
+            vec![
+                RoutingTarget::new("a").with_priority(1),
+                RoutingTarget::new("b").with_priority(1),
+                RoutingTarget::new("backup"),
+            ],
+            Some(1),
+        );
+        assert_eq!(
+            select(
+                &RoutingRegistry::new(),
+                &status,
+                &snap,
+                routing,
+                RoutingRequest::default()
+            )
+            .unwrap(),
+            ["backup"],
+        );
+    }
+
+    #[test]
+    fn round_robin_with_no_fallbacks_never_picks_a_cooling_target() {
+        let snap = snap_of(&["a", "b"]);
+        let status = cooling(&["a"]);
+        let registry = RoutingRegistry::new();
+        let picks = first_picks(100, |_| {
+            select(
+                &registry,
+                &status,
+                &snap,
+                r(
+                    RoutingStrategy::RoundRobin,
+                    vec![RoutingTarget::new("a"), RoutingTarget::new("b")],
+                    Some(0),
+                ),
+                RoutingRequest::default(),
+            )
+            .unwrap()
+        });
+        assert_eq!(picks.get("a"), None);
+        assert_eq!(picks.get("b"), Some(&100));
+    }
+
+    /// The cap still bounds the walk, over the targets that can serve.
+    #[test]
+    fn the_fallback_cap_applies_to_the_targets_left_after_the_filter() {
+        let snap = snap_of(&["a", "b", "c", "d"]);
+        let status = cooling(&["a"]);
+        let routing = r(
+            RoutingStrategy::Failover,
+            ["a", "b", "c", "d"]
+                .iter()
+                .map(|t| RoutingTarget::new(*t))
+                .collect(),
+            Some(1),
+        );
+        assert_eq!(
+            select(
+                &RoutingRegistry::new(),
+                &status,
+                &snap,
+                routing,
+                RoutingRequest::default()
+            )
+            .unwrap(),
+            ["b", "c"],
+        );
+    }
+
+    #[test]
+    fn a_cooling_targets_share_spreads_across_the_rest() {
+        let snap = snap_of(&["a", "b", "c"]);
+        let status = cooling(&["a"]);
+        let registry = RoutingRegistry::new();
+        let picks = first_picks(3000, |_| {
+            select(
+                &registry,
+                &status,
+                &snap,
+                r(
+                    RoutingStrategy::RoundRobin,
+                    ["a", "b", "c"]
+                        .iter()
+                        .map(|t| RoutingTarget::new(*t))
+                        .collect(),
+                    None,
+                ),
+                RoutingRequest::default(),
+            )
+            .unwrap()
+        });
+        assert_eq!(picks.get("b"), Some(&1500));
+        assert_eq!(picks.get("c"), Some(&1500));
+    }
+
+    /// Callers with different tags take turns in one rotation, and each tag's
+    /// targets split that tag's traffic. A rotation that restarted on every
+    /// change of subset sent all of it to each tag's first target.
+    #[test]
+    fn interleaved_tag_subsets_keep_their_rotation() {
+        let snap = snap_of(&["eu1", "eu2", "us1", "us2"]);
+        let status = crate::ModelRuntimeStatusTracker::new();
+        let registry = RoutingRegistry::new();
+        let tags = [vec!["eu".to_string()], vec!["us".to_string()]];
+        let picks = first_picks(4000, |round| {
+            select(
+                &registry,
+                &status,
+                &snap,
+                r(
+                    RoutingStrategy::RoundRobin,
+                    vec![
+                        tagged("eu1", &["eu"]),
+                        tagged("eu2", &["eu"]),
+                        tagged("us1", &["us"]),
+                        tagged("us2", &["us"]),
+                    ],
+                    None,
+                ),
+                RoutingRequest {
+                    tags: &tags[round % 2],
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        });
+        for target in ["eu1", "eu2", "us1", "us2"] {
+            assert_eq!(picks.get(target), Some(&1000), "{target}: {picks:?}");
+        }
+    }
+
+    /// Subsets that overlap: a target only some callers may use keeps its
+    /// share of those callers, and the others split the remainder.
+    #[test]
+    fn overlapping_ip_subsets_share_one_fair_rotation() {
+        let table = aisix_core::snapshot::ResourceTable::default();
+        for (name, cidrs) in [("a", Some(vec!["10.0.0.0/8"])), ("b", None), ("c", None)] {
+            let model: Model = serde_json::from_value(serde_json::json!({
+                "display_name": name,
+                "provider": "openai",
+                "model_name": "up",
+                "provider_key_id": "pk-1",
+                "allowed_cidrs": cidrs,
+            }))
+            .unwrap();
+            table.insert(aisix_core::ResourceEntry::new(
+                format!("id-{name}"),
+                model,
+                1,
+            ));
+        }
+        let snap = AisixSnapshot {
+            models: table,
+            ..Default::default()
+        };
+        let status = crate::ModelRuntimeStatusTracker::new();
+        let registry = RoutingRegistry::new();
+        let picks = first_picks(3000, |round| {
+            select(
+                &registry,
+                &status,
+                &snap,
+                r(
+                    RoutingStrategy::RoundRobin,
+                    ["a", "b", "c"]
+                        .iter()
+                        .map(|t| RoutingTarget::new(*t))
+                        .collect(),
+                    None,
+                ),
+                RoutingRequest {
+                    source_ip: if round % 2 == 0 {
+                        "10.1.2.3"
+                    } else {
+                        "8.8.8.8"
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        });
+        assert_eq!(picks.get("a"), Some(&500), "{picks:?}");
+        assert_eq!(picks.get("b"), Some(&1250), "{picks:?}");
+        assert_eq!(picks.get("c"), Some(&1250), "{picks:?}");
+    }
+
+    #[test]
+    fn a_target_at_weight_zero_gets_no_traffic() {
+        let snap = snap_of(&["live", "drained"]);
+        let status = crate::ModelRuntimeStatusTracker::new();
+        for strategy in [
+            RoutingStrategy::RoundRobin,
+            RoutingStrategy::ConsistentHash,
+            RoutingStrategy::LeastBusy,
+        ] {
+            let registry = RoutingRegistry::new();
+            let headers: Vec<HeaderMap> = (0..64)
+                .map(|i| {
+                    let mut h = HeaderMap::new();
+                    h.insert(
+                        "x-aisix-routing-key",
+                        format!("key-{i}").parse().expect("header value"),
+                    );
+                    h
+                })
+                .collect();
+            let picks = first_picks(64, |round| {
+                select(
+                    &registry,
+                    &status,
+                    &snap,
+                    r(
+                        strategy,
+                        vec![
+                            RoutingTarget::new("live").with_weight(1),
+                            RoutingTarget::new("drained").with_weight(0),
+                        ],
+                        None,
+                    ),
+                    RoutingRequest {
+                        headers: Some(&headers[round]),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+            });
+            assert_eq!(picks.get("live"), Some(&64), "{strategy:?}: {picks:?}");
+        }
+    }
+
+    /// `failover` documents that it does not read `weight`, so a 0 there
+    /// changes nothing.
+    #[test]
+    fn weight_zero_means_nothing_to_a_strategy_that_ignores_weight() {
+        let snap = snap_of(&["a", "b"]);
+        let routing = r(
+            RoutingStrategy::Failover,
+            vec![
+                RoutingTarget::new("a").with_weight(0),
+                RoutingTarget::new("b"),
+            ],
+            None,
+        );
+        assert_eq!(
+            select(
+                &RoutingRegistry::new(),
+                &crate::ModelRuntimeStatusTracker::new(),
+                &snap,
+                routing,
+                RoutingRequest::default()
+            )
+            .unwrap(),
+            ["a", "b"],
+        );
+    }
+
+    /// With nothing above 0 there is no share to compare, so the candidates
+    /// stay equal rather than every request being refused.
+    #[test]
+    fn candidates_all_at_weight_zero_stay_equal() {
+        let snap = snap_of(&["a", "b"]);
+        let status = crate::ModelRuntimeStatusTracker::new();
+        let registry = RoutingRegistry::new();
+        let picks = first_picks(10, |_| {
+            select(
+                &registry,
+                &status,
+                &snap,
+                r(
+                    RoutingStrategy::RoundRobin,
+                    vec![
+                        RoutingTarget::new("a").with_weight(0),
+                        RoutingTarget::new("b").with_weight(0),
+                    ],
+                    None,
+                ),
+                RoutingRequest::default(),
+            )
+            .unwrap()
+        });
+        assert_eq!(picks.get("a"), Some(&5));
+        assert_eq!(picks.get("b"), Some(&5));
+    }
+
+    #[test]
+    fn a_deleted_member_costs_the_group_only_that_member() {
+        let snap = snap_of(&["good"]);
+        for targets in [
+            vec![RoutingTarget::new("good"), RoutingTarget::new("deleted")],
+            vec![RoutingTarget::new("deleted"), RoutingTarget::new("good")],
+        ] {
+            assert_eq!(
+                select(
+                    &RoutingRegistry::new(),
+                    &crate::ModelRuntimeStatusTracker::new(),
+                    &snap,
+                    r(RoutingStrategy::Failover, targets, None),
+                    RoutingRequest::default()
+                )
+                .unwrap(),
+                ["good"],
+            );
+        }
+    }
+
+    /// A deleted member must not use up the fallback budget either.
+    #[test]
+    fn a_deleted_member_does_not_spend_the_fallback_budget() {
+        let snap = snap_of(&["good"]);
+        let routing = r(
+            RoutingStrategy::Failover,
+            vec![RoutingTarget::new("deleted"), RoutingTarget::new("good")],
+            Some(0),
+        );
+        assert_eq!(
+            select(
+                &RoutingRegistry::new(),
+                &crate::ModelRuntimeStatusTracker::new(),
+                &snap,
+                routing,
+                RoutingRequest::default()
+            )
+            .unwrap(),
+            ["good"],
+        );
+    }
+
+    #[test]
+    fn a_group_with_no_member_left_is_refused_without_naming_one() {
+        let snap = snap_of(&["unrelated"]);
+        let err = select(
+            &RoutingRegistry::new(),
+            &crate::ModelRuntimeStatusTracker::new(),
+            &snap,
+            r(
+                RoutingStrategy::Failover,
+                vec![RoutingTarget::new("secret-member")],
+                None,
+            ),
+            RoutingRequest::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(!err.to_string().contains("secret-member"), "{err}");
+    }
+
+    /// `when_all_unavailable: fail` answers for a group a health check has
+    /// entirely marked down. Cooling targets are still sent to: nothing shows
+    /// them broken, and a success is what brings them back early.
+    #[test]
+    fn every_target_cooling_is_still_dispatched_under_fail() {
+        let snap = snap_of(&["a", "b"]);
+        let status = cooling(&["a", "b"]);
+        let mut routing = r(
+            RoutingStrategy::Failover,
+            vec![RoutingTarget::new("a"), RoutingTarget::new("b")],
+            None,
+        );
+        routing.when_all_unavailable = Some(WhenAllUnavailablePolicy::Fail);
+        assert_eq!(
+            select(
+                &RoutingRegistry::new(),
+                &status,
+                &snap,
+                routing,
+                RoutingRequest::default()
+            )
+            .unwrap(),
+            ["a", "b"],
+        );
+    }
+
+    #[test]
+    fn every_target_unhealthy_is_refused_under_fail() {
+        let snap = snap_of(&["a", "b"]);
+        let status = crate::ModelRuntimeStatusTracker::new();
+        status.mark_unhealthy("id-a", Some(503), "background_check_failed");
+        status.mark_unhealthy("id-b", Some(503), "background_check_failed");
+        let mut routing = r(
+            RoutingStrategy::Failover,
+            vec![RoutingTarget::new("a"), RoutingTarget::new("b")],
+            None,
+        );
+        routing.when_all_unavailable = Some(WhenAllUnavailablePolicy::Fail);
+        assert!(matches!(
+            select(
+                &RoutingRegistry::new(),
+                &status,
+                &snap,
+                routing,
+                RoutingRequest::default()
+            ),
+            Err(ProxyError::AllCandidatesUnavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn try_anyway_tries_unhealthy_targets_up_to_the_fallback_cap() {
+        let snap = snap_of(&["a", "b", "c"]);
+        let status = crate::ModelRuntimeStatusTracker::new();
+        for id in ["id-a", "id-b", "id-c"] {
+            status.mark_unhealthy(id, Some(503), "background_check_failed");
+        }
+        let mut routing = r(
+            RoutingStrategy::Failover,
+            vec![
+                RoutingTarget::new("a"),
+                RoutingTarget::new("b"),
+                RoutingTarget::new("c"),
+            ],
+            Some(1),
+        );
+        routing.when_all_unavailable = Some(WhenAllUnavailablePolicy::TryAnyway);
+        assert_eq!(
+            select(
+                &RoutingRegistry::new(),
+                &status,
+                &snap,
+                routing,
+                RoutingRequest::default()
+            )
+            .unwrap(),
+            ["a", "b"],
+        );
+    }
+
+    /// A target that failed drops behind the others instead of being tried
+    /// first on every request, whether it had no samples or a fast history.
+    #[test]
+    fn a_failed_target_ranks_last_on_least_latency() {
+        let snap = snap_of(&["broken", "ok"]);
+        let routing = || {
+            r(
+                RoutingStrategy::LeastLatency,
+                vec![RoutingTarget::new("broken"), RoutingTarget::new("ok")],
+                None,
+            )
+        };
+        let run = |status: &crate::ModelRuntimeStatusTracker| {
+            select(
+                &RoutingRegistry::new(),
+                status,
+                &snap,
+                routing(),
+                RoutingRequest::default(),
+            )
+            .unwrap()
+        };
+        let unmeasured = crate::ModelRuntimeStatusTracker::new();
+        unmeasured.record_latency("id-ok", 900);
+        assert_eq!(run(&unmeasured), ["broken", "ok"], "a probe goes first");
+        unmeasured.penalize_latency("id-broken");
+        assert_eq!(run(&unmeasured), ["ok", "broken"]);
+
+        let was_fast = crate::ModelRuntimeStatusTracker::new();
+        was_fast.record_latency("id-ok", 900);
+        was_fast.record_latency("id-broken", 50);
+        assert_eq!(run(&was_fast), ["broken", "ok"]);
+        was_fast.penalize_latency("id-broken");
+        assert_eq!(run(&was_fast), ["ok", "broken"]);
+    }
+
+    /// A route only some targets can answer: the others are not candidates,
+    /// so they cannot use up the fallback budget.
+    #[test]
+    fn a_partial_route_only_sees_the_targets_it_can_use() {
+        let snap = snap_of(&["foreign", "native"]);
+        let status = crate::ModelRuntimeStatusTracker::new();
+        let registry = RoutingRegistry::new();
+        let serves = |m: &Model| m.display_name == "native";
+        for _ in 0..4 {
+            assert_eq!(
+                select(
+                    &registry,
+                    &status,
+                    &snap,
+                    r(
+                        RoutingStrategy::RoundRobin,
+                        vec![RoutingTarget::new("foreign"), RoutingTarget::new("native")],
+                        Some(0),
+                    ),
+                    RoutingRequest {
+                        serves: Some(&serves),
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+                ["native"],
+            );
+        }
+        let serves_nothing = |_: &Model| false;
+        assert_eq!(
+            select(
+                &registry,
+                &status,
+                &snap,
+                r(
+                    RoutingStrategy::RoundRobin,
+                    vec![RoutingTarget::new("foreign")],
+                    None,
+                ),
+                RoutingRequest {
+                    serves: Some(&serves_nothing),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+            Vec::<String>::new(),
+        );
+    }
+
+    /// A client alternating a partial route with the group's other routes
+    /// must not always land the others on the same target.
+    #[test]
+    fn a_partial_route_does_not_move_the_groups_rotation() {
+        let snap = snap_of(&["a", "b"]);
+        let status = crate::ModelRuntimeStatusTracker::new();
+        let registry = RoutingRegistry::new();
+        let group = || {
+            r(
+                RoutingStrategy::RoundRobin,
+                vec![RoutingTarget::new("a"), RoutingTarget::new("b")],
+                None,
+            )
+        };
+        let serves = |_: &Model| true;
+        let picks = first_picks(10, |_| {
+            let _ = select(
+                &registry,
+                &status,
+                &snap,
+                group(),
+                RoutingRequest {
+                    serves: Some(&serves),
+                    ..Default::default()
+                },
+            );
+            select(
+                &registry,
+                &status,
+                &snap,
+                group(),
+                RoutingRequest::default(),
+            )
+            .unwrap()
+        });
+        assert_eq!(picks.get("a"), Some(&5));
+        assert_eq!(picks.get("b"), Some(&5));
+    }
+
+    /// The partial route's rotation is reclaimed with its group, and only then.
+    #[test]
+    fn a_partial_routes_rotation_lives_and_dies_with_its_group() {
+        let registry = RoutingRegistry::new();
+        let routing = r(
+            RoutingStrategy::RoundRobin,
+            vec![RoutingTarget::new("a"), RoutingTarget::new("b")],
+            None,
+        );
+        let partial = format!("group{PARTIAL_ROUTE_ROTATION}");
+        registry.pick_targets(&partial, &routing, &routing.targets, "");
+        registry.retain_configured(&|name| name == "group");
+        assert_eq!(registry.wrr.len(), 1);
+        registry.retain_configured(&|_| false);
+        assert_eq!(registry.wrr.len(), 0);
+    }
+
+    #[test]
+    fn a_targets_own_configuration_moves_the_loop_on_and_a_bad_request_does_not() {
+        for unusable in [
+            ProxyError::UnusableTarget("no provider key".into()),
+            ProxyError::ProviderUnavailable,
+            ProxyError::Bridge(BridgeError::InvalidUpstreamConfig("no base".into())),
+            ProxyError::Bridge(BridgeError::InvalidUpstreamCredentials("empty".into())),
+        ] {
+            assert!(target_unusable(&unusable), "{unusable:?}");
+        }
+        for other in [
+            ProxyError::InvalidRequest("bad body".into()),
+            ProxyError::Bridge(BridgeError::InvalidRequest("bad body".into())),
+            ProxyError::Bridge(BridgeError::upstream_status(401, "expired")),
+            ProxyError::Bridge(BridgeError::UpstreamDecode("x".into())),
+        ] {
+            assert!(!target_unusable(&other), "{other:?}");
+        }
+    }
+
     fn ip_snapshot(models: &[(&str, Option<Vec<&str>>)]) -> AisixSnapshot {
         let table = aisix_core::snapshot::ResourceTable::default();
         for (i, (name, cidrs)) in models.iter().enumerate() {
@@ -2437,9 +3297,9 @@ mod tests {
 
     #[test]
     fn ip_filter_keeps_unresolvable_names_for_the_config_error_path() {
-        // A target naming a Model that isn't in the snapshot must surface as
-        // the existing "does not resolve to a Model" config error, not be
-        // silently swallowed here as an IP rejection.
+        // A target naming a Model that isn't in the snapshot is counted as a
+        // missing member further on, not silently swallowed here as an IP
+        // rejection.
         let snap = ip_snapshot(&[("known", None)]);
         let targets = vec![tagged("ghost", &[])];
         assert_eq!(
@@ -2629,8 +3489,9 @@ mod tests {
 
     #[test]
     fn wrr_zero_weights_clamp_to_one() {
-        // weight: 0 clamps to 1 (the write path forbids 0; clamping keeps a
-        // hand-written 0 reachable instead of silently dropping the target).
+        // Candidates that are ALL at 0 reach the strategy (see
+        // `targets_with_share`): they have no share to compare, so each counts
+        // as 1 rather than the rotation dividing by nothing.
         let reg = RoutingRegistry::new();
         let routing = r(
             RoutingStrategy::RoundRobin,
@@ -2647,6 +3508,27 @@ mod tests {
             })
             .collect();
         assert_eq!(picks, vec!["a", "b", "a", "b"]);
+    }
+
+    /// A subset is not a config change: only the configured list restarts it.
+    #[test]
+    fn wrr_state_survives_a_different_subset_of_the_same_config() {
+        let reg = RoutingRegistry::new();
+        let routing = r(
+            RoutingStrategy::RoundRobin,
+            vec![RoutingTarget::new("a"), RoutingTarget::new("b")],
+            None,
+        );
+        assert_eq!(
+            reg.pick_targets("v", &routing, &routing.targets, "")[0],
+            "a"
+        );
+        let only_a = vec![RoutingTarget::new("a")];
+        assert_eq!(reg.pick_targets("v", &routing, &only_a, "")[0], "a");
+        assert_eq!(
+            reg.pick_targets("v", &routing, &routing.targets, "")[0],
+            "b"
+        );
     }
 
     #[test]

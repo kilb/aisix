@@ -829,6 +829,7 @@ async fn dispatch(
     let crate::routing::Dispatched {
         value: (answered, provider, pk_id),
         target,
+        attempt_started,
         member_reservation,
         ..
     } = match dispatched {
@@ -855,7 +856,9 @@ async fn dispatch(
             // #701: clear any cooldown/unhealthy mark now the upstream
             // answered — same recovery signal as rerank/audio/chat.
             state.health.record_success(&model.display_name);
-            state.runtime_status.mark_healthy(&target.id);
+            state
+                .runtime_status
+                .mark_healthy(&target.id, attempt_started);
             // Token accounting (#226 / #1074). Embeddings are
             // input-only, so `prompt_tokens == total_tokens` on the OpenAI
             // shape. Providers that report only `total_tokens` (e.g. some

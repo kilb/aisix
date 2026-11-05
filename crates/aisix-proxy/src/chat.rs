@@ -1843,8 +1843,20 @@ async fn dispatch(
     // the matched route name (None on a fall-through to `default` or a
     // non-semantic request) for the `x-aisix-route` response header.
     // 第三个值是这次分类调用的花费（micro-USD）：语义路由每次请求都会打一发
-    // 嵌入调用，那是真金白银。它在预留建立之前发生，所以拦不住，但要在下面提交
-    // 时并进去 —— 否则用户能靠语义路由白嫖这部分。
+    // 嵌入调用，那是真金白银。花费要等上游报回用量才知道，所以要在下面提交时
+    // 并进去 —— 否则用户能靠语义路由白嫖这部分。
+    // A semantic router's decision is an upstream call that costs real money,
+    // so a caller over its limits is turned away before it, as with a remote
+    // guardrail check (`quota::reserve_before_costly_check`).
+    let early_reservation = match early_reservation {
+        None if virtual_entry.value.is_semantic() => Some(
+            crate::quota::enforce_rate_limit(state, snapshot, auth, Some(&model_rl))
+                .await
+                .map_err(&with_model)?,
+        ),
+        early => early,
+    };
+
     // 分类阶段已计过请求数的路由策略桶：目标阶段只检查、不再计（M3）。
     let mut semantic_counted: Vec<String> = Vec::new();
     let (attempt_models, semantic_route, semantic_embed_spend): (
@@ -1882,6 +1894,7 @@ async fn dispatch(
                 source_ip: &client.source_ip,
                 context_origin: None,
                 budget: Some(&budget_gate),
+                serves: None,
             },
         )
         .map_err(&with_model)?;
@@ -1900,11 +1913,20 @@ async fn dispatch(
     // and dispatched in `dispatch_ensemble`, branched below.
     if attempt_models.len() == 1 && !virtual_entry.value.is_ensemble() {
         let only = &attempt_models[0].model;
-        let _provider = crate::dispatch::require_provider(only).map_err(with_model)?;
+        let refused = |e: ProxyError| {
+            with_model(
+                if virtual_entry.value.is_routing() || virtual_entry.value.is_semantic() {
+                    crate::routing::group_refusal(e, &req.model)
+                } else {
+                    e
+                },
+            )
+        };
+        let _provider = crate::dispatch::require_provider(only).map_err(refused)?;
         // Pre-flight the PK-based two-tier dispatch so a missing
         // family/specialized bridge surfaces as 503 here, before
         // we commit to a long upstream call.
-        let pk_entry = crate::dispatch::resolve_provider_key(snapshot, only).map_err(with_model)?;
+        let pk_entry = crate::dispatch::resolve_provider_key(snapshot, only).map_err(refused)?;
         if crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value).is_none() {
             return Err(with_model(ProxyError::ProviderUnavailable));
         }
@@ -2002,6 +2024,8 @@ async fn dispatch(
             /// this attempt alone, matching the failed-attempt events and
             /// the non-streaming winner (#655 contract in `usage.rs`).
             attempt_started: Instant,
+            /// Raised when the attempt began; see `in_flight_hold` below.
+            in_flight: crate::health::InFlightGuard,
         }
         let mut won: Option<StreamWin> = None;
         // The winning target's own model-layer reservation (routing dispatch
@@ -2078,83 +2102,95 @@ async fn dispatch(
                 target_idx + 1 < attempt_models.len(),
             );
 
+            let target_model = if is_routing_request {
+                model.display_name.clone()
+            } else {
+                String::new()
+            };
+            // Reserve THIS target's own model rate-limit layers before
+            // dispatching to it (#1087), once for all its retries: a
+            // same-target retry is the same request, and charging it again
+            // would let the retries themselves exhaust the limit. Over-limit
+            // → record a 429 attempt and move on to the remaining targets in
+            // strategy order.
+            let member_reservation = match crate::quota::reserve_routing_target_counted(
+                state,
+                snapshot,
+                auth,
+                is_routing_request.then_some(crate::quota::RoutingParent {
+                    name: &virtual_entry.value.display_name,
+                    entry_id: &virtual_entry.id,
+                }),
+                &model.display_name,
+                &attempt.id,
+                model,
+                &semantic_counted,
+            )
+            .await
+            {
+                Ok(r) => {
+                    last_reserve_reject = None;
+                    r
+                }
+                Err(e) => {
+                    let (idx, kind) = stream_routing.begin_attempt(crate::attempt::AttemptTarget {
+                        display_name: &model.display_name,
+                        target_model: &target_model,
+                        model_id: &attempt.id,
+                    });
+                    stream_routing.record(
+                        state,
+                        AttemptRecord {
+                            index: idx,
+                            kind,
+                            target_model,
+                            target_model_id: attempt.id.clone(),
+                            provider_key_id: pk_entry.id.clone(),
+                            status: 429,
+                            success: false,
+                            error_class: "rate_limit_exceeded".to_string(),
+                            error_message: e.to_string(),
+                            latency_ms: 0,
+                            dispatched: false,
+                        },
+                    );
+                    // Fallback only: `last_reserve_reject` below carries
+                    // the same refusal un-flattened and takes precedence
+                    // at exhaustion. This stays so the loop still has a
+                    // 429-shaped `last_err` if a later target clears the
+                    // reject without recording one of its own.
+                    last_err = Some(BridgeError::upstream_status_with_retry_after(
+                        429,
+                        format!(
+                            "routing target {:?} is over its model rate limit: {e}",
+                            model.display_name
+                        ),
+                        crate::quota::retry_after_of(&e).map(Duration::from_secs),
+                    ));
+                    // Surface the quota rejection un-flattened. A
+                    // `Bridge` error reads as the PROVIDER's 429 — it
+                    // carries no `error.policy` attribution and no
+                    // `x-ratelimit-*` headers, so a caller refused by this
+                    // gateway's own limiter would see the wire shape of
+                    // somebody else's refusal. `/v1/messages` and
+                    // `/v1/responses` keep theirs too; this arm used to keep
+                    // only the policy layer's.
+                    last_reserve_reject = Some(e);
+                    continue 'targets;
+                }
+            };
+
             for attempt_idx in 0..=budget.attempts {
-                let target_model = if is_routing_request {
-                    model.display_name.clone()
-                } else {
-                    String::new()
-                };
                 let (idx, kind) = stream_routing.begin_attempt(crate::attempt::AttemptTarget {
                     display_name: &model.display_name,
                     target_model: &target_model,
                     model_id: &attempt.id,
                 });
-                // Reserve THIS target's own model rate-limit layers before
-                // dispatching to it (#1087). Over-limit → record a
-                // 429 attempt and move on to the remaining targets in strategy
-                // order (same-target retries can't help — the window won't
-                // reset mid-loop).
-                let member_reservation = match crate::quota::reserve_routing_target_counted(
-                    state,
-                    snapshot,
-                    auth,
-                    is_routing_request.then_some(crate::quota::RoutingParent {
-                        name: &virtual_entry.value.display_name,
-                        entry_id: &virtual_entry.id,
-                    }),
-                    &model.display_name,
-                    &attempt.id,
-                    model,
-                    &semantic_counted,
-                )
-                .await
-                {
-                    Ok(r) => {
-                        last_reserve_reject = None;
-                        r
-                    }
-                    Err(e) => {
-                        stream_routing.record(
-                            state,
-                            AttemptRecord {
-                                index: idx,
-                                kind,
-                                target_model,
-                                target_model_id: attempt.id.clone(),
-                                provider_key_id: pk_entry.id.clone(),
-                                status: 429,
-                                success: false,
-                                error_class: "rate_limit_exceeded".to_string(),
-                                error_message: e.to_string(),
-                                latency_ms: 0,
-                                dispatched: false,
-                            },
-                        );
-                        // Fallback only: `last_reserve_reject` below carries
-                        // the same refusal un-flattened and takes precedence
-                        // at exhaustion. This stays so the loop still has a
-                        // 429-shaped `last_err` if a later target clears the
-                        // reject without recording one of its own.
-                        last_err = Some(BridgeError::upstream_status_with_retry_after(
-                            429,
-                            format!(
-                                "routing target {:?} is over its model rate limit: {e}",
-                                model.display_name
-                            ),
-                            crate::quota::retry_after_of(&e).map(Duration::from_secs),
-                        ));
-                        // Surface the quota rejection un-flattened. A
-                        // `Bridge` error reads as the PROVIDER's 429 — it
-                        // carries no `error.policy` attribution and no
-                        // `x-ratelimit-*` headers, so a caller refused by this
-                        // gateway's own limiter would see the wire shape of
-                        // somebody else's refusal. `/v1/messages` and
-                        // `/v1/responses` keep theirs too; this arm used to keep
-                        // only the policy layer's.
-                        last_reserve_reject = Some(e);
-                        continue 'targets;
-                    }
-                };
+                // least_busy: count this target as in-flight from the moment
+                // the attempt goes out, not from when it answers: a burst
+                // arriving during connect and time to first token must see
+                // the load it is adding to.
+                let in_flight = state.runtime_status.begin_in_flight(&attempt.id);
                 let attempt_started = Instant::now();
                 // Connect, then — only when a streaming budget is configured
                 // ON THE RESOURCES — peek the first chunk so a slow or
@@ -2211,7 +2247,7 @@ async fn dispatch(
                         stream_routing.stage(AttemptRecord {
                             index: idx,
                             kind,
-                            target_model,
+                            target_model: target_model.clone(),
                             target_model_id: attempt.id.clone(),
                             provider_key_id: pk_entry.id.clone(),
                             status: 200,
@@ -2230,6 +2266,7 @@ async fn dispatch(
                             idx,
                             kind,
                             attempt_started,
+                            in_flight,
                         });
                         won_member_reservation = member_reservation;
                         break 'targets;
@@ -2240,7 +2277,7 @@ async fn dispatch(
                             AttemptRecord {
                                 index: idx,
                                 kind,
-                                target_model,
+                                target_model: target_model.clone(),
                                 target_model_id: attempt.id.clone(),
                                 provider_key_id: pk_entry.id.clone(),
                                 status: err.http_status(),
@@ -2262,6 +2299,7 @@ async fn dispatch(
                         );
                         if retryable {
                             state.health.record_failure(&model.display_name);
+                            state.runtime_status.penalize_latency(&attempt.id);
                         }
                         if let Some((ttl, reason)) =
                             decide_cooldown(&err, attempt.model.cooldown.as_ref())
@@ -2273,9 +2311,13 @@ async fn dispatch(
                         // timeout — see `RetryBudget::covers`. Fail-over is
                         // unaffected: the outer loop still moves on.
                         let budget_covers = budget.covers(&err);
+                        let unusable = crate::routing::bridge_target_unusable(&err);
                         last_reserve_reject = None;
                         last_err = Some(err);
                         if !retryable {
+                            if unusable {
+                                break;
+                            }
                             break 'targets;
                         }
                         if attempt_idx == budget.attempts || !budget_covers {
@@ -2321,6 +2363,7 @@ async fn dispatch(
             idx: winner_idx,
             kind: winner_kind,
             attempt_started: winner_attempt_started,
+            in_flight: in_flight_hold,
         } = won;
         let model = &model;
         // Hold concurrency for the stream's full lifetime instead of
@@ -2350,12 +2393,11 @@ async fn dispatch(
         // 加同一个数字会把 token 数当成钱记进去。
         let spend_post_stream_keys = reservation.spend_keys();
         let stream_concurrency_hold = reservation.into_stream_hold();
-        // least_busy: keep this target counted as in-flight for the stream's
-        // full lifetime. Like `stream_concurrency_hold`, the guard is moved
-        // into the on_complete closure (dropped there), so the count stays
-        // raised until the stream completes or is cancelled — the window a
-        // concurrent routing decision must see this target as loaded.
-        let in_flight_hold = state.runtime_status.begin_in_flight(&winner_target_id);
+        // least_busy: `in_flight_hold` keeps this target counted as in-flight
+        // for the stream's full lifetime. Like `stream_concurrency_hold`, the
+        // guard is moved into the on_complete closure (dropped there), so the
+        // count stays raised until the stream completes or is cancelled — the
+        // window a concurrent routing decision must see this target as loaded.
         // Capture everything the stream-completion callback needs so
         // it can fire `emit_usage_event` once the terminal SSE chunk
         // has yielded its `usage` block. Telemetry emission has to
@@ -2511,6 +2553,7 @@ async fn dispatch(
                     comp.terminal_failure.take(),
                     comp.reached_end || comp.guardrail_blocked,
                     200,
+                    winner_attempt_started,
                 );
                 // One figure for both the usage event and the spend metric —
                 // computing it twice is how the two drift.
@@ -3402,89 +3445,94 @@ async fn dispatch(
             target_idx + 1 < attempt_models.len(),
         );
 
+        // Routing target name only for routing groups; a direct model
+        // leaves it empty since `model_id` already identifies it.
+        let target_model = if is_routing_request {
+            model.display_name.clone()
+        } else {
+            String::new()
+        };
+        // Reserve THIS target's own model rate-limit layers before
+        // dispatching to it (#1087), once for all its retries: a same-target
+        // retry is the same request, and charging it again would let the
+        // retries themselves exhaust the limit. Over-limit → record a 429
+        // attempt and move on to the remaining targets in strategy order.
+        let member_reservation = match crate::quota::reserve_routing_target_counted(
+            state,
+            snapshot,
+            auth,
+            is_routing_request.then_some(crate::quota::RoutingParent {
+                name: &virtual_entry.value.display_name,
+                entry_id: &virtual_entry.id,
+            }),
+            &model.display_name,
+            &attempt.id,
+            model,
+            &semantic_counted,
+        )
+        .await
+        {
+            Ok(r) => {
+                last_reserve_reject = None;
+                r
+            }
+            Err(e) => {
+                let (attempt_index, kind) = routing.begin_attempt(crate::attempt::AttemptTarget {
+                    display_name: &model.display_name,
+                    target_model: &target_model,
+                    model_id: &attempt.id,
+                });
+                routing.record(
+                    state,
+                    AttemptRecord {
+                        index: attempt_index,
+                        kind,
+                        target_model,
+                        target_model_id: attempt.id.clone(),
+                        provider_key_id: pk_entry.id.clone(),
+                        status: 429,
+                        success: false,
+                        error_class: "rate_limit_exceeded".to_string(),
+                        error_message: e.to_string(),
+                        latency_ms: 0,
+                        dispatched: false,
+                    },
+                );
+                // Fallback only: `last_reserve_reject` below carries the
+                // same refusal un-flattened and takes precedence at
+                // exhaustion. This stays so the loop still has a
+                // 429-shaped `last_err` if a later target clears the
+                // reject without recording one of its own.
+                last_err = Some(BridgeError::upstream_status_with_retry_after(
+                    429,
+                    format!(
+                        "routing target {:?} is over its model rate limit: {e}",
+                        model.display_name
+                    ),
+                    crate::quota::retry_after_of(&e).map(Duration::from_secs),
+                ));
+                // Surface the quota rejection un-flattened. A
+                // `Bridge` error reads as the PROVIDER's 429 — it
+                // carries no `error.policy` attribution and no
+                // `x-ratelimit-*` headers, so a caller refused by this
+                // gateway's own limiter would see the wire shape of
+                // somebody else's refusal. `/v1/messages` and
+                // `/v1/responses` keep theirs too; this arm used to keep
+                // only the policy layer's.
+                last_reserve_reject = Some(e);
+                continue 'targets;
+            }
+        };
+
         for attempt_idx in 0..=budget.attempts {
             // Per-attempt telemetry kind (#655): the first attempt overall
             // is "initial"; a different target than the previous attempt is
             // a "fallback"; the same target again is a "retry".
-            // Routing target name only for routing groups; a direct model
-            // leaves it empty since `model_id` already identifies it.
-            let target_model = if is_routing_request {
-                model.display_name.clone()
-            } else {
-                String::new()
-            };
             let (attempt_index, kind) = routing.begin_attempt(crate::attempt::AttemptTarget {
                 display_name: &model.display_name,
                 target_model: &target_model,
                 model_id: &attempt.id,
             });
-
-            // Reserve THIS target's own model rate-limit layers before
-            // dispatching to it (#1087). Over-limit → record a
-            // 429 attempt and move on to the remaining targets in strategy
-            // order (same-target retries can't help — the window won't
-            // reset mid-loop).
-            let member_reservation = match crate::quota::reserve_routing_target_counted(
-                state,
-                snapshot,
-                auth,
-                is_routing_request.then_some(crate::quota::RoutingParent {
-                    name: &virtual_entry.value.display_name,
-                    entry_id: &virtual_entry.id,
-                }),
-                &model.display_name,
-                &attempt.id,
-                model,
-                &semantic_counted,
-            )
-            .await
-            {
-                Ok(r) => {
-                    last_reserve_reject = None;
-                    r
-                }
-                Err(e) => {
-                    routing.record(
-                        state,
-                        AttemptRecord {
-                            index: attempt_index,
-                            kind,
-                            target_model,
-                            target_model_id: attempt.id.clone(),
-                            provider_key_id: pk_entry.id.clone(),
-                            status: 429,
-                            success: false,
-                            error_class: "rate_limit_exceeded".to_string(),
-                            error_message: e.to_string(),
-                            latency_ms: 0,
-                            dispatched: false,
-                        },
-                    );
-                    // Fallback only: `last_reserve_reject` below carries the
-                    // same refusal un-flattened and takes precedence at
-                    // exhaustion. This stays so the loop still has a
-                    // 429-shaped `last_err` if a later target clears the
-                    // reject without recording one of its own.
-                    last_err = Some(BridgeError::upstream_status_with_retry_after(
-                        429,
-                        format!(
-                            "routing target {:?} is over its model rate limit: {e}",
-                            model.display_name
-                        ),
-                        crate::quota::retry_after_of(&e).map(Duration::from_secs),
-                    ));
-                    // Surface the quota rejection un-flattened. A
-                    // `Bridge` error reads as the PROVIDER's 429 — it
-                    // carries no `error.policy` attribution and no
-                    // `x-ratelimit-*` headers, so a caller refused by this
-                    // gateway's own limiter would see the wire shape of
-                    // somebody else's refusal. `/v1/messages` and
-                    // `/v1/responses` keep theirs too; this arm used to keep
-                    // only the policy layer's.
-                    last_reserve_reject = Some(e);
-                    continue 'targets;
-                }
-            };
 
             let attempt_started = Instant::now();
             // least_busy: count this target as in-flight for the upstream
@@ -3501,7 +3549,9 @@ async fn dispatch(
             match result {
                 Ok(resp) => {
                     state.health.record_success(&model.display_name);
-                    state.runtime_status.mark_healthy(&attempt.id);
+                    state
+                        .runtime_status
+                        .mark_healthy(&attempt.id, attempt_started);
                     // Feed the least_latency EWMA with this attempt's
                     // round-trip latency.
                     state
@@ -3518,7 +3568,7 @@ async fn dispatch(
                         AttemptRecord {
                             index: attempt_index,
                             kind,
-                            target_model,
+                            target_model: target_model.clone(),
                             target_model_id: attempt.id.clone(),
                             provider_key_id: pk_entry.id.clone(),
                             status: 200,
@@ -3539,7 +3589,7 @@ async fn dispatch(
                         AttemptRecord {
                             index: attempt_index,
                             kind,
-                            target_model,
+                            target_model: target_model.clone(),
                             target_model_id: attempt.id.clone(),
                             provider_key_id: pk_entry.id.clone(),
                             status: err.http_status(),
@@ -3561,6 +3611,7 @@ async fn dispatch(
                     );
                     if retryable {
                         state.health.record_failure(&model.display_name);
+                        state.runtime_status.penalize_latency(&attempt.id);
                     }
                     // Cooldown decision is independent of retry — a
                     // non-retryable 401 still cools down because the
@@ -3606,7 +3657,9 @@ async fn dispatch(
             break;
         }
         if let Some(err) = last_err.as_ref() {
-            if !is_retryable(err, retry_on_429, fallback_statuses) {
+            if !is_retryable(err, retry_on_429, fallback_statuses)
+                && !crate::routing::bridge_target_unusable(err)
+            {
                 break;
             }
         }

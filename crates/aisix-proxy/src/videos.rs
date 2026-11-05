@@ -2103,12 +2103,12 @@ async fn dispatch_create(
     )
     .await;
     let mut reservation = reservation;
-    let submitted = match dispatched {
+    let (submitted, attempt_started) = match dispatched {
         Ok(d) => {
             if let Some(member) = d.member_reservation {
                 reservation.merge(member);
             }
-            d.value
+            (d.value, d.attempt_started)
         }
         Err(e) => {
             reservation.commit_tokens_no_spend(0).await;
@@ -2133,7 +2133,9 @@ async fn dispatch_create(
     state
         .health
         .record_success(&target.model_entry.value.display_name);
-    state.runtime_status.mark_healthy(&target.model_entry.id);
+    state
+        .runtime_status
+        .mark_healthy(&target.model_entry.id, attempt_started);
 
     let submit = target.provider.parse_submit(&resp)?;
 

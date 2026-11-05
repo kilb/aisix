@@ -285,6 +285,9 @@ impl Default for RuntimeStatusSnapshot {
 struct RuntimeEntry {
     unhealthy: bool,
     cooldown_until: Option<SystemTime>,
+    /// When the cooldown in `cooldown_until` was set, on the clock an
+    /// attempt's start is read from. See [`RuntimeEntry::cooldown_outlives`].
+    cooldown_marked_at: Option<Instant>,
     last_checked_at: Option<SystemTime>,
     last_check_status: Option<u16>,
     status_reason: Option<String>,
@@ -309,6 +312,18 @@ impl RuntimeEntry {
         } else {
             DeploymentState::Healthy
         }
+    }
+
+    /// Whether a live cooldown was set after the attempt that began at
+    /// `attempt_started`. That attempt succeeding says nothing about the
+    /// failure behind the cooldown: on a busy target, streams opened before
+    /// a 429 go on finishing for as long as they run.
+    fn cooldown_outlives(&self, attempt_started: Instant) -> bool {
+        self.cooldown_marked_at
+            .is_some_and(|marked| attempt_started < marked)
+            && self
+                .cooldown_until
+                .is_some_and(|until| until > SystemTime::now())
     }
 
     fn snapshot(&self, now: SystemTime, stale_after: Option<Duration>) -> RuntimeStatusSnapshot {
@@ -540,6 +555,17 @@ const LATENCY_EWMA_ALPHA: f64 = 0.3;
 /// needs it.
 const EXCLUSION_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How long a target that just failed ranks behind the others on
+/// `least_latency`. Latency samples come only from answers, so without this a
+/// target that stops answering keeps the rank it had and is tried first on
+/// every request. It lapses rather than lasting until a success, because
+/// nothing else would ever try the target again to find out it recovered.
+const LATENCY_FAILURE_PENALTY: Duration = Duration::from_secs(30);
+
+/// Upper bound on the deadline a cooldown TTL can produce, for a configured
+/// TTL too large to add to the clock.
+const COOLDOWN_UNTIL_CEILING: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
 #[derive(Default, Debug)]
 pub struct ModelRuntimeStatusTracker {
     entries: DashMap<String, RuntimeEntry>,
@@ -585,6 +611,9 @@ pub struct ModelRuntimeStatusTracker {
     /// `in_flight`: measuring a target must not create the entry a first
     /// success publishes `aisix_deployment_state` from.
     latency_ewma_ms: DashMap<String, f64>,
+    /// When each target that failed stops ranking last on `least_latency`.
+    /// See [`LATENCY_FAILURE_PENALTY`].
+    latency_penalty_until: DashMap<String, Instant>,
 }
 
 /// RAII guard that decrements a target's in-flight counter when dropped.
@@ -700,6 +729,7 @@ impl ModelRuntimeStatusTracker {
         self.in_flight
             .retain(|id, count| count.load(Ordering::Relaxed) > 0 || is_configured(id));
         self.latency_ewma_ms.retain(|id, _| is_configured(id));
+        self.latency_penalty_until.retain(|id, _| is_configured(id));
     }
 
     pub fn new() -> Self {
@@ -724,6 +754,7 @@ impl ModelRuntimeStatusTracker {
             exclusion_log: DashMap::new(),
             in_flight: DashMap::new(),
             latency_ewma_ms: DashMap::new(),
+            latency_penalty_until: DashMap::new(),
         }
     }
 
@@ -775,7 +806,9 @@ impl ModelRuntimeStatusTracker {
 
     pub fn mark_cooldown(&self, model_id: &str, ttl: Duration, reason: impl Into<String>) {
         let now = SystemTime::now();
-        let until = now + ttl;
+        let until = now
+            .checked_add(ttl)
+            .unwrap_or_else(|| now + COOLDOWN_UNTIL_CEILING);
         let reason = reason.into();
         let mut entry = self.entries.entry(model_id.to_string()).or_default();
         // A fresh cooldown = the target was not already cooling (never
@@ -784,6 +817,7 @@ impl ModelRuntimeStatusTracker {
         // already-cooled target doesn't inflate the counter.
         let entered_cooldown = entry.cooldown_until.is_none_or(|u| u <= now);
         entry.cooldown_until = Some(until);
+        entry.cooldown_marked_at = Some(Instant::now());
         entry.status_reason = Some(reason);
         // Hold the DashMap entry guard across the emit so concurrent
         // cooldown/recovery on the same model can't publish the gauge out of
@@ -796,11 +830,18 @@ impl ModelRuntimeStatusTracker {
         self.sync_deployment_state(model_id, &mut entry, now);
     }
 
-    pub fn mark_healthy(&self, model_id: &str) {
+    /// Record that an attempt which began at `attempt_started` succeeded.
+    /// One that began before the target's live cooldown was set changes
+    /// nothing: see [`RuntimeEntry::cooldown_outlives`].
+    pub fn mark_healthy(&self, model_id: &str, attempt_started: Instant) {
         if self.bookkeeping_active() {
             if let Some(mut entry) = self.entries.get_mut(model_id) {
+                if entry.cooldown_outlives(attempt_started) {
+                    return;
+                }
                 entry.unhealthy = false;
                 entry.cooldown_until = None;
+                entry.cooldown_marked_at = None;
                 entry.status_reason = None;
                 self.sync_deployment_state(model_id, &mut entry, SystemTime::now());
             }
@@ -830,8 +871,12 @@ impl ModelRuntimeStatusTracker {
             return;
         }
         if let Some(mut entry) = self.entries.get_mut(model_id) {
+            if entry.cooldown_outlives(attempt_started) {
+                return;
+            }
             entry.unhealthy = false;
             entry.cooldown_until = None;
+            entry.cooldown_marked_at = None;
             entry.status_reason = None;
             self.sync_deployment_state(model_id, &mut entry, SystemTime::now());
         }
@@ -953,6 +998,8 @@ impl ModelRuntimeStatusTracker {
     pub fn clear_unhealthy(&self, model_id: &str) {
         if let Some(mut entry) = self.entries.get_mut(model_id) {
             entry.unhealthy = false;
+            entry.last_checked_at = Some(SystemTime::now());
+            entry.last_check_status = Some(200);
             if entry.status_reason.as_deref() == Some("background_check_failed") {
                 entry.status_reason = None;
             }
@@ -1018,6 +1065,29 @@ impl ModelRuntimeStatusTracker {
                 *prev = LATENCY_EWMA_ALPHA * sample + (1.0 - LATENCY_EWMA_ALPHA) * *prev;
             })
             .or_insert(sample);
+    }
+
+    /// Rank `model_id` behind the others on `least_latency` for
+    /// [`LATENCY_FAILURE_PENALTY`]: it just failed in a way that says nothing
+    /// about the caller's request.
+    pub fn penalize_latency(&self, model_id: &str) {
+        self.penalize_latency_for(model_id, LATENCY_FAILURE_PENALTY);
+    }
+
+    fn penalize_latency_for(&self, model_id: &str, penalty: Duration) {
+        // Same consumer and gate as `record_latency`.
+        if !self.bookkeeping_active() {
+            return;
+        }
+        self.latency_penalty_until
+            .insert(model_id.to_string(), Instant::now() + penalty);
+    }
+
+    /// Whether `model_id` is ranking behind the others for a recent failure.
+    pub fn latency_penalized(&self, model_id: &str) -> bool {
+        self.latency_penalty_until
+            .get(model_id)
+            .is_some_and(|until| *until > Instant::now())
     }
 
     /// Current latency EWMA (ms) for `model_id`, or `None` if never sampled.
@@ -1108,6 +1178,91 @@ mod tests {
     /// row's counters would otherwise outlive it for the process lifetime.
     /// The key is `display_name`, which is reusable — so a model deleted and
     /// recreated under the same name must not inherit the old failure count.
+    #[test]
+    fn a_success_that_began_before_the_cooldown_leaves_it_in_place() {
+        let t = ModelRuntimeStatusTracker::new();
+        let older = Instant::now();
+        std::thread::sleep(Duration::from_millis(2));
+        t.mark_cooldown("m", Duration::from_secs(60), "upstream_rate_limited");
+        t.mark_healthy("m", older);
+        assert_eq!(t.status("m").status, RuntimeStatus::Cooldown);
+        assert_eq!(
+            t.status("m").status_reason.as_deref(),
+            Some("upstream_rate_limited")
+        );
+    }
+
+    /// The read-first path, taken when nothing configured consumes the
+    /// bookkeeping, answers the same.
+    #[test]
+    fn a_success_that_began_before_the_cooldown_leaves_it_in_place_without_bookkeeping() {
+        let snapshot = SnapshotHandle::new(AisixSnapshot::default());
+        let flags = BookkeepingFlags::new(snapshot.clone());
+        let metrics = Arc::new(Metrics::new(false));
+        let t = ModelRuntimeStatusTracker::with_observability(metrics, snapshot, flags);
+        let older = Instant::now();
+        std::thread::sleep(Duration::from_millis(2));
+        t.mark_cooldown("m", Duration::from_secs(60), "x");
+        t.mark_healthy("m", older);
+        assert_eq!(t.status("m").status, RuntimeStatus::Cooldown);
+        t.mark_healthy("m", Instant::now());
+        assert_eq!(t.status("m").status, RuntimeStatus::Healthy);
+    }
+
+    #[test]
+    fn a_success_that_began_after_the_cooldown_ends_it_early() {
+        let t = ModelRuntimeStatusTracker::new();
+        t.mark_cooldown("m", Duration::from_secs(60), "x");
+        std::thread::sleep(Duration::from_millis(2));
+        t.mark_healthy("m", Instant::now());
+        assert_eq!(t.status("m").status, RuntimeStatus::Healthy);
+    }
+
+    /// A cooldown that already lapsed is over whoever reports next.
+    #[test]
+    fn an_older_success_still_clears_a_lapsed_cooldown() {
+        let t = ModelRuntimeStatusTracker::new();
+        let older = Instant::now();
+        std::thread::sleep(Duration::from_millis(2));
+        t.mark_cooldown("m", Duration::from_millis(1), "x");
+        std::thread::sleep(Duration::from_millis(3));
+        t.mark_healthy("m", older);
+        assert_eq!(t.status("m").status_reason, None);
+    }
+
+    /// A configured TTL too large for the clock must not panic the request
+    /// that tripped it.
+    #[test]
+    fn a_huge_cooldown_ttl_does_not_overflow_the_clock() {
+        let t = ModelRuntimeStatusTracker::new();
+        t.mark_cooldown("m", Duration::from_secs(u64::MAX), "x");
+        assert_eq!(t.status("m").status, RuntimeStatus::Cooldown);
+    }
+
+    #[test]
+    fn a_latency_penalty_lapses_so_the_target_gets_probed_again() {
+        let t = ModelRuntimeStatusTracker::new();
+        assert!(!t.latency_penalized("m"));
+        t.penalize_latency("m");
+        assert!(t.latency_penalized("m"));
+        t.penalize_latency_for("m", Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(3));
+        assert!(!t.latency_penalized("m"));
+    }
+
+    #[test]
+    fn a_passing_background_check_updates_what_the_status_reports() {
+        let t = ModelRuntimeStatusTracker::new();
+        t.mark_unhealthy("m", Some(503), "background_check_failed");
+        let failed_at = t.status("m").last_checked_at.expect("failed check");
+        std::thread::sleep(Duration::from_millis(2));
+        t.clear_unhealthy("m");
+        let status = t.status("m");
+        assert_eq!(status.status, RuntimeStatus::Healthy);
+        assert_eq!(status.last_check_status, Some(200));
+        assert!(status.last_checked_at.expect("checked") > failed_at);
+    }
+
     #[test]
     fn retain_configured_drops_state_for_deleted_models() {
         let t = HealthTracker::new();
@@ -1343,7 +1498,7 @@ mod tests {
         // the entry (no-op guard, but the side effect is preserved),
         // then the first success publishes Healthy.
         drop(t.begin_in_flight("d1"));
-        t.mark_healthy("d1");
+        t.mark_healthy("d1", Instant::now());
         {
             let e = t
                 .entries
@@ -1352,7 +1507,7 @@ mod tests {
             assert_eq!(e.emitted_state, Some(DeploymentState::Healthy));
         }
         // Steady state: read-only, entry untouched.
-        t.mark_healthy("d1");
+        t.mark_healthy("d1", Instant::now());
         assert_eq!(t.status("d1").status, RuntimeStatus::Healthy);
     }
 
@@ -1365,7 +1520,7 @@ mod tests {
     #[test]
     fn inactive_mark_healthy_without_begin_in_flight_stays_noop() {
         let (_handle, t) = inactive_tracker();
-        t.mark_healthy("embeddings-only-target");
+        t.mark_healthy("embeddings-only-target", Instant::now());
         assert!(
             t.entries.get("embeddings-only-target").is_none(),
             "mark_healthy on a never-seen id must not create an entry"
@@ -1381,14 +1536,14 @@ mod tests {
         let active = ModelRuntimeStatusTracker::new();
         let g = active.count_in_flight("single-shot-target");
         assert_eq!(active.in_flight("single-shot-target"), 1);
-        active.mark_healthy("single-shot-target");
+        active.mark_healthy("single-shot-target", Instant::now());
         assert!(active.entries.get("single-shot-target").is_none());
         drop(g);
         assert_eq!(active.in_flight("single-shot-target"), 0);
 
         let (_handle, inactive) = inactive_tracker();
         drop(inactive.count_in_flight("single-shot-target"));
-        inactive.mark_healthy("single-shot-target");
+        inactive.mark_healthy("single-shot-target", Instant::now());
         assert!(inactive.entries.get("single-shot-target").is_none());
     }
 
@@ -1400,7 +1555,7 @@ mod tests {
         let t = ModelRuntimeStatusTracker::new();
         t.record_latency("single-shot-target", 50);
         assert_eq!(t.latency_ewma_ms("single-shot-target"), Some(50.0));
-        t.mark_healthy("single-shot-target");
+        t.mark_healthy("single-shot-target", Instant::now());
         assert!(t.entries.get("single-shot-target").is_none());
     }
 
@@ -1412,7 +1567,7 @@ mod tests {
         // A success during cooldown still recovers immediately — the
         // read-first path detects the dirty entry and takes the full
         // write path.
-        t.mark_healthy("d1");
+        t.mark_healthy("d1", Instant::now());
         assert_eq!(t.status("d1").status, RuntimeStatus::Healthy);
         assert_eq!(
             t.entries.get("d1").unwrap().emitted_state,
@@ -1580,7 +1735,7 @@ mod tests {
         let unhealthy = t.status("m-1");
         assert_eq!(unhealthy.status, RuntimeStatus::Unhealthy);
         assert_eq!(unhealthy.last_check_status, Some(500));
-        t.mark_healthy("m-1");
+        t.mark_healthy("m-1", Instant::now());
         assert_eq!(t.status("m-1").status, RuntimeStatus::Healthy);
     }
 
@@ -1637,7 +1792,7 @@ mod tests {
         assert_eq!(count, 1.0, "cooldown counted once per transition: {cooled}");
 
         // Recovery flips the gauge back to Healthy(0).
-        tracker.mark_healthy("m-cool");
+        tracker.mark_healthy("m-cool", Instant::now());
         assert_eq!(
             deployment_state_gauge(&metrics),
             Some(0.0),
@@ -1675,7 +1830,7 @@ mod tests {
             "the cooldown has lapsed, so the target is back in rotation"
         );
 
-        tracker.mark_healthy("m-expiry");
+        tracker.mark_healthy("m-expiry", Instant::now());
         assert_eq!(
             deployment_state_gauge(&metrics),
             Some(0.0),
@@ -1720,9 +1875,9 @@ mod tests {
         // it inactive (this tracker: empty snapshot) the first mark_healthy
         // does. Either way the assertions below must hold.
         drop(tracker.begin_in_flight("m-ok"));
-        tracker.mark_healthy("m-ok");
-        tracker.mark_healthy("m-ok");
-        tracker.mark_healthy("m-ok");
+        tracker.mark_healthy("m-ok", Instant::now());
+        tracker.mark_healthy("m-ok", Instant::now());
+        tracker.mark_healthy("m-ok", Instant::now());
 
         assert_eq!(deployment_state_gauge(&metrics), Some(0.0));
         assert!(

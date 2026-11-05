@@ -692,6 +692,7 @@ pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
         | ProxyError::RouteIpRestricted(_)
         | ProxyError::RouteForbidden(_)
         | ProxyError::InvalidRequest(_)
+        | ProxyError::UnusableTarget(_)
         | ProxyError::WebSocketUpgradeRequired { .. }
         | ProxyError::ProviderUnavailable
         | ProxyError::SemanticDecisionFailed { .. }

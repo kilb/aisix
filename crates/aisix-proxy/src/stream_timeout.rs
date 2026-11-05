@@ -116,6 +116,7 @@ pub(crate) fn finish_bridge_stream(
     failure: Option<BridgeError>,
     completed: bool,
     complete_status: u16,
+    attempt_started: std::time::Instant,
 ) -> StreamTerminalStatus {
     if let Some(error) = failure {
         let status = error.http_status();
@@ -131,7 +132,7 @@ pub(crate) fn finish_bridge_stream(
     }
     if completed {
         health.record_success(model_display_name);
-        runtime_status.mark_healthy(model_id);
+        runtime_status.mark_healthy(model_id, attempt_started);
         return StreamTerminalStatus {
             status: complete_status,
             error_class: String::new(),
@@ -449,6 +450,7 @@ mod tests {
             }),
             false,
             200,
+            std::time::Instant::now(),
         );
 
         assert_eq!(terminal.status, 504);
@@ -465,13 +467,29 @@ mod tests {
         }
 
         let dropped = finish_bridge_stream(
-            &health, &runtime, "model", "model-id", None, None, false, 200,
+            &health,
+            &runtime,
+            "model",
+            "model-id",
+            None,
+            None,
+            false,
+            200,
+            std::time::Instant::now(),
         );
         assert_eq!(dropped.status, crate::CLIENT_CLOSED_REQUEST);
         assert_eq!(health.level("model"), crate::health::HealthLevel::Degraded);
 
         let completed = finish_bridge_stream(
-            &health, &runtime, "model", "model-id", None, None, true, 200,
+            &health,
+            &runtime,
+            "model",
+            "model-id",
+            None,
+            None,
+            true,
+            200,
+            std::time::Instant::now(),
         );
         assert_eq!(completed.status, 200);
         assert_eq!(health.level("model"), crate::health::HealthLevel::Healthy);
@@ -483,7 +501,15 @@ mod tests {
         let runtime = crate::health::ModelRuntimeStatusTracker::new();
 
         let completed = finish_bridge_stream(
-            &health, &runtime, "model", "model-id", None, None, true, 422,
+            &health,
+            &runtime,
+            "model",
+            "model-id",
+            None,
+            None,
+            true,
+            422,
+            std::time::Instant::now(),
         );
 
         assert_eq!(completed.status, 422);

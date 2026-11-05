@@ -77,13 +77,13 @@ pub(crate) fn resolve_provider_key(
     model: &Model,
 ) -> Result<Arc<ResourceEntry<ProviderKey>>, ProxyError> {
     let pk_id = model.provider_key_id.as_deref().ok_or_else(|| {
-        ProxyError::InvalidRequest(format!(
+        ProxyError::UnusableTarget(format!(
             "model {:?} has no provider_key_id (routing models can't be dispatched directly)",
             model.display_name
         ))
     })?;
     let entry = snapshot.provider_keys.get_by_id(pk_id).ok_or_else(|| {
-        ProxyError::InvalidRequest(format!(
+        ProxyError::UnusableTarget(format!(
             "model {:?} references unknown provider_key_id {pk_id:?}",
             model.display_name
         ))
@@ -118,7 +118,7 @@ pub(crate) fn require_provider(model: &Model) -> Result<&str, ProxyError> {
         )));
     }
     model.provider.as_deref().ok_or_else(|| {
-        ProxyError::InvalidRequest(format!(
+        ProxyError::UnusableTarget(format!(
             "model {:?} has no provider (routing models can't be dispatched directly)",
             model.display_name
         ))
@@ -258,13 +258,18 @@ pub(crate) fn serves_natively(
     model: &Model,
     surface: ApiSurface,
 ) -> bool {
-    let pk = resolve_provider_key(snapshot, model).ok();
+    // Not `resolve_provider_key`: this is a question, asked of targets the
+    // request may never dispatch to, and that one records the request as
+    // committed to the target it is handed.
+    let pk = model
+        .provider_key_id
+        .as_deref()
+        .and_then(|id| snapshot.provider_keys.get_by_id(id));
     serves_natively_with(model, pk.as_ref().map(|e| e.value.as_ref()), surface)
 }
 
-/// [`serves_natively`] over an already-resolved key, with no attribution
-/// side effect — for readers that run after dispatch, such as the span
-/// encoder's upstream lookup.
+/// [`serves_natively`] over an already-resolved key — for readers that run
+/// after dispatch, such as the span encoder's upstream lookup.
 pub(crate) fn serves_natively_with(
     model: &Model,
     pk: Option<&ProviderKey>,
@@ -313,7 +318,7 @@ pub(crate) fn serves_natively_with(
 /// Required upstream model id (`model_name`) for a non-routing Model.
 pub(crate) fn require_upstream_model(model: &Model) -> Result<&str, ProxyError> {
     model.model_name.as_deref().ok_or_else(|| {
-        ProxyError::InvalidRequest(format!(
+        ProxyError::UnusableTarget(format!(
             "model {:?} has no model_name (routing models can't be dispatched directly)",
             model.display_name
         ))
@@ -405,7 +410,7 @@ pub(crate) fn resolve_base_url(provider_key: &ProviderKey) -> Result<String, Pro
                  standalone: directly on the resource). Only the openai \
                  vendor has a built-in default base."
             );
-            Err(ProxyError::InvalidRequest(format!(
+            Err(ProxyError::UnusableTarget(format!(
                 "provider_key {:?} has no api_base configured",
                 provider_key.display_name
             )))
@@ -691,7 +696,7 @@ pub(crate) fn require_api_key<'a>(
     model: &Model,
 ) -> Result<&'a str, ProxyError> {
     if provider_key.api_key.is_empty() {
-        return Err(ProxyError::InvalidRequest(format!(
+        return Err(ProxyError::UnusableTarget(format!(
             "model {:?} provider_key has empty api_key",
             model.display_name
         )));
@@ -820,6 +825,25 @@ pub(crate) fn upstream_body_is_sse(headers: &axum::http::HeaderMap) -> bool {
     !(essence == "application/json" || essence.ends_with("+json"))
 }
 
+/// The JSON of the first complete SSE frame in `bytes`, when there is one.
+/// What a relay that peeks at a stream's first read uses to tell an upstream
+/// that answered `200` and then reported a failure as its first frame from
+/// one that started answering.
+pub(crate) fn first_sse_frame_json(bytes: &[u8]) -> Option<serde_json::Value> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let frame = text
+        .split_once("\n\n")
+        .or_else(|| text.split_once("\r\n\r\n"))?
+        .0;
+    let data = frame
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect::<Vec<_>>()
+        .join("\n");
+    serde_json::from_str(&data).ok()
+}
+
 /// Buffer a JSON response body under an optional deadline.
 ///
 /// The relays attach reqwest's request-level timeout only when the REQUEST
@@ -855,6 +879,39 @@ pub(crate) async fn json_body_within(
 mod tests {
     use super::*;
     use aisix_core::resource::ResourceEntry;
+
+    #[test]
+    fn the_first_frame_is_read_from_a_streams_first_read() {
+        let frame = first_sse_frame_json(
+            b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\nevent: x\n",
+        )
+        .expect("a complete frame");
+        assert_eq!(frame["type"], "error");
+        assert_eq!(
+            first_sse_frame_json(b"data: {\"type\":\"ok\"}\r\n\r\n").expect("crlf frame")["type"],
+            "ok"
+        );
+        // A frame the read has not finished, and one that is not JSON.
+        assert_eq!(first_sse_frame_json(b"data: {\"type\":\"err"), None);
+        assert_eq!(first_sse_frame_json(b"data: [DONE]\n\n"), None);
+    }
+
+    /// `serves_natively` is a question asked of targets the request may never
+    /// dispatch to, so it must leave what the request reports alone.
+    #[tokio::test]
+    async fn asking_whether_a_target_serves_a_surface_commits_the_request_to_nothing() {
+        let snap = snapshot_with_pk_json(
+            "pk-1",
+            r#"{"display_name":"o","secret":"k","api_base":"https://up/v1","provider":"openai","adapter":"openai"}"#,
+        );
+        let target = model_on("openai", "pk-1");
+        let cell = Arc::new(crate::attribution::RequestAttribution::default());
+        crate::attribution::scope(cell.clone(), async {
+            assert!(serves_natively(&snap, &target, ApiSurface::Responses));
+        })
+        .await;
+        assert_eq!(cell.get().provider_key_id, "");
+    }
 
     /// #1093: `reqwest::Error::is_timeout()` is satisfied by an
     /// expired request budget, an expired `connect_timeout`, and the
@@ -1272,7 +1329,7 @@ mod tests {
         let m = direct_model("pk-MISSING");
         let err = resolve_provider_key(&snap, &m).unwrap_err();
         match err {
-            ProxyError::InvalidRequest(msg) => {
+            ProxyError::UnusableTarget(msg) => {
                 assert!(msg.contains("provider_key_id"), "{msg}");
                 assert!(msg.contains("my-gpt4"), "{msg}");
             }
@@ -1285,7 +1342,7 @@ mod tests {
         let snap = snapshot_with("pk-1");
         let m = routing_model();
         let err = resolve_provider_key(&snap, &m).unwrap_err();
-        assert!(matches!(err, ProxyError::InvalidRequest(_)));
+        assert!(matches!(err, ProxyError::UnusableTarget(_)));
     }
 
     #[test]
@@ -1322,7 +1379,7 @@ mod tests {
         let pk: ProviderKey = serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
         let err = resolve_base_url(&pk).unwrap_err();
         match err {
-            ProxyError::InvalidRequest(msg) => {
+            ProxyError::UnusableTarget(msg) => {
                 assert!(
                     msg.contains("api_base"),
                     "error must mention api_base; got: {msg}"
@@ -1379,7 +1436,7 @@ mod tests {
             ))
             .unwrap();
             assert!(
-                matches!(resolve_base_url(&pk), Err(ProxyError::InvalidRequest(_))),
+                matches!(resolve_base_url(&pk), Err(ProxyError::UnusableTarget(_))),
                 "adapter {adapter:?} must not fall back to the OpenAI default base"
             );
         }
@@ -1569,7 +1626,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             resolve_base_url(&pk).unwrap_err(),
-            ProxyError::InvalidRequest(_)
+            ProxyError::UnusableTarget(_)
         ));
     }
 

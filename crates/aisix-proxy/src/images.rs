@@ -626,6 +626,7 @@ async fn dispatch(
     let crate::routing::Dispatched {
         value: (answered, provider_label, pk_id),
         target,
+        attempt_started,
         member_reservation,
         ..
     } = match dispatched {
@@ -648,7 +649,9 @@ async fn dispatch(
             // #701: clear any cooldown/unhealthy mark now the upstream
             // answered — same recovery signal as rerank/audio/chat.
             state.health.record_success(&model.display_name);
-            state.runtime_status.mark_healthy(&target.id);
+            state
+                .runtime_status
+                .mark_healthy(&target.id, attempt_started);
             // Extract usage tokens (gpt-image-1 returns a `usage` block;
             // dall-e-3 doesn't) BEFORE moving resp_json into the
             // Response, so the success struct carries typed counters.

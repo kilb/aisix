@@ -183,8 +183,10 @@ pub struct RoutingTarget {
     pub model_id: Option<String>,
     /// Target weight, default `1`. Used by `round_robin` (rotation share),
     /// `consistent_hash` (share of the hash ring), and `least_busy`
-    /// (in-flight divided by weight). `failover`, `least_cost`, and
-    /// `least_latency` accept the field but do not use it.
+    /// (in-flight divided by weight). On those strategies `0` takes the
+    /// target out of rotation while another candidate for the request has a
+    /// positive weight. `failover`, `least_cost`, and `least_latency` accept
+    /// the field but do not use it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u32>,
     /// Priority tier, default `0`; a higher value is preferred (the APISIX
@@ -282,7 +284,7 @@ impl RoutingTarget {
     }
 }
 
-/// Behavior when every routing target is unavailable because of runtime health or cooldown state.
+/// Behavior when a background health check reports every routing target unhealthy. Targets in request-path cooldown are not unavailable in this sense: with no healthy target left, the request goes to the cooling ones, which lets a recovered target answer before its cooldown lapses.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
 )]
@@ -291,10 +293,9 @@ pub enum WhenAllUnavailablePolicy {
     /// Return `503` with a fixed `Retry-After` hint.
     #[default]
     Fail,
-    /// Try every target in declaration order even when all of them are
-    /// currently unavailable because of health or cooldown status. Use
-    /// only when maintaining availability is preferred over avoiding
-    /// recently unhealthy targets.
+    /// Try the targets anyway, in the strategy's order and up to
+    /// `max_fallbacks`. Use only when maintaining availability is preferred
+    /// over avoiding targets a health check reports as broken.
     TryAnyway,
 }
 
@@ -319,7 +320,7 @@ pub struct Routing {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(inner(range(min = 400, max = 599)))]
     pub fallback_on_statuses: Option<Vec<u16>>,
-    /// Policy to apply when every target is unavailable because of runtime health or cooldown state.
+    /// Policy to apply when a background health check reports every target unhealthy. Targets in cooldown are still tried when no healthy target is left.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when_all_unavailable: Option<WhenAllUnavailablePolicy>,
     /// Where the `consistent_hash` hash key comes from: an ordered chain of
