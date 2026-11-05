@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { connect } from "node:net";
+import { connect, createServer, type AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { harnessRequest } from "../harness/http.js";
 import {
@@ -638,6 +638,81 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     };
     expect(noKeyBody.error?.message).toContain("x-aisix-api-key");
     expect(noKeyBody.error?.message).not.toContain("Authorization");
+  });
+
+  // A host-scoped route is bounded by its `hosts` list only if the host it
+  // matched is the host it dials. A value with URL syntax in it can sit under
+  // `*.example.com` as text and name another host as a URL, so it must reach
+  // neither the route's upstream nor that other host.
+  test("a Host that is not a hostname matches no host-scoped route", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+    const upstream = await startOpenAiUpstream({
+      nonStreamBody: { routed: "wildcard-host" },
+    });
+    upstreams.push(upstream);
+
+    // What the caller would have the gateway dial, credential and all.
+    let dialled = 0;
+    const elsewhere = createServer((socket) => {
+      dialled += 1;
+      socket.destroy();
+    });
+    await new Promise<void>((resolve) => elsewhere.listen(0, "127.0.0.1", resolve));
+    const elsewherePort = (elsewhere.address() as AddressInfo).port;
+
+    try {
+      await seed.createPassthroughRoute({
+        name: "ptr-wildcard-preserve",
+        hosts: ["*.preserve.ptr.example.com"],
+        preserve_host: true,
+        auth_mode: "header_key",
+        auth_header_name: "x-aisix-api-key",
+        credential_mode: "forward_client",
+      });
+      await seed.createPassthroughRoute({
+        name: "ptr-wildcard-target",
+        hosts: ["*.target.ptr.example.com"],
+        target_url: upstream.baseUrl,
+        auth_mode: "header_key",
+        auth_header_name: "x-aisix-api-key",
+        credential_mode: "forward_client",
+      });
+
+      const call = (host: string) =>
+        harnessRequest(`${app!.proxyUrl}/ptr-host-probe`, {
+          method: "GET",
+          headers: { host, "x-aisix-api-key": CALLER_PLAINTEXT },
+        });
+      await waitConfigPropagation(async () => {
+        try {
+          const r = await call("agent.target.ptr.example.com");
+          await r.body.text();
+          return r.statusCode === 200;
+        } catch {
+          return false;
+        }
+      });
+
+      const before = upstream.receivedRequests.length;
+      for (const host of [
+        `127%2e0%2e0%2e1:${elsewherePort}#.preserve.ptr.example.com`,
+        `127%2e0%2e0%2e1:${elsewherePort}/.preserve.ptr.example.com`,
+        `127%2e0%2e0%2e1:${elsewherePort}?.preserve.ptr.example.com`,
+        "evil%2ecom#.target.ptr.example.com",
+        "user@agent.target.ptr.example.com",
+      ]) {
+        const r = await call(host);
+        await r.body.text();
+        expect(r.statusCode, host).toBe(404);
+      }
+      expect(dialled).toBe(0);
+      expect(upstream.receivedRequests.length).toBe(before);
+    } finally {
+      await new Promise((resolve) => elsewhere.close(resolve));
+    }
   });
 
   test("a prefixed host route claims a reserved namespace and mirrors the path", async (ctx) => {

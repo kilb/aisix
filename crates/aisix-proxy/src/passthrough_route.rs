@@ -562,7 +562,9 @@ async fn dispatch(
     let base = if route.preserve_host {
         // `preserve_host` is only schema-legal with a `hosts` allowlist,
         // and only host-matched requests reach a hosts-bearing route — so
-        // the derived target is bounded by the operator's own list.
+        // the derived target is bounded by the operator's own list, given a
+        // host `inbound_host` admitted, which holds nothing a URL parser
+        // could read as another host.
         let host = matched.host.as_deref().ok_or_else(|| {
             RouteError::of(
                 ProxyError::InvalidRequest(format!(
